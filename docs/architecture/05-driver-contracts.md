@@ -1,0 +1,186 @@
+# 05 — Driver Contracts (v1)
+
+> The canonical TypeScript contracts every backend implements — the kernel/backend boundary (ADR-016). The router consumes these ([`04`](04-capability-router-and-ladder.md)); the execution model runs them ([`06`](06-execution-and-runtime.md)). **This file is the source of truth for the contract types.**
+
+## 1. Principles
+
+- **Three kinds:** `CodecDriver` (decode/encode one codec), `ContainerDriver` (demux/mux one container family), `FilterDriver` (transform frames).
+- **Streaming via `TransformStream`.** Backpressure, cancellation (via `signal`), and error propagation come for free, and the stream *is* the lifecycle (configure on start, flush on close). No bespoke `init()/close()` for coders.
+- **WebCodecs-native units at the seams.** Encoded units are `EncodedVideoChunk`/`EncodedAudioChunk`; raw frames are `VideoFrame`/`AudioData`. A demuxer's output feeds a decoder directly.
+- **Drivers declare, the router decides.** A driver answers `supports()`; it never picks itself over another.
+
+## 2. The contracts
+
+```ts
+// ============ versioning ============
+export const DRIVER_API_VERSION = 1 as const
+
+// ============ shared ============
+export type Tier = 'hardware' | 'gpu' | 'native' | 'wasm'   // ranking order, best first
+export type MediaType = 'video' | 'audio'
+
+export interface StageOptions {
+  signal?: AbortSignal
+  onProgress?: (p: Progress) => void
+  determinism?: 'auto' | 'force-software'      // force-software drops the hardware/gpu tiers
+}
+export interface Progress { done: number; total?: number; stage: string }
+
+// WebCodecs-native units flow across the seams:
+export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk   // container <-> codec
+export type RawFrame     = VideoFrame | AudioData                  // codec <-> filter
+
+export interface DriverBase {
+  readonly id: string          // unique, e.g. 'webcodecs-video', 'wasm-flac', 'mp4'
+  readonly apiVersion: number  // = DRIVER_API_VERSION it was built against
+}
+
+// ============ error model ============
+export type MediaErrorCode =
+  | 'capability-miss'     // no eligible driver for op + codec + env
+  | 'unsupported-input'   // garbled / empty / unknown source
+  | 'decode-error' | 'encode-error' | 'demux-error' | 'mux-error'
+  | 'aborted'             // signal aborted
+  | 'driver-incompatible' // apiVersion mismatch at registration
+export class MediaError extends Error {
+  constructor(readonly code: MediaErrorCode, message: string, readonly detail?: unknown) { super(message) }
+}
+export class CapabilityError extends MediaError {}   // 'capability-miss'; detail carries { op, tried[] }
+export class InputError extends MediaError {}        // 'unsupported-input'
+
+// ============ 1) CodecDriver ============
+export type DecoderConfig = VideoDecoderConfig | AudioDecoderConfig   // WebCodecs-native
+export type EncoderConfig = VideoEncoderConfig | AudioEncoderConfig
+export interface CodecQuery { mediaType: MediaType; direction: 'decode' | 'encode'; config: DecoderConfig | EncoderConfig }
+export interface CodecSupport { supported: boolean; hardwareAccelerated?: boolean; reason?: string }
+
+export interface CodecDriver extends DriverBase {
+  readonly kind: 'codec'
+  readonly tier: Tier
+  supports(q: CodecQuery): Promise<CodecSupport>                                  // wraps isConfigSupported
+  createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame>
+  createEncoder(c: EncoderConfig, o?: StageOptions): TransformStream<RawFrame, EncodedChunk>
+}
+
+// ============ 2) ContainerDriver ============
+export interface ByteSource {
+  stream(): ReadableStream<Uint8Array>
+  size?: number
+  range?(start: number, end: number): Promise<Uint8Array>   // enables header-only probe
+}
+export interface ContainerQuery { direction: 'demux' | 'mux'; mime?: string; extension?: string; head?: Uint8Array /* magic */ }
+export interface TrackInfo {
+  id: number; mediaType: MediaType; codec: string; durationSec?: number
+  config?: DecoderConfig            // video: coded dims/rotation/fps; audio: sampleRate/channels
+}
+export interface Demuxer {
+  readonly tracks: readonly TrackInfo[]
+  packets(trackId: number): ReadableStream<EncodedChunk>   // lazy, per-track
+  close(): Promise<void>
+}
+export interface MuxOptions { faststart?: boolean; fragmented?: boolean }
+export interface Muxer {
+  readonly output: ReadableStream<Uint8Array>
+  addTrack(info: TrackInfo): number
+  write(trackId: number, chunk: EncodedChunk): Promise<void>
+  finalize(): Promise<void>
+}
+export interface ContainerDriver extends DriverBase {
+  readonly kind: 'container'
+  readonly formats: readonly string[]                      // e.g. ['mp4','mov']
+  supports(q: ContainerQuery): boolean                     // sync: mime / extension / magic
+  demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>
+  createMuxer(o?: MuxOptions): Muxer
+}
+
+// ============ 3) FilterDriver ============
+export type FilterSpec =
+  | { mediaType: 'video'; type: 'resize'; width: number; height: number; fit?: 'contain' | 'cover' | 'fill' }
+  | { mediaType: 'video'; type: 'crop'; x: number; y: number; width: number; height: number }
+  | { mediaType: 'video'; type: 'rotate'; degrees: 0 | 90 | 180 | 270 }
+  | { mediaType: 'video'; type: 'flip'; axis: 'h' | 'v' }
+  | { mediaType: 'video'; type: 'colorspace'; to: string }
+  | { mediaType: 'video'; type: 'tonemap'; to: 'sdr' }
+  | { mediaType: 'audio'; type: 'resample'; sampleRate: number }
+  | { mediaType: 'audio'; type: 'remix'; channels: number }
+  | { mediaType: 'audio'; type: 'gain'; db: number }
+export interface FilterDriver extends DriverBase {
+  readonly kind: 'filter'
+  readonly substrate: 'webgpu' | 'webgl' | 'canvas2d' | 'wasm'
+  supports(f: FilterSpec): boolean
+  createFilter(f: FilterSpec, o?: StageOptions):           // matches the spec's mediaType
+    | TransformStream<VideoFrame, VideoFrame>
+    | TransformStream<AudioData, AudioData>
+}
+
+// ============ registration ============
+export interface Registry {
+  addCodec(d: CodecDriver): void
+  addContainer(d: ContainerDriver): void
+  addFilter(d: FilterDriver): void
+}
+export interface DriverModule {
+  readonly apiVersion: number   // checked against DRIVER_API_VERSION at registration
+  register(reg: Registry): void // adds this module's drivers
+}
+// A lazily-imported driver chunk default-exports a DriverModule.
+```
+
+## 3. Lifecycle, cancellation, errors
+
+- A coder/filter is a `TransformStream`. The driver configures its underlying WebCodecs/WASM object when the stream starts, processes each chunk, and **flushes on writable close** (encoder/muxer `finalize`).
+- **Cancellation:** aborting `StageOptions.signal` cancels the readable and writable; the driver must release WebCodecs/WASM resources in the stream's `cancel`/`abort` handlers.
+- **Errors:** a driver throws/【rejects the stream with】a `MediaError` (`decode-error`/`encode-error`/`demux-error`/`mux-error`); never swallow an error and emit silence (that is exactly the kind of WEAK-GATE behavior we reject, ADR-018).
+
+## 4. Authoring a driver (the rules)
+
+1. Implement exactly one `kind` and one substrate; keep it small and lazily importable.
+2. `supports()` must be cheap and **honest** — return `false` rather than throwing later. For codecs, defer to `isConfigSupported`; for WASM, feature-detect what the core actually builds.
+3. Set `tier` truthfully (`hardware`/`gpu`/`native`/`wasm`) — the router ranks on it.
+4. Emit/consume only the seam types (`EncodedChunk`, `RawFrame`, `Uint8Array`). Do not invent a private frame type.
+5. Heavy `.wasm` loads inside `createDecoder/Encoder/Filter`, **not** in `supports()` (keeps probing cheap, [`04`](04-capability-router-and-ladder.md)).
+6. Declare `apiVersion = DRIVER_API_VERSION`.
+
+### Skeleton (a WASM FLAC decode driver)
+
+```ts
+const FlacModule: DriverModule = {
+  apiVersion: DRIVER_API_VERSION,
+  register(reg) {
+    reg.addCodec({
+      id: 'wasm-flac', kind: 'codec', tier: 'wasm', apiVersion: DRIVER_API_VERSION,
+      async supports(q) {
+        return { supported: q.mediaType === 'audio' && q.direction === 'decode'
+                            && (q.config as AudioDecoderConfig).codec.startsWith('flac') }
+      },
+      createDecoder(config, o) {
+        return new TransformStream<EncodedChunk, RawFrame>({
+          async start() { this.core = await loadFlacWasm() /* new URL('./flac.wasm', import.meta.url) */ },
+          async transform(chunk, ctrl) { ctrl.enqueue(this.core.decode(chunk)) /* -> AudioData */ },
+          flush() { this.core.free() },
+        })
+      },
+      createEncoder() { throw new MediaError('encode-error', 'flac encode not provided by this driver') },
+    })
+  },
+}
+export default FlacModule
+```
+
+## 5. Versioning / semver policy (for third-party drivers)
+
+The driver API has its **own integer major** (`DRIVER_API_VERSION`), **decoupled** from the library's public semver. Each driver declares the version it targets; the core verifies compatibility at registration.
+
+| Change | Bump | Examples |
+|---|---|---|
+| **Breaking** | major | remove/rename a method, change a signature, narrow a type, change the lifecycle/ordering contract |
+| **Additive** | minor | new *optional* method/field, a new `Tier`/substrate value, a new `FilterSpec` variant |
+| **Clarification** | patch | docs/behavior note, no shape change |
+
+- The core supports the **current and previous major** (`N`, `N-1`) via an internal shim, for a **2-minor deprecation window**, then drops `N-1`.
+- **Registration check:** if `driver.apiVersion` is unsupported, the core refuses to register it and throws `MediaError{ code: 'driver-incompatible', detail: { got, supported } }` — a clear error, not a later crash.
+- **First-party** drivers move in lockstep with the core; the policy exists for **third-party** drivers published as separate packages.
+
+## 6. Why these three contracts (and not more)
+
+They map exactly to the two data-flow seams ([`03`](03-system-architecture.md) §5): containers↔codecs (packets) and codecs↔filters (frames). Everything an engine does is some composition of demux/decode/filter/encode/mux, so three driver kinds cover the whole surface. Sources/sinks are separate (they bound the pipeline, they aren't stages) — see [`07-public-api.md`](07-public-api.md).
