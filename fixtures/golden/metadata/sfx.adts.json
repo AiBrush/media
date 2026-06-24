@@ -1,0 +1,15 @@
+{
+  "container": "adts",
+  "durationSec": 0.21333333333333335,
+  "sizeBytes": 2078,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "mp4a.40.2",
+      "durationSec": 0.21333333333333335,
+      "sampleRate": 48000,
+      "channels": 1
+    }
+  ]
+}

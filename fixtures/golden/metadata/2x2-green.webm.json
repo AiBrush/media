@@ -1,0 +1,24 @@
+{
+  "container": "webm",
+  "durationSec": 0.096,
+  "sizeBytes": 814,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "video",
+      "codec": "vp8",
+      "durationSec": 0.096,
+      "fps": 25,
+      "width": 2,
+      "height": 2
+    },
+    {
+      "id": 1,
+      "type": "audio",
+      "codec": "opus",
+      "durationSec": 0.096,
+      "sampleRate": 48000,
+      "channels": 1
+    }
+  ]
+}

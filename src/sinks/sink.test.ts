@@ -1,0 +1,91 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { InputError } from '../contracts/errors.ts';
+import { type Sink, materialize, toBlob, toElement, toFile, toOPFS, toStream } from './sink.ts';
+
+function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      for (const a of arrays) c.enqueue(new Uint8Array(a));
+      c.close();
+    },
+  });
+}
+
+describe('sink descriptors', () => {
+  it('build the expected shapes', () => {
+    expect(toBlob()).toEqual({ kind: 'blob' });
+    expect(toFile('a.mp4')).toEqual({ kind: 'file', name: 'a.mp4' });
+    expect(toStream()).toEqual({ kind: 'stream' });
+    expect(toOPFS('/o.mp4')).toEqual({ kind: 'opfs', path: '/o.mp4' });
+    const el = {} as HTMLMediaElement;
+    expect(toElement(el)).toEqual({ kind: 'element', el, via: 'blob' });
+    expect(toElement(el, { via: 'mse' }).via).toBe('mse');
+  });
+});
+
+describe('materialize', () => {
+  it('collects into a Blob with the given mime', async () => {
+    const out = await materialize(toBlob(), bytesStream([1, 2], [3]), { mime: 'video/mp4' });
+    expect(out).toBeInstanceOf(Blob);
+    const blob = out as Blob;
+    expect(blob.type).toBe('video/mp4');
+    expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([1, 2, 3]);
+  });
+
+  it('collects into a named File', async () => {
+    const out = await materialize(toFile('clip.mp4'), bytesStream([9]));
+    expect(out).toBeInstanceOf(File);
+    expect((out as File).name).toBe('clip.mp4');
+  });
+
+  it('returns a stream sink lazily (the same stream)', async () => {
+    const stream = bytesStream([1]);
+    expect(await materialize(toStream(), stream)).toBe(stream);
+  });
+
+  it('rejects an unknown sink kind', async () => {
+    const bogus = { kind: 'bogus' } as unknown as Sink;
+    await expect(materialize(bogus, bytesStream([1]))).rejects.toBeInstanceOf(InputError);
+  });
+});
+
+describe('materialize — stubbed environment sinks', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('writes to an OPFS file via a stubbed StorageManager', async () => {
+    const written: number[] = [];
+    const writable = new WritableStream<Uint8Array>({
+      write(chunk): void {
+        written.push(...chunk);
+      },
+    });
+    const handle = { createWritable: () => Promise.resolve(writable) };
+    const root = {
+      getDirectoryHandle: () => Promise.resolve(root),
+      getFileHandle: () => Promise.resolve(handle),
+    };
+    vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve(root) } });
+
+    expect(await materialize(toOPFS('/media/out.mp4'), bytesStream([4, 5, 6]))).toBeUndefined();
+    expect(written).toEqual([4, 5, 6]);
+  });
+
+  it('rejects an OPFS sink when OPFS is unavailable', async () => {
+    vi.stubGlobal('navigator', {});
+    await expect(materialize(toOPFS('/x'), bytesStream([1]))).rejects.toBeInstanceOf(InputError);
+  });
+
+  it('attaches a Blob URL to an element (via:blob) and rejects other vias', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:fake');
+    const el = { src: '' } as HTMLMediaElement;
+    await materialize(toElement(el), bytesStream([1, 2]));
+    expect(el.src).toBe('blob:fake');
+
+    await expect(
+      materialize(toElement(el, { via: 'mse' }), bytesStream([1])),
+    ).rejects.toBeInstanceOf(InputError);
+  });
+});

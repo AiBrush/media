@@ -1,0 +1,12 @@
+{
+  "format": "f32",
+  "sampleRate": 48000,
+  "channels": 1,
+  "frames": 10240,
+  "sha256": {
+    "identity_f32": "9ff67ad6630efc47a363f364b1849de85fed9ac721412aaee2370d14ad653576",
+    "to_f32": "9ff67ad6630efc47a363f364b1849de85fed9ac721412aaee2370d14ad653576",
+    "to_s24": "058fcac8edbd60294e273b22757e3afb198c4ed8b0d72757a0daff65eb3e13e6",
+    "remix_stereo_s16": "0756f81d85e04cf77f53b39c5938fb46c2731a023e48dfb5cbd425a763c8c988"
+  }
+}

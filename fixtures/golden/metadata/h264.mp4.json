@@ -1,0 +1,17 @@
+{
+  "container": "mp4",
+  "durationSec": 1,
+  "sizeBytes": 9821,
+  "tracks": [
+    {
+      "id": 1,
+      "type": "video",
+      "codec": "avc1.64000B",
+      "durationSec": 1,
+      "fps": 10,
+      "rotation": 0,
+      "width": 320,
+      "height": 240
+    }
+  ]
+}

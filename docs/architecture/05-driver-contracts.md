@@ -85,12 +85,38 @@ export interface Muxer {
   write(trackId: number, chunk: EncodedChunk): Promise<void>
   finalize(): Promise<void>
 }
+export interface StreamCopyOptions extends StageOptions {  // ADR-021
+  trim?: { startSec: number; endSec: number }              // keyframe-aligned range copy; omit for full remux
+  faststart?: boolean
+  fragmented?: boolean
+}
+export interface PcmTransform extends StageOptions {       // ADR-022 (raw-PCM containers, e.g. WAV)
+  channels?: number                                        // up/down-mix (BS.775); omit = passthrough
+  sampleRate?: number                                      // resample; differing rate needs the WASM tail
+  gainDb?: number                                          // gain
+}
+export interface DecryptParams extends StageOptions {      // ADR-023 (CENC / HLS sample decryption)
+  scheme: 'cenc' | 'cbcs' | 'hls-aes128'
+  keys: Record<string, string>                             // keyId(hex) → key(hex); CENC keys by tenc default_KID
+}
 export interface ContainerDriver extends DriverBase {
   readonly kind: 'container'
   readonly formats: readonly string[]                      // e.g. ['mp4','mov']
   supports(q: ContainerQuery): boolean                     // sync: mime / extension / magic
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>
   createMuxer(o?: MuxOptions): Muxer
+  // Optional lossless same-container stream-copy (remux + keyframe-trim), bypassing the PTS-only
+  // codec seam so DTS/B-frames/codec-private survive (ADR-021). Absent ⇒ fall back to demux→mux.
+  streamCopy?(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>>
+  // Optional PCM-native audio transform for raw-PCM containers (ADR-022): apply mix/gain/resample in
+  // the TS audio-dsp path and re-serialize, preserving the source sample-format. Absent ⇒ codec seam.
+  transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
+  // Optional driver-native sample decryption (ADR-023): parse protection boxes (enca/tenc/senc),
+  // AES-CTR-decrypt with the caller's keys (WebCrypto), re-serialize cleartext. Absent ⇒ typed miss.
+  decrypt?(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>>
+  // Optional pure-TS decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024),
+  // e.g. FLAC → WAV, applying a PcmTransform. Absent ⇒ the WebCodecs/WASM codec seam.
+  decodePcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
 }
 
 // ============ 3) FilterDriver ============

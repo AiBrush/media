@@ -1,0 +1,17 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+*.tsbuildinfo
+
+# Test / coverage
+coverage
+.vitest
+
+# Downloaded real-media corpus (committed: only fixtures/manifest.json + small goldens)
+fixtures/media
+
+# OS / editor
+.DS_Store
+*.log

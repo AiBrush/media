@@ -33,7 +33,7 @@ Reclaim the ~5% heavy tail and the rest of the matrix; turn the monolith into th
 **Deliverables**
 - **Refactor to ARCH-1:** drivers register lazily via the router (public DX unchanged).
 - **More containers (TS):** WebM/MKV, Ogg, WAV, ADTS, MP3, MPEG-TS (+ HLS demux).
-- **More codecs:** VP9, AV1, HEVC (WebCodecs where present), with **WASM fallback drivers** loaded only on a hardware miss (ADR-005) — incl. **WASM FLAC decode** (the confirmed gap), libopus, libvpx.
+- **More codecs:** VP9, AV1, HEVC (WebCodecs where present), with **WASM fallback drivers** loaded only on a hardware miss (ADR-005) — libopus, libvpx. **FLAC decode is pure TS, not WASM** (ADR-024): it is lossless/integer, so the TS decoder is bit-exact (validated via STREAMINFO-MD5 on the IETF FLAC conformance corpus) and ~kilobytes — no toolchain needed. Per ADR-025, the WebCodecs/WASM-tier codecs are validated on the browser/target runtime, the pure-TS tier in Node CI.
 - **audio-dsp:** PCM format/endianness/gain/mix/fade in TS; **resample** via WebAudio/WASM soxr; lossy encode via WASM.
 - **decrypt:** CENC (`cenc`/`cbcs`) + HLS AES-128 via WebCrypto + TS box parse.
 - **streaming-output:** `StreamTarget` incremental writes, fragmented CMAF.

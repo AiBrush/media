@@ -1,0 +1,12 @@
+{
+  "format": "u8",
+  "sampleRate": 48000,
+  "channels": 1,
+  "frames": 10240,
+  "sha256": {
+    "identity_u8": "3145e298ac107d13113dab3d0bb787cc40b6f699e807d8e9a76fc5a720b42c47",
+    "to_f32": "c01486fe087e6a22982fe9c940af0f36bc1927d2533cf2fc1ac63e3a38c91854",
+    "to_s24": "2c71b9ec501883449b9627b6424f6e78bf26670432dd5e1f86afbc1d0fe3dbd4",
+    "remix_stereo_s16": "e1d29265c139de2447f5f721aa8de8d42aa0b485e5f47bcbf09ab1b7b7abad6e"
+  }
+}

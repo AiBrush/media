@@ -1,0 +1,15 @@
+{
+  "container": "mp3",
+  "durationSec": 5.067755102040817,
+  "sizeBytes": 23442,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "mp3",
+      "durationSec": 5.067755102040817,
+      "sampleRate": 22050,
+      "channels": 1
+    }
+  ]
+}

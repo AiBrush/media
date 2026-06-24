@@ -1,0 +1,12 @@
+{
+  "format": "s16",
+  "sampleRate": 48000,
+  "channels": 1,
+  "frames": 10240,
+  "sha256": {
+    "identity_s16": "64b61796b95f02d03530b7d99bcc0489be891734fcd57b3519f0c0e9c497a9e5",
+    "to_f32": "b908f6adc44c736c17989bf31aea4134bd565d0f2bc6a83b5be78e74356a550b",
+    "to_s24": "62353ecd563581e00a813fd03e8ac0f11b342a1d4c8be59b212ea8b56a7c40b4",
+    "remix_stereo_s16": "3947222f60db33bfed06b6f640244931405d676a07b09d91aba3a4fa4833da91"
+  }
+}

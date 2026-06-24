@@ -1,0 +1,15 @@
+{
+  "container": "wav",
+  "durationSec": 1.0000226757369615,
+  "sizeBytes": 88246,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "pcm-s16",
+      "durationSec": 1.0000226757369615,
+      "sampleRate": 44100,
+      "channels": 1
+    }
+  ]
+}

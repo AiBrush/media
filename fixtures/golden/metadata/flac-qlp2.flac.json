@@ -1,0 +1,15 @@
+{
+  "container": "flac",
+  "durationSec": 4.954603174603174,
+  "sizeBytes": 530759,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "flac",
+      "durationSec": 4.954603174603174,
+      "sampleRate": 44100,
+      "channels": 2
+    }
+  ]
+}

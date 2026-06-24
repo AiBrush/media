@@ -1,0 +1,15 @@
+{
+  "container": "ogg",
+  "durationSec": 5.000226757369615,
+  "sizeBytes": 18541,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "vorbis",
+      "durationSec": 5.000226757369615,
+      "sampleRate": 22050,
+      "channels": 1
+    }
+  ]
+}

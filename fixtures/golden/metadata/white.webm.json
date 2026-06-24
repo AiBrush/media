@@ -1,0 +1,16 @@
+{
+  "container": "webm",
+  "durationSec": 10,
+  "sizeBytes": 10880,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "video",
+      "codec": "vp8",
+      "durationSec": 10,
+      "fps": 30,
+      "width": 320,
+      "height": 240
+    }
+  ]
+}

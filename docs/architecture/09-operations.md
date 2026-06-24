@@ -74,9 +74,10 @@
 - **Goal:** PCM format/endianness conversion, gain, fade, channel up/down-mix, resample, lossy encode.
 - **Ladder:** TS / AudioWorklet for format/gain/mix/fade (cheap) → WebAudio `OfflineAudioContext` or WASM **soxr** for resample → WASM for lossy encode.
 - **Why [data]:** ffmpeg.wasm won audio-dsp 25/36 — but ~most are PCM format/endianness/gain/mix/fade, which are kilobytes of TS; only true **resample** and **lossy encode** genuinely need WASM (Finding 4). We reclaim the cheap majority in TS.
-- **Flow:** decode/parse PCM → transform samples (TS) or run resampler → encode/mux.
+- **Flow:** decode/parse PCM → transform samples (TS) or run resampler → encode/mux. For raw-PCM containers (WAV) the engine takes the **PCM-native path** (ADR-022): `ContainerDriver.transformPcm` runs the TS kernels (`src/dsp`) and re-serializes, preserving the source sample-format — no codec seam, no browser. `convert(→ wav)` channel mix/format ships here; resample + lossy encode raise `CapabilityError` until the WASM tail.
 - **Edge cases:** s16/s24/f32, LE/BE, BS.775 downmix coefficients, upmix, variable channel count, empty audio, 5.1.
 - **Oracle:** `decoded-audio-pcm` (sample-exact) for lossless conversions; `property-invariant` (channels/duration) for lossy — we push toward PCM-exact where math is deterministic.
+- **FLAC decode** is **pure TS** (ADR-024, `codecs/flac`), not the WASM tail: lossless integer Rice + fixed/LPC + decorrelation, exposed via `ContainerDriver.decodePcm` (FLAC → WAV). Validated **bit-exact** on the IETF FLAC conformance corpus via each file's STREAMINFO MD5 (the `flac --test` oracle). True resample + lossy **encode** stay WASM-tail.
 
 ## filters (video)
 - **Goal:** pixel transforms — resize, crop, pad, rotate, flip, colorspace, tonemap.
@@ -90,9 +91,9 @@
 - **Goal:** CENC (`cenc`/CTR, `cbcs`) and HLS AES-128 sample decryption given keys; clean rejection of unsupported schemes.
 - **Ladder:** WebCrypto AES-CTR/CBC + TS ISO-BMFF box parse (`tenc/senc/saiz/saio`) → for HLS, AES-128-CBC over TS segments.
 - **Why [data]:** ffmpeg.wasm won `cenc-ctr`, mediabunny won `cbcs` (subsample pattern); both via real crypto, not canned output.
-- **Flow:** parse protection boxes → derive per-sample IV/subsample map → `crypto.subtle.decrypt` → emit cleartext packets → optional remux.
+- **Flow:** parse protection boxes → derive per-sample IV/subsample map → `crypto.subtle.decrypt` → emit cleartext packets → optional remux. **`cenc`/AES-CTR is implemented driver-native** (ADR-023): `ContainerDriver.decrypt` parses `enca`/`tenc`/`senc`, AES-CTR-decrypts samples (whole-sample for audio, subsample-aware for video), and re-serializes cleartext; `cbcs`/`hls-aes128` raise a typed miss until added.
 - **Edge cases:** subsample patterns (cbcs), per-sample IVs, zeroed/bitflipped/ truncated protection → graceful; **reject** unsupported schemes (`cens`, `sample-aes`, `clearkey`) with a clear error, not a crash.
-- **Oracle:** `decrypt-bitexact` — decoded frames sha256-match a cleartext golden.
+- **Oracle:** `decrypt-bitexact` — decoded frames sha256-match a cleartext golden. Browser-free, we use the **stronger** sample-level gate: an encrypt→decrypt round-trip on real media recovers the sample bytes **bit-exact** (+ anti-cheat: cipher≠clear, wrong-key≠clear; + a NIST AES-CTR vector on the crypto core).
 
 ## streaming-output
 - **Goal:** produce output incrementally with bounded memory (live/streaming targets).
