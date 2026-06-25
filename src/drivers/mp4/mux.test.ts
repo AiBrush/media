@@ -81,6 +81,34 @@ describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
     expect(samples.map((s) => s.durationTicks)).toEqual([f, f, f, f]);
   });
 
+  it('true-DTS verbatim remux (ADR-045): lays DTS+ctts from each packet dtsUs, ignoring a wrong duration', () => {
+    const ts = 90_000;
+    // Decode order I,P,B,B with the SOURCE's own DTS (100ms decode spacing) and reordered PTS. Each
+    // chunk's `durationUs` is deliberately WRONG (10ms) — the duration-recovery path would compute a
+    // different, wrong DTS timeline; the true-DTS path derives duration from the DTS gaps instead, so
+    // this asserts the dtsUs branch is taken and is exact. ctts = PTS − DTS (incl. negatives).
+    const dtsChunk = (pts: number, dts: number, key: boolean): ChunkStruct => ({
+      timestampUs: pts,
+      durationUs: 10_000,
+      key,
+      data: new Uint8Array([key ? 0x65 : 0x41]),
+      dtsUs: dts,
+    });
+    const chunks: ChunkStruct[] = [
+      dtsChunk(0, 0, true),
+      dtsChunk(300_000, 100_000, false),
+      dtsChunk(100_000, 200_000, false),
+      dtsChunk(200_000, 300_000, false),
+    ];
+    const samples = buildMuxSamples(chunks, ts);
+    // Durations from the DTS gaps (100ms → 9000 ticks); the final sample has no next DTS, so it reuses
+    // its own (10ms → 900) duration. NOT the wrong 10ms for the first three.
+    expect(samples.map((s) => s.durationTicks)).toEqual([9000, 9000, 9000, 900]);
+    // ctts = PTS − DTS: [0−0, 300k−100k, 100k−200k, 200k−300k] = [0, 200k, −100k, −100k] µs → ticks.
+    expect(samples.map((s) => s.cttsTicks)).toEqual([0, 18_000, -9000, -9000]);
+    expect(samples.map((s) => s.keyframe)).toEqual([true, false, false, false]);
+  });
+
   it('VFR: durations vary; DTS stays contiguous so ctts stays 0 when not reordered', () => {
     const ts = 90_000;
     const chunks: ChunkStruct[] = [
@@ -363,8 +391,43 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     ).toThrowError(/cannot write video codec 'theora'/);
   });
 
-  it('fragmented mux is a typed capability miss at construction', () => {
-    expect(() => new Mp4Muxer({ fragmented: true })).toThrowError(/fragmented/);
+  it('fragmented mux emits a CMAF init segment + moof media segments, re-parsing to the right track', async () => {
+    const muxer = new Mp4Muxer({ fragmented: true });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      config: { codec: 'avc1.42C01E', codedWidth: 16, codedHeight: 8, description: AVCC },
+    });
+    // Two GOPs (key, delta, key, delta) so the fragmenter splits at the second keyframe → ≥2 media segments.
+    muxer.addChunkStruct(vid, videoChunk(0, 33_333, true, 20));
+    muxer.addChunkStruct(vid, videoChunk(33_333, 33_333, false, 10));
+    muxer.addChunkStruct(vid, videoChunk(66_666, 33_333, true, 18));
+    muxer.addChunkStruct(vid, videoChunk(99_999, 33_333, false, 9));
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    // The output is a fragmented MP4: a `moov` init segment FOLLOWED by ≥1 `moof` media segment (a plain
+    // faststart MP4 has no `moof`). Scan top-level boxes for the order + presence.
+    const order: string[] = [];
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off + 8 <= bytes.byteLength; ) {
+      const size = dv.getUint32(off);
+      order.push(String.fromCharCode(...bytes.subarray(off + 4, off + 8)));
+      if (size <= 0) break;
+      off += size;
+    }
+    expect(order.filter((t) => t === 'moof').length).toBeGreaterThanOrEqual(2);
+    expect(order.indexOf('moov')).toBeLessThan(order.indexOf('moof'));
+
+    // The fragment-aware demux recovers the track + a faithful duration from the moof/trun timing (the
+    // `moov` init segment's sample tables are intentionally empty — samples live in the fragments).
+    const movie = await readMovie(ra(bytes));
+    expect(movie.tracks).toHaveLength(1);
+    expect(movie.tracks[0]?.codec).toBe('avc1.42C01E');
+    // Four 33.333 ms samples → ~0.133 s recovered from the fragment timing (not from an empty `stbl`).
+    expect(movie.tracks[0]?.durationSec ?? 0).toBeCloseTo(4 * 0.033333, 2);
   });
 });
 

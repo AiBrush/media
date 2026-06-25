@@ -11,7 +11,7 @@
  * independently testable, so it is factored out behind small pure functions rather than inlined.
  */
 
-import type { EncodedChunk, FilterSpec, TrackInfo } from '../contracts/driver.ts';
+import type { EncodedChunk, FilterSpec, Packet, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { AudioCodec, AudioTarget, Container, VideoCodec, VideoTarget } from './types.ts';
@@ -625,25 +625,53 @@ export function frameSatisfiesSeek(timestampUs: number, targetUs: number): boole
 // and are unit-tested in Node with fake frame/chunk objects (no WebCodecs construction); the live
 // round-trips with real `VideoFrame`s are validated in the browser harness (BUILD §6.1).
 
-/** The minimal `Muxer` surface {@link drainEncoderToMuxer} needs (addTrack + write). */
+/** The minimal `Muxer` surface {@link drainEncoderToMuxer} needs (addTrack + write a {@link Packet}). */
 export interface MuxerSink {
   addTrack(info: TrackInfo): number;
-  write(trackId: number, chunk: EncodedChunk): Promise<void>;
+  write(trackId: number, packet: Packet): Promise<void>;
 }
 
 /**
- * Drain an encoder's {@link EncodedChunk} output into a `Muxer`, allocating the track lazily on the
- * first chunk — *after* the encoder has published its `decoderConfig` (codec box), which the caller
- * captures through the encoder driver's `onDecoderConfig`/`onConfig` bridge. The chunk stream carries
- * only bytes, so the config must arrive out-of-band before `addTrack`; the muxer's `write` preserves
- * PTS/duration/B-frame composition. Returns when the encoder stream ends (all chunks written). An empty
- * stream allocates no track (so an encoder that produced nothing does not create a sample-less track).
+ * Normalize a seam item to a {@link Packet}: a bare {@link EncodedChunk} from an *encoder* (PTS only, the
+ * muxer recovers DTS from arrival/durations) is wrapped `{ chunk }`; a {@link Packet} from a *demuxer*
+ * (verbatim remux — already carries `dtsUs`) passes through. `'chunk' in v` cleanly discriminates: the
+ * sealed `Encoded*Chunk` host objects have no `chunk` property. Pure + total.
+ */
+function toPacket(v: EncodedChunk | Packet): Packet {
+  return v instanceof Object && 'chunk' in v ? v : { chunk: v };
+}
+
+/**
+ * Drop the DTS side-channel: project a {@link Packet} stream back to the bare {@link EncodedChunk}s a
+ * WebCodecs decoder consumes (the decoder only needs the coded bytes + PTS in `timestamp`; DTS is a
+ * muxer concern). Used at every demux→decode seam in the engine. Pure stream plumbing — Node-testable
+ * with fake packets; the live decode that follows is browser-gated.
+ */
+export function unwrapPackets(packets: ReadableStream<Packet>): ReadableStream<EncodedChunk> {
+  return packets.pipeThrough(
+    new TransformStream<Packet, EncodedChunk>({
+      transform(p, controller): void {
+        controller.enqueue(p.chunk);
+      },
+    }),
+  );
+}
+
+/**
+ * Drain a seam stream into a `Muxer`, allocating the track lazily on the first item — *after* the
+ * encoder has published its `decoderConfig` (codec box), which the caller captures through the encoder
+ * driver's `onDecoderConfig`/`onConfig` bridge. Serves BOTH seam producers: an *encoder*'s bare
+ * {@link EncodedChunk}s (PTS only — the muxer recovers DTS from arrival order/durations) and a
+ * *demuxer*'s {@link Packet}s (verbatim remux — carrying the source `dtsUs` so B-frame composition
+ * survives losslessly); each item is normalized via {@link toPacket} before `write`. Returns when the
+ * stream ends (all packets written). An empty stream allocates no track (an encoder that produced
+ * nothing does not create a sample-less track).
  *
- * Frame lifetime: chunks are not closable; the encoder already closed every input `VideoFrame`/
+ * Frame lifetime: packets are not closable; the encoder already closed every input `VideoFrame`/
  * `AudioData` (its contract). On error the stream rejects and the caller cancels the siblings.
  */
 export async function drainEncoderToMuxer(
-  chunks: ReadableStream<EncodedChunk>,
+  chunks: ReadableStream<EncodedChunk | Packet>,
   muxer: MuxerSink,
   getConfig: () => TrackInfo,
 ): Promise<void> {
@@ -654,7 +682,7 @@ export async function drainEncoderToMuxer(
       const { done, value } = await reader.read();
       if (done) break;
       if (trackId === undefined) trackId = muxer.addTrack(getConfig());
-      await muxer.write(trackId, value);
+      await muxer.write(trackId, toPacket(value));
     }
   } finally {
     reader.releaseLock();

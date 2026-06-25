@@ -51,6 +51,7 @@ import {
   isPureStreamCopy,
   normalizeDecoderCodec,
   seekFrame,
+  unwrapPackets,
   videoFilterSpecs,
   videoTrackInfoFromDecoderConfig,
 } from './codec-pipeline.ts';
@@ -347,7 +348,10 @@ export class MediaEngineImpl implements MediaEngine {
         // it (owned by the caller). The demuxer is closed on every exit by the finally.
         const codec = await this.#routeCodec(decodeQueryFor(track), o);
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
-        const fromKeyframe = await startAtSeekKeyframe(demuxer.packets(track.id), timeUs);
+        const fromKeyframe = await startAtSeekKeyframe(
+          unwrapPackets(demuxer.packets(track.id)),
+          timeUs,
+        );
         const out = fromKeyframe.pipeThrough(
           codec.createDecoder(decodeConfigOf(track), stage),
         ) as ReadableStream<VideoFrame>;
@@ -515,7 +519,9 @@ export class MediaEngineImpl implements MediaEngine {
     // The demuxer stays open for the life of the packet stream; closing it is a no-op for the mp4 driver
     // (range-backed), so the frame stream owns no teardown beyond the decoder's own abort listener. The
     // track's mediaType matches `M`, so the decoder's RawFrame output is the corresponding frame type.
-    return demuxer.packets(track.id).pipeThrough(decoder) as ReadableStream<RawFrameOf<M>>;
+    return unwrapPackets(demuxer.packets(track.id)).pipeThrough(decoder) as ReadableStream<
+      RawFrameOf<M>
+    >;
     /* v8 ignore stop */
   }
 
@@ -628,11 +634,9 @@ export class MediaEngineImpl implements MediaEngine {
         // the composition below is the live path, browser-validated.
         const videoCodec = await this.#routeCodec(decodeQueryFor(videoTrack), o);
         /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
-        const decoded = demuxer
-          .packets(videoTrack.id)
-          .pipeThrough(
-            videoCodec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
-          );
+        const decoded = unwrapPackets(demuxer.packets(videoTrack.id)).pipeThrough(
+          videoCodec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
+        );
         const filtered = await this.#applyVideoFilters(
           decoded as ReadableStream<VideoFrame>,
           opts.video || {},
@@ -649,11 +653,9 @@ export class MediaEngineImpl implements MediaEngine {
       if (audioTrack) {
         const audioCodec = await this.#routeCodec(decodeQueryFor(audioTrack), o);
         /* v8 ignore start -- live decode→[remix/resample]→encode requires WebCodecs; browser-validated. */
-        const decoded = demuxer
-          .packets(audioTrack.id)
-          .pipeThrough(
-            audioCodec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
-          ) as ReadableStream<AudioData>;
+        const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
+          audioCodec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
+        ) as ReadableStream<AudioData>;
         // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
         // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
         // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.

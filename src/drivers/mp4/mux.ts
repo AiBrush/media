@@ -14,8 +14,9 @@
  * WebCodecs (see mux.test.ts).
  */
 
-import type { EncodedChunk, MuxOptions, Muxer, TrackInfo } from '../../contracts/driver.ts';
+import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { fragmentMp4 } from './fragment.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
 import { type ContainerBrand, writeMp4 } from './write.ts';
 
@@ -37,6 +38,12 @@ export interface ChunkStruct {
   key: boolean;
   /** The packet bytes (owned copy). */
   data: Uint8Array;
+  /**
+   * Decode timestamp (µs), from the demuxer's {@link Packet.dtsUs} on a verbatim remux. When **every**
+   * chunk carries it, {@link buildMuxSamples} lays the DTS timeline + composition offsets down from it
+   * exactly (lossless B-frame preservation); `undefined` ⇒ recover DTS from arrival order/durations.
+   */
+  dtsUs?: number;
 }
 
 /** How a track's codec config is carried into {@link MuxTrackInput} once the sample entry is known. */
@@ -163,6 +170,29 @@ export function buildMuxSamples(
   const recovered = hasAllDurations ? undefined : recoverDurationsUs(chunks);
   const durationsUs = chunks.map((c, i) => c.durationUs ?? recovered?.[i] ?? 0);
 
+  // Verbatim-remux fast path: every packet carries the source's true decode timestamp (the demuxer read
+  // it from `stts`). Lay the composition offset down as the exact (PTS − DTS), and derive each sample's
+  // duration from the gap to the next DTS so writeMp4's cumulative-sum `stts` reconstructs the source
+  // decode timeline 1:1 — preserving the original B-frame/open-GOP structure losslessly (ADR-045). The
+  // chunks arrive in decode order, so DTS is monotonic and every gap is ≥ 0.
+  if (chunks.every((c) => c.dtsUs !== undefined)) {
+    const out: MuxSampleInput[] = [];
+    for (let i = 0; i < n; i++) {
+      const c = chunks[i];
+      if (c === undefined) continue;
+      const dts = c.dtsUs ?? 0;
+      const next = chunks[i + 1]?.dtsUs;
+      const durUs = next !== undefined ? Math.max(0, next - dts) : (durationsUs[i] ?? 0);
+      out.push({
+        data: c.data,
+        durationTicks: ticks(durUs, timescale),
+        cttsTicks: ticks(c.timestampUs - dts, timescale),
+        keyframe: c.key,
+      });
+    }
+    return out;
+  }
+
   let baseUs = Number.POSITIVE_INFINITY;
   for (const c of chunks) if (c.timestampUs < baseUs) baseUs = c.timestampUs;
 
@@ -269,6 +299,7 @@ export class Mp4Muxer implements Muxer {
 
   readonly #tracks = new Map<number, TrackState>();
   readonly #faststart: boolean;
+  readonly #fragmented: boolean;
   readonly #brand: ContainerBrand;
   #nextId = 1;
   #finalized = false;
@@ -277,13 +308,9 @@ export class Mp4Muxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions) {
-    if (options?.fragmented === true) {
-      throw new CapabilityError(
-        'capability-miss',
-        'fragmented/CMAF mp4 mux is not supported by this driver',
-        { op: { op: 'mux', fragmented: true }, tried: ['mp4'] },
-      );
-    }
+    // Fragmented/CMAF output (ADR-034): finalize emits an init segment + one media segment per fragment
+    // via {@link fragmentMp4}, instead of the single faststart `moov`+`mdat` from {@link writeMp4}.
+    this.#fragmented = options?.fragmented === true;
     this.#faststart = options?.faststart ?? true;
     this.#brand = options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
     this.#ready = new Promise<void>((resolve) => {
@@ -309,8 +336,9 @@ export class Mp4Muxer implements Muxer {
    * real `EncodedVideoChunk`/`EncodedAudioChunk` (`copyTo`) is the only browser-only step (guarded); the
    * resulting struct flows through the pure {@link addChunkStruct}, which the tests drive directly.
    */
-  write(trackId: number, chunk: EncodedChunk): Promise<void> {
+  write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
+    const chunk = packet.chunk;
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
     this.addChunkStruct(trackId, {
@@ -318,6 +346,7 @@ export class Mp4Muxer implements Muxer {
       durationUs: chunk.duration ?? undefined,
       key: chunk.type === 'key',
       data,
+      ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
     });
     return Promise.resolve();
     /* v8 ignore stop */
@@ -348,8 +377,12 @@ export class Mp4Muxer implements Muxer {
     }
     try {
       const tracks = this.#buildTracks();
-      const bytes = writeMp4(tracks, { faststart: this.#faststart, brand: this.#brand });
-      controller.enqueue(bytes);
+      if (this.#fragmented) {
+        // Stream the init segment then one media segment per fragment (bounded memory, ADR-034).
+        for (const segment of fragmentMp4(tracks)) controller.enqueue(segment);
+      } else {
+        controller.enqueue(writeMp4(tracks, { faststart: this.#faststart, brand: this.#brand }));
+      }
       controller.close();
     } catch (err) {
       controller.error(err);

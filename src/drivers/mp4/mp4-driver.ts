@@ -13,9 +13,9 @@ import type {
   DecryptParams,
   Demuxer,
   DriverModule,
-  EncodedChunk,
   MuxOptions,
   Muxer,
+  Packet,
   Registry,
   StageOptions,
   StreamCopyOptions,
@@ -34,6 +34,7 @@ import {
   parseSenc,
   parseTenc,
 } from './cenc.ts';
+import { fragmentMp4 } from './fragment.ts';
 import { Mp4Muxer } from './mux.ts';
 import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
 import { Reader } from './reader.ts';
@@ -251,12 +252,17 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
   };
 }
 
-/** Stream a track's samples as WebCodecs encoded chunks (browser: requires `Encoded*Chunk`). */
+/**
+ * Stream a track's samples as seam {@link Packet}s (browser: requires `Encoded*Chunk`). The chunk's
+ * `timestamp` is the PTS (DTS + composition offset); the packet's `dtsUs` carries the true **decode**
+ * timestamp from the `stts` table, so a B-frame/open-GOP track enumerates and remuxes in decode order
+ * losslessly (ADR-045). For a non-reordered track `dtsUs === ptsUs`, which is the documented no-op.
+ */
 function packetStream(
   ra: RandomAccess,
   track: ParsedTrack,
   signal: AbortSignal | undefined,
-): ReadableStream<EncodedChunk> {
+): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
       'capability-miss',
@@ -268,7 +274,7 @@ function packetStream(
   const samples = buildSamples(track);
   const isVideo = track.mediaType === 'video';
   let i = 0;
-  return new ReadableStream<EncodedChunk>({
+  return new ReadableStream<Packet>({
     async pull(controller): Promise<void> {
       if (signal?.aborted) {
         controller.error(new MediaError('aborted', 'operation aborted'));
@@ -287,7 +293,8 @@ function packetStream(
         duration: sample.durationUs,
         data,
       };
-      controller.enqueue(isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init));
+      const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+      controller.enqueue({ chunk, dtsUs: sample.dtsUs });
     },
   });
   /* v8 ignore stop */
@@ -464,6 +471,22 @@ function oneShot(bytes: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+/**
+ * Stream a fragmented/CMAF MP4 (ADR-034): drive the {@link fragmentMp4} generator one segment at a time
+ * (init segment, then one `moof`+`mdat` media segment per pull) so a `StreamTarget` writes each segment as
+ * it is produced and peak memory stays bounded to a single fragment — never buffering the whole movie.
+ */
+function fragmentedStream(tracks: readonly MuxTrackInput[]): ReadableStream<Uint8Array> {
+  const segments = fragmentMp4(tracks);
+  return new ReadableStream<Uint8Array>({
+    pull(controller): void {
+      const { done, value } = segments.next();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+  });
+}
+
 export const Mp4Driver: ContainerDriver = {
   id: 'mp4',
   apiVersion: DRIVER_API_VERSION,
@@ -477,7 +500,7 @@ export const Mp4Driver: ContainerDriver = {
     const signal = o?.signal;
     return {
       tracks: movie.tracks.map(toTrackInfo),
-      packets(trackId: number): ReadableStream<EncodedChunk> {
+      packets(trackId: number): ReadableStream<Packet> {
         const track = byId.get(trackId);
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(ra, track, signal);
@@ -492,16 +515,15 @@ export const Mp4Driver: ContainerDriver = {
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec)
       : await muxTracksFromMovie(ra, movie);
+    // Fragmented/CMAF output (ADR-034): a sequence of self-describing `moof`+`mdat` segments after the
+    // init segment, streamed one at a time so a StreamTarget never buffers the whole movie. The lossless
+    // sample copy (DTS/ctts/codec-private preserved) is identical; only the on-disk box layout differs.
+    if (o?.fragmented === true) return fragmentedStream(tracks);
     const bytes = writeMp4(tracks, {
       faststart: o?.faststart ?? true,
       brand: brandFor(o?.container),
     });
-    return new ReadableStream<Uint8Array>({
-      start(c): void {
-        c.enqueue(bytes);
-        c.close();
-      },
-    });
+    return oneShot(bytes);
   },
   async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
     const ra = await randomAccess(src);

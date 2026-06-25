@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { EncodedChunk, FilterSpec, TrackInfo } from '../contracts/driver.ts';
+import type { EncodedChunk, FilterSpec, Packet, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
   audioCodecToken,
@@ -679,15 +679,15 @@ describe('seekFrame (drop-until-target, close-once)', () => {
 // ── drainEncoderToMuxer ─────────────────────────────────────────────────────────────────────────
 
 describe('drainEncoderToMuxer', () => {
-  /** A fake muxer recording addTrack/write calls. */
+  /** A fake muxer recording addTrack/write calls (write receives a {@link Packet}). */
   function fakeMuxer(): {
     addTrack: (info: TrackInfo) => number;
-    write: (trackId: number, chunk: EncodedChunk) => Promise<void>;
+    write: (trackId: number, packet: Packet) => Promise<void>;
     tracks: TrackInfo[];
-    writes: { trackId: number; chunk: unknown }[];
+    writes: { trackId: number; packet: Packet }[];
   } {
     const tracks: TrackInfo[] = [];
-    const writes: { trackId: number; chunk: unknown }[] = [];
+    const writes: { trackId: number; packet: Packet }[] = [];
     return {
       tracks,
       writes,
@@ -695,8 +695,8 @@ describe('drainEncoderToMuxer', () => {
         tracks.push(info);
         return tracks.length; // 1-based id
       },
-      write(trackId, chunk): Promise<void> {
-        writes.push({ trackId, chunk });
+      write(trackId, packet): Promise<void> {
+        writes.push({ trackId, packet });
         return Promise.resolve();
       },
     };
@@ -713,7 +713,9 @@ describe('drainEncoderToMuxer', () => {
     });
     expect(configReads).toBe(1); // config read exactly once, on the first chunk
     expect(muxer.tracks).toEqual([info]);
-    expect(muxer.writes.map((w) => w.chunk)).toEqual(['a', 'b', 'c']);
+    // A bare encoder chunk is normalized to a Packet `{ chunk }` (no dtsUs) before write.
+    expect(muxer.writes.map((w) => w.packet.chunk)).toEqual(['a', 'b', 'c']);
+    expect(muxer.writes.every((w) => w.packet.dtsUs === undefined)).toBe(true);
     expect(muxer.writes.every((w) => w.trackId === 1)).toBe(true);
   });
 

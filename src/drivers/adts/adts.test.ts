@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
-import { InputError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { Mp3Driver } from '../mp3/mp3-driver.ts';
-import { AdtsDriver, parseAdts } from './adts-driver.ts';
+import { AdtsDriver, enumerateAdtsFrames, parseAdts } from './adts-driver.ts';
 
 /** Build a crafted ADTS stream of `count` AAC frames (7-byte headers + zero payload). */
 function buildAdts(
@@ -88,9 +88,20 @@ describe('probe ADTS — real corpus', () => {
     expect(mp3.container).toBe('mp3');
   });
 
-  it('the decode seam is a typed capability gap (AAC decode is codec-layer)', async () => {
+  it('the packet seam is browser-gated (EncodedAudioChunk absent in node → typed CapabilityError)', async () => {
     const demuxed = await AdtsDriver.demux(await fixtureSource('sfx.adts'));
-    expect(() => demuxed.packets(0)).toThrowError(/AAC decode/);
+    // In node WebCodecs' EncodedAudioChunk is undefined → the same typed miss the mpegts driver raises.
+    expect(() => demuxed.packets(0)).toThrowError(CapabilityError);
+    expect(() => demuxed.packets(1)).toThrowError(MediaError); // unknown track id
+    await demuxed.close();
+  });
+
+  it('attaches a synthesized 2-byte AudioSpecificConfig to the track config', async () => {
+    const demuxed = await AdtsDriver.demux(await fixtureSource('sfx.adts'));
+    const config = demuxed.tracks[0]?.config as AudioDecoderConfig | undefined;
+    // AOT=2 (LC), freqIdx=3 (48 kHz), chCfg=1 (mono): byte0=(2<<3)|(3>>1)=0x11, byte1=((3&1)<<7)|(1<<3)=0x88.
+    expect(config?.description).toBeInstanceOf(Uint8Array);
+    expect(Array.from(config?.description as Uint8Array)).toEqual([0x11, 0x88]);
     await demuxed.close();
   });
 
@@ -141,5 +152,73 @@ describe('parseAdts — variants + robustness', () => {
 
   it('rejects a reserved sampling-frequency index', () => {
     expect(() => parseAdts(buildAdts({ freqIndex: 13 }))).toThrowError(/sampling-frequency/);
+  });
+});
+
+describe('enumerateAdtsFrames — strict can-fail oracle vs ffprobe (sfx.adts)', () => {
+  // INDEPENDENT ground truth — baked, NOT shelled out at run time (the repo golden pattern). Recorded with:
+  //   ffprobe -v error -show_packets -select_streams a:0 -of csv=p=0 \
+  //           -show_entries packet=pts_time,size fixtures/media/sfx.adts
+  // ffprobe's ADTS `size` is the FULL frame (7-byte header + payload; this stream has no CRC). PTS advances
+  // by exactly 1024/48000 s = 21333.33µs per frame. All 10 frames consume the whole 2078-byte file.
+  const FFPROBE: ReadonlyArray<{ ptsSec: number; size: number }> = [
+    { ptsSec: 0.0, size: 248 },
+    { ptsSec: 0.021333, size: 280 },
+    { ptsSec: 0.042667, size: 258 },
+    { ptsSec: 0.064, size: 125 },
+    { ptsSec: 0.085333, size: 230 },
+    { ptsSec: 0.106667, size: 148 },
+    { ptsSec: 0.128, size: 224 },
+    { ptsSec: 0.149333, size: 166 },
+    { ptsSec: 0.170667, size: 216 },
+    { ptsSec: 0.192, size: 183 },
+  ];
+
+  it('reproduces the packet COUNT, every full-frame SIZE, and every PTS within ±1µs', async () => {
+    const frames = enumerateAdtsFrames(await loadFixture('sfx.adts'));
+    expect(frames.length).toBe(FFPROBE.length); // 10 frames — count must match exactly
+    for (let i = 0; i < FFPROBE.length; i++) {
+      const f = frames[i];
+      const g = FFPROBE[i];
+      if (!f || !g) throw new Error(`missing frame ${i}`);
+      expect(f.size).toBe(g.size); // byte-exact full-frame length == ffprobe size (can fail if mis-framed)
+      expect(Math.abs(f.ptsUs - Math.round(g.ptsSec * 1_000_000))).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('frames tile the file: offsets are contiguous and the last frame ends at EOF', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    let expected = 0; // ID3-free fixture, so the first frame is at offset 0
+    for (const f of frames) {
+      expect(f.offset).toBe(expected);
+      expect(f.headerBytes).toBe(7); // protection_absent==1 → no CRC
+      expect(f.durationUs).toBe(21333); // round(1024*1e6/48000)
+      expected += f.size;
+    }
+    expect(expected).toBe(bytes.byteLength); // every byte accounted for — no gaps, no overrun
+  });
+
+  it('the raw access unit (header stripped) is size − 7 bytes and starts past the syncword', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    const f = frames[0];
+    if (!f) throw new Error('no frames');
+    const au = bytes.subarray(f.offset + f.headerBytes, f.offset + f.size);
+    expect(au.byteLength).toBe(f.size - 7);
+    expect(bytes[f.offset]).toBe(0xff); // the stripped header began with the syncword
+  });
+
+  it('rejects truncated / garbage input (the oracle can fail on bad bytes)', () => {
+    expect(() => enumerateAdtsFrames(new Uint8Array(6))).toThrowError(InputError); // too short
+    expect(() =>
+      enumerateAdtsFrames(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06])),
+    ).toThrowError(InputError); // no syncword
+  });
+
+  it('stops cleanly when the declared frame_length overruns a truncated tail', () => {
+    // A single header claiming frameLen 248 but only 100 bytes present: no full frame ⇒ honest reject.
+    const truncated = buildAdts({ count: 1, payload: 241 }).subarray(0, 100);
+    expect(() => enumerateAdtsFrames(truncated)).toThrowError(InputError);
   });
 });

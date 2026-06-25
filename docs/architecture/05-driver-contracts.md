@@ -27,8 +27,16 @@ export interface StageOptions {
 export interface Progress { done: number; total?: number; stage: string }
 
 // WebCodecs-native units flow across the seams:
-export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk   // container <-> codec
+export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk   // sealed coded unit (PTS in .timestamp)
 export type RawFrame     = VideoFrame | AudioData                  // codec <-> filter
+
+// The container <-> codec seam packet: a sealed chunk + its optional DECODE timestamp (ADR-045). The
+// sealed Encoded*Chunk exposes only `timestamp` (PTS); a reordered (B-frame/open-GOP) stream also needs
+// DTS for decode-order enumeration + lossless remux. `dtsUs` undefined ⇒ DTS == PTS (no reordering).
+export interface Packet {
+  readonly chunk: EncodedChunk
+  readonly dtsUs?: number
+}
 
 export interface DriverBase {
   readonly id: string          // unique, e.g. 'webcodecs-video', 'wasm-flac', 'mp4'
@@ -75,14 +83,14 @@ export interface TrackInfo {
 }
 export interface Demuxer {
   readonly tracks: readonly TrackInfo[]
-  packets(trackId: number): ReadableStream<EncodedChunk>   // lazy, per-track
+  packets(trackId: number): ReadableStream<Packet>         // lazy, per-track (Packet = chunk + optional DTS)
   close(): Promise<void>
 }
 export interface MuxOptions { faststart?: boolean; fragmented?: boolean }
 export interface Muxer {
   readonly output: ReadableStream<Uint8Array>
   addTrack(info: TrackInfo): number
-  write(trackId: number, chunk: EncodedChunk): Promise<void>
+  write(trackId: number, packet: Packet): Promise<void>    // honors packet.dtsUs for B-frame layout (ADR-045)
   finalize(): Promise<void>
 }
 export interface StreamCopyOptions extends StageOptions {  // ADR-021

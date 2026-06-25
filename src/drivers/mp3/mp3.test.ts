@@ -3,7 +3,7 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
-import { Mp3Driver, Mp3Module, parseMp3 } from './mp3-driver.ts';
+import { Mp3Driver, Mp3Module, enumerateMp3Packets, parseMp3 } from './mp3-driver.ts';
 
 // MPEG1 Layer III header. version 3, layer III, bitrateIdx 9 (128k), srIdx 0 (44100).
 function header(
@@ -146,5 +146,101 @@ describe('Mp3Driver — demux seam + muxer', () => {
 
   it('createMuxer is a typed out-of-scope error', () => {
     expect(() => Mp3Driver.createMuxer()).toThrowError(MediaError);
+  });
+});
+
+/**
+ * MP3 framing validation. The independent oracle is ffprobe (golden pattern: run ONCE in the shell, bake
+ * the numbers, never shell out at run time). `enumerateMp3Packets` must reproduce, frame-for-frame,
+ * ffprobe's packet COUNT, each packet SIZE (the FULL MPEG frame incl. its 4-byte header — what
+ * `packet=size` reports for MP3), and each PTS in µs (±1 µs for rounding). It can fail: mis-framing (wrong
+ * skip of the Xing/Info frame, wrong VBR stride, off-by-one length) diverges sizes/PTS immediately.
+ *
+ * Oracle command (run once per fixture; col 1 pts_time → µs, col 2 size — ffprobe already omits the Xing
+ * frame from its packet timeline, so its packet[0] is our emitted frame[0]):
+ *   ffprobe -v error -show_packets -select_streams a:0 -of csv=p=0 \
+ *     -show_entries packet=pts_time,size <fixture>
+ *
+ * Coverage: BOTH a CBR-ish fixture (sound_5.mp3 — MPEG-2 L3, 22.05 kHz mono, 576 spf) and a VBR fixture
+ * (bear-vbr-toc.mp3 — MPEG-1 L3, 44.1 kHz stereo, 1152 spf, per-frame bitrate varies).
+ */
+interface OracleFrame {
+  ptsUs: number;
+  size: number;
+}
+interface Oracle {
+  fixture: string;
+  count: number;
+  head: readonly OracleFrame[];
+}
+
+const SOUND5: Oracle = {
+  fixture: 'sound_5.mp3',
+  count: 194,
+  head: [
+    { ptsUs: 0, size: 52 },
+    { ptsUs: 26122, size: 313 },
+    { ptsUs: 52245, size: 365 },
+    { ptsUs: 78367, size: 104 },
+    { ptsUs: 104490, size: 104 },
+    { ptsUs: 130612, size: 104 },
+    { ptsUs: 156735, size: 104 },
+    { ptsUs: 182857, size: 104 },
+  ],
+};
+
+const BEAR: Oracle = {
+  fixture: 'bear-vbr-toc.mp3',
+  count: 384,
+  head: [
+    { ptsUs: 0, size: 626 },
+    { ptsUs: 26122, size: 365 },
+    { ptsUs: 52245, size: 261 },
+    { ptsUs: 78367, size: 208 },
+    { ptsUs: 104490, size: 313 },
+    { ptsUs: 130612, size: 208 },
+    { ptsUs: 156735, size: 208 },
+    { ptsUs: 182857, size: 208 },
+  ],
+};
+
+describe.each([SOUND5, BEAR])('enumerateMp3Packets — framing vs ffprobe ($fixture)', (oracle) => {
+  it('reproduces ffprobe packet count, sizes, and PTS (±1 µs)', async () => {
+    const packets = enumerateMp3Packets(await loadFixture(oracle.fixture));
+
+    // COUNT must match exactly — the Xing/Info header frame is skipped, just as ffprobe omits it.
+    expect(packets.length).toBe(oracle.count);
+
+    oracle.head.forEach((expected, i) => {
+      const frame = packets[i];
+      expect(frame, `packet ${i} present`).toBeDefined();
+      if (!frame) return;
+      // SIZE is the full MPEG frame length (4-byte header included) — the unit ffprobe reports.
+      expect(frame.size, `packet ${i} size`).toBe(expected.size);
+      // PTS from cumulative samples ÷ sampleRate; ±1 µs for the integer rounding both sides do.
+      expect(Math.abs(frame.ptsUs - expected.ptsUs), `packet ${i} pts`).toBeLessThanOrEqual(1);
+    });
+  });
+
+  it('PTS is strictly monotonic and every frame stays inside the file', async () => {
+    const bytes = await loadFixture(oracle.fixture);
+    const packets = enumerateMp3Packets(bytes);
+    let prev = -1;
+    for (const p of packets) {
+      expect(p.ptsUs).toBeGreaterThan(prev);
+      prev = p.ptsUs;
+      expect(p.offset).toBeGreaterThanOrEqual(0);
+      expect(p.offset + p.size).toBeLessThanOrEqual(bytes.byteLength);
+      expect(p.durationUs).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('enumerateMp3Packets — robustness', () => {
+  it('rejects truncated/garbage input with a typed InputError', () => {
+    expect(() => enumerateMp3Packets(new Uint8Array(16))).toThrowError(InputError);
+    expect(() => enumerateMp3Packets(new Uint8Array([0x00, 0x01, 0x02, 0x03]))).toThrowError(
+      InputError,
+    );
   });
 });

@@ -6,6 +6,7 @@
 
 import { InputError } from '../contracts/errors.ts';
 import { type ExecuteOptions, collect, runToSink } from '../kernel/executor.ts';
+import { type StreamTarget, writeToStreamTarget } from './stream-target.ts';
 
 export type Sink =
   | { readonly kind: 'blob' }
@@ -16,7 +17,11 @@ export type Sink =
       readonly kind: 'element';
       readonly el: HTMLMediaElement;
       readonly via: 'blob' | 'mse' | 'stream';
-    };
+    }
+  // A streaming destination (doc 09 streaming-output, ADR-034): each produced chunk is written straight
+  // to a caller-owned `WritableStream`/callback as it is produced, so peak memory stays at one chunk —
+  // the point of a fragmented/CMAF or long-recording output. Its materializer lives in stream-target.ts.
+  | StreamTarget;
 
 /** What an op returns, depending on the sink (`undefined` = wrote to a target, no value). */
 export type Output = Blob | File | ReadableStream<Uint8Array> | undefined;
@@ -76,6 +81,9 @@ export async function materialize(
     case 'element':
       await writeElement(sink, stream, opts);
       return undefined;
+    case 'stream-target':
+      // Incremental write to the caller's destination (never buffers the whole output); returns undefined.
+      return writeToStreamTarget(sink, stream, opts);
     default:
       return assertNever(sink);
   }

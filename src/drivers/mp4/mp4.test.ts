@@ -149,7 +149,10 @@ describe('demux over a non-seekable source + browser-only seam', () => {
     expect(id).toBeGreaterThan(0);
   });
 
-  it('createMuxer rejects fragmented mux with a typed CapabilityError', () => {
-    expect(() => Mp4Driver.createMuxer({ fragmented: true })).toThrowError(CapabilityError);
+  it('createMuxer accepts a fragmented mux (CMAF output, ADR-034)', () => {
+    // Fragmented/CMAF mux is now supported: the muxer constructs (it emits init + moof segments on
+    // finalize). The full fragmented round-trip is validated in mux.test.ts; here we only assert that
+    // requesting it no longer raises a capability miss.
+    expect(() => Mp4Driver.createMuxer({ fragmented: true })).not.toThrow();
   });
 });

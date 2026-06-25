@@ -28,6 +28,21 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
   return true;
 }
+/** Walk the top-level boxes and return their fourcc types in file order (ftyp, moov, mdat, moof, …). */
+function topLevelBoxTypes(file: Uint8Array): string[] {
+  const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  const types: string[] = [];
+  let off = 0;
+  while (off + 8 <= file.byteLength) {
+    let size = dv.getUint32(off);
+    const type = String.fromCharCode(...file.subarray(off + 4, off + 8));
+    if (size === 1) size = Number(dv.getBigUint64(off + 8)); // 64-bit largesize
+    if (size <= 0) break;
+    types.push(type);
+    off += size;
+  }
+  return types;
+}
 async function bytesOf(
   out: Blob | File | ReadableStream<Uint8Array> | undefined,
 ): Promise<Uint8Array> {
@@ -59,16 +74,39 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     ).rejects.toBeInstanceOf(CapabilityError);
   });
 
-  it('honors faststart:false and fragmented options', async () => {
+  it('faststart:false lays mdat BEFORE moov (progressive), still re-parsing losslessly', async () => {
     const out = await bytesOf(
-      await media().remux(await fixtureSource('movie_5.mp4'), {
-        to: 'mp4',
-        faststart: false,
-        fragmented: true,
-      }),
+      await media().remux(await fixtureSource('movie_5.mp4'), { to: 'mp4', faststart: false }),
     );
-    const re = await readMovie(ra(out)); // non-faststart layout still re-parses
-    expect(re.tracks.length).toBeGreaterThan(0);
+    // Top-level box order is ftyp, mdat, moov (the progressive/non-streamable layout the oracle checks).
+    const order = topLevelBoxTypes(out);
+    expect(order.indexOf('mdat')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('mdat')).toBeLessThan(order.indexOf('moov'));
+    // …and it still round-trips to the same tracks (the byte layout differs, the content does not).
+    const orig = await readMovie(ra(await loadFixture('movie_5.mp4')));
+    const re = await readMovie(ra(out));
+    expect(re.tracks.length).toBe(orig.tracks.length);
+    for (let i = 0; i < orig.tracks.length; i++) {
+      expect(buildSampleData(re.tracks[i]!).map(strip)).toEqual(
+        buildSampleData(orig.tracks[i]!).map(strip),
+      );
+    }
+  });
+
+  it('fragmented:true emits an init segment + moof media segments (CMAF), re-parsing to the same tracks', async () => {
+    const out = await bytesOf(
+      await media().remux(await fixtureSource('movie_5.mp4'), { to: 'mp4', fragmented: true }),
+    );
+    // A fragmented file carries at least one `moof` (media segment) — never present in a plain MP4 — and
+    // its `moov` (the init segment) is sample-less (empty `stbl`; real timing lives in the fragments).
+    const order = topLevelBoxTypes(out);
+    expect(order.filter((t) => t === 'moof').length).toBeGreaterThan(0);
+    expect(order.indexOf('moov')).toBeLessThan(order.indexOf('moof')); // init segment precedes media
+    // The fragment-aware demux recovers the same track count + a faithful duration from moof/sidx.
+    const orig = await readMovie(ra(await loadFixture('movie_5.mp4')));
+    const re = await readMovie(ra(out));
+    expect(re.tracks.length).toBe(orig.tracks.length);
+    expect(re.durationSec).toBeCloseTo(orig.durationSec, 1);
   });
 });
 

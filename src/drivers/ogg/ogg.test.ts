@@ -3,7 +3,7 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { InputError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
-import { OggDriver, OggModule, parseOgg } from './ogg-driver.ts';
+import { OggDriver, OggModule, oggAudioPackets, parseOgg } from './ogg-driver.ts';
 import { OggMuxer } from './ogg-write.ts';
 
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
@@ -199,5 +199,104 @@ describe('OggDriver — demux seam + muxer', () => {
     };
     const demuxed = await OggDriver.demux(fake);
     expect(demuxed.tracks[0]?.durationSec).toBeCloseTo(1, 5);
+  });
+});
+
+/**
+ * STRICT can-fail oracle for the pure {@link oggAudioPackets} de-lacer/framer, cross-checked against
+ * ffprobe (the independent oracle). The expected constants were recorded ONCE with:
+ *
+ *   ffprobe -v error -show_packets -select_streams a:0 -of csv=p=0 \
+ *     -show_entries packet=pts_time,size,pos fixtures/media/<file>
+ *
+ * and BAKED below (tests never shell out at run time). ffprobe's `size` is the de-laced **packet payload**
+ * (the unit our enumeration reports). The test fails on any mis-framing: a wrong segment-table walk shifts
+ * byte sizes, a wrong header-skip shifts the packet count, a wrong granule/TOC shifts PTS.
+ *
+ * - **Opus** is sample-exact (TOC-decoded): every (count, size, PTS µs within ±1) is asserted.
+ * - **Vorbis** per-packet PTS is an *even-split* approximation (documented in oggAudioPackets), so we
+ *   assert count + sizes exactly and only the **sum of durations ≈ true duration**, not per-packet PTS.
+ */
+describe('oggAudioPackets — pure de-lacing + framing vs ffprobe', () => {
+  // ffprobe a:0 packets for sfx-opus.ogg — pts (48 kHz samples), pts_time (s), size (payload bytes):
+  //   -312/-0.006500/450, 648/0.013500/268, 1608/0.033500/285, 2568/0.053500/296, 3528/0.073500/287,
+  //   4488/0.093500/308, 5448/0.113500/289, 6408/0.133500/286, 7368/0.153500/296, 8328/0.173500/294
+  const OPUS_EXPECTED: ReadonlyArray<{ ptsUs: number; size: number }> = [
+    { ptsUs: -6500, size: 450 },
+    { ptsUs: 13500, size: 268 },
+    { ptsUs: 33500, size: 285 },
+    { ptsUs: 53500, size: 296 },
+    { ptsUs: 73500, size: 287 },
+    { ptsUs: 93500, size: 308 },
+    { ptsUs: 113500, size: 289 },
+    { ptsUs: 133500, size: 286 },
+    { ptsUs: 153500, size: 296 },
+    { ptsUs: 173500, size: 294 },
+  ];
+
+  it('sfx-opus.ogg — exact count, sizes, and per-packet PTS (TOC-decoded)', async () => {
+    const pkts = oggAudioPackets(await loadFixture('sfx-opus.ogg'));
+    expect(pkts.length).toBe(OPUS_EXPECTED.length); // 10 audio packets; OpusHead/OpusTags skipped
+    for (let i = 0; i < OPUS_EXPECTED.length; i++) {
+      const exp = OPUS_EXPECTED[i];
+      const got = pkts[i];
+      if (exp === undefined || got === undefined) throw new Error('length mismatch');
+      expect(got.size).toBe(exp.size); // de-laced payload bytes must match ffprobe exactly
+      expect(Math.abs(got.ptsUs - exp.ptsUs)).toBeLessThanOrEqual(1); // PTS µs within rounding
+    }
+    // Every Opus frame here is 20 ms (960 @ 48 kHz); sum of durations == 10 × 20 ms = 200 ms = duration.
+    const totalUs = pkts.reduce((s, p) => s + p.durationUs, 0);
+    expect(totalUs).toBe(200_000);
+  });
+
+  // ffprobe a:0 audio packets for sound_5.oga (pts_time, payload size), its spurious Metadata-Update
+  // duplicate of the first line dropped:
+  //   0.000000/98, 0.011610/65, 0.023220/94, 0.034830/98, 0.046440/66, 0.063855/64, 0.087075/61, 0.110295/55
+  //
+  // CONTAINER vs DECODER accounting (the documented, *correct* offset): a demuxer must emit EVERY coded
+  // audio packet, including Vorbis's first one — which by spec produces no PCM output (it only primes the
+  // IMDCT overlap; output begins with the *second* packet). ffprobe lists DECODER-output packets, so it
+  // omits that priming packet. Hence our container-true list == [primingPacket, ...ffprobeList]:
+  //   our packets[0]  = the 100-byte priming packet (ffprobe drops it)
+  //   our packets[1:] = ffprobe's list exactly (sizes 98, 65, 94, …)
+  // This is why our COUNT is ffprobe's + 1 and our packets[1].size == ffprobe's first size (98).
+  const VORBIS_AFTER_PRIMING_SIZES: readonly number[] = [98, 65, 94, 98, 66, 64, 61, 55];
+  const VORBIS_PRIMING_SIZE = 100; // packets[0]: the no-output priming packet (container-real)
+  const VORBIS_PACKET_COUNT = 231; // 234 total packets − 3 Vorbis header packets (id/comment/setup)
+  const VORBIS_DURATION_SEC = 5.000227; // ffprobe stream duration (22050 Hz)
+
+  it('sound_5.oga — exact count + sizes; per-packet PTS is an even-split approximation', async () => {
+    const pkts = oggAudioPackets(await loadFixture('sound_5.oga'));
+    expect(pkts.length).toBe(VORBIS_PACKET_COUNT); // 3 Vorbis header packets skipped, priming kept
+    expect(pkts[0]?.size).toBe(VORBIS_PRIMING_SIZE); // container-real priming packet (ffprobe omits)
+    for (let i = 0; i < VORBIS_AFTER_PRIMING_SIZES.length; i++) {
+      // packets[1:] must reproduce ffprobe's de-laced payload sizes byte-exactly.
+      expect(pkts[i + 1]?.size).toBe(VORBIS_AFTER_PRIMING_SIZES[i]);
+    }
+    expect(pkts[0]?.ptsUs).toBe(0); // first coded packet starts at the stream origin
+    // Sum of (approximate) durations equals the true total to ±2 ms (the granule/rate end, not per-packet).
+    const totalSec = pkts.reduce((s, p) => s + p.durationUs, 0) / 1_000_000;
+    expect(totalSec).toBeCloseTo(VORBIS_DURATION_SEC, 2);
+    // Monotonic, non-decreasing PTS (a sane decode timeline even under the approximation).
+    for (let i = 1; i < pkts.length; i++) {
+      expect(pkts[i]?.ptsUs ?? 0).toBeGreaterThanOrEqual(pkts[i - 1]?.ptsUs ?? 0);
+    }
+  });
+
+  it('excludes the codec setup/header packets from the audio stream (both fixtures)', async () => {
+    // The first emitted Opus packet (450 B) is real audio, never the 19-B OpusHead or the OpusTags page.
+    const opus = oggAudioPackets(await loadFixture('sfx-opus.ogg'));
+    expect(opus[0]?.size).toBe(450);
+    // The first emitted Vorbis packet (100 B priming packet) is audio, never the id (30 B) / comment /
+    // setup headers — those three header packets are skipped; audio (incl. the priming packet) is kept.
+    const vorbis = oggAudioPackets(await loadFixture('sound_5.oga'));
+    expect(vorbis[0]?.size).toBe(100);
+  });
+
+  it('rejects truncated / garbage input with a typed InputError', () => {
+    expect(() => oggAudioPackets(new Uint8Array([0x00, 0x01, 0x02, 0x03]))).toThrowError(
+      InputError,
+    );
+    expect(() => oggAudioPackets(new Uint8Array(0))).toThrowError(InputError);
   });
 });

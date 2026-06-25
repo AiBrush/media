@@ -14,6 +14,7 @@ import {
   type EncodedChunk,
   type FilterDriver,
   type Muxer,
+  type Packet,
   type RawFrame,
   type Registry,
 } from '../contracts/driver.ts';
@@ -26,8 +27,8 @@ function emptyByteStream(): ReadableStream<Uint8Array> {
   });
 }
 
-function emptyChunkStream(): ReadableStream<EncodedChunk> {
-  return new ReadableStream<EncodedChunk>({
+function emptyPacketStream(): ReadableStream<Packet> {
+  return new ReadableStream<Packet>({
     start(c): void {
       c.close();
     },
@@ -55,7 +56,7 @@ export const NOOP_CONTAINER: ContainerDriver = {
   demux: (): Promise<Demuxer> =>
     Promise.resolve({
       tracks: [],
-      packets: () => emptyChunkStream(),
+      packets: () => emptyPacketStream(),
       close: () => Promise.resolve(),
     }),
   createMuxer: (): Muxer => {

@@ -13,9 +13,9 @@ import type {
   ContainerQuery,
   Demuxer,
   DriverModule,
-  EncodedChunk,
   MuxOptions,
   Muxer,
+  Packet,
   Registry,
   StageOptions,
   TrackInfo,
@@ -75,7 +75,7 @@ function packetStream(
   units: readonly TsAccessUnit[],
   mediaType: TsTrack['stream']['mediaType'],
   signal: AbortSignal | undefined,
-): ReadableStream<EncodedChunk> {
+): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
       'capability-miss',
@@ -86,7 +86,7 @@ function packetStream(
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */
   const isVideo = mediaType === 'video';
   let i = 0;
-  return new ReadableStream<EncodedChunk>({
+  return new ReadableStream<Packet>({
     pull(controller): void {
       if (signal?.aborted) {
         controller.error(new MediaError('aborted', 'operation aborted'));
@@ -103,7 +103,10 @@ function packetStream(
         timestamp: unit.ptsUs,
         data: unit.data,
       };
-      controller.enqueue(isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init));
+      // The PES carries a real DTS (B-frame H.264 streams keep PTS ≠ DTS); ts-parse already resolved it
+      // (== ptsUs when the PES had no separate DTS), so carry it through for lossless decode-order remux.
+      const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+      controller.enqueue({ chunk, dtsUs: unit.dtsUs });
     },
   });
   /* v8 ignore stop */
@@ -138,7 +141,7 @@ export const MpegTsDriver: ContainerDriver = {
     const tracks = parsed.tracks.map((t, i) => toTrackInfo(t, i));
     return {
       tracks,
-      packets(trackId: number): ReadableStream<EncodedChunk> {
+      packets(trackId: number): ReadableStream<Packet> {
         const track = parsed.tracks[trackId];
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(track.units, track.stream.mediaType, signal);

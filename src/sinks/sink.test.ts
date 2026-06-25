@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { InputError } from '../contracts/errors.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { type Sink, materialize, toBlob, toElement, toFile, toOPFS, toStream } from './sink.ts';
+import { toStreamTarget } from './stream-target.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -86,6 +87,20 @@ describe('materialize', () => {
   it('rejects an unknown sink kind', async () => {
     const bogus = { kind: 'bogus' } as unknown as Sink;
     await expect(materialize(bogus, bytesStream([1]))).rejects.toBeInstanceOf(InputError);
+  });
+
+  it('delegates a stream-target sink to writeToStreamTarget (incremental writes, contiguous positions)', async () => {
+    // A streaming destination (doc 09 streaming-output, ADR-034): each produced chunk is written straight
+    // to the caller's callback with its running byte offset, never buffering the whole output. materialize
+    // returns undefined (the bytes went to the target), matching the OPFS/element sinks.
+    const writes: { bytes: number[]; position: number }[] = [];
+    const target = toStreamTarget((chunk, position) => {
+      writes.push({ bytes: [...chunk], position });
+    });
+    const out = await materialize(target, bytesStream([1, 2], [3], [4, 5, 6]));
+    expect(out).toBeUndefined();
+    expect(writes.map((w) => w.bytes)).toEqual([[1, 2], [3], [4, 5, 6]]);
+    expect(writes.map((w) => w.position)).toEqual([0, 2, 3]); // contiguous, starting at 0
   });
 });
 

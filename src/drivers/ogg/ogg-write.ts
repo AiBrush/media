@@ -14,7 +14,7 @@
  * is browser-only and guarded.
  */
 
-import type { EncodedChunk, MuxOptions, Muxer, TrackInfo } from '../../contracts/driver.ts';
+import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 
 const MAX_SEGMENT = 255; // a lacing value is one byte; 255 means "continues in the next segment"
@@ -449,10 +449,13 @@ export class OggMuxer implements Muxer {
    * Buffer one encoded packet. Extracting bytes/timing from a real WebCodecs `Encoded*Chunk` (`copyTo`)
    * is the only browser-only step (guarded); the struct flows through the pure {@link addChunkStruct}.
    */
-  write(trackId: number, chunk: EncodedChunk): Promise<void> {
+  write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
+    const chunk = packet.chunk;
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
+    // Ogg audio is never reordered (no B-frames), so the packet's `dtsUs` is ignored — PTS granule
+    // positions fully describe the page timing.
     this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
       durationUs: chunk.duration ?? undefined,

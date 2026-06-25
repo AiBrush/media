@@ -15,7 +15,7 @@
  * separate DTS/ctts as in MP4), so reordered (B-frame) input simply yields blocks timestamped by PTS.
  */
 
-import type { EncodedChunk, MuxOptions, Muxer, TrackInfo } from '../../contracts/driver.ts';
+import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 
 // ============ Matroska/EBML element IDs (verbatim, marker bits included) ============
@@ -211,12 +211,22 @@ export interface ChunkStruct {
   key: boolean;
   /** The packet bytes (owned copy). */
   data: Uint8Array;
+  /**
+   * Decode timestamp (µs), from the demuxer's {@link Packet.dtsUs} on a verbatim remux. Matroska stores
+   * blocks in **decode** order (a Cluster is read front-to-back and fed straight to the decoder), so a
+   * reordered (B-frame) source must lay its blocks down by DTS even though each `SimpleBlock` timecode is
+   * the PTS. `undefined` ⇒ DTS == PTS (the no-reorder case, where decode order == presentation order).
+   */
+  dtsUs?: number;
 }
 
-/** One block placed on the global, time-ordered timeline (presentation time in ms ticks). */
+/** One block on the timeline: stored in **decode** order (`dtsMs`); its `SimpleBlock` timecode is `timeMs` (PTS). */
 export interface TimelineBlock {
   trackNumber: number;
+  /** Presentation time (ms ticks) — written as the `SimpleBlock` timecode (relative to its Cluster). */
   timeMs: number;
+  /** Decode time (ms ticks) — the storage/decode order key; equals `timeMs` for a non-reordered stream. */
+  dtsMs: number;
   key: boolean;
   data: Uint8Array;
 }
@@ -232,12 +242,15 @@ interface TrackChunks {
 }
 
 /**
- * Flatten every track's chunks into one presentation-time-ordered block list (ms ticks), rebased so the
- * earliest block sits at t=0 (a standalone file starts at zero), and report the stream end time (ms) for
- * the `Duration` element. Blocks are sorted by `(timeMs, trackNumber)` — Matroska expects roughly
- * time-ordered blocks; each block independently carries its TrackNumber + absolute time, so the demuxer
- * recovers per-track timing regardless. The end time uses each track's last chunk duration (recovered
- * from the prior gap when the encoder omitted it), so `Duration` reflects real content, never a bare 0.
+ * Flatten every track's chunks into one **decode**-ordered block list (ms ticks), rebased so the earliest
+ * presentation time sits at t=0 (a standalone file starts at zero), and report the stream end time (ms)
+ * for the `Duration` element. Blocks are sorted by `(dtsMs, trackNumber)` — Matroska reads a Cluster's
+ * blocks front-to-back and submits them to the decoder, so storage order must be DECODE order even though
+ * each `SimpleBlock` carries a PTS timecode (a B-frame source therefore lays blocks down by DTS; for a
+ * non-reordered stream DTS == PTS, so this is byte-identical to the old presentation-order layout). Each
+ * block independently carries its TrackNumber + absolute PTS, so the demuxer recovers per-track timing
+ * regardless. The end time uses each track's last presented chunk's PTS + duration (recovered from the
+ * prior gap when the encoder omitted it), so `Duration` reflects real content, never a bare 0.
  */
 export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   blocks: TimelineBlock[];
@@ -256,6 +269,7 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
       blocks.push({
         trackNumber: t.trackNumber,
         timeMs: usToMs(c.timestampUs - baseUs),
+        dtsMs: usToMs((c.dtsUs ?? c.timestampUs) - baseUs),
         key: c.key,
         data: c.data,
       });
@@ -267,7 +281,7 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
       endUs = Math.max(endUs, last.timestampUs + lastDurUs);
     }
   }
-  blocks.sort((a, b) => a.timeMs - b.timeMs || a.trackNumber - b.trackNumber);
+  blocks.sort((a, b) => a.dtsMs - b.dtsMs || a.trackNumber - b.trackNumber);
   return { blocks, endMs: usToMs(endUs - baseUs) };
 }
 
@@ -423,22 +437,36 @@ function simpleBlock(block: TimelineBlock, clusterTimeMs: number): Uint8Array {
 }
 
 /**
- * Serialize the time-ordered blocks into one or more `Cluster`s, starting a new cluster whenever the next
- * block's time would exceed the int16 relative-timecode range (so a long stream never overflows the
- * `SimpleBlock` field). Each cluster opens with its absolute `Timecode` (ms ticks).
+ * Serialize the **decode**-ordered blocks into one or more `Cluster`s. Blocks are accumulated greedily
+ * while their **presentation**-time span (max−min PTS) fits the signed int16 relative-timecode range (so
+ * a long stream never overflows the `SimpleBlock` field, and a reordered B-frame whose PTS dips below a
+ * sibling's still encodes a non-negative relative timecode). Each cluster opens with its absolute
+ * `Timecode` set to the cluster's **minimum** PTS, so every block's relative timecode is ≥ 0. For a
+ * non-reordered stream (decode order == presentation order) the min PTS is the first block's time and
+ * this is byte-identical to a presentation-order layout.
  */
 function clusterElements(blocks: readonly TimelineBlock[]): Uint8Array {
   const clusters: Uint8Array[] = [];
   let i = 0;
   while (i < blocks.length) {
-    const clusterTime = blocks[i]?.timeMs ?? 0;
-    const body: Uint8Array[] = [uintEl(EBML_ID.Timecode, clusterTime)];
+    const start = i;
+    let minPts = blocks[i]?.timeMs ?? 0;
+    let maxPts = minPts;
+    i++;
     while (i < blocks.length) {
       const b = blocks[i];
       if (b === undefined) break;
-      if (b.timeMs - clusterTime > MAX_CLUSTER_REL_MS) break; // would overflow int16 → new cluster
-      body.push(simpleBlock(b, clusterTime));
+      const newMin = Math.min(minPts, b.timeMs);
+      const newMax = Math.max(maxPts, b.timeMs);
+      if (newMax - newMin > MAX_CLUSTER_REL_MS) break; // PTS span would overflow int16 → new cluster
+      minPts = newMin;
+      maxPts = newMax;
       i++;
+    }
+    const body: Uint8Array[] = [uintEl(EBML_ID.Timecode, minPts)];
+    for (let j = start; j < i; j++) {
+      const b = blocks[j];
+      if (b !== undefined) body.push(simpleBlock(b, minPts));
     }
     clusters.push(element(EBML_ID.Cluster, concatBytes(body)));
   }
@@ -507,8 +535,9 @@ export class WebmMuxer implements Muxer {
    * `Encoded*Chunk` (`copyTo`) is the only browser-only step (guarded); the resulting struct flows
    * through the pure {@link addChunkStruct}, which the tests drive directly.
    */
-  write(trackId: number, chunk: EncodedChunk): Promise<void> {
+  write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
+    const chunk = packet.chunk;
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
     this.addChunkStruct(trackId, {
@@ -516,6 +545,7 @@ export class WebmMuxer implements Muxer {
       durationUs: chunk.duration ?? undefined,
       key: chunk.type === 'key',
       data,
+      ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
     });
     return Promise.resolve();
     /* v8 ignore stop */

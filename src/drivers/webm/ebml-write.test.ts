@@ -172,6 +172,34 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     expect(endMs).toBe(120); // last PTS 80ms + recovered 40ms gap
   });
 
+  it('stores B-frame blocks in DECODE order (by dtsUs), keeping each SimpleBlock timecode at its PTS', () => {
+    // Decode order I,P,B,B fed with the source DTS; PTS is reordered (display order I,B,B,P). Matroska
+    // reads a Cluster front-to-back into the decoder, so storage MUST be decode order even though each
+    // block's timecode is the PTS (ADR-045). The OLD presentation-order layout would scramble decode.
+    const dtsChunk = (pts: number, dts: number, key: boolean): ChunkStruct => ({
+      timestampUs: pts,
+      durationUs: 100_000,
+      key,
+      data: new Uint8Array([1]),
+      dtsUs: dts,
+    });
+    const { blocks } = buildBlockTimeline([
+      {
+        trackNumber: 1,
+        chunks: [
+          dtsChunk(0, 0, true), // I
+          dtsChunk(300_000, 100_000, false), // P (displayed last)
+          dtsChunk(100_000, 200_000, false), // B
+          dtsChunk(200_000, 300_000, false), // B
+        ],
+      },
+    ]);
+    // Storage stays in DECODE order: PTS timecodes are [0, 300, 100, 200] ms (NOT sorted), DTS monotonic.
+    expect(blocks.map((b) => b.timeMs)).toEqual([0, 300, 100, 200]);
+    expect(blocks.map((b) => b.dtsMs)).toEqual([0, 100, 200, 300]);
+    expect(blocks.map((b) => b.key)).toEqual([true, false, false, false]);
+  });
+
   it('empty input → no blocks, end 0', () => {
     expect(buildBlockTimeline([])).toEqual({ blocks: [], endMs: 0 });
   });
@@ -216,6 +244,41 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     expect(blocks.map((b) => b.timeMs)).toEqual([0, 33, 67, 100]); // round(PTS µs / 1000)
     expect(blocks.map((b) => b.key)).toEqual([true, false, false, false]);
     expect(blocks.map((b) => b.size)).toEqual([120, 40, 55, 33]);
+  });
+
+  it('B-frame remux: SimpleBlocks are stored in decode order with PTS timecodes, all relative ≥ 0', async () => {
+    const muxer = new WebmMuxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      fps: 30,
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    // Decode order I,P,B,B with reordered PTS (display I,B,B,P) — carries the source DTS through the seam.
+    const dtsChunk = (pts: number, dts: number, key: boolean, n: number): ChunkStruct => ({
+      timestampUs: pts,
+      durationUs: 100_000,
+      key,
+      data: new Uint8Array(n).fill(key ? 0x6b : 0x42),
+      dtsUs: dts,
+    });
+    muxer.addChunkStruct(vid, dtsChunk(0, 0, true, 50));
+    muxer.addChunkStruct(vid, dtsChunk(300_000, 100_000, false, 40));
+    muxer.addChunkStruct(vid, dtsChunk(100_000, 200_000, false, 30));
+    muxer.addChunkStruct(vid, dtsChunk(200_000, 300_000, false, 20));
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    const blocks = scanBlocks(bytes);
+    // Storage (file) order == DECODE order; the recovered ABSOLUTE timecodes are the PTS (not re-sorted).
+    expect(blocks.map((b) => b.timeMs)).toEqual([0, 300, 100, 200]);
+    expect(blocks.map((b) => b.key)).toEqual([true, false, false, false]);
+    expect(blocks.map((b) => b.size)).toEqual([50, 40, 30, 20]);
+    // The single Cluster's Timecode is the minimum PTS (0), so every block's relative timecode is ≥ 0.
+    expect(blocks.every((b) => b.timeMs >= 0)).toBe(true);
+    // It re-demuxes as a valid WebM whose duration spans the full presentation timeline (300ms + 100ms).
+    expect(parseWebm(bytes).durationSec).toBeCloseTo(0.4, 3);
   });
 
   it('multitrack VP9 + Opus: both re-parse; Opus CodecPrivate survives; per-track blocks correct', async () => {

@@ -41,10 +41,27 @@ export interface Progress {
 
 // WebCodecs-native units flow across the seams:
 
-/** The container ↔ codec seam: an encoded packet. */
+/** The container ↔ codec seam: a sealed WebCodecs encoded unit (its `timestamp` is the PTS). */
 export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk;
 /** The codec ↔ filter seam: a decoded frame (ref-counted; must be `close()`d exactly once). */
 export type RawFrame = VideoFrame | AudioData;
+
+/**
+ * The container ↔ codec seam **packet** (ADR-045): a sealed {@link EncodedChunk} plus its optional
+ * **decode** timestamp. `EncodedVideoChunk`/`EncodedAudioChunk` are immutable host objects exposing
+ * only `timestamp` (the *presentation* time, PTS); a reordered stream (B-frames / open-GOP) additionally
+ * needs DTS to (a) enumerate packets in decode order and (b) remux losslessly — MP4 stores DTS + a
+ * per-sample composition offset, and a Matroska/WebM muxer must lay blocks down in decode order. `dtsUs`
+ * carries it alongside the sealed chunk; **`undefined` ⇒ DTS equals the chunk's PTS** (no reordering).
+ * Demuxers attach it from the container's timing tables; muxers honor it; decoders ignore it (they
+ * consume the bare {@link chunk}). A pure data view — no resources to release (the chunk owns its bytes).
+ */
+export interface Packet {
+  /** The sealed WebCodecs encoded unit: the coded bytes, the keyframe flag, and `timestamp` = PTS. */
+  readonly chunk: EncodedChunk;
+  /** Decode timestamp (µs); omitted ⇒ equals the chunk's presentation `timestamp` (no reorder). */
+  readonly dtsUs?: number;
+}
 
 /** Common identity every driver declares. */
 export interface DriverBase {
@@ -114,10 +131,10 @@ export interface TrackInfo {
   config?: DecoderConfig;
 }
 
-/** A live demux session: per-track lazy packet streams. */
+/** A live demux session: per-track lazy packet streams ({@link Packet} carries PTS + optional DTS). */
 export interface Demuxer {
   readonly tracks: readonly TrackInfo[];
-  packets(trackId: number): ReadableStream<EncodedChunk>;
+  packets(trackId: number): ReadableStream<Packet>;
   close(): Promise<void>;
 }
 
@@ -132,11 +149,11 @@ export interface MuxOptions {
   container?: string;
 }
 
-/** A live mux session: add tracks, write packets (preserving PTS/duration), finalize. */
+/** A live mux session: add tracks, write packets (preserving PTS/DTS/duration), finalize. */
 export interface Muxer {
   readonly output: ReadableStream<Uint8Array>;
   addTrack(info: TrackInfo): number;
-  write(trackId: number, chunk: EncodedChunk): Promise<void>;
+  write(trackId: number, packet: Packet): Promise<void>;
   finalize(): Promise<void>;
 }
 

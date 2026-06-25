@@ -3,7 +3,13 @@
  * choice is invisible (ADR-003); options are flat typed objects (ADR-011).
  */
 
-import type { Determinism, EncodedChunk, Progress, TrackInfo } from '../contracts/driver.ts';
+import type {
+  Determinism,
+  EncodedChunk,
+  Packet,
+  Progress,
+  TrackInfo,
+} from '../contracts/driver.ts';
 import type { Sink } from '../sinks/sink.ts';
 
 export type { Output, Sink } from '../sinks/sink.ts';
@@ -26,8 +32,10 @@ export type {
 export type {
   /** The tier-ladder reproducibility mode passed to {@link CreateMediaOptions.determinism}. */
   Determinism,
-  /** An encoded packet — the unit of {@link Demuxed.packets} and {@link PacketStreams}. */
+  /** A sealed encoded unit (PTS only) — the unit of {@link PacketStreams} and {@link Packet.chunk}. */
   EncodedChunk,
+  /** A demuxed packet (sealed chunk + optional DTS) — the unit of {@link Demuxed.packets} (ADR-045). */
+  Packet,
   /** Monotonic progress delivered to {@link CallOptions.onProgress}. */
   Progress,
   /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
@@ -182,10 +190,10 @@ export interface MediaInfo {
   tags?: Record<string, string>;
 }
 
-/** A live demux result (public-facing). */
+/** A live demux result (public-facing); {@link Packet} carries each chunk's PTS + optional DTS. */
 export interface Demuxed {
   readonly tracks: readonly TrackInfo[];
-  packets(trackId: number): ReadableStream<EncodedChunk>;
+  packets(trackId: number): ReadableStream<Packet>;
   close(): Promise<void>;
 }
 

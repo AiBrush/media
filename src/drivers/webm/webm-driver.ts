@@ -12,10 +12,10 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
-  type EncodedChunk,
   type MediaType,
   type MuxOptions,
   type Muxer,
+  type Packet,
   type Registry,
   type StageOptions,
   type TrackInfo,
@@ -631,7 +631,7 @@ function packetStream(
   frames: readonly WebmFrame[],
   mediaType: MediaType,
   signal: AbortSignal | undefined,
-): ReadableStream<EncodedChunk> {
+): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
       'capability-miss',
@@ -642,7 +642,7 @@ function packetStream(
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */
   const isVideo = mediaType === 'video';
   let i = 0;
-  return new ReadableStream<EncodedChunk>({
+  return new ReadableStream<Packet>({
     pull(controller): void {
       if (signal?.aborted) {
         controller.error(new MediaError('aborted', 'operation aborted'));
@@ -659,7 +659,10 @@ function packetStream(
         timestamp: frame.timestampUs,
         data: frame.data,
       };
-      controller.enqueue(isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init));
+      // Matroska `SimpleBlock`s carry only a presentation timecode and are stored in decode order; the
+      // container has no separate DTS, so `dtsUs` is left implicit (== PTS) per the {@link Packet} contract.
+      const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+      controller.enqueue({ chunk });
     },
   });
   /* v8 ignore stop */
@@ -703,7 +706,7 @@ export const WebmDriver: ContainerDriver = {
     const signal = o?.signal;
     return {
       tracks: info.tracks.map((t, i) => toTrackInfo(t, i, info.durationSec)),
-      packets(trackId: number): ReadableStream<EncodedChunk> {
+      packets(trackId: number): ReadableStream<Packet> {
         const track = info.tracks[trackId];
         const frames = framesByIndex[trackId];
         if (!track || !frames) throw new MediaError('demux-error', `no track ${trackId}`);

@@ -13,8 +13,8 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
-  type EncodedChunk,
   type Muxer,
+  type Packet,
   type PcmTransform,
   type Registry,
   type TrackInfo,
@@ -93,7 +93,7 @@ export const AiffDriver: ContainerDriver = {
     };
     return {
       tracks: [track],
-      packets(): ReadableStream<EncodedChunk> {
+      packets(): ReadableStream<Packet> {
         throw new CapabilityError(
           'capability-miss',
           'AIFF PCM flows through the TS audio-dsp path (browser seam), not WebCodecs',

@@ -13,14 +13,15 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
-  type EncodedChunk,
   type MediaType,
   type MuxOptions,
   type Muxer,
+  type Packet,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
-import { CapabilityError, InputError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { OggMuxer } from './ogg-write.ts';
 
 const OGG_MIMES = new Set(['audio/ogg', 'video/ogg', 'application/ogg', 'audio/opus']);
@@ -124,6 +125,229 @@ function maxGranule(dv: DataView, serial: number): number {
   return best;
 }
 
+// ============ packet de-lacing + per-packet timing (pure, Node-validated) ============
+
+const MICROS_PER_SECOND = 1_000_000;
+
+/**
+ * One de-laced Ogg **packet** of a logical stream: its byte span in the source plus how many segments
+ * completed it. `complete` is false only for the final packet when the file is truncated mid-packet
+ * (last page's last segment was 255 with no continuation) — those are dropped, not emitted.
+ */
+interface RawPacket {
+  offset: number;
+  size: number;
+  /** The page granule_position carried on the page where this packet *completed* (-1 ⇒ none). */
+  pageGranule: number;
+  complete: boolean;
+}
+
+/**
+ * De-lace every page of `serial` into packets (segment table: a packet is the concat of segments until a
+ * segment < 255 ends it; a 255 segment continues — across pages when it is a page's last segment). The
+ * packets are returned in stream order; each carries the granule of the page on which it *completed* so
+ * callers can anchor PTS to the container's timing. Non-`serial` pages are skipped (multiplexed streams).
+ */
+function delacePackets(dv: DataView, serial: number): RawPacket[] {
+  const packets: RawPacket[] = [];
+  // A packet may span pages; we accumulate its [start,end) byte span across continuation pages.
+  let pendingStart = -1;
+  let pendingSize = 0;
+  let at = 0;
+  while (at + 27 <= dv.byteLength) {
+    const header = asciiAt(dv, at, 4);
+    if (header !== 'OggS' || dv.getUint8(at + 4) !== 0) {
+      at++;
+      continue;
+    }
+    const segCount = dv.getUint8(at + 26);
+    if (at + 27 + segCount > dv.byteLength) break; // truncated header → stop cleanly
+    const granule = readGranule(dv, at + 6);
+    const pageSerial = dv.getUint32(at + 14, true);
+    const body = at + 27 + segCount; // first body byte (after header + segment table)
+    let bodyLen = 0;
+    for (let i = 0; i < segCount; i++) bodyLen += dv.getUint8(at + 27 + i);
+    const pageEnd = body + bodyLen;
+    if (pageEnd > dv.byteLength) break; // truncated body → stop cleanly (trailing packet is incomplete)
+    if (pageSerial !== serial) {
+      at = pageEnd > at ? pageEnd : at + 1; // different logical stream: skip its whole body
+      continue;
+    }
+    // De-lace this page's segment table. A run of segments forms one packet that ends on the first <255.
+    // A run carried in from the previous page (HT_CONTINUED) resumes from `pending*`.
+    let segOffset = body;
+    let runStart = pendingStart >= 0 ? pendingStart : body;
+    let runSize = pendingSize;
+    pendingStart = -1;
+    pendingSize = 0;
+    for (let i = 0; i < segCount; i++) {
+      const lace = dv.getUint8(at + 27 + i);
+      if (runStart < 0) runStart = segOffset;
+      runSize += lace;
+      segOffset += lace;
+      if (lace < 255) {
+        packets.push({ offset: runStart, size: runSize, pageGranule: granule, complete: true });
+        runStart = -1;
+        runSize = 0;
+      }
+    }
+    // A run still open at page end (last lace was 255) continues into the next page (HT_CONTINUED).
+    if (runStart >= 0) {
+      pendingStart = runStart;
+      pendingSize = runSize;
+    }
+    at = pageEnd > at ? pageEnd : at + 1;
+  }
+  // A still-open run at EOF is a truncated trailing packet — record it as incomplete so it is dropped.
+  if (pendingStart >= 0) {
+    packets.push({ offset: pendingStart, size: pendingSize, pageGranule: -1, complete: false });
+  }
+  return packets;
+}
+
+/** Opus TOC frame-size table (config 0..31 → frame duration in 48 kHz samples), RFC 6716 §3.1. */
+const OPUS_FRAME_SAMPLES: readonly number[] = [
+  // SILK NB/MB/WB: 10,20,40,60 ms ; Hybrid SWB/FB: 10,20 ms ; CELT NB/WB/SWB/FB: 2.5,5,10,20 ms
+  480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960, 120, 240,
+  480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+];
+
+/** Decode an Opus packet's output sample count (at 48 kHz) from its TOC byte (RFC 6716 §3.1). */
+function opusPacketSamples(dv: DataView, offset: number, size: number): number {
+  if (size < 1) return 0;
+  const toc = dv.getUint8(offset);
+  const frameSamples = OPUS_FRAME_SAMPLES[toc >> 3] ?? 960;
+  const code = toc & 0x03; // frame-packing code: 0=1 frame, 1/2=2 frames, 3=arbitrary count (byte 1 &0x3f)
+  let frames = 1;
+  if (code === 1 || code === 2) frames = 2;
+  else if (code === 3) frames = size >= 2 ? dv.getUint8(offset + 1) & 0x3f : 1;
+  return frameSamples * (frames > 0 ? frames : 1);
+}
+
+/** A framed audio packet ready for the browser block: byte span + presentation/duration in µs. */
+export interface OggPacket {
+  offset: number;
+  size: number;
+  ptsUs: number;
+  durationUs: number;
+}
+
+/**
+ * The number of **codec header packets** that precede the audio for each Ogg-mapped codec — these carry
+ * setup/metadata (not decodable audio) and must be skipped: Vorbis = 3 (id, comment, setup), Opus = 2
+ * (OpusHead, OpusTags), FLAC-in-Ogg = 2 (the FLAC-mapping/STREAMINFO header + the metadata block packet).
+ */
+function headerPacketCount(codec: string): number {
+  if (codec === 'vorbis') return 3;
+  return 2; // opus / flac
+}
+
+/**
+ * Enumerate the **audio** packets of the first recognized Ogg stream as {@link OggPacket}s (offset/size +
+ * PTS/duration in µs). Pure — no WebCodecs — so it is the unit under test. Timing is anchored to the
+ * container's page granules:
+ *
+ * - **Opus** (deterministic): per-packet sample counts come from the TOC byte; the running decode granule
+ *   is offset by the stream's `pre_skip` (from OpusHead) so PTS matches the decoder's output clock — the
+ *   first audio packet starts at `-pre_skip` (ffprobe reports the same negative t0).
+ * - **Vorbis** (approximate, documented): exact per-packet sample counts need the setup-header blocksizes
+ *   + per-packet mode flags (a partial Vorbis decode). We instead **even-split** each page's granule delta
+ *   across the packets that completed on that page. Packet *count* and *byte size* are exact; per-packet
+ *   PTS is an honest approximation whose **sum of durations equals the true total** (granule/rate). This
+ *   is called out so no caller mistakes it for sample-exact Vorbis timing. We emit EVERY coded audio
+ *   packet, including Vorbis's first ("priming") packet which by spec produces no PCM output but is
+ *   required to seed the IMDCT overlap — so the decoder gets a complete stream. (ffprobe lists decoder
+ *   *output* packets and therefore omits that priming packet; our container-true count is its + 1.)
+ */
+export function oggAudioPackets(data: Uint8Array): OggPacket[] {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  // Identify the first stream from its BOS page (same scan as parseOgg).
+  let stream: OggStream | undefined;
+  let at = 0;
+  while (at + 27 <= dv.byteLength && !stream) {
+    const page = parsePage(dv, at);
+    if (!page) {
+      at++;
+      continue;
+    }
+    if (page.headerType & 0x02) stream = identifyStream(dv, page);
+    at = page.pageEnd > at ? page.pageEnd : at + 1;
+  }
+  if (!stream) throw new InputError('unsupported-input', 'no recognized Ogg codec stream found');
+
+  const preSkip = stream.codec === 'opus' ? readOpusPreSkip(dv, stream.serial) : 0;
+  const raw = delacePackets(dv, stream.serial);
+  const skip = headerPacketCount(stream.codec);
+  // Drop the codec header packets and any truncated trailing packet; keep audio packets in order.
+  const audio = raw.slice(skip).filter((p) => p.complete);
+  if (audio.length === 0) return [];
+
+  const rate = stream.granuleRate;
+  const out: OggPacket[] = [];
+  if (stream.codec === 'opus') {
+    // Opus: exact per-packet samples from the TOC; PTS = running start granule − pre_skip.
+    let startGranule = -preSkip;
+    for (const p of audio) {
+      const samples = opusPacketSamples(dv, p.offset, p.size);
+      out.push({
+        offset: p.offset,
+        size: p.size,
+        ptsUs: Math.round((startGranule / rate) * MICROS_PER_SECOND),
+        durationUs: Math.round((samples / rate) * MICROS_PER_SECOND),
+      });
+      startGranule += samples;
+    }
+    return out;
+  }
+
+  // Vorbis (and FLAC-in-Ogg): even-split each page's granule delta across the packets it completed.
+  // `prevGranule` starts at 0 (decode begins at sample 0); each page advances to its granule.
+  let prevGranule = 0;
+  let i = 0;
+  while (i < audio.length) {
+    // Group the contiguous run of packets that complete on the same page (share a pageGranule).
+    const granule = audio[i]?.pageGranule ?? -1;
+    let j = i;
+    while (j < audio.length && audio[j]?.pageGranule === granule) j++;
+    const count = j - i;
+    const pageEndGranule = granule >= 0 ? granule : prevGranule;
+    const totalSamples = Math.max(0, pageEndGranule - prevGranule);
+    // Even split: every packet on the page gets an equal share of the page's decoded samples.
+    for (let k = 0; k < count; k++) {
+      const startSamples = prevGranule + Math.round((k / count) * totalSamples);
+      const endSamples = prevGranule + Math.round(((k + 1) / count) * totalSamples);
+      const p = audio[i + k];
+      if (!p) continue;
+      out.push({
+        offset: p.offset,
+        size: p.size,
+        ptsUs: Math.round((startSamples / rate) * MICROS_PER_SECOND),
+        durationUs: Math.round(((endSamples - startSamples) / rate) * MICROS_PER_SECOND),
+      });
+    }
+    prevGranule = pageEndGranule;
+    i = j;
+  }
+  return out;
+}
+
+/** Read the Opus `pre_skip` (16-bit LE at OpusHead+10) from the BOS page of `serial`; 0 if absent. */
+function readOpusPreSkip(dv: DataView, serial: number): number {
+  let at = 0;
+  while (at + 27 <= dv.byteLength) {
+    const page = parsePage(dv, at);
+    if (!page) {
+      at++;
+      continue;
+    }
+    if (page.serial === serial && asciiAt(dv, page.dataStart, 8) === 'OpusHead') {
+      return dv.getUint16(page.dataStart + 10, true);
+    }
+    at = page.pageEnd > at ? page.pageEnd : at + 1;
+  }
+  return 0;
+}
+
 export interface OggInfo {
   codec: string;
   mediaType: MediaType;
@@ -179,6 +403,69 @@ async function readTail(src: ByteSource): Promise<Uint8Array | undefined> {
   return undefined;
 }
 
+/** Read the entire source into one buffer — packets() must de-lace the whole file, not just the head. */
+async function readAll(src: ByteSource): Promise<Uint8Array> {
+  if (src.range && src.size !== undefined) return src.range(0, src.size);
+  const reader = src.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Map the pure {@link oggAudioPackets} enumeration onto WebCodecs `EncodedAudioChunk`s. Browser-only: the
+ * `EncodedAudioChunk` constructor is unavailable in Node, so we raise a typed `CapabilityError` first
+ * (mirroring the mpegts driver); the emission body is v8-ignored and validated under browser-mode. Every
+ * Ogg audio frame is a sync sample, so `type:'key'`; audio has no reorder, so we emit `{ chunk }` (DTS ==
+ * PTS, `dtsUs` omitted per ADR-045).
+ */
+function packetStream(data: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
+  if (typeof EncodedAudioChunk === 'undefined') {
+    throw new CapabilityError(
+      'capability-miss',
+      'Ogg packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
+      { op: 'demux', tried: ['ogg'] },
+    );
+  }
+  /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
+  const frames = oggAudioPackets(data);
+  let i = 0;
+  return new ReadableStream<Packet>({
+    pull(controller): void {
+      if (signal?.aborted) {
+        controller.error(new MediaError('aborted', 'operation aborted'));
+        return;
+      }
+      const frame = frames[i];
+      if (frame === undefined) {
+        controller.close();
+        return;
+      }
+      i++;
+      const chunk = new EncodedAudioChunk({
+        type: 'key', // every Ogg audio packet is independently a sync sample
+        timestamp: frame.ptsUs,
+        duration: frame.durationUs,
+        data: data.subarray(frame.offset, frame.offset + frame.size),
+      });
+      controller.enqueue({ chunk });
+    },
+  });
+  /* v8 ignore stop */
+}
+
 function matches(q: ContainerQuery): boolean {
   if (q.mime !== undefined && OGG_MIMES.has(q.mime)) return true;
   if (q.extension !== undefined && OGG_EXTENSIONS.has(q.extension.toLowerCase())) return true;
@@ -193,8 +480,12 @@ export const OggDriver: ContainerDriver = {
   kind: 'container',
   formats: ['ogg'],
   supports: matches,
-  async demux(src: ByteSource): Promise<Demuxer> {
+  async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+    // Probe `info` from head+tail (unchanged: cheap duration via the moov-at-tail granule strategy).
+    // packets() de-laces the WHOLE file, so additionally read every byte once for the packet stream.
     const info = parseOgg(await readHead(src), await readTail(src));
+    const all = await readAll(src);
+    const signal = o?.signal;
     const track: TrackInfo = {
       id: 0,
       mediaType: info.mediaType,
@@ -204,12 +495,9 @@ export const OggDriver: ContainerDriver = {
     };
     return {
       tracks: [track],
-      packets(): ReadableStream<EncodedChunk> {
-        throw new CapabilityError(
-          'capability-miss',
-          'Ogg packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-          { op: 'demux', tried: [] },
-        );
+      packets(trackId: number): ReadableStream<Packet> {
+        if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
+        return packetStream(all, signal);
       },
       close: () => Promise.resolve(),
     };

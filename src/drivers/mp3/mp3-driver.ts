@@ -12,9 +12,10 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
-  type EncodedChunk,
   type Muxer,
+  type Packet,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
@@ -124,6 +125,63 @@ function xingFrameCount(
   return dv.getUint32(tagAt + 8, false); // big-endian frame count
 }
 
+/**
+ * One emitted MPEG audio frame: its byte span in the file and its presentation timing. `size` is the
+ * FULL MPEG frame length (4-byte header included) — the verbatim bytes handed to the decoder and the
+ * unit ffprobe's `packet=size` reports for MP3. `ptsUs`/`durationUs` come from cumulative sample counts
+ * (samplesPerFrame ÷ sampleRate), the only timeline MP3 has (there is no container timestamp table).
+ */
+export interface Mp3Packet {
+  offset: number;
+  size: number;
+  ptsUs: number;
+  durationUs: number;
+}
+
+/** True iff the frame at `offset` is a Xing/Info VBR header frame (silent — must not be emitted as audio). */
+function isInfoFrame(dv: DataView, offset: number, header: FrameHeader): boolean {
+  const sideInfo =
+    header.version === 3 ? (header.channels === 1 ? 17 : 32) : header.channels === 1 ? 9 : 17;
+  const tagAt = offset + 4 + sideInfo;
+  const tag = asciiAt(dv, tagAt, 4);
+  return tag === 'Xing' || tag === 'Info';
+}
+
+/**
+ * Enumerate every emittable MPEG audio frame across the WHOLE file — the PURE framing core that
+ * `packets()` maps to `EncodedAudioChunk`s (kept separate so it is testable in Node without WebCodecs).
+ *
+ * Walks frame-by-frame using each header's own frame-length (so per-frame VBR bitrate changes are honored
+ * exactly), skipping (a) a leading ID3v2 tag and (b) the Xing/Info VBR header frame, which is metadata
+ * carried in an otherwise-silent first frame and must never reach the decoder as audio. PTS/duration are
+ * derived from a running sample counter — the only clock MP3 has — so the first *emitted* frame is t=0,
+ * matching ffprobe (which likewise omits the Xing frame from its packet timeline).
+ */
+export function enumerateMp3Packets(bytes: Uint8Array): Mp3Packet[] {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const first = findFirstFrame(dv, id3v2Length(dv));
+  if (!first) throw new InputError('unsupported-input', 'no valid MP3 frame header found');
+
+  const packets: Mp3Packet[] = [];
+  let cumulativeSamples = 0;
+  let at = first.offset;
+  // Re-parse each header at its own offset: VBR streams change bitrate (hence frameLength) per frame, so
+  // we cannot stride by a constant. Stop at the first byte that no longer parses as a frame (trailing
+  // ID3v1/APE tags or padding) rather than guessing a length.
+  for (;;) {
+    const header = parseFrameHeader(dv, at);
+    if (!header || header.frameLength < 4 || at + header.frameLength > dv.byteLength) break;
+    if (!isInfoFrame(dv, at, header)) {
+      const ptsUs = Math.round((cumulativeSamples * 1_000_000) / header.sampleRate);
+      const durationUs = Math.round((header.samplesPerFrame * 1_000_000) / header.sampleRate);
+      packets.push({ offset: at, size: header.frameLength, ptsUs, durationUs });
+      cumulativeSamples += header.samplesPerFrame;
+    }
+    at += header.frameLength;
+  }
+  return packets;
+}
+
 /** Parse MP3 metadata + duration from (enough of) the file. `totalSize` enables CBR estimation. */
 export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -142,12 +200,71 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
   return { sampleRate: header.sampleRate, channels: header.channels, durationSec };
 }
 
-async function readHead(src: ByteSource, n: number): Promise<Uint8Array> {
-  if (src.range) return src.range(0, Math.min(n, src.size ?? n));
+/**
+ * Read the ENTIRE source into one buffer — `packets()` must walk every frame to the end of the file,
+ * whereas `probe` only reads the head. MP3 has no index, so there is no shortcut; pull the whole stream.
+ */
+async function readAll(src: ByteSource): Promise<Uint8Array> {
+  if (src.range && src.size !== undefined) return src.range(0, src.size);
   const reader = src.stream().getReader();
-  const { value } = await reader.read();
-  await reader.cancel().catch(() => {});
-  return value ?? new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Stream a fully-parsed MP3's frames as WebCodecs `EncodedAudioChunk`s. Browser-only: the
+ * `EncodedAudioChunk` constructor does not exist in Node, so we raise a typed `CapabilityError` there
+ * (mirroring the mpegts driver); the emission body is istanbul-ignored and validated under browser-mode.
+ * Every audio frame is a sync sample (`type:'key'`); DTS == PTS for audio, so `dtsUs` is omitted (ADR-045).
+ */
+function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
+  if (typeof EncodedAudioChunk === 'undefined') {
+    throw new CapabilityError(
+      'capability-miss',
+      'MP3 packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
+      { op: 'demux', tried: ['mp3'] },
+    );
+  }
+  /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
+  const frames = enumerateMp3Packets(bytes);
+  let i = 0;
+  return new ReadableStream<Packet>({
+    pull(controller): void {
+      if (signal?.aborted) {
+        controller.error(new MediaError('aborted', 'operation aborted'));
+        return;
+      }
+      const frame = frames[i];
+      if (frame === undefined) {
+        controller.close();
+        return;
+      }
+      i++;
+      // Emit the frame verbatim (full 4-byte header included) — the MP3 decoder re-reads it; codec 'mp3'
+      // needs no out-of-band description. Slice a fresh view so the chunk owns an independent byte range.
+      const chunk = new EncodedAudioChunk({
+        type: 'key',
+        timestamp: frame.ptsUs,
+        duration: frame.durationUs,
+        data: bytes.subarray(frame.offset, frame.offset + frame.size),
+      });
+      controller.enqueue({ chunk });
+    },
+  });
+  /* v8 ignore stop */
 }
 
 function matches(q: ContainerQuery): boolean {
@@ -169,8 +286,12 @@ export const Mp3Driver: ContainerDriver = {
   kind: 'container',
   formats: ['mp3'],
   supports: matches,
-  async demux(src: ByteSource): Promise<Demuxer> {
-    const info = parseMp3(await readHead(src, 1 << 16), src.size);
+  async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+    // Read the whole file once: `packets()` needs every frame, and parsing the full buffer also lets the
+    // probe info reflect the real (Xing-counted or byte-summed) duration without a second pass.
+    const bytes = await readAll(src);
+    const info = parseMp3(bytes, bytes.byteLength);
+    const signal = o?.signal;
     const track: TrackInfo = {
       id: 0,
       mediaType: 'audio',
@@ -180,12 +301,9 @@ export const Mp3Driver: ContainerDriver = {
     };
     return {
       tracks: [track],
-      packets(): ReadableStream<EncodedChunk> {
-        throw new CapabilityError(
-          'capability-miss',
-          'MP3 packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-          { op: 'demux', tried: [] },
-        );
+      packets(trackId: number): ReadableStream<Packet> {
+        if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
+        return packetStream(bytes, signal);
       },
       close: () => Promise.resolve(),
     };

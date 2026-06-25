@@ -5,6 +5,7 @@ import {
   DRIVER_API_VERSION,
   type EncodedChunk,
   type FilterDriver,
+  type Packet,
   type RawFrame,
 } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
@@ -132,7 +133,7 @@ describe('conformance harness — it can fail (anti-cheat: oracles must reject w
 });
 
 describe('noop container driver — demux seam (empty tracks + empty packet stream)', () => {
-  async function drain(stream: ReadableStream<EncodedChunk>): Promise<number> {
+  async function drain(stream: ReadableStream<Packet>): Promise<number> {
     const reader = stream.getReader();
     let n = 0;
     for (;;) {
