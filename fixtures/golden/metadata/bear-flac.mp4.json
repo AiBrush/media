@@ -1,0 +1,15 @@
+{
+  "container": "mp4",
+  "durationSec": 2.7399546485260773,
+  "sizeBytes": 216415,
+  "tracks": [
+    {
+      "id": 1,
+      "type": "audio",
+      "codec": "fLaC",
+      "durationSec": 2.7399546485260773,
+      "sampleRate": 44100,
+      "channels": 2
+    }
+  ]
+}

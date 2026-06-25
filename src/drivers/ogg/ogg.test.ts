@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
-import { InputError, MediaError } from '../../contracts/errors.ts';
+import { InputError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { OggDriver, OggModule, parseOgg } from './ogg-driver.ts';
+import { OggMuxer } from './ogg-write.ts';
 
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 const u16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
@@ -184,8 +185,8 @@ describe('OggDriver — demux seam + muxer', () => {
     await demuxed.close();
   });
 
-  it('createMuxer is a typed not-yet-implemented error', () => {
-    expect(() => OggDriver.createMuxer()).toThrowError(MediaError);
+  it('createMuxer returns a working OggMuxer (round-trip validated in ogg-write.test.ts)', () => {
+    expect(OggDriver.createMuxer()).toBeInstanceOf(OggMuxer);
   });
 
   it('reads head + tail via range for a large (>64 kB) source', async () => {

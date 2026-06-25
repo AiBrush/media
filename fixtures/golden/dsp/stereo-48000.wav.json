@@ -1,0 +1,11 @@
+{
+  "format": "s16",
+  "sampleRate": 48000,
+  "channels": 2,
+  "frames": 48000,
+  "sha256": {
+    "identity_s16": "343be3617550884d5ace88baaa59cfbfac6d9d3e7e751117f5973da0dc1b49a7",
+    "to_f32": "f0e8f02c9e7f6f4d7a015504ef7cbf9aa39e0a5e6606c46ca9c3a9168415d0f2",
+    "to_s24": "3b1f0eca8cf9624acdd69e395910c980a52f62cad95e7ae84069144f47a76446"
+  }
+}

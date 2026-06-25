@@ -91,3 +91,13 @@ export async function fixturesByTrait(trait: string): Promise<FixtureEntry[]> {
 export async function loadGoldenMetadata(id: string): Promise<unknown> {
   return JSON.parse(await readFile(`${GOLDEN_DIR}/metadata/${id}.json`, 'utf8'));
 }
+
+/** Whether a committed golden-metadata reference exists for a fixture id. */
+export async function hasGoldenMetadata(id: string): Promise<boolean> {
+  try {
+    await access(`${GOLDEN_DIR}/metadata/${id}.json`);
+    return true;
+  } catch {
+    return false;
+  }
+}

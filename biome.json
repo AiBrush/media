@@ -2,7 +2,18 @@
   "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
   "organizeImports": { "enabled": true },
   "files": {
-    "ignore": ["dist", "coverage", "fixtures/media", "node_modules", "*.tsbuildinfo"]
+    "ignore": [
+      "dist",
+      "coverage",
+      "fixtures/media",
+      "node_modules",
+      "*.tsbuildinfo",
+      "**/crate/pkg",
+      "**/crate/target",
+      "**/*-core.js",
+      "**/*_wasm_bg.wasm",
+      "**/*.head.ts"
+    ]
   },
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
   "formatter": {

@@ -93,7 +93,7 @@ Because both seams are WebCodecs-native types, any single stage's driver can cha
 - **`probe(mp4)`** → Normalizer → ContainerDriver(mp4).demux (header only) → TrackInfo. (No codecs; main thread; fast.)
 - **`remux(mp4 → mkv)`** → demux(mp4) → [stream-copy packets] → mux(mkv). (No decode/encode.)
 - **`convert(mov h264 → mp4 h264, resize 720p)`** → demux → decode(WebCodecs hw) → filter(GPU resize) → encode(WebCodecs hw) → mux(mp4). (Worker; hardware first.)
-- **`convert(flac → opus/webm)`** → demux(flac) → decode(**WASM flac**, browser lacks it [data: Finding 8]) → encode(WebCodecs/wasm opus) → mux(webm).
+- **`convert(flac → opus/webm)`** → demux(flac) → decode(**pure-TS FLAC**, browser lacks the codec [data: Finding 8]; `src/codecs/flac`, ADR-024 — not WASM) → encode(WebCodecs/wasm opus) → mux(webm).
 
 ## 7. Architecture evolution (ADR-015)
 

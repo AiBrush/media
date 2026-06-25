@@ -70,11 +70,19 @@ describe('media.decrypt — CENC (cenc / AES-CTR) on real MP4 (ADR-023)', () => 
     ).rejects.toBeInstanceOf(CapabilityError);
   });
 
-  it('rejects unsupported schemes (cbcs / hls-aes128) with a typed CapabilityError', async () => {
+  it('rejects a scheme that contradicts the container (cenc file asked as cbcs) with a MediaError', async () => {
+    // `cbcs` and `hls-aes128` are now supported schemes (see cbcs.test.ts); asking for `cbcs` on a file
+    // whose `schm` says `cenc` is a scheme mismatch — corrupt/contradictory input, a typed MediaError
+    // (NOT a CapabilityError, which is reserved for a genuinely-unsupported capability).
     const enc = await encryptCenc(await loadFixture('movie_5.mp4'), { keyHex: KEY, kidHex: KID });
-    await expect(
-      createMedia().decrypt(encSource(enc), { scheme: 'cbcs', keys: { [KID]: KEY } }),
-    ).rejects.toBeInstanceOf(CapabilityError);
+    const err = await createMedia()
+      .decrypt(encSource(enc), { scheme: 'cbcs', keys: { [KID]: KEY } })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(MediaError);
+    expect(err).not.toBeInstanceOf(CapabilityError);
   });
 
   it('cancels an in-flight decrypt via the handle', async () => {

@@ -1,0 +1,350 @@
+{
+  "generatedAt": "2026-06-25T08:09:15.905Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 3,
+  "iters": 21,
+  "files": [
+    {
+      "id": "2x2-green.mp4",
+      "sizeBytes": 3503,
+      "durationSec": 0.18179138321995464,
+      "fragmentedBytes": 4097,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.124583,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 1.109375
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.199334,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.484375
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 4097,
+          "mediaSeconds": 0.18179138321995464,
+          "wallMs": 0.177,
+          "mbPerSec": 22.074597030036195,
+          "throughputRealtime": 1027.069961694659,
+          "peakMemoryMb": 1.09375
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 4097,
+          "mediaSeconds": 0.18179138321995464,
+          "wallMs": 0.113,
+          "mbPerSec": 34.57702366651687,
+          "throughputRealtime": 1608.773302831457,
+          "peakMemoryMb": 0.953125
+        }
+      ]
+    },
+    {
+      "id": "av1.mp4",
+      "sizeBytes": 4019,
+      "durationSec": 1,
+      "fragmentedBytes": 3983,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.030791,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.06975,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 1.40625
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 3983,
+          "mediaSeconds": 1,
+          "wallMs": 0.059666,
+          "mbPerSec": 63.66246777471414,
+          "throughputRealtime": 16759.963798478195,
+          "peakMemoryMb": 0.34375
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 3983,
+          "mediaSeconds": 1,
+          "wallMs": 0.047084,
+          "mbPerSec": 80.6746411147331,
+          "throughputRealtime": 21238.63732902897,
+          "peakMemoryMb": 0.34375
+        }
+      ]
+    },
+    {
+      "id": "four-colors.mp4",
+      "sizeBytes": 709,
+      "durationSec": 0.04170833333333333,
+      "fragmentedBytes": 829,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.030417,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.28125
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.055333,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.046875
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 829,
+          "mediaSeconds": 0.04170833333333333,
+          "wallMs": 0.048792,
+          "mbPerSec": 16.203394169142097,
+          "throughputRealtime": 854.819096026671,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 829,
+          "mediaSeconds": 0.04170833333333333,
+          "wallMs": 0.035667,
+          "mbPerSec": 22.166036064170836,
+          "throughputRealtime": 1169.3815945645367,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "h264.mp4",
+      "sizeBytes": 9821,
+      "durationSec": 1,
+      "fragmentedBytes": 9795,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.029708,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.077916,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 9795,
+          "mediaSeconds": 1,
+          "wallMs": 0.049833,
+          "mbPerSec": 187.45088453834242,
+          "throughputRealtime": 20067.02385969137,
+          "peakMemoryMb": 0.109375
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 9795,
+          "mediaSeconds": 1,
+          "wallMs": 0.043833,
+          "mbPerSec": 213.10975587341088,
+          "throughputRealtime": 22813.861702370363,
+          "peakMemoryMb": 0.09375
+        }
+      ]
+    },
+    {
+      "id": "h265.mp4",
+      "sizeBytes": 8522,
+      "durationSec": 1,
+      "fragmentedBytes": 8491,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.242792,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.546875
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.551958,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.078125
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 8491,
+          "mediaSeconds": 1,
+          "wallMs": 0.222458,
+          "mbPerSec": 36.40079754652774,
+          "throughputRealtime": 4495.230560375441,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 8491,
+          "mediaSeconds": 1,
+          "wallMs": 0.219583,
+          "mbPerSec": 36.877393152500275,
+          "throughputRealtime": 4554.086609619142,
+          "peakMemoryMb": 0.015625
+        }
+      ]
+    },
+    {
+      "id": "movie_5.mp4",
+      "sizeBytes": 31603,
+      "durationSec": 5.154829931972789,
+      "fragmentedBytes": 43983,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.046167,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.261041,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.171875
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 43983,
+          "mediaSeconds": 5.154829931972789,
+          "wallMs": 0.632875,
+          "mbPerSec": 66.27763374836437,
+          "throughputRealtime": 8145.099635746063,
+          "peakMemoryMb": 0.859375
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 43983,
+          "mediaSeconds": 5.154829931972789,
+          "wallMs": 0.549292,
+          "mbPerSec": 76.3627678147435,
+          "throughputRealtime": 9384.498467068132,
+          "peakMemoryMb": 6.703125
+        }
+      ]
+    },
+    {
+      "id": "test.mp4",
+      "sizeBytes": 192844,
+      "durationSec": 6.0424,
+      "fragmentedBytes": 221076,
+      "ops": [
+        {
+          "op": "first-byte (fragment init)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.045541,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.5
+        },
+        {
+          "op": "first-byte (writeMp4 full)",
+          "bytes": 0,
+          "mediaSeconds": 0,
+          "wallMs": 0.582,
+          "mbPerSec": 0,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 4.234375
+        },
+        {
+          "op": "stream→writable",
+          "bytes": 221076,
+          "mediaSeconds": 6.0424,
+          "wallMs": 1.265792,
+          "mbPerSec": 166.56330832698274,
+          "throughputRealtime": 4773.612094246132,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "stream→callback",
+          "bytes": 221076,
+          "mediaSeconds": 6.0424,
+          "wallMs": 1.096791,
+          "mbPerSec": 192.22851315686228,
+          "throughputRealtime": 5509.162639007796,
+          "peakMemoryMb": 0.75
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "op": "first-byte (fragment init)",
+      "files": 7,
+      "medianWallMs": 0.045541,
+      "geomeanMbPerSec": 0,
+      "minMbPerSec": null,
+      "maxPeakMemoryMb": 1.109375
+    },
+    {
+      "op": "first-byte (writeMp4 full)",
+      "files": 7,
+      "medianWallMs": 0.199334,
+      "geomeanMbPerSec": 0,
+      "minMbPerSec": null,
+      "maxPeakMemoryMb": 4.234375
+    },
+    {
+      "op": "stream→writable",
+      "files": 7,
+      "medianWallMs": 0.177,
+      "geomeanMbPerSec": 55.94496374175246,
+      "minMbPerSec": 16.203394169142097,
+      "maxPeakMemoryMb": 1.09375
+    },
+    {
+      "op": "stream→callback",
+      "files": 7,
+      "medianWallMs": 0.113,
+      "geomeanMbPerSec": 68.57759375269035,
+      "minMbPerSec": 22.166036064170836,
+      "maxPeakMemoryMb": 6.703125
+    }
+  ]
+}

@@ -84,7 +84,10 @@ async function decryptBytes(mp4: Uint8Array): Promise<Uint8Array> {
 }
 
 /** Locate a top-level/`stbl` four-cc box by signature scan; returns `[boxStart, payloadStart, boxEnd]`. */
-function locateBox(bytes: Uint8Array, type: string): { start: number; payload: number; end: number } {
+function locateBox(
+  bytes: Uint8Array,
+  type: string,
+): { start: number; payload: number; end: number } {
   const dec = new TextDecoder('latin1');
   for (let i = 4; i + 4 <= bytes.length; i++) {
     if (dec.decode(bytes.subarray(i, i + 4)) !== type) continue;
@@ -156,40 +159,42 @@ const describeHarness = harnessAvailable ? describe : describe.skip;
 if (!harnessAvailable) {
   // eslint-disable-next-line no-console -- a skipped suite must announce why (corpus is git-ignored).
   console.warn(
-    `[cenc-robustness] sibling harness corpus not found at ${HARNESS_MEDIA_DIR}; ` +
-      'the load-from-harness reject cases are skipped (in-memory structural cases still run).',
+    `[cenc-robustness] sibling harness corpus not found at ${HARNESS_MEDIA_DIR}; the load-from-harness reject cases are skipped (in-memory structural cases still run).`,
   );
 }
 
-describeHarness('media.decrypt — CENC robustness on the ACTUAL harness fixtures (graceful-failure)', () => {
-  it('the clean cenc_ctr.mp4 still decrypts and produces an MP4 (positive case, not regressed)', async () => {
-    const clean = harnessFixture('cenc_ctr.mp4');
-    expect(clean).toBeDefined();
-    if (!clean) return;
-    const out = await decryptHarness(clean);
-    expect(out.byteLength).toBeGreaterThan(0);
-    // The output re-parses as a real MP4 (sanity: we did real work, not throw).
-    await expect(readMovie(ra(out))).resolves.toBeDefined();
-  });
-
-  for (const name of [
-    'cenc_ctr_protection_zeroed.mp4',
-    'cenc_ctr_senc_bitflip.mp4',
-    'cenc_ctr_truncated_mdat.mp4',
-  ]) {
-    it(`rejects ${name} with a typed MediaError (not a CapabilityError) → graceful-failure passes`, async () => {
-      const bytes = harnessFixture(name);
-      expect(bytes).toBeDefined();
-      if (!bytes) return;
-      const err = await decryptHarness(bytes).then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-      expect(err).toBeInstanceOf(MediaError);
-      expect(err).not.toBeInstanceOf(CapabilityError);
+describeHarness(
+  'media.decrypt — CENC robustness on the ACTUAL harness fixtures (graceful-failure)',
+  () => {
+    it('the clean cenc_ctr.mp4 still decrypts and produces an MP4 (positive case, not regressed)', async () => {
+      const clean = harnessFixture('cenc_ctr.mp4');
+      expect(clean).toBeDefined();
+      if (!clean) return;
+      const out = await decryptHarness(clean);
+      expect(out.byteLength).toBeGreaterThan(0);
+      // The output re-parses as a real MP4 (sanity: we did real work, not throw).
+      await expect(readMovie(ra(out))).resolves.toBeDefined();
     });
-  }
-});
+
+    for (const name of [
+      'cenc_ctr_protection_zeroed.mp4',
+      'cenc_ctr_senc_bitflip.mp4',
+      'cenc_ctr_truncated_mdat.mp4',
+    ]) {
+      it(`rejects ${name} with a typed MediaError (not a CapabilityError) → graceful-failure passes`, async () => {
+        const bytes = harnessFixture(name);
+        expect(bytes).toBeDefined();
+        if (!bytes) return;
+        const err = await decryptHarness(bytes).then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(MediaError);
+        expect(err).not.toBeInstanceOf(CapabilityError);
+      });
+    }
+  },
+);
 
 describe('media.decrypt — CENC robustness: malformed protection rejects cleanly (ADR-023, §6.2)', () => {
   it('happy path: the UNmutated encrypted file still decrypts the audio bit-exact (regression)', async () => {
@@ -240,7 +245,11 @@ describe('media.decrypt — CENC robustness: malformed protection rejects cleanl
 
 describe('parseTenc — structural validation (both arms of every guard)', () => {
   /** A valid `tenc` payload: version+flags, reserved, pattern, isProtected, ivSize, 16-byte KID. */
-  function tencPayload(opts: { protected: boolean; ivSize: number; kidZero?: boolean }): Uint8Array {
+  function tencPayload(opts: {
+    protected: boolean;
+    ivSize: number;
+    kidZero?: boolean;
+  }): Uint8Array {
     const p = new Uint8Array(24);
     p[6] = opts.protected ? 1 : 0;
     p[7] = opts.ivSize;

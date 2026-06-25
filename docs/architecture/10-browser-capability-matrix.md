@@ -21,7 +21,7 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 | AAC | HW/SW | yes | varies | yes | wasm fallback |
 | Opus | SW | yes | SW | SW | wasm (libopus) |
 | MP3 | SW | varies | SW | — (decode only in WC) | wasm libmp3lame for **encode** |
-| **FLAC** | **none (Chrome 149)** [data] | varies | varies | — | **wasm FLAC decode (required)** + wasm encode |
+| **FLAC** | **none (Chrome 149)** [data] | varies | varies | — | **pure-TS FLAC decode (shipped, ADR-024)**; wasm encode |
 | Vorbis | none | none | none | — | wasm (libvorbis) |
 | PCM (s16/s24/f32) | n/a (trivial) | n/a | n/a | n/a | **TS** (no codec needed) |
 
@@ -31,14 +31,14 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 
 | Feature | Gap | Plan |
 |---|---|---|
-| `flac → opus/webm` | Chrome 149 WebCodecs has **no FLAC `AudioDecoder`** | ship a **WASM FLAC decode** driver (Phase 2) |
+| `flac → opus/webm` | Chrome 149 WebCodecs has **no FLAC `AudioDecoder`** | **FLAC decode now ships in pure TS** (ADR-024, `src/codecs/flac` — the decode side of this gap is closed); the remaining tail is the Opus *encode* (WebCodecs where present, else WASM libopus) |
 | `h264-8bit → hevc-10bit` | **no 10-bit HEVC encoder** in-browser | **out of scope** (license/size); `CapabilityError` with a clear message |
 | `h264 → vp8/webm` | encode succeeded but output **failed `<video>` playback** | enforce `playback-smoke` in our oracle; prefer VP9/AV1 or fix the VP8 muxing path |
 
 ## 4. Filters & GPU
 
-- **WebGPU** is the preferred filter substrate; where absent, **WebGL**, then **Canvas2D**, then **WASM libavfilter** (ADR-002). All probed once per session (`navigator.gpu?.requestAdapter()`, WebGL context).
-- Pixel filters (resize/crop/pad/rotate/flip/colorspace/tonemap) therefore work everywhere, at varying speed — never a hard gap.
+- **WebGPU** is the preferred filter substrate; where absent, **Canvas2D** (geometry + display-space colour), then the **pure-TS CPU filter** (`cpu-video-filter`, ADR-038 — the universal floor), then **WASM libavfilter** (ADR-002/027). The **WebGL rung is omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for the geometric ops. Substrate availability is probed once per session (`navigator.gpu` + `OffscreenCanvas` + `VideoFrame`; `OffscreenCanvas` for Canvas2D; `VideoFrame` for the CPU floor).
+- The **geometric** pixel filters (resize/crop/rotate/flip) ship now and work everywhere at varying speed — never a hard gap. **Colorspace + tonemap are now implemented** — on WebGPU for all targets (ADR-032) and, for browsers without WebGPU, on the **CPU filter** which performs genuine wide-gamut colorspace + HDR→SDR tonemap via `VideoFrame.copyTo` (ADR-038); Canvas2D handles only display-space colour. So colorspace/tonemap is no longer a hard gap on any WebCodecs-capable browser.
 
 ## 5. Crypto, storage, streams
 

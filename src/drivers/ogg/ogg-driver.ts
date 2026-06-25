@@ -15,11 +15,13 @@ import {
   type DriverModule,
   type EncodedChunk,
   type MediaType,
+  type MuxOptions,
   type Muxer,
   type Registry,
   type TrackInfo,
 } from '../../contracts/driver.ts';
-import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError } from '../../contracts/errors.ts';
+import { OggMuxer } from './ogg-write.ts';
 
 const OGG_MIMES = new Set(['audio/ogg', 'video/ogg', 'application/ogg', 'audio/opus']);
 const OGG_EXTENSIONS = new Set(['ogg', 'oga', 'ogv', 'opus', 'spx']);
@@ -212,8 +214,10 @@ export const OggDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(): Muxer {
-    throw new MediaError('mux-error', 'ogg muxing lands in Phase 2');
+  createMuxer(o?: MuxOptions): Muxer {
+    // The EncodedChunk-seam adapter over the Ogg page writer ({@link OggMuxer}); the packet→page lacing
+    // + granule timing is pure + Node-validated, only the per-chunk `copyTo` is browser-only (ogg-write.ts).
+    return new OggMuxer(o);
   },
 };
 

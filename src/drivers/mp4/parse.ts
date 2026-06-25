@@ -66,6 +66,12 @@ export interface ParsedTrack {
   fps?: number;
   sampleRate?: number;
   channels?: number;
+  /**
+   * For fragmented/CMAF tracks (empty `moov` sample table), the sample count accumulated from the
+   * movie fragments ({@link applyFragmentTiming}). Lets probe report timing the `stts`/`stsz` path
+   * cannot, without faking a sample table the demuxer would mis-read.
+   */
+  fragmentSampleCount?: number;
   /** Present when the track is CENC-protected (sample entry was `enca`/`encv`). */
   encryption?: TrackProtection;
   samples: SampleTable;
@@ -139,6 +145,227 @@ function parseMvhd(r: Reader, box: BoxHeader): { timescale: number; durationSec:
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
   return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
+}
+
+/**
+ * Per-track timing recovered from movie fragments, in track-timescale ticks.
+ * - `durationTicks` is the **presentation end** (prefers `sidx`, which carries the start offset) — the
+ *   value to report as the track's `durationSec`, matching ffprobe's stream duration.
+ * - `mediaTicks` is the **sum of sample durations** (the content span) — the denominator for `fps`
+ *   (`sampleCount / mediaSec` = ffprobe `avg_frame_rate`); it excludes any presentation start offset.
+ */
+export interface FragmentTiming {
+  sampleCount: number;
+  durationTicks: number;
+  mediaTicks: number;
+}
+
+// trun flags (ISO/IEC 14496-12 §8.8.8): which optional per-sample fields are present, and the
+// run-level data-offset / first-sample-flags. tfhd flags (§8.8.7): which track-level defaults are set.
+const TRUN_DATA_OFFSET = 0x000001;
+const TRUN_FIRST_SAMPLE_FLAGS = 0x000004;
+const TRUN_SAMPLE_DURATION = 0x000100;
+const TRUN_SAMPLE_SIZE = 0x000200;
+const TRUN_SAMPLE_FLAGS = 0x000400;
+const TRUN_SAMPLE_CTO = 0x000800;
+const TFHD_BASE_DATA_OFFSET = 0x000001;
+const TFHD_SAMPLE_DESC_INDEX = 0x000002;
+const TFHD_DEFAULT_SAMPLE_DURATION = 0x000008;
+
+/** `mvex`→`trex` per-track defaults (default_sample_duration), the last-resort fragment timing source. */
+function parseTrexDefaults(r: Reader, moov: BoxHeader): Map<number, number> {
+  const out = new Map<number, number>();
+  const mvex = child(r, moov, 'mvex');
+  if (!mvex) return out;
+  for (const trex of children(r, mvex, 'trex')) {
+    r.seek(trex.payloadStart);
+    readFullBoxHeader(r);
+    const trackId = r.u32();
+    r.skip(4); // default_sample_description_index
+    out.set(trackId, r.u32()); // default_sample_duration
+  }
+  return out;
+}
+
+/** One `traf`: its track id, sample count, and summed duration (per-sample `trun` deltas, else defaults). */
+function parseTraf(
+  r: Reader,
+  traf: BoxHeader,
+  trexDefaults: Map<number, number>,
+): { trackId: number; sampleCount: number; durationTicks: number; baseDecodeTime: number } {
+  const tfhd = child(r, traf, 'tfhd');
+  let trackId = 0;
+  let tfhdDefaultDuration: number | undefined;
+  if (tfhd) {
+    r.seek(tfhd.payloadStart);
+    const { flags } = readFullBoxHeader(r);
+    trackId = r.u32();
+    if (flags & TFHD_BASE_DATA_OFFSET) r.skip(8);
+    if (flags & TFHD_SAMPLE_DESC_INDEX) r.skip(4);
+    if (flags & TFHD_DEFAULT_SAMPLE_DURATION) tfhdDefaultDuration = r.u32();
+  }
+  const fallbackDuration = tfhdDefaultDuration ?? trexDefaults.get(trackId) ?? 0;
+
+  const tfdt = child(r, traf, 'tfdt');
+  let baseDecodeTime = 0;
+  if (tfdt) {
+    r.seek(tfdt.payloadStart);
+    const { version } = readFullBoxHeader(r);
+    baseDecodeTime = version === 1 ? r.u64() : r.u32();
+  }
+
+  let sampleCount = 0;
+  let durationTicks = 0;
+  for (const trun of children(r, traf, 'trun')) {
+    r.seek(trun.payloadStart);
+    const { flags } = readFullBoxHeader(r);
+    const count = r.u32();
+    if (flags & TRUN_DATA_OFFSET) r.skip(4);
+    if (flags & TRUN_FIRST_SAMPLE_FLAGS) r.skip(4);
+    for (let i = 0; i < count; i++) {
+      const sampleDuration = flags & TRUN_SAMPLE_DURATION ? r.u32() : fallbackDuration;
+      if (flags & TRUN_SAMPLE_SIZE) r.skip(4);
+      if (flags & TRUN_SAMPLE_FLAGS) r.skip(4);
+      if (flags & TRUN_SAMPLE_CTO) r.skip(4);
+      durationTicks += sampleDuration;
+    }
+    sampleCount += count;
+  }
+  return { trackId, sampleCount, durationTicks, baseDecodeTime };
+}
+
+/**
+ * A `sidx` (Segment Index, §8.16.3) total for one `reference_ID` (track): the presentation end =
+ * `earliest_presentation_time + Σ subsegment_duration`, in the sidx's own timescale. Returns the
+ * per-track maximum across every sidx in the file. This is the most accurate fragmented duration when
+ * present (it carries the presentation start offset that `moof`/`tfdt` decode times omit).
+ */
+function parseSidxEnds(
+  r: Reader,
+  file: Uint8Array,
+): Map<number, { ticks: number; timescale: number }> {
+  const out = new Map<number, { ticks: number; timescale: number }>();
+  r.seek(0);
+  for (const box of boxes(r, file.byteLength)) {
+    if (box.type !== 'sidx') continue;
+    const cursor = r.pos;
+    r.seek(box.payloadStart);
+    const { version } = readFullBoxHeader(r);
+    const referenceId = r.u32();
+    const timescale = r.u32();
+    const earliest = version === 0 ? r.u32() : r.u64();
+    r.skip(version === 0 ? 4 : 8); // first_offset
+    r.skip(2); // reserved
+    const refCount = r.u16();
+    let subDuration = 0;
+    for (let i = 0; i < refCount; i++) {
+      r.skip(4); // reference_type(1) + referenced_size(31)
+      subDuration += r.u32(); // subsegment_duration
+      r.skip(4); // starts_with_SAP(1) + SAP_type(3) + SAP_delta_time(28)
+    }
+    const end = earliest + subDuration;
+    const prev = out.get(referenceId);
+    if (!prev || end > prev.ticks) out.set(referenceId, { ticks: end, timescale });
+    r.seek(cursor);
+  }
+  return out;
+}
+
+/**
+ * Recover per-track timing from movie fragments, for fragmented/CMAF MP4 whose `moov` carries an empty
+ * sample table (so `stts`/`stsz` are absent and `mvhd`/`mdhd` duration is 0).
+ *
+ * Sample count is the sum of all `trun` counts. For duration we prefer a `sidx` total (presentation
+ * end = earliest_presentation_time + Σ subsegment_duration) when present, since it carries the
+ * presentation start offset; otherwise we use the fragment presentation end
+ * `max(tfdt.baseMediaDecodeTime + Σ trun sample durations)`. Per-sample `trun` durations are honored
+ * (VFR); else the `tfhd`/`trex` default applies. `durationTicks` is in the track timescale, so the
+ * caller divides by `track.timescale`.
+ */
+export function parseFragments(file: Uint8Array): Map<number, FragmentTiming> {
+  const r = new Reader(file);
+  const moov = boxFrom(r, file.byteLength, 'moov');
+  const trexDefaults = moov ? parseTrexDefaults(r, moov) : new Map<number, number>();
+  const sidxEnds = parseSidxEnds(r, file);
+
+  const counts = new Map<number, number>();
+  const moofEnds = new Map<number, number>(); // max(tfdt + Σ run durations) — presentation end
+  const mediaTotals = new Map<number, number>(); // Σ sample durations — content span (for fps)
+  const trackTimescales = new Map<number, number>();
+  for (const track of moov ? trackTimescalesOf(r, moov) : [])
+    trackTimescales.set(track.id, track.timescale);
+
+  r.seek(0);
+  for (const top of boxes(r, file.byteLength)) {
+    if (top.type !== 'moof') continue;
+    const cursor = r.pos; // boxes() left the cursor at top.end; restore after scanning children
+    for (const traf of children(r, top, 'traf')) {
+      const { trackId, sampleCount, durationTicks, baseDecodeTime } = parseTraf(
+        r,
+        traf,
+        trexDefaults,
+      );
+      counts.set(trackId, (counts.get(trackId) ?? 0) + sampleCount);
+      mediaTotals.set(trackId, (mediaTotals.get(trackId) ?? 0) + durationTicks);
+      moofEnds.set(trackId, Math.max(moofEnds.get(trackId) ?? 0, baseDecodeTime + durationTicks));
+    }
+    r.seek(cursor);
+  }
+
+  const out = new Map<number, FragmentTiming>();
+  for (const [trackId, sampleCount] of counts) {
+    const sidx = sidxEnds.get(trackId);
+    const trackTs = trackTimescales.get(trackId);
+    // sidx ticks are in the sidx timescale; rescale to the track timescale when they differ.
+    const sidxTicks =
+      sidx && trackTs && sidx.timescale > 0 ? (sidx.ticks * trackTs) / sidx.timescale : undefined;
+    const mediaTicks = mediaTotals.get(trackId) ?? 0;
+    const durationTicks = Math.max(sidxTicks ?? 0, moofEnds.get(trackId) ?? 0, mediaTicks);
+    out.set(trackId, { sampleCount, durationTicks, mediaTicks });
+  }
+  return out;
+}
+
+/** Per-track (id, mdhd timescale) from a `moov`, so fragment timing can rescale `sidx` totals. */
+function trackTimescalesOf(r: Reader, moov: BoxHeader): Array<{ id: number; timescale: number }> {
+  const out: Array<{ id: number; timescale: number }> = [];
+  for (const trak of children(r, moov, 'trak')) {
+    const tkhd = child(r, trak, 'tkhd');
+    const mdia = child(r, trak, 'mdia');
+    const mdhd = mdia ? child(r, mdia, 'mdhd') : undefined;
+    if (!tkhd || !mdhd) continue;
+    const { trackId } = parseTkhd(r, tkhd);
+    const { timescale } = parseMdhd(r, mdhd);
+    out.push({ id: trackId, timescale });
+  }
+  return out;
+}
+
+/**
+ * Patch a fragmented movie's tracks in place from {@link parseFragments}: for any track whose `moov`
+ * sample table is empty, set `durationSec` (and the movie's, as the longest track) and—for video—`fps`
+ * (avg = sampleCount/duration, matching ffprobe's `avg_frame_rate`). A track that already has samples is
+ * left untouched, so non-fragmented inputs are unaffected.
+ */
+export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
+  if (!movie.tracks.some((t) => t.samples.sampleSizes.length === 0)) return movie;
+  const timing = parseFragments(file);
+  let movieDurationSec = movie.durationSec;
+  for (const track of movie.tracks) {
+    if (track.samples.sampleSizes.length > 0) continue;
+    const frag = timing.get(track.id);
+    if (!frag || frag.durationTicks <= 0 || track.timescale <= 0) continue;
+    const durationSec = frag.durationTicks / track.timescale;
+    track.durationSec = durationSec;
+    track.fragmentSampleCount = frag.sampleCount;
+    // fps is frames over the *content* span (Σ sample durations), not the presentation end, so a
+    // start offset in `durationSec` doesn't deflate it — this equals ffprobe's avg_frame_rate.
+    const mediaSec = frag.mediaTicks / track.timescale;
+    if (track.mediaType === 'video' && mediaSec > 0) track.fps = frag.sampleCount / mediaSec;
+    movieDurationSec = Math.max(movieDurationSec, durationSec);
+  }
+  movie.durationSec = movieDurationSec;
+  return movie;
 }
 
 function parseTrak(r: Reader, trak: BoxHeader): ParsedTrack | undefined {

@@ -13,9 +13,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { createMedia } from './create-media.ts';
 import { InputError } from '../contracts/errors.ts';
 import { fixtureSource } from '../test-support/corpus.ts';
+import { createMedia } from './create-media.ts';
 import { assertTrimRange } from './engine.ts';
 
 /** Real, stream-copyable MP4s (h264; ≥3 distinct files, varied duration/tracks). */

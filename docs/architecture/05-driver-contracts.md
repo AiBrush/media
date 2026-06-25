@@ -92,7 +92,7 @@ export interface StreamCopyOptions extends StageOptions {  // ADR-021
 }
 export interface PcmTransform extends StageOptions {       // ADR-022 (raw-PCM containers, e.g. WAV)
   channels?: number                                        // up/down-mix (BS.775); omit = passthrough
-  sampleRate?: number                                      // resample; differing rate needs the WASM tail
+  sampleRate?: number                                      // resample (pure-TS band-limited windowed-sinc, ADR-022)
   gainDb?: number                                          // gain
 }
 export interface DecryptParams extends StageOptions {      // ADR-023 (CENC / HLS sample decryption)
@@ -152,11 +152,14 @@ export interface DriverModule {
 // A lazily-imported driver chunk default-exports a DriverModule.
 ```
 
+> **`FilterDriver` covers audio too (ADR-033).** The three audio `FilterSpec` variants (`resample`/`remix`/`gain`) are served by `audioDspFilterDriver` (`src/filters/audio-dsp.ts`) — a `TransformStream<AudioData, AudioData>` over the pure-TS dsp kernels (`src/dsp`). It declares `substrate:'wasm'` as the **least-wrong existing value**: `FilterSubstrate` (`webgpu|webgl|canvas2d|wasm`) is pixel-oriented and has no CPU-native value, yet a CPU audio filter must rank *below* the GPU substrates, and `'wasm'` is the router's lowest, non-GPU tier (the GPU/canvas values would wrongly imply a pixel pipeline). The proper fit is a future **additive `'native'` `FilterSubstrate`** value (mirroring `Tier`'s existing `'native'`) — a `DRIVER_API_VERSION` event (§5), not yet made. This driver is implemented + tested but **not yet auto-registered** in `defaults.ts` (doc 09 status table).
+
 ## 3. Lifecycle, cancellation, errors
 
 - A coder/filter is a `TransformStream`. The driver configures its underlying WebCodecs/WASM object when the stream starts, processes each chunk, and **flushes on writable close** (encoder/muxer `finalize`).
 - **Cancellation:** aborting `StageOptions.signal` cancels the readable and writable; the driver must release WebCodecs/WASM resources in the stream's `cancel`/`abort` handlers.
 - **Errors:** a driver throws/【rejects the stream with】a `MediaError` (`decode-error`/`encode-error`/`demux-error`/`mux-error`); never swallow an error and emit silence (that is exactly the kind of WEAK-GATE behavior we reject, ADR-018).
+- **Out-of-band encoder→muxer config (ADR-029):** the encoder `TransformStream` carries only `EncodedChunk` bytes, but a muxer needs the encoder-produced `DecoderConfig` (codec string + `description`, e.g. AAC's AudioSpecificConfig / AVC's `avcC`) to write the sample entry. A WebCodecs encoder publishes it on the first chunk's `EncodedVideoChunkMetadata`/`EncodedAudioChunkMetadata.decoderConfig`; the first-party drivers surface it through an **additive, driver-local** options extension read structurally off `o` — `VideoEncoderStageOptions extends StageOptions { keyFrameInterval?; onDecoderConfig? }` and `AudioEncoderStageOptions extends StageOptions { onConfig? }`. The `CodecDriver` contract (`createEncoder(c, o?: StageOptions)`) is **unchanged** — these are engine↔driver implementation detail, not part of the published contract, so they are purely additive (§5, no `DRIVER_API_VERSION` bump). The engine allocates the muxer track lazily on the first chunk once the config has arrived.
 
 ## 4. Authoring a driver (the rules)
 
@@ -168,6 +171,8 @@ export interface DriverModule {
 6. Declare `apiVersion = DRIVER_API_VERSION`.
 
 ### Skeleton (a WASM FLAC decode driver)
+
+> Illustrative of the `DriverModule`/`createDecoder` **pattern** only (the `loadFlacWasm()` is hypothetical). The shipped FLAC decoder is in fact **pure TS**, exposed via `ContainerDriver.decodePcm`, not a WASM `CodecDriver` (ADR-024) — this skeleton stands in for any genuinely-WASM codec (e.g. libopus/libvorbis).
 
 ```ts
 const FlacModule: DriverModule = {

@@ -50,6 +50,17 @@ function tracksModule(): DriverModule {
 
 const NOOP_BYTES = fromBytes(new Uint8Array([1, 2, 3, 4]), { mime: 'application/x-noop' });
 
+/** Pull the first item from a frame stream (forces a lazy `decode` to run its demux/codec route). */
+async function readFirst<T>(stream: ReadableStream<T> | undefined): Promise<T | undefined> {
+  if (!stream) return undefined;
+  const reader = stream.getReader();
+  try {
+    return (await reader.read()).value;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 describe('createMedia', () => {
   it('instantiates an engine exposing the public surface', () => {
     const media = createMedia();
@@ -115,19 +126,24 @@ describe('createMedia', () => {
     ]);
   });
 
-  it('codec-dependent ops raise a typed CapabilityError (Phase 1 pipelines)', async () => {
+  it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {
+    // With no driver matching the NOOP container (and WebCodecs absent in Node), each op must surface a
+    // typed CapabilityError. `convert`/`remux`/`trim`/`decrypt` reject at the container route;
+    // `encode`/`mux` reject building the output; `decode` returns frame streams synchronously (its
+    // contract) whose rejection surfaces when the stream is first pulled (the demux/codec route runs lazily).
     const media = createMedia();
     await expect(media.convert(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(media.remux(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(media.trim(NOOP_BYTES, { start: 0, end: 1 })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    await expect(media.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(media.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(media.decrypt(NOOP_BYTES, { scheme: 'cenc', keys: {} })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    expect(() => media.decode(NOOP_BYTES)).toThrowError(CapabilityError);
+    // `encode` with no frame streams is an input error (nothing to encode); with a stream it would route a codec.
+    await expect(media.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
+    await expect(readFirst(media.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
   });
 
   it('reads the head of a non-seekable custom source, then routes', async () => {
@@ -218,12 +234,12 @@ describe('bare-function sugar', () => {
     await expect(sugar.trim(NOOP_BYTES, { start: 0, end: 1 })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    await expect(sugar.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
+    await expect(sugar.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
     await expect(sugar.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.decrypt(NOOP_BYTES, { scheme: 'cenc', keys: {} })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    expect(() => sugar.decode(NOOP_BYTES)).toThrowError(CapabilityError);
+    await expect(readFirst(sugar.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.preload('probe')).resolves.toBeUndefined();
   });
 });

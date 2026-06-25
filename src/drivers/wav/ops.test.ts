@@ -70,10 +70,22 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(readWavPcm(out).sampleRate).toBe(44100);
   });
 
-  it('rejects true resampling with a typed CapabilityError (needs the WASM tail)', async () => {
-    await expect(
-      media().convert(await fixtureSource(SIN), { to: 'wav', audio: { sampleRate: 22050 } }),
-    ).rejects.toBeInstanceOf(CapabilityError);
+  it('resamples PCM to a new sample rate via the windowed-sinc tail (ADR-022)', async () => {
+    const orig = readWavPcm(
+      await bytesOf(await media().convert(await fixtureSource(SIN), { to: 'wav' })),
+    );
+    const out = readWavPcm(
+      await bytesOf(
+        await media().convert(await fixtureSource(SIN), {
+          to: 'wav',
+          audio: { sampleRate: 22050 },
+        }),
+      ),
+    );
+    expect(out.sampleRate).toBe(22050);
+    expect(out.channels).toBe(orig.channels);
+    const origLen = channelAt(orig.planar, 0).length;
+    expect(channelAt(out.planar, 0).length).toBe(Math.round((origLen * 22050) / orig.sampleRate));
   });
 
   it('rejects a lossy/cross-container target that needs the codec seam', async () => {

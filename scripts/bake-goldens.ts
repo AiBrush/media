@@ -13,6 +13,7 @@
  *   bun run bake-goldens
  */
 
+import { $ } from 'bun';
 import { createMedia } from '../src/api/create-media.ts';
 import { AdtsModule } from '../src/drivers/adts/adts-driver.ts';
 import { FlacModule } from '../src/drivers/flac/flac-driver.ts';
@@ -57,6 +58,26 @@ const PROBE_MIME: Record<string, string> = {
   adts: 'audio/aac',
 };
 
+/**
+ * Fixtures whose probe-metadata golden is **deferred**: our probe currently disagrees with ffprobe
+ * truth on a field, so baking our own output would commit a self-confirming (un-failable) oracle that
+ * encodes the bug (BUILD_INSTRUCTIONS §6 — never fake; doc 11 §5). The files stay in the corpus and
+ * exercise the demuxer; their golden lands once the probe handles the case. The corpus-integrity test
+ * still asserts each of these fetches + loads + probes without error — just not field-equality.
+ *  - `bear-av1-10bit.mp4`, `bear-open-gop-frag.mp4`, `bear-av-frag.mp4`: fragmented (mvex+moof, empty
+ *    moov sample table) → mvhd/mdhd duration is 0; ffprobe reports the real fragment duration.
+ *  - `bear-non-square-pixel.mp4`: probe yields fps 0; ffprobe reports 29.97.
+ *  - `bear-multitrack.webm`: probe emits raw Matroska codec ids (a_pcm/int/lit) and Theora display
+ *    dims 320x192; ffprobe canonicalizes to pcm and coded 320x180.
+ */
+const DEFER_METADATA_GOLDEN = new Set([
+  'bear-av1-10bit.mp4',
+  'bear-open-gop-frag.mp4',
+  'bear-av-frag.mp4',
+  'bear-non-square-pixel.mp4',
+  'bear-multitrack.webm',
+]);
+
 async function main(): Promise<void> {
   const manifest = (await Bun.file(MANIFEST_PATH).json()) as Manifest;
   const index: Record<string, Omit<FixtureEntry, 'id'>> = {};
@@ -100,6 +121,7 @@ async function main(): Promise<void> {
   let metaCount = 0;
   for (const entry of manifest.files) {
     if (!PROBE_CONTAINERS.has(entry.container)) continue;
+    if (DEFER_METADATA_GOLDEN.has(entry.id)) continue;
     const bytes = new Uint8Array(await Bun.file(`${MEDIA_DIR}/${entry.id}`).arrayBuffer());
     const mime = PROBE_MIME[entry.container];
     const info = await media.probe(fromBytes(bytes, mime ? { mime } : {}));
@@ -118,6 +140,11 @@ async function main(): Promise<void> {
     dspCount++;
   }
   console.info(`baked ${dspCount} audio-dsp golden files → fixtures/golden/dsp/`);
+
+  // Commit goldens in the project's canonical format: JSON.stringify expands arrays one-per-line, but
+  // biome collapses short arrays, so the raw output would fail `biome check`. Normalize once here.
+  await $`bunx biome format --write ${`${ROOT}fixtures/golden`}`.quiet();
+  console.info('formatted goldens with biome.');
 }
 
 await main();

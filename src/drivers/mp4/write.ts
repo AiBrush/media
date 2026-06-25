@@ -71,9 +71,19 @@ export interface MuxTrackInput {
   samples: MuxSampleInput[];
 }
 
+/**
+ * Output container flavor → the `ftyp` major + compatible brands. `mp4` writes the ISO brand set
+ * (`isom`/`iso2`/`avc1`/`mp41`); `mov` writes the Apple QuickTime brand `qt  ` so a probe (ffprobe and
+ * ours) recognizes the file as QuickTime/MOV rather than MP4. Same box layout either way — only `ftyp`
+ * differs (ADR: a mov target must not advertise an ISO major brand, doc 09 mux).
+ */
+export type ContainerBrand = 'mp4' | 'mov';
+
 export interface WriteOptions {
   faststart?: boolean;
   movieTimescale?: number;
+  /** Container flavor for the `ftyp` brands (default `'mp4'`). */
+  brand?: ContainerBrand;
 }
 
 interface RunLength {
@@ -297,7 +307,12 @@ function moov(tracks: MuxTrackInput[], movieTimescale: number, chunkOffsets: num
   return box('moov', cat(mvhd, traks));
 }
 
-function ftypBox(): number[] {
+function ftypBox(brand: ContainerBrand): number[] {
+  if (brand === 'mov') {
+    // QuickTime: major_brand 'qt  ' (0x71 74 20 20), minor 0x200, compatible ['qt  '] — what ffprobe
+    // (and our parse) keys on to report container 'mov' instead of 'mp4'.
+    return box('ftyp', cat(fourcc('qt  '), u32(0x200), fourcc('qt  ')));
+  }
   return box(
     'ftyp',
     cat(fourcc('isom'), u32(0x200), fourcc('isom'), fourcc('iso2'), fourcc('avc1'), fourcc('mp41')),
@@ -340,7 +355,7 @@ function writeSamples(out: Uint8Array, pos: number, tracks: MuxTrackInput[]): nu
 export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint8Array {
   const movieTimescale = opts.movieTimescale ?? 1000;
   const faststart = opts.faststart ?? true;
-  const ftyp = ftypBox();
+  const ftyp = ftypBox(opts.brand ?? 'mp4');
 
   // Per-track contiguous byte regions within mdat (one chunk per track).
   const lens = tracks.map((t) => t.samples.reduce((a, s) => a + s.data.byteLength, 0));

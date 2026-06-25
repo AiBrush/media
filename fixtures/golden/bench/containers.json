@@ -1,0 +1,511 @@
+{
+  "generatedAt": "2026-06-24T21:04:55.723Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 3,
+  "iters": 21,
+  "files": [
+    {
+      "id": "test.mp4",
+      "container": "mp4",
+      "sizeBytes": 192844,
+      "durationSec": 6.0424,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 192844,
+          "mediaSeconds": 0,
+          "wallMs": 0.121375,
+          "mbPerSec": 1515.2244685729918,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 1.953125
+        }
+      ]
+    },
+    {
+      "id": "movie_5.mp4",
+      "container": "mp4",
+      "sizeBytes": 31603,
+      "durationSec": 5.154829931972789,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 31603,
+          "mediaSeconds": 0,
+          "wallMs": 0.049833,
+          "mbPerSec": 604.7994184854758,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.546875
+        }
+      ]
+    },
+    {
+      "id": "movie_5.webm",
+      "container": "webm",
+      "sizeBytes": 44447,
+      "durationSec": 5.008,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 44447,
+          "mediaSeconds": 0,
+          "wallMs": 0.102458,
+          "mbPerSec": 413.7106164604872,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 1.03125
+        }
+      ]
+    },
+    {
+      "id": "recorder_headerless.webm",
+      "container": "webm",
+      "sizeBytes": 192412,
+      "durationSec": 3.084173095703125,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 192412,
+          "mediaSeconds": 0,
+          "wallMs": 0.047583,
+          "mbPerSec": 3856.385317620986,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.609375
+        }
+      ]
+    },
+    {
+      "id": "sound_5.mp3",
+      "container": "mp3",
+      "sizeBytes": 23442,
+      "durationSec": 5.067755102040817,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 23442,
+          "mediaSeconds": 0,
+          "wallMs": 0.006375,
+          "mbPerSec": 3506.8287568933824,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.15625
+        }
+      ]
+    },
+    {
+      "id": "sound_5.oga",
+      "container": "ogg",
+      "sizeBytes": 18541,
+      "durationSec": 5.000226757369615,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 18541,
+          "mediaSeconds": 0,
+          "wallMs": 0.020042,
+          "mbPerSec": 882.2510478239838,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.125
+        }
+      ]
+    },
+    {
+      "id": "speech.wav",
+      "container": "wav",
+      "sizeBytes": 95310,
+      "durationSec": 2.976,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 95310,
+          "mediaSeconds": 0,
+          "wallMs": 0.005959,
+          "mbPerSec": 15253.347725571351,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.046875
+        }
+      ]
+    },
+    {
+      "id": "flac-verbatim.flac",
+      "container": "flac",
+      "sizeBytes": 889862,
+      "durationSec": 4.994421768707483,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 889862,
+          "mediaSeconds": 0,
+          "wallMs": 0.00575,
+          "mbPerSec": 147589.3103558084,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.03125
+        }
+      ]
+    },
+    {
+      "id": "sfx.adts",
+      "container": "adts",
+      "sizeBytes": 2078,
+      "durationSec": 0.21333333333333335,
+      "ops": [
+        {
+          "op": "probe",
+          "bytes": 2078,
+          "mediaSeconds": 0,
+          "wallMs": 0.006458,
+          "mbPerSec": 306.8651640588708,
+          "throughputRealtime": 0,
+          "peakMemoryMb": 0.015625
+        }
+      ]
+    },
+    {
+      "id": "2x2-green.mp4",
+      "container": "mp4",
+      "sizeBytes": 3503,
+      "durationSec": 0.18179138321995464,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 2176,
+          "mediaSeconds": 0.18179138321995464,
+          "wallMs": 0.036,
+          "mbPerSec": 57.64431423611111,
+          "throughputRealtime": 5049.76064499874,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 3289,
+          "mediaSeconds": 0.18179138321995464,
+          "wallMs": 0.205375,
+          "mbPerSec": 15.272719788972156,
+          "throughputRealtime": 885.1680254166994,
+          "peakMemoryMb": 1.171875
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 2856,
+          "mediaSeconds": 0.0908956916099773,
+          "wallMs": 0.205084,
+          "mbPerSec": 13.28086953470895,
+          "throughputRealtime": 443.21200878653286,
+          "peakMemoryMb": 0.875
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 3289,
+          "mediaSeconds": 0.18179138321995464,
+          "wallMs": 0.325291,
+          "mbPerSec": 9.642550290847753,
+          "throughputRealtime": 558.8577096198624,
+          "peakMemoryMb": 0.3125
+        }
+      ]
+    },
+    {
+      "id": "av1.mp4",
+      "container": "mp4",
+      "sizeBytes": 4019,
+      "durationSec": 1,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 3139,
+          "mediaSeconds": 1,
+          "wallMs": 0.015833,
+          "mbPerSec": 189.0724233688637,
+          "throughputRealtime": 63159.224404724315,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 3819,
+          "mediaSeconds": 1,
+          "wallMs": 0.093041,
+          "mbPerSec": 39.14491691142043,
+          "throughputRealtime": 10747.9498285702,
+          "peakMemoryMb": 0.078125
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 3681,
+          "mediaSeconds": 0.5,
+          "wallMs": 0.10625,
+          "mbPerSec": 33.03976619944853,
+          "throughputRealtime": 4705.882352941177,
+          "peakMemoryMb": 0.109375
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 3819,
+          "mediaSeconds": 1,
+          "wallMs": 0.269583,
+          "mbPerSec": 13.510058921947856,
+          "throughputRealtime": 3709.4327164546726,
+          "peakMemoryMb": 0.203125
+        }
+      ]
+    },
+    {
+      "id": "four-colors.mp4",
+      "container": "mp4",
+      "sizeBytes": 709,
+      "durationSec": 0.04170833333333333,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 93,
+          "mediaSeconds": 0.04170833333333333,
+          "wallMs": 0.009542,
+          "mbPerSec": 9.294876485619499,
+          "throughputRealtime": 4371.0263396911905,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 717,
+          "mediaSeconds": 0.04170833333333333,
+          "wallMs": 0.068333,
+          "mbPerSec": 10.006651030443289,
+          "throughputRealtime": 610.3688310674686,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 717,
+          "mediaSeconds": 0.020854166666666663,
+          "wallMs": 0.0805,
+          "mbPerSec": 8.494217203270575,
+          "throughputRealtime": 259.0579710144927,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 717,
+          "mediaSeconds": 0.04170833333333333,
+          "wallMs": 0.112959,
+          "mbPerSec": 6.053386493004376,
+          "throughputRealtime": 369.2342649397864,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "h264.mp4",
+      "container": "mp4",
+      "sizeBytes": 9821,
+      "durationSec": 1,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 8923,
+          "mediaSeconds": 1,
+          "wallMs": 0.013833,
+          "mbPerSec": 615.1692275929278,
+          "throughputRealtime": 72290.8985758693,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 9631,
+          "mediaSeconds": 1,
+          "wallMs": 0.102167,
+          "mbPerSec": 89.90023531383513,
+          "throughputRealtime": 9787.896287450938,
+          "peakMemoryMb": 0.109375
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 8641,
+          "mediaSeconds": 0.5,
+          "wallMs": 0.105041,
+          "mbPerSec": 78.4522212094935,
+          "throughputRealtime": 4760.046077246027,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 9631,
+          "mediaSeconds": 1,
+          "wallMs": 0.275333,
+          "mbPerSec": 33.3590137807985,
+          "throughputRealtime": 3631.9656561327556,
+          "peakMemoryMb": 0.296875
+        }
+      ]
+    },
+    {
+      "id": "h265.mp4",
+      "container": "mp4",
+      "sizeBytes": 8522,
+      "durationSec": 1,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 5258,
+          "mediaSeconds": 1,
+          "wallMs": 0.016,
+          "mbPerSec": 313.4012222290039,
+          "throughputRealtime": 62500,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 8327,
+          "mediaSeconds": 1,
+          "wallMs": 0.501875,
+          "mbPerSec": 15.823155233304794,
+          "throughputRealtime": 1992.52801992528,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 7759,
+          "mediaSeconds": 0.5,
+          "wallMs": 0.469125,
+          "mbPerSec": 15.773107425517919,
+          "throughputRealtime": 1065.8140154543032,
+          "peakMemoryMb": 0.03125
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 8327,
+          "mediaSeconds": 1,
+          "wallMs": 0.665542,
+          "mbPerSec": 11.931998330255407,
+          "throughputRealtime": 1502.5347761673945,
+          "peakMemoryMb": 0.1875
+        }
+      ]
+    },
+    {
+      "id": "movie_5.mp4",
+      "container": "mp4",
+      "sizeBytes": 31603,
+      "durationSec": 5.154829931972789,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 29342,
+          "mediaSeconds": 5.154829931972789,
+          "wallMs": 0.07,
+          "mbPerSec": 399.7530255998884,
+          "throughputRealtime": 73640.42759961128,
+          "peakMemoryMb": 0.09375
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 31355,
+          "mediaSeconds": 5.154829931972789,
+          "wallMs": 0.319875,
+          "mbPerSec": 93.48169813495261,
+          "throughputRealtime": 16115.138513396761,
+          "peakMemoryMb": 0.609375
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 17961,
+          "mediaSeconds": 2.577414965986395,
+          "wallMs": 0.281916,
+          "mbPerSec": 60.759036014176765,
+          "throughputRealtime": 9142.492678621982,
+          "peakMemoryMb": 0.1875
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 31355,
+          "mediaSeconds": 5.154829931972789,
+          "wallMs": 1.845834,
+          "mbPerSec": 16.19997149847601,
+          "throughputRealtime": 2792.683378880652,
+          "peakMemoryMb": 0.109375
+        }
+      ]
+    },
+    {
+      "id": "test.mp4",
+      "container": "mp4",
+      "sizeBytes": 192844,
+      "durationSec": 6.0424,
+      "ops": [
+        {
+          "op": "demux (table+gather)",
+          "bytes": 188483,
+          "mediaSeconds": 6.0424,
+          "wallMs": 0.130625,
+          "mbPerSec": 1376.0872434771234,
+          "throughputRealtime": 46257.6076555024,
+          "peakMemoryMb": 0.1875
+        },
+        {
+          "op": "remux (→mp4)",
+          "bytes": 192788,
+          "mediaSeconds": 6.0424,
+          "wallMs": 0.71175,
+          "mbPerSec": 258.31677430464083,
+          "throughputRealtime": 8489.497716894977,
+          "peakMemoryMb": 0.390625
+        },
+        {
+          "op": "trim (keyframe 25–75%)",
+          "bytes": 120127,
+          "mediaSeconds": 3.0211999999999994,
+          "wallMs": 0.489083,
+          "mbPerSec": 234.23843111891765,
+          "throughputRealtime": 6177.2746139203355,
+          "peakMemoryMb": 1.640625
+        },
+        {
+          "op": "decrypt (cenc)",
+          "bytes": 192788,
+          "mediaSeconds": 6.0424,
+          "wallMs": 4.503584,
+          "mbPerSec": 40.82458861904833,
+          "throughputRealtime": 1341.6869764170049,
+          "peakMemoryMb": 0.03125
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "op": "probe",
+      "files": 9,
+      "medianWallMs": 0.020042,
+      "geomeanMbPerSec": 2445.2064734302135,
+      "minMbPerSec": 306.8651640588708,
+      "maxPeakMemoryMb": 1.953125
+    },
+    {
+      "op": "demux (table+gather)",
+      "files": 7,
+      "medianWallMs": 0.016,
+      "geomeanMbPerSec": 195.05895853752904,
+      "minMbPerSec": 9.294876485619499,
+      "maxPeakMemoryMb": 0.1875
+    },
+    {
+      "op": "remux (→mp4)",
+      "files": 7,
+      "medianWallMs": 0.205375,
+      "geomeanMbPerSec": 41.31580635839844,
+      "minMbPerSec": 10.006651030443289,
+      "maxPeakMemoryMb": 1.171875
+    },
+    {
+      "op": "trim (keyframe 25–75%)",
+      "files": 7,
+      "medianWallMs": 0.205084,
+      "geomeanMbPerSec": 35.10032967431874,
+      "minMbPerSec": 8.494217203270575,
+      "maxPeakMemoryMb": 1.640625
+    },
+    {
+      "op": "decrypt (cenc)",
+      "files": 7,
+      "medianWallMs": 0.325291,
+      "geomeanMbPerSec": 15.423142068400338,
+      "minMbPerSec": 6.053386493004376,
+      "maxPeakMemoryMb": 0.3125
+    }
+  ]
+}

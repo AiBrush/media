@@ -5,6 +5,11 @@ node_modules
 dist
 *.tsbuildinfo
 
+# Generated wasm-tail crate build dirs (the committed surface is crate/{Cargo.toml,Cargo.lock,src} plus
+# the vendored ../*_wasm_bg.wasm + ../*-core.js; the cargo/wasm-pack output dirs are never committed).
+**/crate/pkg
+**/crate/target
+
 # Test / coverage
 coverage
 .vitest

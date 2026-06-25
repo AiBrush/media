@@ -19,7 +19,7 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, gain, remix } from '../../dsp/index.ts';
+import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
 import { readWavPcm, writeWav } from './pcm.ts';
 
 const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
@@ -177,18 +177,15 @@ export const WavDriver: ContainerDriver = {
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const wav = readWavPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    if (o?.sampleRate !== undefined && o.sampleRate !== wav.sampleRate) {
-      throw new CapabilityError(
-        'capability-miss',
-        `audio resample ${wav.sampleRate}→${o.sampleRate} Hz needs the WASM/WebAudio tail`,
-        { op: 'convert', tried: ['wav'] },
-      );
-    }
     let audio: PcmAudio = wav;
     if (o?.gainDb !== undefined && o.gainDb !== 0) audio = gain(audio, o.gainDb);
     if (o?.channels !== undefined && o.channels !== audio.channels)
       audio = remix(audio, o.channels);
-    const out = writeWav(audio, wav.format); // source sample-format preserved (lossless)
+    // Rate change last (on the final channel layout): band-limited windowed-sinc resampler (ADR-022
+    // tail, pure-TS — no longer a CapabilityError). Sample-format is still preserved by writeWav.
+    if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
+      audio = resample(audio, o.sampleRate);
+    const out = writeWav(audio, wav.format); // source sample-FORMAT preserved; rate may change via resample
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(out);

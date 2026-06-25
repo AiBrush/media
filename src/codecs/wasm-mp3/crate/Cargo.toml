@@ -1,0 +1,32 @@
+[package]
+name = "mp3_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust MP3 (MPEG-1/2/2.5 Layer III) decoder (Symphonia) compiled to WASM for aibrush-media's miss-only tail"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Pure Rust (no C): symphonia's MPEG-audio decoder (Layer I/II/III) + core, wrapped by wasm-bindgen.
+# Builds clean for wasm32-unknown-unknown via `wasm-pack build --target web` — see ../BUILD.md.
+[dependencies]
+wasm-bindgen = "0.2"
+symphonia-core = { version = "0.6", default-features = false }
+symphonia-bundle-mp3 = "0.6"
+
+# Small, fast wasm: optimize for size, fat-LTO, abort on panic (no unwinding tables).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Skip the wasm-pack-driven `wasm-opt` post-pass: the homebrew `wasm-opt` here predates the bulk-memory
+# (`memory.copy`) ops modern LLVM emits and rejects the valid module (same as the Vorbis sibling found).
+# The wasm-bindgen output is already correct + complete; size-optimize separately with a current
+# `wasm-opt --enable-bulk-memory` if desired (see ../BUILD.md). `opt-level="s"` + LTO + strip keep it lean.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

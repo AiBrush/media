@@ -3,7 +3,7 @@
  * to WebCodecs-native `EncodedVideoChunk`/`EncodedAudioChunk` with correct PTS/DTS and keyframe flags,
  * reading only the `moov` header for probe and the sample bytes on demand (bounded memory). The
  * byte-level muxer (`write.ts`) + lossless stream-copy ({@link muxTracksFromMovie}) are round-trip
- * validated; the contract `Muxer` (EncodedChunk seam) adapter lands with the browser codec layer.
+ * validated; the contract `Muxer` (EncodedChunk seam) adapter is {@link Mp4Muxer} (`mux.ts`).
  */
 
 import type {
@@ -14,6 +14,7 @@ import type {
   Demuxer,
   DriverModule,
   EncodedChunk,
+  MuxOptions,
   Muxer,
   Registry,
   StageOptions,
@@ -22,15 +23,30 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { hexToBytes } from '../../crypto/aes.ts';
-import { CENC_SCHEME, decryptSamples, kidHex, parseSenc, parseTenc } from './cenc.ts';
-import { type Movie, type ParsedTrack, parseMovie } from './parse.ts';
+import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
+import {
+  CBCS_SCHEME,
+  CENC_SCHEME,
+  type CencScheme,
+  decryptSamples,
+  decryptSamplesCbcs,
+  kidHex,
+  parseSenc,
+  parseTenc,
+} from './cenc.ts';
+import { Mp4Muxer } from './mux.ts';
+import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
 import { Reader } from './reader.ts';
 import { type SampleData, buildSampleData, buildSamples } from './samples.ts';
-import { type MuxSampleInput, type MuxTrackInput, writeMp4 } from './write.ts';
+import { type ContainerBrand, type MuxSampleInput, type MuxTrackInput, writeMp4 } from './write.ts';
 
 const MP4_MIMES = new Set(['video/mp4', 'video/quicktime', 'audio/mp4', 'audio/x-m4a']);
 const MP4_EXTENSIONS = new Set(['mp4', 'mov', 'm4a', 'm4v', 'qt']);
+
+/** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
+function brandFor(container: string | undefined): ContainerBrand {
+  return container === 'mov' || container === 'qt' ? 'mov' : 'mp4';
+}
 
 /** A random-access view over a source: range reads when available, else a one-time buffer. */
 interface RandomAccess {
@@ -98,11 +114,26 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
     }
     if (type === 'moov') {
       const box = await ra.read(offset, size);
-      return parseMovie(brand, box.subarray(headerSize));
+      const movie = parseMovie(brand, box.subarray(headerSize));
+      // Fragmented/CMAF: the `moov` sample tables are empty and the real timing lives in `moof`/`sidx`
+      // (top-level siblings of `moov`). Recover per-track duration + sample count from the fragments so
+      // probe reports a correct `durationSec`/`fps` instead of 0.
+      if (movie.tracks.some((t) => t.samples.sampleSizes.length === 0)) {
+        return applyFragmentTiming(movie, await readWholeFile(ra, limit));
+      }
+      return movie;
     }
     offset += size;
   }
   throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
+}
+
+/** The full source bytes (fragments can follow `moov`); the size is known once we have reached `moov`. */
+async function readWholeFile(ra: RandomAccess, limit: number): Promise<Uint8Array> {
+  const size = ra.size ?? limit;
+  if (!Number.isFinite(size))
+    throw new MediaError('demux-error', 'fragmented MP4 needs a known size');
+  return ra.read(0, size);
 }
 
 function muxTrackMeta(track: ParsedTrack): Omit<MuxTrackInput, 'samples'> {
@@ -124,7 +155,23 @@ async function readSamples(
 ): Promise<MuxSampleInput[]> {
   const out: MuxSampleInput[] = [];
   for (const s of samples) {
+    // A sample whose byte range escapes the source (truncated/corrupt mdat, or a bit-flipped
+    // stsz/stco/co64 entry) would otherwise be read as a silently clamped short buffer and copied as
+    // garbage. Reject it as corrupt input rather than emit a wrong file (graceful-failure, doc 11 §6.3).
+    if (s.offset < 0 || s.size < 0 || (ra.size !== undefined && s.offset + s.size > ra.size)) {
+      const sizeNote = ra.size !== undefined ? ` size ${ra.size}` : '';
+      throw new MediaError(
+        'demux-error',
+        `sample ${s.index} byte range [${s.offset}, ${s.offset + s.size}) is outside the source${sizeNote} (truncated or corrupt MP4)`,
+      );
+    }
     const data = (await ra.read(s.offset, s.size)).slice();
+    if (data.byteLength !== s.size) {
+      throw new MediaError(
+        'demux-error',
+        `sample ${s.index} short read: got ${data.byteLength} of ${s.size} bytes (truncated MP4)`,
+      );
+    }
     out.push({
       data,
       durationTicks: s.durationTicks,
@@ -287,6 +334,136 @@ function resolveKey(keys: Record<string, string>, kid: Uint8Array): Uint8Array<A
   return hexToBytes(hexKey);
 }
 
+/**
+ * Decrypt one CENC-protected track (`cenc` AES-CTR or `cbcs` AES-CBC-pattern) into a cleartext
+ * {@link MuxTrackInput}. The scheme is the container's own (`enc.schemeType` from `schm`); the caller's
+ * declared `scheme` must match it (a mismatch is corrupt/contradictory input). A protected track with no
+ * `senc` or an empty sample table (e.g. fragmented/CMAF metadata in `moof/traf`, which this `moov` path
+ * does not read) cannot be honestly decrypted here, so it rejects rather than emit a sample-less blob.
+ */
+async function decryptCencTrack(
+  parsed: ParsedTrack,
+  track: MuxTrackInput,
+  enc: NonNullable<ParsedTrack['encryption']>,
+  keys: Record<string, string>,
+  declaredScheme: CencScheme,
+  sourceSize: number | undefined,
+): Promise<MuxTrackInput> {
+  const containerScheme: CencScheme = enc.schemeType === CBCS_SCHEME ? CBCS_SCHEME : CENC_SCHEME;
+  if (containerScheme !== declaredScheme) {
+    throw new MediaError(
+      'demux-error',
+      `track ${parsed.id} is '${containerScheme}'-protected but decrypt was asked for '${declaredScheme}' (scheme mismatch)`,
+    );
+  }
+  if (!enc.senc || parsed.samples.sampleSizes.length === 0) {
+    throw new MediaError(
+      'demux-error',
+      `${containerScheme}-protected track ${parsed.id} is not decryptable by this path: ${
+        enc.senc ? 'the sample table is empty' : 'per-sample encryption data (senc) is absent'
+      } (malformed or fragmented protection metadata)`,
+    );
+  }
+  const tenc = parseTenc(enc.tenc, containerScheme);
+  const key = resolveKey(keys, tenc.kid);
+  const senc = parseSenc(enc.senc, tenc.perSampleIvSize, containerScheme);
+  // A protected track's ciphertext must lie entirely within the file; a truncated mdat (sample bytes
+  // promised by the index but missing) is rejected rather than decrypted from a clamped short buffer.
+  if (sourceSize !== undefined) assertSampleRangesInBounds(parsed, sourceSize);
+  if (senc.length !== track.samples.length) {
+    throw new MediaError(
+      'demux-error',
+      `senc describes ${senc.length} samples but the track has ${track.samples.length} (corrupt sample-encryption metadata)`,
+    );
+  }
+  const cipher = track.samples.map((s) => s.data);
+  const clear =
+    containerScheme === CBCS_SCHEME
+      ? await decryptSamplesCbcs(
+          key,
+          cipher,
+          senc,
+          tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 }, // version-0 cbcs ⇒ full CBC, no pattern
+          tenc.constantIv,
+        )
+      : await decryptSamples(key, cipher, senc);
+  return { ...track, samples: track.samples.map((s, j) => ({ ...s, data: clear[j] ?? s.data })) };
+}
+
+/** Hex (16-byte) value from the HLS key map, or a typed error naming the missing/short field. */
+function hlsKeyField(keys: Record<string, string>, field: 'key' | 'iv'): Uint8Array<ArrayBuffer> {
+  const hex = keys[field];
+  if (hex === undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      `HLS AES-128 needs '${field}' (hex) in keys; none provided`,
+      { op: 'decrypt', tried: ['mp4'] },
+    );
+  }
+  return hexToBytes(hex);
+}
+
+/**
+ * Decrypt a full-segment HLS `AES-128` (AES-128-CBC + PKCS#7) **MP4** segment: the whole byte stream is
+ * the ciphertext of a clear MP4. The key/IV come from the caller's `keys` (`key`/`iv` hex). The recovered
+ * bytes must re-parse as an MP4 (a sanity gate that we produced a real container, not garbage). A raw
+ * MPEG-TS HLS segment is not an MP4 and is out of this driver's scope — use `decryptHlsAes128` directly.
+ */
+async function decryptHlsSegmentMp4(
+  ra: RandomAccess,
+  keys: Record<string, string>,
+): Promise<Uint8Array> {
+  if (ra.size === undefined) {
+    throw new MediaError(
+      'demux-error',
+      'HLS AES-128 needs the full segment size (non-seekable source)',
+    );
+  }
+  const cipher = await ra.read(0, ra.size);
+  if (cipher.byteLength === 0 || cipher.byteLength % 16 !== 0) {
+    throw new MediaError(
+      'demux-error',
+      `HLS AES-128 segment must be a positive multiple of 16 bytes (CBC), got ${cipher.byteLength}`,
+    );
+  }
+  const key = hlsKeyField(keys, 'key');
+  const iv = hlsKeyField(keys, 'iv');
+  if (key.byteLength !== 16 || iv.byteLength !== 16) {
+    throw new MediaError(
+      'demux-error',
+      `HLS AES-128 key and IV must be 16 bytes (got key=${key.byteLength}, iv=${iv.byteLength})`,
+    );
+  }
+  // A wrong key/IV trips PKCS#7 validation (SubtleCrypto throws a DOMException `OperationError`) or
+  // yields bytes that are not a valid MP4 (`readMovie` throws). Either way the segment did not decrypt;
+  // surface a typed MediaError, never a leaked DOMException (the typed-error model, ADR-017).
+  try {
+    const clear = await aesCbcPkcs7(key, iv, cipher.slice(), 'decrypt');
+    await readMovie({
+      read: (off, len) => Promise.resolve(clear.subarray(off, off + len)),
+      size: clear.byteLength,
+    });
+    return clear;
+  } catch (e) {
+    if (e instanceof MediaError) throw e; // already typed (CapabilityError/InputError/MediaError)
+    throw new MediaError(
+      'demux-error',
+      'HLS AES-128 segment did not decrypt to a valid MP4 (wrong key/IV, or not an AES-128 MP4 segment)',
+      e,
+    );
+  }
+}
+
+/** A single-chunk byte stream (the whole output is already materialized in memory). */
+function oneShot(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
+}
+
 export const Mp4Driver: ContainerDriver = {
   id: 'mp4',
   apiVersion: DRIVER_API_VERSION,
@@ -315,7 +492,10 @@ export const Mp4Driver: ContainerDriver = {
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec)
       : await muxTracksFromMovie(ra, movie);
-    const bytes = writeMp4(tracks, { faststart: o?.faststart ?? true });
+    const bytes = writeMp4(tracks, {
+      faststart: o?.faststart ?? true,
+      brand: brandFor(o?.container),
+    });
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(bytes);
@@ -324,14 +504,22 @@ export const Mp4Driver: ContainerDriver = {
     });
   },
   async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
-    if (o.scheme !== CENC_SCHEME) {
+    const ra = await randomAccess(src);
+
+    // HLS AES-128: the whole MP4 segment is one AES-128-CBC (PKCS#7) ciphertext — decrypt it as a unit.
+    if (o.scheme === 'hls-aes128') {
+      const clear = await decryptHlsSegmentMp4(ra, o.keys);
+      return oneShot(clear);
+    }
+
+    // CENC sample decryption: 'cenc' (AES-CTR) or 'cbcs' (AES-CBC pattern). Anything else is unsupported.
+    if (o.scheme !== CENC_SCHEME && o.scheme !== CBCS_SCHEME) {
       throw new CapabilityError(
         'capability-miss',
-        `the mp4 driver decrypts CENC ('cenc'); '${o.scheme}' is not supported in this build`,
+        `the mp4 driver decrypts CENC ('cenc'/'cbcs') and HLS ('hls-aes128'); '${o.scheme}' is not supported`,
         { op: 'decrypt', tried: ['mp4'] },
       );
     }
-    const ra = await randomAccess(src);
     const movie = await readMovie(ra);
     const sourceSize = ra.size;
     const tracks = await muxTracksFromMovie(ra, movie); // clear-structured (mp4a), ciphertext samples
@@ -345,55 +533,16 @@ export const Mp4Driver: ContainerDriver = {
         continue;
       }
       // The track IS CENC-protected (enca/encv + tenc), so it MUST be decrypted — never passed through as
-      // if it were clear. This `moov`-based path needs the per-sample IVs (`senc`) and a non-empty sample
-      // table; when they are absent (e.g. a fragmented/CMAF file whose senc/saiz/saio + sample sizes live
-      // in `moof/traf`, which this path does not read) we cannot honestly produce a decrypted track, so we
-      // reject as corrupt/unsupported protected input rather than emit a sample-less file (ADR-023).
-      if (!enc.senc || parsed.samples.sampleSizes.length === 0) {
-        throw new MediaError(
-          'demux-error',
-          `CENC-protected track ${parsed.id} is not decryptable by this path: ${
-            enc.senc ? 'the sample table is empty' : 'per-sample encryption data (senc) is absent'
-          } (malformed or fragmented protection metadata)`,
-        );
-      }
-      const tenc = parseTenc(enc.tenc);
-      const key = resolveKey(o.keys, tenc.kid);
-      const senc = parseSenc(enc.senc, tenc.perSampleIvSize);
-      // A protected track's ciphertext must lie entirely within the file; a truncated mdat (sample bytes
-      // promised by the index but missing) is rejected rather than decrypted from a clamped short buffer.
-      if (sourceSize !== undefined) assertSampleRangesInBounds(parsed, sourceSize);
-      if (senc.length !== track.samples.length) {
-        throw new MediaError(
-          'demux-error',
-          `senc describes ${senc.length} samples but the track has ${track.samples.length} (corrupt sample-encryption metadata)`,
-        );
-      }
-      const clear = await decryptSamples(
-        key,
-        track.samples.map((s) => s.data),
-        senc,
-      );
-      out.push({
-        ...track,
-        samples: track.samples.map((s, j) => ({ ...s, data: clear[j] ?? s.data })),
-      });
+      // if it were clear (ADR-023). The scheme-specific decrypt rejects undecryptable protected input
+      // (absent senc / empty sample table / scheme mismatch) rather than emitting a sample-less file.
+      out.push(await decryptCencTrack(parsed, track, enc, o.keys, o.scheme, sourceSize));
     }
-    const bytes = writeMp4(out, { faststart: true });
-    return new ReadableStream<Uint8Array>({
-      start(c): void {
-        c.enqueue(bytes);
-        c.close();
-      },
-    });
+    return oneShot(writeMp4(out, { faststart: true }));
   },
-  createMuxer(): Muxer {
-    // The byte-level muxer (writeMp4) + stream-copy remux are implemented and round-trip-validated;
-    // the EncodedChunk-seam Muxer adapter lands with the browser codec layer (it needs WebCodecs).
-    throw new MediaError(
-      'mux-error',
-      'the mp4 EncodedChunk-seam muxer requires the browser codec layer',
-    );
+  createMuxer(o?: MuxOptions): Muxer {
+    // The EncodedChunk-seam adapter over writeMp4 ({@link Mp4Muxer}): its packet→sample timing
+    // (DTS/ctts, B-frames) is pure + Node-validated; only the per-chunk `copyTo` is browser-only.
+    return new Mp4Muxer(o);
   },
 };
 

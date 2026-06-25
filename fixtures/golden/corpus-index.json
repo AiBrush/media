@@ -31,6 +31,165 @@
     "video": "av1",
     "traits": ["video-only", "av1", "av01"]
   },
+  "bear-1280x720.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-1280x720.mp4",
+    "sha256": "bcb75d3db0a1a5056f4cd5c770ceccdb4cae920f21abb8139b29cd9ad39e3857",
+    "bytes": 715963,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "h264",
+    "audio": "aac",
+    "traits": ["av", "720p", "h264-high", "aac-stereo", "stereo", "faststart"]
+  },
+  "bear-1280x720.ts": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-1280x720.ts",
+    "sha256": "9a9ea4fd30e520f7a3ae55511985920f85ba4f04f56f9c7bde0ad2978bed26b7",
+    "bytes": 780012,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mpegts",
+    "video": "h264",
+    "audio": "aac",
+    "traits": ["av", "mpeg-ts", "188-byte-packets", "720p", "hls-segment"]
+  },
+  "bear-4k-hevc.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-3840x2160-hevc.mp4",
+    "sha256": "65debe7dd852c60ffc06be155ab52c60c5f091cccf616d64cf3ef8259f55cfed",
+    "bytes": 1784380,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "hevc",
+    "traits": ["video-only", "hevc", "hvc1", "4k", "2160p", "8-bit"]
+  },
+  "bear-av-frag.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-1280x720-av_frag.mp4",
+    "sha256": "affc4ce6c872f9d4160a92a7b959523b3cac2d171e89177e4cd211e55f756175",
+    "bytes": 764465,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "h264",
+    "audio": "aac",
+    "traits": ["av", "fragmented", "cmaf", "720p", "moof"]
+  },
+  "bear-av1-10bit.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-av1-320x180-10bit.mp4",
+    "sha256": "b34ad35f5ea9697c7afed36bb98a29649158ea808aab384e99920c43bcd2be61",
+    "bytes": 19658,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "av1",
+    "traits": ["video-only", "av1", "av01", "10-bit", "320x180"]
+  },
+  "bear-flac.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-flac.mp4",
+    "sha256": "358d7b65ec0157b59ee5f2f8f923da255c2d906d83cfb1cb7448ac804d4b5b7e",
+    "bytes": 216415,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "audio": "flac",
+    "traits": ["audio-only", "flac", "flac-in-mp4", "44100Hz"]
+  },
+  "bear-hevc-10bit-hdr10.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-1280x720-hevc-10bit-hdr10.mp4",
+    "sha256": "49b960ac28ae13153ba8e62e3fceb50408564c21f25fc38936e7c8a06b61f2db",
+    "bytes": 319643,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "hevc",
+    "traits": ["video-only", "hevc", "hvc1", "10-bit", "hdr", "hdr10", "720p"]
+  },
+  "bear-multitrack.webm": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-320x240-multitrack.webm",
+    "sha256": "63ed41b21a83c67032a86826414fab5ef45e44a69be3e1a0b599cdfbb0ef1963",
+    "bytes": 447985,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "webm",
+    "video": "vp8",
+    "audio": "vorbis",
+    "traits": ["av", "multitrack", "320x240"]
+  },
+  "bear-non-square-pixel.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-640x360-non_square_pixel-with_pasp.mp4",
+    "sha256": "b1445b3c356e0a0893cd77fb5da09eb99966e859598fe8795a1bc0efb24be4e1",
+    "bytes": 73181,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "h264",
+    "traits": ["video-only", "h264", "non-square-pixel", "pasp", "anamorphic", "640x360"]
+  },
+  "bear-open-gop-frag.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-320x240-v-2fragments-open-gop_frag.mp4",
+    "sha256": "b1b9d1a69968d3bf6ea62b1a74d37ae1c4f5e62248c0906aafd368cda0662de6",
+    "bytes": 75698,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "h264",
+    "traits": ["video-only", "h264", "open-gop", "b-frames", "fragmented", "cmaf", "320x240"]
+  },
+  "bear-opus.webm": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-opus.webm",
+    "sha256": "5742d1c367bd9ecc9e022a916597fc8f5c06495d0676d807b63c70eea0136457",
+    "bytes": 25717,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "webm",
+    "audio": "opus",
+    "traits": ["audio-only", "opus", "opus-in-webm"]
+  },
+  "bear-rotate-90.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear_rotate_90.mp4",
+    "sha256": "433e32570d5b2960a2045924c0fa8f54bd479461c0881cdac65379aed3f42060",
+    "bytes": 63080,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mov",
+    "video": "h264",
+    "audio": "aac",
+    "traits": ["av", "rotation", "rotate-90", "display-matrix", "qt-brand"]
+  },
+  "bear-vbr-toc.mp3": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-audio-10s-VBR-has-TOC.mp3",
+    "sha256": "11c132fb96f1ad28230d2927997eb600a2d8870c3265f66b4edc83bf7ac30fbd",
+    "bytes": 87096,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp3",
+    "audio": "mp3",
+    "traits": ["audio-only", "mp3", "vbr", "xing-toc", "id3v2", "tags", "10s"]
+  },
+  "bear-vp9-alpha.webm": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-vp9a-444.webm",
+    "sha256": "4ef05127380af0a50511a8a0917d150dd9fcadae49e345b2969f0047c2a04b41",
+    "bytes": 113605,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "webm",
+    "video": "vp9",
+    "traits": ["video-only", "vp9", "alpha", "yuv444"]
+  },
   "flac-08bit.flac": {
     "url": "https://raw.githubusercontent.com/ietf-wg-cellar/flac-test-files/main/subset/23%20-%208%20bit%20per%20sample.flac",
     "sha256": "d72ad54e1d0ebe5d65b1b1addd13ee873d38c58cb3357774a1943ced2d984cf9",
@@ -50,6 +209,47 @@
     "container": "flac",
     "audio": "flac",
     "traits": ["audio-only", "flac", "stereo", "12-bit", "44100Hz", "flac-decode"]
+  },
+  "flac-192khz.flac": {
+    "url": "https://raw.githubusercontent.com/ietf-wg-cellar/flac-test-files/main/subset/33%20-%20samplerate%20192kHz.flac",
+    "sha256": "4833aafc6a7d652bac05de6d304d3e63cc419a731df995b146d91294062bbcd0",
+    "bytes": 6611359,
+    "license": "CC0-1.0",
+    "source": "ietf-wg-cellar/flac-test-files",
+    "attribution": "ietf-wg-cellar/flac-test-files, CC0-1.0 (public domain)",
+    "container": "flac",
+    "audio": "flac",
+    "traits": [
+      "audio-only",
+      "flac",
+      "stereo",
+      "24-bit",
+      "192000Hz",
+      "high-samplerate",
+      "flac-decode"
+    ]
+  },
+  "flac-24bit-hires.flac": {
+    "url": "https://raw.githubusercontent.com/ietf-wg-cellar/flac-test-files/main/subset/28%20-%20high%20resolution%20audio%2C%20default%20settings.flac",
+    "sha256": "62322a5c7821081bae99cc1a3f398f177a17cf9312131a5fbcfcc2ee38539346",
+    "bytes": 3476937,
+    "license": "CC0-1.0",
+    "source": "ietf-wg-cellar/flac-test-files",
+    "attribution": "ietf-wg-cellar/flac-test-files, CC0-1.0 (public domain)",
+    "container": "flac",
+    "audio": "flac",
+    "traits": ["audio-only", "flac", "stereo", "24-bit", "high-resolution", "flac-decode"]
+  },
+  "flac-5_1ch.flac": {
+    "url": "https://raw.githubusercontent.com/ietf-wg-cellar/flac-test-files/main/subset/41%20-%206%20channels%20(5.1).flac",
+    "sha256": "c12650fda54a384abf017d4b931491de043eaa7a815ae74c7a9b49d4087d6193",
+    "bytes": 171527,
+    "license": "CC0-1.0",
+    "source": "ietf-wg-cellar/flac-test-files",
+    "attribution": "ietf-wg-cellar/flac-test-files, CC0-1.0 (public domain)",
+    "container": "flac",
+    "audio": "flac",
+    "traits": ["audio-only", "flac", "5.1", "6-channel", "multichannel", "16-bit", "flac-decode"]
   },
   "flac-blocksize-16.flac": {
     "url": "https://raw.githubusercontent.com/ietf-wg-cellar/flac-test-files/main/subset/03%20-%20blocksize%2016.flac",
@@ -179,6 +379,29 @@
     "audio": "opus",
     "traits": ["short", "av"]
   },
+  "obs-remux-variable-aac.mp4": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/obs_remux_variable_aac_durations.mp4",
+    "sha256": "9bd7f8cb1372078f9b23aa4c80751926f8c5e2db6b5587459f0892785175ddcf",
+    "bytes": 4777511,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "mp4",
+    "video": "h264",
+    "audio": "aac",
+    "traits": ["av", "vfr", "variable-durations", "recorder-remux", "obs"]
+  },
+  "sfx-opus.ogg": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/webcodecs/sfx-opus.ogg",
+    "sha256": "ff310a63dbd7984bb67805740f9478990415b6784e7f631b842e8e4cdf01ea45",
+    "bytes": 3244,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/webcodecs",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "ogg",
+    "audio": "opus",
+    "traits": ["audio-only", "opus", "opus-in-ogg", "48000Hz"]
+  },
   "sfx-pcm-f32.wav": {
     "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/webcodecs/sfx-pcm-f32.wav",
     "sha256": "5599132be989e73fee9a6cfd68e8bab8a7a8cab3ce13fb8fbba86898c1450a6a",
@@ -288,6 +511,17 @@
     "container": "wav",
     "audio": "pcm",
     "traits": ["audio-only", "pcm"]
+  },
+  "stereo-48000.wav": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/stereo_48000.wav",
+    "sha256": "facd5fe79590c3cd69dd2dbc9c540b0122df1485f1b5922a3090274692863fe7",
+    "bytes": 192044,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium media/test/data",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "wav",
+    "audio": "pcm",
+    "traits": ["audio-only", "pcm", "pcm-s16", "stereo", "48000Hz"]
   },
   "test.mp4": {
     "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/test.mp4",

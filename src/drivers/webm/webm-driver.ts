@@ -14,11 +14,14 @@ import {
   type DriverModule,
   type EncodedChunk,
   type MediaType,
+  type MuxOptions,
   type Muxer,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { WebmMuxer } from './ebml-write.ts';
 import {
   type EbmlElement,
   elements,
@@ -47,14 +50,26 @@ const ID = {
   Audio: 0xe1,
   SamplingFrequency: 0xb5,
   Channels: 0x9f,
+  BitDepth: 0x6264,
+  CodecPrivate: 0x63a2,
   DefaultDuration: 0x23e383,
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  ReferenceBlock: 0xfb,
 } as const;
 
+/**
+ * Matroska CodecID → the engine's canonical codec token (the short vocabulary the harness goldens and
+ * the other container drivers use: `h264`/`hevc`/`vp8`/`vp9`/`av1`/`opus`/`vorbis`/`aac`/`mp3`/`flac`,
+ * and `pcm-s16`/… for raw PCM). The full WebCodecs decode string is NOT pinned here on purpose: H.264/
+ * HEVC need their `description` (avcC/hvcC) to form `avc1.PPCCLL`/`hev1…`, which the codec tier expands
+ * from `config.description` (set in {@link toTrackInfo}); pinning a profile string in probe would diverge
+ * from the `h264`/`hevc` goldens and still be incomplete without the level byte. VP8/VP9/AV1/Opus are
+ * already their own canonical tokens. (Matroska CodecID list: matroska.org/technical/codec_specs.html.)
+ */
 const CODEC_MAP: Record<string, string> = {
   V_VP8: 'vp8',
   V_VP9: 'vp9',
@@ -63,12 +78,33 @@ const CODEC_MAP: Record<string, string> = {
   A_OPUS: 'opus',
   A_AAC: 'aac',
   A_FLAC: 'flac',
+  A_AC3: 'ac-3',
+  A_EAC3: 'ec-3',
+  A_DTS: 'dts',
+  A_TRUEHD: 'truehd',
 };
 
-function mapCodec(codecId: string): string {
+/** Canonical PCM token for a Matroska raw-PCM CodecID at the track's BitDepth (matches the WAV driver). */
+function pcmCodec(codecId: string, bitDepth: number | undefined): string {
+  const bits = bitDepth ?? 16;
+  if (codecId.startsWith('A_PCM/FLOAT')) return bits === 64 ? 'pcm-f64' : 'pcm-f32';
+  // A_PCM/INT/LIT and A_PCM/INT/BIG are signed two's-complement (8-bit is unsigned by RIFF convention,
+  // but Matroska PCM is signed at every depth); endianness is decided at the decode seam, not the token.
+  return `pcm-s${bits}`;
+}
+
+/**
+ * Map a Matroska CodecID to the canonical codec token. `bitDepth` (Matroska `BitDepth`) sizes the raw-PCM
+ * token. Unrecognized ids fall back to the lowercased CodecID rather than being dropped (honest), but the
+ * common families — AVC/HEVC, the VPx/AV1 set, the MPEG audio layers, and PCM — are all canonicalized.
+ */
+function mapCodec(codecId: string, bitDepth?: number): string {
   if (codecId.startsWith('V_MPEG4') || codecId.includes('AVC')) return 'h264';
-  if (codecId.includes('HEVC')) return 'hevc';
+  if (codecId.includes('HEVC') || codecId === 'V_MPEGH/ISO/HEVC') return 'hevc';
+  if (codecId === 'V_MPEG2') return 'mpeg2video';
   if (codecId === 'A_MPEG/L3') return 'mp3';
+  if (codecId === 'A_MPEG/L2' || codecId === 'A_MPEG/L1') return 'mp2';
+  if (codecId.startsWith('A_PCM')) return pcmCodec(codecId, bitDepth);
   return CODEC_MAP[codecId] ?? codecId.toLowerCase();
 }
 
@@ -82,6 +118,14 @@ export interface WebmTrack {
   fps?: number;
   sampleRate?: number;
   channels?: number;
+  /**
+   * The WebCodecs decoder `description` — the codec-private bytes a decoder needs to configure. For
+   * H.264 (`V_MPEG4/ISO/AVC`) the Matroska CodecPrivate **is** the `avcC` box, and for HEVC
+   * (`V_MPEGH/ISO/HEVC`) it **is** `hvcC`; surfacing it is what unblocks H.264/HEVC-in-Matroska decode
+   * (the codec tier expands the bare `h264`/`hevc` token + this `description` into `avc1.PPCCLL`/`hev1…`).
+   * VP8/VP9/AV1/Opus are self-describing and carry no decoder description.
+   */
+  description?: Uint8Array;
 }
 
 export interface WebmInfo {
@@ -90,7 +134,12 @@ export interface WebmInfo {
   tracks: WebmTrack[];
 }
 
-function parseTrackEntry(dv: DataView, te: EbmlElement): WebmTrack | undefined {
+/** A no-copy view of an element's raw payload bytes (`[dataStart, dataEnd)` of the source). */
+function readBytes(bytes: Uint8Array, el: EbmlElement): Uint8Array {
+  return bytes.subarray(el.dataStart, el.dataEnd);
+}
+
+function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): WebmTrack | undefined {
   let type = 0;
   let codecId = '';
   let trackNumber: number | undefined;
@@ -98,12 +147,15 @@ function parseTrackEntry(dv: DataView, te: EbmlElement): WebmTrack | undefined {
   let height: number | undefined;
   let sampleRate: number | undefined;
   let channels: number | undefined;
+  let bitDepth: number | undefined;
+  let codecPrivate: Uint8Array | undefined;
   let defaultDuration = 0;
 
   for (const c of elements(dv, te.dataStart, te.dataEnd)) {
     if (c.id === ID.TrackType) type = readUint(dv, c);
     else if (c.id === ID.TrackNumber) trackNumber = readUint(dv, c);
     else if (c.id === ID.CodecID) codecId = readAscii(dv, c);
+    else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
     else if (c.id === ID.DefaultDuration) defaultDuration = readUint(dv, c);
     else if (c.id === ID.Video) {
       for (const v of elements(dv, c.dataStart, c.dataEnd)) {
@@ -114,22 +166,33 @@ function parseTrackEntry(dv: DataView, te: EbmlElement): WebmTrack | undefined {
       for (const a of elements(dv, c.dataStart, c.dataEnd)) {
         if (a.id === ID.SamplingFrequency) sampleRate = Math.round(readFloat(dv, a));
         else if (a.id === ID.Channels) channels = readUint(dv, a);
+        else if (a.id === ID.BitDepth) bitDepth = readUint(dv, a);
       }
     }
   }
 
   const mediaType: MediaType | undefined = type === 1 ? 'video' : type === 2 ? 'audio' : undefined;
   if (mediaType === undefined) return undefined;
+  const codec = mapCodec(codecId, bitDepth);
   const fps = defaultDuration > 0 ? 1e9 / defaultDuration : undefined;
+  // The CodecPrivate IS the WebCodecs `description` for the codecs whose decoder needs one — H.264's
+  // `avcC` and HEVC's `hvcC`. We attach it only for those (VP8/VP9/AV1/Opus are self-describing and a
+  // non-empty CodecPrivate there is not a decoder description), so decode is unblocked without feeding a
+  // decoder bytes it would reject.
+  const description =
+    (codec === 'h264' || codec === 'hevc') && codecPrivate && codecPrivate.byteLength > 0
+      ? codecPrivate
+      : undefined;
   return {
     mediaType,
-    codec: mapCodec(codecId),
+    codec,
     ...(trackNumber !== undefined ? { trackNumber } : {}),
     ...(width !== undefined ? { width } : {}),
     ...(height !== undefined ? { height } : {}),
     ...(fps !== undefined ? { fps } : {}),
     ...(sampleRate !== undefined ? { sampleRate } : {}),
     ...(channels !== undefined ? { channels } : {}),
+    ...(description !== undefined ? { description } : {}),
   };
 }
 
@@ -211,6 +274,181 @@ function collectClusterBlockTimes(
   }
 }
 
+// ── block → encoded frames (the demux seam) ───────────────────────────────────────────────────────
+
+/** A decoded (Simple)Block frame: its bytes + absolute presentation timestamp (µs) + keyframe flag. */
+export interface WebmFrame {
+  data: Uint8Array;
+  timestampUs: number;
+  keyframe: boolean;
+}
+
+/** The 2-bit lacing field of a (Simple)Block flags byte (bits 5-6): none / Xiph / fixed / EBML. */
+type Lacing = 'none' | 'xiph' | 'ebml' | 'fixed';
+function lacingOf(flags: number): Lacing {
+  switch ((flags >> 1) & 0x03) {
+    case 0x00:
+      return 'none';
+    case 0x01:
+      return 'xiph';
+    case 0x03:
+      return 'ebml';
+    default:
+      return 'fixed'; // 0x02
+  }
+}
+
+/** Read an unsigned EBML vint at `off` of `b` (lacing size tables); `undefined` if malformed. */
+function readUVint(b: Uint8Array, off: number): { value: number; length: number } | undefined {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  return readVint(dv, off, false);
+}
+
+/**
+ * Split a laced block body into individual frame byte-lengths (the bytes that follow the lacing header).
+ * `bodyStart` points at the first frame's data after the `[frameCount-1]` byte + size table; the returned
+ * `sizes` sum to the payload and `dataStart` is where frame 0 begins. Returns `undefined` on a malformed
+ * lacing header (so the caller falls back to treating the block as a single frame — never crash).
+ */
+function laceSizes(
+  b: Uint8Array,
+  headerStart: number,
+  blockEnd: number,
+  lacing: Lacing,
+): { sizes: number[]; dataStart: number } | undefined {
+  const frameCount = (b[headerStart] ?? 0) + 1; // `number_of_frames_minus_1`
+  let p = headerStart + 1;
+  if (lacing === 'fixed') {
+    const total = blockEnd - p;
+    if (frameCount <= 0 || total % frameCount !== 0) return undefined;
+    return { sizes: Array.from({ length: frameCount }, () => total / frameCount), dataStart: p };
+  }
+  const sizes: number[] = [];
+  if (lacing === 'xiph') {
+    for (let i = 0; i < frameCount - 1; i++) {
+      let size = 0;
+      for (;;) {
+        const byte = b[p++];
+        if (byte === undefined || p > blockEnd) return undefined;
+        size += byte;
+        if (byte !== 0xff) break;
+      }
+      sizes.push(size);
+    }
+  } else {
+    // EBML lacing: first size is an unsigned vint; each subsequent is a SIGNED vint delta from the prev.
+    const first = readUVint(b, p);
+    if (!first) return undefined;
+    p += first.length;
+    sizes.push(first.value);
+    for (let i = 1; i < frameCount - 1; i++) {
+      const raw = readUVint(b, p);
+      if (!raw) return undefined;
+      // Signed-vint bias: subtract 2^(7*length - 1) - 1 to recover the signed delta.
+      const bias = 2 ** (7 * raw.length - 1) - 1;
+      sizes.push((sizes[sizes.length - 1] ?? 0) + (raw.value - bias));
+      p += raw.length;
+    }
+  }
+  // The final frame fills the remaining bytes.
+  const used = sizes.reduce((s, x) => s + x, 0);
+  const last = blockEnd - p - used;
+  if (last < 0) return undefined;
+  sizes.push(last);
+  return { sizes, dataStart: p };
+}
+
+/**
+ * Decode one (Simple)Block (or BlockGroup's Block) into its frames. The block layout is: track-number
+ * vint · int16 relative timecode · flags byte · [lacing header] · frame data. `keyframeOverride` carries
+ * the BlockGroup verdict (a Block has no keyframe bit; its key-ness is "no ReferenceBlock"); for a
+ * SimpleBlock the flags' bit 0x80 decides. Each frame's timestamp is `clusterTimeUs` + the block's
+ * relative timecode (laced frames share the block's start time — Matroska gives no per-laced-frame time).
+ */
+function blockFrames(
+  bytes: Uint8Array,
+  dv: DataView,
+  block: EbmlElement,
+  clusterTimecode: number,
+  timecodeScale: number,
+  keyframeOverride: boolean | undefined,
+): { trackNumber: number; frames: WebmFrame[] } | undefined {
+  const tn = readVint(dv, block.dataStart, false);
+  if (!tn || tn.value < 0) return undefined;
+  const flagsOff = block.dataStart + tn.length + 2; // after the 2-byte int16 timecode
+  if (flagsOff >= block.dataEnd) return undefined;
+  const relTimecode = dv.getInt16(block.dataStart + tn.length, false);
+  const flags = bytes[flagsOff] ?? 0;
+  const keyframe = keyframeOverride ?? (flags & 0x80) !== 0;
+  const timestampUs = Math.round(((clusterTimecode + relTimecode) * timecodeScale) / 1000);
+  const lacing = lacingOf(flags);
+  const headerStart = flagsOff + 1;
+
+  if (lacing === 'none') {
+    return {
+      trackNumber: tn.value,
+      frames: [{ data: bytes.subarray(headerStart, block.dataEnd), timestampUs, keyframe }],
+    };
+  }
+  const laced = laceSizes(bytes, headerStart, block.dataEnd, lacing);
+  if (!laced) {
+    // Malformed lacing header → treat the whole payload as one frame (robust, never crash/lose data).
+    return {
+      trackNumber: tn.value,
+      frames: [{ data: bytes.subarray(headerStart, block.dataEnd), timestampUs, keyframe }],
+    };
+  }
+  const frames: WebmFrame[] = [];
+  let p = laced.dataStart;
+  for (const size of laced.sizes) {
+    const end = Math.min(p + size, block.dataEnd);
+    // Laced frames are emitted in block order; they share the block timestamp (Matroska stores no
+    // per-laced-frame timecode — a decoder derives sub-timing from the codec). Keyframe flag is shared.
+    frames.push({ data: bytes.subarray(p, end), timestampUs, keyframe });
+    p = end;
+  }
+  return { trackNumber: tn.value, frames };
+}
+
+/**
+ * Walk every Cluster in the segment, decoding each (Simple)Block / BlockGroup into per-track frames in
+ * file (decode) order. Returns a map TrackNumber → frames. The whole file must be read first (clusters
+ * span the body). A BlockGroup's keyframe verdict is "no ReferenceBlock present".
+ */
+function collectFrames(
+  bytes: Uint8Array,
+  dv: DataView,
+  segment: EbmlElement,
+  timecodeScale: number,
+): Map<number, WebmFrame[]> {
+  const byTrack = new Map<number, WebmFrame[]>();
+  const push = (parsed: { trackNumber: number; frames: WebmFrame[] } | undefined): void => {
+    if (!parsed) return;
+    const list = byTrack.get(parsed.trackNumber) ?? [];
+    for (const f of parsed.frames) list.push(f);
+    byTrack.set(parsed.trackNumber, list);
+  };
+  for (const el of elements(dv, segment.dataStart, segment.dataEnd)) {
+    if (el.id !== ID.Cluster) continue;
+    let clusterTimecode = 0;
+    for (const c of elements(dv, el.dataStart, el.dataEnd)) {
+      if (c.id === ID.Timecode) {
+        clusterTimecode = readUint(dv, c);
+      } else if (c.id === ID.SimpleBlock) {
+        push(blockFrames(bytes, dv, c, clusterTimecode, timecodeScale, undefined));
+      } else if (c.id === ID.BlockGroup) {
+        const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
+        if (block) {
+          // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
+          const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
+          push(blockFrames(bytes, dv, block, clusterTimecode, timecodeScale, isKeyframe));
+        }
+      }
+    }
+  }
+  return byTrack;
+}
+
 // A timestamp-derived fps from MediaRecorder output carries jitter (frames land a millisecond
 // early/late around a nominal integer cadence such as 24/25/30/60). We therefore snap a raw estimate
 // to the nearest integer **only** when it lands within a tight relative band; otherwise the raw value
@@ -223,7 +461,8 @@ const FPS_SNAP_REL_TOLERANCE = 0.02; // ±2 % — covers MediaRecorder jitter, e
 /** Snap a raw fps estimate to the nearest integer cadence within the band, else leave it unchanged. */
 function snapFpsToCadence(rawFps: number): number {
   const nearest = Math.round(rawFps);
-  if (nearest >= 1 && Math.abs(rawFps - nearest) / nearest <= FPS_SNAP_REL_TOLERANCE) return nearest;
+  if (nearest >= 1 && Math.abs(rawFps - nearest) / nearest <= FPS_SNAP_REL_TOLERANCE)
+    return nearest;
   return rawFps;
 }
 
@@ -269,7 +508,7 @@ export function parseWebm(bytes: Uint8Array): WebmInfo {
     } else if (el.id === ID.Tracks) {
       for (const te of elements(dv, el.dataStart, el.dataEnd)) {
         if (te.id === ID.TrackEntry) {
-          const track = parseTrackEntry(dv, te);
+          const track = parseTrackEntry(bytes, dv, te);
           if (track) tracks.push(track);
         }
       }
@@ -300,14 +539,56 @@ export function parseWebm(bytes: Uint8Array): WebmInfo {
   return { container: docType === 'matroska' ? 'mkv' : 'webm', durationSec, tracks };
 }
 
+/** The full demux of a WebM/MKV: the {@link WebmInfo} plus each track's frames (by public index). */
+export interface WebmDemux {
+  info: WebmInfo;
+  /** Per-public-track-index frames (decode order); index aligns with `info.tracks`. */
+  framesByIndex: WebmFrame[][];
+}
+
+/**
+ * Parse the whole file: metadata ({@link parseWebm}) + every Cluster's blocks → per-track frames. The
+ * blocks are keyed in Matroska by `TrackNumber`; we remap them to the public **track index** (the array
+ * position in `info.tracks`, which is also the `TrackInfo.id` the engine passes to `packets()`). Pure TS,
+ * Node-validated; `packets()` adds only the browser-only `Encoded*Chunk` wrapping on top of this.
+ */
+export function demuxWebm(bytes: Uint8Array): WebmDemux {
+  const info = parseWebm(bytes);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
+  if (!segment) throw new InputError('unsupported-input', 'not a WebM/Matroska (EBML) file');
+  let timecodeScale = 1_000_000;
+  const infoEl = findChild(dv, segment.dataStart, segment.dataEnd, ID.Info);
+  if (infoEl) {
+    const ts = findChild(dv, infoEl.dataStart, infoEl.dataEnd, ID.TimecodeScale);
+    if (ts) timecodeScale = readUint(dv, ts);
+  }
+  const byTrackNumber = collectFrames(bytes, dv, segment, timecodeScale);
+  // Remap TrackNumber → public index. A track without a TrackNumber (or with no blocks) gets an empty
+  // list, so `packets()` is always a valid (possibly empty) stream rather than a missing-key surprise.
+  const framesByIndex = info.tracks.map((t) =>
+    t.trackNumber !== undefined ? (byTrackNumber.get(t.trackNumber) ?? []) : [],
+  );
+  return { info, framesByIndex };
+}
+
 function toTrackInfo(track: WebmTrack, id: number, durationSec: number): TrackInfo {
-  const config =
+  // The CodecPrivate (avcC/hvcC) rides in the decoder `description` so the codec tier can configure the
+  // H.264/HEVC decoder (and expand the bare token to `avc1.PPCCLL`/`hev1…`); it is a `Uint8Array`, which
+  // satisfies the WebCodecs `description: AllowSharedBufferSource` field.
+  const config: VideoDecoderConfig | AudioDecoderConfig =
     track.mediaType === 'video'
-      ? { codec: track.codec, codedWidth: track.width ?? 0, codedHeight: track.height ?? 0 }
+      ? {
+          codec: track.codec,
+          codedWidth: track.width ?? 0,
+          codedHeight: track.height ?? 0,
+          ...(track.description !== undefined ? { description: track.description } : {}),
+        }
       : {
           codec: track.codec,
           sampleRate: track.sampleRate ?? 0,
           numberOfChannels: track.channels ?? 0,
+          ...(track.description !== undefined ? { description: track.description } : {}),
         };
   return {
     id,
@@ -319,20 +600,18 @@ function toTrackInfo(track: WebmTrack, id: number, durationSec: number): TrackIn
   };
 }
 
-const HEAD_BYTES = 1 << 20;
-
-async function readHead(src: ByteSource): Promise<Uint8Array> {
-  if (src.range) return src.range(0, Math.min(HEAD_BYTES, src.size ?? HEAD_BYTES));
+/** Read the entire source into one buffer — demux walks every Cluster, which spans the whole file. */
+async function readAll(src: ByteSource): Promise<Uint8Array> {
+  if (src.range && src.size !== undefined) return src.range(0, src.size);
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (total < HEAD_BYTES) {
+  for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
     total += value.byteLength;
   }
-  await reader.cancel().catch(() => {});
   const out = new Uint8Array(total);
   let off = 0;
   for (const c of chunks) {
@@ -340,6 +619,50 @@ async function readHead(src: ByteSource): Promise<Uint8Array> {
     off += c.byteLength;
   }
   return out;
+}
+
+/**
+ * Stream a track's (Simple)Block frames as WebCodecs encoded chunks. Browser-only: the `Encoded*Chunk`
+ * constructors are unavailable in Node, so we raise a typed `CapabilityError` (mirroring the mp4/mpegts
+ * drivers); the emission body is istanbul-ignored and validated under browser-mode (codec phase). Frame
+ * order is decode order (block/file order); each chunk's `data` is a view into the parsed buffer.
+ */
+function packetStream(
+  frames: readonly WebmFrame[],
+  mediaType: MediaType,
+  signal: AbortSignal | undefined,
+): ReadableStream<EncodedChunk> {
+  if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
+    throw new CapabilityError(
+      'capability-miss',
+      'WebM packet demux requires WebCodecs EncodedVideoChunk/EncodedAudioChunk (browser/worker only)',
+      { op: 'demux', tried: [] },
+    );
+  }
+  /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */
+  const isVideo = mediaType === 'video';
+  let i = 0;
+  return new ReadableStream<EncodedChunk>({
+    pull(controller): void {
+      if (signal?.aborted) {
+        controller.error(new MediaError('aborted', 'operation aborted'));
+        return;
+      }
+      const frame = frames[i];
+      if (frame === undefined) {
+        controller.close();
+        return;
+      }
+      i++;
+      const init = {
+        type: (frame.keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+        timestamp: frame.timestampUs,
+        data: frame.data,
+      };
+      controller.enqueue(isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init));
+    },
+  });
+  /* v8 ignore stop */
 }
 
 function matches(q: ContainerQuery): boolean {
@@ -372,22 +695,27 @@ export const WebmDriver: ContainerDriver = {
   kind: 'container',
   formats: ['webm', 'mkv'],
   supports: matches,
-  async demux(src: ByteSource): Promise<Demuxer> {
-    const info = parseWebm(await readHead(src));
+  async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+    // Demux reads the whole file (Clusters span the body) and decodes every (Simple)Block into per-track
+    // frames; `packets()` then wraps each frame as a WebCodecs EncodedChunk (browser-gated). The metadata
+    // (tracks/duration/description) comes from the same parse, so probe-fidelity carries into demux.
+    const { info, framesByIndex } = demuxWebm(await readAll(src));
+    const signal = o?.signal;
     return {
       tracks: info.tracks.map((t, i) => toTrackInfo(t, i, info.durationSec)),
-      packets(): ReadableStream<EncodedChunk> {
-        throw new CapabilityError(
-          'capability-miss',
-          'WebM packet demux requires the browser codec layer (WebCodecs EncodedChunk)',
-          { op: 'demux', tried: [] },
-        );
+      packets(trackId: number): ReadableStream<EncodedChunk> {
+        const track = info.tracks[trackId];
+        const frames = framesByIndex[trackId];
+        if (!track || !frames) throw new MediaError('demux-error', `no track ${trackId}`);
+        return packetStream(frames, track.mediaType, signal);
       },
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(): Muxer {
-    throw new MediaError('mux-error', 'webm muxing lands with the browser codec layer');
+  createMuxer(o?: MuxOptions): Muxer {
+    // The EncodedChunk-seam adapter over the EBML byte writer ({@link WebmMuxer}); the packet→block
+    // timeline is pure + Node-validated, only the per-chunk `copyTo` is browser-only (ebml-write.ts).
+    return new WebmMuxer(o);
   },
 };
 

@@ -133,7 +133,23 @@ describe('demux over a non-seekable source + browser-only seam', () => {
     await demuxer.close();
   });
 
-  it('createMuxer is a typed not-yet-implemented error (P1.4)', () => {
-    expect(() => Mp4Driver.createMuxer()).toThrowError(MediaError);
+  it('createMuxer returns a Muxer over the byte-muxer (round-trip covered in mux.test.ts)', () => {
+    const muxer = Mp4Driver.createMuxer({ faststart: true });
+    expect(muxer.output).toBeInstanceOf(ReadableStream);
+    expect(typeof muxer.addTrack).toBe('function');
+    expect(typeof muxer.write).toBe('function');
+    expect(typeof muxer.finalize).toBe('function');
+    // addTrack allocates a positive track id (write()'s real-EncodedChunk path is browser-only).
+    const id = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 4, codedHeight: 4 },
+    });
+    expect(id).toBeGreaterThan(0);
+  });
+
+  it('createMuxer rejects fragmented mux with a typed CapabilityError', () => {
+    expect(() => Mp4Driver.createMuxer({ fragmented: true })).toThrowError(CapabilityError);
   });
 });

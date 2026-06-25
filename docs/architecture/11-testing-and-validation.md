@@ -48,7 +48,7 @@ From strongest to weakest. **Gate on the strongest one the operation admits.**
    - probe duration consistent across containers,
    - double-remux is stable.
 5. **Robustness / fuzz** — garbled/truncated/zeroed/bitflipped/empty inputs must reject cleanly (no crash, **no wrong output**).
-6. **Performance** — multi-sample (`n>1`) wall/throughput/peakMemory/longtasks, re-measured fresh. **The benchmark's perf margins were cached single-sample [data: Finding 7]; we do not trust or reuse them — we re-measure.**
+6. **Performance** — multi-sample (`n>1`) wall/throughput/peakMemory/longtasks, re-measured fresh. **The benchmark's perf margins were cached single-sample [data: Finding 7]; we do not trust or reuse them — we re-measure.** The concrete harnesses (warmup + median + separate RSS pass + checksum sink + a `--check` regression gate) and the committed pure-TS baseline numbers are in [`14-benchmarks.md`](14-benchmarks.md); the WebCodecs/GPU tier is measured on the browser/target runtime (ADR-025).
 
 ## 5. Anti-cheat self-checks (lessons from the 3 SUSPECT findings)
 

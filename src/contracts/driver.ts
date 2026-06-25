@@ -124,6 +124,12 @@ export interface Demuxer {
 export interface MuxOptions {
   faststart?: boolean;
   fragmented?: boolean;
+  /**
+   * The target container token the caller requested (one of the driver's {@link ContainerDriver.formats}).
+   * Lets a multi-format driver pick the right on-disk flavor — e.g. the MP4 driver writes a QuickTime
+   * `ftyp` for `'mov'` vs an ISO `ftyp` for `'mp4'`. Omitted ⇒ the driver's primary format.
+   */
+  container?: string;
 }
 
 /** A live mux session: add tracks, write packets (preserving PTS/duration), finalize. */
@@ -140,6 +146,11 @@ export interface StreamCopyOptions extends StageOptions {
   trim?: { startSec: number; endSec: number };
   faststart?: boolean;
   fragmented?: boolean;
+  /**
+   * The target container token (one of the driver's {@link ContainerDriver.formats}); lets a
+   * multi-format driver pick the right flavor (e.g. MP4 vs QuickTime `ftyp`). Omitted ⇒ primary format.
+   */
+  container?: string;
 }
 
 /**

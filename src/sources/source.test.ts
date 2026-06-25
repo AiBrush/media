@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { InputError } from '../contracts/errors.ts';
+import { loadFixture } from '../test-support/corpus.ts';
 import {
   type MediaInput,
   type Source,
@@ -11,7 +12,47 @@ import {
   fromStream,
   fromURL,
   isSource,
+  probeUrlSize,
 } from './source.ts';
+
+/** A conformant HTTP range server backed by `bytes` (HEAD→Content-Length, Range→206, GET→200). */
+function rangeServer(bytes: Uint8Array): {
+  fetch: typeof fetch;
+  calls: { method: string; range: string | null }[];
+} {
+  const calls: { method: string; range: string | null }[] = [];
+  const total = bytes.byteLength;
+  const fetchImpl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const header = init?.headers as { Range?: string } | undefined;
+    const range = header?.Range ?? null;
+    calls.push({ method, range });
+    if (method === 'HEAD') {
+      return new Response(null, { status: 200, headers: { 'Content-Length': String(total) } });
+    }
+    if (range) {
+      const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (!m) return new Response('bad range', { status: 416 });
+      const a = Number(m[1]);
+      const end = Math.min(Number(m[2]) + 1, total); // a real server clamps the end to EOF
+      const slice = bytes.subarray(a, Math.max(a, end));
+      return new Response(toBody(slice), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${a}-${a + slice.byteLength - 1}/${total}` },
+      });
+    }
+    return new Response(toBody(bytes), {
+      status: 200,
+      headers: { 'Content-Length': String(total) },
+    });
+  }) as typeof fetch;
+  return { fetch: fetchImpl, calls };
+}
+
+/** Copy a (possibly `subarray`-backed) view into a fresh `ArrayBuffer` so it is a valid `Response` body. */
+function toBody(view: Uint8Array): ArrayBuffer {
+  return view.slice().buffer;
+}
 
 function rangeOf(src: Source, start: number, end: number): Promise<Uint8Array> {
   if (!src.range) throw new Error('expected source to support range()');
@@ -217,3 +258,117 @@ describe('stubbed-environment paths', () => {
     expect(() => from(new FakeStream() as unknown as MediaInput)).toThrowError(InputError);
   });
 });
+
+// ── URL size detection + past-EOF clamping (against a conformant range server backed by real bytes) ──
+
+const HREF = 'https://cdn.example/clip.mp4';
+const FIXTURE = 'h264.mp4'; // a real downloaded MP4 — bit-exactness is asserted vs its actual bytes
+
+describe('probeUrlSize — body-free size detection', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('reads Content-Length from a HEAD', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch, calls } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    expect(await probeUrlSize(HREF)).toBe(truth.byteLength);
+    expect(calls[0]?.method).toBe('HEAD'); // tried HEAD first
+  });
+
+  it('falls back to a ranged GET (Content-Range total) when HEAD lacks a length', async () => {
+    const truth = await loadFixture(FIXTURE);
+    // A server that answers HEAD with no Content-Length, but honors a bytes=0-0 probe.
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
+      return Promise.resolve(
+        new Response(truth.subarray(0, 1), {
+          status: 206,
+          headers: { 'Content-Range': `bytes 0-0/${truth.byteLength}` },
+        }),
+      );
+    }) as typeof fetch);
+    expect(await probeUrlSize(HREF)).toBe(truth.byteLength);
+  });
+
+  it('returns undefined for an unknown-length resource (no headers)', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
+      return Promise.resolve(new Response(new Uint8Array([0]), { status: 200 }));
+    }) as typeof fetch);
+    expect(await probeUrlSize(HREF)).toBeUndefined();
+  });
+
+  it('rejects a failed size probe with a typed InputError', async () => {
+    // Both HEAD and the ranged-GET fallback 404 → a typed InputError (never a leaked raw fetch error).
+    vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+      Promise.resolve(new Response('no', { status: 404 }))) as typeof fetch);
+    await expect(probeUrlSize(HREF)).rejects.toBeInstanceOf(InputError);
+  });
+});
+
+describe('fromURL — learns size from a range read and clamps past-EOF', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('memoizes the total length from the first range read (Content-Range)', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    const src = fromURL(HREF);
+    expect(src.size).toBeUndefined(); // not known before any read (honest: a URL has no sync length)
+    expectBytesEqual(await src.range?.(0, 16), truth.subarray(0, 16));
+    expect(src.size).toBe(truth.byteLength); // learned from `Content-Range`
+  });
+
+  it('range reads are bit-identical to the file at arbitrary offsets', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    const src = fromURL(HREF);
+    for (const [lo, hi] of [
+      [0, 32],
+      [777, 1801],
+      [truth.byteLength - 100, truth.byteLength],
+    ] as [number, number][]) {
+      expectBytesEqual(await src.range?.(lo, hi), truth.subarray(lo, hi));
+    }
+  });
+
+  it('clamps a past-EOF range once size is known (returns only real bytes, empty at/after EOF)', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    const src = fromURL(HREF);
+    await src.range?.(0, 8); // learns size first
+
+    const lo = truth.byteLength - 5;
+    expectBytesEqual(await src.range?.(lo, truth.byteLength + 9999), truth.subarray(lo));
+    expect((await src.range?.(truth.byteLength, truth.byteLength + 10))?.byteLength).toBe(0);
+  });
+
+  it('seeds size from the option without any round-trip', () => {
+    const src = fromURL(HREF, { size: 12345 });
+    expect(src.size).toBe(12345);
+  });
+
+  it('learns size from a full stream() Content-Length', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    const src = fromURL(HREF);
+    await readAll(src.stream());
+    expect(src.size).toBe(truth.byteLength);
+  });
+});
+
+/** Byte-equality with a precise first-divergence message (asserts a defined Uint8Array). */
+function expectBytesEqual(actual: Uint8Array | undefined, expected: Uint8Array): void {
+  if (actual === undefined) throw new Error('expected bytes, got undefined (range() missing)');
+  expect(actual.byteLength).toBe(expected.byteLength);
+  for (let i = 0; i < expected.byteLength; i++) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(`byte mismatch at ${i}: got ${actual[i]}, expected ${expected[i]}`);
+    }
+  }
+}

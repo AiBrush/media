@@ -116,4 +116,39 @@ describe('conformance harness — it can fail (anti-cheat: oracles must reject w
     };
     await expect(assertCodecDriverConforms(decodeOnly, codecCase)).resolves.toBeUndefined();
   });
+
+  it('rejects a CONTAINER whose supports() throws on an empty query (the try/catch robustness gate)', () => {
+    // The harness wraps `supports({direction:'demux'})` in a try/catch and asserts it does not throw.
+    const thrower: ContainerDriver = {
+      ...NOOP_CONTAINER,
+      supports: (q) => {
+        if (q.extension === undefined && q.mime === undefined)
+          throw new Error('boom on empty query');
+        return q.extension === 'noop';
+      },
+    };
+    expect(() => assertContainerDriverConforms(thrower, containerCase)).toThrow(ConformanceError);
+  });
+});
+
+describe('noop container driver — demux seam (empty tracks + empty packet stream)', () => {
+  async function drain(stream: ReadableStream<EncodedChunk>): Promise<number> {
+    const reader = stream.getReader();
+    let n = 0;
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+      n++;
+    }
+    return n;
+  }
+
+  it('demux() yields no tracks; packets() is an empty stream; close() resolves', async () => {
+    const demuxer = await NOOP_CONTAINER.demux({
+      stream: () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+    });
+    expect(demuxer.tracks).toEqual([]);
+    expect(await drain(demuxer.packets(0))).toBe(0); // the identity demux emits nothing
+    await expect(demuxer.close()).resolves.toBeUndefined();
+  });
 });

@@ -61,6 +61,10 @@ export function demux(input: MediaInput, o?: CallOptions): Cancellable<Demuxed> 
 export function decode(input: MediaInput, o?: CallOptions): MediaStreams {
   return shared().decode(input, o);
 }
+/** Decode and return the single frame at/just-after `timeUs` (frame-accurate seek). */
+export function seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame> {
+  return shared().seek(input, timeUs, o);
+}
 export function encode(
   frames: MediaStreams,
   opts: EncodeOptions,

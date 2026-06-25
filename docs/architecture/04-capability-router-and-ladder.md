@@ -1,6 +1,6 @@
 # 04 — Capability Router & Ladder
 
-> How a backend is chosen for each stage — the mechanism that makes the API opaque (ADR-003). Contracts → [`05`](05-driver-contracts.md). Decisions: ADR-002 (priority), ADR-007 (determinism), ADR-017 (miss error), ADR-020 (cost-awareness, deferred).
+> How a backend is chosen for each stage — the mechanism that makes the API opaque (ADR-003). Contracts → [`05`](05-driver-contracts.md). Decisions: ADR-002 (priority), ADR-007 (determinism), ADR-017 (miss error), ADR-020 (cost-awareness, deferred), ADR-026 (WebCodecs codec drivers, hardware-first), ADR-027 (GPU filter drivers — WebGPU + Canvas2D, WebGL omitted).
 
 ## 1. What the router does
 
@@ -26,12 +26,14 @@ Top = tried first. These defaults encode the benchmark's per-family winners; the
 | mux · remux · trim (copy) | TS muxer / packet-copy → WASM | container supported? |
 | decode (video/audio) | WebCodecs **hardware** → WebCodecs **software** → WASM decoder | `*Decoder.isConfigSupported(config)` |
 | encode (video/audio) | WebCodecs **hardware** → WebCodecs **software** → WASM encoder | `*Encoder.isConfigSupported(config)` |
-| video filter (resize/crop/rotate/pad/flip/colorspace/tonemap) | WebGPU → WebGL → Canvas2D → WASM (libavfilter) | `navigator.gpu?.requestAdapter()` / WebGL ctx |
+| video filter (resize/crop/rotate/flip) | WebGPU → Canvas2D → WASM (libavfilter) | `navigator.gpu` + `OffscreenCanvas` + `VideoFrame` / `OffscreenCanvas` |
 | audio convert (format/endianness/gain/mix/downmix/fade) | TS / AudioWorklet | always (cheap) |
-| audio resample | WebAudio `OfflineAudioContext` → WASM soxr | target sample-rate supported? |
+| audio resample | TS band-limited windowed-sinc (`src/dsp/resample.ts`, ADR-022) | always (pure-TS; any ratio) |
 | decrypt (CENC / HLS) | WebCrypto + TS box parse | `crypto.subtle` present |
 
 `Tier` ordering used for ranking: `hardware` > `gpu` > `native` > `wasm`.
+
+> **As built (Phase 1–2, ADR-026/027/032/033).** The WebCodecs codec drivers (`webcodecs-video`, `webcodecs-audio`) are a *single* `tier:'hardware'` driver each, codec-agnostic by config; the hardware-vs-software split is not two drivers but the `hardwareAcceleration` hint the determinism modifier sets — `auto → 'prefer-hardware'` (video) / `'no-preference'` (audio), `force-software → 'prefer-software'` (both). `isConfigSupported` then reports whether the UA will actually accelerate, and `force-software` additionally drops the whole `hardware`/`gpu` tier (§6). The video-filter ladder ships **WebGPU + Canvas2D only** — the **WebGL rung is intentionally omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for every geometric op, so it is the single, simpler fallback. The WASM filter rung is the Phase-2 tail. **Colorspace + tonemap are now implemented (ADR-032)** via a second WGSL color pipeline: WebGPU handles `colorspace` (BT.2020↔709↔601↔sRGB gamut+transfer) and `tonemap` (HDR PQ/HLG → SDR) for all targets, while Canvas2D `supports()` is honest — it handles `colorspace` only when the target resolves to the display space (srgb/bt709, a UA-color-managed passthrough) and declines wider-gamut targets and all tonemap, so an unbuilt path is a typed miss until the WASM tail, never wrong pixels. The **audio** `FilterSpec`s (`resample`/`remix`/`gain`) are served by a separate `audio-dsp-filter` (`AudioData` seam over the pure-TS dsp kernels, ADR-033); it declares `substrate:'wasm'` (the least-wrong CPU tier — it must rank below the GPU substrates; a `'native'` `FilterSubstrate` is the proper future fit) and is **implemented but not yet auto-registered** in `defaults.ts`. Likewise `wasm-opus` (ADR-031), `mpegts`, and `hls` are implemented but not yet in `defaults.ts` (see the doc 09 status table).
 
 ## 3. Capability probes (per kind)
 
@@ -78,4 +80,4 @@ A future refinement will let the router pick a cheaper tier for tiny inputs (whe
 
 ## 8. Failure semantics (ADR-017)
 
-A miss is never silent. `CapabilityError` carries `{ op, tried[], suggestion? }` — e.g. probing FLAC decode where neither WebCodecs nor a WASM FLAC driver is registered yields a clear error naming what was tried and how to enable it (register the WASM FLAC driver), rather than a wrong-but-quiet result. See the known gaps in [`10-browser-capability-matrix.md`](10-browser-capability-matrix.md).
+A miss is never silent. `CapabilityError` carries `{ op, tried[], suggestion? }` — e.g. probing Vorbis decode, where no browser has a WebCodecs `AudioDecoder` and no WASM Vorbis driver is registered, yields a clear error naming what was tried and how to enable it (register the WASM Vorbis driver), rather than a wrong-but-quiet result. (FLAC decode is the opposite case — a first-party **pure-TS** driver is registered, ADR-024, so it does *not* miss.) See the known gaps in [`10-browser-capability-matrix.md`](10-browser-capability-matrix.md).

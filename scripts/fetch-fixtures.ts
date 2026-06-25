@@ -21,6 +21,8 @@ interface FixtureEntry {
   bytes: number;
   license: string;
   source: string;
+  /** Provenance line: copyright holder + license (+ link). Recorded for every real-media entry. */
+  attribution?: string;
   container: string;
   video?: string;
   audio?: string;

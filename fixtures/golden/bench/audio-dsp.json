@@ -1,0 +1,563 @@
+{
+  "generatedAt": "2026-06-24T21:02:38.123Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 20,
+  "iters": 200,
+  "files": [
+    {
+      "id": "sfx-pcm-f32.wav",
+      "format": "f32",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0287085,
+          "throughputRealtime": 7431.016365652449,
+          "mSamplesPerSec": 356.6887855513175,
+          "peakMemoryMb": 2.703125
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.1772915,
+          "throughputRealtime": 1203.2913779472415,
+          "mSamplesPerSec": 57.75798614146758,
+          "peakMemoryMb": 0.46875
+        },
+        {
+          "op": "convert → f32",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.104896,
+          "throughputRealtime": 2033.760423022168,
+          "mSamplesPerSec": 97.62050030506406,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0797915,
+          "throughputRealtime": 2673.634827435671,
+          "mSamplesPerSec": 128.3344717169122,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0034585,
+          "throughputRealtime": 61683.774275938515,
+          "mSamplesPerSec": 2960.8211652450486,
+          "peakMemoryMb": 0.015625
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 20480,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.007917,
+          "throughputRealtime": 26946.23384278557,
+          "mSamplesPerSec": 2586.8384489074147,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 48000 → 44100",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 3.062271,
+          "throughputRealtime": 69.6650731869692,
+          "mSamplesPerSec": 3.3439235129745213,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s16.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0204375,
+          "throughputRealtime": 10438.328236493375,
+          "mSamplesPerSec": 501.039755351682,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.119458,
+          "throughputRealtime": 1785.8438391177933,
+          "mSamplesPerSec": 85.72050427765409,
+          "peakMemoryMb": 0.0625
+        },
+        {
+          "op": "convert → f32",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.100709,
+          "throughputRealtime": 2118.3144836442953,
+          "mSamplesPerSec": 101.67909521492616,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.078792,
+          "throughputRealtime": 2707.5506819643283,
+          "mSamplesPerSec": 129.96243273428775,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.010812,
+          "throughputRealtime": 19731.162905413737,
+          "mSamplesPerSec": 947.0958194598594,
+          "peakMemoryMb": 2.109375
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 20480,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.007458,
+          "throughputRealtime": 28604.63037454188,
+          "mSamplesPerSec": 2746.0445159560204,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 48000 → 44100",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 3.030958,
+          "throughputRealtime": 70.38478703213089,
+          "mSamplesPerSec": 3.3784697775422825,
+          "peakMemoryMb": 0.015625
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s24.wav",
+      "format": "s24",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.02075,
+          "throughputRealtime": 10281.124497991968,
+          "mSamplesPerSec": 493.49397590361446,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.1871875,
+          "throughputRealtime": 1139.677239844185,
+          "mSamplesPerSec": 54.70450751252087,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "convert → f32",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.1065415,
+          "throughputRealtime": 2002.349632146472,
+          "mSamplesPerSec": 96.11278234303064,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.08375,
+          "throughputRealtime": 2547.26368159204,
+          "mSamplesPerSec": 122.26865671641791,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.012375,
+          "throughputRealtime": 17239.05723905724,
+          "mSamplesPerSec": 827.4747474747476,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 20480,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.007458,
+          "throughputRealtime": 28604.63037454188,
+          "mSamplesPerSec": 2746.0445159560204,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 48000 → 44100",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 3.1900625,
+          "throughputRealtime": 66.87434284855965,
+          "mSamplesPerSec": 3.2099684567308633,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s32.wav",
+      "format": "s32",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.021979,
+          "throughputRealtime": 9706.234739220772,
+          "mSamplesPerSec": 465.899267482597,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.1849585,
+          "throughputRealtime": 1153.4118914963808,
+          "mSamplesPerSec": 55.363770791826276,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "convert → f32",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.100708,
+          "throughputRealtime": 2118.335517866836,
+          "mSamplesPerSec": 101.68010485760814,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.079917,
+          "throughputRealtime": 2669.4362067311504,
+          "mSamplesPerSec": 128.1329379230952,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.011417,
+          "throughputRealtime": 18685.58582231176,
+          "mSamplesPerSec": 896.9081194709644,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 20480,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.007667,
+          "throughputRealtime": 27824.87717925308,
+          "mSamplesPerSec": 2671.188209208295,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 48000 → 44100",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 3.0466465,
+          "throughputRealtime": 70.02234533390512,
+          "mSamplesPerSec": 3.3610725760274454,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-u8.wav",
+      "format": "u8",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0215,
+          "throughputRealtime": 9922.480620155038,
+          "mSamplesPerSec": 476.27906976744185,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.117062,
+          "throughputRealtime": 1822.396109184307,
+          "mSamplesPerSec": 87.47501324084674,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "convert → f32",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.100709,
+          "throughputRealtime": 2118.3144836442953,
+          "mSamplesPerSec": 101.67909521492616,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0788125,
+          "throughputRealtime": 2706.8464181866248,
+          "mSamplesPerSec": 129.928628072958,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.011416,
+          "throughputRealtime": 18687.22261153936,
+          "mSamplesPerSec": 896.9866853538892,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 20480,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.007417,
+          "throughputRealtime": 28762.75223585457,
+          "mSamplesPerSec": 2761.2242146420385,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 48000 → 44100",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 3.069542,
+          "throughputRealtime": 69.50005353675999,
+          "mSamplesPerSec": 3.3360025697644797,
+          "peakMemoryMb": 0
+        }
+      ]
+    },
+    {
+      "id": "sin_440Hz_-6dBFS_1s.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 44100,
+      "frames": 44101,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.089792,
+          "throughputRealtime": 11137.102144255185,
+          "mSamplesPerSec": 491.14620456165363,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.4840415,
+          "throughputRealtime": 2065.9854077325217,
+          "mSamplesPerSec": 91.1099564810042,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "convert → f32",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.438271,
+          "throughputRealtime": 2281.745029301417,
+          "mSamplesPerSec": 100.62495579219251,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.341,
+          "throughputRealtime": 2932.6178174104443,
+          "mSamplesPerSec": 129.3284457478006,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.01175,
+          "throughputRealtime": 85108.31282867758,
+          "mSamplesPerSec": 3753.276595744681,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 88202,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.031708,
+          "throughputRealtime": 31538.497405606202,
+          "mSamplesPerSec": 2781.6954711744665,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 44100 → 48000",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 50.0267295,
+          "throughputRealtime": 19.989767185099748,
+          "mSamplesPerSec": 0.8815487328628988,
+          "peakMemoryMb": 0.359375
+        }
+      ]
+    },
+    {
+      "id": "speech.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 16000,
+      "frames": 47616,
+      "ops": [
+        {
+          "op": "decode s16 → planar",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.0950005,
+          "throughputRealtime": 31326.150914995185,
+          "mSamplesPerSec": 501.21841463992297,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "encode planar → s16",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.520479,
+          "throughputRealtime": 5717.809940458693,
+          "mSamplesPerSec": 91.48495904733907,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "convert → f32",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.481291,
+          "throughputRealtime": 6183.369312952039,
+          "mSamplesPerSec": 98.93390900723261,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "gain (-6 dB)",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.367875,
+          "throughputRealtime": 8089.704383282366,
+          "mSamplesPerSec": 129.43527013251784,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix mono → stereo",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.012541,
+          "throughputRealtime": 237301.65058607765,
+          "mSamplesPerSec": 3796.8264093772427,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "remix stereo → mono",
+          "samples": 95232,
+          "audioSeconds": 2.976,
+          "wallMs": 0.033333,
+          "throughputRealtime": 89280.89280892808,
+          "mSamplesPerSec": 2856.988569885699,
+          "peakMemoryMb": 0
+        },
+        {
+          "op": "resample 16000 → 48000",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 149.882813,
+          "throughputRealtime": 19.85551205260606,
+          "mSamplesPerSec": 0.3176881928416969,
+          "peakMemoryMb": 0
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "op": "decode s16 → planar",
+      "files": 7,
+      "geomeanRealtime": 11512.055313411405,
+      "minRealtime": 7431.016365652449,
+      "maxPeakMemoryMb": 2.703125
+    },
+    {
+      "op": "encode planar → s16",
+      "files": 7,
+      "geomeanRealtime": 1798.267654689829,
+      "minRealtime": 1139.677239844185,
+      "maxPeakMemoryMb": 0.46875
+    },
+    {
+      "op": "convert → f32",
+      "files": 7,
+      "geomeanRealtime": 2460.6165805053965,
+      "minRealtime": 2002.349632146472,
+      "maxPeakMemoryMb": 0.015625
+    },
+    {
+      "op": "gain (-6 dB)",
+      "files": 7,
+      "geomeanRealtime": 3162.0944555939122,
+      "minRealtime": 2547.26368159204,
+      "maxPeakMemoryMb": 0
+    },
+    {
+      "op": "remix mono → stereo",
+      "files": 7,
+      "geomeanRealtime": 39421.88038190326,
+      "minRealtime": 17239.05723905724,
+      "maxPeakMemoryMb": 2.109375
+    },
+    {
+      "op": "remix stereo → mono",
+      "files": 7,
+      "geomeanRealtime": 33731.32684888943,
+      "minRealtime": 26946.23384278557,
+      "maxPeakMemoryMb": 0
+    },
+    {
+      "op": "resample (rate change)",
+      "files": 7,
+      "geomeanRealtime": 48.5234874344353,
+      "minRealtime": 19.85551205260606,
+      "maxPeakMemoryMb": 0.359375
+    }
+  ]
+}

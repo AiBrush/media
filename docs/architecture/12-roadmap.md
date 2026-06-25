@@ -19,7 +19,7 @@ The smallest end-to-end slice that proves the thesis on the common path.
 **Deliverables**
 - **Containers (TS):** MP4/MOV demux + mux + probe; faststart.
 - **Codecs (WebCodecs):** H.264 decode/encode (hardware-first), AAC decode/encode.
-- **Filters (GPU):** resize/crop/rotate/flip via WebGPU→WebGL→Canvas2D.
+- **Filters (GPU):** resize/crop/rotate/flip via WebGPU→Canvas2D (WebGL rung omitted, ADR-027).
 - **Ops:** `probe`, `remux`, `trim` (keyframe + accurate), `convert` (h264/aac → mp4, with resize) with **auto-route** copy-vs-re-encode.
 - **Runtime:** worker-first for heavy ops; main-thread probe; `from()`/`fromX` + `to*` sinks; cancellation/progress.
 - **Validation:** strict oracles for the above (golden-packets, golden-metadata, reference-reimport, decoded-frames-bitexact in force-software, playback-smoke) + the §5 anti-cheat self-checks.
@@ -34,7 +34,7 @@ Reclaim the ~5% heavy tail and the rest of the matrix; turn the monolith into th
 - **Refactor to ARCH-1:** drivers register lazily via the router (public DX unchanged).
 - **More containers (TS):** WebM/MKV, Ogg, WAV, ADTS, MP3, MPEG-TS (+ HLS demux).
 - **More codecs:** VP9, AV1, HEVC (WebCodecs where present), with **WASM fallback drivers** loaded only on a hardware miss (ADR-005) — libopus, libvpx. **FLAC decode is pure TS, not WASM** (ADR-024): it is lossless/integer, so the TS decoder is bit-exact (validated via STREAMINFO-MD5 on the IETF FLAC conformance corpus) and ~kilobytes — no toolchain needed. Per ADR-025, the WebCodecs/WASM-tier codecs are validated on the browser/target runtime, the pure-TS tier in Node CI.
-- **audio-dsp:** PCM format/endianness/gain/mix/fade in TS; **resample** via WebAudio/WASM soxr; lossy encode via WASM.
+- **audio-dsp:** PCM format/endianness/gain/mix/fade **and resample** in **pure TS** (ADR-022: band-limited windowed-sinc, `src/dsp/resample.ts` — no WebAudio/WASM soxr needed); only lossy encode via WASM.
 - **decrypt:** CENC (`cenc`/`cbcs`) + HLS AES-128 via WebCrypto + TS box parse.
 - **streaming-output:** `StreamTarget` incremental writes, fragmented CMAF.
 

@@ -2,8 +2,16 @@
 
 The architecture base for **aibrush-media**, a unified, capability-routed, in-browser media engine. These documents are the authoritative source for *what* we are building and *why*, and they precede implementation. Code in this repo must conform to them; when reality forces a change, change the doc in the same PR.
 
-> **Status:** pre-implementation architecture base. **Date:** 2026-06-23.
+> **Status:** **implementation in progress** (architecture base first ratified 2026-06-23; this README tracks reality). The docs remain the authoritative source for *what* and *why*; when reality forces a change, the doc + an ADR change in the same commit. Validation is **tier-split (ADR-025)** and labeled honestly throughout — *Node-validated* (pure-TS, runs in CI) vs *browser-validated* (WebCodecs/GPU, runs on the target runtime).
 > **Provenance:** the design is grounded in a 558-feature browser-media benchmark (7 frameworks) — distilled in [`background/benchmark-summary.md`](background/benchmark-summary.md); full report lives in the sibling project `aibrush.lib/media-test/media-browser-test/docs/report/`.
+>
+> **Implemented so far** (full per-driver/op status + validation tier in [`09-operations.md`](09-operations.md) §"Shipped drivers & operations"):
+> - **Containers (12, hand-written TS, Node-validated):** mp4·mov, webm·mkv, ogg, wav, aiff, caf, mp3, flac, adts, mpegts (ts·m2ts·mts), avi, hls (playlist). Probe + demux across all; **muxers** for mp4/webm/ogg (chunk-seam) + wav/aiff/caf (PCM via `transformPcm`).
+> - **Pure-TS ops (Node-validated):** `probe`, `demux`, `remux` + keyframe `trim` (stream-copy), `decrypt` (`cenc`/`cbcs`/`hls-aes128`), PCM `convert` (format/gain/BS.775-mix/**resample**), **FLAC decode** (STREAMINFO-MD5 bit-exact).
+> - **WebCodecs/GPU codec tier (browser-validated):** `decode`/`encode`/`convert` re-encode/`seek` (hardware-first, close-race-safe); **GPU video filters** (WebGPU + Canvas2D) for geometry + colorspace/tonemap, a **pure-TS CPU video filter** floor for no-GPU browsers, and an **`AudioData` audio filter** (resample/remix/gain).
+> - **WASM tail:** real vendored Symphonia decoders for **Vorbis / AAC-LC / MP3** (Node-validated via a clean-process decode oracle) + honest recipe-scaffolds for **Opus / VP8·VP9** (pure-TS framing + a typed core contract). **Not yet in the default bundle** pending browser `.wasm` co-vendoring (ADR-041) — reachable via explicit `media.use(...)`.
+>
+> **Not yet:** browser `.wasm` co-vendoring/packaging for the wasm tail; fragmented-CMAF + `StreamTarget` wiring into the public ops (writer + sink built, ADR-034); the C-codec scaffolds' cores; the 558-feature harness aggregate "win vs 7 engines" (the external acceptance gate). These are tracked as honest gaps, never claimed done.
 
 ## The thesis (one sentence)
 
@@ -33,6 +41,7 @@ No single in-browser media engine spans all the substrates that win — hardware
 | 11 | [`11-testing-and-validation.md`](11-testing-and-validation.md) | Oracle/golden strategy, the anti-cheat lessons, determinism mode, performance measurement. |
 | 12 | [`12-roadmap.md`](12-roadmap.md) | Phases and milestones (MVP → lazy WASM tail → isolation profile). |
 | 13 | [`13-glossary.md`](13-glossary.md) | Terms (substrate, tier, driver, seam, packet, faststart, CENC, …). |
+| 14 | [`14-benchmarks.md`](14-benchmarks.md) | Benchmark methodology (warmup + median + separate RSS pass + checksum sink + `--check` gate) and the committed pure-TS baseline numbers (audio-dsp ×realtime, container ops MB/s). |
 | — | [`background/benchmark-summary.md`](background/benchmark-summary.md) | The 558-feature evidence that justifies every `[data]` claim. |
 
 ## Status legend (used in the decision records)

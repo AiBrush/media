@@ -5,8 +5,20 @@
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
+  "keywords": [
+    "media",
+    "video",
+    "audio",
+    "transcode",
+    "webcodecs",
+    "wasm",
+    "mp4",
+    "webm",
+    "browser",
+    "esm"
+  ],
   "engines": {
-    "note": "Use bun/bunx. npm/npx are unavailable in this environment."
+    "node": ">=18"
   },
   "exports": {
     ".": {
@@ -35,13 +47,16 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
+    "test:dist": "vitest run src/dist-smoke.test.ts",
     "build": "tsup",
+    "vendor-wasm": "bun run scripts/vendor-wasm.ts",
     "check-budgets": "bun run scripts/check-budgets.ts",
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "bake-goldens": "bun run scripts/bake-goldens.ts",
     "bench-dsp": "bun run scripts/bench-dsp.ts",
     "bench-flac": "bun run scripts/bench-flac.ts",
-    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run check-budgets"
+    "bench-sources": "bun run scripts/bench-sources.ts",
+    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run test:dist && bun run check-budgets"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

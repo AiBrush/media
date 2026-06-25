@@ -1,0 +1,15 @@
+{
+  "container": "ogg",
+  "durationSec": 0.2,
+  "sizeBytes": 3244,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "opus",
+      "durationSec": 0.2,
+      "sampleRate": 48000,
+      "channels": 1
+    }
+  ]
+}

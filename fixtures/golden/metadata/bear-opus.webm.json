@@ -1,0 +1,15 @@
+{
+  "container": "webm",
+  "durationSec": 2.741,
+  "sizeBytes": 25717,
+  "tracks": [
+    {
+      "id": 0,
+      "type": "audio",
+      "codec": "opus",
+      "durationSec": 2.741,
+      "sampleRate": 48000,
+      "channels": 2
+    }
+  ]
+}

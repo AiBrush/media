@@ -21,7 +21,10 @@ import { WebmModule, parseWebm } from './webm-driver.ts';
 // fixture (manifest-edits are owned elsewhere), so it is loaded by direct path from the git-ignored
 // media cache. sha256 4423ec5c7a9f50c6615190e642cdd8c0f501284b304a5a7824e226cd4e39c82d — copied from
 // the acceptance harness corpus (`media-test/media-browser-test/fixtures/media/recorder_headerless.webm`).
-const RECORDER_WEBM_URL = new URL('../../../fixtures/media/recorder_headerless.webm', import.meta.url);
+const RECORDER_WEBM_URL = new URL(
+  '../../../fixtures/media/recorder_headerless.webm',
+  import.meta.url,
+);
 
 async function loadRecorderWebm(): Promise<Uint8Array> {
   return new Uint8Array(await readFile(RECORDER_WEBM_URL));
@@ -45,7 +48,9 @@ describe('WebM fps from MediaRecorder block cadence (no DefaultDuration)', () =>
   });
 
   it('recorder_headerless.webm — fps surfaces through the public probe/TrackInfo path', async () => {
-    const info = await createMedia().use(WebmModule).probe(fromBytes(await loadRecorderWebm(), { mime: 'video/webm' }));
+    const info = await createMedia()
+      .use(WebmModule)
+      .probe(fromBytes(await loadRecorderWebm(), { mime: 'video/webm' }));
 
     const video = info.tracks.find((t) => t.type === 'video');
     expect(video?.codec).toBe('vp8');

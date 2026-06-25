@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { InputError } from '../contracts/errors.ts';
+import { loadFixture } from '../test-support/corpus.ts';
 import { type Sink, materialize, toBlob, toElement, toFile, toOPFS, toStream } from './sink.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
@@ -9,6 +10,45 @@ function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
       c.close();
     },
   });
+}
+
+/** Stream `bytes` in several chunks so the sink's collect/concat path is exercised (not one buffer). */
+function chunkedStream(bytes: Uint8Array, chunk = 4096): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      for (let o = 0; o < bytes.byteLength; o += chunk) {
+        c.enqueue(bytes.subarray(o, Math.min(o + chunk, bytes.byteLength)));
+      }
+      c.close();
+    },
+  });
+}
+
+async function readAll(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = s.getReader();
+  const out: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out.push(value);
+  }
+  const total = out.reduce((n, c) => n + c.byteLength, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of out) {
+    buf.set(c, off);
+    off += c.byteLength;
+  }
+  return buf;
+}
+
+function expectBytesEqual(actual: Uint8Array, expected: Uint8Array): void {
+  expect(actual.byteLength).toBe(expected.byteLength);
+  for (let i = 0; i < expected.byteLength; i++) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(`byte mismatch at ${i}: got ${actual[i]}, expected ${expected[i]}`);
+    }
+  }
 }
 
 describe('sink descriptors', () => {
@@ -87,5 +127,62 @@ describe('materialize — stubbed environment sinks', () => {
     await expect(
       materialize(toElement(el, { via: 'mse' }), bytesStream([1])),
     ).rejects.toBeInstanceOf(InputError);
+  });
+});
+
+// Every sink must write **bit-identical** output for a real file's bytes — synthetic streams alone don't
+// prove the collect/concat path is byte-faithful at size (BUILD_INSTRUCTIONS §6, ADR-018).
+describe('materialize — bit-exact output on a real corpus file', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('Blob sink output equals the file byte-for-byte', async () => {
+    const truth = await loadFixture('h264.mp4');
+    const out = (await materialize(toBlob(), chunkedStream(truth), { mime: 'video/mp4' })) as Blob;
+    expect(out).toBeInstanceOf(Blob);
+    expect(out.type).toBe('video/mp4');
+    expectBytesEqual(new Uint8Array(await out.arrayBuffer()), truth);
+  });
+
+  it('File sink output equals the file byte-for-byte (and carries the name)', async () => {
+    const truth = await loadFixture('h264.mp4');
+    const out = (await materialize(toFile('out.mp4'), chunkedStream(truth))) as File;
+    expect(out).toBeInstanceOf(File);
+    expect(out.name).toBe('out.mp4');
+    expectBytesEqual(new Uint8Array(await out.arrayBuffer()), truth);
+  });
+
+  it('Stream sink hands back a lazy readable that yields the exact bytes', async () => {
+    const truth = await loadFixture('h264.mp4');
+    const out = (await materialize(toStream(), chunkedStream(truth))) as ReadableStream<Uint8Array>;
+    expectBytesEqual(await readAll(out), truth);
+  });
+
+  it('OPFS sink streams the exact bytes to the writable (stubbed FileSystem)', async () => {
+    const truth = await loadFixture('h264.mp4');
+    const written: Uint8Array[] = [];
+    const writable = new WritableStream<Uint8Array>({
+      write(chunk): void {
+        written.push(chunk.slice());
+      },
+    });
+    const handle = { createWritable: () => Promise.resolve(writable) };
+    const root = {
+      getDirectoryHandle: () => Promise.resolve(root),
+      getFileHandle: () => Promise.resolve(handle),
+    };
+    vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve(root) } });
+
+    expect(await materialize(toOPFS('/clips/out.mp4'), chunkedStream(truth))).toBeUndefined();
+    const total = written.reduce((n, c) => n + c.byteLength, 0);
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of written) {
+      merged.set(c, off);
+      off += c.byteLength;
+    }
+    expectBytesEqual(merged, truth);
   });
 });

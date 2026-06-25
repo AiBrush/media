@@ -6,7 +6,33 @@
 import type { Determinism, EncodedChunk, Progress, TrackInfo } from '../contracts/driver.ts';
 import type { Sink } from '../sinks/sink.ts';
 
-export type { Output } from '../sinks/sink.ts';
+export type { Output, Sink } from '../sinks/sink.ts';
+// `MediaInput`/`Source`/`isSource` are surfaced by the barrel directly from `../sources/source.ts`;
+// here we add only the source *option* types (for typed `from`/`fromURL`/`fromElement` calls) and the
+// `SourceKind` union on {@link Source.kind}, so the default entry's source surface is fully nameable.
+export type {
+  FromElementOptions,
+  FromOptions,
+  FromUrlOptions,
+  SourceKind,
+} from '../sources/source.ts';
+
+/**
+ * Re-exports of the driver-contract types that appear in this module's public option/result shapes, so
+ * every type on the default-entry surface is nameable by a consumer (`import type { Progress } from
+ * '@aibrush/media'`) without reaching into `@aibrush/media/core`. These are the public-facing view of
+ * the same declarations the driver-author surface exposes (ADR-009/016).
+ */
+export type {
+  /** The tier-ladder reproducibility mode passed to {@link CreateMediaOptions.determinism}. */
+  Determinism,
+  /** An encoded packet — the unit of {@link Demuxed.packets} and {@link PacketStreams}. */
+  EncodedChunk,
+  /** Monotonic progress delivered to {@link CallOptions.onProgress}. */
+  Progress,
+  /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
+  TrackInfo,
+} from '../contracts/driver.ts';
 
 /** Diagnostic event delivered to the `onLog` hook. */
 export interface LogEvent {
@@ -38,7 +64,32 @@ export interface CallOptions {
   strategy?: StrategyOverride;
 }
 
-export type Container = 'mp4' | 'mov' | 'webm' | 'mkv' | 'ogg' | 'wav' | 'mp3' | 'aac' | 'ts';
+/**
+ * A container token — the canonical id (a driver's `formats[0]`) reported as {@link MediaInfo.container}
+ * and accepted as an output target (`to`). Covers every first-party `ContainerDriver` that ships: the
+ * ISO-BMFF/MP4 family, Matroska/WebM, Ogg, the RIFF containers (WAV, AVI), the elementary-stream
+ * containers (MP3, ADTS/AAC, FLAC), AIFF/CAF, and MPEG-TS (`ts`, plus its `m2ts`/`mts`/`mpegts` aliases).
+ * A token with no working muxer is still a legal probe result; routing it as an output `to` raises a
+ * typed `CapabilityError` at the muxer, not a type error here.
+ */
+export type Container =
+  | 'mp4'
+  | 'mov'
+  | 'webm'
+  | 'mkv'
+  | 'ogg'
+  | 'wav'
+  | 'mp3'
+  | 'aac'
+  | 'adts'
+  | 'flac'
+  | 'aiff'
+  | 'caf'
+  | 'avi'
+  | 'ts'
+  | 'm2ts'
+  | 'mts'
+  | 'mpegts';
 export type VideoCodec = 'h264' | 'hevc' | 'vp8' | 'vp9' | 'av1';
 export type AudioCodec = 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis' | 'pcm';
 

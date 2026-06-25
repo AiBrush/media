@@ -1,0 +1,25 @@
+{
+  "container": "mp4",
+  "durationSec": 6.283,
+  "sizeBytes": 4777511,
+  "tracks": [
+    {
+      "id": 1,
+      "type": "video",
+      "codec": "avc1.64002A",
+      "durationSec": 6.283,
+      "fps": 60.00318319274232,
+      "rotation": 0,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 2,
+      "type": "audio",
+      "codec": "mp4a.40.2",
+      "durationSec": 6.271,
+      "sampleRate": 48000,
+      "channels": 2
+    }
+  ]
+}

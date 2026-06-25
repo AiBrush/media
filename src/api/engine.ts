@@ -9,17 +9,27 @@
  * silent or fake result.
  */
 
+import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
+import type { VideoEncoderStageOptions } from '../codecs/webcodecs-video.ts';
 import type {
+  CodecDriver,
+  CodecQuery,
   ContainerDriver,
   ContainerQuery,
   Determinism,
   DriverModule,
+  EncodedChunk,
+  EncoderConfig,
+  FilterDriver,
+  FilterSpec,
+  Muxer,
   PcmTransform,
   StageOptions,
   StreamCopyOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
@@ -29,6 +39,21 @@ import {
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
+import {
+  audioFilterSpecs,
+  audioTrackInfoFromDecoderConfig,
+  buildAudioEncoderConfig,
+  buildVideoEncoderConfig,
+  chooseOutputContainer,
+  containerHasChunkMuxer,
+  drainEncoderToMuxer,
+  isPcmContainer,
+  isPureStreamCopy,
+  normalizeDecoderCodec,
+  seekFrame,
+  videoFilterSpecs,
+  videoTrackInfoFromDecoderConfig,
+} from './codec-pipeline.ts';
 
 const CONTAINER_MIME: Record<string, string> = {
   mp4: 'video/mp4',
@@ -40,8 +65,12 @@ const CONTAINER_MIME: Record<string, string> = {
   mp3: 'audio/mpeg',
   flac: 'audio/flac',
   adts: 'audio/aac',
+  aiff: 'audio/aiff',
+  caf: 'audio/x-caf',
+  avi: 'video/x-msvideo',
 };
 import type {
+  AudioTarget,
   CallOptions,
   Cancellable,
   ConvertOptions,
@@ -58,6 +87,7 @@ import type {
   PreloadSpec,
   RemuxOptions,
   TrimOptions,
+  VideoTarget,
 } from './types.ts';
 
 /** The developer-facing engine surface (ADR-009). */
@@ -70,6 +100,8 @@ export interface MediaEngine {
   decode(input: MediaInput, o?: CallOptions): MediaStreams;
   encode(frames: MediaStreams, opts: EncodeOptions, o?: CallOptions): Cancellable<Output>;
   mux(streams: PacketStreams, opts: MuxSpec, o?: CallOptions): Cancellable<Output>;
+  /** Decode and return the single frame at/just-after `timeUs` (frame-accurate seek, doc 09). */
+  seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame>;
   decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Cancellable<Output>;
   preload(...specs: PreloadSpec[]): Promise<void>;
   /** The universal normalizer, exported for optioned sources (ADR-013). */
@@ -137,28 +169,40 @@ export class MediaEngineImpl implements MediaEngine {
 
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      // PCM-native audio path (ADR-022): a raw-PCM target (WAV) whose source container transforms PCM
-      // directly — channel up/down-mix etc. in the TS audio-dsp path, no codec seam. Lossy re-encode,
-      // video, or cross-codec conversions fall through to the browser codec layer.
+      const src = normalizeInput(input);
+      // PCM-native audio path (ADR-022): a raw-PCM target (WAV/AIFF/CAF) whose source container transforms
+      // PCM directly — channel up/down-mix / format / sample-rate in the TS audio-dsp path, no codec seam.
+      // Lossy re-encode, video, or cross-codec conversions fall through to the browser codec layer.
       const audio = opts.audio;
-      if (opts.to === 'wav' && audio !== false && isPcmCodec(audio?.codec)) {
-        const src = normalizeInput(input);
+      if (
+        opts.to !== undefined &&
+        isPcmContainer(opts.to) &&
+        audio !== false &&
+        isPcmCodec(audio?.codec)
+      ) {
+        const target = opts.to;
         const container = await this.#routeContainer(src, 'demux');
         const pcmOpts: PcmTransform = {
           ...this.#stageOptions(signal, o),
           ...(audio?.channels !== undefined ? { channels: audio.channels } : {}),
           ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
         };
-        // Same-PCM-container transform (WAV→WAV, ADR-022) or a pure-TS decode (FLAC→WAV, ADR-024).
+        // Same-PCM-container transform (WAV→WAV / AIFF→AIFF / CAF→CAF, ADR-022): the source container
+        // re-serializes its own format via `transformPcm`. A WAV target may also be produced by a pure-TS
+        // decode of a compressed-audio source (FLAC→WAV, ADR-024) via `decodePcm`. A cross-PCM-container
+        // request with no matching writer (e.g. AIFF→WAV) falls through to the codec seam below.
         const stream =
-          container.transformPcm && container.formats.includes('wav')
+          container.transformPcm && container.formats.includes(target)
             ? await container.transformPcm(src, pcmOpts)
-            : container.decodePcm
+            : target === 'wav' && container.decodePcm
               ? await container.decodePcm(src, pcmOpts)
               : undefined;
-        if (stream) return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, 'wav'));
+        if (stream) return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
-      return this.#codecUnavailable('convert', input, opts);
+      // Codec seam (the full convert pipeline). A pure container change with no re-encode is preferred
+      // as a lossless stream-copy (ADR-021/012) when the source container supports it; otherwise demux →
+      // decode → (GPU filter) → encode → mux through the WebCodecs/GPU tier.
+      return this.#convertViaCodec(src, opts, signal, o);
     });
   }
 
@@ -166,11 +210,23 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
-      const stream = await this.#streamCopyOrThrow(container, src, opts.to, 'remux', {
-        ...this.#stageOptions(signal, o),
-        ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
-        ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
-      });
+      // (1) Same-container stream-copy — a lossless byte re-serialization that preserves DTS/B-frames/
+      // codec-private (ADR-021), and works in pure TS (Node) for the drivers that implement it (MP4↔MOV).
+      if (container.streamCopy && container.formats.includes(opts.to)) {
+        const stream = await container.streamCopy(src, {
+          ...this.#stageOptions(signal, o),
+          container: opts.to,
+          ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+          ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
+        });
+        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
+      }
+      // (2) Cross-container stream-copy via the packet seam: demux the source, copy each track's encoded
+      // packets verbatim into the target container's muxer (no re-encode). The muxer's addTrack enforces
+      // codec-in-container legality (e.g. vorbis→mp4 rejects), so an unsupported pair stays an honest
+      // CapabilityError. The live packet copy needs WebCodecs `EncodedChunk` (browser); the routing +
+      // track-copy control flow is unit-tested with fakes, and the path is browser-harness validated.
+      const stream = await this.#remuxViaSeam(container, src, opts, signal, o);
       return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
     });
   }
@@ -202,20 +258,105 @@ export class MediaEngineImpl implements MediaEngine {
     });
   }
 
-  decode(input: MediaInput, _o: CallOptions = {}): MediaStreams {
-    normalizeInput(input); // validate the input shape before reporting the capability gap
-    throw new CapabilityError(
-      'capability-miss',
-      'decode requires codec drivers that are not registered',
-      {
-        op: 'decode',
-        tried: [],
-      },
-    );
+  decode(input: MediaInput, o: CallOptions = {}): MediaStreams {
+    const src = normalizeInput(input); // validate the input shape eagerly (throws InputError on bad input)
+    // The `decode` contract returns frame streams synchronously; the async demux + codec routing happens
+    // lazily when each stream is first pulled. A track without a decode `config` (codec unknown) is
+    // simply absent. Cancellation rides `o.signal` threaded into each decoder's StageOptions; a frame
+    // emitted by a decoder is owned by the readable consumer and closed by it (the contract).
+    const ctrl = new AbortController();
+    bridgeSignal(o.signal, ctrl);
+    const stage = this.#stageOptions(ctrl.signal, o);
+    const video = deferredStream<VideoFrame>(() => this.#decodeTrack(src, 'video', stage));
+    const audio = deferredStream<AudioData>(() => this.#decodeTrack(src, 'audio', stage));
+    return { video, audio };
   }
 
   encode(frames: MediaStreams, opts: EncodeOptions, o: CallOptions = {}): Cancellable<Output> {
-    return this.#withCancel(o, () => this.#codecUnavailable('encode', frames, opts));
+    return this.#withCancel(o, async (signal) => {
+      const target = chooseOutputContainer(opts.to, undefined);
+      if (!containerHasChunkMuxer(target)) {
+        // A non-chunk-muxable target (e.g. wav/raw-PCM) cannot accept encoded chunks; surface the honest
+        // miss rather than route into a muxer that throws an opaque error.
+        throw new CapabilityError(
+          'capability-miss',
+          `encode to '${target}' has no EncodedChunk muxer (PCM/WAV output uses the audio-dsp path)`,
+          { op: 'encode', tried: [target] },
+        );
+      }
+      // Validate the input shape (which streams, matched targets) BEFORE building the muxer, so an empty
+      // or mismatched `encode` rejects as bad input rather than a downstream miss; cancel any frame stream
+      // we will not consume so its frames never leak.
+      if (!frames.video && !frames.audio) {
+        throw new InputError(
+          'unsupported-input',
+          'encode received no video or audio frame streams',
+        );
+      }
+      if (frames.video && !opts.video) {
+        await cancelStream(frames.video);
+        throw new InputError(
+          'unsupported-input',
+          'encode received a video stream but no video target',
+        );
+      }
+      if (frames.audio && !opts.audio) {
+        await cancelStream(frames.audio);
+        throw new InputError(
+          'unsupported-input',
+          'encode received an audio stream but no audio target',
+        );
+      }
+      const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+      const tasks: Promise<void>[] = [];
+      if (frames.video && opts.video) {
+        tasks.push(this.#encodeVideoStream(frames.video, opts.video, undefined, muxer, signal, o));
+      }
+      if (frames.audio && opts.audio) {
+        tasks.push(this.#encodeAudioStream(frames.audio, opts.audio, undefined, muxer, signal, o));
+      }
+      await allOrCancel(tasks, frames);
+      await muxer.finalize();
+      return materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+    });
+  }
+
+  seek(input: MediaInput, timeUs: number, o: CallOptions = {}): Cancellable<VideoFrame> {
+    return this.#withCancel(o, async (signal) => {
+      if (!Number.isFinite(timeUs) || timeUs < 0) {
+        throw new InputError(
+          'unsupported-input',
+          `seek time ${timeUs}µs must be a non-negative number`,
+        );
+      }
+      const src = normalizeInput(input);
+      const container = await this.#routeContainer(src, 'demux');
+      const stage = this.#stageOptions(signal, o);
+      const demuxer = await container.demux(src, stage);
+      try {
+        const track = demuxer.tracks.find((t) => t.mediaType === 'video' && t.config !== undefined);
+        if (!track) {
+          throw new CapabilityError('capability-miss', 'seek needs a decodable video track', {
+            op: 'seek',
+            tried: [container.id],
+          });
+        }
+        // Resolve the decode codec first (throws a typed miss in Node where WebCodecs is absent). Then feed
+        // only the packets from the keyframe at/before the target onward (a stream must decode from a
+        // keyframe); seekFrame drops frames before the target, closes them, and returns the first at/after
+        // it (owned by the caller). The demuxer is closed on every exit by the finally.
+        const codec = await this.#routeCodec(decodeQueryFor(track), o);
+        /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
+        const fromKeyframe = await startAtSeekKeyframe(demuxer.packets(track.id), timeUs);
+        const out = fromKeyframe.pipeThrough(
+          codec.createDecoder(decodeConfigOf(track), stage),
+        ) as ReadableStream<VideoFrame>;
+        return await seekFrame(out, timeUs);
+        /* v8 ignore stop */
+      } finally {
+        await demuxer.close();
+      }
+    });
   }
 
   mux(streams: PacketStreams, opts: MuxSpec, o: CallOptions = {}): Cancellable<Output> {
@@ -224,6 +365,17 @@ export class MediaEngineImpl implements MediaEngine {
 
   decrypt(input: MediaInput, opts: DecryptOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
+      // No static key ⇒ EME/ClearKey live key acquisition, which is OUT OF SCOPE: this engine decrypts
+      // CENC (`cenc`/`cbcs`) and HLS `AES-128` with caller-PROVIDED keys, never an EME license exchange.
+      // Fail fast with a typed miss — **before any source read, container route, or network** — so a
+      // ClearKey/EME request maps to a clean capability-miss (NA) instead of a license-fetch retry loop.
+      if (Object.keys(opts.keys).length === 0) {
+        throw new CapabilityError(
+          'capability-miss',
+          'EME/ClearKey live key acquisition unsupported — provide keys',
+          { op: 'decrypt', tried: [] },
+        );
+      }
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       if (!container.decrypt) {
@@ -286,6 +438,26 @@ export class MediaEngineImpl implements MediaEngine {
     }
   }
 
+  /**
+   * Route the *output* container's driver by its token (mime/extension) — for mux, where there are no
+   * input bytes to magic-probe. Loads the first-party defaults on a miss then retries once, mirroring
+   * {@link routeContainer}'s zero-config behavior.
+   */
+  async #routeMuxer(target: string): Promise<ContainerDriver> {
+    const q: ContainerQuery = {
+      direction: 'mux',
+      extension: target,
+      ...(CONTAINER_MIME[target] !== undefined ? { mime: CONTAINER_MIME[target] } : {}),
+    };
+    try {
+      return this.#router.pickContainer(q);
+    } catch (e) {
+      if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
+      await this.#ensureDefaultDrivers();
+      return this.#router.pickContainer(q);
+    }
+  }
+
   /** Lazily import + register the first-party driver bundle (a code-split chunk). One-time. */
   async #ensureDefaultDrivers(): Promise<void> {
     if (this.#defaultsLoaded) return;
@@ -293,6 +465,353 @@ export class MediaEngineImpl implements MediaEngine {
     const { registerDefaultDrivers } = await import('../drivers/defaults.ts');
     registerDefaultDrivers(this.#registry);
     this.#router.clearCache();
+  }
+
+  /** Resolve a codec driver for a query, loading the first-party defaults on a miss then retrying once. */
+  async #routeCodec(q: CodecQuery, o: CallOptions): Promise<CodecDriver> {
+    const opts = { determinism: this.#determinism(o) };
+    try {
+      return await this.#router.pickCodec(q, opts);
+    } catch (e) {
+      if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
+      await this.#ensureDefaultDrivers();
+      return this.#router.pickCodec(q, opts);
+    }
+  }
+
+  /** Resolve a filter driver for a spec, loading the first-party defaults on a miss then retrying once. */
+  async #routeFilter(spec: FilterSpec, o: CallOptions): Promise<FilterDriver> {
+    const opts = { determinism: this.#determinism(o) };
+    try {
+      return this.#router.pickFilter(spec, opts);
+    } catch (e) {
+      if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
+      await this.#ensureDefaultDrivers();
+      return this.#router.pickFilter(spec, opts);
+    }
+  }
+
+  /**
+   * Build one decoded-frame stream for a track of `mediaType` (or `undefined` if the source has no such
+   * decodable track). Demux → route a codec for the track's config → pipe its packets through the
+   * decoder. The decoder owns close-once for the frames it emits; cancellation rides `stage.signal`.
+   */
+  async #decodeTrack<M extends 'video' | 'audio'>(
+    src: Source,
+    mediaType: M,
+    stage: StageOptions,
+  ): Promise<ReadableStream<RawFrameOf<M>> | undefined> {
+    const container = await this.#routeContainer(src, 'demux');
+    const demuxer = await container.demux(src, stage);
+    const track = demuxer.tracks.find((t) => t.mediaType === mediaType && t.config !== undefined);
+    if (!track) {
+      await demuxer.close();
+      return undefined;
+    }
+    const codec = await this.#routeCodec(decodeQueryFor(track), { strategy: stageStrategy(stage) });
+    // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
+    /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
+    const decoder = codec.createDecoder(decodeConfigOf(track), stage);
+    // The demuxer stays open for the life of the packet stream; closing it is a no-op for the mp4 driver
+    // (range-backed), so the frame stream owns no teardown beyond the decoder's own abort listener. The
+    // track's mediaType matches `M`, so the decoder's RawFrame output is the corresponding frame type.
+    return demuxer.packets(track.id).pipeThrough(decoder) as ReadableStream<RawFrameOf<M>>;
+    /* v8 ignore stop */
+  }
+
+  /**
+   * Cross-container stream-copy (ADR-021/012): demux the source and write each track's encoded packets
+   * **verbatim** into the target container's `Muxer` — no decode/re-encode, so codec-private/PTS/DTS/
+   * B-frame composition survive. The target muxer's `addTrack`/`mapCodec` is the single arbiter of
+   * codec-in-container legality, so an illegal pair (e.g. Vorbis→MP4, H.264→Ogg) stays an honest
+   * `CapabilityError` from the muxer; a target with no working muxer is rejected up front. The packet copy
+   * itself needs WebCodecs `EncodedChunk` (browser) — unreachable in Node, where `packets()` throws the
+   * typed miss first — so it is browser-harness validated; the routing decision is unit-tested.
+   */
+  async #remuxViaSeam(
+    container: ContainerDriver,
+    src: Source,
+    opts: RemuxOptions,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    if (!containerHasChunkMuxer(opts.to)) {
+      throw new CapabilityError(
+        'capability-miss',
+        `remux to '${opts.to}' has no muxer in this build (writable containers: mp4/mov, webm/mkv, ogg; ${container.formats[0]} stream-copies only to its own family)`,
+        { op: 'remux', tried: [container.id, opts.to] },
+      );
+    }
+    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+    const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
+    // Copy only tracks the demuxer fully describes (a `config`-less track cannot be re-muxed faithfully).
+    const tracks = demuxer.tracks.filter((t) => t.config !== undefined);
+    if (tracks.length === 0) {
+      await demuxer.close();
+      throw new CapabilityError('capability-miss', 'remux found no copyable track in the source', {
+        op: 'remux',
+        tried: [container.id],
+      });
+    }
+    /* v8 ignore start -- the verbatim packet copy needs WebCodecs EncodedChunk (browser); in Node
+       `packets()` throws the typed miss above. The track fan-out + drain is browser-harness validated. */
+    const openStreams: ReadableStream<unknown>[] = [];
+    try {
+      const tasks = tracks.map((track) => {
+        const packets = demuxer.packets(track.id);
+        openStreams.push(packets);
+        return drainEncoderToMuxer(packets, muxer, () => track);
+      });
+      await allOrCancelStreams(tasks, openStreams);
+      await muxer.finalize();
+      return muxer.output;
+    } finally {
+      await demuxer.close();
+    }
+    /* v8 ignore stop */
+  }
+
+  /**
+   * The full codec-seam convert pipeline: demux → per track decode → optional GPU filter chain (video) →
+   * encode → mux. A pure container change with no re-encode is preferred as a lossless stream-copy
+   * (ADR-021) when the source supports it. Output goes to the chosen container's `Muxer`.
+   */
+  async #convertViaCodec(
+    src: Source,
+    opts: ConvertOptions,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<Output> {
+    const container = await this.#routeContainer(src, 'demux');
+    const target = chooseOutputContainer(opts.to, container.formats[0]);
+
+    // Preferred fast path: a pure container change (no codec/filter/param change, no dropped track) is a
+    // lossless stream-copy when the source container can stream-copy to the target (ADR-012/021).
+    if (
+      isPureStreamCopy(opts) &&
+      container.streamCopy &&
+      container.formats.includes(target) &&
+      target === opts.to
+    ) {
+      const stream = await container.streamCopy(src, {
+        ...this.#stageOptions(signal, o),
+        ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+        ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
+      });
+      return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+    }
+
+    if (!containerHasChunkMuxer(target)) {
+      throw new CapabilityError(
+        'capability-miss',
+        `convert to '${target}' via the codec seam has no EncodedChunk muxer in this build`,
+        { op: 'convert', tried: [target] },
+      );
+    }
+
+    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+    const tasks: Promise<void>[] = [];
+    const openStreams: ReadableStream<unknown>[] = [];
+    try {
+      const videoTrack =
+        opts.video === false
+          ? undefined
+          : demuxer.tracks.find((t) => t.mediaType === 'video' && t.config !== undefined);
+      const audioTrack =
+        opts.audio === false
+          ? undefined
+          : demuxer.tracks.find((t) => t.mediaType === 'audio' && t.config !== undefined);
+
+      if (videoTrack) {
+        // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
+        // the composition below is the live path, browser-validated.
+        const videoCodec = await this.#routeCodec(decodeQueryFor(videoTrack), o);
+        /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
+        const decoded = demuxer
+          .packets(videoTrack.id)
+          .pipeThrough(
+            videoCodec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
+          );
+        const filtered = await this.#applyVideoFilters(
+          decoded as ReadableStream<VideoFrame>,
+          opts.video || {},
+          videoTrack,
+          signal,
+          o,
+        );
+        openStreams.push(filtered);
+        tasks.push(
+          this.#encodeVideoStream(filtered, opts.video || {}, videoTrack, muxer, signal, o),
+        );
+        /* v8 ignore stop */
+      }
+      if (audioTrack) {
+        const audioCodec = await this.#routeCodec(decodeQueryFor(audioTrack), o);
+        /* v8 ignore start -- live decode→[remix/resample]→encode requires WebCodecs; browser-validated. */
+        const decoded = demuxer
+          .packets(audioTrack.id)
+          .pipeThrough(
+            audioCodec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
+          ) as ReadableStream<AudioData>;
+        // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
+        // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
+        // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
+        const shaped = await this.#applyAudioFilters(
+          decoded,
+          opts.audio || {},
+          audioTrack,
+          signal,
+          o,
+        );
+        openStreams.push(shaped);
+        tasks.push(this.#encodeAudioStream(shaped, opts.audio || {}, audioTrack, muxer, signal, o));
+        /* v8 ignore stop */
+      }
+      if (tasks.length === 0) {
+        throw new CapabilityError(
+          'capability-miss',
+          'convert found no decodable video or audio track to re-encode',
+          { op: 'convert', tried: [container.id] },
+        );
+      }
+      /* v8 ignore start -- reached only when a live codec was resolved (browser); harness-validated. */
+      await allOrCancelStreams(tasks, openStreams);
+      await muxer.finalize();
+      return await materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+      /* v8 ignore stop */
+    } finally {
+      await demuxer.close();
+    }
+  }
+
+  /**
+   * Compose the GPU filter chain for a video stream from the target's geometry ops (crop/resize/rotate/
+   * flip), each a router-resolved same-type `VideoFrame→VideoFrame` stage chained with `composeChain`.
+   * No ops ⇒ the decoded stream passes through untouched (no extra copy).
+   */
+  /* v8 ignore start -- only reached after a live decode (WebCodecs); the filter-spec planning it calls is
+     unit-tested directly (videoFilterSpecs), and the GPU composition is validated in the browser harness. */
+  async #applyVideoFilters(
+    frames: ReadableStream<VideoFrame>,
+    target: VideoTarget,
+    track: TrackInfo,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<VideoFrame>> {
+    const specs = videoFilterSpecs(target, sourceGeometryOf(track));
+    if (specs.length === 0) return frames;
+    const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
+    for (const spec of specs) {
+      const driver = await this.#routeFilter(spec, o);
+      stages.push(
+        driver.createFilter(spec, this.#stageOptions(signal, o)) as TransformStream<
+          VideoFrame,
+          VideoFrame
+        >,
+      );
+    }
+    return composeChain(frames, stages);
+  }
+  /* v8 ignore stop */
+
+  /**
+   * Compose the audio remix/resample chain for a decoded `AudioData` stream from the target's
+   * channel/rate (each a router-resolved `AudioData→AudioData` audio-dsp stage). This shapes the buffers
+   * to the encoder's configured layout BEFORE encoding — a downmix/resample the `AudioEncoder` itself does
+   * not perform — so a stereo→mono (or rate-changing) transcode feeds the encoder matching buffers. No
+   * channel/rate change ⇒ the decoded stream passes through untouched.
+   */
+  /* v8 ignore start -- only reached after a live decode (WebCodecs); the spec planning it calls is
+     unit-tested directly (audioFilterSpecs), and the AudioData composition is browser-harness validated. */
+  async #applyAudioFilters(
+    frames: ReadableStream<AudioData>,
+    target: AudioTarget,
+    track: TrackInfo,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<AudioData>> {
+    const specs = audioFilterSpecs(target, audioGeometryOf(track));
+    if (specs.length === 0) return frames;
+    const stages: TransformStream<AudioData, AudioData>[] = [];
+    for (const spec of specs) {
+      const driver = await this.#routeFilter(spec, o);
+      stages.push(
+        driver.createFilter(spec, this.#stageOptions(signal, o)) as TransformStream<
+          AudioData,
+          AudioData
+        >,
+      );
+    }
+    return composeChain(frames, stages);
+  }
+  /* v8 ignore stop */
+
+  /** Encode one video stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
+  async #encodeVideoStream(
+    frames: ReadableStream<VideoFrame>,
+    target: VideoTarget,
+    sourceTrack: TrackInfo | undefined,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const config = buildVideoEncoderConfig(
+      target,
+      sourceTrack ? sourceGeometryOf(sourceTrack) : { width: target.width, height: target.height },
+      sourceTrack?.codec,
+    );
+    const codec = await this.#routeCodec(encodeQueryFor(config), o);
+    // The encoder publishes its VideoDecoderConfig (codec box) out-of-band via onDecoderConfig; the muxer
+    // needs it before addTrack, so we capture it and build the TrackInfo lazily on the first chunk. Past
+    // here is the live WebCodecs path — unreachable in Node (the route above throws first), browser-validated.
+    /* v8 ignore start -- requires a real VideoEncoder; validated in the browser harness (BUILD §6.1). */
+    let decoderConfig: VideoDecoderConfig | undefined;
+    const stage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      onDecoderConfig: (c) => {
+        decoderConfig = c;
+      },
+      ...(target.fps !== undefined
+        ? { keyFrameInterval: Math.max(1, Math.round(target.fps * 2)) }
+        : {}),
+    };
+    const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
+    await drainEncoderToMuxer(chunks, muxer, () =>
+      videoTrackInfoFromDecoderConfig(requireConfig(decoderConfig, 'video'), target.fps),
+    );
+    /* v8 ignore stop */
+  }
+
+  /** Encode one audio stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
+  async #encodeAudioStream(
+    frames: ReadableStream<AudioData>,
+    target: AudioTarget,
+    sourceTrack: TrackInfo | undefined,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const config = buildAudioEncoderConfig(
+      target,
+      audioGeometryOf(sourceTrack),
+      sourceTrack?.codec,
+    );
+    const codec = await this.#routeCodec(encodeQueryFor(config), o);
+    // Past here is the live WebCodecs path — unreachable in Node (the route above throws first).
+    /* v8 ignore start -- requires a real AudioEncoder; validated in the browser harness (BUILD §6.1). */
+    let decoderConfig: AudioDecoderConfig | undefined;
+    const stage: AudioEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      onConfig: (c) => {
+        decoderConfig = c;
+      },
+    };
+    const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
+    await drainEncoderToMuxer(chunks, muxer, () =>
+      audioTrackInfoFromDecoderConfig(requireConfig(decoderConfig, 'audio')),
+    );
+    /* v8 ignore stop */
   }
 
   /** The media's duration (longest track), read via a one-shot demux — mirrors {@link probe}. */
@@ -329,7 +848,9 @@ export class MediaEngineImpl implements MediaEngine {
         },
       );
     }
-    return container.streamCopy(src, opts);
+    // Pass the requested target token so a multi-format driver writes the right flavor (e.g. the MP4
+    // driver emits a QuickTime `ftyp` for a 'mov' target vs an ISO one for 'mp4').
+    return container.streamCopy(src, { ...opts, container: target });
   }
 
   #codecUnavailable(op: string, input: unknown, opts: unknown): Promise<never> {
@@ -360,6 +881,240 @@ export class MediaEngineImpl implements MediaEngine {
 }
 
 // ── Module helpers ──────────────────────────────────────────────────────────────────────────────
+
+/** The raw-frame type for a media type: `VideoFrame` for video, `AudioData` for audio. */
+type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
+
+/** Mirror an external `AbortSignal` onto an internal controller (pre-aborted or future abort). */
+function bridgeSignal(caller: AbortSignal | undefined, ctrl: AbortController): void {
+  if (!caller) return;
+  if (caller.aborted) ctrl.abort(caller.reason);
+  else caller.addEventListener('abort', () => ctrl.abort(caller.reason), { once: true });
+}
+
+/** Re-expose a {@link StageOptions} as a {@link CallOptions.strategy} so a sub-route inherits determinism. */
+function stageStrategy(stage: StageOptions): { determinism: Determinism } {
+  return { determinism: stage.determinism ?? 'auto' };
+}
+
+/**
+ * Wrap an async producer of a `ReadableStream<T>` into an eager `ReadableStream<T>` whose underlying work
+ * runs on first pull. Used by `decode` to honor its synchronous-return contract while the demux + codec
+ * routing it needs are async. When the producer yields `undefined` (no such track) the stream is empty.
+ * `cancel` propagates downstream cancellation to the produced stream's reader so the decoder tears down.
+ */
+function deferredStream<T>(
+  produce: () => Promise<ReadableStream<T> | undefined>,
+): ReadableStream<T> {
+  let reader: ReadableStreamDefaultReader<T> | undefined;
+  let started = false;
+  return new ReadableStream<T>({
+    async pull(controller): Promise<void> {
+      if (!started) {
+        started = true;
+        const inner = await produce();
+        if (inner === undefined) {
+          controller.close();
+          return;
+        }
+        reader = inner.getReader();
+      }
+      if (!reader) {
+        controller.close();
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    async cancel(reason): Promise<void> {
+      await reader?.cancel(reason).catch(() => {});
+    },
+  });
+}
+
+/** Cancel a frame stream so its producer (a decoder/demuxer) releases any buffered frames. */
+async function cancelStream(stream: ReadableStream<unknown>): Promise<void> {
+  await stream.cancel(new MediaError('aborted', 'stream not consumed')).catch(() => {});
+}
+
+/**
+ * Await all encode tasks; if any rejects, cancel the *other* input frame streams so no in-flight frame
+ * leaks, then surface the first error. Used by `encode` (caller-supplied `MediaStreams`).
+ */
+async function allOrCancel(tasks: readonly Promise<void>[], frames: MediaStreams): Promise<void> {
+  try {
+    await Promise.all(tasks);
+  } catch (e) {
+    await Promise.all([
+      frames.video ? cancelStream(frames.video) : Promise.resolve(),
+      frames.audio ? cancelStream(frames.audio) : Promise.resolve(),
+    ]);
+    throw e;
+  }
+}
+
+/** Like {@link allOrCancel} but for the internally-composed convert streams (decode/filter outputs). */
+async function allOrCancelStreams(
+  tasks: readonly Promise<void>[],
+  streams: readonly ReadableStream<unknown>[],
+): Promise<void> {
+  try {
+    await Promise.all(tasks);
+  } catch (e) {
+    await Promise.all(streams.map((s) => cancelStream(s)));
+    throw e;
+  }
+}
+
+/**
+ * Project the optional public mux flags (`faststart`/`fragmented`) — present on `ConvertOptions`/
+ * `MuxSpec`, absent on `EncodeOptions` — onto {@link MuxOptions}, copying only the ones actually set
+ * (exactOptionalPropertyTypes). The parameter accepts each concrete option object so every caller fits
+ * (a bare `{faststart?,fragmented?}` would be a weak type and reject `EncodeOptions`, which has neither).
+ */
+function muxOptionsFrom(
+  opts: ConvertOptions | MuxSpec | EncodeOptions | RemuxOptions,
+  container?: string,
+): {
+  faststart?: boolean;
+  fragmented?: boolean;
+  container?: string;
+} {
+  const faststart = 'faststart' in opts ? opts.faststart : undefined;
+  const fragmented = 'fragmented' in opts ? opts.fragmented : undefined;
+  return {
+    ...(faststart !== undefined ? { faststart } : {}),
+    ...(fragmented !== undefined ? { fragmented } : {}),
+    ...(container !== undefined ? { container } : {}),
+  };
+}
+
+/**
+ * The WebCodecs decode `config` carried on a demux {@link TrackInfo} (guaranteed present by the callers),
+ * with its codec string NORMALIZED to one `VideoDecoder`/`AudioDecoder` accepts. A container demux
+ * (notably WebM/Matroska) emits a bare canonical token (`vp9`/`av1`/…) that `isConfigSupported` rejects;
+ * {@link normalizeDecoderCodec} expands it to a valid WebCodecs string (a no-op for already-qualified
+ * strings, so MP4/MOV configs are untouched). Returns a fresh object only when the codec actually
+ * changes, so the common case allocates nothing.
+ */
+function decodeConfigOf(track: TrackInfo): TrackInfo['config'] & object {
+  const config = track.config;
+  if (config === undefined) {
+    throw new MediaError('decode-error', `track ${track.id} has no decoder config`);
+  }
+  const codec = normalizeDecoderCodec(config);
+  return codec === config.codec ? config : { ...config, codec };
+}
+
+/** Build the decode {@link CodecQuery} for a demux track (its media type + WebCodecs decoder config). */
+function decodeQueryFor(track: TrackInfo): CodecQuery {
+  return { mediaType: track.mediaType, direction: 'decode', config: decodeConfigOf(track) };
+}
+
+/** Build the encode {@link CodecQuery} for a target encoder config (media type inferred from the shape). */
+function encodeQueryFor(config: EncoderConfig): CodecQuery {
+  const mediaType: 'video' | 'audio' = 'width' in config && 'height' in config ? 'video' : 'audio';
+  return { mediaType, direction: 'encode', config };
+}
+
+/** Source geometry (coded dims) for a video track, read from its WebCodecs decoder config. */
+function sourceGeometryOf(track: TrackInfo): {
+  width: number | undefined;
+  height: number | undefined;
+} {
+  const config = track.config;
+  if (config && 'codedWidth' in config) {
+    return { width: config.codedWidth, height: config.codedHeight };
+  }
+  return { width: undefined, height: undefined };
+}
+
+/**
+ * Source audio params (sample rate / channels) for an audio track, read from its decoder config. A
+ * populated source track only reaches here on the live `convert` audio re-encode (browser); the
+ * `undefined`-track path is exercised by the `encode` audio route (Node).
+ */
+function audioGeometryOf(track: TrackInfo | undefined): {
+  sampleRate: number | undefined;
+  channels: number | undefined;
+} {
+  const config = track?.config;
+  /* v8 ignore next 3 -- populated only via live convert (browser); Node encode passes no source track. */
+  if (config && 'sampleRate' in config) {
+    return { sampleRate: config.sampleRate, channels: config.numberOfChannels };
+  }
+  return { sampleRate: undefined, channels: undefined };
+}
+
+/**
+ * Assert the encoder published its decoder config before the muxer needed it (else a typed error). Only
+ * called from the browser-only encoder-drain path (a real WebCodecs encoder always emits the config with
+ * its first chunk), so the undefined-guard is unreachable in Node — validated in the browser harness.
+ */
+/* v8 ignore start -- invoked only on the live WebCodecs encode path; browser-harness validated. */
+function requireConfig<T>(config: T | undefined, media: 'video' | 'audio'): T {
+  if (config === undefined) {
+    throw new MediaError(
+      'encode-error',
+      `the ${media} encoder produced a chunk before publishing its decoder config (cannot configure the muxer track)`,
+    );
+  }
+  return config;
+}
+/* v8 ignore stop */
+
+/**
+ * Build the seek input packet stream: scan the track's packets for the last keyframe at/before `targetUs`
+ * (a stream must decode from a keyframe), then re-emit from that keyframe onward. Packets before it are
+ * pulled (to read their timing) but not forwarded. The bytes are read lazily by the demuxer; this only
+ * gates which packets reach the decoder. Returns a fresh `ReadableStream<EncodedChunk>` for the decoder.
+ *
+ * Single-pass with a bounded GOP buffer: buffer chunks since the last seen keyframe; once a packet's
+ * timestamp exceeds the target, the most-recent buffered keyframe is the start — flush from it. If the
+ * stream ends first (target past EOF), flush from the last keyframe so the final frame is still decodable.
+ */
+/* v8 ignore start -- requires WebCodecs Encoded*Chunk (absent in Node); validated in the browser harness. */
+async function startAtSeekKeyframe(
+  packets: ReadableStream<EncodedChunk>,
+  targetUs: number,
+): Promise<ReadableStream<EncodedChunk>> {
+  // One reader drives both the scan and the continuation. Buffer chunks since the most-recent keyframe at
+  // or before the target; once a packet's timestamp exceeds the target the target lies within this GOP, so
+  // the buffered head (from that keyframe) is the decode start, and the same reader continues after it. The
+  // reader is NOT released — the returned stream keeps reading from it and releases it on close/cancel.
+  const reader = packets.getReader();
+  const head: EncodedChunk[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break; // target at/after EOF: decode from the last buffered keyframe (head holds it)
+    if (value.type === 'key' && value.timestamp <= targetUs) {
+      head.length = 0; // a keyframe at/before the target supersedes everything buffered before it
+      head.push(value);
+    } else {
+      head.push(value);
+    }
+    if (value.timestamp > targetUs) break; // the target frame is within the buffered GOP; stop scanning
+  }
+  return new ReadableStream<EncodedChunk>({
+    start(controller): void {
+      for (const chunk of head) controller.enqueue(chunk);
+    },
+    async pull(controller): Promise<void> {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        reader.releaseLock();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
+}
+/* v8 ignore stop */
 
 async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array> {
   if (src.range) return src.range(0, n);
@@ -392,9 +1147,15 @@ async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array
   return head;
 }
 
-/** PCM-family audio target — the only codec the WAV/transformPcm path produces (ADR-022). */
+/**
+ * PCM-family audio target — the codecs the WAV/`transformPcm` path produces (ADR-022). Accepts the
+ * generic public `pcm` token AND the canonical sample-format variants a caller may pass
+ * (`pcm-s16`/`pcm-s24`/`pcm-f32`/`pcm-s16be`/…), so a `convert(..., {to:'wav', audio:{codec:'pcm-s16'}})`
+ * still routes through the audio-dsp PCM path instead of falling through to the (wav-less) codec seam.
+ * `undefined` (no explicit audio codec) also means "keep PCM" for a wav target.
+ */
 function isPcmCodec(codec: string | undefined): boolean {
-  return codec === undefined || codec === 'pcm';
+  return codec === undefined || codec === 'pcm' || codec.startsWith('pcm-');
 }
 
 /**
