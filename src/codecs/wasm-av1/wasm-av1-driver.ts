@@ -21,9 +21,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type Av1DecodedFrame,
   type Av1DecoderInit,
@@ -85,11 +87,14 @@ export async function probeAv1Core(): Promise<boolean> {
  * Load the dav1d WASM core lazily and at most once. This is the first point that instantiates/fetches the
  * heavy `.wasm`, and it is called only from `createDecoder()` after the router has selected this tail.
  */
-export async function loadAv1Core(): Promise<Dav1dWasmCore | null> {
+export async function loadAv1Core(runtime?: WasmRuntimeProfile): Promise<Dav1dWasmCore | null> {
   corePromise ??= (async (): Promise<Dav1dWasmCore | null> => {
     try {
+      const profile = runtime ?? resolveWasmRuntimeProfile();
       const mod = await import('./dav1d-core.js');
-      await mod.default({ module_or_path: new URL('./dav1d_wasm_bg.wasm', import.meta.url) });
+      await mod.default(
+        wasmInitForProfile(new URL('./dav1d_wasm_bg.wasm', import.meta.url), profile),
+      );
       return mod.createDav1dCore();
     } catch {
       return null;
@@ -265,7 +270,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadAv1Core();
+      const core = await loadAv1Core(o?.wasmRuntime);
       if (signal?.aborted) {
         controller.error(new MediaError('aborted', 'operation aborted'));
         return;

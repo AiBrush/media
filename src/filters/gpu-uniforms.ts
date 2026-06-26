@@ -115,6 +115,9 @@ export function packUniforms(v: UniformValues): Float32Array<ArrayBuffer> {
 /** A colour space's RGB primaries/gamut identity (the SDR gamuts we convert between). */
 export type ColorSpaceId = 'srgb' | 'bt709' | 'bt601' | 'bt2020';
 
+/** The complete in-tree SDR/wide-gamut matrix set; every ordered pair is covered by {@link gamutMatrix}. */
+export const COLOR_SPACE_IDS: readonly ColorSpaceId[] = ['srgb', 'bt709', 'bt601', 'bt2020'];
+
 /** A transfer characteristic (opto-electronic curve). `linear` is the identity (already light-linear). */
 export type TransferId = 'srgb' | 'bt709' | 'pq' | 'hlg' | 'linear';
 

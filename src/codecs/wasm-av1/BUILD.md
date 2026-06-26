@@ -18,7 +18,7 @@ is not auto-registered in `src/drivers/defaults.ts`, and a misrouted decoder rai
 
 ## Status in this environment
 
-Measured locally before adding this scaffold:
+Re-verified in this workspace on 2026-06-26:
 
 - `cargo` exists.
 - `wasm-pack` exists.

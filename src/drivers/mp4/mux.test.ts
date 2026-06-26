@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { CapabilityError } from '../../contracts/errors.ts';
 import { Mp4Driver, readMovie } from './mp4-driver.ts';
 import { type ChunkStruct, Mp4Muxer, buildMuxSamples } from './mux.ts';
 import { buildSampleData } from './samples.ts';
@@ -44,6 +45,10 @@ const H264_SPS = new Uint8Array([0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80]);
 const H264_PPS = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
 /** A minimal AudioSpecificConfig (AAC-LC, 48 kHz, stereo) — the muxer synthesizes `esds` from it. */
 const ASC = new Uint8Array([0x11, 0x90]);
+/** Real h265.mp4 hvcC prefix: Main, 8-bit, low tier, level 60, constraint 0x90. */
+const HVCC_MAIN_8 = Uint8Array.from([0x01, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3c]);
+/** Real bear-hevc-10bit-hdr10 hvcC shape: Main10, low tier, level 93, constraint 0x90. */
+const HVCC_MAIN10 = Uint8Array.from([0x01, 0x02, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x5d]);
 
 function videoChunk(timestampUs: number, durationUs: number, key: boolean, n: number): ChunkStruct {
   return { timestampUs, durationUs, key, data: new Uint8Array(n).fill(key ? 0x65 : 0x41) };
@@ -669,6 +674,68 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
       expect(bytes.byteLength).toBeGreaterThan(32);
       expect(String.fromCharCode(...bytes.subarray(4, 8))).toBe('ftyp');
     }
+  });
+
+  it('HEVC raw-box muxing preserves hvcC bytes and 8/10-bit codec strings exactly', async () => {
+    const cases = [
+      {
+        codec: 'hvc1.1.6.L60.90',
+        sampleEntryType: 'hvc1',
+        description: HVCC_MAIN_8,
+      },
+      {
+        codec: 'hev1.2.4.L93.90',
+        sampleEntryType: 'hev1',
+        description: HVCC_MAIN10,
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const muxer = new Mp4Muxer();
+      const trackId = muxer.addTrack({
+        id: 1,
+        mediaType: 'video',
+        codec: item.codec,
+        config: {
+          codec: item.codec,
+          codedWidth: 16,
+          codedHeight: 16,
+          description: item.description,
+        },
+      });
+      muxer.addChunkStruct(trackId, videoChunk(0, 33_333, true, 4));
+      await muxer.finalize();
+
+      const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+      expect(track?.sampleEntryType).toBe(item.sampleEntryType);
+      expect(track?.codec).toBe(item.codec);
+      expect(track?.config.description).toEqual(item.description);
+      expect(track?.codecPrivate).toEqual({ boxType: 'hvcC', data: item.description });
+    }
+  });
+
+  it('HEVC raw-box muxing rejects a missing hvcC description as a typed capability miss', async () => {
+    const muxer = new Mp4Muxer();
+    const trackId = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'hvc1.1.6.L60.90',
+      config: { codec: 'hvc1.1.6.L60.90', codedWidth: 16, codedHeight: 16 },
+    });
+    muxer.addChunkStruct(trackId, videoChunk(0, 33_333, true, 4));
+
+    const error = await muxer.finalize().then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(CapabilityError);
+    if (!(error instanceof CapabilityError)) throw new Error('expected CapabilityError');
+    expect(error.code).toBe('capability-miss');
+    expect(error.message).toContain('hvcC description');
+    expect(error.detail).toEqual({
+      op: { op: 'mux', mediaType: 'video', codec: 'hvc1' },
+      tried: ['mp4'],
+    });
   });
 
   it('bare aac without ASC or ADTS framing rejects instead of guessing AAC-LC', async () => {

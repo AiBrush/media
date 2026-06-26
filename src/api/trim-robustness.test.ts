@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { InputError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { fixtureSource } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
 import { assertTrimRange } from './engine.ts';
@@ -43,6 +43,26 @@ describe('trim range validation (real corpus MP4s)', () => {
       const out = await trimBytes(id, 0, dur * 0.6);
       expect(out.byteLength).toBeGreaterThan(0);
     }
+  });
+
+  it('accurate mode routes a real MP4 into the codec seam, not the declared-but-throwing stub', async () => {
+    const dur = await durationOf('h264.mp4');
+    let thrown: unknown;
+    try {
+      await media().trim(await fixtureSource('h264.mp4'), {
+        start: 0,
+        end: Math.min(0.5, dur),
+        mode: 'accurate',
+      });
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBeInstanceOf(CapabilityError);
+    const err = thrown as CapabilityError;
+    expect(err.message).not.toMatch(/frame-accurate trim requires/);
+    const detail = err.detail as { tried?: readonly string[] };
+    expect(detail.tried?.length).toBeGreaterThan(0);
   });
 
   it('rejects a negative start with a typed InputError (robust_negative_start)', async () => {

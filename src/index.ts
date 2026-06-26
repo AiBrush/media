@@ -13,6 +13,7 @@ export {
   decrypt,
   demux,
   encode,
+  load,
   mux,
   preload,
   probe,

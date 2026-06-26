@@ -13,7 +13,7 @@ import type {
   Progress,
   TrackInfo,
 } from '../contracts/driver.ts';
-import type { Sink } from '../sinks/sink.ts';
+import type { Output, Sink } from '../sinks/sink.ts';
 
 export type { Output, Sink } from '../sinks/sink.ts';
 // `MediaInput`/`Source`/`isSource` are surfaced by the barrel directly from `../sources/source.ts`;
@@ -200,6 +200,32 @@ export interface MuxSpec {
   sink?: Sink;
 }
 
+export type ChainTrimOptions = Omit<TrimOptions, 'sink'>;
+export type ChainConvertOptions = Omit<ConvertOptions, 'sink'>;
+export type ChainRemuxOptions = Omit<RemuxOptions, 'sink'>;
+export type ChainDecryptOptions = Omit<DecryptOptions, 'sink'>;
+
+/** Fluent façade over the flat task API (ADR-010). */
+export interface MediaChain {
+  trim(opts: ChainTrimOptions): MediaChain;
+  resize(width: number, height: number, fit?: VideoTarget['fit']): MediaChain;
+  crop(crop: NonNullable<VideoTarget['crop']>): MediaChain;
+  rotate(degrees: NonNullable<VideoTarget['rotate']>): MediaChain;
+  flip(axis: NonNullable<VideoTarget['flip']>): MediaChain;
+  colorspace(to: string): MediaChain;
+  tonemap(to?: 'sdr'): MediaChain;
+  video(target: false | VideoTarget): MediaChain;
+  audio(target: false | AudioTarget): MediaChain;
+  to(container: Container): MediaChain;
+  convert(opts?: ChainConvertOptions): MediaChain;
+  remux(opts: ChainRemuxOptions): MediaChain;
+  decrypt(opts: ChainDecryptOptions): MediaChain;
+  run(o?: CallOptions): Cancellable<Output>;
+  blob(o?: CallOptions): Cancellable<Blob>;
+  file(name: string, o?: CallOptions): Cancellable<File>;
+  stream(o?: CallOptions): Cancellable<ReadableStream<Uint8Array>>;
+}
+
 /** A probe result (ADR-013). */
 export interface MediaInfoTrack {
   id: number;
@@ -237,10 +263,23 @@ export interface MediaStreams {
   audio?: ReadableStream<AudioData>;
 }
 
-/** Encoded packet streams (the input to `mux`). */
+/**
+ * One caller-owned encoded packet stream passed to `mux`.
+ *
+ * `track` is mandatory because a muxer cannot safely infer codec-private boxes/headers, dimensions,
+ * sample-rate, channel layout, duration, or DTS/B-frame policy from chunks alone. `packets` accepts both
+ * demuxed {@link Packet}s (verbatim remux, preserving `dtsUs`) and encoder-produced bare
+ * {@link EncodedChunk}s (PTS-only, as in the encoder seam).
+ */
+export interface PacketStream {
+  readonly track: TrackInfo;
+  readonly packets: ReadableStream<EncodedChunk | Packet>;
+}
+
+/** Encoded packet streams (the input to `mux`), keyed by their declared media type. */
 export interface PacketStreams {
-  video?: ReadableStream<EncodedChunk>;
-  audio?: ReadableStream<EncodedChunk>;
+  video?: PacketStream;
+  audio?: PacketStream;
 }
 
 /** Warmup spec for `preload`. */

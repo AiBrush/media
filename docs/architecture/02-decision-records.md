@@ -44,7 +44,7 @@ Format per ADR: **Context** (why) · **Decision** (what) · **Consequences** (re
 
 ### ADR-010 — Call style
 
-**Context:** Different users want simple calls, composition, or serializable jobs. **Decision:** v1 ships **flat task functions** (primary), a **low-level graph** (escape hatch), and a **declarative job spec** (the worker/serialization boundary). The **fluent chain** is **post-v1 additive sugar**, built as a façade over the declarative job (one execution path). **Consequences:** Small, focused v1 surface; fluent added later non-breakingly. See [`07-public-api.md`](07-public-api.md).
+**Context:** Different users want simple calls, composition, or serializable jobs. **Decision:** v1 ships **flat task functions** (primary), a **low-level graph** (escape hatch), and a **declarative job spec** (the worker/serialization boundary). The **fluent chain** is additive sugar. **Status update (2026-06-26):** the chain now ships non-breakingly as an immutable façade over the flat task API (`load(input).trim(...).resize(...).convert(...).blob()`), delegating to the existing ops and using Blob boundaries between multiple flat operations until the serialized declarative runner becomes the single execution path. **Consequences:** Small, focused primary surface; fluent composition is available without a second codec/filter/mux implementation. See [`07-public-api.md`](07-public-api.md).
 
 ### ADR-011 — Options are flat typed objects
 
@@ -642,6 +642,8 @@ where `VideoDecoder.isConfigSupported` fails. The correct core for decode is dav
 environment has `cargo` and `wasm-pack`, but no `emcc`, and no `dav1d`, `rav1d`, `dav1d-core.js`, or
 `dav1d_wasm_bg.wasm` artifact is present in the repo or local Cargo registry cache. Vendoring an arbitrary
 prebuilt binary would be unrebuildable, and fabricating frames would violate ADR-018.
+This blocker was re-verified in this workspace on 2026-06-26 with the same result: no vendored dav1d glue
+or wasm artifact is present, and `emcc` is still absent.
 
 **Decision:** Add `src/codecs/wasm-av1/` as an honest dav1d-ready scaffold, not an auto-registered shipped
 decoder. The pure TypeScript surface is implemented and Node-tested: AV1 codec-string parsing
@@ -672,7 +674,7 @@ packaging); committing an unaudited prebuilt dav1d binary (not rebuildable from 
 claiming decode validation from metadata-only tests (would be a weak gate); adding a software AV1 encoder
 to the dav1d path (wrong library and out of scope — a future SVT-AV1 tail would be a separate driver).
 
-### ADR-078 — Ogg Vorbis mux anchors approximate packet timing to the declared final granule
+### ADR-079 — Ogg Vorbis mux anchors approximate packet timing to the declared final granule
 
 **Context:** Ogg Vorbis granule positions are cumulative decoded samples at the stream sample rate. When
 the source is already Ogg, `oggAudioPackets()` can expose a packet-duration model whose summed duration is
@@ -706,7 +708,7 @@ packet span, contrary to ADR-070); synthesizing Vorbis sample counts from codec 
 loosening the duration oracle tolerance to accept packet-cadence drift; special-casing fixture names or
 browser-harness rows instead of fixing the generic muxer.
 
-### ADR-079 — HEVC WebCodecs uses exact hvcC normalization and rejects non-Main encode without a tail
+### ADR-080 — HEVC WebCodecs uses exact hvcC normalization and rejects non-Main encode without a tail
 
 **Context:** HEVC browser support varies by browser, OS, GPU, and profile. MP4/MOV tracks usually carry
 qualified `hvc1.*`/`hev1.*` RFC-6381 strings, while Matroska/WebM HEVC can surface a bare `hevc`/`h265`
@@ -739,3 +741,109 @@ the public API.
 and level); letting preserved Main10 encode reach muxing and fail later or produce 8-bit output; adding a
 placeholder HEVC WASM fallback with no core; weakening validation to synthetic codec strings only instead
 of real HEVC fixture metadata.
+
+### ADR-081 — Public mux requires explicit TrackInfo and drains caller packet descriptors
+
+**Context:** `media.mux(streams, spec)` is the low-level public packet seam for callers that already have
+encoded packets. A bare `ReadableStream<EncodedChunk>` is not enough information to write a faithful
+container: the muxer needs codec-private bytes (`avcC`/ASC/Vorbis setup/FLAC metadata/etc.), media type,
+dimensions or audio geometry, declared duration, and, for demuxed packets, DTS side data. Inferring those
+from chunks would either be container-specific parsing duplicated at the API edge or outright fabrication.
+The existing internal remux seam already has the correct information because demuxers return `TrackInfo`
+plus `Packet` streams.
+
+**Decision:** make the public `PacketStreams` shape explicit:
+`{ video?: { track: TrackInfo; packets: ReadableStream<Packet | EncodedChunk> }, audio?: ... }`.
+`media.mux()` validates the target is chunk-muxable, validates each descriptor before routing, rejects
+empty inputs and mismatched or config-less tracks with `InputError`, and cancels unread streams when input
+validation fails. A valid call mirrors `#remuxViaSeam`: route the target container's `Muxer`, drain each
+caller stream through `drainEncoderToMuxer` without decoding or re-encoding, finalize, then materialize
+the requested sink. Target legality remains the muxer's responsibility, so illegal codec/container pairs
+surface as typed `CapabilityError`s. Bare streams are rejected with `InputError` rather than accepted and
+guessed.
+
+**Consequences:** the declared public mux API is no longer a `CapabilityError` stub. Tests cover the
+real-corpus path with five H.264/AAC MP4 fixtures: demuxed `Packet` streams plus their `TrackInfo` are
+passed to `media.mux(..., { container:'ts' })`, the output is required to be MPEG-TS packet-aligned,
+non-passthrough, and structurally re-parsed as H.264/AAC. A separate negative test proves bare streams are
+cancelled and rejected. The container benchmark adds a six-file `mux (public →ts)` row that builds
+descriptor packet streams from real MP4 sample tables, routes through the public API, validates the
+resulting TS with `parseTs`, and records a fresh baseline (`~146 MB/s` geomean, checksum `437445` on the
+local Bun 1.3.14 run). This changes only the public TypeScript shape for a formerly throwing operation;
+`DRIVER_API_VERSION` is unchanged.
+
+**Rejected:** accepting bare `ReadableStream<EncodedChunk>` and guessing a track (would fabricate
+codec-private metadata and durations); expanding `MuxSpec` with codec/dimension fields (duplicates
+`TrackInfo` and still cannot carry per-source private headers cleanly); requiring callers to pass a whole
+`Demuxed` object (would make mux less useful for encoder-produced packet streams); silently dropping empty
+streams or muxing zero-track containers; treating public mux as browser-only when its packet seam is
+testable in Node with real sample bytes.
+
+### ADR-082 — Accurate trim uses the browser codec seam and a strict frame-window core
+
+**Context:** `trim({ mode:'accurate' })` was a declared public operation but still rejected through the
+old stub. The keyframe mode already has driver-native packet-copy implementations for MP4/MOV and
+MPEG-TS, but true frame-boundary trimming cannot be implemented by byte-splicing packets: B-frames,
+open-GOP preroll, VFR timestamps, and audio frame cadence all require decoded presentation frames before
+the boundary decision is meaningful. Node cannot validate live WebCodecs decode/encode, so the local
+oracle must split the browser-only codec seam from the pure frame-window logic without fabricating decode
+throughput or pixels.
+
+**Decision:** route accurate trim through the same decode→encode→mux seam as `convert`. The engine probes
+duration, validates the requested range, demuxes the source, selects the first decodable video/audio
+tracks, decodes video from the seek keyframe at or before `start` (audio from the stream head), keeps only
+decoded frames whose presentation timestamp lands in `[start,end)`, rebases the first kept frame to
+timestamp `0`, re-encodes each kept stream, and drains encoded chunks into the source-family chunk muxer.
+Encrypted tracks reject before decode. Output track duration is not copied from the original source track,
+so the muxer derives duration from the encoded trimmed packet tail instead of preserving the full-input
+duration. Unsupported WebCodecs, missing muxers, and unsupported codec/container pairs remain typed
+capability misses.
+
+**Consequences:** the public accurate-trim op no longer throws from the declaration stub. In Node, a real
+MP4 call now reaches codec routing and fails only because WebCodecs is unavailable, proving the public
+control flow is wired. The pure `trimTimedFrameStream` helper is Node-tested for boundary
+inclusion/exclusion, adjacent-window additivity, close-once ownership for preroll/end/rebased/unchanged
+frames, upstream cancellation at `end`, and restamp-failure cleanup. The container benchmark adds
+`trim accurate frame-window` over real MP4 sample timestamp traces across the seven-file MP4/MOV corpus
+and gates it with a fresh baseline (`~18.7 MB/s` geomean on the local Bun 1.3.14 run, checksum `475335`).
+Live decoded-frame digest and pixel/audio quality validation remains the browser harness's responsibility
+under ADR-025 because Node has no native `VideoFrame`/`AudioData` decode path.
+
+**Rejected:** keeping the public op as a permanent stub; implementing accurate trim by packet timestamp
+filtering only (not frame-accurate across B-frames/open-GOP/VFR); copying the source track's original
+duration into the trim mux track (would make duration oracles depend on the full input); fabricating Node
+decoded frames or decode throughput; trying to splice only the boundary GOP while copying the rest before
+the fully streamed encode/copy join is specified and validated.
+
+### ADR-083 — Preload is an idempotent, never-throwing warmup of real router paths
+
+**Context:** `media.preload(...)` was documented as the explicit first-call-latency warmup hook but still
+implemented as a no-op. The warmup must not become part of correctness: a page should behave the same if
+preload is omitted, repeated, unsupported, interrupted by unavailable host APIs, or pointed at a codec tail
+whose WASM artifact is absent. At the same time, a no-op is not acceptable because the first real call then
+pays for the default driver bundle import, codec/container/filter support probes, and predicted WASM tail
+loading.
+
+**Decision:** normalize every preload spec into `{ op, video?, audio?, container?, level }`, memoize work by
+that normalized key, and swallow all warmup failures after optional `onLog` diagnostics. Every valid spec
+imports/registers the default driver bundle through the existing `#ensureDefaultDrivers()` path, then runs
+cheap container, codec, and filter probes through the same router caches used by real ops. Specs that name
+WASM-backed codecs dynamically import the corresponding miss-only tail; `level:'chunks'` stops at the
+driver chunk, while `compile`/`ready` call the tail's core loader (`loadAacCore`, `loadMp3Core`,
+`loadVorbisCore`, and scaffold loaders for Opus/VPX/AV1 that honestly resolve to absence when not
+vendored). Unsupported probes, missing browser host objects, absent WASM artifacts, and even third-party
+driver probe exceptions never reject `preload()`.
+
+**Consequences:** `preload('probe')` now eagerly imports the first-party lazy driver bundle and warms common
+container probes. `preload({ op:'convert', video:'h264', audio:'aac', container:'mp4', level:'ready' })`
+warms target container, codec, filter, and AAC WASM paths without consuming media bytes. Repeating the same
+spec is a cache hit and does not re-probe. Unit tests use instrumented drivers to prove container/codec/
+filter probes are actually called once and use throwing drivers to prove the public promise still resolves.
+The new `bench-preload` harness records warmups/sec for default probe, ready-level H.264/AAC/MP4 warmup,
+the MP3 predicted-WASM compile/load path after same-session warmup, and idempotent repeats (`~20,900`
+warmups/sec geomean on the local Bun 1.3.14 baseline).
+
+**Rejected:** keeping a no-op stub; making preload throw typed capability misses like a real operation
+(would make a latency hint affect correctness); directly probing browser globals outside driver
+`supports()` methods; making `preload('probe')` compile every WASM tail automatically; adding a driver
+contract warmup method before there is a demonstrated third-party need.

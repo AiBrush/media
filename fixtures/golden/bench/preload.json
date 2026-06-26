@@ -1,0 +1,38 @@
+{
+  "generatedAt": "2026-06-26T12:08:31.570Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 3,
+  "iters": 21,
+  "ops": [
+    {
+      "op": "preload default probe",
+      "wallMs": 0.058334,
+      "warmupsPerSec": 17142.661226728836,
+      "peakMemoryMb": 1.515625
+    },
+    {
+      "op": "preload ready h264/aac/mp4",
+      "wallMs": 0.05975,
+      "warmupsPerSec": 16736.401673640168,
+      "peakMemoryMb": 1.390625
+    },
+    {
+      "op": "preload compile mp3 wasm path",
+      "wallMs": 0.034875,
+      "warmupsPerSec": 28673.83512544803,
+      "peakMemoryMb": 0.28125
+    },
+    {
+      "op": "preload idempotent repeat",
+      "wallMs": 0.043209,
+      "warmupsPerSec": 23143.326621768614,
+      "peakMemoryMb": 0.09375
+    }
+  ],
+  "aggregate": {
+    "ops": 4,
+    "geomeanWarmupsPerSec": 20888.775161491194,
+    "minWarmupsPerSec": 16736.401673640168,
+    "maxPeakMemoryMb": 1.515625
+  }
+}

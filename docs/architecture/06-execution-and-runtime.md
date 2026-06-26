@@ -60,7 +60,7 @@ Heavy stages must not block the main thread (the `longtasks` metric decided many
 
 ## 6. The declarative job as the worker/serialization boundary (ADR-010)
 
-The main thread sends the worker a **serializable job spec** (`{ input, ops[], output }`), not function closures. This is what makes the boundary clean (no functions to marshal), the job loggable/replayable, and — later — portable to other runtimes. The flat task API and (post-v1) fluent chain both compile to this job before crossing into the worker.
+The main thread sends the worker a **serializable job spec** (`{ input, ops[], output }`), not function closures. This is what makes the boundary clean (no functions to marshal), the job loggable/replayable, and — later — portable to other runtimes. The flat task API is the canonical execution path today; the fluent chain delegates to those same flat ops and can compile to this job boundary when the serialized runner becomes primary.
 
 ## 7. Cancellation
 

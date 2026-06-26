@@ -1,0 +1,90 @@
+{
+  "generatedAt": "2026-06-26T12:56:36.514Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 3,
+  "iters": 21,
+  "fixtures": [
+    {
+      "id": "fixtures/media/img-still.png",
+      "format": "png",
+      "width": 100,
+      "height": 50,
+      "pixels": 5000,
+      "bytes": 87
+    },
+    {
+      "id": "fixtures/media/img-still.jpg",
+      "format": "jpeg",
+      "width": 320,
+      "height": 240,
+      "pixels": 76800,
+      "bytes": 2018
+    },
+    {
+      "id": "fixtures/media/img-still.webp",
+      "format": "webp",
+      "width": 128,
+      "height": 128,
+      "pixels": 16384,
+      "bytes": 4928
+    },
+    {
+      "id": "fixtures/media/img-anim2.gif",
+      "format": "gif",
+      "width": 50,
+      "height": 50,
+      "pixels": 2500,
+      "bytes": 235
+    },
+    {
+      "id": "fixtures/media/img-still.avif",
+      "format": "avif",
+      "width": 2,
+      "height": 2,
+      "pixels": 4,
+      "bytes": 320
+    }
+  ],
+  "ops": [
+    {
+      "op": "colorspace rgba 709->2020",
+      "fixtures": 5,
+      "pixels": 100688,
+      "wallMs": 13.271209,
+      "megapixelsPerSec": 7.586950066116809,
+      "peakMemoryMb": 3.4375
+    },
+    {
+      "op": "colorspace rgba 2020->709",
+      "fixtures": 5,
+      "pixels": 100688,
+      "wallMs": 12.523208,
+      "megapixelsPerSec": 8.040112405703075,
+      "peakMemoryMb": 0.828125
+    },
+    {
+      "op": "colorspace rgba 601->2020",
+      "fixtures": 5,
+      "pixels": 100688,
+      "wallMs": 12.858917,
+      "megapixelsPerSec": 7.830208407131021,
+      "peakMemoryMb": 0.1875
+    },
+    {
+      "op": "colorspace rgba 2020->601",
+      "fixtures": 5,
+      "pixels": 100688,
+      "wallMs": 13.675667,
+      "megapixelsPerSec": 7.36256593554084,
+      "peakMemoryMb": 0.28125
+    }
+  ],
+  "aggregate": {
+    "ops": 4,
+    "fixtures": 5,
+    "megapixels": 0.402752,
+    "geomeanMegapixelsPerSec": 7.700748965298408,
+    "minMegapixelsPerSec": 7.36256593554084,
+    "maxPeakMemoryMb": 3.4375
+  }
+}

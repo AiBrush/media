@@ -19,7 +19,10 @@
  *   - **mkv remux** — pure MP4 packet-table → `WebmMuxer.addChunkStruct`, preserving PTS/DTS for B-frames
  *                   and edit-list-shifted starts. MB/s of the Matroska output bytes.
  *   - **trim**    — `media.trim(keyframe, 25%–75%)`: keyframe-aligned stream-copy. MB/s of the output.
- *   - **ts remux** — pure MP4 packet-table → `MpegTsMuxer.addChunkStruct` for H.264/AAC output, plus
+ *                   Accurate trim's browser-only decode→trim→encode seam is represented here by its
+ *                   pure frame-window core over real MP4 sample timestamp traces.
+ *   - **ts remux/mux** — pure MP4 packet-table → `MpegTsMuxer.addChunkStruct` for H.264/AAC output,
+ *                   public `media.mux({track,packets}, →ts)` over the same real packet data, plus
  *                   `media.remux(→ts)` / `media.trim(keyframe)` over MPEG-TS same-container packet-copy.
  *   - **ogg mux** — pure `OggMuxer` re-authoring real Opus/Vorbis/FLAC packets into Ogg pages,
  *                   including WebM-laced Vorbis packets whose duration is anchored by source metadata.
@@ -40,8 +43,9 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createMedia } from '../src/api/create-media.ts';
-import type { MediaInfo } from '../src/api/types.ts';
-import type { TrackInfo } from '../src/contracts/driver.ts';
+import { type TimedFrameForTrim, trimTimedFrameStream } from '../src/api/engine.ts';
+import type { MediaInfo, PacketStreams } from '../src/api/types.ts';
+import type { EncodedChunk, Packet, TrackInfo } from '../src/contracts/driver.ts';
 import { parseAiff } from '../src/drivers/aiff/aiff.ts';
 import { parseAvi } from '../src/drivers/avi/avi-parse.ts';
 import {
@@ -52,6 +56,7 @@ import {
 import { muxTracksFromMovie, readMovie } from '../src/drivers/mp4/mp4-driver.ts';
 import type { ParsedTrack } from '../src/drivers/mp4/parse.ts';
 import { buildSamples } from '../src/drivers/mp4/samples.ts';
+import { parseTs } from '../src/drivers/mpegts/ts-parse.ts';
 import { MpegTsMuxer } from '../src/drivers/mpegts/ts-write.ts';
 import { OggDriver, oggAudioPackets, parseOgg } from '../src/drivers/ogg/ogg-driver.ts';
 import { OggMuxer } from '../src/drivers/ogg/ogg-write.ts';
@@ -301,6 +306,62 @@ interface FileResult {
   ops: OpResult[];
 }
 
+type BenchChunkInit = {
+  readonly type: EncodedAudioChunkType | EncodedVideoChunkType;
+  readonly timestamp: number;
+  readonly duration?: number | null;
+  readonly data: Uint8Array;
+};
+
+class BenchEncodedChunk {
+  readonly type: EncodedAudioChunkType | EncodedVideoChunkType;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+
+  constructor(init: BenchChunkInit) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    this.#data = init.data;
+    this.byteLength = init.data.byteLength;
+  }
+
+  copyTo(destination: AllowSharedBufferSource): void {
+    const view = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    view.set(this.#data);
+  }
+}
+
+interface BenchTimedFrameInit {
+  readonly timestamp: number;
+  readonly duration: number | null;
+}
+
+class BenchTimedFrame implements TimedFrameForTrim {
+  readonly timestamp: number;
+  readonly duration: number | null;
+  closed = false;
+
+  constructor(init: BenchTimedFrameInit) {
+    this.timestamp = init.timestamp;
+    this.duration = init.duration;
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+interface AccurateTrimTrace {
+  readonly bounds: { readonly startUs: number; readonly endUs: number };
+  readonly tracks: readonly (readonly BenchTimedFrameInit[])[];
+  readonly recordBytes: number;
+}
+
 // ============ per-file op builders ============
 
 const engine = createMedia();
@@ -349,6 +410,72 @@ async function sampleByteCount(bytes: Uint8Array): Promise<number> {
   return total;
 }
 
+async function accurateTrimTrace(
+  bytes: Uint8Array,
+  startSec: number,
+  endSec: number,
+): Promise<AccurateTrimTrace> {
+  const movie = await readMovie(ra(bytes));
+  const tracks = movie.tracks
+    .map((track) =>
+      buildSamples(track).map((sample) => ({
+        timestamp: sample.ptsUs,
+        duration: sample.durationUs,
+      })),
+    )
+    .filter((track) => track.length > 0);
+  const recordCount = tracks.reduce((count, track) => count + track.length, 0);
+  return {
+    bounds: {
+      startUs: Math.round(startSec * 1_000_000),
+      endUs: Math.round(endSec * 1_000_000),
+    },
+    tracks,
+    recordBytes: recordCount * 16,
+  };
+}
+
+function benchFrameStream(frames: readonly BenchTimedFrameInit[]): ReadableStream<BenchTimedFrame> {
+  let index = 0;
+  return new ReadableStream<BenchTimedFrame>({
+    pull(controller): void {
+      const frame = frames[index];
+      index++;
+      if (frame === undefined) controller.close();
+      else controller.enqueue(new BenchTimedFrame(frame));
+    },
+  });
+}
+
+function restampBenchFrame(
+  frame: BenchTimedFrame,
+  timestamp: number,
+  duration: number | null,
+): BenchTimedFrame {
+  if (frame.timestamp === timestamp && frame.duration === duration) return frame;
+  return new BenchTimedFrame({ timestamp, duration });
+}
+
+async function runAccurateTrimTrace(trace: AccurateTrimTrace): Promise<number> {
+  let kept = 0;
+  let checksum = 0;
+  for (const frames of trace.tracks) {
+    const reader = trimTimedFrameStream(
+      benchFrameStream(frames),
+      trace.bounds,
+      restampBenchFrame,
+    ).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      kept++;
+      checksum = (checksum + value.timestamp + (value.duration ?? 0)) | 0;
+      value.close();
+    }
+  }
+  return kept + (checksum & 0xff);
+}
+
 function trackInfoFromMp4Track(track: ParsedTrack): TrackInfo {
   return {
     id: track.id,
@@ -360,6 +487,43 @@ function trackInfoFromMp4Track(track: ParsedTrack): TrackInfo {
     ...(track.encryption !== undefined ? { encrypted: true } : {}),
     config: track.config,
   };
+}
+
+function benchChunk(init: BenchChunkInit): EncodedChunk {
+  return new BenchEncodedChunk(init) as unknown as EncodedChunk;
+}
+
+function packetStreamFromMp4Track(
+  track: ParsedTrack,
+  muxTrack: { samples: readonly { data: Uint8Array }[] },
+): ReadableStream<Packet> {
+  const timeline = buildSamples(track);
+  if (timeline.length !== muxTrack.samples.length) {
+    throw new Error(
+      `public mux benchmark sample mismatch on track ${track.id}: timeline=${timeline.length}, bytes=${muxTrack.samples.length}`,
+    );
+  }
+  return new ReadableStream<Packet>({
+    start(controller): void {
+      for (let i = 0; i < timeline.length; i++) {
+        const sample = timeline[i];
+        const muxSample = muxTrack.samples[i];
+        if (sample === undefined || muxSample === undefined) {
+          throw new Error(`public mux benchmark lost sample ${i} on track ${track.id}`);
+        }
+        controller.enqueue({
+          chunk: benchChunk({
+            type: sample.keyframe ? 'key' : 'delta',
+            timestamp: sample.ptsUs,
+            duration: sample.durationUs,
+            data: muxSample.data,
+          }),
+          dtsUs: sample.dtsUs,
+        });
+      }
+      controller.close();
+    },
+  });
 }
 
 async function muxMp4ToMkv(bytes: Uint8Array): Promise<Uint8Array> {
@@ -442,6 +606,42 @@ async function muxMp4ToTs(bytes: Uint8Array): Promise<Uint8Array> {
 
   await muxer.finalize();
   return streamBytes(muxer.output);
+}
+
+async function publicMuxMp4ToTs(id: string, bytes: Uint8Array): Promise<Uint8Array> {
+  const access = ra(bytes);
+  const movie = await readMovie(access);
+  const muxTracks = await muxTracksFromMovie(access, movie);
+  const streams: PacketStreams = {};
+  let hasAudio = false;
+  for (let i = 0; i < movie.tracks.length; i++) {
+    const track = movie.tracks[i];
+    const muxTrack = muxTracks[i];
+    if (track === undefined || muxTrack === undefined) {
+      throw new Error(`public mux benchmark lost track ${i} for ${id}`);
+    }
+    if (track.mediaType === 'video' && streams.video === undefined) {
+      streams.video = {
+        track: trackInfoFromMp4Track(track),
+        packets: packetStreamFromMp4Track(track, muxTrack),
+      };
+    } else if (track.mediaType === 'audio' && streams.audio === undefined) {
+      hasAudio = true;
+      streams.audio = {
+        track: trackInfoFromMp4Track(track),
+        packets: packetStreamFromMp4Track(track, muxTrack),
+      };
+    }
+  }
+  const out = await blobBytes(await engine.mux(streams, { container: 'ts' }));
+  const parsed = parseTs(out);
+  if (!parsed.tracks.some((track) => track.stream.codec === 'h264')) {
+    throw new Error(`public mux ${id} did not write a H.264 transport stream`);
+  }
+  if (hasAudio && !parsed.tracks.some((track) => track.stream.codec === 'aac')) {
+    throw new Error(`public mux ${id} did not write an AAC transport stream`);
+  }
+  return out;
 }
 
 /** Probe each file once for its real container/size/duration (used to label + scale the metrics). */
@@ -529,6 +729,12 @@ async function benchMp4Ops(): Promise<FileResult[]> {
                 await engine.trim(source(id, bytes), { mode: 'keyframe', start, end }),
               )
             ).byteLength % 251,
+        ),
+      );
+      const trace = await accurateTrimTrace(bytes, start, end);
+      ops.push(
+        await measure('trim accurate frame-window', trace.recordBytes, trimSeconds, async () =>
+          runAccurateTrimTrace(trace),
         ),
       );
     }
@@ -624,16 +830,25 @@ async function benchMp4ToTsOps(): Promise<FileResult[]> {
     const bytes = new Uint8Array(await Bun.file(`${MEDIA_DIR}/${id}`).arrayBuffer());
     const info = await probeInfo(id, bytes);
     const remuxOut = await muxMp4ToTs(bytes);
-    const op = await measure('remux (→ts)', remuxOut.byteLength, info.durationSec, async () => {
-      const fresh = await muxMp4ToTs(bytes);
-      return fresh.byteLength % 251;
-    });
+    const ops: OpResult[] = [
+      await measure('remux (→ts)', remuxOut.byteLength, info.durationSec, async () => {
+        const fresh = await muxMp4ToTs(bytes);
+        return fresh.byteLength % 251;
+      }),
+    ];
+    const publicMuxOut = await publicMuxMp4ToTs(id, bytes);
+    ops.push(
+      await measure('mux (public →ts)', publicMuxOut.byteLength, info.durationSec, async () => {
+        const fresh = await publicMuxMp4ToTs(id, bytes);
+        return fresh.byteLength % 251;
+      }),
+    );
     out.push({
       id,
       container: info.container,
       sizeBytes: bytes.byteLength,
       durationSec: info.durationSec,
-      ops: [op],
+      ops,
     });
   }
   return out;

@@ -35,7 +35,7 @@ media.trim(input: MediaInput, opts: TrimOptions, o?: CallOptions): Promise<Outpu
 media.decode(input: MediaInput, o?: CallOptions): MediaStreams                            // -> frame streams
 media.encode(frames: MediaStreams, opts: EncodeOptions, o?: CallOptions): Promise<Output>
 media.demux(input: MediaInput, o?: CallOptions): Promise<Demuxed>                          // -> packet streams + tracks
-media.mux(streams: PacketStreams, opts: MuxSpec, o?: CallOptions): Promise<Output>
+media.mux(streams: PacketStreams, opts: MuxSpec, o?: CallOptions): Promise<Output>          // explicit tracks + packets
 media.decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Promise<Output>
 ```
 
@@ -80,7 +80,20 @@ interface ConvertOptions {
 interface RemuxOptions { to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; trackSelect?: readonly string[]; sink?: Sink }
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
 interface DecryptOptions { scheme: 'cenc' | 'cbcs' | 'hls-aes128'; keys: KeyMap; sink?: Sink }
+interface PacketStream { track: TrackInfo; packets: ReadableStream<Packet | EncodedChunk> }
+interface PacketStreams { video?: PacketStream; audio?: PacketStream }
+interface MuxSpec { container: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }
 ```
+
+`trim({ mode:'keyframe' })` is the fast lossless packet-copy path. `trim({ mode:'accurate' })`
+routes through the browser codec seam: decode from a safe preroll, keep decoded frames whose timestamps
+fall inside `[start,end)`, rebase to `0`, re-encode, and mux. Unsupported WebCodecs/container/track cases
+surface as typed errors; the op never falls back to returning the input bytes.
+
+`mux()` is the low-level packet seam. Each stream must include the source or encoder `TrackInfo`; the
+muxer needs codec-private data (`description` boxes/headers), dimensions or sample layout, duration, and
+media type before it can write a legal container. Bare `ReadableStream<EncodedChunk>` inputs are rejected
+with `InputError` and cancelled rather than guessed.
 
 ### `MediaInfo` (probe result)
 
@@ -147,6 +160,11 @@ media.preload({ op: 'convert', video: 'h264', container: 'mp4' }, { op: 'probe' 
 ```
 
 Prefetches op/driver chunks, compiles the predicted WASM, and warms capability probes. `level` default `'compile'`. Explicit only (no auto-warm in v1).
+As built (ADR-083), preload normalizes loose specs, imports/registers the default driver bundle, warms
+requested container/codec/filter probes through the router, dynamically imports predicted WASM tails, and
+calls their core loaders for compile/ready levels. It is memoized per normalized spec and catches every
+warmup miss; failed probes or unavailable WASM assets are surfaced only through optional logs, never as a
+rejected `preload()` promise.
 
 ## 6. Errors (ADR-017)
 
@@ -160,15 +178,15 @@ A capability miss is always a typed throw, never a silent wrong result (e.g. FLA
 
 ## 7. Low-level graph (escape hatch, ADR-010)
 
-For power users; the flat ops and (post-v1) fluent chain compile to this.
+For power users; the flat ops and fluent chain share the same operation seams.
 
 ```ts
 const src     = media.source(input)
-const demuxed = media.demux(src)
-const frames  = media.decode(demuxed.video)
-const filtered= media.filter(frames, [{ type: 'resize', mediaType: 'video', width: 1280, height: 720 }])
-const encoded = media.encode(filtered, { codec: 'h264' })
-const out     = await media.mux({ video: encoded, audio: demuxed.audio /* copy */ }, { container: 'mp4' }).toBlob()
+const demuxed = await media.demux(src)
+const video   = demuxed.tracks.find(t => t.mediaType === 'video' && t.config)
+if (!video) throw new Error('no muxable video track')
+const out     = await media.mux({ video: { track: video, packets: demuxed.packets(video.id) } }, { container: 'mp4' })
+await demuxed.close()
 ```
 
 ## 8. Declarative job (worker/serialization boundary, ADR-010)
@@ -201,10 +219,15 @@ const out = await media.remux(movFile, { to: 'mp4', faststart: true })
 const clear = await media.decrypt(encMp4, { scheme: 'cenc', keys })
 ```
 
-## 10. Post-v1: fluent chain (ADR-010, deferred)
+## 10. Fluent chain (ADR-010)
 
-A façade over the declarative job, added non-breakingly after v1:
+A small immutable façade over the flat task API. Each fluent transform stores intent until a terminal
+sink (`blob`/`file`/`stream`/`run`) is called, then delegates to the existing `trim`/`convert`/`remux`/
+`decrypt` operations. Multi-step chains materialize intermediate flat-op outputs as `Blob`s until the
+serialized declarative runner becomes the primary execution path; this keeps one codec/filter/mux
+implementation and avoids a second hidden pipeline.
 
 ```ts
 await media.load(file).trim({ start: 0, end: 5 }).resize(1280, 720).convert({ to: 'mp4' }).blob()
+await load(file).resize(640, 360).to('webm').stream()
 ```

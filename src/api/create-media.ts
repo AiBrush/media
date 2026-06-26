@@ -14,6 +14,7 @@ import type {
   DecryptOptions,
   Demuxed,
   EncodeOptions,
+  MediaChain,
   MediaInfo,
   MediaStreams,
   MuxSpec,
@@ -84,4 +85,7 @@ export function decrypt(
 }
 export function preload(...specs: PreloadSpec[]): Promise<void> {
   return shared().preload(...specs);
+}
+export function load(input: MediaInput): MediaChain {
+  return shared().load(input);
 }

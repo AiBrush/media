@@ -99,6 +99,9 @@ describe('applyColorPlanToRgba — parity with the GPU colour math', () => {
     fromSrgbTo709: planColorspace({ primaries: 'srgb', transfer: 'srgb' }, 'bt709'),
     from601To709: planColorspace({ primaries: 'bt601', transfer: 'bt709' }, 'bt709'),
     to2020: planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020'),
+    from2020To709: planColorspace({ primaries: 'bt2020', transfer: 'bt709' }, 'bt709'),
+    from601To2020: planColorspace({ primaries: 'bt601', transfer: 'bt709' }, 'bt2020'),
+    from2020To601: planColorspace({ primaries: 'bt2020', transfer: 'bt709' }, 'bt601'),
     tonemapPq: planTonemap({ primaries: 'bt2020', transfer: 'pq' }),
     tonemapHlg: planTonemap({ primaries: 'bt2020', transfer: 'hlg' }),
   } as const;
@@ -190,6 +193,37 @@ describe('colour apply — ground-truth invariants', () => {
     expect(r).toBeGreaterThan(150);
     expect(g).toBeGreaterThanOrEqual(0);
     expect(b).toBeGreaterThanOrEqual(0);
+  });
+
+  it('pins 709↔2020 CPU colorspace output to explicit byte goldens', () => {
+    const cases: ReadonlyArray<
+      readonly [ColorPlan, RgbaImage, readonly [number, number, number, number]]
+    > = [
+      [
+        planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020'),
+        px(255, 0, 0),
+        [202, 59, 19, 255],
+      ],
+      [
+        planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020'),
+        px(128, 64, 200, 77),
+        [116, 73, 191, 77],
+      ],
+      [
+        planColorspace({ primaries: 'bt2020', transfer: 'bt709' }, 'bt709'),
+        px(128, 64, 200, 77),
+        [148, 48, 210, 77],
+      ],
+      [
+        planColorspace({ primaries: 'bt2020', transfer: 'bt709' }, 'bt709'),
+        px(255, 255, 255),
+        [255, 255, 255, 255],
+      ],
+    ];
+
+    for (const [plan, input, expected] of cases) {
+      expect(at(applyColorPlanToRgba(plan, input), 0, 0)).toEqual(expected);
+    }
   });
 
   it('tonemap of a bright HDR pixel does not blow past white and keeps black at black', () => {

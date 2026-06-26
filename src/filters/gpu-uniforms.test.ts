@@ -8,12 +8,31 @@
 import { describe, expect, it } from 'vitest';
 import { cropBlit, flipGeometry, resizeBlit, rotateGeometry } from './geometry.ts';
 import {
+  COLOR_SPACE_IDS,
+  COLOR_UNIFORM_BYTES,
+  type ColorPlan,
+  type Mat3,
   UNIFORM_BYTES,
+  applyMat3,
+  gamutMatrix,
+  packColorUniforms,
   packUniforms,
+  planColorspace,
+  rgbToXyz,
   uniformsForBlit,
   uniformsForOriented,
   uniformsForRecipe,
 } from './gpu-uniforms.ts';
+
+/** Assert two numbers are equal within `eps` (computed color matrices allow ULP-scale drift). */
+function near(a: number, b: number, eps = 1e-6): void {
+  expect(Math.abs(a - b)).toBeLessThanOrEqual(eps);
+}
+
+/** Assert a 3×3 equals an expected row-major matrix within `eps`. */
+function nearMat(m: Mat3, expected: Mat3, eps = 1e-6): void {
+  for (let i = 0; i < 9; i++) near(m[i] ?? Number.NaN, expected[i] ?? Number.NaN, eps);
+}
 
 describe('uniformsForBlit — destination placement & source sub-rect', () => {
   it('fill maps the whole source across the whole output (both scales 1)', () => {
@@ -203,5 +222,83 @@ describe('packUniforms — std140 byte layout', () => {
     expect(a).not.toBe(b);
     expect(a.buffer).not.toBe(b.buffer);
     expect(Array.from(a)).toEqual(Array.from(b));
+  });
+});
+
+describe('colorspace gamut matrices — complete supported pair coverage', () => {
+  const identity: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const bt709ToBt2020: Mat3 = [
+    0.6274039, 0.32928304, 0.04331307, 0.06909729, 0.9195404, 0.01136232, 0.01639144, 0.08801331,
+    0.89559525,
+  ];
+  const bt2020ToBt709: Mat3 = [
+    1.660491, -0.58764114, -0.07284986, -0.12455047, 1.1328999, -0.00834942, -0.01815076,
+    -0.1005789, 1.11872966,
+  ];
+
+  it('exports the complete first-party color-space set used by tests and benchmarks', () => {
+    expect(COLOR_SPACE_IDS).toEqual(['srgb', 'bt709', 'bt601', 'bt2020']);
+  });
+
+  it('pins BT.709 -> BT.2020 to the published BT.2087 conversion matrix', () => {
+    nearMat(gamutMatrix('bt709', 'bt2020'), bt709ToBt2020, 1e-5);
+  });
+
+  it('pins BT.2020 -> BT.709 to the published BT.2087 conversion matrix', () => {
+    nearMat(gamutMatrix('bt2020', 'bt709'), bt2020ToBt709, 1e-5);
+  });
+
+  it('keeps sRGB <-> BT.709 as exact identity because their primaries match', () => {
+    expect(gamutMatrix('srgb', 'bt709')).toEqual(identity);
+    expect(gamutMatrix('bt709', 'srgb')).toEqual(identity);
+  });
+
+  it('round-trips every ordered supported gamut pair through its inverse matrix', () => {
+    const sample: readonly [number, number, number] = [0.23, 0.47, 0.81];
+    for (const src of COLOR_SPACE_IDS) {
+      for (const dst of COLOR_SPACE_IDS) {
+        const converted = applyMat3(gamutMatrix(src, dst), sample);
+        const roundTrip = applyMat3(gamutMatrix(dst, src), converted);
+        near(roundTrip[0], sample[0], 1e-9);
+        near(roundTrip[1], sample[1], 1e-9);
+        near(roundTrip[2], sample[2], 1e-9);
+      }
+    }
+  });
+
+  it('all supported RGB->XYZ matrices share D65 white exactly enough for white to be a fixed point', () => {
+    for (const id of COLOR_SPACE_IDS) {
+      const white = applyMat3(rgbToXyz(id), [1, 1, 1]);
+      near(white[0], 0.95045593, 1e-6);
+      near(white[1], 1, 1e-12);
+      near(white[2], 1.08905775, 1e-6);
+    }
+  });
+});
+
+describe('packColorUniforms — BT.709/BT.2020 GPU matrix layout', () => {
+  it('packs a 709 -> 2020 color plan column-major with no-tonemap params', () => {
+    const plan: ColorPlan = planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020');
+    const buf = packColorUniforms(plan);
+    expect(buf.byteLength).toBe(COLOR_UNIFORM_BYTES);
+    expect(buf.buffer.byteLength).toBe(COLOR_UNIFORM_BYTES);
+
+    const m = gamutMatrix('bt709', 'bt2020');
+    const f = (i: number): number => Math.fround(m[i] ?? Number.NaN);
+    expect(Array.from(buf.slice(0, 12))).toEqual([
+      f(0),
+      f(3),
+      f(6),
+      0,
+      f(1),
+      f(4),
+      f(7),
+      0,
+      f(2),
+      f(5),
+      f(8),
+      0,
+    ]);
+    expect(Array.from(buf.slice(12, 16))).toEqual([2, 2, 0, 0]);
   });
 });

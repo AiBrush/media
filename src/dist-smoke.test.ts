@@ -56,6 +56,7 @@ type ImageEntry = typeof import('./image.ts');
 suite('dist smoke (built package via exports map)', () => {
   it('default entry exposes the engine factory + every bare-function op as callables', () => {
     expect(typeof media.createMedia).toBe('function');
+    const mediaSurface = media as unknown as Record<string, unknown>;
     for (const op of [
       'probe',
       'convert',
@@ -69,8 +70,11 @@ suite('dist smoke (built package via exports map)', () => {
       'seek',
       'decrypt',
       'preload',
+      'load',
     ] as const) {
-      expect(typeof media[op], `bare-function sugar '${op}' must be exported`).toBe('function');
+      expect(typeof mediaSurface[op], `bare-function sugar '${op}' must be exported`).toBe(
+        'function',
+      );
     }
     // `transcode` is the documented alias of `convert` (ADR-012) — same function identity.
     expect(media.transcode).toBe(media.convert);
@@ -173,6 +177,7 @@ suite('dist smoke (built package via exports map)', () => {
 
   it('a created engine has the full intent-only op surface', () => {
     const engine: MediaEngine = media.createMedia();
+    const engineSurface = engine as unknown as Record<string, unknown>;
     for (const method of [
       'probe',
       'convert',
@@ -185,11 +190,12 @@ suite('dist smoke (built package via exports map)', () => {
       'seek',
       'decrypt',
       'preload',
+      'load',
       'from',
       'source',
       'use',
     ] as const) {
-      expect(typeof engine[method], `engine.${method}`).toBe('function');
+      expect(typeof engineSurface[method], `engine.${method}`).toBe('function');
     }
   });
 

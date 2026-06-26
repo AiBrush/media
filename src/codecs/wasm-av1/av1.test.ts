@@ -154,13 +154,14 @@ describe('4:2:0 plane layout', () => {
 
 describe('normalizeAv1DecoderConfig', () => {
   it('carries parsed codec facts, coded dimensions, and description bytes', () => {
-    const description = Uint8Array.of(0x81, 0x00, 0x0c, 0x00);
+    const description = Uint8Array.of(0xff, 0x81, 0x00, 0x0c, 0x00, 0xee);
     const init = normalizeAv1DecoderConfig({
       codec: 'av01.0.00M.08',
       codedWidth: 320,
       codedHeight: 240,
-      description,
+      description: description.subarray(1, 5),
     });
+    description[1] = 0x00;
     expect(init).toMatchObject({
       codec: 'av1',
       profile: 0,
@@ -170,7 +171,7 @@ describe('normalizeAv1DecoderConfig', () => {
       codedWidth: 320,
       codedHeight: 240,
     });
-    expect([...(init.description ?? [])]).toEqual([...description]);
+    expect([...(init.description ?? [])]).toEqual([0x81, 0x00, 0x0c, 0x00]);
   });
 
   it('omits invalid optional dimensions without writing undefined keys', () => {
@@ -241,7 +242,14 @@ describe('wasm-av1 driver identity and honest absence', () => {
 
   it('does not find or load a dav1d core when artifacts are absent', async () => {
     expect(await probeAv1Core()).toBe(false);
-    expect(await loadAv1Core()).toBeNull();
+    await expect(
+      loadAv1Core({
+        kind: 'baseline',
+        simd: false,
+        threads: false,
+        sharedArrayBuffer: false,
+      }),
+    ).resolves.toBeNull();
   });
 
   it('supports() returns false in Node before any core load', async () => {

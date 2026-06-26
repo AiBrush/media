@@ -24,13 +24,14 @@ import type {
   FilterDriver,
   FilterSpec,
   Muxer,
+  Packet,
   PcmTransform,
   StageOptions,
   StreamCopyOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
+import { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/audio-data.ts';
 import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
@@ -42,6 +43,7 @@ import {
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
+import { createMediaChain } from './chain.ts';
 import {
   audioFilterSpecs,
   audioTrackInfoFromDecoderConfig,
@@ -64,11 +66,13 @@ import type {
   AudioTarget,
   CallOptions,
   Cancellable,
+  Container,
   ConvertOptions,
   CreateMediaOptions,
   DecryptOptions,
   Demuxed,
   EncodeOptions,
+  MediaChain,
   MediaInfo,
   MediaInfoTrack,
   MediaStreams,
@@ -94,6 +98,7 @@ const CONTAINER_MIME: Record<string, string> = {
   aiff: 'audio/aiff',
   caf: 'audio/x-caf',
   avi: 'video/x-msvideo',
+  ts: 'video/mp2t',
 };
 const PCM_AUDIO_DATA_CHUNK_FRAMES = 4096;
 
@@ -111,6 +116,8 @@ export interface MediaEngine {
   seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame>;
   decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Cancellable<Output>;
   preload(...specs: PreloadSpec[]): Promise<void>;
+  /** Start an immutable fluent chain over the flat operation API (ADR-010). */
+  load(input: MediaInput): MediaChain;
   /** The universal normalizer, exported for optioned sources (ADR-013). */
   from(input: MediaInput, opts?: FromOptions): Source;
   source(input: MediaInput): Source;
@@ -119,11 +126,13 @@ export interface MediaEngine {
 }
 
 const HEAD_BYTES = 64 * 1024;
+const INVALID_MUX_PACKET_STREAM = 'invalid mux packet stream';
 
 export class MediaEngineImpl implements MediaEngine {
   readonly #opts: CreateMediaOptions;
   readonly #registry = new Registry();
   readonly #router = new Router({ registry: this.#registry });
+  readonly #preloadTasks = new Map<string, Promise<void>>();
   #defaultsLoaded = false;
 
   constructor(opts: CreateMediaOptions = {}) {
@@ -151,6 +160,10 @@ export class MediaEngineImpl implements MediaEngine {
 
   source(input: MediaInput): Source {
     return normalizeInput(input);
+  }
+
+  load(input: MediaInput): MediaChain {
+    return createMediaChain(this, input);
   }
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
@@ -251,13 +264,6 @@ export class MediaEngineImpl implements MediaEngine {
 
   trim(input: MediaInput, opts: TrimOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      if (opts.mode === 'accurate') {
-        throw new CapabilityError(
-          'capability-miss',
-          'frame-accurate trim requires the decode/encode seam (browser codec layer)',
-          { op: 'trim', tried: [] },
-        );
-      }
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       // Validate the requested range against the media's real duration BEFORE any cut, so a malformed
@@ -266,7 +272,19 @@ export class MediaEngineImpl implements MediaEngine {
       // same way `probe` does — demux once, take the longest track — then the demuxer is released.
       const durationSec = await this.#probeDurationSec(container, src, signal, o);
       assertTrimRange(opts.start, opts.end, durationSec);
-      const target = container.formats[0] ?? 'mp4';
+      const target = (container.formats[0] ?? 'mp4') as Container;
+      if (opts.mode === 'accurate') {
+        const stream = await this.#trimViaCodec(
+          container,
+          src,
+          target,
+          opts,
+          durationSec,
+          signal,
+          o,
+        );
+        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      }
       const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
         ...this.#stageOptions(signal, o),
         trim: { startSec: opts.start, endSec: opts.end },
@@ -392,7 +410,41 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   mux(streams: PacketStreams, opts: MuxSpec, o: CallOptions = {}): Cancellable<Output> {
-    return this.#withCancel(o, () => this.#codecUnavailable('mux', streams, opts));
+    return this.#withCancel(o, async (signal) => {
+      const target = opts.container;
+      if (!containerHasChunkMuxer(target)) {
+        throw new CapabilityError('capability-miss', `mux to '${target}' has no chunk muxer`, {
+          op: 'mux',
+          tried: [target],
+        });
+      }
+
+      let inputs: MuxPacketStream[];
+      try {
+        inputs = muxPacketStreams(streams);
+      } catch (e) {
+        await Promise.all(readablePacketStreams(streams).map((stream) => cancelStream(stream)));
+        throw e;
+      }
+
+      const openStreams = inputs.map((input) => input.packets as ReadableStream<unknown>);
+      let drainsStarted = false;
+      try {
+        const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+        const tasks = inputs.map((input) =>
+          drainEncoderToMuxer(input.packets, muxer, () => input.track),
+        );
+        drainsStarted = true;
+        await allOrCancelStreams(tasks, openStreams);
+        await muxer.finalize();
+        return materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+      } catch (e) {
+        if (!drainsStarted) {
+          await Promise.all(openStreams.map((stream) => cancelStream(stream)));
+        }
+        throw e;
+      }
+    });
   }
 
   decrypt(input: MediaInput, opts: DecryptOptions, o: CallOptions = {}): Cancellable<Output> {
@@ -431,9 +483,24 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   async preload(...specs: PreloadSpec[]): Promise<void> {
-    // Idempotent, never throws (ADR / doc 07 §5). Phase 0 has no heavy chunks/wasm to warm yet;
-    // Phase 1 prefetches op/driver chunks, compiles predicted wasm, and warms capability probes.
-    void specs.length;
+    const { runPreload } = await import('./preload.ts');
+    await runPreload(
+      {
+        tasks: this.#preloadTasks,
+        ensureDefaultDrivers: () => this.#ensureDefaultDrivers(),
+        pickContainer: (q) => {
+          this.#router.pickContainer(q);
+        },
+        pickCodec: async (q) => {
+          await this.#router.pickCodec(q, { determinism: this.#opts.determinism ?? 'auto' });
+        },
+        pickFilter: (filter) => {
+          this.#router.pickFilter(filter, { determinism: this.#opts.determinism ?? 'auto' });
+        },
+        ...(this.#opts.onLog !== undefined ? { onLog: this.#opts.onLog } : {}),
+      },
+      specs,
+    );
   }
 
   // ── Internals ───────────────────────────────────────────────────────────────────────────────
@@ -666,6 +733,103 @@ export class MediaEngineImpl implements MediaEngine {
       await demuxer.close();
     }
     /* v8 ignore stop */
+  }
+
+  /**
+   * Accurate trim: decode from a safe video keyframe preroll (audio from the head), keep decoded frames
+   * whose presentation timestamp lands in the requested window, rebase the first kept frame to t=0, then
+   * re-encode and mux. This is the browser codec seam; Node reaches the typed codec miss before packets
+   * are consumed. Frame lifetime is owned by `trimTimedFrameStream` (skipped/input frames) and the encoder
+   * stages (emitted frames).
+   */
+  async #trimViaCodec(
+    container: ContainerDriver,
+    src: Source,
+    target: Container,
+    opts: TrimOptions,
+    durationSec: number,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    if (!containerHasChunkMuxer(target)) {
+      throw new CapabilityError(
+        'capability-miss',
+        `accurate trim to '${target}' has no EncodedChunk muxer in this build`,
+        { op: 'trim', tried: [target] },
+      );
+    }
+
+    const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
+    const bounds = trimBoundsUs(opts.start, endSec);
+    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+    const tasks: Promise<void>[] = [];
+    const openStreams: ReadableStream<unknown>[] = [];
+    let drainsStarted = false;
+    try {
+      const videoTrack = demuxer.tracks.find(
+        (t) => t.mediaType === 'video' && t.config !== undefined,
+      );
+      const audioTrack = demuxer.tracks.find(
+        (t) => t.mediaType === 'audio' && t.config !== undefined,
+      );
+
+      if (videoTrack) {
+        assertTrimTrackDecodable(videoTrack);
+        const codec = await this.#routeCodec(decodeQueryFor(videoTrack), o);
+        /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
+        const packets = await startAtSeekKeyframe(
+          unwrapPackets(demuxer.packets(videoTrack.id)),
+          bounds.startUs,
+        );
+        const decoded = packets.pipeThrough(
+          codec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
+        ) as ReadableStream<VideoFrame>;
+        const trimmed = trimTimedFrameStream(decoded, bounds, restampVideoFrame);
+        openStreams.push(trimmed);
+        tasks.push(
+          this.#encodeVideoStream(trimmed, {}, trimEncodeTrack(videoTrack), muxer, signal, o),
+        );
+        /* v8 ignore stop */
+      }
+
+      if (audioTrack) {
+        assertTrimTrackDecodable(audioTrack);
+        const codec = await this.#routeCodec(decodeQueryFor(audioTrack), o);
+        /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
+        const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
+          codec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
+        ) as ReadableStream<AudioData>;
+        const trimmed = trimTimedFrameStream(decoded, bounds, restampAudioData);
+        openStreams.push(trimmed);
+        tasks.push(
+          this.#encodeAudioStream(trimmed, {}, trimEncodeTrack(audioTrack), muxer, signal, o),
+        );
+        /* v8 ignore stop */
+      }
+
+      if (tasks.length === 0) {
+        throw new CapabilityError(
+          'capability-miss',
+          'accurate trim found no decodable video or audio track to re-encode',
+          { op: 'trim', tried: [container.id] },
+        );
+      }
+
+      /* v8 ignore start -- reached only after live codec routes resolve; browser-harness validated. */
+      drainsStarted = true;
+      await allOrCancelStreams(tasks, openStreams);
+      await muxer.finalize();
+      return muxer.output;
+      /* v8 ignore stop */
+    } catch (e) {
+      if (!drainsStarted) {
+        await Promise.all(openStreams.map((stream) => cancelStream(stream)));
+      }
+      throw e;
+    } finally {
+      await demuxer.close();
+    }
   }
 
   /**
@@ -953,20 +1117,6 @@ export class MediaEngineImpl implements MediaEngine {
     return container.streamCopy(src, { ...opts, container: target });
   }
 
-  #codecUnavailable(op: string, input: unknown, opts: unknown): Promise<never> {
-    if (typeof input !== 'object' && typeof input !== 'string') {
-      return Promise.reject(new InputError('unsupported-input', `invalid input for ${op}`));
-    }
-    void opts;
-    return Promise.reject(
-      new CapabilityError(
-        'capability-miss',
-        `${op} requires codec/filter/crypto drivers that are not registered in this build`,
-        { op, tried: [] },
-      ),
-    );
-  }
-
   #withCancel<T>(o: CallOptions, exec: (signal: AbortSignal) => Promise<T>): Cancellable<T> {
     const ctrl = new AbortController();
     const caller = o.signal;
@@ -984,6 +1134,44 @@ export class MediaEngineImpl implements MediaEngine {
 
 /** The raw-frame type for a media type: `VideoFrame` for video, `AudioData` for audio. */
 type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
+type PacketStreamSlot = 'video' | 'audio';
+
+interface MuxPacketStream {
+  readonly track: TrackInfo;
+  readonly packets: ReadableStream<EncodedChunk | Packet>;
+}
+
+interface MuxPacketDescriptorRecord {
+  readonly track?: unknown;
+  readonly packets?: unknown;
+}
+
+interface ReadableStreamLikeRecord {
+  readonly getReader?: unknown;
+}
+
+interface TrackInfoLikeRecord {
+  readonly id?: unknown;
+  readonly mediaType?: unknown;
+  readonly codec?: unknown;
+}
+
+interface TrimBoundsUs {
+  readonly startUs: number;
+  readonly endUs: number;
+}
+
+export interface TimedFrameForTrim {
+  readonly timestamp: number;
+  readonly duration?: number | null;
+  close(): void;
+}
+
+type RestampFrame<T extends TimedFrameForTrim> = (
+  frame: T,
+  timestamp: number,
+  duration: number | null,
+) => T;
 
 interface ImageDecodeRoute {
   readonly ops: ImageOps;
@@ -991,6 +1179,127 @@ interface ImageDecodeRoute {
 }
 
 type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
+
+const MICROS_PER_SECOND = 1_000_000;
+
+function trimBoundsUs(startSec: number, endSec: number): TrimBoundsUs {
+  return {
+    startUs: Math.round(startSec * MICROS_PER_SECOND),
+    endUs: Math.round(endSec * MICROS_PER_SECOND),
+  };
+}
+
+function assertTrimTrackDecodable(track: TrackInfo): void {
+  if (track.encrypted !== true) return;
+  throw new MediaError(
+    'decode-error',
+    `accurate trim cannot decode a protected ${track.mediaType} track before decrypt() emits clear samples`,
+  );
+}
+
+function trimEncodeTrack(track: TrackInfo): TrackInfo {
+  const { durationSec: _durationSec, ...rest } = track;
+  return rest;
+}
+
+/* v8 ignore start -- browser-only restamp constructors; trimTimedFrameStream is Node-tested below. */
+function restampVideoFrame(
+  frame: VideoFrame,
+  timestamp: number,
+  duration: number | null,
+): VideoFrame {
+  if (frame.timestamp === timestamp && frame.duration === duration) return frame;
+  const init: VideoFrameInit = duration === null ? { timestamp } : { timestamp, duration };
+  return new VideoFrame(frame, init);
+}
+
+function restampAudioData(
+  frame: AudioData,
+  timestamp: number,
+  _duration: number | null,
+): AudioData {
+  if (frame.timestamp === timestamp) return frame;
+  const { init } = pcmToPlanarInit(audioDataToPcm(frame), timestamp);
+  return new AudioData(init);
+}
+/* v8 ignore stop */
+
+/**
+ * Keep decoded frames whose presentation timestamp is inside `[startUs, endUs)`, close every skipped
+ * source frame immediately, stop/cancel upstream at the first frame on/after `endUs`, and rebase the first
+ * kept frame to timestamp 0. `restamp` must return either the original frame (when timing is unchanged) or
+ * a new frame; this helper closes the original when a replacement is emitted, while downstream owns the
+ * returned frame.
+ */
+export function trimTimedFrameStream<T extends TimedFrameForTrim>(
+  frames: ReadableStream<T>,
+  bounds: TrimBoundsUs,
+  restamp: RestampFrame<T>,
+): ReadableStream<T> {
+  const reader = frames.getReader();
+  let released = false;
+  let anchorUs: number | undefined;
+
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
+  const cancelReader = async (reason?: unknown): Promise<void> => {
+    if (released) return;
+    released = true;
+    try {
+      await reader.cancel(reason);
+    } finally {
+      reader.releaseLock();
+    }
+  };
+
+  return new ReadableStream<T>({
+    async pull(controller): Promise<void> {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          release();
+          controller.close();
+          return;
+        }
+        const frame = value;
+        if (frame.timestamp < bounds.startUs) {
+          frame.close();
+          continue;
+        }
+        if (frame.timestamp >= bounds.endUs) {
+          frame.close();
+          await cancelReader();
+          controller.close();
+          return;
+        }
+        anchorUs ??= frame.timestamp;
+        const duration = frame.duration ?? null;
+        let out: T;
+        try {
+          out = restamp(frame, frame.timestamp - anchorUs, duration);
+        } catch (e) {
+          frame.close();
+          await cancelReader(e);
+          throw e;
+        }
+        if (out !== frame) frame.close();
+        try {
+          controller.enqueue(out);
+        } catch (e) {
+          out.close();
+          throw e;
+        }
+        return;
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await cancelReader(reason);
+    },
+  });
+}
 
 function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
   let promise: Promise<T> | undefined;
@@ -1114,6 +1423,78 @@ function assertPcmAudioDataAvailable(label: string): void {
       tried: [label],
       suggestion: 'run decode() in a browser or worker where WebCodecs AudioData exists',
     },
+  );
+}
+
+function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {
+  const out: MuxPacketStream[] = [];
+  appendMuxPacketStream(out, 'video', streams.video);
+  appendMuxPacketStream(out, 'audio', streams.audio);
+  if (out.length === 0) {
+    throw new InputError('unsupported-input', 'mux received no packet streams');
+  }
+  return out;
+}
+
+function appendMuxPacketStream(
+  out: MuxPacketStream[],
+  slot: PacketStreamSlot,
+  input: unknown,
+): void {
+  if (input === undefined) return;
+  if (isReadableStreamLike(input) || !isObject(input)) throw invalidMuxPacketStream();
+  const descriptor = input as MuxPacketDescriptorRecord;
+  const track = descriptor.track;
+  const packets = descriptor.packets;
+  if (
+    !isTrackInfoLike(track) ||
+    track.mediaType !== slot ||
+    track.config === undefined ||
+    !isReadableStreamLike(packets)
+  )
+    throw invalidMuxPacketStream();
+  out.push({ track, packets: packets as ReadableStream<EncodedChunk | Packet> });
+}
+
+function invalidMuxPacketStream(): InputError {
+  return new InputError('unsupported-input', INVALID_MUX_PACKET_STREAM);
+}
+
+function readablePacketStreams(streams: PacketStreams): ReadableStream<unknown>[] {
+  const out: ReadableStream<unknown>[] = [];
+  collectReadablePacketStream(out, streams.video);
+  collectReadablePacketStream(out, streams.audio);
+  return out;
+}
+
+function collectReadablePacketStream(out: ReadableStream<unknown>[], input: unknown): void {
+  if (isReadableStreamLike(input)) {
+    out.push(input);
+    return;
+  }
+  if (!isObject(input)) return;
+  const packets = (input as MuxPacketDescriptorRecord).packets;
+  if (isReadableStreamLike(packets)) out.push(packets);
+}
+
+function isObject(value: unknown): value is object {
+  return typeof value === 'object' && value !== null;
+}
+
+function isReadableStreamLike(value: unknown): value is ReadableStream<unknown> {
+  if (!isObject(value)) return false;
+  const stream = value as ReadableStreamLikeRecord;
+  return typeof stream.getReader === 'function';
+}
+
+function isTrackInfoLike(value: unknown): value is TrackInfo {
+  if (!isObject(value)) return false;
+  const track = value as TrackInfoLikeRecord;
+  const { id, mediaType, codec } = track;
+  return (
+    typeof id === 'number' &&
+    (mediaType === 'video' || mediaType === 'audio') &&
+    typeof codec === 'string'
   );
 }
 

@@ -1,0 +1,38 @@
+{
+  "generatedAt": "2026-06-26T12:38:02.400Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 5,
+  "iters": 51,
+  "ops": [
+    {
+      "op": "chain convert blob",
+      "wallMs": 0.017667,
+      "chainsPerSec": 56602.70560932813,
+      "peakMemoryMb": 0.4375
+    },
+    {
+      "op": "chain trim+resize+convert blob",
+      "wallMs": 0.011166,
+      "chainsPerSec": 89557.58552749419,
+      "peakMemoryMb": 0.390625
+    },
+    {
+      "op": "chain file+stream terminals",
+      "wallMs": 0.02225,
+      "chainsPerSec": 44943.8202247191,
+      "peakMemoryMb": 0.703125
+    },
+    {
+      "op": "chain empty typed reject",
+      "wallMs": 0.006042,
+      "chainsPerSec": 165508.10989738497,
+      "peakMemoryMb": 0.03125
+    }
+  ],
+  "aggregate": {
+    "ops": 4,
+    "geomeanChainsPerSec": 78362.30602234941,
+    "minChainsPerSec": 44943.8202247191,
+    "maxPeakMemoryMb": 0.703125
+  }
+}

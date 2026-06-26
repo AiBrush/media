@@ -223,9 +223,9 @@ export interface Av1DecoderInit extends Av1CodecInfo {
 
 /** Read-only byte view over a WebCodecs description. */
 function bufferSourceBytes(src: AllowSharedBufferSource): Uint8Array {
-  if (src instanceof ArrayBuffer) return new Uint8Array(src);
+  if (src instanceof ArrayBuffer) return new Uint8Array(src).slice();
   const view = src as ArrayBufferView;
-  return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  return new Uint8Array(view.buffer, view.byteOffset, view.byteLength).slice();
 }
 
 /** Validate and normalize a `VideoDecoderConfig` for the dav1d core. */

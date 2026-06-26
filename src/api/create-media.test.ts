@@ -4,9 +4,13 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { NoopDriverModule } from '../conformance/noop-driver.ts';
 import {
+  type CodecDriver,
   type ContainerDriver,
   DRIVER_API_VERSION,
   type DriverModule,
+  type EncodedChunk,
+  type FilterDriver,
+  type RawFrame,
   type TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
@@ -51,6 +55,110 @@ function tracksModule(): DriverModule {
   return { apiVersion: DRIVER_API_VERSION, register: (reg) => reg.addContainer(driver) };
 }
 
+interface WarmupProbeCounts {
+  container: number;
+  codec: number;
+  filter: number;
+}
+
+function warmableModule(counts: WarmupProbeCounts): DriverModule {
+  const container: ContainerDriver = {
+    id: 'warm-container',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['warm'],
+    supports: (q) => {
+      counts.container++;
+      return q.extension === 'warm' || q.mime === 'application/x-warm';
+    },
+    demux: () =>
+      Promise.resolve({
+        tracks: [],
+        packets: () => new ReadableStream({ start: (c) => c.close() }),
+        close: () => Promise.resolve(),
+      }),
+    createMuxer: () => {
+      let nextTrack = 0;
+      return {
+        output: new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+        addTrack: () => nextTrack++,
+        write: () => Promise.resolve(),
+        finalize: () => Promise.resolve(),
+      };
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'warm-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: (q) => {
+      counts.codec++;
+      return Promise.resolve({ supported: q.config.codec === 'warm' });
+    },
+    createDecoder: () => new TransformStream<EncodedChunk, RawFrame>(),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  const filter: FilterDriver = {
+    id: 'warm-filter',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'filter',
+    substrate: 'wasm',
+    supports: (f) => {
+      counts.filter++;
+      return f.mediaType === 'audio' && f.type === 'gain';
+    },
+    createFilter: () => new TransformStream<AudioData, AudioData>(),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(reg): void {
+      reg.addContainer(container);
+      reg.addCodec(codec);
+      reg.addFilter(filter);
+    },
+  };
+}
+
+function throwingWarmupModule(): DriverModule {
+  const container: ContainerDriver = {
+    id: 'throw-container',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['throw'],
+    supports: () => {
+      throw new Error('container probe boom');
+    },
+    demux: () =>
+      Promise.resolve({
+        tracks: [],
+        packets: () => new ReadableStream({ start: (c) => c.close() }),
+        close: () => Promise.resolve(),
+      }),
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'throw-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: () => {
+      throw new Error('codec probe boom');
+    },
+    createDecoder: () => new TransformStream<EncodedChunk, RawFrame>(),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(reg): void {
+      reg.addContainer(container);
+      reg.addCodec(codec);
+    },
+  };
+}
+
 const NOOP_BYTES = fromBytes(new Uint8Array([1, 2, 3, 4]), { mime: 'application/x-noop' });
 const IMG = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media-derived/img');
 const loadImage = (name: string): Uint8Array => Uint8Array.from(readFileSync(resolve(IMG, name)));
@@ -85,6 +193,7 @@ describe('createMedia', () => {
       'mux',
       'decrypt',
       'preload',
+      'load',
       'from',
       'source',
       'use',
@@ -187,7 +296,7 @@ describe('createMedia', () => {
   it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {
     // With no driver matching the NOOP container (and WebCodecs absent in Node), each op must surface a
     // typed CapabilityError. `convert`/`remux`/`trim`/`decrypt` reject at the container route;
-    // `encode`/`mux` reject building the output; `decode` returns frame streams synchronously (its
+    // `decode` returns frame streams synchronously (its
     // contract) whose rejection surfaces when the stream is first pulled (the demux/codec route runs lazily).
     const media = createMedia();
     await expect(media.convert(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
@@ -195,11 +304,11 @@ describe('createMedia', () => {
     await expect(media.trim(NOOP_BYTES, { start: 0, end: 1 })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    await expect(media.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
+    await expect(media.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(InputError);
     await expect(media.decrypt(NOOP_BYTES, { scheme: 'cenc', keys: {} })).rejects.toBeInstanceOf(
       CapabilityError,
     );
-    // `encode` with no frame streams is an input error (nothing to encode); with a stream it would route a codec.
+    // `encode`/`mux` with no streams are input errors (nothing to encode/mux).
     await expect(media.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
     await expect(readFirst(media.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
   });
@@ -280,6 +389,49 @@ describe('createMedia', () => {
       createMedia().preload('probe', { op: 'convert', container: 'mp4' }),
     ).resolves.toBeUndefined();
   });
+
+  it('preload warms registered container, codec, and filter capability probes once', async () => {
+    const counts = { container: 0, codec: 0, filter: 0 };
+    const media = createMedia().use(warmableModule(counts));
+
+    await expect(
+      media.preload({
+        op: 'convert',
+        container: 'warm',
+        video: 'warm',
+        audio: 'warm',
+        level: 'ready',
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(counts.container).toBeGreaterThan(0);
+    expect(counts.codec).toBeGreaterThan(0);
+    expect(counts.filter).toBeGreaterThan(0);
+    const afterFirst = { ...counts };
+
+    await expect(
+      media.preload({
+        op: 'convert',
+        container: 'warm',
+        video: 'warm',
+        audio: 'warm',
+        level: 'ready',
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(counts).toEqual(afterFirst);
+  });
+
+  it('preload swallows warmup probe failures from drivers', async () => {
+    await expect(
+      createMedia().use(throwingWarmupModule()).preload({
+        op: 'convert',
+        container: 'throw',
+        video: 'throw',
+        level: 'ready',
+      }),
+    ).resolves.toBeUndefined();
+  });
 });
 
 describe('bare-function sugar', () => {
@@ -293,11 +445,12 @@ describe('bare-function sugar', () => {
       CapabilityError,
     );
     await expect(sugar.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
-    await expect(sugar.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
+    await expect(sugar.mux({}, { container: 'mp4' })).rejects.toBeInstanceOf(InputError);
     await expect(sugar.decrypt(NOOP_BYTES, { scheme: 'cenc', keys: {} })).rejects.toBeInstanceOf(
       CapabilityError,
     );
     await expect(readFirst(sugar.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.preload('probe')).resolves.toBeUndefined();
+    expect(typeof sugar.load(NOOP_BYTES).convert).toBe('function');
   });
 });

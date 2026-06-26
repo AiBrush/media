@@ -12,4 +12,11 @@ describe('registerDefaultDrivers', () => {
       'png',
     );
   });
+
+  it('keeps core-less video wasm scaffolds out of zero-config defaults', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+
+    expect(reg.codecs().map((d) => d.id)).not.toContain('wasm-av1');
+  });
 });

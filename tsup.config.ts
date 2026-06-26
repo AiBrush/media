@@ -17,10 +17,9 @@ import { defineConfig } from 'tsup';
  * sourcemaps stay readable. No CJS is emitted: CJS would break `import()` code-splitting and the
  * `new URL(..., import.meta.url)` same-origin WASM/worker assets.
  *
- * `keepNames` is REQUIRED with `minify`: the typed-error model (ADR-017, doc 07 §6) sets
- * `this.name = new.target.name` so `MediaError`/`CapabilityError`/`InputError` print and read naturally;
- * bare minification renames the classes (→ `o`), corrupting that public `.name` contract. `keepNames`
- * preserves function/class `.name` (a tiny `__name` helper) at a few hundred bytes — well inside budget.
+ * Typed errors stamp their public `.name` strings explicitly in `src/contracts/errors.ts`; do NOT enable
+ * esbuild `keepNames` here. Keeping every helper/class name injects name-preservation code throughout the
+ * eager kernel and can push the default entry over the hard 50 kB DoD budget without adding behavior.
  */
 export default defineConfig({
   entry: ['src/index.ts', 'src/core.ts', 'src/image.ts'],
@@ -34,8 +33,4 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   outDir: 'dist',
-  esbuildOptions(options) {
-    // Preserve class/function .name under minify (see header) — the typed-error DX depends on it.
-    options.keepNames = true;
-  },
 });

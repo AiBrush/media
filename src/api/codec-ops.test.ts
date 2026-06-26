@@ -11,6 +11,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import type { EncodedChunk, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
@@ -21,6 +22,7 @@ import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
+import type { PacketStreams } from './types.ts';
 
 /** Real, stream-copyable MP4s (h264 + aac), ≥3 distinct files of varied duration/tracks. */
 const MP4_FIXTURES = ['movie_5.mp4', 'test.mp4', 'h264.mp4'] as const;
@@ -335,6 +337,123 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
         media().remux(await fixtureSource('movie_5.mp4'), { to }),
       ).rejects.toBeInstanceOf(CapabilityError);
     }
+  });
+});
+
+describe('mux — caller packet streams (public packet seam)', () => {
+  const videoTrack: TrackInfo = {
+    id: 1,
+    mediaType: 'video',
+    codec: 'h264',
+    config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+  };
+
+  function trackOf(
+    tracks: readonly TrackInfo[],
+    mediaType: 'video' | 'audio',
+  ): TrackInfo | undefined {
+    return tracks.find((track) => track.mediaType === mediaType && track.config !== undefined);
+  }
+
+  function cancellablePacketStream(onCancel: () => void): ReadableStream<EncodedChunk> {
+    return new ReadableStream<EncodedChunk>({
+      cancel(): void {
+        onCancel();
+      },
+    });
+  }
+
+  it('muxes caller-supplied demux packets into MPEG-TS without re-encoding', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      for (const id of [
+        'h264.mp4',
+        'movie_5.mp4',
+        'test.mp4',
+        'bear-1280x720.mp4',
+        'obs-remux-variable-aac.mp4',
+      ] as const) {
+        const input = await loadFixture(id);
+        const demuxed = await media().demux(await fixtureSource(id));
+        try {
+          const video = trackOf(demuxed.tracks, 'video');
+          const audio = trackOf(demuxed.tracks, 'audio');
+          const streams: PacketStreams = {
+            ...(video ? { video: { track: video, packets: demuxed.packets(video.id) } } : {}),
+            ...(audio ? { audio: { track: audio, packets: demuxed.packets(audio.id) } } : {}),
+          };
+
+          const out = await outputBytes(await media().mux(streams, { container: 'ts' }));
+          expect(out.byteLength).toBeGreaterThan(0);
+          expect(out.byteLength % 188).toBe(0);
+          expect(
+            out.byteLength === input.byteLength && out.every((b, index) => b === input[index]),
+          ).toBe(false);
+
+          const parsed = parseTs(out);
+          expect(parsed.tracks.find((track) => track.stream.codec === 'h264')).toBeDefined();
+          if (audio !== undefined) {
+            expect(parsed.tracks.find((track) => track.stream.codec === 'aac')).toBeDefined();
+          }
+          for (const track of parsed.tracks) {
+            expect(track.units.length).toBeGreaterThan(0);
+          }
+        } finally {
+          await demuxed.close();
+        }
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects bare packet streams because mux needs TrackInfo, and cancels the unread stream', async () => {
+    let cancelled = false;
+    const bare = new ReadableStream<EncodedChunk>({
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    await expect(
+      media().mux({ video: bare } as never, { container: 'mp4' }),
+    ).rejects.toBeInstanceOf(InputError);
+    expect(cancelled).toBe(true);
+  });
+
+  it('rejects malformed packet descriptors before muxing and cancels unread packet streams', async () => {
+    let cancelled = 0;
+    const packetStream = (): ReadableStream<EncodedChunk> =>
+      cancellablePacketStream(() => {
+        cancelled++;
+      });
+    const invalidTrack = { id: 'bad', mediaType: 'video', codec: 'h264' };
+    const audioInVideoSlot: TrackInfo = {
+      id: 2,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+    };
+    const configlessVideo: TrackInfo = { id: 3, mediaType: 'video', codec: 'h264' };
+
+    for (const streams of [
+      { video: 7 as never },
+      { video: { track: invalidTrack, packets: packetStream() } as never },
+      { video: { track: audioInVideoSlot, packets: packetStream() } },
+      { video: { track: configlessVideo, packets: packetStream() } },
+      { video: { track: videoTrack } as never },
+    ] satisfies readonly PacketStreams[]) {
+      await expect(media().mux(streams, { container: 'mp4' })).rejects.toBeInstanceOf(InputError);
+    }
+    expect(cancelled).toBe(3);
+  });
+
+  it('rejects non-chunk-muxable targets before consuming packet streams', async () => {
+    await expect(
+      media().mux(
+        { video: { track: videoTrack, packets: cancellablePacketStream(() => {}) } },
+        { container: 'mp3' },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityError);
   });
 });
 

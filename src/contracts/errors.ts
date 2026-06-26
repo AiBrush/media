@@ -19,8 +19,8 @@ export type MediaErrorCode =
 
 /**
  * Base class for every error the engine raises. Carries a machine-readable {@link MediaErrorCode} and
- * an optional structured `detail`. The concrete subclass name is reflected onto `name` so logs and
- * `instanceof` both read naturally.
+ * an optional structured `detail`. Concrete subclasses stamp their public names explicitly so minified
+ * builds keep logs and `instanceof` readable without preserving every internal helper function name.
  */
 export class MediaError extends Error {
   constructor(
@@ -29,8 +29,7 @@ export class MediaError extends Error {
     readonly detail?: unknown,
   ) {
     super(message);
-    // `new.target.name` yields the actual constructed subclass ('MediaError' | 'CapabilityError' | …).
-    this.name = new.target.name;
+    this.name = 'MediaError';
   }
 }
 
@@ -48,7 +47,17 @@ export interface CapabilityErrorDetail {
  * No eligible driver exists for an operation in this environment (code `capability-miss`). `detail`
  * carries {@link CapabilityErrorDetail} naming what was tried and how to enable it (ADR-017).
  */
-export class CapabilityError extends MediaError {}
+export class CapabilityError extends MediaError {
+  constructor(code: MediaErrorCode, message: string, detail?: unknown) {
+    super(code, message, detail);
+    this.name = 'CapabilityError';
+  }
+}
 
 /** The source bytes are garbled, empty, or of an unknown/unsupported kind (code `unsupported-input`). */
-export class InputError extends MediaError {}
+export class InputError extends MediaError {
+  constructor(code: MediaErrorCode, message: string, detail?: unknown) {
+    super(code, message, detail);
+    this.name = 'InputError';
+  }
+}

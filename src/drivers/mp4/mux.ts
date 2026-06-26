@@ -610,11 +610,21 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
   };
-  // Config box: AVC/AAC synthesize from `description`; other codecs carry it as their raw box.
-  if (prepared.description === undefined) return base;
   if (t.config.kind === 'raw-box') {
+    if (prepared.description === undefined) {
+      throw new CapabilityError(
+        'capability-miss',
+        `${t.sampleEntryType} MP4 muxing requires ${t.config.boxType} description`,
+        {
+          op: { op: 'mux', mediaType: t.mediaType, codec: t.sampleEntryType },
+          tried: ['mp4'],
+        },
+      );
+    }
     return { ...base, codecPrivate: { boxType: t.config.boxType, data: prepared.description } };
   }
+  // Config box: AVC/AAC synthesize from `description`; other codecs carry it as their raw box.
+  if (prepared.description === undefined) return base;
   return { ...base, description: prepared.description };
 }
 
