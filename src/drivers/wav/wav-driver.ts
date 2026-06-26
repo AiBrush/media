@@ -20,7 +20,8 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { readWavPcm, writeWav } from './pcm.ts';
+import { writePcmContainer } from '../pcm-output.ts';
+import { readWavPcm } from './pcm.ts';
 
 const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
 const WAV_EXTENSIONS = new Set(['wav', 'wave']);
@@ -182,10 +183,16 @@ export const WavDriver: ContainerDriver = {
     if (o?.channels !== undefined && o.channels !== audio.channels)
       audio = remix(audio, o.channels);
     // Rate change last (on the final channel layout): band-limited windowed-sinc resampler (ADR-022
-    // tail, pure-TS — no longer a CapabilityError). Sample-format is still preserved by writeWav.
+    // tail, pure-TS — no longer a CapabilityError). Sample-format is preserved unless the caller
+    // explicitly requested a PCM target codec such as `pcm-s16`.
     if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
       audio = resample(audio, o.sampleRate);
-    const out = writeWav(audio, wav.format); // source sample-FORMAT preserved; rate may change via resample
+    const out = writePcmContainer(
+      audio,
+      o?.container ?? 'wav',
+      o?.sampleFormat ?? wav.format,
+      o?.endian ?? 'le',
+    );
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(out);

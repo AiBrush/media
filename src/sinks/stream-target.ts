@@ -15,7 +15,7 @@
  * cancellable pull loop for the callback case — both honour `signal` and surface a typed {@link MediaError}.
  */
 
-import { MediaError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import type { ExecuteOptions } from '../kernel/executor.ts';
 import { runToSink } from '../kernel/executor.ts';
 
@@ -46,12 +46,53 @@ export function toStreamTarget(destination: StreamDestination): StreamTarget {
 }
 
 /** Narrow a {@link StreamDestination} to the `WritableStream` arm (vs the callback arm). */
-function isWritableStream(d: StreamDestination): d is WritableStream<Uint8Array> {
+function isWritableStream(d: unknown): d is WritableStream<Uint8Array> {
   // A callback is a function; a WritableStream is an object with a `getWriter` method. Feature-detect
   // rather than `instanceof` so a structurally-compatible writable (or a polyfill) is also accepted.
   return (
-    typeof d !== 'function' && typeof (d as WritableStream<Uint8Array>).getWriter === 'function'
+    typeof d === 'object' &&
+    d !== null &&
+    typeof (d as { getWriter?: unknown }).getWriter === 'function'
   );
+}
+
+function isStreamTargetWriter(d: unknown): d is StreamTargetWriter {
+  return typeof d === 'function';
+}
+
+/** Runtime-validate the descriptor before pulling from the produced byte stream. */
+function streamDestinationOf(target: StreamTarget): StreamDestination {
+  const destination = (target as { readonly destination?: unknown }).destination;
+  if (isStreamTargetWriter(destination) || isWritableStream(destination)) return destination;
+  throw new CapabilityError(
+    'capability-miss',
+    'stream-target destination must be a WritableStream<Uint8Array> or a callback writer',
+    { op: { op: 'stream-target' }, tried: [] },
+  );
+}
+
+function abortedError(): MediaError {
+  return new MediaError('aborted', 'operation aborted');
+}
+
+/** Race one async step against cancellation so a stalled producer/writer cannot pin the op forever. */
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  if (signal.aborted) return Promise.reject(abortedError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortedError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
@@ -72,17 +113,22 @@ async function writeToCallback(
   try {
     for (;;) {
       if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const { done, value } = await reader.read();
+      const { done, value } = await raceAbort(reader.read(), signal);
       if (done) break;
-      await write(value, position);
+      await raceAbort(Promise.resolve(write(value, position)), signal);
       position += value.byteLength;
     }
   } catch (err) {
-    // Best-effort: release upstream; the original error is what we surface.
-    await reader.cancel(err).catch(() => undefined);
+    // Best-effort: release upstream, but never let a stuck cancel hide the primary typed error.
+    void reader.cancel(err).catch(() => undefined);
     throw mapToMediaError(err, signal);
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read can still be unwinding after an abort-race; cancellation above owns cleanup.
+    }
   }
-  reader.releaseLock();
 }
 
 /**
@@ -95,7 +141,7 @@ export async function writeToStreamTarget(
   stream: ReadableStream<Uint8Array>,
   opts: ExecuteOptions = {},
 ): Promise<undefined> {
-  const dest = target.destination;
+  const dest = streamDestinationOf(target);
   if (isWritableStream(dest)) {
     // Native pipe: backpressure + abort are handled by the streams runtime. Tag the stage with
     // `mux-error` so a destination-side write failure surfaces as a typed MediaError (runToSink passes

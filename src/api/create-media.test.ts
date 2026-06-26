@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { NoopDriverModule } from '../conformance/noop-driver.ts';
 import {
@@ -49,6 +52,13 @@ function tracksModule(): DriverModule {
 }
 
 const NOOP_BYTES = fromBytes(new Uint8Array([1, 2, 3, 4]), { mime: 'application/x-noop' });
+const IMG = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media-derived/img');
+const loadImage = (name: string): Uint8Array => Uint8Array.from(readFileSync(resolve(IMG, name)));
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(copy).set(bytes);
+  return copy;
+}
 
 /** Pull the first item from a frame stream (forces a lazy `decode` to run its demux/codec route). */
 async function readFirst<T>(stream: ReadableStream<T> | undefined): Promise<T | undefined> {
@@ -124,6 +134,43 @@ describe('createMedia', () => {
         channels: 2,
       },
     ]);
+  });
+
+  it('probe routes still images through the registered image capability', async () => {
+    const info = await createMedia().probe(
+      fromBytes(loadImage('test.jpeg'), { mime: 'image/jpeg' }),
+    );
+    expect(info).toEqual({
+      container: 'jpeg',
+      durationSec: 0.04,
+      sizeBytes: loadImage('test.jpeg').byteLength,
+      tracks: [
+        {
+          id: 0,
+          type: 'video',
+          codec: 'mjpeg',
+          durationSec: 0.04,
+          width: 239,
+          height: 178,
+          fps: 25,
+        },
+      ],
+    });
+  });
+
+  it('probe lets image magic beat misleading MP4 mime and extension', async () => {
+    const bytes = loadImage('test.jpeg');
+    const info = await createMedia().probe(
+      new File([toArrayBuffer(bytes)], 'still.mp4', { type: 'video/mp4' }),
+    );
+    expect(info.container).toBe('jpeg');
+    expect(info.tracks[0]?.codec).toBe('mjpeg');
+  });
+
+  it('decode exposes images as video frames, with a typed browser-only miss in Node and no audio stream', async () => {
+    const streams = createMedia().decode(fromBytes(loadImage('test.png'), { mime: 'image/png' }));
+    await expect(readFirst(streams.video)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(readFirst(streams.audio)).resolves.toBeUndefined();
   });
 
   it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {

@@ -291,8 +291,15 @@ interface TrackState {
   readonly channels: number;
   readonly sampleRate: number;
   readonly granuleRate: number;
+  readonly durationSec: number | undefined;
   readonly description: Uint8Array | undefined;
   readonly chunks: ChunkStruct[];
+}
+
+function finitePositiveDurationSec(durationSec: number | undefined): number | undefined {
+  return durationSec !== undefined && Number.isFinite(durationSec) && durationSec > 0
+    ? durationSec
+    : undefined;
 }
 
 /** Resolve the codec + audio geometry from a track's {@link TrackInfo}; reject non-Ogg codecs. */
@@ -323,6 +330,7 @@ function trackStateFrom(info: TrackInfo): TrackState {
     channels: ac?.numberOfChannels && ac.numberOfChannels > 0 ? ac.numberOfChannels : 2,
     sampleRate,
     granuleRate: codec === 'opus' ? OPUS_GRANULE_RATE : sampleRate,
+    durationSec: finitePositiveDurationSec(info.durationSec),
     description: ac?.description !== undefined ? toBytes(ac.description) : undefined,
     chunks: [],
   };
@@ -332,6 +340,12 @@ function trackStateFrom(info: TrackInfo): TrackState {
 function samplesFor(chunk: ChunkStruct, fallbackUs: number, granuleRate: number): number {
   const durUs = chunk.durationUs ?? fallbackUs;
   return Math.max(0, Math.round((durUs * granuleRate) / MICROS_PER_SECOND));
+}
+
+function declaredFinalGranule(track: TrackState): number | undefined {
+  return track.durationSec === undefined
+    ? undefined
+    : Math.max(0, Math.round(track.durationSec * track.granuleRate));
 }
 
 /** The median inter-chunk PTS gap (µs), a per-chunk duration estimate when the encoder omitted it. */
@@ -373,10 +387,20 @@ export function writeOgg(track: TrackState, serial = DEFAULT_SERIAL): Uint8Array
   // Audio packets in presentation order with cumulative granule positions.
   const ordered = [...track.chunks].sort((a, b) => a.timestampUs - b.timestampUs);
   const fallbackUs = fallbackGapUs(ordered);
+  const targetFinalGranule = declaredFinalGranule(track);
   const audio: OggPacket[] = [];
   let granule = 0;
-  for (const chunk of ordered) {
-    granule += samplesFor(chunk, fallbackUs, track.granuleRate);
+  for (let i = 0; i < ordered.length; i++) {
+    const chunk = ordered[i];
+    if (chunk === undefined) continue;
+    const previousGranule = granule;
+    const nextGranule = granule + samplesFor(chunk, fallbackUs, track.granuleRate);
+    const canUseDeclaredFinal =
+      i === ordered.length - 1 &&
+      targetFinalGranule !== undefined &&
+      targetFinalGranule >= previousGranule &&
+      targetFinalGranule <= nextGranule;
+    granule = canUseDeclaredFinal ? targetFinalGranule : nextGranule;
     audio.push({ data: chunk.data, granule });
   }
 

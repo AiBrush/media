@@ -238,6 +238,7 @@ function usToMs(us: number): number {
 
 interface TrackChunks {
   trackNumber: number;
+  durationSec?: number;
   chunks: readonly ChunkStruct[];
 }
 
@@ -249,8 +250,10 @@ interface TrackChunks {
  * each `SimpleBlock` carries a PTS timecode (a B-frame source therefore lays blocks down by DTS; for a
  * non-reordered stream DTS == PTS, so this is byte-identical to the old presentation-order layout). Each
  * block independently carries its TrackNumber + absolute PTS, so the demuxer recovers per-track timing
- * regardless. The end time uses each track's last presented chunk's PTS + duration (recovered from the
- * prior gap when the encoder omitted it), so `Duration` reflects real content, never a bare 0.
+ * regardless. The end time uses a source-declared track duration when the demuxer provided one (remux
+ * path: honor the source container's movie/stream duration rather than B-frame or audio-padding tails);
+ * otherwise it falls back to each track's last presented chunk's PTS + duration (recovered from the
+ * prior gap when the encoder omitted it), so newly-encoded streams still get a real non-zero Duration.
  */
 export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   blocks: TimelineBlock[];
@@ -262,7 +265,7 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   if (!Number.isFinite(baseUs)) return { blocks: [], endMs: 0 };
 
   const blocks: TimelineBlock[] = [];
-  let endUs = baseUs;
+  let endMs = 0;
   for (const t of tracks) {
     const sorted = [...t.chunks].sort((a, b) => a.timestampUs - b.timestampUs);
     for (const c of t.chunks) {
@@ -274,15 +277,26 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
         data: c.data,
       });
     }
+    const declaredEndMs = durationSecToMs(t.durationSec);
+    if (declaredEndMs !== undefined) {
+      endMs = Math.max(endMs, declaredEndMs);
+      continue;
+    }
     // Track end = last presented chunk's PTS + its duration (recovered from the prior gap if missing).
     const last = sorted[sorted.length - 1];
     if (last !== undefined) {
       const lastDurUs = last.durationUs ?? lastGapUs(sorted);
-      endUs = Math.max(endUs, last.timestampUs + lastDurUs);
+      endMs = Math.max(endMs, usToMs(last.timestampUs + lastDurUs - baseUs));
     }
   }
   blocks.sort((a, b) => a.dtsMs - b.dtsMs || a.trackNumber - b.trackNumber);
-  return { blocks, endMs: usToMs(endUs - baseUs) };
+  return { blocks, endMs };
+}
+
+function durationSecToMs(durationSec: number | undefined): number | undefined {
+  return durationSec !== undefined && Number.isFinite(durationSec) && durationSec > 0
+    ? durationSec * 1000
+    : undefined;
 }
 
 /** The gap between the last two presented chunks (µs), a duration estimate for the final chunk; 0 if <2. */
@@ -306,6 +320,7 @@ interface TrackState {
   readonly width: number | undefined;
   readonly height: number | undefined;
   readonly fps: number | undefined;
+  readonly durationSec: number | undefined;
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
   readonly chunks: ChunkStruct[];
@@ -335,6 +350,7 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
       width: vc?.codedWidth,
       height: vc?.codedHeight,
       fps: info.fps,
+      durationSec: info.durationSec,
       sampleRate: undefined,
       channels: undefined,
       chunks: [],
@@ -349,6 +365,7 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     width: undefined,
     height: undefined,
     fps: undefined,
+    durationSec: info.durationSec,
     sampleRate: ac?.sampleRate,
     channels: ac?.numberOfChannels,
     chunks: [],
@@ -476,7 +493,12 @@ function clusterElements(blocks: readonly TimelineBlock[]): Uint8Array {
 /** Assemble the full WebM byte stream from finalized tracks (definite sizes throughout). */
 export function writeWebm(tracks: readonly TrackState[], docType: string): Uint8Array {
   const { blocks, endMs } = buildBlockTimeline(
-    tracks.map((t) => ({ trackNumber: t.trackNumber, chunks: t.chunks })),
+    tracks.map((t): TrackChunks => {
+      const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
+      return durationSec !== undefined
+        ? { trackNumber: t.trackNumber, durationSec, chunks: t.chunks }
+        : { trackNumber: t.trackNumber, chunks: t.chunks };
+    }),
   );
   const segment = element(
     EBML_ID.Segment,

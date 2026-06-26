@@ -75,20 +75,22 @@ export function parseAdtsFrame(
   if (offset + 7 > bytes.length) {
     throw new InputError('unsupported-input', 'aac: ADTS frame truncated (header)');
   }
-  const b0 = bytes[offset] ?? 0;
-  const b1 = bytes[offset + 1] ?? 0;
+  const b0 = bytes[offset] as number;
+  const b1 = bytes[offset + 1] as number;
   const sync = (b0 << 4) | (b1 >> 4);
   if (sync !== ADTS_SYNC) {
     throw new InputError('unsupported-input', `aac: lost ADTS sync at byte ${offset}`);
   }
   const protectionAbsent = b1 & 0x01;
-  const b2 = bytes[offset + 2] ?? 0;
+  const b2 = bytes[offset + 2] as number;
   const profile = (b2 >> 6) & 0x03; // 0=Main,1=LC,2=SSR,3=LTP → objectType = profile + 1
   const freqIndex = (b2 >> 2) & 0x0f;
-  const b3 = bytes[offset + 3] ?? 0;
+  const b3 = bytes[offset + 3] as number;
   const channelConfig = ((b2 & 0x01) << 2) | (b3 >> 6);
   const frameLength =
-    ((b3 & 0x03) << 11) | ((bytes[offset + 4] ?? 0) << 3) | ((bytes[offset + 5] ?? 0) >> 5);
+    ((b3 & 0x03) << 11) |
+    ((bytes[offset + 4] as number) << 3) |
+    ((bytes[offset + 5] as number) >> 5);
 
   const sampleRate = sampleRateForIndex(freqIndex);
   if (sampleRate === undefined) {
@@ -148,10 +150,10 @@ export function readAdtsFrames(bytes: Uint8Array): {
 export function skipId3(bytes: Uint8Array): number {
   if (bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
     const size =
-      ((bytes[6] ?? 0) & 0x7f) * 0x200000 +
-      ((bytes[7] ?? 0) & 0x7f) * 0x4000 +
-      ((bytes[8] ?? 0) & 0x7f) * 0x80 +
-      ((bytes[9] ?? 0) & 0x7f);
+      ((bytes[6] as number) & 0x7f) * 0x200000 +
+      ((bytes[7] as number) & 0x7f) * 0x4000 +
+      ((bytes[8] as number) & 0x7f) * 0x80 +
+      ((bytes[9] as number) & 0x7f);
     return 10 + size;
   }
   return 0;
@@ -175,15 +177,17 @@ export interface AscFields {
 export function parseAsc(asc: Uint8Array): AscFields {
   if (asc.length < 2)
     throw new InputError('unsupported-input', 'aac: AudioSpecificConfig too short');
-  const b0 = asc[0] ?? 0;
-  const b1 = asc[1] ?? 0;
+  const b0 = asc[0] as number;
+  const b1 = asc[1] as number;
   const objectType = b0 >> 3;
   const freqIndex = ((b0 & 0x07) << 1) | (b1 >> 7);
   if (freqIndex === 15) {
+    if (asc.length < 5)
+      throw new InputError('unsupported-input', 'aac: explicit-rate ASC too short');
     // Explicit 24-bit rate spanning b1[6:0] | b2 | b3 | b4[7]; channelConfig is the next 4 bits (b4[6:3]).
-    const b2 = asc[2] ?? 0;
-    const b3 = asc[3] ?? 0;
-    const b4 = asc[4] ?? 0;
+    const b2 = asc[2] as number;
+    const b3 = asc[3] as number;
+    const b4 = asc[4] as number;
     const sampleRate = ((b1 & 0x7f) << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7);
     return { objectType, sampleRate, channels: (b4 >> 3) & 0x0f };
   }
@@ -214,9 +218,8 @@ export function deinterleaveF32(
   }
   const planes = Array.from({ length: channels }, () => new Float32Array(frames));
   for (let c = 0; c < channels; c++) {
-    const plane = planes[c];
-    if (plane === undefined) throw new MediaError('decode-error', `aac: missing plane ${c}`);
-    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] ?? 0;
+    const plane = planes[c] as Float32Array;
+    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] as number;
   }
   return planes;
 }

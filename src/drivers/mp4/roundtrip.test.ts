@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import type { ByteSource } from '../../contracts/driver.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
-import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
-import { buildSampleData } from './samples.ts';
+import { Mp4Driver, mp4PacketMetadata, muxTracksFromMovie, readMovie } from './mp4-driver.ts';
+import type { Movie, ParsedTrack } from './parse.ts';
+import { buildSampleData, buildSamples } from './samples.ts';
 import { writeMp4 } from './write.ts';
 
 const ra = (b: Uint8Array) => ({
@@ -22,6 +24,73 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
   for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+function syntheticAudioMovie(sampleSizes: number[], chunkOffsets: number[]): Movie {
+  const track: ParsedTrack = {
+    id: 1,
+    mediaType: 'audio',
+    timescale: 48_000,
+    durationSec: sampleSizes.length / 48_000,
+    codec: 'mp4a.40.2',
+    sampleEntryType: 'mp4a',
+    config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+    sampleRate: 48_000,
+    channels: 2,
+    samples: {
+      timeToSample: [{ count: sampleSizes.length, delta: 1 }],
+      compositionOffsets: [],
+      sampleSizes,
+      sampleToChunk: chunkOffsets.map((_, i) => ({
+        firstChunk: i + 1,
+        samplesPerChunk: 1,
+        descIndex: 1,
+      })),
+      chunkOffsets,
+      syncSamples: [],
+    },
+  };
+  return { brand: 'isom', timescale: 1_000, durationSec: track.durationSec, tracks: [track] };
+}
+
+function syntheticBFrameMovie(): Movie {
+  const track: ParsedTrack = {
+    id: 7,
+    mediaType: 'video',
+    timescale: 1_000,
+    durationSec: 3,
+    codec: 'avc1.64001f',
+    sampleEntryType: 'avc1',
+    config: { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 },
+    width: 16,
+    height: 16,
+    samples: {
+      timeToSample: [{ count: 3, delta: 1_000 }],
+      compositionOffsets: [
+        { count: 1, offset: 2_000 },
+        { count: 2, offset: 0 },
+      ],
+      sampleSizes: [4, 5, 6],
+      sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 3, descIndex: 1 }],
+      chunkOffsets: [100],
+      syncSamples: [1],
+    },
+  };
+  return { brand: 'isom', timescale: 1_000, durationSec: 3, tracks: [track] };
+}
+
+function rangeSource(
+  bytes: Uint8Array,
+  reads: Array<{ offset: number; length: number }>,
+): ByteSource {
+  return {
+    size: bytes.byteLength,
+    stream: () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+    range: (start: number, end: number): Promise<Uint8Array> => {
+      reads.push({ offset: start, length: end - start });
+      return Promise.resolve(bytes.subarray(start, end));
+    },
+  };
 }
 
 describe('MP4 muxer — reference-reimport round-trip on the real corpus', () => {
@@ -64,5 +133,143 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     const once = writeMp4(await muxTracksFromMovie(ra(input), await readMovie(ra(input))));
     const twice = writeMp4(await muxTracksFromMovie(ra(once), await readMovie(ra(once))));
     expect(equalBytes(twice, once)).toBe(true);
+  });
+
+  it('coalesces range reads instead of fetching once per sample', async () => {
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const countingRa = {
+      read: (offset: number, length: number): Promise<Uint8Array> => {
+        reads.push({ offset, length });
+        return Promise.resolve(input.subarray(offset, offset + length));
+      },
+      size: input.byteLength,
+    };
+    const movie = await readMovie(countingRa);
+    const sampleCount = movie.tracks.reduce((n, track) => n + buildSampleData(track).length, 0);
+
+    reads.length = 0;
+    const tracks = await muxTracksFromMovie(countingRa, movie);
+    const copiedSamples = tracks.reduce((n, track) => n + track.samples.length, 0);
+
+    expect(sampleCount).toBeGreaterThan(4);
+    expect(copiedSamples).toBe(sampleCount);
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.length).toBeLessThan(sampleCount);
+    expect(reads.every((r) => r.length <= 8 * 1024 * 1024)).toBe(true);
+  });
+
+  it('rejects short sample-window reads instead of copying truncated payload', async () => {
+    const movie = syntheticAudioMovie([2], [0]);
+    const shortRa = {
+      read: (): Promise<Uint8Array> => Promise.resolve(new Uint8Array([0xff])),
+      size: 2,
+    };
+
+    await expect(muxTracksFromMovie(shortRa, movie)).rejects.toThrow(/short read/);
+  });
+
+  it('exposes packet metadata from sample tables without reading payload bytes', async () => {
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const demuxed = await Mp4Driver.demux(rangeSource(input, reads));
+    const readsAfterMoov = reads.length;
+
+    const table = demuxed.packetTable?.();
+    await demuxed.close();
+
+    expect(table).toBeDefined();
+    expect(table?.length).toBeGreaterThan(0);
+    expect(reads.length).toBe(readsAfterMoov);
+  });
+
+  it('packet metadata matches parsed sample tables, preserving B-frame PTS/DTS offsets', () => {
+    const movie = syntheticBFrameMovie();
+    const table = mp4PacketMetadata(movie, 115);
+    const track = movie.tracks[0];
+    if (!track) {
+      throw new Error('missing track');
+    }
+    const expected = buildSamples(track).map((sample) => ({
+      trackId: 7,
+      sizeBytes: sample.size,
+      ptsUs: sample.ptsUs,
+      dtsUs: sample.dtsUs,
+      durationUs: sample.durationUs,
+      keyframe: sample.keyframe,
+    }));
+
+    expect(table).toEqual(expected);
+    expect(table[0]?.dtsUs).toBe(0);
+    expect(table[0]?.ptsUs).toBe(2_000_000);
+    expect(table[1]?.ptsUs).toBe(1_000_000);
+  });
+
+  it('packet metadata works when the source size is unknown', () => {
+    const table = mp4PacketMetadata(syntheticBFrameMovie());
+
+    expect(table.map((p) => p.sizeBytes)).toEqual([4, 5, 6]);
+    expect(table[0]?.trackId).toBe(7);
+    expect(table[2]?.dtsUs).toBe(2_000_000);
+  });
+
+  it('packet metadata rejects sample tables whose byte ranges escape the source', () => {
+    const movie = syntheticBFrameMovie();
+    expect(() => mp4PacketMetadata(movie, 112)).toThrow(/outside the source/);
+  });
+
+  it('packet metadata rejects impossible ranges even when the source size is unknown', () => {
+    const movie = syntheticAudioMovie([2], [-1]);
+    expect(() => mp4PacketMetadata(movie)).toThrow(/outside the source/);
+  });
+
+  it.each([
+    ['negative sample offset', syntheticAudioMovie([2], [-1])],
+    ['negative sample size', syntheticAudioMovie([-1], [0])],
+  ])('packet metadata rejects %s', (_label, movie) => {
+    expect(() => mp4PacketMetadata(movie, 8)).toThrow(/outside the source/);
+  });
+
+  it('splits range windows when sample gaps are too large to coalesce', async () => {
+    const farOffset = 9 * 1024 * 1024;
+    const reads: Array<{ offset: number; length: number }> = [];
+    const movie = syntheticAudioMovie([2, 3], [0, farOffset]);
+    const countingRa = {
+      read: (offset: number, length: number): Promise<Uint8Array> => {
+        reads.push({ offset, length });
+        return Promise.resolve(new Uint8Array(length));
+      },
+      size: farOffset + 3,
+    };
+
+    const tracks = await muxTracksFromMovie(countingRa, movie);
+
+    expect(tracks[0]?.samples.map((s) => s.data.byteLength)).toEqual([2, 3]);
+    expect(reads).toEqual([
+      { offset: 0, length: 2 },
+      { offset: farOffset, length: 3 },
+    ]);
+  });
+
+  it('splits range windows when the merged span would exceed the cap', async () => {
+    const firstSize = 8 * 1024 * 1024 - 16;
+    const secondOffset = firstSize + 1;
+    const reads: Array<{ offset: number; length: number }> = [];
+    const movie = syntheticAudioMovie([firstSize, 32], [0, secondOffset]);
+    const countingRa = {
+      read: (offset: number, length: number): Promise<Uint8Array> => {
+        reads.push({ offset, length });
+        return Promise.resolve(new Uint8Array(length));
+      },
+      size: secondOffset + 32,
+    };
+
+    const tracks = await muxTracksFromMovie(countingRa, movie);
+
+    expect(tracks[0]?.samples.map((s) => s.data.byteLength)).toEqual([firstSize, 32]);
+    expect(reads).toEqual([
+      { offset: 0, length: firstSize },
+      { offset: secondOffset, length: 32 },
+    ]);
   });
 });

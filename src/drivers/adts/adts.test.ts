@@ -5,7 +5,13 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { Mp3Driver } from '../mp3/mp3-driver.ts';
-import { AdtsDriver, enumerateAdtsFrames, parseAdts } from './adts-driver.ts';
+import {
+  AdtsDriver,
+  concatPcmChunks,
+  enumerateAdtsFrames,
+  parseAdts,
+  pcmFromInterleavedF32,
+} from './adts-driver.ts';
 
 /** Build a crafted ADTS stream of `count` AAC frames (7-byte headers + zero payload). */
 function buildAdts(
@@ -220,5 +226,49 @@ describe('enumerateAdtsFrames — strict can-fail oracle vs ffprobe (sfx.adts)',
     // A single header claiming frameLen 248 but only 100 bytes present: no full frame ⇒ honest reject.
     const truncated = buildAdts({ count: 1, payload: 241 }).subarray(0, 100);
     expect(() => enumerateAdtsFrames(truncated)).toThrowError(InputError);
+  });
+});
+
+describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
+  const decodePcm = AdtsDriver.decodePcm;
+  if (!decodePcm) throw new Error('AdtsDriver must expose decodePcm');
+
+  it('converts interleaved f32 decoder output into canonical planar PCM', () => {
+    const pcm = pcmFromInterleavedF32(new Float32Array([0.25, -0.25, 0.5, -0.5]), 2, 48_000);
+    expect(pcm.sampleRate).toBe(48_000);
+    expect(pcm.channels).toBe(2);
+    expect(pcm.frames).toBe(2);
+    expect(Array.from(pcm.planar[0] ?? [])).toEqual([0.25, 0.5]);
+    expect(Array.from(pcm.planar[1] ?? [])).toEqual([-0.25, -0.5]);
+  });
+
+  it('rejects impossible decoded PCM geometry', () => {
+    expect(() => pcmFromInterleavedF32(new Float32Array([1, 2, 3]), 2, 48_000)).toThrowError(
+      MediaError,
+    );
+    expect(() => concatPcmChunks([], 48_000, 0)).toThrowError(MediaError);
+  });
+
+  it('concatenates sequential decoded chunks and rejects geometry drift', () => {
+    const a = pcmFromInterleavedF32(new Float32Array([0.1, 0.2]), 1, 48_000);
+    const b = pcmFromInterleavedF32(new Float32Array([0.3, 0.4, 0.5]), 1, 48_000);
+    const merged = concatPcmChunks([a, b], 48_000, 1);
+    expect(merged.frames).toBe(5);
+    expect(Array.from(merged.planar[0] ?? [])).toEqual([
+      expect.closeTo(0.1),
+      expect.closeTo(0.2),
+      expect.closeTo(0.3),
+      expect.closeTo(0.4),
+      expect.closeTo(0.5),
+    ]);
+
+    const wrongRate = pcmFromInterleavedF32(new Float32Array([0.6]), 1, 44_100);
+    expect(() => concatPcmChunks([a, wrongRate], 48_000, 1)).toThrowError(MediaError);
+  });
+
+  it('honors an already-aborted signal before acquiring a browser or wasm decoder', async () => {
+    await expect(
+      decodePcm(await fixtureSource('sfx.adts'), { signal: AbortSignal.abort() }),
+    ).rejects.toThrowError(/abort/i);
   });
 });

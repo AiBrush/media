@@ -126,9 +126,9 @@ export function sniffImageFormat(b: Uint8Array): ImageFormat | undefined {
   return undefined;
 }
 
-const AVIF_BRANDS = new Set(['avif', 'avis', 'avio', 'av01']);
+const AVIF_BRANDS = new Set(['avif', 'avis']);
 
-/** True iff the `ftyp` box's major brand or any compatible brand is an AVIF brand. */
+/** True iff the `ftyp` box's major brand or any compatible brand is an AVIF image brand. */
 function isAvifFtyp(b: Uint8Array): boolean {
   const size = u32be(b, 0, 'avif');
   // major_brand at 8; compatible_brands run from 16 to the end of the (bounded) ftyp box.
@@ -586,12 +586,14 @@ export function probeImage(bytes: Uint8Array): ImageInfo {
         'unsupported-input',
         'not a recognized image (expected GIF/PNG/JPEG/WebP/AVIF magic)',
       );
+    /* v8 ignore next 2 -- ImageFormat is exhaustive; TypeScript prevents this branch. */
     default:
       return assertNever(format);
   }
 }
 
 /** Exhaustiveness guard: the `switch` above covers every {@link ImageFormat}; this is unreachable. */
+/* v8 ignore next 3 -- Defensive runtime guard for impossible future format widening. */
 function assertNever(x: never): never {
   throw new InputError('unsupported-input', `unhandled image format ${String(x)}`);
 }

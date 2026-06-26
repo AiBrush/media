@@ -8,6 +8,7 @@
  * (HMR, double dynamic-import) is safe.
  */
 
+import type { ImageOps, ImageRegistry } from '../codecs/image/image-driver.ts';
 import {
   type CodecDriver,
   type ContainerDriver,
@@ -23,6 +24,7 @@ export interface RegistryView {
   codecs(): readonly CodecDriver[];
   containers(): readonly ContainerDriver[];
   filters(): readonly FilterDriver[];
+  imageOps(): ImageOps | undefined;
 }
 
 /** The set of contract majors this core accepts: the current and previous major (05 §5). */
@@ -40,10 +42,11 @@ export function isApiVersionSupported(apiVersion: number): boolean {
  * The concrete capability registry. Implements the write-side {@link RegistryContract} that driver
  * modules use, plus the read-side {@link RegistryView} the router uses.
  */
-export class Registry implements RegistryContract, RegistryView {
+export class Registry implements RegistryContract, RegistryView, ImageRegistry {
   readonly #codecs = new Map<string, CodecDriver>();
   readonly #containers = new Map<string, ContainerDriver>();
   readonly #filters = new Map<string, FilterDriver>();
+  #imageOps: ImageOps | undefined;
 
   addCodec(d: CodecDriver): void {
     this.#add(this.#codecs, d);
@@ -57,6 +60,10 @@ export class Registry implements RegistryContract, RegistryView {
     this.#add(this.#filters, d);
   }
 
+  addImageOps(ops: ImageOps): void {
+    this.#imageOps ??= ops;
+  }
+
   codecs(): readonly CodecDriver[] {
     return [...this.#codecs.values()];
   }
@@ -67,6 +74,10 @@ export class Registry implements RegistryContract, RegistryView {
 
   filters(): readonly FilterDriver[] {
     return [...this.#filters.values()];
+  }
+
+  imageOps(): ImageOps | undefined {
+    return this.#imageOps;
   }
 
   /** True when a driver id of the given kind is already registered. */

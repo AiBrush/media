@@ -1,12 +1,16 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
+import { readAiffPcm } from '../aiff/aiff.ts';
+import { readCafPcm } from '../caf/caf.ts';
 import { readWavPcm } from './pcm.ts';
 
 const SIN = 'sin_440Hz_-6dBFS_1s.wav';
+const DERIVED = new URL('../../../fixtures/media-derived/aiff-caf/', import.meta.url).pathname;
 const media = () => createMedia(); // zero-config: first-party WAV driver auto-registers on demand
 
 async function bytesOf(
@@ -16,6 +20,9 @@ async function bytesOf(
   return new Uint8Array(await out.arrayBuffer());
 }
 const wavSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/wav' });
+const aiffSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/aiff' });
+const loadDerived = async (id: string): Promise<Uint8Array> =>
+  new Uint8Array(await readFile(`${DERIVED}${id}`));
 
 describe('media.convert — PCM-native audio path (ADR-022)', () => {
   it('up-mixes mono → stereo (re-probes as 2ch; both channels are the source, bit-exact)', async () => {
@@ -68,6 +75,92 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
       }),
     );
     expect(readWavPcm(out).sampleRate).toBe(44100);
+  });
+
+  it.each([
+    ['sfx-pcm-s24.wav', 's24'],
+    ['sfx-pcm-f32.wav', 'f32'],
+  ])('converts %s to an explicit pcm-s16 WAV target', async (id, sourceFormat) => {
+    const orig = readWavPcm(await loadFixture(id));
+    expect(orig.format).toBe(sourceFormat);
+    const out = await bytesOf(
+      await media().convert(await fixtureSource(id), {
+        to: 'wav',
+        audio: { codec: 'pcm-s16' as never },
+      }),
+    );
+
+    const re = readWavPcm(out);
+    expect(re.format).toBe('s16');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    const info = await media().probe(wavSource(out));
+    expect(info.tracks[0]?.codec).toBe('pcm-s16');
+  });
+
+  it('converts big-endian AIFF PCM to little-endian WAV without changing samples', async () => {
+    const input = await loadDerived('sfx.aiff');
+    const orig = readAiffPcm(input);
+    expect(orig.format).toBe('s16');
+    expect(orig.endian).toBe('be');
+
+    const out = await bytesOf(
+      await media().convert(aiffSource(input), {
+        to: 'wav',
+        audio: { codec: 'pcm-s16' as never },
+      }),
+    );
+
+    const re = readWavPcm(out);
+    expect(re.format).toBe('s16');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+    const info = await media().probe(wavSource(out));
+    expect(info.container).toBe('wav');
+    expect(info.tracks[0]?.codec).toBe('pcm-s16');
+  });
+
+  it('converts little-endian WAV PCM to big-endian AIFF without changing samples', async () => {
+    const orig = readWavPcm(await loadFixture(SIN));
+    const out = await bytesOf(
+      await media().convert(await fixtureSource(SIN), {
+        to: 'aiff',
+        audio: { codec: 'pcm-s16be' as never },
+      }),
+    );
+
+    const re = readAiffPcm(out);
+    expect(re.kind).toBe('aiff');
+    expect(re.format).toBe('s16');
+    expect(re.endian).toBe('be');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+    const info = await media().probe(aiffSource(out));
+    expect(info.container).toBe('aiff');
+    expect(info.tracks[0]?.codec).toBe('pcm-s16be');
+  });
+
+  it('converts WAV PCM to CAF through the same native PCM path', async () => {
+    const orig = readWavPcm(await loadFixture(SIN));
+    const out = await bytesOf(
+      await media().convert(await fixtureSource(SIN), {
+        to: 'caf',
+        audio: { codec: 'pcm-s16' as never },
+      }),
+    );
+
+    const re = readCafPcm(out);
+    expect(re.format).toBe('s16');
+    expect(re.endian).toBe('le');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
   });
 
   it('resamples PCM to a new sample rate via the windowed-sinc tail (ADR-022)', async () => {

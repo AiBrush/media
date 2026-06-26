@@ -87,9 +87,12 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     const re = await readMovie(ra(out));
     expect(re.tracks.length).toBe(orig.tracks.length);
     for (let i = 0; i < orig.tracks.length; i++) {
-      expect(buildSampleData(re.tracks[i]!).map(strip)).toEqual(
-        buildSampleData(orig.tracks[i]!).map(strip),
-      );
+      const reTrack = re.tracks[i];
+      const origTrack = orig.tracks[i];
+      if (!reTrack || !origTrack) {
+        throw new Error(`missing track ${i} after faststart remux round-trip`);
+      }
+      expect(buildSampleData(reTrack).map(strip)).toEqual(buildSampleData(origTrack).map(strip));
     }
   });
 

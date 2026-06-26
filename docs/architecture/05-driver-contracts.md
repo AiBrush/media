@@ -5,6 +5,7 @@
 ## 1. Principles
 
 - **Three kinds:** `CodecDriver` (decode/encode one codec), `ContainerDriver` (demux/mux one container family), `FilterDriver` (transform frames).
+- **Images are a side capability, not a fourth driver kind.** Still/animated images have no packet seam, so `ImageOps` registers on the first-party registry side slot (ADR-049) and leaves the driver API unchanged.
 - **Streaming via `TransformStream`.** Backpressure, cancellation (via `signal`), and error propagation come for free, and the stream *is* the lifecycle (configure on start, flush on close). No bespoke `init()/close()` for coders.
 - **WebCodecs-native units at the seams.** Encoded units are `EncodedVideoChunk`/`EncodedAudioChunk`; raw frames are `VideoFrame`/`AudioData`. A demuxer's output feeds a decoder directly.
 - **Drivers declare, the router decides.** A driver answers `supports()`; it never picks itself over another.
@@ -30,12 +31,21 @@ export interface Progress { done: number; total?: number; stage: string }
 export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk   // sealed coded unit (PTS in .timestamp)
 export type RawFrame     = VideoFrame | AudioData                  // codec <-> filter
 
-// The container <-> codec seam packet: a sealed chunk + its optional DECODE timestamp (ADR-045). The
-// sealed Encoded*Chunk exposes only `timestamp` (PTS); a reordered (B-frame/open-GOP) stream also needs
-// DTS for decode-order enumeration + lossless remux. `dtsUs` undefined ⇒ DTS == PTS (no reordering).
+// The container <-> codec seam packet: a sealed chunk plus optional side data (ADR-045/055). The sealed
+// Encoded*Chunk exposes only `timestamp` (PTS); reordered streams also need DTS, and some container
+// oracles need the on-disk packet size when the decoder access unit strips container headers.
 export interface Packet {
   readonly chunk: EncodedChunk
-  readonly dtsUs?: number
+  readonly dtsUs?: number        // undefined ⇒ DTS == PTS (no reordering)
+  readonly sizeBytes?: number    // undefined ⇒ chunk.byteLength
+}
+export interface PacketMetadata {
+  readonly trackId: number
+  readonly sizeBytes: number
+  readonly ptsUs: number
+  readonly dtsUs: number
+  readonly durationUs: number
+  readonly keyframe: boolean
 }
 
 export interface DriverBase {
@@ -79,14 +89,16 @@ export interface ByteSource {
 export interface ContainerQuery { direction: 'demux' | 'mux'; mime?: string; extension?: string; head?: Uint8Array /* magic */ }
 export interface TrackInfo {
   id: number; mediaType: MediaType; codec: string; durationSec?: number
+  encrypted?: boolean               // protected samples require decrypt() before generic decode/seek
   config?: DecoderConfig            // video: coded dims/rotation/fps; audio: sampleRate/channels
 }
 export interface Demuxer {
   readonly tracks: readonly TrackInfo[]
-  packets(trackId: number): ReadableStream<Packet>         // lazy, per-track (Packet = chunk + optional DTS)
+  packetTable?(): readonly PacketMetadata[]                // optional payload-free packet metadata
+  packets(trackId: number): ReadableStream<Packet>         // lazy, per-track Packet stream
   close(): Promise<void>
 }
-export interface MuxOptions { faststart?: boolean; fragmented?: boolean }
+export interface MuxOptions { container?: string; faststart?: boolean; fragmented?: boolean }
 export interface Muxer {
   readonly output: ReadableStream<Uint8Array>
   addTrack(info: TrackInfo): number
@@ -99,6 +111,9 @@ export interface StreamCopyOptions extends StageOptions {  // ADR-021
   fragmented?: boolean
 }
 export interface PcmTransform extends StageOptions {       // ADR-022 (raw-PCM containers, e.g. WAV)
+  container?: 'wav' | 'aiff' | 'caf'                       // target raw-PCM wrapper; omit = source wrapper
+  sampleFormat?: SampleFormat                              // target wire sample format; omit = source format
+  endian?: Endianness                                      // target wire endianness; omit = source endianness
   channels?: number                                        // up/down-mix (BS.775); omit = passthrough
   sampleRate?: number                                      // resample (pure-TS band-limited windowed-sinc, ADR-022)
   gainDb?: number                                          // gain
@@ -116,14 +131,18 @@ export interface ContainerDriver extends DriverBase {
   // Optional lossless same-container stream-copy (remux + keyframe-trim), bypassing the PTS-only
   // codec seam so DTS/B-frames/codec-private survive (ADR-021). Absent ⇒ fall back to demux→mux.
   streamCopy?(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>>
-  // Optional PCM-native audio transform for raw-PCM containers (ADR-022): apply mix/gain/resample in
-  // the TS audio-dsp path and re-serialize, preserving the source sample-format. Absent ⇒ codec seam.
+  // Optional PCM-native audio transform for raw-PCM containers (ADR-022/054/059): apply target
+  // wrapper/sample-format/endianness, mix, gain, and resample in the TS audio-dsp path, then
+  // re-serialize. Source sample-format/endianness are preserved unless the transform asks for a
+  // target format; cross-wrapper WAV/AIFF/CAF output is still PCM-native, not an EncodedChunk mux.
+  // Absent ⇒ codec seam.
   transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
   // Optional driver-native sample decryption (ADR-023): parse protection boxes (enca/tenc/senc),
   // AES-CTR-decrypt with the caller's keys (WebCrypto), re-serialize cleartext. Absent ⇒ typed miss.
   decrypt?(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>>
-  // Optional pure-TS decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024),
-  // e.g. FLAC → WAV, applying a PcmTransform. Absent ⇒ the WebCodecs/WASM codec seam.
+  // Optional decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024/050),
+  // e.g. FLAC → WAV in pure TS, or ADTS AAC → WAV through native WebCodecs / the wasm tail, applying
+  // a PcmTransform. Absent ⇒ the WebCodecs/WASM codec seam.
   decodePcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
 }
 
@@ -160,14 +179,16 @@ export interface DriverModule {
 // A lazily-imported driver chunk default-exports a DriverModule.
 ```
 
-> **`FilterDriver` covers audio too (ADR-033).** The three audio `FilterSpec` variants (`resample`/`remix`/`gain`) are served by `audioDspFilterDriver` (`src/filters/audio-dsp.ts`) — a `TransformStream<AudioData, AudioData>` over the pure-TS dsp kernels (`src/dsp`). It declares `substrate:'wasm'` as the **least-wrong existing value**: `FilterSubstrate` (`webgpu|webgl|canvas2d|wasm`) is pixel-oriented and has no CPU-native value, yet a CPU audio filter must rank *below* the GPU substrates, and `'wasm'` is the router's lowest, non-GPU tier (the GPU/canvas values would wrongly imply a pixel pipeline). The proper fit is a future **additive `'native'` `FilterSubstrate`** value (mirroring `Tier`'s existing `'native'`) — a `DRIVER_API_VERSION` event (§5), not yet made. This driver is implemented + tested but **not yet auto-registered** in `defaults.ts` (doc 09 status table).
+> **`FilterDriver` covers audio too (ADR-033).** The three audio `FilterSpec` variants (`resample`/`remix`/`gain`) are served by `audioDspFilterDriver` (`src/filters/audio-dsp.ts`) — a `TransformStream<AudioData, AudioData>` over the pure-TS dsp kernels (`src/dsp`). It declares `substrate:'wasm'` as the **least-wrong existing value**: `FilterSubstrate` (`webgpu|webgl|canvas2d|wasm`) is pixel-oriented and has no CPU-native value, yet a CPU audio filter must rank *below* the GPU substrates, and `'wasm'` is the router's lowest, non-GPU tier (the GPU/canvas values would wrongly imply a pixel pipeline). The proper fit is a future **additive `'native'` `FilterSubstrate`** value (mirroring `Tier`'s existing `'native'`) — a `DRIVER_API_VERSION` event (§5), not yet made. This driver is implemented, tested, and auto-registered in `defaults.ts` (doc 09 status table).
+
+> **`ImageOps` is intentionally outside the driver contract (ADR-049).** GIF/PNG/JPEG/WebP/AVIF probe is pure header parsing, and browser image decode is `ImageDecoder` over a whole encoded image payload. There is no demuxed packet stream and no codec-config handoff, so forcing images into `ContainerDriver`/`CodecDriver` would invent a fake seam. `ImageModule` is `DriverModule`-shaped only so `defaults.ts` can register it alongside first-party modules; it attaches to an `ImageRegistry` host and does not change `DRIVER_API_VERSION`.
 
 ## 3. Lifecycle, cancellation, errors
 
 - A coder/filter is a `TransformStream`. The driver configures its underlying WebCodecs/WASM object when the stream starts, processes each chunk, and **flushes on writable close** (encoder/muxer `finalize`).
 - **Cancellation:** aborting `StageOptions.signal` cancels the readable and writable; the driver must release WebCodecs/WASM resources in the stream's `cancel`/`abort` handlers.
 - **Errors:** a driver throws/【rejects the stream with】a `MediaError` (`decode-error`/`encode-error`/`demux-error`/`mux-error`); never swallow an error and emit silence (that is exactly the kind of WEAK-GATE behavior we reject, ADR-018).
-- **Out-of-band encoder→muxer config (ADR-029):** the encoder `TransformStream` carries only `EncodedChunk` bytes, but a muxer needs the encoder-produced `DecoderConfig` (codec string + `description`, e.g. AAC's AudioSpecificConfig / AVC's `avcC`) to write the sample entry. A WebCodecs encoder publishes it on the first chunk's `EncodedVideoChunkMetadata`/`EncodedAudioChunkMetadata.decoderConfig`; the first-party drivers surface it through an **additive, driver-local** options extension read structurally off `o` — `VideoEncoderStageOptions extends StageOptions { keyFrameInterval?; onDecoderConfig? }` and `AudioEncoderStageOptions extends StageOptions { onConfig? }`. The `CodecDriver` contract (`createEncoder(c, o?: StageOptions)`) is **unchanged** — these are engine↔driver implementation detail, not part of the published contract, so they are purely additive (§5, no `DRIVER_API_VERSION` bump). The engine allocates the muxer track lazily on the first chunk once the config has arrived.
+- **Out-of-band encoder→muxer config (ADR-029/051):** the encoder `TransformStream` carries only `EncodedChunk` bytes, but a muxer needs the encoder-produced `DecoderConfig` (codec string + `description`, e.g. AAC's AudioSpecificConfig / AVC's `avcC`) to write the sample entry. A WebCodecs encoder publishes it on the first chunk's `EncodedVideoChunkMetadata`/`EncodedAudioChunkMetadata.decoderConfig`; the first-party drivers surface it through an **additive, driver-local** options extension read structurally off `o` — `VideoEncoderStageOptions extends StageOptions { keyFrameInterval?; onDecoderConfig? }` and `AudioEncoderStageOptions extends StageOptions { onConfig? }`. The `CodecDriver` contract (`createEncoder(c, o?: StageOptions)`) is **unchanged** — these are engine↔driver implementation detail, not part of the published contract, so they are purely additive (§5, no `DRIVER_API_VERSION` bump). The engine allocates the muxer track lazily on the first chunk once the config has arrived, and when the encode stage came from a demuxed source track it also carries that track's declared `durationSec` into the mux `TrackInfo` rather than inventing timing from encoder tails.
 
 ## 4. Authoring a driver (the rules)
 

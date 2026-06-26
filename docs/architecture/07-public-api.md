@@ -41,6 +41,8 @@ media.decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Promise
 
 `convert` is the headline op and **auto-routes copy-vs-re-encode** per stream: if a stream already matches the target codec/params it is stream-copied (remux-fast); otherwise it is re-encoded (ADR-012). `transcode` is an exported alias of `convert`.
 
+Still/animated images are accepted by `probe` and `decode` for GIF, PNG/APNG, JPEG, WebP, and AVIF (ADR-049). `probe` returns a video-like `MediaInfo` track from the pure header parser. `decode` returns a lazy video `ReadableStream<VideoFrame>` via browser `ImageDecoder`; the paired audio stream is empty, and Node raises a typed `CapabilityError` for image pixel decode because `ImageDecoder` is absent there.
+
 ### Option shapes (flat, typed — ADR-011)
 
 ```ts
@@ -59,7 +61,7 @@ interface ConvertOptions {
   faststart?: boolean; fragmented?: boolean          // MP4 layout
   sink?: Sink                                        // default: Blob
 }
-interface RemuxOptions { to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }
+interface RemuxOptions { to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; trackSelect?: readonly string[]; sink?: Sink }
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
 interface DecryptOptions { scheme: 'cenc' | 'cbcs' | 'hls-aes128'; keys: KeyMap; sink?: Sink }
 ```
@@ -79,6 +81,8 @@ interface MediaInfo {
 }
 ```
 
+Image helper exports are available from `@aibrush/media/image` for callers that want the standalone route without constructing an engine: `probeImage`, `inspectImage`, `sniffImageFormat`, `decodeImage`, `decodeImageFrames`, `hasImageDecoder`, `IMAGE_FORMATS`, `IMAGE_MIME`, and the `ImageInfo`/`ImageFormat`/`DecodeImageOptions` types. They live on a subpath so the pure image parser does not join the eager default-entry bundle.
+
 ## 3. Data in — sources (ADR-013)
 
 Operations accept media **directly** (`MediaInput`), so most callers never construct a source:
@@ -91,6 +95,7 @@ type MediaInput =
 
 await media.probe(file)
 await media.probe('https://cdn/x.mp4')      // URL string -> range/header read
+await media.probe(imageFile)                // GIF/PNG/JPEG/WebP/AVIF -> pure image header probe
 await media.probe(videoEl)                  // <video> -> BYTES mode (reads currentSrc), never loadedmetadata
 ```
 

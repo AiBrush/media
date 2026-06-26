@@ -23,11 +23,13 @@ import {
   frameSatisfiesSeek,
   h264CodecStringForDimensions,
   h264LevelIdcForDimensions,
+  hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
   normalizeDecoderCodec,
   outputDimensions,
   seekFrame,
+  selectTrackInfos,
   videoCodecToken,
   videoEncoderCodecString,
   videoFilterSpecs,
@@ -92,6 +94,47 @@ describe('isPcmContainer', () => {
       'ts',
     ] as const; // prettier-ignore
     for (const c of nonPcm) expect(isPcmContainer(c)).toBe(false);
+  });
+});
+
+describe('selectTrackInfos', () => {
+  const tracks = [
+    { mediaType: 'video', label: 'v0' },
+    { mediaType: 'audio', label: 'a0' },
+    { mediaType: 'audio', label: 'a1' },
+    { mediaType: 'video', label: 'v1' },
+  ] as const;
+
+  it('detects whether explicit selectors are present', () => {
+    expect(hasTrackSelection(undefined)).toBe(false);
+    expect(hasTrackSelection([])).toBe(false);
+    expect(hasTrackSelection(['audio:0'])).toBe(true);
+  });
+
+  it('selects tracks by media type and per-type index, preserving selector order', () => {
+    expect(selectTrackInfos(tracks, ['audio:1', 'video:0']).map((t) => t.label)).toEqual([
+      'a1',
+      'v0',
+    ]);
+  });
+
+  it('collapses duplicate selectors and accepts the single-source @0 suffix', () => {
+    expect(
+      selectTrackInfos(tracks, ['audio:0', 'audio:0@0', 'video:1']).map((t) => t.label),
+    ).toEqual(['a0', 'v1']);
+  });
+
+  it('ignores selectors for non-zero source indexes and rejects an empty final selection', () => {
+    expect(selectTrackInfos(tracks, ['audio:0@1', 'audio:0@0']).map((t) => t.label)).toEqual([
+      'a0',
+    ]);
+    expect(() => selectTrackInfos(tracks, ['audio:0@1'])).toThrow(InputError);
+  });
+
+  it('rejects malformed selectors with a typed InputError', () => {
+    for (const selector of ['audio', 'audio:-1', 'subtitle:0', 'video:x']) {
+      expect(() => selectTrackInfos(tracks, [selector])).toThrow(InputError);
+    }
   });
 });
 
@@ -524,6 +567,7 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
     const info = videoTrackInfoFromDecoderConfig(
       { codec: 'avc1.42E01E', codedWidth: 640, codedHeight: 480, description },
       30,
+      12.5,
     );
     expect(info).toEqual<TrackInfo>({
       id: 0,
@@ -531,28 +575,34 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
       codec: 'avc1.42E01E',
       config: { codec: 'avc1.42E01E', codedWidth: 640, codedHeight: 480, description },
       fps: 30,
+      durationSec: 12.5,
     });
   });
 
   it('omits fps when undefined (exactOptionalPropertyTypes)', () => {
     const info = videoTrackInfoFromDecoderConfig({ codec: 'vp09.00.10.08' }, undefined);
     expect('fps' in info).toBe(false);
+    expect('durationSec' in info).toBe(false);
   });
 
-  it('builds the audio TrackInfo from the AAC decoder config', () => {
+  it('builds the audio TrackInfo from the AAC decoder config and declared duration', () => {
     const description = new Uint8Array([0x12, 0x10]);
     expect(
-      audioTrackInfoFromDecoderConfig({
-        codec: 'mp4a.40.2',
-        sampleRate: 48000,
-        numberOfChannels: 2,
-        description,
-      }),
+      audioTrackInfoFromDecoderConfig(
+        {
+          codec: 'mp4a.40.2',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+          description,
+        },
+        9.75,
+      ),
     ).toEqual<TrackInfo>({
       id: 0,
       mediaType: 'audio',
       codec: 'mp4a.40.2',
       config: { codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, description },
+      durationSec: 9.75,
     });
   });
 });

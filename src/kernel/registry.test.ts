@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { imageOps } from '../codecs/image/image-driver.ts';
 import {
   type CodecDriver,
   type CodecSupport,
@@ -92,6 +93,20 @@ describe('Registry', () => {
     expect(reg.has(c)).toBe(true);
     expect(reg.has(ct)).toBe(true);
     expect(reg.has(f)).toBe(true);
+  });
+
+  it('holds image ops idempotently outside the container/codec/filter driver maps', () => {
+    const reg = new Registry();
+    expect(reg.imageOps()).toBeUndefined();
+    reg.addImageOps(imageOps);
+    reg.addImageOps({
+      ...imageOps,
+      formats: ['png'] as const,
+    });
+    expect(reg.imageOps()).toBe(imageOps);
+    expect(reg.codecs()).toEqual([]);
+    expect(reg.containers()).toEqual([]);
+    expect(reg.filters()).toEqual([]);
   });
 
   it('refuses a driver targeting an unsupported apiVersion with a typed error', () => {

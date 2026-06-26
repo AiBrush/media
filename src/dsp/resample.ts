@@ -31,6 +31,7 @@ import { type PcmAudio, sampleAt } from './pcm.ts';
 const ZERO_CROSSINGS = 32; // sinc lobes on each side of center → transition sharpness
 const SAMPLES_PER_ZERO_CROSSING = 512; // table phases between adjacent sinc zero crossings (interp grid)
 const KAISER_BETA = 9.42; // Kaiser β for ≈ 80 dB stopband attenuation (Kaiser/Schafer design)
+const MAX_POLYPHASE_PHASES = 4096;
 
 /** Normalized sinc, `sin(πx)/(πx)`, with the removable singularity at 0 filled by its limit (1). */
 function sinc(x: number): number {
@@ -91,6 +92,104 @@ function tapAt(table: Float64Array, pos: number): number {
   return a + (b - a) * frac;
 }
 
+interface PolyphaseKernel {
+  readonly offsets: Int32Array;
+  readonly coeffs: Float64Array;
+}
+
+interface PolyphaseBank {
+  readonly phaseCount: number;
+  readonly step: number;
+  readonly kernels: readonly PolyphaseKernel[];
+}
+
+const POLYPHASE_CACHE = new Map<string, PolyphaseBank>();
+
+function gcd(a: number, b: number): number {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+  while (y !== 0) {
+    const r = x % y;
+    x = y;
+    y = r;
+  }
+  return x;
+}
+
+function buildPolyphaseKernel(
+  phase: number,
+  phaseCount: number,
+  halfSupport: number,
+  cutoff: number,
+  table: Float64Array,
+): PolyphaseKernel {
+  const frac = phase / phaseCount;
+  const first = Math.ceil(frac - halfSupport);
+  const last = Math.floor(frac + halfSupport);
+  const tapCount = Math.max(0, last - first + 1);
+  const offsets = new Int32Array(tapCount);
+  const coeffs = new Float64Array(tapCount);
+  for (let i = 0; i < tapCount; i++) {
+    const offset = first + i;
+    offsets[i] = offset;
+    coeffs[i] = tapAt(table, Math.abs((frac - offset) * cutoff)) * cutoff;
+  }
+  return { offsets, coeffs };
+}
+
+function polyphaseBank(
+  inRate: number,
+  outRate: number,
+  ratio: number,
+  table: Float64Array,
+): PolyphaseBank | undefined {
+  if (!Number.isInteger(inRate) || inRate <= 0) return undefined;
+  const divisor = gcd(inRate, outRate);
+  const phaseCount = outRate / divisor;
+  if (phaseCount > MAX_POLYPHASE_PHASES) return undefined;
+  const step = inRate / divisor;
+  const key = `${inRate}:${outRate}`;
+  const cached = POLYPHASE_CACHE.get(key);
+  if (cached !== undefined) return cached;
+
+  const cutoff = ratio < 1 ? ratio : 1;
+  const halfSupport = ZERO_CROSSINGS / cutoff;
+  const kernels: PolyphaseKernel[] = [];
+  for (let phase = 0; phase < phaseCount; phase++) {
+    kernels.push(buildPolyphaseKernel(phase, phaseCount, halfSupport, cutoff, table));
+  }
+  const bank = { phaseCount, step, kernels };
+  POLYPHASE_CACHE.set(key, bank);
+  return bank;
+}
+
+function resampleChannelPolyphase(
+  input: Float64Array,
+  outFrames: number,
+  bank: PolyphaseBank,
+): Float64Array {
+  const out = new Float64Array(outFrames);
+  const inputFrames = input.length;
+  let base = 0;
+  let phase = 0;
+  for (let m = 0; m < outFrames; m++) {
+    const kernel = bank.kernels[phase] as PolyphaseKernel;
+    const { offsets, coeffs } = kernel;
+    let acc = 0;
+    for (let i = 0; i < coeffs.length; i++) {
+      const idx = base + (offsets[i] as number);
+      if (idx >= 0 && idx < inputFrames) acc += (input[idx] as number) * (coeffs[i] as number);
+    }
+    out[m] = acc;
+    phase += bank.step;
+    if (phase >= bank.phaseCount) {
+      base += Math.floor(phase / bank.phaseCount);
+      phase %= bank.phaseCount;
+    }
+  }
+  return out;
+}
+
 /**
  * Resample one channel to `outFrames` samples. `ratio = outRate/inRate`; `cutoff = min(1, ratio)` shrinks
  * the kernel in input-space when downsampling so its cutoff drops to the **output** Nyquist (anti-alias).
@@ -145,6 +244,10 @@ export function resample(audio: PcmAudio, outRate: number): PcmAudio {
   const ratio = outRate / inRate;
   const outFrames = Math.round(audio.frames * ratio);
   const table = filterTable();
-  const planar = audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table));
+  const bank = polyphaseBank(inRate, outRate, ratio, table);
+  const planar =
+    bank === undefined
+      ? audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table))
+      : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank));
   return { sampleRate: outRate, channels: audio.channels, frames: outFrames, planar };
 }

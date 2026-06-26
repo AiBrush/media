@@ -172,6 +172,20 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     expect(endMs).toBe(120); // last PTS 80ms + recovered 40ms gap
   });
 
+  it('prefers a declared remux duration over packet-tail padding', () => {
+    const { endMs } = buildBlockTimeline([
+      {
+        trackNumber: 1,
+        durationSec: 1,
+        chunks: [
+          { timestampUs: 66_667, durationUs: 33_333, key: true, data: new Uint8Array([1]) },
+          { timestampUs: 1_033_333, durationUs: 33_333, key: false, data: new Uint8Array([2]) },
+        ],
+      },
+    ]);
+    expect(endMs).toBe(1000);
+  });
+
   it('stores B-frame blocks in DECODE order (by dtsUs), keeping each SimpleBlock timecode at its PTS', () => {
     // Decode order I,P,B,B fed with the source DTS; PTS is reordered (display order I,B,B,P). Matroska
     // reads a Cluster front-to-back into the decoder, so storage MUST be decode order even though each
@@ -279,6 +293,35 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     expect(blocks.every((b) => b.timeMs >= 0)).toBe(true);
     // It re-demuxes as a valid WebM whose duration spans the full presentation timeline (300ms + 100ms).
     expect(parseWebm(bytes).durationSec).toBeCloseTo(0.4, 3);
+  });
+
+  it('writes a declared remux duration into the Segment Info Duration', async () => {
+    const muxer = new WebmMuxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      durationSec: 1,
+      fps: 30,
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    muxer.addChunkStruct(vid, {
+      timestampUs: 66_667,
+      durationUs: 33_333,
+      key: true,
+      data: new Uint8Array([1]),
+      dtsUs: 0,
+    });
+    muxer.addChunkStruct(vid, {
+      timestampUs: 1_033_333,
+      durationUs: 33_333,
+      key: false,
+      data: new Uint8Array([2]),
+      dtsUs: 33_333,
+    });
+    await muxer.finalize();
+
+    expect(parseWebm(await collect(muxer.output)).durationSec).toBeCloseTo(1, 5);
   });
 
   it('multitrack VP9 + Opus: both re-parse; Opus CodecPrivate survives; per-track blocks correct', async () => {
@@ -466,6 +509,24 @@ describe('WebmDriver.createMuxer — wired to WebmMuxer', () => {
     const info = parseWebm(await collect(muxer.output));
     expect(info.tracks[0]?.codec).toBe('vp9');
     expect(info.tracks[0]?.width).toBe(16);
+  });
+
+  it('uses the Matroska DocType for mkv targets', async () => {
+    const muxer = WebmDriver.createMuxer({ container: 'mkv' });
+    expect(muxer).toBeInstanceOf(WebmMuxer);
+    if (muxer instanceof WebmMuxer) {
+      const vid = muxer.addTrack({
+        id: 1,
+        mediaType: 'video',
+        codec: 'vp09.00.10.08',
+        fps: 24,
+        config: { codec: 'vp09.00.10.08', codedWidth: 16, codedHeight: 16 },
+      });
+      muxer.addChunkStruct(vid, chunk(0, 41_667, true, 100));
+    }
+    await muxer.finalize();
+
+    expect(parseWebm(await collect(muxer.output)).container).toBe('mkv');
   });
 
   it('rejects a MediaError (not throwing strings) is impossible here — sanity that errors are typed', () => {

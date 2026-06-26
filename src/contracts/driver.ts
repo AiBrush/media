@@ -10,6 +10,8 @@
  * `DRIVER_API_VERSION` event (§5).
  */
 
+import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
+
 // ============ versioning ============
 
 /** The driver-contract major version. Bumped only on a breaking driver-contract change (§5). */
@@ -53,14 +55,34 @@ export type RawFrame = VideoFrame | AudioData;
  * needs DTS to (a) enumerate packets in decode order and (b) remux losslessly — MP4 stores DTS + a
  * per-sample composition offset, and a Matroska/WebM muxer must lay blocks down in decode order. `dtsUs`
  * carries it alongside the sealed chunk; **`undefined` ⇒ DTS equals the chunk's PTS** (no reordering).
- * Demuxers attach it from the container's timing tables; muxers honor it; decoders ignore it (they
- * consume the bare {@link chunk}). A pure data view — no resources to release (the chunk owns its bytes).
+ * `sizeBytes`, when present, is the container packet's byte size for oracles/diagnostics whose packet
+ * unit is wider than the decoder access unit (e.g. ADTS: header+payload on disk, raw AAC AU in
+ * WebCodecs). Demuxers attach these facts from container tables/headers; muxers honor DTS and copy the
+ * bare {@link chunk} bytes; decoders ignore both side fields. A pure data view — no resources to release
+ * (the chunk owns its bytes).
  */
 export interface Packet {
   /** The sealed WebCodecs encoded unit: the coded bytes, the keyframe flag, and `timestamp` = PTS. */
   readonly chunk: EncodedChunk;
   /** Decode timestamp (µs); omitted ⇒ equals the chunk's presentation `timestamp` (no reorder). */
   readonly dtsUs?: number;
+  /** Container packet byte length; omitted ⇒ equals `chunk.byteLength`. */
+  readonly sizeBytes?: number;
+}
+
+/** Packet-table metadata for consumers that need container packet facts but not payload bytes. */
+export interface PacketMetadata {
+  /** Track id from {@link TrackInfo.id}. */
+  readonly trackId: number;
+  /** Container packet byte length. */
+  readonly sizeBytes: number;
+  /** Presentation timestamp in microseconds. */
+  readonly ptsUs: number;
+  /** Decode timestamp in microseconds. */
+  readonly dtsUs: number;
+  /** Packet duration in microseconds. */
+  readonly durationUs: number;
+  readonly keyframe: boolean;
 }
 
 /** Common identity every driver declares. */
@@ -127,6 +149,8 @@ export interface TrackInfo {
   /** Video frame rate (frames ÷ duration) and display rotation in degrees, when known. */
   fps?: number;
   rotation?: number;
+  /** True when encoded samples are protected and must be decrypted before generic decode/seek. */
+  encrypted?: boolean;
   /** WebCodecs config: video coded dims/rotation/fps; audio sampleRate/channels. */
   config?: DecoderConfig;
 }
@@ -134,6 +158,8 @@ export interface TrackInfo {
 /** A live demux session: per-track lazy packet streams ({@link Packet} carries PTS + optional DTS). */
 export interface Demuxer {
   readonly tracks: readonly TrackInfo[];
+  /** Optional packet-table fast path: no encoded payload bytes are read or materialized. */
+  packetTable?(): readonly PacketMetadata[];
   packets(trackId: number): ReadableStream<Packet>;
   close(): Promise<void>;
 }
@@ -172,11 +198,17 @@ export interface StreamCopyOptions extends StageOptions {
 
 /**
  * A PCM-domain audio transform for containers that carry raw PCM (ADR-022). PCM is not a WebCodecs
- * codec, so these run in the TS audio-dsp path — channel up/down-mix, gain, and (where the tail is
- * available) resample — without the decode/encode + `AudioData` filter seam. Omitted fields pass
- * through; `sampleRate` differing from the source needs the resample tail (else a `CapabilityError`).
+ * codec, so these run in the TS audio-dsp path — sample-format conversion, channel up/down-mix, gain,
+ * and resample — without the decode/encode + `AudioData` filter seam. Omitted fields pass through.
+ * `container` names the raw-PCM wrapper to serialize after the source driver has parsed its own bytes;
+ * this is how WAV/AIFF/CAF cross-container PCM conversion stays outside the EncodedChunk muxer seam.
  */
+export type PcmContainer = 'wav' | 'aiff' | 'caf';
+
 export interface PcmTransform extends StageOptions {
+  container?: PcmContainer;
+  sampleFormat?: SampleFormat;
+  endian?: Endianness;
   channels?: number;
   sampleRate?: number;
   gainDb?: number;
@@ -205,7 +237,8 @@ export interface ContainerDriver extends DriverBase {
   /**
    * Optional PCM-native audio transform (ADR-022) for raw-PCM containers (e.g. WAV) — applies
    * {@link PcmTransform} in the TS audio-dsp path and re-serializes the same container. Source
-   * sample-format is preserved (lossless); absent ⇒ the engine falls back to the codec seam.
+   * sample-format/endianness are preserved unless the transform asks for a target format; absent ⇒ the
+   * engine falls back to the codec seam.
    */
   transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>;
   /**
@@ -214,8 +247,9 @@ export interface ContainerDriver extends DriverBase {
    */
   decrypt?(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>>;
   /**
-   * Optional decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024) — e.g.
-   * FLAC → WAV, in pure TS — applying the {@link PcmTransform}. Absent ⇒ the WebCodecs/WASM codec seam.
+   * Optional decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024/050) — e.g.
+   * FLAC → WAV in pure TS, or ADTS AAC → WAV through native WebCodecs / the wasm tail — applying the
+   * {@link PcmTransform}. Absent ⇒ the WebCodecs/WASM codec seam.
    */
   decodePcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>;
 }

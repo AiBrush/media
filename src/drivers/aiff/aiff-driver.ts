@@ -21,7 +21,8 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { parseAiff, readAiffPcm, writeAiff } from './aiff.ts';
+import { writePcmContainer } from '../pcm-output.ts';
+import { parseAiff, readAiffPcm } from './aiff.ts';
 
 const AIFF_MIMES = new Set(['audio/aiff', 'audio/x-aiff', 'audio/aifc', 'audio/x-aifc']);
 const AIFF_EXTENSIONS = new Set(['aiff', 'aif', 'aifc']);
@@ -113,7 +114,13 @@ export const AiffDriver: ContainerDriver = {
     // Rate change last, on the final channel layout (band-limited windowed-sinc; pure-TS, ADR-022).
     if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
       audio = resample(audio, o.sampleRate);
-    const out = writeAiff(audio, aiff.format, { kind: aiff.kind, endian: aiff.endian });
+    const out = writePcmContainer(
+      audio,
+      o?.container ?? 'aiff',
+      o?.sampleFormat ?? aiff.format,
+      o?.endian ?? aiff.endian,
+      aiff.kind,
+    );
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(out);

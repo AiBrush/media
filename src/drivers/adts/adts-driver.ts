@@ -2,10 +2,12 @@
  * The ADTS (raw AAC) container driver — hand-written TS. ADTS wraps each AAC frame in a 7- or 9-byte
  * header beginning with a 12-bit `0xFFF` syncword; the first header carries the audio object type,
  * sampling-frequency index, and channel configuration. Duration comes from walking the frames (each is
- * `frame_length` bytes and 1024 samples per raw block). AAC *decode* is a WebCodecs/WASM codec, so the
- * packet seam raises a typed {@link CapabilityError}; probe is pure TS.
+ * `frame_length` bytes and 1024 samples per raw block). Probe and framing are pure TS; AAC packet decode
+ * is capability-routed through native WebCodecs first and the vendored `wasm-aac` tail second. The
+ * `decodePcm` bridge exposes ADTS → WAV extraction without pretending WAV is an `EncodedChunk` muxer.
  */
 
+import { loadAacCore } from '../../codecs/wasm-aac/wasm-aac-driver.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -15,14 +17,22 @@ import {
   type DriverModule,
   type Muxer,
   type Packet,
+  type PcmTransform,
   type Registry,
   type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
+import { audioDataToPcm } from '../../filters/audio-dsp.ts';
+import { writeWav } from '../wav/pcm.ts';
 
 const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
 const ADTS_EXTENSIONS = new Set(['aac', 'adts']);
+const AAC_PCM_TRIED = ['webcodecs-audio', 'wasm-aac'] as const;
+const NATIVE_AAC_TRIED = ['webcodecs-audio'] as const;
+const WASM_AAC_TRIED = ['wasm-aac'] as const;
+const PCM_OUTPUT_FORMAT = 's16' as const;
 
 // MPEG-4 sampling-frequency-index table (Hz); index 13–15 are reserved/explicit (unsupported here).
 const SAMPLE_RATES = [
@@ -112,6 +122,12 @@ function audioSpecificConfig(aot: number, freqIndex: number, channelConfig: numb
     (aot << 3) | (freqIndex >> 1),
     ((freqIndex & 1) << 7) | (channelConfig << 3),
   ]);
+}
+
+interface AdtsLayout {
+  readonly info: AdtsInfo;
+  readonly frames: readonly AdtsPacket[];
+  readonly asc: Uint8Array;
 }
 
 export interface AdtsInfo {
@@ -211,13 +227,283 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
   return out;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+}
+
+function errMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  return 'unknown error';
+}
+
+function errName(e: unknown): string {
+  if (e instanceof Error) return e.name;
+  return 'Error';
+}
+
+function decodeCapabilityMiss(message: string, tried: readonly string[]): CapabilityError {
+  return new CapabilityError('capability-miss', message, {
+    op: 'decode',
+    tried,
+    suggestion: 'use a browser with AAC AudioDecoder support or the vendored wasm-aac tail',
+  });
+}
+
+function readLayout(bytes: Uint8Array): AdtsLayout {
+  const info = parseAdts(bytes, bytes.byteLength);
+  if (info.channels <= 0) {
+    throw new MediaError('demux-error', 'ADTS: unsupported channel configuration 0');
+  }
+  const frames = enumerateAdtsFrames(bytes);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const start = adtsOffset(dv);
+  const b2 = dv.getUint8(start + 2);
+  const aot = ((b2 >> 6) & 0x3) + 1;
+  const freqIndex = (b2 >> 2) & 0xf;
+  const channelConfig = ((b2 & 0x1) << 2) | ((dv.getUint8(start + 3) >> 6) & 0x3);
+  return {
+    info,
+    frames,
+    asc: audioSpecificConfig(aot, freqIndex, channelConfig),
+  };
+}
+
+/** Convert interleaved f32 decoder output into the engine's canonical planar Float64 PCM. */
+export function pcmFromInterleavedF32(
+  interleaved: Float32Array,
+  channels: number,
+  sampleRate: number,
+): PcmAudio {
+  if (!Number.isInteger(channels) || channels <= 0) {
+    throw new MediaError('decode-error', `aac: invalid decoded channel count ${channels}`);
+  }
+  if (interleaved.length % channels !== 0) {
+    throw new MediaError(
+      'decode-error',
+      `aac: decoded interleaved length ${interleaved.length} is not divisible by ${channels}`,
+    );
+  }
+  const frames = interleaved.length / channels;
+  const planar = Array.from({ length: channels }, () => new Float64Array(frames));
+  for (let frame = 0; frame < frames; frame++) {
+    for (let channel = 0; channel < channels; channel++) {
+      const plane = planar[channel];
+      if (plane === undefined)
+        throw new MediaError('decode-error', `aac: missing plane ${channel}`);
+      plane[frame] = interleaved[frame * channels + channel] ?? 0;
+    }
+  }
+  return { sampleRate, channels, frames, planar };
+}
+
+/** Concatenate sequential decoded PCM blocks, rejecting geometry drift instead of silently corrupting WAV. */
+export function concatPcmChunks(
+  chunks: readonly PcmAudio[],
+  sampleRate: number,
+  channels: number,
+): PcmAudio {
+  if (!Number.isInteger(channels) || channels <= 0) {
+    throw new MediaError('decode-error', `aac: invalid channel count ${channels}`);
+  }
+  let frames = 0;
+  for (const chunk of chunks) {
+    if (chunk.sampleRate !== sampleRate || chunk.channels !== channels) {
+      throw new MediaError(
+        'decode-error',
+        `aac: decoded geometry changed (${chunk.channels}ch/${chunk.sampleRate}Hz ` +
+          `inside ${channels}ch/${sampleRate}Hz stream)`,
+      );
+    }
+    frames += chunk.frames;
+  }
+  const planar = Array.from({ length: channels }, () => new Float64Array(frames));
+  let offset = 0;
+  for (const chunk of chunks) {
+    for (let channel = 0; channel < channels; channel++) {
+      const dst = planar[channel];
+      const src = chunk.planar[channel];
+      if (dst === undefined || src === undefined) {
+        throw new MediaError('decode-error', `aac: missing decoded plane ${channel}`);
+      }
+      dst.set(src, offset);
+    }
+    offset += chunk.frames;
+  }
+  return { sampleRate, channels, frames, planar };
+}
+
+function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
+  return bytes.subarray(frame.offset + frame.headerBytes, frame.offset + frame.size);
+}
+
+function nativeDecoderUnavailable(reason: string): CapabilityError {
+  return decodeCapabilityMiss(`webcodecs-audio cannot decode ADTS AAC to PCM (${reason})`, [
+    ...NATIVE_AAC_TRIED,
+  ]);
+}
+
+function webCodecsAudioAvailable(): boolean {
+  return (
+    typeof AudioDecoder !== 'undefined' &&
+    typeof EncodedAudioChunk !== 'undefined' &&
+    typeof AudioData !== 'undefined'
+  );
+}
+
+/* v8 ignore start -- live ADTS AAC decode uses WebCodecs AudioDecoder or the wasm-aac core; browser harness / clean-process codec tests validate it. */
+
+async function decodeNativeAacToPcm(
+  bytes: Uint8Array,
+  layout: AdtsLayout,
+  signal: AbortSignal | undefined,
+): Promise<PcmAudio> {
+  if (!webCodecsAudioAvailable()) {
+    throw nativeDecoderUnavailable(
+      'WebCodecs AudioDecoder/EncodedAudioChunk/AudioData is unavailable',
+    );
+  }
+  const config: AudioDecoderConfig = {
+    codec: layout.info.codec,
+    sampleRate: layout.info.sampleRate,
+    numberOfChannels: layout.info.channels,
+    description: layout.asc,
+  };
+  let support: AudioDecoderSupport;
+  try {
+    support = await AudioDecoder.isConfigSupported(config);
+  } catch (e) {
+    throw nativeDecoderUnavailable(`${errName(e)}: ${errMessage(e)}`);
+  }
+  if (!support.supported) throw nativeDecoderUnavailable(`unsupported config ${layout.info.codec}`);
+
+  const chunks: PcmAudio[] = [];
+  let callbackError: MediaError | undefined;
+  const decoder = new AudioDecoder({
+    output(data): void {
+      try {
+        chunks.push(audioDataToPcm(data));
+      } catch (e) {
+        callbackError = new MediaError('decode-error', `aac native output: ${errMessage(e)}`, e);
+      } finally {
+        data.close();
+      }
+    },
+    error(e): void {
+      callbackError = nativeDecoderUnavailable(`${e.name}: ${e.message}`);
+    },
+  });
+  try {
+    decoder.configure(config);
+    for (const frame of layout.frames) {
+      throwIfAborted(signal);
+      if (callbackError !== undefined) throw callbackError;
+      decoder.decode(
+        new EncodedAudioChunk({
+          type: 'key',
+          timestamp: frame.ptsUs,
+          duration: frame.durationUs,
+          data: payload(bytes, frame),
+        }),
+      );
+      if (decoder.decodeQueueSize >= 8) await decoder.flush();
+    }
+    await decoder.flush();
+    if (callbackError !== undefined) throw callbackError;
+  } catch (e) {
+    if (e instanceof MediaError) throw e;
+    throw nativeDecoderUnavailable(`${errName(e)}: ${errMessage(e)}`);
+  } finally {
+    if (decoder.state !== 'closed') decoder.close();
+  }
+  return concatPcmChunks(chunks, layout.info.sampleRate, layout.info.channels);
+}
+
+function wasmUnavailable(reason: string): CapabilityError {
+  return decodeCapabilityMiss(`wasm-aac cannot decode ADTS AAC to PCM (${reason})`, [
+    ...WASM_AAC_TRIED,
+  ]);
+}
+
+async function decodeWasmAacToPcm(
+  bytes: Uint8Array,
+  layout: AdtsLayout,
+  signal: AbortSignal | undefined,
+): Promise<PcmAudio> {
+  const core = await loadAacCore();
+  if (core === null) throw wasmUnavailable('core is unavailable');
+  const chunks: PcmAudio[] = [];
+  let decoder: ReturnType<typeof core.createDecoder> | undefined;
+  try {
+    decoder = core.createDecoder(layout.asc, layout.info.channels, layout.info.sampleRate);
+    const channels = decoder.channels;
+    const sampleRate = decoder.sampleRate;
+    for (const frame of layout.frames) {
+      throwIfAborted(signal);
+      chunks.push(
+        pcmFromInterleavedF32(decoder.decode(payload(bytes, frame)), channels, sampleRate),
+      );
+    }
+    return concatPcmChunks(chunks, sampleRate, channels);
+  } catch (e) {
+    if (e instanceof MediaError) throw e;
+    throw new MediaError('decode-error', `wasm-aac decode: ${errMessage(e)}`, e);
+  } finally {
+    decoder?.free();
+  }
+}
+
+async function decodeAacToPcm(bytes: Uint8Array, o: PcmTransform | undefined): Promise<PcmAudio> {
+  throwIfAborted(o?.signal);
+  const layout = readLayout(bytes);
+  let nativeMiss: CapabilityError | undefined;
+  try {
+    return await decodeNativeAacToPcm(bytes, layout, o?.signal);
+  } catch (e) {
+    if (!(e instanceof CapabilityError)) throw e;
+    nativeMiss = e;
+  }
+  try {
+    return await decodeWasmAacToPcm(bytes, layout, o?.signal);
+  } catch (e) {
+    if (e instanceof CapabilityError) {
+      throw new CapabilityError(
+        'capability-miss',
+        `ADTS AAC → WAV PCM extract is unavailable (${nativeMiss.message}; ${e.message})`,
+        {
+          op: 'convert',
+          tried: AAC_PCM_TRIED,
+          suggestion: 'enable native AAC AudioDecoder support or ship the vendored wasm-aac core',
+        },
+      );
+    }
+    throw e;
+  }
+}
+
+/* v8 ignore stop */
+
+function applyPcmTransform(audio: PcmAudio, o: PcmTransform | undefined): PcmAudio {
+  throwIfAborted(o?.signal);
+  let result = audio;
+  if (o?.gainDb !== undefined && o.gainDb !== 0) result = gain(result, o.gainDb);
+  if (o?.channels !== undefined && o.channels !== result.channels)
+    result = remix(result, o.channels);
+  if (o?.sampleRate !== undefined && o.sampleRate !== result.sampleRate) {
+    result = resample(result, o.sampleRate);
+  }
+  throwIfAborted(o?.signal);
+  return result;
+}
+
 /**
  * Stream every ADTS frame of `bytes` as WebCodecs `EncodedAudioChunk`s. Browser-only: the `EncodedAudioChunk`
  * constructor exists only in a browser/worker, so we raise a typed {@link CapabilityError} in Node (mirroring
  * the mpegts/mp4 drivers) and istanbul-ignore the emission body (validated under browser-mode in the codec
  * phase). Audio has NO reordering — DTS == PTS — so each {@link Packet} omits `dtsUs`. Each frame is a sync
  * sample (`type:'key'`) and we emit the RAW AAC access unit (ADTS header + optional CRC stripped) so the
- * decoder consumes a bare access unit matched by the synthesized `config.description` ASC.
+ * decoder consumes a bare access unit matched by the synthesized `config.description` ASC. `sizeBytes`
+ * carries the full ADTS frame length so packet-size oracles can compare the on-disk packet unit.
  */
 function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
@@ -249,7 +535,7 @@ function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): Reada
         duration: f.durationUs,
         data,
       });
-      controller.enqueue({ chunk }); // no dtsUs: audio never reorders (DTS == PTS)
+      controller.enqueue({ chunk, sizeBytes: f.size }); // no dtsUs: audio never reorders (DTS == PTS)
     },
   });
   /* v8 ignore stop */
@@ -308,6 +594,16 @@ export const AdtsDriver: ContainerDriver = {
   },
   createMuxer(): Muxer {
     throw new MediaError('mux-error', 'AAC encode requires the WebCodecs/WASM codec layer');
+  },
+  async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
+    const pcm = applyPcmTransform(await decodeAacToPcm(await readAll(src), o), o);
+    const out = writeWav(pcm, PCM_OUTPUT_FORMAT);
+    return new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(out);
+        c.close();
+      },
+    });
   },
 };
 

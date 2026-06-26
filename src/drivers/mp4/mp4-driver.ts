@@ -16,6 +16,7 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketMetadata,
   Registry,
   StageOptions,
   StreamCopyOptions,
@@ -38,11 +39,14 @@ import { fragmentMp4 } from './fragment.ts';
 import { Mp4Muxer } from './mux.ts';
 import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
 import { Reader } from './reader.ts';
-import { type SampleData, buildSampleData, buildSamples } from './samples.ts';
+import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import { type ContainerBrand, type MuxSampleInput, type MuxTrackInput, writeMp4 } from './write.ts';
 
 const MP4_MIMES = new Set(['video/mp4', 'video/quicktime', 'audio/mp4', 'audio/x-m4a']);
 const MP4_EXTENSIONS = new Set(['mp4', 'mov', 'm4a', 'm4v', 'qt']);
+const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
+const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
+const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
@@ -154,23 +158,33 @@ async function readSamples(
   ra: RandomAccess,
   samples: readonly SampleData[],
 ): Promise<MuxSampleInput[]> {
-  const out: MuxSampleInput[] = [];
-  for (const s of samples) {
-    // A sample whose byte range escapes the source (truncated/corrupt mdat, or a bit-flipped
-    // stsz/stco/co64 entry) would otherwise be read as a silently clamped short buffer and copied as
-    // garbage. Reject it as corrupt input rather than emit a wrong file (graceful-failure, doc 11 §6.3).
-    if (s.offset < 0 || s.size < 0 || (ra.size !== undefined && s.offset + s.size > ra.size)) {
-      const sizeNote = ra.size !== undefined ? ` size ${ra.size}` : '';
+  validateSampleRanges(samples, ra.size);
+
+  const sampleBytes = new Array<Uint8Array | undefined>(samples.length);
+  for (const window of planSampleReadWindows(samples)) {
+    const span = await ra.read(window.start, window.end - window.start);
+    if (span.byteLength !== window.end - window.start) {
       throw new MediaError(
         'demux-error',
-        `sample ${s.index} byte range [${s.offset}, ${s.offset + s.size}) is outside the source${sizeNote} (truncated or corrupt MP4)`,
+        `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+          window.end - window.start
+        } bytes (truncated MP4)`,
       );
     }
-    const data = (await ra.read(s.offset, s.size)).slice();
-    if (data.byteLength !== s.size) {
+    for (const item of window.items) {
+      const rel = item.sample.offset - window.start;
+      sampleBytes[item.ordinal] = span.subarray(rel, rel + item.sample.size);
+    }
+  }
+
+  const out: MuxSampleInput[] = [];
+  let ordinal = 0;
+  for (const s of samples) {
+    const data = sampleBytes[ordinal];
+    if (data === undefined) {
       throw new MediaError(
         'demux-error',
-        `sample ${s.index} short read: got ${data.byteLength} of ${s.size} bytes (truncated MP4)`,
+        `sample ${s.index} was not read from the source (internal read plan error)`,
       );
     }
     out.push({
@@ -179,8 +193,77 @@ async function readSamples(
       cttsTicks: s.cttsTicks,
       keyframe: s.keyframe,
     });
+    ordinal++;
   }
   return out;
+}
+
+interface SampleRange {
+  readonly index: number;
+  readonly offset: number;
+  readonly size: number;
+}
+
+function validateSampleRanges(
+  samples: readonly SampleRange[],
+  sourceSize: number | undefined,
+): void {
+  for (const s of samples) {
+    // A sample whose byte range escapes the source (truncated/corrupt mdat, or a bit-flipped
+    // stsz/stco/co64 entry) would otherwise be read as a silently clamped short buffer and copied as
+    // garbage. Reject it as corrupt input rather than emit a wrong file (graceful-failure, doc 11 §6.3).
+    if (
+      s.offset < 0 ||
+      s.size < 0 ||
+      (sourceSize !== undefined && s.offset + s.size > sourceSize)
+    ) {
+      const sizeNote = sourceSize !== undefined ? ` size ${sourceSize}` : '';
+      throw new MediaError(
+        'demux-error',
+        `sample ${s.index} byte range [${s.offset}, ${s.offset + s.size}) is outside the source${sizeNote} (truncated or corrupt MP4)`,
+      );
+    }
+  }
+}
+
+interface SampleReadItem<T extends SampleRange = SampleData> {
+  readonly ordinal: number;
+  readonly sample: T;
+}
+
+interface SampleReadWindow<T extends SampleRange = SampleData> {
+  start: number;
+  end: number;
+  readonly items: SampleReadItem<T>[];
+}
+
+function planSampleReadWindows<T extends SampleRange>(
+  samples: readonly T[],
+): SampleReadWindow<T>[] {
+  const items = samples
+    .map((sample, ordinal): SampleReadItem<T> => ({ sample, ordinal }))
+    .sort((a, b) => a.sample.offset - b.sample.offset || a.ordinal - b.ordinal);
+  const windows: SampleReadWindow<T>[] = [];
+  let current: SampleReadWindow<T> | undefined;
+  for (const item of items) {
+    const start = item.sample.offset;
+    const end = item.sample.offset + item.sample.size;
+    if (current === undefined) {
+      current = { start, end, items: [item] };
+      windows.push(current);
+      continue;
+    }
+    const gap = start - current.end;
+    const combinedSpan = end - current.start;
+    if (gap <= SAMPLE_READ_GAP_BYTES && combinedSpan <= SAMPLE_READ_WINDOW_BYTES) {
+      current.end = Math.max(current.end, end);
+      current.items.push(item);
+      continue;
+    }
+    current = { start, end, items: [item] };
+    windows.push(current);
+  }
+  return windows;
 }
 
 /** Turn a parsed movie + its bytes into mux-ready tracks (lossless stream-copy), for `remux`. */
@@ -190,6 +273,32 @@ export async function muxTracksFromMovie(ra: RandomAccess, movie: Movie): Promis
     out.push({ ...muxTrackMeta(track), samples: await readSamples(ra, buildSampleData(track)) });
   }
   return out;
+}
+
+function hasCompleteSampleTables(movie: Movie): boolean {
+  return movie.tracks.every((track) => {
+    if (track.samples.sampleSizes.length > 0) return true;
+    return track.fragmentSampleCount === undefined && track.durationSec === 0;
+  });
+}
+
+export function mp4PacketMetadata(movie: Movie, sourceSize?: number): readonly PacketMetadata[] {
+  const packets: PacketMetadata[] = [];
+  for (const track of movie.tracks) {
+    const samples = buildSamples(track);
+    validateSampleRanges(samples, sourceSize);
+    for (const sample of samples) {
+      packets.push({
+        trackId: track.id,
+        sizeBytes: sample.size,
+        ptsUs: sample.ptsUs,
+        dtsUs: sample.dtsUs,
+        durationUs: sample.durationUs,
+        keyframe: sample.keyframe,
+      });
+    }
+  }
+  return packets;
 }
 
 /**
@@ -224,17 +333,163 @@ function selectTrimmed(track: ParsedTrack, startSec: number, endSec: number): Sa
   return all.slice(startIdx, Math.max(startIdx, endIdx) + 1);
 }
 
+function toUs(ticks: number, timescale: number): number {
+  return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
+}
+
+function abortedError(): MediaError {
+  return new MediaError('aborted', 'operation aborted');
+}
+
+function describeUnknownError(e: unknown): string {
+  if (e instanceof Error) return `${e.name}: ${e.message}`;
+  if (typeof DOMException !== 'undefined' && e instanceof DOMException) {
+    return `${e.name}: ${e.message}`;
+  }
+  return String(e);
+}
+
+function trimDecodeValidationError(track: ParsedTrack, e: unknown): MediaError {
+  return new MediaError(
+    'demux-error',
+    `track ${track.id} failed browser decode validation during MP4 trim (${describeUnknownError(e)})`,
+    e,
+  );
+}
+
+function avcDecodeConfig(track: ParsedTrack): VideoDecoderConfig | undefined {
+  if (track.mediaType !== 'video') return undefined;
+  if (track.sampleEntryType !== 'avc1' && track.sampleEntryType !== 'avc3') return undefined;
+  if (track.codecPrivate?.boxType !== 'avcC') return undefined;
+  const config = track.config;
+  return 'codedWidth' in config || 'codedHeight' in config
+    ? {
+        ...(config as VideoDecoderConfig),
+        hardwareAcceleration: 'no-preference',
+      }
+    : undefined;
+}
+
+async function canBrowserDecodeForTrim(config: VideoDecoderConfig): Promise<boolean> {
+  if (typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') return false;
+  try {
+    const support = await VideoDecoder.isConfigSupported(config);
+    return support.supported === true;
+  } catch {
+    return false;
+  }
+}
+
+function closeDecoder(decoder: VideoDecoder | undefined): void {
+  if (decoder && decoder.state !== 'closed') decoder.close();
+}
+
+function awaitDecoderDequeueOrAbort(
+  decoder: VideoDecoder,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortedError());
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      decoder.removeEventListener('dequeue', onDequeue);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onDequeue = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(abortedError());
+    };
+    decoder.addEventListener('dequeue', onDequeue);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function drainDecoderBelowHighWater(
+  decoder: VideoDecoder,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  while (decoder.decodeQueueSize >= TRIM_DECODE_VERIFY_HIGH_WATER) {
+    await awaitDecoderDequeueOrAbort(decoder, signal);
+  }
+}
+
+async function verifyTrimmedAvcDecodeIfAvailable(
+  track: ParsedTrack,
+  selected: readonly SampleData[],
+  samples: readonly MuxSampleInput[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const config = avcDecodeConfig(track);
+  if (!config || !(await canBrowserDecodeForTrim(config))) return;
+
+  let decoder: VideoDecoder | undefined;
+  let settled = false;
+  let failDecode = (_error: MediaError): void => undefined;
+  const errorPromise = new Promise<never>((_, reject: (reason?: unknown) => void) => {
+    failDecode = (error): void => reject(error);
+  });
+  const fail = (error: MediaError): void => {
+    if (settled) return;
+    settled = true;
+    closeDecoder(decoder);
+    failDecode(error);
+  };
+  const onAbort = (): void => fail(abortedError());
+
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    decoder = new VideoDecoder({
+      output: (frame: VideoFrame): void => frame.close(),
+      error: (e: DOMException): void => fail(trimDecodeValidationError(track, e)),
+    });
+    try {
+      decoder.configure(config);
+    } catch {
+      return;
+    }
+    for (let i = 0; i < selected.length; i++) {
+      if (signal?.aborted) throw abortedError();
+      const sample = selected[i];
+      const muxSample = samples[i];
+      if (!sample || !muxSample) continue;
+      await Promise.race([drainDecoderBelowHighWater(decoder, signal), errorPromise]);
+      decoder.decode(
+        new EncodedVideoChunk({
+          type: sample.keyframe ? 'key' : 'delta',
+          timestamp: toUs(sample.dtsTicks + sample.cttsTicks, track.timescale),
+          duration: toUs(sample.durationTicks, track.timescale),
+          data: muxSample.data,
+        }),
+      );
+    }
+    await Promise.race([decoder.flush(), errorPromise]);
+  } catch (e) {
+    throw e instanceof MediaError ? e : trimDecodeValidationError(track, e);
+  } finally {
+    settled = true;
+    signal?.removeEventListener('abort', onAbort);
+    closeDecoder(decoder);
+  }
+}
+
 async function trimMuxTracks(
   ra: RandomAccess,
   movie: Movie,
   startSec: number,
   endSec: number,
+  signal: AbortSignal | undefined,
 ): Promise<MuxTrackInput[]> {
   const out: MuxTrackInput[] = [];
   for (const track of movie.tracks) {
+    const selected = selectTrimmed(track, startSec, endSec);
+    const samples = await readSamples(ra, selected);
+    await verifyTrimmedAvcDecodeIfAvailable(track, selected, samples, signal);
     out.push({
       ...muxTrackMeta(track),
-      samples: await readSamples(ra, selectTrimmed(track, startSec, endSec)),
+      samples,
     });
   }
   return out;
@@ -248,6 +503,7 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
     durationSec: t.durationSec,
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
+    ...(t.encryption !== undefined ? { encrypted: true } : {}),
     config: t.config,
   };
 }
@@ -272,12 +528,20 @@ function packetStream(
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
   const samples = buildSamples(track);
+  validateSampleRanges(samples, ra.size);
+  const windows = planSampleReadWindows(samples);
+  const windowByOrdinal = new Array<SampleReadWindow<Sample> | undefined>(samples.length);
+  for (const window of windows) {
+    for (const item of window.items) windowByOrdinal[item.ordinal] = window;
+  }
   const isVideo = track.mediaType === 'video';
   let i = 0;
+  let currentWindow: SampleReadWindow<Sample> | undefined;
+  let currentBytes: Uint8Array | undefined;
   return new ReadableStream<Packet>({
     async pull(controller): Promise<void> {
       if (signal?.aborted) {
-        controller.error(new MediaError('aborted', 'operation aborted'));
+        controller.error(abortedError());
         return;
       }
       const sample = samples[i];
@@ -286,7 +550,35 @@ function packetStream(
         return;
       }
       i++;
-      const data = await ra.read(sample.offset, sample.size);
+      const window = windowByOrdinal[sample.index];
+      if (window === undefined) {
+        throw new MediaError(
+          'demux-error',
+          `sample ${sample.index} has no read window (internal read plan error)`,
+        );
+      }
+      if (window !== currentWindow) {
+        currentBytes = await ra.read(window.start, window.end - window.start);
+        if (signal?.aborted) throw abortedError();
+        if (currentBytes.byteLength !== window.end - window.start) {
+          throw new MediaError(
+            'demux-error',
+            `sample window [${window.start}, ${window.end}) short read: got ${
+              currentBytes.byteLength
+            } of ${window.end - window.start} bytes (truncated MP4)`,
+          );
+        }
+        currentWindow = window;
+      }
+      const bytes = currentBytes;
+      if (bytes === undefined) {
+        throw new MediaError(
+          'demux-error',
+          'sample window bytes are missing (internal read error)',
+        );
+      }
+      const rel = sample.offset - window.start;
+      const data = bytes.subarray(rel, rel + sample.size);
       const init = {
         type: (sample.keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
         timestamp: sample.ptsUs,
@@ -498,8 +790,10 @@ export const Mp4Driver: ContainerDriver = {
     const movie = await readMovie(ra);
     const byId = new Map(movie.tracks.map((t) => [t.id, t]));
     const signal = o?.signal;
+    const supportsPacketTable = hasCompleteSampleTables(movie);
     return {
       tracks: movie.tracks.map(toTrackInfo),
+      ...(supportsPacketTable ? { packetTable: () => mp4PacketMetadata(movie, ra.size) } : {}),
       packets(trackId: number): ReadableStream<Packet> {
         const track = byId.get(trackId);
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
@@ -513,7 +807,7 @@ export const Mp4Driver: ContainerDriver = {
     const movie = await readMovie(ra);
     const trim = o?.trim;
     const tracks = trim
-      ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec)
+      ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal)
       : await muxTracksFromMovie(ra, movie);
     // Fragmented/CMAF output (ADR-034): a sequence of self-describing `moof`+`mdat` segments after the
     // init segment, streamed one at a time so a StreamTarget never buffers the whole movie. The lossless

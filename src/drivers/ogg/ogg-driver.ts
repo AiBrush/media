@@ -242,6 +242,71 @@ function headerPacketCount(codec: string): number {
   return 2; // opus / flac
 }
 
+/** The first recognized logical stream in an Ogg buffer, or `undefined` when none is complete. */
+function firstRecognizedStream(dv: DataView): OggStream | undefined {
+  let at = 0;
+  while (at + 27 <= dv.byteLength) {
+    const page = parsePage(dv, at);
+    if (!page) {
+      at++;
+      continue;
+    }
+    if (page.headerType & 0x02) {
+      const stream = identifyStream(dv, page);
+      if (stream) return stream;
+    }
+    at = page.pageEnd > at ? page.pageEnd : at + 1;
+  }
+  return undefined;
+}
+
+function packetBytes(data: Uint8Array, packet: RawPacket): Uint8Array {
+  return data.slice(packet.offset, packet.offset + packet.size);
+}
+
+function xiphLacedHeaders(headers: readonly Uint8Array[]): Uint8Array | undefined {
+  if (headers.length !== 3) return undefined;
+  const lacing: number[] = [headers.length - 1];
+  for (const h of headers.slice(0, -1)) {
+    let len = h.byteLength;
+    while (len >= 255) {
+      lacing.push(255);
+      len -= 255;
+    }
+    lacing.push(len);
+  }
+  const total = lacing.length + headers.reduce((sum, h) => sum + h.byteLength, 0);
+  const out = new Uint8Array(total);
+  out.set(lacing, 0);
+  let at = lacing.length;
+  for (const h of headers) {
+    out.set(h, at);
+    at += h.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Codec-private headers for remuxing Ogg audio through the EncodedChunk seam:
+ * Opus keeps its OpusHead (notably `pre_skip`); Vorbis uses Matroska/WebCodecs-style Xiph-laced
+ * id/comment/setup packets, which the Ogg muxer can split back into native Ogg headers.
+ */
+function codecPrivateDescription(data: Uint8Array): Uint8Array | undefined {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const stream = firstRecognizedStream(dv);
+  if (!stream) return undefined;
+  const raw = delacePackets(dv, stream.serial).filter((p) => p.complete);
+  if (stream.codec === 'opus') {
+    const opusHead = raw[0];
+    return opusHead ? packetBytes(data, opusHead) : undefined;
+  }
+  if (stream.codec === 'vorbis') {
+    const headers = raw.slice(0, 3).map((p) => packetBytes(data, p));
+    return xiphLacedHeaders(headers);
+  }
+  return undefined;
+}
+
 /**
  * Enumerate the **audio** packets of the first recognized Ogg stream as {@link OggPacket}s (offset/size +
  * PTS/duration in µs). Pure — no WebCodecs — so it is the unit under test. Timing is anchored to the
@@ -261,18 +326,7 @@ function headerPacketCount(codec: string): number {
  */
 export function oggAudioPackets(data: Uint8Array): OggPacket[] {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  // Identify the first stream from its BOS page (same scan as parseOgg).
-  let stream: OggStream | undefined;
-  let at = 0;
-  while (at + 27 <= dv.byteLength && !stream) {
-    const page = parsePage(dv, at);
-    if (!page) {
-      at++;
-      continue;
-    }
-    if (page.headerType & 0x02) stream = identifyStream(dv, page);
-    at = page.pageEnd > at ? page.pageEnd : at + 1;
-  }
+  const stream = firstRecognizedStream(dv);
   if (!stream) throw new InputError('unsupported-input', 'no recognized Ogg codec stream found');
 
   const preSkip = stream.codec === 'opus' ? readOpusPreSkip(dv, stream.serial) : 0;
@@ -486,12 +540,18 @@ export const OggDriver: ContainerDriver = {
     const info = parseOgg(await readHead(src), await readTail(src));
     const all = await readAll(src);
     const signal = o?.signal;
+    const description = codecPrivateDescription(all);
     const track: TrackInfo = {
       id: 0,
       mediaType: info.mediaType,
       codec: info.codec,
       durationSec: info.durationSec,
-      config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+      config: {
+        codec: info.codec,
+        sampleRate: info.sampleRate,
+        numberOfChannels: info.channels,
+        ...(description !== undefined ? { description } : {}),
+      },
     };
     return {
       tracks: [track],

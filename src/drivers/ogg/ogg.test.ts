@@ -181,7 +181,32 @@ describe('OggDriver — demux seam + muxer', () => {
     };
     const demuxed = await OggDriver.demux(streamSource);
     expect(demuxed.tracks[0]?.codec).toBe('vorbis');
+    const description = demuxed.tracks[0]?.config?.description;
+    expect(description).toBeInstanceOf(Uint8Array);
+    expect((description as Uint8Array)[0]).toBe(2); // Xiph-laced Vorbis id/comment/setup headers
     expect(() => demuxed.packets(0)).toThrowError(/browser codec layer/);
+    await demuxed.close();
+  });
+
+  it('carries the source OpusHead through the demux TrackInfo description', async () => {
+    const bytes = await loadFixture('sfx-opus.ogg');
+    const streamSource: ByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+    };
+    const demuxed = await OggDriver.demux(streamSource);
+    const description = demuxed.tracks[0]?.config?.description;
+    expect(description).toBeInstanceOf(Uint8Array);
+    const opusHead = description as Uint8Array;
+    expect(String.fromCharCode(...opusHead.subarray(0, 8))).toBe('OpusHead');
+    expect(
+      new DataView(opusHead.buffer, opusHead.byteOffset, opusHead.byteLength).getUint16(10, true),
+    ).toBe(312);
     await demuxed.close();
   });
 

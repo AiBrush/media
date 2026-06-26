@@ -198,6 +198,7 @@ function versionFromBits(bits: number): MpegVersion {
       return 'mpeg2';
     case 3:
       return 'mpeg1';
+    /* v8 ignore next 2 -- isFrameSync rejects the reserved MPEG version before this switch. */
     default:
       // bits === 1 is the reserved version; isFrameSync already rejects it, so this is unreachable.
       throw new MediaError('decode-error', 'mp3: reserved MPEG version');
@@ -212,6 +213,7 @@ function layerFromBits(bits: number): MpegLayer {
       return 2; // `10` = Layer II
     case 3:
       return 1; // `11` = Layer I
+    /* v8 ignore next 2 -- isFrameSync rejects the reserved layer before this switch. */
     default:
       // bits === 0 is the reserved layer; isFrameSync already rejects it.
       throw new MediaError('decode-error', 'mp3: reserved layer');
@@ -248,7 +250,7 @@ export function id3v2Size(bytes: Uint8Array): number {
   // Syncsafe: each byte uses only its low 7 bits (ID3v2.4 §3.1).
   if ((s0 | s1 | s2 | s3) & 0x80) return 0; // a high bit set ⇒ not a valid syncsafe size
   const bodySize = (s0 << 21) | (s1 << 14) | (s2 << 7) | s3;
-  const footer = (bytes[5] ?? 0) & 0x10 ? 10 : 0; // ID3v2.4 footer present flag
+  const footer = ((bytes[5] as number) & 0x10) !== 0 ? 10 : 0; // ID3v2.4 footer present flag
   return 10 + bodySize + footer;
 }
 
@@ -267,9 +269,9 @@ export function hasId3v1(bytes: Uint8Array): boolean {
 export function firstFrameOffset(bytes: Uint8Array): number {
   const start = id3v2Size(bytes);
   for (let i = start; i + 4 <= bytes.length; i++) {
-    const b0 = bytes[i];
-    const b1 = bytes[i + 1];
-    if (b0 !== undefined && b1 !== undefined && isFrameSync(b0, b1)) {
+    const b0 = bytes[i] as number;
+    const b1 = bytes[i + 1] as number;
+    if (isFrameSync(b0, b1)) {
       // Confirm by fully parsing (rejects a false sync inside data): a parse that doesn't throw wins.
       try {
         parseMp3FrameHeader(bytes, i);
@@ -418,9 +420,8 @@ export function deinterleaveF32(
   }
   const planes = Array.from({ length: channels }, () => new Float32Array(frames));
   for (let c = 0; c < channels; c++) {
-    const plane = planes[c];
-    if (plane === undefined) throw new MediaError('decode-error', `mp3: missing plane ${c}`);
-    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] ?? 0;
+    const plane = planes[c] as Float32Array;
+    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] as number;
   }
   return planes;
 }

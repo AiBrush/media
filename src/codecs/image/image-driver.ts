@@ -9,9 +9,10 @@
  * from `probe`/`decode` when the source sniffs as an image, or (b) call {@link registerImageSupport} on a
  * host that collects image ops. The {@link ImageModule} mirrors the `DriverModule` shape (`apiVersion` +
  * `register`) so it can sit alongside the other modules; `register` is a no-op against the plain driver
- * `Registry` (it has no image slot) and attaches only when given an {@link ImageRegistry}. Public exports
- * to surface (also lead-owned, in `src/index.ts`): `probeImage`, `decodeImage`, `decodeImageFrames`,
- * `inspectImage`, `sniffImageFormat`, the `ImageInfo`/`ImageFormat` types, and `IMAGE_MIME`.
+ * `Registry` (it has no image slot) and attaches only when given an {@link ImageRegistry}. Public helper
+ * exports live on the `@aibrush/media/image` subpath (`src/image.ts`): `probeImage`, `decodeImage`,
+ * `decodeImageFrames`, `inspectImage`, `sniffImageFormat`, the `ImageInfo`/`ImageFormat` types, and
+ * `IMAGE_MIME`.
  */
 
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';

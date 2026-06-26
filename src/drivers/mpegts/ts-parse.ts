@@ -158,9 +158,9 @@ interface TsPacket {
  */
 function parsePacket(bytes: Uint8Array, off: number): TsPacket | undefined {
   if (bytes[off] !== SYNC_BYTE) return undefined;
-  const b1 = bytes[off + 1] ?? 0;
-  const b2 = bytes[off + 2] ?? 0;
-  const b3 = bytes[off + 3] ?? 0;
+  const b1 = bytes[off + 1] as number;
+  const b2 = bytes[off + 2] as number;
+  const b3 = bytes[off + 3] as number;
   const transportError = (b1 & 0x80) !== 0;
   if (transportError) return undefined; // TEI set: the demodulator flagged this packet as corrupt
   const payloadUnitStart = (b1 & 0x40) !== 0;
@@ -175,16 +175,16 @@ function parsePacket(bytes: Uint8Array, off: number): TsPacket | undefined {
   let cursor = off + 4;
   let pcr: number | undefined;
   if (hasAdaptation) {
-    const afLen = bytes[cursor] ?? 0;
+    const afLen = bytes[cursor] as number;
     if (afLen > 0) {
-      const flags = bytes[cursor + 1] ?? 0;
+      const flags = bytes[cursor + 1] as number;
       if ((flags & 0x10) !== 0 && afLen >= 7) {
         // PCR present: 33-bit base in bytes [cursor+2 .. +6] high bits, then a 9-bit extension.
-        const a = bytes[cursor + 2] ?? 0;
-        const c = bytes[cursor + 3] ?? 0;
-        const d = bytes[cursor + 4] ?? 0;
-        const e = bytes[cursor + 5] ?? 0;
-        const f = bytes[cursor + 6] ?? 0;
+        const a = bytes[cursor + 2] as number;
+        const c = bytes[cursor + 3] as number;
+        const d = bytes[cursor + 4] as number;
+        const e = bytes[cursor + 5] as number;
+        const f = bytes[cursor + 6] as number;
         // base = top 33 bits: a(8)<<25 | c(8)<<17 | d(8)<<9 | e(8)<<1 | f>>7. Use * for the >32-bit part.
         pcr = a * 2 ** 25 + c * 2 ** 17 + d * 2 ** 9 + e * 2 + (f >> 7);
       }
@@ -218,13 +218,13 @@ function sectionFromPayload(payload: Uint8Array): Uint8Array | undefined {
 /** Parse a PAT section → the first program's PMT PID (programs repeat; the first is enough). */
 function parsePat(section: Uint8Array): { programPmtPids: Map<number, number> } | undefined {
   if (section[0] !== 0x00) return undefined; // table_id 0x00 = PAT
-  const sectionLength = (((section[1] ?? 0) & 0x0f) << 8) | (section[2] ?? 0);
+  const sectionLength = (((section[1] as number) & 0x0f) << 8) | (section[2] as number);
   const end = Math.min(3 + sectionLength - 4, section.byteLength); // drop the 4-byte CRC
   const map = new Map<number, number>();
   // Program loop starts after the 8-byte section header (table_id..last_section_number).
   for (let i = 8; i + 4 <= end; i += 4) {
-    const programNumber = ((section[i] ?? 0) << 8) | (section[i + 1] ?? 0);
-    const pid = (((section[i + 2] ?? 0) & 0x1f) << 8) | (section[i + 3] ?? 0);
+    const programNumber = ((section[i] as number) << 8) | (section[i + 1] as number);
+    const pid = (((section[i + 2] as number) & 0x1f) << 8) | (section[i + 3] as number);
     if (programNumber !== 0) map.set(programNumber, pid); // program 0 = network PID, not a PMT
   }
   return map.size > 0 ? { programPmtPids: map } : undefined;
@@ -234,12 +234,17 @@ function parsePat(section: Uint8Array): { programPmtPids: Map<number, number> } 
 function codecFromDescriptors(descriptors: Uint8Array): string | undefined {
   let i = 0;
   while (i + 2 <= descriptors.byteLength) {
-    const tag = descriptors[i] ?? 0;
-    const len = descriptors[i + 1] ?? 0;
+    const tag = descriptors[i] as number;
+    const len = descriptors[i + 1] as number;
     const body = descriptors.subarray(i + 2, i + 2 + len);
     if (tag === 0x05 && body.byteLength >= 4) {
       // registration_descriptor: a 4-char format_identifier (e.g. 'AC-3', 'Opus', 'EAC3').
-      const id = String.fromCharCode(body[0] ?? 0, body[1] ?? 0, body[2] ?? 0, body[3] ?? 0);
+      const id = String.fromCharCode(
+        body[0] as number,
+        body[1] as number,
+        body[2] as number,
+        body[3] as number,
+      );
       if (id === 'AC-3') return 'ac-3';
       if (id === 'EAC3') return 'ec-3';
       if (id === 'Opus') return 'opus';
@@ -265,15 +270,15 @@ function codecForStream(streamType: number, descriptors: Uint8Array): string | u
 /** Parse a PMT section → the elementary streams (PID + codec). */
 function parsePmt(section: Uint8Array): TsStream[] | undefined {
   if (section[0] !== 0x02) return undefined; // table_id 0x02 = PMT
-  const sectionLength = (((section[1] ?? 0) & 0x0f) << 8) | (section[2] ?? 0);
+  const sectionLength = (((section[1] as number) & 0x0f) << 8) | (section[2] as number);
   const end = Math.min(3 + sectionLength - 4, section.byteLength);
-  const programInfoLength = (((section[10] ?? 0) & 0x0f) << 8) | (section[11] ?? 0);
+  const programInfoLength = (((section[10] as number) & 0x0f) << 8) | (section[11] as number);
   const streams: TsStream[] = [];
   let i = 12 + programInfoLength; // skip the program-level descriptor loop
   while (i + 5 <= end) {
-    const streamType = section[i] ?? 0;
-    const pid = (((section[i + 1] ?? 0) & 0x1f) << 8) | (section[i + 2] ?? 0);
-    const esInfoLength = (((section[i + 3] ?? 0) & 0x0f) << 8) | (section[i + 4] ?? 0);
+    const streamType = section[i] as number;
+    const pid = (((section[i + 1] as number) & 0x1f) << 8) | (section[i + 2] as number);
+    const esInfoLength = (((section[i + 3] as number) & 0x0f) << 8) | (section[i + 4] as number);
     const descriptors = section.subarray(i + 5, i + 5 + esInfoLength);
     const codec = codecForStream(streamType, descriptors);
     const mediaType =
@@ -291,11 +296,11 @@ function parsePmt(section: Uint8Array): TsStream[] | undefined {
 
 /** Decode a 33-bit PTS/DTS from the 5 marker-interleaved bytes at `b[off..off+5)`. */
 function readPtsDts(b: Uint8Array, off: number): number {
-  const a = b[off] ?? 0;
-  const c = b[off + 1] ?? 0;
-  const d = b[off + 2] ?? 0;
-  const e = b[off + 3] ?? 0;
-  const f = b[off + 4] ?? 0;
+  const a = b[off] as number;
+  const c = b[off + 1] as number;
+  const d = b[off + 2] as number;
+  const e = b[off + 3] as number;
+  const f = b[off + 4] as number;
   // bits: aaa(3) cccccccc(8) ddddddd(7) eeeeeeee(8) fffffff(7) interleaved with marker bits.
   return (
     ((a >> 1) & 0x7) * 2 ** 30 +
@@ -314,7 +319,7 @@ interface PesBuilder {
 
 /** Concatenate a builder's packet payloads into one contiguous PES buffer. */
 function flattenPes(builder: PesBuilder): Uint8Array {
-  if (builder.chunks.length === 1) return builder.chunks[0] ?? new Uint8Array(0);
+  if (builder.chunks.length === 1) return builder.chunks[0] as Uint8Array;
   const out = new Uint8Array(builder.length);
   let off = 0;
   for (const c of builder.chunks) {
@@ -341,20 +346,28 @@ interface PesUnit {
  * `stream_id` carries no PTS (padding/private-2/ECM/EMM map streams), so only real media AUs flow on.
  */
 function splitPes(pes: Uint8Array): PesUnit | undefined {
+  if (pes.byteLength < 9) return undefined;
   if (pes[0] !== 0x00 || pes[1] !== 0x00 || pes[2] !== 0x01) return undefined; // PES start_code prefix
-  const streamId = pes[3] ?? 0;
+  const streamId = pes[3] as number;
   // Stream ids that have no PES header extension (and so no PTS): padding, private_2, and the various
   // map/info streams (ISO/IEC 13818-1 §2.4.3.7). Audio (0xC0..0xDF) and video (0xE0..0xEF) do.
   const isVideo = streamId >= 0xe0 && streamId <= 0xef;
   const isAudio = streamId >= 0xc0 && streamId <= 0xdf;
   if (!isVideo && !isAudio) return undefined;
-  const ptsDtsFlags = ((pes[7] ?? 0) >> 6) & 0x3;
-  const headerDataLength = pes[8] ?? 0;
+  const ptsDtsFlags = ((pes[7] as number) >> 6) & 0x3;
+  const headerDataLength = pes[8] as number;
   const payloadStart = 9 + headerDataLength;
+  if (payloadStart > pes.byteLength) return undefined;
   let pts: number | undefined;
   let dts: number | undefined;
-  if ((ptsDtsFlags & 0x2) !== 0) pts = readPtsDts(pes, 9);
-  if (ptsDtsFlags === 0x3) dts = readPtsDts(pes, 14);
+  if ((ptsDtsFlags & 0x2) !== 0) {
+    if (pes.byteLength < 14) return undefined;
+    pts = readPtsDts(pes, 9);
+  }
+  if (ptsDtsFlags === 0x3) {
+    if (pes.byteLength < 19) return undefined;
+    dts = readPtsDts(pes, 14);
+  }
   return {
     ...(pts !== undefined ? { pts } : {}),
     ...(dts !== undefined ? { dts } : {}),
@@ -367,7 +380,7 @@ function h264HasIdr(au: Uint8Array): boolean {
   // Scan for 00 00 01 / 00 00 00 01 start codes and inspect the NAL unit type (low 5 bits of the byte).
   for (let i = 0; i + 3 < au.byteLength; i++) {
     if (au[i] === 0x00 && au[i + 1] === 0x00 && au[i + 2] === 0x01) {
-      const nalType = (au[i + 3] ?? 0) & 0x1f;
+      const nalType = (au[i + 3] as number) & 0x1f;
       if (nalType === 5) return true; // IDR slice
       i += 2;
     }
@@ -379,7 +392,7 @@ function h264HasIdr(au: Uint8Array): boolean {
 function hevcHasIrap(au: Uint8Array): boolean {
   for (let i = 0; i + 4 < au.byteLength; i++) {
     if (au[i] === 0x00 && au[i + 1] === 0x00 && au[i + 2] === 0x01) {
-      const nalType = ((au[i + 3] ?? 0) >> 1) & 0x3f;
+      const nalType = ((au[i + 3] as number) >> 1) & 0x3f;
       if (nalType >= 16 && nalType <= 23) return true;
       i += 2;
     }
@@ -422,14 +435,14 @@ interface PtsSpan {
 function ptsSpan(ptsTicks: readonly number[]): PtsSpan | undefined {
   if (ptsTicks.length < 2) return undefined;
   const unwrapped = unwrap([...ptsTicks].sort((x, y) => x - y));
-  const first = unwrapped[0] ?? 0;
-  const last = unwrapped[unwrapped.length - 1] ?? first;
+  const first = unwrapped[0] as number;
+  const last = unwrapped[unwrapped.length - 1] as number;
   if (last - first <= 0) return undefined;
   const gaps: number[] = [];
   for (let i = 1; i < unwrapped.length; i++)
-    gaps.push((unwrapped[i] ?? 0) - (unwrapped[i - 1] ?? 0));
+    gaps.push((unwrapped[i] as number) - (unwrapped[i - 1] as number));
   gaps.sort((x, y) => x - y);
-  return { first, last, medianGap: gaps[gaps.length >> 1] ?? 0 };
+  return { first, last, medianGap: gaps[gaps.length >> 1] as number };
 }
 
 /**
@@ -603,7 +616,7 @@ function mediaRank(t: MediaType): number {
 
 /** Parse H.264 SPS coded dimensions from the first SPS NAL in an access unit (Annex-B). */
 function h264Dimensions(au: Uint8Array): { width: number; height: number } | undefined {
-  const sps = findNal(au, (nal) => (nal[0] ?? 0) & 0x1f, 7);
+  const sps = findNal(au, (nal) => (nal[0] as number) & 0x1f, 7);
   return sps ? parseH264Sps(sps) : undefined;
 }
 
@@ -633,7 +646,7 @@ function parseH264Sps(nal: Uint8Array): { width: number; height: number } | unde
     r.u(8); // constraint flags + reserved
     r.u(8); // level_idc
     r.ue(); // seq_parameter_set_id
-    const profileIdc = rbsp[0] ?? 0;
+    const profileIdc = rbsp[0] as number;
     if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profileIdc)) {
       const chromaFormatIdc = r.ue();
       if (chromaFormatIdc === 3) r.u(1); // separate_colour_plane_flag
@@ -699,7 +712,7 @@ function stripEmulation(nal: Uint8Array): Uint8Array {
     ) {
       continue;
     }
-    out.push(nal[i] ?? 0);
+    out.push(nal[i] as number);
   }
   return new Uint8Array(out);
 }
@@ -742,10 +755,11 @@ const AAC_SAMPLE_RATES = [
 
 /** Read AAC sampleRate/channels from an ADTS frame header (the AU on a 0x0f/0x11 PID). */
 function aacParams(au: Uint8Array): { sampleRate: number; channels: number } | undefined {
-  if ((au[0] ?? 0) !== 0xff || ((au[1] ?? 0) & 0xf0) !== 0xf0) return undefined; // ADTS syncword
-  const sampleIndex = ((au[2] ?? 0) >> 2) & 0x0f;
+  if (au.byteLength < 4) return undefined;
+  if ((au[0] as number) !== 0xff || ((au[1] as number) & 0xf0) !== 0xf0) return undefined; // ADTS syncword
+  const sampleIndex = ((au[2] as number) >> 2) & 0x0f;
   const sampleRate = AAC_SAMPLE_RATES[sampleIndex];
-  const channels = (((au[2] ?? 0) & 0x01) << 2) | (((au[3] ?? 0) >> 6) & 0x03);
+  const channels = (((au[2] as number) & 0x01) << 2) | (((au[3] as number) >> 6) & 0x03);
   if (sampleRate === undefined || channels === 0) return undefined;
   return { sampleRate, channels };
 }
@@ -769,16 +783,16 @@ function splitAdtsFrames(payload: Uint8Array): AdtsFrame[] {
   const frames: AdtsFrame[] = [];
   let i = 0;
   while (i + 7 <= payload.byteLength) {
-    if ((payload[i] ?? 0) !== 0xff || ((payload[i + 1] ?? 0) & 0xf0) !== 0xf0) break; // ADTS syncword
+    if ((payload[i] as number) !== 0xff || ((payload[i + 1] as number) & 0xf0) !== 0xf0) break; // ADTS syncword
     const frameLength =
-      (((payload[i + 3] ?? 0) & 0x03) << 11) |
-      ((payload[i + 4] ?? 0) << 3) |
-      (((payload[i + 5] ?? 0) >> 5) & 0x07);
+      (((payload[i + 3] as number) & 0x03) << 11) |
+      ((payload[i + 4] as number) << 3) |
+      (((payload[i + 5] as number) >> 5) & 0x07);
     if (frameLength < 7 || i + frameLength > payload.byteLength) break; // truncated / malformed frame
-    const sampleIndex = ((payload[i + 2] ?? 0) >> 2) & 0x0f;
+    const sampleIndex = ((payload[i + 2] as number) >> 2) & 0x0f;
     const sampleRate = AAC_SAMPLE_RATES[sampleIndex] ?? 0;
     // number_of_raw_data_blocks_in_frame (byte 6, bits 0-1) + 1 blocks, each 1024 samples (AAC-LC).
-    const blocks = ((payload[i + 6] ?? 0) & 0x03) + 1;
+    const blocks = ((payload[i + 6] as number) & 0x03) + 1;
     frames.push({ data: payload.subarray(i, i + frameLength), samples: 1024 * blocks, sampleRate });
     i += frameLength;
   }

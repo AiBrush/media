@@ -181,6 +181,13 @@ describe('resample — quality (band-limited windowed-sinc)', () => {
     expect(channelAt(r.planar, 0).length).toBe(0);
   });
 
+  it('keeps arbitrary high-phase ratios on the dense-table fallback', () => {
+    const a = sine(1000, 44100, 0.002);
+    const r = resample(a, 44101);
+    expect(r.frames).toBe(Math.round((a.frames * 44101) / 44100));
+    expect(Number.isFinite(sampleAt(channelAt(r.planar, 0), 0))).toBe(true);
+  });
+
   it('rejects an invalid target sample rate with a typed CapabilityError', () => {
     const a = sine(1000, 44100, 0.01);
     expect(() => resample(a, 0)).toThrow(CapabilityError);

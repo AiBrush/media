@@ -244,6 +244,22 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     expect(audioPackets.map((p) => [...p])).toEqual(inputs.map((c) => [...c.data]));
   });
 
+  it('uses declared Opus duration as a final in-packet granule trim', async () => {
+    const muxer = new OggMuxer();
+    const declaredFinalGranule = 1500; // between packet 1 (960) and packet 2 (1920)
+    const t = muxer.addTrack({ ...opusTrack, durationSec: declaredFinalGranule / 48_000 });
+    muxer.addChunkStruct(t, audio(0, 80, 0x11));
+    muxer.addChunkStruct(t, audio(20_000, 120, 0x22));
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    expect(parseOgg(bytes).durationSec).toBeCloseTo(declaredFinalGranule / 48_000, 5);
+    const granules = scanPages(bytes)
+      .map((p) => p.granule)
+      .filter((g) => g >= 0);
+    expect(Math.max(...granules)).toBe(declaredFinalGranule);
+  });
+
   it('synthesizes an OpusHead when no description is supplied (parses with the right channels)', async () => {
     const muxer = new OggMuxer();
     const t = muxer.addTrack({

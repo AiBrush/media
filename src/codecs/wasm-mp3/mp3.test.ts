@@ -46,6 +46,34 @@ const WASM_PATH = new URL('./mp3_wasm_bg.wasm', import.meta.url).pathname;
 // ============ pure helpers: frame header ============
 
 describe('parseMp3FrameHeader — ISO/IEC 11172-3 frame header (golden bytes)', () => {
+  function header(
+    opts: {
+      versionBits?: number;
+      layerBits?: number;
+      crcAbsent?: boolean;
+      bitrateIndex?: number;
+      sampleRateIndex?: number;
+      padding?: boolean;
+      channelModeBits?: number;
+    } = {},
+  ): Uint8Array {
+    const {
+      versionBits = 3,
+      layerBits = 1,
+      crcAbsent = true,
+      bitrateIndex = 9,
+      sampleRateIndex = 0,
+      padding = false,
+      channelModeBits = 0,
+    } = opts;
+    return Uint8Array.of(
+      0xff,
+      0xe0 | ((versionBits & 0x3) << 3) | ((layerBits & 0x3) << 1) | (crcAbsent ? 1 : 0),
+      ((bitrateIndex & 0xf) << 4) | ((sampleRateIndex & 0x3) << 2) | (padding ? 0x2 : 0),
+      (channelModeBits & 0x3) << 6,
+    );
+  }
+
   it('MPEG-1 Layer III 128k/44100 stereo (FF FB 90 00) → frame size 417, 1152 samples', () => {
     const h = parseMp3FrameHeader(Uint8Array.of(0xff, 0xfb, 0x90, 0x00));
     expect(h.version).toBe('mpeg1');
@@ -76,6 +104,49 @@ describe('parseMp3FrameHeader — ISO/IEC 11172-3 frame header (golden bytes)', 
     expect(h.frameSize).toBe(208); // floor(72 * 64000 / 22050)
     expect(h.samplesPerFrame).toBe(576);
   });
+  it('MPEG-2.5 Layer III uses the low sample-rate table and 576 samples/frame', () => {
+    const h = parseMp3FrameHeader(
+      header({ versionBits: 0, layerBits: 1, bitrateIndex: 1, sampleRateIndex: 0, padding: true }),
+    );
+    expect(h.version).toBe('mpeg2.5');
+    expect(h.layer).toBe(3);
+    expect(h.bitrate).toBe(8_000);
+    expect(h.sampleRate).toBe(11_025);
+    expect(h.frameSize).toBe(53); // floor(72 * 8000 / 11025) + 1 padding byte
+    expect(h.samplesPerFrame).toBe(576);
+  });
+  it('MPEG-1 Layer II dual-channel uses the Layer-II bitrate table and 1152 samples/frame', () => {
+    const h = parseMp3FrameHeader(
+      header({
+        versionBits: 3,
+        layerBits: 2,
+        bitrateIndex: 5,
+        sampleRateIndex: 1,
+        padding: true,
+        channelModeBits: 2,
+      }),
+    );
+    expect(h.layer).toBe(2);
+    expect(h.bitrate).toBe(80_000);
+    expect(h.sampleRate).toBe(48_000);
+    expect(h.channelMode).toBe('dual');
+    expect(h.channels).toBe(2);
+    expect(h.frameSize).toBe(241); // floor(144 * 80000 / 48000) + 1
+    expect(h.samplesPerFrame).toBe(1152);
+  });
+  it('MPEG-1 Layer I joint-stereo uses 4-byte slots and 384 samples/frame', () => {
+    const h = parseMp3FrameHeader(
+      header({ versionBits: 3, layerBits: 3, bitrateIndex: 14, channelModeBits: 1 }),
+    );
+    expect(h.layer).toBe(1);
+    expect(h.bitrate).toBe(448_000);
+    expect(h.channelMode).toBe('joint');
+    expect(h.frameSize).toBe(484); // floor(12 * 448000 / 44100) * 4
+    expect(h.samplesPerFrame).toBe(384);
+  });
+  it('reports CRC-present frames via crcAbsent=false', () => {
+    expect(parseMp3FrameHeader(header({ crcAbsent: false })).crcAbsent).toBe(false);
+  });
   it('rejects the free bitrate (index 0) and the invalid bitrate (index 15)', () => {
     expect(() => parseMp3FrameHeader(Uint8Array.of(0xff, 0xfb, 0x00, 0x00))).toThrow(
       /free|bitrate/,
@@ -97,6 +168,7 @@ describe('parseMp3FrameHeader — ISO/IEC 11172-3 frame header (golden bytes)', 
 describe('isFrameSync — 11-bit sync + non-reserved version/layer', () => {
   it('accepts a valid MPEG-1 L3 sync, rejects reserved version/layer', () => {
     expect(isFrameSync(0xff, 0xfb)).toBe(true); // MPEG1 L3
+    expect(isFrameSync(0xff, 0xdf)).toBe(false); // missing the top sync bits in byte 1
     expect(isFrameSync(0xff, 0xe0)).toBe(false); // version 01 reserved, layer 00 reserved
     expect(isFrameSync(0xff, 0xf9)).toBe(false); // layer 00 (reserved): (b1 & 0x06)==0
     expect(isFrameSync(0xfe, 0xfb)).toBe(false); // byte0 not 0xFF
@@ -176,6 +248,43 @@ describe('parseVbrHeader — Xing/Info + LAME delay/padding', () => {
     expect(vbr?.encoderDelay).toBe(576);
     expect(vbr?.encoderPadding).toBe(1152);
   });
+  it('parses Info with optional bytes/TOC/quality fields before a Lavf delay tag', () => {
+    const frame = new Uint8Array(256);
+    frame.set([0xff, 0xf3, 0x80, 0xc0], 0); // MPEG-2 L3 mono: Xing offset 13
+    const xo = 13;
+    frame.set([0x49, 0x6e, 0x66, 0x6f], xo); // 'Info'
+    frame[xo + 7] = 0x0f; // frames + bytes + TOC + quality
+    frame[xo + 8] = 0x00;
+    frame[xo + 9] = 0x00;
+    frame[xo + 10] = 0x00;
+    frame[xo + 11] = 0x07;
+    const lame = xo + 8 + 4 + 4 + 100 + 4;
+    frame.set([0x4c, 0x61, 0x76, 0x66], lame); // 'Lavf'
+    frame[lame + 21] = 0x02;
+    frame[lame + 22] = 0x40;
+    frame[lame + 23] = 0x10;
+    const info = parseVbrHeader(frame, parseMp3FrameHeader(frame));
+    expect(info?.tag).toBe('Info');
+    expect(info?.frameCount).toBe(7);
+    expect(info?.encoderDelay).toBe(36);
+    expect(info?.encoderPadding).toBe(16);
+  });
+  it('parses VBRI frame count and tolerates a truncated VBRI count', () => {
+    const frame = new Uint8Array(80);
+    frame.set([0xff, 0xfb, 0x90, 0x00], 0);
+    frame.set([0x56, 0x42, 0x52, 0x49], 36); // 'VBRI'
+    frame[36 + 14] = 0x00;
+    frame[36 + 15] = 0x00;
+    frame[36 + 16] = 0x00;
+    frame[36 + 17] = 0x2a;
+    expect(parseVbrHeader(frame, parseMp3FrameHeader(frame))).toEqual({
+      tag: 'VBRI',
+      frameCount: 42,
+    });
+    expect(parseVbrHeader(frame.subarray(0, 36 + 16), parseMp3FrameHeader(frame))).toEqual({
+      tag: 'VBRI',
+    });
+  });
   it('returns undefined for a plain frame with no Xing/Info/VBRI', () => {
     const frame = new Uint8Array(400);
     frame.set([0xff, 0xfb, 0x90, 0x00], 0);
@@ -251,6 +360,20 @@ describe('iterateMp3Frames — walk the real sound_5.mp3', () => {
     expect(count).toBeGreaterThan(10); // a real clip has many frames
     expect(firstRate).toBeGreaterThan(0);
     expect([576, 1152]).toContain(firstSamples);
+  });
+  it('skips a false sync candidate and stops cleanly on sync loss or truncation', () => {
+    const full = new Uint8Array(417 + 8);
+    full.set([0xff, 0xfb, 0x00, 0x00], 0); // sync-shaped but free bitrate → false candidate
+    full.set([0xff, 0xfb, 0x90, 0x00], 4); // real MPEG-1 L3 frame
+    expect(firstFrameOffset(full)).toBe(4);
+
+    const oneFrameThenJunk = new Uint8Array(417 + 4);
+    oneFrameThenJunk.set([0xff, 0xfb, 0x90, 0x00], 0);
+    const walked = [...iterateMp3Frames(oneFrameThenJunk)];
+    expect(walked.length).toBe(1);
+
+    const truncated = Uint8Array.of(0xff, 0xfb, 0x90, 0x00, 0, 1, 2, 3);
+    expect([...iterateMp3Frames(truncated)]).toEqual([]);
   });
 });
 

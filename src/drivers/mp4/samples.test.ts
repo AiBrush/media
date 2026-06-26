@@ -83,6 +83,19 @@ describe('buildSamples', () => {
     expect(s[1]?.dtsUs).toBe(100_000); // second delta padded from the last value
   });
 
+  it('uses zero durations when a malformed sample table omits stts entries', () => {
+    const s = buildSamples(
+      track({
+        chunkOffsets: [0],
+        sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 2, descIndex: 1 }],
+        sampleSizes: [10, 20],
+        timeToSample: [],
+      }),
+    );
+    expect(s.map((x) => x.durationUs)).toEqual([0, 0]);
+    expect(s.map((x) => x.dtsUs)).toEqual([0, 0]);
+  });
+
   it('returns zero timestamps when the timescale is zero', () => {
     const s = buildSamples(track(oneChunk, 0));
     expect(s.every((x) => x.dtsUs === 0 && x.ptsUs === 0 && x.durationUs === 0)).toBe(true);

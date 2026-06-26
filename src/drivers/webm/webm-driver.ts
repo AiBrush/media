@@ -123,7 +123,8 @@ export interface WebmTrack {
    * H.264 (`V_MPEG4/ISO/AVC`) the Matroska CodecPrivate **is** the `avcC` box, and for HEVC
    * (`V_MPEGH/ISO/HEVC`) it **is** `hvcC`; surfacing it is what unblocks H.264/HEVC-in-Matroska decode
    * (the codec tier expands the bare `h264`/`hevc` token + this `description` into `avc1.PPCCLL`/`hev1…`).
-   * VP8/VP9/AV1/Opus are self-describing and carry no decoder description.
+   * For Vorbis, Matroska `CodecPrivate` is the Xiph-laced id/comment/setup header triplet that an Ogg
+   * muxer needs to author a valid logical stream.
    */
   description?: Uint8Array;
 }
@@ -175,12 +176,13 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   if (mediaType === undefined) return undefined;
   const codec = mapCodec(codecId, bitDepth);
   const fps = defaultDuration > 0 ? 1e9 / defaultDuration : undefined;
-  // The CodecPrivate IS the WebCodecs `description` for the codecs whose decoder needs one — H.264's
-  // `avcC` and HEVC's `hvcC`. We attach it only for those (VP8/VP9/AV1/Opus are self-describing and a
-  // non-empty CodecPrivate there is not a decoder description), so decode is unblocked without feeding a
-  // decoder bytes it would reject.
+  // The CodecPrivate IS the WebCodecs/muxer `description` for codecs that need out-of-band setup:
+  // H.264's `avcC`, HEVC's `hvcC`, and Vorbis' Xiph-laced id/comment/setup headers. VP8/VP9/AV1/Opus
+  // are self-describing for the paths this driver currently exposes, so their CodecPrivate is omitted.
   const description =
-    (codec === 'h264' || codec === 'hevc') && codecPrivate && codecPrivate.byteLength > 0
+    (codec === 'h264' || codec === 'hevc' || codec === 'vorbis') &&
+    codecPrivate &&
+    codecPrivate.byteLength > 0
       ? codecPrivate
       : undefined;
   return {
@@ -573,9 +575,9 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
 }
 
 function toTrackInfo(track: WebmTrack, id: number, durationSec: number): TrackInfo {
-  // The CodecPrivate (avcC/hvcC) rides in the decoder `description` so the codec tier can configure the
-  // H.264/HEVC decoder (and expand the bare token to `avc1.PPCCLL`/`hev1…`); it is a `Uint8Array`, which
-  // satisfies the WebCodecs `description: AllowSharedBufferSource` field.
+  // The CodecPrivate rides in `description`: avcC/hvcC for H.264/HEVC decode config, and Vorbis'
+  // Xiph-laced setup headers for cross-container muxing into Ogg. It is a `Uint8Array`, satisfying the
+  // WebCodecs `description: AllowSharedBufferSource` field where a decoder consumes it.
   const config: VideoDecoderConfig | AudioDecoderConfig =
     track.mediaType === 'video'
       ? {
@@ -718,7 +720,7 @@ export const WebmDriver: ContainerDriver = {
   createMuxer(o?: MuxOptions): Muxer {
     // The EncodedChunk-seam adapter over the EBML byte writer ({@link WebmMuxer}); the packet→block
     // timeline is pure + Node-validated, only the per-chunk `copyTo` is browser-only (ebml-write.ts).
-    return new WebmMuxer(o);
+    return new WebmMuxer(o, o?.container === 'mkv' ? 'matroska' : 'webm');
   },
 };
 

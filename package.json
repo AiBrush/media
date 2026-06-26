@@ -29,6 +29,10 @@
       "types": "./dist/core.d.ts",
       "import": "./dist/core.js"
     },
+    "./image": {
+      "types": "./dist/image.d.ts",
+      "import": "./dist/image.js"
+    },
     "./drivers/*": {
       "types": "./dist/drivers/*.d.ts",
       "import": "./dist/drivers/*.js"

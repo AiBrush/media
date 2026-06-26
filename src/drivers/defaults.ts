@@ -5,6 +5,7 @@
  * never part of the eager bundle.
  */
 
+import { ImageModule } from '../codecs/image/image-driver.ts';
 import { WasmAacModule } from '../codecs/wasm-aac/wasm-aac-driver.ts';
 import { WasmMp3Module } from '../codecs/wasm-mp3/wasm-mp3-driver.ts';
 import { WasmVorbisModule } from '../codecs/wasm-vorbis/wasm-vorbis-driver.ts';
@@ -55,6 +56,7 @@ export function registerDefaultDrivers(reg: Registry): void {
     GpuVideoFilterModule,
     AudioDspFilterModule, // audio filters (resample/remix/gain) over AudioData (ADR-033)
     CpuVideoFilterModule, // CPU video filter fallback (no-WebGPU browsers): colorspace/tonemap/geometry (ADR-038)
+    ImageModule, // still/animated image probe + browser ImageDecoder decode capability (ADR-049)
     // NB: the Opus/VPx wasm tails stay OUT — they're core-less scaffolds (supports()→false). The real
     // Vorbis/AAC/MP3 tails above co-vendor their .wasm via scripts/vendor-wasm.ts (ADR-042) for the lazy
     // import.meta.url load on a WebCodecs miss.

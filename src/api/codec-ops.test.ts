@@ -11,11 +11,15 @@
 
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { fixtureSource } from '../test-support/corpus.ts';
+import { fromBytes } from '../sources/source.ts';
+import { encryptCenc } from '../test-support/cenc-encrypt.ts';
+import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
 
 /** Real, stream-copyable MP4s (h264 + aac), ≥3 distinct files of varied duration/tracks. */
 const MP4_FIXTURES = ['movie_5.mp4', 'test.mp4', 'h264.mp4'] as const;
+const CENC_KEY = '000102030405060708090a0b0c0d0e0f';
+const CENC_KID = '00112233445566778899aabbccddeeff';
 
 const media = () => createMedia();
 
@@ -157,6 +161,16 @@ describe('decode — lazy frame streams (contract)', () => {
       reader.releaseLock();
     }
   });
+
+  it('rejects protected MP4 ciphertext before explicit decrypt', async () => {
+    const encrypted = await encryptCenc(await loadFixture('movie_5.mp4'), {
+      keyHex: CENC_KEY,
+      kidHex: CENC_KID,
+      mediaType: 'video',
+    });
+    const streams = media().decode(fromBytes(encrypted, { mime: 'video/mp4' }));
+    await expect(readFirstFrame(streams.video)).rejects.toBeInstanceOf(MediaError);
+  });
 });
 
 describe('encode — input validation', () => {
@@ -204,6 +218,17 @@ describe('seek — routing + guards', () => {
         CapabilityError,
       );
     }
+  });
+
+  it('rejects protected MP4 video seek before explicit decrypt', async () => {
+    const encrypted = await encryptCenc(await loadFixture('movie_5.mp4'), {
+      keyHex: CENC_KEY,
+      kidHex: CENC_KID,
+      mediaType: 'video',
+    });
+    await expect(
+      media().seek(fromBytes(encrypted, { mime: 'video/mp4' }), 0),
+    ).rejects.toBeInstanceOf(MediaError);
   });
 
   it('rejects a negative or non-finite seek time with a typed InputError', async () => {

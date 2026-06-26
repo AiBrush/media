@@ -43,9 +43,15 @@ import type {
 } from '@aibrush/media';
 import * as core from '@aibrush/media/core';
 import { describe, expect, it } from 'vitest';
+import type { DecodeImageOptions, ImageFormat, ImageInfo } from './image.ts';
 
-const distBuilt = existsSync(fileURLToPath(new URL('../dist/index.js', import.meta.url)));
+const distBuilt =
+  existsSync(fileURLToPath(new URL('../dist/index.js', import.meta.url))) &&
+  existsSync(fileURLToPath(new URL('../dist/core.js', import.meta.url))) &&
+  existsSync(fileURLToPath(new URL('../dist/image.js', import.meta.url)));
 const suite = distBuilt ? describe : describe.skip;
+const packageSubpath = (subpath: string): string => `@aibrush/media/${subpath}`;
+type ImageEntry = typeof import('./image.ts');
 
 suite('dist smoke (built package via exports map)', () => {
   it('default entry exposes the engine factory + every bare-function op as callables', () => {
@@ -154,6 +160,17 @@ suite('dist smoke (built package via exports map)', () => {
     expect('fragmentMp4' in media).toBe(false);
   });
 
+  it('the standalone image helpers live on `/image`, NOT the eager default entry', async () => {
+    const imageEntry = (await import(/* @vite-ignore */ packageSubpath('image'))) as ImageEntry;
+    expect(imageEntry.IMAGE_FORMATS).toEqual(['gif', 'png', 'jpeg', 'webp', 'avif']);
+    expect(typeof imageEntry.probeImage).toBe('function');
+    expect(typeof imageEntry.sniffImageFormat).toBe('function');
+    expect(typeof imageEntry.decodeImage).toBe('function');
+    expect(typeof imageEntry.hasImageDecoder).toBe('function');
+    expect('probeImage' in media).toBe(false);
+    expect('decodeImage' in media).toBe(false);
+  });
+
   it('a created engine has the full intent-only op surface', () => {
     const engine: MediaEngine = media.createMedia();
     for (const method of [
@@ -233,5 +250,6 @@ type _Pins = [
   CacheOptions,
   ByteRange,
 ];
-// Reference the tuple so `noUnusedLocals` is satisfied without emitting runtime code.
-export type __SurfacePins = _Pins;
+type _ImagePins = [ImageFormat, ImageInfo, DecodeImageOptions];
+// Reference the tuples so `noUnusedLocals` is satisfied without emitting runtime code.
+export type __SurfacePins = [_Pins, _ImagePins];

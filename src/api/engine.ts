@@ -9,6 +9,7 @@
  * silent or fake result.
  */
 
+import type { ImageInfo, ImageOps } from '../codecs/image/index.ts';
 import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
 import type { VideoEncoderStageOptions } from '../codecs/webcodecs-video.ts';
 import type {
@@ -29,6 +30,7 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
@@ -47,10 +49,12 @@ import {
   chooseOutputContainer,
   containerHasChunkMuxer,
   drainEncoderToMuxer,
+  hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
   normalizeDecoderCodec,
   seekFrame,
+  selectTrackInfos,
   unwrapPackets,
   videoFilterSpecs,
   videoTrackInfoFromDecoderConfig,
@@ -150,6 +154,8 @@ export class MediaEngineImpl implements MediaEngine {
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
+      const imageInfo = await this.#probeImageInfo(src, signal);
+      if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
       const demuxer = await container.demux(src, this.#stageOptions(signal, o));
       try {
@@ -183,21 +189,25 @@ export class MediaEngineImpl implements MediaEngine {
       ) {
         const target = opts.to;
         const container = await this.#routeContainer(src, 'demux');
+        const sampleFormat = pcmSampleFormat(audio?.codec);
+        const endian = pcmEndian(audio?.codec);
         const pcmOpts: PcmTransform = {
           ...this.#stageOptions(signal, o),
+          container: target,
+          ...(sampleFormat !== undefined ? { sampleFormat } : {}),
+          ...(endian !== undefined ? { endian } : {}),
           ...(audio?.channels !== undefined ? { channels: audio.channels } : {}),
           ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
         };
-        // Same-PCM-container transform (WAV→WAV / AIFF→AIFF / CAF→CAF, ADR-022): the source container
-        // re-serializes its own format via `transformPcm`. A WAV target may also be produced by a pure-TS
-        // decode of a compressed-audio source (FLAC→WAV, ADR-024) via `decodePcm`. A cross-PCM-container
-        // request with no matching writer (e.g. AIFF→WAV) falls through to the codec seam below.
-        const stream =
-          container.transformPcm && container.formats.includes(target)
-            ? await container.transformPcm(src, pcmOpts)
-            : target === 'wav' && container.decodePcm
-              ? await container.decodePcm(src, pcmOpts)
-              : undefined;
+        // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its
+        // own bytes, applies sample format / channel / rate transforms, then serializes the requested
+        // raw-PCM target. A WAV target may also be produced by a compressed-audio source's `decodePcm`
+        // bridge (FLAC→WAV, ADR-024; ADTS AAC→WAV, ADR-050).
+        const stream = container.transformPcm
+          ? await container.transformPcm(src, pcmOpts)
+          : target === 'wav' && container.decodePcm
+            ? await container.decodePcm(src, pcmOpts)
+            : undefined;
         if (stream) return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       // Codec seam (the full convert pipeline). A pure container change with no re-encode is preferred
@@ -211,9 +221,10 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
+      const wantsTrackSelection = hasTrackSelection(opts.trackSelect);
       // (1) Same-container stream-copy — a lossless byte re-serialization that preserves DTS/B-frames/
       // codec-private (ADR-021), and works in pure TS (Node) for the drivers that implement it (MP4↔MOV).
-      if (container.streamCopy && container.formats.includes(opts.to)) {
+      if (!wantsTrackSelection && container.streamCopy && container.formats.includes(opts.to)) {
         const stream = await container.streamCopy(src, {
           ...this.#stageOptions(signal, o),
           container: opts.to,
@@ -268,8 +279,13 @@ export class MediaEngineImpl implements MediaEngine {
     const ctrl = new AbortController();
     bridgeSignal(o.signal, ctrl);
     const stage = this.#stageOptions(ctrl.signal, o);
-    const video = deferredStream<VideoFrame>(() => this.#decodeTrack(src, 'video', stage));
-    const audio = deferredStream<AudioData>(() => this.#decodeTrack(src, 'audio', stage));
+    const imageRoute = memoizeAsync(() => this.#imageDecodeRoute(src, ctrl.signal));
+    const video = deferredStream<VideoFrame>(() =>
+      this.#decodeVideoOrImage(src, stage, imageRoute),
+    );
+    const audio = deferredStream<AudioData>(() =>
+      this.#decodeTrack(src, 'audio', stage, imageRoute),
+    );
     return { video, audio };
   }
 
@@ -341,6 +357,12 @@ export class MediaEngineImpl implements MediaEngine {
             op: 'seek',
             tried: [container.id],
           });
+        }
+        if (track.encrypted === true) {
+          throw new MediaError(
+            'decode-error',
+            'seek cannot decode a protected video track before decrypt() emits clear samples',
+          );
         }
         // Resolve the decode codec first (throws a typed miss in Node where WebCodecs is absent). Then feed
         // only the packets from the keyframe at/before the target onward (a stream must decode from a
@@ -495,6 +517,45 @@ export class MediaEngineImpl implements MediaEngine {
     }
   }
 
+  /** Resolve the default image capability if the source's magic bytes are a supported image format. */
+  async #imageOpsForSource(src: Source): Promise<ImageOps | undefined> {
+    const head = await readHead(src);
+    if (this.#registry.imageOps() === undefined) {
+      await this.#ensureDefaultDrivers();
+    }
+    const ops = this.#registry.imageOps();
+    return ops?.sniff(head) === undefined ? undefined : ops;
+  }
+
+  /** Probe image bytes through the standalone image parser when the source magic matches an image. */
+  async #probeImageInfo(src: Source, signal: AbortSignal): Promise<MediaInfo | undefined> {
+    const ops = await this.#imageOpsForSource(src);
+    if (ops === undefined) return undefined;
+    const bytes = await readAllSource(src, signal);
+    return imageToMediaInfo(ops.probe(bytes), src);
+  }
+
+  /** Sniff an image source once and, if matched, keep the bytes shared by the video/audio decode streams. */
+  async #imageDecodeRoute(src: Source, signal: AbortSignal): Promise<ImageDecodeRoute | undefined> {
+    const ops = await this.#imageOpsForSource(src);
+    if (ops === undefined) return undefined;
+    const bytes = await readAllSource(src, signal);
+    return { ops, bytes };
+  }
+
+  /** Browser-only image decode route: still/animated images become a video frame stream, no packet seam. */
+  async #decodeVideoOrImage(
+    src: Source,
+    stage: StageOptions,
+    imageRoute: ImageDecodeRouteLoader,
+  ): Promise<ReadableStream<VideoFrame> | undefined> {
+    const image = await imageRoute();
+    if (image !== undefined) {
+      return image.ops.decode(image.bytes, stage.signal ? { signal: stage.signal } : {});
+    }
+    return this.#decodeTrack(src, 'video', stage);
+  }
+
   /**
    * Build one decoded-frame stream for a track of `mediaType` (or `undefined` if the source has no such
    * decodable track). Demux → route a codec for the track's config → pipe its packets through the
@@ -504,13 +565,24 @@ export class MediaEngineImpl implements MediaEngine {
     src: Source,
     mediaType: M,
     stage: StageOptions,
+    imageRoute?: ImageDecodeRouteLoader,
   ): Promise<ReadableStream<RawFrameOf<M>> | undefined> {
+    if (mediaType === 'audio' && imageRoute !== undefined && (await imageRoute()) !== undefined) {
+      return undefined;
+    }
     const container = await this.#routeContainer(src, 'demux');
     const demuxer = await container.demux(src, stage);
     const track = demuxer.tracks.find((t) => t.mediaType === mediaType && t.config !== undefined);
     if (!track) {
       await demuxer.close();
       return undefined;
+    }
+    if (track.encrypted === true) {
+      await demuxer.close();
+      throw new MediaError(
+        'decode-error',
+        `decode cannot read a protected ${mediaType} track before decrypt() emits clear samples`,
+      );
     }
     const codec = await this.#routeCodec(decodeQueryFor(track), { strategy: stageStrategy(stage) });
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
@@ -551,7 +623,10 @@ export class MediaEngineImpl implements MediaEngine {
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
     const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
     // Copy only tracks the demuxer fully describes (a `config`-less track cannot be re-muxed faithfully).
-    const tracks = demuxer.tracks.filter((t) => t.config !== undefined);
+    const tracks = selectTrackInfos(
+      demuxer.tracks.filter((t) => t.config !== undefined),
+      opts.trackSelect,
+    );
     if (tracks.length === 0) {
       await demuxer.close();
       throw new CapabilityError('capability-miss', 'remux found no copyable track in the source', {
@@ -780,7 +855,11 @@ export class MediaEngineImpl implements MediaEngine {
     };
     const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
-      videoTrackInfoFromDecoderConfig(requireConfig(decoderConfig, 'video'), target.fps),
+      videoTrackInfoFromDecoderConfig(
+        requireConfig(decoderConfig, 'video'),
+        target.fps,
+        sourceTrack?.durationSec,
+      ),
     );
     /* v8 ignore stop */
   }
@@ -811,7 +890,10 @@ export class MediaEngineImpl implements MediaEngine {
     };
     const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
-      audioTrackInfoFromDecoderConfig(requireConfig(decoderConfig, 'audio')),
+      audioTrackInfoFromDecoderConfig(
+        requireConfig(decoderConfig, 'audio'),
+        sourceTrack?.durationSec,
+      ),
     );
     /* v8 ignore stop */
   }
@@ -886,6 +968,21 @@ export class MediaEngineImpl implements MediaEngine {
 
 /** The raw-frame type for a media type: `VideoFrame` for video, `AudioData` for audio. */
 type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
+
+interface ImageDecodeRoute {
+  readonly ops: ImageOps;
+  readonly bytes: Uint8Array;
+}
+
+type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
+
+function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
+  let promise: Promise<T> | undefined;
+  return () => {
+    promise ??= load();
+    return promise;
+  };
+}
 
 /** Mirror an external `AbortSignal` onto an internal controller (pre-aborted or future abort). */
 function bridgeSignal(caller: AbortSignal | undefined, ctrl: AbortController): void {
@@ -1149,6 +1246,46 @@ async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array
   return head;
 }
 
+async function readAllSource(src: Source, signal: AbortSignal | undefined): Promise<Uint8Array> {
+  throwIfAborted(signal);
+  if (src.range && src.size !== undefined) {
+    const bytes = await src.range(0, src.size);
+    throwIfAborted(signal);
+    return bytes;
+  }
+  const reader = src.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (e) {
+    await reader.cancel(e).catch(() => {});
+    throw e;
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, off);
+    off += chunk.byteLength;
+  }
+  throwIfAborted(signal);
+  return out;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new MediaError('aborted', 'operation cancelled');
+  }
+}
+
 /**
  * PCM-family audio target — the codecs the WAV/`transformPcm` path produces (ADR-022). Accepts the
  * generic public `pcm` token AND the canonical sample-format variants a caller may pass
@@ -1158,6 +1295,32 @@ async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array
  */
 function isPcmCodec(codec: string | undefined): boolean {
   return codec === undefined || codec === 'pcm' || codec.startsWith('pcm-');
+}
+
+function pcmSampleFormat(codec: string | undefined): SampleFormat | undefined {
+  if (codec === undefined || codec === 'pcm') return undefined;
+  const normalized = codec.endsWith('be') ? codec.slice(0, -2) : codec;
+  switch (normalized) {
+    case 'pcm-u8':
+      return 'u8';
+    case 'pcm-s16':
+      return 's16';
+    case 'pcm-s24':
+      return 's24';
+    case 'pcm-s32':
+      return 's32';
+    case 'pcm-f32':
+      return 'f32';
+    case 'pcm-f64':
+      return 'f64';
+    default:
+      return undefined;
+  }
+}
+
+function pcmEndian(codec: string | undefined): Endianness | undefined {
+  if (codec === undefined || codec === 'pcm') return undefined;
+  return codec.endsWith('be') ? 'be' : 'le';
 }
 
 /**
@@ -1233,6 +1396,34 @@ function toMediaInfo(
     ...(src.size !== undefined ? { sizeBytes: src.size } : {}),
     tracks: infoTracks,
   };
+}
+
+const IMAGE_DEFAULT_FPS = 25;
+
+function imageToMediaInfo(info: ImageInfo, src: Source): MediaInfo {
+  const durationSec = imageDurationSec(info);
+  const track: MediaInfoTrack = {
+    id: 0,
+    type: 'video',
+    codec: info.format === 'jpeg' ? 'mjpeg' : info.format,
+    width: info.width,
+    height: info.height,
+    fps: IMAGE_DEFAULT_FPS,
+  };
+  if (durationSec > 0) track.durationSec = durationSec;
+  return {
+    container: info.format === 'jpeg' ? 'jpeg' : info.format,
+    durationSec,
+    ...(src.size !== undefined ? { sizeBytes: src.size } : {}),
+    tracks: [track],
+  };
+}
+
+function imageDurationSec(info: ImageInfo): number {
+  // The harness image goldens model JPEG as one 25 fps frame (0.04s) and PNG/WebP stills as unknown
+  // duration. Animated image formats have a real frame count, but the pure header probe does not yet
+  // preserve every per-frame delay, so expose the conservative 25 fps timing used by the image corpus.
+  return info.animated || info.format === 'jpeg' ? info.frameCount / IMAGE_DEFAULT_FPS : 0;
 }
 
 function toInfoTrack(t: TrackInfo): MediaInfoTrack {

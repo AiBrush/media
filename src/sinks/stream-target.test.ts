@@ -4,8 +4,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { MediaError } from '../contracts/errors.ts';
-import { type StreamTargetWriter, toStreamTarget, writeToStreamTarget } from './stream-target.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import {
+  type StreamTarget,
+  type StreamTargetWriter,
+  toStreamTarget,
+  writeToStreamTarget,
+} from './stream-target.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -66,6 +71,16 @@ describe('writeToStreamTarget — WritableStream destination', () => {
 });
 
 describe('writeToStreamTarget — callback destination', () => {
+  it('rejects unsupported destination shapes as a typed capability miss', async () => {
+    const target = {
+      kind: 'stream-target',
+      destination: { write: () => undefined },
+    } as unknown as StreamTarget;
+    const err = await writeToStreamTarget(target, bytesStream([1])).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CapabilityError);
+    expect((err as CapabilityError).code).toBe('capability-miss');
+  });
+
   it('hands each chunk to the callback with its running byte position', async () => {
     const calls: { data: number[]; position: number }[] = [];
     const writer: StreamTargetWriter = (chunk, position) => {
@@ -156,5 +171,37 @@ describe('writeToStreamTarget — cancellation', () => {
     expect(err).toBeInstanceOf(MediaError);
     expect((err as MediaError).code).toBe('aborted');
     expect(seen).toEqual([1]); // did not continue to chunks 2 and 3
+  });
+
+  it('aborts while waiting for the next source chunk (callback arm)', async () => {
+    const ac = new AbortController();
+    const stream = new ReadableStream<Uint8Array>({
+      pull(): Promise<void> {
+        return new Promise(() => undefined);
+      },
+    });
+    const writer: StreamTargetWriter = () => undefined;
+    const pending = writeToStreamTarget(toStreamTarget(writer), stream, { signal: ac.signal });
+    setTimeout(() => ac.abort(), 1);
+    const err = await pending.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('aborted');
+  });
+
+  it('aborts while a callback write promise is pending', async () => {
+    const ac = new AbortController();
+    let writerCalled = false;
+    const writer: StreamTargetWriter = () => {
+      writerCalled = true;
+      return new Promise(() => undefined);
+    };
+    const pending = writeToStreamTarget(toStreamTarget(writer), bytesStream([1]), {
+      signal: ac.signal,
+    });
+    setTimeout(() => ac.abort(), 1);
+    const err = await pending.catch((e: unknown) => e);
+    expect(writerCalled).toBe(true);
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('aborted');
   });
 });

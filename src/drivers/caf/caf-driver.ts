@@ -22,7 +22,8 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { parseCaf, readCafPcm, writeCaf } from './caf.ts';
+import { writePcmContainer } from '../pcm-output.ts';
+import { parseCaf, readCafPcm } from './caf.ts';
 
 const CAF_MIMES = new Set(['audio/x-caf', 'audio/caf']);
 const CAF_EXTENSIONS = new Set(['caf', 'caff']);
@@ -107,7 +108,12 @@ export const CafDriver: ContainerDriver = {
     // Rate change last, on the final channel layout (band-limited windowed-sinc; pure-TS, ADR-022).
     if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
       audio = resample(audio, o.sampleRate);
-    const out = writeCaf(audio, caf.format, caf.endian);
+    const out = writePcmContainer(
+      audio,
+      o?.container ?? 'caf',
+      o?.sampleFormat ?? caf.format,
+      o?.endian ?? caf.endian,
+    );
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(out);

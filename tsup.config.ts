@@ -23,7 +23,7 @@ import { defineConfig } from 'tsup';
  * preserves function/class `.name` (a tiny `__name` helper) at a few hundred bytes — well inside budget.
  */
 export default defineConfig({
-  entry: ['src/index.ts', 'src/core.ts'],
+  entry: ['src/index.ts', 'src/core.ts', 'src/image.ts'],
   format: ['esm'],
   target: 'es2022',
   platform: 'browser',

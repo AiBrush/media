@@ -147,6 +147,19 @@ describe('CodecPrivate → decoder description + canonical codec ids (real fixtu
     expect(codecs).toContain('vorbis');
   });
 
+  it('bear-multitrack.webm — Vorbis carries Xiph-laced CodecPrivate as config.description', async () => {
+    const demuxed = await WebmDriver.demux(await fixtureSource('bear-multitrack.webm'));
+    const vorbis = demuxed.tracks.find((t) => t.codec === 'vorbis');
+    expect(vorbis?.mediaType).toBe('audio');
+    const config = vorbis?.config;
+    const description = config && 'description' in config ? config.description : undefined;
+    expect(description).toBeInstanceOf(Uint8Array);
+    const xiph = description as Uint8Array;
+    expect(xiph[0]).toBe(2); // three Vorbis headers: id, comment, setup
+    expect(new TextDecoder().decode(xiph)).toContain('vorbis');
+    await demuxed.close();
+  });
+
   it('movie_5.webm — self-describing VP9/Opus carry no decoder description', async () => {
     const demuxed = await WebmDriver.demux(await fixtureSource('movie_5.webm'));
     for (const t of demuxed.tracks) {

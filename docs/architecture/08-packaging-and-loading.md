@@ -24,6 +24,7 @@ Author in **TypeScript (strict)**; emit:
   "exports": {
     ".":            { "types": "./dist/index.d.ts", "import": "./dist/index.js" },     // kernel + sugar
     "./core":       { "types": "./dist/core.d.ts",  "import": "./dist/core.js" },      // MediaEngine + driver hooks
+    "./image":      { "types": "./dist/image.d.ts", "import": "./dist/image.js" },     // standalone image helpers
     "./drivers/*":  { "import": "./dist/drivers/*.js" },                               // optional explicit driver import
     "./package.json": "./package.json"
   },
@@ -33,6 +34,7 @@ Author in **TypeScript (strict)**; emit:
 
 - The **default export** is the tiny kernel + bare-function sugar (ADR-009).
 - Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004).
+- `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
 - `./drivers/*` exists only for the optional "inject a custom/third-party driver" hook; normal usage never imports a driver directly (the router does, lazily).
 
 ## 3. Code-splitting model

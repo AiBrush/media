@@ -58,36 +58,67 @@ describe('AAC invariants + codec id', () => {
   });
 });
 
-describe('parseAdtsFrame — ADTS header (ISO/IEC 13818-7 §6.2)', () => {
-  // Build a 7-byte ADTS header (no CRC) for AAC-LC, 44.1 kHz (index 4), stereo (chanCfg 2), frameLen=20.
-  function adts(frameLen: number, freqIndex = 4, chanCfg = 2, profile = 1): Uint8Array {
-    const h = new Uint8Array(frameLen);
-    h[0] = 0xff;
-    h[1] = 0xf1; // sync(8) ... | MPEG-4(0) | layer(00) | protection-absent(1)
-    h[2] = (profile << 6) | (freqIndex << 2) | ((chanCfg >> 2) & 0x01);
-    h[3] = ((chanCfg & 0x03) << 6) | ((frameLen >> 11) & 0x03);
-    h[4] = (frameLen >> 3) & 0xff;
-    h[5] = ((frameLen & 0x07) << 5) | 0x1f;
-    h[6] = 0xfc;
-    return h;
+// Build an ADTS header for AAC-LC-like test frames. The payload bytes are irrelevant to the parser; the
+// length/profile/rate/channel bits are the can-fail oracle surface.
+function adtsFrame(
+  frameLen: number,
+  freqIndex = 4,
+  chanCfg = 2,
+  profile = 1,
+  protectionAbsent = true,
+): Uint8Array {
+  const h = new Uint8Array(frameLen);
+  h[0] = 0xff;
+  h[1] = protectionAbsent ? 0xf1 : 0xf0; // sync + MPEG-4 + layer(00) + protection bit
+  h[2] = (profile << 6) | (freqIndex << 2) | ((chanCfg >> 2) & 0x01);
+  h[3] = ((chanCfg & 0x03) << 6) | ((frameLen >> 11) & 0x03);
+  h[4] = (frameLen >> 3) & 0xff;
+  h[5] = ((frameLen & 0x07) << 5) | 0x1f;
+  h[6] = 0xfc;
+  return h;
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
   }
+  return out;
+}
+
+describe('parseAdtsFrame — ADTS header (ISO/IEC 13818-7 §6.2)', () => {
   it('reads profile/rate/channels and strips the 7-byte header', () => {
-    const { frame, next } = parseAdtsFrame(adts(20), 0);
+    const { frame, next } = parseAdtsFrame(adtsFrame(20), 0);
     expect(frame.sampleRate).toBe(44100);
     expect(frame.channels).toBe(2);
     expect(frame.objectType).toBe(2); // profile 1 (LC) + 1
     expect(frame.payload.length).toBe(20 - 7); // header stripped
     expect(next).toBe(20);
   });
+  it('strips the 9-byte header when the frame carries a CRC word', () => {
+    const { frame, next } = parseAdtsFrame(adtsFrame(20, 3, 1, 1, false), 0);
+    expect(frame.sampleRate).toBe(48000);
+    expect(frame.channels).toBe(1);
+    expect(frame.payload.length).toBe(20 - 9);
+    expect(next).toBe(20);
+  });
   it('rejects a lost syncword', () => {
     const bad = new Uint8Array(10); // all zero → no 0xFFF sync
     expect(() => parseAdtsFrame(bad, 0)).toThrow(MediaError);
   });
+  it('rejects a truncated ADTS header before reading optional fields', () => {
+    expect(() => parseAdtsFrame(Uint8Array.of(0xff, 0xf1, 0x50), 0)).toThrow(MediaError);
+  });
   it('rejects a frame length that overruns the buffer', () => {
-    expect(() => parseAdtsFrame(adts(20).subarray(0, 12), 0)).toThrow(MediaError);
+    expect(() => parseAdtsFrame(adtsFrame(20).subarray(0, 12), 0)).toThrow(MediaError);
+  });
+  it('rejects a CRC-present frame whose length is smaller than the 9-byte header', () => {
+    expect(() => parseAdtsFrame(adtsFrame(7, 4, 2, 1, false), 0)).toThrow(MediaError);
   });
   it('rejects a reserved sampling-frequency index', () => {
-    expect(() => parseAdtsFrame(adts(20, 13), 0)).toThrow(MediaError);
+    expect(() => parseAdtsFrame(adtsFrame(20, 13), 0)).toThrow(MediaError);
   });
 });
 
@@ -132,6 +163,9 @@ describe('parseAsc — AudioSpecificConfig fields (ISO/IEC 14496-3 §1.6.2.1)', 
     expect(asc.sampleRate).toBe(44100);
     expect(asc.channels).toBe(2);
   });
+  it('rejects an explicit-rate ASC that does not contain the required 24-bit rate', () => {
+    expect(() => parseAsc(Uint8Array.of(0x17, 0x80, 0x00, 0x00))).toThrow(/explicit-rate/);
+  });
   it('rejects a reserved ASC sampling-frequency index', () => {
     // objectType=2, freqIndex=13 (reserved): b0=0x10|0x06=0x16, b1=0x80→ index low bit... use 13=1101.
     // top3=110 → b0=(2<<3)|0x06=0x16; b1 bit7 = index bit0 = 1 → 0x80.
@@ -142,6 +176,17 @@ describe('parseAsc — AudioSpecificConfig fields (ISO/IEC 14496-3 §1.6.2.1)', 
 describe('readAdtsFrames — robustness', () => {
   it('rejects a buffer with no ADTS frames', () => {
     expect(() => readAdtsFrames(new Uint8Array(4))).toThrow(MediaError);
+  });
+  it('skips a leading ID3v2 tag and reads multiple ADTS frames', () => {
+    const id3 = Uint8Array.of(0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 3, 1, 2, 3);
+    const first = adtsFrame(18, 4, 2);
+    const second = adtsFrame(20, 4, 2);
+    const stream = concatBytes(id3, first, second);
+    const out = readAdtsFrames(stream);
+    expect(out.sampleRate).toBe(44100);
+    expect(out.channels).toBe(2);
+    expect(out.objectType).toBe(2);
+    expect(out.frames.map((f) => f.length)).toEqual([11, 13]);
   });
 });
 

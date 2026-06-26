@@ -7,6 +7,7 @@ import type {
   Determinism,
   EncodedChunk,
   Packet,
+  PacketMetadata,
   Progress,
   TrackInfo,
 } from '../contracts/driver.ts';
@@ -34,8 +35,10 @@ export type {
   Determinism,
   /** A sealed encoded unit (PTS only) — the unit of {@link PacketStreams} and {@link Packet.chunk}. */
   EncodedChunk,
-  /** A demuxed packet (sealed chunk + optional DTS) — the unit of {@link Demuxed.packets} (ADR-045). */
+  /** A demuxed packet (sealed chunk + optional DTS/packet size) — the unit of {@link Demuxed.packets}. */
   Packet,
+  /** Demux packet metadata without payload bytes — the unit of {@link Demuxed.packetTable}. */
+  PacketMetadata,
   /** Monotonic progress delivered to {@link CallOptions.onProgress}. */
   Progress,
   /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
@@ -134,6 +137,8 @@ export interface RemuxOptions {
   to: Container;
   faststart?: boolean;
   fragmented?: boolean;
+  /** Optional single-source track selectors such as `video:0` or `audio:0`. */
+  trackSelect?: readonly string[];
   sink?: Sink;
 }
 
@@ -190,9 +195,10 @@ export interface MediaInfo {
   tags?: Record<string, string>;
 }
 
-/** A live demux result (public-facing); {@link Packet} carries each chunk's PTS + optional DTS. */
+/** A live demux result (public-facing); {@link Packet} carries each chunk's PTS plus optional side data. */
 export interface Demuxed {
   readonly tracks: readonly TrackInfo[];
+  packetTable?(): readonly PacketMetadata[];
   packets(trackId: number): ReadableStream<Packet>;
   close(): Promise<void>;
 }

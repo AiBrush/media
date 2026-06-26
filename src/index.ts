@@ -54,6 +54,10 @@ export type {
   StreamTargetWriter,
 } from './sinks/stream-target.ts';
 
+// Images (ADR-049). Zero-config `probe`/`decode` support is registered through defaults, but the
+// standalone helper barrel lives on `@aibrush/media/image` so the pure image parser does not join the
+// eager default-entry closure (BUILD §2 budget).
+
 // NOTE: `fragmentMp4` (the fragmented-MP4/CMAF generator) is intentionally NOT re-exported here. It is
 // heavy MP4 box-writer code (`moof`/`trun`/`tfdt`/`mvex`/…) that, exported from this eager entry, inlines
 // ~19 kB of driver code straight into the kernel chunk — defeating the "tiny eager kernel, lazy drivers"
