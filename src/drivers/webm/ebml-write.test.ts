@@ -16,6 +16,9 @@
 
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { loadFixture } from '../../test-support/corpus.ts';
+import { readMovie } from '../mp4/mp4-driver.ts';
+import { buildSamples } from '../mp4/samples.ts';
 import { type ChunkStruct, WebmMuxer, buildBlockTimeline } from './ebml-write.ts';
 import { type EbmlElement, elements, findChild, readUint, readVint } from './ebml.ts';
 import { WebmDriver, parseWebm } from './webm-driver.ts';
@@ -212,6 +215,30 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     expect(blocks.map((b) => b.timeMs)).toEqual([0, 300, 100, 200]);
     expect(blocks.map((b) => b.dtsMs)).toEqual([0, 100, 200, 300]);
     expect(blocks.map((b) => b.key)).toEqual([true, false, false, false]);
+  });
+
+  it('uses edit-list-adjusted packet timestamps for a real B-frame MP4 fallback end', async () => {
+    const file = await loadFixture('bear-hevc-10bit-hdr10.mp4');
+    const movie = await readMovie({
+      read: (o, l) => Promise.resolve(file.subarray(o, o + l)),
+      size: file.byteLength,
+    });
+    const { endMs } = buildBlockTimeline(
+      movie.tracks.map((track, index) => ({
+        trackNumber: index + 1,
+        chunks: buildSamples(track).map(
+          (sample): ChunkStruct => ({
+            timestampUs: sample.ptsUs,
+            durationUs: sample.durationUs,
+            dtsUs: sample.dtsUs,
+            key: sample.keyframe,
+            data: new Uint8Array([1]),
+          }),
+        ),
+      })),
+    );
+
+    expect(endMs).toBe(2763);
   });
 
   it('empty input → no blocks, end 0', () => {

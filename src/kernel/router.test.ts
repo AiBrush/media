@@ -167,13 +167,57 @@ describe('Router.pickContainer', () => {
 });
 
 describe('Router.pickFilter', () => {
-  it('ranks substrates WebGPU → WebGL → Canvas2D → WASM', () => {
+  it('ranks substrates WebGPU → WebGL → Canvas2D → native → WASM', () => {
     const { router } = routerWith((reg) => {
+      reg.addFilter(makeFilter('wasm', 'wasm', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
       reg.addFilter(makeFilter('canvas', 'canvas2d', true).driver);
       reg.addFilter(makeFilter('gpu', 'webgpu', true).driver);
       reg.addFilter(makeFilter('gl', 'webgl', true).driver);
     });
     expect(router.pickFilter(resizeSpec).id).toBe('gpu');
+  });
+
+  it('prefers native CPU filters over a WASM filter tail', () => {
+    const { router } = routerWith((reg) => {
+      reg.addFilter(makeFilter('wasm', 'wasm', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
+    });
+    expect(router.pickFilter(resizeSpec).id).toBe('native');
+  });
+
+  it('uses telemetry-seeded tiny-input thresholds to prefer native over GPU setup', () => {
+    const tinyResize: FilterSpec = {
+      mediaType: 'video',
+      type: 'resize',
+      width: 32,
+      height: 32,
+    };
+    const { router } = routerWith((reg) => {
+      reg.addFilter(makeFilter('gpu', 'webgpu', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
+    });
+
+    expect(router.pickFilter(tinyResize).id).toBe('native');
+    expect(router.pickFilter(resizeSpec).id).toBe('gpu');
+  });
+
+  it('keeps separate cached filter verdicts for tiny and normal work', () => {
+    const tinyResize: FilterSpec = {
+      mediaType: 'video',
+      type: 'resize',
+      width: 32,
+      height: 32,
+    };
+    const gpu = makeFilter('gpu', 'webgpu', true);
+    const native = makeFilter('native', 'native', true);
+    const { router } = routerWith((reg) => {
+      reg.addFilter(gpu.driver);
+      reg.addFilter(native.driver);
+    });
+
+    expect(router.pickFilter(resizeSpec).id).toBe('gpu');
+    expect(router.pickFilter(tinyResize).id).toBe('native');
   });
 
   it('drops GPU substrates under force-software', () => {
@@ -182,6 +226,15 @@ describe('Router.pickFilter', () => {
       reg.addFilter(makeFilter('canvas', 'canvas2d', true).driver);
     });
     expect(router.pickFilter(resizeSpec, { determinism: 'force-software' }).id).toBe('canvas');
+  });
+
+  it('keeps native and wasm filter substrates under force-software', () => {
+    const { router } = routerWith((reg) => {
+      reg.addFilter(makeFilter('gpu', 'webgpu', true).driver);
+      reg.addFilter(makeFilter('wasm', 'wasm', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
+    });
+    expect(router.pickFilter(resizeSpec, { determinism: 'force-software' }).id).toBe('native');
   });
 
   it('misses when only GPU substrates exist under force-software', () => {

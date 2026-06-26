@@ -21,6 +21,7 @@ async function bytesOf(
 }
 const wavSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/wav' });
 const aiffSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/aiff' });
+const cafSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/x-caf' });
 const loadDerived = async (id: string): Promise<Uint8Array> =>
   new Uint8Array(await readFile(`${DERIVED}${id}`));
 
@@ -75,6 +76,60 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
       }),
     );
     expect(readWavPcm(out).sampleRate).toBe(44100);
+  });
+
+  it('applies public gainDb through the PCM-native transform path', async () => {
+    const orig = readWavPcm(await loadFixture(SIN));
+    const out = await bytesOf(
+      await media().convert(await fixtureSource(SIN), {
+        to: 'wav',
+        audio: { codec: 'pcm-s16' as never, gainDb: -6.020599913279624 },
+      }),
+    );
+
+    const re = readWavPcm(out);
+    expect(re.format).toBe('s16');
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    const input = channelAt(orig.planar, 0);
+    const gained = channelAt(re.planar, 0);
+    const firstNonZero = input.findIndex((sample) => sample !== 0);
+    expect(firstNonZero).toBeGreaterThanOrEqual(0);
+    const inputSample = input[firstNonZero];
+    const gainedSample = gained[firstNonZero];
+    if (inputSample === undefined || gainedSample === undefined) {
+      throw new Error('expected a shared non-zero PCM sample index');
+    }
+    expect(gainedSample).toBeCloseTo(inputSample * 0.5, 8);
+  });
+
+  it('applies public fade through the PCM-native transform path', async () => {
+    const orig = readWavPcm(await loadFixture('sfx-pcm-f32.wav'));
+    const fadeSec = 0.1;
+    const out = await bytesOf(
+      await media().convert(await fixtureSource('sfx-pcm-f32.wav'), {
+        to: 'wav',
+        audio: { codec: 'pcm-f32' as never, fade: { inSec: fadeSec, outSec: fadeSec } },
+      }),
+    );
+
+    const re = readWavPcm(out);
+    expect(re.format).toBe('f32');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    const input = channelAt(orig.planar, 0);
+    const faded = channelAt(re.planar, 0);
+    const fadeFrames = Math.round(orig.sampleRate * fadeSec);
+    const midFade = Math.floor(fadeFrames / 2);
+    expect(faded[0]).toBe(0);
+    expect(faded[re.frames - 1]).toBe(0);
+    const inputSample = input[midFade];
+    const fadedSample = faded[midFade];
+    if (inputSample === undefined || fadedSample === undefined) {
+      throw new Error('expected a midpoint sample inside the fade-in window');
+    }
+    expect(fadedSample).toBeCloseTo(inputSample * (midFade / (fadeFrames - 1)), 6);
   });
 
   it.each([
@@ -161,6 +216,56 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(re.channels).toBe(orig.channels);
     expect(re.frames).toBe(orig.frames);
     expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+  });
+
+  it('converts real signed-8 CAF to legal unsigned-8 WAV by default without changing samples', async () => {
+    const input = await loadDerived('sfx-u8.caf');
+    const orig = readCafPcm(input);
+    expect(orig.format).toBe('s8');
+
+    const out = await bytesOf(await media().convert(cafSource(input), { to: 'wav' }));
+
+    const re = readWavPcm(out);
+    expect(re.format).toBe('u8');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+    const info = await media().probe(wavSource(out));
+    expect(info.tracks[0]?.codec).toBe('pcm-u8');
+  });
+
+  it('converts unsigned-8 WAV to signed-8 CAF by default without changing samples', async () => {
+    const input = await loadFixture('sfx-pcm-u8.wav');
+    const orig = readWavPcm(input);
+    expect(orig.format).toBe('u8');
+
+    const out = await bytesOf(await media().convert(wavSource(input), { to: 'caf' }));
+
+    const re = readCafPcm(out);
+    expect(re.format).toBe('s8');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(re.frames).toBe(orig.frames);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+    const info = await media().probe(cafSource(out));
+    expect(info.tracks[0]?.codec).toBe('pcm-s8');
+  });
+
+  it('rejects explicit incompatible 8-bit PCM targets instead of mislabeling bytes', async () => {
+    await expect(
+      media().convert(await fixtureSource('sfx-pcm-u8.wav'), {
+        to: 'caf',
+        audio: { codec: 'pcm-u8' },
+      }),
+    ).rejects.toBeInstanceOf(CapabilityError);
+
+    await expect(
+      media().convert(cafSource(await loadDerived('sfx-u8.caf')), {
+        to: 'wav',
+        audio: { codec: 'pcm-s8' },
+      }),
+    ).rejects.toBeInstanceOf(CapabilityError);
   });
 
   it('resamples PCM to a new sample rate via the windowed-sinc tail (ADR-022)', async () => {

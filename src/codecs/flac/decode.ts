@@ -23,6 +23,24 @@ export interface FlacDecoded {
   md5: Uint8Array;
 }
 
+/** One native FLAC audio frame, located byte-exactly in the source transport. */
+export interface FlacFrameSpan {
+  /** Byte offset where the native frame begins (the 0xff sync byte). */
+  offset: number;
+  /** Native frame byte length, including header, subframes, padding, and CRC-16 footer. */
+  size: number;
+  /** Decoded PCM samples in this frame after final-stream truncation. */
+  samples: number;
+  /** Presentation start in FLAC sample ticks. */
+  ptsSamples: number;
+  /** Presentation start timestamp, in microseconds. */
+  ptsUs: number;
+  /** Frame duration, in microseconds. */
+  durationUs: number;
+  /** Byte-exact native frame payload, suitable as an Ogg-FLAC audio packet. */
+  data: Uint8Array<ArrayBuffer>;
+}
+
 /** MSB-first bit reader over a byte range (FLAC packs bits big-endian). */
 class BitReader {
   readonly #bytes: Uint8Array;
@@ -70,6 +88,10 @@ class BitReader {
       this.#bit = 0;
       this.#byte++;
     }
+  }
+
+  get byteOffset(): number {
+    return this.#byte;
   }
 }
 
@@ -227,9 +249,17 @@ interface StreamInfo {
   audioStart: number;
 }
 
+interface DecodedFrame {
+  offset: number;
+  size: number;
+  blockSize: number;
+  samples: number;
+  channels: Int32Array[];
+}
+
 function ascii(bytes: Uint8Array, off: number, len: number): string {
   let s = '';
-  for (let i = 0; i < len; i++) s += String.fromCharCode(bytes[off + i] ?? 0);
+  for (let i = 0; i < len; i++) s += String.fromCharCode(bytes[off + i] as number);
   return s;
 }
 
@@ -274,6 +304,44 @@ function readStreamInfo(bytes: Uint8Array): StreamInfo {
   return { ...info, audioStart: off };
 }
 
+function decodeFrame(br: BitReader, si: StreamInfo, produced: number): DecodedFrame {
+  const offset = br.byteOffset;
+  if (br.readBits(14) !== 0x3ffe) throw new MediaError('decode-error', 'FLAC: lost frame sync');
+  br.readBit(); // reserved
+  br.readBit(); // blocking strategy (block size is explicit either way here)
+  const blockSizeCode = br.readBits(4);
+  const sampleRateCode = br.readBits(4);
+  const channelAssignment = br.readBits(4);
+  const sampleSizeCode = br.readBits(3);
+  br.readBit(); // reserved
+  skipUtf8(br); // frame/sample number
+  const blockSize = blockSizeFor(br, blockSizeCode);
+  consumeSampleRate(br, sampleRateCode);
+  br.readBits(8); // CRC-8
+
+  // The frame may restate the sample depth; reserved codes (0/3/7) defer to STREAMINFO.
+  const tableBps = BPS_TABLE[sampleSizeCode] ?? 0;
+  const frameBps = tableBps > 0 ? tableBps : si.bitsPerSample;
+  const stereo = channelAssignment >= 8 && channelAssignment <= 10;
+  const channels = stereo ? 2 : channelAssignment + 1;
+  const frame = Array.from({ length: channels }, () => new Int32Array(blockSize));
+  for (let ch = 0; ch < channels; ch++) {
+    const sideBit =
+      (channelAssignment === 8 && ch === 1) ||
+      (channelAssignment === 9 && ch === 0) ||
+      (channelAssignment === 10 && ch === 1)
+        ? 1
+        : 0;
+    decodeSubframe(br, blockSize, frameBps + sideBit, chan(frame, ch));
+  }
+  if (stereo) decorrelate(frame, channelAssignment, blockSize);
+
+  const samples = Math.min(blockSize, si.totalSamples - produced);
+  br.alignToByte();
+  br.readBits(16); // CRC-16 frame footer
+  return { offset, size: br.byteOffset - offset, blockSize, samples, channels: frame };
+}
+
 /** Decode a native FLAC stream to per-channel PCM (bit-exact; verify with {@link pcmMd5} vs `md5`). */
 export function decodeFlac(bytes: Uint8Array): FlacDecoded {
   const si = readStreamInfo(bytes);
@@ -282,43 +350,11 @@ export function decodeFlac(bytes: Uint8Array): FlacDecoded {
   let produced = 0;
 
   while (produced < si.totalSamples) {
-    if (br.readBits(14) !== 0x3ffe) throw new MediaError('decode-error', 'FLAC: lost frame sync');
-    br.readBit(); // reserved
-    br.readBit(); // blocking strategy (block size is explicit either way here)
-    const blockSizeCode = br.readBits(4);
-    const sampleRateCode = br.readBits(4);
-    const channelAssignment = br.readBits(4);
-    const sampleSizeCode = br.readBits(3);
-    br.readBit(); // reserved
-    skipUtf8(br); // frame/sample number
-    const blockSize = blockSizeFor(br, blockSizeCode);
-    consumeSampleRate(br, sampleRateCode);
-    br.readBits(8); // CRC-8
-
-    // The frame may restate the sample depth; reserved codes (0/3/7) defer to STREAMINFO.
-    const tableBps = BPS_TABLE[sampleSizeCode] ?? 0;
-    const frameBps = tableBps > 0 ? tableBps : si.bitsPerSample;
-    const stereo = channelAssignment >= 8 && channelAssignment <= 10;
-    const channels = stereo ? 2 : channelAssignment + 1;
-    const frame = Array.from({ length: channels }, () => new Int32Array(blockSize));
-    for (let ch = 0; ch < channels; ch++) {
-      const sideBit =
-        (channelAssignment === 8 && ch === 1) ||
-        (channelAssignment === 9 && ch === 0) ||
-        (channelAssignment === 10 && ch === 1)
-          ? 1
-          : 0;
-      decodeSubframe(br, blockSize, frameBps + sideBit, chan(frame, ch));
-    }
-    if (stereo) decorrelate(frame, channelAssignment, blockSize);
-
-    const n = Math.min(blockSize, si.totalSamples - produced);
+    const frame = decodeFrame(br, si, produced);
     for (let ch = 0; ch < si.channels; ch++) {
-      chan(out, ch).set(chan(frame, ch).subarray(0, n), produced);
+      chan(out, ch).set(chan(frame.channels, ch).subarray(0, frame.samples), produced);
     }
-    produced += n;
-    br.alignToByte();
-    br.readBits(16); // CRC-16 frame footer
+    produced += frame.samples;
   }
 
   return {
@@ -329,6 +365,28 @@ export function decodeFlac(bytes: Uint8Array): FlacDecoded {
     samples: out,
     md5: si.md5,
   };
+}
+
+/** Enumerate native FLAC frames byte-exactly, while validating their coded structure by decoding them. */
+export function enumerateFlacFrameSpans(bytes: Uint8Array): FlacFrameSpan[] {
+  const si = readStreamInfo(bytes);
+  const br = new BitReader(bytes, si.audioStart);
+  const frames: FlacFrameSpan[] = [];
+  let produced = 0;
+  while (produced < si.totalSamples) {
+    const frame = decodeFrame(br, si, produced);
+    frames.push({
+      offset: frame.offset,
+      size: frame.size,
+      samples: frame.samples,
+      ptsSamples: produced,
+      ptsUs: Math.round((produced / si.sampleRate) * 1_000_000),
+      durationUs: Math.round((frame.samples / si.sampleRate) * 1_000_000),
+      data: bytes.slice(frame.offset, frame.offset + frame.size),
+    });
+    produced += frame.samples;
+  }
+  return frames;
 }
 
 /** Serialize decoded PCM the way STREAMINFO's MD5 is computed: interleaved, little-endian, per sample. */

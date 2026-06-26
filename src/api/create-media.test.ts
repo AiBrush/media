@@ -167,6 +167,17 @@ describe('createMedia', () => {
     expect(info.tracks[0]?.codec).toBe('mjpeg');
   });
 
+  it('probe reports exact animated-image duration when header frame delays are available', async () => {
+    const bytes = loadImage('anim2.gif');
+    const info = await createMedia().probe(fromBytes(bytes, { mime: 'image/gif' }));
+    expect(info.container).toBe('gif');
+    expect(info.durationSec).toBeCloseTo(0.82, 6);
+    expect(info.tracks).toHaveLength(1);
+    const track = info.tracks[0];
+    expect(track?.durationSec).toBeCloseTo(0.82, 6);
+    expect(track?.fps).toBeCloseTo(36 / 0.82, 6);
+  });
+
   it('decode exposes images as video frames, with a typed browser-only miss in Node and no audio stream', async () => {
     const streams = createMedia().decode(fromBytes(loadImage('test.png'), { mime: 'image/png' }));
     await expect(readFirst(streams.video)).rejects.toBeInstanceOf(CapabilityError);

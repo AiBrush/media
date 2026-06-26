@@ -614,8 +614,9 @@ describe('GpuVideoFilterModule — registration', () => {
 //
 // The GPU pixel render is browser-validated; here we lock the *math* the shader applies with falsifiable
 // oracles: the gamut matrices against the published constants (sRGB/BT.709→XYZ, the 709/2020 luma rows,
-// 2020↔709), the transfer curves (monotonic, black→0, peak→1, round-trip), the tonemap operators
-// (monotonic, black→0, peak→1.0), and the spec→ColorPlan selection + VideoColorSpace mapping.
+// 2020↔709), the transfer curves (monotonic, black→0, SDR white→1, HDR peak→100/12, round-trip), the
+// tonemap operators (monotonic, black→0, peak→1.0), and the spec→ColorPlan selection + VideoColorSpace
+// mapping.
 
 /** Assert two numbers are equal within `eps` (matrices/transfers are computed, not stored, so allow ULP). */
 function near(a: number, b: number, eps = 1e-6): void {
@@ -649,6 +650,13 @@ describe('gamut matrices — exact published values', () => {
     near(m[3] ?? Number.NaN, 0.2627, 5e-5);
     near(m[4] ?? Number.NaN, 0.678, 5e-5);
     near(m[5] ?? Number.NaN, 0.0593, 5e-5);
+  });
+
+  it('the BT.601/SMPTE-C luma row (Y) is (0.2124, 0.7011, 0.0866)', () => {
+    const m = rgbToXyz('bt601');
+    near(m[3] ?? Number.NaN, 0.2124, 5e-5);
+    near(m[4] ?? Number.NaN, 0.7011, 5e-5);
+    near(m[5] ?? Number.NaN, 0.0866, 5e-5);
   });
 
   it('BT.2020 → BT.709 is the published BT.2087 conversion matrix', () => {
@@ -699,14 +707,28 @@ describe('gamut matrices — exact published values', () => {
 });
 
 describe('transfer functions — EOTF/OETF invariants', () => {
+  const SDR_TRANSFERS: readonly TransferId[] = ['srgb', 'bt709', 'linear'];
+  const HDR_TRANSFERS: ReadonlyArray<readonly [TransferId, number]> = [
+    ['pq', 100],
+    ['hlg', 12],
+  ];
   const TRANSFERS: readonly TransferId[] = ['srgb', 'bt709', 'pq', 'hlg', 'linear'];
 
-  it('every transfer maps black→0 and peak (1.0) →1.0', () => {
-    for (const id of TRANSFERS) {
+  it('SDR transfers map black→0 and diffuse white (1.0)→1.0', () => {
+    for (const id of SDR_TRANSFERS) {
       near(oetf(id, 0), 0, 1e-6);
       near(oetf(id, 1), 1, 1e-6);
       near(eotf(id, 0), 0, 1e-6);
       near(eotf(id, 1), 1, 1e-6);
+    }
+  });
+
+  it('HDR transfers decode code-value peak into SDR-white-relative linear units', () => {
+    for (const [id, peak] of HDR_TRANSFERS) {
+      near(eotf(id, 0), 0, 1e-6);
+      near(eotf(id, 1), peak, 1e-5);
+      near(oetf(id, 0), 0, 1e-6);
+      near(oetf(id, peak), 1, 1e-6);
     }
   });
 
@@ -721,9 +743,16 @@ describe('transfer functions — EOTF/OETF invariants', () => {
     }
   });
 
-  it('eotf is the inverse of oetf for each transfer (round-trip ≤ 1e-5)', () => {
+  it('eotf is the inverse of oetf for each transfer in white-relative units', () => {
+    const samples: Readonly<Record<TransferId, readonly number[]>> = {
+      srgb: [0.05, 0.2, 0.5, 0.75, 0.9],
+      bt709: [0.05, 0.2, 0.5, 0.75, 0.9],
+      linear: [0.05, 0.2, 0.5, 0.75, 0.9],
+      pq: [0.01, 0.5, 1, 10, 100],
+      hlg: [0.01, 0.5, 1, 6, 12],
+    };
     for (const id of TRANSFERS) {
-      for (const x of [0.05, 0.2, 0.5, 0.75, 0.9]) {
+      for (const x of samples[id]) {
         near(eotf(id, oetf(id, x)), x, 1e-5);
       }
     }
@@ -742,11 +771,16 @@ describe('transfer functions — EOTF/OETF invariants', () => {
     }
   });
 
-  it('PQ decodes a mid code value to a small linear fraction (HDR is compressed at the top)', () => {
-    // PQ packs 10000 nits into [0,1]; ~0.5 code is only a few hundred nits ⇒ a small linear fraction.
+  it('PQ decodes a mid code value to roughly SDR white in white-relative units', () => {
+    // PQ packs 10000 nits into [0,1]; ~0.5 code is around the 100-nit SDR-white neighborhood.
     const lin = eotf('pq', 0.5);
-    expect(lin).toBeGreaterThan(0);
-    expect(lin).toBeLessThan(0.05);
+    expect(lin).toBeGreaterThan(0.5);
+    expect(lin).toBeLessThan(1);
+  });
+
+  it('HLG code 0.5 is the reference-white neighborhood and code 1.0 is the 12x peak', () => {
+    near(eotf('hlg', 0.5), 1, 1e-6);
+    near(eotf('hlg', 1), 12, 1e-6);
   });
 });
 
@@ -828,8 +862,14 @@ describe('planColorspace / planTonemap — pipeline selection', () => {
     expect(p.encode).toBe('bt709');
     expect(p.tonemap).not.toBeNull();
     expect(p.tonemap?.op).toBe('reinhard');
-    expect(p.tonemap?.peak).toBeGreaterThan(1);
+    expect(p.tonemap?.peak).toBe(100);
     nearMat(p.gamut, gamutMatrix('bt2020', 'bt709'), 1e-12);
+  });
+
+  it('tonemap of an HLG source uses the 12x reference-white peak', () => {
+    const p = planTonemap({ primaries: 'bt2020', transfer: 'hlg' });
+    expect(p.decode).toBe('hlg');
+    expect(p.tonemap?.peak).toBe(12);
   });
 
   it('tonemap of an already-SDR source (peak ≤ 1) collapses to a gamut-only pass (no operator)', () => {
@@ -862,6 +902,7 @@ describe('parseColorSpace — token aliases', () => {
       ['bt2020ncl', 'bt2020'],
       ['smpte170m', 'bt601'],
       ['bt601', 'bt601'],
+      ['bt470bg', 'bt601'],
     ];
     for (const [token, id] of cases) expect(parseColorSpace(token)).toBe(id);
   });

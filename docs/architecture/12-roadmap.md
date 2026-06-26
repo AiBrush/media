@@ -44,7 +44,7 @@ Reclaim the ~5% heavy tail and the rest of the matrix; turn the monolith into th
 
 **Deliverables**
 - **Isolation profile (opt-in):** WASM SIMD+threads under `crossOriginIsolated` to speed the exotic tail (ADR-006).
-- **Cost-aware tier thresholds (ADR-020):** seed from Phase-1/2 telemetry — pick cheaper tiers for tiny inputs.
+- **Cost-aware tier thresholds (ADR-020):** seeded from Phase-1/2 telemetry — pick cheaper tiers for tiny inputs.
 - **Fluent chain (ADR-010):** ship the post-v1 sugar as a façade over the declarative job.
 - **Perf hardening:** worker pool for ABR fan-out; frame-lifetime/backpressure audits; multi-sample perf regression gates.
 
@@ -67,4 +67,4 @@ Reclaim the ~5% heavy tail and the rest of the matrix; turn the monolith into th
 
 ## Open / deferred
 
-- **ADR-020** cost-aware thresholds — deferred to Phase-3 telemetry (the one remaining open decision).
+- No ADR-level decisions are currently deferred; remaining work is implementation breadth and external harness validation.

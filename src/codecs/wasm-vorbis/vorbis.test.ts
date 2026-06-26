@@ -285,6 +285,20 @@ describe('wasm-vorbis — driver identity & module', () => {
       ).supported,
     ).toBe(false);
   });
+  it('supports(): false in Node when the AudioData output seam is unavailable', async () => {
+    const description = buildVorbisExtradata(
+      Uint8Array.of(1, 118, 111, 114, 98, 105, 115),
+      Uint8Array.of(3, 118, 111, 114, 98, 105, 115),
+      Uint8Array.of(5, 118, 111, 114, 98, 105, 115),
+    );
+    const support = await WasmVorbisDriver.supports({
+      mediaType: 'audio',
+      direction: 'decode',
+      config: { codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2, description },
+    });
+    expect(support.supported).toBe(false);
+    expect(support.reason ?? '').toMatch(/AudioData|EncodedAudioChunk/);
+  });
 });
 
 // ============ Ogg de-lacing on real media ============

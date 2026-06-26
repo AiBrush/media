@@ -36,7 +36,7 @@ function assert(cond: boolean, msg: string): asserts cond {
 }
 
 const TIERS: readonly Tier[] = ['hardware', 'gpu', 'native', 'wasm'];
-const SUBSTRATES: readonly FilterSubstrate[] = ['webgpu', 'webgl', 'canvas2d', 'wasm'];
+const SUBSTRATES: readonly FilterSubstrate[] = ['webgpu', 'webgl', 'canvas2d', 'native', 'wasm'];
 
 function isTransformStreamLike(x: unknown): boolean {
   return (

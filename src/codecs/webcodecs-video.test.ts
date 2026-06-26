@@ -350,6 +350,28 @@ describe('WebcodecsVideoDriver.supports — honest under absent WebCodecs (Node 
     expect(s.supported).toBe(false);
   });
 
+  it('returns a deterministic miss for video-shaped codec strings this driver does not route', async () => {
+    const decode = await WebcodecsVideoDriver.supports({
+      mediaType: 'video',
+      direction: 'decode',
+      config: { codec: 'theora', codedWidth: 16, codedHeight: 16 },
+    });
+    expect(decode).toEqual({
+      supported: false,
+      reason: "unsupported video codec string 'theora'",
+    });
+
+    const encode = await WebcodecsVideoDriver.supports({
+      mediaType: 'video',
+      direction: 'encode',
+      config: { codec: 'ap4h', width: 16, height: 16 },
+    });
+    expect(encode).toEqual({
+      supported: false,
+      reason: "unsupported video codec string 'ap4h'",
+    });
+  });
+
   it('returns {supported:false} (never throws) for an audio query — this is the VIDEO driver', async () => {
     const s = await WebcodecsVideoDriver.supports({
       mediaType: 'audio',
@@ -391,5 +413,14 @@ describe('WebcodecsVideoDriver coder factories — typed miss when WebCodecs is 
       expect(e).toBeInstanceOf(CapabilityError);
       expect((e as CapabilityError).code).toBe('capability-miss');
     }
+  });
+
+  it('throws a typed capability miss for unsupported video codec strings before touching WebCodecs', () => {
+    expect(() =>
+      WebcodecsVideoDriver.createDecoder({ codec: 'theora', codedWidth: 16, codedHeight: 16 }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      WebcodecsVideoDriver.createEncoder({ codec: 'ap4h', width: 16, height: 16 }),
+    ).toThrow(CapabilityError);
   });
 });

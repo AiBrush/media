@@ -9,8 +9,14 @@
  * Subject media are REAL corpus MP4s (never synthetic) so the routing tracks the real demuxer output.
  */
 
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { parseFlac } from '../drivers/flac/flac-driver.ts';
+import { parseTs } from '../drivers/mpegts/ts-parse.ts';
+import { parseOgg } from '../drivers/ogg/ogg-driver.ts';
+import { readWavPcm } from '../drivers/wav/pcm.ts';
+import { channelAt } from '../dsp/pcm.ts';
 import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
@@ -20,8 +26,19 @@ import { createMedia } from './create-media.ts';
 const MP4_FIXTURES = ['movie_5.mp4', 'test.mp4', 'h264.mp4'] as const;
 const CENC_KEY = '000102030405060708090a0b0c0d0e0f';
 const CENC_KID = '00112233445566778899aabbccddeeff';
+const DERIVED_DIR = new URL('../../fixtures/media-derived/aiff-caf/', import.meta.url);
 
 const media = () => createMedia();
+
+function peak(ch: Float64Array): number {
+  let out = 0;
+  for (const sample of ch) out = Math.max(out, Math.abs(sample));
+  return out;
+}
+
+async function derivedSource(id: string, mime: string) {
+  return fromBytes(new Uint8Array(await readFile(new URL(id, DERIVED_DIR))), { mime });
+}
 
 async function readFirstFrame<T>(stream: ReadableStream<T> | undefined): Promise<void> {
   if (!stream) throw new Error('expected a frame stream');
@@ -31,6 +48,83 @@ async function readFirstFrame<T>(stream: ReadableStream<T> | undefined): Promise
   } finally {
     reader.releaseLock();
   }
+}
+
+type TestChunkInit = {
+  readonly type: EncodedAudioChunkType | EncodedVideoChunkType;
+  readonly timestamp: number;
+  readonly duration?: number | null;
+  readonly data: AllowSharedBufferSource;
+};
+
+function copyBufferSource(source: AllowSharedBufferSource): Uint8Array {
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice();
+  }
+  return new Uint8Array(source).slice();
+}
+
+class TestEncodedChunk {
+  readonly type: EncodedAudioChunkType | EncodedVideoChunkType;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+
+  constructor(init: TestChunkInit) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    this.#data = copyBufferSource(init.data);
+    this.byteLength = this.#data.byteLength;
+  }
+
+  copyTo(destination: AllowSharedBufferSource): void {
+    const view = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    view.set(this.#data);
+  }
+}
+
+function installEncodedChunkShims(): () => void {
+  const originalVideo = globalThis.EncodedVideoChunk;
+  const originalAudio = globalThis.EncodedAudioChunk;
+  Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+    configurable: true,
+    writable: true,
+    value: TestEncodedChunk as unknown as typeof EncodedVideoChunk,
+  });
+  Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+    configurable: true,
+    writable: true,
+    value: TestEncodedChunk as unknown as typeof EncodedAudioChunk,
+  });
+  return () => {
+    if (originalVideo === undefined) {
+      Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+    } else {
+      Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+        configurable: true,
+        writable: true,
+        value: originalVideo,
+      });
+    }
+    if (originalAudio === undefined) {
+      Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+    } else {
+      Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+        configurable: true,
+        writable: true,
+        value: originalAudio,
+      });
+    }
+  };
+}
+
+async function outputBytes(output: Blob | File | ReadableStream<Uint8Array> | undefined) {
+  if (!(output instanceof Blob)) throw new Error('expected Blob output');
+  return new Uint8Array(await output.arrayBuffer());
 }
 
 describe('convert — stream-copy auto-route (no re-encode needed)', () => {
@@ -67,6 +161,24 @@ describe('convert — stream-copy auto-route (no re-encode needed)', () => {
     });
     expect(out).toBeInstanceOf(Blob);
     if (out instanceof Blob) expect(out.size).toBeGreaterThan(0);
+  });
+
+  it('routes public PCM dynamics and biquad options through convert(), not the codec seam', async () => {
+    const out = await media().convert(await fixtureSource('speech.wav'), {
+      to: 'wav',
+      audio: {
+        codec: 'pcm-f32' as never,
+        biquad: { type: 'highpass', frequency: 300, q: Math.SQRT1_2 },
+        dynamics: {
+          normalize: { mode: 'peak', targetDbfs: -6 },
+          limit: { ceilingDbfs: -1, mode: 'hard' },
+        },
+      },
+    });
+    const pcm = readWavPcm(await outputBytes(out));
+    expect(pcm.format).toBe('f32');
+    expect(pcm.frames).toBeGreaterThan(0);
+    expect(peak(channelAt(pcm.planar, 0))).toBeCloseTo(10 ** (-6 / 20), 5);
   });
 });
 
@@ -125,6 +237,98 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     ).rejects.toBeInstanceOf(CapabilityError);
   });
 
+  it('cross-container remux (mp4 → ts) accepts foreign H.264/AAC packets through the muxer seam', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      for (const id of ['h264.mp4', 'movie_5.mp4', 'test.mp4'] as const) {
+        const input = await loadFixture(id);
+        const out = await outputBytes(await media().remux(await fixtureSource(id), { to: 'ts' }));
+        expect(out.byteLength).toBeGreaterThan(0);
+        expect(out.byteLength % 188).toBe(0);
+        expect(
+          out.byteLength === input.byteLength && out.every((b, index) => b === input[index]),
+        ).toBe(false);
+
+        const parsed = parseTs(out);
+        expect(parsed.tracks.find((track) => track.stream.codec === 'h264')).toBeDefined();
+        for (const track of parsed.tracks) {
+          expect(track.units.length).toBeGreaterThan(0);
+          if (track.stream.codec === 'h264') {
+            const first = track.units[0]?.data ?? new Uint8Array();
+            const annexBStart =
+              first[0] === 0x00 &&
+              first[1] === 0x00 &&
+              (first[2] === 0x01 || (first[2] === 0x00 && first[3] === 0x01));
+            expect(annexBStart).toBe(true);
+          }
+          if (track.stream.codec === 'aac') {
+            expect(track.units[0]?.data[0]).toBe(0xff);
+            expect((track.units[0]?.data[1] ?? 0) & 0xf0).toBe(0xf0);
+          }
+        }
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('cross-container remux (flac → ogg) accepts foreign native FLAC packets through the muxer seam', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const input = await loadFixture('sfx.flac');
+      const sourceInfo = parseFlac(input);
+      const out = await outputBytes(
+        await media().remux(await fixtureSource('sfx.flac'), { to: 'ogg' }),
+      );
+      expect(out.byteLength).toBeGreaterThan(0);
+      expect(
+        out.byteLength === input.byteLength && out.every((b, index) => b === input[index]),
+      ).toBe(false);
+
+      const info = parseOgg(out);
+      expect(info.codec).toBe('flac');
+      expect(info.sampleRate).toBe(sourceInfo.sampleRate);
+      expect(info.channels).toBe(sourceInfo.channels);
+      expect(info.durationSec).toBeCloseTo(sourceInfo.durationSec, 5);
+    } finally {
+      restore();
+    }
+  });
+
+  it('cross-container remux (webm vorbis → ogg) preserves declared duration despite laced packet cadence', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const sourceInfo = await media().probe(await fixtureSource('bear-multitrack.webm'));
+      expect(sourceInfo.tracks.some((track) => track.codec === 'vorbis')).toBe(true);
+
+      const out = await outputBytes(
+        await media().remux(await fixtureSource('bear-multitrack.webm'), {
+          to: 'ogg',
+          trackSelect: ['audio:0'],
+        }),
+      );
+      const info = parseOgg(out);
+      expect(info.codec).toBe('vorbis');
+      expect(Math.abs(info.durationSec - sourceInfo.durationSec)).toBeLessThanOrEqual(1 / 44_100);
+    } finally {
+      restore();
+    }
+  });
+
+  it('cross-container remux keeps illegal codec/container pairs as typed capability misses', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      await expect(
+        media().remux(await fixtureSource('h265.mp4'), { to: 'ts' }),
+      ).rejects.toBeInstanceOf(CapabilityError);
+      await expect(
+        media().remux(await fixtureSource('h264.mp4'), { to: 'ogg' }),
+      ).rejects.toBeInstanceOf(CapabilityError);
+    } finally {
+      restore();
+    }
+  });
+
   it('remux to a container with no muxer (mp4 → mp3 / → aiff) is an honest typed miss', async () => {
     for (const to of ['mp3', 'aiff'] as const) {
       await expect(
@@ -159,6 +363,22 @@ describe('decode — lazy frame streams (contract)', () => {
     if (reader) {
       expect((await reader.read()).done).toBe(true);
       reader.releaseLock();
+    }
+  });
+
+  it('routes raw PCM audio decode through the PCM-native path before the WebCodecs codec ladder', async () => {
+    // Node has no `AudioData`, so the PCM route must still reject here; the important assertion is that
+    // WAV/AIFF/CAF reject at the raw-PCM AudioData bridge, not later as bogus WebCodecs `pcm-*` misses.
+    const sources = [
+      await fixtureSource('speech.wav'),
+      await derivedSource('sfx.aiff', 'audio/aiff'),
+      await derivedSource('sfx.caf', 'audio/x-caf'),
+    ];
+    for (const source of sources) {
+      const streams = media().decode(source);
+      await expect(readFirstFrame(streams.audio)).rejects.toThrow(
+        /PCM audio decode needs AudioData/,
+      );
     }
   });
 

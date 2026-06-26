@@ -5,15 +5,9 @@
  * `remix{channels}` (BS.775 up/down-mix, {@link remix}), and `gain{db}` ({@link gain}). Each is a
  * `TransformStream<AudioData, AudioData>` per the {@link FilterDriver} contract.
  *
- * **Substrate.** The {@link FilterSubstrate} enum (`webgpu|webgl|canvas2d|wasm`) is pixel-oriented; this
- * kernel is pure TS on the CPU, so none of the values describes it well. We declare **`'wasm'`** — not
- * because any WASM runs (it is plain TypeScript), but because `'wasm'` is the router's lowest-rank,
- * non-GPU, CPU tier (doc 04 ranks WebGPU → WebGL → Canvas2D → WASM); a CPU audio filter belongs at the
- * CPU tier and must never rank above a GPU substrate. The three GPU/canvas values would be actively
- * wrong (they imply a pixel pipeline). The `Tier` enum already carries a `'native'` value that
- * `FilterSubstrate` lacks — a `'native'` substrate would fit this exactly; that is a contract change
- * (a `DRIVER_API_VERSION` event) left to the owner of `contracts/driver.ts`, so this driver uses the
- * least-wrong existing value rather than diverging from the frozen contract.
+ * **Substrate.** This kernel is pure TS on the CPU, so it declares `substrate:'native'`. The router ranks
+ * native below WebGPU/WebGL/Canvas2D, keeping GPU pixel filters first, and above the WASM tail reserved for
+ * future compiled filter cores. No WASM runs here.
  *
  * **Frame lifetime (doc 06 §3).** Each input `AudioData` is `close()`d **exactly once** — synchronously
  * in a `finally` right after its samples are copied out (the `copyTo` reads fully consume it before the
@@ -37,10 +31,13 @@ import {
   type StageOptions,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { audioDataToPcm, pcmToPlanarInit } from '../dsp/audio-data.ts';
 import { gain } from '../dsp/gain.ts';
 import { remix } from '../dsp/mix.ts';
-import { type PcmAudio, channelAt } from '../dsp/pcm.ts';
+import type { PcmAudio } from '../dsp/pcm.ts';
 import { resample } from '../dsp/resample.ts';
+
+export { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/audio-data.ts';
 
 /** The audio `FilterSpec` variants this driver handles (resample / remix / gain). */
 export type AudioDspSpec = Extract<FilterSpec, { mediaType: 'audio' }>;
@@ -72,59 +69,6 @@ export function applyAudioFilter(audio: PcmAudio, spec: AudioDspSpec): PcmAudio 
 }
 
 // ============ AudioData ⇄ PcmAudio framing (pure over the read/build surface) ============
-
-/** The `f32-planar` layout: one plane (a full channel) at a time — what we both read and write. */
-const F32_PLANAR = 'f32-planar' as const;
-
-/**
- * Read every channel of an `AudioData` into the canonical `[-1,1]` planar Float64 buffer, copying each
- * plane out as `f32-planar` (lossless for DSP regardless of the source's wire format). This reads only
- * the `AudioData` surface (`numberOfChannels`/`numberOfFrames`/`sampleRate`/`copyTo`) and **does not**
- * close the frame — the stream owns close-once. Pure: exercised in Node via a duck-typed stand-in.
- */
-export function audioDataToPcm(data: AudioData): PcmAudio {
-  const channels = data.numberOfChannels;
-  const frames = data.numberOfFrames;
-  const sampleRate = data.sampleRate;
-  const planar: Float64Array[] = [];
-  for (let c = 0; c < channels; c++) {
-    const plane = new Float32Array(frames);
-    if (frames > 0) data.copyTo(plane, { planeIndex: c, format: F32_PLANAR });
-    const ch = new Float64Array(frames);
-    for (let i = 0; i < frames; i++) ch[i] = plane[i] ?? 0;
-    planar.push(ch);
-  }
-  return { sampleRate, channels, frames, planar };
-}
-
-/**
- * Lay canonical planar audio out as a channel-major `f32-planar` buffer plus the matching
- * {@link AudioDataInit} (carrying `timestamp` in microseconds). `f32-planar` storage is plane-by-plane
- * (all of channel 0, then channel 1, …) — the natural match for our planar buffer, no interleaving. The
- * returned `Float32Array` owns its `ArrayBuffer` so it can be handed straight to `new AudioData(init)`.
- * Pure (no `AudioData` construction here): Node-tested for layout, dtype, and header fields.
- */
-export function pcmToPlanarInit(
-  audio: PcmAudio,
-  timestamp: number,
-): { init: AudioDataInit; data: Float32Array<ArrayBuffer> } {
-  const { channels, frames, sampleRate } = audio;
-  const data = new Float32Array(new ArrayBuffer(channels * frames * 4));
-  for (let c = 0; c < channels; c++) {
-    const ch = channelAt(audio.planar, c);
-    const base = c * frames;
-    for (let i = 0; i < frames; i++) data[base + i] = ch[i] ?? 0;
-  }
-  const init: AudioDataInit = {
-    format: F32_PLANAR,
-    sampleRate,
-    numberOfChannels: channels,
-    numberOfFrames: frames,
-    timestamp,
-    data: data.buffer,
-  };
-  return { init, data };
-}
 
 // ============ stream wiring (browser-only seam) ============
 
@@ -191,16 +135,16 @@ function audioDataAvailable(): boolean {
 }
 
 /**
- * The audio-dsp filter driver (`substrate:'wasm'` — the CPU tier; see the file header). `supports()` is
- * honest: true only for an audio spec **and** when the `AudioData` seam exists (so it returns `false` in
- * Node and the router never builds a stream there). `createFilter` fails fast with a typed
+ * The audio-dsp filter driver (`substrate:'native'` — the pure-TS CPU tier; see the file header).
+ * `supports()` is honest: true only for an audio spec **and** when the `AudioData` seam exists (so it
+ * returns `false` in Node and the router never builds a stream there). `createFilter` fails fast with a typed
  * `CapabilityError` for a non-audio spec or an absent `AudioData`, never deferring the miss into the stream.
  */
 export const audioDspFilterDriver: FilterDriver = {
   id: 'audio-dsp-filter',
   apiVersion: DRIVER_API_VERSION,
   kind: 'filter',
-  substrate: 'wasm',
+  substrate: 'native',
   supports(f: FilterSpec): boolean {
     return isAudioDspSpec(f) && audioDataAvailable();
   },
@@ -231,8 +175,8 @@ function exhaustive(value: never): never {
 /* v8 ignore stop */
 
 /**
- * Driver module registering the audio-dsp filter. The router ranks it by `substrate` (`'wasm'`, the CPU
- * tier) and selects it for the audio `FilterSpec` variants the GPU video filters do not serve.
+ * Driver module registering the audio-dsp filter. The router ranks it by `substrate` (`'native'`, the
+ * pure-TS CPU tier) and selects it for the audio `FilterSpec` variants the GPU video filters do not serve.
  */
 export const AudioDspFilterModule: DriverModule = {
   apiVersion: DRIVER_API_VERSION,

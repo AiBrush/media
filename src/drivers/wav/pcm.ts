@@ -5,7 +5,7 @@
  * oracle: `writeWav(readWavPcm(file), sameFormat)` reproduces the source PCM **bit-exact**.
  */
 
-import { InputError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import {
   type Endianness,
   type PcmAudio,
@@ -81,6 +81,9 @@ export function readWavPcm(bytes: Uint8Array): WavPcm {
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
     if (id === 'fmt ' && size >= 16) {
+      if (body + 16 > bytes.byteLength) {
+        throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
+      }
       fmt = parseFmt(dv, body, size);
     } else if (id === 'data') {
       dataOffset = body;
@@ -107,6 +110,12 @@ export function writeWav(
   format: SampleFormat,
   endian: Endianness = 'le',
 ): Uint8Array<ArrayBuffer> {
+  if (format === 's8') {
+    throw new CapabilityError('capability-miss', 'WAV 8-bit PCM is unsigned; use pcm-u8', {
+      op: { op: 'pcm-write', container: 'wav', sampleFormat: format },
+      tried: ['wav'],
+    });
+  }
   const data = encodePcm(audio, format, endian);
   const blockAlign = audio.channels * bytesPerSample(format);
   const byteRate = audio.sampleRate * blockAlign;

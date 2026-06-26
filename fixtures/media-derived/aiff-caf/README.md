@@ -8,7 +8,7 @@ drivers must parse.
 
 ## Source
 
-All six are transcodes of **`fixtures/media/sfx-pcm-s16.wav`** (a corpus file in `../../manifest.json`:
+All eight are transcodes of **`fixtures/media/sfx-pcm-s16.wav`** (a corpus file in `../../manifest.json`:
 web-platform-tests `webcodecs/sfx-pcm-s16.wav`, **W3C 3-Clause BSD**, 48 kHz mono s16, sha256
 `2f4ee43d…`). Regenerate with, e.g.:
 
@@ -20,7 +20,7 @@ afconvert -f AIFC -d BEI16 fixtures/media/sfx-pcm-s16.wav sfx-twos.aifc   # AIFF
 afconvert -f caff -d LEI16 fixtures/media/sfx-pcm-s16.wav sfx.caf         # CAF little-endian (Apple default)
 afconvert -f caff -d BEI16 fixtures/media/sfx-pcm-s16.wav sfx-be.caf      # CAF big-endian
 afconvert -f caff -d LEF32 fixtures/media/sfx-pcm-s16.wav sfx-f32.caf     # CAF float32
-afconvert -f caff -d  I8   fixtures/media/sfx-pcm-s16.wav sfx-u8.caf      # CAF signed 8-bit (honest miss)
+afconvert -f caff -d  I8   fixtures/media/sfx-pcm-s16.wav sfx-u8.caf      # CAF signed 8-bit
 ```
 
 ## Files (ground truth = `afinfo <file>`)
@@ -34,11 +34,11 @@ afconvert -f caff -d  I8   fixtures/media/sfx-pcm-s16.wav sfx-u8.caf      # CAF 
 | `sfx.caf` | CAF | `lpcm`, flags `0x2` (little-endian) | `pcm-s16` | 1 | 48000 | 16 | LE |
 | `sfx-be.caf` | CAF | `lpcm`, flags `0x0` (big-endian) | `pcm-s16be` | 1 | 48000 | 16 | BE |
 | `sfx-f32.caf` | CAF | `lpcm`, flags `0x3` (float + LE) | `pcm-f32` | 1 | 48000 | 32 | LE |
-| `sfx-u8.caf` | CAF | `lpcm`, flags `0x2`, 8-bit (signed) | — (honest miss) | 1 | 48000 | 8 | LE |
+| `sfx-u8.caf` | CAF | `lpcm`, flags `0x2`, 8-bit (signed) | `pcm-s8` | 1 | 48000 | 8 | LE |
 
-`sfx-u8.caf` is a deliberate **negative** fixture: CoreAudio writes integer PCM as signed two's-complement
-at every depth (`afinfo` reports "8-bit signed integer"), and the dsp's only 8-bit format is offset-binary
-`u8`, so the driver raises a typed `CapabilityError` rather than a 128-off mis-decode.
+`sfx-u8.caf` is deliberately named after the `afconvert -d I8` source command, but CoreAudio writes
+integer PCM as signed two's-complement at every depth (`afinfo` reports "8-bit signed integer"). It is
+therefore a positive `pcm-s8` fixture, distinct from WAV's offset-binary `pcm-u8`.
 
 License of the derived files follows the source: **W3C 3-Clause BSD** (a lossless PCM transcode of
 openly-licensed test audio). `sha256` of each is recorded inline below (re-pin after regenerating).

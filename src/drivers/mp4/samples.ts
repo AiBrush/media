@@ -47,7 +47,7 @@ function expand<E extends { count: number }>(
     const value = pick(e);
     for (let i = 0; i < e.count && out.length < count; i++) out.push(value);
   }
-  while (out.length < count) out.push(out.length > 0 ? (out[out.length - 1] ?? 0) : 0);
+  while (out.length < count) out.push(out.length > 0 ? (out[out.length - 1] as number) : 0);
   return out;
 }
 
@@ -83,8 +83,8 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
     let offset = chunkOffset;
     const spc = samplesPerChunk(st.sampleToChunk, c + 1);
     for (let s = 0; s < spc && sampleIndex < count; s++) {
-      const size = sizes[sampleIndex] ?? 0;
-      const delta = deltas[sampleIndex] ?? 0;
+      const size = sizes[sampleIndex] as number;
+      const delta = deltas[sampleIndex] as number;
       out.push({
         index: sampleIndex,
         offset,
@@ -105,12 +105,13 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
 /** Build the flat sample list with WebCodecs microsecond timestamps. */
 export function buildSamples(track: ParsedTrack): Sample[] {
   const ts = track.timescale;
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
   return buildSampleData(track).map((s) => ({
     index: s.index,
     offset: s.offset,
     size: s.size,
-    dtsUs: toUs(s.dtsTicks, ts),
-    ptsUs: toUs(s.dtsTicks + s.cttsTicks, ts),
+    dtsUs: toUs(s.dtsTicks - editOffsetTicks, ts),
+    ptsUs: toUs(s.dtsTicks + s.cttsTicks - editOffsetTicks, ts),
     durationUs: toUs(s.durationTicks, ts),
     keyframe: s.keyframe,
   }));

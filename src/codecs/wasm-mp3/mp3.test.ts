@@ -468,6 +468,19 @@ describe('wasm-mp3 — driver identity & module', () => {
       ).supported,
     ).toBe(false);
   });
+  it('supports(): false in Node when the AudioData output seam is unavailable', async () => {
+    const support = await WasmMp3Driver.supports({
+      mediaType: 'audio',
+      direction: 'decode',
+      config: {
+        codec: 'mp3',
+        sampleRate: 44_100,
+        numberOfChannels: 2,
+      },
+    });
+    expect(support.supported).toBe(false);
+    expect(support.reason ?? '').toMatch(/AudioData|EncodedAudioChunk/);
+  });
   it('resetMp3CoreForTest lets the core be re-evaluated', async () => {
     resetMp3CoreForTest();
     const a = await loadMp3Core();

@@ -26,6 +26,7 @@ import {
   hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
+  isUnsupportedHevcEncodeProfile,
   normalizeDecoderCodec,
   outputDimensions,
   seekFrame,
@@ -50,6 +51,7 @@ describe('chooseOutputContainer', () => {
     expect(chooseOutputContainer(undefined, 'webm')).toBe('webm'); // webm now has a chunk muxer
     expect(chooseOutputContainer(undefined, 'mkv')).toBe('mkv');
     expect(chooseOutputContainer(undefined, 'ogg')).toBe('ogg');
+    expect(chooseOutputContainer(undefined, 'ts')).toBe('ts');
   });
 
   it('defaults to mp4 when the source is not chunk-muxable or unknown', () => {
@@ -61,15 +63,15 @@ describe('chooseOutputContainer', () => {
 });
 
 describe('containerHasChunkMuxer', () => {
-  it('is true for the containers with a real EncodedChunk-seam muxer (mp4/mov, webm/mkv, ogg)', () => {
-    for (const c of ['mp4', 'mov', 'webm', 'mkv', 'ogg'] as const) {
+  it('is true for the containers with a real EncodedChunk-seam muxer', () => {
+    for (const c of ['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts'] as const) {
       expect(containerHasChunkMuxer(c)).toBe(true);
     }
   });
-  it('is false for PCM (transformPcm path) and the not-yet-muxable elementary/TS containers', () => {
-    // wav/aiff/caf author PCM via transformPcm (not the chunk seam); mp3/aac/adts/flac/ts muxers are
-    // a typed miss for now — declaring them here would over-claim (the muxer still self-rejects too).
-    for (const c of ['wav', 'aiff', 'caf', 'mp3', 'aac', 'adts', 'flac', 'ts'] as const) {
+  it('is false for PCM (transformPcm path) and the not-yet-muxable elementary containers', () => {
+    // wav/aiff/caf author PCM via transformPcm (not the chunk seam); mp3/aac/adts/flac muxers are still
+    // a typed miss here — declaring them would over-claim (the muxer still self-rejects too).
+    for (const c of ['wav', 'aiff', 'caf', 'mp3', 'aac', 'adts', 'flac'] as const) {
       expect(containerHasChunkMuxer(c)).toBe(false);
     }
   });
@@ -164,18 +166,38 @@ describe('videoCodecToken / audioCodecToken', () => {
 describe('videoEncoderCodecString', () => {
   it('maps a token to its default profile string', () => {
     expect(videoEncoderCodecString('h264', undefined)).toBe('avc1.42E01E');
+    expect(videoEncoderCodecString('hevc', undefined)).toBe('hev1.1.6.L93.B0');
     expect(videoEncoderCodecString('vp9', undefined)).toBe('vp09.00.10.08');
     expect(videoEncoderCodecString('av1', undefined)).toBe('av01.0.04M.08');
   });
 
   it('preserves the source codec string when no token is given (same-codec transcode)', () => {
     expect(videoEncoderCodecString(undefined, 'avc1.640028')).toBe('avc1.640028');
+    expect(videoEncoderCodecString(undefined, 'hvc1.1.6.L150.90')).toBe('hvc1.1.6.L150.90');
     expect(videoEncoderCodecString(undefined, 'vp09.00.10.08')).toBe('vp09.00.10.08');
   });
 
   it('throws a typed CapabilityError when neither a token nor a recognizable source codec is available', () => {
     expect(() => videoEncoderCodecString(undefined, undefined)).toThrow(CapabilityError);
     expect(() => videoEncoderCodecString(undefined, 'mp4a.40.2')).toThrow(CapabilityError); // audio source
+  });
+
+  it('throws a typed CapabilityError rather than preserving HEVC Main10/non-Main encode strings', () => {
+    expect(() => videoEncoderCodecString(undefined, 'hev1.2.4.L93.90')).toThrow(CapabilityError);
+  });
+});
+
+describe('isUnsupportedHevcEncodeProfile', () => {
+  it('allows HEVC Main 8-bit codec strings and non-HEVC strings', () => {
+    expect(isUnsupportedHevcEncodeProfile('hev1.1.6.L93.B0')).toBe(false);
+    expect(isUnsupportedHevcEncodeProfile('hvc1.1.6.L150.90')).toBe(false);
+    expect(isUnsupportedHevcEncodeProfile('avc1.640028')).toBe(false);
+    expect(isUnsupportedHevcEncodeProfile('vp09.00.10.08')).toBe(false);
+  });
+
+  it('flags HEVC Main10/non-Main profiles as an honest encode miss without a software tail', () => {
+    expect(isUnsupportedHevcEncodeProfile('hev1.2.4.L93.90')).toBe(true);
+    expect(isUnsupportedHevcEncodeProfile('hvc1.A2.80000000.H120.40.00.80')).toBe(true);
   });
 });
 
@@ -186,8 +208,10 @@ describe('audioEncoderCodecString', () => {
     expect(audioEncoderCodecString(undefined, 'mp4a.40.5')).toBe('mp4a.40.5');
   });
 
-  it('rejects a PCM target (it flows through the audio-dsp path, not the WebCodecs encoder)', () => {
-    expect(() => audioEncoderCodecString('pcm', undefined)).toThrow(CapabilityError);
+  it('rejects PCM targets (they flow through the audio-dsp path, not the WebCodecs encoder)', () => {
+    for (const token of ['pcm', 'pcm-u8', 'pcm-s8', 'pcm-s16be'] as const) {
+      expect(() => audioEncoderCodecString(token, undefined)).toThrow(CapabilityError);
+    }
   });
 
   it('throws a typed CapabilityError with no token and no recognizable source codec', () => {
@@ -200,12 +224,12 @@ describe('audioEncoderCodecString', () => {
 describe('videoFilterSpecs', () => {
   const src = { width: 1920, height: 1080 };
 
-  it('returns no specs when the target requests no geometry', () => {
+  it('returns no specs when the target requests no filters', () => {
     expect(videoFilterSpecs({}, src)).toEqual([]);
     expect(videoFilterSpecs({ codec: 'h264', bitrate: 1_000_000 }, src)).toEqual([]);
   });
 
-  it('emits crop → resize → rotate → flip in order', () => {
+  it('emits crop → resize → rotate → flip → colorspace → tonemap in order', () => {
     const specs = videoFilterSpecs(
       {
         crop: { x: 10, y: 20, width: 640, height: 480 },
@@ -214,6 +238,8 @@ describe('videoFilterSpecs', () => {
         fit: 'cover',
         rotate: 90,
         flip: 'h',
+        colorspace: { to: 'bt2020' },
+        tonemap: { to: 'sdr' },
       },
       src,
     );
@@ -222,6 +248,8 @@ describe('videoFilterSpecs', () => {
       { mediaType: 'video', type: 'resize', width: 320, height: 240, fit: 'cover' },
       { mediaType: 'video', type: 'rotate', degrees: 90 },
       { mediaType: 'video', type: 'flip', axis: 'h' },
+      { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
+      { mediaType: 'video', type: 'tonemap', to: 'sdr' },
     ]);
   });
 
@@ -250,6 +278,14 @@ describe('videoFilterSpecs', () => {
     );
     expect(() => videoFilterSpecs({ width: -5, height: 5 }, src)).toThrow(InputError);
   });
+
+  it('rejects malformed colour targets before the browser filter stream is built', () => {
+    expect(() => videoFilterSpecs({ colorspace: { to: '  ' } }, src)).toThrow(InputError);
+    const badTonemap = { tonemap: { to: 'hdr' } } as unknown as Parameters<
+      typeof videoFilterSpecs
+    >[0];
+    expect(() => videoFilterSpecs(badTonemap, src)).toThrow(InputError);
+  });
 });
 
 describe('outputDimensions', () => {
@@ -277,15 +313,25 @@ describe('outputDimensions', () => {
   });
 });
 
-// ── audio filter chain (the stereo→mono / resample shaping before the encoder) ────────────────────
+// ── audio filter chain (gain / stereo→mono / resample shaping before the encoder) ─────────────────
 
 describe('audioFilterSpecs', () => {
   const src = { sampleRate: 48000, channels: 2 };
 
-  it('emits no filters when channels/rate are unchanged (or unspecified)', () => {
+  it('emits no filters when gain/channels/rate are unchanged (or unspecified)', () => {
     expect(audioFilterSpecs({}, src)).toEqual([]);
     expect(audioFilterSpecs({ codec: 'aac', bitrate: 128_000 }, src)).toEqual([]);
-    expect(audioFilterSpecs({ channels: 2, sampleRate: 48000 }, src)).toEqual([]);
+    expect(audioFilterSpecs({ gainDb: 0, channels: 2, sampleRate: 48000 }, src)).toEqual([]);
+  });
+
+  it('emits gain before remix and resample when all three transforms are requested', () => {
+    expect(
+      audioFilterSpecs({ gainDb: -6.020599913279624, channels: 1, sampleRate: 22050 }, src),
+    ).toEqual<FilterSpec[]>([
+      { mediaType: 'audio', type: 'gain', db: -6.020599913279624 },
+      { mediaType: 'audio', type: 'remix', channels: 1 },
+      { mediaType: 'audio', type: 'resample', sampleRate: 22050 },
+    ]);
   });
 
   it('emits a remix when the target channel count differs (stereo → mono downmix)', () => {
@@ -315,10 +361,25 @@ describe('audioFilterSpecs', () => {
     ]);
   });
 
-  it('rejects a non-positive / non-integer target channel count or rate', () => {
+  it('rejects a non-finite gain or non-positive / non-integer target channel count or rate', () => {
+    expect(() => audioFilterSpecs({ gainDb: Number.NaN }, src)).toThrow(InputError);
+    expect(() => audioFilterSpecs({ gainDb: Number.POSITIVE_INFINITY }, src)).toThrow(InputError);
     expect(() => audioFilterSpecs({ channels: 0 }, src)).toThrow(InputError);
     expect(() => audioFilterSpecs({ channels: 1.5 }, src)).toThrow(InputError);
     expect(() => audioFilterSpecs({ sampleRate: -1 }, src)).toThrow(InputError);
+  });
+
+  it('rejects fade on the codec filter seam until a stream-stateful AudioData fade exists', () => {
+    expect(() => audioFilterSpecs({ fade: { inSec: 1, outSec: 1 } }, src)).toThrow(CapabilityError);
+  });
+
+  it('rejects dynamics and biquad on the codec filter seam until AudioData filters exist', () => {
+    expect(() =>
+      audioFilterSpecs({ dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } }, src),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      audioFilterSpecs({ biquad: { type: 'lowpass', frequency: 1000, q: Math.SQRT1_2 } }, src),
+    ).toThrow(CapabilityError);
   });
 });
 
@@ -397,10 +458,15 @@ describe('buildVideoEncoderConfig', () => {
   it('does NOT rewrite a preserved-source or non-h264-token codec string', () => {
     // preserve-source High profile stays verbatim (we never re-level a pinned profile)
     expect(buildVideoEncoderConfig({}, src, 'avc1.640028').codec).toBe('avc1.640028');
+    // preserve-source HEVC Main stays verbatim so hvc1/hev1 sample-entry semantics are not guessed away
+    expect(buildVideoEncoderConfig({}, src, 'hvc1.1.6.L150.90').codec).toBe('hvc1.1.6.L150.90');
     // a non-h264 token uses its own default string regardless of dims
     expect(
       buildVideoEncoderConfig({ codec: 'vp9', width: 1920, height: 1080 }, src, undefined).codec,
     ).toBe('vp09.00.10.08');
+    expect(buildVideoEncoderConfig({ codec: 'hevc' }, src, undefined).codec).toBe(
+      'hev1.1.6.L93.B0',
+    );
   });
 
   it('uses the resized + rotated output dimensions', () => {
@@ -416,6 +482,13 @@ describe('buildVideoEncoderConfig', () => {
 
   it('preserves the source codec when none is requested', () => {
     expect(buildVideoEncoderConfig({}, src, 'avc1.640028').codec).toBe('avc1.640028');
+  });
+
+  it('rejects preserved HEVC Main10/non-Main encode profiles as a typed miss', () => {
+    expect(() => buildVideoEncoderConfig({}, src, 'hev1.2.4.L93.90')).toThrow(CapabilityError);
+    expect(() => buildVideoEncoderConfig({}, src, 'hvc1.A2.80000000.H120.40.00.80')).toThrow(
+      CapabilityError,
+    );
   });
 
   it('rejects when output dimensions cannot be determined', () => {
@@ -509,14 +582,29 @@ describe('normalizeDecoderCodec', () => {
     expect(normalizeDecoderCodec({ codec: 'h264', description: view })).toBe('avc1.42C01F');
   });
 
-  it('leaves a bare h264/hevc token unchanged when no description is available (demuxer-side gap)', () => {
+  it('derives hev1.* from an HEVC description (hvcC profile/compat/tier/level bytes)', () => {
+    // Real h265.mp4 hvcC bytes: Main, compat 6, low tier, level 60, constraint 0x90.
+    const hvcC8Bit = Uint8Array.from([0x01, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3c]);
+    expect(normalizeDecoderCodec({ codec: 'hevc', description: hvcC8Bit })).toBe('hev1.1.6.L60.90');
+
+    // Real bear-hevc-10bit-hdr10 shape: Main10, compat 4, low tier, level 93, constraint 0x90.
+    const hvcC10Bit = Uint8Array.from([0x01, 0x02, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x5d]);
+    expect(normalizeDecoderCodec({ codec: 'h265', description: hvcC10Bit })).toBe(
+      'hev1.2.4.L93.90',
+    );
+  });
+
+  it('leaves a bare h264/hevc token unchanged when no usable description is available', () => {
     // Without the CodecPrivate the bare token cannot be expanded — honest miss, not a wrong guess.
     expect(normalizeDecoderCodec({ codec: 'h264' })).toBe('h264');
     expect(normalizeDecoderCodec({ codec: 'hevc' })).toBe('hevc');
-    // too-short avcC → cannot parse → unchanged
+    // too-short avcC/hvcC → cannot parse → unchanged
     expect(
       normalizeDecoderCodec({ codec: 'h264', description: new Uint8Array([0x01, 0x64]) }),
     ).toBe('h264');
+    expect(
+      normalizeDecoderCodec({ codec: 'hevc', description: new Uint8Array([0x01, 0x02, 0x20]) }),
+    ).toBe('hevc');
   });
 });
 
@@ -613,6 +701,7 @@ describe('isPureStreamCopy', () => {
   it('is true when no re-encode is requested for either stream', () => {
     expect(isPureStreamCopy({})).toBe(true);
     expect(isPureStreamCopy({ video: {}, audio: {} })).toBe(true);
+    expect(isPureStreamCopy({ audio: { gainDb: 0 } })).toBe(true);
   });
 
   it('is false when any re-encode trigger is present', () => {
@@ -622,9 +711,19 @@ describe('isPureStreamCopy', () => {
     expect(isPureStreamCopy({ video: { crop: { x: 0, y: 0, width: 10, height: 10 } } })).toBe(
       false,
     );
+    expect(isPureStreamCopy({ video: { colorspace: { to: 'bt2020' } } })).toBe(false);
+    expect(isPureStreamCopy({ video: { tonemap: { to: 'sdr' } } })).toBe(false);
     expect(isPureStreamCopy({ audio: { codec: 'opus' } })).toBe(false);
     expect(isPureStreamCopy({ audio: { sampleRate: 44100 } })).toBe(false);
     expect(isPureStreamCopy({ audio: { bitrate: 96_000 } })).toBe(false);
+    expect(isPureStreamCopy({ audio: { gainDb: -6 } })).toBe(false);
+    expect(isPureStreamCopy({ audio: { fade: { inSec: 1 } } })).toBe(false);
+    expect(
+      isPureStreamCopy({ audio: { dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } } }),
+    ).toBe(false);
+    expect(
+      isPureStreamCopy({ audio: { biquad: { type: 'lowpass', frequency: 1000, q: 1 } } }),
+    ).toBe(false);
   });
 
   it('is false when a track is dropped (false), since copy keeps every track', () => {

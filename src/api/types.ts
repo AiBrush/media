@@ -8,6 +8,8 @@ import type {
   EncodedChunk,
   Packet,
   PacketMetadata,
+  PcmBiquad,
+  PcmDynamics,
   Progress,
   TrackInfo,
 } from '../contracts/driver.ts';
@@ -39,6 +41,10 @@ export type {
   Packet,
   /** Demux packet metadata without payload bytes — the unit of {@link Demuxed.packetTable}. */
   PacketMetadata,
+  /** PCM-native biquad/EQ spec accepted by {@link AudioTarget.biquad}. */
+  PcmBiquad,
+  /** PCM-native dynamics spec accepted by {@link AudioTarget.dynamics}. */
+  PcmDynamics,
   /** Monotonic progress delivered to {@link CallOptions.onProgress}. */
   Progress,
   /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
@@ -102,7 +108,23 @@ export type Container =
   | 'mts'
   | 'mpegts';
 export type VideoCodec = 'h264' | 'hevc' | 'vp8' | 'vp9' | 'av1';
-export type AudioCodec = 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis' | 'pcm';
+export type PcmCodec =
+  | 'pcm'
+  | 'pcm-u8'
+  | 'pcm-u8be'
+  | 'pcm-s8'
+  | 'pcm-s8be'
+  | 'pcm-s16'
+  | 'pcm-s16be'
+  | 'pcm-s24'
+  | 'pcm-s24be'
+  | 'pcm-s32'
+  | 'pcm-s32be'
+  | 'pcm-f32'
+  | 'pcm-f32be'
+  | 'pcm-f64'
+  | 'pcm-f64be';
+export type AudioCodec = 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis' | PcmCodec;
 
 export interface VideoTarget {
   codec?: VideoCodec;
@@ -115,6 +137,8 @@ export interface VideoTarget {
   rotate?: 0 | 90 | 180 | 270;
   flip?: 'h' | 'v';
   crop?: { x: number; y: number; width: number; height: number };
+  colorspace?: { to: string };
+  tonemap?: { to: 'sdr' };
 }
 
 export interface AudioTarget {
@@ -122,6 +146,10 @@ export interface AudioTarget {
   sampleRate?: number;
   channels?: number;
   bitrate?: number;
+  gainDb?: number;
+  fade?: { inSec?: number; outSec?: number; curve?: 'linear' | 'equal-power' };
+  dynamics?: PcmDynamics;
+  biquad?: PcmBiquad | readonly PcmBiquad[];
 }
 
 export interface ConvertOptions {

@@ -3,7 +3,7 @@
  * carrying raw PCM (or, in AIFF-C, big-endian float or byte-swapped `sowt` little-endian PCM), so demux
  * is a chunk walk: `COMM` for the layout, `SSND` for the samples. PCM is not a WebCodecs codec — it flows
  * to the TS audio-dsp path — so the packet seam raises a typed {@link CapabilityError} and the codec
- * token is `pcm-s16be` / `pcm-s24be` / `pcm-f32` etc. (docs/architecture/09 audio-dsp).
+ * token is `pcm-s8` / `pcm-s16be` / `pcm-s24be` / `pcm-f32` etc. (docs/architecture/09 audio-dsp).
  */
 
 import {
@@ -17,11 +17,13 @@ import {
   type Packet,
   type PcmTransform,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { writePcmContainer } from '../pcm-output.ts';
+import type { PcmAudio } from '../../dsp/pcm.ts';
+import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
+import { applyPcmTransform } from '../pcm-transform.ts';
 import { parseAiff, readAiffPcm } from './aiff.ts';
 
 const AIFF_MIMES = new Set(['audio/aiff', 'audio/x-aiff', 'audio/aifc', 'audio/x-aifc']);
@@ -107,17 +109,12 @@ export const AiffDriver: ContainerDriver = {
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const aiff = readAiffPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    let audio: PcmAudio = aiff;
-    if (o?.gainDb !== undefined && o.gainDb !== 0) audio = gain(audio, o.gainDb);
-    if (o?.channels !== undefined && o.channels !== audio.channels)
-      audio = remix(audio, o.channels);
-    // Rate change last, on the final channel layout (band-limited windowed-sinc; pure-TS, ADR-022).
-    if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
-      audio = resample(audio, o.sampleRate);
+    const audio = applyPcmTransform(aiff, o);
+    const container = o?.container ?? 'aiff';
     const out = writePcmContainer(
       audio,
-      o?.container ?? 'aiff',
-      o?.sampleFormat ?? aiff.format,
+      container,
+      resolvePcmSampleFormat(container, aiff.format, o?.sampleFormat),
       o?.endian ?? aiff.endian,
       aiff.kind,
     );
@@ -127,6 +124,11 @@ export const AiffDriver: ContainerDriver = {
         c.close();
       },
     });
+  },
+  async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
+    const aiff = readAiffPcm(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return aiff;
   },
   createMuxer(): Muxer {
     // AIFF carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is

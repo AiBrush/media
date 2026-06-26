@@ -14,10 +14,10 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 | Codec | Decode (Chromium) | Decode (Safari) | Decode (Firefox) | Encode (Chromium) | Our fallback |
 |---|---|---|---|---|---|
 | H.264 (avc1) | HW/SW | HW | SW/HW | HW/SW | wasm (openh264/x264) if WC missing |
-| HEVC (hev1/hvc1) | HW (OS-dependent) | HW | varies | limited | wasm decode; **10-bit encode out of scope** |
+| HEVC (hev1/hvc1) | HW (OS-dependent) | HW | varies | limited | no bundled software HEVC fallback yet; unsupported exact configs raise `CapabilityError`; **10-bit encode out of scope** |
 | VP8 | SW | varies | SW | SW | wasm (libvpx) |
 | VP9 (vp09) | HW/SW | HW (newer) | SW | SW | wasm (libvpx) |
-| AV1 (av01) | SW/HW | HW (newer) | SW | limited | wasm (dav1d decode / SVT-AV1 encode) |
+| AV1 (av01) | SW/HW | HW (newer) | SW | limited | wasm (dav1d decode scaffold until core vendored / SVT-AV1 encode future) |
 | AAC | HW/SW | yes | varies | yes | wasm fallback |
 | Opus | SW | yes | SW | SW | wasm (libopus) |
 | MP3 | SW | varies | SW | — (decode only in WC) | wasm libmp3lame for **encode** |
@@ -32,7 +32,7 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 | Feature | Gap | Plan |
 |---|---|---|
 | `flac → opus/webm` | Chrome 149 WebCodecs has **no FLAC `AudioDecoder`** | **FLAC decode now ships in pure TS** (ADR-024, `src/codecs/flac` — the decode side of this gap is closed); the remaining tail is the Opus *encode* (WebCodecs where present, else WASM libopus) |
-| `h264-8bit → hevc-10bit` | **no 10-bit HEVC encoder** in-browser | **out of scope** (license/size); `CapabilityError` with a clear message |
+| `h264-8bit → hevc-10bit` | **no 10-bit HEVC encoder** in-browser | **out of scope** (license/size); `CapabilityError` with a clear message. The public `hevc` token targets Main 8-bit (`hev1.1.6.L93.B0`); preserving a source Main10/non-Main HEVC codec string for encode is rejected until a real software or proven browser encoder tail exists. |
 | `h264 → vp8/webm` | encode succeeded but output **failed `<video>` playback** | enforce `playback-smoke` in our oracle; prefer VP9/AV1 or fix the VP8 muxing path |
 
 ## 4. Filters & GPU
@@ -48,7 +48,7 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 ## 6. Feature-detection discipline (rules)
 
 1. **Never hardcode** "browser X supports codec Y." Call `isConfigSupported` and cache the verdict per session ([`04`](04-capability-router-and-ladder.md) §5).
-2. Probe the **exact config** (codec string incl. profile/level, dims, bitDepth), not just the codec family — e.g. `hev1.2.4.L153.B0`, `av01.0.04M.08`, 10-bit vs 8-bit differ.
+2. Probe the **exact config** (codec string incl. profile/level, dims, bitDepth), not just the codec family — e.g. `hev1.2.4.L153.B0`, `av01.0.04M.08`, 10-bit vs 8-bit differ. Bare HEVC demux tokens must first be expanded from `hvcC` `description` bytes to exact `hvc1.*`/`hev1.*` strings.
 3. On any miss, fall to the next tier; if the tier chain is exhausted, raise `CapabilityError` naming what was tried and which WASM driver would enable it (ADR-017).
 4. Re-probe is unnecessary within a session (capabilities are stable); `preload` warms these.
 
@@ -58,4 +58,4 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 - **Safari** ≥ 16.4/17 (WebCodecs).
 - **Firefox** where WebCodecs is shipped; otherwise the engine still does containers/probe/decrypt in TS and falls to WASM for codecs.
 
-The engine **degrades, never breaks**: missing WebCodecs → WASM codecs; missing WebGPU → WebGL/Canvas; missing OPFS → memory/Blob. The only true "no" is a capability no engine can provide in that environment, surfaced as a typed error.
+The engine **degrades, never breaks**: missing WebCodecs → WASM codecs; missing WebGPU → Canvas2D/native CPU filters/WASM filter tails; missing OPFS → memory/Blob. The only true "no" is a capability no engine can provide in that environment, surfaced as a typed error.

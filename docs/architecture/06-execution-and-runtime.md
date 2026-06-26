@@ -55,6 +55,7 @@ Heavy stages must not block the main thread (the `longtasks` metric decided many
 
 - The common path is **single-thread WASM where WASM is used at all**, and needs **no COOP/COEP**.
 - An **opt-in** `enableThreads` (default = `crossOriginIsolated`) lets the WASM tail use SIMD + threads via `SharedArrayBuffer` for ~order-of-magnitude speedups on the exotic codecs — only when the page is cross-origin isolated.
+- The runtime profile is resolved before a WASM core is instantiated: `baseline` never exposes `SharedArrayBuffer`, while `isolated-simd-threads` is selected only when both `crossOriginIsolated === true` and `SharedArrayBuffer` exists. A threaded-only core must raise a typed `CapabilityError` when those conditions are absent; first-party baseline cores simply stay correct-but-slower.
 - Hardware WebCodecs needs none of this; it is already the fast path with zero isolation.
 
 ## 6. The declarative job as the worker/serialization boundary (ADR-010)

@@ -32,9 +32,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
 import {
   VORBIS_CODEC,
   type VorbisDecodeConfig,
@@ -61,10 +63,24 @@ export function unsupported(reason: string): CodecSupport {
   return { supported: false, reason };
 }
 
+/** True when this runtime can carry the public audio codec stream (`EncodedAudioChunk` → `AudioData`). */
+function hasWebCodecsAudioSeam(): boolean {
+  return typeof EncodedAudioChunk !== 'undefined' && typeof AudioData !== 'undefined';
+}
+
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
 let corePromise: Promise<VorbisWasmCore | null> | undefined;
+let coreGluePromise: Promise<boolean> | undefined;
+
+async function hasVorbisCoreGlue(): Promise<boolean> {
+  coreGluePromise ??= import('./vorbis-core.js').then(
+    () => true,
+    () => false,
+  );
+  return coreGluePromise;
+}
 
 /**
  * Load the vendored Symphonia-Vorbis wasm core, lazily and at most once. Resolves to a
@@ -72,12 +88,15 @@ let corePromise: Promise<VorbisWasmCore | null> | undefined;
  * load — keeping the driver honest about absence rather than fabricating support. The wasm bytes are
  * addressed via `new URL('./vorbis_wasm_bg.wasm', import.meta.url)` so they ship same-origin.
  */
-export async function loadVorbisCore(): Promise<VorbisWasmCore | null> {
+export async function loadVorbisCore(runtime?: WasmRuntimeProfile): Promise<VorbisWasmCore | null> {
   corePromise ??= (async (): Promise<VorbisWasmCore | null> => {
     try {
+      const profile = runtime ?? resolveWasmRuntimeProfile();
       // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
       const mod = await import('./vorbis-core.js');
-      await mod.default({ module_or_path: new URL('./vorbis_wasm_bg.wasm', import.meta.url) });
+      await mod.default(
+        wasmInitForProfile(new URL('./vorbis_wasm_bg.wasm', import.meta.url), profile),
+      );
       return {
         createDecoder(
           extraData: Uint8Array,
@@ -97,6 +116,7 @@ export async function loadVorbisCore(): Promise<VorbisWasmCore | null> {
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetVorbisCoreForTest(): void {
   corePromise = undefined;
+  coreGluePromise = undefined;
 }
 
 /** The {@link CapabilityError} a coder throws when the vendored Vorbis wasm core is unavailable. */
@@ -111,9 +131,10 @@ function coreMissing(): CapabilityError {
 // ============ supports() ============
 
 /**
- * Honest capability probe: a Vorbis **decode** query whose vendored wasm core loads. Non-Vorbis,
- * `encode` (no pure-Rust Vorbis encoder), or core-absent → `{ supported:false }` with a reason; never
- * throws. Being `tier:'wasm'`, the router only calls this after WebCodecs Vorbis has already missed.
+ * Honest capability probe: a Vorbis **decode** query in a runtime that can carry WebCodecs-shaped audio
+ * frames and whose vendored wasm core loads. Non-Vorbis, `encode` (no pure-Rust Vorbis encoder), missing
+ * `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
+ * Being `tier:'wasm'`, the router only calls this after WebCodecs Vorbis has already missed.
  */
 async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.mediaType !== 'audio') return unsupported('wasm-vorbis handles audio only');
@@ -121,8 +142,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported(`wasm-vorbis handles Vorbis only, not '${q.config.codec}'`);
   }
   if (q.direction === 'encode') return unsupported('wasm-vorbis decodes only (no Vorbis encoder)');
-  const core = await loadVorbisCore();
-  if (core === null) return unsupported('wasm-vorbis core failed to load (see BUILD.md)');
+  if (!hasWebCodecsAudioSeam()) {
+    return unsupported('wasm-vorbis requires WebCodecs AudioData/EncodedAudioChunk');
+  }
+  if (!(await hasVorbisCoreGlue())) {
+    return unsupported('wasm-vorbis core glue is not vendored (see BUILD.md)');
+  }
   return { supported: true, hardwareAccelerated: false };
 }
 
@@ -208,7 +233,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadVorbisCore();
+      const core = await loadVorbisCore(o?.wasmRuntime);
       if (core === null) {
         controller.error(coreMissing());
         return;

@@ -1,6 +1,6 @@
 # 04 — Capability Router & Ladder
 
-> How a backend is chosen for each stage — the mechanism that makes the API opaque (ADR-003). Contracts → [`05`](05-driver-contracts.md). Decisions: ADR-002 (priority), ADR-007 (determinism), ADR-017 (miss error), ADR-020 (cost-awareness, deferred), ADR-026 (WebCodecs codec drivers, hardware-first), ADR-027 (GPU filter drivers — WebGPU + Canvas2D, WebGL omitted), ADR-049 (image probe/decode as a side capability).
+> How a backend is chosen for each stage — the mechanism that makes the API opaque (ADR-003). Contracts → [`05`](05-driver-contracts.md). Decisions: ADR-002 (priority), ADR-007 (determinism), ADR-017 (miss error), ADR-020 (cost-awareness), ADR-026 (WebCodecs codec drivers, hardware-first), ADR-027 (GPU filter drivers — WebGPU + Canvas2D, WebGL omitted), ADR-049 (image probe/decode as a side capability), ADR-076 (native filter substrate for pure-TS CPU filters).
 
 ## 1. What the router does
 
@@ -26,14 +26,14 @@ Top = tried first. These defaults encode the benchmark's per-family winners; the
 | mux · remux · trim (copy) | TS muxer / packet-copy → WASM | container supported? |
 | decode (video/audio) | WebCodecs **hardware** → WebCodecs **software** → WASM decoder; images use browser `ImageDecoder` | `*Decoder.isConfigSupported(config)` / `ImageDecoder` presence |
 | encode (video/audio) | WebCodecs **hardware** → WebCodecs **software** → WASM encoder | `*Encoder.isConfigSupported(config)` |
-| video filter (resize/crop/rotate/flip) | WebGPU → Canvas2D → WASM (libavfilter) | `navigator.gpu` + `OffscreenCanvas` + `VideoFrame` / `OffscreenCanvas` |
+| video filter (resize/crop/rotate/flip/colorspace/tonemap) | WebGPU → Canvas2D → native CPU → WASM (libavfilter) | `navigator.gpu` + `OffscreenCanvas` + `VideoFrame` / `OffscreenCanvas` / `VideoFrame` |
 | audio convert (format/endianness/gain/mix/downmix/fade) | TS / AudioWorklet | always (cheap) |
 | audio resample | TS band-limited windowed-sinc (`src/dsp/resample.ts`, ADR-022) | always (pure-TS; any ratio) |
 | decrypt (CENC / HLS) | WebCrypto + TS box parse | `crypto.subtle` present |
 
-`Tier` ordering used for ranking: `hardware` > `gpu` > `native` > `wasm`.
+`Tier` ordering used for normal ranking: `hardware` > `gpu` > `native` > `wasm`. For telemetry-classified tiny work (ADR-020), `hardware` remains first for codecs and `native` moves ahead of GPU/WASM setup.
 
-> **As built (Phase 1–2, ADR-026/027/032/033/049).** The WebCodecs codec drivers (`webcodecs-video`, `webcodecs-audio`) are a *single* `tier:'hardware'` driver each, codec-agnostic by config; the hardware-vs-software split is not two drivers but the `hardwareAcceleration` hint the determinism modifier sets — `auto → 'prefer-hardware'` (video) / `'no-preference'` (audio), `force-software → 'prefer-software'` (both). `isConfigSupported` then reports whether the UA will actually accelerate, and `force-software` additionally drops the whole `hardware`/`gpu` tier (§6). The image path is deliberately outside the codec/container ladders: `ImageOps` sniffs GIF/PNG/JPEG/WebP/AVIF magic before container probing, uses a pure header parser for `probe`, and uses browser `ImageDecoder` for `decode` when present. The video-filter ladder ships **WebGPU + Canvas2D only** — the **WebGL rung is intentionally omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for every geometric op, so it is the single, simpler fallback. The WASM filter rung is the Phase-2 tail. **Colorspace + tonemap are now implemented (ADR-032)** via a second WGSL color pipeline: WebGPU handles `colorspace` (BT.2020↔709↔601↔sRGB gamut+transfer) and `tonemap` (HDR PQ/HLG → SDR) for all targets, while Canvas2D `supports()` is honest — it handles `colorspace` only when the target resolves to the display space (srgb/bt709, a UA-color-managed passthrough) and declines wider-gamut targets and all tonemap, so an unbuilt path is a typed miss until the WASM tail, never wrong pixels. The **audio** `FilterSpec`s (`resample`/`remix`/`gain`) are served by a separate auto-registered `audio-dsp-filter` (`AudioData` seam over the pure-TS dsp kernels, ADR-033); it declares `substrate:'wasm'` (the least-wrong CPU tier — it must rank below the GPU substrates; a `'native'` `FilterSubstrate` is the proper future fit). `mpegts` and `hls` are auto-registered container drivers; the wasm codec tails stay explicit/not in the default bundle until browser `.wasm` co-vendoring is complete (see the doc 09 status table).
+> **As built (Phase 1–2, ADR-026/027/032/033/049/069/076).** The WebCodecs codec drivers (`webcodecs-video`, `webcodecs-audio`) are a *single* `tier:'hardware'` driver each, codec-agnostic by config; the hardware-vs-software split is not two drivers but the `hardwareAcceleration` hint the determinism modifier sets — `auto → 'prefer-hardware'` (video) / `'no-preference'` (audio), `force-software → 'prefer-software'` (both). `isConfigSupported` then reports whether the UA will actually accelerate, and `force-software` additionally drops the whole `hardware`/`gpu` tier (§6). The image path is deliberately outside the codec/container ladders: `ImageOps` sniffs GIF/PNG/JPEG/WebP/AVIF magic before container probing, uses a pure header parser for `probe`, and uses browser `ImageDecoder` for `decode` when present. The video-filter ladder ships **WebGPU + Canvas2D + native CPU** — the **WebGL rung is intentionally omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for every geometric op, so it is the single, simpler fallback before the pure-TS CPU floor. The WASM filter rung remains reserved for a future compiled filter tail. **Colorspace + tonemap are now implemented (ADR-032/038)** via a WebGPU color pipeline and the native CPU fallback: WebGPU handles `colorspace` (BT.2020↔709↔601↔sRGB gamut+transfer) and `tonemap` (HDR PQ/HLG → SDR) for all targets, Canvas2D handles `colorspace` only when the target resolves to the display space (srgb/bt709, a UA-color-managed passthrough), and `cpu-video-filter` handles all six video filter specs through `VideoFrame.copyTo` when GPU/canvas decline. The **audio** `FilterSpec`s (`resample`/`remix`/`gain`) are served by a separate auto-registered `audio-dsp-filter` (`AudioData` seam over the pure-TS dsp kernels, ADR-033); it declares `substrate:'native'`, ranked below GPU/canvas and above WASM. `mpegts` and `hls` are auto-registered container drivers. The real Symphonia audio WASM codec tails are also auto-registered and miss-only, but their probes require the browser `EncodedAudioChunk` → `AudioData` seam and co-vendored assets; scaffold tails stay explicit/not in defaults until their cores exist (see the doc 09 status table).
 
 ## 3. Capability probes (per kind)
 
@@ -47,11 +47,11 @@ Top = tried first. These defaults encode the benchmark's per-family winners; the
 
 ```ts
 async function pickCodec(q: CodecQuery, opts: StageOptions): Promise<CodecDriver> {
-  const key = codecKey(q, opts.determinism)
+  const key = codecKey(q, opts.determinism, costBucket(q, opts.cost))
   if (cache.has(key)) return cache.get(key)!
   const candidates = registry.codecs()
     .filter(d => opts.determinism === 'force-software' ? d.tier !== 'hardware' && d.tier !== 'gpu' : true)
-    .sort(byTier)                                  // hardware -> gpu -> native -> wasm
+    .sort(byTierAndCost)                           // normal: hardware -> gpu -> native -> wasm; tiny: hardware -> native -> gpu -> wasm
   for (const d of candidates) {
     await ensureLoaded(d)                           // lazy import the driver module if needed
     const s = await d.supports(q)                   // isConfigSupported / wasm caps
@@ -67,7 +67,7 @@ Container and filter selection are the synchronous analogues (no `await` on `sup
 
 ## 5. Caching
 
-- Verdicts are cached by `(stage-kind, codec/mime, direction, determinism)`. Capabilities are environment-stable within a session, so one probe per distinct query suffices.
+- Verdicts are cached by `(stage-kind, codec/mime, direction, determinism, cost-bucket)`. Capabilities are environment-stable within a session, but tiny-work re-ranking is intentionally a separate bucket so small and normal jobs do not poison each other's hot paths.
 - Capability of the *environment* (does the browser have WebGPU? does WebCodecs support `hev1`?) is also cached once per session.
 - `media.preload(...)` (ADR / [`07`](07-public-api.md)) warms these caches ahead of the first real call.
 
@@ -75,9 +75,9 @@ Container and filter selection are the synchronous analogues (no `await` on `sup
 
 `determinism: 'force-software'` removes the `hardware` and `gpu` tiers from candidate lists before ranking, forcing software WebCodecs / WASM / Canvas paths so output is identical across machines. Default `'auto'` keeps the full ladder.
 
-## 7. Cost-awareness (ADR-020 — deferred)
+## 7. Cost-awareness (ADR-020)
 
-A future refinement will let the router pick a cheaper tier for tiny inputs (where a worker/WASM spin-up costs more than it saves). The cutoffs need real measurements, so until then the **static ladder** is used and no thresholds are guessed. When added, it is a re-ranking input, not a new public knob.
+The router now accepts an internal `RouteCost` and derives cost automatically for video `resize`/`crop` output area; codec stages keep the static ladder unless an internal caller supplies explicit cost. Thresholds are seeded from committed fresh telemetry, not guessed: `inputBytes <= 64 KiB`, `outputPixels <= 4096`, `mediaSeconds <= 1`, or `audioFrames <= 48_000` marks the stage as tiny. Tiny work re-ranks cheaper native/in-process tiers ahead of GPU/WASM setup while keeping hardware WebCodecs first where present. Unknown cost data keeps the static ladder. This is deliberately not exposed as a public backend knob.
 
 ## 8. Failure semantics (ADR-017)
 

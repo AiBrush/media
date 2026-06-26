@@ -2,7 +2,8 @@
  * Image probe — strict-oracle validation on REAL downloaded media (BUILD §6.1: ≥5 diverse real files,
  * never a hand-forged byte array). Ground truth is produced by INDEPENDENT tools, so the oracle can fail:
  *   • pixel dimensions ← macOS `sips -g pixelWidth -g pixelHeight`
- *   • animated-GIF frame count ← `ffprobe -count_frames` (36 frames for the Newton's-cradle GIF)
+ *   • animated-GIF frame count/duration ← `ffprobe -count_frames` (36 frames, 0.82 s for the
+ *     Newton's-cradle GIF)
  * Fixtures live in fixtures/media-derived/img/ (committed; provenance in that dir's README). Additional
  * spec-minimal byte streams below exercise alternate parser branches with concrete metadata assertions;
  * they are unit coverage for header syntax, not substitutes for the real-corpus oracle. The decode path is
@@ -86,6 +87,22 @@ function pngChunk(type: string, body: Uint8Array): Uint8Array {
   return concatBytes(be32(body.length), asciiBytes(type), body, Uint8Array.of(0, 0, 0, 0));
 }
 
+function apngFrameControl(sequence: number, delayNum: number, delayDen: number): Uint8Array {
+  return pngChunk(
+    'fcTL',
+    concatBytes(
+      be32(sequence),
+      be32(1),
+      be32(1),
+      be32(0),
+      be32(0),
+      Uint8Array.of((delayNum >>> 8) & 0xff, delayNum & 0xff),
+      Uint8Array.of((delayDen >>> 8) & 0xff, delayDen & 0xff),
+      Uint8Array.of(0, 0),
+    ),
+  );
+}
+
 function pngBytes(
   width: number,
   height: number,
@@ -115,6 +132,14 @@ function gifImageBlock(localPacked = 0, localTable = new Uint8Array(0)): Uint8Ar
   );
 }
 
+function gifGraphicControl(delayCs: number): Uint8Array {
+  return concatBytes(
+    Uint8Array.of(0x21, 0xf9, 0x04, 0x00),
+    le16(delayCs),
+    Uint8Array.of(0x00, 0x00),
+  );
+}
+
 function riffChunk(type: string, body: Uint8Array): Uint8Array {
   return concatBytes(
     asciiBytes(type),
@@ -127,6 +152,13 @@ function riffChunk(type: string, body: Uint8Array): Uint8Array {
 function webpBytes(...chunks: Uint8Array[]): Uint8Array {
   const riffBody = concatBytes(asciiBytes('WEBP'), ...chunks);
   return concatBytes(asciiBytes('RIFF'), le32(riffBody.length), riffBody);
+}
+
+function webpAnmf(durationMs: number): Uint8Array {
+  return riffChunk(
+    'ANMF',
+    concatBytes(le24(0), le24(0), le24(0), le24(0), le24(durationMs), Uint8Array.of(0)),
+  );
 }
 
 function ftyp(major: string): Uint8Array {
@@ -154,6 +186,7 @@ interface Truth {
   readonly height: number;
   readonly frameCount: number;
   readonly animated: boolean;
+  readonly durationSec?: number;
 }
 
 /** Each row's width/height/frameCount come from an external tool, never from our own probe. */
@@ -161,7 +194,15 @@ const CORPUS: readonly Truth[] = [
   { file: 'test.png', format: 'png', width: 100, height: 100, frameCount: 1, animated: false },
   { file: 'test.jpeg', format: 'jpeg', width: 239, height: 178, frameCount: 1, animated: false },
   { file: 'test.webp', format: 'webp', width: 274, height: 367, frameCount: 1, animated: false },
-  { file: 'anim2.gif', format: 'gif', width: 480, height: 360, frameCount: 36, animated: true },
+  {
+    file: 'anim2.gif',
+    format: 'gif',
+    width: 480,
+    height: 360,
+    frameCount: 36,
+    animated: true,
+    durationSec: 0.82,
+  },
   { file: 'test.avif', format: 'avif', width: 100, height: 100, frameCount: 1, animated: false },
 ];
 
@@ -179,6 +220,7 @@ describe('image probe — strict oracle on ≥5 real downloaded images', () => {
       expect(info.height).toBe(t.height);
       expect(info.frameCount).toBe(t.frameCount);
       expect(info.animated).toBe(t.animated);
+      if (t.durationSec !== undefined) expect(info.durationSec).toBeCloseTo(t.durationSec, 6);
       // structural sanity — a real decoder must report a positive depth + a non-empty colour descriptor.
       expect(info.bitDepth).toBeGreaterThan(0);
       expect(info.colorType.length).toBeGreaterThan(0);
@@ -193,6 +235,7 @@ describe('image probe — strict oracle on ≥5 real downloaded images', () => {
     const gif = probeImage(load('anim2.gif'));
     expect(gif.animated).toBe(true);
     expect(gif.frameCount).toBeGreaterThan(1);
+    expect(gif.durationSec).toBeCloseTo(0.82, 6);
     // GIF carries a NETSCAPE loop block → loopCount is defined (0 ⇒ forever ⇒ Infinity here).
     expect(gif.loopCount).toBeDefined();
   });
@@ -295,6 +338,23 @@ describe('image probe — spec-minimal parser branch fixtures', () => {
     );
     expect(probeGif(finiteLoop).loopCount).toBe(5);
 
+    const timed = concatBytes(
+      asciiBytes('GIF89a'),
+      le16(2),
+      le16(3),
+      Uint8Array.of(0, 0, 0),
+      gifGraphicControl(7),
+      gifImageBlock(),
+      gifGraphicControl(13),
+      gifImageBlock(),
+      Uint8Array.of(0x3b),
+    );
+    expect(probeGif(timed)).toMatchObject({
+      frameCount: 2,
+      animated: true,
+      durationSec: 0.2,
+    });
+
     const commentExtension = concatBytes(
       asciiBytes('GIF89a'),
       le16(2),
@@ -326,7 +386,16 @@ describe('image probe — spec-minimal parser branch fixtures', () => {
   });
 
   it('parses APNG acTL metadata, finite plays, and unknown PNG color types', () => {
-    const apng = pngBytes(7, 5, 8, 6, pngChunk('acTL', concatBytes(be32(3), be32(0))));
+    const apng = pngBytes(
+      7,
+      5,
+      8,
+      6,
+      pngChunk('acTL', concatBytes(be32(3), be32(0))),
+      apngFrameControl(0, 1, 10),
+      apngFrameControl(1, 25, 100),
+      apngFrameControl(2, 1, 0),
+    );
     expect(probePng(apng)).toEqual({
       format: 'png',
       width: 7,
@@ -336,6 +405,7 @@ describe('image probe — spec-minimal parser branch fixtures', () => {
       bitDepth: 8,
       colorType: 'rgba',
       loopCount: Number.POSITIVE_INFINITY,
+      durationSec: 0.36,
     });
 
     expect(probePng(pngBytes(4, 3, 12, 99)).colorType).toBe('unknown');
@@ -430,8 +500,8 @@ describe('image probe — spec-minimal parser branch fixtures', () => {
     const animated = webpBytes(
       riffChunk('VP8X', concatBytes(Uint8Array.of(0x02, 0, 0, 0), le24(4), le24(5))),
       riffChunk('ANIM', concatBytes(Uint8Array.of(0, 0, 0, 0), le16(0))),
-      riffChunk('ANMF', new Uint8Array(16)),
-      riffChunk('ANMF', new Uint8Array(16)),
+      webpAnmf(1000),
+      webpAnmf(250),
     );
     expect(probeWebp(animated)).toEqual({
       format: 'webp',
@@ -442,6 +512,7 @@ describe('image probe — spec-minimal parser branch fixtures', () => {
       bitDepth: 8,
       colorType: 'rgb',
       loopCount: Number.POSITIVE_INFINITY,
+      durationSec: 1.25,
     });
 
     const emptyAnimation = webpBytes(

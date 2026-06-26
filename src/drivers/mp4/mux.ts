@@ -14,6 +14,7 @@
  * WebCodecs (see mux.test.ts).
  */
 
+import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fragmentMp4 } from './fragment.ts';
@@ -64,7 +65,7 @@ function mapCodec(
 ): { sampleEntryType: string; config: ConfigKind } {
   const c = codec.toLowerCase();
   if (mediaType === 'video') {
-    if (c.startsWith('avc1') || c.startsWith('avc3')) {
+    if (c === 'h264' || c === 'avc' || c.startsWith('avc1') || c.startsWith('avc3')) {
       return { sampleEntryType: 'avc1', config: { kind: 'avcC-from-description' } };
     }
     if (c.startsWith('hev1') || c.startsWith('hvc1')) {
@@ -80,7 +81,7 @@ function mapCodec(
       return { sampleEntryType: 'vp09', config: { kind: 'raw-box', boxType: 'vpcC' } };
     }
   } else {
-    if (c.startsWith('mp4a')) {
+    if (c === 'aac' || c.startsWith('mp4a')) {
       return { sampleEntryType: 'mp4a', config: { kind: 'esds-from-description' } };
     }
     if (c.startsWith('opus')) {
@@ -115,6 +116,332 @@ function toBytes(src: AllowSharedBufferSource): Uint8Array {
   return new Uint8Array(src).slice();
 }
 
+const AVC_NAL_LENGTH_SIZE = 4;
+const H264_NAL_TYPE_SPS = 7;
+const H264_NAL_TYPE_PPS = 8;
+const AVC_MAX_SPS_COUNT = 31;
+const AVC_MAX_PPS_COUNT = 255;
+
+interface AvcPreparedSamples {
+  readonly chunks: ChunkStruct[];
+  readonly description: Uint8Array;
+}
+
+interface AacPreparedSamples {
+  readonly chunks: ChunkStruct[];
+  readonly description: Uint8Array;
+}
+
+interface H264ParameterSets {
+  readonly sps: Uint8Array[];
+  readonly pps: Uint8Array[];
+}
+
+interface AacAdtsAccessUnit {
+  readonly payload: Uint8Array;
+  readonly objectType: number;
+  readonly sampleRateIndex: number;
+  readonly sampleRate: number;
+  readonly channelConfig: number;
+}
+
+function startCodeLengthAt(data: Uint8Array, offset: number): 3 | 4 | undefined {
+  if (offset + 3 > data.byteLength) return undefined;
+  if (data[offset] !== 0 || data[offset + 1] !== 0) return undefined;
+  if (data[offset + 2] === 1) return 3;
+  if (offset + 4 <= data.byteLength && data[offset + 2] === 0 && data[offset + 3] === 1) return 4;
+  return undefined;
+}
+
+function findStartCode(
+  data: Uint8Array,
+  from: number,
+): { offset: number; length: 3 | 4 } | undefined {
+  for (let i = Math.max(0, from); i + 3 <= data.byteLength; i++) {
+    const length = startCodeLengthAt(data, i);
+    if (length !== undefined) return { offset: i, length };
+  }
+  return undefined;
+}
+
+/** Split one Annex-B access unit into NAL unit payloads (start codes removed). */
+function annexBNalUnits(data: Uint8Array): Uint8Array[] | undefined {
+  const first = findStartCode(data, 0);
+  if (first === undefined) return undefined;
+  const out: Uint8Array[] = [];
+  let payloadOffset = first.offset + first.length;
+  for (;;) {
+    const next = findStartCode(data, payloadOffset);
+    let payloadEnd = next?.offset ?? data.byteLength;
+    // Annex-B permits zero_byte/trailing_zero_8bits before the next start code; those are not NAL payload.
+    while (payloadEnd > payloadOffset && data[payloadEnd - 1] === 0) payloadEnd--;
+    if (payloadEnd > payloadOffset) out.push(data.subarray(payloadOffset, payloadEnd));
+    if (next === undefined) break;
+    payloadOffset = next.offset + next.length;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function h264NalType(nal: Uint8Array): number | undefined {
+  if (nal.byteLength === 0) return undefined;
+  return (nal[0] as number) & 0x1f;
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function pushUniqueParameterSet(out: Uint8Array[], nal: Uint8Array): void {
+  if (out.some((item) => equalBytes(item, nal))) return;
+  out.push(nal.slice());
+}
+
+function collectParameterSets(nalus: readonly Uint8Array[], sets: H264ParameterSets): void {
+  for (const nal of nalus) {
+    const type = h264NalType(nal);
+    if (type === H264_NAL_TYPE_SPS) pushUniqueParameterSet(sets.sps, nal);
+    else if (type === H264_NAL_TYPE_PPS) pushUniqueParameterSet(sets.pps, nal);
+  }
+}
+
+function writeU16(out: number[], value: number): void {
+  out.push((value >>> 8) & 0xff, value & 0xff);
+}
+
+function assertParameterSetLength(kind: 'SPS' | 'PPS', nal: Uint8Array): void {
+  if (nal.byteLength === 0 || nal.byteLength > 0xffff) {
+    throw new MediaError('mux-error', `invalid H.264 ${kind} length ${nal.byteLength} for avcC`);
+  }
+}
+
+function avcCFromParameterSets(sets: H264ParameterSets): Uint8Array {
+  if (sets.sps.length === 0 || sets.pps.length === 0) {
+    throw new CapabilityError(
+      'capability-miss',
+      'H.264 MP4 muxing requires avcC description or Annex-B SPS/PPS parameter sets',
+      { op: { op: 'mux', mediaType: 'video', codec: 'h264' }, tried: ['mp4'] },
+    );
+  }
+  if (sets.sps.length > AVC_MAX_SPS_COUNT || sets.pps.length > AVC_MAX_PPS_COUNT) {
+    throw new MediaError(
+      'mux-error',
+      `too many H.264 parameter sets for avcC (${sets.sps.length} SPS, ${sets.pps.length} PPS)`,
+    );
+  }
+  const firstSps = sets.sps[0];
+  if (firstSps === undefined || firstSps.byteLength < 4) {
+    throw new MediaError('mux-error', 'H.264 SPS is too short to synthesize avcC');
+  }
+  const out: number[] = [
+    1,
+    firstSps[1] as number,
+    firstSps[2] as number,
+    firstSps[3] as number,
+    0xfc | (AVC_NAL_LENGTH_SIZE - 1),
+    0xe0 | sets.sps.length,
+  ];
+  for (const sps of sets.sps) {
+    assertParameterSetLength('SPS', sps);
+    writeU16(out, sps.byteLength);
+    out.push(...sps);
+  }
+  out.push(sets.pps.length);
+  for (const pps of sets.pps) {
+    assertParameterSetLength('PPS', pps);
+    writeU16(out, pps.byteLength);
+    out.push(...pps);
+  }
+  return new Uint8Array(out);
+}
+
+function lengthPrefixedAvcAccessUnit(nalus: readonly Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const nal of nalus) {
+    if (nal.byteLength === 0)
+      throw new MediaError('mux-error', 'empty H.264 NAL in Annex-B access unit');
+    total += AVC_NAL_LENGTH_SIZE + nal.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const nal of nalus) {
+    out[offset] = (nal.byteLength >>> 24) & 0xff;
+    out[offset + 1] = (nal.byteLength >>> 16) & 0xff;
+    out[offset + 2] = (nal.byteLength >>> 8) & 0xff;
+    out[offset + 3] = nal.byteLength & 0xff;
+    offset += AVC_NAL_LENGTH_SIZE;
+    out.set(nal, offset);
+    offset += nal.byteLength;
+  }
+  return out;
+}
+
+function copyChunkWithData(chunk: ChunkStruct, data: Uint8Array): ChunkStruct {
+  return {
+    timestampUs: chunk.timestampUs,
+    durationUs: chunk.durationUs,
+    key: chunk.key,
+    data,
+    ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
+  };
+}
+
+function prepareAvcSamples(
+  chunks: readonly ChunkStruct[],
+  description: Uint8Array | undefined,
+): AvcPreparedSamples {
+  const sets: H264ParameterSets = { sps: [], pps: [] };
+  let sawAnnexB = false;
+  const normalized = chunks.map((chunk): ChunkStruct => {
+    const nalus = annexBNalUnits(chunk.data);
+    if (nalus === undefined) return chunk;
+    sawAnnexB = true;
+    collectParameterSets(nalus, sets);
+    return copyChunkWithData(chunk, lengthPrefixedAvcAccessUnit(nalus));
+  });
+  if (description !== undefined) return { chunks: normalized, description };
+  if (!sawAnnexB) {
+    throw new CapabilityError(
+      'capability-miss',
+      'H.264 MP4 muxing requires avcC description or Annex-B access units with SPS/PPS',
+      { op: { op: 'mux', mediaType: 'video', codec: 'h264' }, tried: ['mp4'] },
+    );
+  }
+  return { chunks: normalized, description: avcCFromParameterSets(sets) };
+}
+
+function parseAdtsAccessUnit(data: Uint8Array): AacAdtsAccessUnit | undefined {
+  if (data.byteLength < 7) return undefined;
+  const b1 = data[1] as number;
+  if (data[0] !== 0xff || (b1 & 0xf0) !== 0xf0) {
+    return undefined;
+  }
+  if ((b1 & 0x06) !== 0) return undefined;
+  const b2 = data[2] as number;
+  const b3 = data[3] as number;
+  const profile = (b2 >> 6) & 0x03;
+  const sampleRateIndex = (b2 >> 2) & 0x0f;
+  const channelConfig = ((b2 & 0x01) << 2) | (b3 >> 6);
+  const sampleRate = MPEG4_SAMPLE_RATES[sampleRateIndex];
+  if (sampleRate === undefined) return undefined;
+  if (channelConfig < 1 || channelConfig > 7) return undefined;
+  const frameLength =
+    ((b3 & 0x03) << 11) | ((data[4] as number) << 3) | (((data[5] as number) >> 5) & 0x07);
+  if (frameLength !== data.byteLength) return undefined;
+  const headerBytes = (b1 & 0x01) === 1 ? 7 : 9;
+  if (frameLength < headerBytes) return undefined;
+  return {
+    payload: data.subarray(headerBytes, frameLength),
+    objectType: profile + 1,
+    sampleRateIndex,
+    sampleRate,
+    channelConfig,
+  };
+}
+
+function audioSpecificConfig(
+  objectType: number,
+  sampleRateIndex: number,
+  channelConfig: number,
+): Uint8Array {
+  if (!Number.isInteger(objectType) || objectType < 1 || objectType > 31) {
+    throw new CapabilityError(
+      'capability-miss',
+      'AAC MP4 muxing requires a representable MPEG-4 audio object type',
+      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', objectType }, tried: ['mp4'] },
+    );
+  }
+  if (MPEG4_SAMPLE_RATES[sampleRateIndex] === undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'AAC MP4 muxing requires a representable MPEG-4 sampling-frequency index',
+      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', sampleRateIndex }, tried: ['mp4'] },
+    );
+  }
+  if (!Number.isInteger(channelConfig) || channelConfig < 1 || channelConfig > 7) {
+    throw new CapabilityError(
+      'capability-miss',
+      'AAC MP4 muxing requires a representable channel configuration',
+      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', channelConfig }, tried: ['mp4'] },
+    );
+  }
+  return new Uint8Array([
+    (objectType << 3) | (sampleRateIndex >> 1),
+    ((sampleRateIndex & 0x01) << 7) | (channelConfig << 3),
+  ]);
+}
+
+function assertSameAdtsConfig(first: AacAdtsAccessUnit, next: AacAdtsAccessUnit): void {
+  if (
+    first.objectType !== next.objectType ||
+    first.sampleRateIndex !== next.sampleRateIndex ||
+    first.channelConfig !== next.channelConfig
+  ) {
+    throw new MediaError(
+      'mux-error',
+      'AAC ADTS samples changed object type, sample rate, or channel layout within one MP4 track',
+    );
+  }
+}
+
+function assertAdtsMatchesDescription(adts: AacAdtsAccessUnit, description: Uint8Array): void {
+  const asc = parseAsc(description);
+  if (
+    asc.objectType !== adts.objectType ||
+    asc.sampleRate !== adts.sampleRate ||
+    asc.channels !== adts.channelConfig
+  ) {
+    throw new MediaError(
+      'mux-error',
+      'AAC ADTS sample geometry does not match the track AudioSpecificConfig',
+    );
+  }
+}
+
+function prepareAacSamples(
+  chunks: readonly ChunkStruct[],
+  description: Uint8Array | undefined,
+): AacPreparedSamples {
+  const parsed = chunks.map((chunk) => parseAdtsAccessUnit(chunk.data));
+  const adtsCount = parsed.reduce((count, frame) => count + (frame === undefined ? 0 : 1), 0);
+  if (adtsCount === 0) {
+    if (description !== undefined) return { chunks: [...chunks], description };
+    throw new CapabilityError(
+      'capability-miss',
+      'AAC MP4 muxing requires AudioSpecificConfig description or ADTS-framed samples',
+      { op: { op: 'mux', mediaType: 'audio', codec: 'aac' }, tried: ['mp4'] },
+    );
+  }
+  if (adtsCount !== chunks.length) {
+    throw new MediaError('mux-error', 'AAC MP4 muxing cannot mix ADTS-framed and raw samples');
+  }
+
+  const first = parsed[0];
+  if (first === undefined) {
+    throw new MediaError('mux-error', 'AAC ADTS sample parsing failed unexpectedly');
+  }
+  if (description !== undefined) assertAdtsMatchesDescription(first, description);
+
+  const normalized: ChunkStruct[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const frame = parsed[i];
+    if (chunk === undefined || frame === undefined) {
+      throw new MediaError('mux-error', 'AAC ADTS sample parsing failed unexpectedly');
+    }
+    assertSameAdtsConfig(first, frame);
+    normalized.push(copyChunkWithData(chunk, frame.payload.slice()));
+  }
+
+  return {
+    chunks: normalized,
+    description:
+      description ??
+      audioSpecificConfig(first.objectType, first.sampleRateIndex, first.channelConfig),
+  };
+}
+
 function ticks(us: number, timescale: number): number {
   return Math.round((us * timescale) / MICROS_PER_SECOND);
 }
@@ -127,24 +454,23 @@ function ticks(us: number, timescale: number): number {
 function recoverDurationsUs(chunks: readonly ChunkStruct[]): number[] {
   const n = chunks.length;
   const order = [...chunks.keys()].sort((a, b) => {
-    const ca = chunks[a];
-    const cb = chunks[b];
-    return (ca?.timestampUs ?? 0) - (cb?.timestampUs ?? 0);
+    const ca = chunks[a] as ChunkStruct;
+    const cb = chunks[b] as ChunkStruct;
+    return ca.timestampUs - cb.timestampUs;
   });
   const byDecode = new Array<number>(n).fill(0);
   for (let k = 0; k < n; k++) {
-    const cur = order[k];
-    if (cur === undefined) continue;
+    const cur = order[k] as number;
     const next = order[k + 1];
-    const curTs = chunks[cur]?.timestampUs ?? 0;
-    const gap = next !== undefined ? (chunks[next]?.timestampUs ?? curTs) - curTs : undefined;
+    const curTs = (chunks[cur] as ChunkStruct).timestampUs;
+    const gap = next !== undefined ? (chunks[next] as ChunkStruct).timestampUs - curTs : undefined;
     byDecode[cur] = gap ?? 0;
   }
   // The last-presented frame has no following gap; reuse the previous presented frame's duration.
   if (n >= 2) {
-    const last = order[n - 1];
-    const prev = order[n - 2];
-    if (last !== undefined && prev !== undefined) byDecode[last] = byDecode[prev] ?? 0;
+    const last = order[n - 1] as number;
+    const prev = order[n - 2] as number;
+    byDecode[last] = byDecode[prev] as number;
   }
   return byDecode;
 }
@@ -178,11 +504,10 @@ export function buildMuxSamples(
   if (chunks.every((c) => c.dtsUs !== undefined)) {
     const out: MuxSampleInput[] = [];
     for (let i = 0; i < n; i++) {
-      const c = chunks[i];
-      if (c === undefined) continue;
-      const dts = c.dtsUs ?? 0;
+      const c = chunks[i] as ChunkStruct;
+      const dts = c.dtsUs as number;
       const next = chunks[i + 1]?.dtsUs;
-      const durUs = next !== undefined ? Math.max(0, next - dts) : (durationsUs[i] ?? 0);
+      const durUs = next !== undefined ? Math.max(0, next - dts) : (durationsUs[i] as number);
       out.push({
         data: c.data,
         durationTicks: ticks(durUs, timescale),
@@ -199,9 +524,8 @@ export function buildMuxSamples(
   const out: MuxSampleInput[] = [];
   let dtsUs = 0;
   for (let i = 0; i < n; i++) {
-    const c = chunks[i];
-    if (c === undefined) continue;
-    const durUs = durationsUs[i] ?? 0;
+    const c = chunks[i] as ChunkStruct;
+    const durUs = durationsUs[i] as number;
     const cttsUs = c.timestampUs - baseUs - dtsUs;
     out.push({
       data: c.data,
@@ -269,7 +593,13 @@ function trackStateFrom(info: TrackInfo): TrackState {
 
 /** Turn a finalized {@link TrackState} into the {@link MuxTrackInput} {@link writeMp4} consumes. */
 function toMuxTrack(t: TrackState): MuxTrackInput {
-  const samples = buildMuxSamples(t.chunks, t.timescale);
+  const prepared =
+    t.mediaType === 'video' && t.sampleEntryType === 'avc1'
+      ? prepareAvcSamples(t.chunks, t.description)
+      : t.mediaType === 'audio' && t.sampleEntryType === 'mp4a'
+        ? prepareAacSamples(t.chunks, t.description)
+        : { chunks: t.chunks, description: t.description };
+  const samples = buildMuxSamples(prepared.chunks, t.timescale);
   const base = {
     mediaType: t.mediaType,
     sampleEntryType: t.sampleEntryType,
@@ -281,11 +611,11 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
   };
   // Config box: AVC/AAC synthesize from `description`; other codecs carry it as their raw box.
-  if (t.description === undefined) return base;
+  if (prepared.description === undefined) return base;
   if (t.config.kind === 'raw-box') {
-    return { ...base, codecPrivate: { boxType: t.config.boxType, data: t.description } };
+    return { ...base, codecPrivate: { boxType: t.config.boxType, data: prepared.description } };
   }
-  return { ...base, description: t.description };
+  return { ...base, description: prepared.description };
 }
 
 /**

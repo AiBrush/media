@@ -1,5 +1,5 @@
 /**
- * CPU video filter driver (doc 09 §filters; ladder doc 04: WebGPU → Canvas2D → **CPU/WASM** → libavfilter).
+ * CPU video filter driver (doc 09 §filters; ladder doc 04: WebGPU → Canvas2D → native CPU → WASM).
  * The cross-browser fallback that runs **every** video `FilterSpec` — resize, crop, rotate, flip, colorspace,
  * tonemap — without WebGPU or Canvas2D colour management, for engines (Firefox/Safari often lack WebGPU)
  * where the GPU drivers' `supports()` is false. It reads a frame's pixels with `VideoFrame.copyTo` into a
@@ -10,10 +10,9 @@
  * One driver registers, ranked **below** the GPU substrates (the router tries WebGPU → Canvas2D first and
  * only reaches this on a miss):
  *
- * - {@link cpuVideoFilterDriver} (`substrate:'wasm'`) — the least-wrong existing {@link FilterSubstrate} for
- *   a pure-CPU filter (it must rank under the GPU rungs; a dedicated `'native'`/`'cpu'` substrate is the
- *   proper future fit — see ADR-033's identical note for the audio-dsp filter). It is **pure TS**, not WASM:
- *   the byte-for-byte colour/geometry math is plain TypeScript, so it ships zero binary and is Node-validated.
+ * - {@link cpuVideoFilterDriver} (`substrate:'native'`) — a pure-CPU filter ranked under the GPU/canvas
+ *   rungs and above the WASM tail. It is **pure TS**, not WASM: the byte-for-byte colour/geometry math is
+ *   plain TypeScript, so it ships zero binary and is Node-validated.
  *
  * **Why the CPU path is *more* capable than Canvas2D for colour (ADR-038):** `copyTo` to `'RGBA'` yields
  * the frame's pixels in the frame's **own** colour space (the UA does only the YUV→RGB matrix, not display
@@ -56,7 +55,6 @@ import {
   type ColorPlan,
   type ColorSpaceId,
   type SourceColor,
-  type TransferId,
   applyMat3,
   applyTonemap,
   eotf,
@@ -65,6 +63,13 @@ import {
   planColorspace,
   planTonemap,
 } from './gpu-uniforms.ts';
+import {
+  type RgbVideoColorSpaceInit,
+  mapVideoColorSpace,
+  sourceColorToVideoColorSpaceInit,
+} from './video-color-space.ts';
+
+export { type VideoColorSpaceLike, mapVideoColorSpace } from './video-color-space.ts';
 
 // ============ pure image model + per-pixel transforms (Node-tested) ============
 
@@ -371,46 +376,6 @@ export function planCpuColor(spec: ColorVideoSpec, source: SourceColor): ColorPl
 
 // ---- VideoColorSpace ↔ SourceColor / target tagging (pure plan side; render side is browser-only) ----
 
-/** The default source colour interpretation when a frame carries no `colorSpace`: BT.709 SDR. */
-const DEFAULT_SOURCE_COLOR: SourceColor = { primaries: 'bt709', transfer: 'bt709' };
-
-/** A structural view of `VideoColorSpace` (only the fields we read), so this stays Node-pure. */
-export interface VideoColorSpaceLike {
-  readonly primaries: string | null;
-  readonly transfer: string | null;
-}
-
-/** Map a WebCodecs `VideoColorSpace.transfer` token onto a {@link TransferId} (unknown → BT.709 SDR). */
-function mapTransfer(transfer: string | null): TransferId {
-  switch (transfer) {
-    case 'bt709':
-    case 'smpte170m':
-      return 'bt709';
-    case 'iec61966-2-1':
-      return 'srgb';
-    case 'pq':
-      return 'pq';
-    case 'hlg':
-      return 'hlg';
-    case 'linear':
-      return 'linear';
-    default:
-      return DEFAULT_SOURCE_COLOR.transfer;
-  }
-}
-
-/** Map a WebCodecs `VideoColorSpace.primaries` token onto a {@link ColorSpaceId} (unknown → BT.709). */
-function mapPrimaries(primaries: string | null): ColorSpaceId {
-  const parsed = primaries === null ? null : parseColorSpace(primaries);
-  return parsed ?? DEFAULT_SOURCE_COLOR.primaries;
-}
-
-/** Map a frame's `VideoColorSpace` onto the {@link SourceColor} the colour plan needs (default BT.709 SDR). */
-export function mapVideoColorSpace(cs: VideoColorSpaceLike | null | undefined): SourceColor {
-  if (cs === null || cs === undefined) return DEFAULT_SOURCE_COLOR;
-  return { primaries: mapPrimaries(cs.primaries), transfer: mapTransfer(cs.transfer) };
-}
-
 /** The output gamut a colour spec targets (for tagging the output frame's colour space). */
 export function colorSpecTargetGamut(spec: ColorVideoSpec): ColorSpaceId {
   if (spec.type === 'tonemap') return 'bt709';
@@ -428,23 +393,9 @@ function videoFrameRgbaAvailable(): boolean {
   return typeof VideoFrame !== 'undefined';
 }
 
-/**
- * The bundled `lib.dom.d.ts` `VideoColorPrimaries` (`"bt470bg" | "bt709" | "smpte170m"`) omits `"bt2020"`,
- * which the WebCodecs spec defines and `VideoFrame` accepts — the same DOM-lib lag the codec drivers patch
- * for `VideoPixelFormat`/`hardwareAcceleration`. Narrow the spec token to the lib type at the single point it
- * enters the `VideoColorSpaceInit` (no `any`); the runtime accepts the value.
- */
-function asVideoColorPrimaries(token: 'bt709' | 'bt2020' | 'smpte170m'): VideoColorPrimaries {
-  return token as VideoColorPrimaries;
-}
-
-/** The WebCodecs `VideoColorSpaceInit` for a full-range RGB output in a given target gamut. */
-function targetColorSpaceInit(gamut: ColorSpaceId): VideoColorSpaceInit {
-  const primaries = asVideoColorPrimaries(
-    gamut === 'bt2020' ? 'bt2020' : gamut === 'bt601' ? 'smpte170m' : 'bt709',
-  );
-  const transfer: VideoTransferCharacteristics = gamut === 'srgb' ? 'iec61966-2-1' : 'bt709';
-  return { primaries, transfer, matrix: 'rgb', fullRange: true };
+/** Cast through the lib.dom lag for BT.2020/PQ/HLG tokens; the runtime accepts the spec-defined values. */
+function domColorSpace(init: RgbVideoColorSpaceInit): VideoColorSpaceInit {
+  return init as VideoColorSpaceInit;
 }
 
 /** Read a frame's pixels into a tightly-packed RGBA {@link RgbaImage} (async — `copyTo` returns a Promise). */
@@ -463,14 +414,14 @@ function rgbaToFrame(
   img: RgbaImage,
   timestamp: number,
   duration: number | null,
-  colorSpace: VideoColorSpaceInit,
+  colorSpace: RgbVideoColorSpaceInit,
 ): VideoFrame {
   const base: VideoFrameBufferInit = {
     format: 'RGBA',
     codedWidth: img.width,
     codedHeight: img.height,
     timestamp,
-    colorSpace,
+    colorSpace: domColorSpace(colorSpace),
     layout: [{ offset: 0, stride: img.width * RGBA }],
   };
   const init: VideoFrameBufferInit = duration === null ? base : { ...base, duration };
@@ -485,13 +436,22 @@ async function filterFrameCpu(spec: CpuVideoSpec, frame: VideoFrame): Promise<Vi
   if (isColorVideoSpec(spec)) {
     const plan = planCpuColor(spec, mapVideoColorSpace(frame.colorSpace));
     const out = applyColorPlanToRgba(plan, src);
-    return rgbaToFrame(out, timestamp, duration, targetColorSpaceInit(colorSpecTargetGamut(spec)));
+    const target = colorSpecTargetGamut(spec);
+    return rgbaToFrame(
+      out,
+      timestamp,
+      duration,
+      sourceColorToVideoColorSpaceInit({ primaries: target, transfer: plan.encode }),
+    );
   }
   const recipe = planCpuGeometry(spec, src.width, src.height);
   const out = geometryToRgba(recipe, src);
-  // Geometry preserves colour: pass the source colour space through (RGB full-range, source primaries/transfer).
-  const srcColor = mapVideoColorSpace(frame.colorSpace);
-  return rgbaToFrame(out, timestamp, duration, targetColorSpaceInit(srcColor.primaries));
+  return rgbaToFrame(
+    out,
+    timestamp,
+    duration,
+    sourceColorToVideoColorSpaceInit(mapVideoColorSpace(frame.colorSpace)),
+  );
 }
 
 /**
@@ -542,11 +502,11 @@ function exhaustive(value: never): never {
 }
 /* v8 ignore stop */
 
-/** The CPU substrate: `'wasm'` is the least-wrong existing CPU `FilterSubstrate` (ranks below the GPU rungs). */
-const CPU_SUBSTRATE: FilterSubstrate = 'wasm';
+/** The pure-TS CPU substrate, ranked below GPU/canvas rungs and above the WASM tail. */
+const CPU_SUBSTRATE: FilterSubstrate = 'native';
 
 /**
- * The CPU video filter driver (`substrate:'wasm'`, ranked **below** WebGPU + Canvas2D). Handles **all six**
+ * The CPU video filter driver (`substrate:'native'`, ranked **below** WebGPU + Canvas2D). Handles **all six**
  * video ops on the CPU via `VideoFrame.copyTo` + the shared pure math, so filters work even without WebGPU
  * or Canvas2D colour management (the cross-browser fallback). `supports()` is honest: true for every video
  * geometric/colour spec when `VideoFrame` is present, false otherwise (e.g. Node) and for audio specs. The
@@ -573,8 +533,8 @@ export const cpuVideoFilterDriver: FilterDriver = {
 
 /**
  * Driver module registering the CPU video filter fallback. The router ranks substrates WebGPU → Canvas2D →
- * (this) wasm, so a WebGPU/Canvas2D-capable browser uses the GPU path and others fall back to the CPU — no
- * caller choice (doc 04, ADR-003/038).
+ * (this) native → WASM, so a WebGPU/Canvas2D-capable browser uses the GPU path and others fall back to the
+ * CPU — no caller choice (doc 04, ADR-003/038).
  */
 export const CpuVideoFilterModule: DriverModule = {
   apiVersion: DRIVER_API_VERSION,

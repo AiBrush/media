@@ -58,6 +58,7 @@
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "bake-goldens": "bun run scripts/bake-goldens.ts",
     "bench-dsp": "bun run scripts/bench-dsp.ts",
+    "bench-image": "bun run scripts/bench-image.ts",
     "bench-flac": "bun run scripts/bench-flac.ts",
     "bench-sources": "bun run scripts/bench-sources.ts",
     "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run test:dist && bun run check-budgets"

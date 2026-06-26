@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
+import { parseAsc } from '../../codecs/wasm-aac/aac.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
@@ -127,12 +128,21 @@ describe('CodecPrivate → decoder description + canonical codec ids (real fixtu
     const videoTrack = demuxed.tracks.find((t) => t.mediaType === 'video');
     expect(videoTrack?.codec).toBe('h264');
     const videoConfig = videoTrack?.config;
-    const description =
+    const videoDescription =
       videoConfig && 'description' in videoConfig ? videoConfig.description : undefined;
-    expect(description).toBeInstanceOf(Uint8Array);
-    const avcC = description as Uint8Array;
+    expect(videoDescription).toBeInstanceOf(Uint8Array);
+    const avcC = videoDescription as Uint8Array;
     expect(avcC.byteLength).toBeGreaterThan(0);
     expect(avcC[0]).toBe(0x01); // avcC configurationVersion — proves this is the codec-private record
+
+    const audioTrack = demuxed.tracks.find((t) => t.mediaType === 'audio');
+    expect(audioTrack?.codec).toBe('aac');
+    const audioConfig = audioTrack?.config;
+    const audioDescription =
+      audioConfig && 'description' in audioConfig ? audioConfig.description : undefined;
+    expect(audioDescription).toBeInstanceOf(Uint8Array);
+    const asc = parseAsc(audioDescription as Uint8Array);
+    expect(asc).toMatchObject({ objectType: 2, sampleRate: 48_000, channels: 2 });
     await demuxed.close();
   });
 

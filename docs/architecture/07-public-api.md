@@ -41,12 +41,19 @@ media.decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Promise
 
 `convert` is the headline op and **auto-routes copy-vs-re-encode** per stream: if a stream already matches the target codec/params it is stream-copied (remux-fast); otherwise it is re-encoded (ADR-012). `transcode` is an exported alias of `convert`.
 
-Still/animated images are accepted by `probe` and `decode` for GIF, PNG/APNG, JPEG, WebP, and AVIF (ADR-049). `probe` returns a video-like `MediaInfo` track from the pure header parser. `decode` returns a lazy video `ReadableStream<VideoFrame>` via browser `ImageDecoder`; the paired audio stream is empty, and Node raises a typed `CapabilityError` for image pixel decode because `ImageDecoder` is absent there.
+Still/animated images are accepted by `probe` and `decode` for GIF, PNG/APNG, JPEG, WebP, and AVIF (ADR-049/077). `probe` returns a video-like `MediaInfo` track from the pure header parser, including exact animation duration when GIF/APNG/WebP headers carry per-frame delays; animated images without parsed timing keep the conservative frame-count fallback, and still images report duration `0`. `decode` returns a lazy video `ReadableStream<VideoFrame>` via browser `ImageDecoder`; the paired audio stream is empty, and Node raises a typed `CapabilityError` for image pixel decode because `ImageDecoder` is absent there.
 
 ### Option shapes (flat, typed — ADR-011)
 
 ```ts
 interface CallOptions { signal?: AbortSignal; onProgress?: (p: Progress) => void; strategy?: StrategyOverride /* hidden, ADR-014 */ }
+
+type AudioBiquad = {
+  type: 'lowpass' | 'highpass' | 'bandpass' | 'notch' | 'peaking' | 'lowshelf' | 'highshelf'
+  frequency: number
+  q: number
+  gainDb?: number
+}
 
 interface ConvertOptions {
   to?: 'mp4' | 'mov' | 'webm' | 'mkv' | 'ogg' | 'wav' | 'mp3' | 'aac' | 'ts'   // target container
@@ -57,7 +64,16 @@ interface ConvertOptions {
     rotate?: 0 | 90 | 180 | 270; flip?: 'h' | 'v'
     crop?: { x: number; y: number; width: number; height: number }
   }
-  audio?: false | { codec?: 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis' | 'pcm'; sampleRate?: number; channels?: number; bitrate?: number }
+  audio?: false | {
+    codec?: 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis'
+      | 'pcm' | 'pcm-u8' | 'pcm-s8' | 'pcm-s16' | 'pcm-s24' | 'pcm-s32' | 'pcm-f32' | 'pcm-f64'
+      | 'pcm-u8be' | 'pcm-s8be' | 'pcm-s16be' | 'pcm-s24be' | 'pcm-s32be' | 'pcm-f32be' | 'pcm-f64be'
+    sampleRate?: number; channels?: number; bitrate?: number
+    gainDb?: number
+    fade?: { inSec?: number; outSec?: number; curve?: 'linear' | 'equal-power' }
+    dynamics?: { normalize?: { mode: 'peak' | 'rms'; targetDbfs: number }; limit?: { ceilingDbfs?: number; mode?: 'hard' | 'soft'; knee?: number } }
+    biquad?: AudioBiquad | readonly AudioBiquad[]
+  }
   faststart?: boolean; fragmented?: boolean          // MP4 layout
   sink?: Sink                                        // default: Blob
 }

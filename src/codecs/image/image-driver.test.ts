@@ -37,6 +37,7 @@ describe('image driver — capability surface (Node-reachable)', () => {
       height: 360,
       frameCount: 36,
       animated: true,
+      durationSec: 0.82,
     });
   });
 

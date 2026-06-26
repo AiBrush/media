@@ -334,7 +334,9 @@ describe('readExtendedFloat80 / writeExtendedFloat80 — the 80-bit IEEE sample-
 });
 
 describe('aiffCodec — harness codec-token vocabulary', () => {
-  it('big-endian ints carry a be suffix; LE ints and floats do not', () => {
+  it('big-endian multi-byte ints carry a be suffix; 8-bit and floats do not', () => {
+    expect(aiffCodec('s8', 'be')).toBe('pcm-s8');
+    expect(aiffCodec('s8', 'le')).toBe('pcm-s8');
     expect(aiffCodec('s16', 'be')).toBe('pcm-s16be');
     expect(aiffCodec('s24', 'be')).toBe('pcm-s24be');
     expect(aiffCodec('s16', 'le')).toBe('pcm-s16'); // AIFF-C sowt
@@ -371,10 +373,18 @@ describe('parseAiff — robustness on real-truncated + crafted-bad inputs (grace
     );
   });
 
-  it('reports an honest CapabilityError for signed 8-bit AIFF PCM (dsp has no signed-8 format)', () => {
-    expect(() => parseAiff(form('AIFF', [chunk('COMM', comm(1, 8, 8000))]))).toThrowError(
-      CapabilityError,
-    );
+  it('parses signed 8-bit AIFF PCM and round-trips SSND bytes exactly', () => {
+    const samples = Uint8Array.of(0x80, 0x00, 0x7f, 0x40);
+    const ssnd = new Uint8Array(8 + samples.byteLength);
+    ssnd.set(samples, 8);
+    const file = form('AIFF', [chunk('COMM', comm(1, 8, 8000)), chunk('SSND', ssnd)]);
+    const info = parseAiff(file);
+    expect(info.codec).toBe('pcm-s8');
+    expect(info.sampleSize).toBe(8);
+    const pcm = readAiffPcm(file);
+    expect(pcm.format).toBe('s8');
+    const re = writeAiff(pcm, pcm.format, { kind: pcm.kind, endian: pcm.endian });
+    expect(ssndSamples(re)).toEqual(samples);
   });
 
   it('rejects an unsupported AIFF integer sample size (e.g. 64-bit int)', () => {

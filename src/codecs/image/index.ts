@@ -3,7 +3,7 @@
  *
  * Two capabilities, split by validation tier (ADR-025):
  *  - **probe** ({@link probeImage}) — pure TS, Node-runnable, **bit-exact** on real files: format, width,
- *    height, frame count, animated flag, bit depth/colour, loop count.
+ *    height, frame count, animated flag, exact header duration when present, bit depth/colour, loop count.
  *  - **decode** ({@link decodeImage}/{@link decodeImageFrames}) — browser-only via WebCodecs `ImageDecoder`,
  *    capability-gated (a typed `CapabilityError` in Node), yielding `VideoFrame`(s) the consumer closes.
  *

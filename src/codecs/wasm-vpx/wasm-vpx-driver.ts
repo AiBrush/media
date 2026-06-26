@@ -40,9 +40,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type VpxCodec,
   type VpxDecodedFrame,
@@ -85,6 +87,15 @@ export function unsupported(reason: string): CodecSupport {
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
 let corePromise: Promise<VpxWasmCore | null> | undefined;
+let coreGluePromise: Promise<boolean> | undefined;
+
+async function hasVpxCoreGlue(): Promise<boolean> {
+  coreGluePromise ??= import('./vpx-core.js').then(
+    () => true,
+    () => false,
+  );
+  return coreGluePromise;
+}
 
 /**
  * Load the vendored libvpx-in-wasm core, lazily and at most once. Resolves to the {@link VpxWasmCore}, or
@@ -93,12 +104,13 @@ let corePromise: Promise<VpxWasmCore | null> | undefined;
  * `new URL('./vpx.wasm', import.meta.url)` so they ship same-origin alongside this chunk; the specifier is
  * a string literal so bundlers code-split it into its own lazy chunk (loaded only on a real VPX miss).
  */
-export async function loadVpxCore(): Promise<VpxWasmCore | null> {
+export async function loadVpxCore(runtime?: WasmRuntimeProfile): Promise<VpxWasmCore | null> {
   corePromise ??= (async (): Promise<VpxWasmCore | null> => {
     try {
+      const profile = runtime ?? resolveWasmRuntimeProfile();
       // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
       const mod = await import('./vpx-core.js');
-      await mod.default({ module_or_path: new URL('./vpx.wasm', import.meta.url) });
+      await mod.default(wasmInitForProfile(new URL('./vpx.wasm', import.meta.url), profile));
       return mod.createVpxCore();
     } catch {
       // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.
@@ -111,6 +123,7 @@ export async function loadVpxCore(): Promise<VpxWasmCore | null> {
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetVpxCoreForTest(): void {
   corePromise = undefined;
+  coreGluePromise = undefined;
 }
 
 /** The {@link CapabilityError} a coder throws when the vendored VPX wasm core is unavailable. */
@@ -148,8 +161,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   } catch {
     return unsupported(`wasm-vpx handles VP8/VP9 only, not '${q.config.codec}'`);
   }
-  const core = await loadVpxCore();
-  if (core === null) return unsupported('wasm-vpx core is not vendored (see BUILD.md)');
+  if (!(await hasVpxCoreGlue())) {
+    return unsupported('wasm-vpx core glue is not vendored (see BUILD.md)');
+  }
+  if (typeof EncodedVideoChunk === 'undefined' || typeof VideoFrame === 'undefined') {
+    return unsupported('wasm-vpx requires WebCodecs VideoFrame/EncodedVideoChunk');
+  }
   return { supported: true, hardwareAccelerated: false };
 }
 
@@ -250,7 +267,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadVpxCore();
+      const core = await loadVpxCore(o?.wasmRuntime);
       if (core === null) {
         controller.error(coreMissing('decode'));
         return;

@@ -4,7 +4,9 @@
  * (codec + dims/sample params + PES-span duration); `demux` reassembles each PID's access units and emits
  * them as WebCodecs-native `EncodedVideoChunk`/`EncodedAudioChunk` in decode order, browser-gated exactly
  * like {@link import('../mp4/mp4-driver.ts')} `packetStream` (the `Encoded*Chunk` constructors only exist
- * in a browser/worker). A transport stream has no front index, so the whole (bounded) segment is read.
+ * in a browser/worker). `streamCopy` remuxes/trims the parsed H.264/AAC access units directly through the
+ * TS writer, so same-container remux/trim stays pure TS and preserves PES PTS/DTS. A transport stream has
+ * no front index, so the whole (bounded) segment is read.
  */
 
 import type {
@@ -18,11 +20,13 @@ import type {
   Packet,
   Registry,
   StageOptions,
+  StreamCopyOptions,
   TrackInfo,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { type TsAccessUnit, type TsParse, type TsTrack, parseTs } from './ts-parse.ts';
+import { MpegTsMuxer } from './ts-write.ts';
 
 const TS_MIMES = new Set([
   'video/mp2t',
@@ -32,14 +36,35 @@ const TS_MIMES = new Set([
   'audio/mp2t',
 ]);
 const TS_EXTENSIONS = new Set(['ts', 'm2ts', 'mts', 'm2t']);
+const MICROSECONDS_PER_SECOND = 1_000_000;
+
+interface NormalizedTrimRange {
+  readonly startUs: number;
+  readonly endUs: number;
+}
+
+interface SelectedTrack {
+  readonly track: TsTrack;
+  readonly units: readonly TsAccessUnit[];
+}
+
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+}
 
 /** Read the entire source into one buffer (a TS has no header/index — duration needs the full PES span). */
-async function readAll(src: ByteSource): Promise<Uint8Array> {
-  if (src.range && src.size !== undefined) return src.range(0, src.size);
+async function readAll(src: ByteSource, signal: AbortSignal | undefined): Promise<Uint8Array> {
+  assertNotAborted(signal);
+  if (src.range && src.size !== undefined) {
+    const bytes = await src.range(0, src.size);
+    assertNotAborted(signal);
+    return bytes;
+  }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
+    assertNotAborted(signal);
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
@@ -51,6 +76,7 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
     out.set(c, off);
     off += c.byteLength;
   }
+  assertNotAborted(signal);
   return out;
 }
 
@@ -64,6 +90,167 @@ function toTrackInfo(track: TsTrack, id: number): TrackInfo {
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     config: track.config,
   };
+}
+
+function capabilityDetail(extra: Record<string, unknown>): Record<string, unknown> {
+  return { op: 'stream-copy:mpegts', tried: ['mpegts'], ...extra };
+}
+
+function assertStreamCopyOptions(options: StreamCopyOptions | undefined): void {
+  const target = options?.container?.toLowerCase();
+  if (target !== undefined && !TS_EXTENSIONS.has(target)) {
+    throw new CapabilityError(
+      'capability-miss',
+      `MPEG-TS stream-copy cannot write '${options?.container}' output.`,
+      capabilityDetail({ container: options?.container }),
+    );
+  }
+  if (options?.fragmented === true) {
+    throw new CapabilityError(
+      'capability-miss',
+      'MPEG-TS stream-copy does not support fragmented output.',
+      capabilityDetail({ container: target ?? 'ts', fragmented: true }),
+    );
+  }
+}
+
+function normalizeTrimRange(trim: StreamCopyOptions['trim']): NormalizedTrimRange | undefined {
+  if (trim === undefined) return undefined;
+  const { startSec, endSec } = trim;
+  const range = `[${startSec}s, ${endSec}s]`;
+  if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
+    throw new InputError('unsupported-input', `trim range ${range} is not a finite interval`);
+  }
+  if (startSec < 0) {
+    throw new InputError('unsupported-input', `trim start ${startSec}s is negative`);
+  }
+  if (endSec <= startSec) {
+    throw new InputError(
+      'unsupported-input',
+      `trim range ${range} is empty or inverted (end must be greater than start)`,
+    );
+  }
+  return {
+    startUs: Math.round(startSec * MICROSECONDS_PER_SECOND),
+    endUs: Math.round(endSec * MICROSECONDS_PER_SECOND),
+  };
+}
+
+function firstPresentationUs(parsed: TsParse): number {
+  let first = Number.POSITIVE_INFINITY;
+  for (const track of parsed.tracks) {
+    for (const unit of track.units) {
+      first = Math.min(first, unit.ptsUs);
+    }
+  }
+  if (!Number.isFinite(first)) {
+    throw new MediaError(
+      'demux-error',
+      'MPEG-TS stream-copy requires at least one timed access unit.',
+    );
+  }
+  return first;
+}
+
+function estimateDurationUs(units: readonly TsAccessUnit[], index: number): number {
+  const current = units[index];
+  if (current === undefined) return 0;
+  const next = units[index + 1];
+  if (next !== undefined && next.ptsUs > current.ptsUs) return next.ptsUs - current.ptsUs;
+  const previous = units[index - 1];
+  if (previous !== undefined && current.ptsUs > previous.ptsUs) {
+    return current.ptsUs - previous.ptsUs;
+  }
+  return 0;
+}
+
+function selectTrimmedUnits(
+  track: TsTrack,
+  trim: NormalizedTrimRange | undefined,
+  originUs: number,
+): readonly TsAccessUnit[] {
+  const units = track.units;
+  if (trim === undefined || units.length === 0) return units;
+
+  let startIndex = 0;
+  if (track.stream.mediaType === 'video') {
+    for (let index = 0; index < units.length; index += 1) {
+      const unit = units[index];
+      if (unit?.keyframe === true && unit.ptsUs - originUs <= trim.startUs) {
+        startIndex = index;
+      }
+    }
+  } else {
+    const found = units.findIndex(
+      (unit, index) => unit.ptsUs - originUs + estimateDurationUs(units, index) > trim.startUs,
+    );
+    if (found < 0) return [];
+    startIndex = found;
+  }
+
+  let endExclusive = units.length;
+  for (let index = startIndex; index < units.length; index += 1) {
+    const unit = units[index];
+    if (unit !== undefined && unit.dtsUs - originUs >= trim.endUs) {
+      endExclusive = index;
+      break;
+    }
+  }
+  if (endExclusive <= startIndex && units[startIndex] !== undefined) {
+    endExclusive = startIndex + 1;
+  }
+  return units.slice(startIndex, endExclusive);
+}
+
+function selectedTracks(parsed: TsParse, trim: NormalizedTrimRange | undefined): SelectedTrack[] {
+  const originUs = trim === undefined ? 0 : firstPresentationUs(parsed);
+  return parsed.tracks.map((track) => ({
+    track,
+    units: selectTrimmedUnits(track, trim, originUs),
+  }));
+}
+
+async function streamCopyParsed(
+  parsed: TsParse,
+  options: StreamCopyOptions | undefined,
+): Promise<ReadableStream<Uint8Array>> {
+  const muxer = new MpegTsMuxer();
+  const trim = normalizeTrimRange(options?.trim);
+  const selections = selectedTracks(parsed, trim);
+  const selectedUnitCount = selections.reduce(
+    (total, selection) => total + selection.units.length,
+    0,
+  );
+  if (selectedUnitCount === 0) {
+    throw new MediaError('mux-error', 'MPEG-TS stream-copy selected no access units.', {
+      trim: options?.trim,
+    });
+  }
+
+  const muxTrackIds = selections.map((selection, index) =>
+    muxer.addTrack(toTrackInfo(selection.track, index)),
+  );
+  for (let trackIndex = 0; trackIndex < selections.length; trackIndex += 1) {
+    assertNotAborted(options?.signal);
+    const muxTrackId = muxTrackIds[trackIndex];
+    const selection = selections[trackIndex];
+    if (muxTrackId === undefined || selection === undefined) {
+      throw new MediaError('mux-error', 'Internal MPEG-TS stream-copy track mismatch.', {
+        trackIndex,
+      });
+    }
+    for (const unit of selection.units) {
+      assertNotAborted(options?.signal);
+      muxer.addChunkStruct(muxTrackId, {
+        data: unit.data,
+        timestampUs: unit.ptsUs,
+        dtsUs: unit.dtsUs,
+        key: unit.keyframe,
+      });
+    }
+  }
+  await muxer.finalize();
+  return muxer.output;
 }
 
 /**
@@ -124,8 +311,8 @@ function matches(q: ContainerQuery): boolean {
 }
 
 /** Parse the source into the track table + per-PID access units (shared by `probe` and `demux`). */
-async function parse(src: ByteSource): Promise<TsParse> {
-  return parseTs(await readAll(src));
+async function parse(src: ByteSource, signal: AbortSignal | undefined): Promise<TsParse> {
+  return parseTs(await readAll(src, signal));
 }
 
 export const MpegTsDriver: ContainerDriver = {
@@ -135,8 +322,8 @@ export const MpegTsDriver: ContainerDriver = {
   formats: ['ts', 'm2ts', 'mts'],
   supports: matches,
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-    const parsed = await parse(src);
     const signal = o?.signal;
+    const parsed = await parse(src, signal);
     // The public track id is the array index (stable: video-first, then by PID — see parseTs sort).
     const tracks = parsed.tracks.map((t, i) => toTrackInfo(t, i));
     return {
@@ -149,10 +336,14 @@ export const MpegTsDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(_o?: MuxOptions): Muxer {
-    // TS muxing (continuity counters, PCR insertion, PSI tables) lands with the streaming-output family;
-    // until then it is an honest typed gap rather than a half-working muxer.
-    throw new MediaError('mux-error', 'MPEG-TS muxing is not yet implemented');
+  async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+    assertStreamCopyOptions(o);
+    const parsed = await parse(src, o?.signal);
+    assertNotAborted(o?.signal);
+    return streamCopyParsed(parsed, o);
+  },
+  createMuxer(o?: MuxOptions): Muxer {
+    return new MpegTsMuxer(o);
   },
 };
 

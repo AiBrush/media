@@ -121,15 +121,7 @@ function formatFromCompression(
 }
 
 function intFormat(sampleSize: number): SampleFormat {
-  // AIFF 8-bit PCM is *signed* (two's-complement), which the dsp's offset-binary `u8` cannot represent
-  // exactly; rather than corrupt it by 128, declare an honest miss until a signed-8-bit path exists.
-  if (sampleSize <= 8) {
-    throw new CapabilityError(
-      'capability-miss',
-      'AIFF signed 8-bit PCM is not yet supported (the dsp PCM core is offset-binary u8 only)',
-      { op: 'demux', tried: ['aiff'] },
-    );
-  }
+  if (sampleSize <= 8) return 's8';
   if (sampleSize <= 16) return 's16';
   if (sampleSize <= 24) return 's24';
   if (sampleSize <= 32) return 's32';
@@ -201,7 +193,9 @@ function locate(bytes: Uint8Array): {
     if (c.id === 'COMM' && comm === undefined) {
       comm = parseComm(bytes, dv, c, kind);
     } else if (c.id === 'SSND' && ssnd === undefined) {
-      if (c.size < 8) throw new MediaError('demux-error', 'AIFF: truncated SSND chunk');
+      if (c.size < 8 || c.body + 8 > bytes.byteLength) {
+        throw new MediaError('demux-error', 'AIFF: truncated SSND chunk');
+      }
       const dataOffset = dv.getUint32(c.body); // skip N alignment bytes before the first sample
       const samples = c.body + 8 + dataOffset;
       const declared = c.size - 8 - dataOffset;
@@ -236,6 +230,7 @@ export interface AiffInfo {
 export function aiffCodec(format: SampleFormat, endian: Endianness): string {
   if (format === 'f32') return 'pcm-f32';
   if (format === 'f64') return 'pcm-f64';
+  if (format === 's8') return 'pcm-s8';
   return endian === 'be' ? `pcm-${format}be` : `pcm-${format}`;
 }
 
@@ -298,6 +293,12 @@ export function writeAiff(
   format: SampleFormat,
   opts: { kind?: AiffKind; endian?: Endianness } = {},
 ): Uint8Array<ArrayBuffer> {
+  if (format === 'u8') {
+    throw new CapabilityError('capability-miss', 'AIFF 8-bit PCM is signed; use pcm-s8', {
+      op: { op: 'pcm-write', container: 'aiff', sampleFormat: format },
+      tried: ['aiff'],
+    });
+  }
   // f32/f64 only exist as AIFF-C compressions; force AIFC for them. 'sowt' (LE) likewise needs AIFC.
   const isFloat = format === 'f32' || format === 'f64';
   const endian: Endianness = opts.endian ?? 'be';

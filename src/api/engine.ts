@@ -30,7 +30,8 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
+import { pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
+import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
@@ -59,21 +60,6 @@ import {
   videoFilterSpecs,
   videoTrackInfoFromDecoderConfig,
 } from './codec-pipeline.ts';
-
-const CONTAINER_MIME: Record<string, string> = {
-  mp4: 'video/mp4',
-  mov: 'video/quicktime',
-  webm: 'video/webm',
-  mkv: 'video/x-matroska',
-  ogg: 'audio/ogg',
-  wav: 'audio/wav',
-  mp3: 'audio/mpeg',
-  flac: 'audio/flac',
-  adts: 'audio/aac',
-  aiff: 'audio/aiff',
-  caf: 'audio/x-caf',
-  avi: 'video/x-msvideo',
-};
 import type {
   AudioTarget,
   CallOptions,
@@ -94,6 +80,22 @@ import type {
   TrimOptions,
   VideoTarget,
 } from './types.ts';
+
+const CONTAINER_MIME: Record<string, string> = {
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  ogg: 'audio/ogg',
+  wav: 'audio/wav',
+  mp3: 'audio/mpeg',
+  flac: 'audio/flac',
+  adts: 'audio/aac',
+  aiff: 'audio/aiff',
+  caf: 'audio/x-caf',
+  avi: 'video/x-msvideo',
+};
+const PCM_AUDIO_DATA_CHUNK_FRAMES = 4096;
 
 /** The developer-facing engine surface (ADR-009). */
 export interface MediaEngine {
@@ -198,6 +200,10 @@ export class MediaEngineImpl implements MediaEngine {
           ...(endian !== undefined ? { endian } : {}),
           ...(audio?.channels !== undefined ? { channels: audio.channels } : {}),
           ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
+          ...(audio?.gainDb !== undefined ? { gainDb: audio.gainDb } : {}),
+          ...(audio?.fade !== undefined ? { fade: audio.fade } : {}),
+          ...(audio?.dynamics !== undefined ? { dynamics: audio.dynamics } : {}),
+          ...(audio?.biquad !== undefined ? { biquad: audio.biquad } : {}),
         };
         // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its
         // own bytes, applies sample format / channel / rate transforms, then serializes the requested
@@ -584,6 +590,16 @@ export class MediaEngineImpl implements MediaEngine {
         `decode cannot read a protected ${mediaType} track before decrypt() emits clear samples`,
       );
     }
+    if (mediaType === 'audio' && isRawPcmTrack(track) && container.decodePcmAudio) {
+      await demuxer.close();
+      assertPcmAudioDataAvailable(`${container.id}:${track.codec}`);
+      const audio = await container.decodePcmAudio(src, stage);
+      return pcmAudioToAudioDataStream(
+        audio,
+        stage,
+        `${container.id}:${track.codec}`,
+      ) as ReadableStream<RawFrameOf<M>>;
+    }
     const codec = await this.#routeCodec(decodeQueryFor(track), { strategy: stageStrategy(stage) });
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
     /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
@@ -763,9 +779,9 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /**
-   * Compose the GPU filter chain for a video stream from the target's geometry ops (crop/resize/rotate/
-   * flip), each a router-resolved same-type `VideoFrame→VideoFrame` stage chained with `composeChain`.
-   * No ops ⇒ the decoded stream passes through untouched (no extra copy).
+   * Compose the video filter chain for a stream from the target's geometry + colour ops, each a
+   * router-resolved same-type `VideoFrame→VideoFrame` stage chained with `composeChain`. No ops ⇒ the
+   * decoded stream passes through untouched (no extra copy).
    */
   /* v8 ignore start -- only reached after a live decode (WebCodecs); the filter-spec planning it calls is
      unit-tested directly (videoFilterSpecs), and the GPU composition is validated in the browser harness. */
@@ -1032,6 +1048,75 @@ function deferredStream<T>(
   });
 }
 
+/** True for raw PCM codec tokens (`pcm`, `pcm-s16`, `pcm-s16be`, `pcm-f32`, …). */
+function isRawPcmTrack(track: TrackInfo): boolean {
+  return track.codec === 'pcm' || track.codec.startsWith('pcm-');
+}
+
+/**
+ * Browser raw-PCM decode bridge: a raw PCM container has already parsed canonical samples; this wraps
+ * them as `AudioData` chunks for the public `decode()` stream. Emitted frames are owned by the readable
+ * consumer and must be closed by that consumer. If an enqueue loses a cancel race, this function closes
+ * the frame it just constructed so no native handle leaks.
+ */
+function pcmAudioToAudioDataStream(
+  audio: PcmAudio,
+  stage: StageOptions,
+  label: string,
+): ReadableStream<AudioData> {
+  assertPcmAudioDataAvailable(label);
+  /* v8 ignore start -- requires the browser `AudioData` constructor; validated in the browser harness. */
+  let cursor = 0;
+  return new ReadableStream<AudioData>({
+    pull(controller): void {
+      try {
+        throwIfAborted(stage.signal);
+        if (cursor >= audio.frames) {
+          controller.close();
+          return;
+        }
+        const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
+        const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
+        const { init } = pcmRangeToPlanarInit(audio, cursor, frames, timestamp);
+        const frame = new AudioData(init);
+        try {
+          controller.enqueue(frame);
+        } catch (e) {
+          frame.close();
+          throw e;
+        }
+        cursor += frames;
+      } catch (e) {
+        if (e instanceof MediaError) {
+          throw e;
+        }
+        throw new MediaError(
+          'decode-error',
+          `PCM audio decode failed to construct AudioData: ${unknownMessage(e)}`,
+          e,
+        );
+      }
+    },
+    cancel(): void {
+      cursor = audio.frames;
+    },
+  });
+  /* v8 ignore stop */
+}
+
+function assertPcmAudioDataAvailable(label: string): void {
+  if (typeof AudioData !== 'undefined') return;
+  throw new CapabilityError(
+    'capability-miss',
+    'PCM audio decode needs AudioData, which is unavailable in this environment',
+    {
+      op: 'decode',
+      tried: [label],
+      suggestion: 'run decode() in a browser or worker where WebCodecs AudioData exists',
+    },
+  );
+}
+
 /** Cancel a frame stream so its producer (a decoder/demuxer) releases any buffered frames. */
 async function cancelStream(stream: ReadableStream<unknown>): Promise<void> {
   await stream.cancel(new MediaError('aborted', 'stream not consumed')).catch(() => {});
@@ -1286,6 +1371,10 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
+function unknownMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /**
  * PCM-family audio target — the codecs the WAV/`transformPcm` path produces (ADR-022). Accepts the
  * generic public `pcm` token AND the canonical sample-format variants a caller may pass
@@ -1303,6 +1392,8 @@ function pcmSampleFormat(codec: string | undefined): SampleFormat | undefined {
   switch (normalized) {
     case 'pcm-u8':
       return 'u8';
+    case 'pcm-s8':
+      return 's8';
     case 'pcm-s16':
       return 's16';
     case 'pcm-s24':
@@ -1408,7 +1499,7 @@ function imageToMediaInfo(info: ImageInfo, src: Source): MediaInfo {
     codec: info.format === 'jpeg' ? 'mjpeg' : info.format,
     width: info.width,
     height: info.height,
-    fps: IMAGE_DEFAULT_FPS,
+    fps: imageFrameRate(info, durationSec),
   };
   if (durationSec > 0) track.durationSec = durationSec;
   return {
@@ -1420,10 +1511,14 @@ function imageToMediaInfo(info: ImageInfo, src: Source): MediaInfo {
 }
 
 function imageDurationSec(info: ImageInfo): number {
+  if (info.durationSec !== undefined) return info.durationSec;
   // The harness image goldens model JPEG as one 25 fps frame (0.04s) and PNG/WebP stills as unknown
-  // duration. Animated image formats have a real frame count, but the pure header probe does not yet
-  // preserve every per-frame delay, so expose the conservative 25 fps timing used by the image corpus.
+  // duration. Animated formats without parsed header timing keep the conservative corpus fallback.
   return info.animated || info.format === 'jpeg' ? info.frameCount / IMAGE_DEFAULT_FPS : 0;
+}
+
+function imageFrameRate(info: ImageInfo, durationSec: number): number {
+  return durationSec > 0 ? info.frameCount / durationSec : IMAGE_DEFAULT_FPS;
 }
 
 function toInfoTrack(t: TrackInfo): MediaInfoTrack {

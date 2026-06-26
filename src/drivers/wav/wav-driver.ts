@@ -2,7 +2,7 @@
  * The WAV (RIFF/WAVE) container driver — hand-written TS. WAV is **little-endian** (unlike MP4) and
  * carries raw PCM (or IEEE float), so demux is a chunk walk: parse `fmt ` for the layout and the
  * `data` chunk header for duration. PCM is not a WebCodecs codec — it flows to the TS audio-dsp path —
- * so the codec token is `pcm-s16` / `pcm-s24` / `pcm-f32` etc. (docs/architecture/09 audio-dsp).
+ * so the codec token is `pcm-u8` / `pcm-s16` / `pcm-s24` / `pcm-f32` etc. (docs/architecture/09 audio-dsp).
  */
 
 import {
@@ -16,11 +16,13 @@ import {
   type Packet,
   type PcmTransform,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { writePcmContainer } from '../pcm-output.ts';
+import type { PcmAudio } from '../../dsp/pcm.ts';
+import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
+import { applyPcmTransform } from '../pcm-transform.ts';
 import { readWavPcm } from './pcm.ts';
 
 const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
@@ -84,6 +86,9 @@ export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
     if (id === 'fmt ' && size >= 16) {
+      if (body + 16 > bytes.byteLength) {
+        throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
+      }
       format = parseFormat(dv, body, size);
     } else if (id === 'data') {
       // Trust the declared size for duration, but never exceed the real file length.
@@ -178,19 +183,12 @@ export const WavDriver: ContainerDriver = {
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const wav = readWavPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    let audio: PcmAudio = wav;
-    if (o?.gainDb !== undefined && o.gainDb !== 0) audio = gain(audio, o.gainDb);
-    if (o?.channels !== undefined && o.channels !== audio.channels)
-      audio = remix(audio, o.channels);
-    // Rate change last (on the final channel layout): band-limited windowed-sinc resampler (ADR-022
-    // tail, pure-TS — no longer a CapabilityError). Sample-format is preserved unless the caller
-    // explicitly requested a PCM target codec such as `pcm-s16`.
-    if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
-      audio = resample(audio, o.sampleRate);
+    const audio = applyPcmTransform(wav, o);
+    const container = o?.container ?? 'wav';
     const out = writePcmContainer(
       audio,
-      o?.container ?? 'wav',
-      o?.sampleFormat ?? wav.format,
+      container,
+      resolvePcmSampleFormat(container, wav.format, o?.sampleFormat),
       o?.endian ?? 'le',
     );
     return new ReadableStream<Uint8Array>({
@@ -199,6 +197,11 @@ export const WavDriver: ContainerDriver = {
         c.close();
       },
     });
+  },
+  async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
+    const wav = readWavPcm(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return wav;
   },
   createMuxer(): Muxer {
     // WAV carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is

@@ -597,7 +597,12 @@ function matches(q: ContainerQuery): boolean {
   if (q.extension !== undefined && MP4_EXTENSIONS.has(q.extension.toLowerCase())) return true;
   const head = q.head;
   if (head && head.byteLength >= 8) {
-    const magic = String.fromCharCode(head[4] ?? 0, head[5] ?? 0, head[6] ?? 0, head[7] ?? 0);
+    const magic = String.fromCharCode(
+      head[4] as number,
+      head[5] as number,
+      head[6] as number,
+      head[7] as number,
+    );
     if (magic === 'ftyp' || magic === 'styp' || magic === 'moov') return true;
   }
   return false;

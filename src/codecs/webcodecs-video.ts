@@ -326,17 +326,31 @@ function absentWebCodecsError(op: 'decode' | 'encode'): CapabilityError {
   );
 }
 
+function unsupportedVideoCodecError(op: 'decode' | 'encode', codec: string): CapabilityError {
+  return new CapabilityError(
+    'capability-miss',
+    `webcodecs-video cannot ${op} unsupported video codec string '${codec}'`,
+    { op, tried: ['webcodecs-video'] },
+  );
+}
+
 // ── supports() — cheap, honest, never throws (wraps isConfigSupported) ────────────────────────────
 
 async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
+  const videoConfig = asVideoDecoderConfig(config);
+  if (!videoConfig) return { supported: false, reason: 'not a video decoder config' };
+  if (!isVideoCodecString(videoConfig.codec)) {
+    return {
+      supported: false,
+      reason: `unsupported video codec string '${videoConfig.codec}'`,
+    };
+  }
   if (!hasVideoDecoder()) {
     return {
       supported: false,
       reason: 'WebCodecs VideoDecoder is unavailable in this environment',
     };
   }
-  const videoConfig = asVideoDecoderConfig(config);
-  if (!videoConfig) return { supported: false, reason: 'not a video decoder config' };
   /* v8 ignore start -- requires WebCodecs VideoDecoder; validated under browser-mode (Phase 1) */
   // Probe hardware first, then a software-permitting probe (ACCELERATION_PROBE_ORDER): a software-only
   // decoder reports `prefer-hardware` unsupported but `no-preference` supported, so probing hardware-only
@@ -365,14 +379,20 @@ async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
 }
 
 async function supportsEncode(config: EncoderConfig): Promise<CodecSupport> {
+  const videoConfig = asVideoEncoderConfig(config);
+  if (!videoConfig) return { supported: false, reason: 'not a video encoder config' };
+  if (!isVideoCodecString(videoConfig.codec)) {
+    return {
+      supported: false,
+      reason: `unsupported video codec string '${videoConfig.codec}'`,
+    };
+  }
   if (!hasVideoEncoder()) {
     return {
       supported: false,
       reason: 'WebCodecs VideoEncoder is unavailable in this environment',
     };
   }
-  const videoConfig = asVideoEncoderConfig(config);
-  if (!videoConfig) return { supported: false, reason: 'not a video encoder config' };
   /* v8 ignore start -- requires WebCodecs VideoEncoder; validated under browser-mode (Phase 1) */
   // Hardware-first, then software: VP8/VP9/AV1 (and H.264/HEVC on some browsers) have software-only
   // encoders that report `prefer-hardware` unsupported — probing hardware-only NAs every such transcode
@@ -658,18 +678,21 @@ export const WebcodecsVideoDriver: CodecDriver = {
       : supportsEncode(q.config as EncoderConfig);
   },
   createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame> {
-    if (!hasVideoDecoder()) throw absentWebCodecsError('decode');
-    if (!asVideoDecoderConfig(c)) {
+    const videoConfig = asVideoDecoderConfig(c);
+    if (!videoConfig) {
       throw new CapabilityError('capability-miss', 'webcodecs-video decodes video, not audio', {
         op: 'decode',
         tried: ['webcodecs-video'],
       });
     }
+    if (!isVideoCodecString(videoConfig.codec)) {
+      throw unsupportedVideoCodecError('decode', videoConfig.codec);
+    }
+    if (!hasVideoDecoder()) throw absentWebCodecsError('decode');
     /* v8 ignore next -- requires WebCodecs; validated under browser-mode (Phase 1) */
-    return createVideoDecoder(c, o);
+    return createVideoDecoder(videoConfig, o);
   },
   createEncoder(c: EncoderConfig, o?: StageOptions): TransformStream<RawFrame, EncodedChunk> {
-    if (!hasVideoEncoder()) throw absentWebCodecsError('encode');
     const videoConfig = asVideoEncoderConfig(c);
     if (!videoConfig) {
       throw new CapabilityError('capability-miss', 'webcodecs-video encodes video, not audio', {
@@ -677,6 +700,10 @@ export const WebcodecsVideoDriver: CodecDriver = {
         tried: ['webcodecs-video'],
       });
     }
+    if (!isVideoCodecString(videoConfig.codec)) {
+      throw unsupportedVideoCodecError('encode', videoConfig.codec);
+    }
+    if (!hasVideoEncoder()) throw absentWebCodecsError('encode');
     /* v8 ignore next -- requires WebCodecs; validated under browser-mode (Phase 1) */
     return createVideoEncoder(videoConfig, o);
   },

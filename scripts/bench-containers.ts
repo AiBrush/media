@@ -16,13 +16,22 @@
  *                   MB/s of the sample bytes gathered. (Labelled honestly — it is the parse+gather unit,
  *                   not the browser chunk emit.)
  *   - **remux**   — `media.remux(→mp4)`: lossless demux→mux stream-copy. MB/s of the output bytes.
+ *   - **mkv remux** — pure MP4 packet-table → `WebmMuxer.addChunkStruct`, preserving PTS/DTS for B-frames
+ *                   and edit-list-shifted starts. MB/s of the Matroska output bytes.
  *   - **trim**    — `media.trim(keyframe, 25%–75%)`: keyframe-aligned stream-copy. MB/s of the output.
+ *   - **ts remux** — pure MP4 packet-table → `MpegTsMuxer.addChunkStruct` for H.264/AAC output, plus
+ *                   `media.remux(→ts)` / `media.trim(keyframe)` over MPEG-TS same-container packet-copy.
+ *   - **ogg mux** — pure `OggMuxer` re-authoring real Opus/Vorbis/FLAC packets into Ogg pages,
+ *                   including WebM-laced Vorbis packets whose duration is anchored by source metadata.
  *   - **decrypt** — `media.decrypt(cenc)`: CENC AES-CTR sample decryption of a freshly CENC-encrypted
  *                   twin (via the test-support encryptor). MB/s of the decrypted output.
+ *   - **fuzz robustness** — deterministic corrupt-input matrices over real fixture heads, asserting the
+ *                   typed-error contract while reporting corrupt-input MB/s.
  *
  * `demux`/`remux`/`trim`/`decrypt` run on the **MP4/MOV** corpus (the pure-TS container with a Node
- * stream-copy + decrypt path); `probe` spans every container family. Each metric also reports
- * `throughputRealtime` (media seconds processed per wall second) where the op yields a timed file.
+ * stream-copy + decrypt path); MPEG-TS stream-copy runs on the committed local TS corpus; `probe` spans
+ * every container family. Each metric also reports `throughputRealtime` (media seconds processed per wall
+ * second) where the op yields a timed file.
  *
  *   bun run bench-containers              # run + print + (re)write the baseline
  *   bun run bench-containers --check      # run + print + diff vs the committed baseline (non-zero on regress)
@@ -32,12 +41,36 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createMedia } from '../src/api/create-media.ts';
 import type { MediaInfo } from '../src/api/types.ts';
+import type { TrackInfo } from '../src/contracts/driver.ts';
+import { parseAiff } from '../src/drivers/aiff/aiff.ts';
+import { parseAvi } from '../src/drivers/avi/avi-parse.ts';
+import {
+  enumerateFlacFrames,
+  nativeFlacMetadata,
+  parseFlac,
+} from '../src/drivers/flac/flac-driver.ts';
 import { muxTracksFromMovie, readMovie } from '../src/drivers/mp4/mp4-driver.ts';
+import type { ParsedTrack } from '../src/drivers/mp4/parse.ts';
+import { buildSamples } from '../src/drivers/mp4/samples.ts';
+import { MpegTsMuxer } from '../src/drivers/mpegts/ts-write.ts';
+import { OggDriver, oggAudioPackets, parseOgg } from '../src/drivers/ogg/ogg-driver.ts';
+import { OggMuxer } from '../src/drivers/ogg/ogg-write.ts';
+import { parseWav } from '../src/drivers/wav/wav-driver.ts';
+import { WebmMuxer } from '../src/drivers/webm/ebml-write.ts';
+import { demuxWebm, parseWebm } from '../src/drivers/webm/webm-driver.ts';
 import { fromBytes } from '../src/sources/source.ts';
 import { encryptCenc } from '../src/test-support/cenc-encrypt.ts';
+import {
+  type CorruptCase,
+  type Family,
+  corruptMatrix,
+  escapes,
+  runMatrix,
+} from '../src/test-support/fuzz/corrupt.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
+const DERIVED_DIR = `${ROOT}fixtures/media-derived`;
 const BASELINE_PATH = `${ROOT}fixtures/golden/bench/containers.json`;
 
 const WARMUP = 3;
@@ -72,6 +105,106 @@ const MP4_FILES = [
   'movie_5.mp4',
   'test.mp4',
 ];
+
+/** H.264/AAC MP4 inputs that the MPEG-TS muxer can honestly author through the packet seam. */
+const MP4_TO_TS_FILES = [
+  'h264.mp4',
+  'movie_5.mp4',
+  'test.mp4',
+  'bear-1280x720.mp4',
+  'bear-rotate-90.mp4',
+  'obs-remux-variable-aac.mp4',
+] as const;
+
+/** Local real transport streams for the MPEG-TS driver-native remux/trim packet-copy path. */
+const TS_FILES = [
+  { id: 'bear-1280x720.ts', path: `${MEDIA_DIR}/bear-1280x720.ts` },
+  { id: 'h264_720p.head.ts', path: `${DERIVED_DIR}/h264_720p.head.ts` },
+] as const;
+
+/** Real audio packet sources for the pure Ogg page writer: Opus/Vorbis already in Ogg, plus FLAC frames. */
+const OGG_MUX_FILES = [
+  { id: 'sfx-opus.ogg', kind: 'ogg' },
+  { id: 'sound_5.oga', kind: 'ogg' },
+  { id: 'bear-multitrack.webm', kind: 'webm-vorbis' },
+  { id: 'sfx.flac', kind: 'flac' },
+  { id: 'flac-08bit.flac', kind: 'flac' },
+  { id: 'flac-12bit.flac', kind: 'flac' },
+  { id: 'flac-5_1ch.flac', kind: 'flac' },
+  { id: 'flac-wasted-bits.flac', kind: 'flac' },
+] as const;
+
+interface RobustnessFile {
+  readonly id: string;
+  readonly path: string;
+  readonly family: Family;
+  readonly parse: (bytes: Uint8Array) => unknown;
+  readonly container: string;
+}
+
+/**
+ * A bounded fuzz-benchmark matrix over real fixture heads. The full oracle lives in
+ * `src/test-support/fuzz/parser-robustness.test.ts`; this benchmark tracks cost across representative
+ * families without replaying the entire large matrix for every timed sample.
+ */
+const ROBUSTNESS_FILES = [
+  {
+    id: 'h264.mp4',
+    path: `${MEDIA_DIR}/h264.mp4`,
+    family: 'isobmff',
+    container: 'mp4',
+    parse: (bytes: Uint8Array) => readMovie(ra(bytes)),
+  },
+  {
+    id: 'speech.wav',
+    path: `${MEDIA_DIR}/speech.wav`,
+    family: 'riff',
+    container: 'wav',
+    parse: (bytes: Uint8Array) => parseWav(bytes, bytes.byteLength),
+  },
+  {
+    id: 'sfx-opus.ogg',
+    path: `${MEDIA_DIR}/sfx-opus.ogg`,
+    family: 'ogg',
+    container: 'ogg',
+    parse: (bytes: Uint8Array) => parseOgg(bytes),
+  },
+  {
+    id: 'sfx.flac',
+    path: `${MEDIA_DIR}/sfx.flac`,
+    family: 'framed',
+    container: 'flac',
+    parse: (bytes: Uint8Array) => parseFlac(bytes),
+  },
+  {
+    id: 'movie_5.webm',
+    path: `${MEDIA_DIR}/movie_5.webm`,
+    family: 'ebml',
+    container: 'webm',
+    parse: (bytes: Uint8Array) => parseWebm(bytes),
+  },
+  {
+    id: 'aiff-caf/sfx.aiff',
+    path: `${DERIVED_DIR}/aiff-caf/sfx.aiff`,
+    family: 'iff',
+    container: 'aiff',
+    parse: (bytes: Uint8Array) => parseAiff(bytes),
+  },
+  {
+    id: 'mjpeg_pcm_160p.avi',
+    path: `${DERIVED_DIR}/mjpeg_pcm_160p.avi`,
+    family: 'riff',
+    container: 'avi',
+    parse: (bytes: Uint8Array) => parseAvi(bytes),
+  },
+] as const satisfies readonly RobustnessFile[];
+
+const ROBUSTNESS_MATRIX_OPTIONS = {
+  seedCap: 8 * 1024,
+  truncateStride: 257,
+  randomCount: 6,
+  bitflipCount: 24,
+} as const;
 
 const MIME: Record<string, string> = {
   mp4: 'video/mp4',
@@ -183,6 +316,25 @@ async function blobBytes(out: unknown): Promise<Uint8Array> {
   return new Uint8Array(await out.arrayBuffer());
 }
 
+async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 /** A `RandomAccess` over an in-memory buffer (mirrors the driver's buffered path). */
 const ra = (b: Uint8Array) => ({
   read: (o: number, l: number): Promise<Uint8Array> => Promise.resolve(b.subarray(o, o + l)),
@@ -195,6 +347,101 @@ async function sampleByteCount(bytes: Uint8Array): Promise<number> {
   let total = 0;
   for (const t of tracks) for (const s of t.samples) total += s.data.byteLength;
   return total;
+}
+
+function trackInfoFromMp4Track(track: ParsedTrack): TrackInfo {
+  return {
+    id: track.id,
+    mediaType: track.mediaType,
+    codec: track.codec,
+    durationSec: track.durationSec,
+    ...(track.fps !== undefined ? { fps: track.fps } : {}),
+    ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
+    ...(track.encryption !== undefined ? { encrypted: true } : {}),
+    config: track.config,
+  };
+}
+
+async function muxMp4ToMkv(bytes: Uint8Array): Promise<Uint8Array> {
+  const access = ra(bytes);
+  const movie = await readMovie(access);
+  const muxTracks = await muxTracksFromMovie(access, movie);
+  const muxer = new WebmMuxer({ container: 'mkv' }, 'matroska');
+
+  for (let i = 0; i < movie.tracks.length; i++) {
+    const track = movie.tracks[i];
+    const muxTrack = muxTracks[i];
+    if (track === undefined || muxTrack === undefined) {
+      throw new Error(`MP4→MKV benchmark lost track ${i}`);
+    }
+
+    const samples = buildSamples(track);
+    if (samples.length !== muxTrack.samples.length) {
+      throw new Error(
+        `MP4→MKV benchmark sample mismatch on track ${track.id}: timeline=${samples.length}, bytes=${muxTrack.samples.length}`,
+      );
+    }
+
+    const trackId = muxer.addTrack(trackInfoFromMp4Track(track));
+    for (let j = 0; j < samples.length; j++) {
+      const sample = samples[j];
+      const muxSample = muxTrack.samples[j];
+      if (sample === undefined || muxSample === undefined) {
+        throw new Error(`MP4→MKV benchmark lost sample ${j} on track ${track.id}`);
+      }
+      muxer.addChunkStruct(trackId, {
+        timestampUs: sample.ptsUs,
+        durationUs: sample.durationUs,
+        key: sample.keyframe,
+        data: muxSample.data,
+        dtsUs: sample.dtsUs,
+      });
+    }
+  }
+
+  await muxer.finalize();
+  return streamBytes(muxer.output);
+}
+
+async function muxMp4ToTs(bytes: Uint8Array): Promise<Uint8Array> {
+  const access = ra(bytes);
+  const movie = await readMovie(access);
+  const muxTracks = await muxTracksFromMovie(access, movie);
+  const muxer = new MpegTsMuxer();
+
+  for (let i = 0; i < movie.tracks.length; i++) {
+    const track = movie.tracks[i];
+    const muxTrack = muxTracks[i];
+    if (track === undefined || muxTrack === undefined) {
+      throw new Error(`MP4→TS benchmark lost track ${i}`);
+    }
+
+    const samples = buildSamples(track);
+    if (samples.length !== muxTrack.samples.length) {
+      throw new Error(
+        `MP4→TS benchmark sample mismatch on track ${track.id}: timeline=${samples.length}, bytes=${muxTrack.samples.length}`,
+      );
+    }
+
+    const trackId = muxer.addTrack(trackInfoFromMp4Track(track));
+    for (let j = 0; j < samples.length; j++) {
+      const sample = samples[j];
+      const muxSample = muxTrack.samples[j];
+      if (sample === undefined || muxSample === undefined) {
+        throw new Error(`MP4→TS benchmark lost sample ${j} on track ${track.id}`);
+      }
+      muxer.addChunkStruct(trackId, {
+        timestampUs: sample.ptsUs,
+        durationUs: sample.durationUs,
+        key: sample.keyframe,
+        data: muxSample.data,
+        dtsUs: sample.dtsUs,
+      });
+    }
+  }
+
+  await muxer.finalize();
+  return streamBytes(muxer.output);
 }
 
 /** Probe each file once for its real container/size/duration (used to label + scale the metrics). */
@@ -254,6 +501,14 @@ async function benchMp4Ops(): Promise<FileResult[]> {
       ),
     );
 
+    const mkvOut = await muxMp4ToMkv(bytes);
+    ops.push(
+      await measure('remux (→mkv)', mkvOut.byteLength, dur, async () => {
+        const fresh = await muxMp4ToMkv(bytes);
+        return fresh.byteLength % 251;
+      }),
+    );
+
     // trim: keyframe-aligned stream-copy of the middle half (25%–75%). Skip when the file is too short
     // to carve a non-empty inner range (a degenerate 0-length trim is not representative work).
     const start = dur * 0.25;
@@ -307,6 +562,238 @@ async function benchMp4Ops(): Promise<FileResult[]> {
     );
 
     out.push({ id, container: info.container, sizeBytes: bytes.byteLength, durationSec: dur, ops });
+  }
+  return out;
+}
+
+async function benchMpegTsOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const file of TS_FILES) {
+    const bytes = new Uint8Array(await Bun.file(file.path).arrayBuffer());
+    const info = await probeInfo(file.id, bytes);
+    const dur = info.durationSec;
+    const ops: OpResult[] = [];
+
+    const remuxOut = await blobBytes(await engine.remux(source(file.id, bytes), { to: 'ts' }));
+    ops.push(
+      await measure(
+        'remux (ts→ts)',
+        remuxOut.byteLength,
+        dur,
+        async () =>
+          (await blobBytes(await engine.remux(source(file.id, bytes), { to: 'ts' }))).byteLength %
+          251,
+      ),
+    );
+
+    const start = dur * 0.25;
+    const end = dur * 0.75;
+    if (end - start > 0.001) {
+      const trimOut = await blobBytes(
+        await engine.trim(source(file.id, bytes), { mode: 'keyframe', start, end }),
+      );
+      ops.push(
+        await measure(
+          'trim (ts keyframe 25–75%)',
+          trimOut.byteLength,
+          end - start,
+          async () =>
+            (
+              await blobBytes(
+                await engine.trim(source(file.id, bytes), { mode: 'keyframe', start, end }),
+              )
+            ).byteLength % 251,
+        ),
+      );
+    }
+
+    out.push({
+      id: file.id,
+      container: info.container,
+      sizeBytes: bytes.byteLength,
+      durationSec: dur,
+      ops,
+    });
+  }
+  return out;
+}
+
+async function benchMp4ToTsOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const id of MP4_TO_TS_FILES) {
+    const bytes = new Uint8Array(await Bun.file(`${MEDIA_DIR}/${id}`).arrayBuffer());
+    const info = await probeInfo(id, bytes);
+    const remuxOut = await muxMp4ToTs(bytes);
+    const op = await measure('remux (→ts)', remuxOut.byteLength, info.durationSec, async () => {
+      const fresh = await muxMp4ToTs(bytes);
+      return fresh.byteLength % 251;
+    });
+    out.push({
+      id,
+      container: info.container,
+      sizeBytes: bytes.byteLength,
+      durationSec: info.durationSec,
+      ops: [op],
+    });
+  }
+  return out;
+}
+
+async function muxOggSource(id: string, bytes: Uint8Array): Promise<Uint8Array> {
+  const demuxed = await OggDriver.demux(source(id, bytes));
+  try {
+    const track = demuxed.tracks[0];
+    if (track === undefined) throw new Error(`Ogg fixture ${id} has no audio track`);
+    const packets = oggAudioPackets(bytes);
+    const muxer = new OggMuxer();
+    const trackId = muxer.addTrack(track);
+    for (const packet of packets) {
+      muxer.addChunkStruct(trackId, {
+        timestampUs: packet.ptsUs,
+        durationUs: packet.durationUs,
+        key: true,
+        data: bytes.slice(packet.offset, packet.offset + packet.size),
+      });
+    }
+    await muxer.finalize();
+    return streamBytes(muxer.output);
+  } finally {
+    await demuxed.close();
+  }
+}
+
+async function muxFlacSource(bytes: Uint8Array): Promise<Uint8Array> {
+  const info = parseFlac(bytes);
+  const frames = enumerateFlacFrames(bytes);
+  const muxer = new OggMuxer();
+  const trackId = muxer.addTrack({
+    id: 0,
+    mediaType: 'audio',
+    codec: 'flac',
+    durationSec: info.durationSec,
+    config: {
+      codec: 'flac',
+      sampleRate: info.sampleRate,
+      numberOfChannels: info.channels,
+      description: nativeFlacMetadata(bytes),
+    },
+  });
+  for (const frame of frames) {
+    muxer.addChunkStruct(trackId, {
+      timestampUs: frame.ptsUs,
+      durationUs: frame.durationUs,
+      key: true,
+      data: frame.data,
+    });
+  }
+  await muxer.finalize();
+  return streamBytes(muxer.output);
+}
+
+async function muxWebmVorbisSource(bytes: Uint8Array): Promise<Uint8Array> {
+  const { info, framesByIndex } = demuxWebm(bytes);
+  const trackIndex = info.tracks.findIndex((track) => track.codec === 'vorbis');
+  const track = info.tracks[trackIndex];
+  const frames = framesByIndex[trackIndex];
+  if (track === undefined || frames === undefined) {
+    throw new Error('WebM→Ogg benchmark needs a real Vorbis track');
+  }
+  const muxer = new OggMuxer();
+  const trackId = muxer.addTrack({
+    id: 0,
+    mediaType: track.mediaType,
+    codec: track.codec,
+    durationSec: info.durationSec,
+    config: {
+      codec: track.codec,
+      sampleRate: track.sampleRate ?? 0,
+      numberOfChannels: track.channels ?? 0,
+      ...(track.description !== undefined ? { description: track.description } : {}),
+    },
+  });
+  for (const frame of frames) {
+    muxer.addChunkStruct(trackId, {
+      timestampUs: frame.timestampUs,
+      durationUs: undefined,
+      key: true,
+      data: frame.data,
+    });
+  }
+  await muxer.finalize();
+  const out = await streamBytes(muxer.output);
+  const parsed = parseOgg(out);
+  if (parsed.codec !== 'vorbis' || Math.abs(parsed.durationSec - info.durationSec) > 1 / 44_100) {
+    throw new Error('WebM→Ogg benchmark lost declared Vorbis duration');
+  }
+  return out;
+}
+
+async function muxToOgg(
+  file: (typeof OGG_MUX_FILES)[number],
+  bytes: Uint8Array,
+): Promise<Uint8Array> {
+  if (file.kind === 'ogg') return muxOggSource(file.id, bytes);
+  if (file.kind === 'webm-vorbis') return muxWebmVorbisSource(bytes);
+  return muxFlacSource(bytes);
+}
+
+async function benchOggMuxOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const file of OGG_MUX_FILES) {
+    const bytes = new Uint8Array(await Bun.file(`${MEDIA_DIR}/${file.id}`).arrayBuffer());
+    const info = await probeInfo(file.id, bytes);
+    const muxOut = await muxToOgg(file, bytes);
+    const op = await measure('mux (→ogg)', muxOut.byteLength, info.durationSec, async () => {
+      const fresh = await muxToOgg(file, bytes);
+      return fresh.byteLength % 251;
+    });
+    out.push({
+      id: file.id,
+      container: info.container,
+      sizeBytes: bytes.byteLength,
+      durationSec: info.durationSec,
+      ops: [op],
+    });
+  }
+  return out;
+}
+
+function matrixBytes(cases: readonly CorruptCase[]): number {
+  return cases.reduce((sum, item) => sum + item.bytes.byteLength, 0);
+}
+
+async function runRobustnessCases(
+  file: RobustnessFile,
+  cases: readonly CorruptCase[],
+): Promise<number> {
+  const results = await runMatrix(cases, file.parse);
+  const failures = escapes(results);
+  if (failures.length > 0) {
+    const first = failures[0];
+    throw new Error(
+      `${file.id} fuzz robustness leaked ${first?.errorName ?? first?.outcome ?? 'unknown'} at ${first?.label ?? 'unknown case'}`,
+    );
+  }
+  return results.length;
+}
+
+async function benchRobustnessOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const file of ROBUSTNESS_FILES) {
+    const bytes = new Uint8Array(await Bun.file(file.path).arrayBuffer());
+    const cases = corruptMatrix(bytes, { family: file.family, ...ROBUSTNESS_MATRIX_OPTIONS });
+    const bytesParsed = matrixBytes(cases);
+    const op = await measure('fuzz robustness', bytesParsed, 0, async () => {
+      const count = await runRobustnessCases(file, cases);
+      return count + (bytesParsed % 251);
+    });
+    out.push({
+      id: file.id,
+      container: file.container,
+      sizeBytes: bytesParsed,
+      durationSec: 0,
+      ops: [op],
+    });
   }
   return out;
 }
@@ -432,21 +919,44 @@ function regressions(fresh: readonly OpAggregate[], base: Baseline): string[] {
 
 async function main(): Promise<void> {
   const check = process.argv.includes('--check');
-  if (PROBE_FILES.length < 5 || MP4_FILES.length < 5) {
+  if (
+    PROBE_FILES.length < 5 ||
+    MP4_FILES.length < 5 ||
+    MP4_TO_TS_FILES.length < 5 ||
+    TS_FILES.length < 2 ||
+    OGG_MUX_FILES.length < 5 ||
+    ROBUSTNESS_FILES.length < 5
+  ) {
     throw new Error(
-      `container benchmark needs ≥ 5 real files per op (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}.`,
+      `container benchmark needs real multi-file corpora (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}, mp4ToTs=${MP4_TO_TS_FILES.length}, ts=${TS_FILES.length}, oggMux=${OGG_MUX_FILES.length}, robustness=${ROBUSTNESS_FILES.length}.`,
     );
   }
   console.info(
-    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, demux/remux/trim/decrypt×${MP4_FILES.length} MP4 files:`,
+    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, MP4 demux/remux/remux-to-mkv/trim/decrypt×${MP4_FILES.length} files, MP4-to-TS remux×${MP4_TO_TS_FILES.length} files, remux/trim×${TS_FILES.length} TS files, Ogg mux×${OGG_MUX_FILES.length} audio files, fuzz robustness×${ROBUSTNESS_FILES.length} files:`,
   );
 
   const probeResults = await benchProbe();
   const mp4Results = await benchMp4Ops();
+  const mp4ToTsResults = await benchMp4ToTsOps();
+  const mpegTsResults = await benchMpegTsOps();
+  const oggMuxResults = await benchOggMuxOps();
+  const robustnessResults = await benchRobustnessOps();
   for (const r of probeResults) printFile(r);
   for (const r of mp4Results) printFile(r);
+  for (const r of mp4ToTsResults) printFile(r);
+  for (const r of mpegTsResults) printFile(r);
+  for (const r of oggMuxResults) printFile(r);
+  for (const r of robustnessResults) printFile(r);
 
-  const aggs = aggregate([...probeResults, ...mp4Results]);
+  const allResults = [
+    ...probeResults,
+    ...mp4Results,
+    ...mp4ToTsResults,
+    ...mpegTsResults,
+    ...oggMuxResults,
+    ...robustnessResults,
+  ];
+  const aggs = aggregate(allResults);
   printAggregates(aggs);
   console.info(`\n(checksum ${sink})`);
 
@@ -463,10 +973,7 @@ async function main(): Promise<void> {
   }
 
   await mkdir(dirname(BASELINE_PATH), { recursive: true });
-  await writeFile(
-    BASELINE_PATH,
-    `${JSON.stringify(buildBaseline([...probeResults, ...mp4Results], aggs), null, 2)}\n`,
-  );
+  await writeFile(BASELINE_PATH, `${JSON.stringify(buildBaseline(allResults, aggs), null, 2)}\n`);
   console.info(`\nbaseline written → ${BASELINE_PATH}`);
 }
 

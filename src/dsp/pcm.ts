@@ -4,7 +4,7 @@
  * math). Converts interleaved integer/float PCM ⇄ a canonical **planar Float64** working buffer
  * normalized to [-1, 1].
  *
- * Float64 (not Float32) is the canonical precision on purpose: every integer width (u8…s32) *and* f32
+ * Float64 (not Float32) is the canonical precision on purpose: every integer width (8-bit…s32) *and* f32
  * round-trips **bit-exact** through it (the `decoded-audio-pcm` sample-exact oracle, doc 11), because a
  * 32-bit mantissa needs 53 bits of headroom to survive `int → x/2^n → round(x*2^n)`. The browser
  * `AudioData` seam narrows to f32 only where the platform requires it. Little-endian by default;
@@ -14,7 +14,7 @@
 import { InputError } from '../contracts/errors.ts';
 
 /** Interleaved PCM sample encodings we read/write. Integers are two's-complement except `u8` (offset). */
-export type SampleFormat = 'u8' | 's16' | 's24' | 's32' | 'f32' | 'f64';
+export type SampleFormat = 'u8' | 's8' | 's16' | 's24' | 's32' | 'f32' | 'f64';
 export type Endianness = 'le' | 'be';
 
 /** Canonical de-interleaved audio: one `[-1,1]`-normalized Float64 channel per `channels`. */
@@ -27,6 +27,7 @@ export interface PcmAudio {
 
 const BYTES_PER_SAMPLE: Record<SampleFormat, number> = {
   u8: 1,
+  s8: 1,
   s16: 2,
   s24: 3,
   s32: 4,
@@ -62,6 +63,8 @@ function readSample(dv: DataView, off: number, format: SampleFormat, le: boolean
   switch (format) {
     case 'u8':
       return (dv.getUint8(off) - 128) / 128;
+    case 's8':
+      return dv.getInt8(off) / 128;
     case 's16':
       return dv.getInt16(off, le) / 32768;
     case 's24': {
@@ -97,6 +100,9 @@ function writeSample(
   switch (format) {
     case 'u8':
       dv.setUint8(off, clampInt(Math.round(x * 128) + 128, 0, 255));
+      return;
+    case 's8':
+      dv.setInt8(off, clampInt(Math.round(x * 128), -128, 127));
       return;
     case 's16':
       dv.setInt16(off, clampInt(Math.round(x * 32768), -32768, 32767), le);

@@ -1,7 +1,7 @@
 /**
  * The Ogg container driver — hand-written TS. An Ogg file is a sequence of **pages** (little-endian);
  * each logical stream opens with a BOS page whose first packet is the codec identification header
- * (Vorbis and Opus now; FLAC/Theora join with their fixtures, §6.1). Probe reads the head (for the ID
+ * (Vorbis, Opus, and FLAC now; Theora joins with its fixtures, §6.1). Probe reads the head (for the ID
  * header) and the tail (for the last page's `granule_position` → duration), mirroring the moov-at-tail
  * strategy (docs/architecture/09).
  */
@@ -34,6 +34,17 @@ function asciiAt(dv: DataView, offset: number, length: number): string {
   return out;
 }
 
+function concatBytes(parts: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array<ArrayBuffer> {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.byteLength;
+  }
+  return out;
+}
+
 interface PageHeader {
   headerType: number;
   granule: number; // -1 when no packet completes on the page
@@ -59,6 +70,7 @@ function parsePage(dv: DataView, at: number): PageHeader | undefined {
   let dataLen = 0;
   for (let i = 0; i < segCount; i++) dataLen += dv.getUint8(at + 27 + i);
   const dataStart = at + 27 + segCount;
+  if (dataStart + dataLen > dv.byteLength) return undefined;
   return {
     headerType: dv.getUint8(at + 5),
     granule: readGranule(dv, at + 6),
@@ -81,7 +93,7 @@ interface OggStream {
 /** Identify the first audio stream from its BOS page's identification packet. */
 function identifyStream(dv: DataView, page: PageHeader): OggStream | undefined {
   const d = page.dataStart;
-  if (dv.getUint8(d) === 0x01 && asciiAt(dv, d + 1, 6) === 'vorbis') {
+  if (d + 30 <= page.pageEnd && dv.getUint8(d) === 0x01 && asciiAt(dv, d + 1, 6) === 'vorbis') {
     const channels = dv.getUint8(d + 11);
     const sampleRate = dv.getUint32(d + 12, true);
     return {
@@ -93,7 +105,7 @@ function identifyStream(dv: DataView, page: PageHeader): OggStream | undefined {
       serial: page.serial,
     };
   }
-  if (asciiAt(dv, d, 8) === 'OpusHead') {
+  if (d + 19 <= page.pageEnd && asciiAt(dv, d, 8) === 'OpusHead') {
     // OpusHead is a fixed, unambiguous layout: magic(8) + version(1) + channel_count(1) + … Opus
     // always decodes at 48 kHz, so the granule clock is 48 kHz regardless of the input rate field.
     return {
@@ -105,7 +117,33 @@ function identifyStream(dv: DataView, page: PageHeader): OggStream | undefined {
       serial: page.serial,
     };
   }
-  // Ogg-FLAC and Theora are added with their fixtures (the corpus only grows, §6.1).
+  if (
+    d + 51 <= page.pageEnd &&
+    dv.getUint8(d) === 0x7f &&
+    asciiAt(dv, d + 1, 4) === 'FLAC' &&
+    asciiAt(dv, d + 9, 4) === 'fLaC'
+  ) {
+    const streamInfoHeader = d + 13;
+    const body = streamInfoHeader + 4;
+    const blockType = dv.getUint8(streamInfoHeader) & 0x7f;
+    const blockLength =
+      (dv.getUint8(streamInfoHeader + 1) << 16) |
+      (dv.getUint8(streamInfoHeader + 2) << 8) |
+      dv.getUint8(streamInfoHeader + 3);
+    if (blockType !== 0 || blockLength < 34 || body + 34 > page.pageEnd) return undefined;
+    const hi = dv.getUint32(body + 10);
+    const sampleRate = hi >>> 12;
+    if (sampleRate === 0) return undefined;
+    return {
+      codec: 'flac',
+      mediaType: 'audio',
+      channels: ((hi >>> 9) & 0x7) + 1,
+      sampleRate,
+      granuleRate: sampleRate,
+      serial: page.serial,
+    };
+  }
+  // Theora is added with its fixtures (the corpus only grows, §6.1).
   return undefined;
 }
 
@@ -234,12 +272,22 @@ export interface OggPacket {
 
 /**
  * The number of **codec header packets** that precede the audio for each Ogg-mapped codec — these carry
- * setup/metadata (not decodable audio) and must be skipped: Vorbis = 3 (id, comment, setup), Opus = 2
- * (OpusHead, OpusTags), FLAC-in-Ogg = 2 (the FLAC-mapping/STREAMINFO header + the metadata block packet).
+ * setup/metadata (not decodable audio) and must be skipped.
  */
-function headerPacketCount(codec: string): number {
+function headerPacketCount(codec: string, dv: DataView, raw: readonly RawPacket[]): number {
   if (codec === 'vorbis') return 3;
-  return 2; // opus / flac
+  if (codec === 'flac') {
+    const first = raw[0];
+    if (
+      first &&
+      first.size >= 9 &&
+      dv.getUint8(first.offset) === 0x7f &&
+      asciiAt(dv, first.offset + 1, 4) === 'FLAC'
+    ) {
+      return 1 + ((dv.getUint8(first.offset + 7) << 8) | dv.getUint8(first.offset + 8));
+    }
+  }
+  return 2; // opus, or a malformed FLAC stream that identifyStream should already have rejected.
 }
 
 /** The first recognized logical stream in an Ogg buffer, or `undefined` when none is complete. */
@@ -304,6 +352,23 @@ function codecPrivateDescription(data: Uint8Array): Uint8Array | undefined {
     const headers = raw.slice(0, 3).map((p) => packetBytes(data, p));
     return xiphLacedHeaders(headers);
   }
+  if (stream.codec === 'flac') {
+    const first = raw[0];
+    if (!first) return undefined;
+    const firstBytes = packetBytes(data, first);
+    if (
+      firstBytes.byteLength < 13 ||
+      firstBytes[0] !== 0x7f ||
+      String.fromCharCode(...firstBytes.slice(1, 5)) !== 'FLAC' ||
+      String.fromCharCode(...firstBytes.slice(9, 13)) !== 'fLaC'
+    ) {
+      return undefined;
+    }
+    const headerPackets = ((firstBytes[7] ?? 0) << 8) | (firstBytes[8] ?? 0);
+    const metadata: Uint8Array<ArrayBufferLike>[] = [firstBytes.slice(9)];
+    for (const packet of raw.slice(1, 1 + headerPackets)) metadata.push(packetBytes(data, packet));
+    return concatBytes(metadata);
+  }
   return undefined;
 }
 
@@ -331,7 +396,7 @@ export function oggAudioPackets(data: Uint8Array): OggPacket[] {
 
   const preSkip = stream.codec === 'opus' ? readOpusPreSkip(dv, stream.serial) : 0;
   const raw = delacePackets(dv, stream.serial);
-  const skip = headerPacketCount(stream.codec);
+  const skip = headerPacketCount(stream.codec, dv, raw);
   // Drop the codec header packets and any truncated trailing packet; keep audio packets in order.
   const audio = raw.slice(skip).filter((p) => p.complete);
   if (audio.length === 0) return [];
@@ -394,7 +459,11 @@ function readOpusPreSkip(dv: DataView, serial: number): number {
       at++;
       continue;
     }
-    if (page.serial === serial && asciiAt(dv, page.dataStart, 8) === 'OpusHead') {
+    if (
+      page.serial === serial &&
+      page.dataStart + 12 <= page.pageEnd &&
+      asciiAt(dv, page.dataStart, 8) === 'OpusHead'
+    ) {
       return dv.getUint16(page.dataStart + 10, true);
     }
     at = page.pageEnd > at ? page.pageEnd : at + 1;

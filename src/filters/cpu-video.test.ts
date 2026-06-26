@@ -96,8 +96,11 @@ describe('applyColorPlanToRgba — parity with the GPU colour math', () => {
   const planes = {
     identity: planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt709'),
     toSrgb: planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'srgb'),
+    fromSrgbTo709: planColorspace({ primaries: 'srgb', transfer: 'srgb' }, 'bt709'),
+    from601To709: planColorspace({ primaries: 'bt601', transfer: 'bt709' }, 'bt709'),
     to2020: planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020'),
     tonemapPq: planTonemap({ primaries: 'bt2020', transfer: 'pq' }),
+    tonemapHlg: planTonemap({ primaries: 'bt2020', transfer: 'hlg' }),
   } as const;
 
   const SAMPLES: ReadonlyArray<readonly [number, number, number, number]> = [
@@ -166,15 +169,18 @@ describe('colour apply — ground-truth invariants', () => {
     }
   });
 
-  it('a tonemap preserves black but compresses the HDR peak below SDR white (by design, not a fixed point)', () => {
-    // Under PQ, full code value is the 10000-nit peak — tone-mapping pulls it down well below SDR white.
+  it('a tonemap preserves black and maps normalized HDR transfer peaks to SDR white', () => {
     const tm = planTonemap({ primaries: 'bt2020', transfer: 'pq' });
     expect(at(applyColorPlanToRgba(tm, px(0, 0, 0)), 0, 0).slice(0, 3)).toEqual([0, 0, 0]);
     const peak = at(applyColorPlanToRgba(tm, px(255, 255, 255)), 0, 0).slice(0, 3);
-    for (const c of peak) {
-      expect(c).toBeGreaterThan(0);
-      expect(c).toBeLessThan(255); // compressed, never clipped to white
-    }
+    for (const c of peak) expect(c).toBeGreaterThanOrEqual(254);
+  });
+
+  it('HLG tonemap uses the 12x source peak and maps HLG code peak to SDR white', () => {
+    const tm = planTonemap({ primaries: 'bt2020', transfer: 'hlg' });
+    expect(tm.tonemap?.peak).toBe(12);
+    const peak = at(applyColorPlanToRgba(tm, px(255, 255, 255)), 0, 0).slice(0, 3);
+    for (const c of peak) expect(c).toBeGreaterThanOrEqual(254);
   });
 
   it('709→2020 shrinks a saturated primary toward the wider gamut (red gains green/blue, loses red)', () => {
@@ -483,9 +489,9 @@ const AUDIO: readonly FilterSpec[] = [
 ];
 
 describe('cpuVideoFilterDriver — identity & honest supports()', () => {
-  it('declares the wasm (CPU) substrate, ranked below the GPU substrates', () => {
+  it('declares the native CPU substrate, ranked below the GPU substrates', () => {
     expect(cpuVideoFilterDriver.kind).toBe('filter');
-    expect(cpuVideoFilterDriver.substrate).toBe('wasm');
+    expect(cpuVideoFilterDriver.substrate).toBe('native');
     expect(cpuVideoFilterDriver.apiVersion).toBe(1);
     expect(cpuVideoFilterDriver.id).toBe('cpu-video-filter');
   });

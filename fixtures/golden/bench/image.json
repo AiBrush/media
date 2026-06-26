@@ -1,0 +1,77 @@
+{
+  "generatedAt": "2026-06-26T04:25:00.995Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 500,
+  "batch": 4000,
+  "samples": 7,
+  "memoryIters": 10000,
+  "files": [
+    {
+      "id": "test.png",
+      "format": "png",
+      "width": 100,
+      "height": 100,
+      "frames": 1,
+      "bytes": 8090,
+      "wallUs": 0.31435425,
+      "probesPerSec": 3181124.479786738,
+      "mbps": 25735.297041474707,
+      "peakMemoryMb": 0.75
+    },
+    {
+      "id": "test.jpeg",
+      "format": "jpeg",
+      "width": 239,
+      "height": 178,
+      "frames": 1,
+      "bytes": 35588,
+      "wallUs": 0.10471875,
+      "probesPerSec": 9549388.242315726,
+      "mbps": 339843.62876753206,
+      "peakMemoryMb": 0.171875
+    },
+    {
+      "id": "test.webp",
+      "format": "webp",
+      "width": 274,
+      "height": 367,
+      "frames": 1,
+      "bytes": 10568,
+      "wallUs": 0.23533349999999997,
+      "probesPerSec": 4249288.775291236,
+      "mbps": 44906.483777277776,
+      "peakMemoryMb": 0.21875
+    },
+    {
+      "id": "anim2.gif",
+      "format": "gif",
+      "width": 480,
+      "height": 360,
+      "frames": 36,
+      "durationSec": 0.82,
+      "bytes": 308156,
+      "wallUs": 3.76848975,
+      "probesPerSec": 265358.29107668396,
+      "mbps": 81771.74954502661,
+      "peakMemoryMb": 0.484375
+    },
+    {
+      "id": "test.avif",
+      "format": "avif",
+      "width": 100,
+      "height": 100,
+      "frames": 1,
+      "bytes": 3676,
+      "wallUs": 1.644729,
+      "probesPerSec": 608002.8989578222,
+      "mbps": 2235.0186565689546,
+      "peakMemoryMb": 0.421875
+    }
+  ],
+  "aggregate": {
+    "files": 5,
+    "geomeanProbesPerSec": 1835363.7695131628,
+    "minProbesPerSec": 265358.29107668396,
+    "maxPeakMemoryMb": 0.75
+  }
+}

@@ -23,8 +23,9 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
+import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
+import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
 
 const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
@@ -482,19 +483,6 @@ async function decodeAacToPcm(bytes: Uint8Array, o: PcmTransform | undefined): P
 }
 
 /* v8 ignore stop */
-
-function applyPcmTransform(audio: PcmAudio, o: PcmTransform | undefined): PcmAudio {
-  throwIfAborted(o?.signal);
-  let result = audio;
-  if (o?.gainDb !== undefined && o.gainDb !== 0) result = gain(result, o.gainDb);
-  if (o?.channels !== undefined && o.channels !== result.channels)
-    result = remix(result, o.channels);
-  if (o?.sampleRate !== undefined && o.sampleRate !== result.sampleRate) {
-    result = resample(result, o.sampleRate);
-  }
-  throwIfAborted(o?.signal);
-  return result;
-}
 
 /**
  * Stream every ADTS frame of `bytes` as WebCodecs `EncodedAudioChunk`s. Browser-only: the `EncodedAudioChunk`

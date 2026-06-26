@@ -8,7 +8,11 @@
  * STREAMINFO packs `sampleRate:20 | channels-1:3 | bitsPerSample-1:5 | totalSamples:36` big-endian.
  */
 
-import { decodeFlac } from '../../codecs/flac/decode.ts';
+import {
+  type FlacFrameSpan,
+  decodeFlac,
+  enumerateFlacFrameSpans,
+} from '../../codecs/flac/decode.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -20,10 +24,12 @@ import {
   type Packet,
   type PcmTransform,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, type SampleFormat, gain, remix } from '../../dsp/index.ts';
+import type { PcmAudio, SampleFormat } from '../../dsp/index.ts';
+import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
 
 const FLAC_MIMES = new Set(['audio/flac', 'audio/x-flac']);
@@ -31,7 +37,7 @@ const FLAC_EXTENSIONS = new Set(['flac']);
 
 function ascii(bytes: Uint8Array, offset: number, length: number): string {
   let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
+  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] as number);
   return out;
 }
 
@@ -43,6 +49,8 @@ export interface FlacInfo {
   totalSamples: number;
   durationSec: number;
 }
+
+export type FlacFrame = FlacFrameSpan;
 
 /** Byte offset of the `fLaC` marker, skipping a (legal but rare) ID3v2 prefix. */
 function flacOffset(bytes: Uint8Array): number {
@@ -93,12 +101,32 @@ export function parseFlac(bytes: Uint8Array): FlacInfo {
   };
 }
 
-async function readHead(src: ByteSource, n: number): Promise<Uint8Array> {
-  if (src.range) return src.range(0, n);
-  const reader = src.stream().getReader();
-  const { value } = await reader.read();
-  await reader.cancel().catch(() => {});
-  return value ?? new Uint8Array(0);
+/** Return the native FLAC metadata prelude (`fLaC` + all metadata blocks), excluding audio frames. */
+export function nativeFlacMetadata(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const start = flacOffset(bytes);
+  if (bytes.byteLength < start + 8 || ascii(bytes, start, 4) !== 'fLaC') {
+    throw new InputError('unsupported-input', 'not a native FLAC stream (no fLaC marker)');
+  }
+  let at = start + 4;
+  for (;;) {
+    if (at + 4 > bytes.byteLength)
+      throw new MediaError('demux-error', 'FLAC: truncated metadata block');
+    const last = ((bytes[at] as number) & 0x80) !== 0;
+    const len =
+      ((bytes[at + 1] as number) << 16) |
+      ((bytes[at + 2] as number) << 8) |
+      (bytes[at + 3] as number);
+    const next = at + 4 + len;
+    if (next > bytes.byteLength)
+      throw new MediaError('demux-error', 'FLAC: truncated metadata block');
+    at = next;
+    if (last) return bytes.slice(start, at);
+  }
+}
+
+/** Enumerate native FLAC audio frames as byte-exact packet spans for container remuxing. */
+export function enumerateFlacFrames(bytes: Uint8Array): FlacFrame[] {
+  return enumerateFlacFrameSpans(bytes);
 }
 
 /** Read the whole source — FLAC decode needs every frame (bounded by file size). */
@@ -120,6 +148,43 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
     off += c.byteLength;
   }
   return out;
+}
+
+function packetStream(
+  frames: readonly FlacFrame[],
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
+  if (typeof EncodedAudioChunk === 'undefined') {
+    throw new CapabilityError(
+      'capability-miss',
+      'FLAC packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
+      { op: 'demux', tried: ['flac'] },
+    );
+  }
+  /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
+  let i = 0;
+  return new ReadableStream<Packet>({
+    pull(controller): void {
+      if (signal?.aborted) {
+        controller.error(new MediaError('aborted', 'operation aborted'));
+        return;
+      }
+      const frame = frames[i];
+      if (frame === undefined) {
+        controller.close();
+        return;
+      }
+      i++;
+      const chunk = new EncodedAudioChunk({
+        type: 'key',
+        timestamp: frame.ptsUs,
+        duration: frame.durationUs,
+        data: frame.data,
+      });
+      controller.enqueue({ chunk, sizeBytes: frame.size });
+    },
+  });
+  /* v8 ignore stop */
 }
 
 // FLAC bit depth → the WAV sample format that stores it (non-byte-aligned depths use the next wider).
@@ -170,24 +235,29 @@ export const FlacDriver: ContainerDriver = {
   kind: 'container',
   formats: ['flac'],
   supports: matches,
-  async demux(src: ByteSource): Promise<Demuxer> {
-    const head = await readHead(src, 65536);
-    const info = parseFlac(head);
+  async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+    const bytes = await readAll(src);
+    const info = parseFlac(bytes);
+    const metadata = nativeFlacMetadata(bytes);
+    const frames = enumerateFlacFrames(bytes);
     const track: TrackInfo = {
       id: 0,
       mediaType: 'audio',
       codec: info.codec,
       durationSec: info.durationSec,
-      config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+      config: {
+        codec: info.codec,
+        sampleRate: info.sampleRate,
+        numberOfChannels: info.channels,
+        description: metadata,
+      },
     };
+    const signal = o?.signal;
     return {
       tracks: [track],
-      packets(): ReadableStream<Packet> {
-        throw new CapabilityError(
-          'capability-miss',
-          'FLAC flows through the pure-TS decodePcm path (decode → PCM), not the WebCodecs chunk seam',
-          { op: 'demux', tried: ['flac'] },
-        );
+      packets(trackId: number): ReadableStream<Packet> {
+        if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
+        return packetStream(frames, signal);
       },
       close: () => Promise.resolve(),
     };
@@ -195,17 +265,7 @@ export const FlacDriver: ContainerDriver = {
   async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const { audio, format } = flacToPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate) {
-      throw new CapabilityError(
-        'capability-miss',
-        `audio resample ${audio.sampleRate}→${o.sampleRate} Hz needs the WASM/WebAudio tail`,
-        { op: 'convert', tried: ['flac'] },
-      );
-    }
-    let result: PcmAudio = audio;
-    if (o?.gainDb !== undefined && o.gainDb !== 0) result = gain(result, o.gainDb);
-    if (o?.channels !== undefined && o.channels !== result.channels)
-      result = remix(result, o.channels);
+    const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
     const out = writeWav(result, format);
     return new ReadableStream<Uint8Array>({
       start(c): void {

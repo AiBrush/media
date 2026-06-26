@@ -37,9 +37,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type AacDecodeConfig,
   type AacWasmCore,
@@ -66,10 +68,24 @@ export function unsupported(reason: string): CodecSupport {
   return { supported: false, reason };
 }
 
+/** True when this runtime can carry the public audio codec stream (`EncodedAudioChunk` → `AudioData`). */
+function hasWebCodecsAudioSeam(): boolean {
+  return typeof EncodedAudioChunk !== 'undefined' && typeof AudioData !== 'undefined';
+}
+
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
 let corePromise: Promise<AacWasmCore | null> | undefined;
+let coreGluePromise: Promise<boolean> | undefined;
+
+async function hasAacCoreGlue(): Promise<boolean> {
+  coreGluePromise ??= import('./aac-core.js').then(
+    () => true,
+    () => false,
+  );
+  return coreGluePromise;
+}
 
 /**
  * Load the vendored Symphonia-AAC wasm core, lazily and at most once. Resolves to an {@link AacWasmCore}
@@ -77,12 +93,15 @@ let corePromise: Promise<AacWasmCore | null> | undefined;
  * honest about absence rather than fabricating support. The wasm bytes are addressed via
  * `new URL('./aac_wasm_bg.wasm', import.meta.url)` so they ship same-origin.
  */
-export async function loadAacCore(): Promise<AacWasmCore | null> {
+export async function loadAacCore(runtime?: WasmRuntimeProfile): Promise<AacWasmCore | null> {
   corePromise ??= (async (): Promise<AacWasmCore | null> => {
     try {
+      const profile = runtime ?? resolveWasmRuntimeProfile();
       // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
       const mod = await import('./aac-core.js');
-      await mod.default({ module_or_path: new URL('./aac_wasm_bg.wasm', import.meta.url) });
+      await mod.default(
+        wasmInitForProfile(new URL('./aac_wasm_bg.wasm', import.meta.url), profile),
+      );
       return {
         createDecoder(extraData: Uint8Array, channels: number, sampleRate: number): AacWasmDecoder {
           return new mod.AacWasm(extraData, channels, sampleRate);
@@ -98,6 +117,7 @@ export async function loadAacCore(): Promise<AacWasmCore | null> {
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetAacCoreForTest(): void {
   corePromise = undefined;
+  coreGluePromise = undefined;
 }
 
 /** The {@link CapabilityError} a coder throws when the vendored AAC wasm core is unavailable. */
@@ -112,9 +132,10 @@ function coreMissing(): CapabilityError {
 // ============ supports() ============
 
 /**
- * Honest capability probe: an AAC **decode** query whose vendored wasm core loads. Non-AAC, `encode` (no
- * pure-Rust AAC encoder), or core-absent → `{ supported:false }` with a reason; never throws. Being
- * `tier:'wasm'`, the router only calls this after WebCodecs AAC has already missed.
+ * Honest capability probe: an AAC **decode** query in a runtime that can carry WebCodecs-shaped audio
+ * frames and whose vendored wasm core loads. Non-AAC, `encode` (no pure-Rust AAC encoder), missing
+ * `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
+ * Being `tier:'wasm'`, the router only calls this after WebCodecs AAC has already missed.
  */
 async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.mediaType !== 'audio') return unsupported('wasm-aac handles audio only');
@@ -122,8 +143,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported(`wasm-aac handles AAC only, not '${q.config.codec}'`);
   }
   if (q.direction === 'encode') return unsupported('wasm-aac decodes only (no AAC encoder)');
-  const core = await loadAacCore();
-  if (core === null) return unsupported('wasm-aac core failed to load (see BUILD.md)');
+  if (!hasWebCodecsAudioSeam()) {
+    return unsupported('wasm-aac requires WebCodecs AudioData/EncodedAudioChunk');
+  }
+  if (!(await hasAacCoreGlue())) {
+    return unsupported('wasm-aac core glue is not vendored (see BUILD.md)');
+  }
   return { supported: true, hardwareAccelerated: false };
 }
 
@@ -213,7 +238,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadAacCore();
+      const core = await loadAacCore(o?.wasmRuntime);
       if (core === null) {
         controller.error(coreMissing());
         return;

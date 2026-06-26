@@ -21,7 +21,7 @@ import {
 // CoreAudio ASBD format flags (kAudioFormatFlag*): bit 0 = IsFloat, bit 1 = IsLittleEndian (CAF stores
 // the canonical flags, where 0x2 means little-endian PCM). CoreAudio canonicalizes integer PCM to
 // **signed** two's-complement at every depth (it omits IsSignedInteger in the file but `afinfo` reports
-// "signed integer"), so 8-bit CAF PCM is signed — not the dsp's offset-binary `u8`.
+// "signed integer"), so 8-bit CAF PCM is signed (`s8`) rather than WAV-style offset-binary `u8`.
 const FLAG_FLOAT = 0x1;
 const FLAG_LITTLE_ENDIAN = 0x2;
 
@@ -64,16 +64,7 @@ function formatFromAsbd(asbd: CafAsbd): { format: SampleFormat; endian: Endianne
     if (bits === 64) return { format: 'f64', endian };
     throw new InputError('unsupported-input', `unsupported CAF float depth ${bits}-bit`);
   }
-  // CAF integer PCM is signed two's-complement (CoreAudio canonicalizes it so at every depth). The dsp's
-  // only 8-bit format is offset-binary `u8`, which cannot represent signed 8-bit exactly, so it is an
-  // honest miss rather than a 128-off corruption.
-  if (bits === 8) {
-    throw new CapabilityError(
-      'capability-miss',
-      'CAF signed 8-bit PCM is not yet supported (the dsp PCM core is offset-binary u8 only)',
-      { op: 'demux', tried: ['caf'] },
-    );
-  }
+  if (bits === 8) return { format: 's8', endian };
   if (bits === 16) return { format: 's16', endian };
   if (bits === 24) return { format: 's24', endian };
   if (bits === 32) return { format: 's32', endian };
@@ -166,7 +157,7 @@ export interface CafInfo {
 export function cafCodec(format: SampleFormat, endian: Endianness): string {
   if (format === 'f32') return 'pcm-f32';
   if (format === 'f64') return 'pcm-f64';
-  if (format === 'u8') return 'pcm-u8';
+  if (format === 's8') return 'pcm-s8';
   return endian === 'be' ? `pcm-${format}be` : `pcm-${format}`;
 }
 
@@ -216,6 +207,12 @@ export function writeCaf(
   format: SampleFormat,
   endian: Endianness = 'le',
 ): Uint8Array<ArrayBuffer> {
+  if (format === 'u8') {
+    throw new CapabilityError('capability-miss', 'CAF 8-bit PCM is signed; use pcm-s8', {
+      op: { op: 'pcm-write', container: 'caf', sampleFormat: format },
+      tried: ['caf'],
+    });
+  }
   const data = encodePcm(audio, format, endian);
   const bytesPer = bytesPerSample(format);
   const isFloat = format === 'f32' || format === 'f64';

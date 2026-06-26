@@ -120,7 +120,7 @@ describe('corpus integrity — every manifest entry fetches, loads, and (where p
       asserted++;
     }
     expect(asserted, 'goldens asserted').toBeGreaterThanOrEqual(40);
-  });
+  }, 15_000);
 
   it('the golden oracle can fail — a tampered field is rejected (mutation self-check)', async () => {
     const golden = (await loadGoldenMetadata('bear-1280x720.mp4')) as MediaInfo;

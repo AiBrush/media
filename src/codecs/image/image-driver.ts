@@ -36,7 +36,7 @@ export interface ImageOps {
   readonly formats: readonly ImageFormat[];
   /** Format from magic bytes, or `undefined` if the bytes are not a supported image. */
   sniff(bytes: Uint8Array): ImageFormat | undefined;
-  /** Pure, bit-exact header probe (dimensions/frame count/animated/bit depth/colour/loop). */
+  /** Pure, bit-exact header probe (dimensions/frame count/animated/duration/bit depth/colour/loop). */
   probe(bytes: Uint8Array): ImageInfo;
   /** Whether the live decode path is available here (a real WebCodecs `ImageDecoder`). */
   canDecode(): boolean;

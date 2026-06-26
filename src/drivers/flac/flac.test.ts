@@ -3,9 +3,14 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
-import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
+import {
+  fixtureSource,
+  fixturesByContainer,
+  loadFixture,
+  loadGoldenMetadata,
+} from '../../test-support/corpus.ts';
 import { readWavPcm } from '../wav/pcm.ts';
-import { FlacDriver, parseFlac } from './flac-driver.ts';
+import { FlacDriver, enumerateFlacFrames, parseFlac } from './flac-driver.ts';
 
 /** Build a minimal native-FLAC header (fLaC + STREAMINFO), optionally with an ID3v2 prefix. */
 function buildFlac(
@@ -81,14 +86,53 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     });
   });
 
-  it('the WebCodecs chunk seam is a typed gap; FLAC decodes via the pure-TS decodePcm path', async () => {
+  it('the FLAC packet seam is browser-gated; pure frame enumeration is Node-validated', async () => {
     const demuxed = await FlacDriver.demux(await fixtureSource('sfx.flac'));
-    expect(() => demuxed.packets(0)).toThrowError(/decodePcm/);
+    if (typeof EncodedAudioChunk === 'undefined') {
+      expect(() => demuxed.packets(0)).toThrowError(/EncodedAudioChunk/);
+      await demuxed.close();
+      return;
+    }
+    const reader = demuxed.packets(0).getReader();
+    const first = await reader.read();
+    await reader.cancel().catch(() => {});
+    expect(first.value?.chunk.byteLength).toBeGreaterThan(0);
     await demuxed.close();
   });
 
   it('createMuxer is a typed not-yet-implemented error', () => {
     expect(() => FlacDriver.createMuxer()).toThrowError(MediaError);
+  });
+});
+
+describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
+  it('enumerates byte-exact native FLAC frames across the real corpus', async () => {
+    const entries = (await fixturesByContainer('flac')).slice(0, 5);
+    expect(entries.length).toBeGreaterThanOrEqual(5);
+
+    for (const entry of entries) {
+      const bytes = await loadFixture(entry.id);
+      const info = parseFlac(bytes);
+      const frames = enumerateFlacFrames(bytes);
+      expect(frames.length, `${entry.id}: frame count`).toBeGreaterThan(0);
+      expect(
+        frames.reduce((sum, f) => sum + f.samples, 0),
+        `${entry.id}: samples`,
+      ).toBe(info.totalSamples);
+      expect(
+        frames.reduce((sum, f) => sum + f.durationUs, 0) / 1_000_000,
+        `${entry.id}: duration`,
+      ).toBeCloseTo(info.durationSec, 3);
+
+      for (const frame of frames) {
+        expect(frame.data[0], `${entry.id}: frame sync byte`).toBe(0xff);
+        expect((frame.data[1] ?? 0) & 0xfc, `${entry.id}: frame sync bits`).toBe(0xf8);
+        expect(
+          bytes.subarray(frame.offset, frame.offset + frame.size),
+          `${entry.id}: byte span`,
+        ).toEqual(frame.data);
+      }
+    }
   });
 });
 

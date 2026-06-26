@@ -47,8 +47,9 @@ From strongest to weakest. **Gate on the strongest one the operation admits.**
    - trim additivity: `trim(a,b)+trim(b,c) ≈ trim(a,c)`,
    - probe duration consistent across containers,
    - double-remux is stable.
-5. **Robustness / fuzz** — garbled/truncated/zeroed/bitflipped/empty inputs must reject cleanly (no crash, **no wrong output**).
+5. **Robustness / fuzz** — garbled/truncated/zeroed/bitflipped/empty inputs must reject cleanly (no raw host exception/hang, **no wrong output**). The pure parser battery (`src/test-support/fuzz/parser-robustness.test.ts`, ADR-073) treats a correct parse or a typed `MediaError` subclass as acceptable and fails on `RangeError`/`TypeError`/bare `Error` escapes.
 6. **Performance** — multi-sample (`n>1`) wall/throughput/peakMemory/longtasks, re-measured fresh. **The benchmark's perf margins were cached single-sample [data: Finding 7]; we do not trust or reuse them — we re-measure.** The concrete harnesses (warmup + median + separate RSS pass + checksum sink + a `--check` regression gate) and the committed pure-TS baseline numbers are in [`14-benchmarks.md`](14-benchmarks.md); the WebCodecs/GPU tier is measured on the browser/target runtime (ADR-025).
+7. **Routing/runtime unit gates** — pure router decisions that do not require media decode are Node-tested directly: cost buckets are seeded from committed telemetry baselines and keep tiny/normal cache entries separate, while WASM runtime profile tests prove `SharedArrayBuffer` is used only when cross-origin isolation is available and missing isolation surfaces as a typed capability miss for threaded-only cores.
 
 ## 5. Anti-cheat self-checks (lessons from the 3 SUSPECT findings)
 

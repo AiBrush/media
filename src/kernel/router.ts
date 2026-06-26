@@ -22,21 +22,18 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import type { RegistryView } from './registry.ts';
+import {
+  type RouteCost,
+  TINY_AUDIO_FRAMES,
+  TINY_INPUT_BYTES,
+  TINY_MEDIA_SECONDS,
+  TINY_VIDEO_PIXELS,
+} from './tier-thresholds.ts';
 
-/** Codec/encoder tier ranking, best-first (ADR-002). */
-const TIER_RANK: Record<Tier, number> = { hardware: 0, gpu: 1, native: 2, wasm: 3 };
-
-/** Video-filter substrate ranking, best-first: WebGPU → WebGL → Canvas2D → WASM (doc 04 §2). */
-const SUBSTRATE_RANK: Record<FilterSubstrate, number> = {
-  webgpu: 0,
-  webgl: 1,
-  canvas2d: 2,
-  wasm: 3,
-};
-
-/** Per-selection options. Only `determinism` influences the ladder today (ADR-020 deferred). */
+/** Per-selection options. Cost is an internal ADR-020 re-ranking input, never a public backend knob. */
 export interface StageSelectOptions {
   determinism?: Determinism;
+  cost?: RouteCost;
 }
 
 /** Hook the router calls before probing a driver, to lazily import its module (no-op by default). */
@@ -62,7 +59,8 @@ export class Router {
   /** Select a codec driver (async: `supports()` wraps `isConfigSupported`). */
   async pickCodec(q: CodecQuery, opts: StageSelectOptions = {}): Promise<CodecDriver> {
     const determinism: Determinism = opts.determinism ?? 'auto';
-    const key = `codec|${q.mediaType}|${q.direction}|${q.config.codec}|${determinism}`;
+    const tiny = opts.cost !== undefined && isTinyCost(opts.cost);
+    const key = `codec|${q.mediaType}|${q.direction}|${q.config.codec}|${determinism}|${tiny ? 1 : 0}`;
     const cached = this.#codecCache.get(key);
     if (cached) return cached;
 
@@ -70,7 +68,7 @@ export class Router {
       .codecs()
       .filter((d) => (determinism === 'force-software' ? isSoftwareTier(d.tier) : true))
       .slice()
-      .sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier]);
+      .sort((a, b) => codecTierRank(a.tier, tiny) - codecTierRank(b.tier, tiny));
 
     for (const d of candidates) {
       await this.#ensureLoaded(d);
@@ -112,7 +110,8 @@ export class Router {
   /** Select a filter driver (sync). `force-software` drops the GPU substrates. */
   pickFilter(spec: FilterSpec, opts: StageSelectOptions = {}): FilterDriver {
     const determinism: Determinism = opts.determinism ?? 'auto';
-    const key = `filter|${spec.mediaType}|${spec.type}|${determinism}`;
+    const tiny = opts.cost === undefined ? isTinyFilterSpec(spec) : isTinyCost(opts.cost);
+    const key = `filter|${spec.mediaType}|${spec.type}|${determinism}|${tiny ? 1 : 0}`;
     const cached = this.#filterCache.get(key);
     if (cached) return cached;
 
@@ -120,7 +119,7 @@ export class Router {
       .filters()
       .filter((d) => (determinism === 'force-software' ? isSoftwareSubstrate(d.substrate) : true))
       .slice()
-      .sort((a, b) => SUBSTRATE_RANK[a.substrate] - SUBSTRATE_RANK[b.substrate]);
+      .sort((a, b) => filterRank(a.substrate, tiny) - filterRank(b.substrate, tiny));
 
     for (const d of candidates) {
       if (d.supports(spec)) {
@@ -152,6 +151,56 @@ function isSoftwareTier(tier: Tier): boolean {
 
 function isSoftwareSubstrate(substrate: FilterSubstrate): boolean {
   return substrate !== 'webgpu' && substrate !== 'webgl';
+}
+
+function isTinyFilterSpec(spec: FilterSpec): boolean {
+  switch (spec.type) {
+    case 'resize':
+    case 'crop':
+      return within(spec.width * spec.height, TINY_VIDEO_PIXELS);
+    case 'rotate':
+    case 'flip':
+    case 'colorspace':
+    case 'tonemap':
+    case 'resample':
+    case 'remix':
+    case 'gain':
+      return false;
+    default:
+      return spec;
+  }
+}
+
+function isTinyCost(cost: RouteCost | undefined): boolean {
+  if (cost === undefined) return false;
+  return (
+    within(cost.inputBytes, TINY_INPUT_BYTES) ||
+    within(cost.outputPixels, TINY_VIDEO_PIXELS) ||
+    within(cost.mediaSeconds, TINY_MEDIA_SECONDS) ||
+    within(cost.audioFrames, TINY_AUDIO_FRAMES)
+  );
+}
+
+function codecTierRank(tier: Tier, tiny: boolean): number {
+  if (tier === 'hardware') return 0;
+  if (tier === 'wasm') return 3;
+  return tier === (tiny ? 'native' : 'gpu') ? 1 : 2;
+}
+
+function filterRank(substrate: FilterSubstrate, tiny: boolean): number {
+  if (substrate === 'wasm') return 4;
+  if (tiny) {
+    if (substrate === 'native') return 0;
+    if (substrate === 'canvas2d') return 1;
+    return substrate === 'webgpu' ? 2 : 3;
+  }
+  if (substrate === 'webgpu') return 0;
+  if (substrate === 'webgl') return 1;
+  return substrate === 'canvas2d' ? 2 : 3;
+}
+
+function within(value: number | undefined, threshold: number): boolean {
+  return value !== undefined && Number.isFinite(value) && value > 0 && value <= threshold;
 }
 
 /**

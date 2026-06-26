@@ -4,6 +4,8 @@
  * the format requires.
  */
 
+import { MediaError } from '../../contracts/errors.ts';
+
 /** Sequential big-endian reader over a byte range. */
 export class Reader {
   readonly #u8: Uint8Array;
@@ -23,23 +25,33 @@ export class Reader {
     return this.length - this.pos;
   }
   seek(p: number): void {
+    if (!Number.isFinite(p) || p < 0 || p > this.length) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: seek ${p} outside [0, ${this.length}]`,
+      );
+    }
     this.pos = p;
   }
   skip(n: number): void {
+    this.#need(n);
     this.pos += n;
   }
 
   u8(): number {
+    this.#need(1);
     const v = this.#view.getUint8(this.pos);
     this.pos += 1;
     return v;
   }
   u16(): number {
+    this.#need(2);
     const v = this.#view.getUint16(this.pos);
     this.pos += 2;
     return v;
   }
   i16(): number {
+    this.#need(2);
     const v = this.#view.getInt16(this.pos);
     this.pos += 2;
     return v;
@@ -51,11 +63,13 @@ export class Reader {
     return (hi << 16) | (mid << 8) | lo;
   }
   u32(): number {
+    this.#need(4);
     const v = this.#view.getUint32(this.pos);
     this.pos += 4;
     return v;
   }
   i32(): number {
+    this.#need(4);
     const v = this.#view.getInt32(this.pos);
     this.pos += 4;
     return v;
@@ -75,13 +89,35 @@ export class Reader {
   }
   /** A subarray view of `n` bytes (no copy), advancing the cursor. */
   bytes(n: number): Uint8Array {
+    this.#need(n);
     const b = this.#u8.subarray(this.pos, this.pos + n);
     this.pos += n;
     return b;
   }
   /** A subarray view of `[start, end)` (no copy), without moving the cursor. */
   bytesAt(start: number, end: number): Uint8Array {
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 0 ||
+      end < start ||
+      end > this.length
+    ) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: byte range [${start}, ${end}) outside length ${this.length}`,
+      );
+    }
     return this.#u8.subarray(start, end);
+  }
+
+  #need(n: number): void {
+    if (!Number.isFinite(n) || n < 0 || this.pos + n > this.length) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: need ${n} bytes at ${this.pos}, length ${this.length}`,
+      );
+    }
   }
 }
 

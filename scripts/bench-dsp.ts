@@ -5,7 +5,8 @@
  * peakMemory … measured across several real §6.1 corpus files, not one"; doc 09 §audio-dsp).
  *
  * It runs the real kernels — **resample** (up & down), **gain**, **remix** (both BS.775 directions),
- * and **format-convert** (decode/encode/convert PCM) — on **every real WAV in the corpus** (≥ 5 files,
+ * **dynamics** (RMS normalize + limiter), **biquad/EQ**, and **format-convert** (decode/encode/convert
+ * PCM, including signed and unsigned 8-bit conversion) — on **every real WAV in the corpus** (≥ 5 files,
  * never one), and records, per op × file:
  *
  *   - **wall**              — median ms per op over {@link ITERS} timed iterations (warmup discarded),
@@ -25,6 +26,8 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { readWavPcm } from '../src/drivers/wav/pcm.ts';
+import { biquad } from '../src/dsp/biquad.ts';
+import { limit, normalizeRms } from '../src/dsp/dynamics.ts';
 import { gain } from '../src/dsp/gain.ts';
 import { remix } from '../src/dsp/mix.ts';
 import { decodePcm, encodePcm } from '../src/dsp/pcm.ts';
@@ -123,12 +126,17 @@ function resampleTarget(sampleRate: number): number {
   return sampleRate === 48000 ? 44100 : 48000;
 }
 
+function eqFrequency(sampleRate: number): number {
+  return Math.min(1000, sampleRate / 4);
+}
+
 function benchFile(id: string, bytes: Uint8Array): FileResult {
   const audio = readWavPcm(bytes); // WavPcm: PcmAudio + the source `format` (for the report)
   const { frames, channels, sampleRate } = audio;
   const samples = frames * channels;
   const audioSeconds = sampleRate > 0 ? frames / sampleRate : 0;
   const s16 = encodePcm(audio, 's16'); // canonical interleaved s16 bytes to decode from
+  const s8 = encodePcm(audio, 's8'); // AIFF/CAF-style signed 8-bit bytes to decode from
   const stereo = remix(audio, channels === 1 ? 2 : channels); // a 2ch buffer to exercise the downmix
   const target = resampleTarget(sampleRate);
   // Resample output buffer is longer/shorter than the input; report against input samples (the work unit).
@@ -140,9 +148,30 @@ function benchFile(id: string, bytes: Uint8Array): FileResult {
       audioSeconds,
       () => decodePcm(s16, 's16', channels, sampleRate).frames,
     ),
+    measure(
+      'decode s8 → planar',
+      samples,
+      audioSeconds,
+      () => decodePcm(s8, 's8', channels, sampleRate).frames,
+    ),
     measure('encode planar → s16', samples, audioSeconds, () => encodePcm(audio, 's16')[0] ?? 0),
+    measure('convert → s8', samples, audioSeconds, () => encodePcm(audio, 's8')[0] ?? 0),
     measure('convert → f32', samples, audioSeconds, () => encodePcm(audio, 'f32')[0] ?? 0),
     measure('gain (-6 dB)', samples, audioSeconds, () => gain(audio, -6).planar.length),
+    measure(
+      'dynamics rms→limit',
+      samples,
+      audioSeconds,
+      () => limit(normalizeRms(audio, -14), -1, 'soft').frames,
+    ),
+    measure(
+      'biquad highpass',
+      samples,
+      audioSeconds,
+      () =>
+        biquad(audio, { type: 'highpass', frequency: eqFrequency(sampleRate), q: Math.SQRT1_2 })
+          .frames,
+    ),
     measure('remix mono → stereo', samples, audioSeconds, () => remix(audio, 2).channels),
     measure(
       'remix stereo → mono',

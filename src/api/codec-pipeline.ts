@@ -20,22 +20,30 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
-import type { AudioCodec, AudioTarget, Container, VideoCodec, VideoTarget } from './types.ts';
+import type {
+  AudioCodec,
+  AudioTarget,
+  Container,
+  PcmCodec,
+  VideoCodec,
+  VideoTarget,
+} from './types.ts';
 
 // ============ container choice ============
 
 /**
  * Container tokens with a working EncodedChunk-seam `Muxer` (`createMuxer` returns a real muxer, not a
- * typed mux miss): MP4/MOV (`writeMp4`), WebM/MKV (`ebml-write`), and Ogg (`ogg-write`). The raw-PCM
- * containers (WAV/AIFF/CAF) go through the audio-dsp `transformPcm` path instead (ADR-022), and the
- * elementary-stream containers (MP3/ADTS/FLAC) plus MPEG-TS expose a typed mux miss for now — so a
- * codec-seam convert/encode/remux targeting any of those surfaces an honest miss rather than pretend.
- * This mirrors the registered muxers' own truth; an illegal codec-in-container is still rejected by the
- * muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this set never over-claims.
+ * typed mux miss): MP4/MOV (`writeMp4`), WebM/MKV (`ebml-write`), Ogg (`ogg-write`), and MPEG-TS
+ * (`ts-write`, H.264/AAC only). The raw-PCM containers (WAV/AIFF/CAF) go through the audio-dsp
+ * `transformPcm` path instead (ADR-022), and the elementary-stream containers (MP3/ADTS/FLAC) expose a
+ * typed mux miss for now — so a codec-seam convert/encode/remux targeting any of those surfaces an honest
+ * miss rather than pretend. This mirrors the registered muxers' own truth; an illegal codec-in-container
+ * is still rejected by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this
+ * set never over-claims.
  */
-const CODEC_MUX_CONTAINERS = new Set<Container>(['mp4', 'mov', 'webm', 'mkv', 'ogg']);
+const CODEC_MUX_CONTAINERS = new Set<Container>(['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts']);
 
-/** True when {@link container} has a working EncodedChunk-seam muxer (MP4/MOV, WebM/MKV, Ogg). */
+/** True when {@link container} has a working EncodedChunk-seam muxer. */
 export function containerHasChunkMuxer(container: Container): boolean {
   return CODEC_MUX_CONTAINERS.has(container);
 }
@@ -255,14 +263,20 @@ export function h264CodecStringForDimensions(
   return `avc1.42E0${idc.toString(16).toUpperCase().padStart(2, '0')}`;
 }
 
-/** Default WebCodecs codec strings for each public {@link AudioCodec} token (AAC-LC, Opus, …). */
-const AUDIO_CODEC_STRING: Record<Exclude<AudioCodec, 'pcm'>, string> = {
+type EncodedAudioCodec = Exclude<AudioCodec, PcmCodec>;
+
+/** Default WebCodecs codec strings for each encoded public audio token (AAC-LC, Opus, …). */
+const AUDIO_CODEC_STRING: Record<EncodedAudioCodec, string> = {
   aac: 'mp4a.40.2',
   opus: 'opus',
   mp3: 'mp3',
   flac: 'flac',
   vorbis: 'vorbis',
 };
+
+function isPcmCodecToken(token: AudioCodec): token is PcmCodec {
+  return token === 'pcm' || token.startsWith('pcm-');
+}
 
 // ── decoder codec-string normalization (demux token → valid WebCodecs string) ────────────────────
 
@@ -310,6 +324,61 @@ function avcCodecStringFromDescription(description: AllowSharedBufferSource): st
   return `avc1.${hex2(profile)}${hex2(compat)}${hex2(level)}`;
 }
 
+/** Reverse the 32 bits of `x` — HEVC stores profile compatibility flags in reverse bit order. */
+function reverseBits32(x: number): number {
+  let out = 0;
+  for (let i = 0; i < 32; i++) out = (out << 1) | ((x >>> i) & 1);
+  return out >>> 0;
+}
+
+/**
+ * Derive a WebCodecs HEVC codec string from an HEVCDecoderConfigurationRecord (`hvcC`). Matroska/WebM
+ * HEVC tracks surface the `hvcC` bytes as `description` but only a bare `hevc` token as `codec`; this
+ * expands that pair into an exact RFC-6381 string. `prefix` is the sample-entry style to use when known;
+ * bare Matroska defaults to `hev1`, the engine's HEVC encode token. Returns `undefined` for a truncated
+ * record so the caller can preserve the typed capability miss instead of throwing a raw RangeError.
+ */
+function hevcCodecStringFromDescription(
+  description: AllowSharedBufferSource,
+  prefix: 'hev1' | 'hvc1' = 'hev1',
+): string | undefined {
+  const bytes = bufferSourceBytes(description);
+  if (bytes.length < 13) return undefined;
+  const profileByte = bytes[1];
+  const compat0 = bytes[2];
+  const compat1 = bytes[3];
+  const compat2 = bytes[4];
+  const compat3 = bytes[5];
+  const constraint0 = bytes[6];
+  const level = bytes[12];
+  if (
+    profileByte === undefined ||
+    compat0 === undefined ||
+    compat1 === undefined ||
+    compat2 === undefined ||
+    compat3 === undefined ||
+    constraint0 === undefined ||
+    level === undefined
+  ) {
+    return undefined;
+  }
+  const profileSpace = (profileByte >> 6) & 0x03;
+  const profileIdc = profileByte & 0x1f;
+  const tier = (profileByte & 0x20) !== 0 ? 'H' : 'L';
+  const rawCompat = ((compat0 << 24) | (compat1 << 16) | (compat2 << 8) | compat3) >>> 0;
+  const compat = reverseBits32(rawCompat).toString(16).toUpperCase();
+  const space = profileSpace === 0 ? '' : String.fromCharCode(0x40 + profileSpace);
+  let out = `${prefix}.${space}${profileIdc}.${compat}.${tier}${level}`;
+  let lastConstraint = 5;
+  while (lastConstraint >= 0 && bytes[6 + lastConstraint] === 0) lastConstraint--;
+  for (let i = 0; i <= lastConstraint; i++) {
+    const b = bytes[6 + i];
+    if (b === undefined) return undefined;
+    out += `.${hex2(b)}`;
+  }
+  return out;
+}
+
 /** A read-only byte view over an `ArrayBuffer`/typed-array `BufferSource` (no copy). */
 function bufferSourceBytes(src: AllowSharedBufferSource): Uint8Array {
   if (src instanceof ArrayBuffer) return new Uint8Array(src);
@@ -323,8 +392,7 @@ function bufferSourceBytes(src: AllowSharedBufferSource): Uint8Array {
  * as `config.codec`, which `isConfigSupported` rejects; this maps it to a valid WebCodecs string:
  *   - already-qualified strings (`avc1.*`, `vp09.*`, `av01.*`, `vp8`, `opus`, `mp4a.*`, …) pass through;
  *   - bare `vp8`/`vp9`/`av1` → their default profile string ({@link DECODE_CODEC_STRING});
- *   - bare `h264`/`hevc` with a `description` (avcC) → the profile-accurate `avc1.PPCCLL` (HEVC has no
- *     simple expansion, so it is left to the description-bearing decoder path);
+ *   - bare `h264`/`hevc` with a `description` (`avcC`/`hvcC`) → the profile-accurate RFC-6381 string;
  *   - anything else is returned unchanged (audio tokens like `opus`/`flac`/`vorbis` are already valid).
  * Pure + total; unit-tested. The wider H.264/HEVC-in-Matroska decode also needs the demuxer to surface
  * the CodecPrivate as `description` — without it the bare token cannot be expanded and decode stays a
@@ -341,6 +409,9 @@ export function normalizeDecoderCodec(config: {
   if (mapped !== undefined) return mapped;
   if ((lower === 'h264' || lower === 'avc') && config.description !== undefined) {
     return avcCodecStringFromDescription(config.description) ?? codec;
+  }
+  if ((lower === 'hevc' || lower === 'h265') && config.description !== undefined) {
+    return hevcCodecStringFromDescription(config.description) ?? codec;
   }
   return codec;
 }
@@ -379,6 +450,7 @@ export function videoEncoderCodecString(
 ): string {
   if (token !== undefined) return VIDEO_CODEC_STRING[token];
   if (sourceCodecString !== undefined && videoCodecToken(sourceCodecString) !== undefined) {
+    assertSupportedVideoEncodeProfile(sourceCodecString);
     return sourceCodecString;
   }
   throw new CapabilityError(
@@ -388,13 +460,41 @@ export function videoEncoderCodecString(
   );
 }
 
+/** The parsed profile idc from a qualified HEVC codec string, or `undefined` for non-HEVC/malformed. */
+function hevcProfileIdc(codecString: string): number | undefined {
+  const match = /^(?:hev1|hvc1)\.([ABC]?)(\d+)\./i.exec(codecString);
+  if (!match) return undefined;
+  const idc = Number(match[2]);
+  return Number.isInteger(idc) ? idc : undefined;
+}
+
+/** True for HEVC profiles this build cannot honestly encode without a software HEVC encoder tail. */
+export function isUnsupportedHevcEncodeProfile(codecString: string): boolean {
+  const profileIdc = hevcProfileIdc(codecString);
+  return profileIdc !== undefined && profileIdc !== 1;
+}
+
+function assertSupportedVideoEncodeProfile(codecString: string): void {
+  if (!isUnsupportedHevcEncodeProfile(codecString)) return;
+  throw new CapabilityError(
+    'capability-miss',
+    `HEVC encode for '${codecString}' would preserve a non-Main/10-bit HEVC profile, but this build has no software HEVC encoder fallback`,
+    {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion:
+        'request the public hevc token for Main 8-bit output, or use a browser/build with a proven HEVC Main10 encoder',
+    },
+  );
+}
+
 /** Resolve the WebCodecs audio codec string to encode to (caller token, else preserve the source). */
 export function audioEncoderCodecString(
   token: AudioCodec | undefined,
   sourceCodecString: string | undefined,
 ): string {
   if (token !== undefined) {
-    if (token === 'pcm') {
+    if (isPcmCodecToken(token)) {
       throw new CapabilityError(
         'capability-miss',
         'PCM audio output flows through the audio-dsp path, not the WebCodecs encoder',
@@ -427,11 +527,12 @@ export interface SourceGeometry {
 
 /**
  * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → rotate →
- * flip**, each emitted only when the target requests it. Order matters — crop selects a source sub-rect
- * first, then resize scales it to the requested output, then orientation. A `resize` is emitted when
- * width/height are given (or implied by a non-identity `fit` against known source dims); `rotate`/`flip`
- * pass straight through. Pure: every spec is a plain object, so the whole chain is Node-validated; the
- * GPU substrate that runs it is browser-only. Empty array ⇒ no filters (the decode→encode is direct).
+ * flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
+ * selects a source sub-rect first, then resize scales it to the requested output, then orientation, then
+ * full-frame colour conversion. A `resize` is emitted when width/height are given (or implied by a
+ * non-identity `fit` against known source dims); `rotate`/`flip` pass straight through. Pure: every spec
+ * is a plain object, so the whole chain is Node-validated; the GPU substrate that runs it is
+ * browser-only. Empty array ⇒ no filters (the decode→encode is direct).
  */
 export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): FilterSpec[] {
   const specs: FilterSpec[] = [];
@@ -467,6 +568,20 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
   }
   if (target.flip !== undefined) {
     specs.push({ mediaType: 'video', type: 'flip', axis: target.flip });
+  }
+  if (target.colorspace !== undefined) {
+    const to = target.colorspace.to.trim();
+    if (to.length === 0) {
+      throw new InputError('unsupported-input', 'colorspace target must be a non-empty string');
+    }
+    specs.push({ mediaType: 'video', type: 'colorspace', to });
+  }
+  if (target.tonemap !== undefined) {
+    const to = (target.tonemap as { to?: unknown }).to;
+    if (to !== 'sdr') {
+      throw new InputError('unsupported-input', `tonemap target '${String(to)}' is not supported`);
+    }
+    specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
   }
   return specs;
 }
@@ -508,18 +623,45 @@ export interface SourceAudio {
 }
 
 /**
- * Build the ordered audio {@link FilterSpec} chain for an {@link AudioTarget} re-encode: **remix →
- * resample**, each emitted only when the target's value differs from the source's. The order mirrors the
- * PCM path (`transformPcm` does gain → remix → resample): remix to the target channel layout first, then
- * resample on that layout. These run as `AudioData→AudioData` stages (the audio-dsp filter driver) on the
- * decoded stream BEFORE the encoder, so the `AudioData` fed in matches the encoder's configured
- * `numberOfChannels`/`sampleRate` exactly — otherwise the `AudioEncoder` rejects a buffer whose channel
- * count differs from its config (the stereo→mono transcode bug). Empty array ⇒ the decoded stream feeds
- * the encoder unchanged. Pure: every spec is a plain object, so the chain is Node-validated; the GPU/
- * WebCodecs substrate that runs it is browser-only.
+ * Build the ordered audio {@link FilterSpec} chain for an {@link AudioTarget} re-encode: **gain →
+ * remix → resample**, each emitted only when it is not a no-op. The order mirrors the PCM path
+ * (`transformPcm` does gain → remix → resample): scale samples in the source layout, remix to the target
+ * channel layout, then resample on that layout. These run as `AudioData→AudioData` stages (the audio-dsp
+ * filter driver) on the decoded stream BEFORE the encoder, so the `AudioData` fed in matches the
+ * encoder's configured `numberOfChannels`/`sampleRate` exactly — otherwise the `AudioEncoder` rejects a
+ * buffer whose channel count differs from its config (the stereo→mono transcode bug). Empty array ⇒ the
+ * decoded stream feeds the encoder unchanged. Pure: every spec is a plain object, so the chain is
+ * Node-validated; the GPU/WebCodecs substrate that runs it is browser-only.
  */
 export function audioFilterSpecs(target: AudioTarget, src: SourceAudio): FilterSpec[] {
   const specs: FilterSpec[] = [];
+  if (target.fade !== undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'audio fade is currently available only on the PCM-native transform path',
+      { op: 'filter', tried: [] },
+    );
+  }
+  if (target.biquad !== undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'audio biquad/EQ is currently available only on the PCM-native transform path',
+      { op: 'filter', tried: [] },
+    );
+  }
+  if (target.dynamics !== undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'audio dynamics are currently available only on the PCM-native transform path',
+      { op: 'filter', tried: [] },
+    );
+  }
+  if (target.gainDb !== undefined) {
+    if (!Number.isFinite(target.gainDb)) {
+      throw new InputError('unsupported-input', `audio gain ${target.gainDb} dB must be finite`);
+    }
+    if (target.gainDb !== 0) specs.push({ mediaType: 'audio', type: 'gain', db: target.gainDb });
+  }
   if (target.channels !== undefined && target.channels !== src.channels) {
     if (target.channels <= 0 || !Number.isInteger(target.channels)) {
       throw new InputError(
@@ -569,6 +711,7 @@ export function buildVideoEncoderConfig(
     target.codec === 'h264'
       ? h264CodecStringForDimensions(width, height, target.fps)
       : videoEncoderCodecString(target.codec, sourceCodecString);
+  assertSupportedVideoEncodeProfile(codec);
   return {
     codec,
     width,
@@ -672,7 +815,9 @@ function videoTargetRequestsReencode(t: VideoTarget): boolean {
     t.crf !== undefined ||
     t.rotate !== undefined ||
     t.flip !== undefined ||
-    t.crop !== undefined
+    t.crop !== undefined ||
+    t.colorspace !== undefined ||
+    t.tonemap !== undefined
   );
 }
 
@@ -681,7 +826,11 @@ function audioTargetRequestsReencode(t: AudioTarget): boolean {
     t.codec !== undefined ||
     t.sampleRate !== undefined ||
     t.channels !== undefined ||
-    t.bitrate !== undefined
+    t.bitrate !== undefined ||
+    (t.gainDb !== undefined && t.gainDb !== 0) ||
+    t.fade !== undefined ||
+    t.dynamics !== undefined ||
+    t.biquad !== undefined
   );
 }
 

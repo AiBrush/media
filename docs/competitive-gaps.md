@@ -73,10 +73,12 @@ Source of truth: `src/drivers/defaults.ts` (registration), `src/codecs/**`, the 
    fallbacks (lines 16/17/20); none are built.
 5. **MP3 and FLAC encode missing entirely** — `*→mp3` / `*→flac` are unconditional hard misses (WebCodecs
    has no encoder either).
-6. **Doc/code disagreement on bundle reachability.** ADR-041/README say the wasm tail is "not in the
-   default bundle," but `defaults.ts` registers WasmVorbis/Aac/Mp3 (lines 52-54). Browser reachability
-   still hinges on `scripts/vendor-wasm.ts` co-vendoring (ADR-042) being run after build — **verify it's
-   wired** before claiming the real decoders are browser-reachable in a consumer build.
+6. **WASM-tail consumer reachability still needs published-build proof.** ADR-069 reconciles the old
+   ADR-041/code split: `defaults.ts` now auto-registers the real Symphonia Vorbis/AAC/MP3 tails, and their
+   `supports()` probes honestly require the browser `EncodedAudioChunk` → `AudioData` seam. Browser
+   reachability still hinges on `scripts/vendor-wasm.ts` co-vendoring (ADR-042) being run after build and
+   on the published package carrying those lazy assets — **verify that path** before claiming consumer
+   builds get the real decoders.
 7. **AAC decode is AAC-LC mono/stereo only** (Symphonia rejects SBR/HE-AAC & >2ch).
 
 > **Net:** decode is genuinely strong where it ships (3 real Symphonia decoders, bit-exact TS FLAC, PCM);
@@ -180,8 +182,8 @@ self-checks) is visibly conscientious — but they bound what the aggregate can 
 1. **Fill the WASM encode cores** — libopus first (it unblocks the universal "encode to Opus" fallback),
    then libvpx (VP8/VP9 encode+decode), dav1d/SVT-AV1 (AV1), libmp3lame, libFLAC. This is the single
    biggest real-SOTA lever and needs an `emcc` build machine (out of scope in the current sandbox).
-2. **Verify the wasm-tail co-vendoring is actually wired** for consumer builds (ADR-042), and reconcile
-   the doc/code disagreement (ADR-041 vs `defaults.ts`).
+2. **Verify the wasm-tail co-vendoring is actually wired** for consumer builds (ADR-042/069): published
+   package install, lazy chunk import, `.wasm` fetch, and browser decode rows after WebCodecs misses.
 3. **Get the harness re-run by a non-author** on a clean checkout of the **published** package, with the
    results published and diffable; replace the message-regex NA path with typed codes only; publish the
    contested/uncontested + NA-ledger breakdown.

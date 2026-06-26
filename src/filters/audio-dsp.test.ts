@@ -9,6 +9,7 @@ import {
   audioDataToPcm,
   audioDspFilterDriver,
   isAudioDspSpec,
+  pcmRangeToPlanarInit,
   pcmToPlanarInit,
 } from './audio-dsp.ts';
 
@@ -160,6 +161,25 @@ describe('audio-dsp filter — AudioData ↔ PcmAudio framing (pure)', () => {
     expect(init.data).toBe(data.buffer);
   });
 
+  it('pcmRangeToPlanarInit lays out a bounded frame window for chunked decode output', () => {
+    const audio = {
+      sampleRate: 48000,
+      channels: 2,
+      frames: 5,
+      planar: [
+        Float64Array.of(0.1, 0.2, 0.3, 0.4, 0.5),
+        Float64Array.of(-0.1, -0.2, -0.3, -0.4, -0.5),
+      ],
+    };
+    const { init, data } = pcmRangeToPlanarInit(audio, 1, 3, 20_833);
+    expect(init.format).toBe('f32-planar');
+    expect(init.sampleRate).toBe(48000);
+    expect(init.numberOfChannels).toBe(2);
+    expect(init.numberOfFrames).toBe(3);
+    expect(init.timestamp).toBe(20_833);
+    expect(Array.from(data)).toEqual([0.2, 0.3, 0.4, -0.2, -0.3, -0.4].map((v) => Math.fround(v)));
+  });
+
   it('round-trips a known buffer: AudioData → PcmAudio → planar init reproduces the samples', () => {
     const data = fakeAudioData([[0.5, -0.5, 0.25, -0.25]], 16000, 7);
     const pcm = audioDataToPcm(data);
@@ -190,7 +210,7 @@ describe('audio-dsp filter — AudioData ↔ PcmAudio framing (pure)', () => {
 describe('audio-dsp filter — driver surface', () => {
   it('declares kind/substrate and matches only the audio specs in supports()', () => {
     expect(audioDspFilterDriver.kind).toBe('filter');
-    expect(audioDspFilterDriver.substrate).toBe('wasm');
+    expect(audioDspFilterDriver.substrate).toBe('native');
     // supports() is also gated on AudioData availability, which is absent in Node → false here.
     const audioDataPresent = typeof AudioData !== 'undefined';
     expect(audioDspFilterDriver.supports(RESAMPLE_48K)).toBe(audioDataPresent);

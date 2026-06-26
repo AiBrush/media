@@ -23,6 +23,12 @@ const OPUS_GRANULE_RATE = 48_000; // Opus always granule-clocks at 48 kHz, whate
 const MICROS_PER_SECOND = 1_000_000;
 const DEFAULT_SERIAL = 0x00000001;
 
+/** Opus TOC config → frame duration in 48 kHz samples (RFC 6716 §3.1, Table 2). */
+const OPUS_FRAME_SAMPLES: readonly number[] = [
+  480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960, 120, 240,
+  480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+];
+
 // Header-type flag bits (byte 5 of a page header).
 const HT_CONTINUED = 0x01;
 const HT_BOS = 0x02;
@@ -46,8 +52,8 @@ const CRC_TABLE: Uint32Array = (() => {
 function oggCrc(bytes: Uint8Array): number {
   let crc = 0;
   for (let i = 0; i < bytes.length; i++) {
-    const idx = ((crc >>> 24) ^ (bytes[i] ?? 0)) & 0xff;
-    crc = ((crc << 8) ^ (CRC_TABLE[idx] ?? 0)) >>> 0;
+    const idx = ((crc >>> 24) ^ (bytes[i] as number)) & 0xff;
+    crc = ((crc << 8) ^ (CRC_TABLE[idx] as number)) >>> 0;
   }
   return crc >>> 0;
 }
@@ -172,9 +178,9 @@ export function buildPages(
       const room = MAX_PAGE_SEGMENTS - lacing.length;
       const take = Math.min(room, segs.length - segOffset);
       for (let i = 0; i < take; i++) {
-        const lv = segs[segOffset + i] ?? 0;
+        const lv = segs[segOffset + i] as number;
         lacing.push(lv);
-        for (let b = 0; b < lv; b++) body.push(packet.data[byteOffset++] ?? 0);
+        for (let b = 0; b < lv; b++) body.push(packet.data[byteOffset++] as number);
       }
       segOffset += take;
       if (segOffset === segs.length) {
@@ -276,6 +282,89 @@ function splitVorbisHeaders(description: Uint8Array): [Uint8Array, Uint8Array, U
   return [id, comment, setup];
 }
 
+interface FlacMetadataBlock {
+  readonly type: number;
+  readonly body: Uint8Array;
+}
+
+function flacFail(): never {
+  throw new CapabilityError(
+    'capability-miss',
+    'the ogg muxer needs native FLAC metadata (fLaC + STREAMINFO) in the track description',
+    { op: { op: 'mux', codec: 'flac' }, tried: ['ogg'] },
+  );
+}
+
+function splitFlacMetadata(description: Uint8Array): FlacMetadataBlock[] {
+  if (description.byteLength < 42 || String.fromCharCode(...description.slice(0, 4)) !== 'fLaC') {
+    flacFail();
+  }
+  const blocks: FlacMetadataBlock[] = [];
+  let pos = 4;
+  for (;;) {
+    if (pos + 4 > description.byteLength) flacFail();
+    const header = description[pos] as number;
+    const type = header & 0x7f;
+    const len =
+      ((description[pos + 1] as number) << 16) |
+      ((description[pos + 2] as number) << 8) |
+      (description[pos + 3] as number);
+    const body = description.slice(pos + 4, pos + 4 + len);
+    if (body.byteLength !== len) flacFail();
+    blocks.push({ type, body });
+    pos += 4 + len;
+    if ((header & 0x80) !== 0) break;
+  }
+  const streamInfo = blocks[0];
+  if (streamInfo?.type !== 0 || streamInfo.body.byteLength < 34) flacFail();
+  return blocks;
+}
+
+function flacMetadataPacket(block: FlacMetadataBlock, last: boolean): Uint8Array {
+  return concatBytes([
+    [block.type | (last ? 0x80 : 0x00)],
+    [
+      (block.body.byteLength >>> 16) & 0xff,
+      (block.body.byteLength >>> 8) & 0xff,
+      block.body.byteLength & 0xff,
+    ],
+    block.body,
+  ]);
+}
+
+function emptyVorbisCommentBlock(): FlacMetadataBlock {
+  return {
+    type: 4,
+    body: Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0]), // vendor length 0 + comment count 0
+  };
+}
+
+function flacHeaderPackets(description: Uint8Array): {
+  idHeader: Uint8Array;
+  setupHeaders: Uint8Array[];
+} {
+  const blocks = splitFlacMetadata(description);
+  const streamInfo = blocks[0] ?? flacFail();
+  const afterStreamInfo = blocks.slice(1);
+  const comment = afterStreamInfo.find((b) => b.type === 4) ?? emptyVorbisCommentBlock();
+  const rest = afterStreamInfo.filter((b) => b !== comment && b.type !== 1);
+  const setupBlocks = [comment, ...rest];
+  if (setupBlocks.length > 0xffff) flacFail();
+  const streamInfoPacket = flacMetadataPacket(streamInfo, false);
+  const idHeader = concatBytes([
+    [0x7f, 0x46, 0x4c, 0x41, 0x43, 0x01, 0x00], // 0x7F "FLAC", mapping v1.0
+    [(setupBlocks.length >>> 8) & 0xff, setupBlocks.length & 0xff],
+    [0x66, 0x4c, 0x61, 0x43], // native "fLaC" marker
+    streamInfoPacket,
+  ]);
+  return {
+    idHeader,
+    setupHeaders: setupBlocks.map((block, i) =>
+      flacMetadataPacket(block, i === setupBlocks.length - 1),
+    ),
+  };
+}
+
 // ============ track state + assembly ============
 
 /** A decoded view of one `EncodedChunk` in container-neutral terms (owns its byte copy). */
@@ -287,7 +376,7 @@ export interface ChunkStruct {
 }
 
 interface TrackState {
-  readonly codec: 'opus' | 'vorbis';
+  readonly codec: 'opus' | 'vorbis' | 'flac';
   readonly channels: number;
   readonly sampleRate: number;
   readonly granuleRate: number;
@@ -311,15 +400,17 @@ function trackStateFrom(info: TrackInfo): TrackState {
     });
   }
   const c = info.codec.toLowerCase();
-  const codec: 'opus' | 'vorbis' | undefined = c.startsWith('opus')
+  const codec: 'opus' | 'vorbis' | 'flac' | undefined = c.startsWith('opus')
     ? 'opus'
     : c.startsWith('vorbis')
       ? 'vorbis'
-      : undefined;
+      : c.startsWith('flac')
+        ? 'flac'
+        : undefined;
   if (codec === undefined) {
     throw new CapabilityError(
       'capability-miss',
-      `the ogg muxer cannot write audio codec '${info.codec}' (Opus/Vorbis only)`,
+      `the ogg muxer cannot write audio codec '${info.codec}' (Opus/Vorbis/FLAC only)`,
       { op: { op: 'mux', codec: info.codec }, tried: ['ogg'] },
     );
   }
@@ -336,10 +427,27 @@ function trackStateFrom(info: TrackInfo): TrackState {
   };
 }
 
-/** The number of granule samples one chunk represents (from its duration, or a recovered gap). */
-function samplesFor(chunk: ChunkStruct, fallbackUs: number, granuleRate: number): number {
+/** Opus packet decoded duration in 48 kHz samples, or undefined when the packet is malformed/empty. */
+function opusPacketSamples(data: Uint8Array): number | undefined {
+  const toc = data[0];
+  if (toc === undefined) return undefined;
+  const frameSamples = OPUS_FRAME_SAMPLES[toc >> 3];
+  if (frameSamples === undefined) return undefined;
+  const code = toc & 0x03;
+  if (code === 0) return frameSamples;
+  if (code === 1 || code === 2) return frameSamples * 2;
+  const count = data[1] === undefined ? undefined : data[1] & 0x3f;
+  return count !== undefined && count > 0 ? frameSamples * count : undefined;
+}
+
+/** The number of granule samples one chunk represents (Opus TOC first, else duration or gap). */
+function samplesFor(chunk: ChunkStruct, fallbackUs: number, track: TrackState): number {
+  if (track.codec === 'opus') {
+    const samples = opusPacketSamples(chunk.data);
+    if (samples !== undefined) return samples;
+  }
   const durUs = chunk.durationUs ?? fallbackUs;
-  return Math.max(0, Math.round((durUs * granuleRate) / MICROS_PER_SECOND));
+  return Math.max(0, Math.round((durUs * track.granuleRate) / MICROS_PER_SECOND));
 }
 
 function declaredFinalGranule(track: TrackState): number | undefined {
@@ -354,10 +462,10 @@ function fallbackGapUs(chunks: readonly ChunkStruct[]): number {
   const sorted = [...chunks].sort((a, b) => a.timestampUs - b.timestampUs);
   const gaps: number[] = [];
   for (let i = 1; i < sorted.length; i++) {
-    gaps.push((sorted[i]?.timestampUs ?? 0) - (sorted[i - 1]?.timestampUs ?? 0));
+    gaps.push((sorted[i] as ChunkStruct).timestampUs - (sorted[i - 1] as ChunkStruct).timestampUs);
   }
   gaps.sort((a, b) => a - b);
-  return Math.max(0, gaps[gaps.length >> 1] ?? 0);
+  return Math.max(0, gaps[gaps.length >> 1] as number);
 }
 
 /** The codec's header packets (BOS-page packet + the comment/setup-page packets). */
@@ -368,6 +476,10 @@ function headerPackets(track: TrackState): { idHeader: Uint8Array; setupHeaders:
         ? track.description
         : synthOpusHead(track.channels, track.sampleRate);
     return { idHeader, setupHeaders: [opusTags()] };
+  }
+  if (track.codec === 'flac') {
+    if (track.description === undefined) flacFail();
+    return flacHeaderPackets(track.description);
   }
   if (track.description === undefined) {
     throw new CapabilityError(
@@ -389,19 +501,45 @@ export function writeOgg(track: TrackState, serial = DEFAULT_SERIAL): Uint8Array
   const fallbackUs = fallbackGapUs(ordered);
   const targetFinalGranule = declaredFinalGranule(track);
   const audio: OggPacket[] = [];
-  let granule = 0;
-  for (let i = 0; i < ordered.length; i++) {
-    const chunk = ordered[i];
-    if (chunk === undefined) continue;
-    const previousGranule = granule;
-    const nextGranule = granule + samplesFor(chunk, fallbackUs, track.granuleRate);
-    const canUseDeclaredFinal =
-      i === ordered.length - 1 &&
-      targetFinalGranule !== undefined &&
-      targetFinalGranule >= previousGranule &&
-      targetFinalGranule <= nextGranule;
-    granule = canUseDeclaredFinal ? targetFinalGranule : nextGranule;
-    audio.push({ data: chunk.data, granule });
+  const weightedVorbis =
+    track.codec === 'vorbis' && targetFinalGranule !== undefined && ordered.length > 0;
+  const sampleSpans = ordered.map((chunk) => samplesFor(chunk, fallbackUs, track));
+  if (weightedVorbis) {
+    // WebM/Matroska Vorbis packets can arrive without per-packet durations (especially when laced). The
+    // packet spans are then approximate weights; the declared source duration is the exact final granule.
+    const rawTotal = sampleSpans.reduce((sum, span) => sum + span, 0);
+    const totalWeight = rawTotal > 0 ? rawTotal : sampleSpans.length;
+    let weight = 0;
+    let previous = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      const chunk = ordered[i];
+      if (chunk === undefined) continue;
+      weight += rawTotal > 0 ? (sampleSpans[i] ?? 0) : 1;
+      const scaled =
+        i === ordered.length - 1
+          ? targetFinalGranule
+          : Math.min(
+              targetFinalGranule,
+              Math.max(previous, Math.round((weight * targetFinalGranule) / totalWeight)),
+            );
+      audio.push({ data: chunk.data, granule: scaled });
+      previous = scaled;
+    }
+  } else {
+    let granule = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      const chunk = ordered[i];
+      if (chunk === undefined) continue;
+      const previousGranule = granule;
+      const nextGranule = granule + (sampleSpans[i] ?? 0);
+      const canUseDeclaredFinal =
+        i === ordered.length - 1 &&
+        targetFinalGranule !== undefined &&
+        targetFinalGranule >= previousGranule &&
+        targetFinalGranule <= nextGranule;
+      granule = canUseDeclaredFinal ? targetFinalGranule : nextGranule;
+      audio.push({ data: chunk.data, granule });
+    }
   }
 
   // Page layout: the identification header alone on the BOS page; the comment/setup header(s) on the

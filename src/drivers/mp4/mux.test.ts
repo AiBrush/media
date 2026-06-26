@@ -40,11 +40,81 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
 
 /** A minimal AVCDecoderConfigurationRecord (avcC) — the muxer synthesizes the `avcC` box from it. */
 const AVCC = new Uint8Array([1, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0x00, 0x00]);
+const H264_SPS = new Uint8Array([0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80]);
+const H264_PPS = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
 /** A minimal AudioSpecificConfig (AAC-LC, 48 kHz, stereo) — the muxer synthesizes `esds` from it. */
 const ASC = new Uint8Array([0x11, 0x90]);
 
 function videoChunk(timestampUs: number, durationUs: number, key: boolean, n: number): ChunkStruct {
   return { timestampUs, durationUs, key, data: new Uint8Array(n).fill(key ? 0x65 : 0x41) };
+}
+
+function avcCWithParameterSets(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+  return new Uint8Array([
+    1,
+    sps[1] ?? 0,
+    sps[2] ?? 0,
+    sps[3] ?? 0,
+    0xff,
+    0xe1,
+    (sps.byteLength >>> 8) & 0xff,
+    sps.byteLength & 0xff,
+    ...sps,
+    1,
+    (pps.byteLength >>> 8) & 0xff,
+    pps.byteLength & 0xff,
+    ...pps,
+  ]);
+}
+
+function annexB(...nalus: Uint8Array[]): Uint8Array {
+  const total = nalus.reduce((n, nal) => n + 4 + nal.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const nal of nalus) {
+    out.set([0, 0, 0, 1], offset);
+    offset += 4;
+    out.set(nal, offset);
+    offset += nal.byteLength;
+  }
+  return out;
+}
+
+function lengthPrefixed(...nalus: Uint8Array[]): Uint8Array {
+  const total = nalus.reduce((n, nal) => n + 4 + nal.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const nal of nalus) {
+    out[offset] = (nal.byteLength >>> 24) & 0xff;
+    out[offset + 1] = (nal.byteLength >>> 16) & 0xff;
+    out[offset + 2] = (nal.byteLength >>> 8) & 0xff;
+    out[offset + 3] = nal.byteLength & 0xff;
+    offset += 4;
+    out.set(nal, offset);
+    offset += nal.byteLength;
+  }
+  return out;
+}
+
+function adtsFrame(
+  payload: Uint8Array,
+  freqIndex = 4,
+  channelConfig = 2,
+  profile = 1,
+  protectionAbsent = true,
+): Uint8Array {
+  const headerBytes = protectionAbsent ? 7 : 9;
+  const frameLength = headerBytes + payload.byteLength;
+  const out = new Uint8Array(frameLength);
+  out[0] = 0xff;
+  out[1] = protectionAbsent ? 0xf1 : 0xf0;
+  out[2] = (profile << 6) | (freqIndex << 2) | ((channelConfig >> 2) & 0x01);
+  out[3] = ((channelConfig & 0x03) << 6) | ((frameLength >> 11) & 0x03);
+  out[4] = (frameLength >> 3) & 0xff;
+  out[5] = ((frameLength & 0x07) << 5) | 0x1f;
+  out[6] = 0xfc;
+  out.set(payload, headerBytes);
+  return out;
 }
 
 describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
@@ -163,6 +233,131 @@ describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
 });
 
 describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', () => {
+  it('bare h264 with Annex-B samples synthesizes avcC and writes length-prefixed AVC samples', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      fps: 30,
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 8 },
+    });
+    const key = annexB(H264_SPS, H264_PPS, new Uint8Array([0x65, 0x88, 0x84]));
+    const delta = annexB(new Uint8Array([0x41, 0x9a]));
+    muxer.addChunkStruct(vid, { timestampUs: 0, durationUs: 33_333, key: true, data: key });
+    muxer.addChunkStruct(vid, { timestampUs: 33_333, durationUs: 33_333, key: false, data: delta });
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const track = movie.tracks[0];
+    expect(track?.codec).toBe('avc1.42C01E');
+    expect(track?.width).toBe(16);
+    expect(track?.height).toBe(8);
+    expect(track?.codecPrivate?.boxType).toBe('avcC');
+    const samples = track ? buildSampleData(track) : [];
+    expect(samples.map((s) => s.size)).toEqual([
+      lengthPrefixed(H264_SPS, H264_PPS, new Uint8Array([0x65, 0x88, 0x84])).byteLength,
+      lengthPrefixed(new Uint8Array([0x41, 0x9a])).byteLength,
+    ]);
+    expect(samples.map((s) => s.keyframe)).toEqual([true, false]);
+  });
+
+  it('bare h264 with an avcC description preserves already length-prefixed samples', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      fps: 30,
+      config: {
+        codec: 'h264',
+        codedWidth: 32,
+        codedHeight: 18,
+        description: avcCWithParameterSets(H264_SPS, H264_PPS),
+      },
+    });
+    const key = lengthPrefixed(new Uint8Array([0x65, 0xaa, 0xbb]));
+    const delta = lengthPrefixed(new Uint8Array([0x41, 0xcc]));
+    muxer.addChunkStruct(vid, { timestampUs: 0, durationUs: 33_333, key: true, data: key });
+    muxer.addChunkStruct(vid, { timestampUs: 33_333, durationUs: 33_333, key: false, data: delta });
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const track = movie.tracks[0];
+    expect(track?.codec).toBe('avc1.42C01E');
+    expect(track?.width).toBe(32);
+    expect(track?.height).toBe(18);
+    expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([
+      key.byteLength,
+      delta.byteLength,
+    ]);
+  });
+
+  it('bare aac with an ASC description preserves raw AAC access units', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2, description: ASC },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array([1, 2, 3, 4, 5]),
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 21_333,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array([6, 7, 8, 9, 10, 11]),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.codec).toBe('mp4a.40.2');
+    expect(track?.sampleRate).toBe(48_000);
+    expect(track?.channels).toBe(2);
+    expect(track?.config?.description).toEqual(ASC);
+    expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([5, 6]);
+  });
+
+  it('bare aac with ADTS samples synthesizes ASC and strips ADTS headers for MP4', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 44_100, numberOfChannels: 2 },
+    });
+    const firstPayload = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01, 0x02, 0x03]);
+    const secondPayload = new Uint8Array([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]);
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 23_220,
+      key: true,
+      data: adtsFrame(firstPayload),
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 23_220,
+      durationUs: 23_220,
+      key: true,
+      data: adtsFrame(secondPayload, 4, 2, 1, false),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.codec).toBe('mp4a.40.2');
+    expect(track?.sampleRate).toBe(44_100);
+    expect(track?.channels).toBe(2);
+    expect(track?.config?.description).toEqual(new Uint8Array([0x12, 0x10]));
+    expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([
+      firstPayload.byteLength,
+      secondPayload.byteLength,
+    ]);
+  });
+
   it('video-only (no reorder): re-parses to identical sizes/durations/keyframes, ctts absent', async () => {
     const muxer = new Mp4Muxer();
     const vid = muxer.addTrack({
@@ -389,6 +584,165 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     expect(() =>
       muxer.addTrack({ id: 1, mediaType: 'video', codec: 'theora', config: { codec: 'theora' } }),
     ).toThrowError(/cannot write video codec 'theora'/);
+  });
+
+  it('maps legal raw-box codec families without rewriting their codec-private bytes', async () => {
+    const cases = [
+      {
+        mediaType: 'video' as const,
+        codec: 'hev1.1.6.L93.B0',
+        config: {
+          codec: 'hev1.1.6.L93.B0',
+          codedWidth: 8,
+          codedHeight: 8,
+          description: new Uint8Array([1, 2, 3, 4]),
+        },
+      },
+      {
+        mediaType: 'video' as const,
+        codec: 'hvc1.1.6.L93.B0',
+        config: {
+          codec: 'hvc1.1.6.L93.B0',
+          codedWidth: 8,
+          codedHeight: 8,
+          description: new Uint8Array([5, 6, 7, 8]),
+        },
+      },
+      {
+        mediaType: 'video' as const,
+        codec: 'av01.0.04M.08',
+        config: {
+          codec: 'av01.0.04M.08',
+          codedWidth: 8,
+          codedHeight: 8,
+          description: new Uint8Array([0x81, 0x00, 0x0c, 0x00]),
+        },
+      },
+      {
+        mediaType: 'video' as const,
+        codec: 'vp9',
+        config: {
+          codec: 'vp9',
+          codedWidth: 8,
+          codedHeight: 8,
+          description: new Uint8Array([1, 1, 0, 0]),
+        },
+      },
+      {
+        mediaType: 'audio' as const,
+        codec: 'opus',
+        config: {
+          codec: 'opus',
+          sampleRate: 48_000,
+          numberOfChannels: 2,
+          description: new Uint8Array([0x00, 0x02, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00]),
+        },
+      },
+      {
+        mediaType: 'audio' as const,
+        codec: 'flac',
+        config: {
+          codec: 'flac',
+          sampleRate: 48_000,
+          numberOfChannels: 2,
+          description: new Uint8Array([0x00, 0x00, 0x00, 0x22, ...new Array<number>(34).fill(0)]),
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const muxer = new Mp4Muxer();
+      const trackId = muxer.addTrack({
+        id: 1,
+        mediaType: item.mediaType,
+        codec: item.codec,
+        config: item.config,
+      });
+      muxer.addChunkStruct(trackId, {
+        timestampUs: 0,
+        durationUs: item.mediaType === 'video' ? 33_333 : 21_333,
+        key: true,
+        data: new Uint8Array([1, 2, 3, 4]),
+      });
+      await muxer.finalize();
+      const bytes = await collect(muxer.output);
+      expect(bytes.byteLength).toBeGreaterThan(32);
+      expect(String.fromCharCode(...bytes.subarray(4, 8))).toBe('ftyp');
+    }
+  });
+
+  it('bare aac without ASC or ADTS framing rejects instead of guessing AAC-LC', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/AAC MP4 muxing requires/);
+  });
+
+  it('bare h264 without avcC or Annex-B SPS/PPS rejects instead of guessing parameter sets', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+    });
+    muxer.addChunkStruct(vid, {
+      timestampUs: 0,
+      durationUs: 33_333,
+      key: true,
+      data: lengthPrefixed(new Uint8Array([0x65, 0x88, 0x84])),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/requires avcC description/);
+  });
+
+  it('bare aac rejects mixed raw and ADTS samples in one MP4 track', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 44_100, numberOfChannels: 2 },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 23_220,
+      key: true,
+      data: adtsFrame(new Uint8Array([1, 2, 3])),
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 23_220,
+      durationUs: 23_220,
+      key: true,
+      data: new Uint8Array([4, 5, 6]),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/cannot mix ADTS-framed and raw/);
+  });
+
+  it('bare aac rejects ADTS samples whose geometry contradicts the ASC description', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2, description: ASC },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 23_220,
+      key: true,
+      data: adtsFrame(new Uint8Array([1, 2, 3]), 4, 2),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/does not match/);
   });
 
   it('fragmented mux emits a CMAF init segment + moof media segments, re-parsing to the right track', async () => {

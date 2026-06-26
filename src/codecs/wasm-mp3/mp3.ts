@@ -243,10 +243,10 @@ export function id3v2Size(bytes: Uint8Array): number {
   // ID3v2 header: 'ID3', version(2), flags(1), size(4 syncsafe) = 10 bytes, then the tag body.
   if (bytes.length < 10) return 0;
   if (bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) return 0; // not 'ID3'
-  const s0 = bytes[6] ?? 0;
-  const s1 = bytes[7] ?? 0;
-  const s2 = bytes[8] ?? 0;
-  const s3 = bytes[9] ?? 0;
+  const s0 = bytes[6] as number;
+  const s1 = bytes[7] as number;
+  const s2 = bytes[8] as number;
+  const s3 = bytes[9] as number;
   // Syncsafe: each byte uses only its low 7 bits (ID3v2.4 §3.1).
   if ((s0 | s1 | s2 | s3) & 0x80) return 0; // a high bit set ⇒ not a valid syncsafe size
   const bodySize = (s0 << 21) | (s1 << 14) | (s2 << 7) | s3;

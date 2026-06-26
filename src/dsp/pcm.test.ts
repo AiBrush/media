@@ -14,7 +14,7 @@ function pattern(length: number): Uint8Array {
   return Uint8Array.from({ length }, (_, i) => (i * 37 + 11) & 0xff);
 }
 
-const INT_FORMATS: SampleFormat[] = ['u8', 's16', 's24', 's32'];
+const INT_FORMATS: SampleFormat[] = ['u8', 's8', 's16', 's24', 's32'];
 
 describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => {
   // The strongest oracle that can fail: over ARBITRARY bytes, encode∘decode must be the identity for
@@ -50,7 +50,8 @@ describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => 
 
 describe('PCM codec — normalization & clamping', () => {
   it('decodes the documented normalization (full-scale → ±1)', () => {
-    // s16: -32768 → -1.0, 32767 → ~+1.0; u8: 0 → -1.0, 255 → ~+1.0 (offset binary).
+    // s16: -32768 → -1.0, 32767 → ~+1.0; u8: 0 → -1.0, 255 → ~+1.0 (offset);
+    // s8: -128 → -1.0, 127 → ~+1.0 (two's-complement).
     const s16 = new Uint8Array(new Int16Array([-32768, 32767, 0]).buffer);
     const a = decodePcm(s16, 's16', 1, 8000);
     expect(sampleAt(channelAt(a.planar, 0), 0)).toBe(-1);
@@ -60,6 +61,11 @@ describe('PCM codec — normalization & clamping', () => {
     const u8 = decodePcm(Uint8Array.of(0, 128, 255), 'u8', 1, 8000);
     expect(sampleAt(channelAt(u8.planar, 0), 0)).toBe(-1);
     expect(sampleAt(channelAt(u8.planar, 0), 1)).toBe(0);
+
+    const s8 = decodePcm(Uint8Array.of(0x80, 0, 0x7f), 's8', 1, 8000);
+    expect(sampleAt(channelAt(s8.planar, 0), 0)).toBe(-1);
+    expect(sampleAt(channelAt(s8.planar, 0), 1)).toBe(0);
+    expect(sampleAt(channelAt(s8.planar, 0), 2)).toBe(127 / 128);
   });
 
   it('clamps out-of-range floats at the integer encode boundary', () => {
@@ -73,6 +79,8 @@ describe('PCM codec — normalization & clamping', () => {
 
     const out24 = decodePcm(encodePcm(audio, 's24'), 's24', 1, 8000);
     expect(sampleAt(channelAt(out24.planar, 0), 0)).toBeCloseTo(1, 6); // clamped near +1
+
+    expect(Array.from(encodePcm(audio, 's8'))).toEqual([127, 128, 64]);
   });
 });
 
@@ -103,6 +111,7 @@ describe('PCM codec — edges & guards', () => {
 
   it('reports bytes per sample', () => {
     expect(bytesPerSample('u8')).toBe(1);
+    expect(bytesPerSample('s8')).toBe(1);
     expect(bytesPerSample('s24')).toBe(3);
     expect(bytesPerSample('f64')).toBe(8);
   });

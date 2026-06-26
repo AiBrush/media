@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 import type { ParsedTrack, SampleTable } from './parse.ts';
 import { buildSamples } from './samples.ts';
 
-function track(partial: Partial<SampleTable>, timescale = 1000): ParsedTrack {
+function track(
+  partial: Partial<SampleTable>,
+  timescale = 1000,
+  edit: ParsedTrack['edit'] = undefined,
+): ParsedTrack {
   const samples: SampleTable = {
     timeToSample: partial.timeToSample ?? [],
     compositionOffsets: partial.compositionOffsets ?? [],
@@ -11,7 +15,7 @@ function track(partial: Partial<SampleTable>, timescale = 1000): ParsedTrack {
     chunkOffsets: partial.chunkOffsets ?? [],
     syncSamples: partial.syncSamples ?? [],
   };
-  return {
+  const parsed: ParsedTrack = {
     id: 1,
     mediaType: 'video',
     timescale,
@@ -21,6 +25,7 @@ function track(partial: Partial<SampleTable>, timescale = 1000): ParsedTrack {
     config: { codec: 'avc1' },
     samples,
   };
+  return edit === undefined ? parsed : { ...parsed, edit };
 }
 
 const oneChunk = {
@@ -51,6 +56,19 @@ describe('buildSamples', () => {
     expect(s[0]?.ptsUs).toBe(250_000);
     expect(s[0]?.dtsUs).toBe(0);
     expect(s.some((x) => x.ptsUs !== x.dtsUs)).toBe(true);
+  });
+
+  it('applies an edit-list media_time offset to packet PTS/DTS', () => {
+    const s = buildSamples(
+      track({ ...oneChunk, compositionOffsets: [{ count: 2, offset: 250 }] }, 1000, {
+        mediaTimeTicks: 250,
+        durationSec: 1,
+      }),
+    );
+    expect(s[0]?.ptsUs).toBe(0);
+    expect(s[0]?.dtsUs).toBe(-250_000);
+    expect(s[1]?.ptsUs).toBe(500_000);
+    expect(s[1]?.dtsUs).toBe(250_000);
   });
 
   it('honors stss: only listed samples are keyframes', () => {

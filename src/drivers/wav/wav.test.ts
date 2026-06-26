@@ -170,6 +170,17 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     for (const s of ch) m = Math.max(m, Math.abs(s));
     return m;
   };
+  const hasNaN = (ch: Float64Array): boolean => {
+    for (const s of ch) if (Number.isNaN(s)) return true;
+    return false;
+  };
+  const differs = (a: Float64Array, b: Float64Array): boolean => {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+      if (Math.abs((a[i] ?? 0) - (b[i] ?? 0)) > 1e-9) return true;
+    }
+    return a.length !== b.length;
+  };
 
   it('reads a non-seekable stream source (no range) and up-mixes mono → stereo', async () => {
     const bytes = await loadFixture(SIN);
@@ -184,6 +195,49 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     const out = await drain(await transformPcm(streamOnly(bytes), { gainDb: -6.020599913279624 }));
     const orig = peak(channelAt(readWavPcm(bytes).planar, 0));
     expect(peak(channelAt(readWavPcm(out).planar, 0))).toBeCloseTo(orig * 0.5, 2);
+  });
+
+  it.each(WAVS)(
+    '%s applies public PCM dynamics over real corpus audio (peak-normalize then hard-limit)',
+    async (id) => {
+      const bytes = await loadFixture(id);
+      const out = await drain(
+        await transformPcm(streamOnly(bytes), {
+          sampleFormat: 'f32',
+          dynamics: {
+            normalize: { mode: 'peak', targetDbfs: -3 },
+            limit: { ceilingDbfs: -1, mode: 'hard' },
+          },
+        }),
+      );
+      const re = readWavPcm(out);
+      const ch = channelAt(re.planar, 0);
+      expect(re.frames).toBe(readWavPcm(bytes).frames);
+      expect(hasNaN(ch)).toBe(false);
+      expect(peak(ch)).toBeCloseTo(10 ** (-3 / 20), 5);
+    },
+  );
+
+  it.each(WAVS)('%s applies a PCM biquad section over real corpus audio', async (id) => {
+    const bytes = await loadFixture(id);
+    const source = readWavPcm(bytes);
+    const out = await drain(
+      await transformPcm(streamOnly(bytes), {
+        sampleFormat: 'f32',
+        biquad: {
+          type: 'highpass',
+          frequency: Math.min(1000, source.sampleRate / 4),
+          q: Math.SQRT1_2,
+        },
+      }),
+    );
+    const re = readWavPcm(out);
+    const ch = channelAt(re.planar, 0);
+    expect(re.frames).toBe(source.frames);
+    expect(re.sampleRate).toBe(source.sampleRate);
+    expect(re.channels).toBe(source.channels);
+    expect(hasNaN(ch)).toBe(false);
+    expect(differs(ch, channelAt(source.planar, 0))).toBe(true);
   });
 
   it('honors an already-aborted signal', async () => {

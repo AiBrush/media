@@ -10,7 +10,9 @@
  * `DRIVER_API_VERSION` event (§5).
  */
 
-import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
+import type { BiquadSpec } from '../dsp/biquad.ts';
+import type { LimitMode } from '../dsp/dynamics.ts';
+import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 
 // ============ versioning ============
 
@@ -26,12 +28,26 @@ export type MediaType = 'video' | 'audio';
 /** How far the router may go in the tier ladder (ADR-007). */
 export type Determinism = 'auto' | 'force-software';
 
+export type WasmRuntimeProfileKind = 'baseline' | 'isolated-simd-threads';
+
+/** Runtime profile a WASM driver may use when it is actually built (ADR-006). */
+export interface WasmRuntimeProfile {
+  readonly kind: WasmRuntimeProfileKind;
+  readonly simd: boolean;
+  readonly threads: boolean;
+  /** True only when `SharedArrayBuffer` is safe to use in a cross-origin-isolated page. */
+  readonly sharedArrayBuffer: boolean;
+  readonly reason?: string;
+}
+
 /** Options threaded through every stage. */
 export interface StageOptions {
   signal?: AbortSignal;
   onProgress?: (p: Progress) => void;
   /** `force-software` drops the hardware/gpu tiers for cross-machine reproducibility. */
   determinism?: Determinism;
+  /** WASM execution profile. Omitted means drivers resolve ADR-006 from the current runtime. */
+  wasmRuntime?: WasmRuntimeProfile;
 }
 
 /** Monotonic progress signal derived from timestamps against a known duration. */
@@ -199,11 +215,36 @@ export interface StreamCopyOptions extends StageOptions {
 /**
  * A PCM-domain audio transform for containers that carry raw PCM (ADR-022). PCM is not a WebCodecs
  * codec, so these run in the TS audio-dsp path — sample-format conversion, channel up/down-mix, gain,
- * and resample — without the decode/encode + `AudioData` filter seam. Omitted fields pass through.
- * `container` names the raw-PCM wrapper to serialize after the source driver has parsed its own bytes;
- * this is how WAV/AIFF/CAF cross-container PCM conversion stays outside the EncodedChunk muxer seam.
+ * fade, resample, dynamics, and biquad/EQ — without the decode/encode + `AudioData` filter seam.
+ * Omitted fields pass through. `container` names the raw-PCM wrapper to serialize after the source driver
+ * has parsed its own bytes; this is how WAV/AIFF/CAF cross-container PCM conversion stays outside the
+ * EncodedChunk muxer seam.
  */
 export type PcmContainer = 'wav' | 'aiff' | 'caf';
+
+export interface PcmFade {
+  inSec?: number;
+  outSec?: number;
+  curve?: 'linear' | 'equal-power';
+}
+
+export interface PcmDynamicsNormalize {
+  mode: 'peak' | 'rms';
+  targetDbfs: number;
+}
+
+export interface PcmDynamicsLimit {
+  ceilingDbfs?: number;
+  mode?: LimitMode;
+  knee?: number;
+}
+
+export interface PcmDynamics {
+  normalize?: PcmDynamicsNormalize;
+  limit?: PcmDynamicsLimit;
+}
+
+export type PcmBiquad = BiquadSpec;
 
 export interface PcmTransform extends StageOptions {
   container?: PcmContainer;
@@ -212,6 +253,9 @@ export interface PcmTransform extends StageOptions {
   channels?: number;
   sampleRate?: number;
   gainDb?: number;
+  fade?: PcmFade;
+  dynamics?: PcmDynamics;
+  biquad?: PcmBiquad | readonly PcmBiquad[];
 }
 
 /** Options for a driver-native decrypt (CENC / HLS sample decryption), ADR-023. */
@@ -252,6 +296,12 @@ export interface ContainerDriver extends DriverBase {
    * {@link PcmTransform}. Absent ⇒ the WebCodecs/WASM codec seam.
    */
   decodePcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * Optional decode of a raw-PCM container to canonical planar PCM for the public `decode()` frame stream.
+   * The engine wraps the returned samples as browser `AudioData` chunks; Node/unsupported browsers raise
+   * a typed capability miss before constructing frames. Absent ⇒ the WebCodecs/WASM codec seam.
+   */
+  decodePcmAudio?(src: ByteSource, o?: StageOptions): Promise<PcmAudio>;
 }
 
 // ============ 3) FilterDriver ============
@@ -274,8 +324,8 @@ export type FilterSpec =
   | { mediaType: 'audio'; type: 'remix'; channels: number }
   | { mediaType: 'audio'; type: 'gain'; db: number };
 
-/** The substrate a filter runs on; the router ranks WebGPU → WebGL → Canvas2D → WASM. */
-export type FilterSubstrate = 'webgpu' | 'webgl' | 'canvas2d' | 'wasm';
+/** The substrate a filter runs on; the router ranks WebGPU → WebGL → Canvas2D → native → WASM. */
+export type FilterSubstrate = 'webgpu' | 'webgl' | 'canvas2d' | 'native' | 'wasm';
 
 export interface FilterDriver extends DriverBase {
   readonly kind: 'filter';

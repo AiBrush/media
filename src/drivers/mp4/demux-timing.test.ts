@@ -79,6 +79,24 @@ describe('MP4 demux timing — DTS/CTS/keyframe per sample (B-frame reorder)', (
     expect(anyReorder).toBe(true);
     expect(us.some((s) => s.ptsUs > s.dtsUs)).toBe(true);
   });
+
+  it('applies a real MP4 edit-list media_time before exposing packet timestamps', async () => {
+    const file = await loadFixture('bear-rotate-90.mp4');
+    const movie = await readMovie({
+      read: (o, l) => Promise.resolve(file.subarray(o, o + l)),
+      size: file.byteLength,
+    });
+    const video = movie.tracks.find((t) => t.mediaType === 'video');
+    if (!video) throw new Error('no video');
+
+    expect(video.edit?.mediaTimeTicks).toBe(1024);
+    const us = buildSamples(video);
+    expect(us[0]?.ptsUs).toBe(0);
+    expect(us[0]?.dtsUs).toBeLessThan(0);
+
+    const presentationEndUs = Math.max(...us.map((s) => s.ptsUs + s.durationUs));
+    expect(presentationEndUs / 1_000_000).toBeCloseTo(movie.durationSec, 5);
+  });
 });
 
 describe('MP4 demux timing — VFR (variable frame rate) per-sample durations', () => {

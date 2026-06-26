@@ -23,6 +23,13 @@ export {
   type RouterDeps,
   type StageSelectOptions,
 } from './kernel/router.ts';
+export {
+  type WasmBindgenInit,
+  type WasmRuntimeRequest,
+  requireIsolatedWasmProfile,
+  resolveWasmRuntimeProfile,
+  wasmInitForProfile,
+} from './kernel/wasm-runtime.ts';
 export { closeFrame, closeFrames, type Closable, isClosable } from './kernel/frames.ts';
 export { collect, composeChain, type ExecuteOptions, runToSink } from './kernel/executor.ts';
 export { InlineBridge, type WorkerBridge } from './kernel/worker-bridge.ts';

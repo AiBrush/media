@@ -1,5 +1,5 @@
 /**
- * Video filter drivers (doc 09 §filters, ladder doc 04: WebGPU → WebGL → Canvas2D → WASM). Implements the
+ * Video filter drivers (doc 09 §filters, ladder doc 04: WebGPU → Canvas2D → native CPU → WASM). Implements the
  * four geometric `FilterSpec` ops — `resize`, `crop`, `rotate`, `flip` — on the best available pixel
  * substrate, each as a `TransformStream<VideoFrame, VideoFrame>` per the {@link FilterDriver} contract.
  *
@@ -45,9 +45,7 @@ import {
 import {
   COLOR_UNIFORM_BYTES,
   type ColorPlan,
-  type ColorSpaceId,
   type SourceColor,
-  type TransferId,
   UNIFORM_BYTES,
   isDisplayColorSpace,
   packColorUniforms,
@@ -57,6 +55,9 @@ import {
   planTonemap,
   uniformsForRecipe,
 } from './gpu-uniforms.ts';
+import { mapVideoColorSpace } from './video-color-space.ts';
+
+export { type VideoColorSpaceLike, mapVideoColorSpace } from './video-color-space.ts';
 
 /** The geometric video specs handled by the single quad pipeline (resize/crop/rotate/flip). */
 type GeometricVideoSpec = Extract<
@@ -138,53 +139,6 @@ export function planDraw(spec: GeometricVideoSpec, srcW: number, srcH: number): 
   }
 }
 
-/**
- * The default source colour interpretation when a `VideoFrame` carries no `colorSpace` metadata: BT.709
- * primaries + BT.709 transfer (the ubiquitous HD/SDR assumption). Used by {@link mapVideoColorSpace}.
- */
-const DEFAULT_SOURCE_COLOR: SourceColor = { primaries: 'bt709', transfer: 'bt709' };
-
-/** A structural view of `VideoColorSpace` (only the two fields the planner reads), so this stays Node-pure. */
-export interface VideoColorSpaceLike {
-  readonly primaries: string | null;
-  readonly transfer: string | null;
-}
-
-/** Map a WebCodecs `VideoColorSpace.transfer` token onto a {@link TransferId} (unknown → BT.709 SDR). */
-function mapTransfer(transfer: string | null): TransferId {
-  switch (transfer) {
-    case 'bt709':
-    case 'smpte170m': // SD SDR shares the BT.709 camera curve for our purposes.
-      return 'bt709';
-    case 'iec61966-2-1':
-      return 'srgb';
-    case 'pq':
-      return 'pq';
-    case 'hlg':
-      return 'hlg';
-    case 'linear':
-      return 'linear';
-    default:
-      return DEFAULT_SOURCE_COLOR.transfer;
-  }
-}
-
-/** Map a WebCodecs `VideoColorSpace.primaries` token onto a {@link ColorSpaceId} (unknown → BT.709). */
-function mapPrimaries(primaries: string | null): ColorSpaceId {
-  const parsed = primaries === null ? null : parseColorSpace(primaries);
-  return parsed ?? DEFAULT_SOURCE_COLOR.primaries;
-}
-
-/**
- * Map a frame's `VideoColorSpace` (or any structural {@link VideoColorSpaceLike}) onto the {@link SourceColor}
- * the colour-plan selector needs, defaulting unknown/absent primaries+transfer to BT.709 SDR. Pure — tested
- * in Node with plain objects (a real `VideoColorSpace` cannot be constructed there).
- */
-export function mapVideoColorSpace(cs: VideoColorSpaceLike | null | undefined): SourceColor {
-  if (cs === null || cs === undefined) return DEFAULT_SOURCE_COLOR;
-  return { primaries: mapPrimaries(cs.primaries), transfer: mapTransfer(cs.transfer) };
-}
-
 /** Resolve a *colour* spec + the source colour interpretation into a {@link ColorPlan}. Pure/Node-tested. */
 export function planColor(spec: ColorVideoSpec, source: SourceColor): ColorPlan {
   if (spec.type === 'tonemap') return planTonemap(source);
@@ -206,9 +160,8 @@ function recipeDims(recipe: DrawRecipe): Dims {
 
 /** Build a `VideoFrameInit` carrying the source frame's timing (duration only when present, ADR-011/strict). */
 function framedInit(source: VideoFrame): VideoFrameInit {
-  return source.duration === null
-    ? { timestamp: source.timestamp }
-    : { timestamp: source.timestamp, duration: source.duration };
+  const base: VideoFrameInit = { timestamp: source.timestamp };
+  return source.duration === null ? base : { ...base, duration: source.duration };
 }
 /* v8 ignore stop */
 
@@ -349,9 +302,9 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
  * exactly (same constants), so the Node-validated plan and the GPU render agree. Alpha is passed through.
  *
  * `params = vec4(decodeTag, encodeTag, tonemapTag, peak)` and `gamut` is a column-major `mat3x3`, matching
- * {@link packColorUniforms}. Transfer tags: 0 linear · 1 sRGB · 2 BT.709/2020 · 3 PQ · 4 HLG. Tonemap tags:
- * 0 none · 1 extended-Reinhard · 2 Hable. The tonemap operator is applied per channel and normalized so the
- * source `peak` maps to 1.0 (black stays at 0).
+ * {@link packColorUniforms}. Transfer tags: 0 linear · 1 sRGB · 2 BT.709/2020 · 3 PQ · 4 HLG. HDR EOTFs
+ * return SDR-white-relative linear light (PQ peak 100, HLG peak 12), so the tonemap operator's `peak`
+ * parameter maps the real source peak to 1.0 (black stays at 0).
  */
 const COLOR_WGSL = /* wgsl */ `
 struct ColorUniforms {
@@ -383,6 +336,8 @@ const PQ_M2 : f32 = 78.84375;                 // 2523/4096*128
 const PQ_C1 : f32 = 0.8359375;                // 3424/4096
 const PQ_C2 : f32 = 18.8515625;               // 2413/4096*32
 const PQ_C3 : f32 = 18.6875;                  // 2392/4096*32
+const PQ_PEAK_WHITE : f32 = 100.0;
+const HLG_PEAK_WHITE : f32 = 12.0;
 const HLG_A : f32 = 0.17883277;
 const HLG_B : f32 = 0.28466892;               // 1 - 4a
 const HLG_C : f32 = 0.55991073;               // 0.5 - a*ln(4a)
@@ -400,11 +355,11 @@ fn eotf_ch(id : f32, x : f32) -> f32 {
   if (id < 3.5) {                                               // PQ
     let xc = clamp(x, 0.0, 1.0);
     let ep = pow(xc, 1.0 / PQ_M2);
-    return pow(max(ep - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * ep), 1.0 / PQ_M1);
+    return pow(max(ep - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * ep), 1.0 / PQ_M1) * PQ_PEAK_WHITE;
   }
   // HLG
   if (x <= 0.5) { return (x * x) / 3.0; }
-  return (exp((x - HLG_C) / HLG_A) + HLG_B) / 12.0;
+  return ((exp((x - HLG_C) / HLG_A) + HLG_B) / 12.0) * HLG_PEAK_WHITE;
 }
 
 fn oetf_ch(id : f32, x : f32) -> f32 {
@@ -413,9 +368,18 @@ fn oetf_ch(id : f32, x : f32) -> f32 {
     if (x <= 0.0031308) { return 12.92 * x; }
     return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
   }
-  // BT.709/2020 (output is always an SDR display curve; PQ/HLG never used on encode)
-  if (x < BT709_B) { return 4.5 * x; }
-  return BT709_A * pow(x, 0.45) - (BT709_A - 1.0);
+  if (id < 2.5) {                                               // BT.709/2020
+    if (x < BT709_B) { return 4.5 * x; }
+    return BT709_A * pow(x, 0.45) - (BT709_A - 1.0);
+  }
+  if (id < 3.5) {                                               // PQ
+    let y = clamp(x / PQ_PEAK_WHITE, 0.0, 1.0);
+    let ym = pow(y, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym), PQ_M2);
+  }
+  let y = clamp(x / HLG_PEAK_WHITE, 0.0, 1.0);                  // HLG
+  if (y <= 1.0 / 12.0) { return sqrt(3.0 * y); }
+  return HLG_A * log(12.0 * y - HLG_B) + HLG_C;
 }
 
 fn eotf3(id : f32, v : vec3<f32>) -> vec3<f32> {
@@ -619,9 +583,11 @@ type VideoFilterSpec = GeometricVideoSpec | ColorVideoSpec;
 /* v8 ignore start -- reads a live VideoFrame; the pure planners it delegates to are Node-tested. */
 function recipeForFrame(spec: VideoFilterSpec, frame: VideoFrame): DrawRecipe {
   if (isColorVideoSpec(spec)) {
+    const source = mapVideoColorSpace(frame.colorSpace);
+    const plan = planColor(spec, source);
     return {
       kind: 'color',
-      plan: planColor(spec, mapVideoColorSpace(frame.colorSpace)),
+      plan,
       dims: { width: frame.displayWidth, height: frame.displayHeight },
     };
   }

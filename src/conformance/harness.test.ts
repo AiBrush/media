@@ -107,6 +107,11 @@ describe('conformance harness — it can fail (anti-cheat: oracles must reject w
     expect(() => assertFilterDriverConforms(bad, filterCase)).toThrow(ConformanceError);
   });
 
+  it('accepts the additive native filter substrate', () => {
+    const native: FilterDriver = { ...NOOP_FILTER, substrate: 'native' };
+    expect(() => assertFilterDriverConforms(native, filterCase)).not.toThrow();
+  });
+
   it('accepts a codec whose createEncoder throws a typed MediaError (encode-not-provided is legal)', async () => {
     const decodeOnly: CodecDriver = {
       ...NOOP_CODEC,

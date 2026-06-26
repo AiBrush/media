@@ -12,11 +12,12 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
+import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { MpegTsDriver, MpegTsModule } from './mpegts-driver.ts';
 import { TS_CLOCK_HZ, detectFraming, parseTs } from './ts-parse.ts';
+import { MpegTsMuxer } from './ts-write.ts';
 
 // The sibling acceptance corpus holds full-length real transport streams; we read them by direct path
 // (they are not in this project's fetch-fixtures manifest). The committed slice is self-contained.
@@ -31,6 +32,82 @@ async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
 }
 async function bytesFromDerived(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${DERIVED}${name}`));
+}
+async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+async function streamCopyTs(
+  bytes: Uint8Array,
+  options?: Parameters<NonNullable<typeof MpegTsDriver.streamCopy>>[1],
+): Promise<Uint8Array> {
+  const streamCopy = MpegTsDriver.streamCopy;
+  if (streamCopy === undefined) throw new Error('MpegTsDriver.streamCopy is not implemented');
+  return collectBytes(await streamCopy(fromBytes(bytes, { mime: 'video/mp2t' }), options));
+}
+function concatBytes(...parts: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, part) => n + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+function u16Bytes(value: number): Uint8Array {
+  return Uint8Array.of((value >> 8) & 0xff, value & 0xff);
+}
+function avcCWithParameterSets(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+  return concatBytes(
+    Uint8Array.of(0x01, sps[1] ?? 0x42, sps[2] ?? 0x00, sps[3] ?? 0x1e, 0xff, 0xe1),
+    u16Bytes(sps.byteLength),
+    sps,
+    Uint8Array.of(0x01),
+    u16Bytes(pps.byteLength),
+    pps,
+  );
+}
+function expectUnitsPreserved(
+  actual: readonly { data: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }[],
+  expected: readonly { data: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }[],
+): void {
+  expect(actual.length).toBe(expected.length);
+  for (let index = 0; index < expected.length; index += 1) {
+    const rewritten = actual[index];
+    const original = expected[index];
+    if (rewritten === undefined || original === undefined) {
+      throw new Error(`missing unit ${index}`);
+    }
+    expect(rewritten.data).toEqual(original.data);
+    expect(Math.abs(rewritten.ptsUs - original.ptsUs)).toBeLessThanOrEqual(12);
+    expect(Math.abs(rewritten.dtsUs - original.dtsUs)).toBeLessThanOrEqual(12);
+    expect(rewritten.keyframe).toBe(original.keyframe);
+  }
+}
+function unitDurationUs(units: readonly { ptsUs: number }[], index: number): number {
+  const current = units[index];
+  if (current === undefined) return 0;
+  const next = units[index + 1];
+  if (next !== undefined && next.ptsUs > current.ptsUs) return next.ptsUs - current.ptsUs;
+  const previous = units[index - 1];
+  if (previous !== undefined && current.ptsUs > previous.ptsUs) {
+    return current.ptsUs - previous.ptsUs;
+  }
+  return 0;
 }
 
 /** The committed verbatim head of `h264_ts.ts` — a valid standalone TS (PAT+PMT+first PES). */
@@ -300,6 +377,353 @@ describe('demux — packet seam (browser-gated like mp4)', () => {
     const demuxed = await MpegTsDriver.demux(streamSource);
     expect(demuxed.tracks.map((t) => t.codec)).toEqual(['h264', 'aac']);
     await demuxed.close();
+  });
+});
+
+describe('mux — H.264/AAC access units into MPEG-TS', () => {
+  const sps = Uint8Array.of(0x67, 0x42, 0x00, 0x1e, 0xf4, 0x05, 0x01, 0xec, 0x80);
+  const pps = Uint8Array.of(0x68, 0xce, 0x3c, 0x80);
+  const h264Track = (description = avcCWithParameterSets(sps, pps)): TrackInfo => ({
+    id: 0,
+    mediaType: 'video',
+    codec: 'avc1.42001e',
+    durationSec: 1 / 30,
+    config: {
+      codec: 'avc1.42001e',
+      codedWidth: 16,
+      codedHeight: 16,
+      description,
+    },
+  });
+  const aacTrack = (description = Uint8Array.of(0x11, 0x90)): TrackInfo => ({
+    id: 1,
+    mediaType: 'audio',
+    codec: 'mp4a.40.2',
+    durationSec: 1024 / 48_000,
+    config: {
+      codec: 'mp4a.40.2',
+      sampleRate: 48_000,
+      numberOfChannels: 2,
+      description,
+    },
+  });
+
+  it('authors PAT/PMT/PES packets and converts AVCC H.264 plus raw AAC into Annex B/ADTS', async () => {
+    const muxer = new MpegTsMuxer();
+    const videoTrack = h264Track();
+    const audioTrack = aacTrack();
+    const videoTrackId = muxer.addTrack(videoTrack);
+    const audioTrackId = muxer.addTrack(audioTrack);
+    muxer.addChunkStruct(videoTrackId, {
+      data: Uint8Array.of(0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84),
+      timestampUs: 0,
+      dtsUs: 0,
+      durationUs: 33_333,
+      key: true,
+    });
+    muxer.addChunkStruct(audioTrackId, {
+      data: Uint8Array.of(0x21, 0x10, 0x56, 0xe5, 0x00, 0x40),
+      timestampUs: 0,
+      dtsUs: 0,
+      durationUs: 21_333,
+      key: true,
+    });
+
+    await muxer.finalize();
+    const bytes = await collectBytes(muxer.output);
+    expect(bytes.byteLength % 188).toBe(0);
+    expect(bytes[0]).toBe(0x47);
+    expect(bytes[188]).toBe(0x47);
+
+    const parsed = parseTs(bytes);
+    expect(parsed.tracks.map((track) => track.stream.codec)).toEqual(['h264', 'aac']);
+    const video = parsed.tracks[0];
+    const audio = parsed.tracks[1];
+    expect(video?.units).toHaveLength(1);
+    expect(audio?.units).toHaveLength(1);
+    expect(video?.units[0]?.keyframe).toBe(true);
+    expect([...(video?.units[0]?.data ?? new Uint8Array()).subarray(0, 4)]).toEqual([0, 0, 0, 1]);
+    expect(video?.units[0]?.data.includes(0x67)).toBe(true);
+    expect(video?.units[0]?.data.includes(0x68)).toBe(true);
+    expect(audio?.config).toMatchObject({ codec: 'aac', sampleRate: 48_000, numberOfChannels: 2 });
+    expect(audio?.units[0]?.data[0]).toBe(0xff);
+    expect((audio?.units[0]?.data[1] ?? 0) & 0xf0).toBe(0xf0);
+  });
+
+  it('round-trips real Annex-B/ADTS access units without changing boundaries or data bytes', async () => {
+    const source = parseTs(await bytesFromDerived(DERIVED_TS));
+    const muxer = new MpegTsMuxer();
+    const trackIds = source.tracks.map((track, index) =>
+      muxer.addTrack({
+        id: index,
+        mediaType: track.stream.mediaType,
+        codec: track.stream.codec,
+        durationSec: track.durationSec,
+        ...(track.fps !== undefined ? { fps: track.fps } : {}),
+        config: track.config,
+      }),
+    );
+
+    const units = source.tracks.flatMap((track, trackIndex) =>
+      track.units.map((unit) => ({ trackIndex, unit })),
+    );
+    units.sort(
+      (left, right) => left.unit.dtsUs - right.unit.dtsUs || left.trackIndex - right.trackIndex,
+    );
+    for (const { trackIndex, unit } of units) {
+      const trackId = trackIds[trackIndex];
+      if (trackId === undefined) throw new Error(`missing mux track ${trackIndex}`);
+      muxer.addChunkStruct(trackId, {
+        data: unit.data,
+        timestampUs: unit.ptsUs,
+        dtsUs: unit.dtsUs,
+        key: unit.keyframe,
+      });
+    }
+
+    await muxer.finalize();
+    const remuxed = parseTs(await collectBytes(muxer.output));
+    expect(remuxed.tracks.map((track) => track.stream.codec)).toEqual(
+      source.tracks.map((track) => track.stream.codec),
+    );
+    for (let trackIndex = 0; trackIndex < source.tracks.length; trackIndex += 1) {
+      const before = source.tracks[trackIndex]?.units ?? [];
+      const after = remuxed.tracks[trackIndex]?.units ?? [];
+      expect(after.length).toBe(before.length);
+      for (let index = 0; index < Math.min(20, before.length); index += 1) {
+        const original = before[index];
+        const rewritten = after[index];
+        if (original === undefined || rewritten === undefined)
+          throw new Error(`missing unit ${trackIndex}:${index}`);
+        expect([...rewritten.data]).toEqual([...original.data]);
+        expect(Math.abs(rewritten.ptsUs - original.ptsUs)).toBeLessThanOrEqual(12);
+        expect(Math.abs(rewritten.dtsUs - original.dtsUs)).toBeLessThanOrEqual(12);
+        expect(rewritten.keyframe).toBe(original.keyframe);
+      }
+    }
+  });
+
+  it('rejects unsupported shapes and write/finalize misuse with typed errors', async () => {
+    expect(() => new MpegTsMuxer({ fragmented: true })).toThrowError(CapabilityError);
+
+    const mediaMismatch = new MpegTsMuxer();
+    expect(() =>
+      mediaMismatch.addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'h264',
+        config: { codec: 'h264', sampleRate: 48_000, numberOfChannels: 2 },
+      }),
+    ).toThrowError(/media type does not match/i);
+
+    const unsupported = new MpegTsMuxer();
+    expect(() =>
+      unsupported.addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp3',
+        config: { codec: 'mp3', sampleRate: 48_000, numberOfChannels: 2 },
+      }),
+    ).toThrowError(/supports H.264 and AAC/);
+
+    const empty = new MpegTsMuxer();
+    await expect(empty.finalize()).rejects.toThrowError(/at least one track/);
+
+    const noPackets = new MpegTsMuxer();
+    noPackets.addTrack(h264Track());
+    await expect(noPackets.finalize()).rejects.toThrowError(/at least one packet/);
+
+    const invalid = new MpegTsMuxer();
+    const trackId = invalid.addTrack(aacTrack());
+    expect(() =>
+      invalid.addChunkStruct(99, {
+        data: Uint8Array.of(1),
+        timestampUs: 0,
+        key: true,
+      }),
+    ).toThrowError(/unknown mux track/);
+    expect(() =>
+      invalid.addChunkStruct(trackId, {
+        data: Uint8Array.of(1),
+        timestampUs: Number.NaN,
+        key: true,
+      }),
+    ).toThrowError(/Invalid MPEG-TS timestampUs/);
+    expect(() =>
+      invalid.addChunkStruct(trackId, {
+        data: Uint8Array.of(1),
+        timestampUs: 0,
+        durationUs: -1,
+        key: true,
+      }),
+    ).toThrowError(/Invalid MPEG-TS durationUs/);
+    expect(() =>
+      invalid.addChunkStruct(trackId, {
+        data: new Uint8Array(),
+        timestampUs: 0,
+        key: true,
+      }),
+    ).toThrowError(/empty MPEG-TS access unit/);
+
+    invalid.addChunkStruct(trackId, {
+      data: Uint8Array.of(1, 2, 3),
+      timestampUs: 0,
+      durationUs: 21_333,
+      key: true,
+    });
+    await invalid.finalize();
+    expect(() =>
+      invalid.addChunkStruct(trackId, {
+        data: Uint8Array.of(4),
+        timestampUs: 21_333,
+        key: true,
+      }),
+    ).toThrowError(/after finalize/);
+  });
+
+  it('rejects malformed H.264 avcC descriptions and invalid length-prefixed samples', async () => {
+    expect(() => new MpegTsMuxer().addTrack(h264Track(Uint8Array.of(0, 1, 2)))).toThrowError(
+      /Invalid avcC/,
+    );
+    expect(() =>
+      new MpegTsMuxer().addTrack(
+        h264Track(
+          concatBytes(
+            Uint8Array.of(1, 0x42, 0, 0x1e, 0xff, 0xe1),
+            u16Bytes(sps.byteLength + 1),
+            sps,
+          ),
+        ),
+      ),
+    ).toThrowError(/parameter set length/);
+    expect(() =>
+      new MpegTsMuxer().addTrack(
+        h264Track(concatBytes(Uint8Array.of(1, 0x42, 0, 0x1e, 0xff, 0xe0, 0x00))),
+      ),
+    ).toThrowError(/missing SPS\/PPS/);
+
+    const noConfig = new MpegTsMuxer();
+    const noConfigTrack = noConfig.addTrack({
+      id: 0,
+      mediaType: 'video',
+      codec: 'h264',
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+    });
+    noConfig.addChunkStruct(noConfigTrack, {
+      data: Uint8Array.of(0, 0, 0, 1, 0x65),
+      timestampUs: 0,
+      key: true,
+    });
+    await noConfig.finalize();
+    expect(parseTs(await collectBytes(noConfig.output)).tracks[0]?.units[0]?.data[4]).toBe(0x65);
+
+    const invalidNal = new MpegTsMuxer();
+    const invalidNalTrack = invalidNal.addTrack(h264Track());
+    invalidNal.addChunkStruct(invalidNalTrack, {
+      data: Uint8Array.of(0, 0, 0, 10, 0x65),
+      timestampUs: 0,
+      key: true,
+    });
+    await expect(invalidNal.finalize()).rejects.toThrowError(/Invalid H.264 NAL length/);
+  });
+
+  it('rejects AAC configs that cannot be represented as ADTS', () => {
+    expect(() =>
+      new MpegTsMuxer().addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'aac', numberOfChannels: 2 },
+      }),
+    ).toThrowError(/sampleRate metadata/);
+    expect(() =>
+      new MpegTsMuxer().addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'aac', sampleRate: 12_345, numberOfChannels: 2 },
+      }),
+    ).toThrowError(/sample rate is not representable/);
+    expect(() =>
+      new MpegTsMuxer().addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 8 },
+      }),
+    ).toThrowError(/channel count is not representable/);
+    expect(() => new MpegTsMuxer().addTrack(aacTrack(Uint8Array.of(0x29, 0x90)))).toThrowError(
+      /object types 1 through 4/,
+    );
+  });
+});
+
+describe('streamCopy — driver-native MPEG-TS remux and keyframe trim', () => {
+  it('remuxes a real TS without WebCodecs and preserves every access-unit byte/timestamp', async () => {
+    const sourceBytes = await bytesFromMediaTest('h264_ts.ts');
+    const source = parseTs(sourceBytes);
+    const copiedBytes = await streamCopyTs(sourceBytes, { container: 'ts' });
+    expect(copiedBytes.byteLength % 188).toBe(0);
+    expect(copiedBytes[0]).toBe(0x47);
+    expect(copiedBytes[188]).toBe(0x47);
+
+    const copied = parseTs(copiedBytes);
+    expect(copied.tracks.map((track) => track.stream.codec)).toEqual(
+      source.tracks.map((track) => track.stream.codec),
+    );
+    for (let trackIndex = 0; trackIndex < source.tracks.length; trackIndex += 1) {
+      expectUnitsPreserved(
+        copied.tracks[trackIndex]?.units ?? [],
+        source.tracks[trackIndex]?.units ?? [],
+      );
+    }
+  });
+
+  it('keyframe-trims a real TS with source-relative timing and no codec seam', async () => {
+    const sourceBytes = await bytesFromMediaTest('h264_ts.ts');
+    const source = parseTs(sourceBytes);
+    const allPts = source.tracks.flatMap((track) => track.units.map((unit) => unit.ptsUs));
+    const originUs = Math.min(...allPts);
+    const startSec = 2.1;
+    const endSec = 4.05;
+    const startUs = Math.round(startSec * 1_000_000);
+    const endUs = Math.round(endSec * 1_000_000);
+
+    const video = source.tracks.find((track) => track.stream.mediaType === 'video');
+    const audio = source.tracks.find((track) => track.stream.mediaType === 'audio');
+    if (video === undefined || audio === undefined) throw new Error('fixture missing tracks');
+
+    let videoStartIndex = 0;
+    for (let index = 0; index < video.units.length; index += 1) {
+      const unit = video.units[index];
+      if (unit?.keyframe === true && unit.ptsUs - originUs <= startUs) {
+        videoStartIndex = index;
+      }
+    }
+    const expectedVideo = video.units
+      .slice(videoStartIndex)
+      .filter((unit) => unit.dtsUs - originUs < endUs);
+    const audioStartIndex = audio.units.findIndex(
+      (unit, index) => unit.ptsUs - originUs + unitDurationUs(audio.units, index) > startUs,
+    );
+    const expectedAudio = audio.units
+      .slice(audioStartIndex < 0 ? 0 : audioStartIndex)
+      .filter((unit) => unit.dtsUs - originUs < endUs);
+
+    const trimmedBytes = await streamCopyTs(sourceBytes, {
+      container: 'ts',
+      trim: { startSec, endSec },
+    });
+    const trimmed = parseTs(trimmedBytes);
+    const trimmedVideo = trimmed.tracks.find((track) => track.stream.mediaType === 'video');
+    const trimmedAudio = trimmed.tracks.find((track) => track.stream.mediaType === 'audio');
+    const trimmedDurationSec = Math.max(...trimmed.tracks.map((track) => track.durationSec));
+
+    expect(trimmedDurationSec).toBeGreaterThan(1.8);
+    expect(trimmedDurationSec).toBeLessThan(2.2);
+    expect(trimmedVideo?.units[0]?.keyframe).toBe(true);
+    expectUnitsPreserved(trimmedVideo?.units ?? [], expectedVideo);
+    expectUnitsPreserved(trimmedAudio?.units ?? [], expectedAudio);
   });
 });
 

@@ -326,6 +326,20 @@ describe('wasm-aac — driver identity & module', () => {
       ).supported,
     ).toBe(false);
   });
+  it('supports(): false in Node when the AudioData output seam is unavailable', async () => {
+    const support = await WasmAacDriver.supports({
+      mediaType: 'audio',
+      direction: 'decode',
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        description: Uint8Array.of(0x11, 0x90),
+      },
+    });
+    expect(support.supported).toBe(false);
+    expect(support.reason ?? '').toMatch(/AudioData|EncodedAudioChunk/);
+  });
   it('resetAacCoreForTest lets the core be re-evaluated', async () => {
     resetAacCoreForTest();
     const a = await loadAacCore();

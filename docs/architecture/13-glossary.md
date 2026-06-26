@@ -4,7 +4,7 @@ Terms used across the architecture docs.
 
 ## Engine concepts
 
-- **Substrate** — an execution mechanism a stage can run on: hardware **WebCodecs**, the **GPU** (WebGPU/WebGL/Canvas), **WASM** (libav-style codecs), or hand-written **TS** containers. Four total.
+- **Substrate** — an execution mechanism a stage can run on: hardware **WebCodecs**, the **GPU** (WebGPU/WebGL/Canvas), **native** browser/CPU code (software WebCodecs or pure-TS CPU filters), **WASM** (codec/filter tails), or hand-written **TS** containers.
 - **Tier** — a substrate's rank for a stage: `hardware` > `gpu` > `native` (software WebCodecs) > `wasm`. The router tries best-first.
 - **Driver** — an adapter implementing one stage on one substrate (e.g. a WebCodecs H.264 codec driver, an MP4 container driver, a WASM FLAC decoder). The unit of extension. See [`05`](05-driver-contracts.md).
 - **Capability ladder** — the ordered list of strategies the router walks for a stage, picking the first the environment supports. See [`04`](04-capability-router-and-ladder.md).

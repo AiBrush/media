@@ -91,6 +91,16 @@ const CAFS: readonly CafGolden[] = [
     bitsPerChannel: 32,
     durationSec: 10240 / 48000,
   },
+  {
+    id: 'sfx-u8.caf',
+    load: loadDerived,
+    codec: 'pcm-s8',
+    endian: 'le',
+    sampleRate: 48000,
+    channels: 1,
+    bitsPerChannel: 8,
+    durationSec: 10240 / 48000,
+  },
   // Larger real harness CAF (stereo, 5 s) — same provenance as pcm_s16.caf.meta.json (codec pcm-s16).
   {
     id: 'pcm_s16.caf',
@@ -278,11 +288,12 @@ describe('convert(→ caf) end-to-end through the engine (CONTAINER_TOKENS + PCM
 });
 
 describe('cafCodec — harness codec-token vocabulary', () => {
-  it('little-endian ints have no suffix; big-endian ints carry be; floats are pcm-fN', () => {
+  it('little-endian ints have no suffix; big-endian multi-byte ints carry be; floats are pcm-fN', () => {
     expect(cafCodec('s16', 'le')).toBe('pcm-s16');
     expect(cafCodec('s24', 'le')).toBe('pcm-s24');
     expect(cafCodec('s16', 'be')).toBe('pcm-s16be');
-    expect(cafCodec('u8', 'le')).toBe('pcm-u8');
+    expect(cafCodec('s8', 'le')).toBe('pcm-s8');
+    expect(cafCodec('s8', 'be')).toBe('pcm-s8');
     expect(cafCodec('f32', 'le')).toBe('pcm-f32');
     expect(cafCodec('f64', 'be')).toBe('pcm-f64');
   });
@@ -311,13 +322,15 @@ describe('parseCaf — robustness on crafted-bad inputs (graceful-failure oracle
     expect(() => parseCaf(file)).toThrowError(CapabilityError);
   });
 
-  it('reports an honest CapabilityError for real signed 8-bit CAF (afconvert I8) PCM', async () => {
-    // sfx-u8.caf is a genuine Apple-native 8-bit lpcm CAF; its samples are signed (afinfo: "8-bit signed
-    // integer"), which the offset-binary `u8` cannot represent — so it is a typed miss, never a wrong
-    // (128-off) decode. Round-tripping it as `u8` would silently corrupt the waveform.
-    await expect(
-      CafDriver.demux(bytesSource(await loadDerived('sfx-u8.caf'))),
-    ).rejects.toThrowError(CapabilityError);
+  it('parses real signed 8-bit CAF (afconvert I8) PCM as pcm-s8', async () => {
+    // sfx-u8.caf is a genuine Apple-native 8-bit lpcm CAF; despite the historical fixture name,
+    // CoreAudio writes signed 8-bit integer samples, not WAV-style offset-binary `u8`.
+    const file = await loadDerived('sfx-u8.caf');
+    const info = parseCaf(file);
+    expect(info.codec).toBe('pcm-s8');
+    const pcm = readCafPcm(file);
+    const re = writeCaf(pcm, pcm.format, pcm.endian);
+    expect(cafDataSamples(re)).toEqual(cafDataSamples(file));
   });
 
   it('decodes lpcm at 24-bit and 32-bit integer depths', () => {

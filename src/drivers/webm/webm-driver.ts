@@ -120,11 +120,11 @@ export interface WebmTrack {
   channels?: number;
   /**
    * The WebCodecs decoder `description` — the codec-private bytes a decoder needs to configure. For
-   * H.264 (`V_MPEG4/ISO/AVC`) the Matroska CodecPrivate **is** the `avcC` box, and for HEVC
-   * (`V_MPEGH/ISO/HEVC`) it **is** `hvcC`; surfacing it is what unblocks H.264/HEVC-in-Matroska decode
-   * (the codec tier expands the bare `h264`/`hevc` token + this `description` into `avc1.PPCCLL`/`hev1…`).
-   * For Vorbis, Matroska `CodecPrivate` is the Xiph-laced id/comment/setup header triplet that an Ogg
-   * muxer needs to author a valid logical stream.
+   * H.264 (`V_MPEG4/ISO/AVC`) the Matroska CodecPrivate **is** the `avcC` box, for HEVC
+   * (`V_MPEGH/ISO/HEVC`) it **is** `hvcC`, and for AAC it is the AudioSpecificConfig that MP4 `esds`
+   * / WebCodecs need. Surfacing it is what unblocks Matroska packet-copy into codec-private-aware targets.
+   * For Vorbis, Matroska `CodecPrivate` is the Xiph-laced id/comment/setup header triplet that an Ogg muxer
+   * needs to author a valid logical stream.
    */
   description?: Uint8Array;
 }
@@ -177,10 +177,11 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   const codec = mapCodec(codecId, bitDepth);
   const fps = defaultDuration > 0 ? 1e9 / defaultDuration : undefined;
   // The CodecPrivate IS the WebCodecs/muxer `description` for codecs that need out-of-band setup:
-  // H.264's `avcC`, HEVC's `hvcC`, and Vorbis' Xiph-laced id/comment/setup headers. VP8/VP9/AV1/Opus
-  // are self-describing for the paths this driver currently exposes, so their CodecPrivate is omitted.
+  // H.264's `avcC`, HEVC's `hvcC`, AAC's AudioSpecificConfig, and Vorbis' Xiph-laced id/comment/setup
+  // headers. VP8/VP9/AV1/Opus are self-describing for the paths this driver currently exposes, so their
+  // CodecPrivate is omitted.
   const description =
-    (codec === 'h264' || codec === 'hevc' || codec === 'vorbis') &&
+    (codec === 'h264' || codec === 'hevc' || codec === 'aac' || codec === 'vorbis') &&
     codecPrivate &&
     codecPrivate.byteLength > 0
       ? codecPrivate
@@ -348,7 +349,7 @@ function laceSizes(
       if (!raw) return undefined;
       // Signed-vint bias: subtract 2^(7*length - 1) - 1 to recover the signed delta.
       const bias = 2 ** (7 * raw.length - 1) - 1;
-      sizes.push((sizes[sizes.length - 1] ?? 0) + (raw.value - bias));
+      sizes.push((sizes[sizes.length - 1] as number) + (raw.value - bias));
       p += raw.length;
     }
   }
@@ -380,7 +381,7 @@ function blockFrames(
   const flagsOff = block.dataStart + tn.length + 2; // after the 2-byte int16 timecode
   if (flagsOff >= block.dataEnd) return undefined;
   const relTimecode = dv.getInt16(block.dataStart + tn.length, false);
-  const flags = bytes[flagsOff] ?? 0;
+  const flags = bytes[flagsOff] as number;
   const keyframe = keyframeOverride ?? (flags & 0x80) !== 0;
   const timestampUs = Math.round(((clusterTimecode + relTimecode) * timecodeScale) / 1000);
   const lacing = lacingOf(flags);

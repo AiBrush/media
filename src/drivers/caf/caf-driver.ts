@@ -3,7 +3,7 @@
  * (`caff` header + `desc`/`data`/… chunks with signed-64-bit sizes) carrying raw PCM whose endianness is
  * declared in the ASBD format flags (Apple writes `lpcm` little-endian by default). PCM is not a
  * WebCodecs codec — it flows to the TS audio-dsp path — so the packet seam raises a typed
- * {@link CapabilityError} and the codec token is `pcm-s16` / `pcm-s16be` / `pcm-f32` etc.
+ * {@link CapabilityError} and the codec token is `pcm-s8` / `pcm-s16` / `pcm-s16be` / `pcm-f32` etc.
  * (docs/architecture/09 audio-dsp).
  */
 
@@ -18,11 +18,13 @@ import {
   type Packet,
   type PcmTransform,
   type Registry,
+  type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, gain, remix, resample } from '../../dsp/index.ts';
-import { writePcmContainer } from '../pcm-output.ts';
+import type { PcmAudio } from '../../dsp/pcm.ts';
+import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
+import { applyPcmTransform } from '../pcm-transform.ts';
 import { parseCaf, readCafPcm } from './caf.ts';
 
 const CAF_MIMES = new Set(['audio/x-caf', 'audio/caf']);
@@ -101,17 +103,12 @@ export const CafDriver: ContainerDriver = {
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const caf = readCafPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    let audio: PcmAudio = caf;
-    if (o?.gainDb !== undefined && o.gainDb !== 0) audio = gain(audio, o.gainDb);
-    if (o?.channels !== undefined && o.channels !== audio.channels)
-      audio = remix(audio, o.channels);
-    // Rate change last, on the final channel layout (band-limited windowed-sinc; pure-TS, ADR-022).
-    if (o?.sampleRate !== undefined && o.sampleRate !== audio.sampleRate)
-      audio = resample(audio, o.sampleRate);
+    const audio = applyPcmTransform(caf, o);
+    const container = o?.container ?? 'caf';
     const out = writePcmContainer(
       audio,
-      o?.container ?? 'caf',
-      o?.sampleFormat ?? caf.format,
+      container,
+      resolvePcmSampleFormat(container, caf.format, o?.sampleFormat),
       o?.endian ?? caf.endian,
     );
     return new ReadableStream<Uint8Array>({
@@ -120,6 +117,11 @@ export const CafDriver: ContainerDriver = {
         c.close();
       },
     });
+  },
+  async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
+    const caf = readCafPcm(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return caf;
   },
   createMuxer(): Muxer {
     // CAF carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is

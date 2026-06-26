@@ -264,7 +264,7 @@ export function interleaveF32(planes: readonly Float32Array[], frames: number): 
   for (let c = 0; c < channels; c++) {
     const plane = planes[c];
     if (plane === undefined) throw new MediaError('encode-error', `opus: missing plane ${c}`);
-    for (let i = 0; i < frames; i++) out[i * channels + c] = plane[i] ?? 0;
+    for (let i = 0; i < frames; i++) out[i * channels + c] = plane[i] as number;
   }
   return out;
 }
@@ -289,7 +289,7 @@ export function deinterleaveF32(
   for (let c = 0; c < channels; c++) {
     const plane = planes[c];
     if (plane === undefined) throw new MediaError('decode-error', `opus: missing plane ${c}`);
-    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] ?? 0;
+    for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] as number;
   }
   return planes;
 }
@@ -339,7 +339,7 @@ export function preSkipFromDescription(description: AllowSharedBufferSource | un
   if (bytes.length < HEAD_PRESKIP_OFFSET + 2) return 0;
   const magic = String.fromCharCode(...bytes.subarray(0, 8));
   if (magic !== 'OpusHead') return 0;
-  return (bytes[HEAD_PRESKIP_OFFSET] ?? 0) | ((bytes[HEAD_PRESKIP_OFFSET + 1] ?? 0) << 8); // u16 LE
+  return (bytes[HEAD_PRESKIP_OFFSET] as number) | ((bytes[HEAD_PRESKIP_OFFSET + 1] as number) << 8); // u16 LE
 }
 
 /** Narrow an arbitrary number to an {@link OpusDecodeRate}, or `undefined` if Opus can't output it. */

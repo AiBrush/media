@@ -15,6 +15,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { loadFixture } from '../../test-support/corpus.ts';
+import { enumerateFlacFrames, nativeFlacMetadata, parseFlac } from '../flac/flac-driver.ts';
 import { OggDriver, parseOgg } from './ogg-driver.ts';
 import { type ChunkStruct, OggMuxer, buildPages } from './ogg-write.ts';
 
@@ -156,9 +158,11 @@ const OPUS_HEAD = Uint8Array.from([
   0x00,
 ]);
 
-/** An audio chunk of `n` bytes filled with `fill`, at the given PTS, 20 ms long (= 960 samples @ 48 kHz). */
+/** An audio chunk with a valid 20 ms Opus TOC byte (= 960 samples @ 48 kHz), then filler payload. */
 function audio(timestampUs: number, n: number, fill: number): ChunkStruct {
-  return { timestampUs, durationUs: 20_000, key: true, data: new Uint8Array(n).fill(fill) };
+  const data = new Uint8Array(n).fill(fill);
+  if (data.byteLength > 0) data[0] = 1 << 3;
+  return { timestampUs, durationUs: 20_000, key: true, data };
 }
 
 const opusTrack = {
@@ -250,6 +254,47 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     const t = muxer.addTrack({ ...opusTrack, durationSec: declaredFinalGranule / 48_000 });
     muxer.addChunkStruct(t, audio(0, 80, 0x11));
     muxer.addChunkStruct(t, audio(20_000, 120, 0x22));
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    expect(parseOgg(bytes).durationSec).toBeCloseTo(declaredFinalGranule / 48_000, 5);
+    const granules = scanPages(bytes)
+      .map((p) => p.granule)
+      .filter((g) => g >= 0);
+    expect(Math.max(...granules)).toBe(declaredFinalGranule);
+  });
+
+  it('derives Opus granule duration from the packet TOC instead of a misleading chunk duration', async () => {
+    const muxer = new OggMuxer();
+    const t = muxer.addTrack(opusTrack);
+    const sixtyMsSilkPacket = Uint8Array.of(3 << 3, 0x11, 0x22, 0x33);
+    muxer.addChunkStruct(t, {
+      timestampUs: 0,
+      durationUs: 20_000,
+      key: true,
+      data: sixtyMsSilkPacket,
+    });
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    const expectedGranule = 2880; // Opus TOC config 3 = one 60 ms frame at 48 kHz.
+    expect(parseOgg(bytes).durationSec).toBeCloseTo(expectedGranule / 48_000, 5);
+    const granules = scanPages(bytes)
+      .map((p) => p.granule)
+      .filter((g) => g >= 0);
+    expect(Math.max(...granules)).toBe(expectedGranule);
+  });
+
+  it('applies a declared final Opus trim against the TOC-derived packet span', async () => {
+    const muxer = new OggMuxer();
+    const declaredFinalGranule = 2400; // 50 ms, inside one 60 ms Opus packet.
+    const t = muxer.addTrack({ ...opusTrack, durationSec: declaredFinalGranule / 48_000 });
+    muxer.addChunkStruct(t, {
+      timestampUs: 0,
+      durationUs: 20_000,
+      key: true,
+      data: Uint8Array.of(3 << 3, 0x44, 0x55, 0x66),
+    });
     await muxer.finalize();
     const bytes = await collect(muxer.output);
 
@@ -448,6 +493,56 @@ describe('OggMuxer — Vorbis round-trip (Xiph-laced 3 headers)', () => {
     });
     // …the miss surfaces at finalize when the headers are needed (errored on the output too).
     return expect(muxer.finalize()).rejects.toBeInstanceOf(CapabilityError);
+  });
+});
+
+describe('OggMuxer — FLAC mapping v1.0 round-trip', () => {
+  it('wraps native FLAC frames as Ogg packets byte-exactly', async () => {
+    const flac = await loadFixture('flac-qlp2.flac');
+    const info = parseFlac(flac);
+    const frames = enumerateFlacFrames(flac);
+    expect(frames.length).toBeGreaterThan(1);
+
+    const muxer = new OggMuxer();
+    const t = muxer.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'flac',
+      durationSec: info.durationSec,
+      config: {
+        codec: 'flac',
+        sampleRate: info.sampleRate,
+        numberOfChannels: info.channels,
+        description: nativeFlacMetadata(flac),
+      },
+    });
+    for (const frame of frames) {
+      muxer.addChunkStruct(t, {
+        timestampUs: frame.ptsUs,
+        durationUs: frame.durationUs,
+        key: true,
+        data: frame.data,
+      });
+    }
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    const parsed = parseOgg(bytes);
+    expect(parsed.codec).toBe('flac');
+    expect(parsed.sampleRate).toBe(info.sampleRate);
+    expect(parsed.channels).toBe(info.channels);
+    expect(parsed.durationSec).toBeCloseTo(info.durationSec, 5);
+
+    const pages = scanPages(bytes);
+    for (const p of pages) expect(p.computedCrc).toBe(p.storedCrc);
+    expect((pages[0]?.headerType ?? 0) & HT_BOS).toBe(HT_BOS);
+    expect((pages[pages.length - 1]?.headerType ?? 0) & HT_EOS).toBe(HT_EOS);
+
+    const packets = delacePackets(pages);
+    expect(packets[0]?.[0]).toBe(0x7f);
+    expect(String.fromCharCode(...(packets[0] ?? []).slice(1, 5))).toBe('FLAC');
+    const audioPackets = packets.filter((p) => p[0] === 0xff && ((p[1] ?? 0) & 0xfc) === 0xf8);
+    expect(audioPackets.map((p) => [...p])).toEqual(frames.map((f) => [...f.data]));
   });
 });
 

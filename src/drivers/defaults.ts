@@ -57,7 +57,7 @@ export function registerDefaultDrivers(reg: Registry): void {
     AudioDspFilterModule, // audio filters (resample/remix/gain) over AudioData (ADR-033)
     CpuVideoFilterModule, // CPU video filter fallback (no-WebGPU browsers): colorspace/tonemap/geometry (ADR-038)
     ImageModule, // still/animated image probe + browser ImageDecoder decode capability (ADR-049)
-    // NB: the Opus/VPx wasm tails stay OUT — they're core-less scaffolds (supports()→false). The real
+    // NB: the Opus/VPx/AV1 wasm tails stay OUT — they're core-less scaffolds (supports()→false). The real
     // Vorbis/AAC/MP3 tails above co-vendor their .wasm via scripts/vendor-wasm.ts (ADR-042) for the lazy
     // import.meta.url load on a WebCodecs miss.
   ];

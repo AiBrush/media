@@ -338,7 +338,12 @@ function readU32LE(bytes: Uint8Array, off: number): number {
 
 /** Map an IVF FourCC to a {@link VpxCodec}; `undefined` for anything but `VP80`/`VP90`. */
 function ivfFourCcToCodec(bytes: Uint8Array): VpxCodec | undefined {
-  const fourcc = String.fromCharCode(bytes[8] ?? 0, bytes[9] ?? 0, bytes[10] ?? 0, bytes[11] ?? 0);
+  const fourcc = String.fromCharCode(
+    bytes[8] as number,
+    bytes[9] as number,
+    bytes[10] as number,
+    bytes[11] as number,
+  );
   if (fourcc === 'VP80') return 'vp8';
   if (fourcc === 'VP90') return 'vp9';
   return undefined;

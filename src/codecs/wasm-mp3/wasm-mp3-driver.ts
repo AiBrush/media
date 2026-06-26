@@ -32,9 +32,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type Mp3DecodeConfig,
   type Mp3WasmCore,
@@ -61,10 +63,24 @@ export function unsupported(reason: string): CodecSupport {
   return { supported: false, reason };
 }
 
+/** True when this runtime can carry the public audio codec stream (`EncodedAudioChunk` → `AudioData`). */
+function hasWebCodecsAudioSeam(): boolean {
+  return typeof EncodedAudioChunk !== 'undefined' && typeof AudioData !== 'undefined';
+}
+
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
 let corePromise: Promise<Mp3WasmCore | null> | undefined;
+let coreGluePromise: Promise<boolean> | undefined;
+
+async function hasMp3CoreGlue(): Promise<boolean> {
+  coreGluePromise ??= import('./mp3-core.js').then(
+    () => true,
+    () => false,
+  );
+  return coreGluePromise;
+}
 
 /**
  * Load the vendored Symphonia-MP3 wasm core, lazily and at most once. Resolves to an {@link Mp3WasmCore}
@@ -74,12 +90,15 @@ let corePromise: Promise<Mp3WasmCore | null> | undefined;
  * specifier is a string literal so bundlers code-split it into its own lazy chunk (loaded only on a real
  * MP3 miss).
  */
-export async function loadMp3Core(): Promise<Mp3WasmCore | null> {
+export async function loadMp3Core(runtime?: WasmRuntimeProfile): Promise<Mp3WasmCore | null> {
   corePromise ??= (async (): Promise<Mp3WasmCore | null> => {
     try {
+      const profile = runtime ?? resolveWasmRuntimeProfile();
       // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
       const mod = await import('./mp3-core.js');
-      await mod.default({ module_or_path: new URL('./mp3_wasm_bg.wasm', import.meta.url) });
+      await mod.default(
+        wasmInitForProfile(new URL('./mp3_wasm_bg.wasm', import.meta.url), profile),
+      );
       return {
         createDecoder(channels: number, sampleRate: number): Mp3WasmDecoder {
           return new mod.Mp3Wasm(channels, sampleRate);
@@ -95,6 +114,7 @@ export async function loadMp3Core(): Promise<Mp3WasmCore | null> {
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetMp3CoreForTest(): void {
   corePromise = undefined;
+  coreGluePromise = undefined;
 }
 
 /** The {@link CapabilityError} a coder throws when the vendored MP3 wasm core is unavailable. */
@@ -109,9 +129,10 @@ function coreMissing(): CapabilityError {
 // ============ supports() ============
 
 /**
- * Honest capability probe: an MP3 **decode** query whose vendored wasm core loads. Non-MP3, `encode` (no
- * pure-Rust MP3 encoder), or core-absent → `{ supported:false }` with a reason; never throws. Being
- * `tier:'wasm'`, the router only calls this after WebCodecs MP3 has already missed.
+ * Honest capability probe: an MP3 **decode** query in a runtime that can carry WebCodecs-shaped audio
+ * frames and whose vendored wasm core loads. Non-MP3, `encode` (no pure-Rust MP3 encoder), missing
+ * `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
+ * Being `tier:'wasm'`, the router only calls this after WebCodecs MP3 has already missed.
  */
 async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.mediaType !== 'audio') return unsupported('wasm-mp3 handles audio only');
@@ -119,8 +140,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported(`wasm-mp3 handles MP3 only, not '${q.config.codec}'`);
   }
   if (q.direction === 'encode') return unsupported('wasm-mp3 decodes only (no MP3 encoder)');
-  const core = await loadMp3Core();
-  if (core === null) return unsupported('wasm-mp3 core failed to load (see BUILD.md)');
+  if (!hasWebCodecsAudioSeam()) {
+    return unsupported('wasm-mp3 requires WebCodecs AudioData/EncodedAudioChunk');
+  }
+  if (!(await hasMp3CoreGlue())) {
+    return unsupported('wasm-mp3 core glue is not vendored (see BUILD.md)');
+  }
   return { supported: true, hardwareAccelerated: false };
 }
 
@@ -207,7 +232,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadMp3Core();
+      const core = await loadMp3Core(o?.wasmRuntime);
       if (core === null) {
         controller.error(coreMissing());
         return;

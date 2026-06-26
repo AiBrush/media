@@ -271,6 +271,9 @@ const PQ_M2 = (2523 / 4096) * 128;
 const PQ_C1 = 3424 / 4096;
 const PQ_C2 = (2413 / 4096) * 32;
 const PQ_C3 = (2392 / 4096) * 32;
+// HDR EOTFs below return linear light in SDR-diffuse-white-relative units (100 nits = 1.0).
+const PQ_PEAK_WHITE = 100;
+const HLG_PEAK_WHITE = 12;
 // ARIB STD-B67 / BT.2100 HLG OETF constants.
 const HLG_A = 0.17883277;
 const HLG_B = 1 - 4 * HLG_A;
@@ -282,9 +285,10 @@ function sat(x: number): number {
 }
 
 /**
- * Electro-optical transfer (decode): normalized signal → light-linear [0,1]. PQ/HLG map their code value
- * to display-linear normalized so 1.0 is the format's peak (10000 nits PQ / 12·white HLG-scene), which is
- * exactly what the tonemap operator then compresses.
+ * Electro-optical transfer (decode): normalized signal → light-linear. SDR transfers return [0,1] where
+ * 1.0 is diffuse white. HDR transfers return the same **white-relative** unit: PQ code 1.0 is 10000 nits,
+ * i.e. 100× SDR white; HLG code 1.0 is 12× reference white. That makes the tonemap `peak` parameter real
+ * rather than decorative: PQ peak 100 and HLG peak 12 both map back to SDR white after tone mapping.
  */
 export function eotf(id: TransferId, x: number): number {
   switch (id) {
@@ -296,10 +300,12 @@ export function eotf(id: TransferId, x: number): number {
       return x < 4.5 * BT709_B ? x / 4.5 : ((x + (BT709_A - 1)) / BT709_A) ** (1 / 0.45);
     case 'pq': {
       const ep = sat(x) ** (1 / PQ_M2);
-      return (Math.max(ep - PQ_C1, 0) / (PQ_C2 - PQ_C3 * ep)) ** (1 / PQ_M1);
+      return (Math.max(ep - PQ_C1, 0) / (PQ_C2 - PQ_C3 * ep)) ** (1 / PQ_M1) * PQ_PEAK_WHITE;
     }
     case 'hlg':
-      return x <= 0.5 ? (x * x) / 3 : (Math.exp((x - HLG_C) / HLG_A) + HLG_B) / 12;
+      return (
+        (x <= 0.5 ? (x * x) / 3 : (Math.exp((x - HLG_C) / HLG_A) + HLG_B) / 12) * HLG_PEAK_WHITE
+      );
     /* v8 ignore next 2 -- unreachable: TransferId is a closed union. */
     default:
       return assertNeverTransfer(id);
@@ -307,8 +313,9 @@ export function eotf(id: TransferId, x: number): number {
 }
 
 /**
- * Opto-electronic transfer (encode): light-linear [0,1] → normalized signal. The inverse of {@link eotf}
- * for the same `id`. Output ops always encode to an SDR display curve (sRGB or BT.709), never PQ/HLG.
+ * Opto-electronic transfer (encode): light-linear → normalized signal. This is the inverse of {@link eotf}
+ * in the same units. Output filter plans currently encode to SDR (sRGB/BT.709), but PQ/HLG are still
+ * implemented so the transfer pair stays complete and testable.
  */
 export function oetf(id: TransferId, x: number): number {
   switch (id) {
@@ -319,11 +326,13 @@ export function oetf(id: TransferId, x: number): number {
     case 'bt709':
       return x < BT709_B ? 4.5 * x : BT709_A * x ** 0.45 - (BT709_A - 1);
     case 'pq': {
-      const ym = sat(x) ** PQ_M1;
+      const ym = sat(x / PQ_PEAK_WHITE) ** PQ_M1;
       return ((PQ_C1 + PQ_C2 * ym) / (1 + PQ_C3 * ym)) ** PQ_M2;
     }
-    case 'hlg':
-      return x <= 1 / 12 ? Math.sqrt(3 * x) : HLG_A * Math.log(12 * x - HLG_B) + HLG_C;
+    case 'hlg': {
+      const y = sat(x / HLG_PEAK_WHITE);
+      return y <= 1 / 12 ? Math.sqrt(3 * y) : HLG_A * Math.log(12 * y - HLG_B) + HLG_C;
+    }
     /* v8 ignore next 2 -- unreachable: TransferId is a closed union. */
     default:
       return assertNeverTransfer(id);
@@ -441,8 +450,8 @@ export function planColorspace(source: SourceColor, dst: ColorSpaceId): ColorPla
 function defaultPeak(transfer: TransferId): number {
   // PQ normalizes 1.0 to 10000 nits; SDR reference white ≈ 100 nits ⇒ peak ≈ 100× white.
   // HLG scene-linear ranges to 12× the reference; both are clamped to ≥ 1 so the operator is well-defined.
-  if (transfer === 'pq') return 100;
-  if (transfer === 'hlg') return 12;
+  if (transfer === 'pq') return PQ_PEAK_WHITE;
+  if (transfer === 'hlg') return HLG_PEAK_WHITE;
   return 1;
 }
 

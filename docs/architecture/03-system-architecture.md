@@ -25,7 +25,7 @@
                v (each driver targets one substrate)
 +-------------------------------------------------------------+
 | SUBSTRATES (browser-provided / shipped)                     |
-|  WebCodecs | WebGPU/WebGL/Canvas | WASM codecs | TS containers|
+|  WebCodecs | WebGPU/Canvas | native TS filters | WASM tails | TS containers |
 +-------------------------------------------------------------+
 ```
 

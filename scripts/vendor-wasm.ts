@@ -19,7 +19,7 @@
  *
  * Honest by construction: a tail with only one half of the pair, or a `--check` with a missing artifact,
  * fails loudly (non-zero exit) — never a silent half-vendor. Scaffold-only tails (no `*_wasm_bg.wasm`
- * vendored yet, e.g. opus/vpx) are skipped with a note; they carry nothing to co-vendor.
+ * vendored yet, e.g. opus/vpx/av1) are skipped with a note; they carry nothing to co-vendor.
  */
 
 import { readdir } from 'node:fs/promises';

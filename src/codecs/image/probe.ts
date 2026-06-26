@@ -1,15 +1,17 @@
 /**
  * Pure-TS still/animated **image probe** — magic-byte format detection plus a from-scratch container
- * parse that yields the dimensions, frame count, animation flag, bit depth/colour descriptor, and loop
- * count for GIF, PNG/APNG, JPEG, WebP, and AVIF. These bitstreams are integer, self-describing headers,
- * so the probe is **bit-exact and Node-validatable** without a browser or WASM toolchain — the
- * un-fakeable oracle is "frame count + dimensions match the real file" (BUILD §6.2; ADR-025 Node tier).
+ * parse that yields the dimensions, frame count, animation flag, bit depth/colour descriptor, loop count,
+ * and exact animation duration when the header stores per-frame delays (GIF/APNG/WebP). These bitstreams
+ * are integer, self-describing headers, so the probe is **bit-exact and Node-validatable** without a
+ * browser or WASM toolchain — the un-fakeable oracle is "frame count + dimensions + header timing match
+ * the real file" (BUILD §6.2; ADR-025 Node tier).
  *
  * Scope: this is the *header* parser only — it never decodes pixels (that is {@link ./decode.ts}, behind
  * the browser-only WebCodecs `ImageDecoder`). It parses just enough structure to count frames and read
  * the canvas geometry: GIF block walk (Image Descriptors + NETSCAPE2.0 loop), PNG chunk walk (IHDR +
- * `acTL`), JPEG marker walk (SOFn), WebP RIFF chunk walk (VP8/VP8L/VP8X + ANMF/ANIM), and the ISO-BMFF
- * box tree for AVIF (`ftyp` brand + `ispe` + `av1C` depth, and `stsz` sample count for `avis` sequences).
+ * `acTL`/`fcTL`), JPEG marker walk (SOFn), WebP RIFF chunk walk (VP8/VP8L/VP8X + ANMF/ANIM), and the
+ * ISO-BMFF box tree for AVIF (`ftyp` brand + `ispe` + `av1C` depth, and `stsz` sample count for `avis`
+ * sequences).
  *
  * Robustness: a truncated/garbled header rejects with a typed {@link InputError} rather than crashing or
  * fabricating a number; an unknown magic is an honest {@link InputError}, never a guess.
@@ -33,9 +35,10 @@ export const IMAGE_MIME: Readonly<Record<ImageFormat, string>> = {
  * Structured result of {@link probeImage}. `frameCount` is the number of animation frames (1 for a still
  * image); `animated` is `frameCount > 1` for a true multi-frame track. `loopCount` is the number of
  * additional plays — `Infinity` means "loop forever" (the common GIF/APNG/WebP default), a finite integer
- * is an explicit repeat count, and `undefined` means the format/stream did not specify one. `bitDepth` is
- * bits per channel/component; `colorType` is a short, format-specific colour descriptor (e.g. PNG colour
- * type name, JPEG component count, WebP `'lossy'`/`'lossless'`).
+ * is an explicit repeat count, and `undefined` means the format/stream did not specify one.
+ * `durationSec`, when present, is the sum of parsed per-frame header delays. `bitDepth` is bits per
+ * channel/component; `colorType` is a short, format-specific colour descriptor (e.g. PNG colour type name,
+ * JPEG component count, WebP `'lossy'`/`'lossless'`).
  */
 export interface ImageInfo {
   format: ImageFormat;
@@ -53,6 +56,8 @@ export interface ImageInfo {
   colorType: string;
   /** Additional plays: `Infinity` = forever, a finite count, or `undefined` if unspecified. */
   loopCount?: number;
+  /** Exact animation duration in seconds when per-frame header delays are present. */
+  durationSec?: number;
 }
 
 // ── tiny byte helpers (bounds-checked; an overrun is a typed InputError, never a wrong number) ─────
@@ -169,6 +174,8 @@ export function probeGif(b: Uint8Array): ImageInfo {
 
   let frameCount = 0;
   let loopCount: number | undefined;
+  let pendingDelayCs = 0;
+  let durationCs = 0;
 
   for (;;) {
     const block = u8(b, i, fmt);
@@ -176,6 +183,8 @@ export function probeGif(b: Uint8Array): ImageInfo {
     if (block === 0x2c) {
       // Image Descriptor: 10 fixed bytes; optional local colour table; LZW data as sub-blocks.
       frameCount++;
+      durationCs += pendingDelayCs;
+      pendingDelayCs = 0;
       const localPacked = u8(b, i + 9, fmt);
       i += 10;
       if ((localPacked & 0x80) !== 0) i += 3 * (1 << ((localPacked & 0x07) + 1));
@@ -195,6 +204,10 @@ export function probeGif(b: Uint8Array): ImageInfo {
             loopCount = loops === 0 ? Number.POSITIVE_INFINITY : loops;
           }
         }
+      } else if (label === 0xf9) {
+        // Graphic Control Extension: [blockSize=4, packed, delayCs(LE16), transparentIndex, terminator].
+        const blockSize = u8(b, j, fmt);
+        if (blockSize >= 4) pendingDelayCs = u16le(b, j + 2, fmt);
       }
       i = skipGifSubBlocks(b, j, fmt);
     } else {
@@ -211,6 +224,7 @@ export function probeGif(b: Uint8Array): ImageInfo {
     bitDepth,
     colorType: 'indexed',
     ...(loopCount !== undefined ? { loopCount } : {}),
+    ...(durationCs > 0 ? { durationSec: durationCs / 100 } : {}),
   };
 }
 
@@ -238,7 +252,8 @@ const PNG_COLOR_TYPE: Readonly<Record<number, string>> = {
  * Walk PNG chunks: IHDR (the second chunk, fixed layout) gives width/height/bit-depth/colour-type; an
  * `acTL` (Animation Control, the APNG extension) makes it animated and carries `num_frames`/`num_plays`.
  * The frame count is `acTL.num_frames` (governs the animation regardless of a separate default image),
- * else 1 for a plain PNG.
+ * while `fcTL` chunks carry frame delays as `delay_num / delay_den` seconds (`delay_den==0` means 100).
+ * Plain PNGs have no duration.
  */
 export function probePng(b: Uint8Array): ImageInfo {
   const fmt = 'png';
@@ -254,6 +269,7 @@ export function probePng(b: Uint8Array): ImageInfo {
   let frameCount = 1;
   let animated = false;
   let loopCount: number | undefined;
+  let durationSec = 0;
 
   let i = 8;
   for (;;) {
@@ -271,6 +287,10 @@ export function probePng(b: Uint8Array): ImageInfo {
       frameCount = u32be(b, body, fmt);
       const plays = u32be(b, body + 4, fmt);
       loopCount = plays === 0 ? Number.POSITIVE_INFINITY : plays;
+    } else if (type === 'fcTL') {
+      const delayNum = u16be(b, body + 20, fmt);
+      const delayDen = u16be(b, body + 22, fmt);
+      durationSec += delayNum / (delayDen === 0 ? 100 : delayDen);
     }
     if (type === 'IEND') break;
     i = body + len + 4; // skip body + CRC32
@@ -285,6 +305,7 @@ export function probePng(b: Uint8Array): ImageInfo {
     bitDepth,
     colorType,
     ...(loopCount !== undefined ? { loopCount } : {}),
+    ...(durationSec > 0 ? { durationSec } : {}),
   };
 }
 
@@ -389,7 +410,8 @@ function probeWebpLossless(b: Uint8Array): ImageInfo {
 
 /**
  * VP8X extended: a flags byte (ANIM bit 0x02, ALPHA bit 0x10) and a 24-bit (canvas-1) width/height. For
- * an animated file, walk the remaining chunks counting `ANMF` frames and reading the `ANIM` loop count.
+ * an animated file, walk the remaining chunks counting `ANMF` frames, summing their 24-bit millisecond
+ * durations, and reading the `ANIM` loop count.
  */
 function probeWebpExtended(b: Uint8Array): ImageInfo {
   const fmt = 'webp';
@@ -401,6 +423,7 @@ function probeWebpExtended(b: Uint8Array): ImageInfo {
 
   let frameCount = 0;
   let loopCount: number | undefined;
+  let durationMs = 0;
   // The VP8X chunk itself is 10 bytes of body; chunks start after it (RIFF body begins at offset 12,
   // each chunk = 4-byte FourCC + 4-byte LE size + padded body).
   let i = 12 + 8 + roundUpEven(u32le(b, 16, fmt));
@@ -414,6 +437,7 @@ function probeWebpExtended(b: Uint8Array): ImageInfo {
       loopCount = loops === 0 ? Number.POSITIVE_INFINITY : loops;
     } else if (cc === 'ANMF') {
       frameCount++;
+      durationMs += u24le(b, body + 12, fmt);
     }
     i = body + roundUpEven(size);
   }
@@ -430,6 +454,7 @@ function probeWebpExtended(b: Uint8Array): ImageInfo {
       bitDepth: 8,
       colorType: color,
       ...(loopCount !== undefined ? { loopCount } : {}),
+      ...(durationMs > 0 ? { durationSec: durationMs / 1000 } : {}),
     };
   }
   return frame(fmt, width, height, color, 8);

@@ -97,6 +97,7 @@ The ~500 kB ceiling is for **JS glue only**; WASM lives outside it and downloads
 
 - Compiling any WASM requires CSP `script-src 'wasm-unsafe-eval'`.
 - WASM **threads** (`SharedArrayBuffer`) require **COOP/COEP** cross-origin isolation — opt-in only (ADR-006); the common path needs neither beyond `wasm-unsafe-eval`.
+- WASM `supports()` probes may import tiny JS glue to prove a core is vendored, but must not fetch or instantiate the `.wasm` asset. The `.wasm` URL is passed only from `createDecoder`/`createEncoder`/`createFilter`, after the router has selected that miss-only tier and the runtime profile has been resolved.
 - Same-origin assets avoid the CORS/CRP allowlisting a cross-origin CDN would require.
 
 ## 9. Versioning & release

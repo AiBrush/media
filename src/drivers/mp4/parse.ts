@@ -49,12 +49,22 @@ export interface TrackProtection {
   senc?: Uint8Array;
 }
 
+/** A supported MP4 edit-list mapping from movie time 0 to track media time. */
+export interface TrackEdit {
+  /** `elst.media_time`, in this track's `mdhd` timescale ticks. */
+  mediaTimeTicks: number;
+  /** `elst.segment_duration`, converted from the movie timescale. */
+  durationSec: number;
+}
+
 export interface ParsedTrack {
   id: number;
   mediaType: MediaType;
   /** mdhd timescale (ticks per second). */
   timescale: number;
   durationSec: number;
+  /** Present for a normal single-rate edit list; applied by the packet/WebCodecs seam. */
+  edit?: TrackEdit;
   codec: string;
   sampleEntryType: string;
   config: VideoDecoderConfig | AudioDecoderConfig;
@@ -130,7 +140,7 @@ export function parseMovie(brand: string, moov: Uint8Array): Movie {
 
   const tracks: ParsedTrack[] = [];
   for (const trak of children(r, root, 'trak')) {
-    const parsed = parseTrak(r, trak);
+    const parsed = parseTrak(r, trak, movie.timescale);
     if (parsed) tracks.push(parsed);
   }
   if (tracks.length === 0) fail('moov has no decodable tracks');
@@ -145,6 +155,12 @@ function parseMvhd(r: Reader, box: BoxHeader): { timescale: number; durationSec:
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
   return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
+}
+
+function readI64(r: Reader): number {
+  const hi = r.i32();
+  const lo = r.u32();
+  return hi * 2 ** 32 + lo;
 }
 
 /**
@@ -368,7 +384,7 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
   return movie;
 }
 
-function parseTrak(r: Reader, trak: BoxHeader): ParsedTrack | undefined {
+function parseTrak(r: Reader, trak: BoxHeader, movieTimescale: number): ParsedTrack | undefined {
   const tkhd = child(r, trak, 'tkhd') ?? fail('trak has no tkhd');
   const { trackId, rotation } = parseTkhd(r, tkhd);
 
@@ -392,12 +408,14 @@ function parseTrak(r: Reader, trak: BoxHeader): ParsedTrack | undefined {
 
   const entry = parseStsd(r, stsd, mediaType);
   const encryption = entry.encryption ? readSenc(r, stbl, entry.encryption) : undefined;
+  const edit = parseTrackEdit(r, trak, movieTimescale);
 
   const base = {
     id: trackId,
     mediaType,
     timescale,
     durationSec,
+    ...(edit !== undefined ? { edit } : {}),
     codec: entry.codec,
     sampleEntryType: entry.type,
     config: entry.config,
@@ -419,6 +437,35 @@ function parseTrak(r: Reader, trak: BoxHeader): ParsedTrack | undefined {
     ...(entry.sampleRate !== undefined ? { sampleRate: entry.sampleRate } : {}),
     ...(entry.channels !== undefined ? { channels: entry.channels } : {}),
   };
+}
+
+function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): TrackEdit | undefined {
+  const edts = child(r, trak, 'edts');
+  if (edts === undefined) return undefined;
+  const elst = child(r, edts, 'elst');
+  if (elst === undefined) return undefined;
+
+  r.seek(elst.payloadStart);
+  const { version } = readFullBoxHeader(r);
+  const entryCount = r.u32();
+  let active: TrackEdit | undefined;
+
+  for (let i = 0; i < entryCount; i++) {
+    const segmentDuration = version === 1 ? r.u64() : r.u32();
+    const mediaTime = version === 1 ? readI64(r) : r.i32();
+    const mediaRateInteger = r.i16();
+    const mediaRateFraction = r.i16();
+
+    if (mediaTime < 0) continue; // leading empty edit: no media samples to timestamp
+    if (mediaRateInteger !== 1 || mediaRateFraction !== 0) return undefined;
+    if (active !== undefined) return undefined; // multiple active edits need sample filtering/concatenation
+    active = {
+      mediaTimeTicks: mediaTime,
+      durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
+    };
+  }
+
+  return active;
 }
 
 function parseTkhd(r: Reader, box: BoxHeader): { trackId: number; rotation?: number } {
