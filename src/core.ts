@@ -32,7 +32,62 @@ export {
 } from './kernel/wasm-runtime.ts';
 export { closeFrame, closeFrames, type Closable, isClosable } from './kernel/frames.ts';
 export { collect, composeChain, type ExecuteOptions, runToSink } from './kernel/executor.ts';
-export { InlineBridge, type WorkerBridge } from './kernel/worker-bridge.ts';
+export {
+  DEFAULT_CREDIT,
+  InlineBridge,
+  type RunStreamOptions,
+  type WorkerBridge,
+  type WorkerSelection,
+  WorkerStreamBridge,
+  resolvePoolSize,
+  selectWorkerMode,
+  workerOffloadAvailable,
+} from './kernel/worker-bridge.ts';
+// Worker offload surface (doc 06 §4, ADR-019): the ABR worker pool + rendition fan-out, the host spawn/
+// offload glue, and the serializable job protocol — for advanced embedders composing offload directly.
+// (The default entry reaches all of this transparently through `createMedia({ worker })`.)
+export {
+  type InlineWorkerPool,
+  WorkerPool,
+  type WorkerPoolOptions,
+  type WorkerPoolTransport,
+  inlineWorkerPool,
+} from './kernel/worker-pool.ts';
+export {
+  type AbrRendition,
+  type JobStreamRunner,
+  type OffloadStreamOptions,
+  type SpawnedWorker,
+  type WithOptionalSink,
+  type WorkerSpawn,
+  buildOffloadPayload,
+  createWorkerPool,
+  ensureWorkerBridge,
+  offloadAbrLadder,
+  offloadHeavyOp,
+  runOffloadStream,
+} from './kernel/worker-host.ts';
+export {
+  type ConvertOffloadPayload,
+  type InnerEngine,
+  type InnerEngineFactory,
+  type OffloadJobPayload,
+  type TrimOffloadPayload,
+  decodeOffloadPayload,
+  makeJobRunner,
+} from './kernel/worker-main.ts';
+export {
+  type ChunkMessage,
+  type HostMessage,
+  type JobMessage,
+  type MessageLike,
+  type OffloadJob,
+  type WorkerMessage,
+  collectTransferables,
+  deserializeError,
+  serializeError,
+} from './kernel/worker-protocol.ts';
+export { type JobRunner, type ProgressSink, runOffloadWorker } from './kernel/worker-entry.ts';
 export type { PlannedStage, Planner, StageGraph, StageKind } from './kernel/planner.ts';
 
 // Engine
@@ -47,6 +102,20 @@ export { type MediaEngine, MediaEngineImpl } from './api/engine.ts';
 // internal segment/run builders (`buildMediaSegment`/`planFragmentRuns`/`SegmentTrackRun`) stay private.
 export { fragmentMp4 } from './drivers/mp4/fragment.ts';
 export type { FragmentOptions, FragmentTrackInput } from './drivers/mp4/fragment.ts';
+
+// HLS input resolution (RFC 8216). HLS `.m3u8` is a manifest, not a byte container — `resolveHlsSource`
+// parses the playlist, fetches + AES-128-decrypts + stitches the segments into ONE demuxable `Source` the
+// engine's existing probe/demux/decode path consumes (so the container router needs no "hls" entry). It is
+// on this driver-author surface (NOT the eager default entry) because it pulls the m3u8 parser + the AES
+// stack; apps/harnesses reach HLS by calling `resolveHlsSource(playlistText, { baseUrl, fetchResource })`
+// and feeding the returned source to `probe`/`demux`/`convert`/`remux`/`decrypt`.
+export {
+  type HlsResolveOptions,
+  type HlsResourceFetcher,
+  type HlsVariantChoice,
+  resolveHlsSource,
+} from './drivers/hls/hls-source.ts';
+export { parseM3u8 } from './drivers/hls/m3u8-parse.ts';
 
 // Conformance harness (so third-party drivers can self-test against the contract)
 export {

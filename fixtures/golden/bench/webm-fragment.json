@@ -1,0 +1,83 @@
+{
+  "generatedAt": "2026-06-26T15:30:44.095Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 2,
+  "iters": 11,
+  "files": [
+    {
+      "id": "movie_5.webm",
+      "tracks": 2,
+      "frames": 371,
+      "outBytes": 43951,
+      "chunks": 7,
+      "peakChunkBytes": 10615,
+      "wallMs": 0.458959,
+      "mbPerSec": 91.32610947899724
+    },
+    {
+      "id": "white.webm",
+      "tracks": 1,
+      "frames": 300,
+      "outBytes": 10466,
+      "chunks": 6,
+      "peakChunkBytes": 2064,
+      "wallMs": 0.201833,
+      "mbPerSec": 49.45254440803938
+    },
+    {
+      "id": "bear-vp9-alpha.webm",
+      "tracks": 1,
+      "frames": 82,
+      "outBytes": 110431,
+      "chunks": 2,
+      "peakChunkBytes": 110284,
+      "wallMs": 0.084459,
+      "mbPerSec": 1246.9388512184444
+    },
+    {
+      "id": "bear-opus.webm",
+      "tracks": 1,
+      "frames": 137,
+      "outBytes": 25384,
+      "chunks": 3,
+      "peakChunkBytes": 16499,
+      "wallMs": 0.109292,
+      "mbPerSec": 221.49900127782684
+    },
+    {
+      "id": "2x2-green.webm",
+      "tracks": 2,
+      "frames": 6,
+      "outBytes": 307,
+      "chunks": 3,
+      "peakChunkBytes": 184,
+      "wallMs": 0.021292,
+      "mbPerSec": 13.750611268867122
+    },
+    {
+      "id": "recorder_headerless.webm",
+      "tracks": 2,
+      "frames": 139,
+      "outBytes": 188080,
+      "chunks": 3,
+      "peakChunkBytes": 121478,
+      "wallMs": 0.11575,
+      "mbPerSec": 1549.607476714363
+    },
+    {
+      "id": "bear-multitrack.webm",
+      "tracks": 2,
+      "frames": 248,
+      "outBytes": 218758,
+      "chunks": 8,
+      "peakChunkBytes": 40945,
+      "wallMs": 0.192791,
+      "mbPerSec": 1082.1246121883203
+    }
+  ],
+  "aggregate": {
+    "files": 7,
+    "geomeanMbPerSec": 224.52267909211508,
+    "minMbPerSec": 13.750611268867122
+  }
+}

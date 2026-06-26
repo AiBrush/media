@@ -157,6 +157,30 @@ function biquadSpecs(value: unknown): readonly BiquadSpec[] {
   return [biquadSpec(value)];
 }
 
+/**
+ * Slice a PCM buffer to the half-open time window `[startSec, endSec)`, in its OWN sample rate (the cut
+ * happens before any resample). Bounds are clamped to `[0, frames]` and `start ≤ end` so a request slightly
+ * past EOF (a "to the end" trim that rounds up) yields the tail, never an error or a negative length — the
+ * public `trim` op has already range-validated against the probed duration (engine `assertTrimRange`). Each
+ * channel is a zero-copy `subarray` view of the source planar data (lossless; the serializer copies on
+ * write). Returns the original buffer untouched when the window already covers everything.
+ */
+function slicePcmFrames(
+  audio: PcmAudio,
+  bounds: { readonly startSec: number; readonly endSec: number },
+): PcmAudio {
+  const rate = audio.sampleRate;
+  const start = Math.min(audio.frames, Math.max(0, Math.round(bounds.startSec * rate)));
+  const end = Math.min(audio.frames, Math.max(start, Math.round(bounds.endSec * rate)));
+  if (start === 0 && end === audio.frames) return audio;
+  return {
+    sampleRate: rate,
+    channels: audio.channels,
+    frames: end - start,
+    planar: audio.planar.map((ch) => ch.subarray(start, end)),
+  };
+}
+
 export function applyPcmTransform(
   audio: PcmAudio,
   o?: PcmTransform,
@@ -164,6 +188,11 @@ export function applyPcmTransform(
 ): PcmAudio {
   throwIfAborted(o?.signal);
   let result = audio;
+  // Sample-accurate trim FIRST (ADR-021 PCM-native trim): cut to `[startSec, endSec)` in the source rate so
+  // every later stage (gain/fade/remix/resample) operates on the kept range — a fade-out then lands at the
+  // new end, a resample changes the cut buffer's rate, etc. PCM has no inter-frame dependency, so this is a
+  // lossless, frame-exact slice (no codec seam).
+  if (o?.timeBounds !== undefined) result = slicePcmFrames(result, o.timeBounds);
   if (o?.gainDb !== undefined && o.gainDb !== 0) result = gain(result, o.gainDb);
   const fade = fadePlan(o, result.sampleRate);
   if (fade !== undefined) {
@@ -180,7 +209,7 @@ export function applyPcmTransform(
         { op: options.op ?? 'convert', tried: [...(options.tried ?? [])] },
       );
     }
-    result = resample(result, o.sampleRate);
+    result = resample(result, o.sampleRate, { signal: o.signal });
   }
   if (o?.biquad !== undefined) {
     for (const spec of biquadSpecs(o.biquad)) result = biquad(result, spec);

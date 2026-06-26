@@ -357,6 +357,144 @@
     "video": "hevc",
     "traits": ["video-only", "hevc", "hvc1"]
   },
+  "img-anim.webp": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/webp-animated.webp",
+    "sha256": "292753f066add623af1e30bbeeca58f15b3d6d1052e12b13e30f21f8d3c14505",
+    "bytes": 340,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "webp",
+    "video": "webp",
+    "traits": [
+      "image",
+      "animated",
+      "webp",
+      "vp8x",
+      "anim",
+      "11x29",
+      "3-frames",
+      "loop-forever",
+      "image-probe"
+    ]
+  },
+  "img-anim2.gif": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/red-green-animated.gif",
+    "sha256": "693360ccc02b5142695873c6f8e849000548c808d6baf5ad89071cd504fa5c1b",
+    "bytes": 235,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "gif",
+    "video": "gif",
+    "traits": [
+      "image",
+      "animated",
+      "gif",
+      "gif89a",
+      "indexed",
+      "50x50",
+      "2-frames",
+      "loop-forever",
+      "image-probe"
+    ]
+  },
+  "img-anim5.gif": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/animated-gif-with-offsets.gif",
+    "sha256": "fd36f15fb01770308774db3e378786508492ad8833ac217b6e3821e9b121bef9",
+    "bytes": 1769,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium third_party/blink/web_tests/images/resources",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "gif",
+    "video": "gif",
+    "traits": [
+      "image",
+      "animated",
+      "gif",
+      "gif89a",
+      "indexed",
+      "100x100",
+      "5-frames",
+      "frame-offsets",
+      "image-probe"
+    ]
+  },
+  "img-apng.png": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/apng.png",
+    "sha256": "76c3568f8dbf0adcdf15d8a42acd96815ccf317d566118d569c218725167d0a0",
+    "bytes": 259,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "png",
+    "video": "apng",
+    "traits": ["image", "animated", "apng", "png", "indexed", "100x50", "2-frames", "image-probe"]
+  },
+  "img-still.avif": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/green.avif",
+    "sha256": "5fb76c8dba2312deea9b8a63dc04aad67919b4a0ff454de75eb1adde39138951",
+    "bytes": 320,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "avif",
+    "video": "av1",
+    "traits": ["image", "still", "avif", "av01", "isobmff", "2x2", "tiny", "image-probe"]
+  },
+  "img-still.jpg": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/computer.jpg",
+    "sha256": "fd2eba4f5155689a65908688081324499daff7946ec433abaf683075d4d7730b",
+    "bytes": 2018,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "jpeg",
+    "video": "jpeg",
+    "traits": [
+      "image",
+      "still",
+      "jpeg",
+      "progressive",
+      "8-bit",
+      "320x240",
+      "3-component",
+      "image-probe"
+    ]
+  },
+  "img-still.png": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/images/green.png",
+    "sha256": "c27973460bbd796574d9623ec70089128996119ba715d27c22938dbfdf9ecf80",
+    "bytes": 87,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/images",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "png",
+    "video": "png",
+    "traits": ["image", "still", "png", "indexed", "1-bit", "100x50", "image-probe"]
+  },
+  "img-still.webp": {
+    "url": "https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/test.webp",
+    "sha256": "a3665d7a6fd48ff60137ae29ac6792207aed3f768c2c05ef324f64c78352d5a5",
+    "bytes": 4928,
+    "license": "BSD-3-Clause",
+    "source": "chromium/chromium third_party/blink/web_tests/images/resources",
+    "attribution": "© The Chromium Authors, BSD-3-Clause (https://chromium.googlesource.com/chromium/src/+/main/LICENSE)",
+    "container": "webp",
+    "video": "webp",
+    "traits": ["image", "still", "webp", "vp8", "lossy", "128x128", "image-probe"]
+  },
+  "img-truecolor.png": {
+    "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/css/css-images/support/colors-16x8.png",
+    "sha256": "0321709b07f15b65ee07cedde820d1474da99f3d3f7c74bbfc0cf30b89c066a8",
+    "bytes": 93,
+    "license": "W3C-3-Clause-BSD",
+    "source": "web-platform-tests/css",
+    "attribution": "© web-platform-tests contributors, W3C 3-Clause BSD test suite license",
+    "container": "png",
+    "video": "png",
+    "traits": ["image", "still", "png", "rgb", "truecolor", "16x8", "tiny", "image-probe"]
+  },
   "movie_5.mp4": {
     "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/movie_5.mp4",
     "sha256": "e2e2bd5b7641b88406a8db15410dc1ed55d89547cb29bd133491e4f90229e1e1",

@@ -1,0 +1,347 @@
+{
+  "generatedAt": "2026-06-26T15:39:25.139Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 10,
+  "iters": 60,
+  "chunkFrames": 1024,
+  "files": [
+    {
+      "id": "sfx-pcm-f32.wav",
+      "format": "f32",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.085958,
+          "throughputRealtime": 2481.832212630975,
+          "mSamplesPerSec": 119.1279462062868,
+          "peakMemoryMb": 0.609375,
+          "chunkOverhead": 1.5688342976036211
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.1048125,
+          "throughputRealtime": 2035.3806400318028,
+          "mSamplesPerSec": 97.69827072152653,
+          "peakMemoryMb": 0.078125,
+          "chunkOverhead": 1.1008733463923914
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0944375,
+          "throughputRealtime": 2258.9896315905585,
+          "mSamplesPerSec": 108.4315023163468,
+          "peakMemoryMb": 0.515625,
+          "chunkOverhead": 1.1398061650614333
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s16.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0563545,
+          "throughputRealtime": 3785.5598636015466,
+          "mSamplesPerSec": 181.70687345287422,
+          "peakMemoryMb": 0.015625,
+          "chunkOverhead": 0.5587730779146093
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.096771,
+          "throughputRealtime": 2204.5171935118306,
+          "mSamplesPerSec": 105.81682528856786,
+          "peakMemoryMb": 0.015625,
+          "chunkOverhead": 1.0762258527308517
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.062771,
+          "throughputRealtime": 3398.5970166690568,
+          "mSamplesPerSec": 163.1326568001147,
+          "peakMemoryMb": 0.03125,
+          "chunkOverhead": 1.2713242665748514
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s24.wav",
+      "format": "s24",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.055271,
+          "throughputRealtime": 3859.769740611412,
+          "mSamplesPerSec": 185.26894754934776,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.3563435582822085
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0942085,
+          "throughputRealtime": 2264.480735107059,
+          "mSamplesPerSec": 108.69507528513881,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.048946416144746
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.058813,
+          "throughputRealtime": 3627.3159562228307,
+          "mSamplesPerSec": 174.11116589869584,
+          "peakMemoryMb": 0.046875,
+          "chunkOverhead": 1.204875800256082
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s32.wav",
+      "format": "s32",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0551045,
+          "throughputRealtime": 3871.432157688271,
+          "mSamplesPerSec": 185.82874356903702,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.3536528446497003
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0938125,
+          "throughputRealtime": 2274.039529202754,
+          "mSamplesPerSec": 109.15389740173218,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.044298865672971
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.061166,
+          "throughputRealtime": 3487.7764335306106,
+          "mSamplesPerSec": 167.41326880946932,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.3927794792390105
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-u8.wav",
+      "format": "u8",
+      "channels": 1,
+      "sampleRate": 48000,
+      "frames": 10240,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.057604,
+          "throughputRealtime": 3703.4465199175984,
+          "mSamplesPerSec": 177.76543295604472,
+          "peakMemoryMb": 0.34375,
+          "chunkOverhead": 1.415053552127346
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.094354,
+          "throughputRealtime": 2260.9887586465156,
+          "mSamplesPerSec": 108.52746041503275,
+          "peakMemoryMb": 0.203125,
+          "chunkOverhead": 1.049835883171071
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 10240,
+          "audioSeconds": 0.21333333333333335,
+          "wallMs": 0.0631245,
+          "throughputRealtime": 3379.564722624866,
+          "mSamplesPerSec": 162.21910668599355,
+          "peakMemoryMb": 0.078125,
+          "chunkOverhead": 1.445604754216619
+        }
+      ]
+    },
+    {
+      "id": "sin_440Hz_-6dBFS_1s.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 44100,
+      "frames": 44101,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.4677705,
+          "throughputRealtime": 2137.8489574202763,
+          "mSamplesPerSec": 94.27913902223419,
+          "peakMemoryMb": 1.84375,
+          "chunkOverhead": 5.000700227707636
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.4298125,
+          "throughputRealtime": 2326.648656651357,
+          "mSamplesPerSec": 102.60520575832484,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.112364145027569
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 44101,
+          "audioSeconds": 1.0000226757369615,
+          "wallMs": 0.2573545,
+          "throughputRealtime": 3885.778860431667,
+          "mSamplesPerSec": 171.3628477450365,
+          "peakMemoryMb": 0.34375,
+          "chunkOverhead": 1.1279241255837293
+        }
+      ]
+    },
+    {
+      "id": "speech.wav",
+      "format": "s16",
+      "channels": 1,
+      "sampleRate": 16000,
+      "frames": 47616,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.14925,
+          "throughputRealtime": 19939.69849246231,
+          "mSamplesPerSec": 319.035175879397,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 3.9514965383037026
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.4539375,
+          "throughputRealtime": 6555.968608013217,
+          "mSamplesPerSec": 104.89549772821148,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.0798394290811775
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 47616,
+          "audioSeconds": 2.976,
+          "wallMs": 0.279396,
+          "throughputRealtime": 10651.548339990552,
+          "mSamplesPerSec": 170.42477343984882,
+          "peakMemoryMb": 0,
+          "chunkOverhead": 1.2054855989006366
+        }
+      ]
+    },
+    {
+      "id": "stereo-48000.wav",
+      "format": "s16",
+      "channels": 2,
+      "sampleRate": 48000,
+      "frames": 48000,
+      "ops": [
+        {
+          "op": "fade-out (0.5s, equal-power)",
+          "samples": 96000,
+          "audioSeconds": 1,
+          "wallMs": 0.446625,
+          "throughputRealtime": 2239.014833473272,
+          "mSamplesPerSec": 214.94542401343412,
+          "peakMemoryMb": 0.28125,
+          "chunkOverhead": 1.8072837632776935
+        },
+        {
+          "op": "biquad highpass (DF2T, stateful)",
+          "samples": 96000,
+          "audioSeconds": 1,
+          "wallMs": 0.91325,
+          "throughputRealtime": 1094.9904188338353,
+          "mSamplesPerSec": 105.11908020804817,
+          "peakMemoryMb": 0.046875,
+          "chunkOverhead": 1.0594031381301607
+        },
+        {
+          "op": "dynamics rms→limit (whole-signal buffer)",
+          "samples": 96000,
+          "audioSeconds": 1,
+          "wallMs": 0.527208,
+          "throughputRealtime": 1896.7845707955871,
+          "mSamplesPerSec": 182.09131879637638,
+          "peakMemoryMb": 0.015625,
+          "chunkOverhead": 1.2830051847516466
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "op": "fade-out (0.5s, equal-power)",
+      "files": 8,
+      "geomeanRealtime": 3863.3297634171895,
+      "minRealtime": 2137.8489574202763,
+      "maxChunkOverhead": 5.000700227707636,
+      "maxPeakMemoryMb": 1.84375
+    },
+    {
+      "op": "biquad highpass (DF2T, stateful)",
+      "files": 8,
+      "geomeanRealtime": 2331.311309043291,
+      "minRealtime": 1094.9904188338353,
+      "maxChunkOverhead": 1.112364145027569,
+      "maxPeakMemoryMb": 0.203125
+    },
+    {
+      "op": "dynamics rms→limit (whole-signal buffer)",
+      "files": 8,
+      "geomeanRealtime": 3559.5056929308166,
+      "minRealtime": 1896.7845707955871,
+      "maxChunkOverhead": 1.445604754216619,
+      "maxPeakMemoryMb": 0.515625
+    }
+  ]
+}

@@ -25,6 +25,15 @@ export {
   type HlsVariant,
   parseM3u8,
 } from './m3u8-parse.ts';
+// Playlist → single demuxable Source (parse + variant-pick + fetch + AES-128 decrypt + stitch). This is how
+// an HLS `.m3u8` input becomes something the engine's `probe`/`demux`/`decode` accept — a source-level
+// adapter, so the container router needs no "hls" entry (HLS is a manifest, not a byte container).
+export {
+  type HlsResolveOptions,
+  type HlsResourceFetcher,
+  type HlsVariantChoice,
+  resolveHlsSource,
+} from './hls-source.ts';
 
 /**
  * The HLS driver module: registers the MPEG-TS container driver used by HLS media segments. Idempotent

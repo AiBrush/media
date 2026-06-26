@@ -21,7 +21,7 @@ Legend: **HW/SW** = WebCodecs (hardware/software) usually available · **wasm** 
 | AAC | HW/SW | yes | varies | yes | wasm fallback |
 | Opus | SW | yes | SW | SW | wasm (libopus) |
 | MP3 | SW | varies | SW | — (decode only in WC) | wasm libmp3lame for **encode** |
-| **FLAC** | **none (Chrome 149)** [data] | varies | varies | — | **pure-TS FLAC decode (shipped, ADR-024)**; wasm encode |
+| **FLAC** | **none (Chrome 149)** [data] | varies | varies | — | **pure-TS FLAC decode (ADR-024) + pure-TS FLAC encode/author (LPC/Rice, ADR-086) — both shipped, no wasm** |
 | Vorbis | none | none | none | — | wasm (libvorbis) |
 | PCM (s16/s24/f32) | n/a (trivial) | n/a | n/a | n/a | **TS** (no codec needed) |
 

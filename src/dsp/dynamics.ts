@@ -25,6 +25,7 @@
 import { InputError } from '../contracts/errors.ts';
 import { dbToLinear } from './gain.ts';
 import type { PcmAudio } from './pcm.ts';
+import type { StatefulAudioStage } from './stream.ts';
 
 /** Peak-limiter response: `hard` clips at the ceiling; `soft` rounds the knee with a bounded saturator. */
 export type LimitMode = 'hard' | 'soft';
@@ -146,4 +147,126 @@ export function limit(
     throw new InputError('unsupported-input', `limiter knee must be in (0, 1]; got ${knee}`);
   }
   return mapSamples(audio, (x) => softLimitSample(x, ceiling, knee));
+}
+
+// ============ streaming dynamics stage (codec seam) ============
+
+/** A resolved normalize stage (mode + dBFS target), mirroring the public `PcmDynamicsNormalize`. */
+export interface NormalizeSpec {
+  readonly mode: 'peak' | 'rms';
+  readonly targetDbfs: number;
+}
+
+/** A resolved limiter stage (dBFS ceiling + mode + optional knee), mirroring `PcmDynamicsLimit`. */
+export interface LimitSpec {
+  readonly ceilingDbfs: number;
+  readonly mode: LimitMode;
+  readonly knee?: number;
+}
+
+/** A resolved dynamics chain for the streaming stage: optional normalize, then optional limit. */
+export interface DynamicsSpec {
+  readonly normalize?: NormalizeSpec;
+  readonly limit?: LimitSpec;
+}
+
+/** Apply the resolved normalize→limit chain to a whole buffer (the exact whole-signal reference order). */
+function applyDynamicsChain(audio: PcmAudio, spec: DynamicsSpec): PcmAudio {
+  let result = audio;
+  if (spec.normalize !== undefined) {
+    result =
+      spec.normalize.mode === 'peak'
+        ? normalizePeak(result, spec.normalize.targetDbfs)
+        : normalizeRms(result, spec.normalize.targetDbfs);
+  }
+  if (spec.limit !== undefined) {
+    const { ceilingDbfs, mode, knee } = spec.limit;
+    result =
+      knee === undefined
+        ? limit(result, ceilingDbfs, mode)
+        : limit(result, ceilingDbfs, mode, knee);
+  }
+  return result;
+}
+
+/** Concatenate same-layout chunks into one buffer (layout taken from the first chunk; [] ⇒ empty). */
+function concatChunks(chunks: readonly PcmAudio[]): PcmAudio {
+  const first = chunks[0];
+  if (first === undefined) return { sampleRate: 0, channels: 0, frames: 0, planar: [] };
+  const { sampleRate, channels } = first;
+  const frames = chunks.reduce((s, c) => s + c.frames, 0);
+  const planar = Array.from({ length: channels }, () => new Float64Array(frames));
+  let pos = 0;
+  for (const c of chunks) {
+    for (let ch = 0; ch < channels; ch++)
+      planar[ch]?.set(c.planar[ch] ?? new Float64Array(c.frames), pos);
+    pos += c.frames;
+  }
+  return { sampleRate, channels, frames, planar };
+}
+
+/** Re-split `whole` back into chunks of `sizes` frames each (preserving the original framing/timestamps). */
+function splitLike(whole: PcmAudio, sizes: readonly number[]): PcmAudio[] {
+  const out: PcmAudio[] = [];
+  let pos = 0;
+  for (const n of sizes) {
+    out.push({
+      sampleRate: whole.sampleRate,
+      channels: whole.channels,
+      frames: n,
+      planar: whole.planar.map((ch) => ch.slice(pos, pos + n)),
+    });
+    pos += n;
+  }
+  return out;
+}
+
+/**
+ * A {@link StatefulAudioStage} applying a dynamics chain across a stream of {@link PcmAudio} chunks,
+ * bit-exactly equal to the whole-signal reference (`normalize` then `limit`, the `transformPcm` order).
+ *
+ *   - **`limit`-only is causal** — the limiter is purely per-sample, so each chunk is limited on `push`
+ *     and emitted 1:1 (no buffering, O(1) latency); `flush` holds nothing. Per-chunk `limit` equals
+ *     whole-signal `limit` because no sample depends on another.
+ *   - **`normalize` is non-causal** — peak/RMS normalize scales by a factor derived from the **global**
+ *     peak/RMS, which is unknown until the last sample, so the stage buffers the decoded chunks, then on
+ *     `flush` concatenates them, runs the exact whole-signal kernels (so it cannot drift from the
+ *     reference), and re-splits to the original framing/timestamps (gapless). This whole-signal buffer is
+ *     inherent: no causal streaming normalize is bit-exact (loudness normalization is a two-pass / non-
+ *     causal operation), so this is the correct cost, paid only when `normalize` is requested.
+ *
+ * Buffers are copied on `push` (the caller may reuse input arrays). An empty stream emits nothing.
+ */
+export function dynamicsStage(spec: DynamicsSpec): StatefulAudioStage {
+  if (spec.normalize === undefined) {
+    // Causal: the limiter (or a no-op) is per-sample; emit one limited chunk per input chunk.
+    return {
+      push(chunk: PcmAudio): readonly PcmAudio[] {
+        return [applyDynamicsChain(chunk, spec)];
+      },
+      flush(): readonly PcmAudio[] {
+        return [];
+      },
+    };
+  }
+  // Non-causal: hold the decoded chunks; normalize (global stat) + limit on flush, framing preserved.
+  const held: PcmAudio[] = [];
+  return {
+    push(chunk: PcmAudio): readonly PcmAudio[] {
+      held.push({
+        sampleRate: chunk.sampleRate,
+        channels: chunk.channels,
+        frames: chunk.frames,
+        planar: chunk.planar.map((ch) => ch.slice()),
+      });
+      return [];
+    },
+    flush(): readonly PcmAudio[] {
+      if (held.length === 0) return [];
+      const sizes = held.map((c) => c.frames);
+      const processed = applyDynamicsChain(concatChunks(held), spec);
+      held.length = 0;
+      return splitLike(processed, sizes);
+    },
+  };
 }

@@ -18,19 +18,47 @@ is not auto-registered in `src/drivers/defaults.ts`, and a misrouted decoder rai
 
 ## Status in this environment
 
-Re-verified in this workspace on 2026-06-26:
+**VENDORED (prebuilt permissive core, ADR-093).** A from-source dav1d build here needs **Meson** (absent —
+`docs/notes/wasm-codec-cores.md`), so per **ADR-085** the core is a committed **prebuilt**: **`dav1d.js`
+v0.1.1** (npm) — dav1d itself **BSD-3** (VideoLAN), the dav1d.js wrapper **CC0** (public domain). It ships a
+**separate 376 kB `.wasm`** (the standard pair, not inlined) with named C exports (`djs_decode_obu` …) and
+**stubbed pthreads** (single-thread, no COOP/COEP). Vendored files (committed):
 
-- `cargo` exists.
-- `wasm-pack` exists.
-- `emcc` does **not** exist.
-- No `dav1d`, `rav1d`, `dav1d-core.js`, or `dav1d_wasm_bg.wasm` artifact is present in this repo or the
-  local Cargo registry cache.
+| file | role | source / license |
+|---|---|---|
+| `dav1d-wasm.js` | the prebuilt dav1d.js wrapper (`create({wasmData}) → decodeFrameAsYUV`) | npm `dav1d.js@0.1.1` `dav1d.js` |
+| `dav1d_wasm_bg.wasm` | compiled dav1d | npm `dav1d.js@0.1.1` `dav1d.wasm` (**dav1d BSD-3**) |
+| `dav1d-core.js` | hand-written glue adapting the wrapper to the {@link Dav1dWasmCore} contract | this repo |
+| `LICENSE.dav1d-js` | the CC0 wrapper license | the package |
 
-dav1d is a C decoder, so a production dav1d WASM core cannot be built in this sandbox without Emscripten
-or an already-vendored core artifact. Per the project rules, this file records the blocked vendor step
-instead of committing an unaudited prebuilt binary or faking decoded frames.
+**Provenance** (also `provenance.json`): package `https://registry.npmjs.org/dav1d.js/-/dav1d.js-0.1.1.tgz`.
+sha256 — `dav1d-wasm.js` `18841e6ed40b28d5104d0690442a5fc93b15716008709f5c434768624534da67`;
+`dav1d_wasm_bg.wasm` `db43216c275e6eb82662125a0aec794fd4a30153a1e60915558fe53113365487`.
 
-## Recipe A — dav1d via Emscripten (recommended)
+**Capability boundary (NEVER-FAKE):** this dav1d.js build's YUV output is **8-bit 4:2:0 only** — a 10-bit
+stream (`bear-av1-10bit.mp4`) decodes to ZERO frames, so the glue's `supports()` **declines** 10-bit /
+non-4:2:0 / monochrome and the driver surfaces a clean `capability-miss`. 8-bit decode is **bit-exact vs
+ffmpeg** (verified in Node on `av1.mp4`'s 10 frames — `wasm-av1-decode.test.ts`).
+
+**Re-vendor** (`npm` is disabled — use `bun`/`curl`):
+```sh
+V=0.1.1
+curl -sL "https://registry.npmjs.org/dav1d.js/-/dav1d.js-${V}.tgz" -o /tmp/dav1d.tgz
+mkdir -p /tmp/dav1d && tar xzf /tmp/dav1d.tgz -C /tmp/dav1d
+D=src/codecs/wasm-av1
+cp /tmp/dav1d/package/dav1d.js   "$D/dav1d-wasm.js"
+cp /tmp/dav1d/package/dav1d.wasm "$D/dav1d_wasm_bg.wasm"
+cp /tmp/dav1d/package/COPYING    "$D/LICENSE.dav1d-js"
+shasum -a 256 "$D/dav1d-wasm.js" "$D/dav1d_wasm_bg.wasm"   # update provenance.json + above
+bunx vitest run src/codecs/wasm-av1                        # must stay green
+```
+
+`vendor-wasm.ts` discovers the `dav1d_wasm_bg.wasm` + `dav1d-core.js` pair (standard both-files path); the
+glue statically imports `./dav1d-wasm.js`, which `tsup` bundles into the lazy `dav1d-core.js` chunk.
+
+---
+
+## Alternative: from-source dav1d via Emscripten + Meson (documented; needs Meson)
 
 Requires Emscripten (`emcc` / `emconfigure` / `emmake`), Meson, Ninja, and a pinned dav1d source checkout.
 Build the common-path single-thread artifact first; SIMD/threads can be an opt-in profile later and must

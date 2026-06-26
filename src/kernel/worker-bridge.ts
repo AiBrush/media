@@ -73,6 +73,13 @@ export class WorkerStreamBridge implements TerminableTransport {
   readonly #terminate: (() => void) | undefined;
   #busy = false;
   #terminated = false;
+  /**
+   * Per-job id, incremented for each {@link runStream}. Because the pool **reuses** one bridge across jobs,
+   * an in-transit `chunk`/`done`/`error` from a cancelled or finished job can arrive after the next job's
+   * listener is attached; stamping every host→worker post with the current epoch and ignoring any worker
+   * message whose epoch differs makes a reused bridge incapable of cross-talk between jobs (doc 06 §4/§10).
+   */
+  #epoch = 0;
 
   constructor(port: MessageLike<WorkerMessage, HostMessage>, terminate?: () => void) {
     this.#port = port;
@@ -103,7 +110,8 @@ export class WorkerStreamBridge implements TerminableTransport {
     }
     this.#busy = true;
     const credit = opts.credit ?? DEFAULT_CREDIT;
-    return this.#pump(job, credit, opts);
+    const epoch = ++this.#epoch;
+    return this.#pump(job, epoch, credit, opts);
   }
 
   /** Terminate the worker. Idempotent; a real `Worker` is killed, a channel port simply stops. */
@@ -127,7 +135,12 @@ export class WorkerStreamBridge implements TerminableTransport {
    * credit; `cancel`/abort/error posts `Cancel`, drains the queue closed (close-once, doc 06 §3), and
    * settles the stream; a worker `error` is rebuilt to its typed {@link MediaError} subclass.
    */
-  #pump(job: OffloadJob, credit: number, opts: RunStreamOptions): ReadableStream<Transferable> {
+  #pump(
+    job: OffloadJob,
+    epoch: number,
+    credit: number,
+    opts: RunStreamOptions,
+  ): ReadableStream<Transferable> {
     const port = this.#port;
     const { signal } = opts;
     let controller!: ReadableStreamDefaultController<Transferable>;
@@ -171,12 +184,19 @@ export class WorkerStreamBridge implements TerminableTransport {
       demand = false;
       controller.enqueue(frame);
       // Permit the next frame only while the producer is still running; after `done` there is no more.
-      if (!settled && !producerDone) post(port, { t: 'credit', n: 1 });
+      if (!settled && !producerDone) post(port, { t: 'credit', epoch, n: 1 });
       // The producer is done and this was the last buffered frame → close after the consumer drained it.
       if (producerDone && queue.length === 0) finish();
     };
 
     onMessage = ({ data }): void => {
+      // Discriminate by job epoch first: a `ready` carries none (pre-job, always relevant); anything else
+      // from a PRIOR job (the bridge's port is reused by the pool) is stale and must not touch this job's
+      // state — but a stale `chunk` was transferred to us, so close its frame to avoid a leak (doc 06 §3).
+      if (data.t !== 'ready' && data.epoch !== epoch) {
+        if (data.t === 'chunk') closeFrame(data.frame);
+        return;
+      }
       if (settled) {
         // Already torn down (cancel/error/done) but a chunk was in transit when we settled: the host owns
         // that transferred frame, so close it here — dropping it would leak (doc 06 §3, close-once).
@@ -223,7 +243,7 @@ export class WorkerStreamBridge implements TerminableTransport {
           if (signal) {
             onAbort = (): void => {
               // Tell the worker to stop (it closes its in-flight frames), then error + drain locally.
-              post(port, { t: 'cancel' });
+              post(port, { t: 'cancel', epoch });
               fail(new MediaError('aborted', 'operation aborted'));
             };
             signal.addEventListener('abort', onAbort, { once: true });
@@ -231,7 +251,7 @@ export class WorkerStreamBridge implements TerminableTransport {
           // Post the job, transferring the input byte buffers (moved, not copied — doc 06 §4). The
           // initial `credit` is the backpressure window the worker may fill before awaiting more.
           const transfer = collectTransferables(job.payload);
-          post(port, { t: 'job', job, credit }, transfer);
+          post(port, { t: 'job', epoch, job, credit }, transfer);
         },
         pull: (): void => {
           if (settled) return;
@@ -243,7 +263,7 @@ export class WorkerStreamBridge implements TerminableTransport {
         cancel: (reason): void => {
           if (settled) return;
           settled = true;
-          post(port, { t: 'cancel' });
+          post(port, { t: 'cancel', epoch });
           drainQueue();
           cleanup();
           void reason;
@@ -254,16 +274,16 @@ export class WorkerStreamBridge implements TerminableTransport {
   }
 }
 
-/**
- * Decide whether heavy ops can actually be offloaded to a Worker in this environment — the honest gate
- * for the inline fallback (Prime Directive 6 / ADR-025). Returns `true` only when the `Worker`
- * constructor exists; the deeper "WebCodecs runs *inside* the worker" check is answered by the worker's
- * `ready.webcodecs` handshake (the host downgrades to {@link InlineBridge} when a freshly-spawned worker
- * reports `webcodecs:false`). Never assumes isolation that isn't there.
- */
-export function workerOffloadAvailable(): boolean {
-  return typeof Worker === 'function';
-}
+// The pure worker-mode selectors (`workerOffloadAvailable`/`selectWorkerMode`/`resolvePoolSize` + the
+// `WorkerSelection` type) live in the dependency-free `worker-mode.ts` so the eager kernel reaches them
+// WITHOUT pulling this module's heavy `WorkerStreamBridge`/pump into its closure (doc 08 §7 budget). They
+// are re-exported here so the bridge surface is unchanged for existing importers.
+export {
+  type WorkerSelection,
+  resolvePoolSize,
+  selectWorkerMode,
+  workerOffloadAvailable,
+} from './worker-mode.ts';
 
 // ── Internals ───────────────────────────────────────────────────────────────────────────────────
 

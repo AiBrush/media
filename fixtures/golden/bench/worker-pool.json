@@ -1,0 +1,198 @@
+{
+  "generatedAt": "2026-06-26T20:20:37.403Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 2,
+  "iters": 12,
+  "ladder": 4,
+  "poolSize": 4,
+  "files": [
+    {
+      "id": "sfx-pcm-f32.wav",
+      "frames": 10240,
+      "sampleRate": 48000,
+      "audioSeconds": 0.21333333333333335,
+      "renditions": 4,
+      "outputBytes": [20524, 18860, 13698, 9452],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 3.125938,
+          "renditionsPerSec": 1279.615910488308,
+          "audioSecondsPerSec": 272.984727570839
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 3.254625,
+          "renditionsPerSec": 1229.0202404270847,
+          "audioSecondsPerSec": 262.19098462444475
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s16.wav",
+      "frames": 10240,
+      "sampleRate": 48000,
+      "audioSeconds": 0.21333333333333335,
+      "renditions": 4,
+      "outputBytes": [20524, 18860, 13698, 9452],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 2.523,
+          "renditionsPerSec": 1585.4141894569957,
+          "audioSecondsPerSec": 338.22169375082575
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 2.6528955,
+          "renditionsPerSec": 1507.786492155458,
+          "audioSecondsPerSec": 321.66111832649773
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s24.wav",
+      "frames": 10240,
+      "sampleRate": 48000,
+      "audioSeconds": 0.21333333333333335,
+      "renditions": 4,
+      "outputBytes": [20524, 18860, 13698, 9452],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 2.761333,
+          "renditionsPerSec": 1448.5757422230495,
+          "audioSecondsPerSec": 309.0294916742506
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 2.774291,
+          "renditionsPerSec": 1441.8098173551368,
+          "audioSecondsPerSec": 307.5860943690959
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-s32.wav",
+      "frames": 10240,
+      "sampleRate": 48000,
+      "audioSeconds": 0.21333333333333335,
+      "renditions": 4,
+      "outputBytes": [20524, 18860, 13698, 9452],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 2.7969375000000003,
+          "renditionsPerSec": 1430.1356394270517,
+          "audioSecondsPerSec": 305.09560307777105
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 2.8496455000000003,
+          "renditionsPerSec": 1403.683370440288,
+          "audioSecondsPerSec": 299.4524523605948
+        }
+      ]
+    },
+    {
+      "id": "sfx-pcm-u8.wav",
+      "frames": 10240,
+      "sampleRate": 48000,
+      "audioSeconds": 0.21333333333333335,
+      "renditions": 4,
+      "outputBytes": [20524, 18860, 13698, 9452],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 3.024042,
+          "renditionsPerSec": 1322.7329514603302,
+          "audioSecondsPerSec": 282.18302964487043
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 2.755208,
+          "renditionsPerSec": 1451.796016852448,
+          "audioSecondsPerSec": 309.71648359518895
+        }
+      ]
+    },
+    {
+      "id": "sin_440Hz_-6dBFS_1s.wav",
+      "frames": 44101,
+      "sampleRate": 44100,
+      "audioSeconds": 1.0000226757369615,
+      "renditions": 4,
+      "outputBytes": [96046, 88246, 64046, 44146],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 11.558625,
+          "renditionsPerSec": 346.0619234554283,
+          "audioSecondsPerSec": 346.069770664577
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 11.4723545,
+          "renditionsPerSec": 348.6642606798805,
+          "audioSecondsPerSec": 348.67216689894354
+        }
+      ]
+    },
+    {
+      "id": "speech.wav",
+      "frames": 47616,
+      "sampleRate": 16000,
+      "audioSeconds": 2.976,
+      "renditions": 4,
+      "outputBytes": [285740, 262528, 190508, 131286],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 32.1059585,
+          "renditionsPerSec": 124.58746559458739,
+          "audioSecondsPerSec": 370.77229760949206
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 32.523625,
+          "renditionsPerSec": 122.9875206100181,
+          "audioSecondsPerSec": 366.0108613354139
+        }
+      ]
+    },
+    {
+      "id": "stereo-48000.wav",
+      "frames": 48000,
+      "sampleRate": 48000,
+      "audioSeconds": 1,
+      "renditions": 4,
+      "outputBytes": [192044, 176444, 128044, 88244],
+      "arms": [
+        {
+          "arm": "inline",
+          "wallMs": 22.285229,
+          "renditionsPerSec": 179.4910880206795,
+          "audioSecondsPerSec": 179.4910880206795
+        },
+        {
+          "arm": "pool(4)",
+          "wallMs": 22.2592085,
+          "renditionsPerSec": 179.70090895190637,
+          "audioSecondsPerSec": 179.70090895190637
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "arm": "inline",
+      "files": 8,
+      "geomeanRenditionsPerSec": 674.8550547882367
+    },
+    {
+      "arm": "pool(4)",
+      "files": 8,
+      "geomeanRenditionsPerSec": 672.7443302228245
+    }
+  ]
+}

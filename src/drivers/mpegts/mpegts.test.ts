@@ -84,6 +84,7 @@ function avcCWithParameterSets(sps: Uint8Array, pps: Uint8Array): Uint8Array {
 function expectUnitsPreserved(
   actual: readonly { data: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }[],
   expected: readonly { data: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }[],
+  timestampBaseUs = 0,
 ): void {
   expect(actual.length).toBe(expected.length);
   for (let index = 0; index < expected.length; index += 1) {
@@ -93,10 +94,22 @@ function expectUnitsPreserved(
       throw new Error(`missing unit ${index}`);
     }
     expect(rewritten.data).toEqual(original.data);
-    expect(Math.abs(rewritten.ptsUs - original.ptsUs)).toBeLessThanOrEqual(12);
-    expect(Math.abs(rewritten.dtsUs - original.dtsUs)).toBeLessThanOrEqual(12);
+    expect(Math.abs(rewritten.ptsUs - (original.ptsUs - timestampBaseUs))).toBeLessThanOrEqual(12);
+    expect(Math.abs(rewritten.dtsUs - (original.dtsUs - timestampBaseUs))).toBeLessThanOrEqual(12);
     expect(rewritten.keyframe).toBe(original.keyframe);
   }
+}
+function minUnitTimestampUs(
+  groups: readonly (readonly { ptsUs: number; dtsUs: number }[])[],
+): number {
+  let timestampBaseUs = Number.POSITIVE_INFINITY;
+  for (const group of groups) {
+    for (const unit of group) {
+      timestampBaseUs = Math.min(timestampBaseUs, unit.ptsUs, unit.dtsUs);
+    }
+  }
+  if (!Number.isFinite(timestampBaseUs)) throw new Error('no timed units selected');
+  return timestampBaseUs;
 }
 function unitDurationUs(units: readonly { ptsUs: number }[], index: number): number {
   const current = units[index];
@@ -108,6 +121,27 @@ function unitDurationUs(units: readonly { ptsUs: number }[], index: number): num
     return current.ptsUs - previous.ptsUs;
   }
   return 0;
+}
+function earliestTimestampUs(parsed: ReturnType<typeof parseTs>): number {
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const track of parsed.tracks) {
+    for (const unit of track.units) {
+      earliest = Math.min(earliest, unit.ptsUs, unit.dtsUs);
+    }
+  }
+  if (!Number.isFinite(earliest)) throw new Error('MPEG-TS parse has no timed access units');
+  return earliest;
+}
+function referenceProbeDurationSec(parsed: ReturnType<typeof parseTs>): number {
+  let endUs = 0;
+  for (const track of parsed.tracks) {
+    for (let index = 0; index < track.units.length; index += 1) {
+      const unit = track.units[index];
+      if (unit === undefined) throw new Error(`missing unit ${track.stream.pid}:${index}`);
+      endUs = Math.max(endUs, unit.ptsUs + unitDurationUs(track.units, index));
+    }
+  }
+  return endUs / 1_000_000;
 }
 
 /** The committed verbatim head of `h264_ts.ts` — a valid standalone TS (PAT+PMT+first PES). */
@@ -450,6 +484,98 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
     expect((audio?.units[0]?.data[1] ?? 0) & 0xf0).toBe(0xf0);
   });
 
+  it('streams the transport stream as packet-aligned incremental writes (target:writes), bytes identical', async () => {
+    // Build the SAME stream two ways: the default single-batch granularity and a tiny per-write granularity.
+    // The streamed output must arrive as MANY 188-aligned chunks (not one blob), and reassemble byte-exact.
+    const source = parseTs(await bytesFromDerived(DERIVED_TS));
+    const makeMuxer = (writeChunkPackets?: number): MpegTsMuxer => {
+      const muxer =
+        writeChunkPackets === undefined
+          ? new MpegTsMuxer()
+          : new MpegTsMuxer({ writeChunkPackets });
+      const trackIds = source.tracks.map((track, index) =>
+        muxer.addTrack({
+          id: index,
+          mediaType: track.stream.mediaType,
+          codec: track.stream.codec,
+          durationSec: track.durationSec,
+          ...(track.fps !== undefined ? { fps: track.fps } : {}),
+          config: track.config,
+        }),
+      );
+      const units = source.tracks
+        .flatMap((track, trackIndex) => track.units.map((unit) => ({ trackIndex, unit })))
+        .sort((l, r) => l.unit.dtsUs - r.unit.dtsUs || l.trackIndex - r.trackIndex);
+      for (const { trackIndex, unit } of units) {
+        const trackId = trackIds[trackIndex];
+        if (trackId === undefined) throw new Error(`missing mux track ${trackIndex}`);
+        muxer.addChunkStruct(trackId, {
+          data: unit.data,
+          timestampUs: unit.ptsUs,
+          dtsUs: unit.dtsUs,
+          key: unit.keyframe,
+        });
+      }
+      return muxer;
+    };
+    const collectChunks = async (
+      stream: ReadableStream<Uint8Array>,
+    ): Promise<Uint8Array[]> => {
+      const reader = stream.getReader();
+      const out: Uint8Array[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        out.push(value);
+      }
+      return out;
+    };
+    const concat = (parts: readonly Uint8Array[]): Uint8Array => {
+      const total = parts.reduce((n, p) => n + p.byteLength, 0);
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const p of parts) {
+        merged.set(p, off);
+        off += p.byteLength;
+      }
+      return merged;
+    };
+
+    // Tiny granularity (4 packets = 752 B/write): a multi-packet, multi-write stream the StreamTarget sees.
+    const tinyMuxer = makeMuxer(4);
+    await tinyMuxer.finalize();
+    const tinyChunks = await collectChunks(tinyMuxer.output);
+    const tiny = concat(tinyChunks);
+
+    // It is streamed, not single-shot: many writes, each a whole number of 188-byte packets.
+    expect(tinyChunks.length).toBeGreaterThan(1);
+    expect(tiny.byteLength % 188).toBe(0);
+    tinyChunks.forEach((chunk, i) => {
+      expect(chunk.byteLength % 188).toBe(0); // every write lands on a packet boundary
+      expect(chunk[0]).toBe(0x47); // and begins with the TS sync byte (resynchronizable)
+      const isLast = i === tinyChunks.length - 1;
+      if (!isLast) expect(chunk.byteLength).toBe(4 * 188); // full writes carry exactly the granularity
+      else expect(chunk.byteLength).toBeLessThanOrEqual(4 * 188);
+    });
+
+    // The default granularity also streams in packet-aligned chunks (a 16 KB write unit).
+    const defaultMuxer = makeMuxer();
+    await defaultMuxer.finalize();
+    const defaultChunks = await collectChunks(defaultMuxer.output);
+    const whole = concat(defaultChunks);
+    defaultChunks.forEach((chunk) => expect(chunk.byteLength % 188).toBe(0));
+
+    // Granularity NEVER changes content: both assemble to the exact same bytes, which re-parse faithfully.
+    expect([...tiny]).toEqual([...whole]);
+    const reparsed = parseTs(tiny);
+    expect(reparsed.tracks.map((t) => t.stream.codec)).toEqual(
+      source.tracks.map((t) => t.stream.codec),
+    );
+    for (let i = 0; i < source.tracks.length; i += 1) {
+      expect(reparsed.tracks[i]?.units.length).toBe(source.tracks[i]?.units.length);
+    }
+  });
+
   it('round-trips real Annex-B/ADTS access units without changing boundaries or data bytes', async () => {
     const source = parseTs(await bytesFromDerived(DERIVED_TS));
     const muxer = new MpegTsMuxer();
@@ -679,7 +805,7 @@ describe('streamCopy — driver-native MPEG-TS remux and keyframe trim', () => {
     }
   });
 
-  it('keyframe-trims a real TS with source-relative timing and no codec seam', async () => {
+  it('keyframe-trims a real TS with clip-local timing and no codec seam', async () => {
     const sourceBytes = await bytesFromMediaTest('h264_ts.ts');
     const source = parseTs(sourceBytes);
     const allPts = source.tracks.flatMap((track) => track.units.map((unit) => unit.ptsUs));
@@ -702,13 +828,23 @@ describe('streamCopy — driver-native MPEG-TS remux and keyframe trim', () => {
     }
     const expectedVideo = video.units
       .slice(videoStartIndex)
-      .filter((unit) => unit.dtsUs - originUs < endUs);
+      .filter(
+        (unit, index) =>
+          unit.ptsUs - originUs + unitDurationUs(video.units, videoStartIndex + index) <= endUs,
+      );
     const audioStartIndex = audio.units.findIndex(
       (unit, index) => unit.ptsUs - originUs + unitDurationUs(audio.units, index) > startUs,
     );
     const expectedAudio = audio.units
       .slice(audioStartIndex < 0 ? 0 : audioStartIndex)
-      .filter((unit) => unit.dtsUs - originUs < endUs);
+      .filter(
+        (unit, index) =>
+          unit.ptsUs -
+            originUs +
+            unitDurationUs(audio.units, (audioStartIndex < 0 ? 0 : audioStartIndex) + index) <=
+          endUs,
+      );
+    const timestampBaseUs = minUnitTimestampUs([expectedVideo, expectedAudio]);
 
     const trimmedBytes = await streamCopyTs(sourceBytes, {
       container: 'ts',
@@ -722,8 +858,28 @@ describe('streamCopy — driver-native MPEG-TS remux and keyframe trim', () => {
     expect(trimmedDurationSec).toBeGreaterThan(1.8);
     expect(trimmedDurationSec).toBeLessThan(2.2);
     expect(trimmedVideo?.units[0]?.keyframe).toBe(true);
-    expectUnitsPreserved(trimmedVideo?.units ?? [], expectedVideo);
-    expectUnitsPreserved(trimmedAudio?.units ?? [], expectedAudio);
+    expectUnitsPreserved(trimmedVideo?.units ?? [], expectedVideo, timestampBaseUs);
+    expectUnitsPreserved(trimmedAudio?.units ?? [], expectedAudio, timestampBaseUs);
+  });
+
+  it('rebases the exact harness ts_keyframe_aligned trim to a clip-local timeline', async () => {
+    const sourceBytes = await bytesFromMediaTest('h264_ts.ts');
+    const requestedSec = 4;
+    const toleranceSec = 1;
+
+    const trimmedBytes = await streamCopyTs(sourceBytes, {
+      container: 'ts',
+      trim: { startSec: 2, endSec: 6 },
+    });
+    const trimmed = parseTs(trimmedBytes);
+    const referenceStyleDurationSec = referenceProbeDurationSec(trimmed);
+
+    expect(earliestTimestampUs(trimmed)).toBeLessThanOrEqual(12);
+    expect(referenceStyleDurationSec).toBeLessThanOrEqual(requestedSec + toleranceSec);
+    expect(Math.abs(referenceStyleDurationSec - requestedSec)).toBeLessThanOrEqual(toleranceSec);
+    expect(
+      trimmed.tracks.find((track) => track.stream.mediaType === 'video')?.units[0]?.keyframe,
+    ).toBe(true);
   });
 });
 

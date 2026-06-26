@@ -1,0 +1,10 @@
+{
+  "path": "wav",
+  "sampleRate": 48000,
+  "channels": 1,
+  "bitsPerSample": 8,
+  "frames": 10240,
+  "bytes": 10240,
+  "sha256": "3145e298ac107d13113dab3d0bb787cc40b6f699e807d8e9a76fc5a720b42c47",
+  "ffmpegCrossChecked": true
+}

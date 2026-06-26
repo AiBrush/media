@@ -287,13 +287,46 @@ function copyChunkWithData(chunk: ChunkStruct, data: Uint8Array): ChunkStruct {
   };
 }
 
+/**
+ * True iff `data` is a well-formed AVC-format (`avcC`) access unit: a sequence of `lengthSize`-byte
+ * big-endian NAL lengths each followed by exactly that many payload bytes, consuming the buffer exactly.
+ *
+ * This is the disambiguator that fixes the avc-format-vs-Annex-B detection bug: an `avcC` access unit whose
+ * 4-byte length prefix is ≤ 0x0000FFFF (e.g. a 501-byte NAL → `00 00 01 F5`) *contains* the byte pattern
+ * `00 00 01`, so a naive Annex-B start-code scan ({@link annexBNalUnits}) would misparse it as Annex-B and
+ * mangle the sample (the encoder/decoder then fails on the first such frame). When the caller already holds
+ * the `avcC` `description`, the chunks are by definition length-prefixed; we verify that structurally here
+ * and pass them through verbatim, only treating a chunk as Annex-B if it does NOT parse as length-prefixed.
+ */
+function isLengthPrefixedAvc(data: Uint8Array, lengthSize: number): boolean {
+  let pos = 0;
+  let sawNal = false;
+  while (pos + lengthSize <= data.byteLength) {
+    let len = 0;
+    for (let i = 0; i < lengthSize; i++) len = len * 256 + (data[pos + i] as number);
+    if (len === 0) return false; // a zero-length NAL never occurs in a valid avcC AU
+    pos += lengthSize + len;
+    sawNal = true;
+    if (pos > data.byteLength) return false; // a length overran the buffer ⇒ not length-prefixed
+  }
+  return sawNal && pos === data.byteLength; // consumed the buffer exactly ⇒ well-formed avcC AU
+}
+
 function prepareAvcSamples(
   chunks: readonly ChunkStruct[],
   description: Uint8Array | undefined,
 ): AvcPreparedSamples {
   const sets: H264ParameterSets = { sps: [], pps: [] };
   let sawAnnexB = false;
+  // With an `avcC` description, NAL length size = (lengthSizeMinusOne & 3) + 1 (byte 4 of avcC); default 4.
+  const lengthSize =
+    description !== undefined && description.byteLength > 4
+      ? ((description[4] as number) & 0x03) + 1
+      : AVC_NAL_LENGTH_SIZE;
   const normalized = chunks.map((chunk): ChunkStruct => {
+    // An `avcC`-described chunk that already parses as length-prefixed is passed through verbatim — never
+    // run through the Annex-B start-code scan, which would mis-split a length prefix containing `00 00 01`.
+    if (description !== undefined && isLengthPrefixedAvc(chunk.data, lengthSize)) return chunk;
     const nalus = annexBNalUnits(chunk.data);
     if (nalus === undefined) return chunk;
     sawAnnexB = true;

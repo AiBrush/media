@@ -23,6 +23,7 @@
 
 import { InputError } from '../contracts/errors.ts';
 import type { PcmAudio } from './pcm.ts';
+import type { StatefulAudioStage } from './stream.ts';
 
 /** The RBJ filter responses supported here. `peaking`/`lowshelf`/`highshelf` require `gainDb`. */
 export type BiquadType =
@@ -196,11 +197,21 @@ export function polesInsideUnitCircle(c: BiquadCoeffs): boolean {
   return Math.abs(c.a2) < 1 && Math.abs(c.a1) < 1 + c.a2;
 }
 
-/** Filter one channel in place into `out` via DF2T with zero initial state. */
-function filterChannel(input: Float64Array, c: BiquadCoeffs): Float64Array {
+/** The two DF2T state registers of one channel — mutated in place so it persists across chunks. */
+interface BiquadState {
+  z1: number;
+  z2: number;
+}
+
+/**
+ * Filter `input` into a fresh buffer via DF2T, **carrying** `state` (mutated in place). With a fresh
+ * zero state this is the whole-signal filter; with the previous chunk's state it is the *continuation*,
+ * so feeding a signal one chunk at a time yields bit-exactly the single-call result (the recurrence reads
+ * only `x[i]` and the running registers — never a chunk-relative index or a future sample).
+ */
+function filterChannelInto(input: Float64Array, c: BiquadCoeffs, state: BiquadState): Float64Array {
   const out = new Float64Array(input.length);
-  let z1 = 0;
-  let z2 = 0;
+  let { z1, z2 } = state;
   for (let i = 0; i < input.length; i++) {
     const x = input[i] ?? 0;
     const y = c.b0 * x + z1;
@@ -208,7 +219,14 @@ function filterChannel(input: Float64Array, c: BiquadCoeffs): Float64Array {
     z2 = c.b2 * x - c.a2 * y;
     out[i] = y;
   }
+  state.z1 = z1;
+  state.z2 = z2;
   return out;
+}
+
+/** Filter one channel via DF2T with zero initial state (the whole-signal kernel). */
+function filterChannel(input: Float64Array, c: BiquadCoeffs): Float64Array {
+  return filterChannelInto(input, c, { z1: 0, z2: 0 });
 }
 
 /**
@@ -221,6 +239,41 @@ export function biquad(audio: PcmAudio, spec: BiquadSpec): PcmAudio {
   const coeffs = designBiquad(spec, audio.sampleRate);
   const planar = audio.planar.map((ch) => filterChannel(ch, coeffs));
   return { sampleRate: audio.sampleRate, channels: audio.channels, frames: audio.frames, planar };
+}
+
+/**
+ * A {@link StatefulAudioStage} applying one biquad across a stream of {@link PcmAudio} chunks. Coefficients
+ * are designed once at `sampleRate` (the stage runs after any resample, so the rate is fixed); DF2T state
+ * is kept **per channel** and carried across `push` calls, so the concatenated output is bit-exactly the
+ * whole-signal {@link biquad} — chunk sizes are irrelevant. The op is causal (no look-ahead): each `push`
+ * emits exactly one output chunk with the same frame count, and `flush` holds nothing. State is sized to
+ * the first chunk's channel count and grows if a later chunk presents more channels (each channel's
+ * recurrence is independent). An empty chunk is a no-op that still emits an empty chunk (framing 1:1).
+ *
+ * @throws InputError for an out-of-band frequency / `q ≤ 0` / missing `gainDb` (via {@link designBiquad}).
+ */
+export function biquadStage(spec: BiquadSpec, sampleRate: number): StatefulAudioStage {
+  const coeffs = designBiquad(spec, sampleRate);
+  const states: BiquadState[] = [];
+  const stateFor = (ch: number): BiquadState => {
+    let s = states[ch];
+    if (s === undefined) {
+      s = { z1: 0, z2: 0 };
+      states[ch] = s;
+    }
+    return s;
+  };
+  return {
+    push(chunk: PcmAudio): readonly PcmAudio[] {
+      const planar = chunk.planar.map((ch, i) => filterChannelInto(ch, coeffs, stateFor(i)));
+      return [
+        { sampleRate: chunk.sampleRate, channels: chunk.channels, frames: chunk.frames, planar },
+      ];
+    },
+    flush(): readonly PcmAudio[] {
+      return [];
+    },
+  };
 }
 
 /* v8 ignore start -- unreachable exhaustiveness guard (a `never` parameter). */

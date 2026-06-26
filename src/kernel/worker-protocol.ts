@@ -48,16 +48,27 @@ export interface TerminableTransport {
  * inputs travel in `transfer` (moved, not copied). `determinism` threads ADR-007 into the worker.
  */
 export interface OffloadJob {
-  readonly op: 'decode' | 'encode' | 'convert' | 'transcode' | 'filter' | 'mux' | 'remux';
+  readonly op: 'decode' | 'encode' | 'convert' | 'transcode' | 'trim' | 'filter' | 'mux' | 'remux';
   readonly payload: unknown;
   readonly determinism?: 'auto' | 'force-software';
 }
 
 // ============ host → worker ============
 
+/**
+ * A monotonically increasing per-job id stamped by the host bridge and echoed by the worker on every
+ * message for that job. It exists because a {@link WorkerStreamBridge}'s transport is **reused across jobs**
+ * by the worker pool: over an async port, an in-transit `chunk` (or a trailing `done`/`error`) from a
+ * cancelled/finished job N can arrive after job N+1's listener is attached. The host ignores any worker
+ * message whose `epoch` ≠ the current job's, and the worker ignores credit/cancel for a stale epoch — so a
+ * reused bridge can never cross-talk between jobs (doc 06 §4/§10). Pre-job messages (`ready`) carry none.
+ */
+export type JobEpoch = number;
+
 /** Start a job. `transfer` lists the input Transferables (input `ArrayBuffer`s) moved with the message. */
 export interface JobMessage {
   readonly t: 'job';
+  readonly epoch: JobEpoch;
   readonly job: OffloadJob;
   /** Initial backpressure credit: how many result chunks the worker may send before awaiting more. */
   readonly credit: number;
@@ -66,12 +77,14 @@ export interface JobMessage {
 /** Replenish backpressure credit as the host consumes result chunks (one credit per consumed chunk). */
 export interface CreditMessage {
   readonly t: 'credit';
+  readonly epoch: JobEpoch;
   readonly n: number;
 }
 
 /** Cancel the in-flight job (AbortSignal → worker). The worker tears down and closes in-flight frames. */
 export interface CancelMessage {
   readonly t: 'cancel';
+  readonly epoch: JobEpoch;
 }
 
 /** Every message the host sends the worker. */
@@ -94,6 +107,7 @@ export interface ReadyMessage {
  */
 export interface ChunkMessage {
   readonly t: 'chunk';
+  readonly epoch: JobEpoch;
   readonly seq: number;
   readonly frame: Transferable;
 }
@@ -101,6 +115,7 @@ export interface ChunkMessage {
 /** Monotonic progress derived from timestamps (doc 06 §8); forwarded to the caller's `onProgress`. */
 export interface ProgressMessage {
   readonly t: 'progress';
+  readonly epoch: JobEpoch;
   readonly done: number;
   readonly total?: number;
   readonly stage: string;
@@ -109,11 +124,13 @@ export interface ProgressMessage {
 /** The job finished successfully; no more chunks follow. */
 export interface DoneMessage {
   readonly t: 'done';
+  readonly epoch: JobEpoch;
 }
 
 /** The job failed; `error` is the serialized typed error (rebuilt to its subclass on the host). */
 export interface ErrorMessage {
   readonly t: 'error';
+  readonly epoch: JobEpoch;
   readonly error: SerializedError;
 }
 

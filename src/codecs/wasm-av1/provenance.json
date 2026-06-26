@@ -1,0 +1,30 @@
+{
+  "note": "Provenance for the vendored prebuilt dav1d AV1-DECODE WASM core (ADR-085/093). Self-hosted (committed + served same-origin, NOT a runtime CDN dependency). dav1d itself is BSD-3 (VideoLAN); the dav1d.js wrapper is CC0 (public domain). 8-bit 4:2:0 only (10-bit honestly declined by supports()). Re-vendor + sha256-refresh steps are in BUILD.md.",
+  "package": "dav1d.js",
+  "version": "0.1.1",
+  "url": "https://registry.npmjs.org/dav1d.js/-/dav1d.js-0.1.1.tgz",
+  "licenses": {
+    "wrapper": "CC0-1.0",
+    "dav1d": "BSD-3-Clause"
+  },
+  "upstream": "https://code.videolan.org/videolan/dav1d",
+  "capabilities": {
+    "decode": ["av1 8-bit 4:2:0 (Main)"],
+    "declined": [
+      "10-bit (this dav1d.js build outputs 8-bit YUV only)",
+      "encode (dav1d is decode-only)"
+    ]
+  },
+  "artifacts": [
+    {
+      "file": "dav1d-wasm.js",
+      "from": "package/dav1d.js",
+      "sha256": "18841e6ed40b28d5104d0690442a5fc93b15716008709f5c434768624534da67"
+    },
+    {
+      "file": "dav1d_wasm_bg.wasm",
+      "from": "package/dav1d.wasm",
+      "sha256": "db43216c275e6eb82662125a0aec794fd4a30153a1e60915558fe53113365487"
+    }
+  ]
+}

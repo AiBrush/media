@@ -17,6 +17,7 @@ import { parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
 import { parseOgg } from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
+import { demuxWebm, parseWebm } from '../drivers/webm/webm-driver.ts';
 import { channelAt } from '../dsp/pcm.ts';
 import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
@@ -448,12 +449,130 @@ describe('mux — caller packet streams (public packet seam)', () => {
   });
 
   it('rejects non-chunk-muxable targets before consuming packet streams', async () => {
+    // `aac`/`adts` are still a typed mux miss (no EncodedChunk-seam muxer); `mp3` now HAS one (Mp3Muxer),
+    // so it is no longer a valid example of a non-muxable target here.
     await expect(
       media().mux(
         { video: { track: videoTrack, packets: cancellablePacketStream(() => {}) } },
-        { container: 'mp3' },
+        { container: 'aac' },
       ),
     ).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  // Multi-source / multi-track assembly (PacketStreams.tracks): tracks demuxed from DIFFERENT sources, or
+  // ≥2 of one media type, packed into ONE container via the chunk seam. This is the engine op that backs
+  // the harness's `video_a_plus_audio_b`, `three_track_assembly`, and `swap_audio_video` mux cases.
+  it('assembles video from source A + audio from source B into one MKV (multi-source mux)', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const aId = 'bear-1280x720.mp4';
+      const bId = 'movie_5.mp4';
+      const demuxA = await media().demux(await fixtureSource(aId));
+      const demuxB = await media().demux(await fixtureSource(bId));
+      try {
+        const videoA = trackOf(demuxA.tracks, 'video');
+        const audioB = trackOf(demuxB.tracks, 'audio');
+        expect(videoA).toBeDefined();
+        expect(audioB).toBeDefined();
+        if (!videoA || !audioB) return;
+
+        // No `video`/`audio` slot — purely the `tracks[]` arm, with the two tracks from two distinct files.
+        const out = await outputBytes(
+          await media().mux(
+            {
+              tracks: [
+                { track: videoA, packets: demuxA.packets(videoA.id) },
+                { track: audioB, packets: demuxB.packets(audioB.id) },
+              ],
+            },
+            { container: 'mkv' },
+          ),
+        );
+        expect(out.byteLength).toBeGreaterThan(0);
+        // The assembled bytes re-demux to exactly the two assembled tracks (video then audio) with blocks.
+        const reparsed = parseWebm(out);
+        expect(reparsed.tracks.map((t) => t.mediaType)).toEqual(['video', 'audio']);
+        expect(reparsed.tracks.find((t) => t.mediaType === 'video')?.codec).toBe('h264');
+        expect(reparsed.tracks.find((t) => t.mediaType === 'audio')?.codec).toBe('aac');
+        const { framesByIndex } = demuxWebm(out);
+        expect(framesByIndex).toHaveLength(2);
+        for (const frames of framesByIndex) expect(frames.length).toBeGreaterThan(0);
+      } finally {
+        await demuxA.close();
+        await demuxB.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('assembles three tracks (video + two audio) from multiple sources into one MKV', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const demuxA = await media().demux(await fixtureSource('bear-1280x720.mp4'));
+      const demuxB = await media().demux(await fixtureSource('movie_5.mp4'));
+      const demuxC = await media().demux(await fixtureSource('test.mp4'));
+      try {
+        const videoA = trackOf(demuxA.tracks, 'video');
+        const audioB = trackOf(demuxB.tracks, 'audio');
+        const audioC = trackOf(demuxC.tracks, 'audio');
+        expect(videoA && audioB && audioC).toBeTruthy();
+        if (!videoA || !audioB || !audioC) return;
+
+        const out = await outputBytes(
+          await media().mux(
+            {
+              tracks: [
+                { track: videoA, packets: demuxA.packets(videoA.id) },
+                { track: audioB, packets: demuxB.packets(audioB.id) },
+                { track: audioC, packets: demuxC.packets(audioC.id) },
+              ],
+            },
+            { container: 'mkv' },
+          ),
+        );
+        const { info, framesByIndex } = demuxWebm(out);
+        // Three output tracks, in list order: one video + two audio, each with real blocks (no drop).
+        expect(info.tracks.map((t) => t.mediaType)).toEqual(['video', 'audio', 'audio']);
+        expect(framesByIndex).toHaveLength(3);
+        for (const frames of framesByIndex) expect(frames.length).toBeGreaterThan(0);
+      } finally {
+        await demuxA.close();
+        await demuxB.close();
+        await demuxC.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects a malformed tracks[] descriptor and cancels the already-supplied streams', async () => {
+    let cancelled = 0;
+    const ps = (): ReadableStream<EncodedChunk> =>
+      cancellablePacketStream(() => {
+        cancelled++;
+      });
+    const goodVideo: TrackInfo = {
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+    };
+    // First entry is valid; the second is config-less → the whole mux rejects, and BOTH supplied streams
+    // (the valid one was never drained) are cancelled so no producer leaks.
+    const configless: TrackInfo = { id: 2, mediaType: 'audio', codec: 'aac' };
+    await expect(
+      media().mux(
+        {
+          tracks: [
+            { track: goodVideo, packets: ps() },
+            { track: configless, packets: ps() },
+          ],
+        },
+        { container: 'mkv' },
+      ),
+    ).rejects.toBeInstanceOf(InputError);
+    expect(cancelled).toBe(2);
   });
 });
 

@@ -21,7 +21,7 @@
  * resample→f32 path lossless in spirit.
  */
 
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { type PcmAudio, sampleAt } from './pcm.ts';
 
 /**
@@ -32,6 +32,12 @@ const ZERO_CROSSINGS = 32; // sinc lobes on each side of center → transition s
 const SAMPLES_PER_ZERO_CROSSING = 512; // table phases between adjacent sinc zero crossings (interp grid)
 const KAISER_BETA = 9.42; // Kaiser β for ≈ 80 dB stopband attenuation (Kaiser/Schafer design)
 const MAX_POLYPHASE_PHASES = 4096;
+const ABORT_CHECK_INTERVAL = 4096;
+
+/** Optional controls for long-running sample-rate conversion. */
+export interface ResampleOptions {
+  readonly signal?: AbortSignal | undefined;
+}
 
 /** Normalized sinc, `sin(πx)/(πx)`, with the removable singularity at 0 filled by its limit (1). */
 function sinc(x: number): number {
@@ -93,13 +99,13 @@ function tapAt(table: Float64Array, pos: number): number {
 }
 
 interface PolyphaseKernel {
-  readonly offsets: Int32Array;
+  readonly firstOffset: number;
   readonly coeffs: Float64Array;
 }
 
 interface PolyphaseBank {
-  readonly phaseCount: number;
-  readonly step: number;
+  readonly baseIncrements: Int32Array;
+  readonly nextPhases: Int32Array;
   readonly kernels: readonly PolyphaseKernel[];
 }
 
@@ -127,14 +133,30 @@ function buildPolyphaseKernel(
   const first = Math.ceil(frac - halfSupport);
   const last = Math.floor(frac + halfSupport);
   const tapCount = Math.max(0, last - first + 1);
-  const offsets = new Int32Array(tapCount);
   const coeffs = new Float64Array(tapCount);
   for (let i = 0; i < tapCount; i++) {
     const offset = first + i;
-    offsets[i] = offset;
     coeffs[i] = tapAt(table, Math.abs((frac - offset) * cutoff)) * cutoff;
   }
-  return { offsets, coeffs };
+  return { firstOffset: first, coeffs };
+}
+
+function buildPhaseIncrements(
+  phaseCount: number,
+  step: number,
+): {
+  readonly baseIncrements: Int32Array;
+  readonly nextPhases: Int32Array;
+} {
+  const baseIncrements = new Int32Array(phaseCount);
+  const nextPhases = new Int32Array(phaseCount);
+  for (let phase = 0; phase < phaseCount; phase++) {
+    const next = phase + step;
+    const increment = Math.floor(next / phaseCount);
+    baseIncrements[phase] = increment;
+    nextPhases[phase] = next - increment * phaseCount;
+  }
+  return { baseIncrements, nextPhases };
 }
 
 function polyphaseBank(
@@ -158,34 +180,59 @@ function polyphaseBank(
   for (let phase = 0; phase < phaseCount; phase++) {
     kernels.push(buildPolyphaseKernel(phase, phaseCount, halfSupport, cutoff, table));
   }
-  const bank = { phaseCount, step, kernels };
+  const { baseIncrements, nextPhases } = buildPhaseIncrements(phaseCount, step);
+  const bank = { baseIncrements, nextPhases, kernels };
   POLYPHASE_CACHE.set(key, bank);
   return bank;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new MediaError('aborted', 'operation aborted');
 }
 
 function resampleChannelPolyphase(
   input: Float64Array,
   outFrames: number,
   bank: PolyphaseBank,
+  signal: AbortSignal | undefined,
 ): Float64Array {
   const out = new Float64Array(outFrames);
   const inputFrames = input.length;
+  const kernels = bank.kernels;
+  const baseIncrements = bank.baseIncrements;
+  const nextPhases = bank.nextPhases;
   let base = 0;
   let phase = 0;
+  throwIfAborted(signal);
   for (let m = 0; m < outFrames; m++) {
-    const kernel = bank.kernels[phase] as PolyphaseKernel;
-    const { offsets, coeffs } = kernel;
+    if ((m & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+    const kernel = kernels[phase] as PolyphaseKernel;
+    const { coeffs } = kernel;
+    const tapCount = coeffs.length;
+    const start = base + kernel.firstOffset;
     let acc = 0;
-    for (let i = 0; i < coeffs.length; i++) {
-      const idx = base + (offsets[i] as number);
-      if (idx >= 0 && idx < inputFrames) acc += (input[idx] as number) * (coeffs[i] as number);
+    if (start >= 0 && start + tapCount <= inputFrames) {
+      let i = 0;
+      let idx = start;
+      const unrolled = tapCount - (tapCount & 3);
+      for (; i < unrolled; i += 4, idx += 4) {
+        acc +=
+          (input[idx] as number) * (coeffs[i] as number) +
+          (input[idx + 1] as number) * (coeffs[i + 1] as number) +
+          (input[idx + 2] as number) * (coeffs[i + 2] as number) +
+          (input[idx + 3] as number) * (coeffs[i + 3] as number);
+      }
+      for (; i < tapCount; i++, idx++) {
+        acc += (input[idx] as number) * (coeffs[i] as number);
+      }
+    } else {
+      for (let i = 0, idx = start; i < tapCount; i++, idx++) {
+        if (idx >= 0 && idx < inputFrames) acc += (input[idx] as number) * (coeffs[i] as number);
+      }
     }
     out[m] = acc;
-    phase += bank.step;
-    if (phase >= bank.phaseCount) {
-      base += Math.floor(phase / bank.phaseCount);
-      phase %= bank.phaseCount;
-    }
+    base += baseIncrements[phase] as number;
+    phase = nextPhases[phase] as number;
   }
   return out;
 }
@@ -199,12 +246,15 @@ function resampleChannel(
   outFrames: number,
   ratio: number,
   table: Float64Array,
+  signal: AbortSignal | undefined,
 ): Float64Array {
   const out = new Float64Array(outFrames);
   const cutoff = ratio < 1 ? ratio : 1; // ≤ 1: lower-Nyquist low-pass; 1 for upsampling (input Nyquist)
   const halfSupport = ZERO_CROSSINGS / cutoff; // kernel half-width in INPUT samples (widens when downsampling)
   const invRatio = 1 / ratio; // output index → input position
+  throwIfAborted(signal);
   for (let m = 0; m < outFrames; m++) {
+    if ((m & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
     const center = m * invRatio; // continuous input position this output sample lands on
     const first = Math.ceil(center - halfSupport);
     const last = Math.floor(center + halfSupport);
@@ -225,13 +275,18 @@ function resampleChannel(
  *
  * @throws CapabilityError if `outRate` is not a positive integer (the resample capability cannot be met).
  */
-export function resample(audio: PcmAudio, outRate: number): PcmAudio {
+export function resample(
+  audio: PcmAudio,
+  outRate: number,
+  options: ResampleOptions = {},
+): PcmAudio {
   if (!Number.isInteger(outRate) || outRate <= 0) {
     throw new CapabilityError('capability-miss', `invalid target sample rate ${outRate}`, {
       op: 'filter',
       tried: [],
     });
   }
+  throwIfAborted(options.signal);
   const inRate = audio.sampleRate;
   if (outRate === inRate) {
     return {
@@ -247,7 +302,7 @@ export function resample(audio: PcmAudio, outRate: number): PcmAudio {
   const bank = polyphaseBank(inRate, outRate, ratio, table);
   const planar =
     bank === undefined
-      ? audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table))
-      : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank));
+      ? audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table, options.signal))
+      : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank, options.signal));
   return { sampleRate: outRate, channels: audio.channels, frames: outFrames, planar };
 }

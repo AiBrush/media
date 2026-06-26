@@ -276,10 +276,18 @@ export interface PacketStream {
   readonly packets: ReadableStream<EncodedChunk | Packet>;
 }
 
-/** Encoded packet streams (the input to `mux`), keyed by their declared media type. */
+/**
+ * Encoded packet streams (the input to `mux`). The `video`/`audio` slots cover the common single-video +
+ * single-audio assembly; `tracks` carries an arbitrary, ordered list — the **multi-source / multi-track**
+ * assembly seam (≥2 video, ≥2 audio, or tracks demuxed from several sources packed into one container).
+ * Each {@link PacketStream} owns its own {@link TrackInfo} (codec + config), so the target muxer's
+ * `addTrack` is the single arbiter of what it can write. All present streams are muxed; `tracks` entries
+ * are appended after `video`/`audio` in list order, each becoming its own output track.
+ */
 export interface PacketStreams {
   video?: PacketStream;
   audio?: PacketStream;
+  tracks?: readonly PacketStream[];
 }
 
 /** Warmup spec for `preload`. */

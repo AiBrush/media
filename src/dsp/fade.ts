@@ -21,6 +21,7 @@
 
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { type PcmAudio, channelAt, sampleAt } from './pcm.ts';
+import type { StatefulAudioStage } from './stream.ts';
 
 /** Fade curve: amplitude-linear, or constant-power (`sin`/`cos`, the cross-fade default). */
 export type FadeShape = 'linear' | 'equal-power';
@@ -144,4 +145,133 @@ export function crossfade(
     planar.push(out);
   }
   return { sampleRate: a.sampleRate, channels: a.channels, frames, planar };
+}
+
+// ============ streaming fade stage (codec seam) ============
+
+/** A resolved fade envelope for the streaming stage: source-rate frame counts + the curve. */
+export interface FadeSpec {
+  readonly curve: FadeShape;
+  /** Fade-in length in frames (0 ⇒ no fade-in). */
+  readonly inFrames: number;
+  /** Fade-out length in frames (0 ⇒ no fade-out). */
+  readonly outFrames: number;
+}
+
+/** A held chunk plus the absolute frame index of its first frame (for index-driven gain at emit time). */
+interface HeldFade {
+  readonly planar: readonly Float64Array[];
+  readonly frames: number;
+  readonly start: number;
+  readonly sampleRate: number;
+  readonly channels: number;
+}
+
+/** The fade-in gain at absolute frame index `i` for an `nIn`-frame fade-in (1 once `i ≥ nIn`). */
+function fadeInGainAt(i: number, nIn: number, curve: FadeShape): number {
+  if (nIn <= 0 || i >= nIn) return 1;
+  const denom = nIn > 1 ? nIn - 1 : 1;
+  return gainIn(i / denom, curve);
+}
+
+/** The fade-out gain at absolute frame index `i` for an `nOut`-frame fade-out ending at `total` (1 before). */
+function fadeOutGainAt(i: number, nOut: number, total: number, curve: FadeShape): number {
+  const start = total - nOut;
+  if (nOut <= 0 || i < start) return 1;
+  const denom = nOut > 1 ? nOut - 1 : 1;
+  return gainOut((i - start) / denom, curve);
+}
+
+/**
+ * Apply the (fade-in × fade-out) envelope to one held chunk by **absolute** frame index, returning a new
+ * chunk (held buffers are never mutated). `nIn`/`nOut` are the clamped fade lengths; `total` (the final
+ * frame count) is only needed for the fade-out tail position — pass `undefined` for an early-committed
+ * chunk that is proven to be entirely outside the tail (fade-out gain is then 1).
+ */
+function applyFadeEnvelope(
+  held: HeldFade,
+  nIn: number,
+  nOut: number,
+  total: number | undefined,
+  curve: FadeShape,
+): PcmAudio {
+  const planar = held.planar.map((ch) => {
+    const out = new Float64Array(held.frames);
+    for (let k = 0; k < held.frames; k++) {
+      const abs = held.start + k;
+      const gOut = total === undefined ? 1 : fadeOutGainAt(abs, nOut, total, curve);
+      out[k] = (ch[k] ?? 0) * fadeInGainAt(abs, nIn, curve) * gOut;
+    }
+    return out;
+  });
+  return { sampleRate: held.sampleRate, channels: held.channels, frames: held.frames, planar };
+}
+
+/**
+ * A {@link StatefulAudioStage} applying a duration-aware fade across a stream of {@link PcmAudio} chunks,
+ * bit-exactly equal to `fadeOut(fadeIn(whole, inFrames), outFrames)` (the `transformPcm` reference) — for
+ * **any** chunk split and **without trusting duration metadata**. A fade-out needs the absolute tail
+ * position, so the stage holds back the last `H = max(inFrames, outFrames)` frames in a FIFO; a front chunk
+ * is committed once `≥ H` frames follow it (proving it is outside both the tail and any fade-in clamp), and
+ * the held remainder is faded at `flush` when the true total is known.
+ *
+ * Why `H = max(inFrames, outFrames)` and not just `outFrames`: it makes the clamp reasoning exact. The
+ * whole-signal kernels clamp a fade longer than the signal to the signal length; a committed-early frame at
+ * absolute index `i` provably has `> i + max(inFrames,outFrames)` total frames after it, so `total > inFrames`
+ * (its fade-in uses the unclamped `denom`, matching the kernel) **and** `total > i + outFrames` (its fade-out
+ * gain is 1). If instead `total ≤ inFrames` or `total ≤ outFrames` (a fade longer than the whole stream),
+ * nothing is ever committed early — the entire signal sits in the FIFO at `flush`, where it is faded with the
+ * correctly-clamped lengths. So no frame is ever scaled with the wrong clamp, in either regime.
+ *
+ * Framing is preserved 1:1 (each input chunk maps to one output chunk with the same frame count and the
+ * caller's timestamp), so the stream stays gapless; only the sample values change. Memory is bounded by
+ * `H + one chunk`. An empty stream emits nothing. Held buffers are copied on `push` so the caller may reuse
+ * input arrays.
+ */
+export function fadeStage(spec: FadeSpec): StatefulAudioStage {
+  const { curve } = spec;
+  const nIn = Math.max(0, spec.inFrames);
+  const nOut = Math.max(0, spec.outFrames);
+  const holdback = Math.max(nIn, nOut);
+  const queue: HeldFade[] = [];
+  let queuedFrames = 0; // total frames currently held in `queue`
+  let produced = 0; // total frames consumed from the input so far (absolute counter)
+
+  const enqueue = (chunk: PcmAudio): void => {
+    queue.push({
+      planar: chunk.planar.map((ch) => ch.slice()),
+      frames: chunk.frames,
+      start: produced,
+      sampleRate: chunk.sampleRate,
+      channels: chunk.channels,
+    });
+    queuedFrames += chunk.frames;
+    produced += chunk.frames;
+  };
+
+  return {
+    push(chunk: PcmAudio): readonly PcmAudio[] {
+      enqueue(chunk);
+      const out: PcmAudio[] = [];
+      // Commit any front chunk that is provably outside the tail (≥ holdback frames follow it).
+      while (queue.length > 0) {
+        const front = queue[0] as HeldFade;
+        if (queuedFrames - front.frames < holdback) break;
+        queue.shift();
+        queuedFrames -= front.frames;
+        // Outside the tail and (since holdback ≥ nIn) past any fade-in clamp ⇒ fade-out gain is 1.
+        out.push(applyFadeEnvelope(front, nIn, nOut, undefined, curve));
+      }
+      return out;
+    },
+    flush(): readonly PcmAudio[] {
+      const total = produced;
+      const effIn = Math.min(nIn, total);
+      const effOut = Math.min(nOut, total);
+      const out = queue.map((held) => applyFadeEnvelope(held, effIn, effOut, total, curve));
+      queue.length = 0;
+      queuedFrames = 0;
+      return out;
+    },
+  };
 }

@@ -1,0 +1,40 @@
+{
+  "container": "flac",
+  "count": 3,
+  "totalBytes": 4835,
+  "sha256": "7eb6de66e429bad4e3cc5aeba45d3bc9bb134826302b1240ae3312c2660c779b",
+  "perTrack": [
+    {
+      "trackId": 0,
+      "count": 3,
+      "bytes": 4835
+    }
+  ],
+  "rows": [
+    {
+      "trackId": 0,
+      "sizeBytes": 2276,
+      "ptsUs": 0,
+      "durationUs": 96000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 2038,
+      "ptsUs": 96000,
+      "durationUs": 96000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 521,
+      "ptsUs": 192000,
+      "durationUs": 21333
+    }
+  ],
+  "ffprobe": [
+    {
+      "selector": "a:0",
+      "count": 3,
+      "bytes": 4835
+    }
+  ]
+}

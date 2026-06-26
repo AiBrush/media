@@ -165,6 +165,11 @@ function isTinyFilterSpec(spec: FilterSpec): boolean {
     case 'resample':
     case 'remix':
     case 'gain':
+    case 'fade':
+    case 'biquad':
+    case 'dynamics':
+      // Audio specs carry no pixel cost; the audio-dsp native driver is the only candidate, so the
+      // tiny/GPU re-ranking is moot — never "tiny" in the video-pixel sense.
       return false;
     default:
       return spec;

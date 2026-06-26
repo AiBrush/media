@@ -12,6 +12,7 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
+  type MuxOptions,
   type Muxer,
   type Packet,
   type Registry,
@@ -19,6 +20,7 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { Mp3Muxer } from './mp3-mux.ts';
 
 const MP3_MIMES = new Set(['audio/mpeg', 'audio/mp3', 'audio/mpeg3', 'audio/x-mpeg-3']);
 const MP3_EXTENSIONS = new Set(['mp3']);
@@ -89,6 +91,20 @@ function parseFrameHeader(dv: DataView, at: number): FrameHeader | undefined {
   const frameLength = Math.floor((coeff * bitrateKbps * 1000) / sampleRate) + padding;
 
   return { version, sampleRate, channels, bitrateKbps, padding, samplesPerFrame, frameLength };
+}
+
+/**
+ * True iff `bytes` begins with a valid MPEG Layer III audio frame whose declared `frameLength` fits within
+ * the buffer. The muxer's chunk-validation gate: it rejects anything that is not a real MP3 frame (a stray
+ * ID3/Xing frame, ADTS/AAC, truncated bytes, or arbitrary data) before concatenating it into the `.mp3`,
+ * so the authored elementary stream can never desync a downstream parser. A frame whose `frameLength`
+ * exceeds the chunk is rejected (a single chunk is expected to hold exactly one whole frame).
+ */
+export function isMpegLayer3Frame(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 4) return false;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const header = parseFrameHeader(dv, 0);
+  return header !== undefined && header.frameLength >= 4 && header.frameLength <= bytes.byteLength;
 }
 
 /** Find the first valid frame at/after `start`, confirmed by the next frame's sync (avoid false locks). */
@@ -308,8 +324,10 @@ export const Mp3Driver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(): Muxer {
-    throw new MediaError('mux-error', 'mp3 muxing is out of scope (decode/transcode only)');
+  createMuxer(o?: MuxOptions): Muxer {
+    // MP3 is an elementary stream of self-describing frames — concatenate the track's MPEG Layer III
+    // frames into a `.mp3` (no fragmented form; the encoder/remux path feeds the frames). See {@link Mp3Muxer}.
+    return new Mp3Muxer(o);
   },
 };
 

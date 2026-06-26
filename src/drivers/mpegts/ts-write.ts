@@ -64,14 +64,35 @@ interface PacketizedTs {
   readonly continuity: ReadonlyMap<number, number>;
 }
 
+/**
+ * Default streaming write granularity: how many 188-byte transport packets each `output` chunk carries.
+ * A transport stream is a flat run of fixed-size packets with no front index, so it is the one container
+ * that can be emitted as a sequence of packet-aligned writes the instant `finalize` serializes it — the
+ * streaming-target shape (doc 09 streaming-output) a `StreamTarget` turns into one positioned write each.
+ * 87×188 = 16 356 B ≈ a 16 KB network/disk write unit: small enough to stream incrementally (TTFB, bounded
+ * peak copy at the sink), large enough that a long stream is not thousands of micro-enqueues. Every chunk
+ * is a whole number of packets (188-aligned), so a consumer that resynchronizes on the `0x47` sync byte
+ * sees an intact packet boundary at every chunk edge.
+ */
+const DEFAULT_WRITE_CHUNK_PACKETS = 87;
+
 export interface MpegTsMuxerOptions {
   readonly fragmented?: boolean;
+  /**
+   * Streaming write granularity in whole 188-byte packets per emitted `output` chunk (≥ 1). The serialized
+   * stream is sliced on packet boundaries into chunks of at most this many packets, each `enqueue`d
+   * separately so a positioned-write sink observes incremental, packet-aligned writes rather than one
+   * single-shot blob. Omitted ⇒ {@link DEFAULT_WRITE_CHUNK_PACKETS}. The assembled bytes are identical
+   * regardless of granularity (this only changes how the output is chunked, never its content).
+   */
+  readonly writeChunkPackets?: number;
 }
 
 export class MpegTsMuxer implements Muxer {
   readonly #tracks: TrackState[] = [];
   readonly #controllerPromise: Promise<ReadableStreamDefaultController<Uint8Array>>;
   readonly #output: ReadableStream<Uint8Array>;
+  readonly #writeChunkPackets: number;
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   #finalized = false;
 
@@ -83,6 +104,10 @@ export class MpegTsMuxer implements Muxer {
         capabilityDetail({ container: 'ts', fragmented: true }),
       );
     }
+    this.#writeChunkPackets = Math.max(
+      1,
+      Math.floor(options.writeChunkPackets ?? DEFAULT_WRITE_CHUNK_PACKETS),
+    );
     let resolveController: (controller: ReadableStreamDefaultController<Uint8Array>) => void =
       () => {};
     this.#controllerPromise = new Promise((resolve) => {
@@ -194,7 +219,14 @@ export class MpegTsMuxer implements Muxer {
     const controller = this.#controller ?? (await this.#controllerPromise);
     try {
       const bytes = writeMpegTs(this.#tracks);
-      controller.enqueue(bytes);
+      // Emit the transport stream as a sequence of packet-aligned writes (the streaming-target shape):
+      // each chunk is a whole number of 188-byte packets, so a positioned-write sink sees incremental,
+      // resynchronizable writes rather than one single-shot blob. The concatenation is byte-identical to
+      // `bytes`. An empty stream (no packets) enqueues nothing — just closes.
+      const chunkBytes = this.#writeChunkPackets * TS_PACKET_SIZE;
+      for (let offset = 0; offset < bytes.byteLength; offset += chunkBytes) {
+        controller.enqueue(bytes.subarray(offset, Math.min(offset + chunkBytes, bytes.byteLength)));
+      }
       controller.close();
     } catch (error) {
       controller.error(error);

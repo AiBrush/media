@@ -20,6 +20,52 @@ typed `CapabilityError` rather than faking one (ADR-017, directive 6).
 
 ## Status in this environment (why it is not vendored here) — measured, not assumed
 
+**VENDORED (prebuilt permissive cores, ADR-094).** A from-source libvpx build is heavy/slow, and there is no
+pure-Rust VP8/VP9 decoder; so per **ADR-085** the cores are committed **prebuilts**: **ogv.js v1.9.0**'s
+standalone single-threaded per-codec decoders (libvpx **BSD-3**/WebM Project, ogv.js wrappers **MIT**).
+Vendored files (committed):
+
+| file | role | source / license |
+|---|---|---|
+| `ogv-vp8-wasm.js` / `ogv-vp9-wasm.js` | the prebuilt ogv.js decoder modules (`processFrame → frameBuffer`) | npm `ogv@1.9.0` `dist/ogv-decoder-video-vp{8,9}-wasm.js` |
+| `vpx-vp8-data-wasm.js` / `vpx-vp9-data-wasm.js` | the libvpx wasm, **base64-embedded** (so the tail is self-contained; the `-wasm.js` suffix keeps biome/vendor-wasm treating it as a wasm artifact) | npm `ogv@1.9.0` `dist/…-wasm.wasm` (**libvpx BSD-3**) |
+| `vpx-core.js` | hand-written glue adapting the modules to the {@link VpxWasmCore} contract (de-stride → packed I420) | this repo |
+| `LICENSE.ogv` | the ogv.js MIT/BSD license | the package |
+
+**Provenance** (also `provenance.json`): `https://registry.npmjs.org/ogv/-/ogv-1.9.0.tgz`. sha256 —
+ogv-vp8-wasm.js `e88760eaed22be03e2efc3a8ada0e9ec2faa274eda6a2e539580f18a1ef02b0a`, vp8 wasm
+`3175074b9bfd47317a550bbab287ca876ff66f71dfa5aa43ab1ab8897dc5252d`, ogv-vp9-wasm.js
+`012e2daaa34fa84d53520ab8bfa79a950aa922a2663405f4ddaa5f83cecaf435`, vp9 wasm
+`79efca8f980458be2abadfc0531a17036326685102ba281f172e2c9eb683bdcb`.
+
+**Shape:** ogv.js's `OGVDecoderVideoVPxW({...})` is an Emscripten MODULARIZE factory that runs in Node; the
+glue feeds each module its base64-embedded wasm via `instantiateWasm` (no separate `.wasm`), so the tail is
+**self-contained** — `tsup` bundles it into the lazy `vpx-core.js` chunk and `vendor-wasm.ts` skips it (the
+`selfContained` branch, ADR-090). The driver's `new URL('./vpx.wasm', import.meta.url)` is vestigial (the
+glue's `init` ignores it). ogv returns **stride-aligned** planes; the glue **de-strides** to packed I420.
+
+**Capability boundary (NEVER-FAKE):** **8-bit 4:2:0 only**. A 4:4:4 stream (`bear-vp9-alpha.webm`) is detected
+by its full-luma-stride U plane and **declined** (the glue throws → the driver yields a clean
+`capability-miss`) rather than emitting wrong-colour frames. VP8 + VP9 8-bit 4:2:0 decode is **bit-exact vs
+ffmpeg** (verified in Node on real WebM streams — `wasm-vpx-decode.test.ts`).
+
+**Re-vendor** (`npm` is disabled — use `bun`/`curl`):
+```sh
+V=1.9.0
+curl -sL "https://registry.npmjs.org/ogv/-/ogv-${V}.tgz" -o /tmp/ogv.tgz
+mkdir -p /tmp/ogv && tar xzf /tmp/ogv.tgz -C /tmp/ogv
+D=src/codecs/wasm-vpx
+cp /tmp/ogv/package/dist/ogv-decoder-video-vp8-wasm.js "$D/ogv-vp8-wasm.js"
+cp /tmp/ogv/package/dist/ogv-decoder-video-vp9-wasm.js "$D/ogv-vp9-wasm.js"
+cp /tmp/ogv/package/COPYING "$D/LICENSE.ogv"
+# regenerate the base64 *-data-wasm.js modules (see the snippet in this repo's history) + update provenance.json
+bunx vitest run src/codecs/wasm-vpx   # must stay green
+```
+
+---
+
+## (historical) Why not from-source in this sandbox — measured
+
 This build sandbox has `rustc` 1.94, `cargo`, `wasm-pack` 0.14, the `wasm32-unknown-unknown` target,
 `clang`, and `cmake` — but **no Emscripten (`emcc`)** and no C/wasm sysroot. Three facts were measured (cf.
 the Opus sibling's ADR-026, which reached the identical conclusion for libopus):

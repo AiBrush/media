@@ -17,9 +17,11 @@
  *   bun run build && bun run vendor-wasm     # copy every vendored tail's wasm+glue into dist/
  *   bun run vendor-wasm --check              # verify dist/ already has every tail pair (CI; no writes)
  *
- * Honest by construction: a tail with only one half of the pair, or a `--check` with a missing artifact,
- * fails loudly (non-zero exit) — never a silent half-vendor. Scaffold-only tails (no `*_wasm_bg.wasm`
- * vendored yet, e.g. opus/vpx/av1) are skipped with a note; they carry nothing to co-vendor.
+ * Honest by construction: a tail with only one half of the pair AND no inlined-wasm carrier, or a
+ * `--check` with a missing artifact, fails loudly (non-zero exit) — never a silent half-vendor.
+ * Self-contained inlined-wasm tails (a `*-core.js` glue + an inlined carrier, no separate `*_wasm_bg.wasm`,
+ * e.g. `wasm-opus`, `wasm-vpx`) and not-yet-built scaffolds are both skipped — they carry nothing for this
+ * script to co-vendor (see {@link discoverTails}).
  */
 
 import { readdir } from 'node:fs/promises';
@@ -44,9 +46,17 @@ interface TailArtifacts {
 }
 
 /**
- * Discover every real tail under `src/codecs/wasm-*` that has BOTH a `*_wasm_bg.wasm` and a `*-core.js`.
- * A directory with neither is a not-yet-built scaffold (skipped); a directory with exactly one half is a
- * broken vendor and is reported by {@link main} as an error.
+ * Discover every real tail under `src/codecs/wasm-*` that has BOTH a `*_wasm_bg.wasm` and a `*-core.js`
+ * to co-vendor. Three other shapes are handled WITHOUT error:
+ *   1. NEITHER half present → a not-yet-built scaffold (skipped; nothing to vendor).
+ *   2. A **self-contained inlined-wasm** tail — a `*-core.js` glue PLUS an inlined-wasm carrier (a
+ *      `*-wasm.js` single-file module and/or a `generated/*.generated.mjs` blob) and NO separate
+ *      `*_wasm_bg.wasm` (ADR-090). `tsup` bundles the wasm into the glue chunk, so there is nothing
+ *      separate to copy → skipped. This is the Option-A path for prebuilt cores: libopus (`wasm-opus`),
+ *      ogv.js libvpx (`wasm-vpx`).
+ * A directory with exactly ONE half of the standard pair and NO inlined carrier is a genuinely broken
+ * vendor, reported by {@link main} as an error. So a Rust/Symphonia tail (vorbis/aac/mp3) still REQUIRES
+ * both files, while an inlined prebuilt is a valid glue-only tail.
  */
 async function discoverTails(): Promise<{ tails: TailArtifacts[]; broken: string[] }> {
   const entries = await readdir(CODECS_DIR, { withFileTypes: true });
@@ -59,7 +69,20 @@ async function discoverTails(): Promise<{ tails: TailArtifacts[]; broken: string
     const files = await readdir(dir);
     const wasmName = files.find((f) => f.endsWith('_wasm_bg.wasm'));
     const glueName = files.find((f) => f.endsWith('-core.js'));
+    // A self-contained core INLINES its wasm into the glue rather than shipping a separate
+    // `*_wasm_bg.wasm`: a prebuilt Emscripten single-file module (`*-wasm.js`, e.g. `libopus-wasm.js`,
+    // `vpx-vp8-data-wasm.js`, `ogv-vp9-wasm.js`) and/or a generated ESM blob (`*.generated.mjs`, kept under
+    // a `generated/` dir). `tsup` bundles that whole into the lazy `*-core.js` chunk, so there is NOTHING
+    // separate for this script to co-vendor next to the emitted chunk (ADR-090). Detect any inlined-wasm
+    // carrier so such a tail is SKIPPED — never mistaken for a broken half-vendor. (A standard Rust/Symphonia
+    // tail has no such carrier, so it still REQUIRES both `*_wasm_bg.wasm` + `*-core.js`.)
+    const hasInlinedWasmCarrier = files.some(
+      (f) => f.endsWith('-wasm.js') || f.endsWith('.generated.mjs') || f === 'generated',
+    );
+    // Self-contained iff there is a glue chunk AND an inlined carrier but no separate `*_wasm_bg.wasm`.
+    const selfContained = wasmName === undefined && glueName !== undefined && hasInlinedWasmCarrier;
     if (wasmName === undefined && glueName === undefined) continue; // scaffold-only tail: nothing to vendor
+    if (selfContained) continue; // self-contained inlined-wasm core (glue + inlined carrier): tsup bundles it
     if (wasmName === undefined || glueName === undefined) {
       broken.push(
         `wasm-${id}: incomplete vendor (${wasmName ? 'glue' : 'wasm'} missing) — build it per BUILD.md`,

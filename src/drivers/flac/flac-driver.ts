@@ -11,8 +11,17 @@
 import {
   type FlacFrameSpan,
   decodeFlac,
+  interleavedPcmBytes as decodedInterleavedPcmBytes,
   enumerateFlacFrameSpans,
 } from '../../codecs/flac/decode.ts';
+import {
+  type FlacEncodeOptions,
+  encodeFlac,
+  finalizeMd5,
+  flacPcmFromPcmAudio,
+  newMd5State,
+  updateMd5,
+} from '../../codecs/flac/encode.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -20,6 +29,7 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
+  type MuxOptions,
   type Muxer,
   type Packet,
   type PcmTransform,
@@ -222,6 +232,376 @@ function flacToPcm(bytes: Uint8Array): { audio: PcmAudio; format: SampleFormat }
   return { audio, format };
 }
 
+/**
+ * Author a native FLAC byte stream from canonical planar PCM (ADR-024). The lossless authoring seam shared
+ * by the FLAC driver's own `transformPcm` (FLAC → FLAC re-encode) and the engine's cross-container PCM
+ * route (WAV/AIFF/CAF → FLAC): the source samples are quantized to signed integers at `format`'s bit depth
+ * via {@link flacPcmFromPcmAudio} (integer formats round-trip exactly; float is quantized to 24-bit), then
+ * verbatim-encoded. The result is a standards-valid lossless FLAC stream (STREAMINFO MD5 + frame CRCs),
+ * so re-decoding it reproduces the quantized PCM bit-exactly. A zero-sample input raises a typed
+ * {@link InputError} from {@link encodeFlac} (FLAC frames cannot be empty) rather than emitting a malformed
+ * header. `blockSize` defaults to the encoder's 4096-sample frame.
+ */
+export function authorFlacFromPcm(
+  audio: PcmAudio,
+  format: SampleFormat,
+  options: FlacEncodeOptions = {},
+): Uint8Array<ArrayBuffer> {
+  return encodeFlac(flacPcmFromPcmAudio(audio, format), options);
+}
+
+/**
+ * The engine's cross-container FLAC authoring entry (ADR-024): apply the audio-dsp {@link PcmTransform}
+ * (gain / remix / fade / dynamics / biquad; resample is a typed miss without the wasm/WebAudio tail) to the
+ * source's decoded PCM, then author a native FLAC stream at the source's `format` depth. Lives here (not in
+ * the engine) so the FLAC encoder + audio-dsp wiring stay in the lazily-loaded FLAC driver chunk — the
+ * engine reaches it via a dynamic `import()` only when a FLAC convert actually runs, keeping the eager
+ * kernel free of codec code (docs/architecture/08). Returns a one-chunk stream the engine materializes.
+ */
+export function authorFlacStream(
+  audio: PcmAudio,
+  format: SampleFormat,
+  o?: PcmTransform,
+): ReadableStream<Uint8Array> {
+  if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+  const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
+  const out = authorFlacFromPcm(result, format);
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(out);
+      c.close();
+    },
+  });
+}
+
+// ============ native FLAC muxer ============
+
+/** One buffered native FLAC audio frame (already a complete coded frame from the codec encoder). */
+interface ChunkStruct {
+  timestampUs: number;
+  durationUs: number | undefined;
+  key: boolean;
+  data: Uint8Array;
+}
+
+/** STREAMINFO byte offsets within its 34-byte body (after the 4-byte fLaC + 4-byte block header). */
+const STREAMINFO_BODY = 8;
+const STREAMINFO_LEN = 34;
+
+/**
+ * The native FLAC muxer: it lays down `fLaC` + a STREAMINFO metadata block + every coded audio frame, in
+ * arrival (= presentation) order. FLAC audio is never reordered (no B-frames), so a packet's `dtsUs` is
+ * ignored. The codec encoder (or a demuxer remux) supplies complete native frames via {@link write}/
+ * {@link addChunkStruct} and the STREAMINFO prelude as the track's `config.description`; on {@link
+ * finalize} the muxer backfills the frame-derived fields (total samples, min/max block + frame size) into
+ * that STREAMINFO so the header is exact, then emits the whole stream as one materialized chunk. The MD5
+ * carried in the supplied STREAMINFO is preserved verbatim (the encoder owns it; `0` is the spec's legal
+ * "unknown"). `addTrack` is the codec-in-container legality arbiter: only a single FLAC audio track is
+ * accepted (FLAC carries exactly one stream).
+ */
+export class FlacMuxer implements Muxer {
+  readonly output: ReadableStream<Uint8Array>;
+
+  #track: { id: number; info: TrackInfo; chunks: ChunkStruct[] } | undefined;
+  #finalized = false;
+  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  readonly #ready: Promise<void>;
+  #resolveReady: (() => void) | undefined;
+
+  constructor() {
+    this.#ready = new Promise<void>((resolve) => {
+      this.#resolveReady = resolve;
+    });
+    this.output = new ReadableStream<Uint8Array>({
+      start: (controller): void => {
+        this.#controller = controller;
+        this.#resolveReady?.();
+      },
+    });
+  }
+
+  addTrack(info: TrackInfo): number {
+    this.#assertOpen();
+    if (this.#track !== undefined) {
+      throw new MediaError('mux-error', 'the FLAC muxer writes a single audio stream');
+    }
+    if (info.mediaType !== 'audio' || info.codec !== 'flac') {
+      throw new MediaError(
+        'mux-error',
+        `FLAC container holds one FLAC audio track, not ${info.mediaType}/${info.codec}`,
+      );
+    }
+    const id = 0;
+    this.#track = { id, info, chunks: [] };
+    return id;
+  }
+
+  /**
+   * Buffer one encoded packet. Reading bytes/timing from a real WebCodecs `EncodedAudioChunk` (`copyTo`)
+   * is the only browser-only step (guarded); the struct flows through the pure {@link addChunkStruct}.
+   */
+  write(trackId: number, packet: Packet): Promise<void> {
+    /* v8 ignore start -- requires a real WebCodecs EncodedAudioChunk; validated under browser-mode (Phase 1) */
+    const chunk = packet.chunk;
+    const data = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(data);
+    this.addChunkStruct(trackId, {
+      timestampUs: chunk.timestamp,
+      durationUs: chunk.duration ?? undefined,
+      key: chunk.type === 'key',
+      data,
+    });
+    return Promise.resolve();
+    /* v8 ignore stop */
+  }
+
+  /** Pure packet ingest (the path the Node tests drive directly): append a coded frame to the track. */
+  addChunkStruct(trackId: number, chunk: ChunkStruct): void {
+    this.#assertOpen();
+    if (this.#track === undefined || this.#track.id !== trackId) {
+      throw new MediaError('mux-error', `write to unknown track ${trackId}`);
+    }
+    this.#track.chunks.push(chunk);
+  }
+
+  async finalize(): Promise<void> {
+    this.#assertOpen();
+    this.#finalized = true;
+    await this.#ready;
+    const controller = this.#controller;
+    if (controller === undefined) {
+      throw new MediaError('mux-error', 'muxer output stream was not initialized');
+    }
+    try {
+      if (this.#track === undefined) {
+        throw new MediaError('mux-error', 'cannot finalize a muxer with no tracks');
+      }
+      if (this.#track.chunks.length === 0) {
+        throw new MediaError('mux-error', `track ${this.#track.id} received no packets`);
+      }
+      controller.enqueue(this.#serialize(this.#track.info, this.#track.chunks));
+      controller.close();
+    } catch (err) {
+      controller.error(err);
+      throw err;
+    }
+  }
+
+  /** Assemble `fLaC` + a frame-accurate STREAMINFO + the coded frames into one native FLAC byte stream. */
+  #serialize(info: TrackInfo, chunks: readonly ChunkStruct[]): Uint8Array<ArrayBuffer> {
+    const streamInfo = buildMuxStreamInfo(info, chunks);
+    let total = streamInfo.byteLength;
+    for (const c of chunks) total += c.data.byteLength;
+    const out = new Uint8Array(4 + total);
+    out.set(FLAC_MAGIC, 0);
+    out.set(streamInfo, 4);
+    let off = 4 + streamInfo.byteLength;
+    for (const c of chunks) {
+      out.set(c.data, off);
+      off += c.data.byteLength;
+    }
+    backfillStreamInfoMd5(out);
+    return out;
+  }
+
+  #assertOpen(): void {
+    if (this.#finalized) {
+      throw new MediaError('mux-error', 'muxer already finalized');
+    }
+  }
+}
+
+const FLAC_MAGIC = Uint8Array.from([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
+
+/** Out-stream offset of STREAMINFO's MD5 field: 4 (fLaC) + 4 (block header) + 18 (body offset). */
+const STREAMINFO_MD5_OFFSET = 4 + 4 + 18;
+
+/**
+ * Backfill the STREAMINFO MD5 in place when the supplied prelude left it as the "unknown" all-zero (the
+ * streaming codec-encoder path, which can't know the digest before the first frame). The muxer is the
+ * single-shot authority: it decodes the just-assembled stream with the pure-TS decoder and writes the
+ * digest of the unencoded interleaved PCM — so the output is self-validating (`flac --test` passes). A
+ * non-zero supplied MD5 (a demuxer remux, or a caller that already hashed the PCM) is preserved untouched.
+ */
+function backfillStreamInfoMd5(out: Uint8Array): void {
+  let zero = true;
+  for (let i = 0; i < 16; i++) {
+    if ((out[STREAMINFO_MD5_OFFSET + i] ?? 0) !== 0) {
+      zero = false;
+      break;
+    }
+  }
+  if (!zero) return; // a real MD5 was supplied — keep it
+  const decoded = decodeFlac(out);
+  const state = newMd5State();
+  updateMd5(state, decodedInterleavedPcmBytes(decoded));
+  out.set(finalizeMd5(state), STREAMINFO_MD5_OFFSET);
+}
+
+/**
+ * Build the STREAMINFO metadata block the muxer writes: start from the track's supplied STREAMINFO
+ * (`config.description` — the codec encoder's prelude, preserving its MD5), then backfill the fields the
+ * muxer can derive exactly from the buffered frames: total samples (Σ frame durations, when the supplied
+ * value is the "unknown" 0), min/max frame size (smallest/largest coded frame), and min/max block size
+ * (largest = the nominal fixed block size; min equals it for a fixed-blocksize stream). When no
+ * description was supplied, a minimal STREAMINFO is synthesized from the track's audio config.
+ */
+function buildMuxStreamInfo(
+  info: TrackInfo,
+  chunks: readonly ChunkStruct[],
+): Uint8Array<ArrayBuffer> {
+  const body = streamInfoBodyFrom(info);
+  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+
+  const totalFromChunks = totalSamplesFromChunks(chunks);
+
+  // min/max frame size (24-bit each) from the buffered frame byte lengths.
+  let minFrame = 0xffffff;
+  let maxFrame = 0;
+  for (const c of chunks) {
+    const len = c.data.byteLength;
+    if (len < minFrame) minFrame = len;
+    if (len > maxFrame) maxFrame = len;
+  }
+  writeU24(body, 4, minFrame === 0xffffff ? 0 : minFrame);
+  writeU24(body, 7, Math.min(maxFrame, 0xffffff));
+
+  // Block size: declare a single nominal (max) block size (min == max ⇒ fixed-blocksize stream). The
+  // nominal is the largest decoded frame's sample count; a shorter final frame must not lower it.
+  const nominalBlock = nominalBlockSize(chunks);
+  if (nominalBlock > 0) {
+    dv.setUint16(0, nominalBlock, false);
+    dv.setUint16(2, nominalBlock, false);
+  }
+
+  // Total samples: keep the supplied value unless it is the "unknown" 0, then backfill from frames. The
+  // 36-bit field is `packed[35:32]` (low nibble of the big-endian u32 at +10) | u32 at +14.
+  const suppliedTotal = packedTotalSamples(dv);
+  if (suppliedTotal === 0 && totalFromChunks > 0) writePackedTotalSamples(dv, totalFromChunks);
+
+  return wrapStreamInfo(body);
+}
+
+/** The 34-byte STREAMINFO body from the track description, or a fresh one from the audio config. */
+function streamInfoBodyFrom(info: TrackInfo): Uint8Array<ArrayBuffer> {
+  const config = info.config as AudioDecoderConfig | undefined;
+  const description = config?.description;
+  if (description !== undefined) {
+    const bytes = bufferSourceToBytes(description);
+    const body = streamInfoBodyOf(bytes);
+    if (body !== undefined) return body;
+  }
+  // No usable description: synthesize a minimal STREAMINFO from the audio config (MD5 left 0 = unknown).
+  const sampleRate = config?.sampleRate ?? 0;
+  const channels = config?.numberOfChannels ?? 1;
+  if (sampleRate <= 0) {
+    throw new MediaError('mux-error', 'FLAC muxer needs a STREAMINFO description or a sample rate');
+  }
+  const body = new Uint8Array(STREAMINFO_LEN) as Uint8Array<ArrayBuffer>;
+  const dv = new DataView(body.buffer);
+  const bits = 16; // a description-less synth defaults to 16-bit; the encoder normally supplies the real depth
+  dv.setUint32(10, sampleRate * 2 ** 12 + (channels - 1) * 2 ** 9 + (bits - 1) * 2 ** 4, false);
+  return body;
+}
+
+/** Extract the 34-byte STREAMINFO body from a native-FLAC metadata prelude (`fLaC` + blocks). */
+function streamInfoBodyOf(bytes: Uint8Array): Uint8Array<ArrayBuffer> | undefined {
+  // A bare 34-byte body (some callers pass just the body) or a full prelude beginning with `fLaC`.
+  if (bytes.byteLength === STREAMINFO_LEN) return bytes.slice() as Uint8Array<ArrayBuffer>;
+  if (bytes.byteLength >= STREAMINFO_BODY + STREAMINFO_LEN && ascii(bytes, 0, 4) === 'fLaC') {
+    return bytes.slice(
+      STREAMINFO_BODY,
+      STREAMINFO_BODY + STREAMINFO_LEN,
+    ) as Uint8Array<ArrayBuffer>;
+  }
+  return undefined;
+}
+
+/** Wrap a 34-byte STREAMINFO body in its metadata block header (last block, type 0, length 34). */
+function wrapStreamInfo(body: Uint8Array): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(4 + body.byteLength);
+  out[0] = 0x80; // last-metadata-block flag | STREAMINFO type (0)
+  out[1] = 0x00;
+  out[2] = 0x00;
+  out[3] = body.byteLength;
+  out.set(body, 4);
+  return out;
+}
+
+function packedTotalSamples(dv: DataView): number {
+  const hi = dv.getUint32(10, false) & 0xf;
+  const lo = dv.getUint32(14, false);
+  return hi * 2 ** 32 + lo;
+}
+
+function writePackedTotalSamples(dv: DataView, total: number): void {
+  const high = dv.getUint32(10, false);
+  const packed = (high & 0xfffffff0) | (Math.floor(total / 2 ** 32) & 0xf);
+  dv.setUint32(10, packed >>> 0, false);
+  dv.setUint32(14, total >>> 0, false);
+}
+
+/**
+ * Total decoded samples = Σ of each frame's EXACT block size, read from its native header (every FLAC
+ * frame header encodes its own block size). This is exact — unlike summing rounded per-frame µs
+ * durations — so the STREAMINFO total-samples the decoder loops on matches the coded frames byte-for-byte
+ * (a mismatch would truncate/over-read the MD5 backfill decode). A frame with an unreadable block-size
+ * code (reserved 0) contributes nothing and is excluded.
+ */
+function totalSamplesFromChunks(chunks: readonly ChunkStruct[]): number {
+  let total = 0;
+  for (const c of chunks) total += frameBlockSize(c.data);
+  return total;
+}
+
+/** The nominal (largest) per-frame sample count, decoded from each buffered native frame's header. */
+function nominalBlockSize(chunks: readonly ChunkStruct[]): number {
+  let max = 0;
+  for (const c of chunks) {
+    const n = frameBlockSize(c.data);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/** Decode a native FLAC frame header's block size (RFC 9639 §9.1.1 block-size codes). */
+function frameBlockSize(frame: Uint8Array): number {
+  // Bytes: [0..1]=sync+flags, [2] high nibble = block-size code; explicit sizes trail the frame number.
+  const code = ((frame[2] ?? 0) >> 4) & 0xf;
+  const table = [
+    0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+  ];
+  const tabled = table[code] ?? 0;
+  if (tabled > 0) return tabled;
+  // Codes 6/7 carry the size explicitly after the UTF-8 frame number; codes 0/6/7 fall back to a scan.
+  const utf8Len = frameNumberLen(frame[4] ?? 0);
+  const at = 4 + utf8Len;
+  if (code === 6) return (frame[at] ?? 0) + 1; // 8-bit explicit
+  if (code === 7) return (((frame[at] ?? 0) << 8) | (frame[at + 1] ?? 0)) + 1; // 16-bit explicit
+  return 0; // reserved code 0 — unknown; excluded from the nominal max
+}
+
+/** Byte length of a native FLAC frame's UTF-8-coded frame number (leading-1s count, like UTF-8). */
+function frameNumberLen(first: number): number {
+  if ((first & 0x80) === 0) return 1;
+  let ones = 0;
+  for (let mask = 0x80; (first & mask) !== 0; mask >>= 1) ones++;
+  return ones;
+}
+
+function writeU24(bytes: Uint8Array, offset: number, value: number): void {
+  bytes[offset] = (value >>> 16) & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
+  bytes[offset + 2] = value & 0xff;
+}
+
+/** A read-only byte view over an `ArrayBuffer`/typed-array `BufferSource` (no copy). */
+function bufferSourceToBytes(src: AllowSharedBufferSource): Uint8Array {
+  if (src instanceof ArrayBuffer) return new Uint8Array(src);
+  const view = src as ArrayBufferView;
+  return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+}
+
 function matches(q: ContainerQuery): boolean {
   if (q.mime !== undefined && FLAC_MIMES.has(q.mime)) return true;
   if (q.extension !== undefined && FLAC_EXTENSIONS.has(q.extension.toLowerCase())) return true;
@@ -274,11 +654,38 @@ export const FlacDriver: ContainerDriver = {
       },
     });
   },
-  createMuxer(): Muxer {
-    throw new MediaError(
-      'mux-error',
-      'FLAC encode is a WASM-tail codec (not provided by this driver)',
-    );
+  async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
+    const { audio } = flacToPcm(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return audio;
+  },
+  async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
+    // FLAC authoring + FLAC → WAV decode share this PCM-native seam (ADR-022/024): decode the source FLAC
+    // to canonical PCM, apply the audio-dsp transform (gain/remix/fade/dynamics/biquad; resample is a
+    // typed miss without the wasm/WebAudio tail), then serialize per the requested `container`. A `flac`
+    // (or unspecified) target re-encodes a fresh lossless native FLAC via the verbatim-correct pure-TS
+    // encoder; a `wav` target writes RIFF/WAVE PCM (the FLAC → WAV bridge). The engine's cross-container
+    // route (WAV/AIFF/CAF → FLAC) instead reuses {@link authorFlacStream} with the source's decoded PCM.
+    const { audio, format } = flacToPcm(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
+    const out =
+      o?.container === 'wav' ? writeWav(result, format) : authorFlacFromPcm(result, format);
+    return new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(out);
+        c.close();
+      },
+    });
+  },
+  createMuxer(o?: MuxOptions): Muxer {
+    if (o?.fragmented === true) {
+      throw new CapabilityError('capability-miss', 'FLAC has no fragmented/segmented mux form', {
+        op: { op: 'mux', fragmented: true },
+        tried: ['flac'],
+      });
+    }
+    return new FlacMuxer();
   },
 };
 

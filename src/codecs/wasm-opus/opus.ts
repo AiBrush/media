@@ -433,10 +433,17 @@ export function frameMsFromConfig(config: AudioEncoderConfig): OpusFrameMs {
  * and calls `free()` once on teardown (cancel, flush, or error); the wasm module owns the heap buffers.
  */
 export interface OpusWasmCore {
-  /** Create a libopus decoder (`opus_decoder_create`) for the validated init. */
-  createDecoder(init: OpusDecoderInit): OpusWasmDecoder;
-  /** Create a libopus encoder (`opus_encoder_create` + `OPUS_SET_BITRATE`) for the validated init. */
-  createEncoder(init: OpusEncoderInit): OpusWasmEncoder;
+  /**
+   * Create a libopus decoder (`opus_decoder_create`) for the validated init. Async because the vendored
+   * prebuilt core (`libopus-wasm`) lazy-instantiates its wasm on first coder construction; the driver
+   * `await`s it in its async `start`. The returned decoder's `decode` is synchronous (the hot path).
+   */
+  createDecoder(init: OpusDecoderInit): Promise<OpusWasmDecoder>;
+  /**
+   * Create a libopus encoder (`opus_encoder_create` + `OPUS_SET_BITRATE`) for the validated init. Async
+   * for the same reason as {@link createDecoder}; the returned encoder's `encode` is synchronous.
+   */
+  createEncoder(init: OpusEncoderInit): Promise<OpusWasmEncoder>;
 }
 
 /** A live libopus decoder: feed Opus packets, get interleaved f32 PCM at the configured output rate. */
@@ -458,6 +465,51 @@ export interface OpusWasmEncoder {
    * into a single Opus packet. Returns the packet bytes (a fresh `Uint8Array`).
    */
   encode(frame: Float32Array): Uint8Array;
+  /**
+   * The encoder's algorithmic delay in 48 kHz samples (`OPUS_GET_LOOKAHEAD`) — the leading decoder
+   * warm-up the container records as the OpusHead pre-skip (RFC 7845 §4) so a decoder drops exactly that
+   * many head samples. ~312 (6.5 ms) for libopus' default; the glue reads it from the native encoder.
+   */
+  preSkip(): number;
   /** Release the native encoder (`opus_encoder_destroy`). Idempotent. */
   free(): void;
+}
+
+// ============ OpusHead (RFC 7845 §5.1) ============
+
+/** Bytes of an OpusHead identification header (the codec-private `description` Ogg/WebM Opus carry). */
+export const OPUS_HEAD_BYTES = 19 as const;
+
+/**
+ * Build an OpusHead identification header (RFC 7845 §5.1) — the `AudioDecoderConfig.description` the
+ * Opus encoder publishes to the muxer (via the `onConfig` `StageOptions` hook) so an Ogg/WebM Opus track
+ * carries the channel count, **pre-skip**, and original input rate. Layout (little-endian):
+ * `"OpusHead"`(8) · version=1(1) · channelCount(1) · preSkip:u16(2) · inputSampleRate:u32(4) ·
+ * outputGain:s16=0(2) · channelMappingFamily=0(1). Mono/stereo only (family 0, no channel-mapping table).
+ * Pure + total; Node-tested.
+ */
+export function buildOpusHead(
+  channels: number,
+  preSkip: number,
+  inputSampleRate: number,
+): Uint8Array<ArrayBuffer> {
+  if (channels < 1 || channels > OPUS_MAX_CHANNELS) {
+    throw new MediaError('encode-error', `opus: OpusHead channel count ${channels} must be 1–2`);
+  }
+  if (!Number.isInteger(preSkip) || preSkip < 0 || preSkip > 0xffff) {
+    throw new MediaError('encode-error', `opus: OpusHead pre-skip ${preSkip} out of range`);
+  }
+  if (!Number.isInteger(inputSampleRate) || inputSampleRate <= 0 || inputSampleRate > 0xffffffff) {
+    throw new MediaError('encode-error', `opus: OpusHead input rate ${inputSampleRate} invalid`);
+  }
+  const out = new Uint8Array(OPUS_HEAD_BYTES);
+  out.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0); // "OpusHead"
+  const dv = new DataView(out.buffer);
+  dv.setUint8(8, 1); // version
+  dv.setUint8(9, channels);
+  dv.setUint16(10, preSkip, true);
+  dv.setUint32(12, inputSampleRate, true);
+  dv.setInt16(16, 0, true); // output gain Q7.8 = 0 dB
+  dv.setUint8(18, 0); // channel mapping family 0 (mono/stereo)
+  return out;
 }

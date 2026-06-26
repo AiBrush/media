@@ -58,13 +58,17 @@
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "bake-goldens": "bun run scripts/bake-goldens.ts",
     "bench-dsp": "bun run scripts/bench-dsp.ts",
+    "bench-audio-stream": "bun run scripts/bench-audio-stream.ts",
     "bench-image": "bun run scripts/bench-image.ts",
     "bench-flac": "bun run scripts/bench-flac.ts",
     "bench-colorspace": "bun run scripts/bench-colorspace.ts",
     "bench-preload": "bun run scripts/bench-preload.ts",
     "bench-chain": "bun run scripts/bench-chain.ts",
     "bench-sources": "bun run scripts/bench-sources.ts",
-    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run test:dist && bun run check-budgets"
+    "bench-webm-fragment": "bun run scripts/bench-webm-fragment.ts",
+    "bench-pool": "bun run scripts/bench-pool.ts",
+    "verify:integrity": "bun run scripts/anti-cheat.ts",
+    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

@@ -13,6 +13,7 @@
 import type {
   CodecDriver,
   CodecQuery,
+  CodecSupport,
   ContainerDriver,
   ContainerQuery,
   DecoderConfig,
@@ -141,6 +142,79 @@ export function assertContainerDriverConforms(
   );
 }
 
+/**
+ * Node-checkable conformance facets for a {@link CodecDriver} whose `supports()` answer is
+ * **environment-dependent** — a browser tier (WebCodecs `tier:'hardware'`) or a WASM tier whose vendored
+ * core is loaded miss-only. In Node those drivers honestly report `supported:false` for *every* query
+ * (no `VideoFrame`/`AudioData`/`isConfigSupported`, no core), so the full {@link assertCodecDriverConforms}
+ * "must support its declared query" assertion cannot hold here. This subset asserts everything that IS
+ * decidable in Node — identity, contract version, kind, a valid tier, and `supports()` **honesty +
+ * total-function** behavior (never throws, even on garbage; returns a well-typed `{supported:false,…}` in
+ * this environment) — so every real codec driver is held to the *same* seam contract the browser harness
+ * then extends with the true-support + frame-flow facets. Throws {@link ConformanceError} on any violation.
+ *
+ * @param expectNodeSupport `true` only for a driver that genuinely works in Node (none ship today; the
+ *   parameter keeps the harness honest if a pure-TS codec driver is added later, in which case the
+ *   stronger {@link assertCodecDriverConforms} should be used instead).
+ */
+export async function assertCodecDriverNodeFacets(d: CodecDriver): Promise<void> {
+  const label = 'CodecDriver';
+  assertDriverBase(d, 'codec', label);
+  assert(TIERS.includes(d.tier), `${label} '${d.id}': tier '${d.tier}' is not a valid Tier`);
+
+  // supports() is a total function: it never throws (browser API probes are wrapped) and returns a
+  // well-formed CodecSupport. We probe a representative decode AND encode query plus an empty-codec query.
+  for (const q of nodeCodecProbes()) {
+    const s = await assertResolves(
+      () => d.supports(q),
+      `${label} '${d.id}': supports() must not throw (query ${describeQuery(q)})`,
+    );
+    assert(
+      typeof s === 'object' && s !== null && typeof (s as CodecSupport).supported === 'boolean',
+      `${label} '${d.id}': supports() must return { supported: boolean } (query ${describeQuery(q)})`,
+    );
+    // Honest miss: a browser/WASM tier with no API/core in Node must answer `false`, never a phantom yes.
+    assert(
+      (s as CodecSupport).supported === false,
+      `${label} '${d.id}': a non-Node tier must report supported:false in Node, not a phantom capability (query ${describeQuery(q)})`,
+    );
+  }
+}
+
+/**
+ * Node-checkable conformance facets for a {@link FilterDriver} whose `supports()` is environment-dependent
+ * (GPU substrates need WebGPU/`OffscreenCanvas`/`VideoFrame`; the audio-dsp `native` substrate needs
+ * `AudioData`) — all absent in Node, so each honestly returns `false`. Asserts identity, a valid substrate,
+ * and `supports()` honesty + total-function behavior; the browser harness extends this with the
+ * true-support + `createFilter` stream facets.
+ */
+export function assertFilterDriverNodeFacets(d: FilterDriver): void {
+  const label = 'FilterDriver';
+  assertDriverBase(d, 'filter', label);
+  assert(
+    SUBSTRATES.includes(d.substrate),
+    `${label} '${d.id}': substrate '${d.substrate}' is not valid`,
+  );
+  for (const f of nodeFilterProbes()) {
+    let result: boolean | undefined;
+    let threw = false;
+    try {
+      result = d.supports(f);
+    } catch {
+      threw = true;
+    }
+    assert(!threw, `${label} '${d.id}': supports() must not throw (spec ${f.type})`);
+    assert(
+      typeof result === 'boolean',
+      `${label} '${d.id}': supports() must return a boolean (spec ${f.type})`,
+    );
+    assert(
+      result === false,
+      `${label} '${d.id}': a GPU/native substrate must report false in Node (spec ${f.type})`,
+    );
+  }
+}
+
 /** Cases used to exercise a {@link FilterDriver}. */
 export interface FilterConformanceCase {
   supported: FilterSpec;
@@ -168,6 +242,61 @@ export function assertFilterDriverConforms(d: FilterDriver, c: FilterConformance
 }
 
 // ── Internals ───────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Representative queries spanning decode + encode + a garbage codec, used to exercise a codec driver's
+ * `supports()` as a total function in Node. The configs are minimal-but-valid WebCodecs shapes; a driver
+ * must answer (not throw) for all of them regardless of whether it serves the codec.
+ */
+function nodeCodecProbes(): readonly CodecQuery[] {
+  return [
+    { mediaType: 'video', direction: 'decode', config: { codec: 'avc1.42001e' } },
+    {
+      mediaType: 'audio',
+      direction: 'decode',
+      config: { codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 },
+    },
+    {
+      mediaType: 'video',
+      direction: 'encode',
+      config: { codec: 'avc1.42001e', width: 64, height: 64 },
+    },
+    {
+      mediaType: 'audio',
+      direction: 'encode',
+      config: { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 },
+    },
+    { mediaType: 'video', direction: 'decode', config: { codec: '' } }, // garbage: must not throw
+  ];
+}
+
+/** Representative filter specs spanning every video + audio op family, for `supports()` total-function checks. */
+function nodeFilterProbes(): readonly FilterSpec[] {
+  return [
+    { mediaType: 'video', type: 'resize', width: 64, height: 64 },
+    { mediaType: 'video', type: 'crop', x: 0, y: 0, width: 32, height: 32 },
+    { mediaType: 'video', type: 'rotate', degrees: 90 },
+    { mediaType: 'video', type: 'flip', axis: 'h' },
+    { mediaType: 'video', type: 'colorspace', to: 'srgb' },
+    { mediaType: 'video', type: 'tonemap', to: 'sdr' },
+    { mediaType: 'audio', type: 'resample', sampleRate: 44100 },
+    { mediaType: 'audio', type: 'remix', channels: 1 },
+    { mediaType: 'audio', type: 'gain', db: -3 },
+  ];
+}
+
+/** Run an async thunk, converting any throw into a {@link ConformanceError} with `msg`; return its value. */
+async function assertResolves<T>(fn: () => Promise<T>, msg: string): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    throw new ConformanceError(msg);
+  }
+}
+
+function describeQuery(q: CodecQuery): string {
+  return `${q.mediaType}/${q.direction}/${q.config.codec || '<empty>'}`;
+}
 
 function isMuxerLike(x: unknown): boolean {
   const m = x as { output?: unknown; addTrack?: unknown; write?: unknown; finalize?: unknown };

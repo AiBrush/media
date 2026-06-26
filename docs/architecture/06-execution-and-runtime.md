@@ -42,14 +42,16 @@ WebCodecs `VideoFrame` and `AudioData` (and `ImageBitmap`) are **ref-counted han
 
 Heavy stages must not block the main thread (the `longtasks` metric decided many benchmark wins).
 
-| Runs in a Worker (default on) | Runs on main thread (default) |
+| Runs in a Worker (opt-in: `worker:true`/`{pool}`) | Runs on main thread (default) |
 |---|---|
-| decode, encode, filter, mux, convert (the whole heavy graph) | probe / metadata (cheap; worker round-trip not worth it) |
+| decode, encode, filter, mux, convert (the whole heavy graph) | probe / metadata (cheap); and everything when offload is not opted in |
 
 - **Worker bridge:** the main-thread API is a thin proxy; the engine instance (router + drivers + executor) lives in the worker. Heavy data crosses as **Transferables** (`ArrayBuffer`, `ReadableStream`, `VideoFrame` are transferable) to avoid copies.
 - **WebCodecs, OffscreenCanvas, WebGPU, WebGL all work in workers** — so the entire decode→filter→encode path runs off-main-thread, including GPU filters via `OffscreenCanvas`.
 - A **worker pool** is used for independent parallel jobs (e.g. an ABR ladder fan-out); a single job stays on one worker (the pipeline is already streamed).
 - **Cheap-op fast path:** `probe` and tiny ops run on the main thread to avoid the ~ms worker hop; this is configurable.
+
+**As implemented (ADR-087).** The engine offloads a heavy `convert`/`trim` by **serializing the op, not the pipeline**: the host ships an `OffloadJob` carrying the input bytes (transferred) + the flat public options minus `sink`; the worker (`worker.ts` → `worker-main.ts:makeJobRunner`) reconstructs a `fromBytes` source and runs the **same op on a real inner `MediaEngineImpl` forced `worker:false`**, forcing the sink to a stream and **streaming only the encoded bytes back** — for convert/trim **no `VideoFrame`/`AudioData` ever crosses the boundary** (each frame lives and dies inside the inner engine's already-validated pipeline; only bytes are Transferables on this path). Offload is **opt-in**: the engine selects the mode once (`selectWorkerMode`, in the dependency-free `worker-mode.ts`) — `worker:true`/`{pool}` ⇒ offload, an **unset or `false` `worker` ⇒ inline** (the safe default: no surprise Worker spawn per heavy op) — and only when opted in lazily spawns a `WorkerPool` of `resolvePoolSize(worker)` workers (`createWorkerPool`), **gated on a probe worker's `ready{webcodecs}` handshake**; any spawn/handshake failure (incl. no `Worker`, as in Node) downgrades to the inline path with no behaviour change. Because the pool **reuses** one bridge across successive jobs, every protocol message is tagged with a monotonic **job `epoch`**: the host/worker ignore any message from a stale epoch (closing a stale chunk's frame so nothing leaks), and an aborted job ends silently — so a reused bridge can never cross-talk between jobs. The eager kernel reaches only the tiny pure selectors; the worker boot is a separate `dist/worker.js` chunk referenced via `new URL('./worker.js', import.meta.url)`, and the spawn/pool/glue is a lazy `import('worker-host.ts')` chunk (kernel byte budget preserved).
 
 ## 5. Threading & isolation (ADR-006)
 

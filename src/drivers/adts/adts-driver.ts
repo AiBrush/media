@@ -15,6 +15,7 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
+  type MuxOptions,
   type Muxer,
   type Packet,
   type PcmTransform,
@@ -27,6 +28,7 @@ import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
+import { AdtsMuxer } from './adts-mux.ts';
 
 const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
 const ADTS_EXTENSIONS = new Set(['aac', 'adts']);
@@ -580,8 +582,10 @@ export const AdtsDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(): Muxer {
-    throw new MediaError('mux-error', 'AAC encode requires the WebCodecs/WASM codec layer');
+  createMuxer(o?: MuxOptions): Muxer {
+    // ADTS is an elementary stream: wrap each raw AAC access unit in a 7-byte ADTS header (no re-encode;
+    // the encoder/remux path feeds the access units + the ASC description). See {@link AdtsMuxer}.
+    return new AdtsMuxer(o);
   },
   async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const pcm = applyPcmTransform(await decodeAacToPcm(await readAll(src), o), o);

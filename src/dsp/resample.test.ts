@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { type PcmAudio, channelAt, encodePcm, sampleAt } from './pcm.ts';
@@ -195,6 +195,13 @@ describe('resample — quality (band-limited windowed-sinc)', () => {
     expect(() => resample(a, 44100.5)).toThrow(CapabilityError);
     expect(() => resample(a, Number.NaN)).toThrow(CapabilityError);
   });
+
+  it('rejects an aborted signal with a typed MediaError before resampling', () => {
+    const a = sine(1000, 44100, 0.01);
+    const ac = new AbortController();
+    ac.abort();
+    expect(() => resample(a, 48000, { signal: ac.signal })).toThrow(MediaError);
+  });
 });
 
 describe('resample — on the real WAV corpus', () => {
@@ -251,6 +258,32 @@ describe('resample — on the real WAV corpus', () => {
     expect(maxAbs(channelAt(back.planar, 0))).toBeLessThanOrEqual(maxAbs(ref) + 0.02);
     // The upsampled audio re-encodes to s16 cleanly (no NaN / no overflow → valid byte length).
     expect(encodePcm(up, 's16').byteLength).toBe(up.frames * 2);
+  });
+});
+
+describe('resample — longform performance guard', () => {
+  it('keeps the 44.1 kHz → 16 kHz mono longform hot path comfortably above realtime', () => {
+    const seconds = 60;
+    const sampleRate = 44_100;
+    const frames = sampleRate * seconds;
+    const ch = new Float64Array(frames);
+    for (let i = 0; i < frames; i++) {
+      ch[i] = 0.4 * Math.sin(i * 0.01);
+    }
+    const audio: PcmAudio = { sampleRate, channels: 1, frames, planar: [ch] };
+
+    resample(
+      { sampleRate, channels: 1, frames: sampleRate, planar: [ch.subarray(0, sampleRate)] },
+      16_000,
+    );
+
+    const start = performance.now();
+    const out = resample(audio, 16_000);
+    const wallSeconds = (performance.now() - start) / 1000;
+    const throughputRealtime = seconds / wallSeconds;
+
+    expect(out.frames).toBe(16_000 * seconds);
+    expect(throughputRealtime).toBeGreaterThan(360);
   });
 });
 

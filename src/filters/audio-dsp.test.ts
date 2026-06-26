@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
-import { channelAt, sampleAt } from '../dsp/pcm.ts';
+import { biquad } from '../dsp/biquad.ts';
+import { limit, normalizePeak } from '../dsp/dynamics.ts';
+import { fadeOut } from '../dsp/fade.ts';
+import { type PcmAudio, channelAt, sampleAt } from '../dsp/pcm.ts';
 import { Registry } from '../kernel/registry.ts';
 import {
   AudioDspFilterModule,
+  type StatelessAudioSpec,
   applyAudioFilter,
   audioDataToPcm,
   audioDspFilterDriver,
+  createStatefulStage,
   isAudioDspSpec,
+  isStatefulAudioSpec,
   pcmRangeToPlanarInit,
   pcmToPlanarInit,
 } from './audio-dsp.ts';
@@ -57,9 +63,13 @@ function fakeAudioData(planes: number[][], sampleRate: number, timestamp = 0): A
   return stub as unknown as AudioData;
 }
 
-const RESAMPLE_48K: FilterSpec = { mediaType: 'audio', type: 'resample', sampleRate: 48000 };
-const REMIX_STEREO: FilterSpec = { mediaType: 'audio', type: 'remix', channels: 2 };
-const GAIN_HALF: FilterSpec = { mediaType: 'audio', type: 'gain', db: -6.020599913279624 }; // ×0.5
+const RESAMPLE_48K: StatelessAudioSpec = {
+  mediaType: 'audio',
+  type: 'resample',
+  sampleRate: 48000,
+};
+const REMIX_STEREO: StatelessAudioSpec = { mediaType: 'audio', type: 'remix', channels: 2 };
+const GAIN_HALF: StatelessAudioSpec = { mediaType: 'audio', type: 'gain', db: -6.020599913279624 }; // ×0.5
 
 /** Power at exactly `freq` via a Goertzel-style projection (no FFT dependency). */
 function powerAt(x: Float64Array, freq: number, rate: number): number {
@@ -74,13 +84,111 @@ function powerAt(x: Float64Array, freq: number, rate: number): number {
   return Math.sqrt(re * re + im * im) / (x.length > 0 ? x.length / 2 : 1);
 }
 
+const FADE_SPEC: FilterSpec = {
+  mediaType: 'audio',
+  type: 'fade',
+  curve: 'equal-power',
+  inFrames: 0,
+  outFrames: 200,
+};
+const BIQUAD_SPEC: FilterSpec = {
+  mediaType: 'audio',
+  type: 'biquad',
+  spec: { type: 'highpass', frequency: 300, q: Math.SQRT1_2 },
+};
+const DYNAMICS_SPEC: FilterSpec = {
+  mediaType: 'audio',
+  type: 'dynamics',
+  dynamics: {
+    normalize: { mode: 'peak', targetDbfs: -3 },
+    limit: { ceilingDbfs: -1, mode: 'hard' },
+  },
+};
+
+/** Drive a stateful stage over one whole buffer and concatenate its emitted chunks (single-chunk path). */
+function driveWhole(stage: ReturnType<typeof createStatefulStage>, audio: PcmAudio): PcmAudio {
+  const out = [...stage.push(audio), ...stage.flush()];
+  const frames = out.reduce((s, c) => s + c.frames, 0);
+  const planar = Array.from({ length: audio.channels }, () => new Float64Array(frames));
+  let pos = 0;
+  for (const c of out) {
+    for (let ch = 0; ch < audio.channels; ch++)
+      planar[ch]?.set(c.planar[ch] ?? new Float64Array(0), pos);
+    pos += c.frames;
+  }
+  return { sampleRate: audio.sampleRate, channels: audio.channels, frames, planar };
+}
+
 describe('audio-dsp filter — spec matching', () => {
-  it('isAudioDspSpec accepts the three audio specs and rejects video specs', () => {
+  it('isAudioDspSpec accepts every audio spec (stateless and stateful) and rejects video specs', () => {
     expect(isAudioDspSpec(RESAMPLE_48K)).toBe(true);
     expect(isAudioDspSpec(REMIX_STEREO)).toBe(true);
     expect(isAudioDspSpec(GAIN_HALF)).toBe(true);
+    expect(isAudioDspSpec(FADE_SPEC)).toBe(true);
+    expect(isAudioDspSpec(BIQUAD_SPEC)).toBe(true);
+    expect(isAudioDspSpec(DYNAMICS_SPEC)).toBe(true);
     expect(isAudioDspSpec({ mediaType: 'video', type: 'flip', axis: 'h' })).toBe(false);
     expect(isAudioDspSpec({ mediaType: 'video', type: 'resize', width: 2, height: 2 })).toBe(false);
+  });
+
+  it('isStatefulAudioSpec classifies fade/biquad/dynamics as stateful and the rest as stateless', () => {
+    if (!isAudioDspSpec(FADE_SPEC) || !isAudioDspSpec(GAIN_HALF)) throw new Error('unreachable');
+    expect(isStatefulAudioSpec(FADE_SPEC)).toBe(true);
+    if (isAudioDspSpec(BIQUAD_SPEC)) expect(isStatefulAudioSpec(BIQUAD_SPEC)).toBe(true);
+    if (isAudioDspSpec(DYNAMICS_SPEC)) expect(isStatefulAudioSpec(DYNAMICS_SPEC)).toBe(true);
+    expect(isStatefulAudioSpec(GAIN_HALF)).toBe(false);
+    if (isAudioDspSpec(RESAMPLE_48K)) expect(isStatefulAudioSpec(RESAMPLE_48K)).toBe(false);
+    if (isAudioDspSpec(REMIX_STEREO)) expect(isStatefulAudioSpec(REMIX_STEREO)).toBe(false);
+  });
+});
+
+describe('audio-dsp filter — createStatefulStage (the staged transform, real & can-fail)', () => {
+  const tone = (frames: number): PcmAudio => {
+    const ch = new Float64Array(frames);
+    for (let n = 0; n < frames; n++) ch[n] = 0.7 * Math.sin((2 * Math.PI * 440 * n) / 48000);
+    return { sampleRate: 48000, channels: 1, frames, planar: [ch] };
+  };
+
+  it('builds a fade stage that matches the whole-signal fadeOut', () => {
+    if (!isAudioDspSpec(FADE_SPEC) || !isStatefulAudioSpec(FADE_SPEC))
+      throw new Error('unreachable');
+    const sig = tone(1000);
+    const got = driveWhole(createStatefulStage(FADE_SPEC, sig.sampleRate), sig);
+    const ref = fadeOut(sig, 200, 'equal-power');
+    for (let i = 0; i < sig.frames; i++) {
+      expect(sampleAt(channelAt(got.planar, 0), i)).toBeCloseTo(
+        sampleAt(channelAt(ref.planar, 0), i),
+        12,
+      );
+    }
+  });
+
+  it('builds a biquad stage (designed at the live rate) that matches the whole-signal biquad', () => {
+    if (!isAudioDspSpec(BIQUAD_SPEC) || !isStatefulAudioSpec(BIQUAD_SPEC))
+      throw new Error('unreachable');
+    const sig = tone(1000);
+    const got = driveWhole(createStatefulStage(BIQUAD_SPEC, sig.sampleRate), sig);
+    const ref = biquad(sig, { type: 'highpass', frequency: 300, q: Math.SQRT1_2 });
+    for (let i = 0; i < sig.frames; i++) {
+      expect(sampleAt(channelAt(got.planar, 0), i)).toBeCloseTo(
+        sampleAt(channelAt(ref.planar, 0), i),
+        9,
+      );
+    }
+  });
+
+  it('builds a dynamics stage that matches whole-signal normalize→limit', () => {
+    if (!isAudioDspSpec(DYNAMICS_SPEC) || !isStatefulAudioSpec(DYNAMICS_SPEC))
+      throw new Error('unreachable');
+    const sig = tone(1000);
+    const got = driveWhole(createStatefulStage(DYNAMICS_SPEC, sig.sampleRate), sig);
+    const ref = limit(normalizePeak(sig, -3), -1, 'hard');
+    for (let i = 0; i < sig.frames; i++) {
+      expect(sampleAt(channelAt(got.planar, 0), i)).toBeCloseTo(
+        sampleAt(channelAt(ref.planar, 0), i),
+        12,
+      );
+    }
   });
 });
 

@@ -10,10 +10,10 @@
 import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, FilterSpec, Packet, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
+import { audioFilterSpecs } from './audio-stream-plan.ts';
 import {
   audioCodecToken,
   audioEncoderCodecString,
-  audioFilterSpecs,
   audioTrackInfoFromDecoderConfig,
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
@@ -33,9 +33,9 @@ import {
   selectTrackInfos,
   videoCodecToken,
   videoEncoderCodecString,
-  videoFilterSpecs,
   videoTrackInfoFromDecoderConfig,
 } from './codec-pipeline.ts';
+import { videoFilterSpecs } from './video-stream-plan.ts';
 
 // ── container choice ───────────────────────────────────────────────────────────────────────────
 
@@ -56,22 +56,28 @@ describe('chooseOutputContainer', () => {
 
   it('defaults to mp4 when the source is not chunk-muxable or unknown', () => {
     expect(chooseOutputContainer(undefined, 'wav')).toBe('mp4'); // PCM source → transformPcm, not the seam
-    expect(chooseOutputContainer(undefined, 'mp3')).toBe('mp4'); // no mp3 chunk muxer in this build
     expect(chooseOutputContainer(undefined, undefined)).toBe('mp4');
     expect(chooseOutputContainer(undefined, 'totally-unknown')).toBe('mp4');
+  });
+
+  it('keeps an MP3 source as MP3 now that the MP3 elementary-stream muxer exists', () => {
+    // MP3 joined the chunk-muxable set via Mp3Muxer — a same-container remux stays mp3, not mp4.
+    expect(chooseOutputContainer(undefined, 'mp3')).toBe('mp3');
   });
 });
 
 describe('containerHasChunkMuxer', () => {
   it('is true for the containers with a real EncodedChunk-seam muxer', () => {
-    for (const c of ['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts'] as const) {
+    // FLAC via FlacMuxer (ADR-085); MP3 via Mp3Muxer (MPEG-Layer-III frames); ADTS via AdtsMuxer (raw AAC
+    // access units in 7-byte ADTS headers) — all fed by a remux or the codec encode driver.
+    for (const c of ['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts', 'flac', 'mp3', 'adts'] as const) {
       expect(containerHasChunkMuxer(c)).toBe(true);
     }
   });
   it('is false for PCM (transformPcm path) and the not-yet-muxable elementary containers', () => {
-    // wav/aiff/caf author PCM via transformPcm (not the chunk seam); mp3/aac/adts/flac muxers are still
-    // a typed miss here — declaring them would over-claim (the muxer still self-rejects too).
-    for (const c of ['wav', 'aiff', 'caf', 'mp3', 'aac', 'adts', 'flac'] as const) {
+    // wav/aiff/caf author PCM via transformPcm (not the chunk seam); the bare 'aac' token has no muxer
+    // (ADTS is the AAC elementary-stream target) — declaring them would over-claim.
+    for (const c of ['wav', 'aiff', 'caf', 'aac'] as const) {
       expect(containerHasChunkMuxer(c)).toBe(false);
     }
   });
@@ -369,17 +375,111 @@ describe('audioFilterSpecs', () => {
     expect(() => audioFilterSpecs({ sampleRate: -1 }, src)).toThrow(InputError);
   });
 
-  it('rejects fade on the codec filter seam until a stream-stateful AudioData fade exists', () => {
-    expect(() => audioFilterSpecs({ fade: { inSec: 1, outSec: 1 } }, src)).toThrow(CapabilityError);
+  it('emits a stream-stateful fade with frame counts resolved against the SOURCE rate (before resample)', () => {
+    // 0.5 s in / 0.25 s out @ the 48 kHz source rate → 24000 / 12000 frames; default curve 'linear'.
+    expect(audioFilterSpecs({ fade: { inSec: 0.5, outSec: 0.25 } }, src)).toEqual<FilterSpec[]>([
+      { mediaType: 'audio', type: 'fade', curve: 'linear', inFrames: 24000, outFrames: 12000 },
+    ]);
+    // Fade frames are resolved at the source rate even when a resample follows (fade precedes resample),
+    // and the resample is emitted after the fade.
+    expect(
+      audioFilterSpecs({ fade: { outSec: 1, curve: 'equal-power' }, sampleRate: 22050 }, src),
+    ).toEqual<FilterSpec[]>([
+      { mediaType: 'audio', type: 'fade', curve: 'equal-power', inFrames: 0, outFrames: 48000 },
+      { mediaType: 'audio', type: 'resample', sampleRate: 22050 },
+    ]);
   });
 
-  it('rejects dynamics and biquad on the codec filter seam until AudioData filters exist', () => {
+  it('drops a fade that resolves to zero frames in and out (no-op)', () => {
+    expect(audioFilterSpecs({ fade: {} }, src)).toEqual([]);
+    expect(audioFilterSpecs({ fade: { inSec: 0, outSec: 0 } }, src)).toEqual([]);
+  });
+
+  it('emits one stream-stateful biquad spec per requested filter (array expands in order)', () => {
+    expect(
+      audioFilterSpecs(
+        {
+          biquad: [
+            { type: 'highpass', frequency: 80, q: 0.7 },
+            { type: 'peaking', frequency: 1000, q: 2, gainDb: 6 },
+          ],
+        },
+        src,
+      ),
+    ).toEqual<FilterSpec[]>([
+      { mediaType: 'audio', type: 'biquad', spec: { type: 'highpass', frequency: 80, q: 0.7 } },
+      {
+        mediaType: 'audio',
+        type: 'biquad',
+        spec: { type: 'peaking', frequency: 1000, q: 2, gainDb: 6 },
+      },
+    ]);
+  });
+
+  it('emits a stream-stateful dynamics spec, filling the limiter defaults (ceiling 0 dBFS, hard)', () => {
+    expect(
+      audioFilterSpecs(
+        { dynamics: { normalize: { mode: 'rms', targetDbfs: -14 }, limit: {} } },
+        src,
+      ),
+    ).toEqual<FilterSpec[]>([
+      {
+        mediaType: 'audio',
+        type: 'dynamics',
+        dynamics: {
+          normalize: { mode: 'rms', targetDbfs: -14 },
+          limit: { ceilingDbfs: 0, mode: 'hard' },
+        },
+      },
+    ]);
+  });
+
+  it('emits the full audio chain in the transformPcm order: gain → fade → remix → resample → biquad → dynamics', () => {
+    expect(
+      audioFilterSpecs(
+        {
+          gainDb: -3,
+          fade: { inSec: 0.1, curve: 'equal-power' },
+          channels: 1,
+          sampleRate: 24000,
+          biquad: { type: 'lowpass', frequency: 1000, q: Math.SQRT1_2 },
+          dynamics: { limit: { ceilingDbfs: -1, mode: 'soft', knee: 0.8 } },
+        },
+        src,
+      ),
+    ).toEqual<FilterSpec[]>([
+      { mediaType: 'audio', type: 'gain', db: -3 },
+      { mediaType: 'audio', type: 'fade', curve: 'equal-power', inFrames: 4800, outFrames: 0 },
+      { mediaType: 'audio', type: 'remix', channels: 1 },
+      { mediaType: 'audio', type: 'resample', sampleRate: 24000 },
+      {
+        mediaType: 'audio',
+        type: 'biquad',
+        spec: { type: 'lowpass', frequency: 1000, q: Math.SQRT1_2 },
+      },
+      {
+        mediaType: 'audio',
+        type: 'dynamics',
+        dynamics: { limit: { ceilingDbfs: -1, mode: 'soft', knee: 0.8 } },
+      },
+    ]);
+  });
+
+  it('rejects invalid fade / dynamics inputs with a typed InputError', () => {
+    expect(() => audioFilterSpecs({ fade: { inSec: -1 } }, src)).toThrow(InputError);
+    expect(() => audioFilterSpecs({ fade: { inSec: Number.NaN } }, src)).toThrow(InputError);
+    // A fade needs a known source rate to resolve seconds → frames.
     expect(() =>
-      audioFilterSpecs({ dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } }, src),
-    ).toThrow(CapabilityError);
+      audioFilterSpecs({ fade: { outSec: 1 } }, { sampleRate: undefined, channels: 2 }),
+    ).toThrow(InputError);
     expect(() =>
-      audioFilterSpecs({ biquad: { type: 'lowpass', frequency: 1000, q: Math.SQRT1_2 } }, src),
-    ).toThrow(CapabilityError);
+      audioFilterSpecs(
+        { dynamics: { normalize: { mode: 'lufs' as unknown as 'peak', targetDbfs: -14 } } },
+        src,
+      ),
+    ).toThrow(InputError);
+    // A dynamics with neither normalize nor limit is empty/meaningless.
+    expect(() => audioFilterSpecs({ dynamics: {} }, src)).toThrow(InputError);
   });
 });
 
@@ -436,12 +536,15 @@ describe('buildVideoEncoderConfig', () => {
     });
   });
 
-  it('sizes the H.264 level to the OUTPUT dims (the gap-#1 fix): low dims → low level, 4K → L5.1', () => {
-    // tiny 320×180 → a level ≤ 3.0 (the encoder accepts it; old code over-claimed L3.0 for everything)
+  it('sizes the H.264 level to the output dims while flooring tiny browser encodes at L3.0', () => {
+    // tiny 320×180 is Annex-A-valid at L1.3, but Chromium 149 produced MP4s that its platform
+    // <video> seek path could not decode when the WebCodecs encoder was configured below L3.0.
+    // Keep the browser-facing encode string at the common SD floor (L3.0), which is still a truthful
+    // upper-bound declaration for this stream.
     expect(
       buildVideoEncoderConfig({ codec: 'h264', width: 320, height: 180 }, src, undefined).codec,
     ).toBe(
-      'avc1.42E00D', // level 1.3
+      'avc1.42E01E', // level 3.0 browser-seek-stable floor
     );
     // 720p@30 → L3.1 (0x1F)
     expect(
@@ -539,9 +642,20 @@ describe('h264LevelIdcForDimensions (Annex A Table A-1, min level satisfying Max
 
 describe('h264CodecStringForDimensions', () => {
   it('emits Constrained-Baseline avc1.42E0<LL> with the two-hex upper-case level byte', () => {
-    expect(h264CodecStringForDimensions(320, 180, 30)).toBe('avc1.42E00D');
+    expect(h264CodecStringForDimensions(320, 180, 30)).toBe('avc1.42E01E');
     expect(h264CodecStringForDimensions(1920, 1080, 30)).toBe('avc1.42E028');
     expect(h264CodecStringForDimensions(3840, 2160, 30)).toBe('avc1.42E033');
+  });
+
+  it('floors tiny H.264 encode configs at L3.0 for Chromium platform seek compatibility', () => {
+    // Reproduces the Node-visible half of the failing browser scenarios:
+    // transcode/ladder_tiny_h264_360p_resize_180p and
+    // transcode/ladder_tiny_vp9_360p_to_h264_180p both target H.264 MP4 at 320×180 with no fps override.
+    // The pre-fix string was avc1.42E00D; Chromium 149 accepted the encode but later failed to seek-decode
+    // the produced MP4 via <video>. A higher level is a legal capability upper bound, not a bitrate/dim lie.
+    expect(h264LevelIdcForDimensions(320, 180, undefined)).toBe(0x0d);
+    expect(h264CodecStringForDimensions(320, 180, undefined)).toBe('avc1.42E01E');
+    expect(h264CodecStringForDimensions(1, 1, 30)).toBe('avc1.42E01E');
   });
 });
 

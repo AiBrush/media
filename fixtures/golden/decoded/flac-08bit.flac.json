@@ -1,0 +1,10 @@
+{
+  "path": "flac",
+  "sampleRate": 44100,
+  "channels": 2,
+  "bitsPerSample": 8,
+  "frames": 339973,
+  "bytes": 679946,
+  "sha256": "28f690af2be06de73f0a67b2be5f03953ea3a96eafe0a6fa2853350d1b059e0d",
+  "ffmpegCrossChecked": true
+}

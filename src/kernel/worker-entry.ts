@@ -51,6 +51,8 @@ export function runOffloadWorker(
   runJob: JobRunner,
 ): () => void {
   let active: AbortController | undefined;
+  /** The epoch of the job currently running — stamped on every reply, and the gate for stale credit/cancel. */
+  let activeEpoch = -1;
   /** Credit granted by the host but not yet spent producing a chunk (backpressure window). */
   let credit = 0;
   /** Resolves the producer's wait when fresh credit arrives. */
@@ -59,15 +61,21 @@ export function runOffloadWorker(
   const onMessage = ({ data }: { data: HostMessage }): void => {
     switch (data.t) {
       case 'job':
+        activeEpoch = data.epoch;
         credit = data.credit;
-        void runOne(data.job);
+        void runOne(data.job, data.epoch);
         break;
       case 'credit':
+        // Ignore credit for a stale job (the host reuses one bridge across jobs — doc 06 §4/§10).
+        if (data.epoch !== activeEpoch) break;
         credit += data.n;
         creditWaiter?.();
         creditWaiter = undefined;
         break;
       case 'cancel':
+        // Only cancel if it targets the active job; a stale cancel (from a prior, already-finished job on a
+        // reused bridge) must not abort the job now running.
+        if (data.epoch !== activeEpoch) break;
         active?.abort(new DOMException('aborted', 'AbortError'));
         creditWaiter?.();
         creditWaiter = undefined;
@@ -84,13 +92,14 @@ export function runOffloadWorker(
     });
   };
 
-  const runOne = async (job: OffloadJob): Promise<void> => {
+  const runOne = async (job: OffloadJob, epoch: number): Promise<void> => {
     const controller = new AbortController();
     active = controller;
     const { signal } = controller;
     const progress: ProgressSink = (p) => {
       scope.postMessage({
         t: 'progress',
+        epoch,
         done: p.done,
         ...(p.total !== undefined ? { total: p.total } : {}),
         stage: p.stage,
@@ -110,19 +119,23 @@ export function runOffloadWorker(
         // Transfer the frame to the host: ownership moves, so the worker must NOT close it after this.
         // If the post throws (detached/closed), close it here so it never leaks.
         try {
-          scope.postMessage({ t: 'chunk', seq: seq++, frame: value }, [value]);
+          scope.postMessage({ t: 'chunk', epoch, seq: seq++, frame: value }, [value]);
         } catch (postErr) {
           closeFrame(value);
           throw postErr;
         }
       }
       if (signal.aborted) {
-        scope.postMessage({ t: 'error', error: serializeError(abortError()) });
+        // Host-initiated cancel: the host already errored its stream locally when it posted `{t:'cancel'}`
+        // (it never awaits a worker reply). The epoch stamp already makes any in-transit chunk from this job
+        // ignorable by the next job's listener on a REUSED bridge; emitting no trailing `error`/`done` keeps
+        // the wire quiet so even a same-epoch race can't surface a spurious abort (doc 06 §4/§10).
       } else {
-        scope.postMessage({ t: 'done' });
+        scope.postMessage({ t: 'done', epoch });
       }
     } catch (e) {
-      scope.postMessage({ t: 'error', error: serializeError(e) });
+      // Same reuse hazard: if the teardown surfaced as an abort, stay silent (the host already settled).
+      if (!signal.aborted) scope.postMessage({ t: 'error', epoch, error: serializeError(e) });
     } finally {
       // Drain anything the pipeline still holds: cancel the reader (drivers close their in-flight frames)
       // and clear our credit waiter. Exactly-once close is owned by the driver's cancel + the host.

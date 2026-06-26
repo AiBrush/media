@@ -1,0 +1,11 @@
+{
+  "scheme": "hls-aes128",
+  "tool": "openssl enc -aes-128-cbc",
+  "plaintextId": "sfx.adts",
+  "keyHex": "000102030405060708090a0b0c0d0e0f",
+  "ivHex": "00112233445566778899aabbccddeeff",
+  "cipherFile": "sfx.adts.aes128.bin",
+  "cipherSha256": "ff1a06ffd365d757872e032ec4b71c2b9b3230ed68124d5a52055fc4983f9d80",
+  "plaintextBytes": 2078,
+  "plaintextSha256": "2e4de0517ed13857c5fc24a70d4a84034050bccd1dba72d00817742723d0170d"
+}

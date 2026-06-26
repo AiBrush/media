@@ -1,0 +1,82 @@
+{
+  "container": "adts",
+  "count": 10,
+  "totalBytes": 2078,
+  "sha256": "8dddc3a937d3193d206aef4a3ee15aeeb03d2b6f2c523561d8a489543e274fc5",
+  "perTrack": [
+    {
+      "trackId": 0,
+      "count": 10,
+      "bytes": 2078
+    }
+  ],
+  "rows": [
+    {
+      "trackId": 0,
+      "sizeBytes": 248,
+      "ptsUs": 0,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 280,
+      "ptsUs": 21333,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 258,
+      "ptsUs": 42667,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 125,
+      "ptsUs": 64000,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 230,
+      "ptsUs": 85333,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 148,
+      "ptsUs": 106667,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 224,
+      "ptsUs": 128000,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 166,
+      "ptsUs": 149333,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 216,
+      "ptsUs": 170667,
+      "durationUs": 21333
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 183,
+      "ptsUs": 192000,
+      "durationUs": 21333
+    }
+  ],
+  "ffprobe": [
+    {
+      "selector": "a:0",
+      "count": 10,
+      "bytes": 2078
+    }
+  ]
+}

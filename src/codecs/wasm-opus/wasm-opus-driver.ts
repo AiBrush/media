@@ -46,12 +46,31 @@ import {
   type OpusWasmCore,
   type OpusWasmDecoder,
   type OpusWasmEncoder,
+  buildOpusHead,
   deinterleaveF32,
   interleaveF32,
   normalizeOpusDecoderConfig,
   normalizeOpusEncoderConfig,
   packetDurationSamples,
 } from './opus.ts';
+
+/**
+ * `StageOptions` plus the optional sink the parent passes so the Opus encoder can hand the muxer the
+ * {@link AudioDecoderConfig} it produced — notably the **OpusHead** `description` (RFC 7845) carrying the
+ * pre-skip, which an Ogg/WebM Opus track needs. Read structurally off the options (a driver-local
+ * additive extension), mirroring {@link import('../webcodecs-audio.ts').AudioEncoderStageOptions}.
+ */
+export interface OpusEncoderStageOptions extends StageOptions {
+  onConfig?(config: AudioDecoderConfig): void;
+}
+
+/** Read the optional {@link OpusEncoderStageOptions.onConfig} sink off a `StageOptions` object. */
+function opusConfigSink(
+  o: StageOptions | undefined,
+): ((config: AudioDecoderConfig) => void) | undefined {
+  const sink = (o as OpusEncoderStageOptions | undefined)?.onConfig;
+  return typeof sink === 'function' ? sink : undefined;
+}
 
 // ============ pure, Node-testable helpers ============
 
@@ -268,7 +287,7 @@ function createDecoder(
         controller.error(coreMissing('decode'));
         return;
       }
-      decoder = core.createDecoder(init);
+      decoder = await core.createDecoder(init);
       onAbort = () => {
         teardown();
         controller.error(new MediaError('aborted', 'operation aborted'));
@@ -315,6 +334,7 @@ function createEncoder(
   const signal = o?.signal;
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted before encode');
   const init: OpusEncoderInit = normalizeOpusEncoderConfig(config as AudioEncoderConfig);
+  const onConfig = opusConfigSink(o);
 
   /* v8 ignore start -- requires WebCodecs AudioData + the vendored wasm core; validated in-browser. */
   let encoder: OpusWasmEncoder | undefined;
@@ -353,7 +373,15 @@ function createEncoder(
         controller.error(coreMissing('encode'));
         return;
       }
-      encoder = core.createEncoder(init);
+      encoder = await core.createEncoder(init);
+      // Publish the OpusHead (RFC 7845) so the muxer's track carries the channel count, the real encoder
+      // pre-skip (OPUS_GET_LOOKAHEAD), and the input sample rate — the Ogg/WebM Opus codec-private.
+      onConfig?.({
+        codec: 'opus',
+        sampleRate: init.sampleRate,
+        numberOfChannels: init.channels,
+        description: buildOpusHead(init.channels, encoder.preSkip(), init.sampleRate),
+      });
       onAbort = () => {
         teardown();
         controller.error(new MediaError('aborted', 'operation aborted'));

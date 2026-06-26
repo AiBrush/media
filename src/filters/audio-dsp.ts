@@ -36,25 +36,45 @@ import { gain } from '../dsp/gain.ts';
 import { remix } from '../dsp/mix.ts';
 import type { PcmAudio } from '../dsp/pcm.ts';
 import { resample } from '../dsp/resample.ts';
+import { type StatefulAudioStage, biquadStage, dynamicsStage, fadeStage } from '../dsp/stream.ts';
 
 export { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/audio-data.ts';
 
-/** The audio `FilterSpec` variants this driver handles (resample / remix / gain). */
+/** Every audio `FilterSpec` variant this driver handles (the six `mediaType:'audio'` specs). */
 export type AudioDspSpec = Extract<FilterSpec, { mediaType: 'audio' }>;
 
-/** True for the three audio filter specs (`resample`/`remix`/`gain`) served here. */
+/**
+ * The **stateless** audio specs — pure per-chunk transforms with no cross-chunk state: `resample`,
+ * `remix`, `gain`. Each maps one input `AudioData` to one output `AudioData` independently.
+ */
+export type StatelessAudioSpec = Extract<AudioDspSpec, { type: 'resample' | 'remix' | 'gain' }>;
+
+/**
+ * The **stateful** audio specs — whole-signal effects made to cross the codec seam by carrying state across
+ * chunks: `fade` (tail look-ahead), `biquad` (persisted DF2T registers), `dynamics` (a whole-signal
+ * normalize buffer / per-sample limiter). Each is driven through a {@link StatefulAudioStage}.
+ */
+export type StatefulAudioSpec = Extract<AudioDspSpec, { type: 'fade' | 'biquad' | 'dynamics' }>;
+
+/** True for every audio filter spec served here (the stateless and stateful variants). */
 export function isAudioDspSpec(f: FilterSpec): f is AudioDspSpec {
   return f.mediaType === 'audio';
+}
+
+/** True for a stateful audio spec (`fade`/`biquad`/`dynamics`) — driven via a {@link StatefulAudioStage}. */
+export function isStatefulAudioSpec(f: AudioDspSpec): f is StatefulAudioSpec {
+  return f.type === 'fade' || f.type === 'biquad' || f.type === 'dynamics';
 }
 
 // ============ pure transform dispatch ============
 
 /**
- * Apply one audio {@link AudioDspSpec} to canonical planar audio via the `src/dsp` kernels. Pure and
- * exhaustive over the three audio specs; `remix`/`resample` raise their own typed `CapabilityError` on
- * an unsupported channel pair or rate, which propagates through the stream.
+ * Apply one **stateless** audio spec to canonical planar audio via the `src/dsp` kernels. Pure and
+ * exhaustive over `resample`/`remix`/`gain`; `remix`/`resample` raise their own typed `CapabilityError` on
+ * an unsupported channel pair or rate, which propagates through the stream. The stateful specs
+ * (`fade`/`biquad`/`dynamics`) do not flow through here — they run via {@link createStatefulStage}.
  */
-export function applyAudioFilter(audio: PcmAudio, spec: AudioDspSpec): PcmAudio {
+export function applyAudioFilter(audio: PcmAudio, spec: StatelessAudioSpec): PcmAudio {
   switch (spec.type) {
     case 'resample':
       return resample(audio, spec.sampleRate);
@@ -62,7 +82,31 @@ export function applyAudioFilter(audio: PcmAudio, spec: AudioDspSpec): PcmAudio 
       return remix(audio, spec.channels);
     case 'gain':
       return gain(audio, spec.db);
-    /* v8 ignore next 2 -- unreachable: the audio spec union is exhaustively handled above. */
+    /* v8 ignore next 2 -- unreachable: the stateless spec union is exhaustively handled above. */
+    default:
+      return exhaustive(spec);
+  }
+}
+
+/**
+ * Build the {@link StatefulAudioStage} for a stateful audio spec at the live stream's `sampleRate`. Pure
+ * (no `AudioData`): the stage operates on canonical {@link PcmAudio} chunks, so it is Node-tested directly
+ * (`stream.test.ts`) in arbitrary chunk splits against the whole-signal kernels. `biquad` designs its
+ * coefficients at `sampleRate`; `fade`/`dynamics` are rate-agnostic (their frame counts/targets are already
+ * resolved in the spec). Exhaustive over the three stateful specs.
+ */
+export function createStatefulStage(
+  spec: StatefulAudioSpec,
+  sampleRate: number,
+): StatefulAudioStage {
+  switch (spec.type) {
+    case 'fade':
+      return fadeStage({ curve: spec.curve, inFrames: spec.inFrames, outFrames: spec.outFrames });
+    case 'biquad':
+      return biquadStage(spec.spec, sampleRate);
+    case 'dynamics':
+      return dynamicsStage(spec.dynamics);
+    /* v8 ignore next 2 -- unreachable: the stateful spec union is exhaustively handled above. */
     default:
       return exhaustive(spec);
   }
@@ -84,14 +128,24 @@ function asAudioData(frame: AudioData): AudioData {
   );
 }
 
+/** Build an output `AudioData` from a transformed PCM chunk carrying `timestamp` (µs). */
+function emitPcm(
+  controller: TransformStreamDefaultController<AudioData>,
+  audio: PcmAudio,
+  timestamp: number,
+): void {
+  const { init } = pcmToPlanarInit(audio, timestamp);
+  controller.enqueue(new AudioData(init));
+}
+
 /**
- * Build the `TransformStream<AudioData, AudioData>` for an audio spec. There is no device to acquire, so
- * `start`/`flush` are trivial; cancellation rides the `signal` abort listener (the `Transformer` type has
- * no `cancel` hook). Per chunk: copy samples out, transform via the dsp kernels, emit a new `AudioData`
- * carrying the source `timestamp`, and close the input exactly once in a `finally`.
+ * Build the `TransformStream<AudioData, AudioData>` for a **stateless** audio spec (`resample`/`remix`/
+ * `gain`). No device to acquire, so `start` is trivial; cancellation rides the `signal` abort listener (the
+ * `Transformer` type has no `cancel` hook). Per chunk: copy samples out, transform via the dsp kernels, emit
+ * a new `AudioData` carrying the source `timestamp`, and close the input exactly once in a `finally`.
  */
-function createAudioFilterStream(
-  spec: AudioDspSpec,
+function createStatelessFilterStream(
+  spec: StatelessAudioSpec,
   opts: StageOptions | undefined,
 ): TransformStream<AudioData, AudioData> {
   const signal = opts?.signal;
@@ -111,9 +165,7 @@ function createAudioFilterStream(
       try {
         if (aborted || signal?.aborted === true)
           throw new MediaError('aborted', 'audio filter cancelled');
-        const transformed = applyAudioFilter(audioDataToPcm(data), spec);
-        const { init } = pcmToPlanarInit(transformed, data.timestamp);
-        controller.enqueue(new AudioData(init));
+        emitPcm(controller, applyAudioFilter(audioDataToPcm(data), spec), data.timestamp);
       } finally {
         // The samples were copied out synchronously above; release the input exactly once.
         data.close();
@@ -123,6 +175,87 @@ function createAudioFilterStream(
       if (signal !== undefined) signal.removeEventListener('abort', onAbort);
     },
   });
+}
+
+/**
+ * Build the `TransformStream<AudioData, AudioData>` for a **stateful** audio spec (`fade`/`biquad`/
+ * `dynamics`), driving a {@link StatefulAudioStage} across chunks. The stage is built lazily from the first
+ * frame's `sampleRate` (the live, post-resample rate). Each input frame's samples are copied into canonical
+ * PCM and the input is closed exactly once; the stage may return zero output chunks (it is buffering a fade
+ * tail or the whole-signal normalize) and emit them later, including at `flush`.
+ *
+ * Timestamps: the stage preserves framing 1:1 (one output chunk per input chunk, in order, possibly
+ * delayed), so a parallel FIFO of input timestamps aligns exactly — each emitted chunk dequeues the next
+ * pending timestamp. The FIFO must never under/over-run; a mismatch would be a stage-contract bug and is
+ * asserted as a typed `MediaError` rather than silently emitting a wrong timestamp.
+ */
+function createStatefulFilterStream(
+  spec: StatefulAudioSpec,
+  opts: StageOptions | undefined,
+): TransformStream<AudioData, AudioData> {
+  const signal = opts?.signal;
+  let aborted = false;
+  const onAbort = (): void => {
+    aborted = true;
+  };
+  if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true });
+
+  let stage: StatefulAudioStage | undefined;
+  const pendingTimestamps: number[] = []; // input-chunk timestamps awaiting their output chunk (FIFO)
+
+  const drain = (
+    controller: TransformStreamDefaultController<AudioData>,
+    chunks: readonly PcmAudio[],
+  ): void => {
+    for (const chunk of chunks) {
+      const timestamp = pendingTimestamps.shift();
+      if (timestamp === undefined) {
+        throw new MediaError(
+          'encode-error',
+          'audio-dsp stateful stage emitted more chunks than it consumed (framing contract violated)',
+        );
+      }
+      emitPcm(controller, chunk, timestamp);
+    }
+  };
+
+  return new TransformStream<AudioData, AudioData>({
+    start(): void {
+      if (signal?.aborted === true)
+        throw new MediaError('aborted', 'audio filter cancelled before start');
+    },
+    transform(frame: AudioData, controller): void {
+      const data = asAudioData(frame);
+      let pcm: PcmAudio;
+      try {
+        if (aborted || signal?.aborted === true)
+          throw new MediaError('aborted', 'audio filter cancelled');
+        pcm = audioDataToPcm(data);
+        pendingTimestamps.push(data.timestamp);
+      } finally {
+        // Samples are copied out synchronously above; release the input exactly once.
+        data.close();
+      }
+      stage ??= createStatefulStage(spec, pcm.sampleRate);
+      drain(controller, stage.push(pcm));
+    },
+    flush(controller): void {
+      if (signal?.aborted === true) throw new MediaError('aborted', 'audio filter cancelled');
+      // An empty stream never built the stage; nothing to drain.
+      if (stage !== undefined) drain(controller, stage.flush());
+      if (signal !== undefined) signal.removeEventListener('abort', onAbort);
+    },
+  });
+}
+
+/** Dispatch to the stateless per-chunk stream or the stateful staged stream by spec kind. */
+function createAudioFilterStream(
+  spec: AudioDspSpec,
+  opts: StageOptions | undefined,
+): TransformStream<AudioData, AudioData> {
+  return isStatefulAudioSpec(spec)
+    ? createStatefulFilterStream(spec, opts)
+    : createStatelessFilterStream(spec, opts);
 }
 
 /* v8 ignore stop */

@@ -1,0 +1,92 @@
+{
+  "container": "mp4",
+  "count": 10,
+  "totalBytes": 8923,
+  "sha256": "c92397d8811901019e8a5f31f734a5bf6877606b66aedc415d3720637b373ffd",
+  "perTrack": [
+    {
+      "trackId": 1,
+      "count": 10,
+      "bytes": 8923
+    }
+  ],
+  "rows": [
+    {
+      "trackId": 1,
+      "sizeBytes": 4140,
+      "ptsUs": 0,
+      "durationUs": 100000,
+      "keyframe": true
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 604,
+      "ptsUs": 100000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 475,
+      "ptsUs": 200000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 561,
+      "ptsUs": 300000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 587,
+      "ptsUs": 400000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 519,
+      "ptsUs": 500000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 532,
+      "ptsUs": 600000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 523,
+      "ptsUs": 700000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 454,
+      "ptsUs": 800000,
+      "durationUs": 100000,
+      "keyframe": false
+    },
+    {
+      "trackId": 1,
+      "sizeBytes": 528,
+      "ptsUs": 900000,
+      "durationUs": 100000,
+      "keyframe": false
+    }
+  ],
+  "ffprobe": [
+    {
+      "selector": "v:0",
+      "count": 10,
+      "bytes": 8923
+    }
+  ]
+}

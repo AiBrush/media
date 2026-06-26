@@ -25,7 +25,6 @@ import type {
   FilterSpec,
   Muxer,
   Packet,
-  PcmTransform,
   StageOptions,
   StreamCopyOptions,
   TrackInfo,
@@ -36,6 +35,19 @@ import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
+// Only the tiny, DEPENDENCY-FREE worker-mode selectors are statically imported here, from the dedicated
+// `worker-mode.ts` (NOT `worker-bridge.ts`) so the eager kernel never pulls the heavy worker pump/pool or
+// the offload protocol into its closure (doc 08 §7 budget). The actual worker spawn + ensure-pool + offload
+// runner + payload assembly ALL live behind a lazy `import('../kernel/worker-host.ts')` ({@link tryOffload},
+// ADR-019); `OffloadPoolCache` is consumed here only as an erased `import type` (the engine holds the cache
+// by reference, worker-host owns the spawn LOGIC).
+import type { OffloadPoolCache } from '../kernel/worker-host.ts';
+import {
+  type WorkerSelection,
+  resolvePoolSize,
+  selectWorkerMode,
+  workerOffloadAvailable,
+} from '../kernel/worker-mode.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import {
   type FromOptions,
@@ -45,7 +57,6 @@ import {
 } from '../sources/source.ts';
 import { createMediaChain } from './chain.ts';
 import {
-  audioFilterSpecs,
   audioTrackInfoFromDecoderConfig,
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
@@ -59,9 +70,13 @@ import {
   seekFrame,
   selectTrackInfos,
   unwrapPackets,
-  videoFilterSpecs,
   videoTrackInfoFromDecoderConfig,
 } from './codec-pipeline.ts';
+// Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
+// routines are reached only through lazy `import()`s on an eligible `to:'flac'`/raw-PCM convert. The
+// engine's `#authoringDeps()` returns the `PcmConvertDeps` superset, which also satisfies the FLAC route's
+// (narrower) deps at its call site, so only this one type is referenced here.
+import type { PcmConvertDeps } from './pcm-convert-plan.ts';
 import type {
   AudioTarget,
   CallOptions,
@@ -128,15 +143,43 @@ export interface MediaEngine {
 const HEAD_BYTES = 64 * 1024;
 const INVALID_MUX_PACKET_STREAM = 'invalid mux packet stream';
 
+/**
+ * Output-size ceiling for the **buffer-all** EncodedChunk-seam mux path (cross-container remux): the
+ * MP4/WebM muxers accumulate every packet and serialize the whole file at `finalize()` (no incremental
+ * Cluster/fragment emit), so the peak memory is ~2× the output. A multi-gigabyte output (e.g. a 2-hour
+ * 1080p remux) genuinely exceeds an in-browser tab's memory and would OOM / hang rather than complete. We
+ * decline it UP FRONT with a typed `CapabilityError` — a real resource limit, honestly reported, not a
+ * fake "unsupported" — instead of attempting the serialize and timing out. The streaming-Cluster muxer
+ * (ADR: see below) lifts this ceiling for WebM and is the sequenced SOTA follow-up. 1 GiB output ⇒ ~2 GiB
+ * peak, the defensible browser buffer-all bound; smaller real remuxes are unaffected (most are < 500 MB).
+ */
+const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
+
 export class MediaEngineImpl implements MediaEngine {
   readonly #opts: CreateMediaOptions;
   readonly #registry = new Registry();
   readonly #router = new Router({ registry: this.#registry });
   readonly #preloadTasks = new Map<string, Promise<void>>();
   #defaultsLoaded = false;
+  /**
+   * Worker offload mode for the heavy decode→encode graph (doc 06 §4, ADR-019), resolved once from
+   * `worker` + `Worker` availability. `'inline'` everywhere a `Worker` is absent (e.g. Node) — the honest
+   * fallback. The deeper "WebCodecs inside the worker" gate is the spawned worker's `ready` handshake.
+   */
+  readonly #workerMode: WorkerSelection;
+  /**
+   * Mutable cache for the worker **pool** that runs the heavy decode→encode graph off the main thread (doc
+   * 06 §4, ADR-019): spawned + handshaked **at most once** the first time a heavy op actually offloads (so a
+   * probe-only app never starts a worker), then reused. The spawn/ensure/offload LOGIC lives in the lazily-
+   * imported `worker-host.ts` ({@link tryOffload}); the engine holds only this tiny by-reference cache, so the
+   * eager kernel never carries the worker/WebCodecs spawn code (doc 08 §7 budget). A pool (vs a lone bridge)
+   * is what lets concurrent `convert`/`trim` calls and ABR ladders fan across N workers.
+   */
+  readonly #poolCache: OffloadPoolCache = {};
 
   constructor(opts: CreateMediaOptions = {}) {
     this.#opts = opts;
+    this.#workerMode = selectWorkerMode(opts.worker, workerOffloadAvailable());
   }
 
   use(module: DriverModule): MediaEngine {
@@ -192,42 +235,42 @@ export class MediaEngineImpl implements MediaEngine {
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
+      const audio = opts.audio;
+      // FLAC authoring (ADR-024): a native-FLAC target authored losslessly in pure TS from canonical PCM —
+      // a FLAC source re-encodes through its own `transformPcm`; a raw-PCM source (WAV/AIFF/CAF) is decoded
+      // to PCM and FLAC-encoded. FLAC is compressed (not a PcmContainer), but its authoring shares the PCM
+      // audio-dsp path, never the WebCodecs chunk seam. A non-lossless audio codec request is left to the
+      // codec seam (an honest miss). Returns `undefined` ⇒ no PCM-native FLAC route ⇒ fall through.
+      if (opts.to === 'flac' && audio !== false && isFlacAuthorCodec(audio?.codec)) {
+        // The FLAC-authoring ROUTINE lives in a lazily-imported chunk (`flac-convert-plan.ts`), reached only
+        // for an eligible `to:'flac'` convert, so the eager kernel never carries it (doc 08 §7). The thin
+        // gate above stays inline-eager so a non-FLAC convert never loads the chunk.
+        const { convertToFlac } = await import('./flac-convert-plan.ts');
+        const flac = await convertToFlac(this.#authoringDeps(), src, opts, audio, signal, o);
+        if (flac !== undefined) return flac;
+      }
       // PCM-native audio path (ADR-022): a raw-PCM target (WAV/AIFF/CAF) whose source container transforms
       // PCM directly — channel up/down-mix / format / sample-rate in the TS audio-dsp path, no codec seam.
-      // Lossy re-encode, video, or cross-codec conversions fall through to the browser codec layer.
-      const audio = opts.audio;
+      // Lossy re-encode, video, or cross-codec conversions fall through to the browser codec layer. The
+      // ROUTINE lives in a lazily-imported chunk (`pcm-convert-plan.ts`), reached only for an eligible target,
+      // so the eager kernel never carries it (doc 08 §7); the thin gate below stays inline-eager.
       if (
         opts.to !== undefined &&
         isPcmContainer(opts.to) &&
         audio !== false &&
         isPcmCodec(audio?.codec)
       ) {
-        const target = opts.to;
-        const container = await this.#routeContainer(src, 'demux');
-        const sampleFormat = pcmSampleFormat(audio?.codec);
-        const endian = pcmEndian(audio?.codec);
-        const pcmOpts: PcmTransform = {
-          ...this.#stageOptions(signal, o),
-          container: target,
-          ...(sampleFormat !== undefined ? { sampleFormat } : {}),
-          ...(endian !== undefined ? { endian } : {}),
-          ...(audio?.channels !== undefined ? { channels: audio.channels } : {}),
-          ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
-          ...(audio?.gainDb !== undefined ? { gainDb: audio.gainDb } : {}),
-          ...(audio?.fade !== undefined ? { fade: audio.fade } : {}),
-          ...(audio?.dynamics !== undefined ? { dynamics: audio.dynamics } : {}),
-          ...(audio?.biquad !== undefined ? { biquad: audio.biquad } : {}),
-        };
-        // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its
-        // own bytes, applies sample format / channel / rate transforms, then serializes the requested
-        // raw-PCM target. A WAV target may also be produced by a compressed-audio source's `decodePcm`
-        // bridge (FLAC→WAV, ADR-024; ADTS AAC→WAV, ADR-050).
-        const stream = container.transformPcm
-          ? await container.transformPcm(src, pcmOpts)
-          : target === 'wav' && container.decodePcm
-            ? await container.decodePcm(src, pcmOpts)
-            : undefined;
-        if (stream) return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        const { convertPcmNative } = await import('./pcm-convert-plan.ts');
+        const pcm = await convertPcmNative(
+          this.#authoringDeps(),
+          src,
+          opts,
+          audio,
+          opts.to,
+          signal,
+          o,
+        );
+        if (pcm !== undefined) return pcm;
       }
       // Codec seam (the full convert pipeline). A pure container change with no re-encode is preferred
       // as a lossless stream-copy (ADR-021/012) when the source container supports it; otherwise demux →
@@ -283,6 +326,19 @@ export class MediaEngineImpl implements MediaEngine {
           signal,
           o,
         );
+        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      }
+      // Keyframe trim of a raw-PCM container (WAV/AIFF/CAF) is a lossless **sample-accurate cut** through the
+      // container's own `transformPcm` (ADR-021/022): PCM has no inter-frame dependency, so there is no
+      // keyframe to align to — the audio-dsp path slices `[start, end)` samples and re-serializes, frame-exact
+      // and Node-validatable, with no codec seam. (Compressed audio/video containers fall through to the
+      // byte-level stream-copy below, or its typed miss.)
+      if (isPcmContainer(target) && container.transformPcm) {
+        const stream = await container.transformPcm(src, {
+          ...this.#stageOptions(signal, o),
+          container: target,
+          timeBounds: { startSec: opts.start, endSec: opts.end },
+        });
         return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
@@ -566,6 +622,37 @@ export class MediaEngineImpl implements MediaEngine {
     this.#router.clearCache();
   }
 
+  /**
+   * Run a heavy `convert`/`trim` off the main thread, returning the produced encoded **byte stream** — or
+   * `undefined` to signal "no offload; run the inline path" (offload not selected, or no worker pool spawned
+   * — the honest fallback). The `worker === false`/no-`Worker` opt-out is gated EAGERLY here (`#workerMode`),
+   * so a non-offload engine (e.g. anything in Node) returns at once and NEVER even imports the heavy
+   * `worker-host` chunk. When offload IS selected, the lazily-imported {@link tryOffload} owns the
+   * ensure-pool + payload assembly + byte round-trip (so the eager kernel stays slim, doc 08 §7); the engine
+   * passes its by-reference pool cache + resolved pool size. The caller materializes the returned stream into
+   * the sink on THIS (main) thread — the sink may hold a DOM element, so it never crosses to the worker
+   * (only encoded bytes do; no `VideoFrame`/`AudioData` crosses).
+   */
+  async #offloadStream(
+    src: Source,
+    kind: 'convert' | 'trim',
+    publicOpts: ConvertOptions | TrimOptions,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<Uint8Array> | undefined> {
+    if (this.#workerMode !== 'offload') return undefined;
+    /* v8 ignore start -- offload mode needs a real `Worker` (browser); in Node `#workerMode` is 'inline', so
+       this lazy import + spawn is never reached. The ensure-pool/offload LOGIC in `worker-host` is unit-tested
+       via `createWorkerPool`/`offloadHeavyOp` with an injected transport; browser-harness validated end to end. */
+    const { tryOffload } = await import('../kernel/worker-host.ts');
+    return tryOffload(this.#poolCache, resolvePoolSize(this.#opts.worker), src, kind, publicOpts, {
+      signal,
+      determinism: this.#determinism(o),
+      ...(o.onProgress ? { onProgress: o.onProgress } : {}),
+    });
+    /* v8 ignore stop */
+  }
+
   /** Resolve a codec driver for a query, loading the first-party defaults on a miss then retrying once. */
   async #routeCodec(q: CodecQuery, o: CallOptions): Promise<CodecDriver> {
     const opts = { determinism: this.#determinism(o) };
@@ -703,6 +790,22 @@ export class MediaEngineImpl implements MediaEngine {
         { op: 'remux', tried: [container.id, opts.to] },
       );
     }
+    // Decline an oversize buffer-all remux UP FRONT (ADR-094): the cross-container seam copies every packet
+    // into a muxer that serializes the whole file at finalize (no incremental Cluster emit), so a
+    // multi-GB output would OOM/hang. The output of a verbatim stream-copy is ~the source media size, so a
+    // known source size over the ceiling is a real resource limit — a typed miss, not an attempt-then-timeout.
+    // Unknown size ⇒ proceed (best-effort guard, never a guess); the streaming-mux follow-up lifts this.
+    if (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
+      throw new CapabilityError(
+        'capability-miss',
+        `remux to '${opts.to}' would buffer ~${Math.round(src.size / (1024 * 1024))} MB in memory, exceeding the in-browser buffer-all limit (${Math.round(REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES / (1024 * 1024))} MB); split this large file, or process it server-side, until the streaming mux lands`,
+        {
+          op: 'remux',
+          tried: [container.id, opts.to],
+          suggestion: 'split the source into smaller segments, or remux server-side',
+        },
+      );
+    }
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
     const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
     // Copy only tracks the demuxer fully describes (a `config`-less track cannot be re-muxed faithfully).
@@ -758,6 +861,13 @@ export class MediaEngineImpl implements MediaEngine {
         { op: 'trim', tried: [target] },
       );
     }
+
+    // Accurate trim is decode→(restamp)→encode→mux — the same heavy graph as convert, so it offloads to
+    // the worker too (doc 06 §4, ADR-019), returning the encoded byte stream the caller materializes.
+    // `undefined` ⇒ no worker; run the inline path below (the honest fallback).
+    const offloaded = await this.#offloadStream(src, 'trim', opts, signal, o);
+    /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
+    if (offloaded !== undefined) return offloaded;
 
     const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
     const bounds = trimBoundsUs(opts.start, endSec);
@@ -833,6 +943,22 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /**
+   * The capabilities the lazily-imported PCM-family authoring routines need, bound to this engine instance —
+   * a superset satisfying BOTH {@link FlacConvertDeps} (FLAC route) and {@link PcmConvertDeps} (raw-PCM
+   * route). Built only on an eligible `to:'flac'`/raw-PCM convert (the inline gate gates the lazy import), so
+   * the eager kernel never carries those routes — just this tiny binder + the shared `pcm*` mappers.
+   */
+  #authoringDeps(): PcmConvertDeps {
+    return {
+      routeContainer: (src, direction) => this.#routeContainer(src, direction),
+      stageOptions: (signal, o) => this.#stageOptions(signal, o),
+      mimeOpts: (signal, container) => mimeOpts(signal, container),
+      pcmSampleFormat: (codec) => pcmSampleFormat(codec),
+      pcmEndian: (codec) => pcmEndian(codec),
+    };
+  }
+
+  /**
    * The full codec-seam convert pipeline: demux → per track decode → optional GPU filter chain (video) →
    * encode → mux. A pure container change with no re-encode is preferred as a lossless stream-copy
    * (ADR-021) when the source supports it. Output goes to the chosen container's `Muxer`.
@@ -868,6 +994,16 @@ export class MediaEngineImpl implements MediaEngine {
         `convert to '${target}' via the codec seam has no EncodedChunk muxer in this build`,
         { op: 'convert', tried: [target] },
       );
+    }
+
+    // Heavy decode→filter→encode→mux: run it OFF the main thread when worker offload is selected + a
+    // WebCodecs-capable worker handshook (doc 06 §4, ADR-019). The worker reconstructs THIS same graph
+    // (worker-main.ts) and streams encoded bytes back; the sink is materialized here (it may hold a DOM
+    // element). `undefined` means "no worker — run inline" (the honest fallback below).
+    const offloaded = await this.#offloadStream(src, 'convert', opts, signal, o);
+    /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
+    if (offloaded !== undefined) {
+      return materialize(opts.sink ?? toBlob(), offloaded, mimeOpts(signal, target));
     }
 
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
@@ -956,6 +1092,10 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<VideoFrame>> {
+    // The video filter-spec PLANNER lives in a lazily-imported chunk (`video-stream-plan.ts`), so the eager
+    // kernel never statically pulls the video-spec code (doc 08 §7). Reached only here, on the live convert
+    // video re-encode — already a browser-only, async path.
+    const { videoFilterSpecs } = await import('./video-stream-plan.ts');
     const specs = videoFilterSpecs(target, sourceGeometryOf(track));
     if (specs.length === 0) return frames;
     const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
@@ -988,6 +1128,10 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<AudioData>> {
+    // The lossy-seam audio-filter PLANNER lives in a lazily-imported chunk (`audio-stream-plan.ts`), so the
+    // eager kernel never statically pulls the audio-spec code + its audio-dsp type imports (doc 08 §7).
+    // Reached only here, on the live convert audio re-encode — already a browser-only, async path.
+    const { audioFilterSpecs } = await import('./audio-stream-plan.ts');
     const specs = audioFilterSpecs(target, audioGeometryOf(track));
     if (specs.length === 0) return frames;
     const stages: TransformStream<AudioData, AudioData>[] = [];
@@ -1430,6 +1574,11 @@ function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {
   const out: MuxPacketStream[] = [];
   appendMuxPacketStream(out, 'video', streams.video);
   appendMuxPacketStream(out, 'audio', streams.audio);
+  // The multi-source / multi-track arm: an arbitrary ordered list, each entry its own output track. Not
+  // slot-pinned (a list may carry ≥2 video or ≥2 audio), but each must still be a valid mediaType stream.
+  if (streams.tracks !== undefined) {
+    for (const track of streams.tracks) appendMuxPacketStream(out, undefined, track);
+  }
   if (out.length === 0) {
     throw new InputError('unsupported-input', 'mux received no packet streams');
   }
@@ -1438,7 +1587,7 @@ function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {
 
 function appendMuxPacketStream(
   out: MuxPacketStream[],
-  slot: PacketStreamSlot,
+  slot: PacketStreamSlot | undefined,
   input: unknown,
 ): void {
   if (input === undefined) return;
@@ -1446,9 +1595,11 @@ function appendMuxPacketStream(
   const descriptor = input as MuxPacketDescriptorRecord;
   const track = descriptor.track;
   const packets = descriptor.packets;
+  // `isTrackInfoLike` already narrows mediaType to 'video'|'audio'. A slotted entry must additionally match
+  // its slot; a `tracks[]` entry (slot `undefined`) accepts either — the list may carry ≥2 of one type.
   if (
     !isTrackInfoLike(track) ||
-    track.mediaType !== slot ||
+    (slot !== undefined && track.mediaType !== slot) ||
     track.config === undefined ||
     !isReadableStreamLike(packets)
   )
@@ -1464,6 +1615,9 @@ function readablePacketStreams(streams: PacketStreams): ReadableStream<unknown>[
   const out: ReadableStream<unknown>[] = [];
   collectReadablePacketStream(out, streams.video);
   collectReadablePacketStream(out, streams.audio);
+  if (streams.tracks !== undefined) {
+    for (const track of streams.tracks) collectReadablePacketStream(out, track);
+  }
   return out;
 }
 
@@ -1765,6 +1919,16 @@ function unknownMessage(e: unknown): string {
  */
 function isPcmCodec(codec: string | undefined): boolean {
   return codec === undefined || codec === 'pcm' || codec.startsWith('pcm-');
+}
+
+/**
+ * Audio codec tokens that select the lossless FLAC authoring path (ADR-024) for a `to:'flac'` convert:
+ * no codec / the bare `flac` token (author FLAC at the source's native depth), or a `pcm-*` token (author
+ * at that requested integer depth). A lossy token (e.g. `aac`/`opus`) is NOT FLAC and is left to the codec
+ * seam (an honest miss in this build), so this gate never hijacks a real cross-codec request.
+ */
+function isFlacAuthorCodec(codec: string | undefined): boolean {
+  return codec === undefined || codec === 'flac' || codec === 'pcm' || codec.startsWith('pcm-');
 }
 
 function pcmSampleFormat(codec: string | undefined): SampleFormat | undefined {

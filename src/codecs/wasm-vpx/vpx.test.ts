@@ -448,18 +448,21 @@ describe('supports() / coders — honest when the wasm core is absent (Node has 
     resetVpxCoreForTest();
   });
 
-  it('loadVpxCore resolves to null when the artifact is not vendored', async () => {
-    expect(await loadVpxCore()).toBeNull();
+  it('loadVpxCore resolves to a real core now that the prebuilt artifact is vendored (ADR-094)', async () => {
+    const core = await loadVpxCore();
+    expect(core).not.toBeNull();
+    expect(typeof core?.createDecoder).toBe('function');
   });
 
-  it('returns false (never throws) for a VP9 decode query when the core is absent', async () => {
+  it('returns false (never throws) for a VP9 decode query in Node (WebCodecs VideoFrame absent)', async () => {
     const s = await WasmVpxDriver.supports({
       mediaType: 'video',
       direction: 'decode',
       config: { codec: 'vp09.00.10.08', codedWidth: 1920, codedHeight: 1080 },
     });
+    // The core IS vendored, so the only honest Node miss is the absent WebCodecs frame seam.
     expect(s.supported).toBe(false);
-    expect(s.reason).toMatch(/core/);
+    expect(s.reason).toMatch(/VideoFrame|EncodedVideoChunk/);
   });
 
   it('returns false for an encode query without consulting the core (decode-only)', async () => {
@@ -526,17 +529,27 @@ describe('supports() / coders — honest when the wasm core is absent (Node has 
     ).toThrow(/decode-only/);
   });
 
-  // When (mis)routed in Node despite supports()=false, building a valid decoder succeeds up to the point
-  // the stream is pumped; the first read drives `start`, which loads the (absent) core and errors with a
-  // typed CapabilityError. This proves the "miss-only, honest absence → CapabilityError" contract.
-  it('a pumped decoder errors with CapabilityError when the core is absent', async () => {
-    resetVpxCoreForTest();
-    const ts = WasmVpxDriver.createDecoder({
-      codec: 'vp09.00.10.08',
-      codedWidth: 16,
-      codedHeight: 16,
-    });
-    await expect(ts.readable.getReader().read()).rejects.toBeInstanceOf(CapabilityError);
+  // The vendored ogv.js core is real and runs in Node: build a VP8 and a VP9 decoder directly through the
+  // VpxWasmCore facade and prove each yields a `{decode, free}` decoder (a stronger, falsifiable check than
+  // the old "core absent → CapabilityError" — an absent/broken core would throw here). The bit-exact
+  // decode of real VP8/VP9 streams is in `wasm-vpx-decode.test.ts` / the browser harness.
+  it('the vendored ogv.js core builds VP8 and VP9 decoders (real cores, not stubs)', async () => {
+    const core = await loadVpxCore();
+    expect(core).not.toBeNull();
+    if (!core) return;
+    for (const codec of ['vp8', 'vp9'] as const) {
+      const decoder = await core.createDecoder({
+        codec,
+        profile: 0,
+        bitDepth: 8,
+        codedWidth: 16,
+        codedHeight: 16,
+      });
+      expect(typeof decoder.decode).toBe('function');
+      expect(typeof decoder.free).toBe('function');
+      decoder.free();
+      decoder.free(); // idempotent
+    }
   });
 });
 

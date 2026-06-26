@@ -294,7 +294,7 @@ function createDecoder(
         );
         return;
       }
-      decoder = core.createDecoder(init);
+      decoder = await core.createDecoder(init);
       onAbort = () => {
         teardown();
         controller.error(new MediaError('aborted', 'operation aborted'));

@@ -11,6 +11,9 @@
       "**/crate/pkg",
       "**/crate/target",
       "**/*-core.js",
+      "**/*-wasm.js",
+      "**/*-wasm.cjs",
+      "**/*.generated.mjs",
       "**/*_wasm_bg.wasm",
       "**/*.head.ts"
     ]

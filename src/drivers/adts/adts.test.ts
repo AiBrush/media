@@ -111,8 +111,10 @@ describe('probe ADTS — real corpus', () => {
     await demuxed.close();
   });
 
-  it('createMuxer is a typed not-yet-implemented error', () => {
-    expect(() => AdtsDriver.createMuxer()).toThrowError(MediaError);
+  it('createMuxer returns a real ADTS muxer (AAC access units → 7-byte ADTS frames)', () => {
+    const muxer = AdtsDriver.createMuxer();
+    // A non-AAC track is rejected; the AdtsMuxer round-trip is verified in adts-remux.test.ts.
+    expect(() => muxer.addTrack({ id: 0, mediaType: 'audio', codec: 'opus' })).toThrowError(/AAC/);
   });
 
   it('demuxes a non-seekable stream source (reads the header from the first chunk)', async () => {

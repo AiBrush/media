@@ -254,12 +254,16 @@ export interface Av1DecodedFrame {
   data: Uint8Array;
 }
 
-/** The narrow synchronous facade the dav1d JS glue must expose after WASM initialization. */
+/** The narrow facade the dav1d JS glue must expose after WASM initialization. */
 export interface Dav1dWasmCore {
   /** Optional cheap truth predicate for profile/bit-depth/subsampling the compiled core can wrap. */
   supports?(init: Av1DecoderInit): boolean;
-  /** Create one stateful dav1d decoder. */
-  createDecoder(init: Av1DecoderInit): Dav1dWasmDecoder;
+  /**
+   * Create one stateful dav1d decoder. Async because the vendored prebuilt core (`dav1d.js`)
+   * instantiates its wasm per decoder; the driver `await`s it in its async `start`. The returned
+   * decoder's `decode` is synchronous (the hot path).
+   */
+  createDecoder(init: Av1DecoderInit): Promise<Dav1dWasmDecoder>;
 }
 
 /** A live dav1d decoder. */

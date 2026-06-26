@@ -1,0 +1,82 @@
+{
+  "container": "ogg",
+  "count": 10,
+  "totalBytes": 3059,
+  "sha256": "263b315ebbf20867cdfe78fa5aa9d2a852b44084caf6d742429dcafec5b64fc5",
+  "perTrack": [
+    {
+      "trackId": 0,
+      "count": 10,
+      "bytes": 3059
+    }
+  ],
+  "rows": [
+    {
+      "trackId": 0,
+      "sizeBytes": 450,
+      "ptsUs": -6500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 268,
+      "ptsUs": 13500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 285,
+      "ptsUs": 33500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 296,
+      "ptsUs": 53500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 287,
+      "ptsUs": 73500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 308,
+      "ptsUs": 93500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 289,
+      "ptsUs": 113500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 286,
+      "ptsUs": 133500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 296,
+      "ptsUs": 153500,
+      "durationUs": 20000
+    },
+    {
+      "trackId": 0,
+      "sizeBytes": 294,
+      "ptsUs": 173500,
+      "durationUs": 20000
+    }
+  ],
+  "ffprobe": [
+    {
+      "selector": "a:0",
+      "count": 10,
+      "bytes": 3059
+    }
+  ]
+}

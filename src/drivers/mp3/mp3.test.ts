@@ -3,7 +3,33 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
-import { Mp3Driver, Mp3Module, enumerateMp3Packets, parseMp3 } from './mp3-driver.ts';
+import {
+  Mp3Driver,
+  Mp3Module,
+  enumerateMp3Packets,
+  isMpegLayer3Frame,
+  parseMp3,
+} from './mp3-driver.ts';
+
+/** Drain a muxer's output stream into one buffer (mirrors the FLAC mux test's collectBytes). */
+async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, off);
+    off += chunk.byteLength;
+  }
+  return out;
+}
 
 // MPEG1 Layer III header. version 3, layer III, bitrateIdx 9 (128k), srIdx 0 (44100).
 function header(
@@ -144,8 +170,47 @@ describe('Mp3Driver — demux seam + muxer', () => {
     await demuxed.close();
   });
 
-  it('createMuxer is a typed out-of-scope error', () => {
-    expect(() => Mp3Driver.createMuxer()).toThrowError(MediaError);
+  it('createMuxer returns a real MP3 elementary-stream muxer (ADR pending)', async () => {
+    // Two valid MPEG-1 L3 128k/44100 frames; the muxer concatenates them verbatim into a `.mp3`.
+    const frame = (): Uint8Array => Uint8Array.from(pad(header(), frameLen()));
+    const muxer = Mp3Driver.createMuxer();
+    const id = muxer.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+    muxer.addChunkStruct(id, { timestampUs: 0, durationUs: 26_122, key: true, data: frame() });
+    muxer.addChunkStruct(id, { timestampUs: 26_122, durationUs: 26_122, key: true, data: frame() });
+    await muxer.finalize();
+
+    const out = await collectBytes(muxer.output);
+    // The authored stream is exactly the two frames back-to-back, and it re-parses to two MP3 packets.
+    expect(out.byteLength).toBe(frame().byteLength * 2);
+    expect(isMpegLayer3Frame(out)).toBe(true);
+    expect(enumerateMp3Packets(out)).toHaveLength(2);
+  });
+
+  it('the MP3 muxer rejects misuse with typed errors (non-frame, wrong track/codec, double-finalize)', async () => {
+    const frame = Uint8Array.from(pad(header(), frameLen()));
+
+    // A non-frame chunk must be refused, not silently concatenated (it would desync every parser).
+    const m1 = Mp3Driver.createMuxer();
+    const id1 = m1.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+    expect(() =>
+      m1.addChunkStruct(id1, {
+        timestampUs: 0,
+        durationUs: 0,
+        key: true,
+        data: Uint8Array.of(0x00, 0x01, 0x02, 0x03),
+      }),
+    ).toThrowError(MediaError);
+
+    // A non-audio / non-mp3 track is a capability miss.
+    const m2 = Mp3Driver.createMuxer();
+    expect(() => m2.addTrack({ id: 0, mediaType: 'audio', codec: 'aac' })).toThrowError(/MP3/);
+
+    // Double finalize and finalize-with-no-packets are typed mux errors.
+    const m3 = Mp3Driver.createMuxer();
+    const id3 = m3.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+    m3.addChunkStruct(id3, { timestampUs: 0, durationUs: 0, key: true, data: frame });
+    await m3.finalize();
+    await expect(m3.finalize()).rejects.toThrowError(MediaError);
   });
 });
 

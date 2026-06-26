@@ -1,0 +1,37 @@
+{
+  "note": "Provenance for the vendored prebuilt ogv.js VP8/VP9 DECODE WASM cores (ADR-085/094). Self-hosted (committed + served same-origin, NOT a runtime CDN dependency). libvpx itself is BSD-3 (WebM Project); the ogv.js wrappers are MIT. 8-bit 4:2:0 only (4:4:4 honestly declined by the glue). The wasm bytes are base64-embedded into vpx-{vp8,vp9}-data-wasm.js so the tail is self-contained (no separate *.wasm asset; tsup bundles it into the lazy vpx-core.js chunk — the vendor-wasm.ts selfContained branch). Re-vendor + sha256-refresh steps are in BUILD.md.",
+  "package": "ogv",
+  "version": "1.9.0",
+  "url": "https://registry.npmjs.org/ogv/-/ogv-1.9.0.tgz",
+  "licenses": {
+    "wrapper": "MIT",
+    "libvpx": "BSD-3-Clause"
+  },
+  "upstream": "https://chromium.googlesource.com/webm/libvpx",
+  "capabilities": {
+    "decode": ["vp8 8-bit 4:2:0", "vp9 8-bit 4:2:0 (profile 0)"],
+    "declined": ["4:4:4 / non-4:2:0 (packed-I420 contract)", "10/12-bit", "encode (decode-only)"]
+  },
+  "artifacts": [
+    {
+      "file": "ogv-vp8-wasm.js",
+      "from": "package/dist/ogv-decoder-video-vp8-wasm.js",
+      "sha256": "e88760eaed22be03e2efc3a8ada0e9ec2faa274eda6a2e539580f18a1ef02b0a"
+    },
+    {
+      "file": "vpx-vp8-data-wasm.js (base64 of)",
+      "from": "package/dist/ogv-decoder-video-vp8-wasm.wasm",
+      "sha256": "3175074b9bfd47317a550bbab287ca876ff66f71dfa5aa43ab1ab8897dc5252d"
+    },
+    {
+      "file": "ogv-vp9-wasm.js",
+      "from": "package/dist/ogv-decoder-video-vp9-wasm.js",
+      "sha256": "012e2daaa34fa84d53520ab8bfa79a950aa922a2663405f4ddaa5f83cecaf435"
+    },
+    {
+      "file": "vpx-vp9-data-wasm.js (base64 of)",
+      "from": "package/dist/ogv-decoder-video-vp9-wasm.wasm",
+      "sha256": "79efca8f980458be2abadfc0531a17036326685102ba281f172e2c9eb683bdcb"
+    }
+  ]
+}

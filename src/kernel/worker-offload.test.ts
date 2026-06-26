@@ -527,7 +527,7 @@ describe('frame transfer + close-exactly-once', () => {
     runOffloadWorker(throwingScope, runJob);
     expect(readyDelivered).toBe(true);
     expect(workerListener).toBeDefined();
-    workerListener?.({ data: { t: 'job', job: job({}), credit: 4 } });
+    workerListener?.({ data: { t: 'job', epoch: 1, job: job({}), credit: 4 } });
     await new Promise<void>((r) => setTimeout(r, 5));
     // The post failed, so the worker closed the otherwise-leaked frame exactly once.
     expect(frame.closeCount).toBe(1);

@@ -542,8 +542,12 @@ export interface VpxDecodedFrame {
  * teardown (cancel, flush, or error); the wasm module owns the heap buffers.
  */
 export interface VpxWasmCore {
-  /** Create a libvpx decoder (`vpx_codec_dec_init` with the VP8 or VP9 interface) for the validated init. */
-  createDecoder(init: VpxDecoderInit): VpxWasmDecoder;
+  /**
+   * Create a libvpx decoder (the VP8 or VP9 interface) for the validated init. Async because the vendored
+   * prebuilt cores (ogv.js) instantiate their wasm per decoder; the driver `await`s it in its async
+   * `start`. The returned decoder's `decode` is synchronous (the hot path).
+   */
+  createDecoder(init: VpxDecoderInit): Promise<VpxWasmDecoder>;
 }
 
 /** A live libvpx decoder: feed coded VP8/VP9 packets, pull decoded 4:2:0 frames. */

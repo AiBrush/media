@@ -1,0 +1,23 @@
+{
+  "note": "Provenance for the vendored prebuilt libopus WASM core (ADR-085/088). Self-hosted (committed + served same-origin, NOT a runtime CDN dependency). The wrapper JS is MIT; the compiled libopus is BSD-3 (Xiph.Org). Re-vendor + sha256-refresh steps are in BUILD.md.",
+  "package": "libopus-wasm",
+  "version": "0.2.0",
+  "url": "https://registry.npmjs.org/libopus-wasm/-/libopus-wasm-0.2.0.tgz",
+  "licenses": {
+    "wrapper": "MIT",
+    "libopus": "BSD-3-Clause"
+  },
+  "upstream": "https://github.com/xiph/opus",
+  "artifacts": [
+    {
+      "file": "libopus-wasm.js",
+      "from": "package/dist/index.js",
+      "sha256": "8dbe83b16b1e41dda9eba4469c3aec24058a8ad852d1e399c2aa602d0d2d6b61"
+    },
+    {
+      "file": "generated/libopus.generated.mjs",
+      "from": "package/dist/generated/libopus.generated.mjs",
+      "sha256": "7f254556d782ac20a304068d4ecf7a1b9e6e94df5694f550e6d14c217d7e2028"
+    }
+  ]
+}

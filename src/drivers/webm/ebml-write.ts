@@ -64,6 +64,14 @@ const MICROS_PER_MS = 1_000;
  * int16 `SimpleBlock` field. The hard limit is 32767 ms; 30000 leaves margin (and bounds cluster size).
  */
 const MAX_CLUSTER_REL_MS = 30_000;
+const INT16_MIN = -32_768;
+const INT16_MAX = 32_767;
+/**
+ * Video+audio MP4 inputs often carry tiny AAC priming/padding that extends the audio track declaration
+ * beyond the movie/video duration. For WebM remux metadata, keep that padding from redefining the global
+ * Segment duration when a video declaration exists and the overhang is clearly codec padding, not content.
+ */
+const DECLARED_AV_PADDING_SLACK_MS = 250;
 const APP_NAME = 'aibrush-media';
 
 // ============ EBML write primitives ============
@@ -124,6 +132,11 @@ function element(id: number, payload: Uint8Array | readonly number[]): Uint8Arra
   return concatBytes([idBytes(id), vintBytes(body.length), body]);
 }
 
+/** Build only an EBML element prefix: `ID · size(definite)`. */
+function elementHeader(id: number, payloadLength: number): Uint8Array {
+  return concatBytes([idBytes(id), vintBytes(payloadLength)]);
+}
+
 /** Big-endian minimal-width unsigned-integer bytes (≥ 1 byte; EBML uint elements are 1–8 bytes). */
 function uintBytes(n: number): number[] {
   if (n < 0 || !Number.isFinite(n)) {
@@ -159,9 +172,37 @@ function stringEl(id: number, s: string): Uint8Array {
 
 /** A signed 16-bit big-endian value (the `SimpleBlock` relative timecode). */
 function int16Bytes(n: number): number[] {
+  if (n < INT16_MIN || n > INT16_MAX || !Number.isFinite(n)) {
+    throw new MediaError('mux-error', `SimpleBlock relative timecode ${n}ms exceeds int16 range`);
+  }
   const buf = new Uint8Array(2);
   new DataView(buf.buffer).setInt16(0, n, false);
   return [buf[0] ?? 0, buf[1] ?? 0];
+}
+
+/** A single pre-sized output writer used by the WebM serializer to avoid full-output recopy cascades. */
+class ByteWriter {
+  readonly #bytes: Uint8Array;
+  #offset = 0;
+
+  constructor(length: number) {
+    this.#bytes = new Uint8Array(length);
+  }
+
+  write(part: Uint8Array | readonly number[]): void {
+    this.#bytes.set(part, this.#offset);
+    this.#offset += part.length;
+  }
+
+  finish(): Uint8Array {
+    if (this.#offset !== this.#bytes.byteLength) {
+      throw new MediaError(
+        'mux-error',
+        `webm writer planned ${this.#bytes.byteLength} bytes but wrote ${this.#offset}`,
+      );
+    }
+    return this.#bytes;
+  }
 }
 
 // ============ codec mapping (write side — inverse of parseWebm's mapCodec) ============
@@ -238,36 +279,48 @@ function usToMs(us: number): number {
 
 interface TrackChunks {
   trackNumber: number;
+  mediaType?: 'video' | 'audio';
   durationSec?: number;
   chunks: readonly ChunkStruct[];
 }
 
+interface DeclaredTrackDuration {
+  mediaType: 'video' | 'audio' | undefined;
+  endMs: number;
+}
+
 /**
- * Flatten every track's chunks into one **decode**-ordered block list (ms ticks), rebased so the earliest
- * presentation time sits at t=0 (a standalone file starts at zero), and report the stream end time (ms)
- * for the `Duration` element. Blocks are sorted by `(dtsMs, trackNumber)` — Matroska reads a Cluster's
- * blocks front-to-back and submits them to the decoder, so storage order must be DECODE order even though
- * each `SimpleBlock` carries a PTS timecode (a B-frame source therefore lays blocks down by DTS; for a
- * non-reordered stream DTS == PTS, so this is byte-identical to the old presentation-order layout). Each
- * block independently carries its TrackNumber + absolute PTS, so the demuxer recovers per-track timing
- * regardless. The end time uses a source-declared track duration when the demuxer provided one (remux
- * path: honor the source container's movie/stream duration rather than B-frame or audio-padding tails);
- * otherwise it falls back to each track's last presented chunk's PTS + duration (recovered from the
- * prior gap when the encoder omitted it), so newly-encoded streams still get a real non-zero Duration.
+ * Flatten every track's chunks into one **decode**-ordered block list (ms ticks) and report the stream
+ * end time (ms) for the `Duration` element. Normal positive-timeline files are rebased so their first
+ * presentation timestamp sits at t=0; when declared source durations exist and only codec priming is
+ * negative, the positive timeline remains anchored at zero and the priming packet is written as a signed
+ * negative `SimpleBlock` relative time. Blocks are sorted by `(dtsMs, trackNumber)` — Matroska reads a
+ * Cluster front-to-back and submits blocks to the decoder, so storage order must be DECODE order even
+ * though each `SimpleBlock` carries a PTS timecode. The end time uses source-declared durations when the
+ * demuxer provided them; for video+audio, a small audio overhang is treated as codec padding and the video
+ * declaration wins. Unknown-duration tracks fall back to their packet tail.
  */
 export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   blocks: TimelineBlock[];
   endMs: number;
 } {
   let baseUs = Number.POSITIVE_INFINITY;
-  for (const t of tracks)
-    for (const c of t.chunks) if (c.timestampUs < baseUs) baseUs = c.timestampUs;
+  let hasDeclaredDuration = false;
+  let hasNonNegativeTimestamp = false;
+  for (const t of tracks) {
+    if (durationSecToMs(t.durationSec) !== undefined) hasDeclaredDuration = true;
+    for (const c of t.chunks) {
+      if (c.timestampUs < baseUs) baseUs = c.timestampUs;
+      if (c.timestampUs >= 0) hasNonNegativeTimestamp = true;
+    }
+  }
   if (!Number.isFinite(baseUs)) return { blocks: [], endMs: 0 };
+  if (hasDeclaredDuration && hasNonNegativeTimestamp && baseUs < 0) baseUs = 0;
 
   const blocks: TimelineBlock[] = [];
-  let endMs = 0;
+  const declaredDurations: DeclaredTrackDuration[] = [];
+  let fallbackEndMs = 0;
   for (const t of tracks) {
-    const sorted = [...t.chunks].sort((a, b) => a.timestampUs - b.timestampUs);
     for (const c of t.chunks) {
       blocks.push({
         trackNumber: t.trackNumber,
@@ -279,17 +332,20 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
     }
     const declaredEndMs = durationSecToMs(t.durationSec);
     if (declaredEndMs !== undefined) {
-      endMs = Math.max(endMs, declaredEndMs);
+      declaredDurations.push({ mediaType: t.mediaType, endMs: declaredEndMs });
       continue;
     }
     // Track end = last presented chunk's PTS + its duration (recovered from the prior gap if missing).
+    const sorted = [...t.chunks].sort((a, b) => a.timestampUs - b.timestampUs);
     const last = sorted[sorted.length - 1];
     if (last !== undefined) {
       const lastDurUs = last.durationUs ?? lastGapUs(sorted);
-      endMs = Math.max(endMs, usToMs(last.timestampUs + lastDurUs - baseUs));
+      fallbackEndMs = Math.max(fallbackEndMs, usToMs(last.timestampUs + lastDurUs - baseUs));
     }
   }
   blocks.sort((a, b) => a.dtsMs - b.dtsMs || a.trackNumber - b.trackNumber);
+  const declaredEndMs = declaredTimelineEndMs(declaredDurations);
+  const endMs = declaredEndMs ?? fallbackEndMs;
   return { blocks, endMs };
 }
 
@@ -297,6 +353,20 @@ function durationSecToMs(durationSec: number | undefined): number | undefined {
   return durationSec !== undefined && Number.isFinite(durationSec) && durationSec > 0
     ? durationSec * 1000
     : undefined;
+}
+
+function declaredTimelineEndMs(durations: readonly DeclaredTrackDuration[]): number | undefined {
+  if (durations.length === 0) return undefined;
+  let maxEndMs = 0;
+  let maxVideoEndMs = 0;
+  for (const duration of durations) {
+    maxEndMs = Math.max(maxEndMs, duration.endMs);
+    if (duration.mediaType === 'video') maxVideoEndMs = Math.max(maxVideoEndMs, duration.endMs);
+  }
+  if (maxVideoEndMs > 0 && maxEndMs <= maxVideoEndMs + DECLARED_AV_PADDING_SLACK_MS) {
+    return maxVideoEndMs;
+  }
+  return maxEndMs;
 }
 
 /** The gap between the last two presented chunks (µs), a duration estimate for the final chunk; 0 if <2. */
@@ -445,25 +515,42 @@ function tracksElement(tracks: readonly TrackState[]): Uint8Array {
   return element(EBML_ID.Tracks, concatBytes(tracks.map(trackEntryElement)));
 }
 
-/** One `SimpleBlock`: track-number vint + int16 relative timecode + flags(keyframe) + frame bytes. */
-function simpleBlock(block: TimelineBlock, clusterTimeMs: number): Uint8Array {
-  const rel = block.timeMs - clusterTimeMs; // guaranteed in [0, MAX_CLUSTER_REL_MS] by the splitter
+function simpleBlockPayloadLength(block: TimelineBlock): number {
+  return vintBytes(block.trackNumber).length + 2 + 1 + block.data.byteLength;
+}
+
+/** Write one `SimpleBlock`: track-number vint + int16 relative timecode + flags(keyframe) + frame bytes. */
+function writeSimpleBlock(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
+  const rel = block.timeMs - clusterTimeMs;
   const flags = block.key ? 0x80 : 0x00;
-  const payload = concatBytes([vintBytes(block.trackNumber), int16Bytes(rel), [flags], block.data]);
-  return element(EBML_ID.SimpleBlock, payload);
+  const trackNumber = vintBytes(block.trackNumber);
+  const payloadLength = trackNumber.length + 2 + 1 + block.data.byteLength;
+  writer.write(elementHeader(EBML_ID.SimpleBlock, payloadLength));
+  writer.write(trackNumber);
+  writer.write(int16Bytes(rel));
+  writer.write([flags]);
+  writer.write(block.data);
+}
+
+interface ClusterPlan {
+  start: number;
+  end: number;
+  timeMs: number;
+  timecodeElement: Uint8Array;
+  payloadLength: number;
+  totalLength: number;
 }
 
 /**
- * Serialize the **decode**-ordered blocks into one or more `Cluster`s. Blocks are accumulated greedily
+ * Plan the **decode**-ordered blocks into one or more `Cluster`s. Blocks are accumulated greedily
  * while their **presentation**-time span (max−min PTS) fits the signed int16 relative-timecode range (so
  * a long stream never overflows the `SimpleBlock` field, and a reordered B-frame whose PTS dips below a
  * sibling's still encodes a non-negative relative timecode). Each cluster opens with its absolute
- * `Timecode` set to the cluster's **minimum** PTS, so every block's relative timecode is ≥ 0. For a
- * non-reordered stream (decode order == presentation order) the min PTS is the first block's time and
- * this is byte-identical to a presentation-order layout.
+ * `Timecode` set to the cluster's minimum non-negative PTS; small negative priming packets remain legal
+ * signed `SimpleBlock` relatives without moving the visible timeline later.
  */
-function clusterElements(blocks: readonly TimelineBlock[]): Uint8Array {
-  const clusters: Uint8Array[] = [];
+function planClusters(blocks: readonly TimelineBlock[]): ClusterPlan[] {
+  const clusters: ClusterPlan[] = [];
   let i = 0;
   while (i < blocks.length) {
     const start = i;
@@ -480,14 +567,42 @@ function clusterElements(blocks: readonly TimelineBlock[]): Uint8Array {
       maxPts = newMax;
       i++;
     }
-    const body: Uint8Array[] = [uintEl(EBML_ID.Timecode, minPts)];
+    const clusterTimeMs = Math.max(0, minPts);
+    const timecodeElement = uintEl(EBML_ID.Timecode, clusterTimeMs);
+    let payloadLength = timecodeElement.byteLength;
     for (let j = start; j < i; j++) {
       const b = blocks[j];
-      if (b !== undefined) body.push(simpleBlock(b, minPts));
+      if (b !== undefined) {
+        const blockPayloadLength = simpleBlockPayloadLength(b);
+        payloadLength +=
+          idBytes(EBML_ID.SimpleBlock).length +
+          vintBytes(blockPayloadLength).length +
+          blockPayloadLength;
+      }
     }
-    clusters.push(element(EBML_ID.Cluster, concatBytes(body)));
+    clusters.push({
+      start,
+      end: i,
+      timeMs: clusterTimeMs,
+      timecodeElement,
+      payloadLength,
+      totalLength: elementHeader(EBML_ID.Cluster, payloadLength).byteLength + payloadLength,
+    });
   }
-  return concatBytes(clusters);
+  return clusters;
+}
+
+function writeCluster(
+  writer: ByteWriter,
+  blocks: readonly TimelineBlock[],
+  cluster: ClusterPlan,
+): void {
+  writer.write(elementHeader(EBML_ID.Cluster, cluster.payloadLength));
+  writer.write(cluster.timecodeElement);
+  for (let i = cluster.start; i < cluster.end; i++) {
+    const block = blocks[i];
+    if (block !== undefined) writeSimpleBlock(writer, block, cluster.timeMs);
+  }
 }
 
 /** Assemble the full WebM byte stream from finalized tracks (definite sizes throughout). */
@@ -496,30 +611,234 @@ export function writeWebm(tracks: readonly TrackState[], docType: string): Uint8
     tracks.map((t): TrackChunks => {
       const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
       return durationSec !== undefined
-        ? { trackNumber: t.trackNumber, durationSec, chunks: t.chunks }
-        : { trackNumber: t.trackNumber, chunks: t.chunks };
+        ? { trackNumber: t.trackNumber, mediaType: t.mediaType, durationSec, chunks: t.chunks }
+        : { trackNumber: t.trackNumber, mediaType: t.mediaType, chunks: t.chunks };
     }),
   );
-  const segment = element(
-    EBML_ID.Segment,
-    concatBytes([infoElement(endMs), tracksElement(tracks), clusterElements(blocks)]),
+  const header = ebmlHeader(docType);
+  const info = infoElement(endMs);
+  const trackBytes = tracksElement(tracks);
+  const clusters = planClusters(blocks);
+  const clustersLength = clusters.reduce((sum, cluster) => sum + cluster.totalLength, 0);
+  const segmentPayloadLength = info.byteLength + trackBytes.byteLength + clustersLength;
+  const segmentHeader = elementHeader(EBML_ID.Segment, segmentPayloadLength);
+  const writer = new ByteWriter(
+    header.byteLength + segmentHeader.byteLength + segmentPayloadLength,
   );
-  return concatBytes([ebmlHeader(docType), segment]);
+  writer.write(header);
+  writer.write(segmentHeader);
+  writer.write(info);
+  writer.write(trackBytes);
+  for (const cluster of clusters) writeCluster(writer, blocks, cluster);
+  return writer.finish();
+}
+
+// ============ fragmented / CMAF WebM (streaming output, ADR-091) ============
+
+/**
+ * The EBML "unknown size" vint, canonical 8-byte form (`0x01` + seven `0xFF`). A {@link EBML_ID.Segment}
+ * written with this size has no declared length, so its Clusters can be emitted live (the streaming form
+ * MediaRecorder and DASH/CMAF WebM use). The reader ({@link import('./ebml.ts').readVint}) decodes an
+ * all-ones size to `-1` and {@link import('./ebml.ts').elements} then runs the element to EOF — so the
+ * init segment is self-terminating and every later top-level Cluster is a sibling inside the Segment.
+ */
+const SEGMENT_UNKNOWN_SIZE = Uint8Array.from([0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+/**
+ * Default maximum blocks per fragment when no keyframe boundary forces a split sooner — e.g. an audio-only
+ * stream, whose every packet is a sync frame, would otherwise be one unbounded Cluster. 90 mirrors the
+ * MP4 fragmenter's `maxSamplesPerFragment` ({@link import('../mp4/fragment.ts')}), keeping segment sizes
+ * comparable across the two containers. The int16-span bound ({@link MAX_CLUSTER_REL_MS}) still applies.
+ */
+const DEFAULT_MAX_BLOCKS_PER_FRAGMENT = 90;
+
+/** Tuning for {@link planWebmFragments} / {@link fragmentWebm}. */
+export interface WebmFragmentOptions {
+  /** Maximum blocks per fragment before a new Cluster is forced (default {@link DEFAULT_MAX_BLOCKS_PER_FRAGMENT}). */
+  maxBlocksPerFragment?: number;
+}
+
+/** A contiguous half-open block range `[start, end)` forming one fragment (one media-segment Cluster). */
+export interface FragmentRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Partition **decode**-ordered blocks ({@link buildBlockTimeline} output) into fragment ranges — each
+ * becomes one top-level Cluster (a CMAF media segment). A new fragment is opened when, with the current
+ * fragment already non-empty, any of:
+ *   - the next block is a **video keyframe** (so every fragment after the first begins decodable — the
+ *     CMAF rule; blocks are in decode order, so a keyframe's decode-predecessors already sit in the prior
+ *     fragment, audio leading);
+ *   - adding the block would push the fragment's **presentation-time span** (max−min PTS) past
+ *     {@link MAX_CLUSTER_REL_MS} (the signed-int16 `SimpleBlock` relative-timecode bound — identical to
+ *     the non-fragmented {@link planClusters} invariant, so a long stream never overflows the field);
+ *   - the fragment already holds `maxBlocks` blocks (bounds audio-only / keyframe-sparse segments).
+ * The ranges are contiguous and cover every block exactly once (no drop/dup). `videoKeyTrackNumbers` is
+ * the set of track numbers whose keyframe flag means "start a new GOP" (video tracks only — an audio sync
+ * frame is not a fragment boundary, else every audio packet would split).
+ */
+export function planWebmFragments(
+  blocks: readonly TimelineBlock[],
+  videoKeyTrackNumbers: ReadonlySet<number>,
+  opts: WebmFragmentOptions = {},
+): FragmentRange[] {
+  const maxBlocks = Math.max(1, opts.maxBlocksPerFragment ?? DEFAULT_MAX_BLOCKS_PER_FRAGMENT);
+  const ranges: FragmentRange[] = [];
+  let i = 0;
+  while (i < blocks.length) {
+    const start = i;
+    const first = blocks[i];
+    if (first === undefined) break;
+    let minPts = first.timeMs;
+    let maxPts = first.timeMs;
+    i++;
+    while (i < blocks.length) {
+      const b = blocks[i];
+      if (b === undefined) break;
+      const isVideoKey = b.key && videoKeyTrackNumbers.has(b.trackNumber);
+      if (isVideoKey) break; // a new GOP head starts a fresh, independently-decodable fragment
+      const newMin = Math.min(minPts, b.timeMs);
+      const newMax = Math.max(maxPts, b.timeMs);
+      if (newMax - newMin > MAX_CLUSTER_REL_MS) break; // PTS span would overflow int16 → new cluster
+      if (i - start >= maxBlocks) break; // per-fragment cap reached
+      minPts = newMin;
+      maxPts = newMax;
+      i++;
+    }
+    ranges.push({ start, end: i });
+  }
+  return ranges;
+}
+
+/** Serialize one top-level `Cluster` (`Timecode` + the range's `SimpleBlock`s) as a standalone element. */
+function serializeFragmentCluster(
+  blocks: readonly TimelineBlock[],
+  range: FragmentRange,
+): Uint8Array {
+  // Cluster Timecode = the fragment's minimum non-negative PTS; each block's relative timecode is then a
+  // signed int16 (PTS − base), so small negative priming packets stay legal without moving the timeline.
+  let minPts = Number.POSITIVE_INFINITY;
+  for (let i = range.start; i < range.end; i++) {
+    const b = blocks[i];
+    if (b !== undefined && b.timeMs < minPts) minPts = b.timeMs;
+  }
+  const clusterTimeMs = Number.isFinite(minPts) ? Math.max(0, minPts) : 0;
+  const timecodeElement = uintEl(EBML_ID.Timecode, clusterTimeMs);
+
+  let payloadLength = timecodeElement.byteLength;
+  for (let i = range.start; i < range.end; i++) {
+    const b = blocks[i];
+    if (b === undefined) continue;
+    const blockPayloadLength = simpleBlockPayloadLength(b);
+    payloadLength +=
+      idBytes(EBML_ID.SimpleBlock).length +
+      vintBytes(blockPayloadLength).length +
+      blockPayloadLength;
+  }
+
+  const clusterHeader = elementHeader(EBML_ID.Cluster, payloadLength);
+  const writer = new ByteWriter(clusterHeader.byteLength + payloadLength);
+  writer.write(clusterHeader);
+  writer.write(timecodeElement);
+  for (let i = range.start; i < range.end; i++) {
+    const b = blocks[i];
+    if (b !== undefined) writeSimpleBlock(writer, b, clusterTimeMs);
+  }
+  return writer.finish();
+}
+
+/**
+ * The init segment for a streaming WebM: the EBML Header, then the `Segment` element header with an
+ * **unknown size** ({@link SEGMENT_UNKNOWN_SIZE}), then `Info` + `Tracks`. The Clusters that follow are
+ * Segment children emitted live. `Info` keeps a `Duration` here because the whole input is buffered by the
+ * EncodedChunk seam before `finalize`, so the value is known — and it remains a valid streamable file (a
+ * pure live recorder would omit it; including a known duration is strictly better for consumers).
+ */
+function webmInitSegment(
+  tracks: readonly TrackState[],
+  docType: string,
+  endMs: number,
+): Uint8Array {
+  const header = ebmlHeader(docType);
+  const info = infoElement(endMs);
+  const trackBytes = tracksElement(tracks);
+  const out = new Uint8Array(
+    header.byteLength +
+      idBytes(EBML_ID.Segment).length +
+      SEGMENT_UNKNOWN_SIZE.byteLength +
+      info.byteLength +
+      trackBytes.byteLength,
+  );
+  let off = 0;
+  out.set(header, off);
+  off += header.byteLength;
+  const segId = idBytes(EBML_ID.Segment);
+  out.set(segId, off);
+  off += segId.length;
+  out.set(SEGMENT_UNKNOWN_SIZE, off);
+  off += SEGMENT_UNKNOWN_SIZE.byteLength;
+  out.set(info, off);
+  off += info.byteLength;
+  out.set(trackBytes, off);
+  return out;
+}
+
+/**
+ * Stream a fragmented/CMAF WebM as a sequence of byte chunks: first the **init segment** (EBML Header +
+ * unknown-size `Segment` header + `Info` + `Tracks`), then one **media segment** — a complete top-level
+ * `Cluster` — per fragment ({@link planWebmFragments}). Yielding incrementally keeps peak **output** memory
+ * bounded to a single Cluster (the streaming-target guarantee, doc 09 streaming-output): the muxer's
+ * `finalize` enqueues each yielded chunk straight to the readable, so a {@link import('../../sinks/stream-target.ts').StreamTarget}
+ * writes each segment as it is produced. The block timeline (decode order, t=0 rebasing, B-frame/priming
+ * handling) is the **same** {@link buildBlockTimeline} the non-fragmented path uses — only the on-disk box
+ * layout (live Clusters vs one length-prefixed Segment) differs.
+ */
+export function* fragmentWebm(
+  tracks: readonly TrackState[],
+  docType: string,
+  opts: WebmFragmentOptions = {},
+): Generator<Uint8Array, void, undefined> {
+  const { blocks, endMs } = buildBlockTimeline(
+    tracks.map((t): TrackChunks => {
+      const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
+      return durationSec !== undefined
+        ? { trackNumber: t.trackNumber, mediaType: t.mediaType, durationSec, chunks: t.chunks }
+        : { trackNumber: t.trackNumber, mediaType: t.mediaType, chunks: t.chunks };
+    }),
+  );
+  const videoKeyTrackNumbers = new Set<number>(
+    tracks.filter((t) => t.mediaType === 'video').map((t) => t.trackNumber),
+  );
+
+  yield webmInitSegment(tracks, docType, endMs);
+
+  for (const range of planWebmFragments(blocks, videoKeyTrackNumbers, opts)) {
+    if (range.end > range.start) yield serializeFragmentCluster(blocks, range);
+  }
 }
 
 // ============ the Muxer adapter ============
 
 /**
- * `Muxer` over {@link writeWebm}: buffers each track's packets and serializes the whole WebM on
+ * `Muxer` over the EBML byte writer: buffers each track's packets and serializes the WebM on
  * {@link finalize}, emitting it on {@link output}. Single-shot — `addTrack`/`write` after `finalize`, and
- * a second `finalize`, are typed misuse (`mux-error`). `output` carries the finalized bytes (one chunk)
- * and is `error()`d if finalization fails, so failures surface on the reader (mirrors {@link Mp4Muxer}).
+ * a second `finalize`, are typed misuse (`mux-error`). `output` is `error()`d if finalization fails, so
+ * failures surface on the reader (mirrors {@link Mp4Muxer}).
+ *
+ * Two on-disk layouts (ADR-091): the default emits one length-prefixed `Segment` ({@link writeWebm}) as a
+ * single `output` chunk (fully seekable, faststart-like). `{ fragmented: true }` instead streams a CMAF
+ * WebM — an init segment then one live top-level `Cluster` per fragment ({@link fragmentWebm}), each
+ * enqueued separately so a {@link import('../../sinks/stream-target.ts').StreamTarget} writes incrementally
+ * and peak **output** memory stays bounded to a single Cluster.
  */
 export class WebmMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
 
   readonly #tracks = new Map<number, TrackState>();
   readonly #docType: string;
+  readonly #fragmented: boolean;
   #nextTrackNumber = 1;
   #finalized = false;
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -527,12 +846,9 @@ export class WebmMuxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions, docType = 'webm') {
-    if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'fragmented/CMAF webm mux is not supported', {
-        op: { op: 'mux', fragmented: true },
-        tried: ['webm'],
-      });
-    }
+    // Fragmented/CMAF output (ADR-091): finalize emits an init segment + one Cluster per fragment via
+    // {@link fragmentWebm}, instead of the single length-prefixed Segment from {@link writeWebm}.
+    this.#fragmented = options?.fragmented === true;
     this.#docType = docType;
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
@@ -598,7 +914,12 @@ export class WebmMuxer implements Muxer {
     }
     try {
       const tracks = this.#buildTracks();
-      controller.enqueue(writeWebm(tracks, this.#docType));
+      if (this.#fragmented) {
+        // Stream the init segment then one top-level Cluster per fragment (bounded output memory, ADR-091).
+        for (const segment of fragmentWebm(tracks, this.#docType)) controller.enqueue(segment);
+      } else {
+        controller.enqueue(writeWebm(tracks, this.#docType));
+      }
       controller.close();
     } catch (err) {
       controller.error(err);

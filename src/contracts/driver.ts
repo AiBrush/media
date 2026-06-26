@@ -11,7 +11,8 @@
  */
 
 import type { BiquadSpec } from '../dsp/biquad.ts';
-import type { LimitMode } from '../dsp/dynamics.ts';
+import type { DynamicsSpec, LimitMode } from '../dsp/dynamics.ts';
+import type { FadeShape } from '../dsp/fade.ts';
 import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 
 // ============ versioning ============
@@ -256,6 +257,13 @@ export interface PcmTransform extends StageOptions {
   fade?: PcmFade;
   dynamics?: PcmDynamics;
   biquad?: PcmBiquad | readonly PcmBiquad[];
+  /**
+   * Sample-accurate time-range cut applied **first**, in the source's own sample rate, before any
+   * gain/fade/remix/resample (ADR-021 trim via the PCM-native path). `[startSec, endSec)` is clamped to the
+   * buffer; PCM has no inter-frame dependency, so a raw-PCM container (WAV/AIFF/CAF) trims losslessly by
+   * slicing samples — no codec seam, frame-exact, and Node-validatable. Absent ⇒ no cut (a full transform).
+   */
+  timeBounds?: { readonly startSec: number; readonly endSec: number };
 }
 
 /** Options for a driver-native decrypt (CENC / HLS sample decryption), ADR-023. */
@@ -322,7 +330,18 @@ export type FilterSpec =
   | { mediaType: 'video'; type: 'tonemap'; to: 'sdr' }
   | { mediaType: 'audio'; type: 'resample'; sampleRate: number }
   | { mediaType: 'audio'; type: 'remix'; channels: number }
-  | { mediaType: 'audio'; type: 'gain'; db: number };
+  | { mediaType: 'audio'; type: 'gain'; db: number }
+  // ── stream-stateful audio variants (codec seam; ADR — lossy-seam audio filter) ──────────────────
+  // These three carry state across `AudioData` chunk boundaries (fade tail look-ahead, persisted biquad
+  // registers, a whole-signal normalize buffer), so fade/dynamics/biquad work BEFORE a lossy encode and
+  // not only on the PCM-native `transformPcm` path. Each carries the **resolved** kernel inputs (frame
+  // counts / coefficients / dBFS targets) so the spec is self-describing and pure to plan & validate.
+  /** Sample-accurate fade-in/out at resolved source-rate frame counts; a duration-aware streaming stage. */
+  | { mediaType: 'audio'; type: 'fade'; curve: FadeShape; inFrames: number; outFrames: number }
+  /** One RBJ biquad (DF2T) whose state persists across chunks (chunked == single-call, bit-exact). */
+  | { mediaType: 'audio'; type: 'biquad'; spec: BiquadSpec }
+  /** Normalize (global peak/RMS) and/or limit; normalize buffers the decoded audio (inherently non-causal). */
+  | { mediaType: 'audio'; type: 'dynamics'; dynamics: DynamicsSpec };
 
 /** The substrate a filter runs on; the router ranks WebGPU → WebGL → Canvas2D → native → WASM. */
 export type FilterSubstrate = 'webgpu' | 'webgl' | 'canvas2d' | 'native' | 'wasm';

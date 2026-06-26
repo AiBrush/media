@@ -13,10 +13,16 @@ describe('registerDefaultDrivers', () => {
     );
   });
 
-  it('keeps core-less video wasm scaffolds out of zero-config defaults', () => {
+  it('registers the real software video-decode wasm tails (AV1/VPx) now that their cores are vendored', () => {
+    // AV1 (dav1d, ADR-093) and VP8/VP9 (ogv.js libvpx, ADR-094) ship vendored prebuilt cores and are
+    // registered as miss-only fallbacks — they are no longer core-less scaffolds. They still `supports()`
+    // →false in Node (no WebCodecs `VideoFrame` seam); registration just makes the tail available so a
+    // browser WebCodecs miss can lazy-load the wasm.
     const reg = new Registry();
     registerDefaultDrivers(reg);
 
-    expect(reg.codecs().map((d) => d.id)).not.toContain('wasm-av1');
+    const ids = reg.codecs().map((d) => d.id);
+    expect(ids).toContain('wasm-av1');
+    expect(ids).toContain('wasm-vpx');
   });
 });

@@ -3,14 +3,15 @@
  * parsing + the 32-config frame-size table (golden values straight from the spec), encoder re-chunking
  * math + the {@link FrameAccumulator}, planar↔interleaved f32 round-trips, OpusHead pre-skip extraction,
  * and config validation/normalization. WebCodecs (`AudioData`/`EncodedAudioChunk`) is **absent in Node
- * and must not be mocked** (ADR-018/ADR-025) — the libopus-in-wasm decode/encode is validated in-browser
- * once the core is vendored (`BUILD.md`). Here we also assert the **honest wasm-absence** behavior: with
- * no vendored core, `supports()` answers `false` (never throws) and the coders raise a typed
- * `CapabilityError`. Every assertion is falsifiable — no oracle that cannot fail (directive 6).
+ * and must not be mocked** (ADR-018/ADR-025) — the full driver *stream* decode/encode is validated
+ * in-browser / in `wasm-opus-encode.test.ts`. The libopus core is now **vendored** (a prebuilt MIT
+ * `libopus-wasm`, ADR-088) and runs in Node, so here we also drive the {@link OpusWasmCore} facade
+ * directly to prove a real PCM→Opus→PCM round-trip, and assert that `supports()` is still an honest
+ * Node miss (WebCodecs seam absent) — never throws. Every assertion is falsifiable (directive 6).
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { MediaError } from '../../contracts/errors.ts';
 import {
   DEFAULT_FRAME_MS,
   FrameAccumulator,
@@ -441,23 +442,27 @@ describe('decodedSamplesAtRate — packet duration rescaled to the output rate',
   });
 });
 
-describe('supports() / coders — honest when the wasm core is absent (Node has no vendored core)', () => {
+describe('supports() / coders — vendored libopus core present; Node still gates on WebCodecs (ADR-088)', () => {
   afterEach(() => {
     resetOpusCoreForTest();
   });
 
-  it('loadOpusCore resolves to null when the artifact is not vendored', async () => {
-    expect(await loadOpusCore()).toBeNull();
+  it('loadOpusCore resolves to a real core now that the prebuilt artifact is vendored', async () => {
+    const core = await loadOpusCore();
+    expect(core).not.toBeNull();
+    expect(typeof core?.createDecoder).toBe('function');
+    expect(typeof core?.createEncoder).toBe('function');
   });
 
-  it('returns false (never throws) for an Opus decode query when the core is absent', async () => {
+  it('returns false (never throws) for an Opus decode query in Node (WebCodecs AudioData absent)', async () => {
     const s = await WasmOpusDriver.supports({
       mediaType: 'audio',
       direction: 'decode',
       config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
     });
+    // The core IS vendored, so the only honest Node miss is the absent WebCodecs seam type.
     expect(s.supported).toBe(false);
-    expect(s.reason).toMatch(/core/);
+    expect(s.reason).toMatch(/WebCodecs|AudioData/);
   });
 
   it('returns false for a non-Opus query without consulting the core', async () => {
@@ -515,26 +520,43 @@ describe('supports() / coders — honest when the wasm core is absent (Node has 
     ).toThrow(/aborted/);
   });
 
-  // When (mis)routed in Node despite supports()=false, building a valid coder succeeds up to the point
-  // the stream is pumped; the first read drives `start`, which loads the (absent) core and errors with a
-  // typed CapabilityError. This proves the "miss-only, honest absence → CapabilityError" contract.
-  it('a pumped decoder errors with CapabilityError when the core is absent', async () => {
-    resetOpusCoreForTest();
-    const ts = WasmOpusDriver.createDecoder({
-      codec: 'opus',
+  // The vendored core is real and runs in Node: build it directly through the OpusWasmCore facade and
+  // prove a PCM frame → Opus packet → PCM round-trips (the lossy CELT/SILK math the wasm supplies). This
+  // is a stronger, falsifiable check than the old "core absent → CapabilityError" — a broken/absent core
+  // would throw here, and a fake passthrough would not produce a valid Opus packet the decoder accepts.
+  // (The driver's `createDecoder`/`createEncoder` stream wrappers themselves need WebCodecs `AudioData`/
+  // `EncodedAudioChunk`, so the END-TO-END stream path is validated in `wasm-opus-encode.test.ts` /
+  // the browser harness; here we exercise the core contract the driver loads.)
+  it('the vendored libopus core round-trips a PCM frame → Opus → PCM (real lossy codec, not a stub)', async () => {
+    const core = await loadOpusCore();
+    expect(core).not.toBeNull();
+    if (!core) return;
+    const frameSamples = 960; // 20 ms @ 48 kHz
+    const encoder = await core.createEncoder({
       sampleRate: 48_000,
-      numberOfChannels: 2,
+      channels: 1,
+      bitrate: 96_000,
+      frameMs: 20,
+      frameSamples,
     });
-    await expect(ts.readable.getReader().read()).rejects.toBeInstanceOf(CapabilityError);
-  });
-
-  it('a pumped encoder errors with CapabilityError when the core is absent', async () => {
-    resetOpusCoreForTest();
-    const ts = WasmOpusDriver.createEncoder({
-      codec: 'opus',
-      sampleRate: 48_000,
-      numberOfChannels: 2,
-    });
-    await expect(ts.readable.getReader().read()).rejects.toBeInstanceOf(CapabilityError);
+    const decoder = await core.createDecoder({ sampleRate: 48_000, channels: 1, preSkip: 0 });
+    try {
+      const pcm = new Float32Array(frameSamples);
+      for (let i = 0; i < frameSamples; i++)
+        pcm[i] = 0.4 * Math.sin((2 * Math.PI * 440 * i) / 48_000);
+      const packet = encoder.encode(pcm);
+      // A real Opus packet: non-empty, and its TOC parses to a 48 kHz frame size.
+      expect(packet.byteLength).toBeGreaterThan(0);
+      expect(typeof encoder.preSkip()).toBe('number');
+      const decoded = decoder.decode(packet, frameSamples);
+      expect(decoded.length).toBe(frameSamples);
+      // The decoded frame carries real signal energy (a stub/silence passthrough would be ~0).
+      let energy = 0;
+      for (const s of decoded) energy += s * s;
+      expect(energy).toBeGreaterThan(0.1);
+    } finally {
+      encoder.free();
+      decoder.free();
+    }
   });
 });

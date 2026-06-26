@@ -5,8 +5,8 @@
  * them as WebCodecs-native `EncodedVideoChunk`/`EncodedAudioChunk` in decode order, browser-gated exactly
  * like {@link import('../mp4/mp4-driver.ts')} `packetStream` (the `Encoded*Chunk` constructors only exist
  * in a browser/worker). `streamCopy` remuxes/trims the parsed H.264/AAC access units directly through the
- * TS writer, so same-container remux/trim stays pure TS and preserves PES PTS/DTS. A transport stream has
- * no front index, so the whole (bounded) segment is read.
+ * TS writer, so same-container remux stays pure TS and preserves PES PTS/DTS while trim emits a clip-local
+ * timeline. A transport stream has no front index, so the whole (bounded) segment is read.
  */
 
 import type {
@@ -191,7 +191,10 @@ function selectTrimmedUnits(
   let endExclusive = units.length;
   for (let index = startIndex; index < units.length; index += 1) {
     const unit = units[index];
-    if (unit !== undefined && unit.dtsUs - originUs >= trim.endUs) {
+    if (
+      unit !== undefined &&
+      unit.ptsUs - originUs + estimateDurationUs(units, index) > trim.endUs
+    ) {
       endExclusive = index;
       break;
     }
@@ -210,6 +213,19 @@ function selectedTracks(parsed: TsParse, trim: NormalizedTrimRange | undefined):
   }));
 }
 
+function selectedTimestampBaseUs(selections: readonly SelectedTrack[]): number {
+  let timestampBaseUs = Number.POSITIVE_INFINITY;
+  for (const selection of selections) {
+    for (const unit of selection.units) {
+      timestampBaseUs = Math.min(timestampBaseUs, unit.ptsUs, unit.dtsUs);
+    }
+  }
+  if (!Number.isFinite(timestampBaseUs)) {
+    throw new MediaError('mux-error', 'MPEG-TS stream-copy selected no timed access units.');
+  }
+  return timestampBaseUs;
+}
+
 async function streamCopyParsed(
   parsed: TsParse,
   options: StreamCopyOptions | undefined,
@@ -226,6 +242,7 @@ async function streamCopyParsed(
       trim: options?.trim,
     });
   }
+  const timestampBaseUs = trim === undefined ? 0 : selectedTimestampBaseUs(selections);
 
   const muxTrackIds = selections.map((selection, index) =>
     muxer.addTrack(toTrackInfo(selection.track, index)),
@@ -243,8 +260,8 @@ async function streamCopyParsed(
       assertNotAborted(options?.signal);
       muxer.addChunkStruct(muxTrackId, {
         data: unit.data,
-        timestampUs: unit.ptsUs,
-        dtsUs: unit.dtsUs,
+        timestampUs: unit.ptsUs - timestampBaseUs,
+        dtsUs: unit.dtsUs - timestampBaseUs,
         key: unit.keyframe,
       });
     }

@@ -240,16 +240,40 @@ describe('wasm-av1 driver identity and honest absence', () => {
     expect(hasVideoFrameSeam()).toBe(false);
   });
 
-  it('does not find or load a dav1d core when artifacts are absent', async () => {
-    expect(await probeAv1Core()).toBe(false);
-    await expect(
-      loadAv1Core({
-        kind: 'baseline',
-        simd: false,
-        threads: false,
-        sharedArrayBuffer: false,
+  it('finds and loads the vendored dav1d core (artifacts present, ADR-093)', async () => {
+    // The dav1d.js core (BSD/CC0) is now vendored, so the glue probe + load succeed and yield the facade.
+    expect(await probeAv1Core()).toBe(true);
+    const core = await loadAv1Core({
+      kind: 'baseline',
+      simd: false,
+      threads: false,
+      sharedArrayBuffer: false,
+    });
+    expect(core).not.toBeNull();
+    expect(typeof core?.createDecoder).toBe('function');
+    // Honest capability gate: 8-bit 4:2:0 is supported; 10-bit is declined (this build is 8-bit-only).
+    expect(
+      core?.supports?.({
+        codec: 'av1',
+        profile: 0,
+        level: 0,
+        tier: 'main',
+        bitDepth: 8,
+        monochrome: false,
+        chromaSubsampling: '420',
       }),
-    ).resolves.toBeNull();
+    ).toBe(true);
+    expect(
+      core?.supports?.({
+        codec: 'av1',
+        profile: 0,
+        level: 0,
+        tier: 'main',
+        bitDepth: 10,
+        monochrome: false,
+        chromaSubsampling: '420',
+      }),
+    ).toBe(false);
   });
 
   it('supports() returns false in Node before any core load', async () => {

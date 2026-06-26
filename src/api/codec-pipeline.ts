@@ -11,13 +11,7 @@
  * independently testable, so it is factored out behind small pure functions rather than inlined.
  */
 
-import type {
-  EncodedChunk,
-  FilterSpec,
-  Packet,
-  PcmContainer,
-  TrackInfo,
-} from '../contracts/driver.ts';
+import type { EncodedChunk, Packet, PcmContainer, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type {
@@ -33,15 +27,27 @@ import type {
 
 /**
  * Container tokens with a working EncodedChunk-seam `Muxer` (`createMuxer` returns a real muxer, not a
- * typed mux miss): MP4/MOV (`writeMp4`), WebM/MKV (`ebml-write`), Ogg (`ogg-write`), and MPEG-TS
- * (`ts-write`, H.264/AAC only). The raw-PCM containers (WAV/AIFF/CAF) go through the audio-dsp
- * `transformPcm` path instead (ADR-022), and the elementary-stream containers (MP3/ADTS/FLAC) expose a
- * typed mux miss for now — so a codec-seam convert/encode/remux targeting any of those surfaces an honest
- * miss rather than pretend. This mirrors the registered muxers' own truth; an illegal codec-in-container
- * is still rejected by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this
- * set never over-claims.
+ * typed mux miss): MP4/MOV (`writeMp4`), WebM/MKV (`ebml-write`), Ogg (`ogg-write`), MPEG-TS (`ts-write`,
+ * H.264/AAC only), native FLAC (`FlacMuxer`, fed by the pure-TS FLAC encode codec driver, ADR-085), and
+ * MP3 (`Mp3Muxer` — a bare concatenation of MPEG Layer III frames), and ADTS (`AdtsMuxer` — raw AAC access
+ * units each wrapped in a 7-byte ADTS header), both fed by a remux or the codec encode driver. The raw-PCM
+ * containers (WAV/AIFF/CAF) go through the audio-dsp `transformPcm` path instead (ADR-022) and stay a typed
+ * mux miss here — so a codec-seam convert/encode/remux targeting one of those surfaces an honest miss rather
+ * than pretend. This mirrors the registered muxers' own truth; an illegal codec-in-container is still
+ * rejected by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this set never
+ * over-claims.
  */
-const CODEC_MUX_CONTAINERS = new Set<Container>(['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts']);
+const CODEC_MUX_CONTAINERS = new Set<Container>([
+  'mp4',
+  'mov',
+  'webm',
+  'mkv',
+  'ogg',
+  'ts',
+  'flac',
+  'mp3',
+  'adts',
+]);
 
 /** True when {@link container} has a working EncodedChunk-seam muxer. */
 export function containerHasChunkMuxer(container: Container): boolean {
@@ -226,6 +232,15 @@ const H264_DEFAULT_FPS = 30;
 const H264_TOP_LEVEL_IDC = 0x3e;
 
 /**
+ * Browser-interoperability floor for H.264 *encode* codec strings. Ultra-low legal levels (L1.0–L1.3)
+ * are enough for tiny 320×180/1×1 streams on paper, but Chromium 149 accepted such WebCodecs encodes
+ * and then failed to seek-decode the resulting MP4 through `<video>`. L3.0 is the common SD floor used
+ * by browser-oriented encoders; it is still a truthful upper-bound for smaller streams and avoids the
+ * low-level platform seek failure without inflating larger outputs.
+ */
+const H264_BROWSER_PLAYBACK_MIN_LEVEL_IDC = 0x1e;
+
+/**
  * The MINIMUM H.264 `level_idc` byte that can encode `width`×`height` at `fps` — the smallest Annex-A
  * level whose MaxFS covers the frame's macroblock count AND whose MaxMBPS covers macroblocks/second
  * (fps defaults to {@link H264_DEFAULT_FPS} when unknown). Falls back to the top level (6.2) for an
@@ -251,15 +266,20 @@ export function h264LevelIdcForDimensions(
 /**
  * The H.264 Constrained-Baseline WebCodecs codec string sized to `width`×`height`@`fps`:
  * `avc1.42E0<LL>` where `42` = Baseline profile_idc, `E0` = the constraint-set flags pinning Constrained
- * Baseline, and `<LL>` = the {@link h264LevelIdcForDimensions} level byte (two-hex, upper-case). This
- * replaces the static `avc1.42E01E` so a 1080p/4K encode advertises a level the UA can actually accept.
+ * Baseline, and `<LL>` = the browser-facing encode level byte (two-hex, upper-case): the Annex-A minimum
+ * from {@link h264LevelIdcForDimensions}, floored at L3.0 for Chromium platform seek compatibility on
+ * tiny MP4 outputs. This replaces the old static `avc1.42E01E` for larger outputs so a 1080p/4K encode
+ * still advertises a level the UA can actually accept.
  */
 export function h264CodecStringForDimensions(
   width: number,
   height: number,
   fps: number | undefined,
 ): string {
-  const idc = h264LevelIdcForDimensions(width, height, fps);
+  const idc = Math.max(
+    H264_BROWSER_PLAYBACK_MIN_LEVEL_IDC,
+    h264LevelIdcForDimensions(width, height, fps),
+  );
   return `avc1.42E0${idc.toString(16).toUpperCase().padStart(2, '0')}`;
 }
 
@@ -525,66 +545,11 @@ export interface SourceGeometry {
   height: number | undefined;
 }
 
-/**
- * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → rotate →
- * flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
- * selects a source sub-rect first, then resize scales it to the requested output, then orientation, then
- * full-frame colour conversion. A `resize` is emitted when width/height are given (or implied by a
- * non-identity `fit` against known source dims); `rotate`/`flip` pass straight through. Pure: every spec
- * is a plain object, so the whole chain is Node-validated; the GPU substrate that runs it is
- * browser-only. Empty array ⇒ no filters (the decode→encode is direct).
- */
-export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): FilterSpec[] {
-  const specs: FilterSpec[] = [];
-  if (target.crop) {
-    const { x, y, width, height } = target.crop;
-    if (width <= 0 || height <= 0) {
-      throw new InputError('unsupported-input', `crop ${width}x${height} must be positive`);
-    }
-    specs.push({ mediaType: 'video', type: 'crop', x, y, width, height });
-  }
-  if (target.width !== undefined || target.height !== undefined) {
-    const width = target.width ?? src.width;
-    const height = target.height ?? src.height;
-    if (width === undefined || height === undefined) {
-      throw new InputError(
-        'unsupported-input',
-        'resize needs both width and height (source dimensions are unknown; pass both)',
-      );
-    }
-    if (width <= 0 || height <= 0) {
-      throw new InputError('unsupported-input', `resize ${width}x${height} must be positive`);
-    }
-    specs.push({
-      mediaType: 'video',
-      type: 'resize',
-      width,
-      height,
-      ...(target.fit !== undefined ? { fit: target.fit } : {}),
-    });
-  }
-  if (target.rotate !== undefined && target.rotate !== 0) {
-    specs.push({ mediaType: 'video', type: 'rotate', degrees: target.rotate });
-  }
-  if (target.flip !== undefined) {
-    specs.push({ mediaType: 'video', type: 'flip', axis: target.flip });
-  }
-  if (target.colorspace !== undefined) {
-    const to = target.colorspace.to.trim();
-    if (to.length === 0) {
-      throw new InputError('unsupported-input', 'colorspace target must be a non-empty string');
-    }
-    specs.push({ mediaType: 'video', type: 'colorspace', to });
-  }
-  if (target.tonemap !== undefined) {
-    const to = (target.tonemap as { to?: unknown }).to;
-    if (to !== 'sdr') {
-      throw new InputError('unsupported-input', `tonemap target '${String(to)}' is not supported`);
-    }
-    specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
-  }
-  return specs;
-}
+// `videoFilterSpecs` (the crop→resize→rotate→flip→colorspace→tonemap GPU spec builder) lives in
+// `./video-stream-plan.ts`, reached ONLY via the engine's lazy `import()` on the convert-with-video-filter
+// path. It was split out of this (statically-imported) module so the video-spec code stays OUT of the eager
+// kernel closure (doc 08 §7). The geometry math an eager encode touches — {@link outputDimensions} +
+// {@link SourceGeometry} — stays here (the video module imports the type only).
 
 /**
  * The output frame dimensions after a filter chain, given the source coded dims — needed to size the
@@ -616,72 +581,10 @@ export function outputDimensions(
 
 // ============ audio filter chain (AudioTarget → ordered FilterSpec[]) ============
 
-/** Source audio layout an audio filter chain is planned against (the decoded track's rate/channels). */
-export interface SourceAudio {
-  sampleRate: number | undefined;
-  channels: number | undefined;
-}
-
-/**
- * Build the ordered audio {@link FilterSpec} chain for an {@link AudioTarget} re-encode: **gain →
- * remix → resample**, each emitted only when it is not a no-op. The order mirrors the PCM path
- * (`transformPcm` does gain → remix → resample): scale samples in the source layout, remix to the target
- * channel layout, then resample on that layout. These run as `AudioData→AudioData` stages (the audio-dsp
- * filter driver) on the decoded stream BEFORE the encoder, so the `AudioData` fed in matches the
- * encoder's configured `numberOfChannels`/`sampleRate` exactly — otherwise the `AudioEncoder` rejects a
- * buffer whose channel count differs from its config (the stereo→mono transcode bug). Empty array ⇒ the
- * decoded stream feeds the encoder unchanged. Pure: every spec is a plain object, so the chain is
- * Node-validated; the GPU/WebCodecs substrate that runs it is browser-only.
- */
-export function audioFilterSpecs(target: AudioTarget, src: SourceAudio): FilterSpec[] {
-  const specs: FilterSpec[] = [];
-  if (target.fade !== undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      'audio fade is currently available only on the PCM-native transform path',
-      { op: 'filter', tried: [] },
-    );
-  }
-  if (target.biquad !== undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      'audio biquad/EQ is currently available only on the PCM-native transform path',
-      { op: 'filter', tried: [] },
-    );
-  }
-  if (target.dynamics !== undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      'audio dynamics are currently available only on the PCM-native transform path',
-      { op: 'filter', tried: [] },
-    );
-  }
-  if (target.gainDb !== undefined) {
-    if (!Number.isFinite(target.gainDb)) {
-      throw new InputError('unsupported-input', `audio gain ${target.gainDb} dB must be finite`);
-    }
-    if (target.gainDb !== 0) specs.push({ mediaType: 'audio', type: 'gain', db: target.gainDb });
-  }
-  if (target.channels !== undefined && target.channels !== src.channels) {
-    if (target.channels <= 0 || !Number.isInteger(target.channels)) {
-      throw new InputError(
-        'unsupported-input',
-        `audio channel count ${target.channels} must be a positive integer`,
-      );
-    }
-    specs.push({ mediaType: 'audio', type: 'remix', channels: target.channels });
-  }
-  if (target.sampleRate !== undefined && target.sampleRate !== src.sampleRate) {
-    if (target.sampleRate <= 0 || !Number.isInteger(target.sampleRate)) {
-      throw new InputError(
-        'unsupported-input',
-        `audio sample rate ${target.sampleRate} must be a positive integer`,
-      );
-    }
-    specs.push({ mediaType: 'audio', type: 'resample', sampleRate: target.sampleRate });
-  }
-  return specs;
-}
+// `audioFilterSpecs` + its exclusive helpers (`fadeFramesAt`/`fadeCurve`/`resolveDynamics`) and the
+// `SourceAudio` type live in `./audio-stream-plan.ts`, reached ONLY via the engine's lazy `import()` on the
+// convert-with-lossy-audio-filter path. They were split out of this (statically-imported) module so the
+// audio-spec code + its audio-dsp type imports stay OUT of the eager kernel closure (doc 08 §7 budget).
 
 // ============ encoder configs (public target → WebCodecs *EncoderConfig) ============
 
