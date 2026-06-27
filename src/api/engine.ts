@@ -17,6 +17,7 @@ import type {
   CodecQuery,
   ContainerDriver,
   ContainerQuery,
+  Demuxer,
   Determinism,
   DriverModule,
   EncodedChunk,
@@ -57,21 +58,13 @@ import {
 } from '../sources/source.ts';
 import { createMediaChain } from './chain.ts';
 import {
-  audioTrackInfoFromDecoderConfig,
-  buildAudioEncoderConfig,
-  buildVideoEncoderConfig,
   chooseOutputContainer,
   containerHasChunkMuxer,
-  drainEncoderToMuxer,
   hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
-  normalizeDecoderCodec,
-  seekFrame,
   selectTrackInfos,
-  unwrapPackets,
-  videoTrackInfoFromDecoderConfig,
-} from './codec-pipeline.ts';
+} from './codec-routing.ts';
 // Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
 // routines are reached only through lazy `import()`s on an eligible `to:'flac'`/raw-PCM convert. The
 // engine's `#authoringDeps()` returns the `PcmConvertDeps` superset, which also satisfies the FLAC route's
@@ -142,6 +135,11 @@ export interface MediaEngine {
 
 const HEAD_BYTES = 64 * 1024;
 const INVALID_MUX_PACKET_STREAM = 'invalid mux packet stream';
+type CodecPipelineModule = typeof import('./codec-pipeline.ts');
+
+function loadCodecPipeline(): Promise<CodecPipelineModule> {
+  return import('./codec-pipeline.ts');
+}
 
 /**
  * Output-size ceiling for the **buffer-all** EncodedChunk-seam mux path (cross-container remux): the
@@ -292,6 +290,8 @@ export class MediaEngineImpl implements MediaEngine {
           container: opts.to,
           ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
           ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
+          ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
+          ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
         });
         return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
       }
@@ -458,14 +458,16 @@ export class MediaEngineImpl implements MediaEngine {
         // only the packets from the keyframe at/before the target onward (a stream must decode from a
         // keyframe); seekFrame drops frames before the target, closes them, and returns the first at/after
         // it (owned by the caller). The demuxer is closed on every exit by the finally.
-        const codec = await this.#routeCodec(decodeQueryFor(track), o);
+        const codec = await this.#routeCodec(await decodeQueryFor(track), o);
+        const { seekFrame, unwrapPackets } = await loadCodecPipeline();
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
         const fromKeyframe = await startAtSeekKeyframe(
           unwrapPackets(demuxer.packets(track.id)),
           timeUs,
         );
+        const config = await decodeConfigOf(track);
         const out = fromKeyframe.pipeThrough(
-          codec.createDecoder(decodeConfigOf(track), stage),
+          codec.createDecoder(config, stage),
         ) as ReadableStream<VideoFrame>;
         return await seekFrame(out, timeUs);
         /* v8 ignore stop */
@@ -497,6 +499,7 @@ export class MediaEngineImpl implements MediaEngine {
       let drainsStarted = false;
       try {
         const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+        const { drainEncoderToMuxer } = await loadCodecPipeline();
         const tasks = inputs.map((input) =>
           drainEncoderToMuxer(input.packets, muxer, () => input.track),
         );
@@ -763,10 +766,13 @@ export class MediaEngineImpl implements MediaEngine {
       const audio = await container.decodePcmAudio(src, stage);
       return pcmAudioToAudioDataStream(audio, stage, track.codec) as ReadableStream<RawFrameOf<M>>;
     }
-    const codec = await this.#routeCodec(decodeQueryFor(track), { strategy: stageStrategy(stage) });
+    const codec = await this.#routeCodec(await decodeQueryFor(track), {
+      strategy: stageStrategy(stage),
+    });
+    const { unwrapPackets } = await loadCodecPipeline();
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
     /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
-    const decoder = codec.createDecoder(decodeConfigOf(track), stage);
+    const decoder = codec.createDecoder(await decodeConfigOf(track), stage);
     // The demuxer stays open for the life of the packet stream; closing it is a no-op for the mp4 driver
     // (range-backed), so the frame stream owns no teardown beyond the decoder's own abort listener. The
     // track's mediaType matches `M`, so the decoder's RawFrame output is the corresponding frame type.
@@ -774,6 +780,20 @@ export class MediaEngineImpl implements MediaEngine {
       RawFrameOf<M>
     >;
     /* v8 ignore stop */
+  }
+
+  async #decodeAudioTrackPackets(
+    demuxer: Demuxer,
+    track: TrackInfo,
+    stage: StageOptions,
+    o: CallOptions,
+  ): Promise<ReadableStream<AudioData>> {
+    const codec = await this.#routeCodec(await decodeQueryFor(track), o);
+    const { unwrapPackets } = await loadCodecPipeline();
+    const config = await decodeConfigOf(track);
+    return unwrapPackets(demuxer.packets(track.id)).pipeThrough(
+      codec.createDecoder(config, stage),
+    ) as ReadableStream<AudioData>;
   }
 
   /**
@@ -833,6 +853,7 @@ export class MediaEngineImpl implements MediaEngine {
        `packets()` throws the typed miss above. The track fan-out + drain is browser-harness validated. */
     const openStreams: ReadableStream<unknown>[] = [];
     try {
+      const { drainEncoderToMuxer } = await loadCodecPipeline();
       const tasks = tracks.map((track) => {
         const packets = demuxer.packets(track.id);
         openStreams.push(packets);
@@ -898,6 +919,7 @@ export class MediaEngineImpl implements MediaEngine {
         );
       }
       const packets = trimAudioPacketStream(demuxer.packets(track.id), bounds);
+      const { drainEncoderToMuxer } = await loadCodecPipeline();
       await drainEncoderToMuxer(packets, muxer, () => trimPacketCopyTrack(track, bounds));
       await muxer.finalize();
       return muxer.output;
@@ -954,14 +976,16 @@ export class MediaEngineImpl implements MediaEngine {
 
       if (videoTrack) {
         assertTrimTrackDecodable(videoTrack);
-        const codec = await this.#routeCodec(decodeQueryFor(videoTrack), o);
+        const codec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
+        const { unwrapPackets } = await loadCodecPipeline();
         /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
         const packets = await startAtSeekKeyframe(
           unwrapPackets(demuxer.packets(videoTrack.id)),
           bounds.startUs,
         );
+        const config = await decodeConfigOf(videoTrack);
         const decoded = packets.pipeThrough(
-          codec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
+          codec.createDecoder(config, this.#stageOptions(signal, o)),
         ) as ReadableStream<VideoFrame>;
         const trimmed = trimTimedFrameStream(decoded, bounds, restampVideoFrame);
         openStreams.push(trimmed);
@@ -973,10 +997,12 @@ export class MediaEngineImpl implements MediaEngine {
 
       if (audioTrack) {
         assertTrimTrackDecodable(audioTrack);
-        const codec = await this.#routeCodec(decodeQueryFor(audioTrack), o);
+        const codec = await this.#routeCodec(await decodeQueryFor(audioTrack), o);
+        const { unwrapPackets } = await loadCodecPipeline();
         /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
+        const config = await decodeConfigOf(audioTrack);
         const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
-          codec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
+          codec.createDecoder(config, this.#stageOptions(signal, o)),
         ) as ReadableStream<AudioData>;
         const trimmed = trimTimedFrameStream(decoded, bounds, restampAudioData);
         openStreams.push(trimmed);
@@ -1052,6 +1078,8 @@ export class MediaEngineImpl implements MediaEngine {
         ...this.#stageOptions(signal, o),
         ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
         ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
+        ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
+        ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
       });
       return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     }
@@ -1091,10 +1119,12 @@ export class MediaEngineImpl implements MediaEngine {
       if (videoTrack) {
         // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
         // the composition below is the live path, browser-validated.
-        const videoCodec = await this.#routeCodec(decodeQueryFor(videoTrack), o);
+        const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
+        const { unwrapPackets } = await loadCodecPipeline();
+        const config = await decodeConfigOf(videoTrack);
         /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
         const decoded = unwrapPackets(demuxer.packets(videoTrack.id)).pipeThrough(
-          videoCodec.createDecoder(decodeConfigOf(videoTrack), this.#stageOptions(signal, o)),
+          videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
         );
         const filtered = await this.#applyVideoFilters(
           decoded as ReadableStream<VideoFrame>,
@@ -1118,12 +1148,7 @@ export class MediaEngineImpl implements MediaEngine {
                 stage,
                 audioTrack.codec,
               )
-            : (unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
-                (await this.#routeCodec(decodeQueryFor(audioTrack), o)).createDecoder(
-                  decodeConfigOf(audioTrack),
-                  stage,
-                ),
-              ) as ReadableStream<AudioData>);
+            : await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
         /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
         // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
         // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
@@ -1235,6 +1260,8 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<void> {
+    const { buildVideoEncoderConfig, drainEncoderToMuxer, videoTrackInfoFromDecoderConfig } =
+      await loadCodecPipeline();
     const config = buildVideoEncoderConfig(
       target,
       sourceTrack ? sourceGeometryOf(sourceTrack) : { width: target.width, height: target.height },
@@ -1275,6 +1302,8 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<void> {
+    const { audioTrackInfoFromDecoderConfig, buildAudioEncoderConfig, drainEncoderToMuxer } =
+      await loadCodecPipeline();
     const config = buildAudioEncoderConfig(
       target,
       audioGeometryOf(sourceTrack),
@@ -1843,18 +1872,19 @@ function muxOptionsFrom(
  * strings, so MP4/MOV configs are untouched). Returns a fresh object only when the codec actually
  * changes, so the common case allocates nothing.
  */
-function decodeConfigOf(track: TrackInfo): TrackInfo['config'] & object {
+async function decodeConfigOf(track: TrackInfo): Promise<TrackInfo['config'] & object> {
   const config = track.config;
   if (config === undefined) {
     throw new MediaError('decode-error', `track ${track.id} has no decoder config`);
   }
+  const { normalizeDecoderCodec } = await loadCodecPipeline();
   const codec = normalizeDecoderCodec(config);
   return codec === config.codec ? config : { ...config, codec };
 }
 
 /** Build the decode {@link CodecQuery} for a demux track (its media type + WebCodecs decoder config). */
-function decodeQueryFor(track: TrackInfo): CodecQuery {
-  return { mediaType: track.mediaType, direction: 'decode', config: decodeConfigOf(track) };
+async function decodeQueryFor(track: TrackInfo): Promise<CodecQuery> {
+  return { mediaType: track.mediaType, direction: 'decode', config: await decodeConfigOf(track) };
 }
 
 /** Build the encode {@link CodecQuery} for a target encoder config (media type inferred from the shape). */

@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
-import { Mp4Driver, mp4PacketMetadata, muxTracksFromMovie, readMovie } from './mp4-driver.ts';
+import {
+  Mp4Driver,
+  mp4PacketMetadata,
+  muxTracksFromMovie,
+  planLazySampleDataFragmentRuns,
+  readMovie,
+} from './mp4-driver.ts';
 import type { Movie, ParsedTrack } from './parse.ts';
-import { buildSampleData, buildSamples } from './samples.ts';
+import { type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import { writeMp4 } from './write.ts';
 
 const ra = (b: Uint8Array) => ({
@@ -90,6 +96,18 @@ function rangeSource(
       reads.push({ offset: start, length: end - start });
       return Promise.resolve(bytes.subarray(start, end));
     },
+  };
+}
+
+function sampleData(index: number, keyframe: boolean): SampleData {
+  return {
+    index,
+    offset: index * 10,
+    size: 10,
+    dtsTicks: index,
+    durationTicks: 1,
+    cttsTicks: 0,
+    keyframe,
   };
 }
 
@@ -199,8 +217,102 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
       const outTrack = reparsed.tracks[i];
       expect(outTrack?.codec).toBe(sourceTrack?.codec);
       expect(outTrack?.durationSec).toBeCloseTo(sourceTrack?.durationSec ?? 0, 3);
-      expect(outTrack?.fragmentSampleCount).toBe(sourceTrack ? buildSampleData(sourceTrack).length : 0);
+      expect(outTrack?.fragmentSampleCount).toBe(
+        sourceTrack ? buildSampleData(sourceTrack).length : 0,
+      );
     }
+  });
+
+  it('streaming stream-copy emits progressive headers before lazy sample-payload reads', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const stream = await Mp4Driver.streamCopy(rangeSource(input, reads), { streaming: true });
+    const readsAfterSetup = reads.length;
+
+    const reader = stream.getReader();
+    const first = await reader.read();
+    const second = await reader.read();
+    const third = await reader.read();
+    expect(first.done).toBe(false);
+    expect(second.done).toBe(false);
+    expect(third.done).toBe(false);
+    expect(reads.length).toBe(readsAfterSetup);
+
+    const parts: Uint8Array[] = [
+      first.value as Uint8Array,
+      second.value as Uint8Array,
+      third.value as Uint8Array,
+    ];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      parts.push(next.value);
+    }
+    reader.releaseLock();
+
+    expect(parts.length).toBeGreaterThan(3);
+    expect(reads.length).toBeGreaterThan(readsAfterSetup);
+
+    const total = parts.reduce((n, part) => n + part.byteLength, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      output.set(part, offset);
+      offset += part.byteLength;
+    }
+
+    const sourceMovie = await readMovie(ra(input));
+    const reparsed = await readMovie(ra(output));
+    expect(reparsed.tracks.length).toBe(sourceMovie.tracks.length);
+    for (let i = 0; i < sourceMovie.tracks.length; i++) {
+      const sourceTrack = sourceMovie.tracks[i];
+      const outTrack = reparsed.tracks[i];
+      expect(outTrack?.codec).toBe(sourceTrack?.codec);
+      expect(outTrack?.durationSec).toBeCloseTo(sourceTrack?.durationSec ?? 0, 3);
+      expect(outTrack ? buildSampleData(outTrack).map(strip) : []).toEqual(
+        sourceTrack ? buildSampleData(sourceTrack).map(strip) : [],
+      );
+    }
+  });
+
+  it('buffered stream-copy emits one exact output chunk without eager sample-payload reads', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const stream = await Mp4Driver.streamCopy(rangeSource(input, reads), { buffered: true });
+    const readsAfterSetup = reads.length;
+
+    const reader = stream.getReader();
+    const first = await reader.read();
+    const second = await reader.read();
+    reader.releaseLock();
+
+    expect(first.done).toBe(false);
+    expect(second.done).toBe(true);
+    expect(reads.length).toBeGreaterThan(readsAfterSetup);
+
+    const output = first.value as Uint8Array;
+    const expected = writeMp4(await muxTracksFromMovie(ra(input), await readMovie(ra(input))));
+    expect(equalBytes(output, expected)).toBe(true);
+  });
+
+  it('lazy source fragments group GOPs until the target sample budget', () => {
+    const video = Array.from({ length: 12 }, (_, index) => sampleData(index, index % 3 === 0));
+    const videoRuns = planLazySampleDataFragmentRuns(video, 6, true);
+    expect(videoRuns.map((run) => run.map((sample) => sample.index))).toEqual([
+      [0, 1, 2, 3, 4, 5],
+      [6, 7, 8, 9, 10, 11],
+    ]);
+    expect(videoRuns.every((run) => run[0]?.keyframe === true)).toBe(true);
+
+    const audio = Array.from({ length: 12 }, (_, index) => sampleData(index, true));
+    const audioRuns = planLazySampleDataFragmentRuns(audio, 5, false);
+    expect(audioRuns.map((run) => run.map((sample) => sample.index))).toEqual([
+      [0, 1, 2, 3, 4],
+      [5, 6, 7, 8, 9],
+      [10, 11],
+    ]);
   });
 
   it('rejects short sample-window reads instead of copying truncated payload', async () => {

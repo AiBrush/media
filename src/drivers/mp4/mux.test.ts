@@ -142,6 +142,30 @@ function adtsFrame(
   return out;
 }
 
+function fullEsdsBoxFromDescriptor(descriptorBytes: Uint8Array): Uint8Array {
+  const size = 12 + descriptorBytes.byteLength;
+  const out = new Uint8Array(size);
+  out[0] = (size >>> 24) & 0xff;
+  out[1] = (size >>> 16) & 0xff;
+  out[2] = (size >>> 8) & 0xff;
+  out[3] = size & 0xff;
+  out.set(new TextEncoder().encode('esds'), 4);
+  out.set(descriptorBytes, 12);
+  return out;
+}
+
+function topLevelBoxes(bytes: Uint8Array): string[] {
+  const out: string[] = [];
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let off = 0; off + 8 <= bytes.byteLength; ) {
+    const size = dv.getUint32(off);
+    out.push(String.fromCharCode(...bytes.subarray(off + 4, off + 8)));
+    if (size <= 0) break;
+    off += size;
+  }
+  return out;
+}
+
 describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
   it('no reorder (CFR): ctts is exactly 0 for every sample', () => {
     const ts = 90_000;
@@ -318,6 +342,78 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     ]);
   });
 
+  it('accepts sliced description views without leaking prefix/suffix bytes into avcC', async () => {
+    const avcc = avcCWithParameterSets(H264_SPS, H264_PPS);
+    const backing = new Uint8Array(avcc.byteLength + 4);
+    backing.set([0xde, 0xad], 0);
+    backing.set(avcc, 2);
+    backing.set([0xbe, 0xef], 2 + avcc.byteLength);
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: {
+        codec: 'avc1.42C01E',
+        codedWidth: 16,
+        codedHeight: 16,
+        description: new DataView(backing.buffer, backing.byteOffset + 2, avcc.byteLength),
+      },
+    });
+    muxer.addChunkStruct(vid, {
+      timestampUs: 0,
+      durationUs: 33_333,
+      key: true,
+      data: lengthPrefixed(new Uint8Array([0x65, 0xaa])),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.config.description).toEqual(avcc);
+  });
+
+  it('normalizes 3-byte Annex-B start codes, trailing zeros, and duplicate parameter sets', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      fps: 24,
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+    });
+    const idr = new Uint8Array([0x65, 0x88]);
+    const key = Uint8Array.from([
+      0,
+      0,
+      1,
+      ...H264_SPS,
+      0,
+      0,
+      0,
+      1,
+      ...H264_SPS,
+      0,
+      0,
+      1,
+      ...H264_PPS,
+      0,
+      0,
+      0,
+      1,
+      ...idr,
+      0,
+      0,
+    ]);
+    muxer.addChunkStruct(vid, { timestampUs: 0, durationUs: 41_667, key: true, data: key });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.codecPrivate?.boxType).toBe('avcC');
+    expect(track ? buildSampleData(track).map((sample) => sample.size) : []).toEqual([
+      lengthPrefixed(H264_SPS, H264_SPS, H264_PPS, idr).byteLength,
+    ]);
+  });
+
   it('bare aac with an ASC description preserves raw AAC access units', async () => {
     const muxer = new Mp4Muxer();
     const aud = muxer.addTrack({
@@ -348,6 +444,27 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([5, 6]);
   });
 
+  it('uses the documented 48 kHz audio clock fallback when config omits sampleRate', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', description: ASC },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 24_000,
+      key: true,
+      data: new Uint8Array([1, 2, 3, 4]),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.sampleRate).toBe(48_000);
+    expect(track ? buildSampleData(track).map((s) => s.durationTicks) : []).toEqual([1152]);
+  });
+
   it('bare aac unwraps WebKit ES_Descriptor metadata to the ASC before writing esds', async () => {
     const muxer = new Mp4Muxer();
     const aud = muxer.addTrack({
@@ -373,6 +490,31 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(track?.codec).toBe('mp4a.40.2');
     expect(track?.sampleRate).toBe(48_000);
     expect(track?.channels).toBe(2);
+    expect(track?.config?.description).toEqual(ASC);
+  });
+
+  it('bare aac unwraps a full esds box to the ASC before writing esds', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description: fullEsdsBoxFromDescriptor(WEBKIT_AAC_ES_DESCRIPTOR),
+      },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array([1, 2, 3]),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
     expect(track?.config?.description).toEqual(ASC);
   });
 
@@ -409,6 +551,56 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
       firstPayload.byteLength,
       secondPayload.byteLength,
     ]);
+  });
+
+  it('muxes synthesized raw-box codec records when AV1/VP9/Opus descriptions are absent', async () => {
+    const cases = [
+      {
+        codec: 'av01.0.08H.10.0.110',
+        mediaType: 'video' as const,
+        boxType: 'av1C',
+        config: { codec: 'av01.0.08H.10.0.110', codedWidth: 16, codedHeight: 16 },
+      },
+      {
+        codec: 'vp9',
+        mediaType: 'video' as const,
+        boxType: 'vpcC',
+        config: { codec: 'vp9', codedWidth: 16, codedHeight: 16 },
+      },
+      {
+        codec: 'vp09.03.10.12.03',
+        mediaType: 'video' as const,
+        boxType: 'vpcC',
+        config: { codec: 'vp09.03.10.12.03', codedWidth: 16, codedHeight: 16 },
+      },
+      {
+        codec: 'opus',
+        mediaType: 'audio' as const,
+        boxType: 'dOps',
+        config: { codec: 'opus', sampleRate: 16_000, numberOfChannels: 1 },
+      },
+    ];
+
+    for (const item of cases) {
+      const muxer = new Mp4Muxer();
+      const id = muxer.addTrack({
+        id: 1,
+        mediaType: item.mediaType,
+        codec: item.codec,
+        config: item.config,
+      } satisfies TrackInfo);
+      muxer.addChunkStruct(id, {
+        timestampUs: 0,
+        durationUs: item.mediaType === 'video' ? 33_333 : 20_000,
+        key: true,
+        data: new Uint8Array([1, 2, 3, 4]),
+      });
+      await muxer.finalize();
+
+      const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+      expect(track?.codecPrivate?.boxType).toBe(item.boxType);
+      expect(track?.config.description?.byteLength ?? 0).toBeGreaterThan(0);
+    }
   });
 
   it.each([
@@ -896,6 +1088,57 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     await expect(muxer.finalize()).rejects.toThrowError(/AAC MP4 muxing requires/);
   });
 
+  it('bare aac rejects malformed ADTS-looking samples instead of guessing AAC geometry', async () => {
+    const validAdts = adtsFrame(new Uint8Array([1, 2, 3]));
+    const invalidAdtsSamples = [
+      new Uint8Array(6),
+      Uint8Array.of(0xff, 0xe0, 0x50, 0x80, 0, 0xe0, 0xfc),
+      Uint8Array.of(0xff, 0xf7, 0x50, 0x80, 0, 0xe0, 0xfc),
+      adtsFrame(new Uint8Array([1, 2, 3]), 15, 2),
+      adtsFrame(new Uint8Array([1, 2, 3]), 4, 0),
+      validAdts.subarray(0, validAdts.byteLength - 1),
+      Uint8Array.of(0xff, 0xf0, 0x50, 0x80, 0x00, 0xff, 0xfc),
+    ];
+
+    for (const data of invalidAdtsSamples) {
+      const muxer = new Mp4Muxer();
+      const aud = muxer.addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2 },
+      });
+      muxer.addChunkStruct(aud, { timestampUs: 0, durationUs: 21_333, key: true, data });
+      await expect(muxer.finalize()).rejects.toThrowError(/AAC MP4 muxing requires/);
+    }
+  });
+
+  it('bare aac rejects invalid AudioSpecificConfig descriptions before writing esds', async () => {
+    const invalidDescriptions = [
+      new Uint8Array([0x03, 0x01, 0x00]),
+      new Uint8Array([0, 0, 0, 0, 0x05]),
+      Uint8Array.from([0, 0, 0, 16, ...new TextEncoder().encode('esds'), 0, 0, 0, 0]),
+      new Uint8Array([0xff, 0xff]),
+    ];
+
+    for (const description of invalidDescriptions) {
+      const muxer = new Mp4Muxer();
+      const aud = muxer.addTrack({
+        id: 1,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2, description },
+      });
+      muxer.addChunkStruct(aud, {
+        timestampUs: 0,
+        durationUs: 21_333,
+        key: true,
+        data: new Uint8Array([1, 2, 3]),
+      });
+      await expect(muxer.finalize()).rejects.toThrowError(/invalid AudioSpecificConfig|MP4 box/);
+    }
+  });
+
   it('bare h264 without avcC or Annex-B SPS/PPS rejects instead of guessing parameter sets', async () => {
     const muxer = new Mp4Muxer();
     const vid = muxer.addTrack({
@@ -911,6 +1154,40 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
       data: lengthPrefixed(new Uint8Array([0x65, 0x88, 0x84])),
     });
     await expect(muxer.finalize()).rejects.toThrowError(/requires avcC description/);
+  });
+
+  it('bare h264 rejects Annex-B parameter sets that cannot synthesize a legal avcC', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'h264',
+      config: { codec: 'h264', codedWidth: 16, codedHeight: 16 },
+    });
+    muxer.addChunkStruct(vid, {
+      timestampUs: 0,
+      durationUs: 33_333,
+      key: true,
+      data: annexB(new Uint8Array([0x67, 0x42, 0xc0]), H264_PPS, new Uint8Array([0x65])),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/SPS is too short/);
+  });
+
+  it('Opus MP4 muxing rejects unsupported channel-family layouts without a dOps description', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 3 },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 20_000,
+      key: true,
+      data: new Uint8Array([1, 2, 3]),
+    });
+    await expect(muxer.finalize()).rejects.toThrowError(/family-0 mono\/stereo/);
   });
 
   it('bare aac rejects mixed raw and ADTS samples in one MP4 track', async () => {
@@ -990,6 +1267,23 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     expect(movie.tracks[0]?.codec).toBe('avc1.42C01E');
     // Four 33.333 ms samples → ~0.133 s recovered from the fragment timing (not from an empty `stbl`).
     expect(movie.tracks[0]?.durationSec ?? 0).toBeCloseTo(4 * 0.033333, 2);
+  });
+
+  it('can emit a QuickTime-branded non-faststart file', async () => {
+    const muxer = new Mp4Muxer({ faststart: false, container: 'mov' });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 8, codedHeight: 8, description: AVCC },
+    });
+    muxer.addChunkStruct(vid, videoChunk(0, 33_333, true, 4));
+    await muxer.finalize();
+
+    const bytes = await collect(muxer.output);
+    expect(String.fromCharCode(...bytes.subarray(8, 12))).toBe('qt  ');
+    expect(topLevelBoxes(bytes)).toEqual(['ftyp', 'mdat', 'moov']);
+    expect((await readMovie(ra(bytes))).brand).toBe('qt  ');
   });
 });
 

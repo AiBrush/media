@@ -241,6 +241,17 @@ describe('MediaChain', () => {
     expect(engine.calls[0]?.callOptions?.signal?.aborted).toBe(true);
   });
 
+  it('supports proxy symbol reads and cancellation after the lazy operation has become active', async () => {
+    const engine = fakeEngine();
+    const chain = createMediaChain(engine, new Uint8Array([10]));
+    expect(Reflect.get(chain, Symbol.toStringTag)).toBeUndefined();
+
+    const op = chain.convert({ to: 'mp4' }).blob();
+    await expect(op).resolves.toBeInstanceOf(Blob);
+    op.cancel();
+    expect(engine.calls[0]?.callOptions?.signal?.aborted).toBe(true);
+  });
+
   it('rejects an empty chain instead of inventing a no-op output', async () => {
     const engine = fakeEngine();
     await expect(createMediaChain(engine, new Uint8Array([7])).blob()).rejects.toBeInstanceOf(

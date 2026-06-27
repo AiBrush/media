@@ -146,10 +146,7 @@ export class Mp3Muxer implements Muxer {
     this.#assertOpen();
     this.#finalized = true;
     await this.#ready;
-    const controller = this.#controller;
-    if (controller === undefined) {
-      throw new MediaError('mux-error', 'muxer output stream was not initialized');
-    }
+    const controller = this.#controller as ReadableStreamDefaultController<Uint8Array>;
     try {
       const track = this.#track;
       if (track === undefined) {
@@ -191,16 +188,15 @@ function parseFrameHeader(bytes: Uint8Array, at: number): Mp3FrameHeader | undef
   if (bitrateIndex === 0 || bitrateIndex === 15 || sampleRateIndex === 3) return undefined;
 
   const bitrateTable = version === 3 ? BITRATES_MPEG1_L3 : BITRATES_MPEG2_L3;
-  const bitrateKbps = bitrateTable[bitrateIndex] ?? 0;
-  const sampleRate = SAMPLE_RATES[version]?.[sampleRateIndex] ?? 0;
-  if (bitrateKbps <= 0 || sampleRate <= 0) return undefined;
+  const bitrateKbps = bitrateTable[bitrateIndex] as number;
+  const sampleRates = SAMPLE_RATES[version] as readonly number[];
+  const sampleRate = sampleRates[sampleRateIndex] as number;
 
   const channels = ((b3 >> 6) & 0x3) === 3 ? 1 : 2;
   const sideInfoBytes = version === 3 ? (channels === 1 ? 17 : 32) : channels === 1 ? 9 : 17;
   const padding = (b2 >> 1) & 0x1;
   const coeff = version === 3 ? 144 : 72;
   const frameLength = Math.floor((coeff * bitrateKbps * 1000) / sampleRate) + padding;
-  if (frameLength < 4) return undefined;
 
   return {
     version,
@@ -216,9 +212,8 @@ function parseFrameHeader(bytes: Uint8Array, at: number): Mp3FrameHeader | undef
 }
 
 function asciiAt(bytes: Uint8Array, at: number, length: number): string {
-  if (at + length > bytes.byteLength) return '';
   let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[at + i] ?? 0);
+  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[at + i] as number);
   return out;
 }
 
@@ -254,9 +249,8 @@ function metadataBitrateIndex(header: Mp3FrameHeader, minLength: number): number
   }
   const table = header.version === 3 ? BITRATES_MPEG1_L3 : BITRATES_MPEG2_L3;
   for (let i = 1; i < table.length - 1; i++) {
-    const bitrate = table[i] ?? 0;
-    if (bitrate > 0 && frameLength(header.version, bitrate, header.sampleRate) >= minLength)
-      return i;
+    const bitrate = table[i] as number;
+    if (frameLength(header.version, bitrate, header.sampleRate) >= minLength) return i;
   }
   throw new MediaError(
     'mux-error',
@@ -279,14 +273,12 @@ function writeU32BE(out: Uint8Array, at: number, value: number): void {
 }
 
 function buildXingFrame(track: Mp3MuxTrack): Uint8Array {
-  const header = track.firstHeader;
-  if (header === undefined)
-    throw new MediaError('mux-error', 'MP3 mux: cannot write metadata without frames');
+  const header = track.firstHeader as Mp3FrameHeader;
   const tagAt = 4 + header.sideInfoBytes;
   const minLength = tagAt + 16;
   const bitrateIndex = metadataBitrateIndex(header, minLength);
   const bitrateTable = header.version === 3 ? BITRATES_MPEG1_L3 : BITRATES_MPEG2_L3;
-  const bitrateKbps = bitrateTable[bitrateIndex] ?? 0;
+  const bitrateKbps = bitrateTable[bitrateIndex] as number;
   const length = frameLength(header.version, bitrateKbps, header.sampleRate);
   const out = new Uint8Array(length);
   out[0] = 0xff;

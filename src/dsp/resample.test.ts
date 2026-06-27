@@ -5,6 +5,21 @@ import { loadFixture } from '../test-support/corpus.ts';
 import { type PcmAudio, channelAt, encodePcm, sampleAt } from './pcm.ts';
 import { resample } from './resample.ts';
 
+interface VitestWorkerGlobal {
+  readonly __vitest_worker__?: {
+    readonly config?: {
+      readonly coverage?: {
+        readonly enabled?: boolean;
+      };
+    };
+  };
+}
+
+function isCoverageRun(): boolean {
+  const worker = (globalThis as typeof globalThis & VitestWorkerGlobal).__vitest_worker__;
+  return worker?.config?.coverage?.enabled === true;
+}
+
 /** Synthesize a pure sine of `freq` Hz at `rate` for `seconds`, peak amplitude `amp`. */
 function sine(freq: number, rate: number, seconds: number, amp = 0.5): PcmAudio {
   const frames = Math.round(rate * seconds);
@@ -283,7 +298,9 @@ describe('resample — longform performance guard', () => {
     const throughputRealtime = seconds / wallSeconds;
 
     expect(out.frames).toBe(16_000 * seconds);
-    expect(throughputRealtime).toBeGreaterThan(360);
+    // V8 coverage profiling instruments every executed line and is not a fair performance benchmark.
+    // Keep the production-speed guard in normal runs, and only require non-catastrophic throughput there.
+    expect(throughputRealtime).toBeGreaterThan(isCoverageRun() ? 60 : 360);
   });
 });
 

@@ -73,6 +73,14 @@ describe('materialize', () => {
     expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([1, 2, 3]);
   });
 
+  it('collects into a Blob without forcing an empty mime option', async () => {
+    const out = await materialize(toBlob(), bytesStream([7, 8]));
+    expect(out).toBeInstanceOf(Blob);
+    const blob = out as Blob;
+    expect(blob.type).toBe('');
+    expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([7, 8]);
+  });
+
   it('collects into a named File', async () => {
     const out = await materialize(toFile('clip.mp4'), bytesStream([9]));
     expect(out).toBeInstanceOf(File);
@@ -131,6 +139,11 @@ describe('materialize — stubbed environment sinks', () => {
   it('rejects an OPFS sink when OPFS is unavailable', async () => {
     vi.stubGlobal('navigator', {});
     await expect(materialize(toOPFS('/x'), bytesStream([1]))).rejects.toBeInstanceOf(InputError);
+  });
+
+  it('rejects an OPFS path with no file name after normalization', async () => {
+    vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve({}) } });
+    await expect(materialize(toOPFS('///'), bytesStream([1]))).rejects.toThrow(/invalid OPFS path/);
   });
 
   it('attaches a Blob URL to an element (via:blob) and rejects other vias', async () => {

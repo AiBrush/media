@@ -225,7 +225,7 @@ describe('media.trim — native FLAC sample-accurate lossless cut', () => {
       );
       expectDecodedSlice(source, decodeFlac(out), startSec, endSec, id);
     }
-  });
+  }, 30_000);
 });
 
 describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {

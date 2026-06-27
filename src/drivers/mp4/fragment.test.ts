@@ -291,6 +291,19 @@ describe('fragmentMp4 — init segment structure', () => {
   });
 });
 
+describe('fragmentMp4 — audio segment planning', () => {
+  it('groups audio sync packets by cap instead of splitting every packet', () => {
+    const audio = audioTrack(
+      Array.from({ length: 200 }, (_, i) => sample(1024, 0, true, 4, i + 1)),
+    );
+    const file = concat([...fragmentMp4([audio], { maxSamplesPerFragment: 90 })]);
+    const segments = scanSegments(file);
+
+    expect(segments).toHaveLength(3);
+    expect(segments.map((segment) => samplesForTrack([segment], 1).length)).toEqual([90, 90, 20]);
+  });
+});
+
 describe('fragmentMp4 — single video track round-trip', () => {
   it('reconstructs sizes/durations/keyframes/ctts/bytes from moof+mdat fragments', () => {
     // I,P,B,B then a second GOP I,P — splits into two fragments at the second keyframe.

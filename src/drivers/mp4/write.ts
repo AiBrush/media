@@ -46,6 +46,13 @@ export interface MuxSampleInput {
   keyframe: boolean;
 }
 
+export interface MuxSampleLayoutInput {
+  byteLength: number;
+  durationTicks: number;
+  cttsTicks: number;
+  keyframe: boolean;
+}
+
 /** CENC protection for a track (ADR-023): emits `enca`/`encv` + `sinf`/`tenc` and optional `senc` IVs. */
 export interface TrackEncryption {
   schemeType: string; // 'cenc' | 'cbcs'
@@ -74,6 +81,19 @@ export interface MuxTrackInput {
   /** When set, the track is written as CENC-protected (the samples must already be ciphertext). */
   encryption?: TrackEncryption;
   samples: MuxSampleInput[];
+}
+
+export type MuxTrackLayoutInput = Omit<MuxTrackInput, 'samples'> & {
+  samples: readonly (MuxSampleInput | MuxSampleLayoutInput)[];
+};
+
+export interface Mp4ByteStreamLayout {
+  ftyp: Uint8Array;
+  moov: Uint8Array;
+  mdatHeader: Uint8Array;
+  mdatBeforeMoov: boolean;
+  mdatPayloadLen: number;
+  totalLen: number;
 }
 
 /**
@@ -127,7 +147,11 @@ function runLengthTable(runs: readonly RunLength[]): number[] {
   return out;
 }
 
-function trackDurationTicks(track: MuxTrackInput): number {
+function sampleByteLength(sample: MuxSampleInput | MuxSampleLayoutInput): number {
+  return 'data' in sample ? sample.data.byteLength : sample.byteLength;
+}
+
+function trackDurationTicks(track: MuxTrackLayoutInput): number {
   return track.samples.reduce((a, s) => a + s.durationTicks, 0);
 }
 
@@ -142,7 +166,7 @@ function esdsBox(asc: Uint8Array): number[] {
 }
 
 /** The codec-config box: the preserved raw box (lossless remux) or a synthesized one (encode path). */
-function codecConfigBox(track: MuxTrackInput): number[] {
+function codecConfigBox(track: MuxTrackLayoutInput): number[] {
   if (track.codecPrivate) return box(track.codecPrivate.boxType, [...track.codecPrivate.data]);
   if (track.mediaType === 'video' && track.description) return box('avcC', [...track.description]);
   if (track.mediaType === 'audio' && track.description) return esdsBox(track.description);
@@ -150,7 +174,7 @@ function codecConfigBox(track: MuxTrackInput): number[] {
 }
 
 /** The `sinf` protection box (`frma`/`schm`/`schi`→`tenc`) wrapping the original format, when protected. */
-function sinfBox(track: MuxTrackInput): number[] {
+function sinfBox(track: MuxTrackLayoutInput): number[] {
   const enc = track.encryption;
   if (!enc) return [];
   if (enc.constantIv && enc.perSampleIvSize !== 0) {
@@ -176,7 +200,7 @@ function sinfBox(track: MuxTrackInput): number[] {
 }
 
 /** The `senc` sample-encryption box: per-sample IVs (flags=0 → no subsamples for audio). */
-function sencBox(track: MuxTrackInput): number[] {
+function sencBox(track: MuxTrackLayoutInput): number[] {
   const enc = track.encryption;
   if (!enc) return [];
   if (!enc.ivs) {
@@ -208,7 +232,7 @@ function sencBox(track: MuxTrackInput): number[] {
   );
 }
 
-function videoSampleEntry(track: MuxTrackInput): number[] {
+function videoSampleEntry(track: MuxTrackLayoutInput): number[] {
   return box(
     track.encryption ? 'encv' : track.sampleEntryType,
     cat(
@@ -230,7 +254,7 @@ function videoSampleEntry(track: MuxTrackInput): number[] {
   );
 }
 
-function audioSampleEntry(track: MuxTrackInput): number[] {
+function audioSampleEntry(track: MuxTrackLayoutInput): number[] {
   return box(
     track.encryption ? 'enca' : track.sampleEntryType,
     cat(
@@ -247,9 +271,9 @@ function audioSampleEntry(track: MuxTrackInput): number[] {
   );
 }
 
-function sampleTable(track: MuxTrackInput, chunkOffset: number): number[] {
+function sampleTable(track: MuxTrackLayoutInput, chunkOffset: number): number[] {
   const entry = track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
-  const sizes = track.samples.map((s) => s.data.byteLength);
+  const sizes = track.samples.map(sampleByteLength);
   const stts = runLength(track.samples.map((s) => s.durationTicks));
   const cttsVals = track.samples.map((s) => s.cttsTicks);
   const hasCtts = cttsVals.some((v) => v !== 0);
@@ -272,7 +296,7 @@ function sampleTable(track: MuxTrackInput, chunkOffset: number): number[] {
 }
 
 function trak(
-  track: MuxTrackInput,
+  track: MuxTrackLayoutInput,
   trackId: number,
   movieTimescale: number,
   chunkOffset: number,
@@ -322,7 +346,11 @@ function trak(
   return box('trak', cat(tkhd, mdia));
 }
 
-function moov(tracks: MuxTrackInput[], movieTimescale: number, chunkOffsets: number[]): number[] {
+function moov(
+  tracks: readonly MuxTrackLayoutInput[],
+  movieTimescale: number,
+  chunkOffsets: number[],
+): number[] {
   const movieDur = tracks.reduce(
     (max, t) => Math.max(max, Math.round((trackDurationTicks(t) * movieTimescale) / t.timescale)),
     0,
@@ -351,7 +379,7 @@ function addUniqueBrand(out: string[], brand: string): void {
   if (!out.includes(brand)) out.push(brand);
 }
 
-function compatibleBrandsFor(tracks: readonly MuxTrackInput[]): string[] {
+function compatibleBrandsFor(tracks: readonly MuxTrackLayoutInput[]): string[] {
   const brands = ['isom', 'iso2'];
   for (const track of tracks) {
     if (track.mediaType !== 'video') continue;
@@ -364,7 +392,7 @@ function compatibleBrandsFor(tracks: readonly MuxTrackInput[]): string[] {
   return brands;
 }
 
-function ftypBox(brand: ContainerBrand, tracks: readonly MuxTrackInput[]): number[] {
+function ftypBox(brand: ContainerBrand, tracks: readonly MuxTrackLayoutInput[]): number[] {
   if (brand === 'mov') {
     // QuickTime: major_brand 'qt  ' (0x71 74 20 20), minor 0x200, compatible ['qt  '] — what ffprobe
     // (and our parse) keys on to report container 'mov' instead of 'mp4'.
@@ -406,20 +434,25 @@ function writeSamples(out: Uint8Array, pos: number, tracks: MuxTrackInput[]): nu
   return p;
 }
 
-/**
- * Serialize tracks + samples into an MP4 byte stream. The structural boxes (`ftyp`/`moov`) are built
- * as small `number[]`s, but the `mdat` payload is copied straight from each sample's `Uint8Array` into
- * one output buffer via `.set` — never a giant `number[]` (which exceeds the JS array length cap /
- * exhausts the heap on multi-hundred-MB remuxes; that was the `huge`/`massive` rung crash). Byte layout
- * is identical to a naive concat, so `parse(write(x)) == x` still holds.
- */
-export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint8Array {
+interface Mp4LayoutParts {
+  ftyp: number[];
+  moov: number[];
+  mdatHeader: number[];
+  mdatBeforeMoov: boolean;
+  mdatPayloadLen: number;
+  totalLen: number;
+}
+
+function mp4LayoutParts(
+  tracks: readonly MuxTrackLayoutInput[],
+  opts: WriteOptions = {},
+): Mp4LayoutParts {
   const movieTimescale = opts.movieTimescale ?? 1000;
   const faststart = opts.faststart ?? true;
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
 
   // Per-track contiguous byte regions within mdat (one chunk per track).
-  const lens = tracks.map((t) => t.samples.reduce((a, s) => a + s.data.byteLength, 0));
+  const lens = tracks.map((t) => t.samples.reduce((a, s) => a + sampleByteLength(s), 0));
   const mdatPayloadLen = lens.reduce((a, l) => a + l, 0);
   const intra: number[] = [];
   let acc = 0;
@@ -451,20 +484,54 @@ export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint
 
   const totalLen = ftyp.length + moovBytes.length + mdatHeader.length + mdatPayloadLen;
   assertSingleBufferSize(totalLen);
-  const out = new Uint8Array(totalLen);
+  return {
+    ftyp,
+    moov: moovBytes,
+    mdatHeader,
+    mdatBeforeMoov,
+    mdatPayloadLen,
+    totalLen,
+  };
+}
+
+export function planMp4ByteStreamLayout(
+  tracks: readonly MuxTrackLayoutInput[],
+  opts: WriteOptions = {},
+): Mp4ByteStreamLayout {
+  const parts = mp4LayoutParts(tracks, opts);
+  return {
+    ftyp: Uint8Array.from(parts.ftyp),
+    moov: Uint8Array.from(parts.moov),
+    mdatHeader: Uint8Array.from(parts.mdatHeader),
+    mdatBeforeMoov: parts.mdatBeforeMoov,
+    mdatPayloadLen: parts.mdatPayloadLen,
+    totalLen: parts.totalLen,
+  };
+}
+
+/**
+ * Serialize tracks + samples into an MP4 byte stream. The structural boxes (`ftyp`/`moov`) are built
+ * as small `number[]`s, but the `mdat` payload is copied straight from each sample's `Uint8Array` into
+ * one output buffer via `.set` — never a giant `number[]` (which exceeds the JS array length cap /
+ * exhausts the heap on multi-hundred-MB remuxes; that was the `huge`/`massive` rung crash). Byte layout
+ * is identical to a naive concat, so `parse(write(x)) == x` still holds.
+ */
+export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint8Array {
+  const layout = mp4LayoutParts(tracks, opts);
+  const out = new Uint8Array(layout.totalLen);
   let p = 0;
-  out.set(ftyp, p);
-  p += ftyp.length;
-  if (mdatBeforeMoov) {
-    out.set(mdatHeader, p);
-    p += mdatHeader.length;
+  out.set(layout.ftyp, p);
+  p += layout.ftyp.length;
+  if (layout.mdatBeforeMoov) {
+    out.set(layout.mdatHeader, p);
+    p += layout.mdatHeader.length;
     p = writeSamples(out, p, tracks);
-    out.set(moovBytes, p);
+    out.set(layout.moov, p);
   } else {
-    out.set(moovBytes, p);
-    p += moovBytes.length;
-    out.set(mdatHeader, p);
-    p += mdatHeader.length;
+    out.set(layout.moov, p);
+    p += layout.moov.length;
+    out.set(layout.mdatHeader, p);
+    p += layout.mdatHeader.length;
     writeSamples(out, p, tracks);
   }
   return out;

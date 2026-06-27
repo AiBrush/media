@@ -432,6 +432,16 @@ export function planFragmentRuns(
 /** A fragmentation-ready track: the same metadata {@link writeMp4} consumes, plus its ordered samples. */
 export type FragmentTrackInput = MuxTrackInput;
 
+function planTrackFragmentRuns(track: FragmentTrackInput, maxSamples: number): MuxSampleInput[][] {
+  if (track.mediaType === 'video') return planFragmentRuns(track.samples, maxSamples);
+  if (track.samples.length === 0) return [];
+  const runs: MuxSampleInput[][] = [];
+  for (let i = 0; i < track.samples.length; i += maxSamples) {
+    runs.push(track.samples.slice(i, i + maxSamples));
+  }
+  return runs;
+}
+
 function assertTracks(tracks: readonly FragmentTrackInput[]): void {
   if (tracks.length === 0) {
     throw new MediaError('mux-error', 'cannot fragment a movie with no tracks');
@@ -469,7 +479,7 @@ export function* fragmentMp4(
   // 2) Plan each track's fragment runs, then walk them in lockstep so audio + video advance together and
   //    every fragment-step produces ONE moof (one traf per track that still has a run) + a shared mdat.
   //    Per-track DTS accumulates across segments → `tfdt` baseMediaDecodeTime is monotonic per track.
-  const plans = tracks.map((t) => planFragmentRuns(t.samples, maxSamples));
+  const plans = tracks.map((t) => planTrackFragmentRuns(t, maxSamples));
   const cursors = new Array<number>(tracks.length).fill(0);
   const baseDts = new Array<number>(tracks.length).fill(0);
   const maxRuns = plans.reduce((m, p) => Math.max(m, p.length), 0);

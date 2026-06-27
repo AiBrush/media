@@ -46,13 +46,22 @@ import { Mp4Muxer } from './mux.ts';
 import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
 import { Reader } from './reader.ts';
 import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
-import { type ContainerBrand, type MuxSampleInput, type MuxTrackInput, writeMp4 } from './write.ts';
+import {
+  type ContainerBrand,
+  type MuxSampleInput,
+  type MuxTrackInput,
+  type MuxTrackLayoutInput,
+  planMp4ByteStreamLayout,
+  writeMp4,
+} from './write.ts';
 
 const MP4_MIMES = new Set(['video/mp4', 'video/quicktime', 'audio/mp4', 'audio/x-m4a']);
 const MP4_EXTENSIONS = new Set(['mp4', 'mov', 'm4a', 'm4v', 'qt']);
 const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
+const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
+const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
 
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
@@ -817,15 +826,24 @@ interface LazyFragmentTrack {
   readonly samples: readonly SampleData[];
 }
 
-function planSampleDataFragmentRuns(
+export function planLazySampleDataFragmentRuns(
   samples: readonly SampleData[],
-  maxSamples: number,
+  targetSamples: number,
+  splitAtKeyframes: boolean,
+  hardMaxSamples: number = targetSamples,
 ): SampleData[][] {
   if (samples.length === 0) return [];
   const runs: SampleData[][] = [];
   let current: SampleData[] = [];
   for (const sample of samples) {
-    if (current.length > 0 && (sample.keyframe || current.length >= maxSamples)) {
+    const reachedAudioTarget = !splitAtKeyframes && current.length >= targetSamples;
+    const reachedVideoTargetAtKeyframe =
+      splitAtKeyframes && sample.keyframe && current.length >= targetSamples;
+    const reachedHardVideoCap = splitAtKeyframes && current.length >= hardMaxSamples;
+    if (
+      current.length > 0 &&
+      (reachedAudioTarget || reachedVideoTargetAtKeyframe || reachedHardVideoCap)
+    ) {
       runs.push(current);
       current = [];
     }
@@ -852,6 +870,259 @@ function lazyFragmentTracksFromMovie(ra: RandomAccess, movie: Movie): LazyFragme
   return tracks;
 }
 
+interface LazyProgressiveTrack {
+  readonly metadata: MuxTrackLayoutInput;
+  readonly samples: readonly SampleData[];
+}
+
+function lazyProgressiveTracksFromMovie(ra: RandomAccess, movie: Movie): LazyProgressiveTrack[] {
+  const tracks = movie.tracks.map((track): LazyProgressiveTrack => {
+    const samples = buildSampleData(track);
+    validateSampleRanges(samples, ra.size);
+    return {
+      metadata: {
+        ...muxTrackMeta(track),
+        samples: samples.map((sample) => ({
+          byteLength: sample.size,
+          durationTicks: sample.durationTicks,
+          cttsTicks: sample.cttsTicks,
+          keyframe: sample.keyframe,
+        })),
+      },
+      samples,
+    };
+  });
+  if (tracks.length === 0) {
+    throw new MediaError('mux-error', 'cannot stream-copy a movie with no tracks');
+  }
+  for (const [i, track] of tracks.entries()) {
+    if (track.samples.length === 0) {
+      throw new MediaError('mux-error', `track ${i + 1} has no samples to stream-copy`);
+    }
+  }
+  return tracks;
+}
+
+function planOrderedSampleReadWindows(samples: readonly SampleData[]): SampleReadWindow[] {
+  const windows: SampleReadWindow[] = [];
+  let current: SampleReadWindow | undefined;
+  for (let ordinal = 0; ordinal < samples.length; ordinal++) {
+    const sample = samples[ordinal];
+    if (sample === undefined) continue;
+    const start = sample.offset;
+    const end = sample.offset + sample.size;
+    const item: SampleReadItem = { ordinal, sample };
+    if (current === undefined) {
+      current = { start, end, items: [item] };
+      windows.push(current);
+      continue;
+    }
+    const gap = start - current.end;
+    const combinedSpan = end - current.start;
+    if (
+      start >= current.end &&
+      gap <= SAMPLE_READ_GAP_BYTES &&
+      combinedSpan <= SAMPLE_READ_WINDOW_BYTES
+    ) {
+      current.end = Math.max(current.end, end);
+      current.items.push(item);
+      continue;
+    }
+    current = { start, end, items: [item] };
+    windows.push(current);
+  }
+  return windows;
+}
+
+async function readProgressivePayloadChunk(
+  ra: RandomAccess,
+  window: SampleReadWindow,
+): Promise<Uint8Array> {
+  const span = await ra.read(window.start, window.end - window.start);
+  if (span.byteLength !== window.end - window.start) {
+    throw new MediaError(
+      'demux-error',
+      `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+        window.end - window.start
+      } bytes (truncated MP4)`,
+    );
+  }
+
+  let payloadLen = 0;
+  for (const item of window.items) payloadLen += item.sample.size;
+  if (payloadLen === span.byteLength) return span;
+
+  const chunk = new Uint8Array(payloadLen);
+  let p = 0;
+  for (const item of window.items) {
+    const rel = item.sample.offset - window.start;
+    chunk.set(span.subarray(rel, rel + item.sample.size), p);
+    p += item.sample.size;
+  }
+  return chunk;
+}
+
+async function* progressiveSourceSegments(
+  ra: RandomAccess,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  const signal = o?.signal;
+  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
+  const layout = planMp4ByteStreamLayout(
+    tracks.map((track) => track.metadata),
+    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
+  );
+  const throwIfAborted = (): void => {
+    if (signal?.aborted) throw abortedError();
+  };
+  const yieldPayloads = async function* (): AsyncGenerator<Uint8Array, void, undefined> {
+    for (const track of tracks) {
+      for (const window of planOrderedSampleReadWindows(track.samples)) {
+        throwIfAborted();
+        const chunk = await readProgressivePayloadChunk(ra, window);
+        throwIfAborted();
+        yield chunk;
+      }
+    }
+  };
+
+  throwIfAborted();
+  yield layout.ftyp;
+  if (layout.mdatBeforeMoov) {
+    yield layout.mdatHeader;
+    yield* yieldPayloads();
+    yield layout.moov;
+    return;
+  }
+  yield layout.moov;
+  yield layout.mdatHeader;
+  yield* yieldPayloads();
+}
+
+function progressiveSourceStream(
+  ra: RandomAccess,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): ReadableStream<Uint8Array> {
+  const segments = progressiveSourceSegments(ra, movie, o);
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          const { done, value } = await segments.next();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      async cancel(): Promise<void> {
+        await segments.return?.();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+async function materializeProgressiveSourceBytes(
+  ra: RandomAccess,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): Promise<Uint8Array> {
+  const signal = o?.signal;
+  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
+  const layout = planMp4ByteStreamLayout(
+    tracks.map((track) => track.metadata),
+    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
+  );
+  const throwIfAborted = (): void => {
+    if (signal?.aborted) throw abortedError();
+  };
+
+  throwIfAborted();
+  const out = new Uint8Array(layout.totalLen);
+  let p = 0;
+  out.set(layout.ftyp, p);
+  p += layout.ftyp.byteLength;
+  if (!layout.mdatBeforeMoov) {
+    out.set(layout.moov, p);
+    p += layout.moov.byteLength;
+  }
+  out.set(layout.mdatHeader, p);
+  p += layout.mdatHeader.byteLength;
+  const payloadStart = p;
+
+  for (const track of tracks) {
+    for (const window of planOrderedSampleReadWindows(track.samples)) {
+      throwIfAborted();
+      const span = await ra.read(window.start, window.end - window.start);
+      if (span.byteLength !== window.end - window.start) {
+        throw new MediaError(
+          'demux-error',
+          `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+            window.end - window.start
+          } bytes (truncated MP4)`,
+        );
+      }
+      throwIfAborted();
+      for (const item of window.items) {
+        const rel = item.sample.offset - window.start;
+        out.set(span.subarray(rel, rel + item.sample.size), p);
+        p += item.sample.size;
+      }
+    }
+  }
+
+  const payloadEnd = payloadStart + layout.mdatPayloadLen;
+  if (p !== payloadEnd) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 layout mismatch: wrote ${p - payloadStart} payload bytes, expected ${layout.mdatPayloadLen}`,
+    );
+  }
+  if (layout.mdatBeforeMoov) {
+    out.set(layout.moov, p);
+    p += layout.moov.byteLength;
+  }
+  if (p !== layout.totalLen) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 layout mismatch: wrote ${p} total bytes, expected ${layout.totalLen}`,
+    );
+  }
+  return out;
+}
+
+function progressiveSourceBufferStream(
+  ra: RandomAccess,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): ReadableStream<Uint8Array> {
+  let emitted = false;
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        if (emitted) {
+          controller.close();
+          return;
+        }
+        emitted = true;
+        try {
+          controller.enqueue(await materializeProgressiveSourceBytes(ra, movie, o));
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      cancel(): void {
+        // Range reads are one-shot promises; abort is handled through StreamCopyOptions.signal.
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 /**
  * Same-container MP4/MOV streaming copy, lazy on both output and sample payload reads. The init segment is
  * emitted before any mdat bytes are read; each later pull reads only that fragment's source sample windows
@@ -863,8 +1134,14 @@ function fragmentedSourceStream(
   signal: AbortSignal | undefined,
 ): ReadableStream<Uint8Array> {
   const tracks = lazyFragmentTracksFromMovie(ra, movie);
-  const maxSamples = 90;
-  const plans = tracks.map((track) => planSampleDataFragmentRuns(track.samples, maxSamples));
+  const plans = tracks.map((track) =>
+    planLazySampleDataFragmentRuns(
+      track.samples,
+      LAZY_FRAGMENT_TARGET_SAMPLES,
+      track.metadata.mediaType === 'video',
+      LAZY_FRAGMENT_HARD_VIDEO_SAMPLES,
+    ),
+  );
   const cursors = new Array<number>(tracks.length).fill(0);
   const baseDts = new Array<number>(tracks.length).fill(0);
   const maxRuns = plans.reduce((max, plan) => Math.max(max, plan.length), 0);
@@ -955,6 +1232,12 @@ export const Mp4Driver: ContainerDriver = {
     const trim = o?.trim;
     if (o?.fragmented === true && trim === undefined) {
       return fragmentedSourceStream(ra, movie, o?.signal);
+    }
+    if (o?.streaming === true && trim === undefined) {
+      return progressiveSourceStream(ra, movie, o);
+    }
+    if (o?.buffered === true && trim === undefined) {
+      return progressiveSourceBufferStream(ra, movie, o);
     }
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal)

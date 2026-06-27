@@ -132,6 +132,56 @@ describe('Router.pickCodec', () => {
     await router.pickCodec(decodeQuery);
     expect(supports).toHaveBeenCalledTimes(3); // cache cleared → re-probe
   });
+
+  it('uses explicit tiny-cost telemetry to rank native codec work ahead of GPU startup', async () => {
+    const native = makeCodec('native', 'native', true);
+    const gpu = makeCodec('gpu', 'gpu', true);
+    const { router } = routerWith((reg) => {
+      reg.addCodec(gpu.driver);
+      reg.addCodec(native.driver);
+    });
+
+    const tinyCosts = [
+      { inputBytes: 64 },
+      { inputBytes: 10_000_000, outputPixels: 32 * 32 },
+      { inputBytes: 10_000_000, outputPixels: 1920 * 1080, mediaSeconds: 0.1 },
+      {
+        inputBytes: 10_000_000,
+        outputPixels: 1920 * 1080,
+        mediaSeconds: 60,
+        audioFrames: 128,
+      },
+    ] as const;
+
+    let caseIndex = 0;
+    for (const cost of tinyCosts) {
+      expect(
+        (
+          await router.pickCodec(
+            { ...decodeQuery, config: { codec: `vp09.00.10.08.${caseIndex}` } },
+            { cost },
+          )
+        ).id,
+      ).toBe('native');
+      caseIndex++;
+    }
+
+    expect(
+      (
+        await router.pickCodec(
+          { ...decodeQuery, config: { codec: 'vp09.00.10.08.large' } },
+          {
+            cost: {
+              inputBytes: 100_000_000,
+              outputPixels: 1920 * 1080,
+              mediaSeconds: 60,
+              audioFrames: 48_001,
+            },
+          },
+        )
+      ).id,
+    ).toBe('gpu');
+  });
 });
 
 describe('Router.pickContainer', () => {
@@ -250,6 +300,30 @@ describe('Router.pickFilter', () => {
     router.pickFilter(resizeSpec);
     router.pickFilter(resizeSpec);
     expect(supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats audio-only filter specs as non-tiny and keeps the GPU setup ranking irrelevant', () => {
+    const native = makeFilter('native', 'native', true);
+    const wasm = makeFilter('wasm', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addFilter(wasm.driver);
+      reg.addFilter(native.driver);
+    });
+
+    const audioSpecs: readonly FilterSpec[] = [
+      { mediaType: 'audio', type: 'resample', sampleRate: 16_000 },
+      { mediaType: 'audio', type: 'remix', channels: 1 },
+      { mediaType: 'audio', type: 'gain', db: -6 },
+      { mediaType: 'audio', type: 'fade', curve: 'linear', inFrames: 10, outFrames: 20 },
+      { mediaType: 'audio', type: 'biquad', spec: { type: 'lowpass', frequency: 4000, q: 1 } },
+      {
+        mediaType: 'audio',
+        type: 'dynamics',
+        dynamics: { limit: { ceilingDbfs: -1, mode: 'hard' } },
+      },
+    ];
+
+    for (const spec of audioSpecs) expect(router.pickFilter(spec).id).toBe('native');
   });
 });
 

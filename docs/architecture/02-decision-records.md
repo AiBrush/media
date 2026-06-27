@@ -229,6 +229,11 @@ scaffold tails whose cores are absent. Current support is gated on the browser `
 
 ### ADR-053 — Browser harness buffer targets decline over-size whole-output materialization
 
+**Status update (ADR-102 supersedes this for ISO-BMFF same-container remux):** the generic safety boundary
+still applies to formats without a bounded materializer. MP4/MOV ordinary explicit buffer targets can use
+a single-allocation progressive source-range fill, while GB-scale ISO-BMFF buffer rows may route to a
+fragmented whole-buffer output under the verified in-browser cap instead of declining.
+
 **Context:** ADR-052 removed the per-sample HTTP Range storm for URL-backed MP4 stream-copy, but the explicit `target:'buffer'` massive row exposed a separate browser boundary: a buffer target must return `MediaBytes.bytes` as one `Uint8Array`, and a 1+ GiB MP4 remux can spend long synchronous time allocating/writing that output and then fail or starve timers while converting a Blob back to bytes. That is not a streaming-output success path; it is the exact memory-pressure contrast partner for real `target:writes`. Letting it wedge the harness is worse than an honest miss, and raising timeouts would hide the fact that the adapter cannot safely materialize that buffer shape at this scale. **Decision:** keep ordinary buffer remuxes live, but make the browser harness adapter refuse explicit buffer-target remux when the served static input is above a conservative whole-output materialization ceiling (currently 512 MiB), using `HEAD`/one-byte `Range` metadata rather than asset names. The adapter also asks the library for a `toStream()` sink on remux so small/medium outputs avoid a Blob round-trip before satisfying the harness `Uint8Array` contract; this does not declare or instrument `target:writes`. Mutated robustness inputs and unknown-size inputs are not rejected by this guard because their real byte size is not cheaply known without consuming them. **Consequences:** the massive buffer row settles as `NA_ENGINE` quickly instead of failing with a browser file-read error or blocking the page, while normal buffer rows still execute and remain oracle-gated. The paired stream-target rows stay `NA_ENGINE` until the adapter writes through a real `StreamTarget`, records `targetWrites`/`firstByteMs`, and reconstructs output bytes from target writes. This is a harness reachability boundary, not a container-driver capability claim. **Rejected:** hardcoding `massive_h264_1080p_2h.mp4` (fake fixture-specific behavior); increasing adapter or runner timeouts (does not fix synchronous allocation or memory pressure); treating the buffer row as a streaming pass (would fabricate `targetWrites`); globally rejecting all buffer targets (would discard the valid small/ordinary buffer coverage).
 
 ### ADR-054 — Explicit PCM target codec selects the raw output sample format
@@ -1570,3 +1575,120 @@ architecture docs now describe the same capability surface.
 **Rejected:** declaring `fastStart:reserve` as proof of sparse reserved-moov patching; mapping WebM
 `target:'stream'` to the seekable single-chunk writer; disabling the scale guards globally; loosening the
 benchmark shape oracles.
+
+### ADR-101 — Lazy MP4 stream targets use source-range copy, not a giant `writeMp4` buffer
+
+**Context:** the Session 5 streaming-output size ladder includes huge and massive MP4/MOV `target:'stream'`
+rows. Before this decision, same-container MP4 stream-copy always called `muxTracksFromMovie()` and then
+`writeMp4()`: all sample payloads were loaded into `MuxTrackInput.samples`, a single output `Uint8Array`
+was allocated, and only then could `StreamTarget` observe one write. That shape is correct for a small
+buffer target, but it is not a streaming target at 447 MB or 1.14 GB. The root already had a validated CMAF
+fragment writer, but the stream-copy route still fed it eager sample arrays.
+
+**Decision:** for full same-container MP4/MOV stream-copy into a streaming sink, bypass
+`muxTracksFromMovie()` and drive a lazy source-range byte stream. The driver parses `moov`, validates every
+sample range up front, plans the progressive `ftyp`/`moov`/`mdat` layout from sample sizes only, emits the
+headers before reading any `mdat` payload, then pulls compacted coalesced sample windows in track/sample
+order. The output is a real freshly-authored MP4/MOV layout, not source passthrough, and the `StreamTarget`
+sees many bounded chunks without the root driver holding a full source payload set or full output buffer.
+When the caller explicitly requests `{ fragmented:true }`, the same full-remux path still uses the lazy
+fragmented/CMAF source stream: it emits the fragmented init segment (`ftyp` + empty `moov`) and then
+keyframe-aligned `moof`+`mdat` media segments. Fragmented video runs group GOPs until the lazy stream target
+reaches its sample budget (900 samples, with a hard cap for pathological keyframe-sparse streams); audio
+runs split only on that same cap, because every audio packet is sync and splitting on each audio packet
+would turn long files into hundreds of thousands of tiny fragments. Both lazy streams use `highWaterMark:0`
+so the consumer's next pull, not the default stream queue, triggers the next payload reads. Trimmed
+fragmented output keeps the existing eager selected-window path because trim already performs range
+selection and optional decode validation before muxing.
+
+**Consequences:** MP4 `target:'stream'` can now be routed to a progressive lazy stream honestly: it produces
+observable multi-write output, stays browser-decodable/reference-reimportable as ordinary MP4, and does not
+allocate a full output buffer or full source payload set inside the root driver. Separate regression tests
+prove both lazy variants deliver their headers/init before any payload range reads, then assemble the
+stream and re-parse duration/codecs/sample tables from the real corpus. The browser benchmark adapter still
+has a separate `MediaBytes` contract limitation: reference oracles require a final `Uint8Array`, so the
+adapter may still materialize the assembled bytes after observing the writes. That is a harness
+result-shape constraint, not a root stream-copy constraint. The GB-scale browser size-ladder timeout is
+therefore 300 s: Chromium/WebKit finish the massive stream row quickly, but Firefox's strict remux +
+reimport + result-materialization path needs a larger honest benchmark budget than the former 120 s cap,
+which otherwise turned a correct run into an adapter timeout rather than a measured slow pass.
+
+**Rejected:** simply raising the adapter size cap while leaving MP4 `target:'stream'` as a one-shot
+`writeMp4()` output; inventing progressive faststart sparse writes without an oracle; weakening the
+size-ladder rows; making trimmed fragmented output lazy before its decode-validation path is refactored.
+
+### ADR-102 — MP4 buffer targets use bounded whole-buffer routes at scale
+
+**Context:** ADR-101 fixed the `StreamTarget` side of the streaming-output size ladder, but the explicit
+`target:'buffer'` massive MP4 row is a different contract: the harness must receive one final
+`Uint8Array`. Declining the row was honest before the root had a safe materializer, but leaving it as N/A
+would miss the buffer-vs-stream contrast the ladder exists to measure. The old same-container path read
+every sample payload into `MuxTrackInput.samples`, then allocated the output and copied all payloads again;
+lifting the adapter guard over that path would hold a 1+ GiB source payload set plus a 1+ GiB output and
+would be a brittle memory accident, not a SOTA buffer implementation.
+
+**Decision:** add an optional driver-native `StreamCopyOptions.buffered` hint. The engine sets it for
+same-container stream-copy whenever the caller is collecting a whole output (`Blob`/`File`/`toStream`) and
+not writing to a real `StreamTarget`. The MP4 driver handles full, untrimmed, non-fragmented buffered
+remux with the same layout-only plan as ADR-101: parse `moov`, validate sample byte ranges, build the
+`ftyp`/`moov`/`mdat` layout from sample sizes only, allocate the final `Uint8Array` once, write headers,
+then range-read coalesced source sample windows and copy each sample directly into its final `mdat`
+position. `faststart:false` writes the trailing `moov` after payload fill; the default faststart path
+writes `moov` before `mdat`. Abort is checked before allocation and between every source window.
+
+The browser adapter uses a second ISO-BMFF buffer route for the GB-scale suite rows: explicit MP4/MOV
+buffer targets above the generic 512 MiB ceiling request fragmented MP4 output and still return a single
+final `Uint8Array` to the harness. This keeps the target contract as a buffer target (`targetWrites:1`,
+no streaming telemetry declaration) while avoiding the progressive mega-file shape that Chromium could not
+survive during strict reference reimport. The ISO-BMFF cap is 1.5 GiB; formats without either bounded route
+keep the conservative 512 MiB generic cap and decline honestly.
+
+**Consequences:** a massive MP4 buffer target is now a real measured capability, not an honest N/A: it
+materializes one final buffer for the harness oracle while avoiding source-payload retention on ordinary
+progressive outputs and using fragmented whole-buffer output where that is the only browser-stable strict
+oracle shape. The Node oracle compares the progressive buffered route byte-for-byte against the existing
+eager `writeMp4()` result on the real corpus, so any offset, timing, B-frame `ctts`, codec-private, or
+payload-order drift fails. The GB-scale browser row is separately validated by fresh Chromium
+`streaming-output/buffer_massive_h264_mp4` reimport (`results/raw/chromium-2026-06-27T11-57-43-486Z.json`):
+553,501 packets, 341,101 keyframes, two media tracks, duration delta 0.021333 s, `targetWrites:1`, and
+1,144,868,975 output bytes. Outputs still over the single-`Uint8Array`/32-bit MP4 box limit remain typed
+failures and should use `StreamTarget`. **Rejected:** raising only the adapter cap (would run the old
+double-buffer path); assembling a progressive `StreamTarget` result and then concatenating it for the
+buffer row (still holds output twice and preserves the fragile reimport shape); source passthrough (fake
+work, wrong layout); making >4 GiB whole-buffer output a goal (not representable as one `Uint8Array`/
+classic MP4 box).
+
+### ADR-103 — Session-5 budget repair: lazy codec-pipeline helpers and FLAC default proxies
+
+**Context:** after the Session-5 streaming-output work, the root `gate` failed the package budget check even
+though type/lint/tests were green: the eager default-entry closure was 52.01 kB against the 50 kB target.
+The source maps showed two honest but over-eager edges. First, `engine.ts` statically imported the whole
+`codec-pipeline.ts` module, so pure encoder config, packet-drain, seek, and codec-string normalization code
+entered the kernel even for probe/remux users. Second, the default driver bundle statically imported the
+FLAC container and native FLAC encode modules, pulling FLAC decode/encode plus PCM/DSP helpers into the
+first driver-registration download before any FLAC route was selected.
+
+**Decision:** split the cheap route predicates (`containerHasChunkMuxer`, PCM-container detection, track
+selection, and pure stream-copy detection) into `src/api/codec-routing.ts`, which remains eager because
+those decisions are part of ordinary op dispatch. Keep the heavier live-codec helpers in
+`codec-pipeline.ts`, but import them lazily from the decode/encode/mux/seek paths that actually need them;
+`decodeConfigOf`/`decodeQueryFor` now await codec-string normalization before routing, preserving the exact
+WebCodecs probe semantics. For FLAC, register cheap default proxies instead of the heavy implementations:
+`flac-sniff.ts` supplies the synchronous `supports()` predicate, the lazy container proxy imports
+`flac-driver.ts` only when FLAC demux/PCM decode/transform/mux is selected, and the deferred FLAC muxer
+preserves the synchronous `addTrack` contract while loading and piping the real muxer on first async
+write/finalize. The native `flac-encode` codec is registered through the same lazy codec facade as the WASM
+tails, but with `tier:'native'`.
+
+**Consequences:** no public API or driver contract changed, and `DRIVER_API_VERSION` stays unchanged. The
+compatibility import path for existing tests remains intact because `codec-pipeline.ts` re-exports the
+cheap routing helpers. Fresh verification after the split: `bun run check-budgets` reports the eager kernel
+at **46.56 kB / 50.00 kB** and the typical first-operation JS closure at **237.98 kB / 256.00 kB**. FLAC
+focused tests, including the independent `flac`/`ffmpeg` decode oracle, still pass; default FLAC
+reachability remains zero-config because the proxy is registered in `defaults.ts`.
+
+**Rejected:** raising the package budgets again (ADR-092's temporary deviation had a real-fix mandate);
+dropping FLAC from defaults (would turn real zero-config coverage back into N/A); making `createMuxer`
+async (driver-contract break); weakening codec normalization by probing bare container tokens directly;
+moving public `cacheSource`/`StreamTarget` helpers out of the default entry as the first repair (a larger
+surface change than the internal lazy split required).

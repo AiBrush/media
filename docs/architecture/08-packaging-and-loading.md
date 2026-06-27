@@ -34,6 +34,7 @@ Author in **TypeScript (strict)**; emit:
 
 - The **default export** is the tiny kernel + bare-function sugar (ADR-009).
 - Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004).
+- Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103).
 - `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
 - `./drivers/*` exists only for the optional "inject a custom/third-party driver" hook; normal usage never imports a driver directly (the router does, lazily).
 

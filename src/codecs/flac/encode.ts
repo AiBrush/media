@@ -132,7 +132,6 @@ function encodeWith(
     const block = pcm.samples.map((plane) => plane.subarray(start, start + samples));
     frames.push(enc.encodeBlock(block, samples));
   }
-  if (frames.length === 0) throw new InputError('unsupported-input', 'FLAC encode needs samples');
 
   const md5 = md5Bytes(interleavedPcmBytes(pcm));
   const streamInfo = enc.finalizeStreamInfo(md5);
@@ -395,13 +394,13 @@ function planSubframes(
     );
     return { assignment: 0, plans };
   }
-  const left = (planes[0] ?? new Int32Array(samples)).subarray(0, samples);
-  const right = (planes[1] ?? new Int32Array(samples)).subarray(0, samples);
+  const left = (planes[0] as Int32Array).subarray(0, samples);
+  const right = (planes[1] as Int32Array).subarray(0, samples);
   const mid = new Int32Array(samples);
   const side = new Int32Array(samples);
   for (let i = 0; i < samples; i++) {
-    const l = left[i] ?? 0;
-    const r = right[i] ?? 0;
+    const l = left[i] as number;
+    const r = right[i] as number;
     mid[i] = (l + r) >> 1; // floor((l+r)/2); the dropped LSB is recoverable from side's parity
     side[i] = l - r;
   }
@@ -431,7 +430,7 @@ function planSubframes(
 type PlanWithSource = SubframePlan & { readonly source: Int32Array };
 
 function subframePairCost(plans: readonly PlanWithSource[]): number {
-  return (plans[0]?.cost ?? 0) + (plans[1]?.cost ?? 0);
+  return (plans[0] as PlanWithSource).cost + (plans[1] as PlanWithSource).cost;
 }
 
 /** FIXED-predictor coefficients (RFC 9639 §9.2.6) — the exact inverse the decoder applies. */
@@ -499,8 +498,8 @@ function planChannel(
 const SUBFRAME_HEADER_BITS = 8;
 
 function isConstant(plane: Int32Array, samples: number): boolean {
-  const v = plane[0] ?? 0;
-  for (let i = 1; i < samples; i++) if ((plane[i] ?? 0) !== v) return false;
+  const v = plane[0] as number;
+  for (let i = 1; i < samples; i++) if ((plane[i] as number) !== v) return false;
   return true;
 }
 
@@ -517,7 +516,9 @@ function bestFixedOrder(plane: Int32Array, samples: number): number {
   let bestSum = absSum(work, 0, samples);
   for (let order = 1; order <= maxOrder; order++) {
     // Difference in place: work[i] -= work[i-1] over the still-active suffix.
-    for (let i = samples - 1; i >= order; i--) work[i] = (work[i] ?? 0) - (work[i - 1] ?? 0);
+    for (let i = samples - 1; i >= order; i--) {
+      work[i] = (work[i] as number) - (work[i - 1] as number);
+    }
     const sum = absSum(work, order, samples);
     if (sum < bestSum) {
       bestSum = sum;
@@ -530,7 +531,7 @@ function bestFixedOrder(plane: Int32Array, samples: number): number {
 function absSum(arr: Int32Array, start: number, end: number): number {
   let total = 0;
   for (let i = start; i < end; i++) {
-    const v = arr[i] ?? 0;
+    const v = arr[i] as number;
     total += v < 0 ? -v : v;
   }
   return total;
@@ -538,12 +539,12 @@ function absSum(arr: Int32Array, start: number, end: number): number {
 
 /** Compute the order-`order` FIXED residual `res[i] = plane[i] - Σ coef[j]·plane[i-1-j]` (exact inverse). */
 function fixedResidual(plane: Int32Array, samples: number, order: number): Int32Array {
-  const coef = FIXED_COEF[order] ?? [];
+  const coef = FIXED_COEF[order] as readonly number[];
   const residual = new Int32Array(samples - order);
   for (let i = order; i < samples; i++) {
     let pred = 0;
-    for (let j = 0; j < order; j++) pred += (coef[j] ?? 0) * (plane[i - 1 - j] ?? 0);
-    residual[i - order] = (plane[i] ?? 0) - pred;
+    for (let j = 0; j < order; j++) pred += (coef[j] as number) * (plane[i - 1 - j] as number);
+    residual[i - order] = (plane[i] as number) - pred;
   }
   return residual;
 }
@@ -557,16 +558,16 @@ function writeSubframe(
 ): void {
   if (plan.kind === 'constant') {
     writeSubframeHeader(bits, 0); // CONSTANT
-    bits.writeSigned(source[0] ?? 0, plan.bps);
+    bits.writeSigned(source[0] as number, plan.bps);
     return;
   }
   if (plan.kind === 'verbatim') {
     writeSubframeHeader(bits, 1); // VERBATIM
-    for (let i = 0; i < samples; i++) bits.writeSigned(source[i] ?? 0, plan.bps);
+    for (let i = 0; i < samples; i++) bits.writeSigned(source[i] as number, plan.bps);
     return;
   }
   writeSubframeHeader(bits, 8 + plan.order); // FIXED order 0..4
-  for (let i = 0; i < plan.order; i++) bits.writeSigned(source[i] ?? 0, plan.bps);
+  for (let i = 0; i < plan.order; i++) bits.writeSigned(source[i] as number, plan.bps);
   writeResidual(bits, plan.residual, samples, plan.order, plan.partition);
 }
 
@@ -600,19 +601,19 @@ function writeResidual(
   let index = 0;
   for (let p = 0; p < partitions; p++) {
     const count = p === 0 ? partitionSamples - predictorOrder : partitionSamples;
-    const param = params[p] ?? 0;
+    const param = params[p] as number;
     if (param === RICE5_ESCAPE) {
-      const width = escapeBits[p] ?? 0;
+      const width = escapeBits[p] as number;
       bits.writeBits(RICE5_ESCAPE, RICE5_PARAM_BITS);
       bits.writeBits(width, 5);
       for (let j = 0; j < count; j++) {
-        if (width > 0) bits.writeSigned(residual[index] ?? 0, width);
+        if (width > 0) bits.writeSigned(residual[index] as number, width);
         index++;
       }
     } else {
       bits.writeBits(param, RICE5_PARAM_BITS);
       for (let j = 0; j < count; j++) {
-        bits.writeRice(residual[index] ?? 0, param);
+        bits.writeRice(residual[index] as number, param);
         index++;
       }
     }
@@ -689,7 +690,7 @@ function bestRiceForPartition(residual: Int32Array, start: number, count: number
   let sum = 0;
   let maxBits = 0;
   for (let i = 0; i < count; i++) {
-    const u = zigzag(residual[start + i] ?? 0);
+    const u = zigzag(residual[start + i] as number);
     sum += u;
     const needed = 32 - Math.clz32(u); // bits to store u unsigned (0 for u=0)
     if (needed > maxBits) maxBits = needed;
@@ -722,7 +723,7 @@ function bestRiceForPartition(residual: Int32Array, start: number, count: number
 function riceCost(residual: Int32Array, start: number, count: number, k: number): number {
   let total = 0;
   for (let i = 0; i < count; i++) {
-    const u = zigzag(residual[start + i] ?? 0);
+    const u = zigzag(residual[start + i] as number);
     total += (u >>> k) + 1 + k; // quotient (unary) + stop bit + k remainder bits
   }
   return total;
@@ -1070,10 +1071,10 @@ function md5Block(state: Md5State, bytes: Uint8Array, offset: number): void {
   for (let i = 0; i < 16; i++) {
     const at = offset + i * 4;
     words[i] =
-      (bytes[at] ?? 0) |
-      ((bytes[at + 1] ?? 0) << 8) |
-      ((bytes[at + 2] ?? 0) << 16) |
-      ((bytes[at + 3] ?? 0) << 24);
+      (bytes[at] as number) |
+      ((bytes[at + 1] as number) << 8) |
+      ((bytes[at + 2] as number) << 16) |
+      ((bytes[at + 3] as number) << 24);
   }
   let a = state.a;
   let b = state.b;
@@ -1095,11 +1096,11 @@ function md5Block(state: Md5State, bytes: Uint8Array, offset: number): void {
       f = c ^ (b | ~d);
       g = (7 * i) % 16;
     }
-    const sum = (a + f + (MD5_K[i] ?? 0) + (words[g] ?? 0)) >>> 0;
+    const sum = (a + f + (MD5_K[i] as number) + (words[g] as number)) >>> 0;
     a = d;
     d = c;
     c = b;
-    b = (b + leftRotate(sum, MD5_SHIFT[i] ?? 0)) >>> 0;
+    b = (b + leftRotate(sum, MD5_SHIFT[i] as number)) >>> 0;
   }
   state.a = (state.a + a) >>> 0;
   state.b = (state.b + b) >>> 0;

@@ -206,6 +206,10 @@ export interface StreamCopyOptions extends StageOptions {
   trim?: { startSec: number; endSec: number };
   faststart?: boolean;
   fragmented?: boolean;
+  /** True when the caller will materialize the copy into a streaming sink rather than a whole buffer. */
+  streaming?: boolean;
+  /** True when the caller needs a whole output buffer; drivers may avoid retaining source payload chunks. */
+  buffered?: boolean;
   /**
    * The target container token (one of the driver's {@link ContainerDriver.formats}); lets a
    * multi-format driver pick the right flavor (e.g. MP4 vs QuickTime `ftyp`). Omitted ⇒ primary format.

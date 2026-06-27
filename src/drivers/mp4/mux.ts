@@ -620,10 +620,10 @@ function ascFromEsDescriptor(description: Uint8Array): Uint8Array | undefined {
 
 function asciiAt(bytes: Uint8Array, offset: number): string {
   return String.fromCharCode(
-    bytes[offset] ?? 0,
-    bytes[offset + 1] ?? 0,
-    bytes[offset + 2] ?? 0,
-    bytes[offset + 3] ?? 0,
+    bytes[offset] as number,
+    bytes[offset + 1] as number,
+    bytes[offset + 2] as number,
+    bytes[offset + 3] as number,
   );
 }
 
@@ -644,10 +644,10 @@ function normalizeAacDescription(description: Uint8Array): Uint8Array {
   }
   if (description.byteLength >= 12 && asciiAt(description, 4) === 'esds') {
     const size =
-      (description[0] ?? 0) * 0x1000000 +
-      (description[1] ?? 0) * 0x10000 +
-      (description[2] ?? 0) * 0x100 +
-      (description[3] ?? 0);
+      (description[0] as number) * 0x1000000 +
+      (description[1] as number) * 0x10000 +
+      (description[2] as number) * 0x100 +
+      (description[3] as number);
     if (size >= 12 && size <= description.byteLength) {
       const asc = ascFromEsdsPayload(description.subarray(8, size));
       if (asc !== undefined) return asc;
@@ -680,20 +680,14 @@ function prepareAacSamples(
     throw new MediaError('mux-error', 'AAC MP4 muxing cannot mix ADTS-framed and raw samples');
   }
 
-  const first = parsed[0];
-  if (first === undefined) {
-    throw new MediaError('mux-error', 'AAC ADTS sample parsing failed unexpectedly');
-  }
+  const first = parsed[0] as AacAdtsAccessUnit;
   if (normalizedDescription !== undefined)
     assertAdtsMatchesDescription(first, normalizedDescription);
 
   const normalized: ChunkStruct[] = [];
   for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const frame = parsed[i];
-    if (chunk === undefined || frame === undefined) {
-      throw new MediaError('mux-error', 'AAC ADTS sample parsing failed unexpectedly');
-    }
+    const chunk = chunks[i] as ChunkStruct;
+    const frame = parsed[i] as AacAdtsAccessUnit;
     assertSameAdtsConfig(first, frame);
     normalized.push(copyChunkWithData(chunk, frame.payload.slice()));
   }
@@ -757,8 +751,9 @@ export function buildMuxSamples(
   if (n === 0) return [];
 
   const hasAllDurations = chunks.every((c) => c.durationUs !== undefined);
-  const recovered = hasAllDurations ? undefined : recoverDurationsUs(chunks);
-  const durationsUs = chunks.map((c, i) => c.durationUs ?? recovered?.[i] ?? 0);
+  const durationsUs = hasAllDurations
+    ? chunks.map((c) => c.durationUs as number)
+    : recoverDurationsUs(chunks);
 
   // Verbatim-remux fast path: every packet carries the source's true decode timestamp (the demuxer read
   // it from `stts`). Lay the composition offset down as the exact (PTS − DTS), and derive each sample's
@@ -978,11 +973,7 @@ export class Mp4Muxer implements Muxer {
     this.#assertOpen();
     this.#finalized = true;
     await this.#ready; // the readable's `start` has run → the controller is captured
-    const controller = this.#controller;
-    if (controller === undefined) {
-      // Unreachable: `start` resolves `#ready` and captures the controller before this awaits.
-      throw new MediaError('mux-error', 'muxer output stream was not initialized');
-    }
+    const controller = this.#controller as ReadableStreamDefaultController<Uint8Array>;
     try {
       const tracks = this.#buildTracks();
       if (this.#fragmented) {

@@ -270,6 +270,9 @@ describe('videoFilterSpecs', () => {
     expect(videoFilterSpecs({ width: 1280 }, src)).toEqual<FilterSpec[]>([
       { mediaType: 'video', type: 'resize', width: 1280, height: 1080 },
     ]);
+    expect(videoFilterSpecs({ height: 720 }, src)).toEqual<FilterSpec[]>([
+      { mediaType: 'video', type: 'resize', width: 1920, height: 720 },
+    ]);
   });
 
   it('omits a no-op rotate(0) but keeps 180', () => {
@@ -287,6 +290,9 @@ describe('videoFilterSpecs', () => {
 
   it('rejects non-positive crop/resize', () => {
     expect(() => videoFilterSpecs({ crop: { x: 0, y: 0, width: 0, height: 10 } }, src)).toThrow(
+      InputError,
+    );
+    expect(() => videoFilterSpecs({ crop: { x: 0, y: 0, width: 10, height: -1 } }, src)).toThrow(
       InputError,
     );
     expect(() => videoFilterSpecs({ width: -5, height: 5 }, src)).toThrow(InputError);
@@ -381,11 +387,63 @@ describe('planCfrFrameRetiming', () => {
     expect(plan.droppedSourceIndexes).toEqual([1]);
   });
 
+  it('infers missing frame durations from timestamp gaps and rejects an unbounded single frame', () => {
+    const gapInferred = planCfrFrameRetiming(
+      [{ timestamp: 0 }, { timestamp: 40_000 }, { timestamp: 80_000 }],
+      { fps: 25 },
+    );
+    expect(gapInferred.outputs.map((o) => o.sourceIndex)).toEqual([0, 1, 2]);
+    expect(gapInferred.endsAtUs).toBe(120_000);
+    expect(() => planCfrFrameRetiming([{ timestamp: 0 }], { fps: 25 })).toThrow(InputError);
+  });
+
   it('rejects invalid fps or non-monotonic source timestamps with typed errors', () => {
     expect(() => planCfrFrameRetiming(cfrTimings(30, 2), { fps: 0 })).toThrow(InputError);
     expect(() =>
       planCfrFrameRetiming([{ timestamp: 10_000 }, { timestamp: 5_000 }], { fps: 30 }),
     ).toThrow(InputError);
+  });
+
+  it('handles empty and explicit-duration plans, and rejects malformed timing arrays', () => {
+    expect(planCfrFrameRetiming([], { fps: 30 })).toEqual({
+      fps: 30,
+      startsAtUs: undefined,
+      endsAtUs: undefined,
+      outputs: [],
+      droppedSourceIndexes: [],
+    });
+    expect(planCfrFrameRetiming([{ timestamp: 10_000 }], { fps: 10, durationUs: 200_000 })).toEqual(
+      {
+        fps: 10,
+        startsAtUs: 10_000,
+        endsAtUs: 210_000,
+        outputs: [
+          {
+            outputIndex: 0,
+            sourceIndex: 0,
+            timestamp: 10_000,
+            duration: 100_000,
+            duplicate: false,
+          },
+          {
+            outputIndex: 1,
+            sourceIndex: 0,
+            timestamp: 110_000,
+            duration: 100_000,
+            duplicate: true,
+          },
+        ],
+        droppedSourceIndexes: [],
+      },
+    );
+    expect(() => planCfrFrameRetiming([{ timestamp: 0 }], { fps: 30, durationUs: 0 })).toThrow(
+      InputError,
+    );
+    const sparse = new Array(1) as { timestamp: number }[];
+    expect(() => planCfrFrameRetiming(sparse, { fps: 30 })).toThrow(InputError);
+    expect(() => planCfrFrameRetiming([{ timestamp: Number.NaN }], { fps: 30 })).toThrow(
+      InputError,
+    );
   });
 });
 
@@ -458,6 +516,50 @@ describe('retimeTimedFrameStream', () => {
     expect(input.closed).toBe(true);
     await reader.cancel().catch(() => {});
     reader.releaseLock();
+  });
+
+  it('handles empty and single-frame streams, and closes malformed stream input', async () => {
+    expect(
+      await collect(
+        retimeTimedFrameStream(streamOf<RetimeFakeFrame>([]), {
+          fps: 30,
+          restamp(frame): RetimeFakeFrame {
+            return frame;
+          },
+        }),
+      ),
+    ).toEqual([]);
+
+    let nextId = 200;
+    const single = new RetimeFakeFrame(1, 10_000, null);
+    const outputs = await collect(
+      retimeTimedFrameStream(streamOf([single]), {
+        fps: 10,
+        durationUs: 200_000,
+        restamp(frame, timing): RetimeFakeFrame {
+          return new RetimeFakeFrame(nextId++, timing.timestamp, timing.duration, frame.id);
+        },
+      }),
+    );
+    expect(single.closed).toBe(true);
+    expect(outputs.map((frame) => [frame.parentId, frame.timestamp, frame.duration])).toEqual([
+      [1, 10_000, 100_000],
+      [1, 110_000, 100_000],
+    ]);
+    for (const output of outputs) output.close();
+
+    const bad = new RetimeFakeFrame(2, Number.NaN, 10_000);
+    await expect(
+      collect(
+        retimeTimedFrameStream(streamOf([bad]), {
+          fps: 30,
+          restamp(frame): RetimeFakeFrame {
+            return new RetimeFakeFrame(nextId++, frame.timestamp, 33_333, frame.id);
+          },
+        }),
+      ),
+    ).rejects.toThrow(InputError);
+    expect(bad.closed).toBe(true);
   });
 });
 
@@ -768,10 +870,18 @@ describe('buildVideoEncoderConfig', () => {
 
 describe('planVideoRateControl', () => {
   it('plans bitrate, CRF, and two-pass requests distinctly', () => {
+    expect(planVideoRateControl({}, undefined)).toEqual({ mode: 'default' });
     expect(planVideoRateControl({ bitrate: 3_000_000 }, 'avc1.42E01E')).toEqual({
       mode: 'bitrate',
       bitrate: 3_000_000,
       bitrateMode: 'variable',
+    });
+    expect(
+      planVideoRateControl({ bitrate: 3_000_000, bitrateMode: 'constant' }, 'avc1.42E01E'),
+    ).toEqual({
+      mode: 'bitrate',
+      bitrate: 3_000_000,
+      bitrateMode: 'constant',
     });
     expect(planVideoRateControl({ crf: 23 }, 'avc1.42E01E')).toEqual({
       mode: 'crf',
@@ -791,6 +901,7 @@ describe('planVideoRateControl', () => {
   it('rejects malformed or conflicting rate-control requests with typed errors', () => {
     expect(() => planVideoRateControl({ bitrate: -1 }, 'avc1.42E01E')).toThrow(InputError);
     expect(() => planVideoRateControl({ crf: 52 }, 'avc1.42E01E')).toThrow(InputError);
+    expect(() => planVideoRateControl({ crf: 64 }, 'vp09.00.10.08')).toThrow(InputError);
     expect(() => planVideoRateControl({ bitrate: 1_000_000, crf: 23 }, 'avc1.42E01E')).toThrow(
       InputError,
     );
@@ -832,6 +943,38 @@ describe('planVideoBitDepthConversion', () => {
       }),
     ).toThrow(CapabilityError);
   });
+
+  it('reads bit-depth from explicit values and VPx/AV1 codec strings', () => {
+    expect(planVideoBitDepthConversion({ sourceBitDepth: 10, targetBitDepth: 8 })).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 10,
+      targetBitDepth: 8,
+      requiresPixelPath: true,
+    });
+    expect(
+      planVideoBitDepthConversion({
+        sourceCodec: 'vp09.00.10.10',
+        targetCodec: 'av01.0.04M.08',
+      }),
+    ).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 10,
+      targetBitDepth: 8,
+      requiresPixelPath: true,
+    });
+    expect(planVideoBitDepthConversion({ sourceCodec: 'vp8', targetCodec: 'unknown' })).toEqual({
+      kind: 'none',
+      sourceBitDepth: 8,
+      targetBitDepth: undefined,
+      requiresPixelPath: false,
+    });
+    expect(() => planVideoBitDepthConversion({ sourceBitDepth: 9, targetBitDepth: 8 })).toThrow(
+      InputError,
+    );
+    expect(() => planVideoBitDepthConversion({ sourceBitDepth: 12, targetBitDepth: 8 })).toThrow(
+      CapabilityError,
+    );
+  });
 });
 
 describe('planH264AbrLadder', () => {
@@ -862,6 +1005,36 @@ describe('planH264AbrLadder', () => {
         height: 1080,
       }),
     ).toThrow(InputError);
+    expect(() =>
+      planH264AbrLadder([{ width: 640, height: 0, bitrate: 800_000 }], {
+        width: 1920,
+        height: 1080,
+      }),
+    ).toThrow(InputError);
+    expect(() =>
+      planH264AbrLadder([{ width: 640, height: 360, bitrate: 0 }], {
+        width: 1920,
+        height: 1080,
+      }),
+    ).toThrow(InputError);
+    expect(() =>
+      planH264AbrLadder([{ width: 640, height: 360, bitrate: 800_000, fps: Number.NaN }], {
+        width: 1920,
+        height: 1080,
+      }),
+    ).toThrow(InputError);
+  });
+
+  it('fills generated names and omits fps when a rung does not request frame-rate conversion', () => {
+    expect(
+      planH264AbrLadder([{ width: 640, height: 360, bitrate: 800_000 }], {
+        width: 1920,
+        height: 1080,
+      })[0]?.options,
+    ).toEqual({
+      to: 'mp4',
+      video: { codec: 'h264', width: 640, height: 360, bitrate: 800_000 },
+    });
   });
 });
 
