@@ -9,8 +9,13 @@
  * helper {@link buildMuxSamples} is also unit-tested directly (incl. VFR + missing-duration recovery).
  */
 
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import type { TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
+import { loadFixture } from '../../test-support/corpus.ts';
+import { enumerateMp3Packets, parseMp3 } from '../mp3/mp3-driver.ts';
+import { demuxWebm } from '../webm/webm-driver.ts';
 import { Mp4Driver, readMovie } from './mp4-driver.ts';
 import { type ChunkStruct, Mp4Muxer, buildMuxSamples } from './mux.ts';
 import { buildSampleData } from './samples.ts';
@@ -19,6 +24,15 @@ const ra = (b: Uint8Array) => ({
   read: (o: number, l: number) => Promise.resolve(b.subarray(o, o + l)),
   size: b.byteLength,
 });
+
+const MEDIA_TEST = new URL(
+  '../../../../media-test/media-browser-test/fixtures/media/',
+  import.meta.url,
+).pathname;
+
+async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
+  return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+}
 
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -45,6 +59,12 @@ const H264_SPS = new Uint8Array([0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80]);
 const H264_PPS = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
 /** A minimal AudioSpecificConfig (AAC-LC, 48 kHz, stereo) — the muxer synthesizes `esds` from it. */
 const ASC = new Uint8Array([0x11, 0x90]);
+/** WebKit AudioEncoder may publish an ES_Descriptor wrapper instead of the bare ASC. */
+const WEBKIT_AAC_ES_DESCRIPTOR = new Uint8Array([
+  0x03, 0x80, 0x80, 0x80, 0x22, 0x00, 0x00, 0x00, 0x04, 0x80, 0x80, 0x80, 0x14, 0x40, 0x14, 0x00,
+  0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x80, 0x80, 0x80, 0x02, 0x11,
+  0x90, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
+]);
 /** Real h265.mp4 hvcC prefix: Main, 8-bit, low tier, level 60, constraint 0x90. */
 const HVCC_MAIN_8 = Uint8Array.from([0x01, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3c]);
 /** Real bear-hevc-10bit-hdr10 hvcC shape: Main10, low tier, level 93, constraint 0x90. */
@@ -328,6 +348,34 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([5, 6]);
   });
 
+  it('bare aac unwraps WebKit ES_Descriptor metadata to the ASC before writing esds', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description: WEBKIT_AAC_ES_DESCRIPTOR,
+      },
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 0,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array([1, 2, 3, 4, 5]),
+    });
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.codec).toBe('mp4a.40.2');
+    expect(track?.sampleRate).toBe(48_000);
+    expect(track?.channels).toBe(2);
+    expect(track?.config?.description).toEqual(ASC);
+  });
+
   it('bare aac with ADTS samples synthesizes ASC and strips ADTS headers for MP4', async () => {
     const muxer = new Mp4Muxer();
     const aud = muxer.addTrack({
@@ -361,6 +409,99 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
       firstPayload.byteLength,
       secondPayload.byteLength,
     ]);
+  });
+
+  it.each([
+    {
+      fixture: 'vp9_1080p_10s.webm',
+      videoPrefix: 'vp09.',
+      videoBox: 'vpcC',
+    },
+    {
+      fixture: 'av1_720p_5s.webm',
+      videoPrefix: 'av01.',
+      videoBox: 'av1C',
+    },
+  ])('$fixture — WebM video+Opus muxes to MP4 with synthesized ISO codec records', async (c) => {
+    const { info, framesByIndex } = demuxWebm(await bytesFromMediaTest(c.fixture));
+    const muxer = new Mp4Muxer();
+    const trackIds = info.tracks.map((track, index) => {
+      const config =
+        track.mediaType === 'video'
+          ? {
+              codec: track.codec,
+              codedWidth: track.width ?? 0,
+              codedHeight: track.height ?? 0,
+              ...(track.description !== undefined ? { description: track.description } : {}),
+            }
+          : {
+              codec: track.codec,
+              sampleRate: track.sampleRate ?? 48_000,
+              numberOfChannels: track.channels ?? 2,
+              ...(track.description !== undefined ? { description: track.description } : {}),
+            };
+      return muxer.addTrack({
+        id: index,
+        mediaType: track.mediaType,
+        codec: track.codec,
+        ...(track.fps !== undefined ? { fps: track.fps } : {}),
+        config,
+      } satisfies TrackInfo);
+    });
+
+    for (let trackIndex = 0; trackIndex < trackIds.length; trackIndex++) {
+      const trackId = trackIds[trackIndex] as number;
+      for (const frame of (framesByIndex[trackIndex] ?? []).slice(0, 8)) {
+        muxer.addChunkStruct(trackId, {
+          timestampUs: frame.timestampUs,
+          durationUs: undefined,
+          key: frame.keyframe,
+          data: frame.data.slice(),
+        });
+      }
+    }
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const video = movie.tracks.find((track) => track.mediaType === 'video');
+    const audio = movie.tracks.find((track) => track.mediaType === 'audio');
+    expect(video?.codec.startsWith(c.videoPrefix)).toBe(true);
+    expect(video?.codecPrivate?.boxType).toBe(c.videoBox);
+    expect(video ? buildSampleData(video).length : 0).toBeGreaterThanOrEqual(5);
+    expect(audio?.codec).toBe('opus');
+    expect(audio?.codecPrivate?.boxType).toBe('dOps');
+    expect(audio ? buildSampleData(audio).length : 0).toBeGreaterThanOrEqual(5);
+  });
+
+  it('real MP3 frame packets mux to MP4 as an mp4a.6b sample table without AAC rewriting', async () => {
+    const source = await loadFixture('sound_5.mp3');
+    const info = parseMp3(source, source.byteLength);
+    const packets = enumerateMp3Packets(source).slice(0, 8);
+    const muxer = new Mp4Muxer();
+    const audio = muxer.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'mp3',
+      config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
+    });
+    for (const packet of packets) {
+      muxer.addChunkStruct(audio, {
+        timestampUs: packet.ptsUs,
+        durationUs: packet.durationUs,
+        key: true,
+        data: source.subarray(packet.offset, packet.offset + packet.size).slice(),
+      });
+    }
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(track?.codec).toBe('mp4a.6b');
+    expect(track?.codecPrivate?.boxType).toBe('esds');
+    expect(track?.sampleRate).toBe(info.sampleRate);
+    expect(track?.channels).toBe(info.channels);
+    expect(track ? buildSampleData(track).map((sample) => sample.size) : []).toEqual(
+      packets.map((packet) => packet.size),
+    );
   });
 
   it('video-only (no reorder): re-parses to identical sizes/durations/keyframes, ctts absent', async () => {

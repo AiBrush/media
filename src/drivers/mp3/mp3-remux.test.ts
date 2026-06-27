@@ -18,8 +18,9 @@
 
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
-import { loadFixture } from '../../test-support/corpus.ts';
-import { Mp3Driver, enumerateMp3Packets } from './mp3-driver.ts';
+import type { MediaInfo } from '../../api/types.ts';
+import { loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
+import { Mp3Driver, enumerateMp3Packets, parseMp3 } from './mp3-driver.ts';
 import type { Mp3Packet } from './mp3-driver.ts';
 
 /** Drain a muxer's output stream into one buffer. */
@@ -91,6 +92,28 @@ const CASES: readonly Case[] = [
 ];
 
 describe('MP3 output / Mp3Muxer — the engine produces a valid, decodable .mp3 (baseline NA-flip)', () => {
+  it('mp3→mp3 remux preserves every VBR frame and the 10 s duration', async () => {
+    const fixture = 'bear-vbr-toc.mp3';
+    const golden = (await loadGoldenMetadata(fixture)) as MediaInfo;
+    const sourceBytes = await loadFixture(fixture);
+    const sourcePackets = enumerateMp3Packets(sourceBytes);
+    const sourceAudioBytes = sourcePackets.reduce((sum, packet) => sum + packet.size, 0);
+    const outBytes = await remuxToMp3({ bytes: sourceBytes, packets: sourcePackets });
+    const outPackets = enumerateMp3Packets(outBytes);
+    const outAudioBytes = outPackets.reduce((sum, packet) => sum + packet.size, 0);
+    const reparsed = parseMp3(outBytes, outBytes.byteLength);
+
+    expect(outBytes.byteLength, 'duration metadata frame is present').toBeGreaterThan(
+      sourceAudioBytes,
+    );
+    expect(outPackets[0]?.offset, 'first audio frame follows Xing metadata').toBeGreaterThan(0);
+    expect(outPackets.length, 'all audio frames preserved').toBe(sourcePackets.length);
+    expect(outAudioBytes, 'all MP3 frame bytes preserved').toBe(sourceAudioBytes);
+    expect(reparsed.durationSec, 'VBR remux duration').toBeCloseTo(golden.durationSec, 6);
+    expect(reparsed.sampleRate).toBe(golden.tracks[0]?.sampleRate);
+    expect(reparsed.channels).toBe(golden.tracks[0]?.channels);
+  }, 30_000);
+
   it('authors ≥2 real MP3 sources to a valid .mp3 (re-parses + ffmpeg-decodes)', async () => {
     const ffmpeg = hasFfmpeg();
     if (!ffmpeg) console.warn('[mp3-remux] no ffmpeg — skipping the independent-decode assertion');

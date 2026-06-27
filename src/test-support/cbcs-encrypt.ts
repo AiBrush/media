@@ -1,10 +1,9 @@
 /**
  * Test-only CENC `cbcs` (AES-CBC **pattern**) encryptor — produces a real cbcs-protected MP4 from a
  * clear one so the decrypt op can be validated end-to-end on real media (the inverse of the driver's
- * cbcs path). Not shipped (test-support only). It encrypts one media type's samples with a per-sample
- * 16-byte IV and the crypt:skip pattern, re-muxes via {@link writeMp4} as a protected track, then patches
- * the written `tenc` to version 1 + the pattern byte (a same-length byte edit — `writeMp4` emits a
- * version-0 `tenc` with a zero pattern, which it does not let us set otherwise).
+ * cbcs path). Not shipped (test-support only). It encrypts one media type's samples with either
+ * per-sample 16-byte IVs plus `senc`, or a `tenc` default_constant_IV with no `senc`, then re-muxes via
+ * {@link writeMp4} as a protected track.
  *
  * The crypt-block gather/scatter here re-derives the exact offsets the SUT uses (`decryptSampleCbcs`); if
  * they disagreed, the byte-exact round-trip in the tests would fail — so this is a genuine oracle, not a
@@ -74,29 +73,6 @@ export async function encryptSampleCbcs(
   return out;
 }
 
-/** Locate a four-cc box by signature scan; returns the box start (its 4-byte size field). */
-function findBox(bytes: Uint8Array, type: string): number {
-  const dec = new TextDecoder('latin1');
-  for (let i = 4; i + 4 <= bytes.length; i++) {
-    if (dec.decode(bytes.subarray(i, i + 4)) !== type) continue;
-    const start = i - 4;
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const size = dv.getUint32(start);
-    if (size >= 8 && start + size <= bytes.length) return start;
-  }
-  throw new Error(`box '${type}' not found in written MP4`);
-}
-
-/** Patch a version-0 `tenc` (as `writeMp4` emits) to version 1 with the crypt:skip pattern byte. */
-function patchTencPattern(mp4: Uint8Array, crypt: number, skip: number): Uint8Array {
-  const out = mp4.slice();
-  const tencStart = findBox(out, 'tenc');
-  const payload = tencStart + 8; // after the 8-byte box header → version+flags+fields
-  out[payload] = 1; // version 0 → 1 (so the pattern byte is read)
-  out[payload + 5] = ((crypt & 0x0f) << 4) | (skip & 0x0f); // default_crypt_byte_block / default_skip_byte_block
-  return out;
-}
-
 export interface EncryptCbcsOptions {
   keyHex: string;
   kidHex: string;
@@ -104,6 +80,10 @@ export interface EncryptCbcsOptions {
   cryptByteBlock: number;
   skipByteBlock: number;
   mediaType?: 'audio' | 'video';
+  /** When set, writes tenc.default_constant_IV with perSampleIvSize=0 and omits the `senc` box. */
+  constantIvHex?: string;
+  /** Write protected metadata around clear samples; used for Bento4-style no-auxiliary-data fixtures. */
+  metadataOnly?: boolean;
 }
 
 /** Encrypt the chosen track type of a clear MP4 with CENC `cbcs` (AES-CBC pattern), returning MP4 bytes. */
@@ -116,6 +96,18 @@ export async function encryptCbcs(
   const key = hexToBytes(opts.keyHex);
   const kid = hexToBytes(opts.kidHex);
   const target = opts.mediaType ?? 'audio';
+  const constantIv = opts.constantIvHex ? hexToBytes(opts.constantIvHex) : undefined;
+  if (
+    constantIv !== undefined &&
+    constantIv.byteLength !== AES_BLOCK &&
+    constantIv.byteLength !== 8
+  ) {
+    throw new Error(`cbcs default_constant_IV must be 8 or 16 bytes, got ${constantIv.byteLength}`);
+  }
+  const pattern = {
+    cryptByteBlock: opts.cryptByteBlock,
+    skipByteBlock: opts.skipByteBlock,
+  };
 
   const out: MuxTrackInput[] = [];
   for (const [i, parsed] of movie.tracks.entries()) {
@@ -125,27 +117,28 @@ export async function encryptCbcs(
       out.push(track);
       continue;
     }
-    const ivs = track.samples.map((_, j) => cbcsIvFor(j));
-    const cipher = await Promise.all(
-      track.samples.map((s, j) =>
-        encryptSampleCbcs(
-          key,
-          ivs[j] ?? cbcsIvFor(j),
-          s.data,
-          opts.cryptByteBlock,
-          opts.skipByteBlock,
-        ),
-      ),
-    );
+    const ivs = constantIv === undefined ? track.samples.map((_, j) => cbcsIvFor(j)) : undefined;
+    const cipher = opts.metadataOnly
+      ? track.samples.map((s) => s.data)
+      : await Promise.all(
+          track.samples.map((s, j) =>
+            encryptSampleCbcs(
+              key,
+              constantIv ?? ivs?.[j] ?? cbcsIvFor(j),
+              s.data,
+              opts.cryptByteBlock,
+              opts.skipByteBlock,
+            ),
+          ),
+        );
     out.push({
       ...track,
-      encryption: { schemeType: 'cbcs', kid, perSampleIvSize: AES_BLOCK, ivs },
+      encryption:
+        constantIv === undefined
+          ? { schemeType: 'cbcs', kid, perSampleIvSize: AES_BLOCK, ivs: ivs ?? [], pattern }
+          : { schemeType: 'cbcs', kid, perSampleIvSize: 0, pattern, constantIv },
       samples: track.samples.map((s, j) => ({ ...s, data: cipher[j] ?? s.data })),
     });
   }
-  return patchTencPattern(
-    writeMp4(out, { faststart: true }),
-    opts.cryptByteBlock,
-    opts.skipByteBlock,
-  );
+  return writeMp4(out, { faststart: true });
 }

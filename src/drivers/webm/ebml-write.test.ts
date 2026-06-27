@@ -38,6 +38,8 @@ import { WebmDriver, type WebmFrame, demuxWebm, parseWebm } from './webm-driver.
 
 const ID = {
   Segment: 0x18538067,
+  Info: 0x1549a966,
+  Duration: 0x4489,
   Tracks: 0x1654ae6b,
   TrackEntry: 0xae,
   TrackNumber: 0xd7,
@@ -948,6 +950,16 @@ function segmentSizeValue(bytes: Uint8Array): number {
   return Number.NaN;
 }
 
+/** Whether the Segment Info carries a Duration element (for live WebM it must not). */
+function segmentDurationPresent(bytes: Uint8Array): boolean {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
+  if (!segment) throw new Error('no Segment');
+  const info = findChild(dv, segment.dataStart, segment.dataEnd, ID.Info);
+  if (!info) throw new Error('no Segment Info');
+  return findChild(dv, info.dataStart, info.dataEnd, ID.Duration) !== undefined;
+}
+
 /** Count the **top-level** Clusters (siblings of Info/Tracks inside the Segment). */
 function topLevelClusterCount(bytes: Uint8Array): number {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -1084,6 +1096,7 @@ describe('WebmMuxer — fragmented/CMAF streaming output (synthesized)', () => {
     if (!init) return;
     expect([...init.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
     expect(topLevelClusterCount(init)).toBe(0); // init carries Info+Tracks only
+    expect(segmentDurationPresent(init)).toBe(false); // live profile omits Info/Duration
     // Every subsequent chunk is exactly one top-level Cluster.
     for (let i = 1; i < parts.length; i++) {
       const part = parts[i];
@@ -1095,6 +1108,7 @@ describe('WebmMuxer — fragmented/CMAF streaming output (synthesized)', () => {
 
     // The whole stream is a valid streamable WebM: unknown-size Segment + ≥2 Clusters, re-demuxable.
     expect(segmentSizeValue(bytes)).toBe(-1); // unknown size (streaming)
+    expect(segmentDurationPresent(bytes)).toBe(false);
     expect(topLevelClusterCount(bytes)).toBeGreaterThanOrEqual(2);
 
     // The blocks reconstruct via the independent low-level scan: count/time/key/size all intact.

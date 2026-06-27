@@ -54,25 +54,31 @@ interface TrackState {
 
 interface TimedAccessUnit {
   readonly track: TrackState;
-  readonly payload: Uint8Array;
+  readonly chunk: MpegTsChunk;
   readonly ptsTicks: number;
   readonly dtsTicks: number;
 }
 
-interface PacketizedTs {
-  readonly bytes: Uint8Array;
-  readonly continuity: ReadonlyMap<number, number>;
+interface MpegTsSerialization {
+  readonly packetizedTracks: readonly TrackState[];
+  readonly pcrTrack: TrackState;
+  readonly units: readonly TimedAccessUnit[];
 }
+
+type FinalizeState =
+  | { readonly ok: true; readonly iterator: Iterator<Uint8Array> }
+  | { readonly ok: false; readonly error: unknown };
 
 /**
  * Default streaming write granularity: how many 188-byte transport packets each `output` chunk carries.
  * A transport stream is a flat run of fixed-size packets with no front index, so it is the one container
- * that can be emitted as a sequence of packet-aligned writes the instant `finalize` serializes it — the
- * streaming-target shape (doc 09 streaming-output) a `StreamTarget` turns into one positioned write each.
- * 87×188 = 16 356 B ≈ a 16 KB network/disk write unit: small enough to stream incrementally (TTFB, bounded
- * peak copy at the sink), large enough that a long stream is not thousands of micro-enqueues. Every chunk
- * is a whole number of packets (188-aligned), so a consumer that resynchronizes on the `0x47` sync byte
- * sees an intact packet boundary at every chunk edge.
+ * that can be generated as a sequence of packet-aligned writes once `finalize` validates the queued access
+ * units. The `output` stream then packetizes on pull, so a `StreamTarget` turns each group into one
+ * positioned write instead of receiving a pre-materialized blob. 87×188 = 16 356 B ≈ a 16 KB network/disk
+ * write unit: small enough to stream incrementally (TTFB, bounded peak copy at the sink), large enough that
+ * a long stream is not thousands of micro-enqueues. Every chunk is a whole number of packets (188-aligned),
+ * so a consumer that resynchronizes on the `0x47` sync byte sees an intact packet boundary at every chunk
+ * edge.
  */
 const DEFAULT_WRITE_CHUNK_PACKETS = 87;
 
@@ -80,20 +86,20 @@ export interface MpegTsMuxerOptions {
   readonly fragmented?: boolean;
   /**
    * Streaming write granularity in whole 188-byte packets per emitted `output` chunk (≥ 1). The serialized
-   * stream is sliced on packet boundaries into chunks of at most this many packets, each `enqueue`d
-   * separately so a positioned-write sink observes incremental, packet-aligned writes rather than one
-   * single-shot blob. Omitted ⇒ {@link DEFAULT_WRITE_CHUNK_PACKETS}. The assembled bytes are identical
-   * regardless of granularity (this only changes how the output is chunked, never its content).
+   * stream is generated on packet boundaries into chunks of at most this many packets, each produced by the
+   * `ReadableStream` pull path so a positioned-write sink observes incremental, packet-aligned writes rather
+   * than one single-shot blob. Omitted ⇒ {@link DEFAULT_WRITE_CHUNK_PACKETS}. The assembled bytes are
+   * identical regardless of granularity (this only changes how the output is chunked, never its content).
    */
   readonly writeChunkPackets?: number;
 }
 
 export class MpegTsMuxer implements Muxer {
   readonly #tracks: TrackState[] = [];
-  readonly #controllerPromise: Promise<ReadableStreamDefaultController<Uint8Array>>;
+  readonly #finalizeState: Promise<FinalizeState>;
   readonly #output: ReadableStream<Uint8Array>;
   readonly #writeChunkPackets: number;
-  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  #resolveFinalizeState: (state: FinalizeState) => void = () => {};
   #finalized = false;
 
   constructor(options: MpegTsMuxerOptions = {}) {
@@ -108,15 +114,22 @@ export class MpegTsMuxer implements Muxer {
       1,
       Math.floor(options.writeChunkPackets ?? DEFAULT_WRITE_CHUNK_PACKETS),
     );
-    let resolveController: (controller: ReadableStreamDefaultController<Uint8Array>) => void =
-      () => {};
-    this.#controllerPromise = new Promise((resolve) => {
-      resolveController = resolve;
+    this.#finalizeState = new Promise((resolve) => {
+      this.#resolveFinalizeState = resolve;
     });
     this.#output = new ReadableStream<Uint8Array>({
-      start: (controller): void => {
-        this.#controller = controller;
-        resolveController(controller);
+      pull: async (controller): Promise<void> => {
+        const state = await this.#finalizeState;
+        if (!state.ok) {
+          controller.error(state.error);
+          return;
+        }
+        const next = state.iterator.next();
+        if (next.done === true) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
       },
     });
   }
@@ -216,20 +229,15 @@ export class MpegTsMuxer implements Muxer {
   async finalize(): Promise<void> {
     this.#assertWritable();
     this.#finalized = true;
-    const controller = this.#controller ?? (await this.#controllerPromise);
     try {
-      const bytes = writeMpegTs(this.#tracks);
-      // Emit the transport stream as a sequence of packet-aligned writes (the streaming-target shape):
-      // each chunk is a whole number of 188-byte packets, so a positioned-write sink sees incremental,
-      // resynchronizable writes rather than one single-shot blob. The concatenation is byte-identical to
-      // `bytes`. An empty stream (no packets) enqueues nothing — just closes.
-      const chunkBytes = this.#writeChunkPackets * TS_PACKET_SIZE;
-      for (let offset = 0; offset < bytes.byteLength; offset += chunkBytes) {
-        controller.enqueue(bytes.subarray(offset, Math.min(offset + chunkBytes, bytes.byteLength)));
-      }
-      controller.close();
+      const serialization = prepareMpegTsSerialization(this.#tracks);
+      validateAccessUnits(serialization.units);
+      this.#resolveFinalizeState({
+        ok: true,
+        iterator: mpegTsChunks(serialization, this.#writeChunkPackets)[Symbol.iterator](),
+      });
     } catch (error) {
-      controller.error(error);
+      this.#resolveFinalizeState({ ok: false, error });
       throw error;
     }
   }
@@ -242,6 +250,12 @@ export class MpegTsMuxer implements Muxer {
 }
 
 export function writeMpegTs(tracks: readonly TrackState[]): Uint8Array {
+  return concatBytes([
+    ...mpegTsChunks(prepareMpegTsSerialization(tracks), DEFAULT_WRITE_CHUNK_PACKETS),
+  ]);
+}
+
+function prepareMpegTsSerialization(tracks: readonly TrackState[]): MpegTsSerialization {
   if (tracks.length === 0) {
     throw new MediaError('mux-error', 'MPEG-TS muxing requires at least one track.');
   }
@@ -255,26 +269,102 @@ export function writeMpegTs(tracks: readonly TrackState[]): Uint8Array {
     throw new MediaError('mux-error', 'MPEG-TS muxing requires a PCR track.');
   }
 
+  return {
+    packetizedTracks,
+    pcrTrack,
+    units: buildTimedAccessUnits(packetizedTracks),
+  };
+}
+
+function* mpegTsChunks(
+  serialization: MpegTsSerialization,
+  writeChunkPackets: number,
+): Generator<Uint8Array> {
   const continuity = new Map<number, number>();
-  const packets: Uint8Array[] = [];
-  appendPacketized(packets, packetizePayload(PAT_PID, true, psiPayload(patSection()), continuity));
-  appendPacketized(
-    packets,
-    packetizePayload(
-      PMT_PID,
-      true,
-      psiPayload(pmtSection(packetizedTracks, pcrTrack.pid)),
+  const packetGroup: Uint8Array[] = [];
+  const maxPackets = Math.max(1, Math.floor(writeChunkPackets));
+  const flushGroup = (): Uint8Array | undefined => {
+    if (packetGroup.length === 0) return undefined;
+    const chunk = concatBytes(packetGroup);
+    packetGroup.length = 0;
+    return chunk;
+  };
+  const pushPacket = (packet: Uint8Array): Uint8Array | undefined => {
+    packetGroup.push(packet);
+    return packetGroup.length >= maxPackets ? flushGroup() : undefined;
+  };
+  const pushPayload = function* (
+    pid: number,
+    payloadUnitStart: boolean,
+    payload: Uint8Array,
+    pcrTicks?: number,
+  ): Generator<Uint8Array> {
+    for (const packet of packetizePayloadPackets(
+      pid,
+      payloadUnitStart,
+      payload,
       continuity,
-    ),
+      pcrTicks,
+    )) {
+      const chunk = pushPacket(packet);
+      if (chunk !== undefined) yield chunk;
+    }
+  };
+
+  yield* pushPayload(PAT_PID, true, psiPayload(patSection()));
+  yield* pushPayload(
+    PMT_PID,
+    true,
+    psiPayload(pmtSection(serialization.packetizedTracks, serialization.pcrTrack.pid)),
   );
 
-  for (const unit of buildTimedAccessUnits(packetizedTracks)) {
-    const pes = pesPacket(unit.track.streamId, unit.payload, unit.ptsTicks, unit.dtsTicks);
-    const pcrTicks = unit.track.pid === pcrTrack.pid ? unit.dtsTicks : undefined;
-    appendPacketized(packets, packetizePayload(unit.track.pid, true, pes, continuity, pcrTicks));
+  for (const unit of serialization.units) {
+    const payload = accessUnitPayload(unit.track, unit.chunk);
+    const pes = pesPacket(unit.track.streamId, payload, unit.ptsTicks, unit.dtsTicks);
+    const pcrTicks = unit.track.pid === serialization.pcrTrack.pid ? unit.dtsTicks : undefined;
+    yield* pushPayload(unit.track.pid, true, pes, pcrTicks);
   }
 
-  return concatBytes(packets);
+  const finalChunk = flushGroup();
+  if (finalChunk !== undefined) yield finalChunk;
+}
+
+function validateAccessUnits(units: readonly TimedAccessUnit[]): void {
+  for (const unit of units) {
+    validateAccessUnitPayload(unit.track, unit.chunk);
+  }
+}
+
+function validateAccessUnitPayload(track: TrackState, chunk: MpegTsChunk): void {
+  if (track.codec === 'h264') {
+    validateH264AccessUnit(chunk.data, track.avcConfig);
+    return;
+  }
+  if (track.aacConfig === undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'AAC MPEG-TS muxing requires an AAC encoder config.',
+      capabilityDetail({ codec: track.codec, trackId: track.inputTrackId }),
+    );
+  }
+  validateAacAccessUnit(chunk.data);
+}
+
+function validateH264AccessUnit(data: Uint8Array, avcConfig: AvcDecoderConfig | undefined): void {
+  if (isAnnexB(data)) return;
+  if (avcConfig === undefined) {
+    throw new CapabilityError(
+      'capability-miss',
+      'H.264 MPEG-TS muxing requires Annex B samples or avcC decoder configuration.',
+      capabilityDetail({ codec: 'h264' }),
+    );
+  }
+  forEachLengthPrefixedNal(data, avcConfig, () => undefined);
+}
+
+function validateAacAccessUnit(data: Uint8Array): void {
+  if (isAdtsFrame(data)) return;
+  validateAdtsPayloadLength(data.byteLength);
 }
 
 function capabilityDetail(extra: Record<string, unknown>): Record<string, unknown> {
@@ -290,7 +380,7 @@ function buildTimedAccessUnits(tracks: readonly TrackState[]): TimedAccessUnit[]
       const dtsTicks = usToTsTicks((chunk.dtsUs ?? chunk.timestampUs) - rebaseUs);
       units.push({
         track,
-        payload: accessUnitPayload(track, chunk),
+        chunk,
         ptsTicks,
         dtsTicks,
       });
@@ -354,23 +444,9 @@ function h264AnnexBAccessUnit(
     }
   }
 
-  let offset = 0;
-  while (offset < data.byteLength) {
-    if (offset + avcConfig.lengthSize > data.byteLength) {
-      throw new MediaError('mux-error', 'Invalid length-prefixed H.264 access unit.', {
-        codec: 'h264',
-      });
-    }
-    const nalLength = readNalLength(data, offset, avcConfig.lengthSize);
-    offset += avcConfig.lengthSize;
-    if (nalLength <= 0 || offset + nalLength > data.byteLength) {
-      throw new MediaError('mux-error', 'Invalid H.264 NAL length while writing MPEG-TS.', {
-        codec: 'h264',
-      });
-    }
+  forEachLengthPrefixedNal(data, avcConfig, (offset, nalLength) => {
     parts.push(ANNEX_B_START_CODE, data.subarray(offset, offset + nalLength));
-    offset += nalLength;
-  }
+  });
   return concatBytes(parts);
 }
 
@@ -407,14 +483,13 @@ function pesPacket(
   return concatBytes([header, payload]);
 }
 
-function packetizePayload(
+function* packetizePayloadPackets(
   pid: number,
   payloadUnitStart: boolean,
   payload: Uint8Array,
   continuity: Map<number, number>,
   pcrTicks?: number,
-): PacketizedTs {
-  const packets: Uint8Array[] = [];
+): Generator<Uint8Array> {
   let offset = 0;
   let first = true;
   while (offset < payload.byteLength) {
@@ -456,11 +531,10 @@ function packetizePayload(
     }
 
     packet.set(payload.subarray(offset, offset + payloadBytes), payloadOffset);
-    packets.push(packet);
+    yield packet;
     offset += payloadBytes;
     first = false;
   }
-  return { bytes: concatBytes(packets), continuity };
 }
 
 function patSection(): Uint8Array {
@@ -541,12 +615,7 @@ function writePcr(packet: Uint8Array, offset: number, ticks: number): void {
 }
 
 function adtsHeader(payloadLength: number, config: AacEncoderConfig): Uint8Array {
-  const frameLength = payloadLength + 7;
-  if (frameLength > 0x1fff) {
-    throw new MediaError('mux-error', 'AAC frame is too large for an ADTS header.', {
-      frameLength,
-    });
-  }
+  const frameLength = validateAdtsPayloadLength(payloadLength);
   const profile = config.objectType - 1;
   const header = new Uint8Array(7);
   header[0] = 0xff;
@@ -560,6 +629,16 @@ function adtsHeader(payloadLength: number, config: AacEncoderConfig): Uint8Array
   header[5] = ((frameLength & 0x07) << 5) | 0x1f;
   header[6] = 0xfc;
   return header;
+}
+
+function validateAdtsPayloadLength(payloadLength: number): number {
+  const frameLength = payloadLength + 7;
+  if (frameLength > 0x1fff) {
+    throw new MediaError('mux-error', 'AAC frame is too large for an ADTS header.', {
+      frameLength,
+    });
+  }
+  return frameLength;
 }
 
 function parseAvcDecoderConfig(description: Uint8Array | undefined): AvcDecoderConfig | undefined {
@@ -725,6 +804,30 @@ function readNalLength(data: Uint8Array, offset: number, lengthSize: number): nu
   return value;
 }
 
+function forEachLengthPrefixedNal(
+  data: Uint8Array,
+  avcConfig: AvcDecoderConfig,
+  visit: (offset: number, length: number) => void,
+): void {
+  let offset = 0;
+  while (offset < data.byteLength) {
+    if (offset + avcConfig.lengthSize > data.byteLength) {
+      throw new MediaError('mux-error', 'Invalid length-prefixed H.264 access unit.', {
+        codec: 'h264',
+      });
+    }
+    const nalLength = readNalLength(data, offset, avcConfig.lengthSize);
+    offset += avcConfig.lengthSize;
+    if (nalLength <= 0 || offset + nalLength > data.byteLength) {
+      throw new MediaError('mux-error', 'Invalid H.264 NAL length while writing MPEG-TS.', {
+        codec: 'h264',
+      });
+    }
+    visit(offset, nalLength);
+    offset += nalLength;
+  }
+}
+
 function isAnnexB(data: Uint8Array): boolean {
   if (data.byteLength < 4) return false;
   const b0 = data[0] as number;
@@ -820,10 +923,4 @@ function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
     offset += part.byteLength;
   }
   return output;
-}
-
-function appendPacketized(packets: Uint8Array[], packetized: PacketizedTs): void {
-  for (let offset = 0; offset < packetized.bytes.byteLength; offset += TS_PACKET_SIZE) {
-    packets.push(packetized.bytes.subarray(offset, offset + TS_PACKET_SIZE));
-  }
 }

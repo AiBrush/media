@@ -15,8 +15,11 @@
  */
 
 import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
+import { parseAv1Codec } from '../../codecs/wasm-av1/av1.ts';
+import { parseVpxCodec } from '../../codecs/wasm-vpx/vpx.ts';
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { parseEsds } from './codec-strings.ts';
 import { fragmentMp4 } from './fragment.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
 import { type ContainerBrand, writeMp4 } from './write.ts';
@@ -74,13 +77,16 @@ function mapCodec(
         config: { kind: 'raw-box', boxType: 'hvcC' },
       };
     }
-    if (c.startsWith('av01')) {
+    if (c === 'av1' || c.startsWith('av01')) {
       return { sampleEntryType: 'av01', config: { kind: 'raw-box', boxType: 'av1C' } };
     }
     if (c.startsWith('vp09') || c.startsWith('vp9')) {
       return { sampleEntryType: 'vp09', config: { kind: 'raw-box', boxType: 'vpcC' } };
     }
   } else {
+    if (c === 'mp3' || c === 'mp4a.40.34' || c === 'mp4a.6b' || c === 'mp4a.69') {
+      return { sampleEntryType: 'mp4a', config: { kind: 'raw-box', boxType: 'esds' } };
+    }
     if (c === 'aac' || c.startsWith('mp4a')) {
       return { sampleEntryType: 'mp4a', config: { kind: 'esds-from-description' } };
     }
@@ -287,6 +293,166 @@ function copyChunkWithData(chunk: ChunkStruct, data: Uint8Array): ChunkStruct {
   };
 }
 
+function u16be(n: number): number[] {
+  return [(n >>> 8) & 0xff, n & 0xff];
+}
+
+function u24be(n: number): number[] {
+  return [(n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+}
+
+function u32be(n: number): number[] {
+  return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+}
+
+function descriptor(tag: number, payload: readonly number[]): number[] {
+  if (payload.length > 0x7f) {
+    throw new MediaError('mux-error', `MP4 descriptor payload too large: ${payload.length}`);
+  }
+  return [tag, payload.length, ...payload];
+}
+
+function esdsPayloadForObjectType(objectTypeIndication: number): Uint8Array {
+  const decoderConfig = descriptor(0x04, [
+    objectTypeIndication,
+    0x15, // AudioStream + upstream=false + reserved bit.
+    ...u24be(0),
+    ...u32be(0),
+    ...u32be(0),
+  ]);
+  const es = descriptor(0x03, [0x00, 0x01, 0x00, ...decoderConfig]);
+  return Uint8Array.from([0, 0, 0, 0, ...es]);
+}
+
+function av1CFromCodecString(codec: string): Uint8Array {
+  const info = parseAv1Codec(codec);
+  const highBitdepth = info.bitDepth > 8 ? 1 : 0;
+  const twelveBit = info.bitDepth === 12 ? 1 : 0;
+  const subsamplingX = info.chromaSubsampling === '420' || info.chromaSubsampling === '422' ? 1 : 0;
+  const subsamplingY = info.chromaSubsampling === '420' ? 1 : 0;
+  return Uint8Array.of(
+    0x81,
+    ((info.profile & 0x7) << 5) | (info.level & 0x1f),
+    ((info.tier === 'high' ? 1 : 0) << 7) |
+      (highBitdepth << 6) |
+      (twelveBit << 5) |
+      ((info.monochrome ? 1 : 0) << 4) |
+      (subsamplingX << 3) |
+      (subsamplingY << 2),
+    0,
+  );
+}
+
+function vp9LevelFromCodecString(codec: string): number {
+  const normalized = codec.trim().toLowerCase();
+  if (!normalized.startsWith('vp09.')) return 10;
+  const fields = normalized.slice('vp09.'.length).split('.');
+  const level = Number.parseInt(fields[1] ?? '', 10);
+  return Number.isFinite(level) ? Math.max(0, Math.min(255, level)) : 10;
+}
+
+function vpcCFromCodecString(codec: string): Uint8Array {
+  const info = parseVpxCodec(codec);
+  if (info.codec !== 'vp9') {
+    throw new MediaError('mux-error', `VP9 MP4 muxing received non-VP9 codec '${codec}'`);
+  }
+  return Uint8Array.of(
+    1,
+    0,
+    0,
+    0,
+    info.profile & 0xff,
+    vp9LevelFromCodecString(codec),
+    ((info.bitDepth & 0x0f) << 4) | ((info.subsampling & 0x07) << 1),
+    2,
+    2,
+    2,
+    0,
+    0,
+  );
+}
+
+function isOpusHead(description: Uint8Array | undefined): description is Uint8Array {
+  return (
+    description !== undefined &&
+    description.byteLength >= 19 &&
+    String.fromCharCode(
+      description[0] ?? 0,
+      description[1] ?? 0,
+      description[2] ?? 0,
+      description[3] ?? 0,
+      description[4] ?? 0,
+      description[5] ?? 0,
+      description[6] ?? 0,
+      description[7] ?? 0,
+    ) === 'OpusHead'
+  );
+}
+
+function dOpsFromOpusHeadOrTrack(
+  description: Uint8Array | undefined,
+  channels: number | undefined,
+  sampleRate: number | undefined,
+): Uint8Array {
+  const fallbackChannels = channels ?? 2;
+  const fallbackRate = sampleRate ?? 48_000;
+  if (fallbackChannels < 1 || fallbackChannels > 2) {
+    throw new CapabilityError(
+      'capability-miss',
+      `Opus MP4 muxing requires a family-0 mono/stereo channel layout, got ${fallbackChannels}`,
+      { op: { op: 'mux', mediaType: 'audio', codec: 'opus' }, tried: ['mp4'] },
+    );
+  }
+  if (isOpusHead(description)) {
+    const dv = new DataView(description.buffer, description.byteOffset, description.byteLength);
+    const ch = dv.getUint8(9);
+    const preSkip = dv.getUint16(10, true);
+    const rate = dv.getUint32(12, true);
+    const gain = dv.getInt16(16, true);
+    const mapping = dv.getUint8(18);
+    if (mapping !== 0 || ch < 1 || ch > 2) {
+      throw new CapabilityError(
+        'capability-miss',
+        'Opus MP4 muxing currently supports OpusHead mapping-family 0 mono/stereo tracks',
+        { op: { op: 'mux', mediaType: 'audio', codec: 'opus' }, tried: ['mp4'] },
+      );
+    }
+    return Uint8Array.from([
+      0,
+      ch,
+      ...u16be(preSkip),
+      ...u32be(rate),
+      ...u16be(gain & 0xffff),
+      mapping,
+    ]);
+  }
+  return Uint8Array.from([
+    0,
+    fallbackChannels,
+    ...u16be(0),
+    ...u32be(fallbackRate),
+    ...u16be(0),
+    0,
+  ]);
+}
+
+function synthesizeRawBoxDescription(t: TrackState): Uint8Array | undefined {
+  if (t.description !== undefined) return t.description;
+  if (t.config.kind !== 'raw-box') return undefined;
+  switch (t.config.boxType) {
+    case 'av1C':
+      return av1CFromCodecString(t.codec);
+    case 'vpcC':
+      return vpcCFromCodecString(t.codec);
+    case 'dOps':
+      return dOpsFromOpusHeadOrTrack(t.description, t.channels, t.sampleRate);
+    case 'esds':
+      return esdsPayloadForObjectType(0x6b);
+    default:
+      return undefined;
+  }
+}
+
 /**
  * True iff `data` is a well-formed AVC-format (`avcC`) access unit: a sequence of `lengthSize`-byte
  * big-endian NAL lengths each followed by exactly that many payload bytes, consuming the buffer exactly.
@@ -432,14 +598,78 @@ function assertAdtsMatchesDescription(adts: AacAdtsAccessUnit, description: Uint
   }
 }
 
+function isValidAsc(description: Uint8Array): boolean {
+  try {
+    const asc = parseAsc(description);
+    return asc.objectType > 0 && asc.channels > 0 && asc.sampleRate > 0;
+  } catch {
+    return false;
+  }
+}
+
+function ascFromEsdsPayload(payload: Uint8Array): Uint8Array | undefined {
+  const info = parseEsds(payload);
+  return info.asc !== undefined && isValidAsc(info.asc) ? info.asc : undefined;
+}
+
+function ascFromEsDescriptor(description: Uint8Array): Uint8Array | undefined {
+  const payload = new Uint8Array(description.byteLength + 4);
+  payload.set(description, 4);
+  return ascFromEsdsPayload(payload);
+}
+
+function asciiAt(bytes: Uint8Array, offset: number): string {
+  return String.fromCharCode(
+    bytes[offset] ?? 0,
+    bytes[offset + 1] ?? 0,
+    bytes[offset + 2] ?? 0,
+    bytes[offset + 3] ?? 0,
+  );
+}
+
+function normalizeAacDescription(description: Uint8Array): Uint8Array {
+  if (isValidAsc(description)) return description;
+  if (description[0] === 0x03) {
+    const asc = ascFromEsDescriptor(description);
+    if (asc !== undefined) return asc;
+  }
+  if (
+    description.byteLength >= 5 &&
+    description[0] === 0 &&
+    description[1] === 0 &&
+    description[2] === 0
+  ) {
+    const asc = ascFromEsdsPayload(description);
+    if (asc !== undefined) return asc;
+  }
+  if (description.byteLength >= 12 && asciiAt(description, 4) === 'esds') {
+    const size =
+      (description[0] ?? 0) * 0x1000000 +
+      (description[1] ?? 0) * 0x10000 +
+      (description[2] ?? 0) * 0x100 +
+      (description[3] ?? 0);
+    if (size >= 12 && size <= description.byteLength) {
+      const asc = ascFromEsdsPayload(description.subarray(8, size));
+      if (asc !== undefined) return asc;
+    }
+  }
+  throw new MediaError(
+    'mux-error',
+    'AAC MP4 muxing received an invalid AudioSpecificConfig description',
+  );
+}
+
 function prepareAacSamples(
   chunks: readonly ChunkStruct[],
   description: Uint8Array | undefined,
 ): AacPreparedSamples {
+  const normalizedDescription =
+    description !== undefined ? normalizeAacDescription(description) : undefined;
   const parsed = chunks.map((chunk) => parseAdtsAccessUnit(chunk.data));
   const adtsCount = parsed.reduce((count, frame) => count + (frame === undefined ? 0 : 1), 0);
   if (adtsCount === 0) {
-    if (description !== undefined) return { chunks: [...chunks], description };
+    if (normalizedDescription !== undefined)
+      return { chunks: [...chunks], description: normalizedDescription };
     throw new CapabilityError(
       'capability-miss',
       'AAC MP4 muxing requires AudioSpecificConfig description or ADTS-framed samples',
@@ -454,7 +684,8 @@ function prepareAacSamples(
   if (first === undefined) {
     throw new MediaError('mux-error', 'AAC ADTS sample parsing failed unexpectedly');
   }
-  if (description !== undefined) assertAdtsMatchesDescription(first, description);
+  if (normalizedDescription !== undefined)
+    assertAdtsMatchesDescription(first, normalizedDescription);
 
   const normalized: ChunkStruct[] = [];
   for (let i = 0; i < chunks.length; i++) {
@@ -470,7 +701,7 @@ function prepareAacSamples(
   return {
     chunks: normalized,
     description:
-      description ??
+      normalizedDescription ??
       audioSpecificConfig(first.objectType, first.sampleRateIndex, first.channelConfig),
   };
 }
@@ -574,6 +805,7 @@ export function buildMuxSamples(
 /** Per-track recording state, accumulated across `addTrack`/`write` until `finalize`. */
 interface TrackState {
   readonly mediaType: 'video' | 'audio';
+  readonly codec: string;
   readonly sampleEntryType: string;
   readonly config: ConfigKind;
   readonly timescale: number;
@@ -596,6 +828,7 @@ function trackStateFrom(info: TrackInfo): TrackState {
     const vc = decoderConfig as VideoDecoderConfig | undefined;
     return {
       mediaType: 'video',
+      codec: info.codec,
       sampleEntryType,
       config,
       timescale: videoTimescale(info.fps),
@@ -611,6 +844,7 @@ function trackStateFrom(info: TrackInfo): TrackState {
   const sampleRate = ac?.sampleRate;
   return {
     mediaType: 'audio',
+    codec: info.codec,
     sampleEntryType,
     config,
     // Audio clock = sample rate (sample durations map 1:1 to ticks); 48 kHz is a safe default.
@@ -629,7 +863,7 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
   const prepared =
     t.mediaType === 'video' && t.sampleEntryType === 'avc1'
       ? prepareAvcSamples(t.chunks, t.description)
-      : t.mediaType === 'audio' && t.sampleEntryType === 'mp4a'
+      : t.mediaType === 'audio' && t.config.kind === 'esds-from-description'
         ? prepareAacSamples(t.chunks, t.description)
         : { chunks: t.chunks, description: t.description };
   const samples = buildMuxSamples(prepared.chunks, t.timescale);
@@ -644,7 +878,8 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
   };
   if (t.config.kind === 'raw-box') {
-    if (prepared.description === undefined) {
+    const description = prepared.description ?? synthesizeRawBoxDescription(t);
+    if (description === undefined) {
       throw new CapabilityError(
         'capability-miss',
         `${t.sampleEntryType} MP4 muxing requires ${t.config.boxType} description`,
@@ -654,7 +889,7 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
         },
       );
     }
-    return { ...base, codecPrivate: { boxType: t.config.boxType, data: prepared.description } };
+    return { ...base, codecPrivate: { boxType: t.config.boxType, data: description } };
   }
   // Config box: AVC/AAC synthesize from `description`; other codecs carry it as their raw box.
   if (prepared.description === undefined) return base;

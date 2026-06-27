@@ -328,17 +328,27 @@ export class MediaEngineImpl implements MediaEngine {
         );
         return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
-      // Keyframe trim of a raw-PCM container (WAV/AIFF/CAF) is a lossless **sample-accurate cut** through the
-      // container's own `transformPcm` (ADR-021/022): PCM has no inter-frame dependency, so there is no
-      // keyframe to align to — the audio-dsp path slices `[start, end)` samples and re-serializes, frame-exact
-      // and Node-validatable, with no codec seam. (Compressed audio/video containers fall through to the
-      // byte-level stream-copy below, or its typed miss.)
+      // Keyframe trim of PCM-domain audio (raw WAV/AIFF/CAF, plus native FLAC through its lossless
+      // decode→PCM→FLAC path) is a sample-accurate cut through the container's own `transformPcm`
+      // (ADR-021/022/024): audio has no keyframe dependency, so the DSP path slices `[start, end)` samples
+      // before any transform and re-serializes, frame-exact and Node-validatable, with no lossy codec seam.
       if (isPcmContainer(target) && container.transformPcm) {
         const stream = await container.transformPcm(src, {
           ...this.#stageOptions(signal, o),
           container: target,
           timeBounds: { startSec: opts.start, endSec: opts.end },
         });
+        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      }
+      if (target === 'flac' && container.transformPcm) {
+        const stream = await container.transformPcm(src, {
+          ...this.#stageOptions(signal, o),
+          timeBounds: { startSec: opts.start, endSec: opts.end },
+        });
+        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      }
+      if (canTrimAudioPackets(target)) {
+        const stream = await this.#trimAudioPacketsViaSeam(container, src, target, opts, signal, o);
         return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
@@ -744,15 +754,14 @@ export class MediaEngineImpl implements MediaEngine {
         `decode cannot read a protected ${mediaType} track before decrypt() emits clear samples`,
       );
     }
-    if (mediaType === 'audio' && isRawPcmTrack(track) && container.decodePcmAudio) {
+    if (
+      mediaType === 'audio' &&
+      container.decodePcmAudio &&
+      (isRawPcmTrack(track) || track.codec === 'flac')
+    ) {
       await demuxer.close();
-      assertPcmAudioDataAvailable(`${container.id}:${track.codec}`);
       const audio = await container.decodePcmAudio(src, stage);
-      return pcmAudioToAudioDataStream(
-        audio,
-        stage,
-        `${container.id}:${track.codec}`,
-      ) as ReadableStream<RawFrameOf<M>>;
+      return pcmAudioToAudioDataStream(audio, stage, track.codec) as ReadableStream<RawFrameOf<M>>;
     }
     const codec = await this.#routeCodec(decodeQueryFor(track), { strategy: stageStrategy(stage) });
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
@@ -836,6 +845,65 @@ export class MediaEngineImpl implements MediaEngine {
       await demuxer.close();
     }
     /* v8 ignore stop */
+  }
+
+  /**
+   * Audio-only packet trim for elementary / audio-page containers whose muxers already write the copied
+   * compressed frames. This is deliberately narrower than generic keyframe trim: no video tracks, no
+   * multi-audio assembly, and no intra-frame cuts. We keep whole packets overlapping `[start,end)`, rebase
+   * the first kept packet to t=0, and let the container muxer repair duration/header metadata.
+   */
+  async #trimAudioPacketsViaSeam(
+    container: ContainerDriver,
+    src: Source,
+    target: Container,
+    opts: TrimOptions,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    if (typeof EncodedAudioChunk === 'undefined') {
+      throw new CapabilityError(
+        'capability-miss',
+        'compressed-audio packet trim requires EncodedAudioChunk',
+        { op: 'trim', tried: [container.id, target] },
+      );
+    }
+    const bounds = trimBoundsUs(opts.start, opts.end);
+    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+    try {
+      if (demuxer.tracks.some((track) => track.mediaType === 'video')) {
+        throw new CapabilityError(
+          'capability-miss',
+          'audio packet trim does not handle video tracks',
+          { op: 'trim', tried: [container.id, target] },
+        );
+      }
+      const tracks = demuxer.tracks.filter(
+        (track) => track.mediaType === 'audio' && track.config !== undefined,
+      );
+      if (tracks.length !== 1) {
+        throw new CapabilityError(
+          'capability-miss',
+          `audio packet trim needs exactly one copyable audio track, found ${tracks.length}`,
+          { op: 'trim', tried: [container.id, target] },
+        );
+      }
+      const track = tracks[0];
+      if (track === undefined) {
+        throw new CapabilityError(
+          'capability-miss',
+          'audio packet trim found no copyable audio track',
+          { op: 'trim', tried: [container.id, target] },
+        );
+      }
+      const packets = trimAudioPacketStream(demuxer.packets(track.id), bounds);
+      await drainEncoderToMuxer(packets, muxer, () => trimPacketCopyTrack(track, bounds));
+      await muxer.finalize();
+      return muxer.output;
+    } finally {
+      await demuxer.close();
+    }
   }
 
   /**
@@ -1042,11 +1110,21 @@ export class MediaEngineImpl implements MediaEngine {
         /* v8 ignore stop */
       }
       if (audioTrack) {
-        const audioCodec = await this.#routeCodec(decodeQueryFor(audioTrack), o);
-        /* v8 ignore start -- live decode→[remix/resample]→encode requires WebCodecs; browser-validated. */
-        const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
-          audioCodec.createDecoder(decodeConfigOf(audioTrack), this.#stageOptions(signal, o)),
-        ) as ReadableStream<AudioData>;
+        const stage = this.#stageOptions(signal, o);
+        const decoded =
+          container.decodePcmAudio && (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
+            ? pcmAudioToAudioDataStream(
+                await container.decodePcmAudio(src, stage),
+                stage,
+                audioTrack.codec,
+              )
+            : (unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
+                (await this.#routeCodec(decodeQueryFor(audioTrack), o)).createDecoder(
+                  decodeConfigOf(audioTrack),
+                  stage,
+                ),
+              ) as ReadableStream<AudioData>);
+        /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
         // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
         // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
         // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
@@ -1325,11 +1403,63 @@ interface ImageDecodeRoute {
 type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
 
 const MICROS_PER_SECOND = 1_000_000;
+const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
+
+function canTrimAudioPackets(container: Container): boolean {
+  return AUDIO_PACKET_TRIM_CONTAINERS.has(container);
+}
 
 function trimBoundsUs(startSec: number, endSec: number): TrimBoundsUs {
   return {
     startUs: Math.round(startSec * MICROS_PER_SECOND),
     endUs: Math.round(endSec * MICROS_PER_SECOND),
+  };
+}
+
+function trimPacketCopyTrack(track: TrackInfo, bounds: TrimBoundsUs): TrackInfo {
+  return {
+    ...track,
+    durationSec: Math.max(0, bounds.endUs - bounds.startUs) / MICROS_PER_SECOND,
+  };
+}
+
+function trimAudioPacketStream(
+  packets: ReadableStream<Packet>,
+  bounds: TrimBoundsUs,
+): ReadableStream<Packet> {
+  let baseUs: number | undefined;
+  return packets.pipeThrough(
+    new TransformStream<Packet, Packet>({
+      transform(packet, controller): void {
+        const startUs = Math.round(packet.chunk.timestamp);
+        const duration = packet.chunk.duration;
+        const durationUs = duration === null ? undefined : Math.max(0, Math.round(duration));
+        const endUs = durationUs === undefined ? startUs + 1 : startUs + durationUs;
+        if (endUs <= bounds.startUs || startUs >= bounds.endUs) return;
+        baseUs ??= startUs;
+        controller.enqueue(restampAudioPacket(packet, startUs - baseUs, baseUs));
+      },
+    }),
+  );
+}
+
+function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number): Packet {
+  const chunk = packet.chunk;
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  const duration = chunk.duration;
+  const init: EncodedAudioChunkInit = {
+    type: chunk.type as EncodedAudioChunkType,
+    timestamp: Math.max(0, timestampUs),
+    data,
+    ...(duration !== null ? { duration } : {}),
+  };
+  return {
+    chunk: new EncodedAudioChunk(init),
+    ...(packet.dtsUs !== undefined
+      ? { dtsUs: Math.max(0, Math.round(packet.dtsUs) - baseUs) }
+      : {}),
+    ...(packet.sizeBytes !== undefined ? { sizeBytes: packet.sizeBytes } : {}),
   };
 }
 
@@ -1559,15 +1689,11 @@ function pcmAudioToAudioDataStream(
 
 function assertPcmAudioDataAvailable(label: string): void {
   if (typeof AudioData !== 'undefined') return;
-  throw new CapabilityError(
-    'capability-miss',
-    'PCM audio decode needs AudioData, which is unavailable in this environment',
-    {
-      op: 'decode',
-      tried: [label],
-      suggestion: 'run decode() in a browser or worker where WebCodecs AudioData exists',
-    },
-  );
+  throw new CapabilityError('capability-miss', 'AudioData is unavailable for PCM decode', {
+    op: 'decode',
+    tried: [label],
+    suggestion: 'run in a browser or worker with AudioData',
+  });
 }
 
 function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {

@@ -27,12 +27,56 @@ const MEDIA_TEST = new URL(
 async function corpusText(name: string): Promise<string> {
   return readFile(`${MEDIA_TEST}${name}`, 'utf8');
 }
+async function corpusBytes(name: string): Promise<Uint8Array> {
+  return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+}
 
 /** A local-file resource fetcher: maps a resolved URI back to its basename in the corpus dir. */
 const fetchLocal: HlsResourceFetcher = async (uri) => {
   const name = uri.split('/').pop() ?? uri;
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
 };
+
+const HLS_FIXTURE_BASE = 'https://cdn.test/media/';
+const HLS_AES128_RESOURCES = [
+  'hls_aes128.key',
+  'hls_aes128_000.ts',
+  'hls_aes128_001.ts',
+  'hls_aes128_002.ts',
+  'hls_aes128_003.ts',
+  'hls_aes128_004.ts',
+] as const;
+
+async function hlsAes128ResourceMap(
+  baseUrl: string = HLS_FIXTURE_BASE,
+): Promise<Map<string, Uint8Array>> {
+  const resources = new Map<string, Uint8Array>();
+  for (const name of HLS_AES128_RESOURCES) {
+    resources.set(new URL(name, baseUrl).toString(), await corpusBytes(name));
+  }
+  return resources;
+}
+
+function exactResourceFetcher(
+  resources: ReadonlyMap<string, Uint8Array>,
+  seen: string[],
+): HlsResourceFetcher {
+  return async (uri) => {
+    seen.push(uri);
+    const bytes = resources.get(uri);
+    if (bytes === undefined) throw new Error(`unexpected HLS resource fetch: ${uri}`);
+    return bytes;
+  };
+}
+
+async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error: unknown) {
+    return error;
+  }
+  throw new Error('expected promise to reject');
+}
 
 async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -97,6 +141,23 @@ describe('resolveHlsSource — real corpus, MPEG-TS segments', () => {
     // AES-128-CBC decrypt (key + explicit IV from the playlist) recovers it exactly — a falsifiable oracle.
     expect(aesBytes.byteLength).toBe(clearBytes.byteLength);
     expect(aesBytes).toEqual(clearBytes);
+  });
+
+  it('resolves real AES-128 key and segment URIs against the playlist URL, fetching the key once', async () => {
+    const clear = await resolveHlsSource(await corpusText('hls_vod.m3u8'), {
+      fetchResource: fetchLocal,
+    });
+    const seen: string[] = [];
+    const aes = await resolveHlsSource(await corpusText('hls_aes128.m3u8'), {
+      baseUrl: new URL('hls_aes128.m3u8', HLS_FIXTURE_BASE).toString(),
+      fetchResource: exactResourceFetcher(await hlsAes128ResourceMap(), seen),
+    });
+    expect(await drain(aes.stream())).toEqual(await drain(clear.stream()));
+
+    const expectedKeyUri = new URL('hls_aes128.key', HLS_FIXTURE_BASE).toString();
+    expect(seen.filter((uri) => uri === expectedKeyUri)).toHaveLength(1);
+    expect(seen).toContain(new URL('hls_aes128_000.ts', HLS_FIXTURE_BASE).toString());
+    expect(seen).not.toContain('hls_aes128.key');
   });
 
   it('the decrypted AES-128 source also probes as a valid ≈10s TS', async () => {
@@ -312,5 +373,22 @@ describe('resolveHlsSource — AES-128 IV + key-URI handling', () => {
         fetchResource: mapFetcher({ 's0.ts': new Uint8Array(16) }),
       }),
     ).rejects.toMatchObject({ name: 'InputError' });
+  });
+
+  it('raises a typed key-length error naming the resolved key URI when the key fetch returns a wrong resource', async () => {
+    const resources = await hlsAes128ResourceMap();
+    const resolvedKeyUri = new URL('hls_aes128.key', HLS_FIXTURE_BASE).toString();
+    resources.set(resolvedKeyUri, new Uint8Array(27872));
+    const error = await rejectionOf(
+      resolveHlsSource(await corpusText('hls_aes128.m3u8'), {
+        baseUrl: new URL('hls_aes128.m3u8', HLS_FIXTURE_BASE).toString(),
+        fetchResource: exactResourceFetcher(resources, []),
+      }),
+    );
+    expect(error).toBeInstanceOf(InputError);
+    expect(error).toMatchObject({
+      code: 'unsupported-input',
+      message: `HLS AES-128 key ${resolvedKeyUri} must be 16 bytes, got 27872`,
+    });
   });
 });

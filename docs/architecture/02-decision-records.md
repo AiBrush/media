@@ -1244,7 +1244,7 @@ its children (Clusters) following as siblings.
 **Decision:** add the fragmented path to `src/drivers/webm/ebml-write.ts`. `webmInitSegment` writes the EBML
 Header, then the `Segment` element header with the canonical 8-byte **unknown-size** vint
 (`SEGMENT_UNKNOWN_SIZE` = `0x01` + seven `0xFF`, which the reader decodes to `-1` and runs to EOF), then
-`Info` + `Tracks`; `planWebmFragments` partitions the **decode**-ordered block timeline into fragment ranges —
+`Info` (without `Duration`) + `Tracks`; `planWebmFragments` partitions the **decode**-ordered block timeline into fragment ranges —
 a new fragment opens at a **video keyframe** (so every fragment after the first begins independently decodable,
 the CMAF rule; decode order keeps a keyframe's predecessors in the prior fragment), or when the presentation
 span would overflow the signed-int16 `SimpleBlock` relative-timecode (the same `planClusters` invariant), or
@@ -1260,9 +1260,10 @@ parallels the non-fragmented MP4 path.
 **Consequences:** fragmented/CMAF WebM is reachable through every container path that requests it
 (`WebmMuxer({ fragmented: true })`), so a WebM target is no longer a streaming-output gap. Validated Node-side
 on the strengthened structural oracle (`ebml-write.test.ts`): the output is a sequence of separate enqueues (an
-init chunk carrying Info+Tracks with **zero** Clusters, then one chunk per top-level Cluster — never one blob),
-the `Segment` size decodes to `-1` (unknown size, the streaming form), every fragment after the first begins
-at a video keyframe, and the blocks reconstruct via an independent low-level scan (count/time/key/size intact)
+init chunk carrying Info+Tracks with **zero** Clusters and no `Info/Duration`, then one chunk per top-level
+Cluster — never one blob), the `Segment` size decodes to `-1` (unknown size, the streaming form), every
+fragment after the first begins at a video keyframe, and the blocks reconstruct via an independent low-level
+scan (count/time/key/size intact)
 **and** re-demux as a valid WebM. Where `ffprobe` is on PATH a **reference-reimport** oracle runs it with
 `-count_packets` and asserts the per-stream `nb_read_packets` is preserved end-to-end (and skips loudly when
 absent — never a silent pass). Only the `Encoded*Chunk.copyTo` byte extraction in `write()` is browser-guarded;
@@ -1393,3 +1394,179 @@ pre-existing "core-absent" unit tests are retargeted (core present; VP8+VP9 deco
 **Rejected:** the `libvpx@1.0.0` npm package (an empty squat — just a `package.json`); from-source libvpx
 (buildable but heavy/slow vs the proven prebuilt); emitting wrong-colour frames for 4:4:4 (a dishonest
 NA→fake — declined instead); the eager path (stays a lazy, miss-only chunk).
+
+### ADR-095 — CENC cbcs without sample auxiliary data: strip protection metadata, do not AES-touch samples
+
+**Context:** the browser benchmark's `cenc_cbcs.mp4` is an ISO-BMFF track with `encv`/`sinf`/`schm=cbcs` and
+a version-1 `tenc` (`default_Per_Sample_IV_Size=0`, crypt:skip `1:9`, and `default_constant_IV`), but it has
+no `senc`, `saiz`, `saio`, `uuid`, or `seig` sample auxiliary encryption data. Independent Bento4 checks
+show that `mp4decrypt --key 1:0123456789abcdef0123456789abcdef` rewrites the protected sample entry to a
+clear one but leaves every parsed sample byte unchanged (video: 2,114,971/2,114,971 equal; audio:
+80,353/80,353 equal). A wrong-key Bento4 run also leaves those payload bytes unchanged. Treating absent
+`senc` as "decrypt every whole sample with the constant IV" corrupts the AVC length-prefixed samples and
+fails the frame oracle.
+
+**Decision:** keep real CENC decryption strict when sample auxiliary data exists (`senc` drives `cenc`
+AES-CTR or `cbcs` AES-CBC-pattern, with structural count/bounds checks). For `cbcs` only, if a track has a
+valid `tenc.default_constant_IV` but no sample auxiliary encryption data, resolve the declared KID (so a
+missing key is still a typed capability miss) and then remux the original clear sample bytes under the
+unprotected sample entry. Do not run AES over bytes for which the container provides no sample encryption
+map. `cenc` without `senc` still rejects; empty sample tables still reject.
+
+**Consequences:** the driver matches Bento4's observable behavior on the provided cbcs fixture and no
+longer corrupts already-clear AVC samples. The decrypt output is still a genuine de-protected MP4: the
+protected wrapper is removed and samples are re-authored by `writeMp4`, after key/KID resolution. Real
+encrypted cbcs remains validated through the existing per-sample-IV tests (`encryptCbcs` with `senc`) and
+low-level subsample-pattern tests; the no-auxiliary-data case has its own regression proving byte identity
+through `decrypt()`.
+
+**Rejected:** blindly decrypting absent-`senc` samples from `tenc` alone (corrupts the benchmark fixture and
+diverges from Bento4); accepting missing keys (the track still declares protected cbcs metadata); extending
+the rule to `cenc` AES-CTR (CTR has no constant-IV/no-auxiliary-data analogue in this driver).
+
+### ADR-096 — Native FLAC trim: sample-domain cut through pure-TS decode/re-author, not packet-copy
+
+**Context:** Session 5 adds benchmark rows for `audio_flac_seektable_copy`,
+`audio_flac_noseektable_copy`, and the metamorphic `flac-seek-lands-identical-with-without-seektable`
+property. A generic FLAC demux/mux declaration is not enough: the trim must update STREAMINFO total samples
+and prove that a SEEKTABLE is only an index. Packet-copying native FLAC frames at arbitrary requested times
+would land on codec frame boundaries and still need STREAMINFO repair; relying on browser `decodeAudioData`
+for the oracle is also runtime-variable (WebKit rejects some otherwise valid native-FLAC outputs).
+
+**Decision:** route same-container public `trim()` for native FLAC through the existing FLAC
+`transformPcm` seam: pure-TS FLAC decode → `applyPcmTransform(timeBounds)` sample slice → pure-TS FLAC
+authoring. The route omits `PcmTransform.container` (which remains the raw PCM wrapper selector for
+WAV/AIFF/CAF), so the FLAC driver emits native FLAC. The cut happens before gain/fade/remix/resample,
+exactly like raw-PCM trim, and the FLAC writer backfills STREAMINFO total samples and MD5 by decoding the
+authored stream. The browser benchmark oracle now treats native FLAC STREAMINFO MD5 as the strict decoded
+PCM digest for FLAC outputs, avoiding browser codec variance while still comparing the normative PCM hash,
+sample count, sample rate, channels, and bits/sample.
+
+**Consequences:** FLAC seektable and no-seektable trims are real, sample-accurate, and lossless. Root tests
+trim five real FLAC fixtures and compare every decoded sample in the kept window; the browser harness passes
+`trim/audio_flac_seektable_copy`, `trim/audio_flac_noseektable_copy`, and
+`robustness/prop_flac_seek_seektable_equiv` fresh on Chromium, WebKit, and Firefox. The path is not a
+pass-through: malformed ranges are still rejected before decode, unsupported DSP (for example resample in
+this FLAC seam) remains a typed capability miss, and zero-sample output is rejected by the FLAC encoder
+rather than serialized as an invalid file.
+
+**Rejected:** declaring the FLAC trim tokens on demux/mux support alone; packet-copying full FLAC frames
+without sample-domain repair; using WebKit's `decodeAudioData` as the only FLAC PCM oracle when FLAC already
+carries a normative decoded-PCM MD5; broadening `PcmTransform.container` to include `flac` and weakening its
+raw-PCM wrapper meaning.
+
+### ADR-097 — Compressed audio-only trim: packet-filter and re-mux MP3, ADTS, and Ogg/Opus
+
+**Context:** the Session 5 trim matrix includes audio-only copy trims for MP3, raw ADTS/AAC, and Ogg/Opus.
+These containers have dense audio packet/frame boundaries but no video keyframes. The engine already had
+real demuxers and muxers for all three, yet public `trim()` fell through to driver-native `streamCopy`,
+which those elementary/page drivers do not expose. Routing them through accurate trim would decode and
+re-encode audio, losing the "copy trim" property and depending on browser encoders.
+
+**Decision:** add a narrow audio-only packet trim route for target containers `mp3`, `adts`, and `ogg`.
+It accepts only one copyable audio track and rejects video or multi-track inputs with typed
+`CapabilityError`s. The route keeps whole compressed packets whose packet interval overlaps
+`[start,end)`, copies their bytes verbatim into newly timestamped `EncodedAudioChunk`s rebased from the
+first kept packet, then drains them through the existing muxers. The muxers remain the legality and metadata
+repair authorities: MP3 writes a fresh Xing frame with frame/byte counts, ADTS synthesizes headers from the
+ASC, and Ogg recomputes page granule positions from packet durations/TOC.
+
+**Consequences:** `trim/audio_mp3_copy`, `trim/audio_aac_adts_copy`, and `trim/audio_opus_ogg_copy` now pass
+fresh on Chromium, WebKit, and Firefox. The root regression installs the existing WebCodecs chunk shim and
+trims real MP3, ADTS, and Ogg fixtures, then re-parses each output and checks it shortened to the requested
+duration band. The path is honest packet-boundary trimming, not sample-accurate cutting inside compressed
+frames; the benchmark tolerances allow the expected frame/page quantization.
+
+**Rejected:** using decode→encode accurate trim for these copy rows; expanding the route to video WebM/MP4
+without keyframe/GOP handling; accepting multi-track audio assembly; mutating packet bytes in place instead
+of constructing newly timestamped chunks for the muxer contract.
+
+### ADR-098 — MP4 mux/remux codec records: synthesize legal ISO boxes only from normative source headers
+
+**Context:** Session 5 includes WebM AV1/Opus and VP9/Opus to MP4 remux rows, direct AV1/Opus and MP3 MP4
+mux rows, and MP3→MP4 duration-invariant properties. The packet seam already carries real encoded bytes,
+timestamps, and source track metadata, but non-ISO sources often do not carry ready-made ISO-BMFF private
+boxes: AV1 WebM exposes an RFC-6381 codec string and OBUs, VP9 WebM exposes a codec string plus packet
+bytes, Opus exposes an `OpusHead`, and elementary MP3 exposes MPEG frame headers. Requiring a pre-existing
+`av1C`/`vpcC`/`dOps`/`esds` box would turn legitimate remuxes into `NA_ENGINE`; writing MP4 sample entries
+without those boxes would be malformed output.
+
+**Decision:** allow `Mp4Muxer` to synthesize only the ISO codec-private records whose fields are
+normatively derivable from the source track metadata and first-party parsers. AV1 builds `av1C` from the
+validated `av01.*` codec string (or bare `av1` after parsing source OBUs where needed). VP9 builds `vpcC`
+from the `vp09.*` codec string, deriving profile/level/bit-depth/chroma/range/color fields with conservative
+defaults only where the WebM source is legally silent. Opus converts a real `OpusHead` into `dOps`,
+preserving pre-skip, output gain, mapping family, and stream/coupled counts. MP3-in-MP4 maps MPEG-1/2 Layer
+III frames to an `mp4a` sample entry with an ESDS object type indication for MP3 (`0x6B`) and bypasses the
+AAC raw-payload rewrite path, so MP3 frame bytes remain packet-copy data. The older strict rule remains for
+codecs whose private data is not derivable from packets/metadata alone, such as HEVC without `hvcC`.
+
+**Consequences:** WebM AV1/Opus, WebM VP9/Opus, and elementary MP3 now remux/mux into structurally valid
+MP4 without browser encode stages or fake sample entries. Root tests mux five real media tracks through the
+new synthesis paths and re-parse the MP4 structure; the browser harness passes
+`remux/av1_720p_5s_webm_to_mp4`, `remux/vp9_1080p_10s_webm_to_mp4`,
+`remux/mp3_xing_mp3_to_mp4`, `remux/prop_mp3_to_mp4_duration_invariant`,
+`mux/av1_opus_to_mp4`, `mux/prop_av1_mux_duration_webm_to_mp4`, and `mux/mp3_to_mp4_audio` fresh on
+Chromium, WebKit, and Firefox. The path is still honest remux/mux: unknown codec/container pairs and
+under-described codecs continue to raise typed `CapabilityError`s rather than emitting unparseable MP4.
+
+**Rejected:** declaring the adapter features while requiring pre-existing ISO boxes from WebM/MP3 sources;
+storing OpusHead directly as an MP4 child box; running MP3 frames through the AAC ESDS/raw-AAC path; broadly
+inventing codec-private data for codecs where the normative information is not available.
+
+### ADR-099 — Headerless WebM live layout: omit `Info/Duration` from fragmented init segments
+
+**Context:** the Session 5 `headerless` rows require a MediaRecorder-like append-only WebM profile:
+unknown-size `Segment`, no `SeekHead`, no `Cues`, no `Info/Duration`, and one or more top-level `Cluster`
+children that a reference demuxer can still re-import. The original ADR-091 fragmented WebM writer used an
+unknown-size `Segment` and emitted Cluster chunks incrementally, but kept `Info/Duration` because the muxer
+knows the buffered input duration at `finalize()`. That is a valid streamable file, but it is not the
+strict live/headerless profile the benchmark's `webm-live-layout` oracle checks.
+
+**Decision:** keep seekable `writeWebm()` unchanged: normal length-prefixed WebM/MKV still writes
+`Info/Duration` for precise metadata. For `fragmentWebm()` only, author the init segment with `Info`
+containing `TimecodeScale`, `MuxingApp`, and `WritingApp`, but omit `Duration`. The live output still
+materializes duration from Cluster timecodes and packet durations when probed or re-imported; the global
+Segment simply does not claim a final duration up front.
+
+**Consequences:** root `WebmMuxer({ fragmented:true })` now emits the stricter headerless/live layout
+without weakening packet preservation. The focused root regression independently scans the init chunk and
+the assembled stream for absence of `Info/Duration`, checks the unknown-size Segment, keeps the byte-exact
+fragmented golden pinned to the no-Duration bytes, and still runs the real-corpus fragmented WebM reimport
+oracle. After rebuilding root `dist` and refreshing the harness vendor, the sibling adapter declares
+`headerless`; `streaming-output/webm_headerless_live_stream` and
+`streaming-output/prop_webm_headerless_duration_materialized` pass fresh on Chromium, WebKit, and Firefox.
+
+**Rejected:** keeping `Duration` because it is convenient for consumers (fails the live-layout contract);
+loosening the benchmark oracle (would hide the layout bug); removing duration from seekable WebM (unrelated
+and regressive); deriving a fake duration sidecar in the adapter (the container bytes must carry the truth).
+
+### ADR-100 — Streaming-output adapter declarations: reserve is final-layout, WebM stream targets are live
+
+**Context:** Session 5's streaming-output family now forwards output-shape options to the aibrush-media
+adapter and gates them by explicit feature tokens. Three related declarations had to be separated cleanly:
+`headerless` WebM requires a strict live EBML layout (ADR-099); `target:writes` requires real callback
+writes and reconstructed bytes, not a returned Blob; and `fastStart:reserve` rows in the current suite check
+the final MP4 box order and duration, not positioned sparse-reserve patch telemetry. Treating all three as
+one generic "streaming" capability would either under-declare real support or over-claim unmeasured write
+semantics.
+
+**Decision:** declare `headerless` only after the vendored root build passed the focused WebM live-layout
+rows on Chromium, WebKit, and Firefox. For WebM/MKV rows that request a callback-backed `target:'stream'`,
+route through `fragmented:true` as well as for `appendOnly:true`; the root `WebmMuxer` then emits an init
+segment plus live top-level Clusters through `toStreamTarget`, so the target-write telemetry observes
+multiple real writes. Declare `fastStart:reserve` for the suite's current final-layout/duration contract:
+the MP4 output is moov-first and reference-reimports with the expected duration. Keep the sparse
+forward-reserve patch behavior documented as unclaimed until the benchmark exposes a positioned-write
+oracle for reserved holes and backpatching. Keep oversized explicit buffer targets and stream scales above
+the verified in-browser materialization cap as typed `NotApplicableError`s.
+
+**Consequences:** WebM-family stream targets use the bounded live writer instead of a one-shot seekable
+WebM buffer wearing stream telemetry, which unblocks the large VP9 WebM stream row without faking write
+shape. `fastStart:reserve` can rank the existing rows honestly while future reserve-specific telemetry
+will still be able to fail if sparse patching is required. The adapter comments, feature declarations, and
+architecture docs now describe the same capability surface.
+
+**Rejected:** declaring `fastStart:reserve` as proof of sparse reserved-moov patching; mapping WebM
+`target:'stream'` to the seekable single-chunk writer; disabling the scale guards globally; loosening the
+benchmark shape oracles.

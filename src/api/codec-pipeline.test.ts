@@ -35,7 +35,14 @@ import {
   videoEncoderCodecString,
   videoTrackInfoFromDecoderConfig,
 } from './codec-pipeline.ts';
-import { videoFilterSpecs } from './video-stream-plan.ts';
+import {
+  planCfrFrameRetiming,
+  planH264AbrLadder,
+  planVideoBitDepthConversion,
+  planVideoRateControl,
+  retimeTimedFrameStream,
+  videoFilterSpecs,
+} from './video-stream-plan.ts';
 
 // ── container choice ───────────────────────────────────────────────────────────────────────────
 
@@ -319,6 +326,141 @@ describe('outputDimensions', () => {
   });
 });
 
+// ── video fps retiming (CFR drop/dup plan + close-once stream helper) ───────────────────────────
+
+function cfrTimings(fps: number, frames: number): { timestamp: number; duration: number }[] {
+  return Array.from({ length: frames }, (_, index) => {
+    const timestamp = Math.round((index * 1_000_000) / fps);
+    const next = Math.round(((index + 1) * 1_000_000) / fps);
+    return { timestamp, duration: next - timestamp };
+  });
+}
+
+describe('planCfrFrameRetiming', () => {
+  it('duplicates frames for 30→60 and 15→30 CFR targets', () => {
+    expect(planCfrFrameRetiming(cfrTimings(30, 3), { fps: 60 }).outputs).toMatchObject([
+      { sourceIndex: 0, timestamp: 0, duration: 16667, duplicate: false },
+      { sourceIndex: 0, timestamp: 16667, duration: 16666, duplicate: true },
+      { sourceIndex: 1, timestamp: 33333, duration: 16667, duplicate: false },
+      { sourceIndex: 1, timestamp: 50000, duration: 16667, duplicate: true },
+      { sourceIndex: 2, timestamp: 66667, duration: 16666, duplicate: false },
+      { sourceIndex: 2, timestamp: 83333, duration: 16667, duplicate: true },
+    ]);
+
+    expect(
+      planCfrFrameRetiming(cfrTimings(15, 3), { fps: 30 }).outputs.map((o) => o.sourceIndex),
+    ).toEqual([0, 0, 1, 1, 2, 2]);
+  });
+
+  it('drops frames for 30→15 and records the skipped source indexes', () => {
+    const plan = planCfrFrameRetiming(cfrTimings(30, 4), { fps: 15 });
+    expect(plan.outputs.map((o) => o.sourceIndex)).toEqual([0, 2]);
+    expect(plan.droppedSourceIndexes).toEqual([1, 3]);
+    expect(plan.outputs.map((o) => o.timestamp)).toEqual([0, 66667]);
+  });
+
+  it('handles extreme 1 fps and 240 fps targets without special casing', () => {
+    const oneFps = planCfrFrameRetiming(cfrTimings(30, 60), { fps: 1 });
+    expect(oneFps.outputs.map((o) => o.sourceIndex)).toEqual([0, 30]);
+    expect(oneFps.outputs.map((o) => o.timestamp)).toEqual([0, 1_000_000]);
+
+    const highFps = planCfrFrameRetiming(cfrTimings(30, 2), { fps: 240 });
+    expect(highFps.outputs).toHaveLength(16);
+    expect(highFps.outputs.slice(0, 8).every((o) => o.sourceIndex === 0)).toBe(true);
+    expect(highFps.outputs.slice(8).every((o) => o.sourceIndex === 1)).toBe(true);
+  });
+
+  it('converts VFR input to CFR by timestamp ownership, not by source index ratios', () => {
+    const vfr = [
+      { timestamp: 0, duration: 40_000 },
+      { timestamp: 40_000, duration: 20_000 },
+      { timestamp: 60_000, duration: 40_000 },
+    ];
+    const plan = planCfrFrameRetiming(vfr, { fps: 30 });
+    expect(plan.outputs.map((o) => o.sourceIndex)).toEqual([0, 0, 2]);
+    expect(plan.droppedSourceIndexes).toEqual([1]);
+  });
+
+  it('rejects invalid fps or non-monotonic source timestamps with typed errors', () => {
+    expect(() => planCfrFrameRetiming(cfrTimings(30, 2), { fps: 0 })).toThrow(InputError);
+    expect(() =>
+      planCfrFrameRetiming([{ timestamp: 10_000 }, { timestamp: 5_000 }], { fps: 30 }),
+    ).toThrow(InputError);
+  });
+});
+
+describe('retimeTimedFrameStream', () => {
+  class RetimeFakeFrame {
+    closed = false;
+    readonly parentId: number;
+
+    constructor(
+      readonly id: number,
+      readonly timestamp: number,
+      readonly duration: number | null,
+      parentId: number = id,
+    ) {
+      this.parentId = parentId;
+    }
+
+    close(): void {
+      if (this.closed) throw new Error(`frame ${this.id} closed twice`);
+      this.closed = true;
+    }
+  }
+
+  async function collect<T>(stream: ReadableStream<T>): Promise<T[]> {
+    const reader = stream.getReader();
+    const out: T[] = [];
+    try {
+      for (;;) {
+        const read = await reader.read();
+        if (read.done) break;
+        out.push(read.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return out;
+  }
+
+  it('restamps duplicate/drop output and closes every consumed input frame exactly once', async () => {
+    let nextId = 100;
+    const inputs = [new RetimeFakeFrame(0, 0, 33_333), new RetimeFakeFrame(1, 33_333, 33_334)];
+    const outputs = await collect(
+      retimeTimedFrameStream(streamOf(inputs), {
+        fps: 60,
+        restamp(frame, timing): RetimeFakeFrame {
+          return new RetimeFakeFrame(nextId++, timing.timestamp, timing.duration, frame.id);
+        },
+      }),
+    );
+    expect(inputs.map((f) => f.closed)).toEqual([true, true]);
+    expect(outputs.map((f) => [f.parentId, f.timestamp, f.duration, f.closed])).toEqual([
+      [0, 0, 16667, false],
+      [0, 16667, 16666, false],
+      [1, 33333, 16667, false],
+      [1, 50000, 16667, false],
+    ]);
+    for (const output of outputs) output.close();
+  });
+
+  it('rejects same-object restamps while closing the source frame once', async () => {
+    const input = new RetimeFakeFrame(0, 0, 33_333);
+    const reader = retimeTimedFrameStream(streamOf([input]), {
+      fps: 30,
+      restamp(frame): RetimeFakeFrame {
+        return frame;
+      },
+    }).getReader();
+
+    await expect(reader.read()).rejects.toThrow(InputError);
+    expect(input.closed).toBe(true);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  });
+});
+
 // ── audio filter chain (gain / stereo→mono / resample shaping before the encoder) ─────────────────
 
 describe('audioFilterSpecs', () => {
@@ -532,8 +674,27 @@ describe('buildVideoEncoderConfig', () => {
       height: 1080,
       latencyMode: 'quality',
       bitrate: 2_000_000,
+      bitrateMode: 'variable',
       framerate: 30,
     });
+  });
+
+  it('threads bitrate-mode planning through ordinary bitrate encodes and rejects invalid fps/bitrate', () => {
+    expect(
+      buildVideoEncoderConfig({ codec: 'h264', bitrate: 2_000_000 }, src, undefined),
+    ).toMatchObject({ bitrate: 2_000_000, bitrateMode: 'variable' });
+    expect(() => buildVideoEncoderConfig({ codec: 'h264', fps: 0 }, src, undefined)).toThrow(
+      InputError,
+    );
+    expect(() =>
+      buildVideoEncoderConfig({ codec: 'h264', bitrate: Number.NaN }, src, undefined),
+    ).toThrow(InputError);
+  });
+
+  it('does not silently drop CRF/two-pass requests from WebCodecs configs', () => {
+    expect(() => buildVideoEncoderConfig({ codec: 'h264', crf: 23 }, src, undefined)).toThrow(
+      CapabilityError,
+    );
   });
 
   it('sizes the H.264 level to the output dims while flooring tiny browser encodes at L3.0', () => {
@@ -601,6 +762,105 @@ describe('buildVideoEncoderConfig', () => {
         { width: undefined, height: undefined },
         undefined,
       ),
+    ).toThrow(InputError);
+  });
+});
+
+describe('planVideoRateControl', () => {
+  it('plans bitrate, CRF, and two-pass requests distinctly', () => {
+    expect(planVideoRateControl({ bitrate: 3_000_000 }, 'avc1.42E01E')).toEqual({
+      mode: 'bitrate',
+      bitrate: 3_000_000,
+      bitrateMode: 'variable',
+    });
+    expect(planVideoRateControl({ crf: 23 }, 'avc1.42E01E')).toEqual({
+      mode: 'crf',
+      crf: 23,
+      codec: 'h264',
+      bitrateMode: 'quantizer',
+      webCodecsConfigurable: false,
+    });
+    expect(planVideoRateControl({ bitrate: 3_000_000, twoPass: true }, 'avc1.42E01E')).toEqual({
+      mode: 'two-pass-bitrate',
+      bitrate: 3_000_000,
+      passes: 2,
+      webCodecsConfigurable: false,
+    });
+  });
+
+  it('rejects malformed or conflicting rate-control requests with typed errors', () => {
+    expect(() => planVideoRateControl({ bitrate: -1 }, 'avc1.42E01E')).toThrow(InputError);
+    expect(() => planVideoRateControl({ crf: 52 }, 'avc1.42E01E')).toThrow(InputError);
+    expect(() => planVideoRateControl({ bitrate: 1_000_000, crf: 23 }, 'avc1.42E01E')).toThrow(
+      InputError,
+    );
+    expect(() => planVideoRateControl({ twoPass: true }, 'avc1.42E01E')).toThrow(InputError);
+  });
+});
+
+describe('planVideoBitDepthConversion', () => {
+  it('plans supported 10-bit H.264 → 8-bit H.264 down-conversion as a pixel-path requirement', () => {
+    expect(
+      planVideoBitDepthConversion({
+        sourceCodec: 'avc1.6E0033',
+        targetCodec: 'avc1.42E028',
+      }),
+    ).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 10,
+      targetBitDepth: 8,
+      requiresPixelPath: true,
+    });
+  });
+
+  it('keeps same-depth transcodes as no-op and rejects unsupported up-conversion/Main10 output', () => {
+    expect(
+      planVideoBitDepthConversion({
+        sourceCodec: 'avc1.42E01E',
+        targetCodec: 'avc1.42E028',
+      }),
+    ).toEqual({
+      kind: 'none',
+      sourceBitDepth: 8,
+      targetBitDepth: 8,
+      requiresPixelPath: false,
+    });
+    expect(() =>
+      planVideoBitDepthConversion({
+        sourceCodec: 'avc1.42E028',
+        targetCodec: 'hev1.2.4.L93.90',
+      }),
+    ).toThrow(CapabilityError);
+  });
+});
+
+describe('planH264AbrLadder', () => {
+  it('normalizes H.264 ABR rungs into convert options and encoder configs in input order', () => {
+    const ladder = planH264AbrLadder(
+      [
+        { name: '720p', width: 1280, height: 720, bitrate: 3_000_000, fps: 30 },
+        { name: '360p', width: 640, height: 360, bitrate: 800_000, fps: 30 },
+      ],
+      { width: 1920, height: 1080 },
+    );
+    expect(ladder.map((rung) => rung.name)).toEqual(['720p', '360p']);
+    expect(ladder.map((rung) => rung.options)).toEqual([
+      {
+        to: 'mp4',
+        video: { codec: 'h264', width: 1280, height: 720, bitrate: 3_000_000, fps: 30 },
+      },
+      { to: 'mp4', video: { codec: 'h264', width: 640, height: 360, bitrate: 800_000, fps: 30 } },
+    ]);
+    expect(ladder.map((rung) => rung.config.codec)).toEqual(['avc1.42E01F', 'avc1.42E01E']);
+  });
+
+  it('rejects an empty or malformed ABR ladder before worker fanout', () => {
+    expect(() => planH264AbrLadder([], { width: 1920, height: 1080 })).toThrow(InputError);
+    expect(() =>
+      planH264AbrLadder([{ name: 'bad', width: 0, height: 720, bitrate: 3_000_000 }], {
+        width: 1920,
+        height: 1080,
+      }),
     ).toThrow(InputError);
   });
 });

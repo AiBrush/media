@@ -1,5 +1,5 @@
 {
-  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment + one Cluster per fragment. A byte change in the EBML header, Tracks, Segment unknown-size encoding, cluster boundary rule, or SimpleBlock layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (and record an ADR).",
+  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment with no Info/Duration + one Cluster per fragment. A byte change in the EBML header, Tracks, Segment unknown-size encoding, live Info layout, cluster boundary rule, or SimpleBlock layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (and record an ADR).",
   "input": {
     "codec": "vp09.00.10.08",
     "codedWidth": 64,
@@ -12,11 +12,11 @@
   "docType": "webm",
   "fragmented": true,
   "chunkCount": 3,
-  "chunkSizes": [146, 118, 135],
-  "totalBytes": 399,
-  "sha256": "abd59909e1106758405f099561ee53b4c4228a9f952885a3aa0d57ea21bd11ef",
+  "chunkSizes": [135, 118, 135],
+  "totalBytes": 388,
+  "sha256": "a1a297226ab3d78574fefcfb0b0ba6041f8b48806a7b9199e5e0b3cd68397f0c",
   "chunkSha256": [
-    "1c4d4ecf8f6f6661f5ecc7ca9fdaba36e1c313ee575bf678131115c23145c352",
+    "e4a4ed21fcd62539e34fca0e8661d18bfdb3df5704ce80df26eb4fa604b349b8",
     "073752a9ecdc79e2f0f8b18cb4015659d0fed5880fa082d667344ff13a6dc345",
     "717d2286d5f307825af3b1a2ec52d3319750351d22d59fbd50e3d4a377432f8f"
   ]

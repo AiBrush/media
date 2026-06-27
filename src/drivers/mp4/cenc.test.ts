@@ -19,9 +19,16 @@ const ra = (b: Uint8Array) => ({
 });
 
 /** Independent 16-byte counter from an 8-byte IV (high bytes) — written separately from the SUT. */
-function counter(iv: Uint8Array): Uint8Array<ArrayBuffer> {
+function counter(iv: Uint8Array, blockOffset = 0): Uint8Array<ArrayBuffer> {
   const c = new Uint8Array(16);
   c.set(iv, 0);
+  let carry = blockOffset;
+  for (let i = 15; i >= 8 && carry > 0; i--) {
+    const add = carry % 256;
+    const sum = (c[i] ?? 0) + add;
+    c[i] = sum & 0xff;
+    carry = Math.floor(carry / 256) + Math.floor(sum / 256);
+  }
   return c;
 }
 function ivFor(i: number): Uint8Array {
@@ -70,6 +77,33 @@ describe('CENC subsample decryption', () => {
       { iv, subsamples: [{ clear: 10, protected: 20 }] },
       cipher,
     );
+    expect([...recovered]).toEqual([...original]);
+  });
+
+  it('starts each protected subsample range on the next CTR block boundary', async () => {
+    const iv = ivFor(9);
+    const original = Uint8Array.from({ length: 44 }, (_, i) => (i * 11) & 0xff);
+    const subsamples = [
+      { clear: 2, protected: 17 },
+      { clear: 3, protected: 17 },
+    ];
+    const cipher = original.slice();
+    let pos = 0;
+    let blockOffset = 0;
+    for (const ss of subsamples) {
+      pos += ss.clear;
+      const enc = await aesCtr(
+        KEY,
+        counter(iv, blockOffset),
+        original.subarray(pos, pos + ss.protected).slice(),
+        64,
+      );
+      cipher.set(enc, pos);
+      blockOffset += Math.ceil(ss.protected / 16);
+      pos += ss.protected;
+    }
+
+    const recovered = await decryptSample(KEY, { iv, subsamples }, cipher);
     expect([...recovered]).toEqual([...original]);
   });
 });

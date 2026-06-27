@@ -579,6 +579,37 @@ function readBoxHeaderAt(r: Reader): BoxHeader {
   return { type, size, headerSize: 8, start, payloadStart: start + 8, end: start + size };
 }
 
+function vp9CodecString(vpcC: Uint8Array): string {
+  if (vpcC.byteLength < 8) return 'vp9';
+  const profile = vpcC[4] ?? 0;
+  const level = vpcC[5] ?? 10;
+  const bitDepth = (vpcC[6] ?? 0x80) >> 4;
+  return `vp09.${profile.toString().padStart(2, '0')}.${level.toString().padStart(2, '0')}.${bitDepth
+    .toString()
+    .padStart(2, '0')}`;
+}
+
+function opusHeadFromDops(dops: Uint8Array, fallbackSampleRate: number): Uint8Array | undefined {
+  if (dops.byteLength < 11) return undefined;
+  const dv = new DataView(dops.buffer, dops.byteOffset, dops.byteLength);
+  const channels = dv.getUint8(1);
+  const preSkip = dv.getUint16(2, false);
+  const sampleRate = dv.getUint32(4, false) || fallbackSampleRate;
+  const outputGain = dv.getInt16(8, false);
+  const mappingFamily = dv.getUint8(10);
+  if (channels < 1 || channels > 2 || mappingFamily !== 0) return undefined;
+  const out = new Uint8Array(19);
+  out.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0);
+  const od = new DataView(out.buffer);
+  od.setUint8(8, 1);
+  od.setUint8(9, channels);
+  od.setUint16(10, preSkip, true);
+  od.setUint32(12, sampleRate, true);
+  od.setInt16(16, outputGain, true);
+  od.setUint8(18, mappingFamily);
+  return out;
+}
+
 // Video sample-entry → (config box type, codec-string fn). avc1/avc3→avcC, hvc1/hev1→hvcC, av01→av1C.
 const VIDEO_CONFIG: Record<
   string,
@@ -589,6 +620,7 @@ const VIDEO_CONFIG: Record<
   hvc1: { box: 'hvcC', codec: (t, rec) => hevcCodecString(t, rec) },
   hev1: { box: 'hvcC', codec: (t, rec) => hevcCodecString(t, rec) },
   av01: { box: 'av1C', codec: (_t, rec) => av1CodecString(rec) },
+  vp09: { box: 'vpcC', codec: (_t, rec) => vp9CodecString(rec) },
 };
 
 function parseVisualEntry(r: Reader, entry: BoxHeader): SampleEntry {
@@ -715,6 +747,34 @@ function parseAudioEntry(r: Reader, entry: BoxHeader): SampleEntry {
       sampleRate,
       channels,
       codecPrivate: { boxType: 'esds', data: esdsPayload },
+    };
+  }
+  const dops = findAudioConfigBox(r, childStart, entry.end, 'dOps');
+  if (dops && entry.type === 'Opus') {
+    const dopsPayload = r.bytesAt(dops.payloadStart, dops.end).slice();
+    const opusHead = opusHeadFromDops(dopsPayload, sampleRate);
+    const config: AudioDecoderConfig = {
+      codec: 'opus',
+      sampleRate,
+      numberOfChannels: channels,
+      ...(opusHead !== undefined ? { description: opusHead } : {}),
+    };
+    return {
+      type: entry.type,
+      codec: 'opus',
+      config,
+      sampleRate,
+      channels,
+      codecPrivate: { boxType: 'dOps', data: dopsPayload },
+    };
+  }
+  if (entry.type === '.mp3') {
+    return {
+      type: entry.type,
+      codec: 'mp3',
+      config: { codec: 'mp3', sampleRate, numberOfChannels: channels },
+      sampleRate,
+      channels,
     };
   }
   const codec = entry.type;

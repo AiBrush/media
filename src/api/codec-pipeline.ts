@@ -119,10 +119,7 @@ interface ParsedTrackSelector {
 function parseTrackSelector(raw: string): ParsedTrackSelector {
   const match = TRACK_SELECTOR.exec(raw);
   if (!match) {
-    throw new InputError(
-      'unsupported-input',
-      `invalid track selector '${raw}' (expected e.g. 'video:0' or 'audio:0')`,
-    );
+    throw new InputError('unsupported-input', 'bad selector');
   }
   const mediaType = match[1] === 'video' ? 'video' : 'audio';
   const index = Number(match[2]);
@@ -166,10 +163,7 @@ export function selectTrackInfos<T extends Pick<TrackInfo, 'mediaType'>>(
     }
   }
   if (out.length === 0) {
-    throw new InputError(
-      'unsupported-input',
-      `track selection matched no tracks: ${requested.join(', ')}`,
-    );
+    throw new InputError('unsupported-input', 'no track');
   }
   return out;
 }
@@ -203,27 +197,27 @@ const VIDEO_CODEC_STRING: Record<VideoCodec, string> = {
  * hard-coded L3.0 `avc1.42E01E` rejected). 1b (idc 11 + constraint_set3) is omitted: it is profile-
  * constrained and 1.1 covers the same maxFs, so plain 1.1 is the cleaner low rung. (See unit tests.)
  */
-const H264_LEVELS: ReadonlyArray<{ idc: number; maxFs: number; maxMbps: number }> = [
-  { idc: 0x0a, maxFs: 99, maxMbps: 1485 }, //   1.0
-  { idc: 0x0b, maxFs: 396, maxMbps: 3000 }, //  1.1
-  { idc: 0x0c, maxFs: 396, maxMbps: 6000 }, //  1.2
-  { idc: 0x0d, maxFs: 396, maxMbps: 11880 }, // 1.3
-  { idc: 0x14, maxFs: 396, maxMbps: 11880 }, // 2.0
-  { idc: 0x15, maxFs: 792, maxMbps: 19800 }, // 2.1
-  { idc: 0x16, maxFs: 1620, maxMbps: 20250 }, // 2.2
-  { idc: 0x1e, maxFs: 1620, maxMbps: 40500 }, // 3.0
-  { idc: 0x1f, maxFs: 3600, maxMbps: 108000 }, // 3.1
-  { idc: 0x20, maxFs: 5120, maxMbps: 216000 }, // 3.2
-  { idc: 0x28, maxFs: 8192, maxMbps: 245760 }, // 4.0
-  { idc: 0x29, maxFs: 8192, maxMbps: 245760 }, // 4.1
-  { idc: 0x2a, maxFs: 8704, maxMbps: 522240 }, // 4.2
-  { idc: 0x32, maxFs: 22080, maxMbps: 589824 }, // 5.0
-  { idc: 0x33, maxFs: 36864, maxMbps: 983040 }, // 5.1
-  { idc: 0x34, maxFs: 36864, maxMbps: 2073600 }, // 5.2
-  { idc: 0x3c, maxFs: 139264, maxMbps: 4177920 }, // 6.0
-  { idc: 0x3d, maxFs: 139264, maxMbps: 8355840 }, // 6.1
-  { idc: 0x3e, maxFs: 139264, maxMbps: 16711680 }, // 6.2
-];
+const H264_LEVELS = [
+  [0x0a, 99, 1485], //   1.0
+  [0x0b, 396, 3000], //  1.1
+  [0x0c, 396, 6000], //  1.2
+  [0x0d, 396, 11880], // 1.3
+  [0x14, 396, 11880], // 2.0
+  [0x15, 792, 19800], // 2.1
+  [0x16, 1620, 20250], // 2.2
+  [0x1e, 1620, 40500], // 3.0
+  [0x1f, 3600, 108000], // 3.1
+  [0x20, 5120, 216000], // 3.2
+  [0x28, 8192, 245760], // 4.0
+  [0x29, 8192, 245760], // 4.1
+  [0x2a, 8704, 522240], // 4.2
+  [0x32, 22080, 589824], // 5.0
+  [0x33, 36864, 983040], // 5.1
+  [0x34, 36864, 2073600], // 5.2
+  [0x3c, 139264, 4177920], // 6.0
+  [0x3d, 139264, 8355840], // 6.1
+  [0x3e, 139264, 16711680], // 6.2
+] as const satisfies ReadonlyArray<readonly [idc: number, maxFs: number, maxMbps: number]>;
 
 /** Default fps for the throughput (MaxMBPS) bound when the caller did not pin a framerate. */
 const H264_DEFAULT_FPS = 30;
@@ -257,8 +251,8 @@ export function h264LevelIdcForDimensions(
   const frameMbs = mbW * mbH;
   const rate = fps !== undefined && fps > 0 ? fps : H264_DEFAULT_FPS;
   const mbps = frameMbs * rate;
-  for (const level of H264_LEVELS) {
-    if (frameMbs <= level.maxFs && mbps <= level.maxMbps) return level.idc;
+  for (const [idc, maxFs, maxMbps] of H264_LEVELS) {
+    if (frameMbs <= maxFs && mbps <= maxMbps) return idc;
   }
   return H264_TOP_LEVEL_IDC; // over-spec resolution; the encoder probe makes the final call
 }
@@ -473,11 +467,10 @@ export function videoEncoderCodecString(
     assertSupportedVideoEncodeProfile(sourceCodecString);
     return sourceCodecString;
   }
-  throw new CapabilityError(
-    'capability-miss',
-    `cannot determine an output video codec (source '${sourceCodecString ?? 'unknown'}' is not a recognized WebCodecs video codec; pass video.codec)`,
-    { op: 'encode', tried: [] },
-  );
+  throw new CapabilityError('capability-miss', 'unknown video codec', {
+    op: 'encode',
+    tried: [],
+  });
 }
 
 /** The parsed profile idc from a qualified HEVC codec string, or `undefined` for non-HEVC/malformed. */
@@ -496,16 +489,11 @@ export function isUnsupportedHevcEncodeProfile(codecString: string): boolean {
 
 function assertSupportedVideoEncodeProfile(codecString: string): void {
   if (!isUnsupportedHevcEncodeProfile(codecString)) return;
-  throw new CapabilityError(
-    'capability-miss',
-    `HEVC encode for '${codecString}' would preserve a non-Main/10-bit HEVC profile, but this build has no software HEVC encoder fallback`,
-    {
-      op: 'encode',
-      tried: ['webcodecs-video'],
-      suggestion:
-        'request the public hevc token for Main 8-bit output, or use a browser/build with a proven HEVC Main10 encoder',
-    },
-  );
+  throw new CapabilityError('capability-miss', 'bad HEVC profile', {
+    op: 'encode',
+    tried: ['webcodecs-video'],
+    suggestion: 'use HEVC Main8 or add Main10 encode',
+  });
 }
 
 /** Resolve the WebCodecs audio codec string to encode to (caller token, else preserve the source). */
@@ -515,22 +503,20 @@ export function audioEncoderCodecString(
 ): string {
   if (token !== undefined) {
     if (isPcmCodecToken(token)) {
-      throw new CapabilityError(
-        'capability-miss',
-        'PCM audio output flows through the audio-dsp path, not the WebCodecs encoder',
-        { op: 'encode', tried: [] },
-      );
+      throw new CapabilityError('capability-miss', 'PCM uses DSP', {
+        op: 'encode',
+        tried: [],
+      });
     }
     return AUDIO_CODEC_STRING[token];
   }
   if (sourceCodecString !== undefined && audioCodecToken(sourceCodecString) !== undefined) {
     return sourceCodecString;
   }
-  throw new CapabilityError(
-    'capability-miss',
-    `cannot determine an output audio codec (source '${sourceCodecString ?? 'unknown'}' is not a recognized audio codec; pass audio.codec)`,
-    { op: 'encode', tried: [] },
-  );
+  throw new CapabilityError('capability-miss', 'unknown audio codec', {
+    op: 'encode',
+    tried: [],
+  });
 }
 
 // ============ video filter chain (VideoTarget → ordered FilterSpec[]) ============
@@ -579,6 +565,12 @@ export function outputDimensions(
   return { width, height };
 }
 
+function assertPositiveFinite(name: string, value: number): void {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new InputError('unsupported-input', `${name} must be finite and positive`);
+  }
+}
+
 // ============ audio filter chain (AudioTarget → ordered FilterSpec[]) ============
 
 // `audioFilterSpecs` + its exclusive helpers (`fadeFramesAt`/`fadeCurve`/`resolveDynamics`) and the
@@ -587,6 +579,40 @@ export function outputDimensions(
 // audio-spec code + its audio-dsp type imports stay OUT of the eager kernel closure (doc 08 §7 budget).
 
 // ============ encoder configs (public target → WebCodecs *EncoderConfig) ============
+
+interface EagerVideoRateTarget extends Pick<VideoTarget, 'bitrate' | 'crf'> {
+  readonly bitrateMode?: VideoEncoderBitrateMode;
+  readonly twoPass?: boolean;
+}
+
+function assertValidVideoBitrate(bitrate: number): void {
+  if (!Number.isSafeInteger(bitrate) || bitrate <= 0) {
+    throw new InputError('unsupported-input', 'invalid video bitrate');
+  }
+}
+
+function eagerVideoRateConfig(target: EagerVideoRateTarget): {
+  readonly bitrate?: number;
+  readonly bitrateMode?: VideoEncoderBitrateMode;
+} {
+  if (target.bitrate !== undefined) assertValidVideoBitrate(target.bitrate);
+  if (target.bitrate !== undefined && target.crf !== undefined) {
+    throw new InputError('unsupported-input', 'bitrate/CRF conflict');
+  }
+  if (target.twoPass === true && target.bitrate === undefined) {
+    throw new InputError('unsupported-input', 'two-pass needs bitrate');
+  }
+  if (target.crf !== undefined || target.twoPass === true) {
+    throw new CapabilityError('capability-miss', 'CRF/two-pass unsupported', {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion: 'route to encoder tail',
+    });
+  }
+  return target.bitrate === undefined
+    ? {}
+    : { bitrate: target.bitrate, bitrateMode: target.bitrateMode ?? 'variable' };
+}
 
 /**
  * Build the {@link VideoEncoderConfig} for a target stream: the resolved codec string, the post-filter
@@ -601,10 +627,7 @@ export function buildVideoEncoderConfig(
 ): VideoEncoderConfig {
   const { width, height } = outputDimensions(target, src);
   if (width === undefined || height === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'cannot configure a video encoder without output dimensions (pass width/height)',
-    );
+    throw new InputError('unsupported-input', 'video dims required');
   }
   // Resolve the codec string. For the `h264` TOKEN (the default Constrained-Baseline profile) we size
   // the level byte to the OUTPUT dims+fps so e.g. 1080p advertises ≥L4.0 and the UA accepts it (the old
@@ -615,12 +638,14 @@ export function buildVideoEncoderConfig(
       ? h264CodecStringForDimensions(width, height, target.fps)
       : videoEncoderCodecString(target.codec, sourceCodecString);
   assertSupportedVideoEncodeProfile(codec);
+  if (target.fps !== undefined) assertPositiveFinite('fps', target.fps);
+  const rateControl = eagerVideoRateConfig(target);
   return {
     codec,
     width,
     height,
     latencyMode: 'quality',
-    ...(target.bitrate !== undefined ? { bitrate: target.bitrate } : {}),
+    ...rateControl,
     ...(target.fps !== undefined ? { framerate: target.fps } : {}),
   };
 }
@@ -639,10 +664,7 @@ export function buildAudioEncoderConfig(
   const sampleRate = target.sampleRate ?? src.sampleRate;
   const channels = target.channels ?? src.channels;
   if (sampleRate === undefined || channels === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'cannot configure an audio encoder without sampleRate and channels (pass them or use a timed source)',
-    );
+    throw new InputError('unsupported-input', 'audio layout required');
   }
   return {
     codec,
@@ -854,5 +876,5 @@ export async function seekFrame(
     throw e;
   }
   if (last !== undefined) return last; // sought past the last PTS → closest available frame
-  throw new InputError('unsupported-input', 'seek target has no decodable video frame');
+  throw new InputError('unsupported-input', 'no seek frame');
 }

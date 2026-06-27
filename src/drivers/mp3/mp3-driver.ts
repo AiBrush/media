@@ -1,8 +1,9 @@
 /**
  * The MP3 (MPEG-1/2/2.5 Audio Layer III) container driver — hand-written TS. An MP3 is a sequence of
  * frames; probe skips an optional ID3v2 tag, locks the first valid frame header for the sample
- * rate/channels/bitrate, and reads a Xing/Info VBR header for an exact frame count (else estimates a
- * CBR duration). Decode is via WebCodecs/WASM later; the container token is `mp3`.
+ * rate/channels/bitrate, reads a Xing/Info VBR header for its exact frame count when present, and otherwise
+ * walks the complete frame clock when the full stream is available (falling back to CBR byte-rate
+ * estimation only for head-only probes). Decode is via WebCodecs/WASM later; the container token is `mp3`.
  */
 
 import {
@@ -13,7 +14,6 @@ import {
   type Demuxer,
   type DriverModule,
   type MuxOptions,
-  type Muxer,
   type Packet,
   type Registry,
   type StageOptions,
@@ -163,6 +163,24 @@ function isInfoFrame(dv: DataView, offset: number, header: FrameHeader): boolean
   return tag === 'Xing' || tag === 'Info';
 }
 
+/** Exact audio duration from every complete MPEG frame present in `dv`, skipping a leading Xing/Info frame. */
+function fullFrameDurationSec(
+  dv: DataView,
+  first: { offset: number; header: FrameHeader },
+): number | undefined {
+  let durationSec = 0;
+  let at = first.offset;
+  for (;;) {
+    const header = parseFrameHeader(dv, at);
+    if (!header || header.frameLength < 4 || at + header.frameLength > dv.byteLength) break;
+    if (!isInfoFrame(dv, at, header)) {
+      durationSec += header.samplesPerFrame / header.sampleRate;
+    }
+    at += header.frameLength;
+  }
+  return durationSec > 0 ? durationSec : undefined;
+}
+
 /**
  * Enumerate every emittable MPEG audio frame across the WHOLE file — the PURE framing core that
  * `packets()` maps to `EncodedAudioChunk`s (kept separate so it is testable in Node without WebCodecs).
@@ -198,7 +216,7 @@ export function enumerateMp3Packets(bytes: Uint8Array): Mp3Packet[] {
   return packets;
 }
 
-/** Parse MP3 metadata + duration from (enough of) the file. `totalSize` enables CBR estimation. */
+/** Parse MP3 metadata + duration from the file/head. `totalSize` preserves head-only CBR estimation. */
 export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const first = findFirstFrame(dv, id3v2Length(dv));
@@ -209,6 +227,10 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
   let durationSec: number;
   if (frames !== undefined) {
     durationSec = (frames * header.samplesPerFrame) / header.sampleRate;
+  } else if (totalSize === undefined || totalSize <= dv.byteLength) {
+    durationSec =
+      fullFrameDurationSec(dv, first) ??
+      ((dv.byteLength - offset) * 8) / (header.bitrateKbps * 1000);
   } else {
     const audioBytes = (totalSize ?? dv.byteLength) - offset;
     durationSec = (audioBytes * 8) / (header.bitrateKbps * 1000);
@@ -296,7 +318,7 @@ function matches(q: ContainerQuery): boolean {
   return dv.getUint8(0) === 0xff && (b1 & 0xe0) === 0xe0 && (b1 & 0x06) !== 0;
 }
 
-export const Mp3Driver: ContainerDriver = {
+export const Mp3Driver = {
   id: 'mp3',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
@@ -324,12 +346,12 @@ export const Mp3Driver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(o?: MuxOptions): Muxer {
+  createMuxer(o?: MuxOptions): Mp3Muxer {
     // MP3 is an elementary stream of self-describing frames — concatenate the track's MPEG Layer III
     // frames into a `.mp3` (no fragmented form; the encoder/remux path feeds the frames). See {@link Mp3Muxer}.
     return new Mp3Muxer(o);
   },
-};
+} satisfies ContainerDriver;
 
 export const Mp3Module: DriverModule = {
   apiVersion: DRIVER_API_VERSION,

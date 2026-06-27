@@ -53,6 +53,8 @@ export interface HlsResolveOptions {
 /** The MIME the stitched bytes are tagged with, so the engine routes them to the right segment container. */
 const TS_MIME = 'video/mp2t';
 const FMP4_MIME = 'video/mp4';
+const AES128_KEY_LEN = 16;
+type HlsAes128KeyCache = Map<string, Promise<Uint8Array<ArrayBuffer>>>;
 
 /**
  * Resolve an HLS playlist into a single demuxable {@link Source}: parse → (pick variant) → fetch + decrypt +
@@ -84,13 +86,14 @@ export async function resolveHlsSource(
   }
 
   const parts: Uint8Array[] = [];
+  const keyCache: HlsAes128KeyCache = new Map();
   // Prepend the fMP4 init section FIRST (awaited before the segment loop) so the `ftyp`+`moov` lead the
   // fragments; for a TS playlist this is a no-op. Then fetch + decrypt + append each segment in order.
   const fmp4 = await appendInitSection(parts, media.segments[0], fetchResource, opts.signal);
   for (const segment of media.segments) {
     throwIfAborted(opts.signal);
     const raw = await fetchResource(segment.uri);
-    parts.push(await decryptSegmentIfNeeded(raw, segment, fetchResource, opts.signal));
+    parts.push(await decryptSegmentIfNeeded(raw, segment, fetchResource, keyCache, opts.signal));
   }
   throwIfAborted(opts.signal);
 
@@ -165,14 +168,15 @@ async function appendInitSection(
 
 /**
  * Decrypt a segment when an `AES-128` key is in force; pass a clear segment through untouched. The key is
- * fetched once per distinct key URI (memoized by the fetcher's own caching if any); the IV is the explicit
- * `IV=` or, per RFC 8216 §4.3.2.4, the segment's 64-bit media-sequence number in the low bytes of a 16-byte
- * big-endian block. A `SAMPLE-AES` method is declined (that is sample-level, not whole-segment).
+ * fetched once per distinct resolved key URI; the IV is the explicit `IV=` or, per RFC 8216 §4.3.2.4, the
+ * segment's 64-bit media-sequence number in the low bytes of a 16-byte big-endian block. A `SAMPLE-AES`
+ * method is declined (that is sample-level, not whole-segment).
  */
 async function decryptSegmentIfNeeded(
   raw: Uint8Array,
   segment: HlsSegment,
   fetchResource: HlsResourceFetcher,
+  keyCache: HlsAes128KeyCache,
   signal: AbortSignal | undefined,
 ): Promise<Uint8Array> {
   const ranged = segment.byteRange ? sliceByteRange(raw, segment.byteRange) : raw;
@@ -188,9 +192,34 @@ async function decryptSegmentIfNeeded(
     throw new InputError('unsupported-input', 'HLS AES-128 #EXT-X-KEY is missing its key URI');
   }
   throwIfAborted(signal);
-  const keyBytes = toExact(await fetchResource(key.uri));
+  const keyBytes = await fetchAes128Key(key.uri, fetchResource, keyCache);
+  throwIfAborted(signal);
   const iv = toExact(ivForSegment(key, segment.sequence));
   return decryptHlsAes128(toExact(ranged), keyBytes, iv);
+}
+
+/** Fetch and validate a resolved AES-128 key URI once; wrong resources fail with the URI named. */
+function fetchAes128Key(
+  uri: string,
+  fetchResource: HlsResourceFetcher,
+  keyCache: HlsAes128KeyCache,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const cached = keyCache.get(uri);
+  if (cached !== undefined) return cached;
+  const fetched = fetchResource(uri).then((bytes) => exactAes128Key(uri, bytes));
+  keyCache.set(uri, fetched);
+  return fetched;
+}
+
+function exactAes128Key(uri: string, bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (bytes.byteLength !== AES128_KEY_LEN) {
+    throw new InputError(
+      'unsupported-input',
+      `HLS AES-128 key ${uri} must be ${AES128_KEY_LEN} bytes, got ${bytes.byteLength}`,
+      { uri, expectedBytes: AES128_KEY_LEN, actualBytes: bytes.byteLength },
+    );
+  }
+  return toExact(bytes);
 }
 
 /** The 16-byte IV for a segment: the explicit `IV=` if present, else the media sequence as 16-byte BE. */

@@ -38,10 +38,16 @@ import { fragmentMp4 } from '../src/drivers/mp4/fragment.ts';
 import { muxTracksFromMovie, readMovie } from '../src/drivers/mp4/mp4-driver.ts';
 import type { MuxTrackInput } from '../src/drivers/mp4/write.ts';
 import { writeMp4 } from '../src/drivers/mp4/write.ts';
+import { type TsParse, parseTs } from '../src/drivers/mpegts/ts-parse.ts';
+import { MpegTsMuxer } from '../src/drivers/mpegts/ts-write.ts';
 import { toStreamTarget, writeToStreamTarget } from '../src/sinks/stream-target.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
+const HARNESS_MEDIA_DIR = new URL(
+  '../../media-test/media-browser-test/fixtures/media/',
+  import.meta.url,
+).pathname;
 const BASELINE_PATH = `${ROOT}fixtures/golden/bench/streaming.json`;
 
 const WARMUP = 3;
@@ -63,6 +69,17 @@ const MP4_FILES = [
   'movie_5.mp4', // H.264 + AAC, multitrack, faststart
   'test.mp4', // H.264 + AAC, B-frames (non-zero ctts)
 ];
+
+/** Real MPEG-TS/HLS segment fixtures for packet-aligned `StreamTarget` writes (R3 target:writes). */
+const TS_FILES = [
+  { id: 'bear-1280x720.ts', path: `${MEDIA_DIR}/bear-1280x720.ts` },
+  { id: 'h264_ts.ts', path: `${HARNESS_MEDIA_DIR}h264_ts.ts` },
+  { id: 'hls_vod_000.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_000.ts` },
+  { id: 'hls_vod_001.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_001.ts` },
+  { id: 'hls_vod_002.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_002.ts` },
+  { id: 'hls_vod_003.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_003.ts` },
+  { id: 'hls_vod_004.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_004.ts` },
+] as const;
 
 let sink = 0; // accumulate a byte from each result to defeat dead-code elimination
 
@@ -133,6 +150,96 @@ function fragmentedOutputBytes(tracks: readonly MuxTrackInput[]): number {
   return total;
 }
 
+function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const part of parts) total += part.byteLength;
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return concatBytes(chunks);
+}
+
+function tsDurationSec(parsed: TsParse): number {
+  return parsed.tracks.reduce((max, track) => Math.max(max, track.durationSec), 0);
+}
+
+function mpegTsMuxerFromParsed(parsed: TsParse, writeChunkPackets?: number): MpegTsMuxer {
+  const muxer =
+    writeChunkPackets === undefined ? new MpegTsMuxer() : new MpegTsMuxer({ writeChunkPackets });
+  const trackIds = parsed.tracks.map((track, index) =>
+    muxer.addTrack({
+      id: index,
+      mediaType: track.stream.mediaType,
+      codec: track.stream.codec,
+      durationSec: track.durationSec,
+      ...(track.fps !== undefined ? { fps: track.fps } : {}),
+      config: track.config,
+    }),
+  );
+  const units = parsed.tracks
+    .flatMap((track, trackIndex) => track.units.map((unit) => ({ trackIndex, unit })))
+    .sort(
+      (left, right) => left.unit.dtsUs - right.unit.dtsUs || left.trackIndex - right.trackIndex,
+    );
+  for (const { trackIndex, unit } of units) {
+    const trackId = trackIds[trackIndex];
+    if (trackId === undefined) throw new Error(`missing MPEG-TS mux track ${trackIndex}`);
+    muxer.addChunkStruct(trackId, {
+      data: unit.data,
+      timestampUs: unit.ptsUs,
+      dtsUs: unit.dtsUs,
+      key: unit.keyframe,
+    });
+  }
+  return muxer;
+}
+
+async function drainMpegTsToWritable(parsed: TsParse, writeChunkPackets?: number): Promise<number> {
+  const muxer = mpegTsMuxerFromParsed(parsed, writeChunkPackets);
+  await muxer.finalize();
+  let received = 0;
+  let firstByte = 0;
+  const writable = new WritableStream<Uint8Array>({
+    write(chunk): void {
+      if (received === 0) firstByte = chunk[0] ?? 0;
+      received += chunk.byteLength;
+    },
+  });
+  await writeToStreamTarget(toStreamTarget(writable), muxer.output);
+  return (received + firstByte) % 251;
+}
+
+async function drainMpegTsToCallback(parsed: TsParse, writeChunkPackets?: number): Promise<number> {
+  const muxer = mpegTsMuxerFromParsed(parsed, writeChunkPackets);
+  await muxer.finalize();
+  let writes = 0;
+  let end = 0;
+  let firstByte = 0;
+  await writeToStreamTarget(
+    toStreamTarget((chunk, position) => {
+      if (writes === 0) firstByte = chunk[0] ?? 0;
+      writes += 1;
+      end = position + chunk.byteLength;
+    }),
+    muxer.output,
+  );
+  return (end + writes + firstByte) % 251;
+}
+
 // ============ measured op record ============
 
 interface OpResult {
@@ -173,8 +280,10 @@ interface FileResult {
   id: string;
   sizeBytes: number;
   durationSec: number;
-  /** Total bytes of the produced fragmented (CMAF) stream — the streaming throughput work unit. */
-  fragmentedBytes: number;
+  /** Total bytes of the produced stream — the streaming throughput work unit. */
+  outputBytes: number;
+  /** Human label for the stream layout (`CMAF` or `MPEG-TS`). */
+  outputKind: string;
   ops: OpResult[];
 }
 
@@ -202,7 +311,7 @@ async function benchFile(id: string): Promise<FileResult> {
     throw new Error(`${id}: no fragmentable samples (need a real A/V MP4)`);
   }
   const durationSec = movieDurationSec(tracks);
-  const fragmentedBytes = fragmentedOutputBytes(tracks);
+  const outputBytes = fragmentedOutputBytes(tracks);
   const ops: OpResult[] = [];
 
   // (1) first-byte latency, streaming: construct the generator and pull only the init segment.
@@ -229,7 +338,7 @@ async function benchFile(id: string): Promise<FileResult> {
   // (3) stream throughput — WritableStream arm: drain the whole CMAF stream end-to-end through a
   //     StreamTarget(WritableStream), pulling one fragment at a time. Work unit = total output bytes.
   ops.push(
-    await measure('stream→writable', fragmentedBytes, durationSec, async () => {
+    await measure('stream→writable', outputBytes, durationSec, async () => {
       let received = 0;
       const writable = new WritableStream<Uint8Array>({
         write(chunk): void {
@@ -244,7 +353,7 @@ async function benchFile(id: string): Promise<FileResult> {
   // (4) stream throughput — callback arm: the same generator-backed readable into a position-aware
   //     callback destination (exercises the sink's callback backpressure path). Work unit = output bytes.
   ops.push(
-    await measure('stream→callback', fragmentedBytes, durationSec, async () => {
+    await measure('stream→callback', outputBytes, durationSec, async () => {
       let last = 0;
       await writeToStreamTarget(
         toStreamTarget((chunk, position) => {
@@ -256,7 +365,35 @@ async function benchFile(id: string): Promise<FileResult> {
     }),
   );
 
-  return { id, sizeBytes: bytes.byteLength, durationSec, fragmentedBytes, ops };
+  return { id, sizeBytes: bytes.byteLength, durationSec, outputBytes, outputKind: 'CMAF', ops };
+}
+
+async function benchTsFile(id: string, path: string): Promise<FileResult> {
+  const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
+  const parsed = parseTs(bytes);
+  const durationSec = tsDurationSec(parsed);
+  const referenceMuxer = mpegTsMuxerFromParsed(parsed);
+  await referenceMuxer.finalize();
+  const outputBytes = (await collectStream(referenceMuxer.output)).byteLength;
+  const ops: OpResult[] = [];
+
+  ops.push(
+    await measure('ts stream→writable', outputBytes, durationSec, async () =>
+      drainMpegTsToWritable(parsed),
+    ),
+  );
+  ops.push(
+    await measure('ts stream→callback', outputBytes, durationSec, async () =>
+      drainMpegTsToCallback(parsed),
+    ),
+  );
+  ops.push(
+    await measure('ts tiny-writes 188B', outputBytes, durationSec, async () =>
+      drainMpegTsToCallback(parsed, 1),
+    ),
+  );
+
+  return { id, sizeBytes: bytes.byteLength, durationSec, outputBytes, outputKind: 'MPEG-TS', ops };
 }
 
 // ============ reporting ============
@@ -272,7 +409,7 @@ function throughputCell(o: OpResult): string {
 
 function printFile(r: FileResult): void {
   console.info(
-    `\n${r.id} — ${(r.sizeBytes / 1024).toFixed(1)} KB in, ${(r.fragmentedBytes / 1024).toFixed(1)} KB CMAF, ${r.durationSec.toFixed(3)} s`,
+    `\n${r.id} — ${(r.sizeBytes / 1024).toFixed(1)} KB in, ${(r.outputBytes / 1024).toFixed(1)} KB ${r.outputKind}, ${r.durationSec.toFixed(3)} s`,
   );
   console.info(
     `  ${'op'.padEnd(26)} ${'wall(ms)'.padStart(9)} ${'throughput'.padStart(12)} ${'×realtime'.padStart(11)} ${'peakMem(MB)'.padStart(12)}`,
@@ -399,17 +536,18 @@ function regressions(fresh: readonly OpAggregate[], base: Baseline): string[] {
 
 async function main(): Promise<void> {
   const check = process.argv.includes('--check');
-  if (MP4_FILES.length < 5) {
+  if (MP4_FILES.length < 5 || TS_FILES.length < 5) {
     throw new Error(
-      `streaming benchmark needs ≥ 5 real files (BUILD_INSTRUCTIONS §6.1); have ${MP4_FILES.length}.`,
+      `streaming benchmark needs ≥ 5 real files per family (BUILD_INSTRUCTIONS §6.1); have mp4=${MP4_FILES.length}, ts=${TS_FILES.length}.`,
     );
   }
   console.info(
-    `streaming-output benchmark — fragmented-MP4/CMAF writer + StreamTarget sink, pure TS, single-thread,\nmedian of ${ITERS} iters (warmup ${WARMUP}); ${MP4_FILES.length} real MP4 files:`,
+    `streaming-output benchmark — fragmented-MP4/CMAF + MPEG-TS packet writes through StreamTarget, pure TS, single-thread,\nmedian of ${ITERS} iters (warmup ${WARMUP}); ${MP4_FILES.length} real MP4 files + ${TS_FILES.length} real TS/HLS segment files:`,
   );
 
   const results: FileResult[] = [];
   for (const id of MP4_FILES) results.push(await benchFile(id));
+  for (const file of TS_FILES) results.push(await benchTsFile(file.id, file.path));
   for (const r of results) printFile(r);
 
   const aggs = aggregate(results);

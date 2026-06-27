@@ -76,6 +76,47 @@ async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Ar
   return out;
 }
 
+async function blobBytes(out: unknown): Promise<Uint8Array> {
+  if (!(out instanceof Blob)) throw new Error('expected Blob output');
+  return new Uint8Array(await out.arrayBuffer());
+}
+
+function expectDecodedSlice(
+  source: ReturnType<typeof decodeFlac>,
+  trimmed: ReturnType<typeof decodeFlac>,
+  startSec: number,
+  endSec: number,
+  label: string,
+): void {
+  const start = Math.min(
+    source.totalSamples,
+    Math.max(0, Math.round(startSec * source.sampleRate)),
+  );
+  const end = Math.min(
+    source.totalSamples,
+    Math.max(start, Math.round(endSec * source.sampleRate)),
+  );
+  expect(trimmed.sampleRate, `${label}: sample rate`).toBe(source.sampleRate);
+  expect(trimmed.channels, `${label}: channels`).toBe(source.channels);
+  expect(trimmed.totalSamples, `${label}: total samples`).toBe(end - start);
+  for (let ch = 0; ch < source.channels; ch++) {
+    const sourceChannel = source.samples[ch];
+    const trimmedChannel = trimmed.samples[ch];
+    if (sourceChannel === undefined || trimmedChannel === undefined) {
+      throw new Error(`${label}: missing channel ${ch}`);
+    }
+    for (let i = 0; i < trimmedChannel.length; i++) {
+      const got = trimmedChannel[i];
+      const expected = sourceChannel[start + i];
+      if (got !== expected) {
+        throw new Error(
+          `${label}: sample mismatch ch${ch} frame${i}: got ${got} expected ${expected}`,
+        );
+      }
+    }
+  }
+}
+
 describe('FlacDriver.supports', () => {
   it('recognizes fLaC magic, mime, and extension; rejects others', async () => {
     const head = (await loadFixture('sfx.flac')).subarray(0, 16);
@@ -160,6 +201,30 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     const decoded = decodeFlac(out);
     expect(md5(interleavedPcmBytes(decoded))).toBe(hex(decoded.md5));
     expect(hex(decoded.md5)).toBe(hex(decodeFlac(encoded).md5));
+  });
+});
+
+describe('media.trim — native FLAC sample-accurate lossless cut', () => {
+  const CASES = [
+    'sfx.flac',
+    'flac-08bit.flac',
+    'flac-12bit.flac',
+    'flac-24bit-hires.flac',
+    'flac-5_1ch.flac',
+  ];
+
+  it('trims real FLAC fixtures to the exact decoded PCM window', async () => {
+    expect(CASES.length).toBeGreaterThanOrEqual(5);
+    for (const id of CASES) {
+      const sourceBytes = await loadFixture(id);
+      const source = decodeFlac(sourceBytes);
+      const startSec = (source.totalSamples / source.sampleRate) * 0.25;
+      const endSec = (source.totalSamples / source.sampleRate) * 0.7;
+      const out = await blobBytes(
+        await createMedia().trim(await fixtureSource(id), { start: startSec, end: endSec }),
+      );
+      expectDecodedSlice(source, decodeFlac(out), startSec, endSec, id);
+    }
   });
 });
 

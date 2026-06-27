@@ -43,7 +43,6 @@ export interface JobStreamRunner {
   runStream(job: OffloadJob, opts: RunStreamOptions): ReadableStream<Transferable>;
 }
 
-
 /**
  * Spawn a real module `Worker` and await its readiness handshake, resolving to a host
  * {@link WorkerStreamBridge} when the worker is up **and** reports WebCodecs, else `undefined` (route inline

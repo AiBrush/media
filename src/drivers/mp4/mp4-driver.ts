@@ -29,13 +29,19 @@ import {
   CBCS_SCHEME,
   CENC_SCHEME,
   type CencScheme,
+  type SencSample,
   decryptSamples,
   decryptSamplesCbcs,
   kidHex,
   parseSenc,
   parseTenc,
 } from './cenc.ts';
-import { fragmentMp4 } from './fragment.ts';
+import {
+  type FragmentInitTrackInput,
+  buildMediaSegment,
+  fragmentMp4,
+  fragmentMp4InitSegment,
+} from './fragment.ts';
 import { Mp4Muxer } from './mux.ts';
 import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
 import { Reader } from './reader.ts';
@@ -638,12 +644,35 @@ function resolveKey(keys: Record<string, string>, kid: Uint8Array): Uint8Array<A
   return hexToBytes(hexKey);
 }
 
+function cencSamplesForTrack(
+  enc: NonNullable<ParsedTrack['encryption']>,
+  tenc: ReturnType<typeof parseTenc>,
+  containerScheme: CencScheme,
+  trackId: number,
+): SencSample[] | undefined {
+  if (enc.senc) return parseSenc(enc.senc, tenc.perSampleIvSize, containerScheme);
+  if (
+    containerScheme === CBCS_SCHEME &&
+    tenc.perSampleIvSize === 0 &&
+    tenc.constantIv !== undefined
+  ) {
+    return undefined;
+  }
+  throw new MediaError(
+    'demux-error',
+    `${containerScheme}-protected track ${trackId} is not decryptable by this path: per-sample encryption data (senc) is absent and no cbcs default_constant_IV fallback applies (malformed protection metadata)`,
+  );
+}
+
 /**
  * Decrypt one CENC-protected track (`cenc` AES-CTR or `cbcs` AES-CBC-pattern) into a cleartext
  * {@link MuxTrackInput}. The scheme is the container's own (`enc.schemeType` from `schm`); the caller's
- * declared `scheme` must match it (a mismatch is corrupt/contradictory input). A protected track with no
- * `senc` or an empty sample table (e.g. fragmented/CMAF metadata in `moof/traf`, which this `moov` path
- * does not read) cannot be honestly decrypted here, so it rejects rather than emit a sample-less blob.
+ * declared `scheme` must match it (a mismatch is corrupt/contradictory input). A protected track with an
+ * empty sample table (e.g. fragmented/CMAF metadata in `moof/traf`, which this `moov` path does not read)
+ * cannot be honestly decrypted here, so it rejects rather than emit a sample-less blob. `senc` is required
+ * for byte decryption; if a cbcs track has a `tenc` default_constant_IV but no sample auxiliary encryption
+ * data at all, Bento4's `mp4decrypt` leaves the samples unchanged, so this path strips the protection
+ * wrapper after key resolution rather than corrupting already-clear samples.
  */
 async function decryptCencTrack(
   parsed: ParsedTrack,
@@ -660,17 +689,16 @@ async function decryptCencTrack(
       `track ${parsed.id} is '${containerScheme}'-protected but decrypt was asked for '${declaredScheme}' (scheme mismatch)`,
     );
   }
-  if (!enc.senc || parsed.samples.sampleSizes.length === 0) {
+  if (parsed.samples.sampleSizes.length === 0) {
     throw new MediaError(
       'demux-error',
-      `${containerScheme}-protected track ${parsed.id} is not decryptable by this path: ${
-        enc.senc ? 'the sample table is empty' : 'per-sample encryption data (senc) is absent'
-      } (malformed or fragmented protection metadata)`,
+      `${containerScheme}-protected track ${parsed.id} is not decryptable by this path: the sample table is empty (malformed or fragmented protection metadata)`,
     );
   }
   const tenc = parseTenc(enc.tenc, containerScheme);
   const key = resolveKey(keys, tenc.kid);
-  const senc = parseSenc(enc.senc, tenc.perSampleIvSize, containerScheme);
+  const senc = cencSamplesForTrack(enc, tenc, containerScheme, parsed.id);
+  if (senc === undefined) return track;
   // A protected track's ciphertext must lie entirely within the file; a truncated mdat (sample bytes
   // promised by the index but missing) is rejected rather than decrypted from a clamped short buffer.
   if (sourceSize !== undefined) assertSampleRangesInBounds(parsed, sourceSize);
@@ -784,6 +812,120 @@ function fragmentedStream(tracks: readonly MuxTrackInput[]): ReadableStream<Uint
   });
 }
 
+interface LazyFragmentTrack {
+  readonly metadata: FragmentInitTrackInput;
+  readonly samples: readonly SampleData[];
+}
+
+function planSampleDataFragmentRuns(
+  samples: readonly SampleData[],
+  maxSamples: number,
+): SampleData[][] {
+  if (samples.length === 0) return [];
+  const runs: SampleData[][] = [];
+  let current: SampleData[] = [];
+  for (const sample of samples) {
+    if (current.length > 0 && (sample.keyframe || current.length >= maxSamples)) {
+      runs.push(current);
+      current = [];
+    }
+    current.push(sample);
+  }
+  if (current.length > 0) runs.push(current);
+  return runs;
+}
+
+function lazyFragmentTracksFromMovie(ra: RandomAccess, movie: Movie): LazyFragmentTrack[] {
+  const tracks = movie.tracks.map((track): LazyFragmentTrack => {
+    const samples = buildSampleData(track);
+    validateSampleRanges(samples, ra.size);
+    return { metadata: muxTrackMeta(track), samples };
+  });
+  if (tracks.length === 0) {
+    throw new MediaError('mux-error', 'cannot fragment a movie with no tracks');
+  }
+  for (const [i, track] of tracks.entries()) {
+    if (track.samples.length === 0) {
+      throw new MediaError('mux-error', `track ${i + 1} has no samples to fragment`);
+    }
+  }
+  return tracks;
+}
+
+/**
+ * Same-container MP4/MOV streaming copy, lazy on both output and sample payload reads. The init segment is
+ * emitted before any mdat bytes are read; each later pull reads only that fragment's source sample windows
+ * and serializes one `moof`+`mdat`.
+ */
+function fragmentedSourceStream(
+  ra: RandomAccess,
+  movie: Movie,
+  signal: AbortSignal | undefined,
+): ReadableStream<Uint8Array> {
+  const tracks = lazyFragmentTracksFromMovie(ra, movie);
+  const maxSamples = 90;
+  const plans = tracks.map((track) => planSampleDataFragmentRuns(track.samples, maxSamples));
+  const cursors = new Array<number>(tracks.length).fill(0);
+  const baseDts = new Array<number>(tracks.length).fill(0);
+  const maxRuns = plans.reduce((max, plan) => Math.max(max, plan.length), 0);
+  let emittedInit = false;
+  let step = 0;
+  let sequenceNumber = 1;
+
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        if (signal?.aborted) {
+          controller.error(abortedError());
+          return;
+        }
+        if (!emittedInit) {
+          controller.enqueue(fragmentMp4InitSegment(tracks.map((track) => track.metadata)));
+          emittedInit = true;
+          return;
+        }
+        while (step < maxRuns) {
+          const runSpecs: Array<{
+            readonly trackId: number;
+            readonly samples: readonly SampleData[];
+            readonly baseDecodeTime: number;
+          }> = [];
+          for (let ti = 0; ti < tracks.length; ti++) {
+            const run = plans[ti]?.[cursors[ti] ?? 0];
+            if (run === undefined || run.length === 0) continue;
+            cursors[ti] = (cursors[ti] ?? 0) + 1;
+            const base = baseDts[ti] ?? 0;
+            runSpecs.push({ trackId: ti + 1, samples: run, baseDecodeTime: base });
+            let duration = 0;
+            for (const sample of run) duration += sample.durationTicks;
+            baseDts[ti] = base + duration;
+          }
+          step++;
+          if (runSpecs.length === 0) continue;
+          const runs = [];
+          for (const run of runSpecs) {
+            if (signal?.aborted) throw abortedError();
+            runs.push({
+              trackId: run.trackId,
+              samples: await readSamples(ra, run.samples),
+              baseDecodeTime: run.baseDecodeTime,
+            });
+          }
+          if (signal?.aborted) throw abortedError();
+          controller.enqueue(buildMediaSegment(sequenceNumber, runs));
+          sequenceNumber++;
+          return;
+        }
+        controller.close();
+      },
+      cancel(): void {
+        // The stream owns no persistent reader/decoder state; range reads are one-shot promises.
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 export const Mp4Driver: ContainerDriver = {
   id: 'mp4',
   apiVersion: DRIVER_API_VERSION,
@@ -811,6 +953,9 @@ export const Mp4Driver: ContainerDriver = {
     const ra = await randomAccess(src);
     const movie = await readMovie(ra);
     const trim = o?.trim;
+    if (o?.fragmented === true && trim === undefined) {
+      return fragmentedSourceStream(ra, movie, o?.signal);
+    }
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal)
       : await muxTracksFromMovie(ra, movie);
@@ -853,9 +998,10 @@ export const Mp4Driver: ContainerDriver = {
         out.push(track); // genuinely unprotected track passes through unchanged
         continue;
       }
-      // The track IS CENC-protected (enca/encv + tenc), so it MUST be decrypted — never passed through as
-      // if it were clear (ADR-023). The scheme-specific decrypt rejects undecryptable protected input
-      // (absent senc / empty sample table / scheme mismatch) rather than emitting a sample-less file.
+      // The track IS CENC-protected (enca/encv + tenc), so it must go through the scheme-specific decrypt
+      // decision. That path rejects undecryptable protected input (empty sample table / scheme mismatch /
+      // missing required aux data) and only strips protection metadata without AES when the file has no
+      // sample auxiliary encryption data (Bento4 mp4decrypt leaves those bytes unchanged too).
       out.push(await decryptCencTrack(parsed, track, enc, o.keys, o.scheme, sourceSize));
     }
     return oneShot(writeMp4(out, { faststart: true }));

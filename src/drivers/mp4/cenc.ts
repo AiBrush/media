@@ -7,8 +7,9 @@
  *
  * - **cenc (AES-CTR):** an 8-byte IV occupies the high 8 bytes of the 16-byte counter block (low 8 are
  *   the block counter, starting 0); a 16-byte IV is the counter block (block counter = low 64 bits,
- *   `length: 64`). For subsample encryption the CTR keystream advances over the **protected** bytes only
- *   — clear bytes are skipped — so protected ranges are gathered, decrypted as one stream, scattered back.
+ *   `length: 64`). For subsample encryption, clear bytes are skipped and each protected range starts on a
+ *   CTR block boundary after the previous protected range's full/partial blocks (`ceil(protected/16)`);
+ *   partial keystream tails are not carried across the clear gap.
  * - **cbcs (AES-CBC pattern, 23001-7 §10.4):** AES-128-CBC over the protected bytes, but within each
  *   protected subsample only a repeating `crypt:skip` block **pattern** (e.g. 1:9) is encrypted — the
  *   skip blocks and any trailing bytes that don't fill a whole 16-byte block stay clear. The CBC chain
@@ -235,6 +236,22 @@ function counterBlock(iv: Uint8Array): Uint8Array<ArrayBuffer> {
   return block;
 }
 
+function counterBlockAt(iv: Uint8Array, blockOffset: number): Uint8Array<ArrayBuffer> {
+  if (!Number.isSafeInteger(blockOffset) || blockOffset < 0) {
+    throw new MediaError('demux-error', `invalid CENC CTR block offset ${blockOffset}`);
+  }
+  const block = counterBlock(iv);
+  let carry = blockOffset;
+  for (let i = AES_BLOCK - 1; i >= 8 && carry > 0; i--) {
+    const add = carry % 256;
+    const sum = (block[i] ?? 0) + add;
+    block[i] = sum & 0xff;
+    carry = Math.floor(carry / 256) + Math.floor(sum / 256);
+  }
+  if (carry > 0) throw new MediaError('demux-error', 'CENC CTR block counter overflow');
+  return block;
+}
+
 /** Expand a `cbcs` IV to a full 16-byte CBC IV (a constant/per-sample IV is normally already 16). */
 function cbcIv(iv: Uint8Array): Uint8Array<ArrayBuffer> {
   const block = new Uint8Array(AES_BLOCK);
@@ -259,24 +276,20 @@ export async function decryptSample(
   }
   const out = asArrayBufferBytes(data);
   let pos = 0;
-  let protectedLen = 0;
-  for (const ss of sample.subsamples) protectedLen += ss.protected;
-  const gathered = new Uint8Array(protectedLen);
-  let g = 0;
+  let blockOffset = 0;
   for (const ss of sample.subsamples) {
     pos += ss.clear;
-    gathered.set(data.subarray(pos, pos + ss.protected), g);
-    g += ss.protected;
+    if (ss.protected > 0) {
+      const decrypted = await aesCtr(
+        key,
+        counterBlockAt(sample.iv, blockOffset),
+        asArrayBufferBytes(data.subarray(pos, pos + ss.protected)),
+        64,
+      );
+      out.set(decrypted, pos);
+      blockOffset += Math.ceil(ss.protected / AES_BLOCK);
+    }
     pos += ss.protected;
-  }
-  const decrypted = await aesCtr(key, counter, gathered, 64);
-  let d = 0;
-  let o = 0;
-  for (const ss of sample.subsamples) {
-    o += ss.clear;
-    out.set(decrypted.subarray(d, d + ss.protected), o);
-    d += ss.protected;
-    o += ss.protected;
   }
   return out;
 }

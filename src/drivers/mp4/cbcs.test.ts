@@ -77,6 +77,28 @@ describe('media.decrypt — CENC cbcs (AES-CBC pattern) round-trips real media b
       expect(await trackSamples(await decryptBytes(enc, WRONG), 'audio')).not.toEqual(clearAudio);
     });
   }
+
+  it('strips cbcs tenc.default_constant_IV metadata with no sample auxiliary data without touching bytes', async () => {
+    const clear = await loadFixture('movie_5.mp4');
+    const enc = await encryptCbcs(clear, {
+      keyHex: KEY,
+      kidHex: KID,
+      cryptByteBlock: 1,
+      skipByteBlock: 9,
+      mediaType: 'video',
+      constantIvHex: '106e09dc913eafe4205989e2bd8ca245',
+      metadataOnly: true,
+    });
+    const encryptedMovie = await readMovie(ra(enc));
+    const encryptedVideo = encryptedMovie.tracks.find((t) => t.mediaType === 'video');
+    expect(encryptedVideo?.encryption?.senc).toBeUndefined();
+    expect(encryptedVideo?.encryption?.schemeType).toBe('cbcs');
+
+    const clearVideo = await trackSamples(clear, 'video');
+    expect(await trackSamples(enc, 'video')).toEqual(clearVideo);
+
+    expect(await trackSamples(await decryptBytes(enc), 'video')).toEqual(clearVideo);
+  });
 });
 
 describe('cbcs subsample decryption — only protected ranges, only crypt blocks (real video bytes)', () => {

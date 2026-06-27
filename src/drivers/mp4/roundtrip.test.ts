@@ -159,6 +159,50 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(reads.every((r) => r.length <= 8 * 1024 * 1024)).toBe(true);
   });
 
+  it('fragmented stream-copy emits the init segment before lazy sample-payload reads', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const stream = await Mp4Driver.streamCopy(rangeSource(input, reads), { fragmented: true });
+    const readsAfterSetup = reads.length;
+
+    const reader = stream.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(first.value?.byteLength).toBeGreaterThan(0);
+    expect(reads.length).toBe(readsAfterSetup);
+
+    const parts: Uint8Array[] = [first.value as Uint8Array];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      parts.push(next.value);
+    }
+    reader.releaseLock();
+
+    expect(parts.length).toBeGreaterThan(1);
+    expect(reads.length).toBeGreaterThan(readsAfterSetup);
+
+    const total = parts.reduce((n, part) => n + part.byteLength, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      output.set(part, offset);
+      offset += part.byteLength;
+    }
+
+    const sourceMovie = await readMovie(ra(input));
+    const reparsed = await readMovie(ra(output));
+    expect(reparsed.tracks.length).toBe(sourceMovie.tracks.length);
+    for (let i = 0; i < sourceMovie.tracks.length; i++) {
+      const sourceTrack = sourceMovie.tracks[i];
+      const outTrack = reparsed.tracks[i];
+      expect(outTrack?.codec).toBe(sourceTrack?.codec);
+      expect(outTrack?.durationSec).toBeCloseTo(sourceTrack?.durationSec ?? 0, 3);
+      expect(outTrack?.fragmentSampleCount).toBe(sourceTrack ? buildSampleData(sourceTrack).length : 0);
+    }
+  });
+
   it('rejects short sample-window reads instead of copying truncated payload', async () => {
     const movie = syntheticAudioMovie([2], [0]);
     const shortRa = {

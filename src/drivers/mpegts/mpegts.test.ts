@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { toStreamTarget, writeToStreamTarget } from '../../sinks/stream-target.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { MpegTsDriver, MpegTsModule } from './mpegts-driver.ts';
 import { TS_CLOCK_HZ, detectFraming, parseTs } from './ts-parse.ts';
@@ -142,6 +143,60 @@ function referenceProbeDurationSec(parsed: ReturnType<typeof parseTs>): number {
     }
   }
   return endUs / 1_000_000;
+}
+function muxerFromParsedTs(
+  source: ReturnType<typeof parseTs>,
+  writeChunkPackets?: number,
+): MpegTsMuxer {
+  const muxer =
+    writeChunkPackets === undefined ? new MpegTsMuxer() : new MpegTsMuxer({ writeChunkPackets });
+  const trackIds = source.tracks.map((track, index) =>
+    muxer.addTrack({
+      id: index,
+      mediaType: track.stream.mediaType,
+      codec: track.stream.codec,
+      durationSec: track.durationSec,
+      ...(track.fps !== undefined ? { fps: track.fps } : {}),
+      config: track.config,
+    }),
+  );
+  const units = source.tracks
+    .flatMap((track, trackIndex) => track.units.map((unit) => ({ trackIndex, unit })))
+    .sort(
+      (left, right) => left.unit.dtsUs - right.unit.dtsUs || left.trackIndex - right.trackIndex,
+    );
+  for (const { trackIndex, unit } of units) {
+    const trackId = trackIds[trackIndex];
+    if (trackId === undefined) throw new Error(`missing mux track ${trackIndex}`);
+    muxer.addChunkStruct(trackId, {
+      data: unit.data,
+      timestampUs: unit.ptsUs,
+      dtsUs: unit.dtsUs,
+      key: unit.keyframe,
+    });
+  }
+  return muxer;
+}
+function packetContinuityCounts(chunks: readonly Uint8Array[]): Map<number, number> {
+  const expectedByPid = new Map<number, number>();
+  const countsByPid = new Map<number, number>();
+  for (const chunk of chunks) {
+    expect(chunk.byteLength % 188).toBe(0);
+    for (let offset = 0; offset < chunk.byteLength; offset += 188) {
+      expect(chunk[offset]).toBe(0x47);
+      const pid = (((chunk[offset + 1] ?? 0) & 0x1f) << 8) | (chunk[offset + 2] ?? 0);
+      const adaptationControl = ((chunk[offset + 3] ?? 0) >> 4) & 0x03;
+      const counter = (chunk[offset + 3] ?? 0) & 0x0f;
+      const hasPayload = adaptationControl === 0x01 || adaptationControl === 0x03;
+      if (hasPayload) {
+        const expected = expectedByPid.get(pid) ?? 0;
+        expect(counter, `pid ${pid} continuity at byte ${offset}`).toBe(expected);
+        expectedByPid.set(pid, (counter + 1) & 0x0f);
+        countsByPid.set(pid, (countsByPid.get(pid) ?? 0) + 1);
+      }
+    }
+  }
+  return countsByPid;
 }
 
 /** The committed verbatim head of `h264_ts.ts` — a valid standalone TS (PAT+PMT+first PES). */
@@ -488,39 +543,7 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
     // Build the SAME stream two ways: the default single-batch granularity and a tiny per-write granularity.
     // The streamed output must arrive as MANY 188-aligned chunks (not one blob), and reassemble byte-exact.
     const source = parseTs(await bytesFromDerived(DERIVED_TS));
-    const makeMuxer = (writeChunkPackets?: number): MpegTsMuxer => {
-      const muxer =
-        writeChunkPackets === undefined
-          ? new MpegTsMuxer()
-          : new MpegTsMuxer({ writeChunkPackets });
-      const trackIds = source.tracks.map((track, index) =>
-        muxer.addTrack({
-          id: index,
-          mediaType: track.stream.mediaType,
-          codec: track.stream.codec,
-          durationSec: track.durationSec,
-          ...(track.fps !== undefined ? { fps: track.fps } : {}),
-          config: track.config,
-        }),
-      );
-      const units = source.tracks
-        .flatMap((track, trackIndex) => track.units.map((unit) => ({ trackIndex, unit })))
-        .sort((l, r) => l.unit.dtsUs - r.unit.dtsUs || l.trackIndex - r.trackIndex);
-      for (const { trackIndex, unit } of units) {
-        const trackId = trackIds[trackIndex];
-        if (trackId === undefined) throw new Error(`missing mux track ${trackIndex}`);
-        muxer.addChunkStruct(trackId, {
-          data: unit.data,
-          timestampUs: unit.ptsUs,
-          dtsUs: unit.dtsUs,
-          key: unit.keyframe,
-        });
-      }
-      return muxer;
-    };
-    const collectChunks = async (
-      stream: ReadableStream<Uint8Array>,
-    ): Promise<Uint8Array[]> => {
+    const collectChunks = async (stream: ReadableStream<Uint8Array>): Promise<Uint8Array[]> => {
       const reader = stream.getReader();
       const out: Uint8Array[] = [];
       for (;;) {
@@ -542,7 +565,7 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
     };
 
     // Tiny granularity (4 packets = 752 B/write): a multi-packet, multi-write stream the StreamTarget sees.
-    const tinyMuxer = makeMuxer(4);
+    const tinyMuxer = muxerFromParsedTs(source, 4);
     await tinyMuxer.finalize();
     const tinyChunks = await collectChunks(tinyMuxer.output);
     const tiny = concat(tinyChunks);
@@ -554,16 +577,19 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
       expect(chunk.byteLength % 188).toBe(0); // every write lands on a packet boundary
       expect(chunk[0]).toBe(0x47); // and begins with the TS sync byte (resynchronizable)
       const isLast = i === tinyChunks.length - 1;
-      if (!isLast) expect(chunk.byteLength).toBe(4 * 188); // full writes carry exactly the granularity
+      if (!isLast)
+        expect(chunk.byteLength).toBe(4 * 188); // full writes carry exactly the granularity
       else expect(chunk.byteLength).toBeLessThanOrEqual(4 * 188);
     });
 
     // The default granularity also streams in packet-aligned chunks (a 16 KB write unit).
-    const defaultMuxer = makeMuxer();
+    const defaultMuxer = muxerFromParsedTs(source);
     await defaultMuxer.finalize();
     const defaultChunks = await collectChunks(defaultMuxer.output);
     const whole = concat(defaultChunks);
-    defaultChunks.forEach((chunk) => expect(chunk.byteLength % 188).toBe(0));
+    for (const chunk of defaultChunks) {
+      expect(chunk.byteLength % 188).toBe(0);
+    }
 
     // Granularity NEVER changes content: both assemble to the exact same bytes, which re-parse faithfully.
     expect([...tiny]).toEqual([...whole]);
@@ -576,37 +602,39 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
     }
   });
 
+  it('ts_tiny_writes / ts_continuity_many_writes / prop_ts_stream_duration use real StreamTarget packet writes', async () => {
+    const source = parseTs(await bytesFromDerived(DERIVED_TS));
+    const muxer = muxerFromParsedTs(source, 1);
+    await muxer.finalize();
+    const writes: { readonly position: number; readonly bytes: Uint8Array }[] = [];
+    await writeToStreamTarget(
+      toStreamTarget((chunk, position) => {
+        writes.push({ position, bytes: chunk.slice() });
+      }),
+      muxer.output,
+    );
+
+    expect(writes.length).toBeGreaterThan(64);
+    for (let index = 0; index < writes.length; index += 1) {
+      const write = writes[index];
+      if (write === undefined) throw new Error(`missing write ${index}`);
+      expect(write.position).toBe(index * 188);
+      expect(write.bytes.byteLength).toBe(188);
+    }
+    const chunks = writes.map((write) => write.bytes);
+    const countsByPid = packetContinuityCounts(chunks);
+    expect([...countsByPid.values()].some((count) => count > 16)).toBe(true);
+
+    const streamed = parseTs(concatBytes(...chunks));
+    expect(referenceProbeDurationSec(streamed)).toBeCloseTo(referenceProbeDurationSec(source), 5);
+    for (let i = 0; i < source.tracks.length; i += 1) {
+      expect(streamed.tracks[i]?.units.length).toBe(source.tracks[i]?.units.length);
+    }
+  });
+
   it('round-trips real Annex-B/ADTS access units without changing boundaries or data bytes', async () => {
     const source = parseTs(await bytesFromDerived(DERIVED_TS));
-    const muxer = new MpegTsMuxer();
-    const trackIds = source.tracks.map((track, index) =>
-      muxer.addTrack({
-        id: index,
-        mediaType: track.stream.mediaType,
-        codec: track.stream.codec,
-        durationSec: track.durationSec,
-        ...(track.fps !== undefined ? { fps: track.fps } : {}),
-        config: track.config,
-      }),
-    );
-
-    const units = source.tracks.flatMap((track, trackIndex) =>
-      track.units.map((unit) => ({ trackIndex, unit })),
-    );
-    units.sort(
-      (left, right) => left.unit.dtsUs - right.unit.dtsUs || left.trackIndex - right.trackIndex,
-    );
-    for (const { trackIndex, unit } of units) {
-      const trackId = trackIds[trackIndex];
-      if (trackId === undefined) throw new Error(`missing mux track ${trackIndex}`);
-      muxer.addChunkStruct(trackId, {
-        data: unit.data,
-        timestampUs: unit.ptsUs,
-        dtsUs: unit.dtsUs,
-        key: unit.keyframe,
-      });
-    }
-
+    const muxer = muxerFromParsedTs(source);
     await muxer.finalize();
     const remuxed = parseTs(await collectBytes(muxer.output));
     expect(remuxed.tracks.map((track) => track.stream.codec)).toEqual(

@@ -18,6 +18,8 @@
 import { MediaError } from '../../contracts/errors.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
 
+export type FragmentInitTrackInput = Omit<MuxTrackInput, 'samples'>;
+
 // ── byte/box helpers (same encoding as write.ts; kept local so this file edits nothing shared) ──────
 
 const u8 = (n: number): number[] => [n & 0xff];
@@ -81,14 +83,14 @@ function esdsBox(asc: Uint8Array): number[] {
 }
 
 /** The codec-config box: the preserved raw box (lossless), a synthesized `avcC`/`esds`, or nothing. */
-function codecConfigBox(track: MuxTrackInput): number[] {
+function codecConfigBox(track: FragmentInitTrackInput): number[] {
   if (track.codecPrivate) return box(track.codecPrivate.boxType, [...track.codecPrivate.data]);
   if (track.mediaType === 'video' && track.description) return box('avcC', [...track.description]);
   if (track.mediaType === 'audio' && track.description) return esdsBox(track.description);
   return [];
 }
 
-function videoSampleEntry(track: MuxTrackInput): number[] {
+function videoSampleEntry(track: FragmentInitTrackInput): number[] {
   return box(
     track.sampleEntryType,
     cat(
@@ -109,7 +111,7 @@ function videoSampleEntry(track: MuxTrackInput): number[] {
   );
 }
 
-function audioSampleEntry(track: MuxTrackInput): number[] {
+function audioSampleEntry(track: FragmentInitTrackInput): number[] {
   return box(
     track.sampleEntryType,
     cat(
@@ -125,7 +127,7 @@ function audioSampleEntry(track: MuxTrackInput): number[] {
   );
 }
 
-function sampleEntry(track: MuxTrackInput): number[] {
+function sampleEntry(track: FragmentInitTrackInput): number[] {
   return track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
 }
 
@@ -140,7 +142,7 @@ function ftypBox(): number[] {
 }
 
 /** An empty `stbl`: the sample entry (in `stsd`) plus zero-count `stts`/`stsc`/`stsz`/`stco`. */
-function emptyStbl(track: MuxTrackInput): number[] {
+function emptyStbl(track: FragmentInitTrackInput): number[] {
   return box(
     'stbl',
     cat(
@@ -154,7 +156,7 @@ function emptyStbl(track: MuxTrackInput): number[] {
 }
 
 /** An empty (fragmented) `trak`: real codec/geometry in `stsd`, but zero samples in the tables. */
-function emptyTrak(track: MuxTrackInput, trackId: number): number[] {
+function emptyTrak(track: FragmentInitTrackInput, trackId: number): number[] {
   const isVideo = track.mediaType === 'video';
   const tkhd = full(
     'tkhd',
@@ -212,7 +214,7 @@ function mvexBox(trackCount: number): number[] {
   return box('mvex', trexs);
 }
 
-function initMoov(tracks: readonly MuxTrackInput[], movieTimescale: number): number[] {
+function initMoov(tracks: readonly FragmentInitTrackInput[], movieTimescale: number): number[] {
   const mvhd = full(
     'mvhd',
     0,
@@ -231,6 +233,18 @@ function initMoov(tracks: readonly MuxTrackInput[], movieTimescale: number): num
   );
   const traks = tracks.flatMap((t, i) => emptyTrak(t, i + 1));
   return box('moov', cat(mvhd, traks, mvexBox(tracks.length)));
+}
+
+/** Build the fragmented MP4 initialization segment (`ftyp` + empty `moov`) without sample payloads. */
+export function fragmentMp4InitSegment(
+  tracks: readonly FragmentInitTrackInput[],
+  opts: Pick<FragmentOptions, 'movieTimescale'> = {},
+): Uint8Array {
+  if (tracks.length === 0) {
+    throw new MediaError('mux-error', 'cannot fragment a movie with no tracks');
+  }
+  const movieTimescale = opts.movieTimescale ?? 1000;
+  return Uint8Array.from(cat(ftypBox(), initMoov(tracks, movieTimescale)));
 }
 
 // ── media segments (moof + mdat) ────────────────────────────────────────────────────────────────
@@ -450,9 +464,7 @@ export function* fragmentMp4(
 
   // 1) Init segment: ftyp + moov (empty traks + mvex/trex). `ftyp` then `moov` are emitted as one chunk
   //    so a consumer that splits on top-level boxes still sees a complete initialization segment first.
-  const ftyp = ftypBox();
-  const moov = initMoov(tracks, movieTimescale);
-  yield Uint8Array.from(cat(ftyp, moov));
+  yield fragmentMp4InitSegment(tracks, { movieTimescale });
 
   // 2) Plan each track's fragment runs, then walk them in lockstep so audio + video advance together and
   //    every fragment-step produces ONE moof (one traf per track that still has a run) + a shared mdat.

@@ -91,9 +91,17 @@ describe('probe MP3 on the real corpus', () => {
 describe('parseMp3 — frame variants + duration', () => {
   const fl = frameLen();
 
-  it('estimates a CBR duration from two confirmed frames', () => {
+  it('reads exact duration from the full frame clock when the complete stream is available', () => {
     const bytes = new Uint8Array([...pad(header(), fl), ...pad(header(), fl)]);
     const info = parseMp3(bytes, bytes.byteLength);
+    expect(info.sampleRate).toBe(44100);
+    expect(info.channels).toBe(2);
+    expect(info.durationSec).toBeCloseTo((2 * 1152) / 44100, 5);
+  });
+
+  it('falls back to CBR byte-rate estimation for a head-only probe with known total size', () => {
+    const bytes = new Uint8Array([...pad(header(), fl), ...pad(header(), fl)]);
+    const info = parseMp3(bytes.subarray(0, fl), bytes.byteLength);
     expect(info.sampleRate).toBe(44100);
     expect(info.channels).toBe(2);
     expect(info.durationSec).toBeCloseTo((bytes.byteLength * 8) / (128 * 1000), 5);
@@ -180,10 +188,12 @@ describe('Mp3Driver — demux seam + muxer', () => {
     await muxer.finalize();
 
     const out = await collectBytes(muxer.output);
-    // The authored stream is exactly the two frames back-to-back, and it re-parses to two MP3 packets.
-    expect(out.byteLength).toBe(frame().byteLength * 2);
+    // The authored stream has one Xing metadata frame plus the two original audio frames, and the parser
+    // skips the metadata frame while preserving the exact audio packet count and duration.
+    expect(out.byteLength).toBeGreaterThan(frame().byteLength * 2);
     expect(isMpegLayer3Frame(out)).toBe(true);
     expect(enumerateMp3Packets(out)).toHaveLength(2);
+    expect(parseMp3(out).durationSec).toBeCloseTo((2 * 1152) / 44100, 5);
   });
 
   it('the MP3 muxer rejects misuse with typed errors (non-frame, wrong track/codec, double-finalize)', async () => {

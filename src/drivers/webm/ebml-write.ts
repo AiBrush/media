@@ -458,13 +458,14 @@ function ebmlHeader(docType: string): Uint8Array {
   );
 }
 
-/** The `Info` element: TimecodeScale (ns/tick), Duration (ticks, float), and the muxing/writing app. */
-function infoElement(endMs: number): Uint8Array {
+/** The `Info` element: TimecodeScale (ns/tick), optional Duration (ticks, float), and app identifiers. */
+function infoElement(endMs: number, opts: { includeDuration?: boolean } = {}): Uint8Array {
+  const includeDuration = opts.includeDuration ?? true;
   return element(
     EBML_ID.Info,
     concatBytes([
       uintEl(EBML_ID.TimecodeScale, TIMECODE_SCALE_NS),
-      floatEl(EBML_ID.Duration, endMs),
+      ...(includeDuration ? [floatEl(EBML_ID.Duration, endMs)] : []),
       stringEl(EBML_ID.MuxingApp, APP_NAME),
       stringEl(EBML_ID.WritingApp, APP_NAME),
     ]),
@@ -752,9 +753,9 @@ function serializeFragmentCluster(
 /**
  * The init segment for a streaming WebM: the EBML Header, then the `Segment` element header with an
  * **unknown size** ({@link SEGMENT_UNKNOWN_SIZE}), then `Info` + `Tracks`. The Clusters that follow are
- * Segment children emitted live. `Info` keeps a `Duration` here because the whole input is buffered by the
- * EncodedChunk seam before `finalize`, so the value is known — and it remains a valid streamable file (a
- * pure live recorder would omit it; including a known duration is strictly better for consumers).
+ * Segment children emitted live. Live/append-only WebM deliberately omits `Info/Duration`: consumers can
+ * derive a materialized duration from Cluster timecodes, while the layout remains MediaRecorder-like
+ * (unknown duration until the stream ends).
  */
 function webmInitSegment(
   tracks: readonly TrackState[],
@@ -762,7 +763,7 @@ function webmInitSegment(
   endMs: number,
 ): Uint8Array {
   const header = ebmlHeader(docType);
-  const info = infoElement(endMs);
+  const info = infoElement(endMs, { includeDuration: false });
   const trackBytes = tracksElement(tracks);
   const out = new Uint8Array(
     header.byteLength +

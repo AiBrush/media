@@ -43,12 +43,10 @@ describe('remux scale-NA — an oversize cross-container remux declines up front
   it('a >1 GiB mp4→mkv remux raises CapabilityError BEFORE attempting the buffer-all serialize', async () => {
     const src = mp4SourceWithSize(await mp4Bytes(), 2 * GIB); // a "2-hour 1080p"-scale source
     const media = createMedia().use(Mp4Module).use(WebmModule);
-    const err = await media
-      .remux(src, { to: 'mkv' })
-      .then(
-        () => undefined,
-        (e: unknown) => e,
-      );
+    const err = await media.remux(src, { to: 'mkv' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
     expect(err, 'oversize remux rejects').toBeInstanceOf(CapabilityError);
     expect((err as CapabilityError).code).toBe('capability-miss');
     // The message names the real resource limit (memory / MB), not a fake "unsupported codec".
@@ -71,16 +69,16 @@ describe('remux scale-NA — an oversize cross-container remux declines up front
     const bytes = await mp4Bytes();
     const src = mp4SourceWithSize(bytes, bytes.byteLength); // ~32 KB — far below the 1 GiB ceiling
     const media = createMedia().use(Mp4Module).use(WebmModule);
-    const err = await media
-      .remux(src, { to: 'mkv' })
-      .then(
-        () => undefined,
-        (e: unknown) => e,
-      );
+    const err = await media.remux(src, { to: 'mkv' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
     // It may still be a CapabilityError (the browser-only EncodedChunk miss in Node), but it must NOT be the
     // memory/buffer scale message — proving the scale gate did not fire for a normal-sized file.
     if (err instanceof CapabilityError) {
-      expect(err.message).not.toMatch(/buffer.*memory|memory.*buffer|exceeding the in-browser buffer-all/i);
+      expect(err.message).not.toMatch(
+        /buffer.*memory|memory.*buffer|exceeding the in-browser buffer-all/i,
+      );
     }
   });
 });

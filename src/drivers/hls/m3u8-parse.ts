@@ -322,7 +322,9 @@ export function parseM3u8(text: string, baseUrl?: string): HlsPlaylist {
         break;
       case '#EXT-X-KEY': {
         const key = parseKey(parseAttributes(value));
-        media.currentKey = key.method === 'NONE' ? undefined : key; // METHOD=NONE clears inheritance
+        const resolvedKey =
+          key.uri === undefined ? key : { ...key, uri: resolveUri(key.uri, baseUrl) };
+        media.currentKey = key.method === 'NONE' ? undefined : resolvedKey; // METHOD=NONE clears inheritance
         break;
       }
       case '#EXT-X-MAP': {

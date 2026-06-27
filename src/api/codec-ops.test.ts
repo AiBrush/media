@@ -13,7 +13,9 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { parseAdts } from '../drivers/adts/adts-driver.ts';
 import { parseFlac } from '../drivers/flac/flac-driver.ts';
+import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
 import { parseOgg } from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
@@ -206,6 +208,30 @@ describe('convert — codec seam reached and fails honestly without WebCodecs', 
     await expect(
       media().convert(await fixtureSource('movie_5.mp4'), { to: 'webm' }),
     ).rejects.toBeInstanceOf(CapabilityError);
+  });
+});
+
+describe('trim — compressed audio packet-copy path', () => {
+  it('trims MP3, ADTS, and Ogg/Opus as real shortened packet streams', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const mp3 = await outputBytes(
+        await media().trim(await fixtureSource('sound_5.mp3'), { start: 1, end: 3 }),
+      );
+      expect(parseMp3(mp3, mp3.byteLength).durationSec).toBeCloseTo(2, 1);
+
+      const adts = await outputBytes(
+        await media().trim(await fixtureSource('sfx.adts'), { start: 0.04, end: 0.16 }),
+      );
+      expect(parseAdts(adts, adts.byteLength).durationSec).toBeCloseTo(0.12, 1);
+
+      const ogg = await outputBytes(
+        await media().trim(await fixtureSource('sfx-opus.ogg'), { start: 0.04, end: 0.16 }),
+      );
+      expect(parseOgg(ogg, ogg).durationSec).toBeCloseTo(0.12, 1);
+    } finally {
+      restore();
+    }
   });
 });
 
@@ -615,7 +641,7 @@ describe('decode — lazy frame streams (contract)', () => {
     for (const source of sources) {
       const streams = media().decode(source);
       await expect(readFirstFrame(streams.audio)).rejects.toThrow(
-        /PCM audio decode needs AudioData/,
+        /AudioData is unavailable for PCM decode/,
       );
     }
   });

@@ -7,6 +7,16 @@ const ra = (b: Uint8Array) => ({
   size: b.byteLength,
 });
 
+function ftypBrands(bytes: Uint8Array): string[] {
+  const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+  expect(String.fromCharCode(...bytes.subarray(4, 8))).toBe('ftyp');
+  const brands: string[] = [];
+  for (let off = 16; off + 4 <= size; off += 4) {
+    brands.push(String.fromCharCode(...bytes.subarray(off, off + 4)));
+  }
+  return brands;
+}
+
 // Encode-path tracks: no codecPrivate, so the muxer synthesizes avcC/esds from `description`.
 const video: MuxTrackInput = {
   mediaType: 'video',
@@ -47,5 +57,21 @@ describe('writeMp4 — encode path (synthesizes avcC/esds from description)', ()
   it('non-faststart layout (mdat before moov) also re-parses', async () => {
     const movie = await readMovie(ra(writeMp4([video], { faststart: false })));
     expect(movie.tracks[0]?.codec).toBe('avc1.42C01E');
+  });
+
+  it('advertises compatible codec brands from the actual video sample entries', () => {
+    const { description: _description, ...videoBase } = video;
+    const hevc: MuxTrackInput = {
+      ...videoBase,
+      sampleEntryType: 'hvc1',
+      codecPrivate: {
+        boxType: 'hvcC',
+        data: new Uint8Array([1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x78]),
+      },
+    };
+
+    expect(ftypBrands(writeMp4([video, audio]))).toEqual(['isom', 'iso2', 'avc1', 'mp41']);
+    expect(ftypBrands(writeMp4([hevc, audio]))).toEqual(['isom', 'iso2', 'hvc1', 'mp41']);
+    expect(ftypBrands(writeMp4([audio]))).toEqual(['isom', 'iso2', 'mp41']);
   });
 });

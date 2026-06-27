@@ -95,6 +95,18 @@ describe('parseM3u8 — real AES-128 media playlist (hls_aes128.m3u8)', () => {
       expect(seg.key?.iv).toEqual(expectedIv);
     }
   });
+
+  it('resolves the EXT-X-KEY URI against the media playlist URL', async () => {
+    const p = asMedia(
+      parseM3u8(
+        await textFromMediaTest('hls_aes128.m3u8'),
+        'https://cdn.test/fixtures/hls_aes128.m3u8',
+      ),
+    );
+    for (const seg of p.segments) {
+      expect(seg.key?.uri).toBe('https://cdn.test/fixtures/hls_aes128.key');
+    }
+  });
 });
 
 describe('parseM3u8 — master (multivariant) playlist (RFC 8216 §8.4)', () => {

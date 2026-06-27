@@ -46,12 +46,17 @@ export interface MuxSampleInput {
   keyframe: boolean;
 }
 
-/** CENC protection for a track (ADR-023): emits `enca`/`encv` + `sinf`/`tenc` and a `senc` IV box. */
+/** CENC protection for a track (ADR-023): emits `enca`/`encv` + `sinf`/`tenc` and optional `senc` IVs. */
 export interface TrackEncryption {
-  schemeType: string; // 'cenc'
+  schemeType: string; // 'cenc' | 'cbcs'
   kid: Uint8Array; // 16-byte default_KID
-  perSampleIvSize: number; // 8 or 16
-  ivs: Uint8Array[]; // one IV per sample (length === samples.length)
+  perSampleIvSize: number; // 8/16 per-sample IVs, or 0 for cbcs default_constant_IV
+  /** One IV per sample when a `senc` box is emitted. Omitted only for valid cbcs constant-IV tracks. */
+  ivs?: Uint8Array[];
+  /** cbcs crypt:skip block pattern, serialized in tenc version 1. */
+  pattern?: { cryptByteBlock: number; skipByteBlock: number };
+  /** cbcs default_constant_IV, serialized only when `perSampleIvSize === 0`. */
+  constantIv?: Uint8Array;
 }
 
 export interface MuxTrackInput {
@@ -72,10 +77,11 @@ export interface MuxTrackInput {
 }
 
 /**
- * Output container flavor → the `ftyp` major + compatible brands. `mp4` writes the ISO brand set
- * (`isom`/`iso2`/`avc1`/`mp41`); `mov` writes the Apple QuickTime brand `qt  ` so a probe (ffprobe and
- * ours) recognizes the file as QuickTime/MOV rather than MP4. Same box layout either way — only `ftyp`
- * differs (ADR: a mov target must not advertise an ISO major brand, doc 09 mux).
+ * Output container flavor → the `ftyp` major + compatible brands. `mp4` writes generic ISO brands plus
+ * the actual video sample-entry brand(s) present in the file; `mov` writes the Apple QuickTime brand
+ * `qt  ` so a probe (ffprobe and ours) recognizes the file as QuickTime/MOV rather than MP4. Same box
+ * layout either way — only `ftyp` differs (ADR: a mov target must not advertise an ISO major brand,
+ * doc 09 mux).
  */
 export type ContainerBrand = 'mp4' | 'mov';
 
@@ -147,9 +153,25 @@ function codecConfigBox(track: MuxTrackInput): number[] {
 function sinfBox(track: MuxTrackInput): number[] {
   const enc = track.encryption;
   if (!enc) return [];
+  if (enc.constantIv && enc.perSampleIvSize !== 0) {
+    throw new MediaError('mux-error', 'cbcs default_constant_IV requires perSampleIvSize 0');
+  }
+  if (enc.perSampleIvSize === 0 && !enc.constantIv) {
+    throw new MediaError('mux-error', 'perSampleIvSize 0 requires a cbcs default_constant_IV');
+  }
+  const patternByte = enc.pattern
+    ? ((enc.pattern.cryptByteBlock & 0x0f) << 4) | (enc.pattern.skipByteBlock & 0x0f)
+    : 0;
+  const version = enc.pattern || enc.constantIv ? 1 : 0;
+  const constantIv = enc.constantIv ? cat(u8(enc.constantIv.byteLength), [...enc.constantIv]) : [];
   const frma = box('frma', fourcc(track.sampleEntryType));
   const schm = full('schm', 0, 0, cat(fourcc(enc.schemeType), u32(0x00010000)));
-  const tenc = full('tenc', 0, 0, cat(u8(0), u8(0), u8(1), u8(enc.perSampleIvSize), [...enc.kid]));
+  const tenc = full(
+    'tenc',
+    version,
+    0,
+    cat(u8(0), u8(patternByte), u8(1), u8(enc.perSampleIvSize), [...enc.kid], constantIv),
+  );
   return box('sinf', cat(frma, schm, box('schi', tenc)));
 }
 
@@ -157,6 +179,24 @@ function sinfBox(track: MuxTrackInput): number[] {
 function sencBox(track: MuxTrackInput): number[] {
   const enc = track.encryption;
   if (!enc) return [];
+  if (!enc.ivs) {
+    if (enc.perSampleIvSize === 0) return [];
+    throw new MediaError('mux-error', 'per-sample CENC encryption requires one IV per sample');
+  }
+  if (enc.ivs.length !== track.samples.length) {
+    throw new MediaError(
+      'mux-error',
+      `senc IV count ${enc.ivs.length} does not match sample count ${track.samples.length}`,
+    );
+  }
+  for (const iv of enc.ivs) {
+    if (iv.byteLength !== enc.perSampleIvSize) {
+      throw new MediaError(
+        'mux-error',
+        `senc IV length ${iv.byteLength} does not match perSampleIvSize ${enc.perSampleIvSize}`,
+      );
+    }
+  }
   return full(
     'senc',
     0,
@@ -307,7 +347,24 @@ function moov(tracks: MuxTrackInput[], movieTimescale: number, chunkOffsets: num
   return box('moov', cat(mvhd, traks));
 }
 
-function ftypBox(brand: ContainerBrand): number[] {
+function addUniqueBrand(out: string[], brand: string): void {
+  if (!out.includes(brand)) out.push(brand);
+}
+
+function compatibleBrandsFor(tracks: readonly MuxTrackInput[]): string[] {
+  const brands = ['isom', 'iso2'];
+  for (const track of tracks) {
+    if (track.mediaType !== 'video') continue;
+    const entry = track.sampleEntryType;
+    if (entry === 'avc1' || entry === 'avc3') addUniqueBrand(brands, 'avc1');
+    else if (entry === 'hvc1' || entry === 'hev1') addUniqueBrand(brands, entry);
+    else if (entry === 'av01') addUniqueBrand(brands, 'av01');
+  }
+  addUniqueBrand(brands, 'mp41');
+  return brands;
+}
+
+function ftypBox(brand: ContainerBrand, tracks: readonly MuxTrackInput[]): number[] {
   if (brand === 'mov') {
     // QuickTime: major_brand 'qt  ' (0x71 74 20 20), minor 0x200, compatible ['qt  '] — what ffprobe
     // (and our parse) keys on to report container 'mov' instead of 'mp4'.
@@ -315,7 +372,11 @@ function ftypBox(brand: ContainerBrand): number[] {
   }
   return box(
     'ftyp',
-    cat(fourcc('isom'), u32(0x200), fourcc('isom'), fourcc('iso2'), fourcc('avc1'), fourcc('mp41')),
+    cat(
+      fourcc('isom'),
+      u32(0x200),
+      ...compatibleBrandsFor(tracks).map((codecBrand) => fourcc(codecBrand)),
+    ),
   );
 }
 
@@ -355,7 +416,7 @@ function writeSamples(out: Uint8Array, pos: number, tracks: MuxTrackInput[]): nu
 export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint8Array {
   const movieTimescale = opts.movieTimescale ?? 1000;
   const faststart = opts.faststart ?? true;
-  const ftyp = ftypBox(opts.brand ?? 'mp4');
+  const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
 
   // Per-track contiguous byte regions within mdat (one chunk per track).
   const lens = tracks.map((t) => t.samples.reduce((a, s) => a + s.data.byteLength, 0));

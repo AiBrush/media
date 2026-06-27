@@ -16,7 +16,6 @@ import {
   type Demuxer,
   type DriverModule,
   type MuxOptions,
-  type Muxer,
   type Packet,
   type PcmTransform,
   type Registry,
@@ -541,7 +540,7 @@ function matches(q: ContainerQuery): boolean {
   return off + 2 <= head.byteLength && isSync(dv.getUint8(off), dv.getUint8(off + 1));
 }
 
-export const AdtsDriver: ContainerDriver = {
+export const AdtsDriver = {
   id: 'adts',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
@@ -582,7 +581,7 @@ export const AdtsDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(o?: MuxOptions): Muxer {
+  createMuxer(o?: MuxOptions): AdtsMuxer {
     // ADTS is an elementary stream: wrap each raw AAC access unit in a 7-byte ADTS header (no re-encode;
     // the encoder/remux path feeds the access units + the ASC description). See {@link AdtsMuxer}.
     return new AdtsMuxer(o);
@@ -597,7 +596,7 @@ export const AdtsDriver: ContainerDriver = {
       },
     });
   },
-};
+} satisfies ContainerDriver;
 
 export const AdtsModule: DriverModule = {
   apiVersion: DRIVER_API_VERSION,

@@ -17,9 +17,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 import type { ChunkStruct } from './mux.ts';
 import { Mp4Muxer } from './mux.ts';
-import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 
 /** avcC for a Constrained-Baseline 320×180 stream (4-byte NAL length: lengthSizeMinusOne = 3). */
 const AVCC = new Uint8Array([1, 0x42, 0x00, 0x0d, 0xff, 0xe1, 0x00, 0x00]);
@@ -143,7 +143,11 @@ describe('mp4 mux — AVC-format samples whose length prefix contains 00 00 01 s
       const nals: Uint8Array[] = [];
       let p = 0;
       while (p + 4 <= sample.byteLength) {
-        const len = ((sample[p] ?? 0) << 24) | ((sample[p + 1] ?? 0) << 16) | ((sample[p + 2] ?? 0) << 8) | (sample[p + 3] ?? 0);
+        const len =
+          ((sample[p] ?? 0) << 24) |
+          ((sample[p + 1] ?? 0) << 16) |
+          ((sample[p + 2] ?? 0) << 8) |
+          (sample[p + 3] ?? 0);
         nals.push(sample.subarray(p + 4, p + 4 + len));
         p += 4 + len;
       }
