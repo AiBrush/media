@@ -511,6 +511,7 @@ async function trimMuxTracks(
 }
 
 function toTrackInfo(t: ParsedTrack): TrackInfo {
+  const gapless = audioGaplessInfo(t);
   return {
     id: t.id,
     mediaType: t.mediaType,
@@ -519,8 +520,29 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
     ...(t.encryption !== undefined ? { encrypted: true } : {}),
+    ...(gapless !== undefined ? { gapless } : {}),
     config: t.config,
   };
+}
+
+function isAacTrack(track: ParsedTrack): boolean {
+  return track.mediaType === 'audio' && track.codec.startsWith('mp4a');
+}
+
+function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined {
+  if (!isAacTrack(track) || track.sampleRate === undefined || track.edit === undefined) {
+    return undefined;
+  }
+  const sampleRate = track.sampleRate;
+  const scale = sampleRate / track.timescale;
+  const codedSamples = buildSampleData(track).reduce(
+    (total, sample) => total + Math.round(sample.durationTicks * scale),
+    0,
+  );
+  const leadingSamples = Math.max(0, Math.round(track.edit.mediaTimeTicks * scale));
+  const totalSamples = Math.max(0, Math.round(track.edit.durationSec * sampleRate));
+  const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
+  return { leadingSamples, trailingSamples, totalSamples };
 }
 
 /**

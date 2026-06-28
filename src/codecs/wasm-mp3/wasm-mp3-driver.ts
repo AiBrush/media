@@ -13,8 +13,9 @@
  * **Shape mirrors {@link import('../wasm-vorbis/wasm-vorbis-driver.ts')}:** `createDecoder` is a
  * `TransformStream` (`EncodedAudioChunk` → `AudioData`) — construct the wasm decoder on `start` (MP3 needs
  * no codec-private `description`, unlike Vorbis), decode each frame on `transform`, release on
- * `flush`/`cancel`/abort. MP3 *encode* is not provided (no pure-Rust MP3 encoder compiles cleanly here),
- * so `createEncoder` honestly raises a typed {@link CapabilityError}.
+ * `flush`/`cancel`/abort. MP3 *encode* is not provided: libmp3lame would introduce LGPL obligations and
+ * has not been explicitly approved for this build, so `createEncoder` honestly raises a typed
+ * {@link CapabilityError}.
  *
  * **`AudioData` close-exactly-once (docs/architecture/06 §3):** decoder *output* `AudioData` is enqueued
  * to the readable and owned by the consumer — the driver never closes an emitted frame. There is no
@@ -130,7 +131,7 @@ function coreMissing(): CapabilityError {
 
 /**
  * Honest capability probe: an MP3 **decode** query in a runtime that can carry WebCodecs-shaped audio
- * frames and whose vendored wasm core loads. Non-MP3, `encode` (no pure-Rust MP3 encoder), missing
+ * frames and whose vendored wasm core loads. Non-MP3, `encode` (no approved MP3 encoder core), missing
  * `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
  * Being `tier:'wasm'`, the router only calls this after WebCodecs MP3 has already missed.
  */
@@ -139,7 +140,9 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (!isMp3Codec(q.config.codec)) {
     return unsupported(`wasm-mp3 handles MP3 only, not '${q.config.codec}'`);
   }
-  if (q.direction === 'encode') return unsupported('wasm-mp3 decodes only (no MP3 encoder)');
+  if (q.direction === 'encode') {
+    return unsupported('wasm-mp3 decodes only (LGPL MP3 encode core is not approved)');
+  }
   if (!hasWebCodecsAudioSeam()) {
     return unsupported('wasm-mp3 requires WebCodecs AudioData/EncodedAudioChunk');
   }
@@ -288,23 +291,28 @@ function errMessage(e: unknown): string {
   return 'unknown error';
 }
 
-// ============ createEncoder() — honest miss (no pure-Rust MP3 encoder) ============
+// ============ createEncoder() — honest miss (no approved MP3 encoder core) ============
 
 /**
- * MP3 **encode** is not provided: there is no production pure-Rust MP3 encoder to compile to wasm
- * (Symphonia is decode-only, and libmp3lame is C). Per the no-silent-degrade contract (ADR-017) this
+ * MP3 **encode** is not provided: Symphonia is decode-only, and the practical C encoder path
+ * (libmp3lame) is LGPL and not approved for this build. Per the no-silent-degrade contract (ADR-017) this
  * raises a typed {@link CapabilityError} immediately. The router only reaches here on a WebCodecs
- * MP3-encode miss; callers should target Opus/AAC for encoding instead.
+ * MP3-encode miss.
  */
 function createEncoder(
   _config: EncoderConfig,
   _o?: StageOptions,
 ): TransformStream<RawFrame, EncodedChunk> {
-  throw new CapabilityError('capability-miss', 'wasm-mp3 does not support MP3 encode', {
-    op: 'encode',
-    tried: ['wasm-mp3'],
-    suggestion: 'encode to Opus or AAC instead (no pure-Rust MP3 encoder exists)',
-  });
+  throw new CapabilityError(
+    'capability-miss',
+    'wasm-mp3 does not support MP3 encode (no approved MP3 encoder core is vendored)',
+    {
+      op: 'encode',
+      tried: ['wasm-mp3'],
+      suggestion:
+        'encode to Opus/AAC, or explicitly approve and isolate an LGPL libmp3lame tail before registering MP3 encode',
+    },
+  );
 }
 
 // ============ driver + module ============

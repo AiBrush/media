@@ -318,6 +318,33 @@ describe('WorkerPool per-call signal + cancel', () => {
     }
   });
 
+  it('threads a per-call AbortSignal through runMany fan-out jobs', async () => {
+    const runJob: JobRunner = (_j, ctx) => {
+      let i = 0;
+      return new ReadableStream<Transferable>({
+        pull(c): void {
+          if (ctx.signal.aborted) {
+            c.close();
+            return;
+          }
+          c.enqueue(new Uint8Array([i++]).buffer);
+        },
+      });
+    };
+    const pool = new WorkerPool({ size: 1, transport: channelTransport(runJob) });
+    try {
+      const ctrl = new AbortController();
+      const [stream] = pool.runMany([convertJob({})], { signal: ctrl.signal });
+      if (stream === undefined) throw new Error('expected one stream');
+      const reader = stream.getReader();
+      await reader.read();
+      ctrl.abort();
+      await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+    } finally {
+      await pool.terminate();
+    }
+  });
+
   it('cancelling the consumer stream tears the job down and frees the worker for the next job', async () => {
     // Job 0 is endless (so we cancel it mid-stream); job 1 is finite. After cancelling job 0 the freed
     // worker must run job 1 to completion, and job 1's stream must carry ONLY job-1 bytes (no leakage from

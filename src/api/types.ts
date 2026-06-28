@@ -133,7 +133,12 @@ export interface VideoTarget {
   fit?: 'contain' | 'cover' | 'fill';
   fps?: number;
   bitrate?: number;
+  bitrateMode?: VideoEncoderBitrateMode;
   crf?: number;
+  twoPass?: boolean;
+  bitDepth?: 8 | 10 | 12;
+  /** Preserve or discard alpha when the selected codec can carry it (VP8/VP9). Defaults to keep for VPx. */
+  alpha?: 'keep' | 'discard';
   rotate?: 0 | 90 | 180 | 270;
   flip?: 'h' | 'v';
   crop?: { x: number; y: number; width: number; height: number };
@@ -152,6 +157,14 @@ export interface AudioTarget {
   biquad?: PcmBiquad | readonly PcmBiquad[];
 }
 
+export interface H264AbrRung {
+  readonly name?: string;
+  readonly width: number;
+  readonly height: number;
+  readonly bitrate: number;
+  readonly fps?: number;
+}
+
 export interface ConvertOptions {
   to?: Container;
   video?: false | VideoTarget;
@@ -165,6 +178,8 @@ export interface RemuxOptions {
   to: Container;
   faststart?: boolean;
   fragmented?: boolean;
+  /** Same-container metadata tag rewrite. Unsupported containers raise a typed capability miss. */
+  tags?: Record<string, string>;
   /** Optional single-source track selectors such as `video:0` or `audio:0`. */
   trackSelect?: readonly string[];
   sink?: Sink;

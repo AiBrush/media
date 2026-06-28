@@ -31,7 +31,7 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/audio-data.ts';
+import { audioDataToPcm, pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
 import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
@@ -49,7 +49,8 @@ import {
   selectWorkerMode,
   workerOffloadAvailable,
 } from '../kernel/worker-mode.ts';
-import { materialize, toBlob } from '../sinks/sink.ts';
+import { toBlob } from '../sinks/sink.ts';
+import type { MaterializeOptions, Sink } from '../sinks/sink.ts';
 import {
   type FromOptions,
   type MediaInput,
@@ -80,6 +81,7 @@ import type {
   DecryptOptions,
   Demuxed,
   EncodeOptions,
+  H264AbrRung,
   MediaChain,
   MediaInfo,
   MediaInfoTrack,
@@ -115,6 +117,11 @@ export interface MediaEngine {
   probe(input: MediaInput, o?: CallOptions): Cancellable<MediaInfo>;
   demux(input: MediaInput, o?: CallOptions): Cancellable<Demuxed>;
   convert(input: MediaInput, opts: ConvertOptions, o?: CallOptions): Cancellable<Output>;
+  h264AbrLadder(
+    input: MediaInput,
+    ladder: readonly H264AbrRung[],
+    o?: CallOptions,
+  ): Cancellable<readonly Output[]>;
   remux(input: MediaInput, opts: RemuxOptions, o?: CallOptions): Cancellable<Output>;
   trim(input: MediaInput, opts: TrimOptions, o?: CallOptions): Cancellable<Output>;
   decode(input: MediaInput, o?: CallOptions): MediaStreams;
@@ -136,9 +143,27 @@ export interface MediaEngine {
 const HEAD_BYTES = 64 * 1024;
 const INVALID_MUX_PACKET_STREAM = 'invalid mux packet stream';
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
+type AbrFanoutRendition = {
+  readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
+};
 
 function loadCodecPipeline(): Promise<CodecPipelineModule> {
   return import('./codec-pipeline.ts');
+}
+
+function assertSupportedDecryptScheme(scheme: unknown): asserts scheme is DecryptOptions['scheme'] {
+  if (scheme === 'cenc' || scheme === 'cbcs' || scheme === 'hls-aes128') return;
+  const label = typeof scheme === 'string' ? scheme : 'non-string';
+  throw new CapabilityError(
+    'capability-miss',
+    `decrypt scheme '${label}' is not supported; supported schemes are cenc, cbcs, hls-aes128`,
+    {
+      op: 'decrypt',
+      tried: [],
+      suggestion:
+        'reject EME/ClearKey, CENC-CENS, and HLS SAMPLE-AES at the adapter boundary unless a real implementation is registered',
+    },
+  );
 }
 
 /**
@@ -277,11 +302,79 @@ export class MediaEngineImpl implements MediaEngine {
     });
   }
 
+  async #offloadAbrLadder(
+    src: Source,
+    ladder: readonly { readonly opts: ConvertOptions }[],
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<ReadableStream<Uint8Array>[] | undefined> {
+    if (this.#workerMode !== 'offload') return undefined;
+    /* v8 ignore start -- same worker capability gate as #offloadStream; browser-harness validated. */
+    const { ensureOffloadPool, offloadAbrLadder } = await import('../kernel/worker-host.ts');
+    const pool = await ensureOffloadPool(this.#poolCache, resolvePoolSize(this.#opts.worker));
+    if (pool === null) return undefined;
+    const renditions: AbrFanoutRendition[] = ladder.map((rung) => ({
+      opts: openRenditionOptions(rung.opts),
+    }));
+    return offloadAbrLadder(pool, src, renditions, {
+      signal,
+      determinism: this.#determinism(o),
+      ...(o.onProgress ? { onProgress: o.onProgress } : {}),
+    });
+    /* v8 ignore stop */
+  }
+
+  h264AbrLadder(
+    input: MediaInput,
+    ladder: readonly H264AbrRung[],
+    o: CallOptions = {},
+  ): Cancellable<readonly Output[]> {
+    return this.#withCancel(o, async (signal) => {
+      const src = normalizeInput(input);
+      const { planH264AbrLadder } = await import('./video-stream-plan.ts');
+      const planned = planH264AbrLadder(ladder, { width: undefined, height: undefined });
+      const offloaded = await this.#offloadAbrLadder(
+        src,
+        planned.map((rung) => ({ opts: rung.options })),
+        signal,
+        o,
+      );
+      if (offloaded !== undefined) {
+        return Promise.all(
+          offloaded.map((stream) => materializeOutput(toBlob(), stream, mimeOpts(signal, 'mp4'))),
+        );
+      }
+
+      const bytes = await readAllSource(src, signal);
+      const outputs: Output[] = [];
+      for (const rung of planned) {
+        throwIfAborted(signal);
+        outputs.push(await this.convert(bytes.slice(), rung.options, { ...o, signal }));
+      }
+      return outputs;
+    });
+  }
+
   remux(input: MediaInput, opts: RemuxOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       const wantsTrackSelection = hasTrackSelection(opts.trackSelect);
+      if (opts.tags !== undefined) {
+        if (wantsTrackSelection) {
+          throw new CapabilityError(
+            'capability-miss',
+            'metadata tag rewrite does not combine with track selection',
+            { op: 'remux', tried: [container.id, opts.to] },
+          );
+        }
+        const bytes = await this.#writeMetadataTags(src, opts.to, opts.tags, signal);
+        return materializeOutput(
+          opts.sink ?? toBlob(),
+          bytesToStream(bytes),
+          mimeOpts(signal, opts.to),
+        );
+      }
       // (1) Same-container stream-copy — a lossless byte re-serialization that preserves DTS/B-frames/
       // codec-private (ADR-021), and works in pure TS (Node) for the drivers that implement it (MP4↔MOV).
       if (!wantsTrackSelection && container.streamCopy && container.formats.includes(opts.to)) {
@@ -293,7 +386,7 @@ export class MediaEngineImpl implements MediaEngine {
           ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
           ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
         });
-        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
       }
       // (2) Cross-container stream-copy via the packet seam: demux the source, copy each track's encoded
       // packets verbatim into the target container's muxer (no re-encode). The muxer's addTrack enforces
@@ -301,7 +394,7 @@ export class MediaEngineImpl implements MediaEngine {
       // CapabilityError. The live packet copy needs WebCodecs `EncodedChunk` (browser); the routing +
       // track-copy control flow is unit-tested with fakes, and the path is browser-harness validated.
       const stream = await this.#remuxViaSeam(container, src, opts, signal, o);
-      return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
+      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
     });
   }
 
@@ -326,7 +419,7 @@ export class MediaEngineImpl implements MediaEngine {
           signal,
           o,
         );
-        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       // Keyframe trim of PCM-domain audio (raw WAV/AIFF/CAF, plus native FLAC through its lossless
       // decode→PCM→FLAC path) is a sample-accurate cut through the container's own `transformPcm`
@@ -338,25 +431,25 @@ export class MediaEngineImpl implements MediaEngine {
           container: target,
           timeBounds: { startSec: opts.start, endSec: opts.end },
         });
-        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       if (target === 'flac' && container.transformPcm) {
         const stream = await container.transformPcm(src, {
           ...this.#stageOptions(signal, o),
           timeBounds: { startSec: opts.start, endSec: opts.end },
         });
-        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       if (canTrimAudioPackets(target)) {
         const stream = await this.#trimAudioPacketsViaSeam(container, src, target, opts, signal, o);
-        return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
         ...this.#stageOptions(signal, o),
         trim: { startSec: opts.start, endSec: opts.end },
         faststart: true,
       });
-      return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     });
   }
 
@@ -424,7 +517,7 @@ export class MediaEngineImpl implements MediaEngine {
       }
       await allOrCancel(tasks, frames);
       await muxer.finalize();
-      return materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+      return materializeOutput(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
     });
   }
 
@@ -459,16 +552,18 @@ export class MediaEngineImpl implements MediaEngine {
         // keyframe); seekFrame drops frames before the target, closes them, and returns the first at/after
         // it (owned by the caller). The demuxer is closed on every exit by the finally.
         const codec = await this.#routeCodec(await decodeQueryFor(track), o);
-        const { seekFrame, unwrapPackets } = await loadCodecPipeline();
+        const { decodeVideoPacketsWithAlpha, seekFrame, unwrapPackets } = await loadCodecPipeline();
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
-        const fromKeyframe = await startAtSeekKeyframe(
-          unwrapPackets(demuxer.packets(track.id)),
-          timeUs,
-        );
         const config = await decodeConfigOf(track);
-        const out = fromKeyframe.pipeThrough(
-          codec.createDecoder(config, stage),
-        ) as ReadableStream<VideoFrame>;
+        const out =
+          track.alpha === true
+            ? decodeVideoPacketsWithAlpha(
+                await startAtSeekKeyframePackets(demuxer.packets(track.id), timeUs),
+                () => codec.createDecoder(config, stage),
+              )
+            : ((
+                await startAtSeekKeyframe(unwrapPackets(demuxer.packets(track.id)), timeUs)
+              ).pipeThrough(codec.createDecoder(config, stage)) as ReadableStream<VideoFrame>);
         return await seekFrame(out, timeUs);
         /* v8 ignore stop */
       } finally {
@@ -506,7 +601,7 @@ export class MediaEngineImpl implements MediaEngine {
         drainsStarted = true;
         await allOrCancelStreams(tasks, openStreams);
         await muxer.finalize();
-        return materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+        return materializeOutput(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
       } catch (e) {
         if (!drainsStarted) {
           await Promise.all(openStreams.map((stream) => cancelStream(stream)));
@@ -518,6 +613,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   decrypt(input: MediaInput, opts: DecryptOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
+      assertSupportedDecryptScheme(opts.scheme);
       // No static key ⇒ EME/ClearKey live key acquisition, which is OUT OF SCOPE: this engine decrypts
       // CENC (`cenc`/`cbcs`) and HLS `AES-128` with caller-PROVIDED keys, never an EME license exchange.
       // Fail fast with a typed miss — **before any source read, container route, or network** — so a
@@ -543,7 +639,7 @@ export class MediaEngineImpl implements MediaEngine {
         scheme: opts.scheme,
         keys: opts.keys,
       });
-      return materialize(
+      return materializeOutput(
         opts.sink ?? toBlob(),
         stream,
         mimeOpts(signal, container.formats[0] ?? 'mp4'),
@@ -769,16 +865,29 @@ export class MediaEngineImpl implements MediaEngine {
     const codec = await this.#routeCodec(await decodeQueryFor(track), {
       strategy: stageStrategy(stage),
     });
-    const { unwrapPackets } = await loadCodecPipeline();
+    const { decodeVideoPacketsWithAlpha, unwrapPackets } = await loadCodecPipeline();
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
     /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
-    const decoder = codec.createDecoder(await decodeConfigOf(track), stage);
+    const config = await decodeConfigOf(track);
+    if (mediaType === 'video' && track.alpha === true) {
+      return decodeVideoPacketsWithAlpha(demuxer.packets(track.id), () =>
+        codec.createDecoder(config, stage),
+      ) as ReadableStream<RawFrameOf<M>>;
+    }
+    const decoder = codec.createDecoder(config, stage);
     // The demuxer stays open for the life of the packet stream; closing it is a no-op for the mp4 driver
     // (range-backed), so the frame stream owns no teardown beyond the decoder's own abort listener. The
     // track's mediaType matches `M`, so the decoder's RawFrame output is the corresponding frame type.
-    return unwrapPackets(demuxer.packets(track.id)).pipeThrough(decoder) as ReadableStream<
+    const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(decoder) as ReadableStream<
       RawFrameOf<M>
     >;
+    if (mediaType === 'audio') {
+      return (await decodedAudioStreamWithGapless(
+        decoded as ReadableStream<AudioData>,
+        track,
+      )) as ReadableStream<RawFrameOf<M>>;
+    }
+    return decoded;
     /* v8 ignore stop */
   }
 
@@ -791,9 +900,10 @@ export class MediaEngineImpl implements MediaEngine {
     const codec = await this.#routeCodec(await decodeQueryFor(track), o);
     const { unwrapPackets } = await loadCodecPipeline();
     const config = await decodeConfigOf(track);
-    return unwrapPackets(demuxer.packets(track.id)).pipeThrough(
+    const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(
       codec.createDecoder(config, stage),
     ) as ReadableStream<AudioData>;
+    return decodedAudioStreamWithGapless(decoded, track);
   }
 
   /**
@@ -889,6 +999,9 @@ export class MediaEngineImpl implements MediaEngine {
         { op: 'trim', tried: [container.id, target] },
       );
     }
+    const { trimAudioPacketStream, trimBoundsUs, trimPacketCopyTrack } = await import(
+      './trim-streams.ts'
+    );
     const bounds = trimBoundsUs(opts.start, opts.end);
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
     const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
@@ -959,6 +1072,8 @@ export class MediaEngineImpl implements MediaEngine {
     /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
     if (offloaded !== undefined) return offloaded;
 
+    const { trimBoundsUs, trimEncodeTrack, trimTimedFrameStream, trimVideoEncodeTarget } =
+      await import('./trim-streams.ts');
     const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
     const bounds = trimBoundsUs(opts.start, endSec);
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
@@ -990,7 +1105,14 @@ export class MediaEngineImpl implements MediaEngine {
         const trimmed = trimTimedFrameStream(decoded, bounds, restampVideoFrame);
         openStreams.push(trimmed);
         tasks.push(
-          this.#encodeVideoStream(trimmed, {}, trimEncodeTrack(videoTrack), muxer, signal, o),
+          this.#encodeVideoStream(
+            trimmed,
+            trimVideoEncodeTarget(videoTrack),
+            trimEncodeTrack(videoTrack),
+            muxer,
+            signal,
+            o,
+          ),
         );
         /* v8 ignore stop */
       }
@@ -1004,7 +1126,8 @@ export class MediaEngineImpl implements MediaEngine {
         const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
           codec.createDecoder(config, this.#stageOptions(signal, o)),
         ) as ReadableStream<AudioData>;
-        const trimmed = trimTimedFrameStream(decoded, bounds, restampAudioData);
+        const programAudio = await decodedAudioStreamWithGapless(decoded, audioTrack);
+        const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
         openStreams.push(trimmed);
         tasks.push(
           this.#encodeAudioStream(trimmed, {}, trimEncodeTrack(audioTrack), muxer, signal, o),
@@ -1033,6 +1156,45 @@ export class MediaEngineImpl implements MediaEngine {
       throw e;
     } finally {
       await demuxer.close();
+    }
+  }
+
+  async #writeMetadataTags(
+    src: Source,
+    target: Container,
+    tags: Record<string, string>,
+    signal: AbortSignal,
+  ): Promise<Uint8Array> {
+    const bytes = await readAllSource(src, signal);
+    switch (target) {
+      case 'mp4':
+      case 'mov': {
+        const { writeMp4Tags } = await import('../metadata/mp4-tags.ts');
+        return writeMp4Tags(bytes, tags);
+      }
+      case 'webm':
+      case 'mkv': {
+        const { writeMkvTags } = await import('../metadata/matroska-tags.ts');
+        return writeMkvTags(bytes, tags);
+      }
+      case 'mp3': {
+        const { writeMp3Id3Tags } = await import('../metadata/id3.ts');
+        return writeMp3Id3Tags(bytes, tags);
+      }
+      case 'flac': {
+        const { writeFlacVorbisComment } = await import('../metadata/vorbis-comment.ts');
+        return writeFlacVorbisComment(bytes, tags);
+      }
+      case 'ogg': {
+        const { writeOggVorbisComment } = await import('../metadata/ogg-vorbis-comment.ts');
+        return writeOggVorbisComment(bytes, tags);
+      }
+      default:
+        throw new CapabilityError(
+          'capability-miss',
+          `metadata tag rewrite is not available for '${target}'`,
+          { op: 'remux', tried: [target] },
+        );
     }
   }
 
@@ -1081,7 +1243,7 @@ export class MediaEngineImpl implements MediaEngine {
         ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
         ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
       });
-      return materialize(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     }
 
     if (!containerHasChunkMuxer(target)) {
@@ -1099,7 +1261,7 @@ export class MediaEngineImpl implements MediaEngine {
     const offloaded = await this.#offloadStream(src, 'convert', opts, signal, o);
     /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
     if (offloaded !== undefined) {
-      return materialize(opts.sink ?? toBlob(), offloaded, mimeOpts(signal, target));
+      return materializeOutput(opts.sink ?? toBlob(), offloaded, mimeOpts(signal, target));
     }
 
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
@@ -1117,15 +1279,25 @@ export class MediaEngineImpl implements MediaEngine {
           : demuxer.tracks.find((t) => t.mediaType === 'audio' && t.config !== undefined);
 
       if (videoTrack) {
+        // Fail target encode-config errors before creating decode/filter streams. Otherwise a synchronous
+        // config miss (for example the benchmark's 1x1 H.264 edge) can reject the encode task while an
+        // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
+        const { buildVideoEncoderConfig } = await loadCodecPipeline();
+        buildVideoEncoderConfig(opts.video || {}, sourceGeometryOf(videoTrack), videoTrack.codec);
         // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
         // the composition below is the live path, browser-validated.
         const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
-        const { unwrapPackets } = await loadCodecPipeline();
+        const { decodeVideoPacketsWithAlpha, unwrapPackets } = await loadCodecPipeline();
         const config = await decodeConfigOf(videoTrack);
         /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
-        const decoded = unwrapPackets(demuxer.packets(videoTrack.id)).pipeThrough(
-          videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
-        );
+        const decoded =
+          videoTrack.alpha === true
+            ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
+                videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
+              )
+            : unwrapPackets(demuxer.packets(videoTrack.id)).pipeThrough(
+                videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
+              );
         const filtered = await this.#applyVideoFilters(
           decoded as ReadableStream<VideoFrame>,
           opts.video || {},
@@ -1174,7 +1346,7 @@ export class MediaEngineImpl implements MediaEngine {
       /* v8 ignore start -- reached only when a live codec was resolved (browser); harness-validated. */
       await allOrCancelStreams(tasks, openStreams);
       await muxer.finalize();
-      return await materialize(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
+      return await materializeOutput(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
       /* v8 ignore stop */
     } finally {
       await demuxer.close();
@@ -1182,9 +1354,10 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /**
-   * Compose the video filter chain for a stream from the target's geometry + colour ops, each a
-   * router-resolved same-type `VideoFrame→VideoFrame` stage chained with `composeChain`. No ops ⇒ the
-   * decoded stream passes through untouched (no extra copy).
+   * Compose the video transform chain for a decoded stream. Geometry/colour ops are router-resolved
+   * same-type `VideoFrame→VideoFrame` stages; a requested output `fps` then restamps/duplicates/drops
+   * presentation frames onto a CFR grid before encode. No ops ⇒ the decoded stream passes through
+   * untouched (no extra copy).
    */
   /* v8 ignore start -- only reached after a live decode (WebCodecs); the filter-spec planning it calls is
      unit-tested directly (videoFilterSpecs), and the GPU composition is validated in the browser harness. */
@@ -1198,9 +1371,9 @@ export class MediaEngineImpl implements MediaEngine {
     // The video filter-spec PLANNER lives in a lazily-imported chunk (`video-stream-plan.ts`), so the eager
     // kernel never statically pulls the video-spec code (doc 08 §7). Reached only here, on the live convert
     // video re-encode — already a browser-only, async path.
-    const { videoFilterSpecs } = await import('./video-stream-plan.ts');
+    const { retimeVideoFrameStream, videoFilterSpecs } = await import('./video-stream-plan.ts');
     const specs = videoFilterSpecs(target, sourceGeometryOf(track));
-    if (specs.length === 0) return frames;
+    let out = frames;
     const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
     for (const spec of specs) {
       const driver = await this.#routeFilter(spec, o);
@@ -1211,7 +1384,20 @@ export class MediaEngineImpl implements MediaEngine {
         >,
       );
     }
-    return composeChain(frames, stages);
+    if (stages.length > 0) out = composeChain(out, stages);
+    if (target.fps !== undefined) {
+      const durationUs =
+        track.durationSec !== undefined &&
+        Number.isFinite(track.durationSec) &&
+        track.durationSec > 0
+          ? Math.round(track.durationSec * MICROS_PER_SECOND)
+          : undefined;
+      out = retimeVideoFrameStream(
+        out,
+        durationUs === undefined ? { fps: target.fps } : { fps: target.fps, durationUs },
+      );
+    }
+    return out;
   }
   /* v8 ignore stop */
 
@@ -1260,14 +1446,26 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<void> {
-    const { buildVideoEncoderConfig, drainEncoderToMuxer, videoTrackInfoFromDecoderConfig } =
-      await loadCodecPipeline();
+    const {
+      buildVideoEncoderConfig,
+      drainEncoderToMuxer,
+      encodeVideoFramesWithAlpha,
+      videoTrackInfoFromDecoderConfig,
+    } = await loadCodecPipeline();
     const config = buildVideoEncoderConfig(
       target,
       sourceTrack ? sourceGeometryOf(sourceTrack) : { width: target.width, height: target.height },
       sourceTrack?.codec,
     );
-    const codec = await this.#routeCodec(encodeQueryFor(config), o);
+    const { planVideoBitDepthConversion } = await import('./video-stream-plan.ts');
+    const bitDepthPlan = planVideoBitDepthConversion({
+      ...(sourceTrack?.codec !== undefined ? { sourceCodec: sourceTrack.codec } : {}),
+      targetCodec: config.codec,
+      ...(target.bitDepth !== undefined ? { targetBitDepth: target.bitDepth } : {}),
+    });
+    const encoderConfig: VideoEncoderConfig =
+      target.alpha === 'keep' ? { ...config, alpha: 'discard' } : config;
+    const codec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
     // The encoder publishes its VideoDecoderConfig (codec box) out-of-band via onDecoderConfig; the muxer
     // needs it before addTrack, so we capture it and build the TrackInfo lazily on the first chunk. Past
     // here is the live WebCodecs path — unreachable in Node (the route above throws first), browser-validated.
@@ -1278,11 +1476,32 @@ export class MediaEngineImpl implements MediaEngine {
       onDecoderConfig: (c) => {
         decoderConfig = c;
       },
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
       ...(target.fps !== undefined
         ? { keyFrameInterval: Math.max(1, Math.round(target.fps * 2)) }
         : {}),
     };
-    const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
+    const alphaStage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+      ...(target.fps !== undefined
+        ? { keyFrameInterval: Math.max(1, Math.round(target.fps * 2)) }
+        : {}),
+    };
+    const encodeInput = bitDepthPlan.requiresPixelPath
+      ? frames.pipeThrough(
+          (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
+        )
+      : frames;
+    const chunks =
+      target.alpha === 'keep'
+        ? encodeVideoFramesWithAlpha(encodeInput, {
+            config: encoderConfig,
+            createEncoder: (c, stageOptions) => codec.createEncoder(c, stageOptions),
+            colorStage: stage,
+            alphaStage,
+          })
+        : encodeInput.pipeThrough(codec.createEncoder(encoderConfig, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
       videoTrackInfoFromDecoderConfig(
         requireConfig(decoderConfig, 'video'),
@@ -1324,6 +1543,7 @@ export class MediaEngineImpl implements MediaEngine {
       audioTrackInfoFromDecoderConfig(
         requireConfig(decoderConfig, 'audio'),
         sourceTrack?.durationSec,
+        sourceTrack?.gapless,
       ),
     );
     /* v8 ignore stop */
@@ -1387,6 +1607,15 @@ export class MediaEngineImpl implements MediaEngine {
 type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
 type PacketStreamSlot = 'video' | 'audio';
 
+async function materializeOutput(
+  sink: Sink,
+  stream: ReadableStream<Uint8Array>,
+  opts: MaterializeOptions,
+): Promise<Output> {
+  const { materialize } = await import('../sinks/materialize.ts');
+  return materialize(sink, stream, opts);
+}
+
 interface MuxPacketStream {
   readonly track: TrackInfo;
   readonly packets: ReadableStream<EncodedChunk | Packet>;
@@ -1407,23 +1636,6 @@ interface TrackInfoLikeRecord {
   readonly codec?: unknown;
 }
 
-interface TrimBoundsUs {
-  readonly startUs: number;
-  readonly endUs: number;
-}
-
-export interface TimedFrameForTrim {
-  readonly timestamp: number;
-  readonly duration?: number | null;
-  close(): void;
-}
-
-type RestampFrame<T extends TimedFrameForTrim> = (
-  frame: T,
-  timestamp: number,
-  duration: number | null,
-) => T;
-
 interface ImageDecodeRoute {
   readonly ops: ImageOps;
   readonly bytes: Uint8Array;
@@ -1438,60 +1650,6 @@ function canTrimAudioPackets(container: Container): boolean {
   return AUDIO_PACKET_TRIM_CONTAINERS.has(container);
 }
 
-function trimBoundsUs(startSec: number, endSec: number): TrimBoundsUs {
-  return {
-    startUs: Math.round(startSec * MICROS_PER_SECOND),
-    endUs: Math.round(endSec * MICROS_PER_SECOND),
-  };
-}
-
-function trimPacketCopyTrack(track: TrackInfo, bounds: TrimBoundsUs): TrackInfo {
-  return {
-    ...track,
-    durationSec: Math.max(0, bounds.endUs - bounds.startUs) / MICROS_PER_SECOND,
-  };
-}
-
-function trimAudioPacketStream(
-  packets: ReadableStream<Packet>,
-  bounds: TrimBoundsUs,
-): ReadableStream<Packet> {
-  let baseUs: number | undefined;
-  return packets.pipeThrough(
-    new TransformStream<Packet, Packet>({
-      transform(packet, controller): void {
-        const startUs = Math.round(packet.chunk.timestamp);
-        const duration = packet.chunk.duration;
-        const durationUs = duration === null ? undefined : Math.max(0, Math.round(duration));
-        const endUs = durationUs === undefined ? startUs + 1 : startUs + durationUs;
-        if (endUs <= bounds.startUs || startUs >= bounds.endUs) return;
-        baseUs ??= startUs;
-        controller.enqueue(restampAudioPacket(packet, startUs - baseUs, baseUs));
-      },
-    }),
-  );
-}
-
-function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number): Packet {
-  const chunk = packet.chunk;
-  const data = new Uint8Array(chunk.byteLength);
-  chunk.copyTo(data);
-  const duration = chunk.duration;
-  const init: EncodedAudioChunkInit = {
-    type: chunk.type as EncodedAudioChunkType,
-    timestamp: Math.max(0, timestampUs),
-    data,
-    ...(duration !== null ? { duration } : {}),
-  };
-  return {
-    chunk: new EncodedAudioChunk(init),
-    ...(packet.dtsUs !== undefined
-      ? { dtsUs: Math.max(0, Math.round(packet.dtsUs) - baseUs) }
-      : {}),
-    ...(packet.sizeBytes !== undefined ? { sizeBytes: packet.sizeBytes } : {}),
-  };
-}
-
 function assertTrimTrackDecodable(track: TrackInfo): void {
   if (track.encrypted !== true) return;
   throw new MediaError(
@@ -1500,9 +1658,13 @@ function assertTrimTrackDecodable(track: TrackInfo): void {
   );
 }
 
-function trimEncodeTrack(track: TrackInfo): TrackInfo {
-  const { durationSec: _durationSec, ...rest } = track;
-  return rest;
+async function decodedAudioStreamWithGapless(
+  frames: ReadableStream<AudioData>,
+  track: TrackInfo,
+): Promise<ReadableStream<AudioData>> {
+  if (track.gapless === undefined) return frames;
+  const { trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
+  return trimAudioGaplessFrameStream(frames, track.gapless, restampAudioDataRange);
 }
 
 /* v8 ignore start -- browser-only restamp constructors; trimTimedFrameStream is Node-tested below. */
@@ -1521,88 +1683,22 @@ function restampAudioData(
   timestamp: number,
   _duration: number | null,
 ): AudioData {
-  if (frame.timestamp === timestamp) return frame;
-  const { init } = pcmToPlanarInit(audioDataToPcm(frame), timestamp);
+  return restampAudioDataRange(frame, 0, frame.numberOfFrames, timestamp);
+}
+
+function restampAudioDataRange(
+  frame: AudioData,
+  startFrame: number,
+  frameCount: number,
+  timestamp: number,
+): AudioData {
+  if (startFrame === 0 && frameCount === frame.numberOfFrames && frame.timestamp === timestamp) {
+    return frame;
+  }
+  const { init } = pcmRangeToPlanarInit(audioDataToPcm(frame), startFrame, frameCount, timestamp);
   return new AudioData(init);
 }
 /* v8 ignore stop */
-
-/**
- * Keep decoded frames whose presentation timestamp is inside `[startUs, endUs)`, close every skipped
- * source frame immediately, stop/cancel upstream at the first frame on/after `endUs`, and rebase the first
- * kept frame to timestamp 0. `restamp` must return either the original frame (when timing is unchanged) or
- * a new frame; this helper closes the original when a replacement is emitted, while downstream owns the
- * returned frame.
- */
-export function trimTimedFrameStream<T extends TimedFrameForTrim>(
-  frames: ReadableStream<T>,
-  bounds: TrimBoundsUs,
-  restamp: RestampFrame<T>,
-): ReadableStream<T> {
-  const reader = frames.getReader();
-  let released = false;
-  let anchorUs: number | undefined;
-
-  const release = (): void => {
-    if (released) return;
-    released = true;
-    reader.releaseLock();
-  };
-  const cancelReader = async (reason?: unknown): Promise<void> => {
-    if (released) return;
-    released = true;
-    try {
-      await reader.cancel(reason);
-    } finally {
-      reader.releaseLock();
-    }
-  };
-
-  return new ReadableStream<T>({
-    async pull(controller): Promise<void> {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) {
-          release();
-          controller.close();
-          return;
-        }
-        const frame = value;
-        if (frame.timestamp < bounds.startUs) {
-          frame.close();
-          continue;
-        }
-        if (frame.timestamp >= bounds.endUs) {
-          frame.close();
-          await cancelReader();
-          controller.close();
-          return;
-        }
-        anchorUs ??= frame.timestamp;
-        const duration = frame.duration ?? null;
-        let out: T;
-        try {
-          out = restamp(frame, frame.timestamp - anchorUs, duration);
-        } catch (e) {
-          frame.close();
-          await cancelReader(e);
-          throw e;
-        }
-        if (out !== frame) frame.close();
-        try {
-          controller.enqueue(out);
-        } catch (e) {
-          out.close();
-          throw e;
-        }
-        return;
-      }
-    },
-    async cancel(reason): Promise<void> {
-      await cancelReader(reason);
-    },
-  });
-}
 
 function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
   let promise: Promise<T> | undefined;
@@ -1652,12 +1748,29 @@ function deferredStream<T>(
       }
       const { done, value } = await reader.read();
       if (done) controller.close();
-      else controller.enqueue(value);
+      else {
+        try {
+          controller.enqueue(value);
+        } catch (e) {
+          closeIfClosable(value);
+          throw e;
+        }
+      }
     },
     async cancel(reason): Promise<void> {
       await reader?.cancel(reason).catch(() => {});
     },
   });
+}
+
+interface ClosableHandle {
+  close(): void;
+}
+
+function closeIfClosable(value: unknown): void {
+  if (typeof value !== 'object' || value === null || !('close' in value)) return;
+  const close = (value as { readonly close?: unknown }).close;
+  if (typeof close === 'function') (close as ClosableHandle['close']).call(value);
 }
 
 /** True for raw PCM codec tokens (`pcm`, `pcm-s16`, `pcm-s16be`, `pcm-f32`, …). */
@@ -1864,6 +1977,11 @@ function muxOptionsFrom(
   };
 }
 
+function openRenditionOptions(opts: ConvertOptions): AbrFanoutRendition['opts'] {
+  const { sink, ...rest } = opts;
+  return sink === undefined ? { ...rest } : { ...rest, sink };
+}
+
 /**
  * The WebCodecs decode `config` carried on a demux {@link TrackInfo} (guaranteed present by the callers),
  * with its codec string NORMALIZED to one `VideoDecoder`/`AudioDecoder` accepts. A container demux
@@ -1991,6 +2109,44 @@ async function startAtSeekKeyframe(
 }
 /* v8 ignore stop */
 
+/* v8 ignore start -- requires WebCodecs Encoded*Chunk (absent in Node); validated in the browser harness. */
+async function startAtSeekKeyframePackets(
+  packets: ReadableStream<Packet>,
+  targetUs: number,
+): Promise<ReadableStream<Packet>> {
+  const reader = packets.getReader();
+  const head: Packet[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value.chunk.type === 'key' && value.chunk.timestamp <= targetUs) {
+      head.length = 0;
+      head.push(value);
+    } else {
+      head.push(value);
+    }
+    if (value.chunk.timestamp > targetUs) break;
+  }
+  return new ReadableStream<Packet>({
+    start(controller): void {
+      for (const packet of head) controller.enqueue(packet);
+    },
+    async pull(controller): Promise<void> {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        reader.releaseLock();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
+}
+/* v8 ignore stop */
+
 async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array> {
   if (src.range) return src.range(0, n);
   if (src.kind === 'stream') {
@@ -2054,6 +2210,15 @@ async function readAllSource(src: Source, signal: AbortSignal | undefined): Prom
   }
   throwIfAborted(signal);
   return out;
+}
+
+function bytesToStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

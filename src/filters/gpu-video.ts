@@ -642,7 +642,13 @@ function createFilterStream(
       try {
         const recipe = recipeForFrame(spec, frame);
         const out = renderer.render(frame, recipe);
-        controller.enqueue(out);
+        let handedOff = false;
+        try {
+          controller.enqueue(out);
+          handedOff = true;
+        } finally {
+          if (!handedOff) out.close();
+        }
       } finally {
         // The draw consumed the source synchronously; release it exactly once, success or failure.
         frame.close();

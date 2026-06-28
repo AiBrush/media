@@ -14,6 +14,7 @@ import type {
   DecryptOptions,
   Demuxed,
   EncodeOptions,
+  H264AbrRung,
   MediaChain,
   MediaInfo,
   MediaStreams,
@@ -47,6 +48,13 @@ export function convert(
   o?: CallOptions,
 ): Cancellable<Output> {
   return shared().convert(input, opts, o);
+}
+export function h264AbrLadder(
+  input: MediaInput,
+  ladder: readonly H264AbrRung[],
+  o?: CallOptions,
+): Cancellable<readonly Output[]> {
+  return shared().h264AbrLadder(input, ladder, o);
 }
 /** `transcode` is an exported alias of `convert` (ADR-012). */
 export const transcode = convert;

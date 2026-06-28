@@ -424,6 +424,47 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     expect(parseWebm(await collect(muxer.output)).durationSec).toBeCloseTo(1, 5);
   });
 
+  it('preserves VPx alpha side data as BlockAdditions on re-demux', async () => {
+    const muxer = new WebmMuxer();
+    const trackId = muxer.addTrack({
+      id: 0,
+      mediaType: 'video',
+      codec: 'vp9',
+      durationSec: 0.08,
+      fps: 25,
+      config: { codec: 'vp9', codedWidth: 16, codedHeight: 16 },
+    });
+    const firstColor = new Uint8Array([0x9d, 0x01, 0x2a, 0x10]);
+    const firstAlpha = new Uint8Array([0x11, 0x22, 0x33]);
+    const secondColor = new Uint8Array([0x44, 0x55, 0x66]);
+    const secondAlpha = new Uint8Array([0xaa, 0xbb]);
+    muxer.addChunkStruct(trackId, {
+      timestampUs: 0,
+      durationUs: 40_000,
+      key: true,
+      data: firstColor,
+      alpha: firstAlpha,
+    });
+    muxer.addChunkStruct(trackId, {
+      timestampUs: 40_000,
+      durationUs: 40_000,
+      key: false,
+      data: secondColor,
+      alpha: secondAlpha,
+    });
+
+    await muxer.finalize();
+    const demuxed = demuxWebm(concatBytes(await collectChunks(muxer.output)));
+    const frames = demuxed.framesByIndex[0] ?? [];
+
+    expect(frames).toHaveLength(2);
+    expect(frames.map((frame) => frame.keyframe)).toEqual([true, false]);
+    expect(frames[0]?.data).toEqual(firstColor);
+    expect(frames[0]?.alpha).toEqual(firstAlpha);
+    expect(frames[1]?.data).toEqual(secondColor);
+    expect(frames[1]?.alpha).toEqual(secondAlpha);
+  });
+
   it('materializes the real h264_1080p_30s MP4 packet table as a 30s WebM, not AAC padding', async () => {
     const file = await mediaTestFixture('h264_1080p_30s.mp4');
     const movie = await readMovie({

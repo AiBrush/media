@@ -809,6 +809,7 @@ interface TrackState {
   readonly height: number | undefined;
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
+  readonly gapless: TrackInfo['gapless'];
   readonly chunks: ChunkStruct[];
 }
 
@@ -832,6 +833,7 @@ function trackStateFrom(info: TrackInfo): TrackState {
       height: vc?.codedHeight,
       sampleRate: undefined,
       channels: undefined,
+      gapless: undefined,
       chunks: [],
     };
   }
@@ -849,7 +851,64 @@ function trackStateFrom(info: TrackInfo): TrackState {
     height: undefined,
     sampleRate,
     channels: ac?.numberOfChannels,
+    gapless: info.gapless,
     chunks: [],
+  };
+}
+
+interface GaplessMuxLayout {
+  samples: MuxSampleInput[];
+  edit?: MuxTrackInput['edit'];
+}
+
+function clampSamplesToDuration(
+  samples: readonly MuxSampleInput[],
+  targetDurationTicks: number,
+): MuxSampleInput[] {
+  const out: MuxSampleInput[] = [];
+  let remaining = targetDurationTicks;
+  for (const sample of samples) {
+    if (remaining <= 0) break;
+    if (sample.durationTicks <= remaining) {
+      out.push(sample);
+      remaining -= sample.durationTicks;
+      continue;
+    }
+    out.push({ ...sample, durationTicks: remaining });
+    remaining = 0;
+  }
+  return out;
+}
+
+function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): GaplessMuxLayout {
+  const totalSamples = t.gapless?.totalSamples;
+  const sampleRate = t.sampleRate ?? t.timescale;
+  if (
+    t.mediaType !== 'audio' ||
+    t.sampleEntryType !== 'mp4a' ||
+    totalSamples === undefined ||
+    !Number.isFinite(totalSamples) ||
+    totalSamples <= 0 ||
+    sampleRate <= 0
+  ) {
+    return { samples: [...samples] };
+  }
+
+  const rawDurationTicks = samples.reduce((total, sample) => total + sample.durationTicks, 0);
+  const durationTicks = Math.round((totalSamples * t.timescale) / sampleRate);
+  if (durationTicks <= 0 || durationTicks > rawDurationTicks) return { samples: [...samples] };
+
+  const leadingSamples = t.gapless?.leadingSamples;
+  const requestedMediaTime =
+    leadingSamples !== undefined && Number.isFinite(leadingSamples) && leadingSamples > 0
+      ? Math.round((leadingSamples * t.timescale) / sampleRate)
+      : rawDurationTicks - durationTicks;
+  const maxMediaTime = rawDurationTicks - durationTicks;
+  const mediaTimeTicks = Math.min(Math.max(0, requestedMediaTime), maxMediaTime);
+  const targetDurationTicks = mediaTimeTicks + durationTicks;
+  return {
+    samples: clampSamplesToDuration(samples, targetDurationTicks),
+    edit: { mediaTimeTicks, durationTicks },
   };
 }
 
@@ -861,7 +920,8 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
       : t.mediaType === 'audio' && t.config.kind === 'esds-from-description'
         ? prepareAacSamples(t.chunks, t.description)
         : { chunks: t.chunks, description: t.description };
-  const samples = buildMuxSamples(prepared.chunks, t.timescale);
+  const gaplessLayout = gaplessLayoutFor(t, buildMuxSamples(prepared.chunks, t.timescale));
+  const { samples, edit } = gaplessLayout;
   const base = {
     mediaType: t.mediaType,
     sampleEntryType: t.sampleEntryType,
@@ -871,6 +931,7 @@ function toMuxTrack(t: TrackState): MuxTrackInput {
     ...(t.height !== undefined ? { height: t.height } : {}),
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
+    ...(edit !== undefined ? { edit } : {}),
   };
   if (t.config.kind === 'raw-box') {
     const description = prepared.description ?? synthesizeRawBoxDescription(t);

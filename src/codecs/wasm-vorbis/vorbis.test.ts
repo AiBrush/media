@@ -236,10 +236,13 @@ describe('wasm-vorbis — driver identity & module', () => {
       WasmVorbisDriver.createDecoder({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }),
     ).toThrow(MediaError);
   });
-  it('createEncoder is an honest capability miss (no pure-Rust Vorbis encoder)', () => {
+  it('createEncoder is an honest capability miss (no vetted Vorbis encoder core)', () => {
     expect(() =>
       WasmVorbisDriver.createEncoder({ codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2 }),
     ).toThrow(CapabilityError);
+    expect(() =>
+      WasmVorbisDriver.createEncoder({ codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2 }),
+    ).toThrow(/vetted permissive encoder core/);
   });
   it('createDecoder aborts up front when the signal is already aborted', () => {
     const description = buildVorbisExtradata(Uint8Array.of(1), Uint8Array.of(2), Uint8Array.of(3));
@@ -275,15 +278,13 @@ describe('wasm-vorbis — driver identity & module', () => {
         })
       ).supported,
     ).toBe(false);
-    expect(
-      (
-        await WasmVorbisDriver.supports({
-          mediaType: 'audio',
-          direction: 'encode',
-          config: { codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2 },
-        })
-      ).supported,
-    ).toBe(false);
+    const encodeSupport = await WasmVorbisDriver.supports({
+      mediaType: 'audio',
+      direction: 'encode',
+      config: { codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2 },
+    });
+    expect(encodeSupport.supported).toBe(false);
+    expect(encodeSupport.reason ?? '').toMatch(/vetted Vorbis encoder core/);
   });
   it('supports(): false in Node when the AudioData output seam is unavailable', async () => {
     const description = buildVorbisExtradata(

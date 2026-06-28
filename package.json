@@ -67,6 +67,8 @@
     "bench-sources": "bun run scripts/bench-sources.ts",
     "bench-webm-fragment": "bun run scripts/bench-webm-fragment.ts",
     "bench-pool": "bun run scripts/bench-pool.ts",
+    "bench-session6-r1": "bun run scripts/bench-session6-r1.ts",
+    "bench-session6-r4": "bun run scripts/bench-session6-r4.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
     "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:integrity"
   },

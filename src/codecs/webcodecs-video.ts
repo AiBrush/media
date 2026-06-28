@@ -71,6 +71,56 @@ export function shouldKeyframe(index: number, keyFrameInterval: number | undefin
   return index % keyFrameInterval === 0;
 }
 
+interface CodecQuantizerOption {
+  readonly quantizer: number;
+}
+
+interface VideoEncoderEncodeOptionsWithCodecQuantizer extends VideoEncoderEncodeOptions {
+  readonly av1?: CodecQuantizerOption;
+  readonly avc?: CodecQuantizerOption;
+  readonly hevc?: CodecQuantizerOption;
+  readonly vp9?: CodecQuantizerOption;
+}
+
+function assertValidEncodeQuantizer(quantizer: number): void {
+  if (!Number.isFinite(quantizer) || quantizer < 0) {
+    throw new RangeError(`quantizer must be a finite non-negative number, got ${quantizer}`);
+  }
+}
+
+function quantizerEncodeOptions(
+  codec: string,
+  quantizer: number | undefined,
+): Omit<VideoEncoderEncodeOptionsWithCodecQuantizer, 'keyFrame'> {
+  if (quantizer === undefined) return {};
+  assertValidEncodeQuantizer(quantizer);
+  const lower = codec.toLowerCase();
+  if (lower.startsWith('av01')) return { av1: { quantizer } };
+  if (lower.startsWith('avc1') || lower.startsWith('avc3')) return { avc: { quantizer } };
+  if (lower.startsWith('hev1') || lower.startsWith('hvc1')) return { hevc: { quantizer } };
+  if (lower.startsWith('vp09')) return { vp9: { quantizer } };
+  throw new CapabilityError(
+    'capability-miss',
+    `codec '${codec}' has no WebCodecs quantizer option`,
+    {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+    },
+  );
+}
+
+export function videoEncodeOptions(
+  index: number,
+  keyFrameInterval: number | undefined,
+  codec: string,
+  quantizer: number | undefined,
+): VideoEncoderEncodeOptionsWithCodecQuantizer {
+  return {
+    keyFrame: shouldKeyframe(index, keyFrameInterval),
+    ...quantizerEncodeOptions(codec, quantizer),
+  };
+}
+
 /**
  * Backpressure predicate: is the codec's pending-work queue at/above the high-water mark? When true,
  * `transform()` waits (on the `dequeue` event) before submitting more, keeping in-flight frames bounded.
@@ -204,6 +254,37 @@ export function isVideoCodecString(codec: string): boolean {
 }
 
 /**
+ * `VideoDecoderConfig.alpha` exists in Chromium's WebCodecs implementation for alpha-capable VPx streams,
+ * but the current TypeScript DOM lib only exposes `alpha` on `VideoEncoderConfig`. Keep the extension
+ * local and structural so strict mode stays honest and future lib.dom additions do not change the public
+ * driver contract.
+ */
+type VideoDecoderConfigWithAlpha = VideoDecoderConfig & { alpha?: AlphaOption };
+
+/** True for video codec families whose WebCodecs path can carry an alpha plane. */
+export function videoCodecCanCarryAlpha(codec: string): boolean {
+  const c = codec.toLowerCase();
+  return c === 'vp8' || c.startsWith('vp8.') || c === 'vp9' || c.startsWith('vp09.');
+}
+
+/**
+ * Normalize a decode config for WebCodecs configuration/probing. VP8/VP9 alpha streams are lossy if the
+ * decoder silently discards the alpha plane, so alpha-capable VPx decode explicitly asks the browser to
+ * keep it. Other codecs are left untouched; their alpha semantics are either nonexistent or container
+ * specific and must not be guessed.
+ */
+export function normalizeVideoDecoderConfig(
+  config: VideoDecoderConfig,
+  hardwareAcceleration: HardwareAcceleration,
+): VideoDecoderConfigWithAlpha {
+  return {
+    ...config,
+    hardwareAcceleration,
+    ...(videoCodecCanCarryAlpha(config.codec) ? { alpha: 'keep' as const } : {}),
+  };
+}
+
+/**
  * The order to probe `hardwareAcceleration` when answering `supports()` — **hardware first, then a
  * software-permitting probe**. WebCodecs' software-only encoders (notably VP8/VP9/AV1 and, on some
  * browsers, H.264/HEVC/AAC) report `isConfigSupported({hardwareAcceleration:'prefer-hardware'}) =
@@ -284,18 +365,26 @@ function asVideoEncoderConfig(c: EncoderConfig): VideoEncoderConfig | undefined 
 /**
  * Optional encoder controls layered onto {@link StageOptions} (the contract parameter type is unchanged
  * — these are read off `o` when present, additive). `keyFrameInterval` forces a key frame every Nth
- * frame (GOP); `onDecoderConfig` hands the muxer the encoder-produced `VideoDecoderConfig` (codec string
- * + `description`, e.g. avcC/hvcC) that the contract's chunk-only stream cannot carry.
+ * frame (GOP); `quantizer` applies a constant codec-specific encode quantizer for CRF-style output;
+ * `onDecoderConfig` hands the muxer the encoder-produced `VideoDecoderConfig` (codec string +
+ * `description`, e.g. avcC/hvcC) that the contract's chunk-only stream cannot carry.
  */
 export interface VideoEncoderStageOptions extends StageOptions {
   /** Force a key frame every Nth frame; omit/≤0 ⇒ only frame 0 is forced (encoder decides the rest). */
   keyFrameInterval?: number;
+  /** Constant quality/CRF-style quantizer forwarded through the codec-specific WebCodecs encode option. */
+  quantizer?: number;
   /** Receives the decoder config (with `description`) emitted with the encoder's first chunk. */
   onDecoderConfig?: (config: VideoDecoderConfig) => void;
 }
 
 function readEncoderInterval(o: StageOptions | undefined): number | undefined {
   const v = (o as VideoEncoderStageOptions | undefined)?.keyFrameInterval;
+  return typeof v === 'number' ? v : undefined;
+}
+
+function readEncoderQuantizer(o: StageOptions | undefined): number | undefined {
+  const v = (o as VideoEncoderStageOptions | undefined)?.quantizer;
   return typeof v === 'number' ? v : undefined;
 }
 
@@ -359,10 +448,9 @@ async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
   let lastReason: string | undefined;
   for (const acceleration of ACCELERATION_PROBE_ORDER) {
     try {
-      const { supported, config: accepted } = await VideoDecoder.isConfigSupported({
-        ...videoConfig,
-        hardwareAcceleration: acceleration,
-      });
+      const { supported, config: accepted } = await VideoDecoder.isConfigSupported(
+        normalizeVideoDecoderConfig(videoConfig, acceleration),
+      );
       const accel = accepted?.hardwareAcceleration;
       probes.push(
         accel !== undefined
@@ -519,8 +607,7 @@ function createVideoDecoder(
         },
       });
       decoder.configure({
-        ...config,
-        hardwareAcceleration: normalizeHardwareAcceleration(o?.determinism),
+        ...normalizeVideoDecoderConfig(config, normalizeHardwareAcceleration(o?.determinism)),
       });
     },
     async transform(chunk): Promise<void> {
@@ -567,6 +654,7 @@ function createVideoEncoder(
 ): TransformStream<RawFrame, EncodedChunk> {
   const signal = o?.signal;
   const keyFrameInterval = readEncoderInterval(o);
+  const quantizer = readEncoderQuantizer(o);
   const onDecoderConfig = readDecoderConfigSink(o);
 
   let encoder: VideoEncoder | undefined;
@@ -625,7 +713,10 @@ function createVideoEncoder(
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
         await drainBelowHighWater(encoder, signal);
-        encoder.encode(frame, { keyFrame: shouldKeyframe(frameIndex, keyFrameInterval) });
+        encoder.encode(
+          frame,
+          videoEncodeOptions(frameIndex, keyFrameInterval, config.codec, quantizer),
+        );
         frameIndex++;
       } finally {
         frame.close();

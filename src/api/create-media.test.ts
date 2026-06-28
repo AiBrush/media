@@ -10,6 +10,7 @@ import {
   type DriverModule,
   type EncodedChunk,
   type FilterDriver,
+  type Packet,
   type RawFrame,
   type TrackInfo,
 } from '../contracts/driver.ts';
@@ -159,6 +160,110 @@ function throwingWarmupModule(): DriverModule {
   };
 }
 
+class CancelRaceFrame {
+  readonly timestamp = 0;
+  readonly duration = 1_000;
+  closeCount = 0;
+  readonly closed: Promise<void>;
+  #resolveClosed: (() => void) | undefined;
+
+  constructor() {
+    this.closed = new Promise<void>((resolve) => {
+      this.#resolveClosed = resolve;
+    });
+  }
+
+  close(): void {
+    this.closeCount++;
+    this.#resolveClosed?.();
+  }
+}
+
+function fakeVideoPacket(): Packet {
+  const chunk = {
+    type: 'key',
+    timestamp: 0,
+    duration: 1_000,
+    byteLength: 1,
+    copyTo(destination: AllowSharedBufferSource): void {
+      const view = ArrayBuffer.isView(destination)
+        ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+        : new Uint8Array(destination);
+      view[0] = 0;
+    },
+  } satisfies {
+    readonly type: EncodedVideoChunkType;
+    readonly timestamp: number;
+    readonly duration: number;
+    readonly byteLength: number;
+    copyTo(destination: AllowSharedBufferSource): void;
+  };
+  return { chunk: chunk as unknown as EncodedChunk };
+}
+
+function delayedDecodeFrameModule(
+  frame: CancelRaceFrame,
+  waitForDemux: Promise<void>,
+  onDemuxStarted: () => void,
+): DriverModule {
+  const track: TrackInfo = {
+    id: 1,
+    mediaType: 'video',
+    codec: 'fake-video',
+    config: { codec: 'fake-video', codedWidth: 16, codedHeight: 16 },
+  };
+  const container: ContainerDriver = {
+    id: 'delayed-video',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (q) => q.mime === 'video/x-delayed',
+    async demux() {
+      onDemuxStarted();
+      await waitForDemux;
+      return {
+        tracks: [track],
+        packets: () =>
+          new ReadableStream<Packet>({
+            start(controller): void {
+              controller.enqueue(fakeVideoPacket());
+              controller.close();
+            },
+          }),
+        close: () => Promise.resolve(),
+      };
+    },
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'delayed-video-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: (q) =>
+      Promise.resolve({
+        supported:
+          q.mediaType === 'video' && q.direction === 'decode' && q.config.codec === 'fake-video',
+      }),
+    createDecoder: () =>
+      new TransformStream<EncodedChunk, RawFrame>({
+        transform(_chunk, controller): void {
+          controller.enqueue(frame as unknown as RawFrame);
+        },
+      }),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(reg): void {
+      reg.addContainer(container);
+      reg.addCodec(codec);
+    },
+  };
+}
+
 const NOOP_BYTES = fromBytes(new Uint8Array([1, 2, 3, 4]), { mime: 'application/x-noop' });
 const IMG = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media-derived/img');
 const loadImage = (name: string): Uint8Array => Uint8Array.from(readFileSync(resolve(IMG, name)));
@@ -190,6 +295,7 @@ describe('createMedia', () => {
       'decode',
       'encode',
       'demux',
+      'h264AbrLadder',
       'mux',
       'decrypt',
       'preload',
@@ -293,6 +399,34 @@ describe('createMedia', () => {
     await expect(readFirst(streams.audio)).resolves.toBeUndefined();
   });
 
+  it('decode closes a late frame when the lazy public stream is cancelled first', async () => {
+    let releaseDemux: (() => void) | undefined;
+    const demuxGate = new Promise<void>((resolve) => {
+      releaseDemux = resolve;
+    });
+    let markDemuxStarted: (() => void) | undefined;
+    const demuxStarted = new Promise<void>((resolve) => {
+      markDemuxStarted = resolve;
+    });
+    const frame = new CancelRaceFrame();
+    const media = createMedia().use(
+      delayedDecodeFrameModule(frame, demuxGate, () => {
+        markDemuxStarted?.();
+      }),
+    );
+    const stream = media.decode(fromBytes(new Uint8Array([0]), { mime: 'video/x-delayed' })).video;
+    if (stream === undefined) throw new Error('expected a video stream');
+    const reader = stream.getReader();
+    const read = reader.read().catch((e: unknown) => e);
+    await demuxStarted;
+    const cancel = reader.cancel('stop-before-demux-resolves');
+    releaseDemux?.();
+    await cancel;
+    await read;
+    await frame.closed;
+    expect(frame.closeCount).toBe(1);
+  });
+
   it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {
     // With no driver matching the NOOP container (and WebCodecs absent in Node), each op must surface a
     // typed CapabilityError. `convert`/`remux`/`trim`/`decrypt` reject at the container route;
@@ -310,6 +444,7 @@ describe('createMedia', () => {
     );
     // `encode`/`mux` with no streams are input errors (nothing to encode/mux).
     await expect(media.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
+    await expect(media.h264AbrLadder(NOOP_BYTES, [])).rejects.toBeInstanceOf(InputError);
     await expect(readFirst(media.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
   });
 
@@ -440,6 +575,7 @@ describe('bare-function sugar', () => {
     await expect(sugar.probe(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.demux(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.convert(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
+    await expect(sugar.h264AbrLadder(NOOP_BYTES, [])).rejects.toBeInstanceOf(InputError);
     await expect(sugar.remux(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.trim(NOOP_BYTES, { start: 0, end: 1 })).rejects.toBeInstanceOf(
       CapabilityError,

@@ -1,0 +1,28 @@
+aibrush-media wasm-vorbis-enc
+================================
+
+This codec tail embeds libogg 1.3.6 and libvorbis 1.3.7 compiled to WebAssembly with Emscripten.
+
+libogg
+------
+Project: Xiph.Org libogg
+Version: 1.3.6
+License: BSD-3-Clause compatible Xiph.Org license
+Source: https://ftp.osuosl.org/pub/xiph/releases/ogg/libogg-1.3.6.tar.gz
+SHA-256: 83e6704730683d004d20e21b8f7f55dcb3383cdf84c0daedf30bde175f774638
+License text: LICENSE.libogg
+
+libvorbis
+---------
+Project: Xiph.Org libvorbis / libvorbisenc
+Version: 1.3.7
+License: BSD-3-Clause compatible Xiph.Org license
+Source: https://ftp.osuosl.org/pub/xiph/releases/vorbis/libvorbis-1.3.7.tar.xz
+SHA-256: b33cc4934322bcbf6efcbacf49e3ca01aadbea4114ec9589d1b1e9d20f72954b
+License text: LICENSE.libvorbis
+
+Integration note
+----------------
+The small `aibrush_vorbis_enc.c` wrapper only forwards PCM into libvorbisenc and copies produced
+`ogg_packet` payloads and granule positions across the wasm boundary. Ogg page muxing remains in the
+project TypeScript `OggMuxer`.

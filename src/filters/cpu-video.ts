@@ -479,7 +479,13 @@ function createCpuFilterStream(
       }
       try {
         const out = await filterFrameCpu(spec, frame);
-        controller.enqueue(out);
+        let handedOff = false;
+        try {
+          controller.enqueue(out);
+          handedOff = true;
+        } finally {
+          if (!handedOff) out.close();
+        }
       } finally {
         // `copyTo` fully read the source into our buffer before the await resolved; release it exactly once.
         frame.close();

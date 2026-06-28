@@ -74,13 +74,17 @@ export type RawFrame = VideoFrame | AudioData;
  * carries it alongside the sealed chunk; **`undefined` ⇒ DTS equals the chunk's PTS** (no reordering).
  * `sizeBytes`, when present, is the container packet's byte size for oracles/diagnostics whose packet
  * unit is wider than the decoder access unit (e.g. ADTS: header+payload on disk, raw AAC AU in
- * WebCodecs). Demuxers attach these facts from container tables/headers; muxers honor DTS and copy the
- * bare {@link chunk} bytes; decoders ignore both side fields. A pure data view — no resources to release
- * (the chunk owns its bytes).
+ * WebCodecs). `alpha`, when present, is the VPx alpha side-data chunk carried by WebM/Matroska
+ * BlockAdditions (BlockAddID=1). Demuxers attach these facts from container tables/headers; muxers honor
+ * DTS/alpha and copy the bare {@link chunk} bytes; ordinary decoders ignore side fields unless they
+ * explicitly implement alpha-plane merging. A pure data view — no resources to release (chunks own their
+ * bytes).
  */
 export interface Packet {
   /** The sealed WebCodecs encoded unit: the coded bytes, the keyframe flag, and `timestamp` = PTS. */
   readonly chunk: EncodedChunk;
+  /** VPx alpha side-data chunk for WebM/Matroska BlockAdditions (BlockAddID=1), when present. */
+  readonly alpha?: EncodedVideoChunk;
   /** Decode timestamp (µs); omitted ⇒ equals the chunk's presentation `timestamp` (no reorder). */
   readonly dtsUs?: number;
   /** Container packet byte length; omitted ⇒ equals `chunk.byteLength`. */
@@ -168,8 +172,19 @@ export interface TrackInfo {
   rotation?: number;
   /** True when encoded samples are protected and must be decrypted before generic decode/seek. */
   encrypted?: boolean;
+  /** True when the coded video packets carry a separate alpha plane side channel. */
+  alpha?: boolean;
   /** WebCodecs config: video coded dims/rotation/fps; audio sampleRate/channels. */
   config?: DecoderConfig;
+  /** Optional exact compressed-audio gapless facts, in decoded samples at the track sample rate. */
+  gapless?: {
+    /** Leading decoder/encoder-delay samples to discard before exposing program audio. */
+    leadingSamples?: number;
+    /** Trailing encoder-padding samples to discard after program audio. */
+    trailingSamples?: number;
+    /** Exact program-audio sample count after leading/trailing removal. */
+    totalSamples?: number;
+  };
 }
 
 /** A live demux session: per-track lazy packet streams ({@link Packet} carries PTS + optional DTS). */

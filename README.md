@@ -63,6 +63,29 @@ const output = await convert(file, {
 });
 ```
 
+Change frame rate, preserve VPx alpha, or write container metadata with the same intent-only surface:
+
+```ts
+import { convert, remux } from '@aibrush/media';
+
+const cfr = await convert(file, {
+  to: 'mp4',
+  video: { codec: 'h264', fps: 30 },
+  audio: { codec: 'aac' },
+});
+
+const alphaWebm = await convert(file, {
+  to: 'webm',
+  video: { codec: 'vp9', alpha: 'keep' },
+  audio: { codec: 'vorbis' },
+});
+
+const tagged = await remux(file, {
+  to: 'mp4',
+  tags: { title: 'Review cut', artist: 'aibrush-media' },
+});
+```
+
 Trim a clip on keyframes for a fast stream-copy edit:
 
 ```ts

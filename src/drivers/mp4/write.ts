@@ -80,6 +80,8 @@ export interface MuxTrackInput {
   channels?: number;
   /** When set, the track is written as CENC-protected (the samples must already be ciphertext). */
   encryption?: TrackEncryption;
+  /** Single-rate edit list: expose `durationTicks` of media starting at `mediaTimeTicks`. */
+  edit?: { mediaTimeTicks: number; durationTicks: number };
   samples: MuxSampleInput[];
 }
 
@@ -153,6 +155,11 @@ function sampleByteLength(sample: MuxSampleInput | MuxSampleLayoutInput): number
 
 function trackDurationTicks(track: MuxTrackLayoutInput): number {
   return track.samples.reduce((a, s) => a + s.durationTicks, 0);
+}
+
+function trackMovieDurationTicks(track: MuxTrackLayoutInput, movieTimescale: number): number {
+  const durationTicks = track.edit?.durationTicks ?? trackDurationTicks(track);
+  return Math.round((durationTicks * movieTimescale) / track.timescale);
 }
 
 /** Build an `esds` box wrapping an AudioSpecificConfig (the reverse of `parseEsds`). */
@@ -295,6 +302,28 @@ function sampleTable(track: MuxTrackLayoutInput, chunkOffset: number): number[] 
   return box('stbl', children);
 }
 
+function editList(track: MuxTrackLayoutInput, movieTimescale: number): number[] {
+  const edit = track.edit;
+  if (edit === undefined) return [];
+  const segmentDuration = trackMovieDurationTicks(track, movieTimescale);
+  if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 edit segment_duration ${segmentDuration} exceeds version-0 elst`,
+    );
+  }
+  if (edit.mediaTimeTicks < 0 || edit.mediaTimeTicks > 0x7fffffff) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 edit media_time ${edit.mediaTimeTicks} exceeds version-0 elst`,
+    );
+  }
+  return box(
+    'edts',
+    full('elst', 0, 0, cat(u32(1), u32(segmentDuration), u32(edit.mediaTimeTicks), u16(1), u16(0))),
+  );
+}
+
 function trak(
   track: MuxTrackLayoutInput,
   trackId: number,
@@ -302,7 +331,7 @@ function trak(
   chunkOffset: number,
 ): number[] {
   const durTicks = trackDurationTicks(track);
-  const movieDur = Math.round((durTicks * movieTimescale) / track.timescale);
+  const movieDur = trackMovieDurationTicks(track, movieTimescale);
   const isVideo = track.mediaType === 'video';
 
   const tkhd = full(
@@ -343,7 +372,7 @@ function trak(
   const dref = full('dref', 0, 0, cat(u32(1), full('url ', 0, 1, [])));
   const minf = box('minf', cat(mediaHeader, box('dinf', dref), sampleTable(track, chunkOffset)));
   const mdia = box('mdia', cat(mdhd, hdlr, minf));
-  return box('trak', cat(tkhd, mdia));
+  return box('trak', cat(tkhd, editList(track, movieTimescale), mdia));
 }
 
 function moov(
@@ -352,7 +381,7 @@ function moov(
   chunkOffsets: number[],
 ): number[] {
   const movieDur = tracks.reduce(
-    (max, t) => Math.max(max, Math.round((trackDurationTicks(t) * movieTimescale) / t.timescale)),
+    (max, t) => Math.max(max, trackMovieDurationTicks(t, movieTimescale)),
     0,
   );
   const mvhd = full(

@@ -553,6 +553,35 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     ]);
   });
 
+  it('AAC gapless output writes a single edit list with the program sample count', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      durationSec: 1.013,
+      gapless: { leadingSamples: 1024, totalSamples: 44673 },
+      config: { codec: 'aac', sampleRate: 44_100, numberOfChannels: 2, description: ASC },
+    });
+    for (let i = 0; i < 47; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 1024 * 1_000_000) / 44_100),
+        durationUs: Math.round((1024 * 1_000_000) / 44_100),
+        key: true,
+        data: new Uint8Array([0x21, i & 0xff]),
+      });
+    }
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const audio = movie.tracks.find((track) => track.mediaType === 'audio');
+    expect(audio?.durationSec).toBeCloseTo((1024 + 44673) / 44_100, 12);
+    expect(audio?.edit).toEqual({ mediaTimeTicks: 1024, durationSec: 1.013 });
+    const durations = audio ? buildSampleData(audio).map((s) => s.durationTicks) : [];
+    expect(durations).toHaveLength(45);
+    expect(durations.at(-1)).toBe(641);
+  });
+
   it('muxes synthesized raw-box codec records when AV1/VP9/Opus descriptions are absent', async () => {
     const cases = [
       {

@@ -13,6 +13,7 @@ export {
   decrypt,
   demux,
   encode,
+  h264AbrLadder,
   load,
   mux,
   preload,

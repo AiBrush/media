@@ -23,6 +23,7 @@ import { WasmAacDriver } from '../codecs/wasm-aac/wasm-aac-driver.ts';
 import { WasmAv1Driver } from '../codecs/wasm-av1/wasm-av1-driver.ts';
 import { WasmMp3Driver } from '../codecs/wasm-mp3/wasm-mp3-driver.ts';
 import { WasmOpusDriver } from '../codecs/wasm-opus/wasm-opus-driver.ts';
+import { WasmVorbisEncoderDriver } from '../codecs/wasm-vorbis-enc/wasm-vorbis-enc-driver.ts';
 import { WasmVorbisDriver } from '../codecs/wasm-vorbis/wasm-vorbis-driver.ts';
 import { WasmVpxDriver } from '../codecs/wasm-vpx/wasm-vpx-driver.ts';
 import { WebCodecsAudioDriver } from '../codecs/webcodecs-audio.ts';
@@ -195,6 +196,7 @@ const REAL_CODECS: readonly CodecDriver[] = [
   FlacCodecDriver, // tier:'native', pure-TS FLAC encode (supports() honest-false in Node: needs AudioData)
   WasmAacDriver,
   WasmMp3Driver,
+  WasmVorbisEncoderDriver,
   WasmVorbisDriver,
   WasmOpusDriver,
   WasmVpxDriver,
@@ -217,6 +219,7 @@ describe('real codec drivers — every one passes the Node-checkable conformance
       'flac-encode',
       'wasm-aac',
       'wasm-mp3',
+      'wasm-vorbis-enc',
       'wasm-vorbis',
       'wasm-opus',
       'wasm-vpx',

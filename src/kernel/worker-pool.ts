@@ -109,8 +109,11 @@ export class WorkerPool {
    * handle the caller drains in parallel (draining drives dispatch). This is the ABR fan-out entry: pass
    * the rendition ladder, get a stream per rendition.
    */
-  runMany(jobs: readonly OffloadJob[]): ReadableStream<Transferable>[] {
-    return jobs.map((job) => this.run(job));
+  runMany(
+    jobs: readonly OffloadJob[],
+    opts: RunStreamOptions = {},
+  ): ReadableStream<Transferable>[] {
+    return jobs.map((job) => this.run(job, opts));
   }
 
   /**

@@ -260,6 +260,15 @@ function lazyCodecDrivers(): readonly CodecDriver[] {
       load: () => import('./flac/flac-codec.ts').then((m) => m.FlacCodecDriver),
     }),
     lazyCodec({
+      id: 'wasm-vorbis-enc',
+      tier: 'wasm',
+      matches: (q) => q.mediaType === 'audio' && q.direction === 'encode' && codec(q) === 'vorbis',
+      load: () =>
+        import('../codecs/wasm-vorbis-enc/wasm-vorbis-enc-driver.ts').then(
+          (m) => m.WasmVorbisEncoderDriver,
+        ),
+    }),
+    lazyCodec({
       id: 'wasm-vorbis',
       tier: 'wasm',
       matches: (q) => audioDecode(q) && codec(q).startsWith('vorbis'),

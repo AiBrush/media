@@ -382,7 +382,8 @@ export async function offloadAbrLadder(
       ...(determinism !== undefined ? { determinism } : {}),
     };
   });
-  return pool.runMany(jobs).map((stream) => asBytes(stream));
+  const { determinism: _determinism, ...runOpts } = opts;
+  return pool.runMany(jobs, runOpts).map((stream) => asBytes(stream));
 }
 
 /**

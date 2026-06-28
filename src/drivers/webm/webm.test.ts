@@ -59,6 +59,13 @@ const E = {
   Cluster: [0x1f, 0x43, 0xb6, 0x75],
   Timecode: [0xe7],
   SimpleBlock: [0xa3],
+  BlockGroup: [0xa0],
+  Block: [0xa1],
+  BlockAdditions: [0x75, 0xa1],
+  BlockMore: [0xa6],
+  BlockAdditional: [0xa5],
+  BlockAddID: [0xee],
+  ReferenceBlock: [0xfb],
 };
 
 describe('WebmDriver.supports', () => {
@@ -390,6 +397,18 @@ describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm +
     expect((frames[videoIndex]?.[0]?.data.byteLength ?? 0) > 0).toBe(true);
     await demuxed.close();
   });
+
+  it('bear-vp9-alpha.webm exposes VPx alpha BlockAdditions as frame side data', async () => {
+    const { info, framesByIndex } = demuxWebm(await loadFixture('bear-vp9-alpha.webm'));
+    const videoIndex = info.tracks.findIndex((track) => track.mediaType === 'video');
+    const frames = framesByIndex[videoIndex] ?? [];
+    expect(frames.length).toBeGreaterThan(0);
+
+    const alphaFrames = frames.filter((frame) => frame.alpha !== undefined);
+    expect(alphaFrames.length).toBeGreaterThan(0);
+    expect(alphaFrames[0]?.alpha?.byteLength).toBeGreaterThan(0);
+    expect(alphaFrames[0]?.alpha?.byteLength).not.toBe(alphaFrames[0]?.data.byteLength);
+  });
 });
 
 describe('demuxWebm — lacing (none / Xiph / EBML / fixed) splits one block into N frames', () => {
@@ -473,5 +492,37 @@ describe('demuxWebm — lacing (none / Xiph / EBML / fixed) splits one block int
     ]);
     const frames = demuxWebm(bytes).framesByIndex[0] ?? [];
     expect(frames.map((f) => f.keyframe)).toEqual([true, false]);
+  });
+
+  it('a BlockGroup with BlockAddID=1 attaches VPx alpha side data to its single frame', () => {
+    const color = [0xaa, 0xbb, 0xcc];
+    const alpha = [0x11, 0x22, 0x33, 0x44];
+    const block = [0x81, 0, 0, 0x00, ...color];
+    const additions = el(
+      E.BlockAdditions,
+      el(E.BlockMore, [...el(E.BlockAddID, [0x01]), ...el(E.BlockAdditional, alpha)]),
+    );
+    const cluster = el(E.Cluster, [
+      ...el(E.Timecode, uintN(0, 1)),
+      ...el(E.BlockGroup, [...el(E.Block, block), ...additions]),
+    ]);
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackType, [1]),
+      ...el(E.TrackNumber, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, uintN(64, 1)), ...el(E.PixelHeight, uintN(64, 1))]),
+    ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4))),
+        ...el(E.Tracks, track),
+        ...cluster,
+      ]),
+    ]);
+
+    const frame = demuxWebm(bytes).framesByIndex[0]?.[0];
+    expect(frame?.data).toEqual(new Uint8Array(color));
+    expect(frame?.alpha).toEqual(new Uint8Array(alpha));
   });
 });

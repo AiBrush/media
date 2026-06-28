@@ -53,6 +53,13 @@ const EBML_ID = {
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
   SimpleBlock: 0xa3,
+  BlockGroup: 0xa0,
+  Block: 0xa1,
+  BlockAdditions: 0x75a1,
+  BlockMore: 0xa6,
+  BlockAdditional: 0xa5,
+  BlockAddID: 0xee,
+  ReferenceBlock: 0xfb,
 } as const;
 
 /** WebM default TimecodeScale: 1 ms per tick (ns). Matches {@link parseWebm}'s default. */
@@ -252,6 +259,8 @@ export interface ChunkStruct {
   key: boolean;
   /** The packet bytes (owned copy). */
   data: Uint8Array;
+  /** VPx alpha side-data bytes from Matroska BlockAdditions (BlockAddID=1), when present. */
+  alpha?: Uint8Array;
   /**
    * Decode timestamp (µs), from the demuxer's {@link Packet.dtsUs} on a verbatim remux. Matroska stores
    * blocks in **decode** order (a Cluster is read front-to-back and fed straight to the decoder), so a
@@ -270,6 +279,8 @@ export interface TimelineBlock {
   dtsMs: number;
   key: boolean;
   data: Uint8Array;
+  /** VPx alpha side-data bytes to write as BlockAdditions (BlockAddID=1), when present. */
+  alpha?: Uint8Array;
 }
 
 /** Round µs to whole-ms ticks (the chosen TimecodeScale). */
@@ -328,6 +339,7 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
         dtsMs: usToMs((c.dtsUs ?? c.timestampUs) - baseUs),
         key: c.key,
         data: c.data,
+        ...(c.alpha !== undefined ? { alpha: c.alpha } : {}),
       });
     }
     const declaredEndMs = durationSecToMs(t.durationSec);
@@ -402,6 +414,13 @@ function toBytes(src: AllowSharedBufferSource): Uint8Array {
     return new Uint8Array(src.buffer, src.byteOffset, src.byteLength).slice();
   }
   return new Uint8Array(src).slice();
+}
+
+/** Copy an immutable WebCodecs chunk into owned bytes for muxer buffering. */
+function encodedChunkBytes(chunk: EncodedAudioChunk | EncodedVideoChunk): Uint8Array {
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  return data;
 }
 
 /** Build the immutable {@link TrackState} from a track's {@link TrackInfo} (codec + WebCodecs config). */
@@ -516,21 +535,87 @@ function tracksElement(tracks: readonly TrackState[]): Uint8Array {
   return element(EBML_ID.Tracks, concatBytes(tracks.map(trackEntryElement)));
 }
 
-function simpleBlockPayloadLength(block: TimelineBlock): number {
+function blockPayloadLength(block: TimelineBlock): number {
   return vintBytes(block.trackNumber).length + 2 + 1 + block.data.byteLength;
 }
 
-/** Write one `SimpleBlock`: track-number vint + int16 relative timecode + flags(keyframe) + frame bytes. */
-function writeSimpleBlock(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
+function blockPayloadBytes(
+  block: TimelineBlock,
+  clusterTimeMs: number,
+  simpleBlock: boolean,
+): Uint8Array {
   const rel = block.timeMs - clusterTimeMs;
-  const flags = block.key ? 0x80 : 0x00;
+  const flags = simpleBlock && block.key ? 0x80 : 0x00;
   const trackNumber = vintBytes(block.trackNumber);
   const payloadLength = trackNumber.length + 2 + 1 + block.data.byteLength;
-  writer.write(elementHeader(EBML_ID.SimpleBlock, payloadLength));
-  writer.write(trackNumber);
-  writer.write(int16Bytes(rel));
-  writer.write([flags]);
-  writer.write(block.data);
+  const out = new Uint8Array(payloadLength);
+  let off = 0;
+  out.set(trackNumber, off);
+  off += trackNumber.length;
+  out.set(int16Bytes(rel), off);
+  off += 2;
+  out[off++] = flags;
+  out.set(block.data, off);
+  return out;
+}
+
+function blockAdditionsElement(alpha: Uint8Array): Uint8Array {
+  return element(
+    EBML_ID.BlockAdditions,
+    element(
+      EBML_ID.BlockMore,
+      concatBytes([uintEl(EBML_ID.BlockAddID, 1), element(EBML_ID.BlockAdditional, alpha)]),
+    ),
+  );
+}
+
+function blockElementLength(block: TimelineBlock): number {
+  const rawBlockPayloadLength = blockPayloadLength(block);
+  if (block.alpha === undefined) {
+    return (
+      idBytes(EBML_ID.SimpleBlock).length +
+      vintBytes(rawBlockPayloadLength).length +
+      rawBlockPayloadLength
+    );
+  }
+  const blockElementLength =
+    idBytes(EBML_ID.Block).length + vintBytes(rawBlockPayloadLength).length + rawBlockPayloadLength;
+  const referenceElementLength = block.key
+    ? 0
+    : idBytes(EBML_ID.ReferenceBlock).length + vintBytes(1).length + 1;
+  const blockAddId = uintEl(EBML_ID.BlockAddID, 1);
+  const blockAdditionalLength =
+    idBytes(EBML_ID.BlockAdditional).length +
+    vintBytes(block.alpha.byteLength).length +
+    block.alpha.byteLength;
+  const blockMorePayloadLength = blockAddId.byteLength + blockAdditionalLength;
+  const blockMoreLength =
+    idBytes(EBML_ID.BlockMore).length +
+    vintBytes(blockMorePayloadLength).length +
+    blockMorePayloadLength;
+  const blockAdditionsLength =
+    idBytes(EBML_ID.BlockAdditions).length + vintBytes(blockMoreLength).length + blockMoreLength;
+  const blockGroupPayloadLength =
+    blockElementLength + referenceElementLength + blockAdditionsLength;
+  return (
+    idBytes(EBML_ID.BlockGroup).length +
+    vintBytes(blockGroupPayloadLength).length +
+    blockGroupPayloadLength
+  );
+}
+
+function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
+  if (block.alpha === undefined) {
+    writer.write(element(EBML_ID.SimpleBlock, blockPayloadBytes(block, clusterTimeMs, true)));
+    return;
+  }
+
+  const parts: Uint8Array[] = [
+    element(EBML_ID.Block, blockPayloadBytes(block, clusterTimeMs, false)),
+  ];
+  if (!block.key) parts.push(element(EBML_ID.ReferenceBlock, [0x01]));
+  parts.push(blockAdditionsElement(block.alpha));
+  writer.write(element(EBML_ID.BlockGroup, concatBytes(parts)));
 }
 
 interface ClusterPlan {
@@ -574,11 +659,7 @@ function planClusters(blocks: readonly TimelineBlock[]): ClusterPlan[] {
     for (let j = start; j < i; j++) {
       const b = blocks[j];
       if (b !== undefined) {
-        const blockPayloadLength = simpleBlockPayloadLength(b);
-        payloadLength +=
-          idBytes(EBML_ID.SimpleBlock).length +
-          vintBytes(blockPayloadLength).length +
-          blockPayloadLength;
+        payloadLength += blockElementLength(b);
       }
     }
     clusters.push({
@@ -602,7 +683,7 @@ function writeCluster(
   writer.write(cluster.timecodeElement);
   for (let i = cluster.start; i < cluster.end; i++) {
     const block = blocks[i];
-    if (block !== undefined) writeSimpleBlock(writer, block, cluster.timeMs);
+    if (block !== undefined) writeBlockElement(writer, block, cluster.timeMs);
   }
 }
 
@@ -732,11 +813,7 @@ function serializeFragmentCluster(
   for (let i = range.start; i < range.end; i++) {
     const b = blocks[i];
     if (b === undefined) continue;
-    const blockPayloadLength = simpleBlockPayloadLength(b);
-    payloadLength +=
-      idBytes(EBML_ID.SimpleBlock).length +
-      vintBytes(blockPayloadLength).length +
-      blockPayloadLength;
+    payloadLength += blockElementLength(b);
   }
 
   const clusterHeader = elementHeader(EBML_ID.Cluster, payloadLength);
@@ -745,7 +822,7 @@ function serializeFragmentCluster(
   writer.write(timecodeElement);
   for (let i = range.start; i < range.end; i++) {
     const b = blocks[i];
-    if (b !== undefined) writeSimpleBlock(writer, b, clusterTimeMs);
+    if (b !== undefined) writeBlockElement(writer, b, clusterTimeMs);
   }
   return writer.finish();
 }
@@ -877,13 +954,13 @@ export class WebmMuxer implements Muxer {
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
     const chunk = packet.chunk;
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
+    const data = encodedChunkBytes(chunk);
     this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
       durationUs: chunk.duration ?? undefined,
       key: chunk.type === 'key',
       data,
+      ...(packet.alpha !== undefined ? { alpha: encodedChunkBytes(packet.alpha) } : {}),
       ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
     });
     return Promise.resolve();

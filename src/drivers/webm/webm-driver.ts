@@ -18,10 +18,11 @@ import {
   type Packet,
   type Registry,
   type StageOptions,
+  type StreamCopyOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { WebmMuxer } from './ebml-write.ts';
+import { type ChunkStruct, WebmMuxer } from './ebml-write.ts';
 import {
   type EbmlElement,
   elements,
@@ -58,8 +59,15 @@ const ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  BlockAdditions: 0x75a1,
+  BlockMore: 0xa6,
+  BlockAdditional: 0xa5,
+  BlockAddID: 0xee,
   ReferenceBlock: 0xfb,
 } as const;
+
+const MICROS_PER_SECOND = 1_000_000;
+const FULL_RANGE_EPSILON_US = 50_000;
 
 /**
  * Matroska CodecID → the engine's canonical codec token (the short vocabulary the harness goldens and
@@ -282,6 +290,8 @@ function collectClusterBlockTimes(
 /** A decoded (Simple)Block frame: its bytes + absolute presentation timestamp (µs) + keyframe flag. */
 export interface WebmFrame {
   data: Uint8Array;
+  /** VPx alpha side-data bytes from Matroska BlockAdditions (BlockAddID=1), when present. */
+  alpha?: Uint8Array;
   timestampUs: number;
   keyframe: boolean;
 }
@@ -375,6 +385,7 @@ function blockFrames(
   clusterTimecode: number,
   timecodeScale: number,
   keyframeOverride: boolean | undefined,
+  alpha: Uint8Array | undefined,
 ): { trackNumber: number; frames: WebmFrame[] } | undefined {
   const tn = readVint(dv, block.dataStart, false);
   if (!tn || tn.value < 0) return undefined;
@@ -388,9 +399,15 @@ function blockFrames(
   const headerStart = flagsOff + 1;
 
   if (lacing === 'none') {
+    const frame: WebmFrame = {
+      data: bytes.subarray(headerStart, block.dataEnd),
+      timestampUs,
+      keyframe,
+      ...(alpha !== undefined ? { alpha } : {}),
+    };
     return {
       trackNumber: tn.value,
-      frames: [{ data: bytes.subarray(headerStart, block.dataEnd), timestampUs, keyframe }],
+      frames: [frame],
     };
   }
   const laced = laceSizes(bytes, headerStart, block.dataEnd, lacing);
@@ -438,18 +455,49 @@ function collectFrames(
       if (c.id === ID.Timecode) {
         clusterTimecode = readUint(dv, c);
       } else if (c.id === ID.SimpleBlock) {
-        push(blockFrames(bytes, dv, c, clusterTimecode, timecodeScale, undefined));
+        push(blockFrames(bytes, dv, c, clusterTimecode, timecodeScale, undefined, undefined));
       } else if (c.id === ID.BlockGroup) {
         const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
         if (block) {
           // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
           const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
-          push(blockFrames(bytes, dv, block, clusterTimecode, timecodeScale, isKeyframe));
+          push(
+            blockFrames(
+              bytes,
+              dv,
+              block,
+              clusterTimecode,
+              timecodeScale,
+              isKeyframe,
+              readMainBlockAdditional(bytes, dv, c.dataStart, c.dataEnd),
+            ),
+          );
         }
       }
     }
   }
   return byTrack;
+}
+
+function readMainBlockAdditional(
+  bytes: Uint8Array,
+  dv: DataView,
+  start: number,
+  end: number,
+): Uint8Array | undefined {
+  const blockAdditions = findChild(dv, start, end, ID.BlockAdditions);
+  if (blockAdditions === undefined) return undefined;
+  for (const blockMore of elements(dv, blockAdditions.dataStart, blockAdditions.dataEnd)) {
+    if (blockMore.id !== ID.BlockMore) continue;
+    let addId = 1;
+    let data: Uint8Array | undefined;
+    for (const child of elements(dv, blockMore.dataStart, blockMore.dataEnd)) {
+      if (child.id === ID.BlockAddID) addId = readUint(dv, child);
+      else if (child.id === ID.BlockAdditional) data = readBytes(bytes, child).slice();
+    }
+    if (addId === 1 && data !== undefined) return data;
+  }
+  return undefined;
 }
 
 // A timestamp-derived fps from MediaRecorder output carries jitter (frames land a millisecond
@@ -575,7 +623,12 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
   return { info, framesByIndex };
 }
 
-function toTrackInfo(track: WebmTrack, id: number, durationSec: number): TrackInfo {
+function toTrackInfo(
+  track: WebmTrack,
+  id: number,
+  durationSec?: number,
+  alpha?: boolean,
+): TrackInfo {
   // The CodecPrivate rides in `description`: avcC/hvcC for H.264/HEVC decode config, and Vorbis'
   // Xiph-laced setup headers for cross-container muxing into Ogg. It is a `Uint8Array`, satisfying the
   // WebCodecs `description: AllowSharedBufferSource` field where a decoder consumes it.
@@ -597,8 +650,9 @@ function toTrackInfo(track: WebmTrack, id: number, durationSec: number): TrackIn
     id,
     mediaType: track.mediaType,
     codec: track.codec,
-    durationSec,
+    ...(durationSec !== undefined ? { durationSec } : {}),
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
+    ...(alpha === true ? { alpha: true } : {}),
     config,
   };
 }
@@ -622,6 +676,268 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
     off += c.byteLength;
   }
   return out;
+}
+
+function abortedError(): MediaError {
+  return new MediaError('aborted', 'operation aborted');
+}
+
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortedError();
+}
+
+interface WebmTrimRange {
+  startUs: number;
+  endUs: number;
+  durationSec: number;
+  fullRange: boolean;
+}
+
+function normalizeTrimRange(
+  trim: StreamCopyOptions['trim'] | undefined,
+  durationSec: number,
+): WebmTrimRange | undefined {
+  if (trim === undefined) return undefined;
+  const startUs = Math.round(trim.startSec * MICROS_PER_SECOND);
+  const endUs = Math.round(trim.endSec * MICROS_PER_SECOND);
+  if (!Number.isFinite(startUs) || !Number.isFinite(endUs) || startUs < 0 || endUs <= startUs) {
+    throw new InputError(
+      'unsupported-input',
+      `invalid WebM trim range ${trim.startSec}s..${trim.endSec}s`,
+    );
+  }
+  const sourceDurationUs =
+    Number.isFinite(durationSec) && durationSec > 0
+      ? Math.round(durationSec * MICROS_PER_SECOND)
+      : undefined;
+  const fullRange =
+    sourceDurationUs !== undefined &&
+    startUs === 0 &&
+    endUs >= sourceDurationUs - FULL_RANGE_EPSILON_US;
+  return {
+    startUs,
+    endUs,
+    durationSec: fullRange && durationSec > 0 ? durationSec : (endUs - startUs) / MICROS_PER_SECOND,
+    fullRange,
+  };
+}
+
+function videoDecodeStartUs(
+  info: WebmInfo,
+  framesByIndex: readonly WebmFrame[][],
+  startUs: number,
+): number {
+  let candidate = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < info.tracks.length; i++) {
+    const track = info.tracks[i];
+    if (track?.mediaType !== 'video') continue;
+    const frames = framesByIndex[i] ?? [];
+    let keyAtOrBefore: number | undefined;
+    let firstKey: number | undefined;
+    for (const frame of frames) {
+      if (!frame.keyframe) continue;
+      firstKey ??= frame.timestampUs;
+      if (frame.timestampUs <= startUs) keyAtOrBefore = frame.timestampUs;
+    }
+    const safeStart = keyAtOrBefore ?? firstKey;
+    if (safeStart !== undefined) candidate = Math.min(candidate, safeStart);
+  }
+  return Number.isFinite(candidate) ? candidate : startUs;
+}
+
+function frameDurationUs(
+  frames: readonly WebmFrame[],
+  index: number,
+  sourceDurationUs: number | undefined,
+): number | undefined {
+  const current = frames[index];
+  if (current === undefined) return undefined;
+  for (let i = index + 1; i < frames.length; i++) {
+    const next = frames[i];
+    if (next !== undefined && next.timestampUs > current.timestampUs) {
+      return next.timestampUs - current.timestampUs;
+    }
+  }
+  for (let i = index - 1; i >= 0; i--) {
+    const prev = frames[i];
+    if (prev !== undefined && current.timestampUs > prev.timestampUs) {
+      return current.timestampUs - prev.timestampUs;
+    }
+  }
+  if (sourceDurationUs !== undefined && sourceDurationUs > current.timestampUs) {
+    return sourceDurationUs - current.timestampUs;
+  }
+  return undefined;
+}
+
+function firstKeyframeIndex(frames: readonly WebmFrame[], start: number): number {
+  for (let i = start; i < frames.length; i++) {
+    if (frames[i]?.keyframe === true) return i;
+  }
+  return start;
+}
+
+function firstVideoKeyframeAtOrAfter(
+  info: WebmInfo,
+  framesByIndex: readonly WebmFrame[][],
+  startUs: number,
+): number | undefined {
+  const candidates: number[] = [];
+  for (let i = 0; i < info.tracks.length; i++) {
+    const track = info.tracks[i];
+    if (track?.mediaType !== 'video') continue;
+    const candidate = (framesByIndex[i] ?? []).find(
+      (frame) => frame.keyframe && frame.timestampUs >= startUs,
+    )?.timestampUs;
+    if (candidate !== undefined) candidates.push(candidate);
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : undefined;
+}
+
+function effectiveCopyRange(
+  info: WebmInfo,
+  framesByIndex: readonly WebmFrame[][],
+  range: WebmTrimRange | undefined,
+  sourceDurationUs: number | undefined,
+): WebmTrimRange | undefined {
+  if (range === undefined || range.fullRange) return range;
+  const firstKeyframe = firstVideoKeyframeAtOrAfter(info, framesByIndex, range.startUs);
+  const startUs = firstKeyframe ?? videoDecodeStartUs(info, framesByIndex, range.startUs);
+  const requestedDurationUs = range.endUs - range.startUs;
+  const unclampedEndUs = startUs + requestedDurationUs;
+  const endUs =
+    sourceDurationUs !== undefined ? Math.min(unclampedEndUs, sourceDurationUs) : unclampedEndUs;
+  if (endUs <= startUs) {
+    throw new MediaError('mux-error', 'WebM stream-copy trim selected an empty GOP window', {
+      trim: { startUs: range.startUs, endUs: range.endUs },
+    });
+  }
+  return {
+    startUs,
+    endUs,
+    durationSec: (endUs - startUs) / MICROS_PER_SECOND,
+    fullRange: false,
+  };
+}
+
+function selectedFrameIndexes(
+  track: WebmTrack,
+  frames: readonly WebmFrame[],
+  range: WebmTrimRange | undefined,
+): number[] {
+  if (range === undefined || range.fullRange) return frames.map((_frame, index) => index);
+  const indexes: number[] = [];
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i];
+    if (
+      frame !== undefined &&
+      frame.timestampUs >= range.startUs &&
+      frame.timestampUs < range.endUs
+    ) {
+      indexes.push(i);
+    }
+  }
+  if (track.mediaType !== 'video' || indexes.length === 0) return indexes;
+  const first = indexes[0];
+  if (first === undefined || frames[first]?.keyframe === true) return indexes;
+  const keyIndex = firstKeyframeIndex(frames, first);
+  return indexes.filter((index) => index >= keyIndex);
+}
+
+function chunkFromFrame(
+  frames: readonly WebmFrame[],
+  index: number,
+  timestampOffsetUs: number,
+  sourceDurationUs: number | undefined,
+): ChunkStruct | undefined {
+  const frame = frames[index];
+  if (frame === undefined) return undefined;
+  const durationUs = frameDurationUs(frames, index, sourceDurationUs);
+  return {
+    timestampUs: frame.timestampUs - timestampOffsetUs,
+    durationUs,
+    key: frame.keyframe,
+    data: frame.data,
+    ...(frame.alpha !== undefined ? { alpha: frame.alpha } : {}),
+  };
+}
+
+function streamCopyDocType(info: WebmInfo, options: StreamCopyOptions | undefined): string {
+  const sourceDocType = info.container === 'mkv' ? 'matroska' : 'webm';
+  if (
+    options?.trim !== undefined &&
+    (options.container === undefined || options.container === 'webm')
+  ) {
+    return sourceDocType;
+  }
+  return options?.container === 'mkv' ? 'matroska' : 'webm';
+}
+
+async function streamCopyWebm(
+  src: ByteSource,
+  options: StreamCopyOptions | undefined,
+): Promise<ReadableStream<Uint8Array>> {
+  if (
+    options?.container !== undefined &&
+    options.container !== 'webm' &&
+    options.container !== 'mkv'
+  ) {
+    throw new CapabilityError(
+      'capability-miss',
+      `the webm driver cannot stream-copy to '${options.container}'`,
+      { op: 'streamCopy', tried: ['webm', 'mkv'] },
+    );
+  }
+  assertNotAborted(options?.signal);
+  const demux = demuxWebm(await readAll(src));
+  assertNotAborted(options?.signal);
+  const sourceDurationUs =
+    demux.info.durationSec > 0 ? Math.round(demux.info.durationSec * MICROS_PER_SECOND) : undefined;
+  const requestedRange = normalizeTrimRange(options?.trim, demux.info.durationSec);
+  const range = effectiveCopyRange(
+    demux.info,
+    demux.framesByIndex,
+    requestedRange,
+    sourceDurationUs,
+  );
+  const timestampOffsetUs = range === undefined || range.fullRange ? 0 : range.startUs;
+  const declaredDurationSec = range?.durationSec ?? demux.info.durationSec;
+  const muxOptions: MuxOptions = {
+    ...(options?.container !== undefined ? { container: options.container } : {}),
+    ...(options?.fragmented !== undefined ? { fragmented: options.fragmented } : {}),
+  };
+  const muxer = new WebmMuxer(muxOptions, streamCopyDocType(demux.info, options));
+  let selectedPackets = 0;
+  for (let trackIndex = 0; trackIndex < demux.info.tracks.length; trackIndex++) {
+    assertNotAborted(options?.signal);
+    const track = demux.info.tracks[trackIndex];
+    const frames = demux.framesByIndex[trackIndex] ?? [];
+    if (track === undefined || frames.length === 0) continue;
+    const indexes = selectedFrameIndexes(track, frames, range);
+    if (indexes.length === 0) continue;
+    const muxTrackId = muxer.addTrack(
+      toTrackInfo(
+        track,
+        trackIndex,
+        declaredDurationSec,
+        frames.some((frame) => frame.alpha !== undefined),
+      ),
+    );
+    for (const index of indexes) {
+      assertNotAborted(options?.signal);
+      const chunk = chunkFromFrame(frames, index, timestampOffsetUs, sourceDurationUs);
+      if (chunk === undefined) continue;
+      muxer.addChunkStruct(muxTrackId, chunk);
+      selectedPackets++;
+    }
+  }
+  if (selectedPackets === 0) {
+    throw new MediaError('mux-error', 'WebM stream-copy selected no packets', {
+      trim: options?.trim,
+    });
+  }
+  await muxer.finalize();
+  return muxer.output;
 }
 
 /**
@@ -665,7 +981,11 @@ function packetStream(
       // Matroska `SimpleBlock`s carry only a presentation timecode and are stored in decode order; the
       // container has no separate DTS, so `dtsUs` is left implicit (== PTS) per the {@link Packet} contract.
       const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
-      controller.enqueue({ chunk });
+      const alpha =
+        isVideo && frame.alpha !== undefined
+          ? new EncodedVideoChunk({ ...init, data: frame.alpha })
+          : undefined;
+      controller.enqueue({ chunk, ...(alpha !== undefined ? { alpha } : {}) });
     },
   });
   /* v8 ignore stop */
@@ -708,7 +1028,14 @@ export const WebmDriver: ContainerDriver = {
     const { info, framesByIndex } = demuxWebm(await readAll(src));
     const signal = o?.signal;
     return {
-      tracks: info.tracks.map((t, i) => toTrackInfo(t, i, info.durationSec)),
+      tracks: info.tracks.map((t, i) =>
+        toTrackInfo(
+          t,
+          i,
+          info.durationSec,
+          framesByIndex[i]?.some((frame) => frame.alpha !== undefined) === true,
+        ),
+      ),
       packets(trackId: number): ReadableStream<Packet> {
         const track = info.tracks[trackId];
         const frames = framesByIndex[trackId];
@@ -717,6 +1044,9 @@ export const WebmDriver: ContainerDriver = {
       },
       close: () => Promise.resolve(),
     };
+  },
+  async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+    return streamCopyWebm(src, o);
   },
   createMuxer(o?: MuxOptions): Muxer {
     // The EncodedChunk-seam adapter over the EBML byte writer ({@link WebmMuxer}); the packet→block

@@ -425,7 +425,7 @@ describe('wasm-mp3 — driver identity & module', () => {
       WasmMp3Driver.createDecoder({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 }),
     ).toThrow(MediaError);
   });
-  it('createEncoder is an honest capability miss (no pure-Rust MP3 encoder)', () => {
+  it('createEncoder is an honest capability miss (no approved MP3 encoder core)', () => {
     expect(() =>
       WasmMp3Driver.createEncoder({
         codec: 'mp3',
@@ -433,6 +433,13 @@ describe('wasm-mp3 — driver identity & module', () => {
         numberOfChannels: 2,
       } as unknown as AudioEncoderConfig),
     ).toThrow(CapabilityError);
+    expect(() =>
+      WasmMp3Driver.createEncoder({
+        codec: 'mp3',
+        sampleRate: 44_100,
+        numberOfChannels: 2,
+      } as unknown as AudioEncoderConfig),
+    ).toThrow(/no approved MP3 encoder core/);
   });
   it('createDecoder aborts up front when the signal is already aborted', () => {
     const ctrl = new AbortController();
@@ -454,19 +461,17 @@ describe('wasm-mp3 — driver identity & module', () => {
         })
       ).supported,
     ).toBe(false);
-    expect(
-      (
-        await WasmMp3Driver.supports({
-          mediaType: 'audio',
-          direction: 'encode',
-          config: {
-            codec: 'mp3',
-            sampleRate: 44_100,
-            numberOfChannels: 2,
-          } as unknown as AudioEncoderConfig,
-        })
-      ).supported,
-    ).toBe(false);
+    const encodeSupport = await WasmMp3Driver.supports({
+      mediaType: 'audio',
+      direction: 'encode',
+      config: {
+        codec: 'mp3',
+        sampleRate: 44_100,
+        numberOfChannels: 2,
+      } as unknown as AudioEncoderConfig,
+    });
+    expect(encodeSupport.supported).toBe(false);
+    expect(encodeSupport.reason ?? '').toMatch(/LGPL MP3 encode core is not approved/);
   });
   it('supports(): false in Node when the AudioData output seam is unavailable', async () => {
     const support = await WasmMp3Driver.supports({

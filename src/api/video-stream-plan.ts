@@ -16,7 +16,7 @@ import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import { type SourceGeometry, buildVideoEncoderConfig, videoCodecToken } from './codec-pipeline.ts';
-import type { VideoCodec, VideoTarget } from './types.ts';
+import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
 
 /**
  * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → rotate →
@@ -436,6 +436,14 @@ export type VideoRateControlPlan =
       readonly crf: number;
       readonly codec: VideoCodec | 'unknown';
       readonly bitrateMode: 'quantizer';
+      readonly quantizer: number;
+      readonly webCodecsConfigurable: true;
+    }
+  | {
+      readonly mode: 'crf';
+      readonly crf: number;
+      readonly codec: VideoCodec | 'unknown';
+      readonly bitrateMode: 'quantizer';
       readonly webCodecsConfigurable: false;
     }
   | {
@@ -466,6 +474,10 @@ function assertValidCrf(crf: number, codec: VideoCodec | 'unknown'): void {
       `video CRF for ${codec} must be in [${bounds.min}, ${bounds.max}]`,
     );
   }
+}
+
+function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
+  return codec === 'h264' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 }
 
 /** Pure rate-control planner for video transcode paths that may use non-WebCodecs encoder tails. */
@@ -502,13 +514,22 @@ export function planVideoRateControl(
     if (crf === undefined) {
       throw new InputError('unsupported-input', 'video CRF is missing');
     }
-    return {
-      mode: 'crf',
-      crf,
-      codec,
-      bitrateMode: 'quantizer',
-      webCodecsConfigurable: false,
-    };
+    return webCodecsQuantizerSupported(codec)
+      ? {
+          mode: 'crf',
+          crf,
+          codec,
+          bitrateMode: 'quantizer',
+          quantizer: crf,
+          webCodecsConfigurable: true,
+        }
+      : {
+          mode: 'crf',
+          crf,
+          codec,
+          bitrateMode: 'quantizer',
+          webCodecsConfigurable: false,
+        };
   }
   if (hasBitrate) {
     if (bitrate === undefined) {
@@ -628,14 +649,6 @@ export function planVideoBitDepthConversion(
 }
 
 // ============ H.264 ABR ladder planning (fanout normalization; worker pool runs it) ============
-
-export interface H264AbrRung {
-  readonly name?: string;
-  readonly width: number;
-  readonly height: number;
-  readonly bitrate: number;
-  readonly fps?: number;
-}
 
 export interface PlannedH264AbrRung {
   readonly name: string;

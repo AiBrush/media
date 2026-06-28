@@ -1692,3 +1692,203 @@ dropping FLAC from defaults (would turn real zero-config coverage back into N/A)
 async (driver-contract break); weakening codec normalization by probing bare container tokens directly;
 moving public `cacheSource`/`StreamTarget` helpers out of the default entry as the first repair (a larger
 surface change than the internal lazy split required).
+
+### ADR-104 — Session-6 Chromium feature sweep: adapter reachability plus lazy browser-only helpers
+
+**Context:** Session 6 raised the Chromium benchmark from the 2026-06-27 14:17 baseline
+(`518 PASS / 36 NA_ENGINE / 7 NA_BROWSER / 0 FAIL`) by making already-built root capabilities reachable
+from the browser harness and by filling several missing root paths. The feature work covered fps/retime,
+trim composition, Vorbis decode routing, metadata writes, WebM/MKV source trim, CRF and bitrate planning,
+ABR fanout, AAC gapless edit-list handling, 10-bit-to-8-bit downconversion, HEVC accurate-trim reachability,
+typed graceful declines for unsupported decrypt schemes, VPx alpha decode/copy/transcode, Vorbis encode,
+default video bitrate planning for VP8 oracle quality, and early 1x1 encode preflight. After rebuilding, vendoring the rebuilt
+`dist/` into `../media-test/media-browser-test/src/engines/aibrush-media/vendor/`, and running the complete
+no-reuse Chromium matrix with an extended timeout, the fresh measured run is
+`results/raw/chromium-2026-06-28T00-57-29-541Z.json`: `555 PASS / 4 NA_ENGINE / 2 NA_BROWSER / 0 FAIL /
+0 ERROR` across all `561` scenarios.
+
+**Decision:** keep the browser adapter strict: declare only features with real root routes, and map
+unsupported schemes/dimensions to typed, oracle-accepted graceful failures rather than declaring fake
+support. The root engine preflights sub-2px video encode targets before codec routing; the fresh Chromium
+run above proves the previous 1x1 resize non-PASS is now closed. For package health, keep the new
+browser-only helper paths lazy. The 10-bit pixel
+downconversion canvas transform lives in `src/api/video-frame-convert.ts` and is imported only when the
+bit-depth plan requests a pixel path. The trim helper cluster lives in `src/api/trim-streams.ts` and is
+imported only for audio packet trim, accurate trim, or gapless decode. Sink descriptor constructors remain
+small and public; materialization lives in `src/sinks/materialize.ts` while the public `StreamTarget` writer
+keeps the default-entry streaming API intact.
+
+**Consequences:** Chromium conformance is `100%` because there are no FAIL/ERROR rows; coverage is now
+`555/561 = 98.9%`. The remaining `6` non-PASS cells are the ADR-105 register entries, split as
+`2 NA_BROWSER` MP3 encode-tail rows and `4 NA_ENGINE` honest capability/safety declines. Session-6
+verification for this final Chromium shape is the fresh run above plus the root `bun run gate` after the
+docs/register update: typecheck and Biome clean, `142` Vitest files / `2215` tests passing, coverage
+`92.24%` statements and `90.01%` branches, build + WASM vendoring + dist smoke passing, budgets green
+(`49.95 kB / 50.00 kB` eager kernel and `246.18 kB / 256.00 kB` first-operation closure), and all `45`
+anti-cheat integrity checks green.
+
+**Rejected:** keeping canvas pixel conversion and trim/window/gapless helpers in the eager engine chunk
+after the budget regressed; declaring alpha, Vorbis encode, or adapter bypass support without a passing
+strict oracle; treating a missing browser encoder as a fake success; loosening the benchmark oracle to count
+unbuilt rows as PASS.
+
+### ADR-105 — Session-6 honest-NA and encode-tail register
+
+**Context:** Session 6's only admissible Chromium non-PASS cells are either physically blocked encodes
+with no approved permissive implementation or deliberate safety declines. The fresh complete Chromium
+run after re-vendor is `results/raw/chromium-2026-06-28T00-57-29-541Z.json` with `6` non-PASS cells:
+`4 NA_ENGINE` and `2 NA_BROWSER`. Every buildable row now passes on Chromium; every remaining row below is
+an admissible honest-NA entry with an explicit decision.
+
+| Scope | Rows | Current class | Decision |
+| --- | --- | --- | --- |
+| MP3 encode | `transcode/aac_to_mp3_mp4`, `transcode/wav_to_mp3_mp4` | honest-NA | Do not add an LGPL LAME/Shine tail to the default build. MP3 encode requires an explicit future approval for an isolated, lazy, separately-licensed tail with notices. The shipped Symphonia MP3 tail remains decode-only. |
+| HEVC Main10 output | `transcode/h264_8bit_to_hevc_10bit` | honest-NA | WebCodecs does not expose a portable 10-bit HEVC encode target in the current browser path, and no permissive software HEVC Main10 encoder is shipped. Downconversion to 8-bit is implemented; 10-bit output remains a typed capability miss. |
+| H.264 two-pass | `transcode/h264_two_pass_bitrate` | honest-NA | WebCodecs provides single-pass bitrate controls, not a first-pass stats API. Faking two-pass by setting a bitrate once would violate the oracle. No approved software H.264 two-pass tail is shipped. |
+| Massive non-ISO-BMFF materialization | `remux/massive_h264_1080p_2h_mp4_to_mkv`, `trim/massive_h264_copy_sustained` | honest-NA safety decline | ADR-101/102 provide bounded MP4 stream/buffer routes, but MKV whole-output materialization and the massive sustained trim row do not yet have a bounded strict-oracle path. The adapter should decline with a typed capability miss instead of risking tab OOM or a timeout. |
+| Exotic decrypt schemes | ClearKey/`hls-sample-aes`/`cenc-cens` scenario family | PASS via graceful decline | Session 6 keeps these out of scope for real decrypt. The adapter/root route emits typed unsupported-scheme errors that the graceful-failure oracle accepts; they are not counted in the remaining non-PASS set. |
+| Vorbis encode | `transcode/wav_to_vorbis_ogg`, `transcode/h264_to_vp8_webm`, `transcode/vp9_to_vp8_webm`, `transcode/hevc_to_vp8_webm` | PASS | ADR-108 builds, vendors, routes, validates, and benchmarks the permissive `libvorbisenc` + `libogg` tail. These rows are closed in the full Chromium run. |
+| VPx alpha decode, copy-trim, and transcode | `decode-seek/decode_vp9_alpha`, `trim/vp9_alpha_keyframe_aligned`, `transcode/vp9_alpha_to_vp8_keepalpha`, `transcode/vp9_alpha_to_vp9_keepalpha` | PASS | ADR-107 makes VPx alpha packet-native and strict-oracle safe; alpha-preserving transcode is routed through the real alpha side-data path and passes the full Chromium matrix. |
+
+**Consequences:** the encode-tail decision is settled: Vorbis ships as a permissive lazy wasm tail, while
+MP3 encode stays honest-NA until a future explicit LGPL-tail approval. Alpha decode/copy-trim/transcode are
+closed by the full Chromium evidence. The final Chromium non-PASS set is therefore admissible under Session
+6: two physical MP3 browser encode misses, one HEVC Main10 output miss, one H.264 two-pass miss, and two
+bounded-materialization safety declines.
+
+**Rejected:** shipping LGPL LAME silently in the default package; counting Vorbis encode as honest-NA when
+a permissive core exists; declaring alpha or alpha-transcode support before the strict alpha oracles pass;
+widening the massive-output caps for formats without a bounded materializer; converting unsupported decrypt
+schemes into empty passthrough output.
+
+### ADR-106 — Session-6 cross-browser baseline artifacts and decode-frame cancel-race hardening
+
+**Context:** Session 6 requires WebKit and Firefox baseline data for Session 7, but cross-browser hardening
+is not in Session 6 scope. After the final gated `dist/` was vendored into
+`../media-test/media-browser-test/src/engines/aibrush-media/vendor/`, two fresh no-reuse baseline runs were
+started in `../media-test/media-browser-test` and recorded in
+`results/raw/session6-cross-browser-baseline-2026-06-28T01-56-00Z.json`. WebKit produced
+`results/raw/.partial/webkit-2026-06-28T01-36-29-026Z.partial.json` before a stall on
+`transcode/ladder_tiny_h264_360p_resize_180p`: `153` captured rows,
+`124 PASS / 3 NA_BROWSER / 4 NA_ENGINE / 14 FAIL / 8 ERROR`, with `408` rows uncaptured. WebKit's
+`NA_BROWSER` exposure is AV1 encode, MP3 encode, and AV1 decode. Firefox produced
+`results/raw/.partial/firefox-2026-06-28T01-46-10-095Z.partial.json` before a stall on
+`robustness/fuzz_adts_aac_bitflip_probe`: `51` captured rows,
+`40 PASS / 1 NA_BROWSER / 8 NA_ENGINE / 2 FAIL`, with `510` rows uncaptured. Firefox's captured
+`NA_BROWSER` exposure is AAC encode for the large VP9→H.264 ladder row. Both partials quantify fresh
+NA_BROWSER exposure, but neither is a full cross-browser conformance run.
+
+**Decision:** record these partial artifacts as Session-7 baseline inputs rather than weakening the
+Chromium Session-6 acceptance bar. The WebKit and Firefox stalls are cross-browser hardening work; the
+fresh Chromium result remains the only Session-6 feature-completeness measurement. The baseline runs also
+surfaced repeated browser warnings that `VideoFrame` handles were destroyed without explicit `close()`.
+Root-owned handoff races were hardened immediately: `deferredStream()` closes a closable frame on a
+cancel/enqueue race, `canvasBackedVideoFrameStream()` closes a derived output if enqueue fails,
+`encodeVideoFramesWithAlpha()` closes derived frames if encoder handoff fails, and the GPU/CPU video filter
+streams close freshly rendered outputs if downstream enqueue throws. Focused tests cover those close-once
+paths, and the final gate keeps coverage above threshold.
+
+**Consequences:** the partial baselines are useful but not sufficient to call cross-browser hardening done.
+Session 7 must rerun full WebKit and Firefox matrices, investigate the uncaptured stalls and browser
+encode/decode gaps, and verify whether additional frame-lifetime warnings are engine-owned or harness/oracle
+cancellation artifacts. The guards are safe for Chromium because they only close frames when handoff fails;
+normal successful enqueue/write still transfers ownership to the downstream consumer or encoder.
+
+**Rejected:** treating partial WebKit/Firefox artifacts as all-green baselines; suppressing browser
+frame-lifetime warnings as harmless console noise; closing successfully enqueued public frames in the
+engine, which would violate the documented consumer-ownership contract for `decode()` and `seek()`.
+
+### ADR-107 — VPx alpha side data is packet-native; strict decode keeps exact hidden RGB
+
+**Context:** the WebM/Matroska VPx-alpha benchmark rows carry the alpha plane in Matroska
+`BlockAdditions` (`BlockMore` with `BlockAddID=1`), not as a separate track and not as ordinary VP9 bytes.
+Before this work the engine parsed only `SimpleBlock`/`Block` color payloads, so alpha decode, alpha
+copy-trim, and alpha-preserving transcode stayed undeclared. A naive canvas merge was not strict enough:
+Chromium `VideoFrame` readback zeroes or perturbs RGB under low/zero alpha, while the benchmark's
+`ssim-psnr` oracle compares RGB independently from alpha and the platform golden keeps the hidden color
+plane as decoded.
+
+**Decision:** make VPx alpha a first-class packet side channel in the WebM family. The WebM demuxer parses
+`BlockGroup` → `BlockAdditions` → `BlockMore` and attaches `BlockAdditional` payloads with `BlockAddID=1`
+to the corresponding single-frame VPx packet as `Packet.alpha`; `TrackInfo.alpha` marks tracks that carry
+this side data. Decode, seek, and convert source decode paths route alpha tracks through
+`decodeVideoPacketsWithAlpha`: color and alpha packets are decoded by separate WebCodecs decoders, paired
+by timestamp, merged into RGBA pixels by copying only the alpha plane's red channel into the color RGBA
+buffer, and every intermediate `VideoFrame` is closed exactly once. Because browser `VideoFrame` readback
+cannot preserve hidden RGB under alpha, the merged frame carries a private non-enumerable
+`__aibrushRgbaPixels` sidecar containing the real merged pixels; the benchmark adapter consumes that
+sidecar for digest/oracle work and falls back to ordinary platform rasterization for all normal frames.
+This sidecar is real decoded data, not a fixture shortcut.
+
+For packet-copy, the WebM writer emits alpha-bearing packets as `BlockGroup` with `Block`, keyframe
+`ReferenceBlock` semantics, and `BlockAdditions/BlockMore/BlockAddID=1/BlockAdditional`, while ordinary
+packets remain `SimpleBlock`. WebM keyframe trim now computes an effective GOP-copy window: start at the
+first video keyframe at or after the requested start (falling back to the prior decodable keyframe only
+when no later one exists), preserve the requested duration from that snapped start, and rebase output
+timestamps to zero. This avoids negative-preroll WebM output and lets strict reference probing observe the
+requested duration while still copying source packets.
+
+For alpha-preserving transcode, the codec pipeline splits each RGBA input frame into an opaque color frame
+and a grayscale alpha frame, feeds both through identical VPx WebCodecs encoders, pairs the encoded chunks
+by timestamp, and emits the alpha chunk as `Packet.alpha` so the WebM muxer writes the same Matroska
+`BlockAdditions` form used by source alpha. Input frames, derived color frames, and derived alpha frames all
+retain single-owner close semantics.
+
+**Consequences:** the permanent browser adapter declares `alpha` for VPx alpha decode/WebM copy-trim and
+`alpha:transcode` for alpha-preserving VPx transcode. Focused fresh Chromium evidence:
+`results/raw/chromium-2026-06-27T22-35-28-565Z.json` (`decode-seek/decode_vp9_alpha` and
+`trim/vp9_alpha_keyframe_aligned`, `2 PASS / 0 FAIL`, `--no-reuse`) and the final full Chromium run
+`results/raw/chromium-2026-06-28T00-57-29-541Z.json`, where all alpha decode/copy/transcode rows pass.
+Node validation covers real fixture alpha demux, synthetic `BlockAdditions`, muxer alpha round-trip, and
+alpha-preserving GOP trim/transcode plumbing. Root verification for this slice: `bun run typecheck`,
+`bun run check`,
+`bun test src/drivers/webm/webm-stream-copy.test.ts src/drivers/webm/webm.test.ts
+src/drivers/webm/ebml-write.test.ts src/api/codec-pipeline.test.ts src/api/create-media.test.ts`, and
+`bun run build`.
+
+**Rejected:** treating alpha as a second track (wrong WebM model); silently dropping `BlockAdditions` while
+declaring alpha; canvas-only alpha merge (fails hidden-RGB strictness); negative-timestamp preroll in
+WebM copy-trim; declaring `alpha:transcode` from decode support alone; hardcoding the VP9-alpha fixture or
+weakening the SSIM/alpha-plane oracle.
+
+### ADR-108 — Vorbis encode tail: permissive libvorbisenc wasm, lazy and miss-only
+
+**Context:** Session 6's encode-tail split left Vorbis and MP3 in different licensing buckets. Chromium has
+no WebCodecs `AudioEncoder` support for `codec:"vorbis"`, yet Vorbis output is part of the buildable
+benchmark surface: `transcode/wav_to_vorbis_ogg` and the WebM VP8/VP9/HEVC-to-VP8 rows whose audio target is
+Vorbis. Unlike MP3, Vorbis has a permissively licensed reference encoder: libogg and libvorbis/libvorbisenc
+use the Xiph.Org BSD-style license. Treating those rows as honest-NA would therefore violate the Session 6
+rule: a buildable permissive tail must be built, routed, validated, and benchmarked rather than registered
+as unavailable. The implementation still has to obey the package invariants: no CDN, no eager codec tail,
+no COOP/COEP on the common path, no fake WebCodecs support declaration, and every `AudioData` consumed by
+the encoder must be closed exactly once.
+
+**Decision:** add `src/codecs/wasm-vorbis-enc/` as an encode-only first-party `CodecDriver`
+(`id:'wasm-vorbis-enc'`, `tier:'wasm'`). The core is libogg 1.3.6 plus libvorbis/libvorbisenc 1.3.7, built
+with Emscripten as a single-file ES module (`vorbis-enc-wasm.js`) and wrapped by a small C boundary
+(`aibrush_vorbis_enc.c`) that accepts interleaved float PCM, drains libvorbis `ogg_packet`s, and exposes
+packet bytes/granule positions to TypeScript. The TypeScript driver normalizes `AudioEncoderConfig`, copies
+each `AudioData` to interleaved f32, feeds libvorbisenc in bounded chunks, closes the input `AudioData` in a
+`finally`, publishes the three Vorbis header packets through the existing `onConfig` bridge as Xiph-laced
+extradata, and emits encoded packets for `OggMuxer`/WebM muxers to page/lace. The driver is auto-registered
+through a lazy default proxy before the decode-only `wasm-vorbis` tail, so an encode query for Vorbis reaches
+the encoder while Vorbis decode still reaches Symphonia. The browser benchmark runner gets a separate
+`audio:vorbis-encode-native` feature token so only engines that really ship a native/libvorbis encode tail
+bypass `AudioEncoder.isConfigSupported=false`; ordinary WebCodecs audio encode gates remain unchanged.
+
+**Consequences:** Vorbis encode is now a real, permissive, self-hosted tail with recorded source URLs,
+SHA-256 hashes, and preserved license texts in `BUILD.md`, `THIRD_PARTY_NOTICES`, `LICENSE.libogg`, and
+`LICENSE.libvorbis`. Node validation runs the actual wasm/libvorbisenc core, muxes the produced packets via
+the first-party `OggMuxer`, and independently decodes the result through ffmpeg/libvorbis on synthetic plus
+five real WAV fixtures; helper tests pin config validation, header lacing, chunking, and close-once input
+ownership. Fresh focused Chromium evidence after re-vendoring shows the Vorbis encode rows passing in
+`results/raw/chromium-2026-06-28T00-16-13-478Z.json`, including `transcode/wav_to_vorbis_ogg` and the
+WebM VP8/Vorbis transcode rows. The tail is lazy and miss-only: probe-only and non-Vorbis encode paths do
+not instantiate the Emscripten module, while browsers with a future native Vorbis encoder can still win at
+the WebCodecs tier.
+
+**Rejected:** counting Vorbis encode as honest-NA when a permissive core exists; shipping LGPL LAME/Shine
+under the same decision (MP3 remains separately registered honest-NA until explicitly approved); declaring
+Vorbis encode by adapter feature bit while relying on Chromium's absent `AudioEncoder` path; muxing Vorbis
+without encoder-produced setup headers; feeding the whole source as one unbounded wasm buffer; a runtime CDN
+or eager inlined default-entry load.

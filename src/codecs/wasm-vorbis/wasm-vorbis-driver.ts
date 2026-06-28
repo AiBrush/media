@@ -12,9 +12,9 @@
  *
  * **Shape mirrors {@link import('../webcodecs-audio.ts')}:** `createDecoder` is a `TransformStream`
  * (`EncodedAudioChunk` → `AudioData`) — configure the wasm decoder on `start` (from the codec-private
- * `description`), decode each packet on `transform`, release on `flush`/`cancel`/abort. Vorbis is encode-
- * only-upstream here: there is no production pure-Rust Vorbis *encoder*, so `createEncoder` honestly
- * raises a typed {@link CapabilityError} (the router only reaches it on a WebCodecs encode miss anyway).
+ * `description`), decode each packet on `transform`, release on `flush`/`cancel`/abort. Vorbis encode is
+ * an honest miss until a vetted permissive encoder core (for example libvorbisenc + libogg with notices)
+ * is vendored behind the codec seam, so `createEncoder` raises a typed {@link CapabilityError}.
  *
  * **`AudioData` close-exactly-once (docs/architecture/06 §3):** decoder *output* `AudioData` is enqueued
  * to the readable and owned by the consumer — the driver never closes an emitted frame. There is no
@@ -132,8 +132,8 @@ function coreMissing(): CapabilityError {
 
 /**
  * Honest capability probe: a Vorbis **decode** query in a runtime that can carry WebCodecs-shaped audio
- * frames and whose vendored wasm core loads. Non-Vorbis, `encode` (no pure-Rust Vorbis encoder), missing
- * `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
+ * frames and whose vendored wasm core loads. Non-Vorbis, `encode` (no vetted Vorbis encoder core),
+ * missing `AudioData`/`EncodedAudioChunk`, or core-absent → `{ supported:false }` with a reason; never throws.
  * Being `tier:'wasm'`, the router only calls this after WebCodecs Vorbis has already missed.
  */
 async function supports(q: CodecQuery): Promise<CodecSupport> {
@@ -141,7 +141,9 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.config.codec !== VORBIS_CODEC) {
     return unsupported(`wasm-vorbis handles Vorbis only, not '${q.config.codec}'`);
   }
-  if (q.direction === 'encode') return unsupported('wasm-vorbis decodes only (no Vorbis encoder)');
+  if (q.direction === 'encode') {
+    return unsupported('wasm-vorbis decodes only (no vetted Vorbis encoder core vendored)');
+  }
   if (!hasWebCodecsAudioSeam()) {
     return unsupported('wasm-vorbis requires WebCodecs AudioData/EncodedAudioChunk');
   }
@@ -289,23 +291,28 @@ function errMessage(e: unknown): string {
   return 'unknown error';
 }
 
-// ============ createEncoder() — honest miss (no pure-Rust Vorbis encoder) ============
+// ============ createEncoder() — honest miss (no vetted Vorbis encoder core) ============
 
 /**
- * Vorbis **encode** is not provided: there is no production pure-Rust Vorbis encoder to compile to wasm
- * (Symphonia is decode-only). Per the no-silent-degrade contract (ADR-017) this raises a typed
- * {@link CapabilityError} immediately. The router only reaches here on a WebCodecs Vorbis-encode miss;
- * callers should target Opus/AAC for encoding instead.
+ * Vorbis **encode** is not provided: the vendored Symphonia tail is decode-only and no production,
+ * provenance-cleared permissive encoder core is registered. Per the no-silent-degrade contract (ADR-017)
+ * this raises a typed {@link CapabilityError} immediately. The router only reaches here on a WebCodecs
+ * Vorbis-encode miss.
  */
 function createEncoder(
   _config: EncoderConfig,
   _o?: StageOptions,
 ): TransformStream<RawFrame, EncodedChunk> {
-  throw new CapabilityError('capability-miss', 'wasm-vorbis does not support Vorbis encode', {
-    op: 'encode',
-    tried: ['wasm-vorbis'],
-    suggestion: 'encode to Opus or AAC instead (no pure-Rust Vorbis encoder exists)',
-  });
+  throw new CapabilityError(
+    'capability-miss',
+    'wasm-vorbis does not support Vorbis encode (no vetted permissive encoder core is vendored)',
+    {
+      op: 'encode',
+      tried: ['wasm-vorbis'],
+      suggestion:
+        'vendor a permissive libvorbis/libogg encoder core with notices, or encode to Opus/AAC',
+    },
+  );
 }
 
 // ============ driver + module ============

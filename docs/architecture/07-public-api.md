@@ -30,6 +30,7 @@ All ops are `async`, accept a trailing `{ signal?, onProgress? }`, and return a 
 ```ts
 media.probe(input: MediaInput, o?: CallOptions): Promise<MediaInfo>
 media.convert(input: MediaInput, opts: ConvertOptions, o?: CallOptions): Promise<Output>
+media.h264AbrLadder(input: MediaInput, ladder: readonly H264AbrRung[], o?: CallOptions): Promise<readonly Output[]>
 media.remux(input: MediaInput, opts: RemuxOptions, o?: CallOptions): Promise<Output>     // copy, no re-encode
 media.trim(input: MediaInput, opts: TrimOptions, o?: CallOptions): Promise<Output>
 media.decode(input: MediaInput, o?: CallOptions): MediaStreams                            // -> frame streams
@@ -56,13 +57,17 @@ type AudioBiquad = {
 }
 
 interface ConvertOptions {
-  to?: 'mp4' | 'mov' | 'webm' | 'mkv' | 'ogg' | 'wav' | 'mp3' | 'aac' | 'ts'   // target container
+  to?: 'mp4' | 'mov' | 'webm' | 'mkv' | 'ogg' | 'wav' | 'mp3' | 'aac' | 'adts'
+    | 'flac' | 'aiff' | 'caf' | 'avi' | 'ts' | 'm2ts' | 'mts' | 'mpegts'       // target container
   video?: false | {                                  // false = drop video
     codec?: 'h264' | 'hevc' | 'vp8' | 'vp9' | 'av1'
     width?: number; height?: number; fit?: 'contain' | 'cover' | 'fill'
-    fps?: number; bitrate?: number; crf?: number
+    fps?: number; bitrate?: number; bitrateMode?: VideoEncoderBitrateMode
+    crf?: number; twoPass?: boolean; bitDepth?: 8 | 10 | 12
+    alpha?: 'keep' | 'discard'
     rotate?: 0 | 90 | 180 | 270; flip?: 'h' | 'v'
     crop?: { x: number; y: number; width: number; height: number }
+    colorspace?: { to: string }; tonemap?: { to: 'sdr' }
   }
   audio?: false | {
     codec?: 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis'
@@ -74,15 +79,20 @@ interface ConvertOptions {
     dynamics?: { normalize?: { mode: 'peak' | 'rms'; targetDbfs: number }; limit?: { ceilingDbfs?: number; mode?: 'hard' | 'soft'; knee?: number } }
     biquad?: AudioBiquad | readonly AudioBiquad[]
   }
-  faststart?: boolean; fragmented?: boolean          // MP4 layout
+  faststart?: boolean; fragmented?: boolean          // MP4/WebM streaming layout
   sink?: Sink                                        // default: Blob
 }
-interface RemuxOptions { to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; trackSelect?: readonly string[]; sink?: Sink }
+interface RemuxOptions {
+  to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean
+  tags?: Record<string, string>                      // same-container tag rewrite
+  trackSelect?: readonly string[]; sink?: Sink
+}
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
 interface DecryptOptions { scheme: 'cenc' | 'cbcs' | 'hls-aes128'; keys: KeyMap; sink?: Sink }
 interface PacketStream { track: TrackInfo; packets: ReadableStream<Packet | EncodedChunk> }
-interface PacketStreams { video?: PacketStream; audio?: PacketStream }
+interface PacketStreams { video?: PacketStream; audio?: PacketStream; tracks?: readonly PacketStream[] }
 interface MuxSpec { container: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }
+interface H264AbrRung { name?: string; width: number; height: number; bitrate: number; fps?: number }
 ```
 
 `trim({ mode:'keyframe' })` is the fast lossless packet-copy path. `trim({ mode:'accurate' })`

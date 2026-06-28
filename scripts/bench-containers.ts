@@ -43,7 +43,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createMedia } from '../src/api/create-media.ts';
-import { type TimedFrameForTrim, trimTimedFrameStream } from '../src/api/engine.ts';
+import { type TimedFrameForTrim, trimTimedFrameStream } from '../src/api/trim-streams.ts';
 import type { MediaInfo, PacketStreams } from '../src/api/types.ts';
 import type { EncodedChunk, Packet, TrackInfo } from '../src/contracts/driver.ts';
 import { parseAiff } from '../src/drivers/aiff/aiff.ts';

@@ -26,6 +26,7 @@ import WebcodecsVideoModule, {
   queueIsBackpressured,
   reorderByTimestamp,
   shouldKeyframe,
+  videoEncodeOptions,
 } from './webcodecs-video.ts';
 
 /** A fake closable frame that records how many times it was closed (close-exactly-once assertions). */
@@ -245,6 +246,37 @@ describe('shouldKeyframe — GOP / keyframe-interval decision', () => {
   it('rejects a non-integer / negative frame index (a programming error, not silent)', () => {
     expect(() => shouldKeyframe(-1, 30)).toThrow(RangeError);
     expect(() => shouldKeyframe(1.5, 30)).toThrow(RangeError);
+  });
+});
+
+describe('videoEncodeOptions — keyframe plus codec-specific quantizer options', () => {
+  it('emits only a keyFrame flag when CRF/quantizer mode is not requested', () => {
+    expect(videoEncodeOptions(0, 30, 'avc1.42E01E', undefined)).toEqual({ keyFrame: true });
+    expect(videoEncodeOptions(1, 30, 'avc1.42E01E', undefined)).toEqual({ keyFrame: false });
+  });
+
+  it('maps a constant quantizer onto the WebCodecs codec-specific option object', () => {
+    expect(videoEncodeOptions(0, 30, 'avc1.42E01E', 23)).toEqual({
+      keyFrame: true,
+      avc: { quantizer: 23 },
+    });
+    expect(videoEncodeOptions(1, 30, 'hvc1.1.6.L93.B0', 24)).toEqual({
+      keyFrame: false,
+      hevc: { quantizer: 24 },
+    });
+    expect(videoEncodeOptions(2, 30, 'vp09.00.10.08', 31)).toEqual({
+      keyFrame: false,
+      vp9: { quantizer: 31 },
+    });
+    expect(videoEncodeOptions(3, 30, 'av01.0.04M.08', 32)).toEqual({
+      keyFrame: false,
+      av1: { quantizer: 32 },
+    });
+  });
+
+  it('rejects invalid quantizer requests before a frame is submitted', () => {
+    expect(() => videoEncodeOptions(0, 30, 'vp8', 12)).toThrow(CapabilityError);
+    expect(() => videoEncodeOptions(0, 30, 'avc1.42E01E', Number.NaN)).toThrow(RangeError);
   });
 });
 

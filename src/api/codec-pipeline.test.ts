@@ -31,6 +31,7 @@ import {
   outputDimensions,
   seekFrame,
   selectTrackInfos,
+  splitRgbaForVpxAlpha,
   videoCodecToken,
   videoEncoderCodecString,
   videoTrackInfoFromDecoderConfig,
@@ -43,6 +44,19 @@ import {
   retimeTimedFrameStream,
   videoFilterSpecs,
 } from './video-stream-plan.ts';
+
+describe('splitRgbaForVpxAlpha', () => {
+  it('turns RGBA pixels into opaque color plus grayscale alpha planes', () => {
+    const split = splitRgbaForVpxAlpha({
+      width: 3,
+      height: 1,
+      data: Uint8ClampedArray.from([10, 20, 30, 0, 40, 50, 60, 127, 70, 80, 90, 255]),
+    });
+
+    expect([...split.color.data]).toEqual([10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255]);
+    expect([...split.alpha.data]).toEqual([0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+  });
+});
 
 // ── container choice ───────────────────────────────────────────────────────────────────────────
 
@@ -793,8 +807,27 @@ describe('buildVideoEncoderConfig', () => {
     ).toThrow(InputError);
   });
 
-  it('does not silently drop CRF/two-pass requests from WebCodecs configs', () => {
-    expect(() => buildVideoEncoderConfig({ codec: 'h264', crf: 23 }, src, undefined)).toThrow(
+  it('uses a resolution-aware default bitrate for offline video encodes', () => {
+    expect(
+      buildVideoEncoderConfig({ codec: 'vp8', width: 640, height: 360 }, src, undefined),
+    ).toMatchObject({
+      bitrate: 2_534_400,
+      bitrateMode: 'variable',
+    });
+  });
+
+  it('builds CRF as WebCodecs quantizer mode but keeps two-pass as an honest miss', () => {
+    expect(buildVideoEncoderConfig({ codec: 'h264', crf: 23 }, src, undefined)).toEqual({
+      codec: 'avc1.42E028',
+      width: 1920,
+      height: 1080,
+      latencyMode: 'quality',
+      bitrateMode: 'quantizer',
+    });
+    expect(() =>
+      buildVideoEncoderConfig({ codec: 'h264', bitrate: 2_000_000, twoPass: true }, src, undefined),
+    ).toThrow(CapabilityError);
+    expect(() => buildVideoEncoderConfig({ codec: 'vp8', crf: 23 }, src, undefined)).toThrow(
       CapabilityError,
     );
   });
@@ -809,6 +842,9 @@ describe('buildVideoEncoderConfig', () => {
     ).toBe(
       'avc1.42E01E', // level 3.0 browser-seek-stable floor
     );
+    expect(() =>
+      buildVideoEncoderConfig({ codec: 'h264', width: 1, height: 1, fps: 30 }, src, undefined),
+    ).toThrow(InputError);
     // 720p@30 → L3.1 (0x1F)
     expect(
       buildVideoEncoderConfig({ codec: 'h264', width: 1280, height: 720, fps: 30 }, src, undefined)
@@ -857,6 +893,15 @@ describe('buildVideoEncoderConfig', () => {
     );
   });
 
+  it('honors requested 8-bit output and rejects unsupported 10-bit output requests', () => {
+    expect(buildVideoEncoderConfig({ codec: 'h264', bitDepth: 8 }, src, undefined).codec).toBe(
+      'avc1.42E028',
+    );
+    expect(() => buildVideoEncoderConfig({ codec: 'hevc', bitDepth: 10 }, src, undefined)).toThrow(
+      CapabilityError,
+    );
+  });
+
   it('rejects when output dimensions cannot be determined', () => {
     expect(() =>
       buildVideoEncoderConfig(
@@ -887,6 +932,14 @@ describe('planVideoRateControl', () => {
       mode: 'crf',
       crf: 23,
       codec: 'h264',
+      bitrateMode: 'quantizer',
+      quantizer: 23,
+      webCodecsConfigurable: true,
+    });
+    expect(planVideoRateControl({ crf: 23 }, 'vp8')).toEqual({
+      mode: 'crf',
+      crf: 23,
+      codec: 'vp8',
       bitrateMode: 'quantizer',
       webCodecsConfigurable: false,
     });

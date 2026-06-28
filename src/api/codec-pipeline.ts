@@ -11,8 +11,14 @@
  * independently testable, so it is factored out behind small pure functions rather than inlined.
  */
 
-import type { EncodedChunk, Packet, TrackInfo } from '../contracts/driver.ts';
-import { CapabilityError, InputError } from '../contracts/errors.ts';
+import type {
+  EncodedChunk,
+  Packet,
+  RawFrame,
+  StageOptions,
+  TrackInfo,
+} from '../contracts/driver.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
 
@@ -298,6 +304,27 @@ export function videoCodecToken(codecString: string): VideoCodec | undefined {
   return undefined;
 }
 
+function videoCodecCanCarryAlpha(codecString: string): boolean {
+  const c = codecString.toLowerCase();
+  return c === 'vp8' || c.startsWith('vp8.') || c === 'vp9' || c.startsWith('vp09.');
+}
+
+export function videoAlphaOption(
+  target: VideoTarget,
+  codecString: string,
+): AlphaOption | undefined {
+  if (target.alpha === 'discard') return 'discard';
+  if (target.alpha === 'keep') {
+    if (videoCodecCanCarryAlpha(codecString)) return 'keep';
+    throw new CapabilityError('capability-miss', 'alpha encode requires VP8/VP9', {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion: 'target VP8 or VP9, or set alpha:"discard"',
+    });
+  }
+  return undefined;
+}
+
 /** The public audio token a codec string denotes (`mp4a.*`→`aac`), for preserve-source. */
 export function audioCodecToken(codecString: string): AudioCodec | undefined {
   const c = codecString.toLowerCase();
@@ -437,10 +464,9 @@ function assertPositiveFinite(name: string, value: number): void {
 
 // ============ encoder configs (public target → WebCodecs *EncoderConfig) ============
 
-interface EagerVideoRateTarget extends Pick<VideoTarget, 'bitrate' | 'crf'> {
-  readonly bitrateMode?: VideoEncoderBitrateMode;
-  readonly twoPass?: boolean;
-}
+type EagerVideoRateTarget = Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>;
+
+type VideoBitDepth = 8 | 10 | 12;
 
 function assertValidVideoBitrate(bitrate: number): void {
   if (!Number.isSafeInteger(bitrate) || bitrate <= 0) {
@@ -448,27 +474,153 @@ function assertValidVideoBitrate(bitrate: number): void {
   }
 }
 
-function eagerVideoRateConfig(target: EagerVideoRateTarget): {
+function crfBounds(codec: VideoCodec | 'unknown'): { readonly min: number; readonly max: number } {
+  switch (codec) {
+    case 'h264':
+    case 'hevc':
+      return { min: 0, max: 51 };
+    case 'vp8':
+    case 'vp9':
+    case 'av1':
+    case 'unknown':
+      return { min: 0, max: 63 };
+  }
+}
+
+function assertValidVideoCrf(crf: number, codec: VideoCodec | 'unknown'): void {
+  const bounds = crfBounds(codec);
+  if (!Number.isFinite(crf) || crf < bounds.min || crf > bounds.max) {
+    throw new InputError(
+      'unsupported-input',
+      `video CRF for ${codec} must be in [${bounds.min}, ${bounds.max}]`,
+    );
+  }
+}
+
+function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
+  return codec === 'h264' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
+}
+
+function defaultVideoBitrate(codec: VideoCodec | 'unknown', width: number, height: number): number {
+  const minBitrate = 300_000;
+  const bitsPerPixelPerSecond = 10;
+  const efficiency: Record<VideoCodec | 'unknown', number> = {
+    h264: 1,
+    hevc: 0.7,
+    vp8: 1.1,
+    vp9: 0.8,
+    av1: 0.6,
+    unknown: 1,
+  };
+  return Math.max(
+    minBitrate,
+    Math.round(width * height * bitsPerPixelPerSecond * efficiency[codec]),
+  );
+}
+
+function eagerVideoRateConfig(
+  target: EagerVideoRateTarget,
+  codecString: string,
+  width: number,
+  height: number,
+): {
   readonly bitrate?: number;
   readonly bitrateMode?: VideoEncoderBitrateMode;
 } {
+  const codec = videoCodecToken(codecString) ?? 'unknown';
   if (target.bitrate !== undefined) assertValidVideoBitrate(target.bitrate);
+  if (target.crf !== undefined) assertValidVideoCrf(target.crf, codec);
   if (target.bitrate !== undefined && target.crf !== undefined) {
     throw new InputError('unsupported-input', 'bitrate/CRF conflict');
   }
   if (target.twoPass === true && target.bitrate === undefined) {
     throw new InputError('unsupported-input', 'two-pass needs bitrate');
   }
-  if (target.crf !== undefined || target.twoPass === true) {
-    throw new CapabilityError('capability-miss', 'CRF/two-pass unsupported', {
+  if (target.twoPass === true) {
+    throw new CapabilityError('capability-miss', 'WebCodecs has no two-pass video encode API', {
       op: 'encode',
       tried: ['webcodecs-video'],
-      suggestion: 'route to encoder tail',
+      suggestion: 'route to an encoder tail that exposes first-pass stats and second-pass control',
     });
   }
-  return target.bitrate === undefined
-    ? {}
-    : { bitrate: target.bitrate, bitrateMode: target.bitrateMode ?? 'variable' };
+  if (target.crf !== undefined) {
+    if (!webCodecsQuantizerSupported(codec)) {
+      throw new CapabilityError(
+        'capability-miss',
+        `CRF/quantizer encode unsupported for ${codec}`,
+        {
+          op: 'encode',
+          tried: ['webcodecs-video'],
+          suggestion: 'route to an encoder tail with native CRF support',
+        },
+      );
+    }
+    return { bitrateMode: 'quantizer' };
+  }
+  return {
+    bitrate: target.bitrate ?? defaultVideoBitrate(codec, width, height),
+    bitrateMode: target.bitrateMode ?? 'variable',
+  };
+}
+
+function normalizeVideoBitDepth(depth: number | undefined): VideoBitDepth | undefined {
+  if (depth === undefined) return undefined;
+  if (depth === 8 || depth === 10 || depth === 12) return depth;
+  throw new InputError('unsupported-input', `unsupported video bit depth ${depth}`);
+}
+
+function bitDepthFromAvc(codec: string): VideoBitDepth | undefined {
+  const match = /^avc[13]\.([0-9a-f]{2})/i.exec(codec);
+  const profileHex = match?.[1];
+  if (profileHex === undefined) return undefined;
+  const profile = Number.parseInt(profileHex, 16);
+  return profile === 110 ? 10 : 8;
+}
+
+function bitDepthFromHevc(codec: string): VideoBitDepth | undefined {
+  const profile = hevcProfileIdc(codec);
+  if (profile === undefined) return undefined;
+  if (profile === 1) return 8;
+  if (profile === 2) return 10;
+  return undefined;
+}
+
+function bitDepthFromDelimitedCodec(
+  codec: string,
+  prefix: 'vp09' | 'av01',
+): VideoBitDepth | undefined {
+  const fields = codec.split('.');
+  if (fields[0]?.toLowerCase() !== prefix) return undefined;
+  const rawDepth = fields[3];
+  if (rawDepth === undefined) return undefined;
+  return normalizeVideoBitDepth(Number(rawDepth));
+}
+
+function bitDepthFromCodec(codec: string): VideoBitDepth | undefined {
+  const lower = codec.toLowerCase();
+  return (
+    bitDepthFromAvc(lower) ??
+    bitDepthFromHevc(lower) ??
+    bitDepthFromDelimitedCodec(lower, 'vp09') ??
+    bitDepthFromDelimitedCodec(lower, 'av01') ??
+    (lower === 'vp8' ? 8 : undefined)
+  );
+}
+
+function assertTargetBitDepth(target: Pick<VideoTarget, 'bitDepth'>, codecString: string): void {
+  const requested = normalizeVideoBitDepth(target.bitDepth);
+  if (requested === undefined) return;
+  const codecDepth = bitDepthFromCodec(codecString);
+  if (codecDepth === requested) return;
+  throw new CapabilityError(
+    'capability-miss',
+    `video ${requested}-bit output is not available for codec '${codecString}'`,
+    {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion: 'target an 8-bit encode path or add a proven permissive Main10 encoder tail',
+    },
+  );
 }
 
 /**
@@ -494,17 +646,29 @@ export function buildVideoEncoderConfig(
     target.codec === 'h264'
       ? h264CodecStringForDimensions(width, height, target.fps)
       : videoEncoderCodecString(target.codec, sourceCodecString);
+  assertEncodableVideoDimensions(codec, width, height);
   assertSupportedVideoEncodeProfile(codec);
+  assertTargetBitDepth(target, codec);
   if (target.fps !== undefined) assertPositiveFinite('fps', target.fps);
-  const rateControl = eagerVideoRateConfig(target);
+  const rateControl = eagerVideoRateConfig(target, codec, width, height);
+  const alpha = videoAlphaOption(target, codec);
   return {
     codec,
     width,
     height,
     latencyMode: 'quality',
     ...rateControl,
+    ...(alpha !== undefined ? { alpha } : {}),
     ...(target.fps !== undefined ? { framerate: target.fps } : {}),
   };
+}
+
+function assertEncodableVideoDimensions(codec: string, width: number, height: number): void {
+  if (width >= 2 && height >= 2) return;
+  throw new InputError(
+    'unsupported-input',
+    `video encode ${codec} needs at least 2x2 output dimensions; got ${width}x${height}`,
+  );
 }
 
 /**
@@ -558,6 +722,7 @@ export function videoTrackInfoFromDecoderConfig(
 export function audioTrackInfoFromDecoderConfig(
   config: AudioDecoderConfig,
   durationSec?: number,
+  gapless?: TrackInfo['gapless'],
 ): TrackInfo {
   return {
     id: 0,
@@ -565,6 +730,7 @@ export function audioTrackInfoFromDecoderConfig(
     codec: config.codec,
     config,
     ...(durationSec !== undefined ? { durationSec } : {}),
+    ...(gapless !== undefined ? { gapless } : {}),
   };
 }
 
@@ -616,6 +782,414 @@ export function unwrapPackets(packets: ReadableStream<Packet>): ReadableStream<E
       },
     }),
   );
+}
+
+const RGBA_BYTES_PER_PIXEL = 4;
+const RGBA_PIXEL_SIDECAR_PROPERTY = '__aibrushRgbaPixels';
+
+export interface RgbaFramePixels {
+  readonly data: Uint8ClampedArray;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface VpxAlphaSplitPixels {
+  readonly color: RgbaFramePixels;
+  readonly alpha: RgbaFramePixels;
+}
+
+function assertRgbaPixelsShape(pixels: RgbaFramePixels, op: 'decode' | 'encode'): void {
+  const code = op === 'decode' ? 'decode-error' : 'encode-error';
+  if (!Number.isSafeInteger(pixels.width) || pixels.width <= 0) {
+    throw new MediaError(code, `RGBA pixels have invalid width ${pixels.width}`);
+  }
+  if (!Number.isSafeInteger(pixels.height) || pixels.height <= 0) {
+    throw new MediaError(code, `RGBA pixels have invalid height ${pixels.height}`);
+  }
+  const minimumSize = pixels.width * pixels.height * RGBA_BYTES_PER_PIXEL;
+  if (pixels.data.length < minimumSize) {
+    throw new MediaError(
+      code,
+      `RGBA pixels are truncated: ${pixels.data.length} bytes for ${pixels.width}x${pixels.height}`,
+    );
+  }
+}
+
+function rgbaPixelSidecar(frame: VideoFrame): RgbaFramePixels | undefined {
+  const sidecar = (frame as VideoFrame & { readonly __aibrushRgbaPixels?: unknown })
+    .__aibrushRgbaPixels;
+  if (typeof sidecar !== 'object' || sidecar === null) return undefined;
+  const record = sidecar as Partial<RgbaFramePixels>;
+  const { data, width, height } = record;
+  if (!(data instanceof Uint8ClampedArray)) return undefined;
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height)) return undefined;
+  if (width === undefined || height === undefined || width <= 0 || height <= 0) return undefined;
+  if (data.length < width * height * RGBA_BYTES_PER_PIXEL) return undefined;
+  return { data, width, height };
+}
+
+function frameDimension(frame: VideoFrame, axis: 'width' | 'height'): number {
+  const display = axis === 'width' ? frame.displayWidth : frame.displayHeight;
+  const coded = axis === 'width' ? frame.codedWidth : frame.codedHeight;
+  const value = display || coded;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new MediaError('decode-error', `VPx alpha frame has invalid ${axis} ${value}`);
+  }
+  return value;
+}
+
+async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFramePixels> {
+  const width = frameDimension(frame, 'width');
+  const height = frameDimension(frame, 'height');
+  const sidecar = rgbaPixelSidecar(frame);
+  if (sidecar !== undefined && sidecar.width === width && sidecar.height === height) {
+    return {
+      data: sidecar.data.slice(0, width * height * RGBA_BYTES_PER_PIXEL),
+      width,
+      height,
+    };
+  }
+  const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA_BYTES_PER_PIXEL }];
+  const rect: DOMRectInit = { x: 0, y: 0, width, height };
+  const minimumSize = width * height * RGBA_BYTES_PER_PIXEL;
+  const allocationSize = frame.allocationSize({ format: 'RGBA', rect, layout });
+  const data = new Uint8ClampedArray(Math.max(allocationSize, minimumSize));
+  await frame.copyTo(data, { format: 'RGBA', rect, layout });
+  return {
+    data: data.length === minimumSize ? data : data.slice(0, minimumSize),
+    width,
+    height,
+  };
+}
+
+function rgbaPixelsToFrame(pixels: RgbaFramePixels, color: VideoFrame): VideoFrame {
+  const base: VideoFrameBufferInit = {
+    format: 'RGBA',
+    codedWidth: pixels.width,
+    codedHeight: pixels.height,
+    timestamp: color.timestamp,
+    layout: [{ offset: 0, stride: pixels.width * RGBA_BYTES_PER_PIXEL }],
+  };
+  const init: VideoFrameBufferInit =
+    color.duration === null ? base : { ...base, duration: color.duration };
+  const frame = new VideoFrame(pixels.data, init);
+  try {
+    Object.defineProperty(frame, RGBA_PIXEL_SIDECAR_PROPERTY, {
+      value: {
+        data: pixels.data.slice(),
+        width: pixels.width,
+        height: pixels.height,
+      } satisfies RgbaFramePixels,
+    });
+  } catch {
+    // Some host objects may reject expando properties; the VideoFrame itself remains valid.
+  }
+  return frame;
+}
+
+export function splitRgbaForVpxAlpha(pixels: RgbaFramePixels): VpxAlphaSplitPixels {
+  assertRgbaPixelsShape(pixels, 'encode');
+  const minimumSize = pixels.width * pixels.height * RGBA_BYTES_PER_PIXEL;
+  const color = new Uint8ClampedArray(minimumSize);
+  const alpha = new Uint8ClampedArray(minimumSize);
+  for (let i = 0; i < minimumSize; i += RGBA_BYTES_PER_PIXEL) {
+    const a = pixels.data[i + 3] as number;
+    color[i] = pixels.data[i] as number;
+    color[i + 1] = pixels.data[i + 1] as number;
+    color[i + 2] = pixels.data[i + 2] as number;
+    color[i + 3] = 0xff;
+    alpha[i] = a;
+    alpha[i + 1] = a;
+    alpha[i + 2] = a;
+    alpha[i + 3] = 0xff;
+  }
+  return {
+    color: { data: color, width: pixels.width, height: pixels.height },
+    alpha: { data: alpha, width: pixels.width, height: pixels.height },
+  };
+}
+
+async function splitFrameForVpxAlpha(
+  frame: VideoFrame,
+): Promise<{ color: VideoFrame; alpha: VideoFrame }> {
+  const split = splitRgbaForVpxAlpha(await rgbaPixelsFromFrame(frame));
+  return {
+    color: rgbaPixelsToFrame(split.color, frame),
+    alpha: rgbaPixelsToFrame(split.alpha, frame),
+  };
+}
+
+async function mergeAlphaFrames(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
+  const width = frameDimension(color, 'width');
+  const height = frameDimension(color, 'height');
+  if (frameDimension(alpha, 'width') !== width || frameDimension(alpha, 'height') !== height) {
+    throw new MediaError(
+      'decode-error',
+      `VPx alpha plane dimensions ${frameDimension(alpha, 'width')}x${frameDimension(alpha, 'height')} do not match color frame ${width}x${height}`,
+    );
+  }
+
+  const colorPixels = await rgbaPixelsFromFrame(color);
+  const alphaPixels = await rgbaPixelsFromFrame(alpha);
+  for (let i = 0; i < colorPixels.data.length; i += RGBA_BYTES_PER_PIXEL) {
+    colorPixels.data[i + 3] = alphaPixels.data[i] as number;
+  }
+  return rgbaPixelsToFrame(colorPixels, color);
+}
+
+export interface VpxAlphaEncodeOptions {
+  readonly config: VideoEncoderConfig;
+  readonly createEncoder: (
+    config: VideoEncoderConfig,
+    o?: StageOptions,
+  ) => TransformStream<RawFrame, EncodedChunk>;
+  readonly colorStage?: StageOptions;
+  readonly alphaStage?: StageOptions;
+}
+
+/**
+ * Encode an RGBA VPx stream as Matroska/WebM-compatible colour packets plus VPx alpha side packets.
+ * Chromium's WebCodecs encoder does not expose a second alpha chunk from a single encode call, while our
+ * WebM muxer writes the Matroska alpha form through `Packet.alpha`. We therefore split each input frame
+ * into an opaque-colour frame and a grayscale-alpha frame, feed two identical VPx encoders, then pair the
+ * encoded chunks by timestamp. The original input frame is closed exactly once after its pixels have been
+ * copied; the derived frames are owned and closed by the encoder drivers.
+ */
+export function encodeVideoFramesWithAlpha(
+  frames: ReadableStream<VideoFrame>,
+  options: VpxAlphaEncodeOptions,
+): ReadableStream<Packet> {
+  const colorEncoder = options.createEncoder(options.config, options.colorStage);
+  const alphaEncoder = options.createEncoder(options.config, options.alphaStage);
+  const inputReader = frames.getReader();
+  const colorWriter = colorEncoder.writable.getWriter();
+  const alphaWriter = alphaEncoder.writable.getWriter();
+  const colorReader = colorEncoder.readable.getReader();
+  const alphaReader = alphaEncoder.readable.getReader();
+  const alphaByTimestamp = new Map<number, EncodedChunk>();
+  let alphaDone = false;
+  let pumpPromise: Promise<void> | undefined;
+  const writeDerivedFrame = async (
+    writer: WritableStreamDefaultWriter<RawFrame>,
+    frame: VideoFrame,
+  ): Promise<void> => {
+    try {
+      await writer.ready;
+      await writer.write(frame);
+    } catch (error) {
+      closeFrame(frame);
+      throw error;
+    }
+  };
+
+  const pumpInput = (): Promise<void> => {
+    pumpPromise ??= (async (): Promise<void> => {
+      try {
+        for (;;) {
+          const { done, value } = await inputReader.read();
+          if (done) break;
+          let split: { color: VideoFrame; alpha: VideoFrame } | undefined;
+          try {
+            split = await splitFrameForVpxAlpha(value);
+          } finally {
+            closeFrame(value);
+          }
+          await Promise.all([
+            writeDerivedFrame(colorWriter, split.color),
+            writeDerivedFrame(alphaWriter, split.alpha),
+          ]);
+        }
+        await Promise.all([colorWriter.close(), alphaWriter.close()]);
+      } catch (error) {
+        await Promise.allSettled([colorWriter.abort(error), alphaWriter.abort(error)]);
+        throw error;
+      } finally {
+        inputReader.releaseLock();
+        colorWriter.releaseLock();
+        alphaWriter.releaseLock();
+      }
+    })();
+    return pumpPromise;
+  };
+
+  const alphaForTimestamp = async (timestamp: number): Promise<EncodedChunk | undefined> => {
+    for (const [alphaTimestamp] of alphaByTimestamp) {
+      if (alphaTimestamp >= timestamp) continue;
+      alphaByTimestamp.delete(alphaTimestamp);
+    }
+    const cached = alphaByTimestamp.get(timestamp);
+    if (cached !== undefined) {
+      alphaByTimestamp.delete(timestamp);
+      return cached;
+    }
+    while (!alphaDone) {
+      const { done, value } = await alphaReader.read();
+      if (done) {
+        alphaDone = true;
+        return undefined;
+      }
+      if (value.timestamp < timestamp) continue;
+      if (value.timestamp === timestamp) return value;
+      alphaByTimestamp.set(value.timestamp, value);
+      return undefined;
+    }
+    return undefined;
+  };
+
+  return new ReadableStream<Packet>({
+    start(): void {
+      void pumpInput();
+    },
+    async pull(controller): Promise<void> {
+      try {
+        const { done, value: color } = await colorReader.read();
+        if (done) {
+          await pumpInput();
+          controller.close();
+          return;
+        }
+        const alpha = await alphaForTimestamp(color.timestamp);
+        if (alpha === undefined) {
+          throw new MediaError(
+            'encode-error',
+            `VPx alpha encode produced no alpha packet for timestamp ${color.timestamp}`,
+          );
+        }
+        controller.enqueue({ chunk: color, alpha });
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await Promise.allSettled([
+        inputReader.cancel(reason),
+        colorReader.cancel(reason),
+        alphaReader.cancel(reason),
+        colorWriter.abort(reason),
+        alphaWriter.abort(reason),
+      ]);
+      await pumpPromise?.catch(() => undefined);
+    },
+  });
+}
+
+function enqueueFrame(
+  controller: ReadableStreamDefaultController<VideoFrame>,
+  frame: VideoFrame,
+): void {
+  let handedOff = false;
+  try {
+    controller.enqueue(frame);
+    handedOff = true;
+  } finally {
+    if (!handedOff) closeFrame(frame);
+  }
+}
+
+function alphaChunkStream(packets: ReadableStream<Packet>): ReadableStream<EncodedChunk> {
+  return packets.pipeThrough(
+    new TransformStream<Packet, EncodedChunk>({
+      transform(packet, controller): void {
+        if (packet.alpha !== undefined) controller.enqueue(packet.alpha);
+      },
+    }),
+  );
+}
+
+/**
+ * Decode WebM/Matroska VPx packets whose alpha plane rides as BlockAdditions. WebCodecs accepts one VPx
+ * elementary stream per decoder, so color and alpha are decoded separately, then paired by timestamp and
+ * merged into a fresh RGBA `VideoFrame`. Every intermediate color/alpha frame is closed exactly once;
+ * the merged output frame is owned by the downstream consumer. Use only for tracks that are already
+ * known to carry alpha side data, otherwise the alpha branch would needlessly drain a whole filtered
+ * packet stream before the first color frame can be released.
+ */
+export function decodeVideoPacketsWithAlpha(
+  packets: ReadableStream<Packet>,
+  createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+): ReadableStream<VideoFrame> {
+  const [colorPackets, alphaPackets] = packets.tee();
+  const colorFrames = unwrapPackets(colorPackets).pipeThrough(
+    createDecoder(),
+  ) as ReadableStream<VideoFrame>;
+  const alphaFrames = alphaChunkStream(alphaPackets).pipeThrough(
+    createDecoder(),
+  ) as ReadableStream<VideoFrame>;
+  const colorReader = colorFrames.getReader();
+  const alphaReader = alphaFrames.getReader();
+  const alphaByTimestamp = new Map<number, VideoFrame>();
+  let alphaDone = false;
+
+  const closeBufferedAlpha = (): void => {
+    for (const frame of alphaByTimestamp.values()) closeFrame(frame);
+    alphaByTimestamp.clear();
+  };
+
+  const alphaForTimestamp = async (timestamp: number): Promise<VideoFrame | undefined> => {
+    for (const [alphaTimestamp, frame] of alphaByTimestamp) {
+      if (alphaTimestamp >= timestamp) continue;
+      closeFrame(frame);
+      alphaByTimestamp.delete(alphaTimestamp);
+    }
+
+    const cached = alphaByTimestamp.get(timestamp);
+    if (cached !== undefined) {
+      alphaByTimestamp.delete(timestamp);
+      return cached;
+    }
+
+    while (!alphaDone) {
+      const { done, value } = await alphaReader.read();
+      if (done) {
+        alphaDone = true;
+        return undefined;
+      }
+      if (value.timestamp < timestamp) {
+        closeFrame(value);
+        continue;
+      }
+      if (value.timestamp === timestamp) return value;
+      alphaByTimestamp.set(value.timestamp, value);
+      return undefined;
+    }
+    return undefined;
+  };
+
+  return new ReadableStream<VideoFrame>({
+    async pull(controller): Promise<void> {
+      const { done, value: color } = await colorReader.read();
+      if (done) {
+        closeBufferedAlpha();
+        controller.close();
+        return;
+      }
+
+      let alpha: VideoFrame | undefined;
+      let output: VideoFrame | undefined;
+      try {
+        alpha = await alphaForTimestamp(color.timestamp);
+        if (alpha === undefined) {
+          enqueueFrame(controller, color);
+          return;
+        }
+        output = await mergeAlphaFrames(color, alpha);
+        closeFrame(color);
+        closeFrame(alpha);
+        alpha = undefined;
+        enqueueFrame(controller, output);
+        output = undefined;
+      } catch (e) {
+        closeFrame(color);
+        if (alpha !== undefined) closeFrame(alpha);
+        if (output !== undefined) closeFrame(output);
+        controller.error(e);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
+      closeBufferedAlpha();
+    },
+  });
 }
 
 /**

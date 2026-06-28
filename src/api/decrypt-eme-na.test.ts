@@ -11,11 +11,31 @@
 
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import { fromBytes } from '../sources/source.ts';
+import { type Source, fromBytes } from '../sources/source.ts';
 import { createMedia } from './create-media.ts';
+import type { DecryptOptions } from './types.ts';
 
-/** A source that THROWS if anything ever tries to read its bytes — so any I/O would surface loudly. */
-const explodingSource = fromBytes(new Uint8Array(0), { mime: 'video/mp4' });
+/** A source that throws if anything ever tries to read its bytes, so any I/O surfaces loudly. */
+const explodingSource: Source = {
+  __media: 'source',
+  kind: 'bytes',
+  size: 8,
+  mimeHint: 'video/mp4',
+  stream(): ReadableStream<Uint8Array> {
+    throw new Error('decrypt preflight unexpectedly read the source stream');
+  },
+  range(): Promise<Uint8Array> {
+    throw new Error('decrypt preflight unexpectedly read a source range');
+  },
+};
+
+const PROVIDED_KEY: DecryptOptions['keys'] = {
+  '00000000000000000000000000000000': '00112233445566778899aabbccddeeff',
+};
+
+function runtimeDecryptOptions(scheme: string, keys = PROVIDED_KEY): DecryptOptions {
+  return { scheme, keys } as unknown as DecryptOptions;
+}
 
 describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', () => {
   for (const scheme of ['cenc', 'cbcs', 'hls-aes128'] as const) {
@@ -81,4 +101,22 @@ describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', 
     expect(err).toBeInstanceOf(MediaError);
     expect((err as MediaError).message).not.toMatch(/EME\/ClearKey/); // proceeded past the guard
   });
+});
+
+describe('media.decrypt — unsupported encrypted-media schemes are typed misses before I/O', () => {
+  for (const scheme of ['clearkey', 'cenc-cens', 'hls-sample-aes'] as const) {
+    it(`scheme '${scheme}' rejects as unsupported before touching the source`, async () => {
+      const err = await createMedia()
+        .decrypt(explodingSource, runtimeDecryptOptions(scheme))
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+
+      expect(err).toBeInstanceOf(CapabilityError);
+      expect((err as CapabilityError).code).toBe('capability-miss');
+      expect((err as CapabilityError).message).toContain(scheme);
+      expect((err as CapabilityError).detail).toMatchObject({ op: 'decrypt', tried: [] });
+    });
+  }
 });
