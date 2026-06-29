@@ -464,6 +464,7 @@ describe('mux — caller packet streams (public packet seam)', () => {
 
     for (const streams of [
       { video: 7 as never },
+      { video: { track: null, packets: packetStream() } as never },
       { video: { track: invalidTrack, packets: packetStream() } as never },
       { video: { track: audioInVideoSlot, packets: packetStream() } },
       { video: { track: configlessVideo, packets: packetStream() } },
@@ -471,7 +472,7 @@ describe('mux — caller packet streams (public packet seam)', () => {
     ] satisfies readonly PacketStreams[]) {
       await expect(media().mux(streams, { container: 'mp4' })).rejects.toBeInstanceOf(InputError);
     }
-    expect(cancelled).toBe(3);
+    expect(cancelled).toBe(4);
   });
 
   it('rejects non-chunk-muxable targets before consuming packet streams', async () => {

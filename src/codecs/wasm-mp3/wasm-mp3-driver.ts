@@ -143,6 +143,11 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.direction === 'encode') {
     return unsupported('wasm-mp3 decodes only (LGPL MP3 encode core is not approved)');
   }
+  try {
+    normalizeMp3DecoderConfig(q.config as AudioDecoderConfig);
+  } catch (e: unknown) {
+    return unsupported(errMessage(e));
+  }
   if (!hasWebCodecsAudioSeam()) {
     return unsupported('wasm-mp3 requires WebCodecs AudioData/EncodedAudioChunk');
   }

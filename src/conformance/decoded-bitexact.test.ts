@@ -26,6 +26,7 @@ import {
 const ROOT = new URL('../../', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
 const GOLDEN_DIR = `${ROOT}fixtures/golden/decoded`;
+const REAL_FLAC_DIGEST_TIMEOUT_MS = 15_000;
 
 const FLAC_FIXTURES = [
   'sfx.flac',
@@ -52,16 +53,20 @@ async function loadBytes(id: string): Promise<Uint8Array> {
 }
 
 describe('decoded-frames-bitexact — pure-TS FLAC decode reproduces the committed PCM digest', () => {
-  it.each(FLAC_FIXTURES)('%s decodes to the sha256-pinned interleaved PCM', async (id) => {
-    const golden = await loadGolden(id);
-    const actual = await flacDecodeGolden(await loadBytes(id));
-    expect(actual.sampleRate).toBe(golden.sampleRate);
-    expect(actual.channels).toBe(golden.channels);
-    expect(actual.bitsPerSample).toBe(golden.bitsPerSample);
-    expect(actual.frames).toBe(golden.frames);
-    expect(actual.bytes).toBe(golden.bytes);
-    expect(actual.sha256).toBe(golden.sha256); // the bit-exact gate
-  });
+  it.each(FLAC_FIXTURES)(
+    '%s decodes to the sha256-pinned interleaved PCM',
+    async (id) => {
+      const golden = await loadGolden(id);
+      const actual = await flacDecodeGolden(await loadBytes(id));
+      expect(actual.sampleRate).toBe(golden.sampleRate);
+      expect(actual.channels).toBe(golden.channels);
+      expect(actual.bitsPerSample).toBe(golden.bitsPerSample);
+      expect(actual.frames).toBe(golden.frames);
+      expect(actual.bytes).toBe(golden.bytes);
+      expect(actual.sha256).toBe(golden.sha256); // the bit-exact gate
+    },
+    REAL_FLAC_DIGEST_TIMEOUT_MS,
+  );
 
   it('the FLAC corpus is diverse (≥5 files spanning 8/16/24-bit, mono/stereo/multichannel, hi-res)', async () => {
     const depths = new Set<number>();

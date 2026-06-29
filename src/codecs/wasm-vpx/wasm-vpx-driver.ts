@@ -156,11 +156,14 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.direction === 'encode') {
     return unsupported('wasm-vpx is a decode-only fallback (VP8/VP9 encode is out of scope)');
   }
+  let init: VpxDecoderInit;
   try {
-    parseVpxCodec(q.config.codec);
+    init = normalizeVpxDecoderConfig(q.config as VideoDecoderConfig);
   } catch {
     return unsupported(`wasm-vpx handles VP8/VP9 only, not '${q.config.codec}'`);
   }
+  const coreEnvelope = vpxEnvelopeMiss(init);
+  if (coreEnvelope !== undefined) return coreEnvelope;
   if (!(await hasVpxCoreGlue())) {
     return unsupported('wasm-vpx core glue is not vendored (see BUILD.md)');
   }
@@ -168,6 +171,20 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported('wasm-vpx requires WebCodecs VideoFrame/EncodedVideoChunk');
   }
   return { supported: true, hardwareAccelerated: false };
+}
+
+function vpxEnvelopeMiss(init: VpxDecoderInit): CodecSupport | undefined {
+  if (init.bitDepth !== 8) {
+    return unsupported(
+      `wasm-vpx ogv.js core supports 8-bit VP8/VP9 only, not ${init.bitDepth}-bit`,
+    );
+  }
+  if (init.subsampling > 1) {
+    return unsupported(
+      `wasm-vpx ogv.js core supports 4:2:0 VP8/VP9 only, not subsampling code ${init.subsampling}`,
+    );
+  }
+  return undefined;
 }
 
 // ============ seam narrowing + VideoFrame construction (browser-only types) ============

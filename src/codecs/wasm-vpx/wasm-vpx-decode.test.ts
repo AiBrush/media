@@ -96,6 +96,7 @@ describe('VP8/VP9 decode — vendored ogv.js libvpx cores vs the ffmpeg referenc
         codec,
         profile: 0,
         bitDepth: 8,
+        subsampling: 1,
         codedWidth: width,
         codedHeight: height,
       });
@@ -135,6 +136,7 @@ describe('VP8/VP9 decode — vendored ogv.js libvpx cores vs the ffmpeg referenc
       codec: 'vp9',
       profile: 0,
       bitDepth: 8,
+      subsampling: 1,
       codedWidth: 320,
       codedHeight: 240,
     });

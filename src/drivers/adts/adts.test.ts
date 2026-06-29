@@ -7,6 +7,7 @@ import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-suppo
 import { Mp3Driver } from '../mp3/mp3-driver.ts';
 import {
   AdtsDriver,
+  adtsAacPcmDecodePlan,
   concatPcmChunks,
   enumerateAdtsFrames,
   parseAdts,
@@ -234,6 +235,14 @@ describe('enumerateAdtsFrames — strict can-fail oracle vs ffprobe (sfx.adts)',
 describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
   const decodePcm = AdtsDriver.decodePcm;
   if (!decodePcm) throw new Error('AdtsDriver must expose decodePcm');
+
+  it('plans Firefox and force-software AAC PCM extraction through the wasm AAC tail', () => {
+    expect(adtsAacPcmDecodePlan(false)).toEqual(['webcodecs-audio', 'wasm-aac']);
+    expect(adtsAacPcmDecodePlan(false, 'auto')).toEqual(['webcodecs-audio', 'wasm-aac']);
+    expect(adtsAacPcmDecodePlan(true)).toEqual(['wasm-aac']);
+    expect(adtsAacPcmDecodePlan(false, 'force-software')).toEqual(['wasm-aac']);
+    expect(adtsAacPcmDecodePlan(true, 'force-software')).toEqual(['wasm-aac']);
+  });
 
   it('converts interleaved f32 decoder output into canonical planar PCM', () => {
     const pcm = pcmFromInterleavedF32(new Float32Array([0.25, -0.25, 0.5, -0.5]), 2, 48_000);

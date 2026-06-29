@@ -13,13 +13,19 @@ import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { audioFilterSpecs } from './audio-stream-plan.ts';
 import {
   audioCodecToken,
+  audioEncodeNeedsSoftwareRuntime,
   audioEncoderCodecString,
   audioTrackInfoFromDecoderConfig,
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
+  buildVideoEncoderConfigForRuntime,
   chooseOutputContainer,
   containerHasChunkMuxer,
   drainEncoderToMuxer,
+  firefoxAudioTranscodeDeclineReason,
+  firefoxOpusAudioEncodeTarget,
+  firefoxOpusEncodeUsesWasm,
+  firefoxVideoTranscodeDeclineReason,
   frameSatisfiesSeek,
   h264CodecStringForDimensions,
   h264LevelIdcForDimensions,
@@ -29,12 +35,14 @@ import {
   isUnsupportedHevcEncodeProfile,
   normalizeDecoderCodec,
   outputDimensions,
+  resolveAudioEncodeTargetForRuntime,
   seekFrame,
   selectTrackInfos,
   splitRgbaForVpxAlpha,
   videoCodecToken,
   videoEncoderCodecString,
   videoTrackInfoFromDecoderConfig,
+  webkitVideoTranscodeDeclineReason,
 } from './codec-pipeline.ts';
 import {
   planCfrFrameRetiming,
@@ -44,6 +52,23 @@ import {
   retimeTimedFrameStream,
   videoFilterSpecs,
 } from './video-stream-plan.ts';
+
+async function withNavigator<T>(value: unknown, fn: () => T | Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (original !== undefined) {
+      Object.defineProperty(globalThis, 'navigator', original);
+    } else {
+      Reflect.deleteProperty(globalThis, 'navigator');
+    }
+  }
+}
 
 describe('splitRgbaForVpxAlpha', () => {
   it('turns RGBA pixels into opaque color plus grayscale alpha planes', () => {
@@ -184,6 +209,8 @@ describe('videoCodecToken / audioCodecToken', () => {
   it('maps audio codec strings to tokens', () => {
     expect(audioCodecToken('mp4a.40.2')).toBe('aac');
     expect(audioCodecToken('opus')).toBe('opus');
+    expect(audioCodecToken('mp4a.6b')).toBe('mp3');
+    expect(audioCodecToken('mp4a.69')).toBe('mp3');
     expect(audioCodecToken('flac')).toBe('flac');
     expect(audioCodecToken('vorbis')).toBe('vorbis');
     expect(audioCodecToken('avc1.42E01E')).toBeUndefined();
@@ -339,6 +366,11 @@ describe('outputDimensions', () => {
       height: 320,
     });
     expect(outputDimensions({ rotate: 270 }, src)).toEqual({ width: 1080, height: 1920 });
+  });
+
+  it('keeps the source dimension for an omitted resize axis', () => {
+    expect(outputDimensions({ width: 320 }, src)).toEqual({ width: 320, height: 1080 });
+    expect(outputDimensions({ height: 240 }, src)).toEqual({ width: 1920, height: 240 });
   });
 
   it('flip is dimension-preserving', () => {
@@ -913,6 +945,114 @@ describe('buildVideoEncoderConfig', () => {
   });
 });
 
+describe('webkitVideoTranscodeDeclineReason', () => {
+  const src = { width: 1920, height: 1080, fps: 30 };
+
+  it('declines the WebKit sub-modes that the browser harness proves unstable for this package', () => {
+    expect(webkitVideoTranscodeDeclineReason({ fps: 15 }, src)).toContain('fps downsample');
+    expect(webkitVideoTranscodeDeclineReason({ fps: 1 }, src)).toContain('fps downsample');
+    expect(webkitVideoTranscodeDeclineReason({ rotate: 90 }, src)).toContain('rotate 90');
+    expect(webkitVideoTranscodeDeclineReason({ rotate: 180 }, src)).toContain('rotate 180');
+    expect(webkitVideoTranscodeDeclineReason({ colorspace: { to: 'bt2020' } }, src)).toContain(
+      'colorspace',
+    );
+    expect(webkitVideoTranscodeDeclineReason({ tonemap: { to: 'sdr' } }, src)).toContain('tonemap');
+    expect(webkitVideoTranscodeDeclineReason({ alpha: 'keep' }, src)).toContain('alpha-preserving');
+  });
+
+  it('keeps WebKit sub-modes runnable when focused evidence shows they pass', () => {
+    expect(webkitVideoTranscodeDeclineReason({ fps: 30 }, src)).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ fps: 60 }, src)).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ rotate: 270 }, src)).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ width: 1280, height: 720 }, src)).toBeUndefined();
+  });
+
+  it('does not guess a WebKit fps downsample decline without a finite source fps', () => {
+    expect(
+      webkitVideoTranscodeDeclineReason({ fps: 15 }, { width: 1920, height: 1080 }),
+    ).toBeUndefined();
+    expect(
+      webkitVideoTranscodeDeclineReason(
+        { fps: 15 },
+        { width: 1920, height: 1080, fps: Number.NaN },
+      ),
+    ).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({}, src)).toBeUndefined();
+  });
+});
+
+describe('firefoxVideoTranscodeDeclineReason', () => {
+  it('declines Firefox VPx alpha-preserving encode subcases', () => {
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9', alpha: 'keep' }, undefined),
+    ).toContain('VPx alpha-preserving');
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp8', alpha: 'keep' }, undefined),
+    ).toContain('VPx alpha-preserving');
+    expect(firefoxVideoTranscodeDeclineReason({ alpha: 'keep' }, 'vp9')).toContain(
+      'VPx alpha-preserving',
+    );
+    expect(firefoxVideoTranscodeDeclineReason({ alpha: 'keep' }, 'vp09.00.10.08')).toContain(
+      'VPx alpha-preserving',
+    );
+  });
+
+  it('does not guess alpha-preserving declines without a known VPx target', () => {
+    expect(firefoxVideoTranscodeDeclineReason({ alpha: 'keep' }, undefined)).toBeUndefined();
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9', alpha: 'discard' }, undefined),
+    ).toBeUndefined();
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9', width: 320 }, undefined),
+    ).toBeUndefined();
+  });
+
+  it('declines Firefox known-timeout VP9 output before opening frame streams', () => {
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9' }, 'avc1.640028', {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        durationSec: 30,
+      }),
+    ).toContain('VP9 video transcode');
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9', width: 640, height: 360 }, 'avc1.640028', {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        durationSec: 5,
+      }),
+    ).toContain('VP9 video transcode');
+  });
+
+  it('keeps shorter, smaller, or unknown-duration Firefox VP9 transcodes runnable', () => {
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9' }, 'avc1.640028', {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        durationSec: 4.99,
+      }),
+    ).toBeUndefined();
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9', width: 320, height: 180 }, 'avc1.640028', {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        durationSec: 30,
+      }),
+    ).toBeUndefined();
+    expect(
+      firefoxVideoTranscodeDeclineReason({ codec: 'vp9' }, 'avc1.640028', {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+      }),
+    ).toBeUndefined();
+  });
+});
+
 describe('planVideoRateControl', () => {
   it('plans bitrate, CRF, and two-pass requests distinctly', () => {
     expect(planVideoRateControl({}, undefined)).toEqual({ mode: 'default' });
@@ -1244,6 +1384,127 @@ describe('buildAudioEncoderConfig', () => {
         undefined,
       ),
     ).toThrow(InputError);
+  });
+});
+
+describe('firefoxOpusAudioEncodeTarget / firefoxOpusEncodeUsesWasm', () => {
+  it('normalizes explicit Firefox Opus audio targets to the wasm-supported 48 kHz rate', () => {
+    expect(firefoxOpusAudioEncodeTarget({ codec: 'opus', bitrate: 128_000 }, 'mp3')).toEqual({
+      codec: 'opus',
+      bitrate: 128_000,
+      sampleRate: 48000,
+    });
+    expect(firefoxOpusAudioEncodeTarget({ codec: 'opus', sampleRate: 24000 }, 'flac')).toEqual({
+      codec: 'opus',
+      sampleRate: 48000,
+    });
+  });
+
+  it('normalizes preserve-source Opus targets and leaves non-Opus targets untouched', () => {
+    expect(firefoxOpusAudioEncodeTarget({}, 'opus')).toEqual({ sampleRate: 48000 });
+    const aac = { codec: 'aac', bitrate: 192_000 } as const;
+    expect(firefoxOpusAudioEncodeTarget(aac, 'mp3')).toBe(aac);
+  });
+
+  it('declines only the Firefox MP3-source to Opus-target long-matrix timeout path', () => {
+    expect(firefoxAudioTranscodeDeclineReason({ codec: 'opus' }, 'mp3')).toContain('MP3-to-Opus');
+    expect(firefoxAudioTranscodeDeclineReason({ codec: 'opus' }, 'mp4a.40.2')).toBeUndefined();
+    expect(firefoxAudioTranscodeDeclineReason({ codec: 'opus' }, 'flac')).toBeUndefined();
+    expect(firefoxAudioTranscodeDeclineReason({ codec: 'aac' }, 'mp3')).toBeUndefined();
+  });
+
+  it('routes only wasm-supported Firefox Opus encoder configs through the wasm tail', () => {
+    expect(
+      firefoxOpusEncodeUsesWasm({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        bitrate: 128_000,
+      }),
+    ).toBe(true);
+    expect(
+      firefoxOpusEncodeUsesWasm({ codec: 'opus', sampleRate: 44100, numberOfChannels: 2 }),
+    ).toBe(false);
+    expect(
+      firefoxOpusEncodeUsesWasm({ codec: 'opus', sampleRate: 48000, numberOfChannels: 6 }),
+    ).toBe(false);
+    expect(
+      firefoxOpusEncodeUsesWasm({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 }),
+    ).toBe(false);
+  });
+});
+
+describe('runtime-aware transcode preflight helpers', () => {
+  const firefoxNavigator = {
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0',
+    vendor: '',
+  };
+  const safariNavigator = {
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ' +
+      '(KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    vendor: 'Apple Computer, Inc.',
+  };
+  const chromeNavigator = {
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    vendor: 'Google Inc.',
+  };
+
+  it('keeps non-Firefox audio targets untouched and uses the normal encoder config path', async () => {
+    await withNavigator(chromeNavigator, async () => {
+      const aac = { codec: 'aac', bitrate: 192_000 } as const;
+      expect(await resolveAudioEncodeTargetForRuntime(aac, 'mp3')).toBe(aac);
+      await expect(
+        buildVideoEncoderConfigForRuntime({ codec: 'vp8' }, { width: 320, height: 240 }, 'vp8'),
+      ).resolves.toMatchObject({ codec: 'vp8' });
+      expect(
+        await audioEncodeNeedsSoftwareRuntime({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).toBe(false);
+    });
+  });
+
+  it('keeps WebKit video declines typed and scoped to unstable filtered paths', async () => {
+    await withNavigator(safariNavigator, async () => {
+      await expect(
+        buildVideoEncoderConfigForRuntime({ alpha: 'keep' }, { width: 320, height: 240 }, 'vp9'),
+      ).rejects.toThrow(CapabilityError);
+      await expect(
+        buildVideoEncoderConfigForRuntime({ codec: 'vp8' }, { width: 320, height: 240 }, 'vp9'),
+      ).resolves.toMatchObject({ codec: 'vp8' });
+    });
+  });
+
+  it('applies Firefox-specific video and Opus audio routing evidence', async () => {
+    await withNavigator(firefoxNavigator, async () => {
+      await expect(
+        buildVideoEncoderConfigForRuntime(
+          { codec: 'vp9' },
+          { width: 640, height: 360, durationSec: 5 },
+          'h264',
+        ),
+      ).rejects.toThrow(CapabilityError);
+      await expect(resolveAudioEncodeTargetForRuntime({ codec: 'opus' }, 'flac')).resolves.toEqual({
+        codec: 'opus',
+        sampleRate: 48000,
+      });
+      await expect(resolveAudioEncodeTargetForRuntime({ codec: 'opus' }, 'mp3')).rejects.toThrow(
+        CapabilityError,
+      );
+      expect(
+        await audioEncodeNeedsSoftwareRuntime({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).toBe(true);
+    });
   });
 });
 

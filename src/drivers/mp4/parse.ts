@@ -94,6 +94,10 @@ export interface Movie {
   tracks: ParsedTrack[];
 }
 
+export interface MovieMetadata extends Movie {
+  needsFragmentTiming: boolean;
+}
+
 function fail(message: string): never {
   throw new MediaError('demux-error', message);
 }
@@ -125,6 +129,28 @@ function boxFrom(r: Reader, end: number, type: string): BoxHeader | undefined {
 
 /** Parse a `moov` payload (with the file's `ftyp` major brand) into a {@link Movie}. */
 export function parseMovie(brand: string, moov: Uint8Array): Movie {
+  const parsed = parseMovieInternal(brand, moov, 'full');
+  return {
+    brand: parsed.brand,
+    timescale: parsed.timescale,
+    durationSec: parsed.durationSec,
+    tracks: parsed.tracks,
+  };
+}
+
+/** Parse only metadata needed for probe; per-sample byte tables stay unmaterialized. */
+export function parseMovieMetadata(brand: string, moov: Uint8Array): MovieMetadata {
+  return parseMovieInternal(brand, moov, 'metadata');
+}
+
+type ParseMode = 'full' | 'metadata';
+
+interface ParsedTrakResult {
+  track: ParsedTrack;
+  needsFragmentTiming: boolean;
+}
+
+function parseMovieInternal(brand: string, moov: Uint8Array, mode: ParseMode): MovieMetadata {
   const r = new Reader(moov);
   const root: BoxHeader = {
     type: 'moov',
@@ -139,13 +165,22 @@ export function parseMovie(brand: string, moov: Uint8Array): Movie {
   const movie = parseMvhd(r, mvhd);
 
   const tracks: ParsedTrack[] = [];
+  let needsFragmentTiming = false;
   for (const trak of children(r, root, 'trak')) {
-    const parsed = parseTrak(r, trak, movie.timescale);
-    if (parsed) tracks.push(parsed);
+    const parsed = parseTrak(r, trak, movie.timescale, mode);
+    if (!parsed) continue;
+    tracks.push(parsed.track);
+    needsFragmentTiming ||= parsed.needsFragmentTiming;
   }
   if (tracks.length === 0) fail('moov has no decodable tracks');
 
-  return { brand, timescale: movie.timescale, durationSec: movie.durationSec, tracks };
+  return {
+    brand,
+    timescale: movie.timescale,
+    durationSec: movie.durationSec,
+    tracks,
+    needsFragmentTiming,
+  };
 }
 
 function parseMvhd(r: Reader, box: BoxHeader): { timescale: number; durationSec: number } {
@@ -384,7 +419,12 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
   return movie;
 }
 
-function parseTrak(r: Reader, trak: BoxHeader, movieTimescale: number): ParsedTrack | undefined {
+function parseTrak(
+  r: Reader,
+  trak: BoxHeader,
+  movieTimescale: number,
+  mode: ParseMode,
+): ParsedTrakResult | undefined {
   const tkhd = child(r, trak, 'tkhd') ?? fail('trak has no tkhd');
   const { trackId, rotation } = parseTkhd(r, tkhd);
 
@@ -402,12 +442,14 @@ function parseTrak(r: Reader, trak: BoxHeader, movieTimescale: number): ParsedTr
   const stbl = child(r, minf, 'stbl') ?? fail('minf has no stbl');
   const stsd = child(r, stbl, 'stsd') ?? fail('stbl has no stsd');
 
-  const samples = parseSampleTable(r, stbl);
-  const sampleCount = samples.sampleSizes.length;
+  const { samples, sampleCount } =
+    mode === 'full' ? parseSampleTableWithCount(r, stbl) : parseMetadataSampleTable(r, stbl);
   const fps = mediaType === 'video' && durationSec > 0 ? sampleCount / durationSec : undefined;
+  const needsFragmentTiming = sampleCount === 0;
 
   const entry = parseStsd(r, stsd, mediaType);
-  const encryption = entry.encryption ? readSenc(r, stbl, entry.encryption) : undefined;
+  const encryption =
+    entry.encryption && mode === 'full' ? readSenc(r, stbl, entry.encryption) : entry.encryption;
   const edit = parseTrackEdit(r, trak, movieTimescale);
 
   const base = {
@@ -425,17 +467,23 @@ function parseTrak(r: Reader, trak: BoxHeader, movieTimescale: number): ParsedTr
   };
   if (mediaType === 'video') {
     return {
-      ...base,
-      ...(entry.width !== undefined ? { width: entry.width } : {}),
-      ...(entry.height !== undefined ? { height: entry.height } : {}),
-      ...(rotation !== undefined ? { rotation } : {}),
-      ...(fps !== undefined ? { fps } : {}),
+      needsFragmentTiming,
+      track: {
+        ...base,
+        ...(entry.width !== undefined ? { width: entry.width } : {}),
+        ...(entry.height !== undefined ? { height: entry.height } : {}),
+        ...(rotation !== undefined ? { rotation } : {}),
+        ...(fps !== undefined ? { fps } : {}),
+      },
     };
   }
   return {
-    ...base,
-    ...(entry.sampleRate !== undefined ? { sampleRate: entry.sampleRate } : {}),
-    ...(entry.channels !== undefined ? { channels: entry.channels } : {}),
+    needsFragmentTiming,
+    track: {
+      ...base,
+      ...(entry.sampleRate !== undefined ? { sampleRate: entry.sampleRate } : {}),
+      ...(entry.channels !== undefined ? { channels: entry.channels } : {}),
+    },
   };
 }
 
@@ -794,8 +842,22 @@ function readSenc(r: Reader, stbl: BoxHeader, enc: Omit<TrackProtection, 'senc'>
   return { ...enc, senc: r.bytesAt(senc.payloadStart, senc.end).slice() };
 }
 
-function parseSampleTable(r: Reader, stbl: BoxHeader): SampleTable {
+function emptySampleTable(): SampleTable {
   return {
+    timeToSample: [],
+    compositionOffsets: [],
+    sampleSizes: [],
+    sampleToChunk: [],
+    chunkOffsets: [],
+    syncSamples: [],
+  };
+}
+
+function parseSampleTableWithCount(
+  r: Reader,
+  stbl: BoxHeader,
+): { samples: SampleTable; sampleCount: number } {
+  const samples = {
     timeToSample: parseStts(r, child(r, stbl, 'stts')),
     compositionOffsets: parseCtts(r, child(r, stbl, 'ctts')),
     sampleSizes: parseStsz(r, child(r, stbl, 'stsz')),
@@ -803,6 +865,29 @@ function parseSampleTable(r: Reader, stbl: BoxHeader): SampleTable {
     chunkOffsets: parseChunkOffsets(r, child(r, stbl, 'stco'), child(r, stbl, 'co64')),
     syncSamples: parseStss(r, child(r, stbl, 'stss')),
   };
+  return { samples, sampleCount: samples.sampleSizes.length };
+}
+
+function parseMetadataSampleTable(
+  r: Reader,
+  stbl: BoxHeader,
+): { samples: SampleTable; sampleCount: number } {
+  const timeToSample = parseStts(r, child(r, stbl, 'stts'));
+  const sampleCount =
+    parseStszSampleCount(r, child(r, stbl, 'stsz')) ?? sampleCountFromStts(timeToSample);
+  return { samples: { ...emptySampleTable(), timeToSample }, sampleCount };
+}
+
+function sampleCountFromStts(entries: readonly TimeToSample[]): number {
+  return entries.reduce((total, entry) => total + entry.count, 0);
+}
+
+function parseStszSampleCount(r: Reader, box: BoxHeader | undefined): number | undefined {
+  if (!box) return undefined;
+  r.seek(box.payloadStart);
+  readFullBoxHeader(r);
+  r.skip(4); // sample_size
+  return r.u32();
 }
 
 function parseStts(r: Reader, box: BoxHeader | undefined): TimeToSample[] {

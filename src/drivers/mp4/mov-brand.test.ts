@@ -1,9 +1,8 @@
 /**
- * The `ftyp` major-brand the MP4 writer emits per target container: a `mov` target writes the Apple
- * QuickTime brand `qt  ` (0x71 74 20 20); an `mp4` (or unspecified) target keeps the ISO brand `isom`.
- * A probe — ours and ffprobe's — keys on this to report container `mov` vs `mp4` (the transcode/remux
- * property-invariant: output container must match the requested one). Threaded from the target token
- * through `WriteOptions.brand` → `ftyp`. Pure TS; real corpus media; no browser.
+ * The `ftyp` major-brand the MP4 writer emits per target container. Both `mp4` and `mov` targets now use
+ * the ISO-compatible brand set because the authored byte layout is ISO-BMFF; WebKit can raise a decode
+ * error when the same layout is advertised as stricter QuickTime (`qt  `). The requested target still
+ * threads through `WriteOptions.brand`, but branding stays playback-safe.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -29,7 +28,7 @@ function majorBrand(bytes: Uint8Array): string {
 describe('writeMp4 ftyp major-brand by target container', () => {
   it.each<[ContainerBrand, string]>([
     ['mp4', 'isom'],
-    ['mov', 'qt  '],
+    ['mov', 'isom'],
   ])('brand=%s → major_brand %j', (brand, expected) => {
     expect(majorBrand(writeMp4([SAMPLE_TRACK], { brand }))).toBe(expected);
   });
@@ -38,10 +37,10 @@ describe('writeMp4 ftyp major-brand by target container', () => {
     expect(majorBrand(writeMp4([SAMPLE_TRACK]))).toBe('isom');
   });
 
-  it('the QuickTime brand round-trips through our own parse (Movie.brand)', async () => {
+  it('the target brand option round-trips as a playback-safe ISO brand', async () => {
     for (const [brand, expected] of [
       ['mp4', 'isom'],
-      ['mov', 'qt  '],
+      ['mov', 'isom'],
     ] as const) {
       const out = writeMp4([SAMPLE_TRACK], { brand });
       const movie = await readMovie({
@@ -64,8 +63,8 @@ describe('remux to mov vs mp4 — the stream-copy threads the brand from the tar
     return majorBrand(value ?? new Uint8Array());
   }
 
-  it("a 'mov' remux emits the qt brand; an 'mp4' remux stays isom", async () => {
-    expect(await remuxBrand('mov')).toBe('qt  ');
+  it("a 'mov' remux keeps the ISO brand set for WebKit playback compatibility", async () => {
+    expect(await remuxBrand('mov')).toBe('isom');
     expect(await remuxBrand('mp4')).toBe('isom');
   });
 });

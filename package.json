@@ -41,6 +41,18 @@
   },
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
+  "browser": {
+    "module": false,
+    "node:module": false,
+    "fs": false,
+    "node:fs": false,
+    "path": false,
+    "node:path": false,
+    "crypto": false,
+    "os": false,
+    "url": false,
+    "worker_threads": false
+  },
   "files": ["dist"],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
@@ -54,6 +66,8 @@
     "test:dist": "vitest run src/dist-smoke.test.ts",
     "build": "tsup",
     "vendor-wasm": "bun run scripts/vendor-wasm.ts",
+    "vendor-wasm:check": "bun run scripts/vendor-wasm.ts --check",
+    "verify:package": "bun run vendor-wasm:check && bun run scripts/verify-package-install.ts",
     "check-budgets": "bun run scripts/check-budgets.ts",
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "bake-goldens": "bun run scripts/bake-goldens.ts",
@@ -70,7 +84,7 @@
     "bench-session6-r1": "bun run scripts/bench-session6-r1.ts",
     "bench-session6-r4": "bun run scripts/bench-session6-r4.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
-    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:integrity"
+    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

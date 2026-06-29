@@ -3,7 +3,7 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
-import { Mp4Driver, Mp4Module, readMovie } from './mp4-driver.ts';
+import { Mp4Driver, Mp4Module, readMovie, readMovieMetadata } from './mp4-driver.ts';
 import { buildSamples } from './samples.ts';
 
 function makeRA(bytes: Uint8Array) {
@@ -11,6 +11,13 @@ function makeRA(bytes: Uint8Array) {
     read: (o: number, l: number) => Promise.resolve(bytes.subarray(o, o + l)),
     size: bytes.byteLength,
   };
+}
+
+async function blobBytes(
+  out: Blob | File | ReadableStream<Uint8Array> | undefined,
+): Promise<Uint8Array> {
+  if (!(out instanceof Blob)) throw new Error('expected Blob output');
+  return new Uint8Array(await out.arrayBuffer());
 }
 
 describe('Mp4Driver.supports', () => {
@@ -29,6 +36,156 @@ describe('Mp4Driver.supports', () => {
 });
 
 describe('probe (golden-metadata invariants) across the real MP4 corpus', () => {
+  it('metadata-only probe returns the same track facts as demux without reading packet streams', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const src = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      size: bytes.byteLength,
+      range: (start: number, end: number) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    const tracks = await Mp4Driver.probe?.(src);
+    const demuxer = await Mp4Driver.demux(src);
+    try {
+      expect(tracks).toEqual(demuxer.tracks);
+    } finally {
+      await demuxer.close();
+    }
+  });
+
+  it('metadata-only parser preserves track facts without materializing sample-size tables', async () => {
+    const bytes = await loadFixture('test.mp4');
+    const metadata = await readMovieMetadata(makeRA(bytes));
+    const full = await readMovie(makeRA(bytes));
+    expect(metadata.tracks).toHaveLength(full.tracks.length);
+
+    for (const track of metadata.tracks) {
+      expect(track.samples.sampleSizes).toHaveLength(0);
+      expect(track.samples.sampleToChunk).toHaveLength(0);
+      expect(track.samples.chunkOffsets).toHaveLength(0);
+
+      const fullTrack = full.tracks.find((candidate) => candidate.id === track.id);
+      expect(fullTrack).toBeDefined();
+      if (!fullTrack) continue;
+      if (fullTrack.samples.sampleSizes.length > 0) {
+        expect(track.samples.timeToSample.length).toBeGreaterThan(0);
+      }
+      expect({
+        id: track.id,
+        mediaType: track.mediaType,
+        codec: track.codec,
+        durationSec: track.durationSec,
+        fps: track.fps,
+        width: track.width,
+        height: track.height,
+        rotation: track.rotation,
+        sampleRate: track.sampleRate,
+        channels: track.channels,
+        encrypted: track.encryption !== undefined,
+        config: track.config,
+      }).toEqual({
+        id: fullTrack.id,
+        mediaType: fullTrack.mediaType,
+        codec: fullTrack.codec,
+        durationSec: fullTrack.durationSec,
+        fps: fullTrack.fps,
+        width: fullTrack.width,
+        height: fullTrack.height,
+        rotation: fullTrack.rotation,
+        sampleRate: fullTrack.sampleRate,
+        channels: fullTrack.channels,
+        encrypted: fullTrack.encryption !== undefined,
+        config: fullTrack.config,
+      });
+    }
+  });
+
+  it('metadata-only probe accepts a range source whose total size is not known yet', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const src: ByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    const tracks = await Mp4Driver.probe?.(src);
+    expect(tracks?.length).toBeGreaterThan(0);
+    expect(tracks?.some((track) => track.mediaType === 'video')).toBe(true);
+  });
+
+  it('metadata-only probe honors cancellation before and after the metadata read', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const source = (range: (start: number, end: number) => Promise<Uint8Array>): ByteSource => ({
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      size: bytes.byteLength,
+      range,
+    });
+    await expect(
+      Mp4Driver.probe?.(
+        source((start, end) => Promise.resolve(bytes.subarray(start, end))),
+        {
+          signal: AbortSignal.abort(),
+        },
+      ),
+    ).rejects.toThrow(MediaError);
+
+    const controller = new AbortController();
+    let reads = 0;
+    await expect(
+      Mp4Driver.probe?.(
+        source((start, end) => {
+          reads++;
+          const out = bytes.subarray(start, end);
+          if (reads >= 3) controller.abort();
+          return Promise.resolve(out);
+        }),
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(MediaError);
+    expect(reads).toBeGreaterThanOrEqual(3);
+  });
+
+  it('omits packetTable for fragmented MP4s whose init sample tables are empty', async () => {
+    const bytes = await blobBytes(
+      await createMedia()
+        .use(Mp4Module)
+        .remux(await fixtureSource('movie_5.mp4'), { to: 'mp4', fragmented: true }),
+    );
+    const src: ByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      size: bytes.byteLength,
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    const demuxer = await Mp4Driver.demux(src);
+    try {
+      expect(demuxer.tracks.length).toBeGreaterThan(0);
+      expect(demuxer.packetTable).toBeUndefined();
+    } finally {
+      await demuxer.close();
+    }
+  });
+
   it('2x2-green.mp4 — tiny h264 video (exact 2×2) + mp3-in-mp4 audio', async () => {
     const info = await createMedia()
       .use(Mp4Module)

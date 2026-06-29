@@ -76,7 +76,7 @@ const cfr = await convert(file, {
 
 const alphaWebm = await convert(file, {
   to: 'webm',
-  video: { codec: 'vp9', alpha: 'keep' },
+  video: { codec: 'vp8', alpha: 'keep' },
   audio: { codec: 'vorbis' },
 });
 
@@ -143,14 +143,20 @@ Before publishing or vendoring the package, run the focused packaging gates:
 ```sh
 bun run build
 bun run vendor-wasm
+bun run vendor-wasm:check
 bun run test:dist
 bun run check-budgets
+bun run verify:package
 ```
 
 `vendor-wasm` co-locates the built WASM tails with the emitted chunks after `tsup` cleans `dist/`.
+`vendor-wasm:check` proves those co-vendored artifacts are present and byte-identical without writing.
 `test:dist` imports through the published `exports` map and exercises the built package.
 `check-budgets` inspects `dist/` for the eager kernel budget, typical first-operation JS budget,
 code-splitting, and lazy same-origin WASM asset loading.
+`verify:package` packs the built package, installs the tarball into a clean app, typechecks the public
+exports, runs a package-name import, and measures a tree-shaken probe-only browser bundle with zero emitted
+WASM assets.
 
 ## Loading Model
 

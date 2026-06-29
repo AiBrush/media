@@ -1892,3 +1892,277 @@ under the same decision (MP3 remains separately registered honest-NA until expli
 Vorbis encode by adapter feature bit while relying on Chromium's absent `AudioEncoder` path; muxing Vorbis
 without encoder-produced setup headers; feeding the whole source as one unbounded wasm buffer; a runtime CDN
 or eager inlined default-entry load.
+
+### ADR-109 — Session-7 Phase 7.0 Chromium tail Honest-NA sign-off
+
+**Context:** Session 7 reopens the final Chromium tail to ensure every non-PASS cell is either buildable
+and closed or explicitly signed off in the Honest-NA register. The binding target cells are
+`transcode/h264_two_pass_bitrate`, the two MP3 encode rows (`transcode/aac_to_mp3_mp4` and
+`transcode/wav_to_mp3_mp4`), `transcode/h264_8bit_to_hevc_10bit`, and the massive scale rows
+`remux/massive_h264_1080p_2h_mp4_to_mkv` plus `trim/massive_h264_copy_sustained`. The current fresh
+Chromium artifact remains `../media-test/media-browser-test/results/raw/chromium-2026-06-28T00-57-29-541Z.json`:
+`555 PASS / 4 NA_ENGINE / 2 NA_BROWSER / 0 FAIL / 0 ERROR`. A focused audit of that artifact shows exactly
+the six expected non-PASS rows: MP3 encode is `NA_BROWSER` because Chromium cannot configure a WebCodecs
+MP3 encoder; two-pass is `NA_ENGINE` because the adapter does not declare `two-pass`; HEVC Main10 output is
+`NA_ENGINE` because the adapter does not declare `depth:10bit-output`; massive sustained trim is
+`NA_ENGINE` because the adapter does not declare `trim:massive-lazy-read`; and massive MP4-to-MKV remux is
+a runtime `NA_ENGINE` from the root typed scale guard (`~1091 MB` would exceed the in-browser buffer-all
+limit). Root tests already cover the code-level declines: `codec-pipeline.test.ts` rejects two-pass and
+HEVC Main10 output with typed `CapabilityError`s, `wasm-mp3/mp3.test.ts` proves MP3 encode remains an
+unapproved-core miss, and `remux-scale-na.test.ts` proves oversize cross-container remux declines before
+demuxing.
+
+**Decision:** sign off ADR-105 for Session 7 Phase 7.0 without adding new feature declarations. The register
+is authoritative as follows:
+
+| Scope | Rows | Signed-off disposition |
+| --- | --- | --- |
+| H.264 two-pass | `transcode/h264_two_pass_bitrate` | Honest-NA. WebCodecs exposes single-pass bitrate and quantizer controls, but no first-pass stats API or second-pass control surface. A double encode without stats would be an approximation that the strict oracle cannot distinguish from a fake two-pass claim, and no approved software H.264 two-pass tail is shipped. |
+| MP3 encode | `transcode/aac_to_mp3_mp4`, `transcode/wav_to_mp3_mp4` | Honest-NA. The shipped Symphonia MP3 tail is decode-only. Adding LAME/Shine would require explicit approval for an isolated, lazy, separately-noticed LGPL tail; until then the default build must not declare MP3 encode. |
+| HEVC Main10 output | `transcode/h264_8bit_to_hevc_10bit` | Honest-NA. The root supports 10-bit-to-8-bit downconversion, but portable 10-bit HEVC output is not exposed by WebCodecs and no permissive software HEVC Main10 encoder is bundled. |
+| Massive MP4-to-MKV remux | `remux/massive_h264_1080p_2h_mp4_to_mkv` | Honest-NA safety decline. The current MKV packet mux path would buffer the whole output at GB scale; the root scale guard raises a typed capability miss before demuxing rather than risking tab OOM or timeout. |
+| Massive sustained trim | `trim/massive_h264_copy_sustained` | Honest-NA safety decline. The row remains undeclared until a real lazy source-range copy-trim path with strict trim/playback oracle coverage exists for this exact sustained >1 GB shape. |
+
+**Consequences:** Chromium's remaining non-PASS set is now explicitly signed off for Phase 7.0, and there is
+no hidden buildable Chromium tail left in these cells. Future work may close any row by adding a real,
+permissively licensed or browser-proven implementation plus strict validation and a fresh benchmark, but
+until then the adapter must keep the feature tokens undeclared or the typed runtime scale guard active.
+This ADR is documentation/register-only: no codec fallback, packaging, or benchmark adapter code changes
+are required for the sign-off.
+
+**Rejected:** declaring `two-pass` while reusing single-pass bitrate settings; adding an LGPL MP3 encoder
+silently to the default build; downconverting 10-bit HEVC output to 8-bit while reporting Main10; raising
+GB-scale buffer limits for non-bounded mux paths; and hardcoding the massive fixture ids instead of using
+feature negotiation or typed size guards.
+
+### ADR-110 — Session-7 WebKit/Firefox strictness register and browser-runtime declines
+
+**Context:** Session 7's cross-browser gate exposed browser-runtime behavior that cannot be handled by
+loosening oracles. WebKit now has a fresh complete aibrush-only run:
+`../media-test/media-browser-test/results/raw/webkit-2026-06-28T12-57-31-810Z.json`, `561` rows,
+`428 PASS / 119 NA_BROWSER / 14 NA_ENGINE / 0 FAIL / 0 ERROR`. The non-PASS set is deliberate and
+classified: WebKit codec gaps (AV1 decode/encode, MP3 encode), strict RGBA pixel comparability gaps,
+the `<video>` playback-smoke gap for MKV, exact AAC priming/padding sample-count evidence, and typed
+engine declines for sub-modes this package cannot safely complete on WebKit (`alpha:"keep"`,
+colorspace, tonemap, rotate 90/180, fps downsample, 10-bit output, two-pass, massive safety rows, and
+one unsupported H.264 encode profile).
+
+Two focused WebKit artifacts anchor specific fixes. `webkit-2026-06-28T12-56-53-501Z.json` proves
+`robustness/edge_rotated_remux` passes after MOV authoring stopped using QuickTime major brand `qt  ` for
+an ISO-BMFF layout; WebKit playback accepted the same structure when the `ftyp` brand set was ISO/MP4
+compatible. `webkit-2026-06-28T12-57-08-525Z.json` proves the rotated row passes while the remaining
+focused rows settle as honest NAs for AAC gapless sample-count evidence, MKV playback-smoke, and
+WebKit alpha-preserving transcode.
+
+Firefox showed a different split. The all-engine focused artifact
+`firefox-2026-06-28T13-48-46-990Z.json` showed `performance/decode-fps` and
+`metadata/write_mkv_tags` failing the same committed-golden RGBA digest oracle across every engine that
+reached the strict frame comparison, so the problem is Firefox committed-golden pixel comparability rather
+than an aibrush output mutation. After the harness split strict comparability into committed-golden and
+source-reference buckets, `firefox-2026-06-28T14-07-40-051Z.json` classifies those committed-golden rows as
+`NA_BROWSER` instead of false failures. A separate Firefox resize path was engine-owned:
+`performance/convert-peak-memory` failed at SSIM `0.9694 < 0.97` while routed through Firefox WebGPU; the
+root now declines WebGPU filtering on Firefox and lets Canvas2D run with high-quality image smoothing,
+which passes in `firefox-2026-06-28T14-04-31-568Z.json` at SSIM min `0.970591`.
+
+Firefox VPx alpha transcode is narrower again. In
+`firefox-2026-06-28T14-20-52-531Z.json`, Mediabunny passes both `vp9_alpha_to_vp9_keepalpha` and
+`vp9_alpha_to_vp8_keepalpha`; aibrush passes VP8 alpha output but times out on VP9 alpha output. A focused
+queue-pacing experiment still timed out in `firefox-2026-06-28T14-29-48-484Z.json`. The scenario is
+therefore not a browser-wide impossibility, but this package's current dual-WebCodecs VP9 alpha encoder is
+not a buildable Firefox cell inside the suite budget. That first pass carried a Firefox-only typed decline
+for `alpha:"keep"` targeting VP9 while VP8 alpha output stayed live pending a full-family rerun.
+
+The later Firefox transcode-family artifact
+`../media-test/media-browser-test/results/raw/firefox-2026-06-28T20-39-10-451Z.json` tightened that
+evidence. `transcode/vp9_alpha_to_vp8_keepalpha` also timed out at the 120 s operation cap, so Firefox now
+declines aibrush VPx alpha-preserving transcode for both VP8 and VP9 targets. Chromium remains the
+validation browser for this package's alpha-transcode implementation until a Firefox-specific VPx alpha
+encode route is built.
+
+The same Firefox budget boundary appears on non-alpha VP9 encode. In the fresh
+`firefox-2026-06-28T16-32-51-305Z.partial.json` run, `transcode/metamorphic_duration_preserved_h264_to_vp9`
+timed out at the 120 s operation cap on the 30 s 1920x1080 H.264 corpus fixture, and the subsequent base
+`transcode/h264_to_vp9_webm` row stayed inside the same long-running VP9 encode path until the already
+non-green run was stopped. The later transcode-family artifact above proves the smaller
+`transcode/video_only_h264_resize_360p_to_vp9_webm` row also times out on a 5 s 640x360 VP9 output. The
+runtime classifier is still evidence-scoped rather than scenario-id-scoped: Firefox declines VP9 output
+when the source duration is known to be at least 5 s and the planned output is at least 640x360 pixels.
+Shorter, smaller, or unknown-duration VP9 outputs stay live.
+
+Firefox Opus encode showed a separate long-run state/budget issue. Focused and family reruns proved the
+rows can pass in isolation (`firefox-2026-06-28T21-34-32-491Z.json` and
+`firefox-2026-06-28T21-36-05-615Z.json`), but the ordered full-matrix partial
+`firefox-ordered-2026-06-28T22-16-13-474Z.partial.json` put
+`transcode/flac_to_opus_webm` through Firefox WebCodecs Opus encode for `131650 ms`, then the next
+`transcode/mp3_to_opus_webm` row timed out at `121201 ms`. The first fix used the package's real permissive
+`wasm-opus` encoder tail (ADR-088): Firefox Opus transcode normalizes the internal Opus target to
+`48000 Hz`, lets the existing `AudioData` resample filter shape non-48 kHz sources, and routes the Opus
+encoder with `determinism:'force-software'` so the router selects `wasm-opus` instead of Firefox WebCodecs.
+That route is real and stays live for buildable sources: `firefox-2026-06-28T22-39-47-261Z.json` passes
+`transcode/flac_to_opus_webm`, `transcode/gapless_pcm_to_opus_priming`, and a focused
+`transcode/mp3_to_opus_webm` in `3661 ms`.
+
+The full transcode family still proved the MP3-source case is a different Firefox budget boundary:
+`firefox-2026-06-28T22-40-34-349Z.partial.json` passes the FLAC and gapless Opus rows through the wasm-opus
+route, then times out `transcode/mp3_to_opus_webm` at `121059 ms` after prior codec rows. Forcing the decode
+side through the browser MP3 wasm tail is not currently buildable either:
+`firefox-2026-06-28T22-50-44-723Z.json` classifies the same row as `NA_ENGINE` with
+`wasm-mp3 core is not available`. Therefore Firefox keeps the wasm-opus encode route for Opus targets, but
+declines MP3-source to Opus-target transcode with a typed capability miss until a stable Firefox MP3 decode
+route or browser-available wasm-MP3 core exists. Chromium/WebKit keep the hardware-first Opus path;
+non-Opus audio targets are untouched.
+
+The next Firefox transcode-family artifact
+`firefox-2026-06-28T22-57-44-587Z.json` moved past the Opus boundary but found the same long-run native
+decoder problem in the PCM extraction bridge: `transcode/aac_to_pcm_wav_extract` timed out at `121084 ms`
+even though the row passes in isolation (`firefox-2026-06-28T23-04-23-868Z.json`). This row is buildable, not
+an NA: ADTS owns a real `decodePcm` bridge and the package ships a permissive wasm-AAC decoder tail. The ADTS
+PCM bridge now treats Firefox like `determinism:'force-software'` for this path and routes AAC-to-WAV PCM
+extraction through wasm-AAC before touching native `AudioDecoder`. The focused wasm-routed row passes in
+`firefox-2026-06-28T23-07-40-063Z.json`, and the follow-up full transcode-family artifact
+`firefox-2026-06-28T23-08-06-760Z.json` reaches `16 PASS / 49 NA_BROWSER / 19 NA_ENGINE / 0 FAIL / 0 ERROR`.
+
+**Decision:** keep the strict oracles and classify browser/runtime gaps explicitly.
+
+| Scope | Disposition |
+| --- | --- |
+| MOV target brand | Author MOV output with the ISO-compatible MP4 brand set used by the actual writer layout. Do not emit `qt  ` for this path, because WebKit playback-smoke rejects that brand/layout combination while the ISO-compatible file passes. |
+| WebKit strict pixels | Treat WebKit committed-golden and source-reference RGBA pixel strictness as `NA_BROWSER` where the oracle requires browser-stable RGBA readback. Do not weaken the oracle or count unreadable pixels as zero drift. |
+| WebKit AAC gapless sample count | Keep the AAC priming/padding sample-count rows `NA_BROWSER` on WebKit until the browser exposes exact evidence compatible with the strict oracle. |
+| WebKit MKV playback-smoke | Keep MKV output playback-smoke rows `NA_BROWSER` on WebKit because the browser cannot validate Matroska output through a plain `<video>` element even when the bytes are structurally authored. |
+| WebKit filtered transcode sub-modes | Decline alpha preservation, colorspace, tonemap, rotate 90/180, and fps downsample with typed `CapabilityError`s before opening frame streams. These are package/runtime gaps proven by focused runs, not silent passes. |
+| Firefox committed-golden pixels | Treat committed-golden RGBA rows as `NA_BROWSER` on Firefox when the strict digest oracle depends on cross-browser-stable browser rasterization. Source-reference rows remain runnable when the source and candidate are decoded in the same Firefox runtime. |
+| Firefox video filtering | Disable the WebGPU filter rung on Firefox and use Canvas2D/native fallback. This is a root behavior choice, not a harness exception, and keeps strict source-reference resize SSIM above threshold. |
+| Firefox VPx alpha transcode | Decline aibrush Firefox VP8/VP9 alpha-preserving transcode before opening frame streams. Chromium continues to run the alpha-transcode rows, and Firefox can reopen them only with a real VPx alpha encode route that passes the strict alpha-plane oracle inside the suite budget. |
+| Firefox VP9 transcode budget | Decline aibrush Firefox VP9 output when the source has known duration >=5 s and the planned output is >=640x360 pixels. Shorter, smaller, or unknown-duration VP9 outputs remain runnable instead of being guessed into NA. |
+| Firefox Opus encode budget | Route Firefox Opus audio encode through the existing `wasm-opus` tail after normalizing the internal target to 48 kHz. Use the existing audio-dsp resampler for non-48 kHz sources. MP3-source to Opus-target transcode is the Firefox-only exception: decline it with a typed `NA_ENGINE` until Firefox has a stable MP3 decode path for this full-family sequence or the browser wasm-MP3 route is available. |
+| Firefox ADTS AAC PCM extraction | Route `transcode/aac_to_pcm_wav_extract` through the existing wasm-AAC decoder tail on Firefox, matching `force-software`, because Firefox native AAC `AudioDecoder` can hang after prior transcode rows. Chromium/WebKit keep their native-first ADTS PCM bridge with wasm-AAC as a capability fallback. |
+
+**Consequences:** WebKit's complete 561-row artifact is admissible for Session 7 cross-browser conformance:
+zero FAIL/ERROR and every non-PASS row has a signed register entry. Firefox still needs a fresh full
+post-revendor run, but the known false failures now have root or harness classifications backed by focused
+artifacts and unit tests (`runtime-detect.test.ts`, `codec-pipeline.test.ts`, `gpu-video.test.ts`). None of
+these decisions fabricates work: rows either pass a strict oracle, decline before work begins with a typed
+capability miss, or are marked `NA_BROWSER` only where the browser cannot provide the evidence the oracle
+requires.
+
+**Rejected:** weakening pixel digest thresholds; counting missing/unreadable pixels as black or zero drift;
+hardcoding scenario ids instead of browser/runtime predicates; treating Mediabunny's Firefox VPx alpha pass
+as proof that this package may leave timeout rows declared; emitting QuickTime `qt  ` branding for an
+ISO-BMFF writer layout; and reusing Chromium pixel assumptions for WebKit/Firefox committed-golden rows.
+
+### ADR-111 — Session-7 package verification and exact WASM fallback support envelopes
+
+**Context:** Session 7's packaging requirement is stronger than "the workspace builds": the package must be
+npm-installable, tree-shakable through the public export map, same-origin for lazy WASM, and measured from a
+real installed consumer app. The previous local gates covered `dist/` smoke tests and budget analysis, but
+they did not prove that a packed tarball preserved declarations, export subpaths, browser builtin stubs, or
+probe-only tree-shaking after installation. Cross-browser work also exposed a second honesty risk in the
+WASM tails: a driver `supports()` probe that accepts a broad family token but later rejects an exact codec
+configuration is a declared-but-unbuilt cell. The fallback probe must account for each vendored core's real
+decode/encode envelope before the router can choose it.
+
+**Decision:** make the package verifier part of the ordinary `gate`. `verify:package` first runs
+`vendor-wasm:check`, then packs the workspace, installs the tarball into a fresh temporary app, validates
+the package shape (`name`, `sideEffects:false`, `types`, `module`, `exports`, and browser builtin stubs),
+typechecks public imports from `@aibrush/media`, `@aibrush/media/core`, `@aibrush/media/image`, and
+`@aibrush/media/drivers/*`, runs a package-name runtime import, and browser-bundles a probe-only entry. The
+probe-only eager closure must stay under the 50 kB kernel budget and emit zero WASM files; lazy JS chunks
+may still be emitted because dynamic imports are not eagerly downloaded. The root `gate` now runs
+`build -> vendor-wasm -> test:dist -> check-budgets -> verify:package -> verify:integrity`.
+
+At the same time, `supports()` for first-party WASM fallback drivers now declines exact configurations that
+their vendored cores cannot actually satisfy. AAC/MP3/Vorbis/Opus validate normalized audio decoder/encoder
+configs before reporting support. AV1 accepts only the dav1d-backed 8-bit, 4:2:0, non-monochrome decode
+envelope. VP8/VP9 accepts only the ogv.js/libvpx 8-bit 4:2:0 decode envelope and remains decode-only.
+MP3-in-MP4 aliases (`mp4a.6b`, `mp4a.69`) are tokenized as MP3 before the broad AAC `mp4a.*` branch, so
+preserve-source routing does not silently misclassify them as AAC.
+
+**Consequences:** the package path is now exercised as a downstream consumer sees it, including export-map
+declarations, runtime imports, browser stubs, tree-shaking, and lazy WASM behavior. A stale or half-vendored
+WASM asset fails before publishing or harness vendoring. The fallback routing probes are also tighter:
+buildable browser misses can route to real permissive tails, while unsupported profiles, bit depths,
+subsamplings, channel layouts, missing descriptions, and encode directions decline at capability-probe time
+instead of timing out or failing after selection. Local Session-7 verification for this slice is the full
+`bun run gate`, which includes strict typecheck, Biome, coverage, build, WASM vendoring, dist smoke,
+budgets, package verification, and anti-cheat.
+
+**Rejected:** measuring only the workspace `dist/` and calling it a published-package check; allowing
+browser bundlers to polyfill Node builtins into the probe-only bundle; counting lazy chunks as eager bytes;
+letting probe-only imports emit WASM assets; accepting a codec-family query in `supports()` when the exact
+core envelope is known to reject it later; and adding package-size budget relief by raising the 50 kB eager
+kernel limit.
+
+### ADR-112 — Container metadata probe hook for Firefox longform stability
+
+**Context:** Session 7's Firefox post-revendor run
+`../media-test/media-browser-test/results/raw/.partial/firefox-2026-06-28T17-02-17-330Z.partial.json`
+exposed a single engine-owned robustness failure after the VP9 runtime declines were fixed:
+`robustness/edge_longform_probe` timed out at `479957 ms` instead of proving the one-hour AAC M4A can be
+probed cheaply. The fixture's `moov` box is at the head and `readMovie()` parses it in about `5 ms` in the
+local package, so the issue was not the MP4 table parser itself. The public `media.probe()` path still
+constructed a full live `Demuxer` for every container and then mapped `demuxer.tracks`, which needlessly
+tied metadata inspection to the packet-stream demux session. That is the wrong ownership boundary for
+probe: no codecs, frames, packet payloads, backpressure, or B-frame packet iteration are needed to answer
+`MediaInfo`.
+
+**Decision:** add optional `ContainerDriver.probe(src, o): Promise<readonly TrackInfo[]>`. The public
+engine now routes `media.probe()` to that metadata hook when a driver supplies it, otherwise preserving the
+existing v1 fallback through `demux().tracks`. MP4/MOV implements the hook by using the same `readMovie()`
+parser and `toTrackInfo()` mapping as demux, but it does not construct the live demuxer object, expose
+packet streams, or compute packet-table closures. `StageOptions.signal` is checked around the metadata
+read. Demux, packet lifetime, B-frame/VFR DTS semantics, `packetTable()`, stream-copy, and backpressure
+behavior are unchanged.
+
+**Consequences:** the focused Firefox artifact
+`../media-test/media-browser-test/results/raw/firefox-2026-06-28T18-16-31-864Z.json` now passes
+`robustness/edge_longform_probe` in `178 ms` with the strict `golden-metadata` oracle
+(`durationDeltaSec 0.021333333333132032`, tolerance `0.041666666666666664`). Unit coverage pins both
+contract edges: `create-media.test.ts` proves a supplied metadata hook is preferred and a demux session is
+not constructed; `mp4.test.ts` proves MP4 metadata-only probe track facts match demux track facts on real
+corpus bytes. This is an additive optional method, so `DRIVER_API_VERSION` remains `1`.
+
+**Rejected:** hardcoding the longform fixture id; raising the robustness timeout; weakening the
+golden-metadata oracle; reparsing MP4 metadata in the browser harness; changing demux packet behavior; or
+treating a probe as a live packet-stream operation when the caller only asked for metadata.
+
+**Amendment (MP4/MOV metadata-light sample-table parse).** The Firefox full-run follow-up then reached the
+massive MP4 metadata ladder row and stalled after `probe/perf-extract-metadata-large`, before
+`probe/perf-extract-metadata-massive` could complete. The remaining cost was inside MP4 metadata itself:
+`readMovie()` was still the demux parser, so metadata-only probe expanded every `stsz` entry and built the
+same per-sample byte tables the packet seam needs. That is correct for demux, stream-copy, B-frame/VFR
+packet tables, and trim, but unnecessary for `MediaInfo`. `Mp4Driver.probe()` now uses
+`readMovieMetadata()`, which walks the same top-level `ftyp`/`moov` boxes and parses track identity,
+codec config, geometry, rotation, edit-list/gapless timing, encryption presence, and `stts` timing while
+reading only the `stsz` sample-count header (falling back to summed `stts` counts when no `stsz` box is
+present). It leaves `sampleSizes`, chunk offsets, `stsc`, `ctts`, and sync-sample byte tables empty on
+the metadata path, and calls the existing fragment-timing recovery only when the actual metadata sample
+count is zero. Demux still calls the full parser and therefore preserves exact packet byte ranges,
+keyframe flags, B-frame offsets, and VFR packet durations. Unit coverage pins both sides: MP4 metadata
+probe still equals demux track facts on real fixtures, metadata parsing does not materialize sample-size
+tables, `parseMovieMetadata()` covers `stsz` count and `stts` fallback paths, and QuickTime `.mp3` sample
+entry parsing remains covered. After rebuilding, vendoring the package into the browser harness, and
+rerunning the focused Firefox row, artifact
+`../media-test/media-browser-test/results/raw/firefox-2026-06-28T19-59-43-565Z.json` passes
+`probe/perf-extract-metadata-massive` in `1572 ms` with a measured wall median of
+`24.139999999999873 ms`.
+
+**Amendment (WebM/Matroska metadata probe hook).** The next Firefox full-run attempt exposed the same
+ownership-boundary bug on a different container: `probe/av1_720p_5s` timed out in the partial artifact
+`../media-test/media-browser-test/results/raw/.partial/firefox-2026-06-28T18-34-48-406Z.partial.json` after
+the public `probe()` path fell back to constructing a full `WebmDriver.demux()` session. WebM demux is
+correctly packet-oriented: it parses every Cluster, splits lacing, attaches VPx alpha side data, and builds
+per-track frame arrays before `packets()` wraps them as browser `Encoded*Chunk`s. Metadata probe needs none
+of that packet materialization. `WebmDriver.probe()` now maps the existing pure `parseWebm()` metadata result
+directly to `TrackInfo`, honoring `StageOptions.signal` before/after source reads, while preserving the
+existing demux path for packet tables, VPx alpha `BlockAdditions`, lacing, and frame emission. Because
+headerless/MediaRecorder WebM can omit `Info/Duration` and `DefaultDuration`, `parseWebm()` still scans
+Cluster timing when required to preserve strict metadata fidelity, but it no longer slices packet payloads
+or builds frame lists for a metadata-only call. Unit coverage pins the behavior on the real corpus: direct
+`WebmDriver.probe()` prefers a range-backed source without opening `stream()`, matches demux track metadata
+on the real `av1_720p_5s.webm` fixture, and rejects pre-aborted calls with the typed `aborted` error. After
+rebuilding, vendoring the package into the browser harness, and rerunning the focused row, Firefox artifact
+`../media-test/media-browser-test/results/raw/firefox-2026-06-28T19-25-31-827Z.json` passes
+`probe/av1_720p_5s` in `116 ms`, with the strict `golden-metadata` oracle reporting two tracks,
+`durationDeltaSec 0`, and a wall median of `9.920000000000073 ms`.

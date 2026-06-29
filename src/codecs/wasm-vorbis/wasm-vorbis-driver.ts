@@ -144,6 +144,11 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.direction === 'encode') {
     return unsupported('wasm-vorbis decodes only (no vetted Vorbis encoder core vendored)');
   }
+  try {
+    normalizeVorbisDecoderConfig(q.config as AudioDecoderConfig);
+  } catch (e: unknown) {
+    return unsupported(errMessage(e));
+  }
   if (!hasWebCodecsAudioSeam()) {
     return unsupported('wasm-vorbis requires WebCodecs AudioData/EncodedAudioChunk');
   }

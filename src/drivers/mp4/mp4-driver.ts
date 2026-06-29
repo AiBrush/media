@@ -43,7 +43,13 @@ import {
   fragmentMp4InitSegment,
 } from './fragment.ts';
 import { Mp4Muxer } from './mux.ts';
-import { type Movie, type ParsedTrack, applyFragmentTiming, parseMovie } from './parse.ts';
+import {
+  type Movie,
+  type ParsedTrack,
+  applyFragmentTiming,
+  parseMovie,
+  parseMovieMetadata,
+} from './parse.ts';
 import { Reader } from './reader.ts';
 import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import {
@@ -139,6 +145,43 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
       // (top-level siblings of `moov`). Recover per-track duration + sample count from the fragments so
       // probe reports a correct `durationSec`/`fps` instead of 0.
       if (movie.tracks.some((t) => t.samples.sampleSizes.length === 0)) {
+        return applyFragmentTiming(movie, await readWholeFile(ra, limit));
+      }
+      return movie;
+    }
+    offset += size;
+  }
+  throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
+}
+
+/** Read only metadata needed for probe; full packet tables remain a demux-only cost. */
+export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
+  let offset = 0;
+  let brand = 'mp42';
+  const limit = ra.size ?? Number.MAX_SAFE_INTEGER;
+
+  while (offset + 8 <= limit) {
+    const header = await ra.read(offset, 16);
+    if (header.byteLength < 8) break;
+    const r = new Reader(header);
+    let size = r.u32();
+    const type = r.fourcc();
+    let headerSize = 8;
+    if (size === 1) {
+      size = r.u64();
+      headerSize = 16;
+    } else if (size === 0) {
+      size = limit - offset;
+    }
+    if (size < headerSize || size <= 0) break;
+
+    if (type === 'ftyp' && header.byteLength >= 12) {
+      brand = r.fourcc();
+    }
+    if (type === 'moov') {
+      const box = await ra.read(offset, size);
+      const movie = parseMovieMetadata(brand, box.subarray(headerSize));
+      if (movie.needsFragmentTiming) {
         return applyFragmentTiming(movie, await readWholeFile(ra, limit));
       }
       return movie;
@@ -356,6 +399,10 @@ function abortedError(): MediaError {
   return new MediaError('aborted', 'operation aborted');
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortedError();
+}
+
 function describeUnknownError(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
   if (typeof DOMException !== 'undefined' && e instanceof DOMException) {
@@ -466,7 +513,7 @@ async function verifyTrimmedAvcDecodeIfAvailable(
       return;
     }
     for (let i = 0; i < selected.length; i++) {
-      if (signal?.aborted) throw abortedError();
+      throwIfAborted(signal);
       const sample = selected[i];
       const muxSample = samples[i];
       if (!sample || !muxSample) continue;
@@ -535,10 +582,17 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
   }
   const sampleRate = track.sampleRate;
   const scale = sampleRate / track.timescale;
-  const codedSamples = buildSampleData(track).reduce(
-    (total, sample) => total + Math.round(sample.durationTicks * scale),
+  const durationTicks = track.samples.timeToSample.reduce(
+    (total, entry) => total + entry.count * entry.delta,
     0,
   );
+  const codedSamples =
+    durationTicks > 0
+      ? Math.max(0, Math.round(durationTicks * scale))
+      : buildSampleData(track).reduce(
+          (total, sample) => total + Math.round(sample.durationTicks * scale),
+          0,
+        );
   const leadingSamples = Math.max(0, Math.round(track.edit.mediaTimeTicks * scale));
   const totalSamples = Math.max(0, Math.round(track.edit.durationSec * sampleRate));
   const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
@@ -596,7 +650,7 @@ function packetStream(
       }
       if (window !== currentWindow) {
         currentBytes = await ra.read(window.start, window.end - window.start);
-        if (signal?.aborted) throw abortedError();
+        throwIfAborted(signal);
         if (currentBytes.byteLength !== window.end - window.start) {
           throw new MediaError(
             'demux-error',
@@ -995,21 +1049,18 @@ async function* progressiveSourceSegments(
     tracks.map((track) => track.metadata),
     { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
   );
-  const throwIfAborted = (): void => {
-    if (signal?.aborted) throw abortedError();
-  };
   const yieldPayloads = async function* (): AsyncGenerator<Uint8Array, void, undefined> {
     for (const track of tracks) {
       for (const window of planOrderedSampleReadWindows(track.samples)) {
-        throwIfAborted();
+        throwIfAborted(signal);
         const chunk = await readProgressivePayloadChunk(ra, window);
-        throwIfAborted();
+        throwIfAborted(signal);
         yield chunk;
       }
     }
   };
 
-  throwIfAborted();
+  throwIfAborted(signal);
   yield layout.ftyp;
   if (layout.mdatBeforeMoov) {
     yield layout.mdatHeader;
@@ -1058,11 +1109,8 @@ async function materializeProgressiveSourceBytes(
     tracks.map((track) => track.metadata),
     { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
   );
-  const throwIfAborted = (): void => {
-    if (signal?.aborted) throw abortedError();
-  };
 
-  throwIfAborted();
+  throwIfAborted(signal);
   const out = new Uint8Array(layout.totalLen);
   let p = 0;
   out.set(layout.ftyp, p);
@@ -1077,7 +1125,7 @@ async function materializeProgressiveSourceBytes(
 
   for (const track of tracks) {
     for (const window of planOrderedSampleReadWindows(track.samples)) {
-      throwIfAborted();
+      throwIfAborted(signal);
       const span = await ra.read(window.start, window.end - window.start);
       if (span.byteLength !== window.end - window.start) {
         throw new MediaError(
@@ -1087,7 +1135,7 @@ async function materializeProgressiveSourceBytes(
           } bytes (truncated MP4)`,
         );
       }
-      throwIfAborted();
+      throwIfAborted(signal);
       for (const item of window.items) {
         const rel = item.sample.offset - window.start;
         out.set(span.subarray(rel, rel + item.sample.size), p);
@@ -1203,14 +1251,14 @@ function fragmentedSourceStream(
           if (runSpecs.length === 0) continue;
           const runs = [];
           for (const run of runSpecs) {
-            if (signal?.aborted) throw abortedError();
+            throwIfAborted(signal);
             runs.push({
               trackId: run.trackId,
               samples: await readSamples(ra, run.samples),
               baseDecodeTime: run.baseDecodeTime,
             });
           }
-          if (signal?.aborted) throw abortedError();
+          throwIfAborted(signal);
           controller.enqueue(buildMediaSegment(sequenceNumber, runs));
           sequenceNumber++;
           return;
@@ -1231,6 +1279,14 @@ export const Mp4Driver: ContainerDriver = {
   kind: 'container',
   formats: ['mp4', 'mov'],
   supports: matches,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const signal = o?.signal;
+    const ra = await randomAccess(src);
+    throwIfAborted(signal);
+    const movie = await readMovieMetadata(ra);
+    throwIfAborted(signal);
+    return movie.tracks.map(toTrackInfo);
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);
     const movie = await readMovie(ra);

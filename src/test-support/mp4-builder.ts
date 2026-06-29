@@ -26,8 +26,8 @@ export function full(type: string, version: number, payload: number[]): number[]
 const avcC = box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
 const visualEntry = (type: string, w: number, h: number): number[] =>
   box(type, cat(zeros(6), be16(1), zeros(16), be16(w), be16(h), zeros(50), avcC));
-const audioEntry = (channels: number, rate: number): number[] =>
-  box('mp4a', cat(zeros(6), be16(1), zeros(8), be16(channels), zeros(6), be32(rate << 16)));
+const audioEntry = (type: string, channels: number, rate: number): number[] =>
+  box(type, cat(zeros(6), be16(1), zeros(8), be16(channels), zeros(6), be32(rate << 16)));
 
 const stbl = (entry: number[], tables: number[]): number[] =>
   box('stbl', cat(full('stsd', 0, cat(be32(1), entry)), tables));
@@ -80,6 +80,8 @@ const ID = 0x00010000; // 1.0 in 16.16
 export interface MoovOptions {
   /** Video sample-entry fourcc (default 'avc1'; a non-avc type exercises the codec fallback). */
   videoType?: string;
+  /** Audio sample-entry fourcc (default 'mp4a'; '.mp3' exercises QuickTime MP3-in-MOV). */
+  audioType?: string;
   /** tkhd matrix (a, b) in 16.16 (default [0, 1] = 90°). */
   rotationAB?: [number, number];
 }
@@ -87,6 +89,7 @@ export interface MoovOptions {
 /** A full `moov` box: a rotated video track + a stereo mp4a audio track + a skipped text track. */
 export function moovBox(opts: MoovOptions = {}): number[] {
   const videoType = opts.videoType ?? 'avc1';
+  const audioType = opts.audioType ?? 'mp4a';
   const [a, b] = opts.rotationAB ?? [0, ID]; // 90° default
   const video = box(
     'trak',
@@ -121,7 +124,7 @@ export function moovBox(opts: MoovOptions = {}): number[] {
         48000,
         48000,
         stbl(
-          audioEntry(2, 48000),
+          audioEntry(audioType, 2, 48000),
           cat(
             full('stts', 0, cat(be32(1), be32(1), be32(48000))),
             full('stsz', 0, cat(be32(100), be32(1))),

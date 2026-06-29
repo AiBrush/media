@@ -141,7 +141,6 @@ export interface MediaEngine {
 }
 
 const HEAD_BYTES = 64 * 1024;
-const INVALID_MUX_PACKET_STREAM = 'invalid mux packet stream';
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
 type AbrFanoutRendition = {
   readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
@@ -238,7 +237,11 @@ export class MediaEngineImpl implements MediaEngine {
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
-      const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+      const stage = this.#stageOptions(signal, o);
+      if (container.probe) {
+        return toMediaInfo(container, await container.probe(src, stage), src);
+      }
+      const demuxer = await container.demux(src, stage);
       try {
         return toMediaInfo(container, demuxer.tracks, src);
       } finally {
@@ -582,7 +585,8 @@ export class MediaEngineImpl implements MediaEngine {
         });
       }
 
-      let inputs: MuxPacketStream[];
+      const { muxPacketStreams, readablePacketStreams } = await import('./mux-packet-streams.ts');
+      let inputs: ReturnType<typeof muxPacketStreams>;
       try {
         inputs = muxPacketStreams(streams);
       } catch (e) {
@@ -1282,8 +1286,10 @@ export class MediaEngineImpl implements MediaEngine {
         // Fail target encode-config errors before creating decode/filter streams. Otherwise a synchronous
         // config miss (for example the benchmark's 1x1 H.264 edge) can reject the encode task while an
         // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
-        const { buildVideoEncoderConfig } = await loadCodecPipeline();
-        buildVideoEncoderConfig(opts.video || {}, sourceGeometryOf(videoTrack), videoTrack.codec);
+        const { buildVideoEncoderConfigForRuntime } = await loadCodecPipeline();
+        const videoTarget = opts.video || {};
+        const sourceGeometry = sourceGeometryOf(videoTrack);
+        await buildVideoEncoderConfigForRuntime(videoTarget, sourceGeometry, videoTrack.codec);
         // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
         // the composition below is the live path, browser-validated.
         const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
@@ -1312,6 +1318,11 @@ export class MediaEngineImpl implements MediaEngine {
         /* v8 ignore stop */
       }
       if (audioTrack) {
+        const { resolveAudioEncodeTargetForRuntime } = await loadCodecPipeline();
+        const audioTarget = await resolveAudioEncodeTargetForRuntime(
+          opts.audio || {},
+          audioTrack.codec,
+        );
         const stage = this.#stageOptions(signal, o);
         const decoded =
           container.decodePcmAudio && (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
@@ -1325,15 +1336,9 @@ export class MediaEngineImpl implements MediaEngine {
         // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
         // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
         // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
-        const shaped = await this.#applyAudioFilters(
-          decoded,
-          opts.audio || {},
-          audioTrack,
-          signal,
-          o,
-        );
+        const shaped = await this.#applyAudioFilters(decoded, audioTarget, audioTrack, signal, o);
         openStreams.push(shaped);
-        tasks.push(this.#encodeAudioStream(shaped, opts.audio || {}, audioTrack, muxer, signal, o));
+        tasks.push(this.#encodeAudioStream(shaped, audioTarget, audioTrack, muxer, signal, o));
         /* v8 ignore stop */
       }
       if (tasks.length === 0) {
@@ -1521,19 +1526,24 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<void> {
-    const { audioTrackInfoFromDecoderConfig, buildAudioEncoderConfig, drainEncoderToMuxer } =
-      await loadCodecPipeline();
+    const {
+      audioEncodeNeedsSoftwareRuntime,
+      audioTrackInfoFromDecoderConfig,
+      buildAudioEncoderConfig,
+      drainEncoderToMuxer,
+    } = await loadCodecPipeline();
     const config = buildAudioEncoderConfig(
       target,
       audioGeometryOf(sourceTrack),
       sourceTrack?.codec,
     );
-    const codec = await this.#routeCodec(encodeQueryFor(config), o);
+    const encodeOptions = (await audioEncodeNeedsSoftwareRuntime(config)) ? forceSoftware(o) : o;
+    const codec = await this.#routeCodec(encodeQueryFor(config), encodeOptions);
     // Past here is the live WebCodecs path — unreachable in Node (the route above throws first).
     /* v8 ignore start -- requires a real AudioEncoder; validated in the browser harness (BUILD §6.1). */
     let decoderConfig: AudioDecoderConfig | undefined;
     const stage: AudioEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
+      ...this.#stageOptions(signal, encodeOptions),
       onConfig: (c) => {
         decoderConfig = c;
       },
@@ -1605,7 +1615,6 @@ export class MediaEngineImpl implements MediaEngine {
 
 /** The raw-frame type for a media type: `VideoFrame` for video, `AudioData` for audio. */
 type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
-type PacketStreamSlot = 'video' | 'audio';
 
 async function materializeOutput(
   sink: Sink,
@@ -1614,26 +1623,6 @@ async function materializeOutput(
 ): Promise<Output> {
   const { materialize } = await import('../sinks/materialize.ts');
   return materialize(sink, stream, opts);
-}
-
-interface MuxPacketStream {
-  readonly track: TrackInfo;
-  readonly packets: ReadableStream<EncodedChunk | Packet>;
-}
-
-interface MuxPacketDescriptorRecord {
-  readonly track?: unknown;
-  readonly packets?: unknown;
-}
-
-interface ReadableStreamLikeRecord {
-  readonly getReader?: unknown;
-}
-
-interface TrackInfoLikeRecord {
-  readonly id?: unknown;
-  readonly mediaType?: unknown;
-  readonly codec?: unknown;
 }
 
 interface ImageDecodeRoute {
@@ -1713,6 +1702,16 @@ function bridgeSignal(caller: AbortSignal | undefined, ctrl: AbortController): v
   if (!caller) return;
   if (caller.aborted) ctrl.abort(caller.reason);
   else caller.addEventListener('abort', () => ctrl.abort(caller.reason), { once: true });
+}
+
+function forceSoftware(o: CallOptions): CallOptions {
+  return {
+    ...o,
+    strategy: {
+      ...o.strategy,
+      determinism: 'force-software',
+    },
+  };
 }
 
 /** Re-expose a {@link StageOptions} as a {@link CallOptions.strategy} so a sub-route inherits determinism. */
@@ -1838,88 +1837,6 @@ function assertPcmAudioDataAvailable(label: string): void {
   });
 }
 
-function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {
-  const out: MuxPacketStream[] = [];
-  appendMuxPacketStream(out, 'video', streams.video);
-  appendMuxPacketStream(out, 'audio', streams.audio);
-  // The multi-source / multi-track arm: an arbitrary ordered list, each entry its own output track. Not
-  // slot-pinned (a list may carry ≥2 video or ≥2 audio), but each must still be a valid mediaType stream.
-  if (streams.tracks !== undefined) {
-    for (const track of streams.tracks) appendMuxPacketStream(out, undefined, track);
-  }
-  if (out.length === 0) {
-    throw new InputError('unsupported-input', 'mux received no packet streams');
-  }
-  return out;
-}
-
-function appendMuxPacketStream(
-  out: MuxPacketStream[],
-  slot: PacketStreamSlot | undefined,
-  input: unknown,
-): void {
-  if (input === undefined) return;
-  if (isReadableStreamLike(input) || !isObject(input)) throw invalidMuxPacketStream();
-  const descriptor = input as MuxPacketDescriptorRecord;
-  const track = descriptor.track;
-  const packets = descriptor.packets;
-  // `isTrackInfoLike` already narrows mediaType to 'video'|'audio'. A slotted entry must additionally match
-  // its slot; a `tracks[]` entry (slot `undefined`) accepts either — the list may carry ≥2 of one type.
-  if (
-    !isTrackInfoLike(track) ||
-    (slot !== undefined && track.mediaType !== slot) ||
-    track.config === undefined ||
-    !isReadableStreamLike(packets)
-  )
-    throw invalidMuxPacketStream();
-  out.push({ track, packets: packets as ReadableStream<EncodedChunk | Packet> });
-}
-
-function invalidMuxPacketStream(): InputError {
-  return new InputError('unsupported-input', INVALID_MUX_PACKET_STREAM);
-}
-
-function readablePacketStreams(streams: PacketStreams): ReadableStream<unknown>[] {
-  const out: ReadableStream<unknown>[] = [];
-  collectReadablePacketStream(out, streams.video);
-  collectReadablePacketStream(out, streams.audio);
-  if (streams.tracks !== undefined) {
-    for (const track of streams.tracks) collectReadablePacketStream(out, track);
-  }
-  return out;
-}
-
-function collectReadablePacketStream(out: ReadableStream<unknown>[], input: unknown): void {
-  if (isReadableStreamLike(input)) {
-    out.push(input);
-    return;
-  }
-  if (!isObject(input)) return;
-  const packets = (input as MuxPacketDescriptorRecord).packets;
-  if (isReadableStreamLike(packets)) out.push(packets);
-}
-
-function isObject(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
-
-function isReadableStreamLike(value: unknown): value is ReadableStream<unknown> {
-  if (!isObject(value)) return false;
-  const stream = value as ReadableStreamLikeRecord;
-  return typeof stream.getReader === 'function';
-}
-
-function isTrackInfoLike(value: unknown): value is TrackInfo {
-  if (!isObject(value)) return false;
-  const track = value as TrackInfoLikeRecord;
-  const { id, mediaType, codec } = track;
-  return (
-    typeof id === 'number' &&
-    (mediaType === 'video' || mediaType === 'audio') &&
-    typeof codec === 'string'
-  );
-}
-
 /** Cancel a frame stream so its producer (a decoder/demuxer) releases any buffered frames. */
 async function cancelStream(stream: ReadableStream<unknown>): Promise<void> {
   await stream.cancel(new MediaError('aborted', 'stream not consumed')).catch(() => {});
@@ -2015,12 +1932,29 @@ function encodeQueryFor(config: EncoderConfig): CodecQuery {
 function sourceGeometryOf(track: TrackInfo): {
   width: number | undefined;
   height: number | undefined;
+  fps?: number;
+  durationSec?: number;
 } {
   const config = track.config;
+  const fps = track.fps;
+  const durationSec =
+    track.durationSec !== undefined && Number.isFinite(track.durationSec) && track.durationSec > 0
+      ? track.durationSec
+      : undefined;
   if (config && 'codedWidth' in config) {
-    return { width: config.codedWidth, height: config.codedHeight };
+    return {
+      width: config.codedWidth,
+      height: config.codedHeight,
+      ...(fps !== undefined ? { fps } : {}),
+      ...(durationSec !== undefined ? { durationSec } : {}),
+    };
   }
-  return { width: undefined, height: undefined };
+  return {
+    width: undefined,
+    height: undefined,
+    ...(fps !== undefined ? { fps } : {}),
+    ...(durationSec !== undefined ? { durationSec } : {}),
+  };
 }
 
 /**

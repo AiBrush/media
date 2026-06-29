@@ -367,13 +367,14 @@ describe('normalizeVpxDecoderConfig — validate + carry profile/dims', () => {
       codec: 'vp9',
       profile: 0,
       bitDepth: 8,
+      subsampling: 1,
       codedWidth: 1920,
       codedHeight: 1080,
     });
   });
   it('omits coded dims when absent (exactOptionalPropertyTypes — no undefined keys)', () => {
     const init = normalizeVpxDecoderConfig({ codec: 'vp8' });
-    expect(init).toEqual({ codec: 'vp8', profile: 0, bitDepth: 8 });
+    expect(init).toEqual({ codec: 'vp8', profile: 0, bitDepth: 8, subsampling: 1 });
     expect('codedWidth' in init).toBe(false);
   });
   it('rejects a non-VPX codec (e.g. an audio config routed here by mistake)', () => {
@@ -542,6 +543,7 @@ describe('supports() / coders — honest when the wasm core is absent (Node has 
         codec,
         profile: 0,
         bitDepth: 8,
+        subsampling: 1,
         codedWidth: 16,
         codedHeight: 16,
       });

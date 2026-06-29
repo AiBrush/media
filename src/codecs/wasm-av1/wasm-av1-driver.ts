@@ -157,6 +157,8 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   } catch {
     return unsupported(`wasm-av1 handles AV1 only, not '${q.config.codec}'`);
   }
+  const coreEnvelope = dav1dEnvelopeMiss(init);
+  if (coreEnvelope !== undefined) return coreEnvelope;
 
   if (!hasVideoFrameSeam()) {
     return unsupported('wasm-av1 requires browser EncodedVideoChunk + VideoFrame');
@@ -173,6 +175,21 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     );
   }
   return { supported: true, hardwareAccelerated: false };
+}
+
+function dav1dEnvelopeMiss(init: Av1DecoderInit): CodecSupport | undefined {
+  if (init.bitDepth !== 8) {
+    return unsupported(`wasm-av1 dav1d core does not support ${init.bitDepth}-bit AV1`);
+  }
+  if (init.chromaSubsampling !== '420') {
+    return unsupported(
+      `wasm-av1 dav1d core supports 4:2:0 AV1 only, not ${init.chromaSubsampling}`,
+    );
+  }
+  if (init.monochrome) {
+    return unsupported('wasm-av1 dav1d core does not support monochrome AV1 output');
+  }
+  return undefined;
 }
 
 /* v8 ignore start -- requires browser WebCodecs frame globals and a vendored dav1d core. */

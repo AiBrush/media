@@ -99,11 +99,9 @@ export interface Mp4ByteStreamLayout {
 }
 
 /**
- * Output container flavor → the `ftyp` major + compatible brands. `mp4` writes generic ISO brands plus
- * the actual video sample-entry brand(s) present in the file; `mov` writes the Apple QuickTime brand
- * `qt  ` so a probe (ffprobe and ours) recognizes the file as QuickTime/MOV rather than MP4. Same box
- * layout either way — only `ftyp` differs (ADR: a mov target must not advertise an ISO major brand,
- * doc 09 mux).
+ * Output container flavor for callers that target MP4 vs MOV. The writer emits ISO-compatible `ftyp`
+ * brands for both flavors because the rest of the file is authored as ISO-BMFF; Safari/WebKit can raise a
+ * decode error when a `qt  ` major brand advertises a stricter QuickTime dialect over this layout.
  */
 export type ContainerBrand = 'mp4' | 'mov';
 
@@ -422,11 +420,7 @@ function compatibleBrandsFor(tracks: readonly MuxTrackLayoutInput[]): string[] {
 }
 
 function ftypBox(brand: ContainerBrand, tracks: readonly MuxTrackLayoutInput[]): number[] {
-  if (brand === 'mov') {
-    // QuickTime: major_brand 'qt  ' (0x71 74 20 20), minor 0x200, compatible ['qt  '] — what ffprobe
-    // (and our parse) keys on to report container 'mov' instead of 'mp4'.
-    return box('ftyp', cat(fourcc('qt  '), u32(0x200), fourcc('qt  ')));
-  }
+  void brand;
   return box(
     'ftyp',
     cat(

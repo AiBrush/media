@@ -147,5 +147,5 @@ Aggregate: **~1,835,000 probes/sec geomean**, **~265,000 probes/sec worst**, **~
 ## 9. What is *not* in these baselines (and why)
 
 - **The WebCodecs/GPU tier** (lossy `decode`/`encode`, GPU filters, and browser-produced host chunks from live encode/decode) — these require a browser, so their perf is measured on the target runtime against the 558-feature harness, re-measured fresh (ADR-025, [`11`](11-testing-and-validation.md) §7). The public `mux()` packet-descriptor control flow is benchmarked above with real packet bytes; fabricating browser decode/encode numbers in Node remains forbidden (directive 6).
-- **The WASM tail** (`wasm-vorbis` decode ships vendored; `wasm-opus`/`wasm-vpx`/`wasm-av1` are recipe-scaffolds, ADR-031/035/078) — benchmarked where/when their cores run, not faked here.
+- **The WASM tail** (vendored Symphonia, Opus, AV1/dav1d, VPx/libvpx, and Vorbis-encode cores) — benchmarked where/when their cores run, not folded into the pure-TS baseline table here.
 - **The aggregate "win vs 7 engines"** — that is the external harness's job ([`11`](11-testing-and-validation.md) §7); this doc covers the in-repo per-op baselines that gate `main`.

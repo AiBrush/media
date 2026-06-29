@@ -3,7 +3,8 @@
  * header beginning with a 12-bit `0xFFF` syncword; the first header carries the audio object type,
  * sampling-frequency index, and channel configuration. Duration comes from walking the frames (each is
  * `frame_length` bytes and 1024 samples per raw block). Probe and framing are pure TS; AAC packet decode
- * is capability-routed through native WebCodecs first and the vendored `wasm-aac` tail second. The
+ * is capability-routed through native WebCodecs first and the vendored `wasm-aac` tail second, except for
+ * Firefox/force-software PCM extraction where the wasm tail owns the route up front. The
  * `decodePcm` bridge exposes ADTS → WAV extraction without pretending WAV is an `EncodedChunk` muxer.
  */
 
@@ -31,10 +32,13 @@ import { AdtsMuxer } from './adts-mux.ts';
 
 const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
 const ADTS_EXTENSIONS = new Set(['aac', 'adts']);
-const AAC_PCM_TRIED = ['webcodecs-audio', 'wasm-aac'] as const;
 const NATIVE_AAC_TRIED = ['webcodecs-audio'] as const;
 const WASM_AAC_TRIED = ['wasm-aac'] as const;
 const PCM_OUTPUT_FORMAT = 's16' as const;
+const AAC_PCM_NATIVE_FIRST_PLAN = ['webcodecs-audio', 'wasm-aac'] as const;
+const AAC_PCM_WASM_ONLY_PLAN = ['wasm-aac'] as const;
+
+export type AdtsAacPcmDecodeRung = (typeof AAC_PCM_NATIVE_FIRST_PLAN)[number];
 
 // MPEG-4 sampling-frequency-index table (Hz); index 13–15 are reserved/explicit (unsupported here).
 const SAMPLE_RATES = [
@@ -252,6 +256,14 @@ function decodeCapabilityMiss(message: string, tried: readonly string[]): Capabi
   });
 }
 
+export function adtsAacPcmDecodePlan(
+  firefoxRuntime: boolean,
+  determinism?: StageOptions['determinism'],
+): readonly AdtsAacPcmDecodeRung[] {
+  if (firefoxRuntime || determinism === 'force-software') return AAC_PCM_WASM_ONLY_PLAN;
+  return AAC_PCM_NATIVE_FIRST_PLAN;
+}
+
 function readLayout(bytes: Uint8Array): AdtsLayout {
   const info = parseAdts(bytes, bytes.byteLength);
   if (info.channels <= 0) {
@@ -455,32 +467,63 @@ async function decodeWasmAacToPcm(
   }
 }
 
+function aacPcmPlanMiss(
+  plan: readonly AdtsAacPcmDecodeRung[],
+  nativeMiss: CapabilityError | undefined,
+  wasmMiss: CapabilityError | undefined,
+): CapabilityError {
+  const details: string[] = [];
+  if (nativeMiss !== undefined) {
+    details.push(nativeMiss.message);
+  } else if (!plan.includes('webcodecs-audio')) {
+    details.push('webcodecs-audio was not attempted by this runtime/determinism decode plan');
+  }
+  if (wasmMiss !== undefined) details.push(wasmMiss.message);
+  return new CapabilityError(
+    'capability-miss',
+    `ADTS AAC → WAV PCM extract is unavailable (${details.join('; ')})`,
+    {
+      op: 'convert',
+      tried: plan,
+      suggestion: 'enable native AAC AudioDecoder support or ship the vendored wasm-aac core',
+    },
+  );
+}
+
+async function firefoxRuntimeForAdtsPcm(): Promise<boolean> {
+  const runtime = await import('../../api/runtime-detect.ts');
+  return runtime.isFirefoxRuntime();
+}
+
 async function decodeAacToPcm(bytes: Uint8Array, o: PcmTransform | undefined): Promise<PcmAudio> {
   throwIfAborted(o?.signal);
   const layout = readLayout(bytes);
+  const plan = adtsAacPcmDecodePlan(await firefoxRuntimeForAdtsPcm(), o?.determinism);
   let nativeMiss: CapabilityError | undefined;
-  try {
-    return await decodeNativeAacToPcm(bytes, layout, o?.signal);
-  } catch (e) {
-    if (!(e instanceof CapabilityError)) throw e;
-    nativeMiss = e;
-  }
-  try {
-    return await decodeWasmAacToPcm(bytes, layout, o?.signal);
-  } catch (e) {
-    if (e instanceof CapabilityError) {
-      throw new CapabilityError(
-        'capability-miss',
-        `ADTS AAC → WAV PCM extract is unavailable (${nativeMiss.message}; ${e.message})`,
-        {
-          op: 'convert',
-          tried: AAC_PCM_TRIED,
-          suggestion: 'enable native AAC AudioDecoder support or ship the vendored wasm-aac core',
-        },
-      );
+  let wasmMiss: CapabilityError | undefined;
+  for (const rung of plan) {
+    if (rung === 'webcodecs-audio') {
+      try {
+        return await decodeNativeAacToPcm(bytes, layout, o?.signal);
+      } catch (e) {
+        if (!(e instanceof CapabilityError)) throw e;
+        nativeMiss = e;
+      }
+      continue;
     }
-    throw e;
+    if (rung === 'wasm-aac') {
+      try {
+        return await decodeWasmAacToPcm(bytes, layout, o?.signal);
+      } catch (e) {
+        if (!(e instanceof CapabilityError)) throw e;
+        wasmMiss = e;
+      }
+      continue;
+    }
+    const exhaustive: never = rung;
+    throw new MediaError('decode-error', `unknown ADTS AAC PCM decode rung ${exhaustive}`);
   }
+  throw aacPcmPlanMiss(plan, nativeMiss, wasmMiss);
 }
 
 /* v8 ignore stop */

@@ -25,8 +25,20 @@ Author in **TypeScript (strict)**; emit:
     ".":            { "types": "./dist/index.d.ts", "import": "./dist/index.js" },     // kernel + sugar
     "./core":       { "types": "./dist/core.d.ts",  "import": "./dist/core.js" },      // MediaEngine + driver hooks
     "./image":      { "types": "./dist/image.d.ts", "import": "./dist/image.js" },     // standalone image helpers
-    "./drivers/*":  { "import": "./dist/drivers/*.js" },                               // optional explicit driver import
+    "./drivers/*":  { "types": "./dist/drivers/*.d.ts", "import": "./dist/drivers/*.js" }, // optional explicit driver import
     "./package.json": "./package.json"
+  },
+  "browser": {
+    "module": false,
+    "node:module": false,
+    "fs": false,
+    "node:fs": false,
+    "path": false,
+    "node:path": false,
+    "crypto": false,
+    "os": false,
+    "url": false,
+    "worker_threads": false
   },
   "files": ["dist"]
 }
@@ -37,6 +49,7 @@ Author in **TypeScript (strict)**; emit:
 - Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103).
 - `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
 - `./drivers/*` exists only for the optional "inject a custom/third-party driver" hook; normal usage never imports a driver directly (the router does, lazily).
+- The `browser` map stubs Node builtins that can appear in package-manager or transitive analysis, so a browser-targeted consumer bundle does not silently polyfill `fs`, `path`, `crypto`, `worker_threads`, or CommonJS module loaders (ADR-111).
 
 ## 3. Code-splitting model
 
@@ -94,14 +107,32 @@ Same `import.meta.url` mechanism — the worker entry is emitted as a same-origi
 
 The ~500 kB ceiling is for **JS glue only**; WASM lives outside it and downloads only when used.
 
-## 8. CSP / COEP (applies regardless of inline vs file)
+## 8. Packaging verification (ADR-111)
+
+The publish path is verified from the same artifacts a consumer installs, not only from the workspace
+`dist/` directory:
+
+1. `bun run build` emits ESM JavaScript, code-split chunks, `.d.ts`, and worker entries.
+2. `bun run vendor-wasm` co-locates real external `.wasm` tails beside their lazy glue chunks.
+3. `bun run vendor-wasm:check` proves the co-vendored artifacts are present and byte-identical without
+   writing.
+4. `bun run test:dist` imports through the published `exports` map.
+5. `bun run check-budgets` measures the local emitted bundle closures and same-origin WASM discipline.
+6. `bun run verify:package` packs the workspace, installs that tarball into a fresh app, typechecks the
+   public export map, runs a package-name runtime import, and browser-bundles a probe-only entry. The
+   measured eager probe bundle must stay within the 50 kB kernel budget and emit zero WASM assets.
+
+This gate catches stale `dist`, broken export-map declarations, Node builtin leakage into browser bundles,
+eager WASM inclusion, and drift between the source tree and the npm-published shape.
+
+## 9. CSP / COEP (applies regardless of inline vs file)
 
 - Compiling any WASM requires CSP `script-src 'wasm-unsafe-eval'`.
 - WASM **threads** (`SharedArrayBuffer`) require **COOP/COEP** cross-origin isolation — opt-in only (ADR-006); the common path needs neither beyond `wasm-unsafe-eval`.
 - WASM `supports()` probes may import tiny JS glue to prove a core is vendored, but must not fetch or instantiate the `.wasm` asset. The `.wasm` URL is passed only from `createDecoder`/`createEncoder`/`createFilter`, after the router has selected that miss-only tier and the runtime profile has been resolved.
 - Same-origin assets avoid the CORS/CRP allowlisting a cross-origin CDN would require.
 
-## 9. Versioning & release
+## 10. Versioning & release
 
 - **Library public version** follows semver normally.
 - **`DRIVER_API_VERSION`** ([`05`](05-driver-contracts.md)) is a *separate* integer-major that gates third-party drivers; it changes only on driver-contract breaks, not on every library release.

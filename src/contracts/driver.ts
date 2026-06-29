@@ -297,6 +297,12 @@ export interface ContainerDriver extends DriverBase {
   readonly kind: 'container';
   readonly formats: readonly string[];
   supports(q: ContainerQuery): boolean;
+  /**
+   * Optional metadata-only probe: return track facts without constructing a live demux session or packet
+   * streams. Drivers that omit it keep the v1 fallback: `MediaEngine.probe()` calls `demux()` and maps
+   * `demuxer.tracks`.
+   */
+  probe?(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]>;
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
   createMuxer(o?: MuxOptions): Muxer;
   /**

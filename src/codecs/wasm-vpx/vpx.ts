@@ -483,6 +483,8 @@ export interface VpxDecoderInit {
   /** VP9 profile 0–3 (0 for VP8). */
   profile: number;
   bitDepth: 8 | 10 | 12;
+  /** VP9 chroma-subsampling code; VP8 is always 4:2:0. */
+  subsampling: 0 | 1 | 2 | 3;
   /** Coded width hint from the config, when present (the bitstream is authoritative for actual dims). */
   codedWidth?: number;
   codedHeight?: number;
@@ -500,6 +502,7 @@ export function normalizeVpxDecoderConfig(config: VideoDecoderConfig): VpxDecode
     codec: info.codec,
     profile: info.profile,
     bitDepth: info.bitDepth,
+    subsampling: info.subsampling,
   };
   // `codedWidth`/`codedHeight` are optional in the config; only carry them when both are valid positives
   // (exactOptionalPropertyTypes: omit rather than assign `undefined`).

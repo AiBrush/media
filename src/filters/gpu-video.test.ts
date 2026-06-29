@@ -6,7 +6,7 @@
  * for unsupported specs, the spec→recipe dispatch, and registration.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
@@ -488,6 +488,8 @@ describe('FilterDriver identity & metadata', () => {
 });
 
 describe('supports() — honest in a headless (no GPU/canvas/VideoFrame) environment', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   // The node test runner exposes no browser pixel surface: no OffscreenCanvas/VideoFrame and no
   // navigator.gpu (a `navigator` shim may exist, but without `.gpu`). That is precisely what makes
   // `supports()` honestly return false below — so these assertions test real behavior, not a mock.
@@ -507,6 +509,23 @@ describe('supports() — honest in a headless (no GPU/canvas/VideoFrame) environ
 
   it('webgpu supports() is false for every colour spec when WebGPU is absent (env-gated, not handler-gated)', () => {
     for (const spec of COLOR_SPECS) expect(webgpuVideoFilterDriver.supports(spec)).toBe(false);
+  });
+
+  it('webgpu supports() is false on Firefox before probing navigator.gpu', () => {
+    const firefoxNavigator: Partial<Navigator> = {
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0',
+    };
+    vi.stubGlobal('navigator', firefoxNavigator);
+
+    expect(
+      webgpuVideoFilterDriver.supports({
+        mediaType: 'video',
+        type: 'resize',
+        width: 320,
+        height: 240,
+      }),
+    ).toBe(false);
   });
 
   it('canvas2d supports() is false for every geometric spec when OffscreenCanvas is absent', () => {

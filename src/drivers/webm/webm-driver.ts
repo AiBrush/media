@@ -658,16 +658,35 @@ function toTrackInfo(
 }
 
 /** Read the entire source into one buffer — demux walks every Cluster, which spans the whole file. */
-async function readAll(src: ByteSource): Promise<Uint8Array> {
-  if (src.range && src.size !== undefined) return src.range(0, src.size);
+async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Array> {
+  assertNotAborted(signal);
+  if (src.range && src.size !== undefined) {
+    const bytes = await src.range(0, src.size);
+    assertNotAborted(signal);
+    return bytes;
+  }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+  const onAbort = (): void => {
+    void reader.cancel(abortedError()).catch(() => {});
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    for (;;) {
+      assertNotAborted(signal);
+      const { done, value } = await reader.read();
+      assertNotAborted(signal);
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    reader.releaseLock();
   }
   const out = new Uint8Array(total);
   let off = 0;
@@ -675,6 +694,7 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
     out.set(c, off);
     off += c.byteLength;
   }
+  assertNotAborted(signal);
   return out;
 }
 
@@ -889,7 +909,7 @@ async function streamCopyWebm(
     );
   }
   assertNotAborted(options?.signal);
-  const demux = demuxWebm(await readAll(src));
+  const demux = demuxWebm(await readAll(src, options?.signal));
   assertNotAborted(options?.signal);
   const sourceDurationUs =
     demux.info.durationSec > 0 ? Math.round(demux.info.durationSec * MICROS_PER_SECOND) : undefined;
@@ -1021,12 +1041,20 @@ export const WebmDriver: ContainerDriver = {
   kind: 'container',
   formats: ['webm', 'mkv'],
   supports: matches,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const signal = o?.signal;
+    assertNotAborted(signal);
+    const info = parseWebm(await readAll(src, signal));
+    assertNotAborted(signal);
+    return info.tracks.map((track, index) => toTrackInfo(track, index, info.durationSec));
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     // Demux reads the whole file (Clusters span the body) and decodes every (Simple)Block into per-track
     // frames; `packets()` then wraps each frame as a WebCodecs EncodedChunk (browser-gated). The metadata
     // (tracks/duration/description) comes from the same parse, so probe-fidelity carries into demux.
-    const { info, framesByIndex } = demuxWebm(await readAll(src));
     const signal = o?.signal;
+    const { info, framesByIndex } = demuxWebm(await readAll(src, signal));
+    assertNotAborted(signal);
     return {
       tracks: info.tracks.map((t, i) =>
         toTrackInfo(

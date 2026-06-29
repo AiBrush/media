@@ -173,6 +173,15 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (q.config.codec !== OPUS_CODEC) {
     return unsupported(`wasm-opus handles Opus only, not '${q.config.codec}'`);
   }
+  try {
+    if (q.direction === 'decode') {
+      normalizeOpusDecoderConfig(q.config as AudioDecoderConfig);
+    } else {
+      normalizeOpusEncoderConfig(q.config as AudioEncoderConfig);
+    }
+  } catch (e: unknown) {
+    return unsupported(errMessage(e));
+  }
   if (!(await hasOpusCoreGlue())) {
     return unsupported('wasm-opus core glue is not vendored (see BUILD.md)');
   }
@@ -180,6 +189,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported('wasm-opus requires WebCodecs AudioData/EncodedAudioChunk');
   }
   return { supported: true, hardwareAccelerated: false };
+}
+
+function errMessage(e: unknown): string {
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) return e.message;
+  return 'unsupported Opus config';
 }
 
 // ============ seam narrowing (browser-only types) ============

@@ -143,6 +143,11 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported(`wasm-aac handles AAC only, not '${q.config.codec}'`);
   }
   if (q.direction === 'encode') return unsupported('wasm-aac decodes only (no AAC encoder)');
+  try {
+    normalizeAacDecoderConfig(q.config as AudioDecoderConfig);
+  } catch (e: unknown) {
+    return unsupported(errMessage(e));
+  }
   if (!hasWebCodecsAudioSeam()) {
     return unsupported('wasm-aac requires WebCodecs AudioData/EncodedAudioChunk');
   }

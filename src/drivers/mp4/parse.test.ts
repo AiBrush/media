@@ -10,7 +10,20 @@ import {
   moovPayload,
   zeros,
 } from '../../test-support/mp4-builder.ts';
-import { parseMovie } from './parse.ts';
+import { parseMovie, parseMovieMetadata } from './parse.ts';
+
+function withFirstFourccRenamed(source: Uint8Array, from: string, to: string): Uint8Array {
+  const out = source.slice();
+  const needle = [...from].map((char) => char.charCodeAt(0));
+  const replacement = [...to].map((char) => char.charCodeAt(0));
+  for (let i = 0; i <= out.byteLength - needle.length; i++) {
+    if (needle.every((byte, offset) => out[i + offset] === byte)) {
+      out.set(replacement, i);
+      return out;
+    }
+  }
+  throw new Error(`fourcc ${from} not found`);
+}
 
 describe('parseMovie — format variants', () => {
   const movie = parseMovie('isom', moovPayload());
@@ -45,6 +58,34 @@ describe('parseMovie — format variants', () => {
   });
 });
 
+describe('parseMovieMetadata — metadata-only sample tables', () => {
+  it('preserves track timing while leaving packet byte tables empty', () => {
+    const movie = parseMovieMetadata('isom', moovPayload());
+    expect(movie.needsFragmentTiming).toBe(false);
+
+    const video = movie.tracks.find((t) => t.mediaType === 'video');
+    expect(video?.fps).toBe(1);
+    expect(video?.samples.timeToSample).toEqual([{ count: 2, delta: 300 }]);
+    expect(video?.samples.sampleSizes).toEqual([]);
+    expect(video?.samples.sampleToChunk).toEqual([]);
+    expect(video?.samples.chunkOffsets).toEqual([]);
+
+    const audio = movie.tracks.find((t) => t.mediaType === 'audio');
+    expect(audio?.samples.timeToSample).toEqual([{ count: 1, delta: 48000 }]);
+    expect(audio?.samples.sampleSizes).toEqual([]);
+  });
+
+  it('falls back to stts sample counts when metadata has no stsz box', () => {
+    const withoutVideoStsz = withFirstFourccRenamed(moovPayload(), 'stsz', 'free');
+    const movie = parseMovieMetadata('isom', withoutVideoStsz);
+
+    const video = movie.tracks.find((t) => t.mediaType === 'video');
+    expect(video?.fps).toBe(1);
+    expect(video?.samples.timeToSample).toEqual([{ count: 2, delta: 300 }]);
+    expect(video?.samples.sampleSizes).toEqual([]);
+  });
+});
+
 describe('parseMovie — rotation + codec fallback variants', () => {
   it('falls back to the fourcc for a non-avc codec and reads 180° rotation', () => {
     const m = parseMovie(
@@ -59,6 +100,15 @@ describe('parseMovie — rotation + codec fallback variants', () => {
   it('reads 270° rotation', () => {
     const m = parseMovie('isom', bytes(moovBox({ rotationAB: [0, 0xffff0000] }).slice(8)));
     expect(m.tracks.find((t) => t.mediaType === 'video')?.rotation).toBe(270);
+  });
+
+  it('parses QuickTime .mp3 audio sample entries as mp3', () => {
+    const m = parseMovie('isom', bytes(moovBox({ audioType: '.mp3' }).slice(8)));
+    const a = m.tracks.find((t) => t.mediaType === 'audio');
+    expect(a?.codec).toBe('mp3');
+    expect(a?.config.codec).toBe('mp3');
+    expect(a?.sampleRate).toBe(48000);
+    expect(a?.channels).toBe(2);
   });
 });
 

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { parseAsc } from '../../codecs/wasm-aac/aac.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
+import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
@@ -17,6 +17,14 @@ const MEDIA_TEST = new URL(
 ).pathname;
 async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+}
+
+async function probeWithWebmDriver(
+  src: ByteSource,
+  signal?: AbortSignal,
+): Promise<readonly TrackInfo[]> {
+  if (WebmDriver.probe === undefined) throw new Error('WebmDriver.probe is not registered');
+  return WebmDriver.probe(src, signal !== undefined ? { signal } : undefined);
 }
 
 // ── EBML builders ────────────────────────────────────────────────────────────────────────────────
@@ -114,6 +122,44 @@ describe('probe WebM across the real corpus', () => {
       expect(info).toEqual(await loadGoldenMetadata(id));
     },
   );
+
+  it('WebmDriver.probe uses range-backed metadata bytes without opening a stream', async () => {
+    const bytes = await loadFixture('movie_5.webm');
+    const calls: Array<readonly [number, number]> = [];
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('metadata probe should prefer the seekable range source');
+      },
+    };
+
+    const tracks = await probeWithWebmDriver(src);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
+    expect(tracks.find((track) => track.mediaType === 'video')?.codec).toBe('vp9');
+    expect(tracks.find((track) => track.mediaType === 'audio')?.codec).toBe('opus');
+  });
+
+  it('WebmDriver.probe matches demux track metadata on the real AV1 WebM fixture', async () => {
+    const bytes = await bytesFromMediaTest('av1_720p_5s.webm');
+    const probeTracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+    const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
+    try {
+      expect(probeTracks).toEqual(demuxed.tracks);
+      expect(probeTracks.find((track) => track.mediaType === 'video')?.codec).toBe('av1');
+    } finally {
+      await demuxed.close();
+    }
+  });
+
+  it('WebmDriver.probe rejects a pre-aborted signal with the typed abort error', async () => {
+    await expect(
+      probeWithWebmDriver(await fixtureSource('movie_5.webm'), AbortSignal.abort()),
+    ).rejects.toMatchObject({ code: 'aborted' });
+  });
 });
 
 describe('CodecPrivate → decoder description + canonical codec ids (real fixtures)', () => {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import {
   requireIsolatedWasmProfile,
@@ -42,6 +43,25 @@ describe('resolveWasmRuntimeProfile', () => {
       threads: true,
       sharedArrayBuffer: true,
     });
+  });
+
+  it('falls back to baseline when isolation is present but SharedArrayBuffer is unavailable', () => {
+    const profile = resolveWasmRuntimeProfile({
+      enableThreads: true,
+      crossOriginIsolated: true,
+      sharedArrayBuffer: false,
+    });
+
+    expect(profile.kind).toBe('baseline');
+    expect(profile.threads).toBe(false);
+    expect(profile.reason).toMatch(/SharedArrayBuffer/);
+  });
+
+  it('can resolve from the current runtime globals when overrides are omitted', () => {
+    const profile = resolveWasmRuntimeProfile();
+
+    expect(profile.kind === 'baseline' || profile.kind === 'isolated-simd-threads').toBe(true);
+    expect(typeof profile.sharedArrayBuffer).toBe('boolean');
   });
 
   it('honors an explicit threads-off request even in an isolated page', () => {
@@ -89,5 +109,17 @@ describe('wasmInitForProfile', () => {
     });
 
     expect(init).toEqual({ module_or_path: url });
+  });
+
+  it('raises a typed capability miss for an unknown runtime profile kind', () => {
+    const url = new URL('file:///tmp/core.wasm');
+    const unknown = {
+      kind: 'future-wasm-profile',
+      simd: false,
+      threads: false,
+      sharedArrayBuffer: false,
+    } as unknown as WasmRuntimeProfile;
+
+    expect(() => wasmInitForProfile(url, unknown)).toThrow(CapabilityError);
   });
 });

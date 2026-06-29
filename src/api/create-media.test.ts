@@ -351,6 +351,58 @@ describe('createMedia', () => {
     ]);
   });
 
+  it('probe uses a container metadata hook without constructing a demux session', async () => {
+    const calls = { probe: 0, demux: 0 };
+    const tracks: TrackInfo[] = [
+      {
+        id: 7,
+        mediaType: 'audio',
+        codec: 'mp4a.40.2',
+        durationSec: 3600,
+        config: { codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'probe-fast-mp4',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp4'],
+      supports: (q) => q.mime === 'audio/mp4',
+      probe: () => {
+        calls.probe++;
+        return Promise.resolve(tracks);
+      },
+      demux: () => {
+        calls.demux++;
+        throw new Error('metadata probe must not construct a demuxer when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+    const info = await media.probe(fromBytes(new Uint8Array([1]), { mime: 'audio/mp4' }));
+    expect(calls).toEqual({ probe: 1, demux: 0 });
+    expect(info).toEqual({
+      container: 'mp4',
+      durationSec: 3600,
+      sizeBytes: 1,
+      tracks: [
+        {
+          id: 7,
+          type: 'audio',
+          codec: 'mp4a.40.2',
+          durationSec: 3600,
+          sampleRate: 48000,
+          channels: 2,
+        },
+      ],
+    });
+  });
+
   it('probe routes still images through the registered image capability', async () => {
     const info = await createMedia().probe(
       fromBytes(loadImage('test.jpeg'), { mime: 'image/jpeg' }),

@@ -97,6 +97,8 @@ function canvas2dCanColor(f: ColorVideoSpec): boolean {
 
 /** WebGPU is usable here when a `navigator.gpu` exists alongside `OffscreenCanvas` and `VideoFrame`. */
 function webgpuAvailable(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  if (/\bFirefox\//.test(ua)) return false;
   return (
     typeof navigator !== 'undefined' &&
     typeof (navigator as Navigator & { gpu?: unknown }).gpu !== 'undefined' &&
@@ -211,6 +213,8 @@ class Canvas2DRenderer implements Renderer {
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, dims.width, dims.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     if (recipe.kind === 'blit') {
       const { src, dst } = recipe.blit;
       ctx.drawImage(

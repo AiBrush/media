@@ -1298,7 +1298,7 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     expect(movie.tracks[0]?.durationSec ?? 0).toBeCloseTo(4 * 0.033333, 2);
   });
 
-  it('can emit a QuickTime-branded non-faststart file', async () => {
+  it('can emit a MOV-targeted non-faststart file with a WebKit-safe ISO brand', async () => {
     const muxer = new Mp4Muxer({ faststart: false, container: 'mov' });
     const vid = muxer.addTrack({
       id: 1,
@@ -1310,9 +1310,9 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     await muxer.finalize();
 
     const bytes = await collect(muxer.output);
-    expect(String.fromCharCode(...bytes.subarray(8, 12))).toBe('qt  ');
+    expect(String.fromCharCode(...bytes.subarray(8, 12))).toBe('isom');
     expect(topLevelBoxes(bytes)).toEqual(['ftyp', 'mdat', 'moov']);
-    expect((await readMovie(ra(bytes))).brand).toBe('qt  ');
+    expect((await readMovie(ra(bytes))).brand).toBe('isom');
   });
 });
 

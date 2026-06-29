@@ -144,6 +144,9 @@ export interface ContainerDriver extends DriverBase {
   readonly kind: 'container'
   readonly formats: readonly string[]                      // e.g. ['mp4','mov']
   supports(q: ContainerQuery): boolean                     // sync: mime / extension / magic
+  // Optional metadata-only probe: return TrackInfo without constructing a live Demuxer or packet streams.
+  // Absent => media.probe() falls back to demux().tracks. Additive, so DRIVER_API_VERSION stays 1.
+  probe?(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]>
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>
   createMuxer(o?: MuxOptions): Muxer
   // Optional lossless same-container stream-copy (remux + keyframe-trim), bypassing the PTS-only
