@@ -5,11 +5,11 @@
  *
  * Frame lifetime (doc 06 §3 — the rule that prevents leaks): every `VideoFrame` is `close()`d exactly
  * once. The **encoder consumes** each input frame — it `encode()`s then `close()`s it in a `finally`, so
- * the frame closes once even if `encode()` throws. The **decoder's output frames are owned by the
- * readable consumer** (the next stage / sink) which closes them; on cancel/error this driver closes any
- * frame still in its hands and the WebCodecs object. Backpressure: `transform()` awaits while the codec's
- * `*QueueSize` is at/above the high-water mark (driven by the `dequeue` event) so decoded frames never
- * pile up in GPU memory.
+ * the frame closes once even if `encode()` throws. The **decoder** keeps decoded frames in an explicit
+ * pull-driven queue until a readable consumer asks for them; the consumer closes handed-over frames, while
+ * cancel/error closes every frame still in the driver queue plus the WebCodecs object. Backpressure:
+ * decode submission awaits while the codec's `*QueueSize` or decoded-frame queue is at/above the
+ * high-water mark, so decoded frames never pile up in GPU memory.
  *
  * B-frame ordering: **no reorder is performed.** WebCodecs guarantees `VideoDecoder` emits in
  * presentation order — W3C WebCodecs: "decoded video data outputs emitted … in presentation order",
@@ -561,89 +561,200 @@ function createVideoDecoder(
   const signal = o?.signal;
 
   let decoder: VideoDecoder | undefined;
-  // The readable is dead (closed/cancelled/aborted/errored): once set, the async `output` callback must
-  // NOT enqueue — it closes its frame instead. This is what prevents the "enqueue into a closed readable"
-  // throw when a consumer (e.g. `seek`) cancels the reader while the decoder is still draining.
+  let readableController: ReadableStreamDefaultController<RawFrame> | undefined;
+  let onAbort: (() => void) | undefined;
+  const frameQueue: VideoFrame[] = [];
+  const queueWaiters = new Set<{ resolve(): void; reject(error: Error): void }>();
+  // The readable is dead (closed/cancelled/aborted/errored): once set, the async `output` callback closes
+  // its frame instead of queueing it. Normal flush sets `decoderDone`; the readable remains open until the
+  // explicit frame queue drains so already-decoded B-frame tail output is still consumed or closed.
   let closed = false;
-  // Frames the output callback is mid-handover on (synchronous window only): an abort that interleaves
-  // still closes them exactly once. Enqueued frames are removed (the consumer owns them thereafter).
-  const pendingFrames = new Set<VideoFrame>();
+  let decoderDone = false;
+  let pullWaiting = false;
+  let terminalError: Error | undefined;
 
-  const dispose = (): void => {
+  const streamClosedError = (): Error =>
+    terminalError ?? new MediaError('aborted', 'video decoder stream closed');
+  const closeDecoder = (): void => {
+    if (decoder && decoder.state !== 'closed') decoder.close(); // stop WebCodecs emitting + drop buffers
+  };
+  const removeAbortListener = (): void => {
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    onAbort = undefined;
+  };
+  const closeQueuedFrames = (): void => {
+    for (const frame of frameQueue.splice(0)) frame.close();
+  };
+  const rejectQueueWaiters = (error: Error): void => {
+    for (const waiter of queueWaiters) waiter.reject(error);
+    queueWaiters.clear();
+  };
+  const resolveQueueWaiters = (): void => {
+    if (frameQueue.length >= HIGH_WATER_MARK) return;
+    for (const waiter of queueWaiters) waiter.resolve();
+    queueWaiters.clear();
+  };
+  const finishReadableIfDrained = (): void => {
+    if (closed || !decoderDone || frameQueue.length !== 0 || !readableController) return;
     closed = true;
-    for (const frame of pendingFrames) frame.close();
-    pendingFrames.clear();
-    if (decoder && decoder.state !== 'closed') decoder.close(); // stop WebCodecs emitting + drop its buffers
+    removeAbortListener();
+    resolveQueueWaiters();
+    readableController.close();
+  };
+  const fail = (error: Error): void => {
+    if (closed) return;
+    terminalError = error;
+    closed = true;
+    pullWaiting = false;
+    closeQueuedFrames();
+    rejectQueueWaiters(error);
+    closeDecoder();
+    removeAbortListener();
+    readableController?.error(error);
+  };
+  const cancelDecode = (reason?: unknown): void => {
+    if (closed) return;
+    const error =
+      reason instanceof Error
+        ? reason
+        : new MediaError('aborted', 'video decoder stream cancelled');
+    terminalError = error;
+    closed = true;
+    pullWaiting = false;
+    closeQueuedFrames();
+    rejectQueueWaiters(error);
+    closeDecoder();
+    removeAbortListener();
+  };
+  const deliverQueuedFrame = (): void => {
+    if (!pullWaiting || closed || !readableController) return;
+    const frame = frameQueue.shift();
+    if (!frame) {
+      finishReadableIfDrained();
+      return;
+    }
+    pullWaiting = false;
+    try {
+      readableController.enqueue(frame);
+    } catch (e) {
+      frame.close();
+      fail(new MediaError('decode-error', describeError(e), e));
+      return;
+    }
+    resolveQueueWaiters();
+    finishReadableIfDrained();
+  };
+  const waitForOutputRoom = async (): Promise<void> => {
+    while (!closed && frameQueue.length >= HIGH_WATER_MARK) {
+      await new Promise<void>((resolve, reject) => {
+        queueWaiters.add({ resolve, reject });
+      });
+    }
+    if (closed) throw streamClosedError();
   };
 
-  const transformer: TransformerWithCancel<EncodedChunk, RawFrame> = {
-    start(controller): void {
-      // An external abort that outruns the stream teardown still releases resources + ends the readable.
-      signal?.addEventListener(
-        'abort',
-        () => {
-          dispose();
-          controller.error(new MediaError('aborted', 'operation aborted'));
-        },
-        { once: true },
-      );
-      decoder = new VideoDecoder({
-        output: (frame: VideoFrame): void => {
-          // Never throw out of this async callback: enqueue if the readable is alive, else close the
-          // frame. `pendingFrames` guards the synchronous handover window against an interleaved abort.
-          if (closed) {
-            frame.close();
-            return;
-          }
-          pendingFrames.add(frame);
-          enqueueOrClose<RawFrame>(controller, frame, () => closed); // closes the frame iff not handed over
-          pendingFrames.delete(frame);
-        },
-        error: (e: DOMException): void => {
-          // A native-decoder runtime failure (even on an isConfigSupported-approved config) = the browser
-          // cannot decode this → a capability miss the engine degrades to NA, not a crashing DOMException.
-          dispose();
-          controller.error(decoderErrorToCapabilityMiss(e, 'webcodecs-video', config.codec));
-        },
-      });
-      decoder.configure({
-        ...normalizeVideoDecoderConfig(config, normalizeHardwareAcceleration(o?.determinism)),
-      });
+  const readable = new ReadableStream<RawFrame>(
+    {
+      start(controller): void {
+        readableController = controller;
+      },
+      pull(): void {
+        pullWaiting = true;
+        deliverQueuedFrame();
+      },
+      cancel(reason): void {
+        cancelDecode(reason);
+      },
     },
-    async transform(chunk): Promise<void> {
-      if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      if (!decoder) throw new MediaError('decode-error', 'decoder not configured');
-      if (!(chunk instanceof EncodedVideoChunk)) {
-        throw new MediaError('decode-error', 'webcodecs-video decoder expects EncodedVideoChunk');
-      }
-      await drainBelowHighWater(decoder, signal);
-      decoder.decode(chunk);
-    },
-    async flush(controller): Promise<void> {
-      // Drain all queued work so every (presentation-ordered) frame is emitted before the readable
-      // closes; then release the decoder. A flush failure becomes a typed decode-error.
-      try {
-        if (decoder && decoder.state === 'configured') await decoder.flush();
-      } catch (e) {
-        dispose();
-        controller.error(new MediaError('decode-error', describeError(e), e));
-        return;
-      }
-      closed = true; // the readable is about to close; reject any late `output` (none expected post-flush)
-      if (decoder && decoder.state !== 'closed') decoder.close();
-    },
-    // The consumer closed/cancelled the readable (e.g. `seek` got its frame and `cancel()`ed the reader)
-    // while the decoder may still be draining: mark closed and dispose the decoder so it stops emitting
-    // and its remaining in-flight frames are dropped — no late enqueue, no leak.
-    cancel(): void {
-      dispose();
-    },
-  };
-  return new TransformStream<EncodedChunk, RawFrame>(
-    transformer,
-    { highWaterMark: 1 }, // writable: keep the transform's own buffer tiny; the codec queue is the budget
-    { highWaterMark: 0 }, // readable: pull-driven; the consumer's demand paces output
+    { highWaterMark: 0 },
   );
+
+  const writable = new WritableStream<EncodedChunk>(
+    {
+      start(): void {
+        onAbort = () => {
+          fail(new MediaError('aborted', 'operation aborted'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) {
+          fail(new MediaError('aborted', 'operation aborted'));
+          return;
+        }
+        try {
+          decoder = new VideoDecoder({
+            output: (frame: VideoFrame): void => {
+              // Never throw out of this async callback: queue if the readable is alive, else close. Frames
+              // stay driver-owned until a pull hands them to the consumer, so cancellation can close them.
+              if (closed) {
+                frame.close();
+                return;
+              }
+              frameQueue.push(frame);
+              deliverQueuedFrame();
+            },
+            error: (e: DOMException): void => {
+              // A native-decoder runtime failure (even on an isConfigSupported-approved config) = the
+              // browser cannot decode this → a capability miss the engine degrades to NA, not a crash.
+              fail(decoderErrorToCapabilityMiss(e, 'webcodecs-video', config.codec));
+            },
+          });
+          decoder.configure({
+            ...normalizeVideoDecoderConfig(config, normalizeHardwareAcceleration(o?.determinism)),
+          });
+        } catch (e) {
+          const error = new MediaError('decode-error', describeError(e), e);
+          fail(error);
+          throw error;
+        }
+      },
+      async write(chunk): Promise<void> {
+        if (closed) throw streamClosedError();
+        if (!decoder) throw new MediaError('decode-error', 'decoder not configured');
+        if (!(chunk instanceof EncodedVideoChunk)) {
+          throw new MediaError('decode-error', 'webcodecs-video decoder expects EncodedVideoChunk');
+        }
+        await waitForOutputRoom();
+        await drainBelowHighWater(decoder, signal);
+        if (closed) throw streamClosedError();
+        if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+        decoder.decode(chunk);
+      },
+      async close(): Promise<void> {
+        // Drain all queued work so every (presentation-ordered) frame is emitted before the readable
+        // reaches EOF; then release the decoder. The readable closes only after the explicit frame queue
+        // drains, preserving ownership for a slow/early-cancelling consumer.
+        if (closed) {
+          if (terminalError) throw terminalError;
+          return;
+        }
+        try {
+          if (decoder && decoder.state === 'configured') await decoder.flush();
+        } catch (e) {
+          const error = terminalError ?? new MediaError('decode-error', describeError(e), e);
+          fail(error);
+          throw error;
+        }
+        if (closed) {
+          if (terminalError) throw terminalError;
+          return;
+        }
+        decoderDone = true;
+        closeDecoder();
+        finishReadableIfDrained();
+      },
+      // The upstream source aborted before normal close: release native resources and close any decoded
+      // frames still waiting for downstream demand.
+      abort(reason): void {
+        const error =
+          reason instanceof Error
+            ? reason
+            : new MediaError('aborted', 'video decoder stream aborted');
+        fail(error);
+      },
+    },
+    { highWaterMark: 1 }, // writable: keep the transform's own buffer tiny; the codec queue is the budget
+  );
+  return { readable, writable } as TransformStream<EncodedChunk, RawFrame>;
 }
 
 // ── encoder: VideoFrame → EncodedChunk ───────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ import { loadFixture } from '../../test-support/corpus.ts';
 import {
   type SencSample,
   decryptSample,
+  decryptSampleCens,
   decryptSamples,
   kidHex,
   parseSenc,
@@ -108,6 +109,27 @@ describe('CENC subsample decryption', () => {
   });
 });
 
+describe('CENC cens AES-CTR pattern decryption', () => {
+  it('decrypts only crypt blocks, leaving skipped blocks and trailing partial bytes clear', async () => {
+    const iv = ivFor(11);
+    const original = Uint8Array.from({ length: 58 }, (_, i) => (i * 13 + 5) & 0xff);
+    const pattern = { cryptByteBlock: 1, skipByteBlock: 1 };
+    const crypt0 = original.subarray(0, 16);
+    const crypt1 = original.subarray(32, 48);
+    const gathered = new Uint8Array([...crypt0, ...crypt1]);
+    const encrypted = await aesCtr(KEY, counter(iv), gathered, 64);
+    const cipher = original.slice();
+    cipher.set(encrypted.subarray(0, 16), 0);
+    cipher.set(encrypted.subarray(16, 32), 32);
+
+    expect([...cipher.subarray(16, 32)]).toEqual([...original.subarray(16, 32)]);
+    expect([...cipher.subarray(48)]).toEqual([...original.subarray(48)]);
+
+    const recovered = await decryptSampleCens(KEY, pattern, { iv }, cipher);
+    expect([...recovered]).toEqual([...original]);
+  });
+});
+
 describe('CENC box parsing', () => {
   it('parseTenc reads default KID + per-sample IV size', () => {
     const kid = hexToBytes('00112233445566778899aabbccddeeff');
@@ -116,6 +138,14 @@ describe('CENC box parsing', () => {
     expect(tenc.isProtected).toBe(true);
     expect(tenc.perSampleIvSize).toBe(8);
     expect(kidHex(tenc.kid)).toBe('00112233445566778899aabbccddeeff');
+  });
+
+  it('parseTenc reads a cens crypt:skip pattern', () => {
+    const kid = hexToBytes('00112233445566778899aabbccddeeff');
+    const payload = new Uint8Array([1, 0, 0, 0, 0, 0x12, 1, 8, ...kid]);
+    const tenc = parseTenc(payload, 'cens');
+    expect(tenc.pattern).toEqual({ cryptByteBlock: 1, skipByteBlock: 2 });
+    expect(tenc.constantIv).toBeUndefined();
   });
 
   it('parseSenc reads per-sample IVs (no subsamples)', () => {

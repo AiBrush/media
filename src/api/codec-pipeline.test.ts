@@ -549,6 +549,41 @@ describe('retimeTimedFrameStream', () => {
     for (const output of outputs) output.close();
   });
 
+  it('does not prefetch a frame before downstream demand', async () => {
+    let pulls = 0;
+    const frames = [new RetimeFakeFrame(0, 0, 33_333)];
+    const source = new ReadableStream<RetimeFakeFrame>(
+      {
+        pull(controller): void {
+          pulls++;
+          const frame = frames.shift();
+          if (frame === undefined) controller.close();
+          else controller.enqueue(frame);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    const retimed = retimeTimedFrameStream(source, {
+      fps: 30,
+      durationUs: 33_333,
+      restamp(frame, timing): RetimeFakeFrame {
+        return new RetimeFakeFrame(100, timing.timestamp, timing.duration, frame.id);
+      },
+    });
+    await Promise.resolve();
+
+    expect(pulls).toBe(0);
+
+    const reader = retimed.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(pulls).toBe(2);
+    first.value?.close();
+    await reader.cancel();
+    reader.releaseLock();
+  });
+
   it('rejects same-object restamps while closing the source frame once', async () => {
     const input = new RetimeFakeFrame(0, 0, 33_333);
     const reader = retimeTimedFrameStream(streamOf([input]), {
@@ -1649,6 +1684,39 @@ describe('seekFrame (drop-until-target, close-once)', () => {
     )) as unknown as FakeFrame;
     expect(got.timestamp).toBe(5000);
     expect(frames[0]?.closed).toBe(false);
+  });
+
+  it('waits for downstream cancellation before returning the target frame', async () => {
+    const target = new FakeFrame(5000);
+    let resolveCancel: (() => void) | undefined;
+    let cancelStarted = false;
+    let cancelResolved = false;
+    const stream = new ReadableStream<FakeFrame>({
+      start(controller): void {
+        controller.enqueue(target);
+        controller.enqueue(new FakeFrame(6000));
+      },
+      cancel(): Promise<void> {
+        cancelStarted = true;
+        return new Promise<void>((resolve) => {
+          resolveCancel = () => {
+            cancelResolved = true;
+            resolve();
+          };
+        });
+      },
+    });
+
+    const pending = seekFrame(stream as unknown as ReadableStream<VideoFrame>, 0);
+    await Promise.resolve();
+    expect(cancelStarted).toBe(true);
+    expect(cancelResolved).toBe(false);
+
+    resolveCancel?.();
+    const got = (await pending) as unknown as FakeFrame;
+    expect(got).toBe(target);
+    expect(got.closed).toBe(false);
+    expect(cancelResolved).toBe(true);
   });
 
   it('returns the closest (last) frame when the target is past the final PTS', async () => {

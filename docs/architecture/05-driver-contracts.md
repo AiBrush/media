@@ -136,9 +136,9 @@ export interface PcmTransform extends StageOptions {       // ADR-022 (raw-PCM c
   }
   biquad?: BiquadSpec | readonly BiquadSpec[]              // PCM-native RBJ biquad/EQ chain (ADR-074)
 }
-export interface DecryptParams extends StageOptions {      // ADR-023 (CENC / HLS sample decryption)
-  scheme: 'cenc' | 'cbcs' | 'hls-aes128'
-  keys: Record<string, string>                             // keyId(hex) → key(hex); CENC keys by tenc default_KID
+export interface DecryptParams extends StageOptions {      // ADR-023/121 (CENC / HLS decryption)
+  scheme: 'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes'
+  keys: Record<string, string>                             // CENC: keyId(hex) → key(hex); HLS: key/iv hex
 }
 export interface ContainerDriver extends DriverBase {
   readonly kind: 'container'
@@ -159,8 +159,8 @@ export interface ContainerDriver extends DriverBase {
   // `pcm-u8` WAV); cross-wrapper WAV/AIFF/CAF output is still PCM-native, not an EncodedChunk mux.
   // Absent ⇒ codec seam.
   transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
-  // Optional driver-native sample decryption (ADR-023): parse protection boxes (enca/tenc/senc),
-  // AES-CTR-decrypt with the caller's keys (WebCrypto), re-serialize cleartext. Absent ⇒ typed miss.
+  // Optional driver-native decryption (ADR-023/121): parse protection boxes (enca/tenc/senc),
+  // AES-CTR/CBC-decrypt with the caller's keys (WebCrypto), re-serialize cleartext. Absent ⇒ typed miss.
   decrypt?(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>>
   // Optional decode of a compressed-audio container to a raw-PCM (WAV) byte stream (ADR-024/050),
   // e.g. FLAC → WAV in pure TS, or ADTS AAC → WAV through native WebCodecs / the wasm tail, applying

@@ -30,6 +30,7 @@ import {
   type ChunkStruct,
   type TimelineBlock,
   WebmMuxer,
+  WebmStreamingMuxer,
   buildBlockTimeline,
   planWebmFragments,
 } from './ebml-write.ts';
@@ -1107,6 +1108,138 @@ function muxableCodecString(codec: string): string | undefined {
       return undefined; // e.g. v_theora / pcm-s16 — not a WebM-muxable codec
   }
 }
+
+describe('WebmStreamingMuxer — true Cluster-on-write streaming output', () => {
+  it('rejects typed misuse: no tracks, unknown tracks, late tracks, and double finalization', async () => {
+    const emptyMuxer = new WebmStreamingMuxer();
+    await expect(emptyMuxer.finalize()).rejects.toThrow(MediaError);
+
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      config: { codec: 'vp09.00.10.08', codedWidth: 16, codedHeight: 16 },
+    });
+    await expect(muxer.addChunkStruct(99, chunk(0, 33_333, true, 1))).rejects.toThrow(MediaError);
+
+    const reader = muxer.output.getReader();
+    await muxer.addChunkStruct(vid, chunk(0, 33_333, true, 2));
+    await reader.read(); // init segment; frees demand for finalize's Cluster enqueue.
+    expect(() =>
+      muxer.addTrack({
+        id: 2,
+        mediaType: 'audio',
+        codec: 'opus',
+        config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+      }),
+    ).toThrow(MediaError);
+    await muxer.finalize();
+    await reader.read();
+    await reader.read();
+    reader.releaseLock();
+    await expect(muxer.finalize()).rejects.toThrow(MediaError);
+  });
+
+  it('rejects finalization when declared tracks received no packets', async () => {
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    const reader = muxer.output.getReader();
+    await expect(muxer.finalize()).rejects.toThrow(MediaError);
+    await expect(reader.read()).rejects.toThrow(MediaError);
+    reader.releaseLock();
+  });
+
+  it('emits a bounded Cluster before finalize when the next video keyframe arrives', async () => {
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      fps: 30,
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    const reader = muxer.output.getReader();
+
+    await muxer.addChunkStruct(vid, chunk(0, 33_333, true, 20));
+    const init = await reader.read();
+    expect(init.done).toBe(false);
+    expect(init.value).toBeDefined();
+    if (init.value === undefined) return;
+    expect(segmentSizeValue(init.value)).toBe(-1);
+    expect(topLevelClusterCount(init.value)).toBe(0);
+
+    await muxer.addChunkStruct(vid, chunk(33_333, 33_333, false, 21));
+    await muxer.addChunkStruct(vid, chunk(66_666, 33_333, true, 22));
+    const firstCluster = await reader.read();
+    expect(firstCluster.done).toBe(false);
+    expect(firstCluster.value).toBeDefined();
+    if (firstCluster.value === undefined) return;
+    expect([...firstCluster.value.subarray(0, 4)]).toEqual([0x1f, 0x43, 0xb6, 0x75]);
+
+    await muxer.finalize();
+    const tail: Uint8Array[] = [];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      tail.push(next.value);
+    }
+    reader.releaseLock();
+
+    const bytes = concatBytes([init.value, firstCluster.value, ...tail]);
+    expect(segmentSizeValue(bytes)).toBe(-1);
+    expect(topLevelClusterCount(bytes)).toBe(2);
+    expect(scanBlocks(bytes).map((block) => block.size)).toEqual([20, 21, 22]);
+    expect(parseWebm(bytes).tracks[0]?.codec).toBe('vp9');
+  });
+
+  it('splits long audio-only streams at the bounded max-block count without buffering the tail', async () => {
+    const muxer = new WebmStreamingMuxer({ maxBlocksPerFragment: 3, timelineBaseUs: 0 });
+    const aud = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    const partsPromise = collectChunks(muxer.output);
+
+    for (let i = 0; i < 8; i++) {
+      await muxer.addChunkStruct(aud, chunk(i * 20_000, 20_000, true, 10 + i));
+    }
+    await muxer.finalize();
+
+    const parts = await partsPromise;
+    expect(parts.length).toBeGreaterThanOrEqual(4); // init + ceil(8 / 3) Clusters
+    const bytes = concatBytes(parts);
+    expect(topLevelClusterCount(bytes)).toBe(3);
+    expect(scanBlocks(bytes).map((block) => block.size)).toEqual([10, 11, 12, 13, 14, 15, 16, 17]);
+    expect(parseWebm(bytes).tracks[0]?.codec).toBe('opus');
+  });
+
+  it('splits an audio Cluster when the timestamp span exceeds the WebM int16 relative limit', async () => {
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    const aud = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    const partsPromise = collectChunks(muxer.output);
+
+    await muxer.addChunkStruct(aud, chunk(0, 20_000, true, 10));
+    await muxer.addChunkStruct(aud, chunk(33_000_000, 20_000, true, 11));
+    await muxer.finalize();
+
+    const bytes = concatBytes(await partsPromise);
+    expect(topLevelClusterCount(bytes)).toBe(2);
+    expect(scanBlocks(bytes).map((block) => block.timeMs)).toEqual([0, 33_000]);
+  });
+});
 
 describe('WebmMuxer — fragmented/CMAF streaming output (synthesized)', () => {
   it('emits a streamable WebM: separate init chunk + ≥2 Cluster chunks, unknown-size Segment', async () => {

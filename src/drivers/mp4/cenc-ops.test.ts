@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
-import { encryptCenc } from '../../test-support/cenc-encrypt.ts';
+import { encryptCenc, encryptCens } from '../../test-support/cenc-encrypt.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 
@@ -90,5 +90,45 @@ describe('media.decrypt — CENC (cenc / AES-CTR) on real MP4 (ADR-023)', () => 
     const handle = createMedia().decrypt(encSource(enc), { scheme: 'cenc', keys: { [KID]: KEY } });
     handle.cancel();
     await expect(handle).rejects.toBeInstanceOf(MediaError);
+  });
+});
+
+describe('media.decrypt — CENC cens (AES-CTR pattern) on real MP4', () => {
+  it('decrypt(encryptCens(movie_5.mp4)) recovers the audio samples bit-exact', async () => {
+    const clear = await loadFixture('movie_5.mp4');
+    const enc = await encryptCens(clear, { keyHex: KEY, kidHex: KID });
+
+    const clearAudio = await audioSamples(clear);
+    expect(clearAudio.length).toBeGreaterThan(10);
+    expect(await audioSamples(enc)).not.toEqual(clearAudio);
+
+    const out = await blobBytes(
+      await createMedia().decrypt(encSource(enc), { scheme: 'cens', keys: { [KID]: KEY } }),
+    );
+    expect(await audioSamples(out)).toEqual(clearAudio);
+  });
+
+  it('rejects a scheme that contradicts the container (cens file asked as cenc)', async () => {
+    const enc = await encryptCens(await loadFixture('movie_5.mp4'), { keyHex: KEY, kidHex: KID });
+    const err = await createMedia()
+      .decrypt(encSource(enc), { scheme: 'cenc', keys: { [KID]: KEY } })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(MediaError);
+    expect(err).not.toBeInstanceOf(CapabilityError);
+  });
+
+  it('a wrong key does not recover the cens cleartext', async () => {
+    const clear = await loadFixture('movie_5.mp4');
+    const enc = await encryptCens(clear, { keyHex: KEY, kidHex: KID });
+    const out = await blobBytes(
+      await createMedia().decrypt(encSource(enc), {
+        scheme: 'cens',
+        keys: { [KID]: 'ffffffffffffffffffffffffffffffff' },
+      }),
+    );
+    expect(await audioSamples(out)).not.toEqual(await audioSamples(clear));
   });
 });

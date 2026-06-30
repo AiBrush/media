@@ -129,6 +129,34 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     expect(out.map((frame) => frame.closeCount)).toEqual([1, 1]);
   });
 
+  it('does not prefetch a native frame before a downstream reader asks', async () => {
+    let pulls = 0;
+    const input = [new FakeFrame(0, 40), new FakeFrame(40, 40)];
+    const source = new ReadableStream<FakeFrame>(
+      {
+        pull(controller): void {
+          pulls++;
+          const frame = input.shift();
+          if (frame === undefined) controller.close();
+          else controller.enqueue(frame);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    const trimmed = trimTimedFrameStream(source, { startUs: 0, endUs: 100 }, restampFake);
+    await Promise.resolve();
+
+    expect(pulls).toBe(0);
+
+    const reader = trimmed.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(pulls).toBe(1);
+    first.value?.close();
+    await reader.cancel();
+  });
+
   it('keeps a frame exactly at start and excludes a frame exactly at end', async () => {
     const input = [100, 200, 300, 400].map((timestamp) => new FakeFrame(timestamp, 50));
     const source = fakeFrameStream(input);

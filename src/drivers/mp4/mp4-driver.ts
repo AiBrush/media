@@ -28,10 +28,12 @@ import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
 import {
   CBCS_SCHEME,
   CENC_SCHEME,
+  CENS_SCHEME,
   type CencScheme,
   type SencSample,
   decryptSamples,
   decryptSamplesCbcs,
+  decryptSamplesCens,
   kidHex,
   parseSenc,
   parseTenc,
@@ -54,6 +56,7 @@ import { Reader } from './reader.ts';
 import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import {
   type ContainerBrand,
+  type Mp4ByteStreamLayout,
   type MuxSampleInput,
   type MuxTrackInput,
   type MuxTrackLayoutInput,
@@ -537,6 +540,101 @@ async function verifyTrimmedAvcDecodeIfAvailable(
   }
 }
 
+async function verifyTrimmedAvcDecodeFromSourceIfAvailable(
+  track: ParsedTrack,
+  selected: readonly SampleData[],
+  ra: RandomAccess,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const config = avcDecodeConfig(track);
+  if (!config || !(await canBrowserDecodeForTrim(config))) return;
+  validateSampleRanges(selected, ra.size);
+
+  const windows = planSampleReadWindows(selected);
+  const windowByOrdinal = new Array<SampleReadWindow<SampleData> | undefined>(selected.length);
+  for (const window of windows) {
+    for (const item of window.items) windowByOrdinal[item.ordinal] = window;
+  }
+
+  let decoder: VideoDecoder | undefined;
+  let settled = false;
+  let failDecode = (_error: MediaError): void => undefined;
+  const errorPromise = new Promise<never>((_, reject: (reason?: unknown) => void) => {
+    failDecode = (error): void => reject(error);
+  });
+  const fail = (error: MediaError): void => {
+    if (settled) return;
+    settled = true;
+    closeDecoder(decoder);
+    failDecode(error);
+  };
+  const onAbort = (): void => fail(abortedError());
+
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    decoder = new VideoDecoder({
+      output: (frame: VideoFrame): void => frame.close(),
+      error: (e: DOMException): void => fail(trimDecodeValidationError(track, e)),
+    });
+    try {
+      decoder.configure(config);
+    } catch {
+      return;
+    }
+
+    let currentWindow: SampleReadWindow<SampleData> | undefined;
+    let currentBytes: Uint8Array | undefined;
+    for (let i = 0; i < selected.length; i++) {
+      throwIfAborted(signal);
+      const sample = selected[i];
+      if (sample === undefined) continue;
+      const window = windowByOrdinal[i];
+      if (window === undefined) {
+        throw new MediaError(
+          'demux-error',
+          `sample ${sample.index} has no read window (internal read plan error)`,
+        );
+      }
+      if (window !== currentWindow) {
+        currentBytes = await ra.read(window.start, window.end - window.start);
+        throwIfAborted(signal);
+        if (currentBytes.byteLength !== window.end - window.start) {
+          throw new MediaError(
+            'demux-error',
+            `sample window [${window.start}, ${window.end}) short read: got ${
+              currentBytes.byteLength
+            } of ${window.end - window.start} bytes (truncated MP4)`,
+          );
+        }
+        currentWindow = window;
+      }
+      if (currentBytes === undefined) {
+        throw new MediaError(
+          'demux-error',
+          'sample window bytes are missing (internal read error)',
+        );
+      }
+      const rel = sample.offset - window.start;
+      await Promise.race([drainDecoderBelowHighWater(decoder, signal), errorPromise]);
+      decoder.decode(
+        new EncodedVideoChunk({
+          type: sample.keyframe ? 'key' : 'delta',
+          timestamp: toUs(sample.dtsTicks + sample.cttsTicks, track.timescale),
+          duration: toUs(sample.durationTicks, track.timescale),
+          data: currentBytes.subarray(rel, rel + sample.size),
+        }),
+      );
+    }
+    await Promise.race([decoder.flush(), errorPromise]);
+  } catch (e) {
+    throw e instanceof MediaError ? e : trimDecodeValidationError(track, e);
+  } finally {
+    settled = true;
+    signal?.removeEventListener('abort', onAbort);
+    closeDecoder(decoder);
+  }
+}
+
 async function trimMuxTracks(
   ra: RandomAccess,
   movie: Movie,
@@ -745,12 +843,20 @@ function cencSamplesForTrack(
   }
   throw new MediaError(
     'demux-error',
-    `${containerScheme}-protected track ${trackId} is not decryptable by this path: per-sample encryption data (senc) is absent and no cbcs default_constant_IV fallback applies (malformed protection metadata)`,
+    `${containerScheme} track ${trackId} missing senc/default_IV metadata`,
   );
 }
 
+function supportedCencScheme(schemeType: string): CencScheme | undefined {
+  if (schemeType === CENC_SCHEME || schemeType === CENS_SCHEME || schemeType === CBCS_SCHEME) {
+    return schemeType;
+  }
+  return undefined;
+}
+
 /**
- * Decrypt one CENC-protected track (`cenc` AES-CTR or `cbcs` AES-CBC-pattern) into a cleartext
+ * Decrypt one CENC-protected track (`cenc` AES-CTR, `cens` AES-CTR-pattern, or `cbcs`
+ * AES-CBC-pattern) into a cleartext
  * {@link MuxTrackInput}. The scheme is the container's own (`enc.schemeType` from `schm`); the caller's
  * declared `scheme` must match it (a mismatch is corrupt/contradictory input). A protected track with an
  * empty sample table (e.g. fragmented/CMAF metadata in `moof/traf`, which this `moov` path does not read)
@@ -767,17 +873,24 @@ async function decryptCencTrack(
   declaredScheme: CencScheme,
   sourceSize: number | undefined,
 ): Promise<MuxTrackInput> {
-  const containerScheme: CencScheme = enc.schemeType === CBCS_SCHEME ? CBCS_SCHEME : CENC_SCHEME;
+  const containerScheme = supportedCencScheme(enc.schemeType);
+  if (!containerScheme) {
+    throw new CapabilityError(
+      'capability-miss',
+      `unsupported MP4 protection scheme '${enc.schemeType}'`,
+      { op: 'decrypt', tried: ['mp4'] },
+    );
+  }
   if (containerScheme !== declaredScheme) {
     throw new MediaError(
       'demux-error',
-      `track ${parsed.id} is '${containerScheme}'-protected but decrypt was asked for '${declaredScheme}' (scheme mismatch)`,
+      `track ${parsed.id} is ${containerScheme}, not requested ${declaredScheme}`,
     );
   }
   if (parsed.samples.sampleSizes.length === 0) {
     throw new MediaError(
       'demux-error',
-      `${containerScheme}-protected track ${parsed.id} is not decryptable by this path: the sample table is empty (malformed or fragmented protection metadata)`,
+      `${containerScheme} track ${parsed.id} has no decryptable samples`,
     );
   }
   const tenc = parseTenc(enc.tenc, containerScheme);
@@ -790,7 +903,7 @@ async function decryptCencTrack(
   if (senc.length !== track.samples.length) {
     throw new MediaError(
       'demux-error',
-      `senc describes ${senc.length} samples but the track has ${track.samples.length} (corrupt sample-encryption metadata)`,
+      `senc sample count ${senc.length} != track sample count ${track.samples.length}`,
     );
   }
   const cipher = track.samples.map((s) => s.data);
@@ -803,7 +916,14 @@ async function decryptCencTrack(
           tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 }, // version-0 cbcs ⇒ full CBC, no pattern
           tenc.constantIv,
         )
-      : await decryptSamples(key, cipher, senc);
+      : containerScheme === CENS_SCHEME
+        ? await decryptSamplesCens(
+            key,
+            cipher,
+            senc,
+            tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 },
+          )
+        : await decryptSamples(key, cipher, senc);
   return { ...track, samples: track.samples.map((s, j) => ({ ...s, data: clear[j] ?? s.data })) };
 }
 
@@ -979,6 +1099,148 @@ function lazyProgressiveTracksFromMovie(ra: RandomAccess, movie: Movie): LazyPro
   return tracks;
 }
 
+async function lazyProgressiveTrimTracksFromMovie(
+  ra: RandomAccess,
+  movie: Movie,
+  startSec: number,
+  endSec: number,
+  signal: AbortSignal | undefined,
+): Promise<LazyProgressiveTrack[]> {
+  const tracks: LazyProgressiveTrack[] = [];
+  for (const track of movie.tracks) {
+    const samples = selectTrimmed(track, startSec, endSec);
+    validateSampleRanges(samples, ra.size);
+    await verifyTrimmedAvcDecodeFromSourceIfAvailable(track, samples, ra, signal);
+    tracks.push({
+      metadata: {
+        ...muxTrackMeta(track),
+        samples: samples.map((sample) => ({
+          byteLength: sample.size,
+          durationTicks: sample.durationTicks,
+          cttsTicks: sample.cttsTicks,
+          keyframe: sample.keyframe,
+        })),
+      },
+      samples,
+    });
+  }
+  if (tracks.length === 0) {
+    throw new MediaError('mux-error', 'cannot trim-copy a movie with no tracks');
+  }
+  if (!tracks.some((track) => track.samples.length > 0)) {
+    throw new MediaError('mux-error', 'trim selected no samples');
+  }
+  return tracks;
+}
+
+function progressiveLayoutFromTracks(
+  tracks: readonly LazyProgressiveTrack[],
+  o: StreamCopyOptions | undefined,
+): Mp4ByteStreamLayout {
+  return planMp4ByteStreamLayout(
+    tracks.map((track) => track.metadata),
+    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
+  );
+}
+
+async function* progressivePayloadSegments(
+  ra: RandomAccess,
+  tracks: readonly LazyProgressiveTrack[],
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  for (const track of tracks) {
+    for (const window of planOrderedSampleReadWindows(track.samples)) {
+      throwIfAborted(signal);
+      const chunk = await readProgressivePayloadChunk(ra, window);
+      throwIfAborted(signal);
+      yield chunk;
+    }
+  }
+}
+
+async function* progressiveSegmentsFromTracks(
+  ra: RandomAccess,
+  tracks: readonly LazyProgressiveTrack[],
+  o: StreamCopyOptions | undefined,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  const signal = o?.signal;
+  const layout = progressiveLayoutFromTracks(tracks, o);
+
+  throwIfAborted(signal);
+  yield layout.ftyp;
+  if (layout.mdatBeforeMoov) {
+    yield layout.mdatHeader;
+    yield* progressivePayloadSegments(ra, tracks, signal);
+    yield layout.moov;
+    return;
+  }
+  yield layout.moov;
+  yield layout.mdatHeader;
+  yield* progressivePayloadSegments(ra, tracks, signal);
+}
+
+async function materializeProgressiveTracksBytes(
+  ra: RandomAccess,
+  tracks: readonly LazyProgressiveTrack[],
+  o: StreamCopyOptions | undefined,
+): Promise<Uint8Array> {
+  const signal = o?.signal;
+  const layout = progressiveLayoutFromTracks(tracks, o);
+
+  throwIfAborted(signal);
+  const out = new Uint8Array(layout.totalLen);
+  let p = 0;
+  out.set(layout.ftyp, p);
+  p += layout.ftyp.byteLength;
+  if (!layout.mdatBeforeMoov) {
+    out.set(layout.moov, p);
+    p += layout.moov.byteLength;
+  }
+  out.set(layout.mdatHeader, p);
+  p += layout.mdatHeader.byteLength;
+  const payloadStart = p;
+
+  for (const track of tracks) {
+    for (const window of planOrderedSampleReadWindows(track.samples)) {
+      throwIfAborted(signal);
+      const span = await ra.read(window.start, window.end - window.start);
+      if (span.byteLength !== window.end - window.start) {
+        throw new MediaError(
+          'demux-error',
+          `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+            window.end - window.start
+          } bytes (truncated MP4)`,
+        );
+      }
+      throwIfAborted(signal);
+      for (const item of window.items) {
+        const rel = item.sample.offset - window.start;
+        out.set(span.subarray(rel, rel + item.sample.size), p);
+        p += item.sample.size;
+      }
+    }
+  }
+
+  const payloadEnd = payloadStart + layout.mdatPayloadLen;
+  if (p !== payloadEnd) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 layout mismatch: wrote ${p - payloadStart} payload bytes, expected ${layout.mdatPayloadLen}`,
+    );
+  }
+  if (layout.mdatBeforeMoov) {
+    out.set(layout.moov, p);
+    p += layout.moov.byteLength;
+  }
+  if (p !== layout.totalLen) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 layout mismatch: wrote ${p} total bytes, expected ${layout.totalLen}`,
+    );
+  }
+  return out;
+}
+
 function planOrderedSampleReadWindows(samples: readonly SampleData[]): SampleReadWindow[] {
   const windows: SampleReadWindow[] = [];
   let current: SampleReadWindow | undefined;
@@ -1043,34 +1305,20 @@ async function* progressiveSourceSegments(
   movie: Movie,
   o: StreamCopyOptions | undefined,
 ): AsyncGenerator<Uint8Array, void, undefined> {
-  const signal = o?.signal;
-  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
-  const layout = planMp4ByteStreamLayout(
-    tracks.map((track) => track.metadata),
-    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
-  );
-  const yieldPayloads = async function* (): AsyncGenerator<Uint8Array, void, undefined> {
-    for (const track of tracks) {
-      for (const window of planOrderedSampleReadWindows(track.samples)) {
-        throwIfAborted(signal);
-        const chunk = await readProgressivePayloadChunk(ra, window);
-        throwIfAborted(signal);
-        yield chunk;
-      }
-    }
-  };
+  yield* progressiveSegmentsFromTracks(ra, lazyProgressiveTracksFromMovie(ra, movie), o);
+}
 
-  throwIfAborted(signal);
-  yield layout.ftyp;
-  if (layout.mdatBeforeMoov) {
-    yield layout.mdatHeader;
-    yield* yieldPayloads();
-    yield layout.moov;
-    return;
-  }
-  yield layout.moov;
-  yield layout.mdatHeader;
-  yield* yieldPayloads();
+async function* trimmedProgressiveSourceSegments(
+  ra: RandomAccess,
+  movie: Movie,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+  o: StreamCopyOptions | undefined,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  yield* progressiveSegmentsFromTracks(
+    ra,
+    await lazyProgressiveTrimTracksFromMovie(ra, movie, trim.startSec, trim.endSec, o?.signal),
+    o,
+  );
 }
 
 function progressiveSourceStream(
@@ -1098,70 +1346,51 @@ function progressiveSourceStream(
   );
 }
 
+function trimmedProgressiveSourceStream(
+  ra: RandomAccess,
+  movie: Movie,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+  o: StreamCopyOptions | undefined,
+): ReadableStream<Uint8Array> {
+  const segments = trimmedProgressiveSourceSegments(ra, movie, trim, o);
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          const { done, value } = await segments.next();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      async cancel(): Promise<void> {
+        await segments.return?.();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 async function materializeProgressiveSourceBytes(
   ra: RandomAccess,
   movie: Movie,
   o: StreamCopyOptions | undefined,
 ): Promise<Uint8Array> {
-  const signal = o?.signal;
-  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
-  const layout = planMp4ByteStreamLayout(
-    tracks.map((track) => track.metadata),
-    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
+  return materializeProgressiveTracksBytes(ra, lazyProgressiveTracksFromMovie(ra, movie), o);
+}
+
+async function materializeTrimmedProgressiveSourceBytes(
+  ra: RandomAccess,
+  movie: Movie,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+  o: StreamCopyOptions | undefined,
+): Promise<Uint8Array> {
+  return materializeProgressiveTracksBytes(
+    ra,
+    await lazyProgressiveTrimTracksFromMovie(ra, movie, trim.startSec, trim.endSec, o?.signal),
+    o,
   );
-
-  throwIfAborted(signal);
-  const out = new Uint8Array(layout.totalLen);
-  let p = 0;
-  out.set(layout.ftyp, p);
-  p += layout.ftyp.byteLength;
-  if (!layout.mdatBeforeMoov) {
-    out.set(layout.moov, p);
-    p += layout.moov.byteLength;
-  }
-  out.set(layout.mdatHeader, p);
-  p += layout.mdatHeader.byteLength;
-  const payloadStart = p;
-
-  for (const track of tracks) {
-    for (const window of planOrderedSampleReadWindows(track.samples)) {
-      throwIfAborted(signal);
-      const span = await ra.read(window.start, window.end - window.start);
-      if (span.byteLength !== window.end - window.start) {
-        throw new MediaError(
-          'demux-error',
-          `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
-            window.end - window.start
-          } bytes (truncated MP4)`,
-        );
-      }
-      throwIfAborted(signal);
-      for (const item of window.items) {
-        const rel = item.sample.offset - window.start;
-        out.set(span.subarray(rel, rel + item.sample.size), p);
-        p += item.sample.size;
-      }
-    }
-  }
-
-  const payloadEnd = payloadStart + layout.mdatPayloadLen;
-  if (p !== payloadEnd) {
-    throw new MediaError(
-      'mux-error',
-      `internal MP4 layout mismatch: wrote ${p - payloadStart} payload bytes, expected ${layout.mdatPayloadLen}`,
-    );
-  }
-  if (layout.mdatBeforeMoov) {
-    out.set(layout.moov, p);
-    p += layout.moov.byteLength;
-  }
-  if (p !== layout.totalLen) {
-    throw new MediaError(
-      'mux-error',
-      `internal MP4 layout mismatch: wrote ${p} total bytes, expected ${layout.totalLen}`,
-    );
-  }
-  return out;
 }
 
 function progressiveSourceBufferStream(
@@ -1180,6 +1409,36 @@ function progressiveSourceBufferStream(
         emitted = true;
         try {
           controller.enqueue(await materializeProgressiveSourceBytes(ra, movie, o));
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      cancel(): void {
+        // Range reads are one-shot promises; abort is handled through StreamCopyOptions.signal.
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+function trimmedProgressiveSourceBufferStream(
+  ra: RandomAccess,
+  movie: Movie,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+  o: StreamCopyOptions | undefined,
+): ReadableStream<Uint8Array> {
+  let emitted = false;
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        if (emitted) {
+          controller.close();
+          return;
+        }
+        emitted = true;
+        try {
+          controller.enqueue(await materializeTrimmedProgressiveSourceBytes(ra, movie, trim, o));
           controller.close();
         } catch (error) {
           controller.error(error);
@@ -1317,6 +1576,12 @@ export const Mp4Driver: ContainerDriver = {
     if (o?.buffered === true && trim === undefined) {
       return progressiveSourceBufferStream(ra, movie, o);
     }
+    if (o?.streaming === true && trim !== undefined) {
+      return trimmedProgressiveSourceStream(ra, movie, trim, o);
+    }
+    if (o?.buffered === true && trim !== undefined) {
+      return trimmedProgressiveSourceBufferStream(ra, movie, trim, o);
+    }
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal)
       : await muxTracksFromMovie(ra, movie);
@@ -1339,11 +1604,11 @@ export const Mp4Driver: ContainerDriver = {
       return oneShot(clear);
     }
 
-    // CENC sample decryption: 'cenc' (AES-CTR) or 'cbcs' (AES-CBC pattern). Anything else is unsupported.
-    if (o.scheme !== CENC_SCHEME && o.scheme !== CBCS_SCHEME) {
+    // CENC sample decryption: 'cenc' (AES-CTR), 'cens' (AES-CTR pattern), or 'cbcs' (AES-CBC pattern).
+    if (o.scheme !== CENC_SCHEME && o.scheme !== CENS_SCHEME && o.scheme !== CBCS_SCHEME) {
       throw new CapabilityError(
         'capability-miss',
-        `the mp4 driver decrypts CENC ('cenc'/'cbcs') and HLS ('hls-aes128'); '${o.scheme}' is not supported`,
+        `mp4 decrypt supports cenc/cens/cbcs/hls-aes128, not '${o.scheme}'`,
         { op: 'decrypt', tried: ['mp4'] },
       );
     }

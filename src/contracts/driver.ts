@@ -287,7 +287,7 @@ export interface PcmTransform extends StageOptions {
 
 /** Options for a driver-native decrypt (CENC / HLS sample decryption), ADR-023. */
 export interface DecryptParams extends StageOptions {
-  scheme: 'cenc' | 'cbcs' | 'hls-aes128';
+  scheme: 'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes';
   /** keyId(hex) → key(hex). For CENC, keyed by the track's `tenc` default_KID. */
   keys: Record<string, string>;
 }

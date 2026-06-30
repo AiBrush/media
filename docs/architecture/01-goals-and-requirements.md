@@ -18,7 +18,7 @@ A single in-browser media engine that, behind a flat "express your intent" API, 
 | `remux` | Container → container, **stream-copy** (no re-encode). |
 | `trim` | Time-range cut (keyframe-aligned copy or frame-accurate). |
 | `convert` | The headline op: produce a target container/codecs; **auto-routes** copy-vs-re-encode, applies filters. Subsumes transcode. |
-| `decrypt` | CENC (CTR/CBCS) and HLS AES-128 sample decryption **given keys**. |
+| `decrypt` | CENC (`cenc`/`cens`/`cbcs`), HLS full-segment AES-128, and HLS TS SAMPLE-AES decryption **given keys**. |
 
 Filters (resize, crop, pad, rotate, flip, colorspace, tonemap; audio resample, remix/down-up-mix, gain, fade) are stages available to `convert` and the low-level graph.
 
@@ -30,7 +30,7 @@ Filters (resize, crop, pad, rotate, flip, colorspace, tonemap; audio resample, r
 
 **Audio codecs:** AAC, Opus, MP3, FLAC, Vorbis, PCM (s16/s24/f32, LE/BE).
 
-**Encryption:** CENC `cenc`(CTR) and `cbcs`, HLS AES-128 — decrypt with caller-provided keys; clean rejection of unsupported schemes.
+**Encryption:** CENC `cenc`/`cens`/`cbcs`, HLS AES-128, and HLS TS SAMPLE-AES — decrypt with caller-provided keys; clean rejection of unsupported schemes.
 
 Coverage is "what real apps need." The long tail of obscure containers/codecs is explicitly a **non-goal** (§6).
 

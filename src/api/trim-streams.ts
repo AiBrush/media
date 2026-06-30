@@ -130,50 +130,53 @@ export function trimTimedFrameStream<T extends TimedFrameForTrim>(
     }
   };
 
-  return new ReadableStream<T>({
-    async pull(controller): Promise<void> {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) {
-          release();
-          controller.close();
+  return new ReadableStream<T>(
+    {
+      async pull(controller): Promise<void> {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            release();
+            controller.close();
+            return;
+          }
+          const frame = value;
+          if (frame.timestamp < bounds.startUs) {
+            frame.close();
+            continue;
+          }
+          if (frame.timestamp >= bounds.endUs) {
+            frame.close();
+            await cancelReader();
+            controller.close();
+            return;
+          }
+          anchorUs ??= frame.timestamp;
+          const duration = frame.duration ?? null;
+          let out: T;
+          try {
+            out = restamp(frame, frame.timestamp - anchorUs, duration);
+          } catch (e) {
+            frame.close();
+            await cancelReader(e);
+            throw e;
+          }
+          if (out !== frame) frame.close();
+          try {
+            controller.enqueue(out);
+          } catch (e) {
+            out.close();
+            throw e;
+          }
           return;
         }
-        const frame = value;
-        if (frame.timestamp < bounds.startUs) {
-          frame.close();
-          continue;
-        }
-        if (frame.timestamp >= bounds.endUs) {
-          frame.close();
-          await cancelReader();
-          controller.close();
-          return;
-        }
-        anchorUs ??= frame.timestamp;
-        const duration = frame.duration ?? null;
-        let out: T;
-        try {
-          out = restamp(frame, frame.timestamp - anchorUs, duration);
-        } catch (e) {
-          frame.close();
-          await cancelReader(e);
-          throw e;
-        }
-        if (out !== frame) frame.close();
-        try {
-          controller.enqueue(out);
-        } catch (e) {
-          out.close();
-          throw e;
-        }
-        return;
-      }
+      },
+      async cancel(reason): Promise<void> {
+        await cancelReader(reason);
+      },
     },
-    async cancel(reason): Promise<void> {
-      await cancelReader(reason);
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 export function trimAudioGaplessFrameStream<T extends AudioSampleFrameForTrim>(
@@ -208,64 +211,67 @@ export function trimAudioGaplessFrameStream<T extends AudioSampleFrameForTrim>(
     }
   };
 
-  return new ReadableStream<T>({
-    async pull(controller): Promise<void> {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) {
-          release();
-          controller.close();
-          return;
-        }
-
-        const frame = value;
-        const frameStart = decodedSamples;
-        const frameEnd = frameStart + frame.numberOfFrames;
-        decodedSamples = frameEnd;
-
-        const keepStart = Math.max(frameStart, contentStart);
-        const keepEnd = Math.min(frameEnd, contentEnd);
-        if (keepEnd <= keepStart) {
-          frame.close();
-          if (frameEnd >= contentEnd) {
-            await cancelReader();
+  return new ReadableStream<T>(
+    {
+      async pull(controller): Promise<void> {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            release();
             controller.close();
             return;
           }
-          continue;
-        }
 
-        const startFrame = keepStart - frameStart;
-        const frameCount = keepEnd - keepStart;
-        const timestamp = samplesToMicros(emittedSamples, frame.sampleRate);
-        emittedSamples += frameCount;
+          const frame = value;
+          const frameStart = decodedSamples;
+          const frameEnd = frameStart + frame.numberOfFrames;
+          decodedSamples = frameEnd;
 
-        let out: T;
-        try {
-          out = restamp(frame, startFrame, frameCount, timestamp);
-        } catch (e) {
-          frame.close();
-          await cancelReader(e);
-          throw e;
+          const keepStart = Math.max(frameStart, contentStart);
+          const keepEnd = Math.min(frameEnd, contentEnd);
+          if (keepEnd <= keepStart) {
+            frame.close();
+            if (frameEnd >= contentEnd) {
+              await cancelReader();
+              controller.close();
+              return;
+            }
+            continue;
+          }
+
+          const startFrame = keepStart - frameStart;
+          const frameCount = keepEnd - keepStart;
+          const timestamp = samplesToMicros(emittedSamples, frame.sampleRate);
+          emittedSamples += frameCount;
+
+          let out: T;
+          try {
+            out = restamp(frame, startFrame, frameCount, timestamp);
+          } catch (e) {
+            frame.close();
+            await cancelReader(e);
+            throw e;
+          }
+          if (out !== frame) frame.close();
+          try {
+            controller.enqueue(out);
+          } catch (e) {
+            out.close();
+            throw e;
+          }
+          if (keepEnd >= contentEnd) {
+            await cancelReader();
+            controller.close();
+          }
+          return;
         }
-        if (out !== frame) frame.close();
-        try {
-          controller.enqueue(out);
-        } catch (e) {
-          out.close();
-          throw e;
-        }
-        if (keepEnd >= contentEnd) {
-          await cancelReader();
-          controller.close();
-        }
-        return;
-      }
+      },
+      async cancel(reason): Promise<void> {
+        await cancelReader(reason);
+      },
     },
-    async cancel(reason): Promise<void> {
-      await cancelReader(reason);
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number): Packet {

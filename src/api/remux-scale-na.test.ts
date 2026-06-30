@@ -1,14 +1,11 @@
 /**
- * Oversize cross-container remux is an honest, typed scale-NA — NOT a 30s hang / OOM (conf-killer #3,
- * ADR-094). The MP4/WebM EncodedChunk-seam muxers buffer every packet and serialize the whole file at
- * `finalize()`, so a multi-GB remux (e.g. 2h 1080p mp4→mkv) would exhaust an in-browser tab's memory.
- * The engine now declines such a remux UP FRONT — from the known source size, before demuxing — with a
- * typed {@link CapabilityError}, instead of attempting the buffer-all serialize and timing out.
+ * Oversize cross-container MP4→WebM/MKV remux is no longer a scale-NA: S8 routes it to the streaming
+ * Cluster-on-write muxer (ADR-113), so the old buffer-all memory gate must not fire. Node still cannot
+ * execute the browser packet seam because it lacks WebCodecs `EncodedChunk` constructors; that remains a
+ * typed capability miss here, while the browser matrix validates the real pass.
  *
- * This is the Node-checkable half of the fix: the gate fires in `#remuxViaSeam` before any packet is read,
- * so a `Source` with a real MP4 head (for container routing) but a faked >1 GiB `size` triggers it without
- * needing real gigabytes or WebCodecs. The graceful-failure oracle (doc 11 §5) accepts a typed reject here;
- * the streaming-Cluster mux that lifts the ceiling is the sequenced SOTA follow-up (ADR-094).
+ * This is the Node-checkable half of the fix: a `Source` with a real MP4 head but a faked >1 GiB `size`
+ * must bypass the memory-limit message and reach the browser-only streaming-remux boundary instead.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -39,26 +36,27 @@ async function mp4Bytes(): Promise<Uint8Array> {
 
 const GIB = 1024 * 1024 * 1024;
 
-describe('remux scale-NA — an oversize cross-container remux declines up front with a typed CapabilityError', () => {
-  it('a >1 GiB mp4→mkv remux raises CapabilityError BEFORE attempting the buffer-all serialize', async () => {
+describe('remux scale — oversize mp4→mkv uses the streaming WebM/MKV route', () => {
+  it('a >1 GiB mp4→mkv remux no longer raises the buffer-all memory gate', async () => {
     const src = mp4SourceWithSize(await mp4Bytes(), 2 * GIB); // a "2-hour 1080p"-scale source
     const media = createMedia().use(Mp4Module).use(WebmModule);
     const err = await media.remux(src, { to: 'mkv' }).then(
       () => undefined,
       (e: unknown) => e,
     );
-    expect(err, 'oversize remux rejects').toBeInstanceOf(CapabilityError);
+    expect(err, 'Node reaches the browser-only streaming packet seam').toBeInstanceOf(
+      CapabilityError,
+    );
     expect((err as CapabilityError).code).toBe('capability-miss');
-    // The message names the real resource limit (memory / MB), not a fake "unsupported codec".
-    expect((err as CapabilityError).message).toMatch(/buffer|memory|MB/i);
+    expect((err as CapabilityError).message).toMatch(/EncodedChunk constructors/i);
+    expect((err as CapabilityError).message).not.toMatch(/buffer|memory|MB/i);
   });
 
-  it('the reject is fast (the gate runs before demux — no hang / no whole-file read)', async () => {
+  it('the Node miss is fast and does not attempt the old buffer-all serialize', async () => {
     const src = mp4SourceWithSize(await mp4Bytes(), 4 * GIB);
     const media = createMedia().use(Mp4Module).use(WebmModule);
     const t0 = Date.now();
     await media.remux(src, { to: 'mkv' }).catch(() => undefined);
-    // Up-front gate ⇒ well under a second (the 30s harness timeout is what this prevents).
     expect(Date.now() - t0).toBeLessThan(2000);
   });
 

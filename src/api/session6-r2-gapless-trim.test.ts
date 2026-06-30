@@ -98,6 +98,38 @@ describe('Session 6 R2 AAC gapless sample-window trimming', () => {
     expect(out.map((frame) => frame.closeCount)).toEqual([1, 1, 1]);
   });
 
+  it('does not prefetch an AudioData handle before downstream demand', async () => {
+    let pulls = 0;
+    const input = [new FakeAudioFrame(0, 21_333, 1024, 48_000, 'program')];
+    const source = new ReadableStream<FakeAudioFrame>(
+      {
+        pull(controller): void {
+          pulls++;
+          const frame = input.shift();
+          if (frame === undefined) controller.close();
+          else controller.enqueue(frame);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    const trimmed = trimAudioGaplessFrameStream(
+      source,
+      { leadingSamples: 0, totalSamples: 1024 },
+      restampFakeAudioRange,
+    );
+    await Promise.resolve();
+
+    expect(pulls).toBe(0);
+
+    const reader = trimmed.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(pulls).toBe(1);
+    first.value?.close();
+    await reader.cancel();
+  });
+
   it('closes whole priming frames before slicing the first program samples', async () => {
     const input = [
       new FakeAudioFrame(0, 21_333, 1024, 48_000, 'priming'),

@@ -359,6 +359,10 @@ export const MpegTsDriver: ContainerDriver = {
     assertNotAborted(o?.signal);
     return streamCopyParsed(parsed, o);
   },
+  async decrypt(src: ByteSource, o): Promise<ReadableStream<Uint8Array>> {
+    const { decryptMpegTsSampleAes } = await import('./mpegts-decrypt.ts');
+    return decryptMpegTsSampleAes(src, o);
+  },
   createMuxer(o?: MuxOptions): Muxer {
     return new MpegTsMuxer(o);
   },

@@ -8,6 +8,7 @@
  * - code splitting;
  * - same-origin, lazy WASM assets;
  * - the probe-only path pulling zero `.wasm` assets by static import.
+ * - the heavy lazy codec/worker/op chunks staying OUT of the eager/default-probe static closures.
  *
  * Run after `bun run build && bun run vendor-wasm`. Exits non-zero if a check fails.
  */
@@ -29,6 +30,54 @@ const KERNEL_BUDGET = 50 * 1024; // eager kernel ≤ ~50 kB (DoD §2)
 // (they load only on a real codec miss).
 const TYPICAL_APP_BUDGET = 256 * 1024; // ~250 kB DoD band; tight ceiling over the current ~254 kB
 const MIN_JS_CHUNK_COUNT = 8;
+// A tiny but non-zero guard band keeps "exactly at the ceiling" from looking green. The real protection is
+// the hard ceilings above; this catches single-line leaks while leaving the Session-8 razor-thin kernel
+// measurable instead of forcing a fake budget raise.
+const MIN_BUDGET_MARGIN = 256;
+
+const HEAVY_LAZY_GUARDS: readonly HeavyLazyGuard[] = [
+  {
+    label: 'WASM codec driver',
+    pattern: /^wasm-(?:aac|av1|mp3|opus|vorbis|vorbis-enc|vpx)-driver-[A-Z0-9]+\.js$/,
+  },
+  {
+    label: 'WASM/codec core',
+    pattern: /^(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core(?:-[A-Z0-9]+)?\.js$/,
+  },
+  {
+    label: 'lazy FLAC implementation',
+    pattern: /^flac-(?:codec|driver)-[A-Z0-9]+\.js$/,
+  },
+  {
+    label: 'worker boot/host',
+    pattern: /^(?:worker\.js|worker-host-[A-Z0-9]+\.js)$/,
+  },
+  {
+    label: 'live codec pipeline helper',
+    pattern:
+      /^(?:audio-stream-plan|codec-pipeline|flac-convert-plan|materialize|mux-packet-streams|pcm-convert-plan|preload|trim-streams|video-frame-convert|video-stream-plan)-[A-Z0-9]+\.js$/,
+  },
+  {
+    label: 'metadata writer helper',
+    pattern: /^(?:id3|matroska-tags|mp4-tags|ogg-vorbis-comment|vorbis-comment)-[A-Z0-9]+\.js$/,
+  },
+];
+
+const REQUIRED_EAGER_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
+  { label: 'default driver bundle', pattern: /^(?:defaults|defaults-[A-Z0-9]+)\.js$/ },
+  { label: 'worker host', pattern: /^worker-host-[A-Z0-9]+\.js$/ },
+  { label: 'live codec pipeline', pattern: /^codec-pipeline-[A-Z0-9]+\.js$/ },
+  { label: 'metadata writer helpers', pattern: /^mp4-tags-[A-Z0-9]+\.js$/ },
+];
+
+const REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
+  { label: 'lazy FLAC driver', pattern: /^flac-driver-[A-Z0-9]+\.js$/ },
+  {
+    label: 'WASM fallback driver',
+    pattern: /^wasm-(?:aac|av1|mp3|opus|vorbis|vpx)-driver-[A-Z0-9]+\.js$/,
+  },
+  { label: 'WASM encoder driver', pattern: /^wasm-vorbis-enc-driver-[A-Z0-9]+\.js$/ },
+];
 
 interface FileReport {
   readonly file: string;
@@ -45,6 +94,21 @@ interface DistGraph {
 interface WasmReference {
   readonly file: string;
   readonly asset: string;
+}
+
+interface HeavyLazyGuard {
+  readonly label: string;
+  readonly pattern: RegExp;
+}
+
+interface LazyImportRequirement {
+  readonly label: string;
+  readonly pattern: RegExp;
+}
+
+interface LazyImportEdge {
+  readonly from: string;
+  readonly to: string;
 }
 
 function fail(message: string): never {
@@ -193,7 +257,13 @@ function assertBudget(label: string, total: number, budget: number): void {
   if (total > budget) {
     fail(`${label} ${fmt(total)} exceeds the ${fmt(budget)} budget`);
   }
-  console.info(`✓ ${label} within budget (${fmt(total)} <= ${fmt(budget)})`);
+  const margin = budget - total;
+  if (margin < MIN_BUDGET_MARGIN) {
+    fail(
+      `${label} has only ${fmt(margin)} margin; minimum guard band is ${fmt(MIN_BUDGET_MARGIN)}`,
+    );
+  }
+  console.info(`✓ ${label} within budget (${fmt(total)} <= ${fmt(budget)}, margin ${fmt(margin)})`);
 }
 
 function assertCodeSplit(
@@ -207,10 +277,10 @@ function assertCodeSplit(
   );
   const dynamicImports = new Set<string>();
   const staticImports = new Set<string>();
+  for (const edge of dynamicImportEdges(graph, eagerKernel)) dynamicImports.add(edge.to);
   for (const file of eagerKernel.keys()) {
     const code = graph.text.get(file);
     assert(code !== undefined, `dist/${file} is missing`);
-    for (const spec of dynamicLocalJsImports(code)) dynamicImports.add(spec);
     for (const spec of staticLocalJsImports(code)) staticImports.add(spec);
   }
   assert(
@@ -220,6 +290,66 @@ function assertCodeSplit(
   assert(!staticImports.has(defaultDriverChunk), 'default driver bundle is statically imported');
   console.info(`✓ code-split chunks present (${graph.jsFiles.length} JS files)`);
   console.info(`✓ default driver bundle is lazy (${defaultDriverChunk})`);
+}
+
+function dynamicImportEdges(
+  graph: DistGraph,
+  files: ReadonlyMap<string, number>,
+): LazyImportEdge[] {
+  const edges: LazyImportEdge[] = [];
+  for (const file of files.keys()) {
+    const code = graph.text.get(file);
+    assert(code !== undefined, `dist/${file} is missing`);
+    for (const spec of dynamicLocalJsImports(code)) {
+      assert(graph.text.has(spec), `dist/${file} lazy-imports missing chunk ${spec}`);
+      edges.push({ from: file, to: spec });
+    }
+  }
+  return edges.sort((a, b) => a.to.localeCompare(b.to) || a.from.localeCompare(b.from));
+}
+
+function assertRequiredLazyImports(
+  label: string,
+  edges: readonly LazyImportEdge[],
+  requirements: readonly LazyImportRequirement[],
+): void {
+  const targets = new Set(edges.map((edge) => edge.to));
+  for (const requirement of requirements) {
+    assert(
+      [...targets].some((file) => requirement.pattern.test(file)),
+      `${label} does not expose a lazy ${requirement.label} import`,
+    );
+  }
+}
+
+function logLazyFrontier(label: string, edges: readonly LazyImportEdge[]): void {
+  const targets = unique(edges.map((edge) => edge.to));
+  console.info(`${label} lazy frontier (${targets.length} chunks):`);
+  for (const target of targets) {
+    const from = edges
+      .filter((edge) => edge.to === target)
+      .map((edge) => edge.from)
+      .join(', ');
+    console.info(`  ${target}  <- ${from}`);
+  }
+}
+
+function heavyLazyLeaks(files: ReadonlyMap<string, number>): string[] {
+  const leaks: string[] = [];
+  for (const file of files.keys()) {
+    const guard = HEAVY_LAZY_GUARDS.find((candidate) => candidate.pattern.test(file));
+    if (guard !== undefined) leaks.push(`${file} (${guard.label})`);
+  }
+  return leaks.sort();
+}
+
+function assertNoHeavyLazyLeaks(label: string, files: ReadonlyMap<string, number>): void {
+  const leaks = heavyLazyLeaks(files);
+  assert(
+    leaks.length === 0,
+    `${label} statically includes heavy lazy artifacts: ${leaks.join(', ')}`,
+  );
+  console.info(`✓ ${label} excludes heavy lazy codec/worker/op chunks`);
 }
 
 function assertWasmPackaging(
@@ -276,10 +406,21 @@ function assertWasmPackaging(
     `probe-only path statically pulls WASM assets: ${[...probeStaticWasmAssets].join(', ')}`,
   );
   assert(emittedWasm.size > 0, 'expected emitted WASM assets in dist/');
+  const probeWasmUrlRefs = urlRefs.filter((ref) => probeOnlyJs.has(ref.file));
   console.info(`✓ WASM assets emitted separately (${[...emittedWasm].sort().join(', ')})`);
-  console.info(
-    '✓ WASM is same-origin via import.meta.url and absent from the eager/probe static path',
-  );
+  console.info('✓ WASM is same-origin via import.meta.url and absent from the eager static path');
+  if (probeWasmUrlRefs.length === 0) {
+    console.info('✓ default/probe first-operation closure contains no WASM URL references');
+  } else {
+    console.info(
+      `• default/probe first-operation closure contains deferred WASM URL references: ${formatRefs(
+        probeWasmUrlRefs,
+      )}`,
+    );
+    console.info(
+      '  verify:package owns the installed tree-shaken probe-only zero-emitted-WASM assertion',
+    );
+  }
 }
 
 function formatRefs(refs: readonly WasmReference[]): string {
@@ -304,6 +445,7 @@ const eagerTotal = closureReport(
   KERNEL_BUDGET,
 );
 assertBudget('eager kernel', eagerTotal, KERNEL_BUDGET);
+assertNoHeavyLazyLeaks('eager kernel', eagerKernel);
 
 const typicalApp = closure(graph, defaultDriverChunk);
 const typicalTotal = closureReport(
@@ -312,8 +454,19 @@ const typicalTotal = closureReport(
   TYPICAL_APP_BUDGET,
 );
 assertBudget('typical app first-operation JS', typicalTotal, TYPICAL_APP_BUDGET);
+assertNoHeavyLazyLeaks('default/probe first-operation closure', typicalApp);
 
 assertCodeSplit(graph, eagerKernel, defaultDriverChunk);
+const eagerLazyEdges = dynamicImportEdges(graph, eagerKernel);
+const defaultProbeLazyEdges = dynamicImportEdges(graph, typicalApp);
+assertRequiredLazyImports('eager kernel', eagerLazyEdges, REQUIRED_EAGER_LAZY_IMPORTS);
+assertRequiredLazyImports(
+  'default/probe first-operation closure',
+  defaultProbeLazyEdges,
+  REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS,
+);
+logLazyFrontier('\nEager kernel', eagerLazyEdges);
+logLazyFrontier('\nDefault/probe first-operation', defaultProbeLazyEdges);
 assertWasmPackaging(graph, eagerKernel, unionClosure(graph, ['index.js', defaultDriverChunk]));
 
 console.info('\n✓ all package budget checks passed');

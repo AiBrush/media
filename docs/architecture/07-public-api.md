@@ -88,7 +88,7 @@ interface RemuxOptions {
   trackSelect?: readonly string[]; sink?: Sink
 }
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
-interface DecryptOptions { scheme: 'cenc' | 'cbcs' | 'hls-aes128'; keys: KeyMap; sink?: Sink }
+interface DecryptOptions { scheme: 'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes'; keys: KeyMap; sink?: Sink }
 interface PacketStream { track: TrackInfo; packets: ReadableStream<Packet | EncodedChunk> }
 interface PacketStreams { video?: PacketStream; audio?: PacketStream; tracks?: readonly PacketStream[] }
 interface MuxSpec { container: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }

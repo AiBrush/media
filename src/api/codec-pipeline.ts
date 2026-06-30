@@ -1324,41 +1324,44 @@ export function decodeVideoPacketsWithAlpha(
     return undefined;
   };
 
-  return new ReadableStream<VideoFrame>({
-    async pull(controller): Promise<void> {
-      const { done, value: color } = await colorReader.read();
-      if (done) {
-        closeBufferedAlpha();
-        controller.close();
-        return;
-      }
-
-      let alpha: VideoFrame | undefined;
-      let output: VideoFrame | undefined;
-      try {
-        alpha = await alphaForTimestamp(color.timestamp);
-        if (alpha === undefined) {
-          enqueueFrame(controller, color);
+  return new ReadableStream<VideoFrame>(
+    {
+      async pull(controller): Promise<void> {
+        const { done, value: color } = await colorReader.read();
+        if (done) {
+          closeBufferedAlpha();
+          controller.close();
           return;
         }
-        output = await mergeAlphaFrames(color, alpha);
-        closeFrame(color);
-        closeFrame(alpha);
-        alpha = undefined;
-        enqueueFrame(controller, output);
-        output = undefined;
-      } catch (e) {
-        closeFrame(color);
-        if (alpha !== undefined) closeFrame(alpha);
-        if (output !== undefined) closeFrame(output);
-        controller.error(e);
-      }
+
+        let alpha: VideoFrame | undefined;
+        let output: VideoFrame | undefined;
+        try {
+          alpha = await alphaForTimestamp(color.timestamp);
+          if (alpha === undefined) {
+            enqueueFrame(controller, color);
+            return;
+          }
+          output = await mergeAlphaFrames(color, alpha);
+          closeFrame(color);
+          closeFrame(alpha);
+          alpha = undefined;
+          enqueueFrame(controller, output);
+          output = undefined;
+        } catch (e) {
+          closeFrame(color);
+          if (alpha !== undefined) closeFrame(alpha);
+          if (output !== undefined) closeFrame(output);
+          controller.error(e);
+        }
+      },
+      async cancel(reason): Promise<void> {
+        await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
+        closeBufferedAlpha();
+      },
     },
-    async cancel(reason): Promise<void> {
-      await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
-      closeBufferedAlpha();
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 /**
@@ -1415,7 +1418,7 @@ export async function seekFrame(
         // Found the target frame; close the previous candidate (if any) and hand this one to the caller.
         if (last !== undefined) closeFrame(last);
         last = undefined;
-        void reader.cancel(); // stop the decoder; remaining frames are never produced
+        await reader.cancel(); // stop the decoder before handing ownership back to the caller
         return value;
       }
       // This frame precedes the target: it is a drop. Keep it only as the running "closest" fallback.

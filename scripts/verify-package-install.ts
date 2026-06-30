@@ -6,7 +6,7 @@
  * the packed artifact must contain the same `dist/` a publisher would ship.
  */
 
-import { access, mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 
@@ -16,7 +16,12 @@ const TSC = join(ROOT, 'node_modules/typescript/bin/tsc');
 const EAGER_KERNEL_BUDGET = 50 * 1024;
 const KEEP_TEMP = process.argv.includes('--keep-temp');
 const REPORT_PATH = optionValue('--report');
+const INSTALL_SPEC = optionValue('--install-spec') ?? optionValue('--package');
+const TARBALL_PATH = optionValue('--tarball');
+const SOURCE_LABEL = optionValue('--label');
 const TEXT = new TextDecoder();
+
+type PackageSourceKind = 'workspace-pack' | 'tarball' | 'install-spec';
 
 type VerificationErrorCode =
   | 'precondition'
@@ -32,22 +37,45 @@ interface CommandResult {
   readonly stderr: string;
 }
 
+interface SizedFileReport {
+  readonly file: string;
+  readonly size: number;
+}
+
 interface BundleReport {
   readonly entryFile: string;
+  readonly eagerBudgetBytes: number;
   readonly eagerJsBytes: number;
+  readonly eagerMarginBytes: number;
   readonly emittedJsBytes: number;
+  readonly lazyJsBytes: number;
+  readonly eagerJsFiles: readonly SizedFileReport[];
   readonly emittedJsFiles: readonly string[];
+  readonly emittedJsFileDetails: readonly SizedFileReport[];
   readonly emittedWasmFiles: readonly string[];
+  readonly emittedAssetFiles: readonly string[];
+}
+
+interface PackageSourceReport {
+  readonly kind: PackageSourceKind;
+  readonly label: string;
+  readonly installTarget: string;
+  readonly tarball?: string;
+  readonly installSpec?: string;
 }
 
 interface VerificationReport {
   readonly packageName: string;
   readonly packageVersion: string;
-  readonly tarball: string;
+  readonly packageSource: PackageSourceReport;
+  readonly installedPackageDir: string;
+  readonly installedPackageRealPath: string;
+  readonly workspaceRealPath: string;
   readonly exportsMapChecked: true;
   readonly declarationsChecked: true;
   readonly runtimeImportChecked: true;
   readonly bundle: BundleReport;
+  readonly warnings: readonly string[];
 }
 
 interface PackageJsonShape extends Record<string, unknown> {
@@ -63,6 +91,28 @@ interface PackageJsonShape extends Record<string, unknown> {
 interface ExportEntryShape extends Record<string, unknown> {
   readonly import?: unknown;
   readonly types?: unknown;
+}
+
+interface PackageSource {
+  readonly kind: PackageSourceKind;
+  readonly label: string;
+  readonly tarball?: string;
+  readonly installSpec?: string;
+}
+
+interface MaterializedPackageSource {
+  readonly kind: PackageSourceKind;
+  readonly label: string;
+  readonly installTarget: string;
+  readonly tarball?: string;
+  readonly installSpec?: string;
+}
+
+interface InstalledPackageCheck {
+  readonly name: string;
+  readonly version: string;
+  readonly concreteDriverSubpath?: string;
+  readonly warnings: readonly string[];
 }
 
 class PackageVerificationError extends Error {
@@ -125,6 +175,41 @@ async function exists(path: string): Promise<boolean> {
 
 async function assertFile(path: string, message: string): Promise<void> {
   assertCondition(await exists(path), 'precondition', message, path);
+}
+
+function packageSourceFromArgs(): PackageSource {
+  assertCondition(
+    !(INSTALL_SPEC !== undefined && TARBALL_PATH !== undefined),
+    'precondition',
+    'use only one of --install-spec/--package or --tarball',
+    { installSpec: INSTALL_SPEC, tarball: TARBALL_PATH },
+  );
+  if (INSTALL_SPEC !== undefined) {
+    assertCondition(
+      INSTALL_SPEC.trim().length > 0,
+      'precondition',
+      '--install-spec must not be empty',
+    );
+    return {
+      kind: 'install-spec',
+      label: SOURCE_LABEL ?? 'external-install-spec',
+      installSpec: INSTALL_SPEC,
+    };
+  }
+  if (TARBALL_PATH !== undefined) {
+    assertCondition(TARBALL_PATH.trim().length > 0, 'precondition', '--tarball must not be empty');
+    return {
+      kind: 'tarball',
+      label: SOURCE_LABEL ?? 'external-tarball',
+      tarball: resolve(ROOT, TARBALL_PATH),
+    };
+  }
+  return { kind: 'workspace-pack', label: SOURCE_LABEL ?? 'workspace-pack' };
+}
+
+function isPathInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel.length > 0 && !rel.startsWith('..') && !rel.startsWith('/');
 }
 
 function decode(bytes: Uint8Array | string | undefined): string {
@@ -190,9 +275,49 @@ async function packWorkspace(packDir: string): Promise<string> {
   return join(packDir, tarball);
 }
 
-async function installPackedPackage(
+async function materializePackageSource(
+  source: PackageSource,
+  packDir: string,
+): Promise<MaterializedPackageSource> {
+  switch (source.kind) {
+    case 'workspace-pack': {
+      const tarball = await packWorkspace(packDir);
+      return {
+        kind: source.kind,
+        label: source.label,
+        installTarget: tarball,
+        tarball: basename(tarball),
+      };
+    }
+    case 'tarball': {
+      const tarball = expectString(source.tarball, 'tarball source path');
+      await assertFile(tarball, `tarball ${tarball} is missing`);
+      return {
+        kind: source.kind,
+        label: source.label,
+        installTarget: tarball,
+        tarball: basename(tarball),
+      };
+    }
+    case 'install-spec': {
+      const installSpec = expectString(source.installSpec, 'install spec');
+      return {
+        kind: source.kind,
+        label: source.label,
+        installTarget: installSpec,
+        installSpec,
+      };
+    }
+    default: {
+      const unreachable: never = source.kind;
+      return unreachable;
+    }
+  }
+}
+
+async function installPackage(
   appDir: string,
-  tarball: string,
+  installTarget: string,
   cacheDir: string,
 ): Promise<void> {
   await writeFile(
@@ -201,7 +326,14 @@ async function installPackedPackage(
   );
   runCommand(
     'npm',
-    ['install', tarball, '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false'],
+    [
+      'install',
+      installTarget,
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--package-lock=false',
+    ],
     appDir,
     {
       npm_config_cache: cacheDir,
@@ -210,13 +342,11 @@ async function installPackedPackage(
   );
 }
 
-async function verifyInstalledPackage(installedDir: string): Promise<{
-  readonly name: string;
-  readonly version: string;
-}> {
+async function verifyInstalledPackage(installedDir: string): Promise<InstalledPackageCheck> {
   const pkg = (await readJsonRecord(join(installedDir, 'package.json'))) as PackageJsonShape;
   const name = expectString(pkg.name, 'package.json name');
   const version = expectString(pkg.version, 'package.json version');
+  const warnings: string[] = [];
   assertCondition(
     name === '@aibrush/media',
     'package-shape',
@@ -261,6 +391,7 @@ async function verifyInstalledPackage(installedDir: string): Promise<{
     'drivers wildcard types export is wrong',
     driversExport,
   );
+  const concreteDriverSubpath = await concreteDriverExportSubpath(installedDir, warnings);
   assertCondition(
     exportsMap['./package.json'] === './package.json',
     'package-shape',
@@ -288,7 +419,47 @@ async function verifyInstalledPackage(installedDir: string): Promise<{
     );
   }
 
-  return { name, version };
+  return concreteDriverSubpath === undefined
+    ? { name, version, warnings }
+    : { name, version, concreteDriverSubpath, warnings };
+}
+
+async function concreteDriverExportSubpath(
+  installedDir: string,
+  warnings: string[],
+): Promise<string | undefined> {
+  const driversDir = join(installedDir, 'dist/drivers');
+  if (!(await exists(driversDir))) {
+    warnings.push(
+      'package.json advertises exports["./drivers/*"], but the installed package has no dist/drivers/ directory; concrete driver subpath imports were not typechecked',
+    );
+    return undefined;
+  }
+
+  const jsFiles = (await collectFiles(driversDir)).filter((file) => file.endsWith('.js')).sort();
+  if (jsFiles.length === 0) {
+    warnings.push(
+      'package.json advertises exports["./drivers/*"], but dist/drivers/ contains no JavaScript files; concrete driver subpath imports were not typechecked',
+    );
+    return undefined;
+  }
+
+  let withTypes: string | undefined;
+  for (const file of jsFiles) {
+    const dtsFile = `${file.slice(0, -'.js'.length)}.d.ts`;
+    if (await Bun.file(join(driversDir, dtsFile)).exists()) {
+      withTypes = file;
+      break;
+    }
+  }
+  if (withTypes === undefined) {
+    warnings.push(
+      'package.json advertises exports["./drivers/*"], but no dist/drivers/*.js file has a matching .d.ts declaration; concrete driver subpath imports were not typechecked',
+    );
+    return undefined;
+  }
+
+  return withTypes.slice(0, -'.js'.length);
 }
 
 async function verifyExportEntry(
@@ -312,7 +483,10 @@ async function verifyExportEntry(
   await assertFile(join(installedDir, typesPath), `${key} declaration file is missing`);
 }
 
-async function writeConsumerSources(appDir: string): Promise<{
+async function writeConsumerSources(
+  appDir: string,
+  concreteDriverSubpath: string | undefined,
+): Promise<{
   readonly probeEntry: string;
   readonly typecheckConfig: string;
   readonly runtimeProbe: string;
@@ -360,6 +534,18 @@ async function writeConsumerSources(appDir: string): Promise<{
     ].join('\n'),
   );
 
+  const concreteDriverImport =
+    concreteDriverSubpath === undefined
+      ? []
+      : [
+          `import concreteDriverModule from '@aibrush/media/drivers/${concreteDriverSubpath}';`,
+          "import type { DriverModule } from '@aibrush/media/core';",
+        ];
+  const concreteDriverPins =
+    concreteDriverSubpath === undefined
+      ? []
+      : ['const concreteDriver: DriverModule = concreteDriverModule;', 'void concreteDriver;'];
+
   await writeFile(
     typeProbe,
     [
@@ -369,6 +555,7 @@ async function writeConsumerSources(appDir: string): Promise<{
       "import type { CodecDriver, ContainerDriver } from '@aibrush/media/core';",
       "import { IMAGE_FORMATS } from '@aibrush/media/image';",
       "import type { ImageFormat, ImageInfo } from '@aibrush/media/image';",
+      ...concreteDriverImport,
       '',
       'const engine: MediaEngine = createMedia();',
       'const source = fromBytes(new Uint8Array([0]));',
@@ -377,6 +564,7 @@ async function writeConsumerSources(appDir: string): Promise<{
       'const apiVersion: number = DRIVER_API_VERSION;',
       'const streams: PacketStreams = {};',
       'type PublicPins = [MediaInfo, CodecDriver, ContainerDriver, ImageInfo];',
+      ...concreteDriverPins,
       '',
       'void engine;',
       'void source;',
@@ -444,6 +632,7 @@ async function measureProbeBundle(probeEntry: string, outDir: string): Promise<B
   const files = await collectFiles(outDir);
   const jsFiles = files.filter((file) => file.endsWith('.js')).sort();
   const wasmFiles = files.filter((file) => file.endsWith('.wasm')).sort();
+  const assetFiles = files.filter((file) => !file.endsWith('.js')).sort();
   assertCondition(jsFiles.length > 0, 'bundle', 'probe-only bundle emitted no JavaScript');
   assertCondition(
     wasmFiles.length === 0,
@@ -469,6 +658,8 @@ async function measureProbeBundle(probeEntry: string, outDir: string): Promise<B
   const eagerClosure = staticClosure(entryFile, jsText, jsSizes);
   const eagerJsBytes = [...eagerClosure.values()].reduce((sum, size) => sum + size, 0);
   const emittedJsBytes = [...jsSizes.values()].reduce((sum, size) => sum + size, 0);
+  const eagerJsFiles = fileDetails(eagerClosure);
+  const emittedJsFileDetails = fileDetails(jsSizes);
   assertCondition(
     eagerJsBytes <= EAGER_KERNEL_BUDGET,
     'bundle',
@@ -478,11 +669,23 @@ async function measureProbeBundle(probeEntry: string, outDir: string): Promise<B
 
   return {
     entryFile,
+    eagerBudgetBytes: EAGER_KERNEL_BUDGET,
     eagerJsBytes,
+    eagerMarginBytes: EAGER_KERNEL_BUDGET - eagerJsBytes,
     emittedJsBytes,
+    lazyJsBytes: emittedJsBytes - eagerJsBytes,
+    eagerJsFiles,
     emittedJsFiles: jsFiles,
+    emittedJsFileDetails,
     emittedWasmFiles: wasmFiles,
+    emittedAssetFiles: assetFiles,
   };
+}
+
+function fileDetails(files: ReadonlyMap<string, number>): SizedFileReport[] {
+  return [...files]
+    .map(([file, size]) => ({ file, size }))
+    .sort((a, b) => b.size - a.size || a.file.localeCompare(b.file));
 }
 
 async function collectFiles(dir: string, base = dir): Promise<string[]> {
@@ -541,17 +744,21 @@ function errorMessage(error: unknown): string {
 }
 
 async function main(): Promise<void> {
-  await assertFile(
-    join(ROOT, 'dist/index.js'),
-    'dist/index.js is missing; run `bun run build` first',
-  );
-  await assertFile(
-    join(ROOT, 'dist/index.d.ts'),
-    'dist/index.d.ts is missing; run `bun run build` first',
-  );
+  const source = packageSourceFromArgs();
+  if (source.kind === 'workspace-pack') {
+    await assertFile(
+      join(ROOT, 'dist/index.js'),
+      'dist/index.js is missing; run `bun run build` first',
+    );
+    await assertFile(
+      join(ROOT, 'dist/index.d.ts'),
+      'dist/index.d.ts is missing; run `bun run build` first',
+    );
+  }
   await assertFile(TSC, 'TypeScript is not installed; run `bun install` first');
 
   const tmpRoot = await mkdtemp(join(tmpdir(), 'aibrush-package-'));
+  const workspaceRealPath = await realpath(ROOT);
   try {
     const packDir = join(tmpRoot, 'pack');
     const appDir = join(tmpRoot, 'app');
@@ -561,11 +768,19 @@ async function main(): Promise<void> {
     await mkdir(appDir, { recursive: true });
     await mkdir(cacheDir, { recursive: true });
 
-    const tarball = await packWorkspace(packDir);
-    await installPackedPackage(appDir, tarball, cacheDir);
+    const materializedSource = await materializePackageSource(source, packDir);
+    await installPackage(appDir, materializedSource.installTarget, cacheDir);
     const installedDir = join(appDir, 'node_modules/@aibrush/media');
+    const installedPackageRealPath = await realpath(installedDir);
+    assertCondition(
+      installedPackageRealPath !== workspaceRealPath &&
+        !isPathInside(installedPackageRealPath, workspaceRealPath),
+      'package-shape',
+      'installed package resolved to the workspace instead of a clean consumer install',
+      { installedPackageRealPath, workspaceRealPath },
+    );
     const pkg = await verifyInstalledPackage(installedDir);
-    const sources = await writeConsumerSources(appDir);
+    const sources = await writeConsumerSources(appDir, pkg.concreteDriverSubpath);
     runTypecheck(sources.typecheckConfig, appDir);
     runRuntimeImport(sources.runtimeProbe, appDir);
     const bundle = await measureProbeBundle(sources.probeEntry, bundleDir);
@@ -573,11 +788,25 @@ async function main(): Promise<void> {
     const report: VerificationReport = {
       packageName: pkg.name,
       packageVersion: pkg.version,
-      tarball: basename(tarball),
+      packageSource: {
+        kind: materializedSource.kind,
+        label: materializedSource.label,
+        installTarget: materializedSource.installTarget,
+        ...(materializedSource.tarball !== undefined
+          ? { tarball: materializedSource.tarball }
+          : {}),
+        ...(materializedSource.installSpec !== undefined
+          ? { installSpec: materializedSource.installSpec }
+          : {}),
+      },
+      installedPackageDir: installedDir,
+      installedPackageRealPath,
+      workspaceRealPath,
       exportsMapChecked: true,
       declarationsChecked: true,
       runtimeImportChecked: true,
       bundle,
+      warnings: pkg.warnings,
     };
 
     if (REPORT_PATH !== undefined) {
@@ -586,15 +815,34 @@ async function main(): Promise<void> {
       await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
     }
 
-    console.info(`verify-package-install: packed ${report.tarball}`);
+    console.info(
+      `verify-package-install: source ${report.packageSource.label} (${report.packageSource.kind})`,
+    );
+    if (report.packageSource.tarball !== undefined) {
+      console.info(`verify-package-install: packed ${report.packageSource.tarball}`);
+    }
+    if (report.packageSource.installSpec !== undefined) {
+      console.info(`verify-package-install: installed spec ${report.packageSource.installSpec}`);
+    }
+    console.info(
+      `verify-package-install: installed package ${report.installedPackageRealPath} (workspace ${report.workspaceRealPath})`,
+    );
     console.info('verify-package-install: clean npm install + public runtime import passed');
     console.info('verify-package-install: export map and declarations passed TypeScript');
     console.info(
-      `verify-package-install: probe-only eager JS ${fmt(bundle.eagerJsBytes)}; emitted lazy JS ${fmt(
+      `verify-package-install: probe-only eager JS ${fmt(bundle.eagerJsBytes)} / ${fmt(
+        bundle.eagerBudgetBytes,
+      )} (margin ${fmt(bundle.eagerMarginBytes)}); emitted JS ${fmt(
         bundle.emittedJsBytes,
-      )}; emitted WASM ${bundle.emittedWasmFiles.length}`,
+      )} including lazy ${fmt(bundle.lazyJsBytes)}; emitted WASM ${bundle.emittedWasmFiles.length}`,
     );
-    console.info('verify-package-install: all checks passed');
+    for (const warning of report.warnings)
+      console.warn(`verify-package-install: warning: ${warning}`);
+    console.info(
+      report.warnings.length === 0
+        ? 'verify-package-install: all checks passed'
+        : `verify-package-install: all checks passed with ${report.warnings.length} warning(s)`,
+    );
     if (KEEP_TEMP) console.info(`verify-package-install: kept temp dir ${tmpRoot}`);
   } finally {
     if (!KEEP_TEMP) await rm(tmpRoot, { recursive: true, force: true });

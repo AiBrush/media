@@ -26,15 +26,16 @@
  *                   `media.remux(→ts)` / `media.trim(keyframe)` over MPEG-TS same-container packet-copy.
  *   - **ogg mux** — pure `OggMuxer` re-authoring real Opus/Vorbis/FLAC packets into Ogg pages,
  *                   including WebM-laced Vorbis packets whose duration is anchored by source metadata.
- *   - **decrypt** — `media.decrypt(cenc)`: CENC AES-CTR sample decryption of a freshly CENC-encrypted
- *                   twin (via the test-support encryptor). MB/s of the decrypted output.
+ *   - **decrypt** — `media.decrypt(cenc/cens/hls-sample-aes)`: CENC AES-CTR / patterned AES-CTR sample
+ *                   decryption of freshly encrypted twins, plus HLS TS SAMPLE-AES H.264/AAC payload-block
+ *                   decrypt on real VOD TS segments. MB/s of the decrypted output.
  *   - **fuzz robustness** — deterministic corrupt-input matrices over real fixture heads, asserting the
  *                   typed-error contract while reporting corrupt-input MB/s.
  *
- * `demux`/`remux`/`trim`/`decrypt` run on the **MP4/MOV** corpus (the pure-TS container with a Node
- * stream-copy + decrypt path); MPEG-TS stream-copy runs on the committed local TS corpus; `probe` spans
- * every container family. Each metric also reports `throughputRealtime` (media seconds processed per wall
- * second) where the op yields a timed file.
+ * `demux`/`remux`/`trim`/CENC `decrypt` run on the **MP4/MOV** corpus (the pure-TS container with a Node
+ * stream-copy + decrypt path); MPEG-TS stream-copy runs on the committed local TS corpus; HLS SAMPLE-AES
+ * decrypt runs on the five real HLS VOD TS segments; `probe` spans every container family. Each metric also
+ * reports `throughputRealtime` (media seconds processed per wall second) where the op yields a timed file.
  *
  *   bun run bench-containers              # run + print + (re)write the baseline
  *   bun run bench-containers --check      # run + print + diff vs the committed baseline (non-zero on regress)
@@ -64,7 +65,7 @@ import { parseWav } from '../src/drivers/wav/wav-driver.ts';
 import { WebmMuxer } from '../src/drivers/webm/ebml-write.ts';
 import { demuxWebm, parseWebm } from '../src/drivers/webm/webm-driver.ts';
 import { fromBytes } from '../src/sources/source.ts';
-import { encryptCenc } from '../src/test-support/cenc-encrypt.ts';
+import { encryptCenc, encryptCens } from '../src/test-support/cenc-encrypt.ts';
 import {
   type CorruptCase,
   type Family,
@@ -72,9 +73,14 @@ import {
   escapes,
   runMatrix,
 } from '../src/test-support/fuzz/corrupt.ts';
+import { encryptHlsSampleAesTs } from '../src/test-support/hls-sample-aes.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
+const HARNESS_MEDIA_DIR = new URL(
+  '../../media-test/media-browser-test/fixtures/media/',
+  import.meta.url,
+).pathname;
 const DERIVED_DIR = `${ROOT}fixtures/media-derived`;
 const BASELINE_PATH = `${ROOT}fixtures/golden/bench/containers.json`;
 
@@ -86,6 +92,12 @@ const REGRESSION_TOLERANCE = 0.5;
 /** The CENC key/KID used to mint the decrypt op's encrypted twin (any 16-byte key works for a round-trip). */
 const CENC_KEY = '000102030405060708090a0b0c0d0e0f';
 const CENC_KID = '00112233445566778899aabbccddeeff';
+const SAMPLE_AES_KEY = Uint8Array.from([
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+]);
+const SAMPLE_AES_IV = Uint8Array.from([
+  0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
+]);
 
 /** A diverse, multi-container probe set (one+ per family); every entry is a real downloaded fixture. */
 const PROBE_FILES = [
@@ -125,6 +137,15 @@ const MP4_TO_TS_FILES = [
 const TS_FILES = [
   { id: 'bear-1280x720.ts', path: `${MEDIA_DIR}/bear-1280x720.ts` },
   { id: 'h264_720p.head.ts', path: `${DERIVED_DIR}/h264_720p.head.ts` },
+] as const;
+
+/** The five real HLS VOD TS segments for key-provided SAMPLE-AES decrypt benchmarking. */
+const HLS_SAMPLE_AES_FILES = [
+  { id: 'hls_vod_000.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_000.ts` },
+  { id: 'hls_vod_001.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_001.ts` },
+  { id: 'hls_vod_002.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_002.ts` },
+  { id: 'hls_vod_003.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_003.ts` },
+  { id: 'hls_vod_004.ts', path: `${HARNESS_MEDIA_DIR}hls_vod_004.ts` },
 ] as const;
 
 /** Real audio packet sources for the pure Ogg page writer: Opus/Vorbis already in Ogg, plus FLAC frames. */
@@ -222,6 +243,7 @@ const MIME: Record<string, string> = {
   wav: 'audio/wav',
   flac: 'audio/flac',
   adts: 'audio/aac',
+  ts: 'video/mp2t',
 };
 
 let sink = 0; // accumulate a byte from each result to defeat dead-code elimination
@@ -491,6 +513,18 @@ function trackInfoFromMp4Track(track: ParsedTrack): TrackInfo {
 
 function benchChunk(init: BenchChunkInit): EncodedChunk {
   return new BenchEncodedChunk(init) as unknown as EncodedChunk;
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 function packetStreamFromMp4Track(
@@ -767,7 +801,83 @@ async function benchMp4Ops(): Promise<FileResult[]> {
       ),
     );
 
+    const cens = await encryptCens(bytes, {
+      keyHex: CENC_KEY,
+      kidHex: CENC_KID,
+      mediaType: target,
+      pattern: { cryptByteBlock: 1, skipByteBlock: 9 },
+    });
+    const censDecOut = await blobBytes(
+      await engine.decrypt(source('cens.mp4', cens), {
+        scheme: 'cens',
+        keys: { [CENC_KID]: CENC_KEY },
+      }),
+    );
+    ops.push(
+      await measure(
+        'decrypt (cens)',
+        censDecOut.byteLength,
+        dur,
+        async () =>
+          (
+            await blobBytes(
+              await engine.decrypt(source('cens.mp4', cens), {
+                scheme: 'cens',
+                keys: { [CENC_KID]: CENC_KEY },
+              }),
+            )
+          ).byteLength % 251,
+      ),
+    );
+
     out.push({ id, container: info.container, sizeBytes: bytes.byteLength, durationSec: dur, ops });
+  }
+  return out;
+}
+
+async function benchHlsSampleAesOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  const keyHex = hex(SAMPLE_AES_KEY);
+  const ivHex = hex(SAMPLE_AES_IV);
+  for (const file of HLS_SAMPLE_AES_FILES) {
+    const bytes = new Uint8Array(await Bun.file(file.path).arrayBuffer());
+    const info = await probeInfo(file.id, bytes);
+    const cipher = encryptHlsSampleAesTs(bytes, SAMPLE_AES_KEY, SAMPLE_AES_IV);
+    if (bytesEqual(cipher, bytes)) {
+      throw new Error(
+        `${file.id} SAMPLE-AES benchmark encrypted twin did not alter the clear segment`,
+      );
+    }
+    const decOut = await blobBytes(
+      await engine.decrypt(source(file.id, cipher), {
+        scheme: 'hls-sample-aes',
+        keys: { key: keyHex, iv: ivHex },
+      }),
+    );
+    if (!bytesEqual(decOut, bytes)) {
+      throw new Error(`${file.id} SAMPLE-AES benchmark decrypt did not recover the clear segment`);
+    }
+    const op = await measure(
+      'decrypt (hls-sample-aes)',
+      decOut.byteLength,
+      info.durationSec,
+      async () => {
+        const fresh = await blobBytes(
+          await engine.decrypt(source(file.id, cipher), {
+            scheme: 'hls-sample-aes',
+            keys: { key: keyHex, iv: ivHex },
+          }),
+        );
+        return fresh.byteLength % 251;
+      },
+    );
+    out.push({
+      id: file.id,
+      container: info.container,
+      sizeBytes: bytes.byteLength,
+      durationSec: info.durationSec,
+      ops: [op],
+    });
   }
   return out;
 }
@@ -1139,27 +1249,30 @@ async function main(): Promise<void> {
     MP4_FILES.length < 5 ||
     MP4_TO_TS_FILES.length < 5 ||
     TS_FILES.length < 2 ||
+    HLS_SAMPLE_AES_FILES.length < 5 ||
     OGG_MUX_FILES.length < 5 ||
     ROBUSTNESS_FILES.length < 5
   ) {
     throw new Error(
-      `container benchmark needs real multi-file corpora (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}, mp4ToTs=${MP4_TO_TS_FILES.length}, ts=${TS_FILES.length}, oggMux=${OGG_MUX_FILES.length}, robustness=${ROBUSTNESS_FILES.length}.`,
+      `container benchmark needs real multi-file corpora (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}, mp4ToTs=${MP4_TO_TS_FILES.length}, ts=${TS_FILES.length}, hlsSampleAes=${HLS_SAMPLE_AES_FILES.length}, oggMux=${OGG_MUX_FILES.length}, robustness=${ROBUSTNESS_FILES.length}.`,
     );
   }
   console.info(
-    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, MP4 demux/remux/remux-to-mkv/trim/decrypt×${MP4_FILES.length} files, MP4-to-TS remux×${MP4_TO_TS_FILES.length} files, remux/trim×${TS_FILES.length} TS files, Ogg mux×${OGG_MUX_FILES.length} audio files, fuzz robustness×${ROBUSTNESS_FILES.length} files:`,
+    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, MP4 demux/remux/remux-to-mkv/trim/CENC-decrypt×${MP4_FILES.length} files, MP4-to-TS remux×${MP4_TO_TS_FILES.length} files, remux/trim×${TS_FILES.length} TS files, HLS SAMPLE-AES decrypt×${HLS_SAMPLE_AES_FILES.length} TS files, Ogg mux×${OGG_MUX_FILES.length} audio files, fuzz robustness×${ROBUSTNESS_FILES.length} files:`,
   );
 
   const probeResults = await benchProbe();
   const mp4Results = await benchMp4Ops();
   const mp4ToTsResults = await benchMp4ToTsOps();
   const mpegTsResults = await benchMpegTsOps();
+  const hlsSampleAesResults = await benchHlsSampleAesOps();
   const oggMuxResults = await benchOggMuxOps();
   const robustnessResults = await benchRobustnessOps();
   for (const r of probeResults) printFile(r);
   for (const r of mp4Results) printFile(r);
   for (const r of mp4ToTsResults) printFile(r);
   for (const r of mpegTsResults) printFile(r);
+  for (const r of hlsSampleAesResults) printFile(r);
   for (const r of oggMuxResults) printFile(r);
   for (const r of robustnessResults) printFile(r);
 
@@ -1168,6 +1281,7 @@ async function main(): Promise<void> {
     ...mp4Results,
     ...mp4ToTsResults,
     ...mpegTsResults,
+    ...hlsSampleAesResults,
     ...oggMuxResults,
     ...robustnessResults,
   ];

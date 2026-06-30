@@ -54,7 +54,7 @@ Terms used across the architecture docs.
 - **B-frame** — bidirectionally-predicted frame; causes **PTS≠DTS** reordering the muxer/decoder must handle (`ctts`/composition offsets).
 - **PTS / DTS** — presentation vs decode timestamps.
 - **VFR / CFR** — variable vs constant frame rate.
-- **CENC / `cenc`(CTR) / `cbcs`** — Common Encryption schemes (AES-CTR full-sample; AES-CBC subsample-pattern). **HLS AES-128** — segment-level AES-CBC.
+- **CENC / `cenc`(CTR) / `cens`(CTR-pattern) / `cbcs`** — Common Encryption schemes (AES-CTR full-sample, AES-CTR pattern, AES-CBC subsample-pattern). **HLS AES-128** — segment-level AES-CBC. **HLS SAMPLE-AES** — codec sample-payload AES for HLS segments.
 - **Subsample / `senc`/`saiz`/`saio`/`tenc`** — CENC boxes describing per-sample IVs and clear/encrypted byte ranges.
 
 ## Validation

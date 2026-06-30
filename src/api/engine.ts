@@ -151,30 +151,20 @@ function loadCodecPipeline(): Promise<CodecPipelineModule> {
 }
 
 function assertSupportedDecryptScheme(scheme: unknown): asserts scheme is DecryptOptions['scheme'] {
-  if (scheme === 'cenc' || scheme === 'cbcs' || scheme === 'hls-aes128') return;
-  const label = typeof scheme === 'string' ? scheme : 'non-string';
-  throw new CapabilityError(
-    'capability-miss',
-    `decrypt scheme '${label}' is not supported; supported schemes are cenc, cbcs, hls-aes128`,
-    {
-      op: 'decrypt',
-      tried: [],
-      suggestion:
-        'reject EME/ClearKey, CENC-CENS, and HLS SAMPLE-AES at the adapter boundary unless a real implementation is registered',
-    },
-  );
+  switch (scheme) {
+    case 'cenc':
+    case 'cens':
+    case 'cbcs':
+    case 'hls-aes128':
+    case 'hls-sample-aes':
+      return;
+  }
+  throw new CapabilityError('capability-miss', 'bad decrypt', {
+    op: 'decrypt',
+    tried: [],
+  });
 }
 
-/**
- * Output-size ceiling for the **buffer-all** EncodedChunk-seam mux path (cross-container remux): the
- * MP4/WebM muxers accumulate every packet and serialize the whole file at `finalize()` (no incremental
- * Cluster/fragment emit), so the peak memory is ~2× the output. A multi-gigabyte output (e.g. a 2-hour
- * 1080p remux) genuinely exceeds an in-browser tab's memory and would OOM / hang rather than complete. We
- * decline it UP FRONT with a typed `CapabilityError` — a real resource limit, honestly reported, not a
- * fake "unsupported" — instead of attempting the serialize and timing out. The streaming-Cluster muxer
- * (ADR: see below) lifts this ceiling for WebM and is the sequenced SOTA follow-up. 1 GiB output ⇒ ~2 GiB
- * peak, the defensible browser buffer-all bound; smaller real remuxes are unaffected (most are < 500 MB).
- */
 const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
 
 export class MediaEngineImpl implements MediaEngine {
@@ -451,6 +441,8 @@ export class MediaEngineImpl implements MediaEngine {
         ...this.#stageOptions(signal, o),
         trim: { startSec: opts.start, endSec: opts.end },
         faststart: true,
+        ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
+        ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
       });
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     });
@@ -619,24 +611,22 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       assertSupportedDecryptScheme(opts.scheme);
       // No static key ⇒ EME/ClearKey live key acquisition, which is OUT OF SCOPE: this engine decrypts
-      // CENC (`cenc`/`cbcs`) and HLS `AES-128` with caller-PROVIDED keys, never an EME license exchange.
+      // CENC (`cenc`/`cens`/`cbcs`) and HLS AES-128/SAMPLE-AES with caller-PROVIDED keys, never an EME license exchange.
       // Fail fast with a typed miss — **before any source read, container route, or network** — so a
       // ClearKey/EME request maps to a clean capability-miss (NA) instead of a license-fetch retry loop.
       if (Object.keys(opts.keys).length === 0) {
-        throw new CapabilityError(
-          'capability-miss',
-          'EME/ClearKey live key acquisition unsupported — provide keys',
-          { op: 'decrypt', tried: [] },
-        );
+        throw new CapabilityError('capability-miss', 'keys', {
+          op: 'decrypt',
+          tried: [],
+        });
       }
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       if (!container.decrypt) {
-        throw new CapabilityError(
-          'capability-miss',
-          `decrypt is not supported for the ${container.formats[0]} container`,
-          { op: 'decrypt', tried: [container.id] },
-        );
+        throw new CapabilityError('capability-miss', 'no decrypt', {
+          op: 'decrypt',
+          tried: [container.id],
+        });
       }
       const stream = await container.decrypt(src, {
         ...this.#stageOptions(signal, o),
@@ -933,6 +923,14 @@ export class MediaEngineImpl implements MediaEngine {
         { op: 'remux', tried: [container.id, opts.to] },
       );
     }
+    if (
+      (opts.to === 'webm' || opts.to === 'mkv') &&
+      (opts.fragmented === true ||
+        (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES))
+    ) {
+      const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
+      return remuxViaStreamingWebm(container, src, opts, this.#stageOptions(signal, o));
+    }
     // Decline an oversize buffer-all remux UP FRONT (ADR-094): the cross-container seam copies every packet
     // into a muxer that serializes the whole file at finalize (no incremental Cluster emit), so a
     // multi-GB output would OOM/hang. The output of a verbatim stream-copy is ~the source media size, so a
@@ -941,11 +939,10 @@ export class MediaEngineImpl implements MediaEngine {
     if (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
       throw new CapabilityError(
         'capability-miss',
-        `remux to '${opts.to}' would buffer ~${Math.round(src.size / (1024 * 1024))} MB in memory, exceeding the in-browser buffer-all limit (${Math.round(REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES / (1024 * 1024))} MB); split this large file, or process it server-side, until the streaming mux lands`,
+        `remux to '${opts.to}' exceeds the ${Math.round(REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES / (1024 * 1024))} MB buffer-all limit`,
         {
           op: 'remux',
           tried: [container.id, opts.to],
-          suggestion: 'split the source into smaller segments, or remux server-side',
         },
       );
     }
@@ -1730,36 +1727,39 @@ function deferredStream<T>(
 ): ReadableStream<T> {
   let reader: ReadableStreamDefaultReader<T> | undefined;
   let started = false;
-  return new ReadableStream<T>({
-    async pull(controller): Promise<void> {
-      if (!started) {
-        started = true;
-        const inner = await produce();
-        if (inner === undefined) {
+  return new ReadableStream<T>(
+    {
+      async pull(controller): Promise<void> {
+        if (!started) {
+          started = true;
+          const inner = await produce();
+          if (inner === undefined) {
+            controller.close();
+            return;
+          }
+          reader = inner.getReader();
+        }
+        if (!reader) {
           controller.close();
           return;
         }
-        reader = inner.getReader();
-      }
-      if (!reader) {
-        controller.close();
-        return;
-      }
-      const { done, value } = await reader.read();
-      if (done) controller.close();
-      else {
-        try {
-          controller.enqueue(value);
-        } catch (e) {
-          closeIfClosable(value);
-          throw e;
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else {
+          try {
+            controller.enqueue(value);
+          } catch (e) {
+            closeIfClosable(value);
+            throw e;
+          }
         }
-      }
+      },
+      async cancel(reason): Promise<void> {
+        await reader?.cancel(reason).catch(() => {});
+      },
     },
-    async cancel(reason): Promise<void> {
-      await reader?.cancel(reason).catch(() => {});
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 interface ClosableHandle {
@@ -1791,40 +1791,43 @@ function pcmAudioToAudioDataStream(
   assertPcmAudioDataAvailable(label);
   /* v8 ignore start -- requires the browser `AudioData` constructor; validated in the browser harness. */
   let cursor = 0;
-  return new ReadableStream<AudioData>({
-    pull(controller): void {
-      try {
-        throwIfAborted(stage.signal);
-        if (cursor >= audio.frames) {
-          controller.close();
-          return;
-        }
-        const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
-        const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
-        const { init } = pcmRangeToPlanarInit(audio, cursor, frames, timestamp);
-        const frame = new AudioData(init);
+  return new ReadableStream<AudioData>(
+    {
+      pull(controller): void {
         try {
-          controller.enqueue(frame);
+          throwIfAborted(stage.signal);
+          if (cursor >= audio.frames) {
+            controller.close();
+            return;
+          }
+          const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
+          const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
+          const { init } = pcmRangeToPlanarInit(audio, cursor, frames, timestamp);
+          const frame = new AudioData(init);
+          try {
+            controller.enqueue(frame);
+          } catch (e) {
+            frame.close();
+            throw e;
+          }
+          cursor += frames;
         } catch (e) {
-          frame.close();
-          throw e;
+          if (e instanceof MediaError) {
+            throw e;
+          }
+          throw new MediaError(
+            'decode-error',
+            `PCM audio decode failed to construct AudioData: ${unknownMessage(e)}`,
+            e,
+          );
         }
-        cursor += frames;
-      } catch (e) {
-        if (e instanceof MediaError) {
-          throw e;
-        }
-        throw new MediaError(
-          'decode-error',
-          `PCM audio decode failed to construct AudioData: ${unknownMessage(e)}`,
-          e,
-        );
-      }
+      },
+      cancel(): void {
+        cursor = audio.frames;
+      },
     },
-    cancel(): void {
-      cursor = audio.frames;
-    },
-  });
+    { highWaterMark: 0 },
+  );
   /* v8 ignore stop */
 }
 

@@ -366,42 +366,45 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
     }
   };
 
-  return new ReadableStream<F>({
-    async pull(controller): Promise<void> {
-      try {
-        await readUntilPendingOrDone();
-        const next = pending.shift();
-        if (next !== undefined) {
-          try {
-            controller.enqueue(next);
-          } catch (e) {
-            closeFrame(next);
-            throw e;
+  return new ReadableStream<F>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          await readUntilPendingOrDone();
+          const next = pending.shift();
+          if (next !== undefined) {
+            try {
+              controller.enqueue(next);
+            } catch (e) {
+              closeFrame(next);
+              throw e;
+            }
+            return;
           }
-          return;
+          if (inputDone) controller.close();
+        } catch (e) {
+          closePending();
+          if (previous !== undefined) {
+            closeFrame(previous);
+            previous = undefined;
+          }
+          await reader.cancel(e).catch(() => {});
+          releaseReader();
+          controller.error(e);
         }
-        if (inputDone) controller.close();
-      } catch (e) {
+      },
+      async cancel(reason): Promise<void> {
         closePending();
         if (previous !== undefined) {
           closeFrame(previous);
           previous = undefined;
         }
-        await reader.cancel(e).catch(() => {});
+        await reader.cancel(reason).catch(() => {});
         releaseReader();
-        controller.error(e);
-      }
+      },
     },
-    async cancel(reason): Promise<void> {
-      closePending();
-      if (previous !== undefined) {
-        closeFrame(previous);
-        previous = undefined;
-      }
-      await reader.cancel(reason).catch(() => {});
-      releaseReader();
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 /** VideoFrame-specialized CFR retimer; browser-only when called, Node-safe to import. */

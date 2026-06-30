@@ -192,7 +192,7 @@ export interface TrimOptions {
   sink?: Sink;
 }
 
-export type EncryptionScheme = 'cenc' | 'cbcs' | 'hls-aes128';
+export type EncryptionScheme = 'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes';
 export type KeyMap = Record<string, string>;
 
 export interface DecryptOptions {

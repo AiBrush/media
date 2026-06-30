@@ -1,15 +1,19 @@
 /**
- * Common Encryption (CENC, ISO/IEC 23001-7) sample decryption for the `cenc` (AES-CTR) and `cbcs`
- * (AES-CBC **pattern**) schemes. The `tenc` box carries the default key id, per-sample IV size, and —
- * for `cbcs` — the crypt/skip block **pattern** and an optional `default_constant_IV`; the `senc` box
- * carries the per-sample IV (and, for video, a clear/protected subsample map). The key comes from the
- * caller's {@link KeyMap} keyed by the 16-byte KID (doc 09 §encryption). Real WebCrypto only (ADR-023).
+ * Common Encryption (CENC, ISO/IEC 23001-7) sample decryption for the `cenc` (AES-CTR), `cens`
+ * (AES-CTR **pattern**), and `cbcs` (AES-CBC **pattern**) schemes. The `tenc` box carries the default key
+ * id, per-sample IV size, and — for pattern schemes — the crypt/skip block pattern; `cbcs` may also carry
+ * a `default_constant_IV`. The `senc` box carries the per-sample IV (and, for video, a clear/protected
+ * subsample map). The key comes from the caller's {@link KeyMap} keyed by the 16-byte KID (doc 09
+ * §encryption). Real WebCrypto only (ADR-023/121).
  *
  * - **cenc (AES-CTR):** an 8-byte IV occupies the high 8 bytes of the 16-byte counter block (low 8 are
  *   the block counter, starting 0); a 16-byte IV is the counter block (block counter = low 64 bits,
  *   `length: 64`). For subsample encryption, clear bytes are skipped and each protected range starts on a
  *   CTR block boundary after the previous protected range's full/partial blocks (`ceil(protected/16)`);
  *   partial keystream tails are not carried across the clear gap.
+ * - **cens (AES-CTR pattern):** the CTR counterpart to `cbcs`: only full 16-byte crypt blocks selected
+ *   by the `tenc` crypt:skip pattern are transformed; skipped blocks and trailing partial blocks stay
+ *   clear. The CTR counter advances over encrypted crypt blocks only, continuously within a sample.
  * - **cbcs (AES-CBC pattern, 23001-7 §10.4):** AES-128-CBC over the protected bytes, but within each
  *   protected subsample only a repeating `crypt:skip` block **pattern** (e.g. 1:9) is encrypted — the
  *   skip blocks and any trailing bytes that don't fill a whole 16-byte block stay clear. The CBC chain
@@ -22,10 +26,10 @@ import { MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK, aesCbcNoPadding, aesCtr } from '../../crypto/aes.ts';
 import { toHex } from '../../util/digest.ts';
 
-/** The CENC scheme of a protected track — selects the cipher (AES-CTR vs AES-CBC-pattern). */
-export type CencScheme = 'cenc' | 'cbcs';
+/** The CENC scheme of a protected track — selects the cipher/pattern mode. */
+export type CencScheme = 'cenc' | 'cens' | 'cbcs';
 
-/** A crypt:skip block pattern (in 16-byte blocks) for `cbcs`; `cenc` carries no pattern. */
+/** A crypt:skip block pattern (in 16-byte blocks) for `cens`/`cbcs`; `cenc` carries no pattern. */
 export interface CencPattern {
   cryptByteBlock: number;
   skipByteBlock: number;
@@ -43,13 +47,14 @@ export interface TencInfo {
   isProtected: boolean;
   perSampleIvSize: number;
   kid: Uint8Array;
-  /** `cbcs` crypt:skip pattern (present iff the `tenc` is version ≥ 1 with a non-zero pattern). */
+  /** `cens`/`cbcs` crypt:skip pattern (present iff the `tenc` is version ≥ 1 with a non-zero pattern). */
   pattern?: CencPattern;
   /** `cbcs` constant IV (present iff `perSampleIvSize === 0`); used for every sample of the track. */
   constantIv?: Uint8Array;
 }
 
 export const CENC_SCHEME = 'cenc';
+export const CENS_SCHEME = 'cens';
 export const CBCS_SCHEME = 'cbcs';
 
 /** Minimum `tenc` full-box payload: version+flags (4) + reserved (1) + pattern (1) + isProtected/ivSize (2) + 16-byte KID. */
@@ -64,7 +69,7 @@ export function kidHex(kid: Uint8Array): string {
   return toHex(kid);
 }
 
-/** The legal per-sample IV sizes a `senc` may declare for a scheme (excludes 0 for `cenc`). */
+/** The legal per-sample IV sizes a `senc` may declare for a scheme (excludes 0 for CTR modes). */
 function sencIvSizes(scheme: CencScheme): ReadonlySet<number> {
   return scheme === CBCS_SCHEME ? CBCS_IV_SIZES : CTR_IV_SIZES;
 }
@@ -72,8 +77,8 @@ function sencIvSizes(scheme: CencScheme): ReadonlySet<number> {
 /**
  * Parse a `tenc` (Track Encryption Box) payload (full-box bytes: version+flags then fields) for the given
  * `scheme`, rejecting structurally degenerate protection: a too-short box, an illegal per-sample IV size
- * (`cenc` AES-CTR requires 8 or 16; `cbcs` allows 16/8/0-with-constant-IV), an all-zero `default_KID`
- * while protection is claimed (a zeroed/erased `tenc`), or — for `cbcs` — a missing/short
+ * (`cenc`/`cens` AES-CTR require 8 or 16; `cbcs` allows 16/8/0-with-constant-IV), an all-zero
+ * `default_KID` while protection is claimed (a zeroed/erased `tenc`), or — for `cbcs` — a missing/short
  * `default_constant_IV` when the per-sample IV size is 0, or a degenerate all-skip pattern that encrypts
  * nothing. These cannot describe decryptable samples, so they are corrupt input — {@link MediaError}
  * `demux-error`, not a silent wrong result (ISO/IEC 23001-7 §8.2/§10.4, ADR-023).
@@ -109,9 +114,9 @@ export function parseTenc(payload: Uint8Array, scheme: CencScheme = CENC_SCHEME)
     );
   }
 
-  if (scheme !== CBCS_SCHEME) return { isProtected, perSampleIvSize, kid };
+  if (scheme === CENC_SCHEME) return { isProtected, perSampleIvSize, kid };
 
-  // ── cbcs-only fields: the crypt:skip pattern (version ≥ 1) and the constant IV (ivSize 0) ──
+  // ── pattern-scheme fields: crypt:skip (version ≥ 1); cbcs alone may carry constant IV (ivSize 0). ──
   const pattern =
     version >= 1
       ? { cryptByteBlock: patternByte >> 4, skipByteBlock: patternByte & 0x0f }
@@ -119,8 +124,13 @@ export function parseTenc(payload: Uint8Array, scheme: CencScheme = CENC_SCHEME)
   if (pattern && pattern.cryptByteBlock === 0 && pattern.skipByteBlock === 0) {
     throw new MediaError(
       'demux-error',
-      'cbcs tenc declares an all-zero crypt:skip pattern (encrypts nothing) — malformed protection',
+      `${scheme} tenc declares an all-zero crypt:skip pattern (encrypts nothing) — malformed protection`,
     );
+  }
+  if (scheme === CENS_SCHEME) {
+    return pattern
+      ? { isProtected, perSampleIvSize, kid, pattern }
+      : { isProtected, perSampleIvSize, kid };
   }
   if (perSampleIvSize !== 0) {
     return pattern
@@ -161,8 +171,9 @@ const SUBSAMPLE_ENTRY_LEN = 6;
  * payload. A truncated, overrun, or corrupted `senc` (e.g. a bit-flipped `sample_count`, or zeroed
  * entries that no longer match the box length) cannot be trusted to drive the cipher over the right
  * ranges, so it is rejected as corrupt input — {@link MediaError} `demux-error` — rather than read out of
- * bounds. The IV size must be legal for the scheme: `cenc` needs 8/16; `cbcs` allows 16/8, or **0** when
- * the IV is the `tenc` `default_constant_IV` (then `senc` carries no per-sample IV, only subsample maps).
+ * bounds. The IV size must be legal for the scheme: `cenc`/`cens` need 8/16; `cbcs` allows 16/8, or **0**
+ * when the IV is the `tenc` `default_constant_IV` (then `senc` carries no per-sample IV, only subsample
+ * maps).
  */
 export function parseSenc(
   payload: Uint8Array,
@@ -295,6 +306,50 @@ export async function decryptSample(
 }
 
 /**
+ * AES-CTR-**pattern**-decrypt one `cens` sample. Only full 16-byte crypt blocks selected by the
+ * crypt:skip pattern are transformed; skipped full blocks and trailing partial blocks stay clear. Whole
+ * sample protected data (no subsample map) is treated as one protected range. Output length === input
+ * length.
+ */
+export async function decryptSampleCens(
+  key: Uint8Array<ArrayBuffer>,
+  pattern: CencPattern,
+  sample: SencSample,
+  data: Uint8Array,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const out = asArrayBufferBytes(data);
+  const ranges =
+    sample.subsamples && sample.subsamples.length > 0
+      ? sample.subsamples
+      : [{ clear: 0, protected: data.byteLength }];
+  let pos = 0;
+  let encryptedBlockOffset = 0;
+  for (const ss of ranges) {
+    pos += ss.clear;
+    const base = pos;
+    const offsets = cryptBlockOffsets(ss.protected, pattern);
+    if (offsets.length > 0) {
+      const gathered = new Uint8Array(offsets.length * AES_BLOCK);
+      offsets.forEach((off, i) =>
+        gathered.set(data.subarray(base + off, base + off + AES_BLOCK), i * AES_BLOCK),
+      );
+      const decrypted = await aesCtr(
+        key,
+        counterBlockAt(sample.iv, encryptedBlockOffset),
+        gathered,
+        64,
+      );
+      offsets.forEach((off, i) =>
+        out.set(decrypted.subarray(i * AES_BLOCK, i * AES_BLOCK + AES_BLOCK), base + off),
+      );
+      encryptedBlockOffset += offsets.length;
+    }
+    pos += ss.protected;
+  }
+  return out;
+}
+
+/**
  * Within one protected byte range, return the byte offsets of the **crypt** blocks of a `cbcs`
  * crypt:skip pattern. Full 16-byte blocks are walked from the range start; the first `crypt` are
  * encrypted, the next `skip` are clear, repeating; a `skip` of 0 means every full block is encrypted.
@@ -359,6 +414,23 @@ export async function decryptSamples(
   for (const [i, bytes] of data.entries()) {
     const sample = senc[i];
     out.push(sample ? await decryptSample(key, sample, bytes) : asArrayBufferBytes(bytes));
+  }
+  return out;
+}
+
+/** Decrypt a `cens` track's samples in order (patterned AES-CTR; sample `i` uses `senc[i]`). */
+export async function decryptSamplesCens(
+  key: Uint8Array<ArrayBuffer>,
+  data: readonly Uint8Array[],
+  senc: readonly SencSample[],
+  pattern: CencPattern,
+): Promise<Uint8Array[]> {
+  const out: Uint8Array[] = [];
+  for (const [i, bytes] of data.entries()) {
+    const sample = senc[i];
+    out.push(
+      sample ? await decryptSampleCens(key, pattern, sample, bytes) : asArrayBufferBytes(bytes),
+    );
   }
   return out;
 }

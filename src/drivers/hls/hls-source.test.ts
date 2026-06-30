@@ -17,6 +17,8 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { InputError } from '../../contracts/errors.ts';
+import { fromBytes } from '../../sources/source.ts';
+import { encryptHlsSampleAesTs } from '../../test-support/hls-sample-aes.ts';
 import { type HlsResourceFetcher, resolveHlsSource } from './hls-source.ts';
 
 const MEDIA_TEST = new URL(
@@ -38,6 +40,12 @@ const fetchLocal: HlsResourceFetcher = async (uri) => {
 };
 
 const HLS_FIXTURE_BASE = 'https://cdn.test/media/';
+const SAMPLE_AES_KEY = Uint8Array.from([
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+]);
+const SAMPLE_AES_IV = Uint8Array.from([
+  0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
+]);
 const HLS_AES128_RESOURCES = [
   'hls_aes128.key',
   'hls_aes128_000.ts',
@@ -45,6 +53,13 @@ const HLS_AES128_RESOURCES = [
   'hls_aes128_002.ts',
   'hls_aes128_003.ts',
   'hls_aes128_004.ts',
+] as const;
+const HLS_SAMPLE_AES_SEGMENTS = [
+  'hls_vod_000.ts',
+  'hls_vod_001.ts',
+  'hls_vod_002.ts',
+  'hls_vod_003.ts',
+  'hls_vod_004.ts',
 ] as const;
 
 async function hlsAes128ResourceMap(
@@ -76,6 +91,17 @@ async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
     return error;
   }
   throw new Error('expected promise to reject');
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function blobBytes(
+  out: Blob | File | ReadableStream<Uint8Array> | undefined,
+): Promise<Uint8Array> {
+  if (!(out instanceof Blob)) throw new Error('expected Blob output');
+  return new Uint8Array(await out.arrayBuffer());
 }
 
 async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -185,12 +211,41 @@ describe('resolveHlsSource — honest typed errors', () => {
     });
   });
 
-  it('declines SAMPLE-AES (sample-level decrypt is the decrypt op, not whole-segment AES-128)', async () => {
-    const sampleAes =
-      '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="k.key"\n#EXTINF:2.0,\nseg0.ts\n#EXT-X-ENDLIST\n';
-    await expect(
-      resolveHlsSource(sampleAes, { fetchResource: async () => new Uint8Array(16) }),
-    ).rejects.toMatchObject({ code: 'decode-error' });
+  it('BIT-EXACT decrypt: SAMPLE-AES TS segment decrypts to its cleartext twin', async () => {
+    const clear = await corpusBytes('hls_vod_000.ts');
+    const cipher = encryptHlsSampleAesTs(clear, SAMPLE_AES_KEY, SAMPLE_AES_IV);
+    expect(cipher).not.toEqual(clear);
+    const sampleAes = [
+      '#EXTM3U',
+      `#EXT-X-KEY:METHOD=SAMPLE-AES,URI="sample.key",IV=0x${hex(SAMPLE_AES_IV)}`,
+      '#EXTINF:2.0,',
+      'sample_000.ts',
+      '#EXT-X-ENDLIST',
+      '',
+    ].join('\n');
+
+    const src = await resolveHlsSource(sampleAes, {
+      fetchResource: mapFetcher({
+        'sample.key': SAMPLE_AES_KEY,
+        'sample_000.ts': cipher,
+      }),
+    });
+    expect(src.mimeHint).toBe('video/mp2t');
+    expect(await drain(src.stream())).toEqual(clear);
+  });
+
+  it('media.decrypt supports hls-sample-aes across the real five-segment VOD corpus', async () => {
+    for (const segment of HLS_SAMPLE_AES_SEGMENTS) {
+      const clear = await corpusBytes(segment);
+      const cipher = encryptHlsSampleAesTs(clear, SAMPLE_AES_KEY, SAMPLE_AES_IV);
+      const out = await blobBytes(
+        await createMedia().decrypt(fromBytes(cipher, { mime: 'video/mp2t' }), {
+          scheme: 'hls-sample-aes',
+          keys: { key: hex(SAMPLE_AES_KEY), iv: hex(SAMPLE_AES_IV) },
+        }),
+      );
+      expect(out).toEqual(clear);
+    }
   });
 
   it('honors an already-aborted signal', async () => {

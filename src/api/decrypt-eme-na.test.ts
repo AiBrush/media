@@ -1,8 +1,8 @@
 /**
  * EME/ClearKey decrypt → a clean, immediate capability-miss (NA) — never a license-fetch retry hang.
  *
- * This engine decrypts CENC (`cenc`/`cbcs`) and HLS `AES-128` with caller-PROVIDED keys; it does NOT do
- * EME/ClearKey live key acquisition (a license-server exchange). The harness `clearkey_decrypt_na`
+ * This engine decrypts CENC (`cenc`/`cens`/`cbcs`) and HLS AES-128/SAMPLE-AES with caller-PROVIDED keys;
+ * it does NOT do EME/ClearKey live key acquisition (a license-server exchange). The harness `clearkey_decrypt_na`
  * scenario must map to NA — but a naive adapter that retries a ClearKey license fetch would hang the run
  * (404 spam). The op therefore fails FAST when no static key is supplied: an empty `keys` map ⇒ a typed
  * {@link CapabilityError}, thrown **before any source read, container route, or network call** (no fetch,
@@ -38,7 +38,7 @@ function runtimeDecryptOptions(scheme: string, keys = PROVIDED_KEY): DecryptOpti
 }
 
 describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', () => {
-  for (const scheme of ['cenc', 'cbcs', 'hls-aes128'] as const) {
+  for (const scheme of ['cenc', 'cens', 'cbcs', 'hls-aes128', 'hls-sample-aes'] as const) {
     it(`scheme '${scheme}' with empty keys → CapabilityError, no network/no read`, async () => {
       const err = await createMedia()
         .decrypt(explodingSource, { scheme, keys: {} })
@@ -49,9 +49,7 @@ describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', 
       expect(err).toBeInstanceOf(CapabilityError);
       expect(err).toBeInstanceOf(MediaError); // CapabilityError extends MediaError (typed model)
       expect((err as CapabilityError).code).toBe('capability-miss');
-      expect((err as CapabilityError).message).toBe(
-        'EME/ClearKey live key acquisition unsupported — provide keys',
-      );
+      expect((err as CapabilityError).message).toBe('keys');
     });
   }
 
@@ -75,7 +73,7 @@ describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', 
         (e: unknown) => e,
       );
     expect(err).toBeInstanceOf(CapabilityError);
-    expect((err as CapabilityError).message).toMatch(/EME\/ClearKey/);
+    expect((err as CapabilityError).message).toBe('keys');
   });
 
   it('the capability detail names the decrypt op (so the harness can attribute the NA)', async () => {
@@ -104,7 +102,7 @@ describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', 
 });
 
 describe('media.decrypt — unsupported encrypted-media schemes are typed misses before I/O', () => {
-  for (const scheme of ['clearkey', 'cenc-cens', 'hls-sample-aes'] as const) {
+  for (const scheme of ['clearkey', 'cenc-cens', 'sample-aes-ctr'] as const) {
     it(`scheme '${scheme}' rejects as unsupported before touching the source`, async () => {
       const err = await createMedia()
         .decrypt(explodingSource, runtimeDecryptOptions(scheme))
@@ -115,7 +113,7 @@ describe('media.decrypt — unsupported encrypted-media schemes are typed misses
 
       expect(err).toBeInstanceOf(CapabilityError);
       expect((err as CapabilityError).code).toBe('capability-miss');
-      expect((err as CapabilityError).message).toContain(scheme);
+      expect((err as CapabilityError).message).toBe('bad decrypt');
       expect((err as CapabilityError).detail).toMatchObject({ op: 'decrypt', tried: [] });
     });
   }

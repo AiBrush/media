@@ -4,7 +4,7 @@
  * router about HLS. HLS is not a byte container: a `.m3u8` is a text manifest pointing at media segments
  * (typically MPEG-TS, sometimes fMP4). This module does the manifest-shaped work the engine's single-
  * contiguous-`Source` model can't: parse the playlist, pick a variant (master playlists), fetch each
- * segment, **decrypt** `AES-128` segments (RFC 8216 §4.3.2.4), prepend the fMP4 init section, and
+ * segment, **decrypt** `AES-128` / TS `SAMPLE-AES` segments (RFC 8216 §4.3.2.4), prepend the fMP4 init section, and
  * concatenate the cleartext into one byte source tagged with the segment container's MIME — so the existing
  * MPEG-TS / MP4 driver demuxes it verbatim. (ADR-023 keeps segment decrypt a source-level concern, separate
  * from demux.)
@@ -18,7 +18,7 @@
 
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK } from '../../crypto/aes.ts';
-import { decryptHlsAes128 } from '../../crypto/hls-aes.ts';
+import { decryptHlsAes128, decryptHlsSampleAesTs } from '../../crypto/hls-aes.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import {
   type HlsKey,
@@ -61,13 +61,13 @@ type HlsAes128KeyCache = Map<string, Promise<Uint8Array<ArrayBuffer>>>;
  * stitch every segment → a seekable `fromBytes` source the engine probes/demuxes as MPEG-TS (or MP4 for
  * fMP4). `playlistText` is the `.m3u8` document; pass the playlist's own URL as `opts.baseUrl` so relative
  * segment URIs resolve. A master playlist transparently resolves its chosen variant's media playlist (one
- * extra fetch). `AES-128` segments are decrypted with the playlist key (key fetched via `fetchResource`,
- * IV = explicit `IV=` or the segment's media-sequence number per RFC 8216 §4.3.2.4).
+ * extra fetch). `AES-128` / TS `SAMPLE-AES` segments are decrypted with the playlist key (key fetched via
+ * `fetchResource`, IV = explicit `IV=` or the segment's media-sequence number per RFC 8216 §4.3.2.4).
  *
  * Honest about scope: only complete (`#EXT-X-ENDLIST`) VOD/EVENT playlists are fully stitched here; a live
  * sliding playlist (no ENDLIST) is rejected with a typed {@link InputError} (a growing manifest is not a
- * single finite source). `SAMPLE-AES` is declined (sample-level decrypt is the decrypt op's CENC/cbcs path,
- * not whole-segment AES-128) — never a fabricated cleartext.
+ * single finite source). `SAMPLE-AES` is built for MPEG-TS H.264/AAC segments; fMP4 SAMPLE-AES and
+ * `SAMPLE-AES-CTR` remain typed misses until real corpus vectors exist.
  */
 export async function resolveHlsSource(
   playlistText: string,
@@ -167,10 +167,9 @@ async function appendInitSection(
 }
 
 /**
- * Decrypt a segment when an `AES-128` key is in force; pass a clear segment through untouched. The key is
- * fetched once per distinct resolved key URI; the IV is the explicit `IV=` or, per RFC 8216 §4.3.2.4, the
- * segment's 64-bit media-sequence number in the low bytes of a 16-byte big-endian block. A `SAMPLE-AES`
- * method is declined (that is sample-level, not whole-segment).
+ * Decrypt a segment when an encrypted HLS key is in force; pass a clear segment through untouched. The key
+ * is fetched once per distinct resolved key URI; the IV is the explicit `IV=` or, per RFC 8216 §4.3.2.4,
+ * the segment's 64-bit media-sequence number in the low bytes of a 16-byte big-endian block.
  */
 async function decryptSegmentIfNeeded(
   raw: Uint8Array,
@@ -182,20 +181,25 @@ async function decryptSegmentIfNeeded(
   const ranged = segment.byteRange ? sliceByteRange(raw, segment.byteRange) : raw;
   const key = segment.key;
   if (key === undefined || key.method === 'NONE') return ranged;
-  if (key.method !== 'AES-128') {
+  if (key.keyFormat !== undefined && key.keyFormat !== 'identity') {
     throw new MediaError(
       'decode-error',
-      `HLS ${key.method} is not supported by source resolution (whole-segment AES-128 only)`,
+      `HLS ${key.method} key format '${key.keyFormat}' is not supported`,
     );
   }
   if (key.uri === undefined) {
-    throw new InputError('unsupported-input', 'HLS AES-128 #EXT-X-KEY is missing its key URI');
+    throw new InputError(
+      'unsupported-input',
+      `HLS ${key.method} #EXT-X-KEY is missing its key URI`,
+    );
   }
   throwIfAborted(signal);
   const keyBytes = await fetchAes128Key(key.uri, fetchResource, keyCache);
   throwIfAborted(signal);
   const iv = toExact(ivForSegment(key, segment.sequence));
-  return decryptHlsAes128(toExact(ranged), keyBytes, iv);
+  if (key.method === 'AES-128') return decryptHlsAes128(toExact(ranged), keyBytes, iv);
+  if (key.method === 'SAMPLE-AES') return decryptHlsSampleAesTs(toExact(ranged), keyBytes, iv);
+  throw new MediaError('decode-error', `HLS ${key.method} is not supported by source resolution`);
 }
 
 /** Fetch and validate a resolved AES-128 key URI once; wrong resources fail with the URI named. */

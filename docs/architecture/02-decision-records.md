@@ -1740,13 +1740,17 @@ run after re-vendor is `results/raw/chromium-2026-06-28T00-57-29-541Z.json` with
 `4 NA_ENGINE` and `2 NA_BROWSER`. Every buildable row now passes on Chromium; every remaining row below is
 an admissible honest-NA entry with an explicit decision.
 
+**Status update (Session 8):** the two massive materialization safety declines in this Session-6 register
+are superseded by ADR-113 and ADR-114. MP3 encode, HEVC Main10 output, and H.264 two-pass remain signed-off
+unless a future approved tail is added.
+
 | Scope | Rows | Current class | Decision |
 | --- | --- | --- | --- |
 | MP3 encode | `transcode/aac_to_mp3_mp4`, `transcode/wav_to_mp3_mp4` | honest-NA | Do not add an LGPL LAME/Shine tail to the default build. MP3 encode requires an explicit future approval for an isolated, lazy, separately-licensed tail with notices. The shipped Symphonia MP3 tail remains decode-only. |
 | HEVC Main10 output | `transcode/h264_8bit_to_hevc_10bit` | honest-NA | WebCodecs does not expose a portable 10-bit HEVC encode target in the current browser path, and no permissive software HEVC Main10 encoder is shipped. Downconversion to 8-bit is implemented; 10-bit output remains a typed capability miss. |
 | H.264 two-pass | `transcode/h264_two_pass_bitrate` | honest-NA | WebCodecs provides single-pass bitrate controls, not a first-pass stats API. Faking two-pass by setting a bitrate once would violate the oracle. No approved software H.264 two-pass tail is shipped. |
 | Massive non-ISO-BMFF materialization | `remux/massive_h264_1080p_2h_mp4_to_mkv`, `trim/massive_h264_copy_sustained` | honest-NA safety decline | ADR-101/102 provide bounded MP4 stream/buffer routes, but MKV whole-output materialization and the massive sustained trim row do not yet have a bounded strict-oracle path. The adapter should decline with a typed capability miss instead of risking tab OOM or a timeout. |
-| Exotic decrypt schemes | ClearKey/`hls-sample-aes`/`cenc-cens` scenario family | PASS via graceful decline | Session 6 keeps these out of scope for real decrypt. The adapter/root route emits typed unsupported-scheme errors that the graceful-failure oracle accepts; they are not counted in the remaining non-PASS set. |
+| Exotic decrypt schemes | ClearKey/live EME, fMP4 SAMPLE-AES, SAMPLE-AES-CTR, and historical `cenc-cens` labels | PASS via graceful decline except built `cens` and TS `hls-sample-aes` | Session 6 kept these out of scope. Session 8 implements public CENC `cens` patterned CTR decrypt and key-provided HLS TS SAMPLE-AES in ADR-121; ClearKey/live EME, fMP4 SAMPLE-AES, and SAMPLE-AES-CTR remain typed unsupported-scheme paths. |
 | Vorbis encode | `transcode/wav_to_vorbis_ogg`, `transcode/h264_to_vp8_webm`, `transcode/vp9_to_vp8_webm`, `transcode/hevc_to_vp8_webm` | PASS | ADR-108 builds, vendors, routes, validates, and benchmarks the permissive `libvorbisenc` + `libogg` tail. These rows are closed in the full Chromium run. |
 | VPx alpha decode, copy-trim, and transcode | `decode-seek/decode_vp9_alpha`, `trim/vp9_alpha_keyframe_aligned`, `transcode/vp9_alpha_to_vp8_keepalpha`, `transcode/vp9_alpha_to_vp9_keepalpha` | PASS | ADR-107 makes VPx alpha packet-native and strict-oracle safe; alpha-preserving transcode is routed through the real alpha side-data path and passes the full Chromium matrix. |
 
@@ -1911,6 +1915,11 @@ limit). Root tests already cover the code-level declines: `codec-pipeline.test.t
 HEVC Main10 output with typed `CapabilityError`s, `wasm-mp3/mp3.test.ts` proves MP3 encode remains an
 unapproved-core miss, and `remux-scale-na.test.ts` proves oversize cross-container remux declines before
 demuxing.
+
+**Status update (Session 8):** ADR-113 replaces the massive MP4-to-MKV runtime scale guard with a
+Cluster-on-write WebM/MKV streaming remux path, and ADR-114 replaces the massive sustained-trim undeclared
+feature with a bounded selected-source-range MP4 keyframe trim path. This ADR remains the historical S7
+sign-off for the other physical encode gaps.
 
 **Decision:** sign off ADR-105 for Session 7 Phase 7.0 without adding new feature declarations. The register
 is authoritative as follows:
@@ -2166,3 +2175,160 @@ rebuilding, vendoring the package into the browser harness, and rerunning the fo
 `../media-test/media-browser-test/results/raw/firefox-2026-06-28T19-25-31-827Z.json` passes
 `probe/av1_720p_5s` in `116 ms`, with the strict `golden-metadata` oracle reporting two tracks,
 `durationDeltaSec 0`, and a wall median of `9.920000000000073 ms`.
+
+### ADR-113 — Streaming Cluster-on-write WebM/MKV remux for GB-scale MP4 targets
+
+**Context:** Session 7 honestly declined `remux/massive_h264_1080p_2h_mp4_to_mkv` because the generic
+cross-container WebM/MKV packet seam used `WebmMuxer`: it copied every packet into per-track arrays, built a
+full block timeline at `finalize()`, and only then emitted WebM/MKV bytes. That was correct for ordinary
+files but unsafe for the massive row, where a known ~1 GiB source implies a similarly large output and a
+multi-GB browser peak if both packet structs and serialized bytes are resident. Raising
+`REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES` would only hide the risk; hardcoding the massive fixture would violate
+the no-fake rule; and returning the input with a renamed container would fail the strict reimport oracle.
+
+**Decision:** add a second WebM/MKV writer, `WebmStreamingMuxer`, for large or explicitly live
+cross-container remux. It writes the same streamable Matroska/WebM layout as the fragmented path — EBML
+Header, unknown-size `Segment`, `Info` without `Duration`, `Tracks`, then top-level `Cluster` elements —
+but it does not buffer the whole packet timeline. Tracks are registered up front; each incoming
+`ChunkStruct` is converted into a `TimelineBlock` using a packet-table-derived timeline base when one is
+available; the muxer flushes the current Cluster before the next video keyframe, before the signed
+`SimpleBlock` relative-timecode span would overflow, or at the bounded block cap. The output stream applies
+backpressure after one queued segment and exposes `fail(error)` so a producer-side demux/read error becomes
+the consumer's stream error.
+
+The public engine uses this writer when the target is `webm`/`mkv` and the operation either requests
+fragmented/live output or the known source size exceeds the old buffer-all ceiling. The scheduler opens one
+packet reader per selected source track, keeps at most the next packet from each track, chooses the lowest
+`Packet.dtsUs ?? chunk.timestamp` for decode-order storage, writes it to the streaming muxer, then advances
+only that reader. Track selection, codec-private legality, DTS/PTS preservation, and typed misses remain
+the same as the packet-seam remux path. Node still cannot execute the live browser `EncodedChunk` seam, so
+oversize MP4->MKV in Node now reaches a typed "browser EncodedChunk constructors" miss instead of the old
+memory-limit gate; the pure streaming writer itself is Node-validated.
+
+**Consequences:** the S7 massive MP4-to-MKV safety decline is no longer a root memory guard. Unit coverage
+proves the new writer emits a Cluster before `finalize()` when the next keyframe arrives, splits audio-only
+streams at the bounded block cap, preserves block sizes/timing under an independent EBML scan, reparses via
+`parseWebm`, and keeps the unknown-size Segment profile. `remux-scale-na.test.ts` proves a faked >1 GiB MP4
+source no longer trips the old buffer/memory message. After rebuilding and re-vendoring the package into
+the browser harness, the fresh Chromium no-reuse row
+`../media-test/media-browser-test/results/raw/chromium-2026-06-30T08-43-02-647Z.json` passes
+`remux/massive_h264_1080p_2h_mp4_to_mkv`: the strict `reference-reimport` oracle re-imports `553501`
+packets, `341101` keyframes, `2` media tracks, and reports `durationDeltaSec 0` within the `0.1 s`
+tolerance. The row's wall median is `37599.88499999046 ms`, proving the live browser `EncodedVideoChunk`/
+`EncodedAudioChunk` packet seam executes rather than the Node-only typed miss.
+
+**Rejected:** raising the buffer-all ceiling; keeping a declared feature that still buffers every packet;
+hardcoding `massive_h264_1080p_2h.mp4`; serializing one independent WebM file per Cluster instead of a
+single unknown-size Segment; running all track readers to completion before writing; weakening
+`reference-reimport` for the massive row; and treating Node's missing WebCodecs constructors as evidence
+that the browser row is unbuildable.
+
+### ADR-114 — MP4/MOV keyframe trim uses bounded selected-source-range materialization
+
+**Context:** `trim/massive_h264_copy_sustained` is a keyframe-aligned copy trim one hour into a two-hour
+MP4. The MP4 driver already knew how to select the correct GOP/audio overlap and coalesce sample range
+reads, but the public trim call did not pass `buffered`/`streaming` hints and therefore stayed on the older
+eager `trimMuxTracks` path: read all selected sample payloads into `MuxSampleInput[]`, optionally decode
+verify from that in-memory array, and then call `writeMp4`. That path is acceptable for small clips but
+does not prove the massive row is source-bounded. Declaring `trim:massive-lazy-read` without changing the
+driver would be a fake pass; raising caps or lowering the oracle would miss the benchmark's point.
+
+**Decision:** route public keyframe trims through the same sink-sensitive stream-copy hints as remux:
+`stream-target` gets `streaming:true`, ordinary materialization gets `buffered:true`. In the MP4 driver,
+`trim + streaming/buffered` now uses a layout-only selected-sample plan. For each parsed track, the driver
+computes `selectTrimmed(track, startSec, endSec)`, validates every selected byte range, and builds
+`MuxTrackLayoutInput` sample records from byte length, duration, composition offset, and keyframe flags.
+`planMp4ByteStreamLayout` produces the output `ftyp`/`moov`/`mdat` plan without payload arrays; payload
+movement then reads only bounded source windows for selected samples and writes them into either an
+incremental progressive stream or a single final output buffer. The legacy eager path remains as a fallback
+for callers that do not request either hint.
+
+Browser AVC corruption validation stays real. When WebCodecs supports the source AVC config, the lazy path
+feeds `VideoDecoder` from the same selected source windows, with the existing decode-queue high-water mark
+and close-once output-frame disposal, instead of first materializing the selected samples. Thus scale safety
+does not remove the ADR-047 entropy-coded-payload validation.
+
+**Consequences:** the sustained MP4 copy-trim row has a bounded source-read implementation: metadata parse
+plus selected sample windows, never a full-source or all-selected-payload prebuffer. Existing MP4
+round-trip coverage now includes a strict range-read test for keyframe trim over a real MP4 fixture, and
+the broader MP4 stream-copy tests still prove progressive headers emit before payload reads, buffered
+stream-copy uses one exact output chunk, sample-window coalescing respects the 8 MiB cap, and corrupt
+sample ranges/short reads reject. After the harness adapter declares `trim:massive-lazy-read` and the
+package is rebuilt/re-vendored, the fresh Chromium no-reuse row
+`../media-test/media-browser-test/results/raw/chromium-2026-06-30T08-43-02-647Z.json` passes
+`trim/massive_h264_copy_sustained`: `trim-boundaries` reports `outDurationSec 60.010666666666665` for a
+`60 s` request (`durationDeltaSec 0.010666666666665492`), `playback-smoke` plays the output, and the wall
+median is `15668.380000010133 ms`. That browser row is the live scale/performance proof because the strict
+trim/playback oracles run against the real massive fixture.
+
+**Rejected:** declaring `trim:massive-lazy-read` while keeping the old eager selected-sample arrays;
+skipping AVC decode preflight on the lazy path; buffering the full source to simplify random access;
+hardcoding the one-hour cut or the massive fixture id; changing keyframe trim into accurate
+decode/re-encode; and raising operation timeouts as a substitute for bounded source I/O.
+
+### ADR-121 — CENC cens patterned CTR decrypt and HLS TS SAMPLE-AES
+
+**Context:** Session 8's real-decrypt requirement asks for CENC `cens` plus HLS SAMPLE-AES. The existing
+driver-native decrypt path already covered `cenc` (whole/subsample AES-CTR), `cbcs` (AES-CBC pattern), and
+`hls-aes128` (full-segment AES-128-CBC with PKCS#7), but it still treated `cens` as an unsupported
+scenario-family label. That was too coarse: `cens` is not EME live key acquisition, and it can be
+implemented with the same MP4 protection boxes and caller-provided `KeyMap` as `cenc`/`cbcs`. At the same
+time, HLS SAMPLE-AES is not the same as full-segment `AES-128`: it requires a real segment-payload sample
+or packet decrypt model and a cleartext-twin corpus fixture. Counting full-segment AES-128 as SAMPLE-AES
+would violate the no-fake rule.
+
+**Decision:** extend the public decrypt scheme union and the container drivers to accept `scheme:'cens'`
+and `scheme:'hls-sample-aes'`. The MP4 decrypt path now treats `schm='cens'` as a supported CENC scheme,
+parses the `tenc` crypt:skip pattern for both `cens` and `cbcs`, rejects caller/container scheme
+mismatches as typed `MediaError`s, and rejects any unknown `schm` as a typed decrypt capability miss
+instead of silently defaulting to `cenc`. `cens` decryption uses AES-CTR over only the full 16-byte crypt
+blocks selected by the `tenc` pattern. For each sample, the driver builds protected ranges from `senc`
+subsamples (or the whole sample when no subsample map exists), gathers selected crypt blocks, runs
+WebCrypto AES-CTR with the per-sample IV and a 64-bit counter, scatters decrypted blocks back into a
+same-length output buffer, and leaves skipped blocks plus trailing partial blocks clear. The CTR counter
+advances over encrypted crypt blocks only within the sample, matching the paired encrypt/decrypt test
+model.
+
+HLS SAMPLE-AES is implemented for MPEG-TS H.264/AAC segments only, which is the buildable key-provided
+slice in the Session-8 requirement. The HLS source resolver handles `#EXT-X-KEY:METHOD=SAMPLE-AES` by
+fetching the identity key, deriving the IV from the playlist or segment sequence, and calling the shared
+TS payload decryptor. The MPEG-TS driver also exposes the same primitive through `media.decrypt()` for a
+single TS byte source with `keys:{key,iv}`. The decryptor preserves PAT/PMT, PES headers, timestamps, and
+TS packet layout in place; it parses PAT/PMT to identify H.264 and ADTS AAC PIDs, reassembles PES payloads
+per PID, and AES-CBC-decrypts only the protected sample blocks. H.264 slice NAL units keep the first 32
+NAL bytes clear, then decrypt one 16-byte block per 160-byte cycle with the IV reset per NAL. ADTS AAC
+frames keep the first 16 frame bytes clear, then decrypt the remaining full 16-byte blocks with the IV
+reset per frame. The H.264 NAL scanner rejects implausible NAL headers so accidental `00 00 01` patterns
+inside encrypted ciphertext blocks do not become false NAL boundaries during decrypt. fMP4 SAMPLE-AES,
+CENC-in-HLS, SAMPLE-AES-CTR, and live EME license acquisition remain typed non-claims until there are real
+vectors and a separate oracle.
+
+The test-support CENC encryptor now has a real `encryptCens()` path that writes protected MP4 tracks with
+`schemeType:'cens'`, deterministic per-sample IVs, and a `tenc` pattern, so the public decrypt API is
+validated end-to-end on real `movie_5.mp4` bytes: cipher samples differ from clear samples, decrypt
+recovers the original audio samples bit-exact, a wrong key does not recover the cleartext, and a caller
+scheme mismatch is a typed container error. Pure crypto coverage also pins the block-pattern behavior:
+crypt blocks decrypt, skipped blocks and trailing partial bytes stay clear, and `parseTenc()` reads the
+`cens` pattern. The HLS SAMPLE-AES gate uses all five real `hls_vod_000.ts` through `hls_vod_004.ts`
+segments from the corpus: a test-only Node AES-CBC SAMPLE-AES encryptor protects each clear segment,
+asserts `cipher != clear`, and both the HLS playlist resolver and public
+`media.decrypt(..., { scheme:'hls-sample-aes' })` recover the original bytes exactly. This five-segment
+gate caught the final-segment false-start-code edge, so the benchmark now acts as a real can-fail oracle
+instead of a single happy-path smoke.
+
+**Consequences:** library-level CENC `cens` is no longer an honest-NA: callers can decrypt real
+`cens`-protected MP4 content with static keys through the same `media.decrypt()` API used for `cenc` and
+`cbcs`, and callers can decrypt key-provided HLS TS SAMPLE-AES segments without routing through a live DRM
+stack. The public contract docs (`05`/`07`) and operations ledger (`09`) now include
+`'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes'`. `scripts/bench-containers.ts` now measures
+`decrypt (cens)` across the seven-file MP4/MOV corpus and `decrypt (hls-sample-aes)` across the five real
+HLS VOD TS segments. Browser harness rows whose scenario id still says `cenc-cens` need adapter mapping to
+the public `scheme:'cens'` before they can become positive PASS rows; ClearKey/live EME rows remain
+signed-off misses.
+
+**Rejected:** keeping `cens` grouped with ClearKey/live EME as an exotic unsupported scheme; silently
+treating unknown `schm` values as `cenc`; decrypting skipped pattern blocks or partial trailing blocks;
+advancing the CTR counter over clear skipped blocks without a fixture-backed oracle; weakening the
+decrypt oracle to decoded-frame smoke instead of sample byte equality; claiming HLS SAMPLE-AES by pointing
+at the already-built full-segment `hls-aes128` path; decrypting TS SAMPLE-AES as whole-segment CBC; or
+pretending live license acquisition is part of this library.

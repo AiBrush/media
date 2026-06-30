@@ -53,14 +53,14 @@ export interface MuxSampleLayoutInput {
   keyframe: boolean;
 }
 
-/** CENC protection for a track (ADR-023): emits `enca`/`encv` + `sinf`/`tenc` and optional `senc` IVs. */
+/** CENC protection for a track (ADR-023/121): emits `enca`/`encv` + `sinf`/`tenc` and optional `senc` IVs. */
 export interface TrackEncryption {
-  schemeType: string; // 'cenc' | 'cbcs'
+  schemeType: string; // 'cenc' | 'cens' | 'cbcs'
   kid: Uint8Array; // 16-byte default_KID
   perSampleIvSize: number; // 8/16 per-sample IVs, or 0 for cbcs default_constant_IV
   /** One IV per sample when a `senc` box is emitted. Omitted only for valid cbcs constant-IV tracks. */
   ivs?: Uint8Array[];
-  /** cbcs crypt:skip block pattern, serialized in tenc version 1. */
+  /** cens/cbcs crypt:skip block pattern, serialized in tenc version 1. */
   pattern?: { cryptByteBlock: number; skipByteBlock: number };
   /** cbcs default_constant_IV, serialized only when `perSampleIvSize === 0`. */
   constantIv?: Uint8Array;
@@ -182,6 +182,9 @@ function codecConfigBox(track: MuxTrackLayoutInput): number[] {
 function sinfBox(track: MuxTrackLayoutInput): number[] {
   const enc = track.encryption;
   if (!enc) return [];
+  if (enc.constantIv && enc.schemeType !== 'cbcs') {
+    throw new MediaError('mux-error', 'default_constant_IV is valid only for cbcs protection');
+  }
   if (enc.constantIv && enc.perSampleIvSize !== 0) {
     throw new MediaError('mux-error', 'cbcs default_constant_IV requires perSampleIvSize 0');
   }

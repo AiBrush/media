@@ -897,6 +897,220 @@ export function* fragmentWebm(
   }
 }
 
+/** Options for the true streaming WebM/MKV muxer used by large cross-container remux. */
+export interface WebmStreamingMuxerOptions extends WebmFragmentOptions {
+  /**
+   * Timeline base in microseconds. Supplying the packet-table-derived value preserves the same timestamp
+   * rebasing as {@link buildBlockTimeline} without buffering every packet before the first Cluster.
+   */
+  timelineBaseUs?: number;
+}
+
+/**
+ * A bounded Cluster-on-write muxer: unlike {@link WebmMuxer}, this never stores the full packet timeline.
+ * Callers add all tracks up front, then feed packets in decode order. The muxer emits the streaming init
+ * segment before the first packet and flushes each bounded Cluster as soon as a keyframe/span/block-count
+ * boundary is reached, so peak output memory is one Cluster plus one packet per caller-side reader.
+ */
+export class WebmStreamingMuxer {
+  readonly output: ReadableStream<Uint8Array>;
+
+  readonly #tracks = new Map<number, TrackState>();
+  readonly #docType: string;
+  readonly #maxBlocksPerFragment: number;
+  #nextTrackNumber = 1;
+  #finalized = false;
+  #started = false;
+  #timelineBaseUs: number | undefined;
+  #currentBlocks: TimelineBlock[] = [];
+  #currentMinPtsMs = 0;
+  #currentMaxPtsMs = 0;
+  readonly #writtenTrackNumbers = new Set<number>();
+  readonly #pullWaiters: Array<() => void> = [];
+  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  readonly #ready: Promise<void>;
+  #resolveReady: (() => void) | undefined;
+
+  constructor(options?: MuxOptions & WebmStreamingMuxerOptions, docType = 'webm') {
+    this.#docType = docType;
+    this.#maxBlocksPerFragment = Math.max(
+      1,
+      options?.maxBlocksPerFragment ?? DEFAULT_MAX_BLOCKS_PER_FRAGMENT,
+    );
+    this.#timelineBaseUs = options?.timelineBaseUs;
+    this.#ready = new Promise<void>((resolve) => {
+      this.#resolveReady = resolve;
+    });
+    this.output = new ReadableStream<Uint8Array>({
+      start: (controller): void => {
+        this.#controller = controller;
+        this.#resolveReady?.();
+      },
+      pull: (): void => this.#resolvePullWaiters(),
+    });
+  }
+
+  addTrack(info: TrackInfo): number {
+    this.#assertOpen();
+    if (this.#started) {
+      throw new MediaError(
+        'mux-error',
+        'cannot add a track after streaming mux output has started',
+      );
+    }
+    const trackNumber = this.#nextTrackNumber++;
+    this.#tracks.set(trackNumber, trackStateFrom(info, trackNumber));
+    return trackNumber;
+  }
+
+  async write(trackId: number, packet: Packet): Promise<void> {
+    /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; browser-harness validated. */
+    const chunk = packet.chunk;
+    const data = encodedChunkBytes(chunk);
+    await this.addChunkStruct(trackId, {
+      timestampUs: chunk.timestamp,
+      durationUs: chunk.duration ?? undefined,
+      key: chunk.type === 'key',
+      data,
+      ...(packet.alpha !== undefined ? { alpha: encodedChunkBytes(packet.alpha) } : {}),
+      ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
+    });
+    /* v8 ignore stop */
+  }
+
+  async addChunkStruct(trackId: number, chunk: ChunkStruct): Promise<void> {
+    this.#assertOpen();
+    const track = this.#tracks.get(trackId);
+    if (track === undefined) {
+      throw new MediaError('mux-error', `write to unknown track ${trackId}`);
+    }
+    await this.#ensureStarted();
+    const block = this.#blockFromChunk(track, chunk);
+    if (this.#shouldFlushBefore(block)) await this.#flushCurrentCluster();
+    this.#appendBlock(block);
+    this.#writtenTrackNumbers.add(trackId);
+  }
+
+  async finalize(): Promise<void> {
+    this.#assertOpen();
+    this.#finalized = true;
+    try {
+      await this.#ensureStarted();
+      if (this.#writtenTrackNumbers.size === 0) {
+        throw new MediaError('mux-error', 'cannot finalize a muxer with no packets');
+      }
+      await this.#flushCurrentCluster();
+      this.#controller?.close();
+    } catch (err) {
+      this.#controller?.error(err);
+      throw err;
+    }
+  }
+
+  fail(error: unknown): void {
+    this.#finalized = true;
+    this.#resolveAllPullWaiters();
+    void this.#ready.then(() => this.#controller?.error(error));
+  }
+
+  async #ensureStarted(): Promise<void> {
+    if (this.#started) return;
+    if (this.#tracks.size === 0) {
+      throw new MediaError('mux-error', 'cannot finalize a muxer with no tracks');
+    }
+    this.#started = true;
+    await this.#ready;
+    const controller = this.#controller;
+    if (controller === undefined) {
+      throw new MediaError('mux-error', 'muxer output stream was not initialized');
+    }
+    const tracks = [...this.#tracks.values()].sort((a, b) => a.trackNumber - b.trackNumber);
+    await this.#enqueue(webmInitSegment(tracks, this.#docType, 0));
+  }
+
+  #blockFromChunk(track: TrackState, chunk: ChunkStruct): TimelineBlock {
+    const baseUs = this.#timelineBaseUs ?? chunk.timestampUs;
+    this.#timelineBaseUs = baseUs;
+    return {
+      trackNumber: track.trackNumber,
+      timeMs: usToMs(chunk.timestampUs - baseUs),
+      dtsMs: usToMs((chunk.dtsUs ?? chunk.timestampUs) - baseUs),
+      key: chunk.key,
+      data: chunk.data,
+      ...(chunk.alpha !== undefined ? { alpha: chunk.alpha } : {}),
+    };
+  }
+
+  #shouldFlushBefore(block: TimelineBlock): boolean {
+    if (this.#currentBlocks.length === 0) return false;
+    const track = this.#tracks.get(block.trackNumber);
+    const isVideoKey = block.key && track?.mediaType === 'video';
+    if (isVideoKey) return true;
+    const newMin = Math.min(this.#currentMinPtsMs, block.timeMs);
+    const newMax = Math.max(this.#currentMaxPtsMs, block.timeMs);
+    if (newMax - newMin > MAX_CLUSTER_REL_MS) return true;
+    return this.#currentBlocks.length >= this.#maxBlocksPerFragment;
+  }
+
+  #appendBlock(block: TimelineBlock): void {
+    if (this.#currentBlocks.length === 0) {
+      this.#currentMinPtsMs = block.timeMs;
+      this.#currentMaxPtsMs = block.timeMs;
+    } else {
+      this.#currentMinPtsMs = Math.min(this.#currentMinPtsMs, block.timeMs);
+      this.#currentMaxPtsMs = Math.max(this.#currentMaxPtsMs, block.timeMs);
+    }
+    this.#currentBlocks.push(block);
+  }
+
+  async #flushCurrentCluster(): Promise<void> {
+    if (this.#currentBlocks.length === 0) return;
+    const blocks = [...this.#currentBlocks].sort(
+      (a, b) => a.dtsMs - b.dtsMs || a.trackNumber - b.trackNumber,
+    );
+    await this.#enqueue(serializeFragmentCluster(blocks, { start: 0, end: blocks.length }));
+    this.#currentBlocks = [];
+    this.#currentMinPtsMs = 0;
+    this.#currentMaxPtsMs = 0;
+  }
+
+  async #enqueue(chunk: Uint8Array): Promise<void> {
+    await this.#waitForDemand();
+    this.#controller?.enqueue(chunk);
+  }
+
+  async #waitForDemand(): Promise<void> {
+    await this.#ready;
+    const desiredSize = this.#controller?.desiredSize;
+    if (desiredSize === undefined || desiredSize === null || desiredSize > 0) return;
+    await new Promise<void>((resolve) => {
+      this.#pullWaiters.push(resolve);
+    });
+  }
+
+  #resolvePullWaiters(): void {
+    while ((this.#controller?.desiredSize ?? 0) > 0) {
+      const waiter = this.#pullWaiters.shift();
+      if (waiter === undefined) return;
+      waiter();
+    }
+  }
+
+  #resolveAllPullWaiters(): void {
+    for (;;) {
+      const waiter = this.#pullWaiters.shift();
+      if (waiter === undefined) return;
+      waiter();
+    }
+  }
+
+  #assertOpen(): void {
+    if (this.#finalized) {
+      throw new MediaError('mux-error', 'muxer already finalized');
+    }
+  }
+}
+
 // ============ the Muxer adapter ============
 
 /**
