@@ -1,35 +1,24 @@
-# SESSION 8 — GOAL (the true closer)
+# SESSION 8 — GOAL (finish the genuinely-missing Chrome features)
 
-## The goal (binding)
+## Scope (binding)
 
-S7 called itself final but didn't close: **Firefox never ran a clean full 561-row matrix** (ADR-110), the **aggregate win wasn't re-confirmed since S5**, and **independent + real-bundle verification** are open. S8 reaches the parent DoD (@BUILD_INSTRUCTIONS.md §2) for real, reclaims every *fixable* honest-NA, and builds the remaining **permissive** tail. Done when:
+Chromium is already at its honest ceiling — **#1, 557 PASS / 0 FAIL / 0 ERROR**; the only non-PASS are signed-off honest-NA + 3 phantom IDs. This session implements + validates **only the features the engine genuinely lacks on Chromium** (pure-TS code gaps it declines today). **Do not touch anything Chrome already does.**
 
-1. **Cross-browser complete** — fresh full 561-row runs on Chromium/WebKit/Firefox, each 0 FAIL/0 ERROR, every buildable cell PASS, PASS up vs S7. Non-PASS = signed-off §5 entry only.
-2. **2 reclaimable Chromium declines closed** — `massive…mp4_to_mkv` via streaming Clusters-on-write MKV/WebM mux; `massive_h264_copy_sustained` via bounded lazy source-range copy-trim. Bounded oracles, not raised caps.
-3. **Permissive SW tail** *(encoders)* — libvpx VP8/9 encode (+ real VP9 two-pass), AV1 SW encode (rav1e/SVT-AV1), AV1 dav1d decode routing where WebCodecs lacks AV1. Lazy/miss-only, validated + benchmarked; un-buildable → signed-off.
-4. **Breadth** — MP4 faststart/forward-moov, metadata-write (WAV/AIFF/CAF), AVI+WAV mux, first-class fps.
-5. **Real decrypt** — CENC `cens` + HLS sample-AES (key-provided, cleartext-twin oracle).
-6. **Aggregate win re-confirmed** — full 8-engine multi-sample bake, all 3 browsers; `leaderboard.md` refreshed.
-7. **External verification** — independent non-author re-run on the published package; real installed bundle measured; budgets green with margin.
-8. **`bun run gate` green**, coverage ≥90%, anti-cheat green, docs + ADRs (113+) in sync.
+**Out of scope (do NOT build):** SW VP8/VP9/AV1 encoders — Chrome already encodes via WebCodecs; all WebKit/Firefox cross-browser work; and the honest-NA (MP3 encode = license, HEVC Main10 + H.264 two-pass = WebCodecs API limit). **Already landed, do NOT redo:** streaming WebM/MKV remux (ADR-113), bounded source-range trim (ADR-114), CENC `cens` + HLS SAMPLE-AES decrypt (ADR-121).
 
-**Never fake** (parent §0.6): a declared-but-unbuilt cell FAILs the oracle.
+## The missing features (the only work)
 
-## Where we start (verified 2026-06-30)
-
-- **#1 today:** 100% conf / 98.4% cov / 555 PASS / 0 FAIL (Chromium); `leaderboard.md` stale (re-aggregate).
-- **WebKit complete:** 428 PASS / 119 NA_BROWSER / 14 NA_ENGINE / 0 FAIL/0 ERROR (ADR-110). **Firefox incomplete**; aggregate win + independent re-run open.
-- **Shipped, don't rebuild:** Opus/Vorbis/FLAC encode, dav1d AV1 decode, VPx alpha (highest ADR=112). `competitive-gaps.md` codec matrix is a stale S2 snapshot.
-- **Budgets razor-thin** (eager 49.95/50, first-op 246/256) → lazy-split every new driver.
-
-## Decisions that are yours
-
-1. **MP3 encode** — LGPL LAME tail or honest-NA. *Default: honest-NA.*
-2. **AV1 encoder** — rav1e (Rust/BSD) vs SVT-AV1 vs honest-NA. *Recommend: rav1e.*
-3. **HEVC Main10 / H.264 two-pass** — stay honest-NA; build VP9 two-pass on libvpx instead.
-4. **EME** — build `cens`+sample-AES decrypt; live key acquisition stays a non-goal.
-5. **Genuine browser limits** (MKV `<video>` smoke, committed-golden RGBA, AAC gapless) — keep NA_BROWSER.
+1. **Metadata-write breadth** — tag writers for WAV (`INFO`/`bext`), AIFF, CAF. Today `src/api/engine.ts:1196` declines them; only MP4/MKV/MP3/FLAC/OGG ship. *(All pure TS — a gap in our code, not a browser limit.)*
+2. **WAV container mux** — complete the stubbed `WavDriver.createMuxer()` (`src/drivers/wav/wav-driver.ts:206`) so foreign-packet→WAV mux is first-class. (WAV output already works via convert; this finishes the seam.)
+3. **AVI mux** — RIFF `hdrl/strl/movi/idx1` (+ OpenDML for >1 GB); replace the `src/drivers/avi/avi-driver.ts:155` "not yet implemented" throw. *(Completeness — AVI is not in the DoD container set; drop if you want strict minimalism.)*
 
 ## Definition of Done
 
-Full DoD = @BUILD_INSTRUCTIONS_SESSION8.md §2 (= parent §2): all 8 boxes green, every non-PASS a signed-off §5 entry (ADR-113+), `bun run gate` exits 0.
+in full details here: @BUILD_INSTRUCTIONS_SESSION8.md
+
+- Each feature implemented to SOTA and **validated on the ≥5-file real corpus** with its strongest oracle — **metadata-exact** reimport for tags (write→reparse == input, bytes elsewhere unchanged); **structural + bit-exact PCM** round-trip and `demux(mux(x))==x` for WAV/AVI mux — **bit-exact in force-software**, plus a **fresh benchmark**.
+- **Tests cover the missing features only.** The existing green Chrome surface is untouched; a single regression run just confirms no PASS→FAIL.
+- New ADRs from the free range (**115/116/117**; 113/114/121 are taken) + design notes in `docs/notes/`; docs in sync.
+- `bun run gate` exits 0; budgets green **with margin** (lazy-split any new driver code); coverage ≥90%; anti-cheat green.
+
+One line: **ship + strictly validate + benchmark WAV/AIFF/CAF metadata-write, WAV mux, and AVI mux on Chromium — nothing else — with `bun run gate` green and the existing board un-regressed.**

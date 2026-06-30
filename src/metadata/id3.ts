@@ -131,10 +131,9 @@ function buildId3Payload(tags: MetadataTags): Uint8Array {
   return out;
 }
 
-export function writeMp3Id3Tags(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
-  const oldTagLength = id3v2Length(bytes);
+export function buildId3v24Tag(tags: MetadataTags): Uint8Array {
   const payload = buildId3Payload(tags);
-  const header = Uint8Array.from([
+  return Uint8Array.from([
     0x49,
     0x44,
     0x33, // ID3
@@ -142,12 +141,17 @@ export function writeMp3Id3Tags(bytes: Uint8Array, tags: MetadataTags): Uint8Arr
     0,
     0,
     ...synchsafe(payload.byteLength),
+    ...payload,
   ]);
+}
+
+export function writeMp3Id3Tags(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
+  const oldTagLength = id3v2Length(bytes);
+  const tag = buildId3v24Tag(tags);
   const audio = bytes.subarray(oldTagLength);
-  const out = new Uint8Array(header.byteLength + payload.byteLength + audio.byteLength);
-  out.set(header, 0);
-  out.set(payload, header.byteLength);
-  out.set(audio, header.byteLength + payload.byteLength);
+  const out = new Uint8Array(tag.byteLength + audio.byteLength);
+  out.set(tag, 0);
+  out.set(audio, tag.byteLength);
   return out;
 }
 

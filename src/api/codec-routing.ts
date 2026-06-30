@@ -13,28 +13,17 @@ import type { AudioTarget, Container, VideoTarget } from './types.ts';
  * typed mux miss): MP4/MOV (`writeMp4`), WebM/MKV (`ebml-write`), Ogg (`ogg-write`), MPEG-TS (`ts-write`,
  * H.264/AAC only), native FLAC (`FlacMuxer`, fed by the pure-TS FLAC encode codec driver, ADR-085), and
  * MP3 (`Mp3Muxer` — a bare concatenation of MPEG Layer III frames), and ADTS (`AdtsMuxer` — raw AAC access
- * units each wrapped in a 7-byte ADTS header), both fed by a remux or the codec encode driver. The raw-PCM
- * containers (WAV/AIFF/CAF) go through the audio-dsp `transformPcm` path instead (ADR-022) and stay a typed
- * mux miss here — so a codec-seam convert/encode/remux targeting one of those surfaces an honest miss rather
- * than pretend. This mirrors the registered muxers' own truth; an illegal codec-in-container is still
- * rejected by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this set never
- * over-claims.
+ * units each wrapped in a 7-byte ADTS header), both fed by a remux or the codec encode driver. WAV has a
+ * narrow raw-PCM packet muxer for explicit packet-stream assembly, and AVI writes RIFF `hdrl`/`movi`/`idx1`
+ * packet layouts. Ordinary WAV/AIFF/CAF PCM authoring still prefers the audio-dsp `transformPcm` path
+ * (ADR-022). This mirrors the registered muxers' own truth; an illegal codec-in-container is still rejected
+ * by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this set never over-claims.
  */
-const CODEC_MUX_CONTAINERS = new Set<Container>([
-  'mp4',
-  'mov',
-  'webm',
-  'mkv',
-  'ogg',
-  'ts',
-  'flac',
-  'mp3',
-  'adts',
-]);
+const CODEC_MUX_CONTAINERS = '|mp4|mov|webm|mkv|ogg|ts|flac|mp3|adts|wav|avi|';
 
 /** True when {@link container} has a working EncodedChunk-seam muxer. */
-export function containerHasChunkMuxer(container: Container): boolean {
-  return CODEC_MUX_CONTAINERS.has(container);
+export function containerHasChunkMuxer(container: string): container is Container {
+  return hasDelimitedToken(CODEC_MUX_CONTAINERS, container);
 }
 
 /**
@@ -48,34 +37,15 @@ export function chooseOutputContainer(
   sourceContainer: string | undefined,
 ): Container {
   if (to !== undefined) return to;
-  if (sourceContainer !== undefined && isContainerToken(sourceContainer)) {
-    return containerHasChunkMuxer(sourceContainer) ? sourceContainer : 'mp4';
-  }
-  return 'mp4';
+  return sourceContainer !== undefined &&
+    !isPcmContainer(sourceContainer) &&
+    containerHasChunkMuxer(sourceContainer)
+    ? sourceContainer
+    : 'mp4';
 }
 
-const CONTAINER_TOKENS = new Set<string>([
-  'mp4',
-  'mov',
-  'webm',
-  'mkv',
-  'ogg',
-  'wav',
-  'mp3',
-  'aac',
-  'adts',
-  'flac',
-  'aiff',
-  'caf',
-  'avi',
-  'ts',
-  'm2ts',
-  'mts',
-  'mpegts',
-]);
-
-function isContainerToken(s: string): s is Container {
-  return CONTAINER_TOKENS.has(s);
+function hasDelimitedToken(tokens: string, token: string): boolean {
+  return tokens.includes(`|${token}|`);
 }
 
 /**
@@ -85,11 +55,9 @@ function isContainerToken(s: string): s is Container {
  * container's `transformPcm` (a same-container PCM transform — channel mix / format / sample-rate) rather
  * than the codec seam. The set is the engine's gate for that route; a non-PCM container falls through.
  */
-const PCM_CONTAINERS = new Set<PcmContainer>(['wav', 'aiff', 'caf']);
-
 /** True when {@link container} is a raw-PCM container served by the `transformPcm` audio-dsp path. */
-export function isPcmContainer(container: Container): container is PcmContainer {
-  return PCM_CONTAINERS.has(container as PcmContainer);
+export function isPcmContainer(container: string): container is PcmContainer {
+  return container === 'wav' || container === 'aiff' || container === 'caf';
 }
 
 const TRACK_SELECTOR = /^(video|audio):(\d+)(?:@(\d+))?$/;

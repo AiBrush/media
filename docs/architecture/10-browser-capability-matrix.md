@@ -4,7 +4,7 @@
 
 ## 1. Two different "support" questions
 
-- **Containers** (MP4/WebM/Ogg/WAV/ADTS/MP3/FLAC/TS) are **ours** — hand-written TS, so support is uniform across browsers, not browser-dependent.
+- **Containers** (MP4/MOV/WebM/MKV/Ogg/WAV/AIFF/CAF/ADTS/MP3/FLAC/AVI/TS/HLS) are **ours** — hand-written TS, so support is uniform across browsers, not browser-dependent.
 - **Codecs** (decode/encode) depend on **WebCodecs** in the host browser; gaps are filled by **WASM** drivers. This matrix is about codecs.
 
 ## 2. Codec support — expected tier (verify at runtime)

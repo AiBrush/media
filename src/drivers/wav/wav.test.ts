@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
-import { MediaError } from '../../contracts/errors.ts';
+import type { ByteSource, Packet, TrackInfo } from '../../contracts/driver.ts';
+import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { readWavPcm } from './pcm.ts';
 import { WavDriver, WavModule, parseWav } from './wav-driver.ts';
+import { WavMuxer } from './wav-mux.ts';
 
 const WAVS = [
   'speech.wav',
@@ -26,6 +27,112 @@ const riffWave = (extra: number[] = []): Uint8Array =>
     ...[...'WAVE'].map((c) => c.charCodeAt(0)),
     ...extra,
   ]);
+
+async function drain(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = s.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+async function outputBytes(
+  output: Blob | File | ReadableStream<Uint8Array> | undefined,
+): Promise<Uint8Array> {
+  if (output === undefined) throw new Error('expected byte output');
+  if (output instanceof Blob) return new Uint8Array(await output.arrayBuffer());
+  return drain(output);
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  let out = '';
+  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
+  return out;
+}
+
+function chunkPayload(bytes: Uint8Array, target: string): Uint8Array {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 12;
+  while (offset + 8 <= bytes.byteLength) {
+    const id = ascii(bytes, offset, 4);
+    const size = dv.getUint32(offset + 4, true);
+    const body = offset + 8;
+    if (id === target) return bytes.subarray(body, body + size);
+    offset = body + size + (size & 1);
+  }
+  throw new Error(`missing WAV chunk '${target}'`);
+}
+
+class TestEncodedAudioChunk {
+  readonly byteLength: number;
+  readonly timestamp = 0;
+  readonly duration: number | null = null;
+  readonly #bytes: Uint8Array;
+
+  constructor(bytes: Uint8Array) {
+    this.#bytes = bytes.slice();
+    this.byteLength = this.#bytes.byteLength;
+  }
+
+  copyTo(destination: AllowSharedBufferSource): void {
+    const out = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    out.set(this.#bytes);
+  }
+}
+
+function encodedAudioChunk(bytes: Uint8Array): EncodedAudioChunk {
+  return new TestEncodedAudioChunk(bytes) as unknown as EncodedAudioChunk;
+}
+
+function wavTrack(bytes: Uint8Array): TrackInfo {
+  const info = parseWav(bytes, bytes.byteLength);
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  };
+}
+
+function packetStream(bytes: Uint8Array): ReadableStream<Packet> {
+  const packet: Packet = { chunk: encodedAudioChunk(bytes) };
+  return new ReadableStream<Packet>({
+    start(controller): void {
+      controller.enqueue(packet);
+      controller.close();
+    },
+  });
+}
+
+const WAV_MUX_PCM_CASES: readonly {
+  readonly codec: string;
+  readonly data: Uint8Array;
+  readonly expectedCodec: string;
+}[] = [
+  { codec: 'pcm-u8', data: new Uint8Array([0x80]), expectedCodec: 'pcm-u8' },
+  { codec: 'pcm-u8be', data: new Uint8Array([0x80]), expectedCodec: 'pcm-u8' },
+  { codec: 'pcm-s8', data: new Uint8Array([0]), expectedCodec: 'pcm-u8' },
+  { codec: 'pcm-s16be', data: new Uint8Array([0, 1]), expectedCodec: 'pcm-s16' },
+  { codec: 'pcm-s24be', data: new Uint8Array([0, 0, 1]), expectedCodec: 'pcm-s24' },
+  { codec: 'pcm-s32be', data: new Uint8Array([0, 0, 0, 1]), expectedCodec: 'pcm-s32' },
+  { codec: 'pcm-f32be', data: new Uint8Array([0, 0, 0, 0]), expectedCodec: 'pcm-f32' },
+  { codec: 'pcm-f64', data: new Uint8Array(8), expectedCodec: 'pcm-f64' },
+  { codec: 'pcm-f64be', data: new Uint8Array(8), expectedCodec: 'pcm-f64' },
+];
 
 describe('WavDriver.supports', () => {
   it('recognizes RIFF/WAVE magic, mime, and extension; rejects others', async () => {
@@ -84,8 +191,145 @@ describe('probe WAV across the real corpus', () => {
     expect(demuxed.tracks[0]?.codec).toBe('pcm-s16');
   });
 
-  it('createMuxer is a typed not-yet-implemented error (P2)', () => {
-    expect(() => WavDriver.createMuxer()).toThrowError(MediaError);
+  it.each(WAVS)('%s muxes raw PCM packets into WAV with bit-exact data bytes', async (id) => {
+    const input = await loadFixture(id);
+    const source = readWavPcm(input);
+    const inputData = chunkPayload(input, 'data');
+    const muxer = WavDriver.createMuxer();
+    expect(muxer).toBeInstanceOf(WavMuxer);
+    if (!(muxer instanceof WavMuxer)) throw new Error('expected WavMuxer');
+
+    const trackId = muxer.addTrack(wavTrack(input));
+    muxer.addChunkStruct(trackId, { data: inputData });
+    await muxer.finalize();
+
+    const out = await drain(muxer.output);
+    const reparsed = readWavPcm(out);
+    expect(parseWav(out, out.byteLength)).toEqual(parseWav(input, input.byteLength));
+    expect(reparsed.format).toBe(source.format);
+    expect(reparsed.sampleRate).toBe(source.sampleRate);
+    expect(reparsed.channels).toBe(source.channels);
+    expect(reparsed.frames).toBe(source.frames);
+    expect(chunkPayload(out, 'data')).toEqual(inputData);
+  });
+
+  it('public mux() routes explicit WAV raw-PCM packet streams through WavMuxer', async () => {
+    const input = await loadFixture('speech.wav');
+    const track = wavTrack(input);
+    const inputData = chunkPayload(input, 'data');
+    const out = await outputBytes(
+      await createMedia()
+        .use(WavModule)
+        .mux({ audio: { track, packets: packetStream(inputData) } }, { container: 'wav' }),
+    );
+
+    expect(parseWav(out, out.byteLength)).toEqual(parseWav(input, input.byteLength));
+    expect(chunkPayload(out, 'data')).toEqual(inputData);
+  });
+
+  it.each(WAV_MUX_PCM_CASES)(
+    'muxes one legal $codec PCM packet into a parseable WAV',
+    async ({ codec, data, expectedCodec }) => {
+      const muxer = new WavMuxer();
+      const trackId = muxer.addTrack({
+        id: 0,
+        mediaType: 'audio',
+        codec,
+        config: { codec, sampleRate: 48_000, numberOfChannels: 1 },
+      });
+      muxer.addChunkStruct(trackId, { data });
+      await muxer.finalize();
+
+      const out = await drain(muxer.output);
+      const info = parseWav(out, out.byteLength);
+      expect(info.codec).toBe(expectedCodec);
+      expect(info.sampleRate).toBe(48_000);
+      expect(info.channels).toBe(1);
+      expect(readWavPcm(out).frames).toBe(1);
+    },
+  );
+
+  it('rejects unsupported WAV mux shapes with typed errors', async () => {
+    expect(() => WavDriver.createMuxer({ fragmented: true })).toThrowError(CapabilityError);
+
+    expect(() =>
+      WavDriver.createMuxer().addTrack({
+        id: 0,
+        mediaType: 'video',
+        codec: 'h264',
+        config: { codec: 'avc1.42E01E', codedWidth: 16, codedHeight: 16 },
+      }),
+    ).toThrowError(CapabilityError);
+
+    expect(() =>
+      WavDriver.createMuxer().addTrack({
+        id: 0,
+        mediaType: 'audio',
+        codec: 'aac',
+        config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+      }),
+    ).toThrowError(CapabilityError);
+
+    expect(() =>
+      WavDriver.createMuxer().addTrack({
+        id: 0,
+        mediaType: 'audio',
+        codec: 'pcm-s16',
+      }),
+    ).toThrowError(MediaError);
+
+    expect(() =>
+      WavDriver.createMuxer().addTrack({
+        id: 0,
+        mediaType: 'audio',
+        codec: 'pcm-s16',
+        config: { codec: 'pcm-s16', sampleRate: 0, numberOfChannels: 1 },
+      }),
+    ).toThrowError(MediaError);
+
+    expect(() => {
+      const raw = WavDriver.createMuxer();
+      if (!(raw instanceof WavMuxer)) throw new Error('expected WavMuxer');
+      raw.addChunkStruct(0, { data: new Uint8Array([0]) });
+    }).toThrowError(MediaError);
+
+    const muxer = WavDriver.createMuxer();
+    const trackId = muxer.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'pcm-s16',
+      config: { codec: 'pcm-s16', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    const duplicateTrack = wavTrack(await loadFixture('speech.wav'));
+    expect(() => muxer.addTrack(duplicateTrack)).toThrowError(CapabilityError);
+    expect(() => {
+      if (!(muxer instanceof WavMuxer)) throw new Error('expected WavMuxer');
+      muxer.addChunkStruct(trackId, { data: new Uint8Array([0, 1]) });
+    }).toThrowError(MediaError);
+
+    await expect(WavDriver.createMuxer().finalize()).rejects.toThrowError(MediaError);
+
+    const empty = WavDriver.createMuxer();
+    empty.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'pcm-u8',
+      config: { codec: 'pcm-u8', sampleRate: 44_100, numberOfChannels: 1 },
+    });
+    await expect(empty.finalize()).rejects.toThrowError(MediaError);
+
+    const done = new WavMuxer();
+    const doneTrackId = done.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'pcm-u8',
+      config: { codec: 'pcm-u8', sampleRate: 44_100, numberOfChannels: 1 },
+    });
+    done.addChunkStruct(doneTrackId, { data: new Uint8Array([128]) });
+    await done.finalize();
+    expect(() => done.addChunkStruct(doneTrackId, { data: new Uint8Array([128]) })).toThrowError(
+      MediaError,
+    );
   });
 });
 
@@ -147,24 +391,6 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
         },
       }),
   });
-  async function drain(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-    const reader = s.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
-    }
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) {
-      out.set(c, off);
-      off += c.byteLength;
-    }
-    return out;
-  }
   const peak = (ch: Float64Array): number => {
     let m = 0;
     for (const s of ch) m = Math.max(m, Math.abs(s));

@@ -115,15 +115,27 @@ describe('chooseOutputContainer', () => {
 describe('containerHasChunkMuxer', () => {
   it('is true for the containers with a real EncodedChunk-seam muxer', () => {
     // FLAC via FlacMuxer (ADR-085); MP3 via Mp3Muxer (MPEG-Layer-III frames); ADTS via AdtsMuxer (raw AAC
-    // access units in 7-byte ADTS headers) — all fed by a remux or the codec encode driver.
-    for (const c of ['mp4', 'mov', 'webm', 'mkv', 'ogg', 'ts', 'flac', 'mp3', 'adts'] as const) {
+    // access units in 7-byte ADTS headers); WAV via raw-PCM packet muxing; AVI via RIFF packet muxing.
+    for (const c of [
+      'mp4',
+      'mov',
+      'webm',
+      'mkv',
+      'ogg',
+      'ts',
+      'flac',
+      'mp3',
+      'adts',
+      'wav',
+      'avi',
+    ] as const) {
       expect(containerHasChunkMuxer(c)).toBe(true);
     }
   });
-  it('is false for PCM (transformPcm path) and the not-yet-muxable elementary containers', () => {
-    // wav/aiff/caf author PCM via transformPcm (not the chunk seam); the bare 'aac' token has no muxer
-    // (ADTS is the AAC elementary-stream target) — declaring them would over-claim.
-    for (const c of ['wav', 'aiff', 'caf', 'aac'] as const) {
+  it('is false for PCM containers without packet muxers and not-yet-muxable elementary containers', () => {
+    // aiff/caf author PCM via transformPcm (not the chunk seam); the bare 'aac' token has no muxer (ADTS is
+    // the AAC elementary-stream target) — declaring them would over-claim.
+    for (const c of ['aiff', 'caf', 'aac'] as const) {
       expect(containerHasChunkMuxer(c)).toBe(false);
     }
   });

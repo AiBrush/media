@@ -48,6 +48,7 @@ import { type TimedFrameForTrim, trimTimedFrameStream } from '../src/api/trim-st
 import type { MediaInfo, PacketStreams } from '../src/api/types.ts';
 import type { EncodedChunk, Packet, TrackInfo } from '../src/contracts/driver.ts';
 import { parseAiff } from '../src/drivers/aiff/aiff.ts';
+import { AviMuxer } from '../src/drivers/avi/avi-mux.ts';
 import { parseAvi } from '../src/drivers/avi/avi-parse.ts';
 import {
   enumerateFlacFrames,
@@ -62,6 +63,7 @@ import { MpegTsMuxer } from '../src/drivers/mpegts/ts-write.ts';
 import { OggDriver, oggAudioPackets, parseOgg } from '../src/drivers/ogg/ogg-driver.ts';
 import { OggMuxer } from '../src/drivers/ogg/ogg-write.ts';
 import { parseWav } from '../src/drivers/wav/wav-driver.ts';
+import { WavMuxer } from '../src/drivers/wav/wav-mux.ts';
 import { WebmMuxer } from '../src/drivers/webm/ebml-write.ts';
 import { demuxWebm, parseWebm } from '../src/drivers/webm/webm-driver.ts';
 import { fromBytes } from '../src/sources/source.ts';
@@ -160,6 +162,27 @@ const OGG_MUX_FILES = [
   { id: 'flac-wasted-bits.flac', kind: 'flac' },
 ] as const;
 
+/** Real WAV packet sources for the raw-PCM packet muxer. */
+const WAV_MUX_FILES = [
+  'speech.wav',
+  'sin_440Hz_-6dBFS_1s.wav',
+  'sfx-pcm-u8.wav',
+  'sfx-pcm-s16.wav',
+  'sfx-pcm-s24.wav',
+  'sfx-pcm-s32.wav',
+  'sfx-pcm-f32.wav',
+  'stereo-48000.wav',
+] as const;
+
+/** AVI mux cases over the committed real AVI payload corpus. */
+const AVI_MUX_CASES = [
+  { id: 'mjpeg_pcm_160p.avi', source: 'mjpeg_pcm_160p.avi', tracks: [0, 1] },
+  { id: 'mpeg4_mp3_160p.avi', source: 'mpeg4_mp3_160p.avi', tracks: [0, 1] },
+  { id: 'mjpeg_video_only_160p.avi', source: 'mjpeg_pcm_160p.avi', tracks: [0] },
+  { id: 'pcm_audio_only_160p.avi', source: 'mjpeg_pcm_160p.avi', tracks: [1] },
+  { id: 'mp3_audio_only_160p.avi', source: 'mpeg4_mp3_160p.avi', tracks: [1] },
+] as const;
+
 interface RobustnessFile {
   readonly id: string;
   readonly path: string;
@@ -244,6 +267,7 @@ const MIME: Record<string, string> = {
   flac: 'audio/flac',
   adts: 'audio/aac',
   ts: 'video/mp2t',
+  avi: 'video/x-msvideo',
 };
 
 let sink = 0; // accumulate a byte from each result to defeat dead-code elimination
@@ -418,6 +442,24 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
   return out;
 }
 
+function riffChunkPayload(bytes: Uint8Array, target: string): Uint8Array {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 12;
+  while (offset + 8 <= bytes.byteLength) {
+    const id = String.fromCharCode(
+      bytes[offset] ?? 0,
+      bytes[offset + 1] ?? 0,
+      bytes[offset + 2] ?? 0,
+      bytes[offset + 3] ?? 0,
+    );
+    const size = dv.getUint32(offset + 4, true);
+    const body = offset + 8;
+    if (id === target) return bytes.subarray(body, body + size);
+    offset = body + size + (size & 1);
+  }
+  throw new Error(`missing RIFF chunk '${target}'`);
+}
+
 /** A `RandomAccess` over an in-memory buffer (mirrors the driver's buffered path). */
 const ra = (b: Uint8Array) => ({
   read: (o: number, l: number): Promise<Uint8Array> => Promise.resolve(b.subarray(o, o + l)),
@@ -507,6 +549,17 @@ function trackInfoFromMp4Track(track: ParsedTrack): TrackInfo {
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(track.encryption !== undefined ? { encrypted: true } : {}),
+    config: track.config,
+  };
+}
+
+function trackInfoFromAviTrack(track: ReturnType<typeof parseAvi>['tracks'][number]): TrackInfo {
+  return {
+    id: track.stream.index,
+    mediaType: track.stream.mediaType,
+    codec: track.stream.codec,
+    durationSec: track.durationSec,
+    ...(track.fps !== undefined ? { fps: track.fps } : {}),
     config: track.config,
   };
 }
@@ -674,6 +727,72 @@ async function publicMuxMp4ToTs(id: string, bytes: Uint8Array): Promise<Uint8Arr
   }
   if (hasAudio && !parsed.tracks.some((track) => track.stream.codec === 'aac')) {
     throw new Error(`public mux ${id} did not write an AAC transport stream`);
+  }
+  return out;
+}
+
+async function muxWavSource(bytes: Uint8Array): Promise<Uint8Array> {
+  const info = parseWav(bytes, bytes.byteLength);
+  const data = riffChunkPayload(bytes, 'data');
+  const muxer = new WavMuxer();
+  const trackId = muxer.addTrack({
+    id: 0,
+    mediaType: 'audio',
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  });
+  muxer.addChunkStruct(trackId, { data });
+  await muxer.finalize();
+  const out = await streamBytes(muxer.output);
+  const reparsed = parseWav(out, out.byteLength);
+  if (
+    reparsed.codec !== info.codec ||
+    reparsed.sampleRate !== info.sampleRate ||
+    reparsed.channels !== info.channels
+  ) {
+    throw new Error('WAV mux benchmark wrote mismatched PCM metadata');
+  }
+  return out;
+}
+
+async function muxAviCase(
+  bytes: Uint8Array,
+  selectedTracks: readonly number[],
+): Promise<Uint8Array> {
+  const parsed = parseAvi(bytes);
+  const muxer = new AviMuxer();
+  const outputTrackIds = new Map<number, number>();
+  for (const index of selectedTracks) {
+    const track = parsed.tracks[index];
+    if (track === undefined) throw new Error(`AVI mux benchmark lost track ${index}`);
+    outputTrackIds.set(index, muxer.addTrack(trackInfoFromAviTrack(track)));
+  }
+  for (const index of selectedTracks) {
+    const track = parsed.tracks[index];
+    const outputTrackId = outputTrackIds.get(index);
+    if (track === undefined || outputTrackId === undefined) {
+      throw new Error(`AVI mux benchmark lost selected track ${index}`);
+    }
+    for (const packet of track.chunks) {
+      muxer.addChunkStruct(outputTrackId, { data: packet.data, keyframe: packet.keyframe });
+    }
+  }
+  await muxer.finalize();
+  const out = await streamBytes(muxer.output);
+  const reparsed = parseAvi(out);
+  if (reparsed.tracks.length !== selectedTracks.length) {
+    throw new Error('AVI mux benchmark wrote the wrong track count');
+  }
+  for (const [outputIndex, sourceIndex] of selectedTracks.entries()) {
+    const sourceTrack = parsed.tracks[sourceIndex];
+    const outputTrack = reparsed.tracks[outputIndex];
+    if (sourceTrack === undefined || outputTrack === undefined) {
+      throw new Error(`AVI mux benchmark lost reparsed track ${sourceIndex}`);
+    }
+    if (sourceTrack.chunks.length !== outputTrack.chunks.length) {
+      throw new Error(`AVI mux benchmark changed packet count for track ${sourceIndex}`);
+    }
   }
   return out;
 }
@@ -959,6 +1078,52 @@ async function benchMp4ToTsOps(): Promise<FileResult[]> {
       sizeBytes: bytes.byteLength,
       durationSec: info.durationSec,
       ops,
+    });
+  }
+  return out;
+}
+
+async function benchWavMuxOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const id of WAV_MUX_FILES) {
+    const bytes = new Uint8Array(await Bun.file(`${MEDIA_DIR}/${id}`).arrayBuffer());
+    const info = parseWav(bytes, bytes.byteLength);
+    const muxOut = await muxWavSource(bytes);
+    const op = await measure('mux (→wav)', muxOut.byteLength, info.durationSec, async () => {
+      const fresh = await muxWavSource(bytes);
+      return fresh.byteLength % 251;
+    });
+    out.push({
+      id,
+      container: 'wav',
+      sizeBytes: bytes.byteLength,
+      durationSec: info.durationSec,
+      ops: [op],
+    });
+  }
+  return out;
+}
+
+async function benchAviMuxOps(): Promise<FileResult[]> {
+  const out: FileResult[] = [];
+  for (const item of AVI_MUX_CASES) {
+    const bytes = new Uint8Array(await Bun.file(`${DERIVED_DIR}/${item.source}`).arrayBuffer());
+    const parsed = parseAvi(bytes);
+    const durationSec = Math.max(
+      0,
+      ...item.tracks.map((index) => parsed.tracks[index]?.durationSec ?? 0),
+    );
+    const muxOut = await muxAviCase(bytes, item.tracks);
+    const op = await measure('mux (→avi)', muxOut.byteLength, durationSec, async () => {
+      const fresh = await muxAviCase(bytes, item.tracks);
+      return fresh.byteLength % 251;
+    });
+    out.push({
+      id: item.id,
+      container: 'avi',
+      sizeBytes: bytes.byteLength,
+      durationSec,
+      ops: [op],
     });
   }
   return out;
@@ -1251,14 +1416,16 @@ async function main(): Promise<void> {
     TS_FILES.length < 2 ||
     HLS_SAMPLE_AES_FILES.length < 5 ||
     OGG_MUX_FILES.length < 5 ||
+    WAV_MUX_FILES.length < 5 ||
+    AVI_MUX_CASES.length < 5 ||
     ROBUSTNESS_FILES.length < 5
   ) {
     throw new Error(
-      `container benchmark needs real multi-file corpora (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}, mp4ToTs=${MP4_TO_TS_FILES.length}, ts=${TS_FILES.length}, hlsSampleAes=${HLS_SAMPLE_AES_FILES.length}, oggMux=${OGG_MUX_FILES.length}, robustness=${ROBUSTNESS_FILES.length}.`,
+      `container benchmark needs real multi-file corpora (BUILD_INSTRUCTIONS §6.1); have probe=${PROBE_FILES.length}, mp4=${MP4_FILES.length}, mp4ToTs=${MP4_TO_TS_FILES.length}, ts=${TS_FILES.length}, hlsSampleAes=${HLS_SAMPLE_AES_FILES.length}, oggMux=${OGG_MUX_FILES.length}, wavMux=${WAV_MUX_FILES.length}, aviMux=${AVI_MUX_CASES.length}, robustness=${ROBUSTNESS_FILES.length}.`,
     );
   }
   console.info(
-    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, MP4 demux/remux/remux-to-mkv/trim/CENC-decrypt×${MP4_FILES.length} files, MP4-to-TS remux×${MP4_TO_TS_FILES.length} files, remux/trim×${TS_FILES.length} TS files, HLS SAMPLE-AES decrypt×${HLS_SAMPLE_AES_FILES.length} TS files, Ogg mux×${OGG_MUX_FILES.length} audio files, fuzz robustness×${ROBUSTNESS_FILES.length} files:`,
+    `container/parse benchmark — pure TS, single-thread, median of ${ITERS} iters (warmup ${WARMUP}); probe×${PROBE_FILES.length} files, MP4 demux/remux/remux-to-mkv/trim/CENC-decrypt×${MP4_FILES.length} files, MP4-to-TS remux×${MP4_TO_TS_FILES.length} files, remux/trim×${TS_FILES.length} TS files, HLS SAMPLE-AES decrypt×${HLS_SAMPLE_AES_FILES.length} TS files, Ogg mux×${OGG_MUX_FILES.length} audio files, WAV mux×${WAV_MUX_FILES.length} files, AVI mux×${AVI_MUX_CASES.length} cases, fuzz robustness×${ROBUSTNESS_FILES.length} files:`,
   );
 
   const probeResults = await benchProbe();
@@ -1267,6 +1434,8 @@ async function main(): Promise<void> {
   const mpegTsResults = await benchMpegTsOps();
   const hlsSampleAesResults = await benchHlsSampleAesOps();
   const oggMuxResults = await benchOggMuxOps();
+  const wavMuxResults = await benchWavMuxOps();
+  const aviMuxResults = await benchAviMuxOps();
   const robustnessResults = await benchRobustnessOps();
   for (const r of probeResults) printFile(r);
   for (const r of mp4Results) printFile(r);
@@ -1274,6 +1443,8 @@ async function main(): Promise<void> {
   for (const r of mpegTsResults) printFile(r);
   for (const r of hlsSampleAesResults) printFile(r);
   for (const r of oggMuxResults) printFile(r);
+  for (const r of wavMuxResults) printFile(r);
+  for (const r of aviMuxResults) printFile(r);
   for (const r of robustnessResults) printFile(r);
 
   const allResults = [
@@ -1283,6 +1454,8 @@ async function main(): Promise<void> {
     ...mpegTsResults,
     ...hlsSampleAesResults,
     ...oggMuxResults,
+    ...wavMuxResults,
+    ...aviMuxResults,
     ...robustnessResults,
   ];
   const aggs = aggregate(allResults);

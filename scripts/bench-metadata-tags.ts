@@ -9,10 +9,12 @@ import { writeMp3Id3Tags } from '../src/metadata/id3.ts';
 import { writeMkvTags } from '../src/metadata/matroska-tags.ts';
 import { writeMp4Tags } from '../src/metadata/mp4-tags.ts';
 import { writeOggVorbisComment } from '../src/metadata/ogg-vorbis-comment.ts';
+import { writeAiffTags, writeCafTags, writeWavTags } from '../src/metadata/pcm-tags.ts';
 import { writeFlacVorbisComment } from '../src/metadata/vorbis-comment.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
+const DERIVED_DIR = `${ROOT}fixtures/media-derived`;
 const WARMUP = 3;
 const ITERS = 21;
 
@@ -64,6 +66,44 @@ const CASES = [
     ],
     write: writeMkvTags,
   },
+  {
+    name: 'metadata/write_wav_info_bext',
+    files: [
+      'speech.wav',
+      'sin_440Hz_-6dBFS_1s.wav',
+      'sfx-pcm-u8.wav',
+      'sfx-pcm-s16.wav',
+      'sfx-pcm-s24.wav',
+      'sfx-pcm-s32.wav',
+      'sfx-pcm-f32.wav',
+      'stereo-48000.wav',
+    ],
+    write: writeWavTags,
+  },
+  {
+    name: 'metadata/write_aiff_tags',
+    baseDir: DERIVED_DIR,
+    files: [
+      'aiff-caf/sfx.aiff',
+      'aiff-caf/sfx-s24.aiff',
+      'aiff-caf/sfx-fl32.aifc',
+      'aiff-caf/sfx-twos.aifc',
+      'aiff-caf/stereo.aiff',
+    ],
+    write: writeAiffTags,
+  },
+  {
+    name: 'metadata/write_caf_info',
+    baseDir: DERIVED_DIR,
+    files: [
+      'aiff-caf/sfx.caf',
+      'aiff-caf/sfx-be.caf',
+      'aiff-caf/sfx-f32.caf',
+      'aiff-caf/sfx-u8.caf',
+      'aiff-caf/stereo.caf',
+    ],
+    write: writeCafTags,
+  },
 ] as const;
 
 let sink = 0;
@@ -77,8 +117,9 @@ function median(values: readonly number[]): number {
 }
 
 async function timeCase(item: (typeof CASES)[number]): Promise<void> {
+  const baseDir = 'baseDir' in item ? item.baseDir : MEDIA_DIR;
   const fixtures = await Promise.all(
-    item.files.map(async (file) => new Uint8Array(await readFile(`${MEDIA_DIR}/${file}`))),
+    item.files.map(async (file) => new Uint8Array(await readFile(`${baseDir}/${file}`))),
   );
   const totalBytes = fixtures.reduce((sum, bytes) => sum + bytes.byteLength, 0);
   const run = (): number => {

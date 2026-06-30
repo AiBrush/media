@@ -161,6 +161,8 @@ Format per ADR: **Context** (why) · **Decision** (what) · **Consequences** (re
 
 **Context:** The encode/transcode path needs a `Muxer` per output container (doc 05 §2: `addTrack`/`write`/`finalize`, `output` a `ReadableStream<Uint8Array>`) that accepts WebCodecs `EncodedChunk`s and lays out the container's bytes. ADR-028 established this for MP4 (`Mp4Muxer` over `writeMp4`); WebM/Matroska is now added (`WebmMuxer` over `writeWebm` in `ebml-write.ts`), an OggMuxer is in flight, and the raw-PCM containers (WAV/AIFF/CAF) produce output a *different* way (the audio-dsp `transformPcm` path, ADR-022 — there is no WebCodecs codec for PCM, so no chunk `Muxer`). A consistent, validated pattern is needed so each new muxer is correct-by-construction and the doc never conflates "has a chunk `Muxer`" with "can be an output container." **Decision:** Every chunk-seam muxer follows one **`Muxer`-over-byte-writer** shape (the WebM muxer mirrors the MP4 one exactly). (1) A **pure byte writer** (`writeMp4` / `writeWebm`) builds the whole container from container-neutral track structs + samples, with **definite sizes** throughout (payload built first, then length-prefixed) so the output is seekable and re-parseable. (2) A thin **`Muxer` adapter class** (`Mp4Muxer` / `WebmMuxer`) buffers each track's packets (`addTrack` → `write` in arrival order) and serializes on `finalize`, emitting one chunk on `output`; only the per-chunk `EncodedChunk.copyTo` byte-extraction in `write()` is browser-guarded, while the packet ingest (`addChunkStruct`) + the timing model are **pure and Node-driven**. (3) **Codec-ID mapping is per-container and explicit** — MP4 maps the WebCodecs codec string to a sample-entry fourcc + config box (`avcC`/`esds` synthesized, `hvcC`/`av1C`/`vpcC`/`dOps`/`dfLa` verbatim, ADR-028); WebM maps it to a Matroska `CodecID` (`V_VP8`/`V_VP9`/`V_AV1`/`V_MPEG4/ISO/AVC`/`V_MPEGH/ISO/HEVC`; `A_OPUS`/`A_VORBIS`/`A_AAC`/`A_FLAC`/`A_MPEG/L3`) + `CodecPrivate` from the `description`; an unmappable codec is a typed `CapabilityError`, never a malformed file. (4) **Container-specific timing, honestly modeled:** MP4 reconstructs DTS + `ctts` (µs-domain, B-frame-safe, ADR-028); WebM `SimpleBlock`s carry **presentation** time + a keyframe flag only (no DTS/ctts), so reordered input simply yields PTS-timestamped blocks, rebased to t=0, split into `Cluster`s before the int16 relative-timecode range overflows. (5) **Single-shot misuse** (`addTrack`/`write` after `finalize`, double `finalize`, zero-track/empty-track finalize, `fragmented:true`) is a typed `mux-error`/`CapabilityError` in both. **Consequences:** WebM joins MP4 as a real chunk-seam output container, validated by the same **round-trip-via-an-independent-reader** oracle (the strongest, ADR-018): the WebM muxer test re-parses its output with the high-level `parseWebm` **and** an independent low-level `SimpleBlock` scan built from the `ebml` readers (not the writer) to reconstruct the exact per-track sample list (counts/sizes/timecodes/keyframe), and the MP4 muxer test re-demuxes via `readMovie`/`muxTracksFromMovie` (reference-reimport, ADR-028) — both able to fail. The per-container `createMuxer` status is therefore precise (see the doc 09 matrix container-output column): **mp4/mov** and **webm/mkv** return a real chunk `Muxer`; **wav/aiff/caf** have no chunk `Muxer` but produce output via `transformPcm` (PCM, ADR-022); **ogg** is in flight (its `createMuxer` currently throws a typed "Phase 2" miss); **mp3/flac/adts/mpegts/avi** throw a typed `mux-error` (out of scope or codec-layer/format work not yet done) — an honest gap, never a half-working muxer. Additive (new optional muxers behind the existing `createMuxer`) → no `DRIVER_API_VERSION` bump. **Rejected:** a single generic muxer with a container-format parameter (the box/EBML/page layouts share *shape* but not bytes — a per-container writer that owns its own helpers, edits nothing shared, and is independently round-trip-tested is cleaner and safer, mirroring how `ebml-write.ts`/`fragment.ts` own their helpers); a `Muxer` that emits a "valid container" without re-laying-out the samples (the `ftyp`-byte-flip SUSPECT shortcut — ADR-018 forbids passthrough-as-work; the independent-reader oracle is what proves real layout); marking a raw-PCM container's missing chunk `Muxer` as a failure (WAV/AIFF/CAF legitimately output via `transformPcm` — the matrix distinguishes *mechanism*, not just `createMuxer`).
 
+**Update (ADR-116/117):** Session 8 adds two real packet-seam muxers that supersede the current-status sentence above: WAV now has a narrow raw-PCM packet muxer for explicit packet assembly while ordinary WAV/AIFF/CAF conversion stays in `transformPcm`, and AVI now has a RIFF `hdrl`/`strl`/`movi`/`idx1` muxer with OpenDML `AVIX` segmentation. AIFF/CAF remain PCM-native transform targets, not packet muxers.
+
 ### ADR-039 — WASM AAC (AAC-LC) decode via Symphonia (pure-Rust → wasm); real miss-only tail, vendored
 
 **Context:** Some browser builds ship WebCodecs without AAC (no proprietary codecs), making AAC decode a real miss-only need for the Phase-2 wasm tail (docs/architecture/04). Symphonia's `symphonia-codec-aac` is pure Rust and **was measured to compile cleanly to `wasm32-unknown-unknown` via `wasm-pack build --target web` in this environment** (145 kB `.wasm` + glue), so this ships a **real decoder**, not a scaffold — mirroring wasm-vorbis (ADR-036). **Decision:** Add `src/codecs/wasm-aac/` — a `CodecDriver` (`id:'wasm-aac'`, `tier:'wasm'`, decode-only) whose `createDecoder` is a `TransformStream<EncodedAudioChunk, AudioData>` loading the **vendored** Symphonia-in-wasm core lazily via `new URL('./aac_wasm_bg.wasm', import.meta.url)` (self-hosted, same-origin, no CDN/COOP-COEP), decoding each **raw** AAC packet and wrapping the interleaved f32 in an `f32-planar` `AudioData` (consumer-owned, closed once). The Rust crate (`crate/`, committed with `Cargo.lock`; `target`/`pkg` gitignored) exposes a tiny `AacWasm` built from the ASC (`extra_data` = the WebCodecs `description`/`esds`) + container geometry; when no ASC is present (ADTS) Symphonia synthesizes a default AAC-LC ASC from the channels/rate. Pure ADTS-framing / ASC / format glue (`aac.ts`: ADTS header parse + payload strip, the MPEG-4 sample-rate table, ASC field parse, planar f32, config validation) is Node-validated. **Scope is AAC-LC mono/stereo** — Symphonia rejects SBR/HE-AAC/>2ch as "too complex" (a typed `CapabilityError`); **AAC encode** is an honest `CapabilityError` (no pure-Rust AAC encoder — encode to Opus). **Two correctness points discovered + fixed:** (1) Symphonia indexes AAC channels by *position*, so the crate builds the channel layout via `get_mpeg4_audio_channels_by_config_index` (a `Channels::Discrete` layout compiles but panics in channel-element setup); (2) the wasm-bindgen geometry getters must be read **once** and cached, not re-read interleaved with `decode` round-trips (that corrupts the glue's heap-object table on Node — both the driver and the validation harness cache them). **Consequences:** AAC-LC decode is a **real, shipped wasm tail**, validated by **running the actual wasm core on real bytes** (`sfx.adts`, ADTS/AAC-LC) on AAC-LC's exact-frame oracle — reported AAC-LC profile + rate + channels match the header, **every decoded frame is exactly 1024 samples/channel** (total = frames×1024), all samples finite ∈~[-1,1], non-silent — impossible to fake without truly decoding. Because Vitest's V8-coverage instrumentation corrupts the wasm-bindgen heap-object table inside the worker, the real decode runs in a **clean Node child process** (`decode-fixture.mjs`) while the Vitest file covers the pure helpers + driver contract (`aac.ts` 98.7% lines); the codec runs correctly in plain Node and Bun (verified), so this is a genuine decode, not a stub. The browser-only `AudioData` seam + `import.meta.url` fetch path are browser-validated (ADR-025) with a fresh benchmark. Additive (a new codec driver) → no `DRIVER_API_VERSION` bump (05 §5); the parent registers `WasmAacModule` in `defaults.ts`. **Rejected:** a scaffold (the build works — directive 6 demands the real thing when achievable); vendoring a prebuilt third-party AAC `.wasm` (ADR-025 supply-chain prohibition — we build from pinned source); forcing decode through the WebCodecs seam (no browser AAC to route to — the point of the tail).
@@ -218,6 +220,8 @@ scaffold tails whose cores are absent. Current support is gated on the browser `
 ### ADR-050 — ADTS AAC to WAV extraction is a `decodePcm` bridge, not a WAV chunk muxer
 
 **Context:** The browser harness `transcode/aac_to_pcm_wav_extract` requests `adts` AAC input and a WAV `pcm-s16` output. WAV is a raw-PCM container, not a WebCodecs `EncodedChunk` mux target, so routing ADTS through the generic demux→decode→encode→mux seam fell into the correct-but-unhelpful "no WAV chunk muxer" `CapabilityError`. FLAC had already established the right container contract for this class: `ContainerDriver.decodePcm(src, o)` can decode a compressed-audio source and author WAV directly, applying the PCM transform options, without pretending the target has a chunk muxer. ADTS needs the same bridge, but unlike FLAC its AAC decode substrate is browser/WebAssembly rather than pure integer TS. **Decision:** add `AdtsDriver.decodePcm`. It parses the ADTS stream once with the existing pure framer, strips each 7/9-byte header, synthesizes the two-byte AudioSpecificConfig, and decodes raw AAC access units through a capability ladder local to the bridge: native `AudioDecoder` first when `AudioDecoder.isConfigSupported` accepts the config, then the vendored `wasm-aac` core (`loadAacCore`) when native AAC is absent or rejects the config. Native `AudioData` output is copied into canonical planar PCM with the existing `audioDataToPcm` helper and closed exactly once; wasm interleaved f32 output is converted to the same planar shape. Decoded chunks are concatenated only if sample rate and channel count stay stable, then transformed in PCM order (`gain` → `remix` → `resample`) and serialized with `writeWav(..., 's16')`. Node and unsupported browsers still fail honestly with typed `CapabilityError`/`MediaError`; no fallback fabricates samples. **Consequences:** `convert(..., {to:'wav', audio:{codec:'pcm-s16'}})` can now route an ADTS source through the PCM-native branch and produce a real WAV in the browser, while the ADTS container still has no ADTS/AAC muxer and cannot be an ADTS output target. The new pure PCM framing helpers are Node-tested for channel layout, concatenation, geometry drift, and abort-fast behavior; the live AAC decode and WAV output are browser-harness validated by the focused transcode row. This is an additive optional-method implementation and does not change `DRIVER_API_VERSION`. **Rejected:** adding a fake WAV `Muxer` that accepts encoded AAC chunks (WAV has PCM frames, not compressed AAC packets); routing the row through adapter-only code (would duplicate engine behavior and risk a harness-only pass); relying only on native `AudioDecoder` (AAC support varies by browser, and the shipped `wasm-aac` tail already exists for this exact miss); running the wasm core under coverage instrumentation as the primary unit oracle (the AAC ADR documents that V8 coverage can corrupt the wasm-bindgen heap table, so the browser harness / clean-process decode oracle remain the live-decode validation).
+
+**Update:** the "no ADTS muxer" status above was later superseded by the real `AdtsMuxer`, which wraps raw AAC access units in ADTS frames. `decodePcm` remains the separate compressed-source bridge for ADTS-to-WAV extraction and still must not be confused with a WAV chunk muxer.
 
 ### ADR-051 — Target container identity and declared source duration survive the encode→mux bridge
 
@@ -2265,6 +2269,97 @@ trim/playback oracles run against the real massive fixture.
 skipping AVC decode preflight on the lazy path; buffering the full source to simplify random access;
 hardcoding the one-hour cut or the massive fixture id; changing keyframe trim into accurate
 decode/re-encode; and raising operation timeouts as a substitute for bounded source I/O.
+
+### ADR-115 — WAV/AIFF/CAF metadata writers complete raw-PCM tag rewrite breadth
+
+**Context:** Session 8's Chromium board had already reached the honest browser ceiling except for a pure
+TypeScript metadata gap: `media.remux(input, { to, tags })` could rewrite MP4/MOV, WebM/MKV, MP3, FLAC,
+and Ogg tags, but WAV, AIFF/AIFC, and CAF still declined in `engine.ts`. That was not a browser or codec
+limit. These containers carry metadata in container-native chunks (`LIST/INFO` + `bext` for WAV, classic
+AIFF text chunks plus optional ID3, and CAF `info`) and can be rewritten without touching audio packet
+bytes.
+
+**Decision:** add a shared raw-PCM metadata writer module for WAV/AIFF/CAF and route those three targets
+from `#writeMetadataTags` by lazy import so the eager engine budget stays unchanged. WAV validates
+`RIFF/WAVE`, removes prior top-level `LIST/INFO` and `bext` chunks, writes normalized INFO fields plus
+`TXXX:` custom keys, and emits a minimal 602-byte Broadcast Wave `bext` chunk for broad metadata
+compatibility. AIFF/AIFC validates `FORM AIFF/AIFC`, replaces standard text chunks (`NAME`, `AUTH`,
+`ANNO`, `(c) `) and writes an `ID3 ` chunk using the existing ID3v2.4 frame builder so the full tag set
+round-trips exactly. CAF validates `caff`, replaces or inserts an `info` chunk of NUL-terminated UTF-8
+key/value pairs, and inserts it before an indefinite `data` chunk so the file remains legal.
+
+**Consequences:** raw-PCM metadata rewrite is now a real same-container operation on Chromium and in Node.
+The validation oracle writes tags to real WAV/AIFF/CAF corpus bytes, reparses the tags with independent
+container-native readers, asserts exact key/value equality, and compares the audio payload chunks and PCM
+frames before/after so metadata edits cannot pass by corrupting or replacing media data. The public
+`media.remux(..., { to:'wav'|'aiff'|'caf', tags })` dispatch is covered. `scripts/bench-metadata-tags.ts`
+now measures WAV INFO/BWF rewrite across 8 real WAV fixtures plus AIFF and CAF rewrite across 5 committed
+derived fixtures per container, with checksum output so the write loops cannot be optimized away.
+
+**Rejected:** treating raw-PCM metadata as an honest browser NA; writing only one container flavor and
+claiming the others by extension; ID3-only WAV tags that common RIFF tools miss; changing audio chunk
+bytes to simplify insertion; hardcoding fixture paths or accepting an oracle that only checks output size.
+
+### ADR-116 — WAV exposes a strict raw-PCM packet muxer without replacing transformPcm
+
+**Context:** WAV output already existed through `transformPcm`: raw PCM sources can be parsed into
+canonical planar samples, transformed, and serialized by `writeWav`. But `WavDriver.createMuxer()` still
+threw a typed miss, so explicit packet-stream assembly (`media.mux({ audio:{ track, packets } },
+{ container:'wav' })`) could not author WAV even when the caller supplied raw PCM bytes and exact layout
+metadata. This was a first-party code gap, not a browser limitation.
+
+**Decision:** add `WavMuxer`, a single-track raw-PCM `Muxer` that accepts only audio tracks whose codec is
+a raw PCM token (`pcm-u8`, `pcm-s16`, `pcm-s24`, `pcm-s32`, `pcm-f32`, `pcm-f64` and supported big-endian
+input variants). `TrackInfo.config` must carry `sampleRate` and `numberOfChannels`; fragmented output,
+video tracks, compressed codecs, multiple tracks, empty tracks, and partial sample-frame packets reject
+with typed errors. The muxer copies packet bytes, decodes them through the existing deterministic PCM
+bridge, and serializes canonical RIFF/WAVE `fmt ` + `data` with `writeWav`. The routing predicate marks
+`wav` as explicitly packet-muxable for `media.mux`, while `chooseOutputContainer()` still keeps ordinary
+WAV-source conversion on the PCM-native `transformPcm` path.
+
+**Consequences:** WAV is now first-class for foreign raw-PCM packet assembly without pretending that WAV
+can accept encoded AAC/Opus/video chunks. The validation oracle feeds the real WAV corpus `data` chunks
+through `WavMuxer`, reparses the result with `parseWav`/`readWavPcm`, and asserts bit-exact `data` bytes
+plus identical sample counts/layout. Public `media.mux(..., { container:'wav' })` is covered with a
+structural packet stream. The fresh container benchmark adds `mux (->wav)` across 8 real WAV fixtures:
+geomean ~88.1 MB/s, worst ~33.8 MB/s, max peak RSS ~1.80 MB on the recorded Bun run.
+
+**Rejected:** leaving WAV output solely as a transform-only path; allowing compressed chunks into a WAV
+muxer and producing malformed output; inferring sample rate/channel count from packet bytes; silently
+dropping odd partial PCM frames; changing AIFF/CAF to chunk muxers when Session 8 only required WAV's
+missing seam.
+
+### ADR-117 — AVI mux writes RIFF hdrl/strl/movi/idx1 with OpenDML AVIX segmentation
+
+**Context:** The AVI driver could probe and demux real RIFF `AVI ` files, including MJPEG+PCM and
+MPEG-4+MP3 fixtures, but `createMuxer()` still threw "not yet implemented." AVI is not part of the core
+DoD container set, yet the missing feature was pure TypeScript container authoring: write the headers,
+interleaved `movi` chunks, and index from caller-supplied packet bytes. Returning input bytes, weakening
+AVI to probe-only, or skipping zero-length/drop-frame chunks would fail the structural oracle.
+
+**Decision:** add `AviMuxer`, a single-shot RIFF writer over the existing packet seam. The muxer allocates
+fresh two-digit stream numbers, accepts supported video packet codecs (MJPEG, MPEG-4/XVID, H.264, HEVC,
+VP8/VP9, AV1, raw DIB) and audio packet codecs (PCM, MP3, AAC, AC-3), and rejects unsupported codecs,
+missing configs, fragmented output, >99 streams, or misaligned PCM packets with typed errors. At
+`finalize()` it derives stream timing from buffered facts: video fps/declared duration, PCM audio
+byte-count divided by block alignment, packet durations when supplied, or declared compressed-audio
+duration. It writes `avih`, per-stream `strh`/`strf`, an OpenDML `dmlh`, a primary `LIST(movi)`, `idx1`
+entries relative to the `movi` list type, and additional `RIFF('AVIX')` `movi` segments once the segment
+payload threshold is crossed. Zero-length video chunks are preserved because real AVI files use them as
+drop-frame placeholders.
+
+**Consequences:** explicit `media.mux(..., { container:'avi' })` and direct driver muxing now author valid
+AVI layouts in pure TS. The validation oracle uses every committed real AVI payload: full MJPEG+PCM,
+full MPEG-4+MP3, video-only MJPEG, audio-only PCM, audio-only MP3, plus a low-threshold AVIX segmentation
+case. It reparses mux output with the independent `parseAvi` demux reader, compares every selected packet
+payload byte-for-byte, checks stream facts and `idx1`, and covers typed rejection cases. The fresh
+container benchmark adds `mux (->avi)` over five real-packet cases: geomean ~226.0 MB/s, worst
+~123.6 MB/s, max peak RSS ~0.16 MB on the recorded Bun run.
+
+**Rejected:** leaving AVI as probe/demux-only; writing a header without `idx1`; dropping empty video
+chunks; assuming source stream numbers survive multi-source public mux assembly; requiring WebCodecs to
+test the writer; hardcoding the two fixture names inside the muxer; claiming broader codecs without a
+container mapping.
 
 ### ADR-121 — CENC cens patterned CTR decrypt and HLS TS SAMPLE-AES
 

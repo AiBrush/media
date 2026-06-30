@@ -470,12 +470,19 @@ export class MediaEngineImpl implements MediaEngine {
   encode(frames: MediaStreams, opts: EncodeOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
       const target = chooseOutputContainer(opts.to, undefined);
-      if (!containerHasChunkMuxer(target)) {
-        // A non-chunk-muxable target (e.g. wav/raw-PCM) cannot accept encoded chunks; surface the honest
-        // miss rather than route into a muxer that throws an opaque error.
+      if (target === 'wav') {
         throw new CapabilityError(
           'capability-miss',
-          `encode to '${target}' has no EncodedChunk muxer (PCM/WAV output uses the audio-dsp path)`,
+          "encode to 'wav' is not a frame-encode target; use convert(..., { to:'wav' }) for source PCM transforms or mux(..., { container:'wav' }) for raw PCM packets",
+          { op: 'encode', tried: [target] },
+        );
+      }
+      if (!containerHasChunkMuxer(target)) {
+        // A target without a frame-encode packet muxer cannot accept encoded chunks; surface the honest
+        // miss before constructing streams or routing a muxer.
+        throw new CapabilityError(
+          'capability-miss',
+          `encode to '${target}' has no EncodedChunk muxer`,
           { op: 'encode', tried: [target] },
         );
       }
@@ -919,7 +926,7 @@ export class MediaEngineImpl implements MediaEngine {
     if (!containerHasChunkMuxer(opts.to)) {
       throw new CapabilityError(
         'capability-miss',
-        `remux to '${opts.to}' has no muxer in this build (writable containers: mp4/mov, webm/mkv, ogg; ${container.formats[0]} stream-copies only to its own family)`,
+        `remux to '${opts.to}' has no muxer in this build (writable containers: mp4/mov, webm/mkv, ogg, ts, flac, mp3, adts, wav/raw-PCM, avi; ${container.formats[0]} stream-copies only to its own family)`,
         { op: 'remux', tried: [container.id, opts.to] },
       );
     }
@@ -1189,6 +1196,18 @@ export class MediaEngineImpl implements MediaEngine {
       case 'ogg': {
         const { writeOggVorbisComment } = await import('../metadata/ogg-vorbis-comment.ts');
         return writeOggVorbisComment(bytes, tags);
+      }
+      case 'wav': {
+        const { writeWavTags } = await import('../metadata/pcm-tags.ts');
+        return writeWavTags(bytes, tags);
+      }
+      case 'aiff': {
+        const { writeAiffTags } = await import('../metadata/pcm-tags.ts');
+        return writeAiffTags(bytes, tags);
+      }
+      case 'caf': {
+        const { writeCafTags } = await import('../metadata/pcm-tags.ts');
+        return writeCafTags(bytes, tags);
       }
       default:
         throw new CapabilityError(

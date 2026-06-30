@@ -23,6 +23,7 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { AviMuxer } from './avi-mux.ts';
 import { type AviChunk, type AviParse, type AviTrack, parseAvi } from './avi-parse.ts';
 
 const AVI_MIMES = new Set(['video/avi', 'video/x-msvideo', 'video/msvideo', 'video/vnd.avi']);
@@ -149,10 +150,8 @@ export const AviDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
-  createMuxer(_o?: MuxOptions): Muxer {
-    // AVI muxing (idx1/OpenDML index construction, interleaving) lands with the streaming-output family;
-    // until then it is an honest typed gap rather than a half-working muxer.
-    throw new MediaError('mux-error', 'AVI muxing is not yet implemented');
+  createMuxer(o?: MuxOptions): Muxer {
+    return new AviMuxer(o);
   },
 };
 

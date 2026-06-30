@@ -159,7 +159,7 @@ describe('convert — stream-copy auto-route (no re-encode needed)', () => {
   it('routes an explicit PCM sample-format target (pcm-s16) through the audio-dsp WAV path, not the codec seam', async () => {
     // gap #5: a canonical PCM token (pcm-s16/-s24/-f32, what the harness passes) must be recognized as
     // PCM so convert(wav→wav) flows through transformPcm (a Blob) instead of falling through to the
-    // codec seam — which, having no WAV chunk muxer, would wrongly raise a CapabilityError in Node.
+    // codec seam. The Session 8 WAV packet muxer is for raw packet assembly, not PCM AudioData encoding.
     const out = await media().convert(await fixtureSource('speech.wav'), {
       to: 'wav',
       audio: { codec: 'pcm-s16' as never },
@@ -663,9 +663,10 @@ describe('encode — input validation', () => {
     await expect(media().encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
   });
 
-  it('rejects a non-chunk-muxable target with a typed CapabilityError', async () => {
+  it('rejects a frame-encode target with no encode path as a typed CapabilityError', async () => {
     const streams = media().decode(await fixtureSource('movie_5.mp4'));
-    // wav has no EncodedChunk muxer; the encode must surface that honest miss (the streams are unread).
+    // WAV has a raw-PCM packet muxer, but encode() is the raw-frame→codec path and must not invent a
+    // PCM encoder or consume the decoded streams for this unsupported target.
     await expect(media().encode(streams, { to: 'wav' })).rejects.toBeInstanceOf(CapabilityError);
   });
 

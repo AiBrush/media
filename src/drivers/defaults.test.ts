@@ -1,9 +1,13 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { CodecDriver, ContainerDriver, Packet, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Registry } from '../kernel/registry.ts';
+import { fromBytes } from '../sources/source.ts';
 import { fixtureSource } from '../test-support/corpus.ts';
 import { registerDefaultDrivers } from './defaults.ts';
+
+const DERIVED = new URL('../../fixtures/media-derived/', import.meta.url).pathname;
 
 function findContainer(reg: Registry, id: string): ContainerDriver {
   const driver = reg.containers().find((d) => d.id === id);
@@ -50,6 +54,10 @@ function fakeEncodedAudioChunk(bytes: Uint8Array): EncodedAudioChunk {
     },
   };
   return chunk as unknown as EncodedAudioChunk;
+}
+
+async function derivedBytes(name: string): Promise<Uint8Array> {
+  return new Uint8Array(await readFile(`${DERIVED}${name}`));
 }
 
 function flacTrackInfo(description: Uint8Array): TrackInfo {
@@ -165,6 +173,69 @@ describe('registerDefaultDrivers', () => {
     await expect(flac.createMuxer({ fragmented: true }).finalize()).rejects.toThrowError(
       CapabilityError,
     );
+  });
+
+  it('registers AVI as a lazy container proxy with cheap support checks', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+
+    const avi = findContainer(reg, 'avi');
+    expect(avi.formats).toEqual(['avi']);
+    expect(
+      avi.supports({
+        direction: 'demux',
+        head: new Uint8Array([
+          0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00, 0x41, 0x56, 0x49, 0x20,
+        ]),
+      }),
+    ).toBe(true);
+    expect(avi.supports({ direction: 'demux', mime: 'video/x-msvideo' })).toBe(true);
+    expect(avi.supports({ direction: 'demux', extension: 'AVI' })).toBe(true);
+    expect(
+      avi.supports({
+        direction: 'demux',
+        head: new Uint8Array([
+          0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+        ]),
+      }),
+    ).toBe(false);
+    expect(avi.supports({ direction: 'demux', extension: 'wav' })).toBe(false);
+  });
+
+  it('lazy-loads the AVI container for demux and mux while preserving typed proxy errors', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const avi = findContainer(reg, 'avi');
+
+    const demuxer = await avi.demux(
+      fromBytes(await derivedBytes('mjpeg_pcm_160p.avi'), { mime: 'video/x-msvideo' }),
+    );
+    expect(demuxer.tracks.map((track) => track.codec)).toEqual(['mjpeg', 'pcm']);
+    await demuxer.close();
+
+    const muxer = avi.createMuxer();
+    const trackId = muxer.addTrack({
+      id: 0,
+      mediaType: 'audio',
+      codec: 'pcm-u8',
+      config: { codec: 'pcm-u8', sampleRate: 8000, numberOfChannels: 1 },
+    });
+    const output = collectBytes(muxer.output);
+    await muxer.write(trackId, {
+      chunk: fakeEncodedAudioChunk(new Uint8Array([0x80, 0x81, 0x82, 0x83])),
+    });
+    await muxer.finalize();
+    const bytes = await output;
+    expect(new TextDecoder().decode(bytes.slice(0, 4))).toBe('RIFF');
+    expect(new TextDecoder().decode(bytes.slice(8, 12))).toBe('AVI ');
+
+    const invalid = avi.createMuxer();
+    invalid.addTrack({ id: 1, mediaType: 'video', codec: 'unknown-video' });
+    await expect(invalid.finalize()).rejects.toThrowError(CapabilityError);
+
+    await expect(
+      avi.createMuxer().write(9, { chunk: fakeEncodedAudioChunk(new Uint8Array([0])) }),
+    ).rejects.toThrowError(MediaError);
   });
 
   it('registers lazy codec proxies that load only after a matching support query', async () => {

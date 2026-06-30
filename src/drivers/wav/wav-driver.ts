@@ -12,6 +12,7 @@ import {
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
+  type MuxOptions,
   type Muxer,
   type Packet,
   type PcmTransform,
@@ -24,6 +25,7 @@ import type { PcmAudio } from '../../dsp/pcm.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { readWavPcm } from './pcm.ts';
+import { WavMuxer } from './wav-mux.ts';
 
 const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
 const WAV_EXTENSIONS = new Set(['wav', 'wave']);
@@ -203,13 +205,8 @@ export const WavDriver: ContainerDriver = {
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return wav;
   },
-  createMuxer(): Muxer {
-    // WAV carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is
-    // produced by `transformPcm` (writeWav) — the audio-dsp path (ADR-022).
-    throw new MediaError(
-      'mux-error',
-      'wav output flows through transformPcm (PCM), not the chunk seam',
-    );
+  createMuxer(o?: MuxOptions): Muxer {
+    return new WavMuxer(o);
   },
 };
 

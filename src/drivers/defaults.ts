@@ -30,14 +30,13 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import type { PcmAudio } from '../dsp/index.ts';
 import { AudioDspFilterModule } from '../filters/audio-dsp.ts';
 import { CpuVideoFilterModule } from '../filters/cpu-video.ts';
 import { GpuVideoFilterModule } from '../filters/gpu-video.ts';
 import { AdtsModule } from './adts/adts-driver.ts';
 import { AiffModule } from './aiff/aiff-driver.ts';
-import { AviModule } from './avi/avi-driver.ts';
 import { CafModule } from './caf/caf-driver.ts';
 import { matchesFlac } from './flac/flac-sniff.ts';
 import { Mp3Module } from './mp3/mp3-driver.ts';
@@ -63,7 +62,6 @@ export function registerDefaultDrivers(reg: Registry): void {
     AdtsModule,
     MpegTsModule,
     AiffModule,
-    AviModule,
     CafModule,
     WebcodecsVideoModule,
     WebCodecsAudioModule,
@@ -77,6 +75,7 @@ export function registerDefaultDrivers(reg: Registry): void {
   ];
   for (const mod of modules) mod.register(reg);
   reg.addContainer(lazyFlacContainerDriver());
+  reg.addContainer(lazyAviContainerDriver());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
 }
 
@@ -101,12 +100,12 @@ function videoDecode(q: CodecQuery): boolean {
   return q.mediaType === 'video' && q.direction === 'decode';
 }
 
-type FlacContainerLoader = () => Promise<ContainerDriver>;
+type LazyContainerLoader = () => Promise<ContainerDriver>;
 
 function lazyFlacContainerDriver(): ContainerDriver {
   let driver: ContainerDriver | undefined;
   let loadPromise: Promise<ContainerDriver> | undefined;
-  const load: FlacContainerLoader = async (): Promise<ContainerDriver> => {
+  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
     if (driver !== undefined) return driver;
     loadPromise ??= import('./flac/flac-driver.ts').then((m) => m.FlacDriver);
     driver = await loadPromise;
@@ -144,6 +143,50 @@ function lazyFlacContainerDriver(): ContainerDriver {
   };
 }
 
+const AVI_MIMES = new Set(['video/avi', 'video/x-msvideo', 'video/msvideo', 'video/vnd.avi']);
+
+function lazyAviContainerDriver(): ContainerDriver {
+  let driver: ContainerDriver | undefined;
+  let loadPromise: Promise<ContainerDriver> | undefined;
+  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
+    if (driver !== undefined) return driver;
+    loadPromise ??= import('./avi/avi-driver.ts').then((m) => m.AviDriver);
+    driver = await loadPromise;
+    return driver;
+  };
+  return {
+    id: 'avi',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['avi'],
+    supports: matchesAvi,
+    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+      return (await load()).demux(src, o);
+    },
+    createMuxer(o?: MuxOptions): Muxer {
+      return new LazyContainerMuxer(load, o);
+    },
+  };
+}
+
+function matchesAvi(q: ContainerQuery): boolean {
+  if (q.mime !== undefined && AVI_MIMES.has(q.mime)) return true;
+  if (q.extension?.toLowerCase() === 'avi') return true;
+  const head = q.head;
+  return (
+    head !== undefined &&
+    head.byteLength >= 12 &&
+    head[0] === 0x52 &&
+    head[1] === 0x49 &&
+    head[2] === 0x46 &&
+    head[3] === 0x46 &&
+    head[8] === 0x41 &&
+    head[9] === 0x56 &&
+    head[10] === 0x49 &&
+    head[11] === 0x20
+  );
+}
+
 function missingFlacMethod(method: string): CapabilityError {
   return new CapabilityError('capability-miss', `lazy FLAC driver did not expose ${method}`, {
     op: 'flac',
@@ -153,7 +196,7 @@ function missingFlacMethod(method: string): CapabilityError {
 
 class LazyFlacMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
-  readonly #load: FlacContainerLoader;
+  readonly #load: LazyContainerLoader;
   readonly #options: MuxOptions | undefined;
   readonly #ready: Promise<void>;
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -162,7 +205,7 @@ class LazyFlacMuxer implements Muxer {
   #track: TrackInfo | undefined;
   #targetTrackId: number | undefined;
 
-  constructor(load: FlacContainerLoader, options?: MuxOptions) {
+  constructor(load: LazyContainerLoader, options?: MuxOptions) {
     this.#load = load;
     this.#options = options;
     this.#ready = new Promise<void>((resolve) => {
@@ -212,6 +255,94 @@ class LazyFlacMuxer implements Muxer {
       this.#muxer = muxer;
       this.#pumpOutput(muxer.output);
       if (this.#track !== undefined) this.#targetTrackId = muxer.addTrack(this.#track);
+      return muxer;
+    } catch (error) {
+      await this.#errorOutput(error);
+      throw error;
+    }
+  }
+
+  #pumpOutput(output: ReadableStream<Uint8Array>): void {
+    void (async (): Promise<void> => {
+      await this.#ready;
+      const controller = this.#controller;
+      if (controller === undefined) return;
+      const reader = output.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        reader.releaseLock();
+      }
+    })();
+  }
+
+  async #errorOutput(error: unknown): Promise<void> {
+    await this.#ready;
+    this.#controller?.error(error);
+  }
+}
+
+class LazyContainerMuxer implements Muxer {
+  readonly output: ReadableStream<Uint8Array>;
+  readonly #load: LazyContainerLoader;
+  readonly #options: MuxOptions | undefined;
+  readonly #ready: Promise<void>;
+  readonly #tracks: TrackInfo[] = [];
+  readonly #targetTrackIds: number[] = [];
+  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  #resolveReady: (() => void) | undefined;
+  #muxer: Muxer | undefined;
+
+  constructor(load: LazyContainerLoader, options?: MuxOptions) {
+    this.#load = load;
+    this.#options = options;
+    this.#ready = new Promise<void>((resolve) => {
+      this.#resolveReady = resolve;
+    });
+    this.output = new ReadableStream<Uint8Array>({
+      start: (controller): void => {
+        this.#controller = controller;
+        this.#resolveReady?.();
+      },
+    });
+  }
+
+  addTrack(info: TrackInfo): number {
+    const id = this.#tracks.length;
+    this.#tracks.push(info);
+    return id;
+  }
+
+  async write(trackId: number, packet: Packet): Promise<void> {
+    const muxer = await this.#ensureMuxer();
+    const targetTrackId = this.#targetTrackIds[trackId];
+    if (targetTrackId === undefined)
+      throw new MediaError('mux-error', `write to unknown track ${trackId}`);
+    await muxer.write(targetTrackId, packet);
+  }
+
+  async finalize(): Promise<void> {
+    const muxer = await this.#ensureMuxer();
+    await muxer.finalize();
+  }
+
+  async #ensureMuxer(): Promise<Muxer> {
+    if (this.#muxer !== undefined) return this.#muxer;
+    try {
+      const driver = await this.#load();
+      const muxer = driver.createMuxer(this.#options);
+      this.#muxer = muxer;
+      this.#pumpOutput(muxer.output);
+      for (const track of this.#tracks) this.#targetTrackIds.push(muxer.addTrack(track));
       return muxer;
     } catch (error) {
       await this.#errorOutput(error);

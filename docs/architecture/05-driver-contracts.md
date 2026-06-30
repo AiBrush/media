@@ -156,7 +156,8 @@ export interface ContainerDriver extends DriverBase {
   // wrapper/sample-format/endianness, gain/fade, mix/resample, biquad/EQ, and dynamics in the TS
   // audio-dsp path, then re-serialize. Source sample-format/endianness are preserved unless the transform
   // asks for a target format or the target wrapper requires a legal 8-bit mapping (`pcm-s8` AIFF/CAF ↔
-  // `pcm-u8` WAV); cross-wrapper WAV/AIFF/CAF output is still PCM-native, not an EncodedChunk mux.
+  // `pcm-u8` WAV); ordinary cross-wrapper WAV/AIFF/CAF output is still PCM-native, while ADR-116 adds a
+  // separate WAV-only raw-packet muxer for callers that already have legal PCM packet bytes.
   // Absent ⇒ codec seam.
   transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>
   // Optional driver-native decryption (ADR-023/121): parse protection boxes (enca/tenc/senc),
