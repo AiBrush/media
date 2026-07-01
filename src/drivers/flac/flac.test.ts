@@ -3,11 +3,16 @@ import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { MediaStreams } from '../../api/types.ts';
-import { decodeFlac, interleavedPcmBytes } from '../../codecs/flac/decode.ts';
+import {
+  decodeFlac,
+  enumerateFlacFrameSpans as enumerateDecodedFlacFrameSpans,
+  interleavedPcmBytes,
+} from '../../codecs/flac/decode.ts';
 import { encodeFlac, flacPcmFromDecoded } from '../../codecs/flac/encode.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
+import type { ByteSource, PacketInfoTable } from '../../contracts/driver.ts';
 import { InputError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
+import type { Source } from '../../sources/source.ts';
 import {
   fixtureSource,
   fixturesByContainer,
@@ -25,6 +30,15 @@ import {
 
 const md5 = (b: Uint8Array): string => createHash('md5').update(b).digest('hex');
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+
+function expectBytesEqual(actual: Uint8Array, expected: Uint8Array, label: string): void {
+  expect(actual.byteLength, `${label}: byteLength`).toBe(expected.byteLength);
+  for (let i = 0; i < actual.byteLength; i++) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(`${label}: byte ${i} got ${actual[i]} expected ${expected[i]}`);
+    }
+  }
+}
 
 /** Build a minimal native-FLAC header (fLaC + STREAMINFO), optionally with an ID3v2 prefix. */
 function buildFlac(
@@ -148,6 +162,135 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     expect(info).toEqual(await loadGoldenMetadata('sfx.flac'));
   });
 
+  it('known-container zero-config probe reads only the STREAMINFO prefix', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const reads: Array<[number, number]> = [];
+    let streamReads = 0;
+    const src: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      mimeHint: 'audio/flac',
+      filename: 'sfx.flac',
+      size: bytes.byteLength,
+      stream: () => {
+        streamReads++;
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+      },
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    const media = createMedia() as unknown as {
+      probeContainer(input: Source, container: 'flac'): Promise<{ readonly tracks: readonly unknown[] }>;
+    };
+
+    const info = await media.probeContainer(src, 'flac');
+    expect(info.tracks).toHaveLength(1);
+    expect(reads).toEqual([[0, 4096]]);
+    expect(streamReads).toBe(0);
+  });
+
+  it('zero-config packetInfo enumerates native FLAC frame facts without payload streams', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const reads: Array<[number, number]> = [];
+    let streamReads = 0;
+    const src: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      mimeHint: 'audio/flac',
+      filename: 'sfx.flac',
+      size: bytes.byteLength,
+      stream: () => {
+        streamReads++;
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+      },
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    const media = createMedia() as unknown as {
+      packetInfo(input: Source): Promise<PacketInfoTable>;
+    };
+
+    const table = await media.packetInfo(src);
+    const decodedFrames = enumerateDecodedFlacFrameSpans(bytes);
+    expect(table.tracks).toHaveLength(1);
+    expect(table.tracks[0]?.codec).toBe('flac');
+    expect(table.packets).toHaveLength(decodedFrames.length);
+    for (let i = 0; i < decodedFrames.length; i++) {
+      const got = table.packets[i];
+      const expected = decodedFrames[i];
+      if (got === undefined || expected === undefined) throw new Error(`missing frame ${i}`);
+      expect(got.trackIndex, `frame ${i}: trackIndex`).toBe(0);
+      expect(got.size, `frame ${i}: size`).toBe(expected.size);
+      expect(got.ptsUs, `frame ${i}: pts`).toBe(expected.ptsUs);
+      expect(got.dtsUs, `frame ${i}: dts`).toBe(expected.ptsUs);
+      expect(got.keyframe, `frame ${i}: keyframe`).toBe(true);
+    }
+    expect(reads).toEqual([
+      [0, 4096],
+      [0, bytes.byteLength],
+    ]);
+    expect(streamReads).toBe(0);
+  });
+
+  it('known-container packetInfo skips the routing sniff read', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const reads: Array<[number, number]> = [];
+    let streamReads = 0;
+    const src: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      mimeHint: 'audio/flac',
+      filename: 'sfx.flac',
+      size: bytes.byteLength,
+      stream: () => {
+        streamReads++;
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+      },
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    const media = createMedia() as unknown as {
+      packetInfo(
+        input: Source,
+        o: { readonly container: 'flac' },
+      ): Promise<PacketInfoTable>;
+    };
+
+    const table = await media.packetInfo(src, { container: 'flac' });
+    const decodedFrames = enumerateDecodedFlacFrameSpans(bytes);
+    expect(table.packets).toHaveLength(decodedFrames.length);
+    for (let i = 0; i < decodedFrames.length; i++) {
+      const got = table.packets[i];
+      const expected = decodedFrames[i];
+      if (got === undefined || expected === undefined) throw new Error(`missing frame ${i}`);
+      expect(got.size, `frame ${i}: size`).toBe(expected.size);
+      expect(got.ptsUs, `frame ${i}: pts`).toBe(expected.ptsUs);
+    }
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    expect(streamReads).toBe(0);
+  });
+
   it('parseFlac reads STREAMINFO fields from the real file', async () => {
     const info = parseFlac(await loadFixture('sfx.flac'));
     expect(info).toEqual({
@@ -221,11 +364,99 @@ describe('media.trim — native FLAC sample-accurate lossless cut', () => {
       const startSec = (source.totalSamples / source.sampleRate) * 0.25;
       const endSec = (source.totalSamples / source.sampleRate) * 0.7;
       const out = await blobBytes(
-        await createMedia().trim(await fixtureSource(id), { start: startSec, end: endSec }),
+        await createMedia().trim(await fixtureSource(id), {
+          start: startSec,
+          end: endSec,
+          mode: 'accurate',
+        }),
       );
       expectDecodedSlice(source, decodeFlac(out), startSec, endSec, id);
     }
   }, 30_000);
+});
+
+describe('media.trim — native FLAC keyframe packet-copy', () => {
+  it('validates and copies in one full source read after routing', async () => {
+    const sourceBytes = await loadFixture('sfx.flac');
+    let rangeReads = 0;
+    let streamReads = 0;
+    const source: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: sourceBytes.byteLength,
+      mimeHint: 'audio/flac',
+      range(start, end): Promise<Uint8Array> {
+        rangeReads++;
+        return Promise.resolve(sourceBytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        streamReads++;
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(sourceBytes);
+            controller.close();
+          },
+        });
+      },
+    };
+
+    const out = await blobBytes(
+      await createMedia().trim(source, {
+        start: 0.04,
+        end: 0.16,
+        mode: 'keyframe',
+      }),
+    );
+
+    expect(parseFlac(out).totalSamples).toBeGreaterThan(0);
+    expect(rangeReads).toBe(2);
+    expect(streamReads).toBe(0);
+  });
+
+  it('copies overlapping coded frames verbatim and rewrites STREAMINFO without PCM decode', async () => {
+    const sourceBytes = await loadFixture('sfx.flac');
+    const sourceInfo = parseFlac(sourceBytes);
+    const sourceFrames = enumerateFlacFrames(sourceBytes);
+    const startSec = 0.04;
+    const endSec = 0.16;
+    const startSample = Math.round(startSec * sourceInfo.sampleRate);
+    const endSample = Math.round(endSec * sourceInfo.sampleRate);
+    const selected = sourceFrames.filter((frame) => {
+      const frameStart = frame.ptsSamples;
+      const frameEnd = frameStart + frame.samples;
+      return frameEnd > startSample && frameStart < endSample;
+    });
+    expect(selected.length).toBeGreaterThan(0);
+
+    const out = await blobBytes(
+      await createMedia().trim(await fixtureSource('sfx.flac'), {
+        start: startSec,
+        end: endSec,
+        mode: 'keyframe',
+      }),
+    );
+    expect(out.byteLength).toBeLessThan(sourceBytes.byteLength);
+    expect(nativeFlacMetadata(out).byteLength).toBe(42);
+
+    const outInfo = parseFlac(out);
+    expect(outInfo.sampleRate).toBe(sourceInfo.sampleRate);
+    expect(outInfo.channels).toBe(sourceInfo.channels);
+    expect(outInfo.bitsPerSample).toBe(sourceInfo.bitsPerSample);
+    expect(outInfo.totalSamples).toBe(selected.reduce((sum, frame) => sum + frame.samples, 0));
+
+    const outDecoded = decodeFlac(out);
+    expect(hex(outDecoded.md5)).toBe('00000000000000000000000000000000');
+    const outFrames = enumerateFlacFrames(out);
+    expect(outFrames).toHaveLength(selected.length);
+    for (let i = 0; i < selected.length; i++) {
+      const sourceFrame = selected[i];
+      const outFrame = outFrames[i];
+      if (sourceFrame === undefined || outFrame === undefined) {
+        throw new Error(`missing FLAC frame ${i}`);
+      }
+      expectBytesEqual(outFrame.data, sourceFrame.data, `frame ${i}`);
+    }
+  });
 });
 
 describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
@@ -237,6 +468,8 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
       const bytes = await loadFixture(entry.id);
       const info = parseFlac(bytes);
       const frames = enumerateFlacFrames(bytes);
+      const decodedFrames = enumerateDecodedFlacFrameSpans(bytes);
+      expect(frames).toHaveLength(decodedFrames.length);
       expect(frames.length, `${entry.id}: frame count`).toBeGreaterThan(0);
       expect(
         frames.reduce((sum, f) => sum + f.samples, 0),
@@ -247,13 +480,37 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
         `${entry.id}: duration`,
       ).toBeCloseTo(info.durationSec, 3);
 
-      for (const frame of frames) {
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        const decodedFrame = decodedFrames[i];
+        if (frame === undefined || decodedFrame === undefined) {
+          throw new Error(`${entry.id}: missing frame ${i}`);
+        }
+        expect(
+          {
+            offset: frame.offset,
+            size: frame.size,
+            samples: frame.samples,
+            ptsSamples: frame.ptsSamples,
+            ptsUs: frame.ptsUs,
+            durationUs: frame.durationUs,
+          },
+          `${entry.id}: fast frame ${i} metadata`,
+        ).toEqual({
+          offset: decodedFrame.offset,
+          size: decodedFrame.size,
+          samples: decodedFrame.samples,
+          ptsSamples: decodedFrame.ptsSamples,
+          ptsUs: decodedFrame.ptsUs,
+          durationUs: decodedFrame.durationUs,
+        });
         expect(frame.data[0], `${entry.id}: frame sync byte`).toBe(0xff);
         expect((frame.data[1] ?? 0) & 0xfc, `${entry.id}: frame sync bits`).toBe(0xf8);
         expect(
           bytes.subarray(frame.offset, frame.offset + frame.size),
           `${entry.id}: byte span`,
         ).toEqual(frame.data);
+        expectBytesEqual(frame.data, decodedFrame.data, `${entry.id}: decoded frame ${i}`);
       }
     }
   });

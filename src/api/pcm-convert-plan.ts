@@ -26,7 +26,7 @@ import type { Source } from '../sources/source.ts';
 import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
 import { isPcmContainer } from './codec-routing.ts';
 import { CapabilityError } from '../contracts/errors.ts';
-import { rewriteWavPcmCopy } from '../drivers/wav/pcm.ts';
+import { rewriteWavPcmCopy, writeWavHeader } from '../drivers/wav/pcm.ts';
 
 /**
  * The engine capabilities {@link convertPcmNative} needs, threaded in so the routine never reaches into the
@@ -40,6 +40,14 @@ export interface PcmConvertDeps {
   mimeOpts(signal: AbortSignal, container: string): { signal: AbortSignal; mime?: string };
   pcmSampleFormat(codec: string | undefined): SampleFormat | undefined;
   pcmEndian(codec: string | undefined): Endianness | undefined;
+}
+
+export interface WavPcmPacketCopyInput {
+  readonly payload: Uint8Array;
+  readonly sourceBytes?: Uint8Array;
+  readonly codec: string;
+  readonly sampleRate: number;
+  readonly channels: number;
 }
 
 /**
@@ -106,7 +114,7 @@ export async function pcm(
   src: Source | Uint8Array,
   sourceContainer: string,
   opts: { readonly to: Container; readonly audio?: AudioTarget | false; readonly sink?: Sink },
-  signal: AbortSignal,
+  signal: AbortSignal | undefined,
   o: CallOptions,
 ): Promise<Output | Uint8Array> {
   const target = opts.to;
@@ -134,7 +142,8 @@ export async function pcm(
     });
   }
   const container = await routeContainerToken(sourceContainer, 'demux');
-  const pcmOpts = pcmTransformOptions(deps, audio, target, signal, o);
+  const activeSignal = signal ?? new AbortController().signal;
+  const pcmOpts = pcmTransformOptions(deps, audio, target, activeSignal, o);
   const stream = container.transformPcm
     ? await container.transformPcm(src, pcmOpts)
     : target === 'wav' && container.decodePcm
@@ -146,5 +155,44 @@ export async function pcm(
       tried: [container.id, target],
     });
   }
-  return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, target));
+  return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(activeSignal, target));
+}
+
+export function wavPcmPacketCopy(
+  deps: Pick<PcmConvertDeps, 'pcmSampleFormat' | 'pcmEndian'>,
+  input: WavPcmPacketCopyInput,
+): Uint8Array<ArrayBuffer> {
+  const format = deps.pcmSampleFormat(input.codec);
+  const endian = deps.pcmEndian(input.codec) ?? 'le';
+  if (format === undefined || endian !== 'le') {
+    throw new CapabilityError('capability-miss', 'WAV packet copy requires little-endian PCM packets', {
+      op: 'mux',
+      tried: [input.codec],
+    });
+  }
+  if (!Number.isSafeInteger(input.sampleRate) || input.sampleRate <= 0) {
+    throw new CapabilityError('capability-miss', 'WAV packet copy requires a positive sample rate', {
+      op: 'mux',
+      tried: [input.codec],
+    });
+  }
+  if (!Number.isSafeInteger(input.channels) || input.channels <= 0) {
+    throw new CapabilityError('capability-miss', 'WAV packet copy requires a positive channel count', {
+      op: 'mux',
+      tried: [input.codec],
+    });
+  }
+  const sourceBytes = input.sourceBytes;
+  if (sourceBytes !== undefined && input.payload.buffer === sourceBytes.buffer) {
+    const payloadOffset = input.payload.byteOffset - sourceBytes.byteOffset;
+    if (payloadOffset === 44 && sourceBytes.byteLength === 44 + input.payload.byteLength) {
+      const out = sourceBytes.slice() as Uint8Array<ArrayBuffer>;
+      writeWavHeader(out, input.payload.byteLength, input.channels, input.sampleRate, format);
+      return out;
+    }
+  }
+  const out = new Uint8Array(44 + input.payload.byteLength);
+  writeWavHeader(out, input.payload.byteLength, input.channels, input.sampleRate, format);
+  out.set(input.payload, 44);
+  return out;
 }

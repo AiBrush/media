@@ -24,6 +24,7 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketInfoTable,
   PcmTransform,
   RawFrame,
   Registry,
@@ -40,7 +41,16 @@ import { GpuVideoFilterModule } from '../filters/gpu-video.ts';
 import { AdtsModule } from './adts/adts-driver.ts';
 import { AiffModule } from './aiff/aiff-driver.ts';
 import { CafModule } from './caf/caf-driver.ts';
-import { matchesFlac } from './flac/flac-sniff.ts';
+import {
+  type FastFlacFrameSpan,
+  fastFlacFrames,
+  flacMetadataLayout,
+  flacOffset,
+  flacPacketInfoRows,
+  flacTrackInfo,
+  matchesFlac,
+  parseFlacStreamInfo,
+} from './flac/flac-sniff.ts';
 import { Mp3Module } from './mp3/mp3-driver.ts';
 import { Mp4Module } from './mp4/mp4-driver.ts';
 import { OggModule } from './ogg/ogg-driver.ts';
@@ -111,6 +121,7 @@ const TS_MIMES = new Set([
   'audio/mp2t',
 ]);
 const TS_EXTENSIONS = new Set(['ts', 'm2ts', 'mts', 'm2t']);
+const FLAC_PROBE_HEAD_BYTES = 4096;
 
 function lazyMpegTsContainerDriver(): ContainerDriver {
   let driver: ContainerDriver | undefined;
@@ -173,11 +184,44 @@ function lazyFlacContainerDriver(): ContainerDriver {
     supports(q: ContainerQuery): boolean {
       return matchesFlac(q);
     },
+    async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+      const info = parseFlacStreamInfo(await readFlacProbeBytes(src));
+      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+      return [flacTrackInfo(info)];
+    },
+    async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+      const bytes = await readFlacBytes(src);
+      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+      const layout = flacMetadataLayout(bytes);
+      const frames = fastFlacFrames(bytes, layout);
+      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+      return {
+        tracks: [flacTrackInfo(layout.info, bytes.slice(layout.start, layout.audioStart))],
+        packets: flacPacketInfoRows(frames),
+      };
+    },
     async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-      return (await load()).demux(src, o);
+      const bytes = await readFlacBytes(src);
+      const layout = flacMetadataLayout(bytes);
+      const frames = fastFlacFrames(bytes, layout);
+      const track = flacTrackInfo(layout.info, bytes.slice(layout.start, layout.audioStart));
+      return {
+        tracks: [track],
+        packets(trackId: number): ReadableStream<Packet> {
+          if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
+          return flacPacketStream(bytes, frames, o?.signal);
+        },
+        close: () => Promise.resolve(),
+      };
     },
     createMuxer(o?: MuxOptions): Muxer {
       return new LazyFlacMuxer(load, o);
+    },
+    async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+      const streamCopy = (await load()).streamCopy;
+      if (streamCopy === undefined) throw missingLazyMethod('flac', 'streamCopy');
+      return streamCopy(src, o);
     },
     async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
       const decodePcm = (await load()).decodePcm;
@@ -195,6 +239,77 @@ function lazyFlacContainerDriver(): ContainerDriver {
       return transformPcm(src, o);
     },
   };
+}
+
+async function readFlacProbeBytes(src: ByteSource): Promise<Uint8Array> {
+  if (src.range !== undefined) {
+    const head = await src.range(0, FLAC_PROBE_HEAD_BYTES);
+    const need = flacOffset(head) + 42;
+    if (head.byteLength >= need) return head;
+    return src.range(0, need);
+  }
+  return readByteStream(src.stream());
+}
+
+async function readFlacBytes(src: ByteSource): Promise<Uint8Array> {
+  if (src.range !== undefined && src.size !== undefined) return src.range(0, src.size);
+  return readByteStream(src.stream());
+}
+
+function flacPacketStream(
+  bytes: Uint8Array,
+  frames: readonly FastFlacFrameSpan[],
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
+  if (typeof EncodedAudioChunk === 'undefined') {
+    throw new CapabilityError(
+      'capability-miss',
+      'FLAC packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
+      { op: 'demux', tried: ['flac'] },
+    );
+  }
+  let i = 0;
+  return new ReadableStream<Packet>({
+    pull(controller): void {
+      if (signal?.aborted) {
+        controller.error(new MediaError('aborted', 'operation aborted'));
+        return;
+      }
+      const frame = frames[i];
+      if (frame === undefined) {
+        controller.close();
+        return;
+      }
+      i++;
+      const data = bytes.slice(frame.offset, frame.offset + frame.size);
+      const chunk = new EncodedAudioChunk({
+        type: 'key',
+        timestamp: frame.ptsUs,
+        duration: frame.durationUs,
+        data,
+      });
+      controller.enqueue({ chunk, sizeBytes: frame.size });
+    },
+  });
+}
+
+async function readByteStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
 }
 
 const AVI_MIMES = new Set(['video/avi', 'video/x-msvideo', 'video/msvideo', 'video/vnd.avi']);

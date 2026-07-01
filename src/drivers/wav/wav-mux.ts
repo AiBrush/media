@@ -1,7 +1,7 @@
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { type Endianness, type SampleFormat, bytesPerSample, decodePcm } from '../../dsp/pcm.ts';
-import { writeWav } from './pcm.ts';
+import { writeWav, writeWavHeader } from './pcm.ts';
 
 interface PcmWireFormat {
   readonly sourceFormat: SampleFormat;
@@ -78,6 +78,17 @@ function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array 
   const out = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function writeRawPcmWav(track: WavMuxTrack): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(44 + track.audioBytes);
+  writeWavHeader(out, track.audioBytes, track.channels, track.sampleRate, track.wire.outputFormat);
+  let offset = 44;
+  for (const chunk of track.chunks) {
     out.set(chunk, offset);
     offset += chunk.byteLength;
   }
@@ -187,6 +198,14 @@ export class WavMuxer implements Muxer {
       }
       if (track.audioBytes === 0) {
         throw new MediaError('mux-error', `track ${track.id} received no PCM packets`);
+      }
+      if (
+        track.wire.sourceEndian === 'le' &&
+        track.wire.sourceFormat === track.wire.outputFormat
+      ) {
+        controller.enqueue(writeRawPcmWav(track));
+        controller.close();
+        return;
       }
       const pcmBytes = concatChunks(track.chunks, track.audioBytes);
       const audio = decodePcm(

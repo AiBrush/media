@@ -171,10 +171,11 @@ routing work first: metadata/probe should seek to the header or index, and
 packet-table scenarios should enumerate timeline facts without materializing
 payload bytes. Any full-body read on these rows is a real speed loss.
 
-**B. High fixed per-operation overhead.** On tiny inputs we are still 5–30×
-slower even though the real work is microseconds — e.g. \`mux/pcm_s16_to_wav\`
-(a header + copy): **us 110 ms** vs mediabunny 4 ms. A large constant (init /
-WASM / WebCodecs config / worker spin-up / buffer copies with no reuse) dominates.
+**B. High fixed per-operation overhead.** On tiny inputs we are still often
+5–30× slower even though the real work is microseconds — especially micro mux,
+probe, demux, and one-frame decode/seek rows where init / WASM / WebCodecs
+config / worker spin-up / buffer copies with no reuse can dominate the useful
+work.
 This explains the ${T4.length} "minor" losses smeared across *every* family.
 
 Fixing **A** collapses the tail of the distribution; fixing **B** shifts the whole

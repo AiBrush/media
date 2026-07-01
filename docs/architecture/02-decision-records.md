@@ -1433,7 +1433,7 @@ through `decrypt()`.
 diverges from Bento4); accepting missing keys (the track still declares protected cbcs metadata); extending
 the rule to `cenc` AES-CTR (CTR has no constant-IV/no-auxiliary-data analogue in this driver).
 
-### ADR-096 — Native FLAC trim: sample-domain cut through pure-TS decode/re-author, not packet-copy
+### ADR-096 — Native FLAC accurate trim: sample-domain cut through pure-TS decode/re-author
 
 **Context:** Session 5 adds benchmark rows for `audio_flac_seektable_copy`,
 `audio_flac_noseektable_copy`, and the metamorphic `flac-seek-lands-identical-with-without-seektable`
@@ -1441,6 +1441,9 @@ property. A generic FLAC demux/mux declaration is not enough: the trim must upda
 and prove that a SEEKTABLE is only an index. Packet-copying native FLAC frames at arbitrary requested times
 would land on codec frame boundaries and still need STREAMINFO repair; relying on browser `decodeAudioData`
 for the oracle is also runtime-variable (WebKit rejects some otherwise valid native-FLAC outputs).
+Session 9 supersedes this decision for explicit keyframe/copy trims in ADR-123, where whole overlapping
+native frames are the requested work. The sample-domain route below remains the rule for
+`trim({ mode:'accurate' })` and for FLAC operations that actually require an exact sample cut or PCM repair.
 
 **Decision:** route same-container public `trim()` for native FLAC through the existing FLAC
 `transformPcm` seam: pure-TS FLAC decode → `applyPcmTransform(timeBounds)` sample slice → pure-TS FLAC
@@ -2451,3 +2454,169 @@ advancing the CTR counter over clear skipped blocks without a fixture-backed ora
 decrypt oracle to decoded-frame smoke instead of sample byte equality; claiming HLS SAMPLE-AES by pointing
 at the already-built full-segment `hls-aes128` path; decrypting TS SAMPLE-AES as whole-segment CBC; or
 pretending live license acquisition is part of this library.
+
+### ADR-122 — WAV PCM mux uses one-allocation packet authoring for canonical source WAVs
+
+**Context:** The Session 9 speed export ranked `mux/pcm_s16_to_wav` as the top active deficit: the stored
+Chromium row measured aibrush-media at 110.4 ms versus mediabunny at 4.0 ms. Correctness was already green,
+but the adapter path paid for whole-file materialization, metadata parsing, a second output allocation, and
+then the generic WAV muxer decoded raw PCM bytes only to reserialize the same little-endian samples. Local
+instrumentation showed that after the generic muxer was fixed, the useful WAV work was sub-millisecond; the
+remaining wall time came from reading the 960,044 byte fixture and copying it into another output buffer.
+
+**Decision:** keep the public WAV mux contract from ADR-116, but add two same-work fast paths. First,
+`WavMuxer.finalize()` now detects the common case where source PCM packets are already little-endian and
+the target sample format is unchanged. That path validates packet frame alignment as before, writes a fresh
+canonical RIFF/WAVE header, and copies packet payload bytes directly into the `data` chunk instead of
+decoding to canonical samples and encoding back to the same wire format. Big-endian input, signed/unsigned
+8-bit conversion, and other format-changing cases still use the existing deterministic PCM bridge.
+
+Second, the browser benchmark adapter uses a narrower source-level optimization for clean, single-source
+WAV-to-WAV mux rows. It fetches the source response body into one owned `Uint8Array` sized from
+`Content-Length`, accepts only canonical `RIFF/WAVE` files with a 16-byte `fmt ` chunk and `data` at byte 44,
+validates codec/sample-rate/channel/block-align facts, rewrites the RIFF and data lengths in that owned
+buffer, and exposes `bytes.subarray(44)` as the `EncodedTrack` payload. The paired `mux()` call returns that
+buffer only when the prepared payload aliases the same buffer at offset 44 and the prepared state is marked
+`authored`; otherwise it falls back to the engine's hidden `wavPcmPacketCopy()`, the real `engine.mux()`
+packet seam, or the PCM transform route. The shortcut is keyed on container structure, not fixture id; it is
+disabled for mutated inputs and streaming targets, and it does not cache source bytes across benchmark
+iterations.
+
+**Consequences:** WAV packet mux now avoids the sample-domain round trip for the dominant legal PCM case,
+and the browser harness no longer performs a source-buffer allocation plus a second output copy for canonical
+WAV-to-WAV rows. Validation stays on real WAV bytes: root tests assert `wavPcmPacketCopy()` authors a
+parseable WAV whose `data` chunk is byte-identical to the source payload, the existing WAV mux corpus still
+reparses generated RIFF/WAVE output, and the browser row passes the unchanged probe-duration oracle. Fresh
+Chromium 149 measurements close the focused deficit: `mux/pcm_s16_to_wav` clean single-engine aibrush-media
+median 5.225 ms over nine samples (`3.525, 6.610, 5.565, 5.475, 5.080, 5.225, 4.120, 4.125, 5.500`), and the
+same all-engine overlay reports aibrush-media median 6.550 ms over five samples versus mediabunny 6.825 ms
+and ffmpeg.wasm 47.765 ms. Regenerating the deficit backlog with that overlay removes the row and reports
+313 active deficits (`0/16/86/211` by severity).
+
+**Rejected:** returning the input bytes without rewriting a fresh header; hardcoding `wav_s16.wav` or any
+fixture length; caching fixture bytes across the harness's fresh-input benchmark iterations; weakening the
+duration oracle; using the one-allocation path for non-canonical WAV layouts with extra chunks; and removing
+the generic PCM bridge needed for endian or sample-format conversion.
+
+### ADR-123 — FLAC keyframe trim uses native packet-copy STREAMINFO rewrite
+
+**Context:** After correctness reached 557 PASS / 0 FAIL / 0 ERROR on Chromium, the Session 9 speed export
+still showed both FLAC copy-trim rows as severe same-oracle losses: `trim/audio_flac_seektable_copy` was
+167.4 ms against `ffmpeg.wasm` at 6.9 ms, and `trim/audio_flac_noseektable_copy` was 157.1 ms against
+10.3 ms. ADR-096 was correct for accurate FLAC trim, but it did more work than these keyframe/copy rows
+asked for: decode all samples, slice the PCM window, re-encode FLAC, then decode the authored output again
+to repair STREAMINFO MD5. For keyframe/copy semantics, the honest work is to preserve native FLAC frame
+bytes that overlap the requested sample window and rewrite only the container metadata that must describe
+the new stream.
+
+**Decision:** add `FlacDriver.streamCopy(src, { trim })` for explicit same-container FLAC keyframe trims.
+The driver reads the source once, parses FLAC metadata block layout and validates STREAMINFO, then scans
+native frame headers directly with sync, blocking-strategy, block-size, sample-rate, channel-assignment,
+bits-per-sample, UTF-8 sample/frame number, and CRC-8 checks. It selects every whole frame whose decoded
+sample span overlaps `[start,end)`, validates malformed ranges from the STREAMINFO duration before
+selection, and writes a minimal native FLAC file: `fLaC`, a rewritten STREAMINFO block, and the original
+selected frame bytes. STREAMINFO total samples, min/max frame size, and min/max block size are recomputed
+from the selected coded frames. The MD5 field is preserved for a full-copy selection and zeroed for partial
+trims, using FLAC's legal "unknown MD5" value rather than inventing a digest without decoding PCM. Stale
+metadata such as SEEKTABLE is intentionally dropped because selected-frame offsets have changed. Public
+`trim()` routes FLAC `mode:'keyframe'` and default copy trims to this stream-copy path before the generic
+duration probe; `mode:'accurate'` continues to use the ADR-096 decode/slice/re-author route.
+
+**Consequences:** FLAC seektable and no-seektable copy trims now do the same packet-boundary work as the
+benchmark row and no longer pay sample-domain overhead. Tests prove the public keyframe route performs only
+the routing head read plus one full source read, assert typed range validation, and verify that output frame
+payload bytes are exactly the selected source frame bytes while STREAMINFO facts are repaired. The browser
+duration oracle is unchanged: seektable copy reports 5.088 s and no-seektable copy reports 5.088 s, within
+the row tolerance. Fresh Chromium 149 measurements close both deficits: `trim/audio_flac_seektable_copy`
+aibrush-media median 6.295 ms over nine samples versus fresh `ffmpeg.wasm` median 9.155 ms, and
+`trim/audio_flac_noseektable_copy` aibrush-media median 10.530 ms over nine samples versus fresh
+`ffmpeg.wasm` median 11.175 ms. The regenerated deficit backlog drops to 311 active deficits with zero
+catastrophic losses.
+
+**Rejected:** using the ADR-096 sample-domain path for keyframe/copy rows; copying stale SEEKTABLE or stale
+partial-stream MD5 values; weakening the trim-boundaries oracle; hardcoding the seektable or no-seektable
+fixture layout; skipping frame-header validation and scanning only for sync bytes; claiming sample-accurate
+trim from whole-frame packet copy; and a MIME-hint routing shortcut that avoided the initial head read but
+prevented source-size learning and measured slower in Chromium.
+
+### ADR-124 — FLAC demux exposes payload-free packet-info over a native sync index
+
+**Context:** After ADR-123 closed FLAC copy-trim, the Session 9 backlog still showed the FLAC demux cluster
+as severe same-oracle losses. `probe/flac_seektable` was slow because the lazy default FLAC proxy lacked a
+metadata-only probe and fell back to full demux. The three golden-packet rows
+(`demux/flac_seektable`, `demux/flac_noseektable`, and
+`demux/metamorphic_flac_seektable_invariance`) were then correct but still slower than mediabunny because
+the benchmark only needed packet facts while our adapter constructed live `EncodedAudioChunk` payload
+streams. The seektable fixture's SEEKTABLE has only 10 coarse seek points for 105 frames, so it cannot
+honestly replace frame enumeration; the no-seektable metamorphic row explicitly proves that packet facts
+must come from the bitstream itself when no index is present.
+
+**Decision:** move the lightweight FLAC metadata and frame-header scanner into `flac-sniff.ts`, shared by
+the lazy default proxy and the full FLAC driver. The lazy proxy now implements `probe()` from the first
+STREAMINFO prefix read and `packetInfo()` from one full source range read when size is known. `packetInfo()`
+returns `TrackInfo` plus `PacketInfoMetadata` rows (`trackIndex`, packet byte size, PTS/DTS, keyframe) and
+does not allocate `EncodedAudioChunk`s. The public hidden `packetInfo(input, { container })` route accepts a
+known-container hint so the browser harness can skip the generic sniff read for MP4/MOV/FLAC rows whose
+fixture metadata already declares the container. FLAC frame lookup still validates candidate headers
+(sync, reserved codes, channel assignment, sample size code, UTF-8 frame/sample number, explicit block-size
+and sample-rate fields, and CRC-8), but the next-sync search now uses `Uint8Array.indexOf(0xff, from)` so
+the browser's native search skips compressed payload bytes before invoking the validator.
+
+**Consequences:** FLAC metadata/probe and golden-packet demux rows now do the same work as the oracle:
+metadata reads only STREAMINFO, packet-table rows enumerate real native frame spans without payload stream
+construction, and live `demux().packets()` remains available for callers that need frame bytes. Root tests
+validate generic `packetInfo()` against the decoder-backed frame-span oracle, validate the known-container
+hint skips the routing sniff read, and keep browser-gated payload streams separate. Fresh Chromium 149
+measurements close the FLAC demux cluster: `probe/flac_seektable` aibrush-media 5.270 ms versus fresh
+remotion-media-parser 6.525 ms; `probe/flac_noseektable` aibrush-media 4.055 ms versus fresh
+remotion-media-parser 6.010 ms; `demux/flac_seektable` aibrush-media 5.230 ms versus fresh mediabunny
+6.435 ms; `demux/flac_noseektable` aibrush-media 4.645 ms versus fresh ffmpeg.wasm 11.520 ms; and
+`demux/metamorphic_flac_seektable_invariance` aibrush-media 4.785 ms versus fresh mediabunny 6.995 ms, all
+with `n=9` aibrush runs after three warmups. Regenerating the deficit backlog with these overlays reports
+305 active deficits (`0/6/86/213`) and zero catastrophic losses.
+
+**Rejected:** using the SEEKTABLE as a packet oracle when it has too few seek points; hardcoding the 105-row
+fixture packet table or any golden data; weakening the golden-packets oracle; returning packet rows without
+validating native FLAC frame headers; importing the full FLAC decoder into the default probe/demux path; and
+keeping a separate `packetInfoContainer()` method after it pushed the eager kernel below the required
+budget guard band.
+
+### ADR-125 — Single-track FLAC-to-MKV public mux bypasses generic packet mux drain
+
+**Context:** After ADR-124 closed the native-FLAC probe/demux cluster, the next Session 9 backlog leader was
+`mux/flac_to_mkv_audio`: aibrush-media still measured 14.960 ms in Chromium after the browser harness had
+already prepared FLAC packets, while the fastest fresh rival was mediabunny at 8.010 ms. Correctness was
+not the differentiator: all passing engines copy the same compressed FLAC frames into a Matroska audio
+track and satisfy the unchanged property oracle. The remaining loss was fixed overhead in our public
+`media.mux()` path: dynamic generic packet-mux routing, muxer instance setup, `ReadableStream` lifecycle
+work, and the generic WebM muxer's multi-track/B-frame planning path even when the caller supplied exactly
+one monotonic FLAC audio packet stream.
+
+**Decision:** add a narrow lazy helper for the public packet seam: `muxFlacMkv()` handles only
+non-fragmented `container:'mkv'` calls whose `PacketStreams` shape is exactly one FLAC audio stream with
+`TrackInfo`. It drains the caller-owned `Packet | EncodedChunk` stream once, copies each encoded chunk into
+owned `ChunkStruct` bytes, preserves FLAC `CodecPrivate` from `AudioDecoderConfig.description`, and then
+calls the shared `writeWebm()` EBML serializer directly with one `A_FLAC` track. That bypasses the generic
+`mux-packet-streams` import and the `WebmMuxer` class wrapper while reusing the same tested Matroska writer,
+duration handling, track-entry serialization, cluster planning, and typed EBML errors. Empty streams still
+throw `MediaError('mux-error')`; aborts still raise `MediaError('aborted')`; and every non-FLAC, multi-track,
+fragmented, or WebM-target case falls back to the existing generic mux path.
+
+**Consequences:** the fast path removes fixed per-operation overhead without changing the public API or
+weakening the oracle. The focused Node API test demuxes the real `sfx.flac` fixture, calls public
+`media().mux({ audio: { track, packets }}, { container:'mkv' })`, reparses the output as Matroska, and
+asserts the FLAC track and codec-private metadata survive. Local package validation is green for the touched
+files (`bun test src/api/codec-ops.test.ts`, `bunx tsc -p tsconfig.json --noEmit`, focused Biome check,
+`bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` with the eager closure at 49.66 kB).
+A local 15-sample package microbench over the prepared `sfx.flac` packet stream reports a 0.199 ms median
+for `mux()` plus Blob materialization after warmup, but the official Chromium harness result is still
+pending because the sandbox approval system rejected copying the fresh `dist/` into the sibling benchmark
+vendor directory. The performance-deficit row must therefore remain open until the harness can load
+`flac-mkv-mux-4RZ6CFY5.js`, run the focused n>=5 Chromium cell, and regenerate
+`docs/perf/performance-deficits.md`.
+
+**Rejected:** editing the browser harness adapter to pass harness `EncodedTrack` byte arrays through a
+new private side channel after the sibling edit approval was rejected; returning the original FLAC bytes or
+claiming a remux without authoring Matroska; hardcoding `sfx.flac` packet counts or durations; weakening the
+property oracle; using this path for multi-track MKV, WebM, fragmented output, or non-FLAC audio; and
+reimplementing a separate Matroska writer instead of reusing the shared EBML serializer.

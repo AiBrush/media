@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { parseAdts } from '../drivers/adts/adts-driver.ts';
-import { parseFlac } from '../drivers/flac/flac-driver.ts';
+import { FlacDriver, parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
 import { parseOgg } from '../drivers/ogg/ogg-driver.ts';
@@ -319,6 +319,31 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
       expect(info.sampleRate).toBe(sourceInfo.sampleRate);
       expect(info.channels).toBe(sourceInfo.channels);
       expect(info.durationSec).toBeCloseTo(sourceInfo.durationSec, 5);
+    } finally {
+      restore();
+    }
+  });
+
+  it('public mux (flac packets → mkv) authors Matroska through the single-audio fast path', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const demuxed = await FlacDriver.demux(await fixtureSource('sfx.flac'));
+      try {
+        const track = demuxed.tracks[0];
+        if (track === undefined) throw new Error('expected FLAC track');
+        const out = await outputBytes(
+          await media().mux(
+            { audio: { track, packets: demuxed.packets(track.id) } },
+            { container: 'mkv' },
+          ),
+        );
+        const info = parseWebm(out);
+        expect(info.container).toBe('mkv');
+        expect(info.tracks[0]?.codec).toBe('flac');
+        expect(info.tracks[0]?.description?.byteLength).toBeGreaterThan(0);
+      } finally {
+        await demuxed.close();
+      }
     } finally {
       restore();
     }
@@ -642,7 +667,7 @@ describe('decode — lazy frame streams (contract)', () => {
     for (const source of sources) {
       const streams = media().decode(source);
       await expect(readFirstFrame(streams.audio)).rejects.toThrow(
-        /AudioData is unavailable for PCM decode/,
+        /AudioData missing for PCM decode/,
       );
     }
   });

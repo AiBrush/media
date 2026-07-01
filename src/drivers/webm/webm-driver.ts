@@ -192,11 +192,15 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   const codec = mapCodec(codecId, bitDepth);
   const fps = defaultDuration > 0 ? 1e9 / defaultDuration : undefined;
   // The CodecPrivate IS the WebCodecs/muxer `description` for codecs that need out-of-band setup:
-  // H.264's `avcC`, HEVC's `hvcC`, AAC's AudioSpecificConfig, and Vorbis' Xiph-laced id/comment/setup
-  // headers. VP8/VP9/AV1/Opus are self-describing for the paths this driver currently exposes, so their
+  // H.264's `avcC`, HEVC's `hvcC`, AAC's AudioSpecificConfig, Vorbis' Xiph-laced id/comment/setup
+  // headers, and native FLAC metadata prelude. VP8/VP9/AV1/Opus are self-describing for the paths this driver currently exposes, so their
   // CodecPrivate is omitted.
   const description =
-    (codec === 'h264' || codec === 'hevc' || codec === 'aac' || codec === 'vorbis') &&
+    (codec === 'h264' ||
+      codec === 'hevc' ||
+      codec === 'aac' ||
+      codec === 'vorbis' ||
+      codec === 'flac') &&
     codecPrivate &&
     codecPrivate.byteLength > 0
       ? codecPrivate

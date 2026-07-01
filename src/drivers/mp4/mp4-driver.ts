@@ -48,6 +48,7 @@ import {
 import { Mp4Muxer } from './mux.ts';
 import {
   type Movie,
+  type MovieMetadata,
   type ParsedTrack,
   applyFragmentTiming,
   parseMovie,
@@ -73,6 +74,7 @@ const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
+const FASTSTART_METADATA_HEAD_BYTES = 64;
 
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
@@ -119,6 +121,50 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return out;
 }
 
+interface TopBoxHeader {
+  size: number;
+  type: string;
+  headerSize: number;
+}
+
+function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefined {
+  if (offset + 8 > bytes.byteLength) return undefined;
+  const r = new Reader(bytes.subarray(offset, Math.min(bytes.byteLength, offset + 16)));
+  let size = r.u32();
+  const type = r.fourcc();
+  let headerSize = 8;
+  if (size === 1) {
+    if (offset + 16 > bytes.byteLength) return undefined;
+    size = r.u64();
+    headerSize = 16;
+  } else if (size === 0) {
+    return undefined;
+  }
+  if (size < headerSize || size <= 0) return undefined;
+  return { size, type, headerSize };
+}
+
+async function readFaststartMetadata(ra: RandomAccess): Promise<MovieMetadata | undefined> {
+  const head = await ra.read(0, FASTSTART_METADATA_HEAD_BYTES);
+  let offset = 0;
+  let brand = 'mp42';
+
+  for (;;) {
+    const header = topBoxHeader(head, offset);
+    if (header === undefined) return undefined;
+    if (header.type === 'ftyp' && offset + 12 <= head.byteLength) {
+      brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
+    }
+    if (header.type === 'moov') {
+      const box = await ra.read(offset, header.size);
+      if (box.byteLength < header.headerSize) return undefined;
+      return parseMovieMetadata(brand, box.subarray(header.headerSize));
+    }
+    offset += header.size;
+    if (offset + 8 > head.byteLength) return undefined;
+  }
+}
+
 /** Walk the top-level boxes to find the `ftyp` brand and the `moov`, then parse it. */
 export async function readMovie(ra: RandomAccess): Promise<Movie> {
   let offset = 0;
@@ -161,6 +207,14 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
 
 /** Read only metadata needed for probe; full packet tables remain a demux-only cost. */
 export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
+  const faststart = await readFaststartMetadata(ra);
+  if (faststart !== undefined) {
+    if (faststart.needsFragmentTiming) {
+      return applyFragmentTiming(faststart, await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
+    }
+    return faststart;
+  }
+
   let offset = 0;
   let brand = 'mp42';
   const limit = ra.size ?? Number.MAX_SAFE_INTEGER;

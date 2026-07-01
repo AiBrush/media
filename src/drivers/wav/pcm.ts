@@ -118,7 +118,7 @@ function writeFourCC(view: DataView, offset: number, tag: string): void {
   for (let i = 0; i < 4; i++) view.setUint8(offset + i, tag.charCodeAt(i));
 }
 
-function writeWavHeader(
+export function writeWavHeader(
   out: Uint8Array,
   dataBytes: number,
   channels: number,

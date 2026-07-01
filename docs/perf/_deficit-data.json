@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-01T10:44:00.484Z",
+  "generatedFrom": "2026-07-01T17:12:13.564Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-07-01T09-52-13-355Z.json",
@@ -7,75 +7,39 @@
     "chromium-2026-07-01T10-39-35-760Z.json",
     "chromium-2026-07-01T10-40-26-545Z.json",
     "chromium-2026-07-01T10-42-56-723Z.json",
-    "chromium-2026-07-01T10-43-44-532Z.json"
+    "chromium-2026-07-01T10-43-44-532Z.json",
+    "chromium-2026-07-01T14-45-48-952Z.json",
+    "chromium-2026-07-01T16-13-01-381Z.json",
+    "chromium-2026-07-01T16-14-26-878Z.json",
+    "chromium-2026-07-01T16-15-04-371Z.json",
+    "chromium-2026-07-01T16-15-44-541Z.json",
+    "chromium-2026-07-01T16-22-42-803Z.json",
+    "chromium-2026-07-01T16-31-36-148Z.json",
+    "chromium-2026-07-01T16-32-06-907Z.json",
+    "chromium-2026-07-01T16-32-46-831Z.json",
+    "chromium-2026-07-01T16-33-30-454Z.json",
+    "chromium-2026-07-01T16-36-39-715Z.json",
+    "chromium-2026-07-01T16-41-06-572Z.json",
+    "chromium-2026-07-01T16-42-19-021Z.json",
+    "chromium-2026-07-01T16-43-02-463Z.json",
+    "chromium-2026-07-01T16-48-51-169Z.json",
+    "chromium-2026-07-01T17-08-06-949Z.json",
+    "chromium-2026-07-01T17-08-35-605Z.json",
+    "chromium-2026-07-01T17-10-42-201Z.json",
+    "chromium-2026-07-01T17-11-12-957Z.json",
+    "chromium-2026-07-01T17-11-55-232Z.json"
   ],
   "contested": 444,
-  "rawLossCount": 314,
-  "activeLossCount": 314,
+  "rawLossCount": 305,
+  "activeLossCount": 305,
   "exemptLossCount": 0,
   "tiers": {
     "catastrophic": 0,
-    "severe": 17,
+    "severe": 6,
     "moderate": 86,
-    "minor": 211
+    "minor": 213
   },
   "losses": [
-    {
-      "s": "mux/pcm_s16_to_wav",
-      "fam": "mux",
-      "our": 110.44000000040978,
-      "comp": "mediabunny",
-      "cw": 3.9749999940395355,
-      "ratio": 27.78364784050647
-    },
-    {
-      "s": "trim/audio_flac_seektable_copy",
-      "fam": "trim",
-      "our": 167.43999999994412,
-      "comp": "ffmpeg.wasm",
-      "cw": 6.884999990463257,
-      "ratio": 24.319535255174042
-    },
-    {
-      "s": "performance/size-ladder-extract-metadata-huge",
-      "fam": "performance",
-      "our": 130.22500000009313,
-      "comp": "mediabunny",
-      "cw": 6.8499999940395355,
-      "ratio": 19.01094892166529
-    },
-    {
-      "s": "probe/perf-extract-metadata-huge",
-      "fam": "probe",
-      "our": 118.54000000003725,
-      "comp": "mediabunny",
-      "cw": 7.0450000166893005,
-      "ratio": 16.82611777419746
-    },
-    {
-      "s": "probe/flac_seektable",
-      "fam": "probe",
-      "our": 38.49500000011176,
-      "comp": "remotion-media-parser",
-      "cw": 2.294999986886978,
-      "ratio": 16.77342057519041
-    },
-    {
-      "s": "demux/metamorphic_flac_seektable_invariance",
-      "fam": "demux",
-      "our": 92.30500000016764,
-      "comp": "mediabunny",
-      "cw": 5.655000001192093,
-      "ratio": 16.322723250346495
-    },
-    {
-      "s": "probe/flac_noseektable",
-      "fam": "probe",
-      "our": 34.5,
-      "comp": "remotion-media-parser",
-      "cw": 2.1400000154972076,
-      "ratio": 16.121495210356002
-    },
     {
       "s": "mux/flac_to_mkv_audio",
       "fam": "mux",
@@ -83,22 +47,6 @@
       "comp": "mediabunny",
       "cw": 6.96000000834465,
       "ratio": 15.731321820218147
-    },
-    {
-      "s": "trim/audio_flac_noseektable_copy",
-      "fam": "trim",
-      "our": 157.07999999960884,
-      "comp": "ffmpeg.wasm",
-      "cw": 10.280000001192093,
-      "ratio": 15.280155640213373
-    },
-    {
-      "s": "probe/huge_h264_1080p_600s",
-      "fam": "probe",
-      "our": 124.35999999986961,
-      "comp": "remotion-webcodecs",
-      "cw": 8.159999996423721,
-      "ratio": 15.240196085094706
     },
     {
       "s": "mux/size_micro_1frame_to_mp4",
@@ -115,22 +63,6 @@
       "comp": "mediabunny",
       "cw": 3.2000000178813934,
       "ratio": 14.801562417214155
-    },
-    {
-      "s": "demux/flac_seektable",
-      "fam": "demux",
-      "our": 63.7449999996461,
-      "comp": "mediabunny",
-      "cw": 5.094999998807907,
-      "ratio": 12.51128557695009
-    },
-    {
-      "s": "demux/flac_noseektable",
-      "fam": "demux",
-      "our": 76.42499999981374,
-      "comp": "ffmpeg.wasm",
-      "cw": 6.715000003576279,
-      "ratio": 11.38123603263012
     },
     {
       "s": "demux/size_tiny_tiny_h264_360p_2s",
@@ -1277,6 +1209,14 @@
       "ratio": 2.0925110088203214
     },
     {
+      "s": "probe/flac_seektable",
+      "fam": "probe",
+      "our": 5.270000010728836,
+      "comp": "mediabunny",
+      "cw": 2.564999997615814,
+      "ratio": 2.0545809027786897
+    },
+    {
       "s": "decode-seek/seek_zero",
       "fam": "decode-seek",
       "our": 67.76500000013039,
@@ -1603,6 +1543,14 @@
       "comp": "ffmpeg.wasm",
       "cw": 7.91499999165535,
       "ratio": 1.5919140888663421
+    },
+    {
+      "s": "probe/flac_noseektable",
+      "fam": "probe",
+      "our": 4.055000007152557,
+      "comp": "mediabunny",
+      "cw": 2.550000011920929,
+      "ratio": 1.5901960738023306
     },
     {
       "s": "transcode/gapless_pcm_to_aac_priming",

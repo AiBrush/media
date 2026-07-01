@@ -12,7 +12,6 @@ import {
   type FlacFrameSpan,
   decodeFlac,
   interleavedPcmBytes as decodedInterleavedPcmBytes,
-  enumerateFlacFrameSpans,
 } from '../../codecs/flac/decode.ts';
 import {
   type FlacEncodeOptions,
@@ -31,61 +30,37 @@ import {
   type MuxOptions,
   type Muxer,
   type Packet,
+  type PacketInfoTable,
   type PcmTransform,
   type Registry,
   type StageOptions,
+  type StreamCopyOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio, SampleFormat } from '../../dsp/index.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
-import { ascii, flacOffset, matchesFlac } from './flac-sniff.ts';
+import {
+  type FastFlacFrameSpan,
+  type FlacStreamInfo,
+  ascii,
+  fastFlacFrames,
+  flacMetadataLayout,
+  flacOffset,
+  flacPacketInfoTable,
+  flacTrackInfo,
+  matchesFlac,
+  parseFlacStreamInfo,
+} from './flac-sniff.ts';
 
-export interface FlacInfo {
-  codec: 'flac';
-  sampleRate: number;
-  channels: number;
-  bitsPerSample: number;
-  totalSamples: number;
-  durationSec: number;
-}
+export type FlacInfo = FlacStreamInfo;
 
 export type FlacFrame = FlacFrameSpan;
 
 /** Parse the `STREAMINFO` block into the audio layout + duration. Pure; big-endian. */
 export function parseFlac(bytes: Uint8Array): FlacInfo {
-  const start = flacOffset(bytes);
-  if (bytes.byteLength < start + 8 || ascii(bytes, start, 4) !== 'fLaC') {
-    throw new InputError('unsupported-input', 'not a native FLAC stream (no fLaC marker)');
-  }
-  const blockHeader = start + 4;
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const blockType = dv.getUint8(blockHeader) & 0x7f;
-  if (blockType !== 0) {
-    throw new MediaError('demux-error', 'FLAC: first metadata block is not STREAMINFO');
-  }
-  const body = blockHeader + 4; // block header is type(1) + length(3)
-  if (bytes.byteLength < body + 18) {
-    throw new MediaError('demux-error', 'FLAC: truncated STREAMINFO block');
-  }
-  // The 64-bit packed field begins after min/max block size (2+2) and min/max frame size (3+3).
-  const hi = dv.getUint32(body + 10); // big-endian: sampleRate:20 | channels-1:3 | bps-1:5 | samples[35:32]
-  const lo = dv.getUint32(body + 14); // samples[31:0]
-  const sampleRate = hi >>> 12;
-  const channels = ((hi >>> 9) & 0x7) + 1;
-  const bitsPerSample = ((hi >>> 4) & 0x1f) + 1;
-  const totalSamples = (hi & 0xf) * 2 ** 32 + lo;
-  if (sampleRate === 0)
-    throw new MediaError('demux-error', 'FLAC: STREAMINFO has zero sample rate');
-  return {
-    codec: 'flac',
-    sampleRate,
-    channels,
-    bitsPerSample,
-    totalSamples,
-    durationSec: totalSamples / sampleRate,
-  };
+  return parseFlacStreamInfo(bytes);
 }
 
 /** Return the native FLAC metadata prelude (`fLaC` + all metadata blocks), excluding audio frames. */
@@ -111,9 +86,98 @@ export function nativeFlacMetadata(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   }
 }
 
+function writeFlacPacketCopy(
+  bytes: Uint8Array,
+  trim: StreamCopyOptions['trim'] | undefined,
+): Uint8Array<ArrayBuffer> {
+  const layout = flacMetadataLayout(bytes);
+  if (trim !== undefined) {
+    if (trim.startSec < 0) throw new InputError('unsupported-input', 'trim start < 0');
+    if (trim.endSec <= trim.startSec) {
+      throw new InputError('unsupported-input', trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range');
+    }
+    if (trim.startSec >= layout.info.durationSec) {
+      throw new InputError('unsupported-input', 'trim start >= duration');
+    }
+    if (trim.endSec > layout.info.durationSec) {
+      throw new InputError('unsupported-input', 'trim end > duration');
+    }
+  }
+  const frames = fastFlacFrames(bytes, layout);
+  const startSample =
+    trim === undefined ? undefined : Math.round(trim.startSec * layout.info.sampleRate);
+  const endSample = trim === undefined ? undefined : Math.round(trim.endSec * layout.info.sampleRate);
+  const selected =
+    trim === undefined
+      ? frames
+      : frames.filter((frame) => {
+          const frameStart = frame.ptsSamples;
+          const frameEnd = frameStart + frame.samples;
+          return frameEnd > (startSample ?? 0) && frameStart < (endSample ?? 0);
+        });
+  if (selected.length === 0) {
+    throw new InputError('unsupported-input', 'FLAC trim selected no audio frames');
+  }
+  const fullSelection =
+    selected.length === frames.length &&
+    selected[0]?.offset === frames[0]?.offset &&
+    selected[selected.length - 1]?.offset === frames[frames.length - 1]?.offset;
+  const streamInfo = streamInfoForPacketCopy(layout.streamInfoBody, selected, fullSelection);
+  let outBytes = 4 + streamInfo.byteLength;
+  for (const frame of selected) outBytes += frame.size;
+
+  const out = new Uint8Array(outBytes) as Uint8Array<ArrayBuffer>;
+  out.set(FLAC_MAGIC, 0);
+  out.set(streamInfo, 4);
+  let at = 4 + streamInfo.byteLength;
+  for (const frame of selected) {
+    out.set(bytes.subarray(frame.offset, frame.offset + frame.size), at);
+    at += frame.size;
+  }
+  return out;
+}
+
+function streamInfoForPacketCopy(
+  sourceBody: Uint8Array,
+  frames: readonly FastFlacFrameSpan[],
+  preserveMd5: boolean,
+): Uint8Array<ArrayBuffer> {
+  const body = sourceBody.slice() as Uint8Array<ArrayBuffer>;
+  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  let minBlock = Number.POSITIVE_INFINITY;
+  let maxBlock = 0;
+  let minFrame = 0xffffff;
+  let maxFrame = 0;
+  let totalSamples = 0;
+  for (const frame of frames) {
+    const block = frame.samples;
+    if (block < minBlock) minBlock = block;
+    if (frame.blockSize > maxBlock) maxBlock = frame.blockSize;
+    if (frame.size < minFrame) minFrame = frame.size;
+    if (frame.size > maxFrame) maxFrame = frame.size;
+    totalSamples += frame.samples;
+  }
+  if (Number.isFinite(minBlock) && minBlock > 0) dv.setUint16(0, minBlock, false);
+  if (maxBlock > 0) dv.setUint16(2, maxBlock, false);
+  writeU24(body, 4, minFrame === 0xffffff ? 0 : minFrame);
+  writeU24(body, 7, Math.min(maxFrame, 0xffffff));
+  writePackedTotalSamples(dv, totalSamples);
+  if (!preserveMd5) body.fill(0, 18, 34);
+  return wrapStreamInfo(body);
+}
+
 /** Enumerate native FLAC audio frames as byte-exact packet spans for container remuxing. */
 export function enumerateFlacFrames(bytes: Uint8Array): FlacFrame[] {
-  return enumerateFlacFrameSpans(bytes);
+  const layout = flacMetadataLayout(bytes);
+  return fastFlacFrames(bytes, layout).map((frame) => ({
+    offset: frame.offset,
+    size: frame.size,
+    samples: frame.samples,
+    ptsSamples: frame.ptsSamples,
+    ptsUs: frame.ptsUs,
+    durationUs: frame.durationUs,
+    data: bytes.slice(frame.offset, frame.offset + frame.size) as Uint8Array<ArrayBuffer>,
+  }));
 }
 
 /** Read the whole source — FLAC decode needs every frame (bounded by file size). */
@@ -389,6 +453,9 @@ export class FlacMuxer implements Muxer {
 }
 
 const FLAC_MAGIC = Uint8Array.from([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
+const FLAC_BLOCK_SIZE_TABLE = [
+  0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+] as const;
 
 /** Out-stream offset of STREAMINFO's MD5 field: 4 (fLaC) + 4 (block header) + 18 (body offset). */
 const STREAMINFO_MD5_OFFSET = 4 + 4 + 18;
@@ -545,10 +612,7 @@ function nominalBlockSize(chunks: readonly ChunkStruct[]): number {
 function frameBlockSize(frame: Uint8Array): number {
   // Bytes: [0..1]=sync+flags, [2] high nibble = block-size code; explicit sizes trail the frame number.
   const code = ((frame[2] ?? 0) >> 4) & 0xf;
-  const table = [
-    0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-  ];
-  const tabled = table[code] ?? 0;
+  const tabled = FLAC_BLOCK_SIZE_TABLE[code] ?? 0;
   if (tabled > 0) return tabled;
   // Codes 6/7 carry the size explicitly after the UTF-8 frame number; codes 0/6/7 fall back to a scan.
   const utf8Len = frameNumberLen(frame[4] ?? 0);
@@ -585,23 +649,22 @@ export const FlacDriver: ContainerDriver = {
   kind: 'container',
   formats: ['flac'],
   supports: matchesFlac,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const info = parseFlac(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return [flacTrackInfo(info)];
+  },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const table = flacPacketInfoTable(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return table;
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const bytes = await readAll(src);
     const info = parseFlac(bytes);
     const metadata = nativeFlacMetadata(bytes);
     const frames = enumerateFlacFrames(bytes);
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: {
-        codec: info.codec,
-        sampleRate: info.sampleRate,
-        numberOfChannels: info.channels,
-        description: metadata,
-      },
-    };
+    const track = flacTrackInfo(info, metadata);
     const signal = o?.signal;
     return {
       tracks: [track],
@@ -611,6 +674,17 @@ export const FlacDriver: ContainerDriver = {
       },
       close: () => Promise.resolve(),
     };
+  },
+  async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const out = writeFlacPacketCopy(bytes, o?.trim);
+    return new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(out);
+        c.close();
+      },
+    });
   },
   async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const { audio, format } = flacToPcm(await readAll(src));

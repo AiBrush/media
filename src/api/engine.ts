@@ -143,6 +143,7 @@ export interface MediaEngine {
 
 const HEAD_BYTES = 64 * 1024;
 const HINTED_HEAD_BYTES = 4 * 1024;
+type PacketInfoCallOptions = CallOptions & { readonly container?: Container };
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
 type AbrFanoutRendition = {
   readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
@@ -198,13 +199,9 @@ export class MediaEngineImpl implements MediaEngine {
 
   use(module: DriverModule): MediaEngine {
     if (!isApiVersionSupported(module.apiVersion)) {
-      throw new MediaError(
-        'driver-incompatible',
-        `driver module apiVersion ${module.apiVersion}`,
-        {
-          got: module.apiVersion,
-        },
-      );
+      throw new MediaError('driver-incompatible', `driver module apiVersion ${module.apiVersion}`, {
+        got: module.apiVersion,
+      });
     }
     module.register(this.#registry);
     this.#router.clearCache();
@@ -271,13 +268,16 @@ export class MediaEngineImpl implements MediaEngine {
     });
   }
 
-  packetInfo(input: MediaInput, o: CallOptions = {}): Cancellable<PacketInfoTable> {
+  packetInfo(input: MediaInput, o: PacketInfoCallOptions = {}): Cancellable<PacketInfoTable> {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
-      const container = await this.#routeContainer(src, 'demux');
+      const container =
+        o.container === undefined
+          ? await this.#routeContainer(src, 'demux')
+          : await this.#routeContainerToken(o.container, 'demux');
       const packetInfo = container.packetInfo;
       if (packetInfo === undefined) {
-        throw new CapabilityError('capability-miss', 'container packet-info path not registered', {
+        throw new CapabilityError('capability-miss', 'no packet-info', {
           op: 'demux',
           tried: [container.id],
         });
@@ -290,9 +290,9 @@ export class MediaEngineImpl implements MediaEngine {
     src: Source | Uint8Array,
     sourceContainer: string,
     opts: { readonly to: Container; readonly audio?: AudioTarget | false; readonly sink?: Sink },
-    o: CallOptions,
+    o: CallOptions = {},
   ): Cancellable<Output | Uint8Array> {
-    return this.#withCancel(o, async (signal) => {
+    const run = async (signal?: AbortSignal): Promise<Output | Uint8Array> => {
       const { pcm } = await import('./pcm-convert-plan.ts');
       return pcm(
         this.#authoringDeps(),
@@ -303,7 +303,29 @@ export class MediaEngineImpl implements MediaEngine {
         signal,
         o,
       );
-    });
+    };
+    if (src instanceof Uint8Array && o.signal === undefined) {
+      const p = run() as Cancellable<Output | Uint8Array>;
+      p.cancel = (): void => {};
+      return p;
+    }
+    return this.#withCancel(o, run);
+  }
+
+  wavPcmPacketCopy(input: {
+    readonly payload: Uint8Array;
+    readonly sourceBytes?: Uint8Array;
+    readonly codec: string;
+    readonly sampleRate: number;
+    readonly channels: number;
+  }): Cancellable<Uint8Array> {
+    const run = async (): Promise<Uint8Array> => {
+      const { wavPcmPacketCopy } = await import('./pcm-convert-plan.ts');
+      return wavPcmPacketCopy(this.#authoringDeps(), input);
+    };
+    const p = run() as Cancellable<Uint8Array>;
+    p.cancel = (): void => {};
+    return p;
   }
 
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
@@ -413,11 +435,10 @@ export class MediaEngineImpl implements MediaEngine {
       const wantsTrackSelection = hasTrackSelection(opts.trackSelect);
       if (opts.tags !== undefined) {
         if (wantsTrackSelection) {
-          throw new CapabilityError(
-            'capability-miss',
-            'metadata tags with track selection unsupported',
-            { op: 'remux', tried: [container.id, opts.to] },
-          );
+          throw new CapabilityError('capability-miss', 'tags+selection unsupported', {
+            op: 'remux',
+            tried: [container.id, opts.to],
+          });
         }
         const bytes = await this.#writeMetadataTags(src, opts.to, opts.tags, signal);
         return materializeOutput(
@@ -453,14 +474,30 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
+      const target = (container.formats[0] ?? 'mp4') as Container;
+      // Native FLAC keyframe trim validates against STREAMINFO while packet-copying, so it does not need
+      // the generic duration demux that would parse every frame once before parsing it again to write.
+      if (opts.mode !== 'accurate' && target === 'flac' && container.streamCopy) {
+        const stream = await container.streamCopy(src, {
+          ...this.#stageOptions(signal, o),
+          trim: { startSec: opts.start, endSec: opts.end },
+        });
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      }
       // Validate the requested range against the media's real duration BEFORE any cut, so a malformed
       // range (negative / inverted / zero-length / past-EOF) rejects with a typed `InputError` instead
       // of flowing to the driver and fabricating output (ADR-021, robustness §7). Duration is read the
       // same way `probe` does — demux once, take the longest track — then the demuxer is released.
       const durationSec = await this.#probeDurationSec(container, src, signal, o);
       assertTrimRange(opts.start, opts.end, durationSec);
-      const target = (container.formats[0] ?? 'mp4') as Container;
       if (opts.mode === 'accurate') {
+        if (target === 'flac' && container.transformPcm) {
+          const stream = await container.transformPcm(src, {
+            ...this.#stageOptions(signal, o),
+            timeBounds: { startSec: opts.start, endSec: opts.end },
+          });
+          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        }
         const stream = await this.#trimViaCodec(
           container,
           src,
@@ -472,21 +509,14 @@ export class MediaEngineImpl implements MediaEngine {
         );
         return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
-      // Keyframe trim of PCM-domain audio (raw WAV/AIFF/CAF, plus native FLAC through its lossless
-      // decode→PCM→FLAC path) is a sample-accurate cut through the container's own `transformPcm`
-      // (ADR-021/022/024): audio has no keyframe dependency, so the DSP path slices `[start, end)` samples
-      // before any transform and re-serializes, frame-exact and Node-validatable, with no lossy codec seam.
+      // Keyframe trim of raw PCM-domain audio (WAV/AIFF/CAF) is a sample-accurate cut through the
+      // container's own `transformPcm` path: raw audio has no inter-frame dependency, so slicing samples is
+      // still the fast lossless route. Compressed FLAC keyframe trim is handled below by native packet-copy;
+      // explicit accurate FLAC trim used the transformPcm branch above.
       if (isPcmContainer(target) && container.transformPcm) {
         const stream = await container.transformPcm(src, {
           ...this.#stageOptions(signal, o),
           container: target,
-          timeBounds: { startSec: opts.start, endSec: opts.end },
-        });
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-      }
-      if (target === 'flac' && container.transformPcm) {
-        const stream = await container.transformPcm(src, {
-          ...this.#stageOptions(signal, o),
           timeBounds: { startSec: opts.start, endSec: opts.end },
         });
         return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
@@ -529,43 +559,32 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const target = chooseOutputContainer(opts.to, undefined);
       if (target === 'wav') {
-        throw new CapabilityError(
-          'capability-miss',
-          "encode to 'wav' is not frame-encode; use convert/mux for WAV",
-          { op: 'encode', tried: [target] },
-        );
+        throw new CapabilityError('capability-miss', 'bad wav encode', {
+          op: 'encode',
+          tried: [target],
+        });
       }
       if (!containerHasChunkMuxer(target)) {
         // A target without a frame-encode packet muxer cannot accept encoded chunks; surface the honest
         // miss before constructing streams or routing a muxer.
-        throw new CapabilityError(
-          'capability-miss',
-          `encode to '${target}' has no EncodedChunk muxer`,
-          { op: 'encode', tried: [target] },
-        );
+        throw new CapabilityError('capability-miss', `no muxer '${target}'`, {
+          op: 'encode',
+          tried: [target],
+        });
       }
       // Validate the input shape (which streams, matched targets) BEFORE building the muxer, so an empty
       // or mismatched `encode` rejects as bad input rather than a downstream miss; cancel any frame stream
       // we will not consume so its frames never leak.
       if (!frames.video && !frames.audio) {
-        throw new InputError(
-          'unsupported-input',
-          'encode received no video or audio frame streams',
-        );
+        throw new InputError('unsupported-input', 'encode needs streams');
       }
       if (frames.video && !opts.video) {
         await cancelStream(frames.video);
-        throw new InputError(
-          'unsupported-input',
-          'encode received a video stream but no video target',
-        );
+        throw new InputError('unsupported-input', 'video target missing');
       }
       if (frames.audio && !opts.audio) {
         await cancelStream(frames.audio);
-        throw new InputError(
-          'unsupported-input',
-          'encode received an audio stream but no audio target',
-        );
+        throw new InputError('unsupported-input', 'audio target missing');
       }
       const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
       const tasks: Promise<void>[] = [];
@@ -584,10 +603,7 @@ export class MediaEngineImpl implements MediaEngine {
   seek(input: MediaInput, timeUs: number, o: CallOptions = {}): Cancellable<VideoFrame> {
     return this.#withCancel(o, async (signal) => {
       if (!Number.isFinite(timeUs) || timeUs < 0) {
-        throw new InputError(
-          'unsupported-input',
-          `seek time ${timeUs}µs must be a non-negative number`,
-        );
+        throw new InputError('unsupported-input', `bad seek ${timeUs}`);
       }
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
@@ -596,16 +612,13 @@ export class MediaEngineImpl implements MediaEngine {
       try {
         const track = demuxer.tracks.find((t) => t.mediaType === 'video' && t.config !== undefined);
         if (!track) {
-          throw new CapabilityError('capability-miss', 'seek needs a decodable video track', {
+          throw new CapabilityError('capability-miss', 'no seek video', {
             op: 'seek',
             tried: [container.id],
           });
         }
         if (track.encrypted === true) {
-          throw new MediaError(
-            'decode-error',
-            'seek cannot decode a protected video track before decrypt()',
-          );
+          throw new MediaError('decode-error', 'encrypted seek');
         }
         // Resolve the decode codec first (throws a typed miss in Node where WebCodecs is absent). Then feed
         // only the packets from the keyframe at/before the target onward (a stream must decode from a
@@ -636,10 +649,19 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const target = opts.container;
       if (!containerHasChunkMuxer(target)) {
-        throw new CapabilityError('capability-miss', `mux to '${target}' has no chunk muxer`, {
+        throw new CapabilityError('capability-miss', `no muxer '${target}'`, {
           op: 'mux',
           tried: [target],
         });
+      }
+      if (target === 'mkv' && opts.fragmented !== true) {
+        const stream = await (await import('./flac-mkv-mux.ts')).muxFlacMkv(streams, {
+          ...this.#stageOptions(signal, o),
+          container: target,
+        });
+        if (stream) {
+          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        }
       }
 
       const { muxPacketStreams, readablePacketStreams } = await import('./mux-packet-streams.ts');
@@ -910,10 +932,7 @@ export class MediaEngineImpl implements MediaEngine {
     }
     if (track.encrypted === true) {
       await demuxer.close();
-      throw new MediaError(
-        'decode-error',
-        `decode cannot read a protected ${mediaType} track before decrypt()`,
-      );
+      throw new MediaError('decode-error', `protected ${mediaType} needs decrypt()`);
     }
     if (
       mediaType === 'audio' &&
@@ -985,11 +1004,10 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
   ): Promise<ReadableStream<Uint8Array>> {
     if (!containerHasChunkMuxer(opts.to)) {
-      throw new CapabilityError(
-        'capability-miss',
-        `remux to '${opts.to}' has no muxer for ${container.formats[0]}`,
-        { op: 'remux', tried: [container.id, opts.to] },
-      );
+      throw new CapabilityError('capability-miss', `no remux muxer '${opts.to}'`, {
+        op: 'remux',
+        tried: [container.id, opts.to],
+      });
     }
     if (
       (opts.to === 'webm' || opts.to === 'mkv') &&
@@ -1019,7 +1037,7 @@ export class MediaEngineImpl implements MediaEngine {
     );
     if (tracks.length === 0) {
       await demuxer.close();
-      throw new CapabilityError('capability-miss', 'remux found no copyable track', {
+      throw new CapabilityError('capability-miss', 'no remux track', {
         op: 'remux',
         tried: [container.id],
       });
@@ -1058,11 +1076,10 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
   ): Promise<ReadableStream<Uint8Array>> {
     if (typeof EncodedAudioChunk === 'undefined') {
-      throw new CapabilityError(
-        'capability-miss',
-        'audio packet trim requires EncodedAudioChunk',
-        { op: 'trim', tried: [container.id, target] },
-      );
+      throw new CapabilityError('capability-miss', 'audio trim needs EncodedAudioChunk', {
+        op: 'trim',
+        tried: [container.id, target],
+      });
     }
     const { trimAudioPacketStream, trimBoundsUs, trimPacketCopyTrack } = await import(
       './trim-streams.ts'
@@ -1072,11 +1089,10 @@ export class MediaEngineImpl implements MediaEngine {
     const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
     try {
       if (demuxer.tracks.some((track) => track.mediaType === 'video')) {
-        throw new CapabilityError(
-          'capability-miss',
-          'audio trim does not handle video',
-          { op: 'trim', tried: [container.id, target] },
-        );
+        throw new CapabilityError('capability-miss', 'audio trim rejects video', {
+          op: 'trim',
+          tried: [container.id, target],
+        });
       }
       const tracks = demuxer.tracks.filter(
         (track) => track.mediaType === 'audio' && track.config !== undefined,
@@ -1090,11 +1106,10 @@ export class MediaEngineImpl implements MediaEngine {
       }
       const track = tracks[0];
       if (track === undefined) {
-        throw new CapabilityError(
-          'capability-miss',
-          'audio trim found no copyable track',
-          { op: 'trim', tried: [container.id, target] },
-        );
+        throw new CapabilityError('capability-miss', 'no audio trim track', {
+          op: 'trim',
+          tried: [container.id, target],
+        });
       }
       const packets = trimAudioPacketStream(demuxer.packets(track.id), bounds);
       const { drainEncoderToMuxer } = await loadCodecPipeline();
@@ -1265,11 +1280,10 @@ export class MediaEngineImpl implements MediaEngine {
         return writeCafTags(bytes, tags);
       }
       default:
-        throw new CapabilityError(
-          'capability-miss',
-          `metadata tags unavailable for '${target}'`,
-          { op: 'remux', tried: [target] },
-        );
+        throw new CapabilityError('capability-miss', `no tag writer for '${target}'`, {
+          op: 'remux',
+          tried: [target],
+        });
     }
   }
 
@@ -1652,11 +1666,10 @@ export class MediaEngineImpl implements MediaEngine {
     opts: StreamCopyOptions,
   ): Promise<ReadableStream<Uint8Array>> {
     if (!container.streamCopy || !container.formats.includes(target)) {
-      throw new CapabilityError(
-        'capability-miss',
-        `${op} to '${target}' from ${container.formats[0]} needs the codec seam`,
-        { op, tried: [container.id] },
-      );
+      throw new CapabilityError('capability-miss', `${op} to '${target}' needs codec seam`, {
+        op,
+        tried: [container.id],
+      });
     }
     // Pass the requested target token so a multi-format driver writes the right flavor (e.g. the MP4
     // driver emits a QuickTime `ftyp` for a 'mov' target vs an ISO one for 'mp4').
@@ -1706,10 +1719,7 @@ function canTrimAudioPackets(container: Container): boolean {
 
 function assertTrimTrackDecodable(track: TrackInfo): void {
   if (track.encrypted !== true) return;
-  throw new MediaError(
-    'decode-error',
-    `accurate trim cannot decode a protected ${track.mediaType} track before decrypt()`,
-  );
+  throw new MediaError('decode-error', `protected ${track.mediaType} trim needs decrypt()`);
 }
 
 async function decodedAudioStreamWithGapless(
@@ -1901,7 +1911,7 @@ function pcmAudioToAudioDataStream(
 
 function assertPcmAudioDataAvailable(label: string): void {
   if (typeof AudioData !== 'undefined') return;
-  throw new CapabilityError('capability-miss', 'AudioData is unavailable for PCM decode', {
+  throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
     op: 'decode',
     tried: [label],
     suggestion: 'run in a browser or worker with AudioData',
@@ -2173,7 +2183,7 @@ function routeHeadBytes(src: Source): number {
 async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array> {
   if (src.range) return src.range(0, n);
   if (src.kind === 'stream') {
-    throw new InputError('unsupported-input', 'seekable source required');
+    throw new InputError('unsupported-input', 'need seekable');
   }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
@@ -2243,7 +2253,7 @@ function bytesToStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
-    throw new MediaError('aborted', 'operation cancelled');
+    throw new MediaError('aborted', 'aborted');
   }
 }
 
@@ -2317,30 +2327,23 @@ const TRIM_END_SLACK_SEC = 1;
  * unknown-duration path that real, always-timed corpus media cannot reach through the public op).
  */
 export function assertTrimRange(startSec: number, endSec: number, durationSec: number): void {
-  const range = `[${startSec}s, ${endSec}s]`;
   if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
-    throw new InputError('unsupported-input', `trim range ${range} is not a finite interval`);
+    throw new InputError('unsupported-input', 'bad trim');
   }
   if (startSec < 0) {
-    throw new InputError('unsupported-input', `trim start ${startSec}s is negative`);
+    throw new InputError('unsupported-input', 'start<0');
   }
   if (endSec <= startSec) {
-    throw new InputError('unsupported-input', `trim range ${range} is empty or inverted`);
+    throw new InputError('unsupported-input', 'empty trim');
   }
   // Duration-relative bounds only when a real duration was probed; a 0/unknown duration cannot bound
   // the range without spuriously failing an otherwise well-formed request.
   if (durationSec > 0) {
     if (startSec >= durationSec) {
-      throw new InputError(
-        'unsupported-input',
-        `trim start ${startSec}s is at or past the media duration of ${durationSec}s`,
-      );
+      throw new InputError('unsupported-input', 'start>=duration');
     }
     if (endSec > durationSec + TRIM_END_SLACK_SEC) {
-      throw new InputError(
-        'unsupported-input',
-        `trim end ${endSec}s is past the media duration of ${durationSec}s`,
-      );
+      throw new InputError('unsupported-input', 'end>duration');
     }
   }
 }

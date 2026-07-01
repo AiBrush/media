@@ -107,6 +107,7 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
 
   it('metadata-only probe accepts a range source whose total size is not known yet', async () => {
     const bytes = await loadFixture('movie_5.mp4');
+    const reads: Array<[number, number]> = [];
     const src: ByteSource = {
       stream: () =>
         new ReadableStream<Uint8Array>({
@@ -115,11 +116,18 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
             c.close();
           },
         }),
-      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
     };
     const tracks = await Mp4Driver.probe?.(src);
     expect(tracks?.length).toBeGreaterThan(0);
     expect(tracks?.some((track) => track.mediaType === 'video')).toBe(true);
+    expect(reads).toEqual([
+      [0, 64],
+      [24, 2206],
+    ]);
   });
 
   it('metadata-only probe honors cancellation before and after the metadata read', async () => {
@@ -151,13 +159,13 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
         source((start, end) => {
           reads++;
           const out = bytes.subarray(start, end);
-          if (reads >= 3) controller.abort();
+          if (reads >= 2) controller.abort();
           return Promise.resolve(out);
         }),
         { signal: controller.signal },
       ),
     ).rejects.toThrow(MediaError);
-    expect(reads).toBeGreaterThanOrEqual(3);
+    expect(reads).toBe(2);
   });
 
   it('omits packetTable for fragmented MP4s whose init sample tables are empty', async () => {

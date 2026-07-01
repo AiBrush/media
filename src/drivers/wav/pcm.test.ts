@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { wavPcmPacketCopy } from '../../api/pcm-convert-plan.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { gain } from '../../dsp/index.ts';
 import { channelAt, encodePcm } from '../../dsp/pcm.ts';
@@ -84,6 +85,29 @@ describe('readWavPcm / writeWav — bit-exact on real WAV PCM (decoded-audio-pcm
 });
 
 describe('readWavPcm / writeWav — formats, edges & rejects', () => {
+  it('packet-copy authors a canonical WAV from real raw PCM bytes without sample decode', async () => {
+    const file = await loadFixture('speech.wav');
+    const source = readWavPcm(file);
+    const out = wavPcmPacketCopy(
+      {
+        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
+        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
+      },
+      {
+        payload: dataChunk(file),
+        sourceBytes: file,
+        codec: 'pcm-s16',
+        sampleRate: source.sampleRate,
+        channels: source.channels,
+      },
+    );
+    const probe = parseWav(out, out.byteLength);
+    expect(probe.sampleRate).toBe(source.sampleRate);
+    expect(probe.channels).toBe(source.channels);
+    expect(probe.codec).toBe('pcm-s16');
+    expect(dataChunk(out)).toEqual(dataChunk(file));
+  });
+
   it('round-trips a float WAV (tag 3) it wrote', () => {
     const audio = {
       sampleRate: 8000,
