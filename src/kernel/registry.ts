@@ -89,7 +89,7 @@ export class Registry implements RegistryContract, RegistryView, ImageRegistry {
     if (!isApiVersionSupported(driver.apiVersion)) {
       throw new MediaError(
         'driver-incompatible',
-        `driver '${driver.id}' targets apiVersion ${driver.apiVersion}, but this core supports ${supportedApiVersions().join(', ')}`,
+        `driver '${driver.id}' apiVersion ${driver.apiVersion} unsupported`,
         { got: driver.apiVersion, supported: supportedApiVersions() },
       );
     }

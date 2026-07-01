@@ -26,6 +26,7 @@ import type {
   FilterSpec,
   Muxer,
   Packet,
+  PacketInfoTable,
   StageOptions,
   StreamCopyOptions,
   TrackInfo,
@@ -141,6 +142,7 @@ export interface MediaEngine {
 }
 
 const HEAD_BYTES = 64 * 1024;
+const HINTED_HEAD_BYTES = 4 * 1024;
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
 type AbrFanoutRendition = {
   readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
@@ -198,7 +200,7 @@ export class MediaEngineImpl implements MediaEngine {
     if (!isApiVersionSupported(module.apiVersion)) {
       throw new MediaError(
         'driver-incompatible',
-        `driver module targets apiVersion ${module.apiVersion}`,
+        `driver module apiVersion ${module.apiVersion}`,
         {
           got: module.apiVersion,
         },
@@ -223,7 +225,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = cacheProbeRanges(normalizeInput(input));
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
@@ -240,11 +242,67 @@ export class MediaEngineImpl implements MediaEngine {
     });
   }
 
+  probeContainer(
+    input: MediaInput,
+    container: Container,
+    o: CallOptions = {},
+  ): Cancellable<MediaInfo> {
+    return this.#withCancel(o, async (signal) => {
+      const src = normalizeInput(input);
+      const driver = await this.#routeContainerToken(container, 'demux');
+      const stage = this.#stageOptions(signal, o);
+      if (driver.probe) {
+        return toMediaInfo(driver, await driver.probe(src, stage), src);
+      }
+      const demuxer = await driver.demux(src, stage);
+      try {
+        return toMediaInfo(driver, demuxer.tracks, src);
+      } finally {
+        await demuxer.close();
+      }
+    });
+  }
+
   demux(input: MediaInput, o: CallOptions = {}): Cancellable<Demuxed> {
     return this.#withCancel(o, async (signal) => {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       return container.demux(src, this.#stageOptions(signal, o));
+    });
+  }
+
+  packetInfo(input: MediaInput, o: CallOptions = {}): Cancellable<PacketInfoTable> {
+    return this.#withCancel(o, async (signal) => {
+      const src = normalizeInput(input);
+      const container = await this.#routeContainer(src, 'demux');
+      const packetInfo = container.packetInfo;
+      if (packetInfo === undefined) {
+        throw new CapabilityError('capability-miss', 'container packet-info path not registered', {
+          op: 'demux',
+          tried: [container.id],
+        });
+      }
+      return packetInfo.call(container, src, this.#stageOptions(signal, o));
+    });
+  }
+
+  pcm(
+    src: Source | Uint8Array,
+    sourceContainer: string,
+    opts: { readonly to: Container; readonly audio?: AudioTarget | false; readonly sink?: Sink },
+    o: CallOptions,
+  ): Cancellable<Output | Uint8Array> {
+    return this.#withCancel(o, async (signal) => {
+      const { pcm } = await import('./pcm-convert-plan.ts');
+      return pcm(
+        this.#authoringDeps(),
+        (container, direction) => this.#routeContainerToken(container, direction),
+        src,
+        sourceContainer,
+        opts,
+        signal,
+        o,
+      );
     });
   }
 
@@ -357,7 +415,7 @@ export class MediaEngineImpl implements MediaEngine {
         if (wantsTrackSelection) {
           throw new CapabilityError(
             'capability-miss',
-            'metadata tag rewrite does not combine with track selection',
+            'metadata tags with track selection unsupported',
             { op: 'remux', tried: [container.id, opts.to] },
           );
         }
@@ -473,7 +531,7 @@ export class MediaEngineImpl implements MediaEngine {
       if (target === 'wav') {
         throw new CapabilityError(
           'capability-miss',
-          "encode to 'wav' is not a frame-encode target; use convert(..., { to:'wav' }) for source PCM transforms or mux(..., { container:'wav' }) for raw PCM packets",
+          "encode to 'wav' is not frame-encode; use convert/mux for WAV",
           { op: 'encode', tried: [target] },
         );
       }
@@ -546,7 +604,7 @@ export class MediaEngineImpl implements MediaEngine {
         if (track.encrypted === true) {
           throw new MediaError(
             'decode-error',
-            'seek cannot decode a protected video track before decrypt() emits clear samples',
+            'seek cannot decode a protected video track before decrypt()',
           );
         }
         // Resolve the decode codec first (throws a typed miss in Node where WebCodecs is absent). Then feed
@@ -684,7 +742,7 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   async #routeContainer(src: Source, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
-    const head = await readHead(src);
+    const head = await readHead(src, routeHeadBytes(src));
     const ext = extensionOf(src.filename);
     const q: ContainerQuery = {
       direction,
@@ -703,16 +761,10 @@ export class MediaEngineImpl implements MediaEngine {
     }
   }
 
-  /**
-   * Route the *output* container's driver by its token (mime/extension) — for mux, where there are no
-   * input bytes to magic-probe. Loads the first-party defaults on a miss then retries once, mirroring
-   * {@link routeContainer}'s zero-config behavior.
-   */
-  async #routeMuxer(target: string): Promise<ContainerDriver> {
+  async #routeContainerToken(target: string, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
     const q: ContainerQuery = {
-      direction: 'mux',
+      direction,
       extension: target,
-      ...(CONTAINER_MIME[target] !== undefined ? { mime: CONTAINER_MIME[target] } : {}),
     };
     try {
       return this.#router.pickContainer(q);
@@ -721,6 +773,15 @@ export class MediaEngineImpl implements MediaEngine {
       await this.#ensureDefaultDrivers();
       return this.#router.pickContainer(q);
     }
+  }
+
+  /**
+   * Route the *output* container's driver by its token (mime/extension) — for mux, where there are no
+   * input bytes to magic-probe. Loads the first-party defaults on a miss then retries once, mirroring
+   * {@link routeContainer}'s zero-config behavior.
+   */
+  async #routeMuxer(target: string): Promise<ContainerDriver> {
+    return this.#routeContainerToken(target, 'mux');
   }
 
   /** Lazily import + register the first-party driver bundle (a code-split chunk). One-time. */
@@ -789,7 +850,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   /** Resolve the default image capability if the source's magic bytes are a supported image format. */
   async #imageOpsForSource(src: Source): Promise<ImageOps | undefined> {
-    const head = await readHead(src);
+    const head = await readHead(src, HINTED_HEAD_BYTES);
     if (this.#registry.imageOps() === undefined) {
       await this.#ensureDefaultDrivers();
     }
@@ -851,7 +912,7 @@ export class MediaEngineImpl implements MediaEngine {
       await demuxer.close();
       throw new MediaError(
         'decode-error',
-        `decode cannot read a protected ${mediaType} track before decrypt() emits clear samples`,
+        `decode cannot read a protected ${mediaType} track before decrypt()`,
       );
     }
     if (
@@ -926,7 +987,7 @@ export class MediaEngineImpl implements MediaEngine {
     if (!containerHasChunkMuxer(opts.to)) {
       throw new CapabilityError(
         'capability-miss',
-        `remux to '${opts.to}' has no muxer in this build (writable containers: mp4/mov, webm/mkv, ogg, ts, flac, mp3, adts, wav/raw-PCM, avi; ${container.formats[0]} stream-copies only to its own family)`,
+        `remux to '${opts.to}' has no muxer for ${container.formats[0]}`,
         { op: 'remux', tried: [container.id, opts.to] },
       );
     }
@@ -944,14 +1005,10 @@ export class MediaEngineImpl implements MediaEngine {
     // known source size over the ceiling is a real resource limit — a typed miss, not an attempt-then-timeout.
     // Unknown size ⇒ proceed (best-effort guard, never a guess); the streaming-mux follow-up lifts this.
     if (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
-      throw new CapabilityError(
-        'capability-miss',
-        `remux to '${opts.to}' exceeds the ${Math.round(REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES / (1024 * 1024))} MB buffer-all limit`,
-        {
-          op: 'remux',
-          tried: [container.id, opts.to],
-        },
-      );
+      throw new CapabilityError('capability-miss', `remux '${opts.to}' over buffer limit`, {
+        op: 'remux',
+        tried: [container.id, opts.to],
+      });
     }
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
     const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
@@ -962,7 +1019,7 @@ export class MediaEngineImpl implements MediaEngine {
     );
     if (tracks.length === 0) {
       await demuxer.close();
-      throw new CapabilityError('capability-miss', 'remux found no copyable track in the source', {
+      throw new CapabilityError('capability-miss', 'remux found no copyable track', {
         op: 'remux',
         tried: [container.id],
       });
@@ -1003,7 +1060,7 @@ export class MediaEngineImpl implements MediaEngine {
     if (typeof EncodedAudioChunk === 'undefined') {
       throw new CapabilityError(
         'capability-miss',
-        'compressed-audio packet trim requires EncodedAudioChunk',
+        'audio packet trim requires EncodedAudioChunk',
         { op: 'trim', tried: [container.id, target] },
       );
     }
@@ -1017,7 +1074,7 @@ export class MediaEngineImpl implements MediaEngine {
       if (demuxer.tracks.some((track) => track.mediaType === 'video')) {
         throw new CapabilityError(
           'capability-miss',
-          'audio packet trim does not handle video tracks',
+          'audio trim does not handle video',
           { op: 'trim', tried: [container.id, target] },
         );
       }
@@ -1027,7 +1084,7 @@ export class MediaEngineImpl implements MediaEngine {
       if (tracks.length !== 1) {
         throw new CapabilityError(
           'capability-miss',
-          `audio packet trim needs exactly one copyable audio track, found ${tracks.length}`,
+          `audio trim needs one track, found ${tracks.length}`,
           { op: 'trim', tried: [container.id, target] },
         );
       }
@@ -1035,7 +1092,7 @@ export class MediaEngineImpl implements MediaEngine {
       if (track === undefined) {
         throw new CapabilityError(
           'capability-miss',
-          'audio packet trim found no copyable audio track',
+          'audio trim found no copyable track',
           { op: 'trim', tried: [container.id, target] },
         );
       }
@@ -1066,11 +1123,10 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
   ): Promise<ReadableStream<Uint8Array>> {
     if (!containerHasChunkMuxer(target)) {
-      throw new CapabilityError(
-        'capability-miss',
-        `accurate trim to '${target}' has no EncodedChunk muxer in this build`,
-        { op: 'trim', tried: [target] },
-      );
+      throw new CapabilityError('capability-miss', `accurate trim to '${target}' has no muxer`, {
+        op: 'trim',
+        tried: [target],
+      });
     }
 
     // Accurate trim is decode→(restamp)→encode→mux — the same heavy graph as convert, so it offloads to
@@ -1144,11 +1200,10 @@ export class MediaEngineImpl implements MediaEngine {
       }
 
       if (tasks.length === 0) {
-        throw new CapabilityError(
-          'capability-miss',
-          'accurate trim found no decodable video or audio track to re-encode',
-          { op: 'trim', tried: [container.id] },
-        );
+        throw new CapabilityError('capability-miss', 'accurate trim found no track', {
+          op: 'trim',
+          tried: [container.id],
+        });
       }
 
       /* v8 ignore start -- reached only after live codec routes resolve; browser-harness validated. */
@@ -1212,7 +1267,7 @@ export class MediaEngineImpl implements MediaEngine {
       default:
         throw new CapabilityError(
           'capability-miss',
-          `metadata tag rewrite is not available for '${target}'`,
+          `metadata tags unavailable for '${target}'`,
           { op: 'remux', tried: [target] },
         );
     }
@@ -1267,11 +1322,10 @@ export class MediaEngineImpl implements MediaEngine {
     }
 
     if (!containerHasChunkMuxer(target)) {
-      throw new CapabilityError(
-        'capability-miss',
-        `convert to '${target}' via the codec seam has no EncodedChunk muxer in this build`,
-        { op: 'convert', tried: [target] },
-      );
+      throw new CapabilityError('capability-miss', `convert to '${target}' has no muxer`, {
+        op: 'convert',
+        tried: [target],
+      });
     }
 
     // Heavy decode→filter→encode→mux: run it OFF the main thread when worker offload is selected + a
@@ -1358,11 +1412,10 @@ export class MediaEngineImpl implements MediaEngine {
         /* v8 ignore stop */
       }
       if (tasks.length === 0) {
-        throw new CapabilityError(
-          'capability-miss',
-          'convert found no decodable video or audio track to re-encode',
-          { op: 'convert', tried: [container.id] },
-        );
+        throw new CapabilityError('capability-miss', 'convert found no decodable track', {
+          op: 'convert',
+          tried: [container.id],
+        });
       }
       /* v8 ignore start -- reached only when a live codec was resolved (browser); harness-validated. */
       await allOrCancelStreams(tasks, openStreams);
@@ -1601,12 +1654,8 @@ export class MediaEngineImpl implements MediaEngine {
     if (!container.streamCopy || !container.formats.includes(target)) {
       throw new CapabilityError(
         'capability-miss',
-        `${op} to '${target}' from a ${container.formats[0]} source needs the codec seam (browser); same-container stream-copy only here`,
-        {
-          op,
-          tried: [container.id],
-          suggestion: 'use a same-container target, or run the browser codec layer',
-        },
+        `${op} to '${target}' from ${container.formats[0]} needs the codec seam`,
+        { op, tried: [container.id] },
       );
     }
     // Pass the requested target token so a multi-format driver writes the right flavor (e.g. the MP4
@@ -1659,7 +1708,7 @@ function assertTrimTrackDecodable(track: TrackInfo): void {
   if (track.encrypted !== true) return;
   throw new MediaError(
     'decode-error',
-    `accurate trim cannot decode a protected ${track.mediaType} track before decrypt() emits clear samples`,
+    `accurate trim cannot decode a protected ${track.mediaType} track before decrypt()`,
   );
 }
 
@@ -2004,10 +2053,7 @@ function audioGeometryOf(track: TrackInfo | undefined): {
 /* v8 ignore start -- invoked only on the live WebCodecs encode path; browser-harness validated. */
 function requireConfig<T>(config: T | undefined, media: 'video' | 'audio'): T {
   if (config === undefined) {
-    throw new MediaError(
-      'encode-error',
-      `the ${media} encoder produced a chunk before publishing its decoder config (cannot configure the muxer track)`,
-    );
+    throw new MediaError('encode-error', `${media} encoder emitted a chunk before config`);
   }
   return config;
 }
@@ -2103,13 +2149,31 @@ async function startAtSeekKeyframePackets(
 }
 /* v8 ignore stop */
 
+function cacheProbeRanges(src: Source): Source {
+  const range = src.range;
+  if (range === undefined) return src;
+  let cached: Uint8Array | undefined;
+  return {
+    ...src,
+    range: async (start, end) => {
+      if (cached !== undefined && start >= 0 && end <= cached.byteLength) {
+        return cached.subarray(start, end);
+      }
+      const bytes = await range.call(src, start, end);
+      if (start === 0) cached = bytes;
+      return bytes;
+    },
+  };
+}
+
+function routeHeadBytes(src: Source): number {
+  return src.mimeHint !== undefined || src.filename !== undefined ? HINTED_HEAD_BYTES : HEAD_BYTES;
+}
+
 async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array> {
   if (src.range) return src.range(0, n);
   if (src.kind === 'stream') {
-    throw new InputError(
-      'unsupported-input',
-      'probe/demux needs a seekable source (bytes, Blob, or URL), not a one-shot stream',
-    );
+    throw new InputError('unsupported-input', 'seekable source required');
   }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
@@ -2261,10 +2325,7 @@ export function assertTrimRange(startSec: number, endSec: number, durationSec: n
     throw new InputError('unsupported-input', `trim start ${startSec}s is negative`);
   }
   if (endSec <= startSec) {
-    throw new InputError(
-      'unsupported-input',
-      `trim range ${range} is empty or inverted (end must be greater than start)`,
-    );
+    throw new InputError('unsupported-input', `trim range ${range} is empty or inverted`);
   }
   // Duration-relative bounds only when a real duration was probed; a 0/unknown duration cannot bound
   // the range without spuriously failing an otherwise well-formed request.

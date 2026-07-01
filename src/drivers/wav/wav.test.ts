@@ -4,7 +4,7 @@ import type { ByteSource, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
-import { readWavPcm } from './pcm.ts';
+import { readWavPcm, writeWav } from './pcm.ts';
 import { WavDriver, WavModule, parseWav } from './wav-driver.ts';
 import { WavMuxer } from './wav-mux.ts';
 
@@ -58,6 +58,32 @@ async function outputBytes(
 function ascii(bytes: Uint8Array, offset: number, length: number): string {
   let out = '';
   for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
+  return out;
+}
+
+function u32le(bytes: Uint8Array, offset: number): number {
+  return (
+    ((bytes[offset] ?? 0) |
+      ((bytes[offset + 1] ?? 0) << 8) |
+      ((bytes[offset + 2] ?? 0) << 16) |
+      ((bytes[offset + 3] ?? 0) << 24)) >>>
+    0
+  );
+}
+
+function withJunkChunk(bytes: Uint8Array): Uint8Array {
+  const fmtSize = u32le(bytes, 16);
+  const insertAt = 20 + fmtSize + (fmtSize & 1);
+  const junkPayload = new Uint8Array([1, 2, 3, 4]);
+  const junk = new Uint8Array(8 + junkPayload.byteLength);
+  junk.set([...'JUNK'].map((c) => c.charCodeAt(0)), 0);
+  new DataView(junk.buffer).setUint32(4, junkPayload.byteLength, true);
+  junk.set(junkPayload, 8);
+  const out = new Uint8Array(bytes.byteLength + junk.byteLength);
+  out.set(bytes.subarray(0, insertAt), 0);
+  out.set(junk, insertAt);
+  out.set(bytes.subarray(insertAt), insertAt + junk.byteLength);
+  new DataView(out.buffer).setUint32(4, out.byteLength - 8, true);
   return out;
 }
 
@@ -414,6 +440,19 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     const re = readWavPcm(out);
     expect(re.channels).toBe(2);
     expect(channelAt(re.planar, 1)).toEqual(channelAt(readWavPcm(bytes).planar, 0));
+  });
+
+  it('re-authors a no-op WAV transform with a fresh canonical header instead of passing input through', async () => {
+    const canonical = writeWav(
+      { sampleRate: 48_000, channels: 1, frames: 4, planar: [Float64Array.of(0, 0.25, -0.25, 0.5)] },
+      's16',
+    );
+    const withJunk = withJunkChunk(canonical);
+    const out = await drain(await transformPcm(streamOnly(withJunk), { container: 'wav' }));
+    expect(out.byteLength).toBe(canonical.byteLength);
+    expect(out).toEqual(canonical);
+    expect(out).not.toEqual(withJunk);
+    expect(readWavPcm(out).planar).toEqual(readWavPcm(canonical).planar);
   });
 
   it('applies gain in the PCM domain (≈ ×0.5 at -6.02 dB)', async () => {

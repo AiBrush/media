@@ -106,6 +106,21 @@ export interface PacketMetadata {
   readonly keyframe: boolean;
 }
 
+/** Lightweight packet table shape for consumers that only need timeline facts, not track ids/durations. */
+export interface PacketInfoMetadata {
+  readonly trackIndex: number;
+  readonly size: number;
+  readonly ptsUs: number;
+  readonly dtsUs: number;
+  readonly keyframe: boolean;
+}
+
+/** Tracks plus a lightweight packet table, without constructing payload streams. */
+export interface PacketInfoTable {
+  readonly tracks: readonly TrackInfo[];
+  readonly packets: readonly PacketInfoMetadata[];
+}
+
 /** Common identity every driver declares. */
 export interface DriverBase {
   /** Unique driver id, e.g. 'webcodecs-video', 'wasm-flac', 'mp4'. */
@@ -303,6 +318,11 @@ export interface ContainerDriver extends DriverBase {
    * `demuxer.tracks`.
    */
   probe?(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]>;
+  /**
+   * Optional packet-info probe: return track facts plus timeline packet rows without constructing live
+   * payload streams. Drivers that omit it keep the normal `demux()` path.
+   */
+  packetInfo?(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable>;
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
   createMuxer(o?: MuxOptions): Muxer;
   /**

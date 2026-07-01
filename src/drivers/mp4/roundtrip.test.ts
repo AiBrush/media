@@ -3,6 +3,7 @@ import type { ByteSource } from '../../contracts/driver.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import {
   Mp4Driver,
+  mp4PacketInfoMetadata,
   mp4PacketMetadata,
   muxTracksFromMovie,
   planLazySampleDataFragmentRuns,
@@ -393,6 +394,7 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
   it('packet metadata matches parsed sample tables, preserving B-frame PTS/DTS offsets', () => {
     const movie = syntheticBFrameMovie();
     const table = mp4PacketMetadata(movie, 115);
+    const infoTable = mp4PacketInfoMetadata(movie, 115);
     const track = movie.tracks[0];
     if (!track) {
       throw new Error('missing track');
@@ -406,7 +408,26 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
       keyframe: sample.keyframe,
     }));
 
-    expect(table).toEqual(expected);
+    const contractRows = table.map((p) => ({
+      trackId: p.trackId,
+      sizeBytes: p.sizeBytes,
+      ptsUs: p.ptsUs,
+      dtsUs: p.dtsUs,
+      durationUs: p.durationUs,
+      keyframe: p.keyframe,
+    }));
+
+    expect(contractRows).toEqual(expected);
+    expect(infoTable).toEqual(
+      expected.map((packet) => ({
+        trackIndex: 0,
+        size: packet.sizeBytes,
+        ptsUs: packet.ptsUs,
+        dtsUs: packet.dtsUs,
+        keyframe: packet.keyframe,
+      })),
+    );
+    expect(table[0]).toMatchObject({ trackIndex: 0, size: 4 });
     expect(table[0]?.dtsUs).toBe(0);
     expect(table[0]?.ptsUs).toBe(2_000_000);
     expect(table[1]?.ptsUs).toBe(1_000_000);

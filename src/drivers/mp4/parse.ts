@@ -143,7 +143,18 @@ export function parseMovieMetadata(brand: string, moov: Uint8Array): MovieMetada
   return parseMovieInternal(brand, moov, 'metadata');
 }
 
-type ParseMode = 'full' | 'metadata';
+/** Parse packet-info tables needed for timeline-only demux; payload byte-offset tables stay lazy. */
+export function parseMoviePacketInfo(brand: string, moov: Uint8Array): Movie {
+  const parsed = parseMovieInternal(brand, moov, 'packet-info');
+  return {
+    brand: parsed.brand,
+    timescale: parsed.timescale,
+    durationSec: parsed.durationSec,
+    tracks: parsed.tracks,
+  };
+}
+
+type ParseMode = 'full' | 'metadata' | 'packet-info';
 
 interface ParsedTrakResult {
   track: ParsedTrack;
@@ -443,7 +454,11 @@ function parseTrak(
   const stsd = child(r, stbl, 'stsd') ?? fail('stbl has no stsd');
 
   const { samples, sampleCount } =
-    mode === 'full' ? parseSampleTableWithCount(r, stbl) : parseMetadataSampleTable(r, stbl);
+    mode === 'full'
+      ? parseSampleTableWithCount(r, stbl)
+      : mode === 'packet-info'
+        ? parsePacketInfoSampleTable(r, stbl)
+        : parseMetadataSampleTable(r, stbl);
   const fps = mediaType === 'video' && durationSec > 0 ? sampleCount / durationSec : undefined;
   const needsFragmentTiming = sampleCount === 0;
 
@@ -863,6 +878,21 @@ function parseSampleTableWithCount(
     sampleSizes: parseStsz(r, child(r, stbl, 'stsz')),
     sampleToChunk: parseStsc(r, child(r, stbl, 'stsc')),
     chunkOffsets: parseChunkOffsets(r, child(r, stbl, 'stco'), child(r, stbl, 'co64')),
+    syncSamples: parseStss(r, child(r, stbl, 'stss')),
+  };
+  return { samples, sampleCount: samples.sampleSizes.length };
+}
+
+function parsePacketInfoSampleTable(
+  r: Reader,
+  stbl: BoxHeader,
+): { samples: SampleTable; sampleCount: number } {
+  const samples = {
+    timeToSample: parseStts(r, child(r, stbl, 'stts')),
+    compositionOffsets: parseCtts(r, child(r, stbl, 'ctts')),
+    sampleSizes: parseStsz(r, child(r, stbl, 'stsz')),
+    sampleToChunk: [],
+    chunkOffsets: [],
     syncSamples: parseStss(r, child(r, stbl, 'stss')),
   };
   return { samples, sampleCount: samples.sampleSizes.length };

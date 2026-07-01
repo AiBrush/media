@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ParsedTrack, SampleTable } from './parse.ts';
-import { buildSamples } from './samples.ts';
+import { buildSampleData, buildSamples } from './samples.ts';
 
 function track(
   partial: Partial<SampleTable>,
@@ -129,5 +129,42 @@ describe('buildSamples', () => {
       }),
     );
     expect(s).toHaveLength(2);
+  });
+
+  it('walks stsc, stts, ctts, and stss run changes in one decode-order pass', () => {
+    const parsed = track({
+      chunkOffsets: [100, 200, 300],
+      sampleToChunk: [
+        { firstChunk: 1, samplesPerChunk: 2, descIndex: 1 },
+        { firstChunk: 3, samplesPerChunk: 1, descIndex: 1 },
+      ],
+      sampleSizes: [10, 20, 30, 40, 50],
+      timeToSample: [
+        { count: 2, delta: 100 },
+        { count: 2, delta: 200 },
+        { count: 1, delta: 300 },
+      ],
+      compositionOffsets: [
+        { count: 3, offset: 0 },
+        { count: 1, offset: 50 },
+      ],
+      syncSamples: [1, 4],
+    });
+
+    const ticks = buildSampleData(parsed);
+    expect(ticks.map((s) => s.offset)).toEqual([100, 110, 200, 230, 300]);
+    expect(ticks.map((s) => s.dtsTicks)).toEqual([0, 100, 200, 400, 600]);
+    expect(ticks.map((s) => s.durationTicks)).toEqual([100, 100, 200, 200, 300]);
+    expect(ticks.map((s) => s.cttsTicks)).toEqual([0, 0, 0, 50, 50]);
+    expect(ticks.map((s) => s.keyframe)).toEqual([true, false, false, true, false]);
+
+    const us = buildSamples(parsed);
+    expect(us.map((s) => s.dtsUs)).toEqual([0, 100_000, 200_000, 400_000, 600_000]);
+    expect(us.map((s) => s.ptsUs)).toEqual([0, 100_000, 200_000, 450_000, 650_000]);
+  });
+
+  it('keeps sync-sample flags for malformed unsorted stss tables', () => {
+    const s = buildSamples(track({ ...oneChunk, syncSamples: [2, 1] }));
+    expect(s.map((sample) => sample.keyframe)).toEqual([true, true]);
   });
 });

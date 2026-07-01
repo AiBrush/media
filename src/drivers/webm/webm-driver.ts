@@ -68,6 +68,13 @@ const ID = {
 
 const MICROS_PER_SECOND = 1_000_000;
 const FULL_RANGE_EPSILON_US = 50_000;
+const WEBM_METADATA_PREFIX_BYTES = [
+  4 * 1024,
+  64 * 1024,
+  256 * 1024,
+  1024 * 1024,
+  4 * 1024 * 1024,
+] as const;
 
 /**
  * Matroska CodecID → the engine's canonical codec token (the short vocabulary the harness goldens and
@@ -530,8 +537,13 @@ function fpsFromBlockTiming(timing: BlockTiming, timecodeScale: number): number 
 }
 
 /** Parse WebM/MKV metadata from (enough of) the file head. Pure. */
-export function parseWebm(bytes: Uint8Array): WebmInfo {
+interface ParseWebmOptions {
+  readonly scanClusters?: boolean;
+}
+
+export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): WebmInfo {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const scanClusters = options.scanClusters ?? true;
   let docType = 'webm';
   let segment: EbmlElement | undefined;
   for (const el of elements(dv, 0, dv.byteLength)) {
@@ -563,7 +575,7 @@ export function parseWebm(bytes: Uint8Array): WebmInfo {
           if (track) tracks.push(track);
         }
       }
-    } else if (el.id === ID.Cluster) {
+    } else if (scanClusters && el.id === ID.Cluster) {
       lastEndTicks = Math.max(lastEndTicks, clusterEnd(dv, el));
       collectClusterBlockTimes(dv, el, blockTimes);
     }
@@ -696,6 +708,81 @@ async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Arra
   }
   assertNotAborted(signal);
   return out;
+}
+
+function findSegment(dv: DataView): EbmlElement | undefined {
+  for (const el of elements(dv, 0, dv.byteLength)) {
+    if (el.id === ID.Segment) return el;
+  }
+  return undefined;
+}
+
+function segmentHasDeclaredDuration(dv: DataView, segment: EbmlElement): boolean {
+  const info = findChild(dv, segment.dataStart, segment.dataEnd, ID.Info);
+  return (
+    info !== undefined && findChild(dv, info.dataStart, info.dataEnd, ID.Duration) !== undefined
+  );
+}
+
+function videoTracksHaveDefaultDuration(dv: DataView, segment: EbmlElement): boolean {
+  const tracks = findChild(dv, segment.dataStart, segment.dataEnd, ID.Tracks);
+  if (tracks === undefined) return false;
+  for (const te of elements(dv, tracks.dataStart, tracks.dataEnd)) {
+    if (te.id !== ID.TrackEntry) continue;
+    let trackType = 0;
+    let hasDefaultDuration = false;
+    for (const child of elements(dv, te.dataStart, te.dataEnd)) {
+      if (child.id === ID.TrackType) trackType = readUint(dv, child);
+      else if (child.id === ID.DefaultDuration) hasDefaultDuration = true;
+    }
+    if (trackType === 1 && !hasDefaultDuration) return false;
+  }
+  return true;
+}
+
+function metadataComplete(bytes: Uint8Array, info: WebmInfo): boolean {
+  if (info.durationSec <= 0 || info.tracks.length === 0) return false;
+  for (const track of info.tracks) {
+    if (track.mediaType !== 'video') continue;
+    if (track.width === undefined || track.height === undefined || track.fps === undefined) {
+      return false;
+    }
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const segment = findSegment(dv);
+  if (segment === undefined) return false;
+  if (!segmentHasDeclaredDuration(dv, segment)) return false;
+  if (!videoTracksHaveDefaultDuration(dv, segment)) return false;
+  return true;
+}
+
+async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<WebmInfo> {
+  assertNotAborted(signal);
+  const range = src.range;
+  if (range === undefined) return parseWebm(await readAll(src, signal));
+
+  let lastError: unknown;
+  for (const prefixBytes of WEBM_METADATA_PREFIX_BYTES) {
+    assertNotAborted(signal);
+    const end = src.size === undefined ? prefixBytes : Math.min(prefixBytes, src.size);
+    const bytes = await range.call(src, 0, end);
+    assertNotAborted(signal);
+    try {
+      const info = parseWebm(bytes, { scanClusters: false });
+      if (metadataComplete(bytes, info)) {
+        return info;
+      }
+      if (bytes.byteLength >= (src.size ?? Number.POSITIVE_INFINITY)) return parseWebm(bytes);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  try {
+    return parseWebm(await readAll(src, signal));
+  } catch (error) {
+    throw lastError ?? error;
+  }
 }
 
 function abortedError(): MediaError {
@@ -1044,7 +1131,7 @@ export const WebmDriver: ContainerDriver = {
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
     assertNotAborted(signal);
-    const info = parseWebm(await readAll(src, signal));
+    const info = await readMetadataInfo(src, signal);
     assertNotAborted(signal);
     return info.tracks.map((track, index) => toTrackInfo(track, index, info.durationSec));
   },

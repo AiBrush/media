@@ -21,8 +21,12 @@ import type {
 } from '../contracts/driver.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
+import type { Sink } from '../sinks/sink.ts';
 import type { Source } from '../sources/source.ts';
-import type { AudioTarget, CallOptions, ConvertOptions, Output } from './types.ts';
+import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
+import { isPcmContainer } from './codec-routing.ts';
+import { CapabilityError } from '../contracts/errors.ts';
+import { rewriteWavPcmCopy } from '../drivers/wav/pcm.ts';
 
 /**
  * The engine capabilities {@link convertPcmNative} needs, threaded in so the routine never reaches into the
@@ -56,9 +60,33 @@ export async function convertPcmNative(
   o: CallOptions,
 ): Promise<Output | undefined> {
   const container = await deps.routeContainer(src, 'demux');
+  const pcmOpts = pcmTransformOptions(deps, audio, target, signal, o);
+  // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its own bytes,
+  // applies sample format / channel / rate transforms, then serializes the requested raw-PCM target. A WAV
+  // target may also be produced by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADTS AAC→WAV).
+  const stream = container.transformPcm
+    ? await container.transformPcm(src, pcmOpts)
+    : target === 'wav' && container.decodePcm
+      ? await container.decodePcm(src, pcmOpts)
+      : undefined;
+  if (stream) return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, target));
+  return undefined;
+}
+
+function isPcmCodec(codec: string | undefined): boolean {
+  return codec === undefined || codec === 'pcm' || codec.startsWith('pcm-');
+}
+
+function pcmTransformOptions(
+  deps: PcmConvertDeps,
+  audio: AudioTarget | undefined,
+  target: PcmContainer,
+  signal: AbortSignal,
+  o: CallOptions,
+): PcmTransform {
   const sampleFormat = deps.pcmSampleFormat(audio?.codec);
   const endian = deps.pcmEndian(audio?.codec);
-  const pcmOpts: PcmTransform = {
+  return {
     ...deps.stageOptions(signal, o),
     container: target,
     ...(sampleFormat !== undefined ? { sampleFormat } : {}),
@@ -70,14 +98,53 @@ export async function convertPcmNative(
     ...(audio?.dynamics !== undefined ? { dynamics: audio.dynamics } : {}),
     ...(audio?.biquad !== undefined ? { biquad: audio.biquad } : {}),
   };
-  // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its own bytes,
-  // applies sample format / channel / rate transforms, then serializes the requested raw-PCM target. A WAV
-  // target may also be produced by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADTS AAC→WAV).
+}
+
+export async function pcm(
+  deps: PcmConvertDeps,
+  routeContainerToken: (container: string, direction: 'demux') => Promise<ContainerDriver>,
+  src: Source | Uint8Array,
+  sourceContainer: string,
+  opts: { readonly to: Container; readonly audio?: AudioTarget | false; readonly sink?: Sink },
+  signal: AbortSignal,
+  o: CallOptions,
+): Promise<Output | Uint8Array> {
+  const target = opts.to;
+  if (!isPcmContainer(target)) {
+    throw new CapabilityError('capability-miss', 'target is not a raw PCM container', {
+      op: 'convert',
+      tried: [target],
+    });
+  }
+  const audio = opts.audio;
+  if (audio === false || !isPcmCodec(audio?.codec)) {
+    throw new CapabilityError('capability-miss', 'PCM container transform requires a PCM audio target', {
+      op: 'convert',
+      tried: [target],
+    });
+  }
+  if (src instanceof Uint8Array) {
+    if (sourceContainer === 'wav' && target === 'wav' && opts.sink?.kind !== 'stream-target') {
+      const copied = rewriteWavPcmCopy(src, deps.pcmSampleFormat(audio?.codec), deps.pcmEndian(audio?.codec));
+      if (copied !== undefined) return copied;
+    }
+    throw new CapabilityError('capability-miss', 'PCM byte rewrite path not registered', {
+      op: 'convert',
+      tried: [sourceContainer, target],
+    });
+  }
+  const container = await routeContainerToken(sourceContainer, 'demux');
+  const pcmOpts = pcmTransformOptions(deps, audio, target, signal, o);
   const stream = container.transformPcm
     ? await container.transformPcm(src, pcmOpts)
     : target === 'wav' && container.decodePcm
       ? await container.decodePcm(src, pcmOpts)
       : undefined;
-  if (stream) return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, target));
-  return undefined;
+  if (stream === undefined) {
+    throw new CapabilityError('capability-miss', 'container PCM transform path not registered', {
+      op: 'convert',
+      tried: [container.id, target],
+    });
+  }
+  return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, target));
 }

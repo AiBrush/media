@@ -1,0 +1,2537 @@
+{
+  "generatedFrom": "2026-07-01T10:44:00.484Z",
+  "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
+  "overlays": [
+    "chromium-2026-07-01T09-52-13-355Z.json",
+    "chromium-2026-07-01T09-57-08-951Z.json",
+    "chromium-2026-07-01T10-39-35-760Z.json",
+    "chromium-2026-07-01T10-40-26-545Z.json",
+    "chromium-2026-07-01T10-42-56-723Z.json",
+    "chromium-2026-07-01T10-43-44-532Z.json"
+  ],
+  "contested": 444,
+  "rawLossCount": 314,
+  "activeLossCount": 314,
+  "exemptLossCount": 0,
+  "tiers": {
+    "catastrophic": 0,
+    "severe": 17,
+    "moderate": 86,
+    "minor": 211
+  },
+  "losses": [
+    {
+      "s": "mux/pcm_s16_to_wav",
+      "fam": "mux",
+      "our": 110.44000000040978,
+      "comp": "mediabunny",
+      "cw": 3.9749999940395355,
+      "ratio": 27.78364784050647
+    },
+    {
+      "s": "trim/audio_flac_seektable_copy",
+      "fam": "trim",
+      "our": 167.43999999994412,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.884999990463257,
+      "ratio": 24.319535255174042
+    },
+    {
+      "s": "performance/size-ladder-extract-metadata-huge",
+      "fam": "performance",
+      "our": 130.22500000009313,
+      "comp": "mediabunny",
+      "cw": 6.8499999940395355,
+      "ratio": 19.01094892166529
+    },
+    {
+      "s": "probe/perf-extract-metadata-huge",
+      "fam": "probe",
+      "our": 118.54000000003725,
+      "comp": "mediabunny",
+      "cw": 7.0450000166893005,
+      "ratio": 16.82611777419746
+    },
+    {
+      "s": "probe/flac_seektable",
+      "fam": "probe",
+      "our": 38.49500000011176,
+      "comp": "remotion-media-parser",
+      "cw": 2.294999986886978,
+      "ratio": 16.77342057519041
+    },
+    {
+      "s": "demux/metamorphic_flac_seektable_invariance",
+      "fam": "demux",
+      "our": 92.30500000016764,
+      "comp": "mediabunny",
+      "cw": 5.655000001192093,
+      "ratio": 16.322723250346495
+    },
+    {
+      "s": "probe/flac_noseektable",
+      "fam": "probe",
+      "our": 34.5,
+      "comp": "remotion-media-parser",
+      "cw": 2.1400000154972076,
+      "ratio": 16.121495210356002
+    },
+    {
+      "s": "mux/flac_to_mkv_audio",
+      "fam": "mux",
+      "our": 109.48999999999069,
+      "comp": "mediabunny",
+      "cw": 6.96000000834465,
+      "ratio": 15.731321820218147
+    },
+    {
+      "s": "trim/audio_flac_noseektable_copy",
+      "fam": "trim",
+      "our": 157.07999999960884,
+      "comp": "ffmpeg.wasm",
+      "cw": 10.280000001192093,
+      "ratio": 15.280155640213373
+    },
+    {
+      "s": "probe/huge_h264_1080p_600s",
+      "fam": "probe",
+      "our": 124.35999999986961,
+      "comp": "remotion-webcodecs",
+      "cw": 8.159999996423721,
+      "ratio": 15.240196085094706
+    },
+    {
+      "s": "mux/size_micro_1frame_to_mp4",
+      "fam": "mux",
+      "our": 50.140000000130385,
+      "comp": "mediabunny",
+      "cw": 3.3799999952316284,
+      "ratio": 14.834319547593472
+    },
+    {
+      "s": "probe/opus",
+      "fam": "probe",
+      "our": 47.364999999757856,
+      "comp": "mediabunny",
+      "cw": 3.2000000178813934,
+      "ratio": 14.801562417214155
+    },
+    {
+      "s": "demux/flac_seektable",
+      "fam": "demux",
+      "our": 63.7449999996461,
+      "comp": "mediabunny",
+      "cw": 5.094999998807907,
+      "ratio": 12.51128557695009
+    },
+    {
+      "s": "demux/flac_noseektable",
+      "fam": "demux",
+      "our": 76.42499999981374,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.715000003576279,
+      "ratio": 11.38123603263012
+    },
+    {
+      "s": "demux/size_tiny_tiny_h264_360p_2s",
+      "fam": "demux",
+      "our": 55.02500000037253,
+      "comp": "mp4box",
+      "cw": 4.8499999940395355,
+      "ratio": 11.345360838762092
+    },
+    {
+      "s": "demux/size_micro_micro_h264_1frame",
+      "fam": "demux",
+      "our": 27.97499999962747,
+      "comp": "mp4box",
+      "cw": 2.4850000143051147,
+      "ratio": 11.257545206674846
+    },
+    {
+      "s": "mux/opus_to_webm_audio",
+      "fam": "mux",
+      "our": 84.68499999959022,
+      "comp": "mediabunny",
+      "cw": 7.91499999165535,
+      "ratio": 10.699305128095032
+    },
+    {
+      "s": "trim/h264_noop_full_range_idempotent",
+      "fam": "trim",
+      "our": 799.2550000003539,
+      "comp": "mediabunny",
+      "cw": 80.23500001430511,
+      "ratio": 9.961425809906581
+    },
+    {
+      "s": "performance/size-ladder-iterate-packets-tiny",
+      "fam": "performance",
+      "our": 33.83499999996275,
+      "comp": "mediabunny",
+      "cw": 4.259999990463257,
+      "ratio": 7.942488280682681
+    },
+    {
+      "s": "decode-seek/decode_size_micro_h264_1frame",
+      "fam": "decode-seek",
+      "our": 38.5,
+      "comp": "platform",
+      "cw": 4.854999989271164,
+      "ratio": 7.929969121540544
+    },
+    {
+      "s": "metadata/read_h264_1080p_30s",
+      "fam": "metadata",
+      "our": 31.764999999664724,
+      "comp": "remotion-media-parser",
+      "cw": 4.060000002384186,
+      "ratio": 7.8238916209386975
+    },
+    {
+      "s": "decode-seek/decode_tiny_dims_2x2_h264",
+      "fam": "decode-seek",
+      "our": 39.419999999925494,
+      "comp": "platform",
+      "cw": 5.0450000166893005,
+      "ratio": 7.81367688196644
+    },
+    {
+      "s": "metadata/tagedit_no_corrupt_audio_flac",
+      "fam": "metadata",
+      "our": 45.575000000186265,
+      "comp": "mediabunny",
+      "cw": 5.939999997615814,
+      "ratio": 7.672558925669877
+    },
+    {
+      "s": "demux/empty_audio_zero_packets",
+      "fam": "demux",
+      "our": 19.16499999957159,
+      "comp": "remotion-media-parser",
+      "cw": 2.600000023841858,
+      "ratio": 7.371153778395996
+    },
+    {
+      "s": "probe/h264_1080p_30s",
+      "fam": "probe",
+      "our": 31.570000000298023,
+      "comp": "mediabunny",
+      "cw": 4.324999988079071,
+      "ratio": 7.2994219855061075
+    },
+    {
+      "s": "remux/flac_seektable_flac_to_ogg",
+      "fam": "remux",
+      "our": 36.3000000002794,
+      "comp": "ffmpeg.wasm",
+      "cw": 4.990000009536743,
+      "ratio": 7.274549084349477
+    },
+    {
+      "s": "audio-dsp/edge_longform_audio_probe",
+      "fam": "audio-dsp",
+      "our": 17.46000000042841,
+      "comp": "mediabunny",
+      "cw": 2.5049999952316284,
+      "ratio": 6.970059893678341
+    },
+    {
+      "s": "metadata/read_flac_seektable",
+      "fam": "metadata",
+      "our": 32.359999999869615,
+      "comp": "remotion-webcodecs",
+      "cw": 4.834999978542328,
+      "ratio": 6.692864559148481
+    },
+    {
+      "s": "demux/opus",
+      "fam": "demux",
+      "our": 35.53500000014901,
+      "comp": "mediabunny",
+      "cw": 5.455000013113022,
+      "ratio": 6.514207133772332
+    },
+    {
+      "s": "probe/micro_audio_short",
+      "fam": "probe",
+      "our": 15.020000000018626,
+      "comp": "remotion-media-parser",
+      "cw": 2.350000023841858,
+      "ratio": 6.391489296865382
+    },
+    {
+      "s": "mux/opus_to_ogg",
+      "fam": "mux",
+      "our": 65.4750000005588,
+      "comp": "mediabunny",
+      "cw": 10.395000010728836,
+      "ratio": 6.29870129225407
+    },
+    {
+      "s": "audio-dsp/meta_idempotent_resample_same_rate",
+      "fam": "audio-dsp",
+      "our": 33.29000000003725,
+      "comp": "mediabunny",
+      "cw": 5.28999999165535,
+      "ratio": 6.293005681011377
+    },
+    {
+      "s": "probe/tiny_h264_360p_2s",
+      "fam": "probe",
+      "our": 20.43500000005588,
+      "comp": "mediabunny",
+      "cw": 3.274999976158142,
+      "ratio": 6.239694701930318
+    },
+    {
+      "s": "demux/h264_vfr",
+      "fam": "demux",
+      "our": 44.47999999951571,
+      "comp": "remotion-media-parser",
+      "cw": 7.235000014305115,
+      "ratio": 6.14789217851685
+    },
+    {
+      "s": "mux/size_tiny_360p_to_mp4",
+      "fam": "mux",
+      "our": 84.41500000003725,
+      "comp": "mp4box",
+      "cw": 13.73999997973442,
+      "ratio": 6.143740911538845
+    },
+    {
+      "s": "demux/h264_1080p_30s",
+      "fam": "demux",
+      "our": 33.58499999996275,
+      "comp": "web-demuxer",
+      "cw": 5.5,
+      "ratio": 6.106363636356863
+    },
+    {
+      "s": "probe/big_buck_bunny_1080p_h264",
+      "fam": "probe",
+      "our": 28.859999999869615,
+      "comp": "mediabunny",
+      "cw": 4.765000015497208,
+      "ratio": 6.056663149214742
+    },
+    {
+      "s": "decode-seek/decode_tiny_dims_1x1",
+      "fam": "decode-seek",
+      "our": 24.66000000014901,
+      "comp": "platform",
+      "cw": 4.08500000834465,
+      "ratio": 6.036719693947294
+    },
+    {
+      "s": "performance/size-ladder-extract-metadata-large",
+      "fam": "performance",
+      "our": 34.02999999932945,
+      "comp": "mediabunny",
+      "cw": 5.760000020265579,
+      "ratio": 5.9079860902084524
+    },
+    {
+      "s": "probe/realworld_mdn_flower_webm",
+      "fam": "probe",
+      "our": 25.424999999813735,
+      "comp": "mediabunny",
+      "cw": 4.314999997615814,
+      "ratio": 5.892236387917015
+    },
+    {
+      "s": "demux/size_micro_micro_audio_short",
+      "fam": "demux",
+      "our": 25.145000000018626,
+      "comp": "mp4box",
+      "cw": 4.395000010728836,
+      "ratio": 5.721274161236863
+    },
+    {
+      "s": "remux/flac_seektable_flac_to_mkv",
+      "fam": "remux",
+      "our": 43.234999999869615,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.594999998807907,
+      "ratio": 5.692560896202195
+    },
+    {
+      "s": "probe/h264_bframes_1080p",
+      "fam": "probe",
+      "our": 16.169999999925494,
+      "comp": "mediabunny",
+      "cw": 2.854999989271164,
+      "ratio": 5.663747832115908
+    },
+    {
+      "s": "probe/realworld_mdn_trex_mp3",
+      "fam": "probe",
+      "our": 14.5550000006333,
+      "comp": "mediabunny",
+      "cw": 2.594999998807907,
+      "ratio": 5.608863201279224
+    },
+    {
+      "s": "probe/large_h264_1080p_120s",
+      "fam": "probe",
+      "our": 21.62000000011176,
+      "comp": "mediabunny",
+      "cw": 3.854999989271164,
+      "ratio": 5.608300923549235
+    },
+    {
+      "s": "metadata/read_h264_multitrack",
+      "fam": "metadata",
+      "our": 17.78500000014901,
+      "comp": "remotion-media-parser",
+      "cw": 3.380000025033951,
+      "ratio": 5.2618342805989675
+    },
+    {
+      "s": "probe/h264_vfr",
+      "fam": "probe",
+      "our": 18.505000000353903,
+      "comp": "mediabunny",
+      "cw": 3.550000011920929,
+      "ratio": 5.212676038933511
+    },
+    {
+      "s": "probe/longform_1h_audio",
+      "fam": "probe",
+      "our": 25.614999999757856,
+      "comp": "mediabunny",
+      "cw": 4.944999992847443,
+      "ratio": 5.179979784996553
+    },
+    {
+      "s": "mux/prop_vfr_mux_duration_mp4_to_mkv",
+      "fam": "mux",
+      "our": 69.34499999973923,
+      "comp": "mediabunny",
+      "cw": 13.490000009536743,
+      "ratio": 5.140474421846986
+    },
+    {
+      "s": "mux/size_micro_1frame_to_mkv",
+      "fam": "mux",
+      "our": 48.10000000055879,
+      "comp": "ffmpeg.wasm",
+      "cw": 9.375,
+      "ratio": 5.130666666726271
+    },
+    {
+      "s": "demux/aac_adts",
+      "fam": "demux",
+      "our": 29.915000000037253,
+      "comp": "mediabunny",
+      "cw": 5.919999986886978,
+      "ratio": 5.053209470658801
+    },
+    {
+      "s": "demux/realworld_mdn_flower_mp4",
+      "fam": "demux",
+      "our": 35.29000000003725,
+      "comp": "mp4box",
+      "cw": 7.0799999833106995,
+      "ratio": 4.984463288591026
+    },
+    {
+      "s": "demux/realworld_mdn_trex_mp3",
+      "fam": "demux",
+      "our": 16.640000000130385,
+      "comp": "mediabunny",
+      "cw": 3.3400000035762787,
+      "ratio": 4.982035922848274
+    },
+    {
+      "s": "probe/perf-extract-metadata-large",
+      "fam": "probe",
+      "our": 18.06499999994412,
+      "comp": "mediabunny",
+      "cw": 3.6449999809265137,
+      "ratio": 4.956104278319426
+    },
+    {
+      "s": "audio-dsp/edge_gapless_aac_decode",
+      "fam": "audio-dsp",
+      "our": 52.18999999994412,
+      "comp": "mediabunny",
+      "cw": 10.615000009536743,
+      "ratio": 4.916627409614273
+    },
+    {
+      "s": "performance/metamorphic-vfr-iterate-packets",
+      "fam": "performance",
+      "our": 22.195000000065193,
+      "comp": "remotion-webcodecs",
+      "cw": 4.580000013113022,
+      "ratio": 4.84606985513506
+    },
+    {
+      "s": "probe/hevc_1080p_10s",
+      "fam": "probe",
+      "our": 24.114999999757856,
+      "comp": "mediabunny",
+      "cw": 5.03999999165535,
+      "ratio": 4.784722230096168
+    },
+    {
+      "s": "demux/wav_s24",
+      "fam": "demux",
+      "our": 14.484999999403954,
+      "comp": "mediabunny",
+      "cw": 3.0349999964237213,
+      "ratio": 4.7726523942248065
+    },
+    {
+      "s": "trim/audio_aac_adts_copy",
+      "fam": "trim",
+      "our": 27.75499999988824,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.0250000059604645,
+      "ratio": 4.606638999573533
+    },
+    {
+      "s": "probe/vp9_alpha",
+      "fam": "probe",
+      "our": 13.584999999962747,
+      "comp": "mediabunny",
+      "cw": 3.005000025033951,
+      "ratio": 4.52079863121108
+    },
+    {
+      "s": "mux/mp3_to_mp3",
+      "fam": "mux",
+      "our": 33.64999999990687,
+      "comp": "mediabunny",
+      "cw": 7.465000003576279,
+      "ratio": 4.507702610018227
+    },
+    {
+      "s": "trim/h264_multitrack_keyframe_aligned",
+      "fam": "trim",
+      "our": 123.30000000004657,
+      "comp": "ffmpeg.wasm",
+      "cw": 27.759999990463257,
+      "ratio": 4.441642652824401
+    },
+    {
+      "s": "performance/extract-metadata",
+      "fam": "performance",
+      "our": 15.31499999994412,
+      "comp": "remotion-media-parser",
+      "cw": 3.4549999833106995,
+      "ratio": 4.432706244261328
+    },
+    {
+      "s": "metadata/read_opus",
+      "fam": "metadata",
+      "our": 18.429999999701977,
+      "comp": "ffmpeg.wasm",
+      "cw": 4.254999995231628,
+      "ratio": 4.331374857897904
+    },
+    {
+      "s": "transcode/aac_to_pcm_wav_extract",
+      "fam": "transcode",
+      "our": 84.02000000001863,
+      "comp": "ffmpeg.wasm",
+      "cw": 19.604999989271164,
+      "ratio": 4.285641420351878
+    },
+    {
+      "s": "metadata/tracks_attribution_multitrack",
+      "fam": "metadata",
+      "our": 17.055000000167638,
+      "comp": "remotion-media-parser",
+      "cw": 4.044999986886978,
+      "ratio": 4.21631645375928
+    },
+    {
+      "s": "probe/metamorphic-recorder-headerless-sane-duration",
+      "fam": "probe",
+      "our": 14.625,
+      "comp": "mediabunny",
+      "cw": 3.4950000047683716,
+      "ratio": 4.184549350514024
+    },
+    {
+      "s": "probe/tiny_vp9_360p_2s",
+      "fam": "probe",
+      "our": 13.31499999994412,
+      "comp": "mediabunny",
+      "cw": 3.225000023841858,
+      "ratio": 4.128682140002688
+    },
+    {
+      "s": "mux/mp3_to_mp4_audio",
+      "fam": "mux",
+      "our": 26.125,
+      "comp": "mediabunny",
+      "cw": 6.5,
+      "ratio": 4.019230769230769
+    },
+    {
+      "s": "performance/op-sweep-demux",
+      "fam": "performance",
+      "our": 30.65500000026077,
+      "comp": "remotion-media-parser",
+      "cw": 7.699999988079071,
+      "ratio": 3.981168837366234
+    },
+    {
+      "s": "transcode/mp3_to_aac_mp4",
+      "fam": "transcode",
+      "our": 341.1750000002794,
+      "comp": "mediabunny",
+      "cw": 85.72999998927116,
+      "ratio": 3.979645398844936
+    },
+    {
+      "s": "mux/mp4_streaming_target",
+      "fam": "mux",
+      "our": 264.91500000003725,
+      "comp": "mediabunny",
+      "cw": 66.8449999988079,
+      "ratio": 3.9631236443228612
+    },
+    {
+      "s": "mux/aac_to_adts",
+      "fam": "mux",
+      "our": 28.84499999973923,
+      "comp": "mediabunny",
+      "cw": 7.444999992847443,
+      "ratio": 3.874412360973967
+    },
+    {
+      "s": "performance/size-ladder-extract-metadata-medium",
+      "fam": "performance",
+      "our": 13.955000000074506,
+      "comp": "mediabunny",
+      "cw": 3.6749999821186066,
+      "ratio": 3.797278930061264
+    },
+    {
+      "s": "performance/op-sweep-probe",
+      "fam": "performance",
+      "our": 14.395000000018626,
+      "comp": "mediabunny",
+      "cw": 3.7950000166893005,
+      "ratio": 3.7931488634291504
+    },
+    {
+      "s": "probe/mp3_xing",
+      "fam": "probe",
+      "our": 11.209999999962747,
+      "comp": "mediabunny",
+      "cw": 2.9650000035762787,
+      "ratio": 3.7807757121219696
+    },
+    {
+      "s": "remux/aac_adts_adts_to_ts",
+      "fam": "remux",
+      "our": 27.165000000037253,
+      "comp": "mediabunny",
+      "cw": 7.284999996423721,
+      "ratio": 3.728894991540538
+    },
+    {
+      "s": "probe/aac_adts",
+      "fam": "probe",
+      "our": 15.339999999850988,
+      "comp": "mediabunny",
+      "cw": 4.219999998807907,
+      "ratio": 3.6350710910389408
+    },
+    {
+      "s": "metadata/read_mp3_xing",
+      "fam": "metadata",
+      "our": 13.765000000130385,
+      "comp": "remotion-webcodecs",
+      "cw": 3.830000013113022,
+      "ratio": 3.593994765796933
+    },
+    {
+      "s": "transcode/hdr10_to_sdr_tonemap",
+      "fam": "transcode",
+      "our": 145.62000000011176,
+      "comp": "ffmpeg.wasm",
+      "cw": 40.90500000119209,
+      "ratio": 3.5599559954985445
+    },
+    {
+      "s": "demux/mp3_cbr_notoc",
+      "fam": "demux",
+      "our": 18.020000000018626,
+      "comp": "mediabunny",
+      "cw": 5.090000003576279,
+      "ratio": 3.5402750466321447
+    },
+    {
+      "s": "remux/huge_h264_1080p_600s_mov_to_mp4",
+      "fam": "remux",
+      "our": 1478.7400000002235,
+      "comp": "remotion-webcodecs",
+      "cw": 423.4699999988079,
+      "ratio": 3.4919592887439164
+    },
+    {
+      "s": "trim/h264_rotated_keyframe_aligned",
+      "fam": "trim",
+      "our": 119.72999999998137,
+      "comp": "ffmpeg.wasm",
+      "cw": 34.38500002026558,
+      "ratio": 3.4820415858489393
+    },
+    {
+      "s": "mux/audio_only_aac_to_mp4",
+      "fam": "mux",
+      "our": 26.915000000037253,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.784999996423721,
+      "ratio": 3.4572896611947956
+    },
+    {
+      "s": "probe/micro_h264_1frame",
+      "fam": "probe",
+      "our": 17.604999999981374,
+      "comp": "mediabunny",
+      "cw": 5.094999998807907,
+      "ratio": 3.4553483815702593
+    },
+    {
+      "s": "trim/mov_keyframe_aligned",
+      "fam": "trim",
+      "our": 147.5500000002794,
+      "comp": "ffmpeg.wasm",
+      "cw": 42.73499998450279,
+      "ratio": 3.452673453932051
+    },
+    {
+      "s": "mux/prop_h264_decode_mux_mp4_to_mp4",
+      "fam": "mux",
+      "our": 326.15500000002794,
+      "comp": "mediabunny",
+      "cw": 95.52500000596046,
+      "ratio": 3.4143417951287818
+    },
+    {
+      "s": "trim/audio_wav_pcm_copy",
+      "fam": "trim",
+      "our": 25.169999999925494,
+      "comp": "mediabunny",
+      "cw": 7.4000000059604645,
+      "ratio": 3.4013513486016027
+    },
+    {
+      "s": "trim/h264_start_zero_copy",
+      "fam": "trim",
+      "our": 134.22499999962747,
+      "comp": "mediabunny",
+      "cw": 39.58500000834465,
+      "ratio": 3.390804596976946
+    },
+    {
+      "s": "transcode/opus_to_aac_mp4",
+      "fam": "transcode",
+      "our": 323.62999999988824,
+      "comp": "mediabunny",
+      "cw": 96.78499999642372,
+      "ratio": 3.3438032754233262
+    },
+    {
+      "s": "performance/size-ladder-iterate-packets-medium",
+      "fam": "performance",
+      "our": 43.5749999997206,
+      "comp": "web-demuxer",
+      "cw": 13.125,
+      "ratio": 3.3199999999787124
+    },
+    {
+      "s": "performance/size-ladder-extract-metadata-tiny",
+      "fam": "performance",
+      "our": 14.770000000018626,
+      "comp": "mediabunny",
+      "cw": 4.469999998807907,
+      "ratio": 3.3042505601694856
+    },
+    {
+      "s": "probe/realworld_mdn_flower_mp4",
+      "fam": "probe",
+      "our": 12.970000000204891,
+      "comp": "mp4box",
+      "cw": 3.9749999940395355,
+      "ratio": 3.26289308670522
+    },
+    {
+      "s": "metadata/read_no_tags_wav",
+      "fam": "metadata",
+      "our": 14.100000000093132,
+      "comp": "mediabunny",
+      "cw": 4.379999995231628,
+      "ratio": 3.2191780857176644
+    },
+    {
+      "s": "decode-seek/decode_size_tiny_h264_360p",
+      "fam": "decode-seek",
+      "our": 334.16500000003725,
+      "comp": "ffmpeg.wasm",
+      "cw": 105.93999999761581,
+      "ratio": 3.154285444662617
+    },
+    {
+      "s": "transcode/wav_to_flac",
+      "fam": "transcode",
+      "our": 127.35000000009313,
+      "comp": "ffmpeg.wasm",
+      "cw": 40.53000000119209,
+      "ratio": 3.1421169503169857
+    },
+    {
+      "s": "audio-dsp/edge_longform_audio_resample_16k",
+      "fam": "audio-dsp",
+      "our": 12843.055000000633,
+      "comp": "ffmpeg.wasm",
+      "cw": 4117.009999990463,
+      "ratio": 3.1195102756686
+    },
+    {
+      "s": "metadata/read_h264_1080p_5s",
+      "fam": "metadata",
+      "our": 29.175000000279397,
+      "comp": "mp4box",
+      "cw": 9.405000001192093,
+      "ratio": 3.1020733648677763
+    },
+    {
+      "s": "demux/size_tiny_tiny_vp9_360p_2s",
+      "fam": "demux",
+      "our": 30.134999999776483,
+      "comp": "ffmpeg.wasm",
+      "cw": 9.724999994039536,
+      "ratio": 3.0987146548325204
+    },
+    {
+      "s": "probe/recorder_headerless",
+      "fam": "probe",
+      "our": 17.044999999925494,
+      "comp": "mediabunny",
+      "cw": 5.530000001192093,
+      "ratio": 3.0822784803347436
+    },
+    {
+      "s": "mux/drop_audio_track_subset_to_mp4",
+      "fam": "mux",
+      "our": 122.3249999997206,
+      "comp": "mediabunny",
+      "cw": 40.17499998211861,
+      "ratio": 3.044803983924479
+    },
+    {
+      "s": "mux/edge_bframes_decode_mux_mkv",
+      "fam": "mux",
+      "our": 131.05500000016764,
+      "comp": "mediabunny",
+      "cw": 43.23999997973442,
+      "ratio": 3.0308741919886693
+    },
+    {
+      "s": "probe/av1_720p_5s",
+      "fam": "probe",
+      "our": 20.895000000018626,
+      "comp": "mediabunny",
+      "cw": 6.909999996423721,
+      "ratio": 3.0238784386154642
+    },
+    {
+      "s": "performance/metamorphic-vfr-probe-duration",
+      "fam": "performance",
+      "our": 9.199999999720603,
+      "comp": "mediabunny",
+      "cw": 3.070000022649765,
+      "ratio": 2.9967426488094744
+    },
+    {
+      "s": "audio-dsp/pcm_s16be_to_s16le",
+      "fam": "audio-dsp",
+      "our": 30.890000000130385,
+      "comp": "ffmpeg.wasm",
+      "cw": 10.340000003576279,
+      "ratio": 2.9874274651302235
+    },
+    {
+      "s": "streaming-output/buffer_massive_h264_mp4",
+      "fam": "streaming-output",
+      "our": 19850.23499999987,
+      "comp": "ffmpeg.wasm",
+      "cw": 6705.324999988079,
+      "ratio": 2.960368811360398
+    },
+    {
+      "s": "demux/wav_f32",
+      "fam": "demux",
+      "our": 15.884999999776483,
+      "comp": "mediabunny",
+      "cw": 5.384999990463257,
+      "ratio": 2.949860729416629
+    },
+    {
+      "s": "mux/edge_bframes_decode_mux_mp4",
+      "fam": "mux",
+      "our": 159.45499999914318,
+      "comp": "mediabunny",
+      "cw": 54.724999994039536,
+      "ratio": 2.9137505713387024
+    },
+    {
+      "s": "trim/audio_opus_ogg_copy",
+      "fam": "trim",
+      "our": 20.554999999701977,
+      "comp": "mediabunny",
+      "cw": 7.259999990463257,
+      "ratio": 2.8312672213089596
+    },
+    {
+      "s": "mux/video_a_plus_audio_b_to_mkv",
+      "fam": "mux",
+      "our": 325.82500000018626,
+      "comp": "mediabunny",
+      "cw": 115.66999998688698,
+      "ratio": 2.816849658832227
+    },
+    {
+      "s": "trim/audio_aiff_pcm_be_copy",
+      "fam": "trim",
+      "our": 32.264999999664724,
+      "comp": "ffmpeg.wasm",
+      "cw": 11.465000003576279,
+      "ratio": 2.8142171818229653
+    },
+    {
+      "s": "mux/prop_av1_mux_duration_webm_to_mp4",
+      "fam": "mux",
+      "our": 45.83999999985099,
+      "comp": "mediabunny",
+      "cw": 16.34000000357628,
+      "ratio": 2.8053855562924204
+    },
+    {
+      "s": "trim/large_h264_frame_accurate_throughput",
+      "fam": "trim",
+      "our": 2059.2450000001118,
+      "comp": "mediabunny",
+      "cw": 738.2150000035763,
+      "ratio": 2.7894922210875364
+    },
+    {
+      "s": "demux/mp3_xing",
+      "fam": "demux",
+      "our": 16.34500000020489,
+      "comp": "mediabunny",
+      "cw": 5.96000000834465,
+      "ratio": 2.742449660624179
+    },
+    {
+      "s": "decode-seek/decode_vp9_alpha",
+      "fam": "decode-seek",
+      "our": 524.4850000003353,
+      "comp": "mediabunny",
+      "cw": 195.5649999976158,
+      "ratio": 2.681896044827701
+    },
+    {
+      "s": "probe/wav_s16",
+      "fam": "probe",
+      "our": 6.8250000001862645,
+      "comp": "mediabunny",
+      "cw": 2.550000011920929,
+      "ratio": 2.676470575796176
+    },
+    {
+      "s": "probe/mp3_cbr_notoc",
+      "fam": "probe",
+      "our": 10.879999999888241,
+      "comp": "remotion-webcodecs",
+      "cw": 4.139999985694885,
+      "ratio": 2.6280193327252075
+    },
+    {
+      "s": "mux/three_track_assembly_to_mkv",
+      "fam": "mux",
+      "our": 318.75499999988824,
+      "comp": "mediabunny",
+      "cw": 121.74500000476837,
+      "ratio": 2.618218407223324
+    },
+    {
+      "s": "probe/h264_rotated90",
+      "fam": "probe",
+      "our": 14.259999999776483,
+      "comp": "remotion-media-parser",
+      "cw": 5.484999984502792,
+      "ratio": 2.59981769189907
+    },
+    {
+      "s": "audio-dsp/pcm_s24_to_s16",
+      "fam": "audio-dsp",
+      "our": 31.630000000353903,
+      "comp": "ffmpeg.wasm",
+      "cw": 12.175000011920929,
+      "ratio": 2.597946609394987
+    },
+    {
+      "s": "transcode/aac_to_opus_webm",
+      "fam": "transcode",
+      "our": 302.58499999996275,
+      "comp": "remotion-webcodecs",
+      "cw": 117.48499998450279,
+      "ratio": 2.575520279523991
+    },
+    {
+      "s": "probe/hls_vod",
+      "fam": "probe",
+      "our": 54.53000000026077,
+      "comp": "mediabunny",
+      "cw": 21.194999992847443,
+      "ratio": 2.572776599134829
+    },
+    {
+      "s": "demux/wav_s16",
+      "fam": "demux",
+      "our": 14.424999999813735,
+      "comp": "mediabunny",
+      "cw": 5.620000004768372,
+      "ratio": 2.5667259764367674
+    },
+    {
+      "s": "demux/h264_1080p_5s",
+      "fam": "demux",
+      "our": 38.43499999959022,
+      "comp": "mediabunny",
+      "cw": 15.030000001192093,
+      "ratio": 2.5572188953121606
+    },
+    {
+      "s": "remux/micro_audio_short_mp4_to_adts",
+      "fam": "remux",
+      "our": 29.890000000130385,
+      "comp": "mediabunny",
+      "cw": 11.730000019073486,
+      "ratio": 2.548167088791812
+    },
+    {
+      "s": "probe/h264_4k_10s",
+      "fam": "probe",
+      "our": 14.78000000026077,
+      "comp": "mediabunny",
+      "cw": 5.819999992847443,
+      "ratio": 2.53951890350942
+    },
+    {
+      "s": "mux/mp4_fragmented_cmaf",
+      "fam": "mux",
+      "our": 336.320000000298,
+      "comp": "mediabunny",
+      "cw": 132.5649999976158,
+      "ratio": 2.537019575350558
+    },
+    {
+      "s": "audio-dsp/pcm_s24be_to_s16le",
+      "fam": "audio-dsp",
+      "our": 36.39500000001863,
+      "comp": "ffmpeg.wasm",
+      "cw": 14.629999995231628,
+      "ratio": 2.4876965148243944
+    },
+    {
+      "s": "audio-dsp/meta_roundtrip_endianness_s16",
+      "fam": "audio-dsp",
+      "our": 25.09499999973923,
+      "comp": "mediabunny",
+      "cw": 10.094999998807907,
+      "ratio": 2.485884101307839
+    },
+    {
+      "s": "transcode/wav_to_vorbis_ogg",
+      "fam": "transcode",
+      "our": 159.71500000031665,
+      "comp": "ffmpeg.wasm",
+      "cw": 65.28499999642372,
+      "ratio": 2.446427203937593
+    },
+    {
+      "s": "mux/mp4_progressive_buffer",
+      "fam": "mux",
+      "our": 217.67000000039116,
+      "comp": "mediabunny",
+      "cw": 89.45999997854233,
+      "ratio": 2.4331544830382406
+    },
+    {
+      "s": "probe/wav_f32",
+      "fam": "probe",
+      "our": 9.899999999906868,
+      "comp": "mediabunny",
+      "cw": 4.074999988079071,
+      "ratio": 2.429447859844943
+    },
+    {
+      "s": "transcode/vp9_alpha_to_vp8_keepalpha",
+      "fam": "transcode",
+      "our": 1327.054999999702,
+      "comp": "mediabunny",
+      "cw": 551.8550000190735,
+      "ratio": 2.4047168186459045
+    },
+    {
+      "s": "performance/size-ladder-extract-metadata-large4k",
+      "fam": "performance",
+      "our": 8.729999999981374,
+      "comp": "remotion-media-parser",
+      "cw": 3.6400000154972076,
+      "ratio": 2.39835163813561
+    },
+    {
+      "s": "probe/cenc_cbcs",
+      "fam": "probe",
+      "our": 15.614999999757856,
+      "comp": "mediabunny",
+      "cw": 6.564999997615814,
+      "ratio": 2.3785224684582933
+    },
+    {
+      "s": "performance/iterate-video-packets",
+      "fam": "performance",
+      "our": 23.90999999991618,
+      "comp": "web-demuxer",
+      "cw": 10.094999998807907,
+      "ratio": 2.3684992573293364
+    },
+    {
+      "s": "mux/av1_opus_to_mp4",
+      "fam": "mux",
+      "our": 34.764999999664724,
+      "comp": "mediabunny",
+      "cw": 14.694999992847443,
+      "ratio": 2.3657706714247047
+    },
+    {
+      "s": "mux/h264_aac_to_mkv",
+      "fam": "mux",
+      "our": 226.82000000029802,
+      "comp": "mediabunny",
+      "cw": 96.36000001430511,
+      "ratio": 2.3538812781924605
+    },
+    {
+      "s": "probe/empty-audio-wav",
+      "fam": "probe",
+      "our": 6.559999999590218,
+      "comp": "remotion-webcodecs",
+      "cw": 2.794999986886978,
+      "ratio": 2.3470483114014717
+    },
+    {
+      "s": "probe/h264_1080p_5s",
+      "fam": "probe",
+      "our": 19.18999999994412,
+      "comp": "remotion-webcodecs",
+      "cw": 8.219999998807907,
+      "ratio": 2.334549878677265
+    },
+    {
+      "s": "mux/mp4_faststart_reserve",
+      "fam": "mux",
+      "our": 253.58499999996275,
+      "comp": "mediabunny",
+      "cw": 108.85000002384186,
+      "ratio": 2.3296738626037574
+    },
+    {
+      "s": "demux/realworld_mdn_flower_webm",
+      "fam": "demux",
+      "our": 14.234999999869615,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.129999995231628,
+      "ratio": 2.3221859724213147
+    },
+    {
+      "s": "audio-dsp/resample_44k1_to_48k",
+      "fam": "audio-dsp",
+      "our": 112.24000000022352,
+      "comp": "ffmpeg.wasm",
+      "cw": 49.400000005960464,
+      "ratio": 2.272064777058319
+    },
+    {
+      "s": "transcode/h264_resize_4k_to_1080p",
+      "fam": "transcode",
+      "our": 2469.5099999997765,
+      "comp": "mediabunny",
+      "cw": 1090.800000011921,
+      "ratio": 2.263943894364492
+    },
+    {
+      "s": "transcode/h264_rotate_normalize",
+      "fam": "transcode",
+      "our": 931.8499999996275,
+      "comp": "remotion-webcodecs",
+      "cw": 413.3850000202656,
+      "ratio": 2.2541940320861786
+    },
+    {
+      "s": "mux/h264_aac_to_ts",
+      "fam": "mux",
+      "our": 318.33499999996275,
+      "comp": "mediabunny",
+      "cw": 141.54499998688698,
+      "ratio": 2.2490020843509413
+    },
+    {
+      "s": "decode-seek/seek_past_eof",
+      "fam": "decode-seek",
+      "our": 129.089999999851,
+      "comp": "mediabunny",
+      "cw": 57.50499999523163,
+      "ratio": 2.244848274246679
+    },
+    {
+      "s": "probe/wav_s24",
+      "fam": "probe",
+      "our": 9.329999999841675,
+      "comp": "remotion-webcodecs",
+      "cw": 4.185000002384186,
+      "ratio": 2.2293906796956735
+    },
+    {
+      "s": "demux/h264_rotated90",
+      "fam": "demux",
+      "our": 23.364999999757856,
+      "comp": "mediabunny",
+      "cw": 10.564999997615814,
+      "ratio": 2.2115475631832084
+    },
+    {
+      "s": "remux/opus_ogg_to_mkv",
+      "fam": "remux",
+      "our": 16.699999999720603,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.560000002384186,
+      "ratio": 2.2089947082611046
+    },
+    {
+      "s": "audio-dsp/pcm_s24_to_f32",
+      "fam": "audio-dsp",
+      "our": 31.709999999962747,
+      "comp": "ffmpeg.wasm",
+      "cw": 14.520000010728836,
+      "ratio": 2.1838842959044222
+    },
+    {
+      "s": "audio-dsp/gain_half_f32",
+      "fam": "audio-dsp",
+      "our": 34.28000000026077,
+      "comp": "ffmpeg.wasm",
+      "cw": 15.780000001192093,
+      "ratio": 2.1723700885723134
+    },
+    {
+      "s": "metadata/write_mp3_id3",
+      "fam": "metadata",
+      "our": 11.515000000130385,
+      "comp": "mediabunny",
+      "cw": 5.334999978542328,
+      "ratio": 2.158388012454427
+    },
+    {
+      "s": "mux/vorbis_to_ogg",
+      "fam": "mux",
+      "our": 50.234999999869615,
+      "comp": "ffmpeg.wasm",
+      "cw": 23.49500000476837,
+      "ratio": 2.1381144920057156
+    },
+    {
+      "s": "audio-dsp/resample_48k_to_16k",
+      "fam": "audio-dsp",
+      "our": 71.5,
+      "comp": "remotion-webcodecs",
+      "cw": 33.78000000119209,
+      "ratio": 2.1166370632763996
+    },
+    {
+      "s": "mux/edge_rotation_decode_mux_mov",
+      "fam": "mux",
+      "our": 83.47500000009313,
+      "comp": "mediabunny",
+      "cw": 39.439999997615814,
+      "ratio": 2.116506085323004
+    },
+    {
+      "s": "metadata/write_flac_vorbiscomment",
+      "fam": "metadata",
+      "our": 11.875,
+      "comp": "mediabunny",
+      "cw": 5.675000011920929,
+      "ratio": 2.0925110088203214
+    },
+    {
+      "s": "decode-seek/seek_zero",
+      "fam": "decode-seek",
+      "our": 67.76500000013039,
+      "comp": "mediabunny",
+      "cw": 33.44999998807907,
+      "ratio": 2.025859492504649
+    },
+    {
+      "s": "mux/h264_aac_to_mov",
+      "fam": "mux",
+      "our": 222.89000000013039,
+      "comp": "mediabunny",
+      "cw": 110.45999997854233,
+      "ratio": 2.017834510623107
+    },
+    {
+      "s": "mux/size_large_1080p_to_mp4",
+      "fam": "mux",
+      "our": 637.8449999997392,
+      "comp": "mediabunny",
+      "cw": 317.2349999845028,
+      "ratio": 2.0106388009863303
+    },
+    {
+      "s": "demux/pcm_s16be",
+      "fam": "demux",
+      "our": 14.479999999981374,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.234999984502792,
+      "ratio": 2.001382174291252
+    },
+    {
+      "s": "mux/edge_rotation_decode_mux_mkv",
+      "fam": "mux",
+      "our": 83.77499999990687,
+      "comp": "mediabunny",
+      "cw": 41.86500000953674,
+      "ratio": 2.001074883096217
+    },
+    {
+      "s": "audio-dsp/caf_container_probe",
+      "fam": "audio-dsp",
+      "our": 10.694999999832362,
+      "comp": "ffmpeg.wasm",
+      "cw": 5.3499999940395355,
+      "ratio": 1.9990654227565832
+    },
+    {
+      "s": "demux/vp8_720p_10s",
+      "fam": "demux",
+      "our": 19.699999999720603,
+      "comp": "platform",
+      "cw": 9.875,
+      "ratio": 1.994936708832466
+    },
+    {
+      "s": "demux/vp9_alpha",
+      "fam": "demux",
+      "our": 18.43999999994412,
+      "comp": "platform",
+      "cw": 9.280000001192093,
+      "ratio": 1.9870689652559643
+    },
+    {
+      "s": "demux/av1_720p_5s",
+      "fam": "demux",
+      "our": 26.070000000298023,
+      "comp": "ffmpeg.wasm",
+      "cw": 13.160000026226044,
+      "ratio": 1.9810030355884614
+    },
+    {
+      "s": "metadata/read_no_tags_recorder_webm",
+      "fam": "metadata",
+      "our": 10.479999999981374,
+      "comp": "ffmpeg.wasm",
+      "cw": 5.304999977350235,
+      "ratio": 1.9754948246420108
+    },
+    {
+      "s": "mux/swap_audio_video_with_opus_to_mkv",
+      "fam": "mux",
+      "our": 365.0150000001304,
+      "comp": "mediabunny",
+      "cw": 185.2199999988079,
+      "ratio": 1.9707105064381798
+    },
+    {
+      "s": "remux/opus_ogg_to_webm",
+      "fam": "remux",
+      "our": 17.75,
+      "comp": "ffmpeg.wasm",
+      "cw": 9.080000013113022,
+      "ratio": 1.9548458121548529
+    },
+    {
+      "s": "mux/prop_vfr_mux_duration_mp4_to_mp4",
+      "fam": "mux",
+      "our": 47.169999999925494,
+      "comp": "mediabunny",
+      "cw": 24.21000000834465,
+      "ratio": 1.9483684421175977
+    },
+    {
+      "s": "audio-dsp/resample_48k_to_44k1",
+      "fam": "audio-dsp",
+      "our": 69.52999999932945,
+      "comp": "ffmpeg.wasm",
+      "cw": 35.7950000166893,
+      "ratio": 1.942450061933547
+    },
+    {
+      "s": "trim/vp9_noop_full_range_idempotent",
+      "fam": "trim",
+      "our": 52.93500000005588,
+      "comp": "mediabunny",
+      "cw": 27.464999973773956,
+      "ratio": 1.9273620990570894
+    },
+    {
+      "s": "mux/edge_multitrack_keep_all_to_mp4",
+      "fam": "mux",
+      "our": 77.62000000011176,
+      "comp": "mediabunny",
+      "cw": 40.33499997854233,
+      "ratio": 1.924383290973213
+    },
+    {
+      "s": "mux/prop_h264_mux_duration_mp4_to_mkv",
+      "fam": "mux",
+      "our": 239.0500000002794,
+      "comp": "mediabunny",
+      "cw": 125.06499999761581,
+      "ratio": 1.9114060688828733
+    },
+    {
+      "s": "probe/cenc_ctr",
+      "fam": "probe",
+      "our": 17.385000000242144,
+      "comp": "remotion-webcodecs",
+      "cw": 9.185000002384186,
+      "ratio": 1.8927599342111543
+    },
+    {
+      "s": "remux/prop_mp3_to_mp4_duration_invariant",
+      "fam": "remux",
+      "our": 12.470000000204891,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.645000010728836,
+      "ratio": 1.8765989435773016
+    },
+    {
+      "s": "decode-seek/seek_repeated_same_target",
+      "fam": "decode-seek",
+      "our": 69.95000000018626,
+      "comp": "mediabunny",
+      "cw": 37.400000005960464,
+      "ratio": 1.8703208553218793
+    },
+    {
+      "s": "transcode/mp3_to_opus_webm",
+      "fam": "transcode",
+      "our": 242.24500000011176,
+      "comp": "mediabunny",
+      "cw": 131.48999997973442,
+      "ratio": 1.8423074000870574
+    },
+    {
+      "s": "audio-dsp/pcm_f32_to_s16",
+      "fam": "audio-dsp",
+      "our": 28.824999999720603,
+      "comp": "ffmpeg.wasm",
+      "cw": 16.12999999523163,
+      "ratio": 1.7870427779443203
+    },
+    {
+      "s": "probe/vp8_720p_10s",
+      "fam": "probe",
+      "our": 9.145000000018626,
+      "comp": "ffmpeg.wasm",
+      "cw": 5.2049999833106995,
+      "ratio": 1.7569644628897472
+    },
+    {
+      "s": "audio-dsp/throughput_encode_s24",
+      "fam": "audio-dsp",
+      "our": 36,
+      "comp": "ffmpeg.wasm",
+      "cw": 20.569999992847443,
+      "ratio": 1.7501215368263414
+    },
+    {
+      "s": "audio-dsp/upmix_stereo_to_5_1",
+      "fam": "audio-dsp",
+      "our": 60.614999999757856,
+      "comp": "ffmpeg.wasm",
+      "cw": 34.729999989271164,
+      "ratio": 1.7453210486174235
+    },
+    {
+      "s": "probe/pcm_s16be",
+      "fam": "probe",
+      "our": 10.800000000279397,
+      "comp": "ffmpeg.wasm",
+      "cw": 6.189999997615814,
+      "ratio": 1.744749596839936
+    },
+    {
+      "s": "streaming-output/mp4_faststart_none_control",
+      "fam": "streaming-output",
+      "our": 266.66500000003725,
+      "comp": "ffmpeg.wasm",
+      "cw": 154.9699999988079,
+      "ratio": 1.720752403704514
+    },
+    {
+      "s": "probe/h264_in_mkv",
+      "fam": "probe",
+      "our": 17.295000000391155,
+      "comp": "mediabunny",
+      "cw": 10.060000002384186,
+      "ratio": 1.7191848902875049
+    },
+    {
+      "s": "mux/prop_h264_mux_duration_mp4_to_ts",
+      "fam": "mux",
+      "our": 319.1349999997765,
+      "comp": "mediabunny",
+      "cw": 186.03499999642372,
+      "ratio": 1.715456768919351
+    },
+    {
+      "s": "demux/hls_vod",
+      "fam": "demux",
+      "our": 110.37000000011176,
+      "comp": "ffmpeg.wasm",
+      "cw": 64.86499997973442,
+      "ratio": 1.7015339556709217
+    },
+    {
+      "s": "remux/aac_adts_adts_to_mp4",
+      "fam": "remux",
+      "our": 13.209999999962747,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.769999980926514,
+      "ratio": 1.7001287042973139
+    },
+    {
+      "s": "transcode/selfcheck_h264_resize_720p_tie",
+      "fam": "transcode",
+      "our": 3297.3899999996647,
+      "comp": "mediabunny",
+      "cw": 1953.905000001192,
+      "ratio": 1.6875897241665552
+    },
+    {
+      "s": "trim/audio_mp3_copy",
+      "fam": "trim",
+      "our": 10.125,
+      "comp": "mediabunny",
+      "cw": 6.125,
+      "ratio": 1.653061224489796
+    },
+    {
+      "s": "mux/pcm_f32_to_wav",
+      "fam": "mux",
+      "our": 30.15500000026077,
+      "comp": "mediabunny",
+      "cw": 18.294999986886978,
+      "ratio": 1.6482645543522547
+    },
+    {
+      "s": "transcode/wav_to_aac_mp4",
+      "fam": "transcode",
+      "our": 65.46999999973923,
+      "comp": "mediabunny",
+      "cw": 39.86499997973442,
+      "ratio": 1.6422927388190454
+    },
+    {
+      "s": "decode-seek/seek_hevc_keyframe",
+      "fam": "decode-seek",
+      "our": 62.580000000074506,
+      "comp": "mediabunny",
+      "cw": 38.15999999642372,
+      "ratio": 1.639937107073883
+    },
+    {
+      "s": "decode-seek/meta_seek_vs_linear_decode",
+      "fam": "decode-seek",
+      "our": 70.13499999977648,
+      "comp": "mediabunny",
+      "cw": 42.84499999880791,
+      "ratio": 1.636947135061918
+    },
+    {
+      "s": "audio-dsp/pcm_s16_to_f32",
+      "fam": "audio-dsp",
+      "our": 50.135000000242144,
+      "comp": "ffmpeg.wasm",
+      "cw": 30.75,
+      "ratio": 1.6304065040729152
+    },
+    {
+      "s": "audio-dsp/pcm_s16le_to_s16be",
+      "fam": "audio-dsp",
+      "our": 48.05500000016764,
+      "comp": "ffmpeg.wasm",
+      "cw": 29.640000015497208,
+      "ratio": 1.6212887980783464
+    },
+    {
+      "s": "transcode/wav_to_opus_ogg",
+      "fam": "transcode",
+      "our": 75.3300000000745,
+      "comp": "mediabunny",
+      "cw": 46.53000000119209,
+      "ratio": 1.6189555125326576
+    },
+    {
+      "s": "remux/mp3_xing_mp3_to_mp4",
+      "fam": "remux",
+      "our": 12.600000000093132,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.91499999165535,
+      "ratio": 1.5919140888663421
+    },
+    {
+      "s": "transcode/gapless_pcm_to_aac_priming",
+      "fam": "transcode",
+      "our": 57.609999999869615,
+      "comp": "mediabunny",
+      "cw": 36.264999985694885,
+      "ratio": 1.5885840348157863
+    },
+    {
+      "s": "demux/hevc_1080p_10s",
+      "fam": "demux",
+      "our": 39.55499999970198,
+      "comp": "mediabunny",
+      "cw": 24.979999989271164,
+      "ratio": 1.5834667740868988
+    },
+    {
+      "s": "transcode/vp8_to_vp9_webm",
+      "fam": "transcode",
+      "our": 136.83499999996275,
+      "comp": "remotion-webcodecs",
+      "cw": 86.98999997973442,
+      "ratio": 1.572996896560989
+    },
+    {
+      "s": "transcode/h264_rotate_90_dimswap",
+      "fam": "transcode",
+      "our": 3995.0149999996647,
+      "comp": "mediabunny",
+      "cw": 2558.609999984503,
+      "ratio": 1.561400526076214
+    },
+    {
+      "s": "metadata/write_ogg_vorbiscomment",
+      "fam": "metadata",
+      "our": 13.020000000018626,
+      "comp": "ffmpeg.wasm",
+      "cw": 8.474999994039536,
+      "ratio": 1.5362831869233733
+    },
+    {
+      "s": "transcode/vp9_alpha_to_vp9_keepalpha",
+      "fam": "transcode",
+      "our": 1627.3050000001676,
+      "comp": "mediabunny",
+      "cw": 1068.425000011921,
+      "ratio": 1.5230877225654689
+    },
+    {
+      "s": "trim/h264_single_gop_frame_accurate",
+      "fam": "trim",
+      "our": 244.27499999990687,
+      "comp": "mediabunny",
+      "cw": 162.25,
+      "ratio": 1.5055469953769298
+    },
+    {
+      "s": "transcode/h264_fps_15_to_30",
+      "fam": "transcode",
+      "our": 1077.5099999997765,
+      "comp": "mediabunny",
+      "cw": 717.2049999833107,
+      "ratio": 1.502373798321052
+    },
+    {
+      "s": "performance/op-sweep-transcode-webm",
+      "fam": "performance",
+      "our": 2615.524999999907,
+      "comp": "mediabunny",
+      "cw": 1757.7300000190735,
+      "ratio": 1.4880129485026286
+    },
+    {
+      "s": "transcode/ladder_tiny_vp9_360p_to_h264_180p",
+      "fam": "transcode",
+      "our": 225.89000000013039,
+      "comp": "mediabunny",
+      "cw": 152.1400000154972,
+      "ratio": 1.4847508871902253
+    },
+    {
+      "s": "mux/video_plus_audio_to_mp4",
+      "fam": "mux",
+      "our": 219.52999999932945,
+      "comp": "mediabunny",
+      "cw": 148.04499998688698,
+      "ratio": 1.4828599413608985
+    },
+    {
+      "s": "streaming-output/mp4_faststart_reserve",
+      "fam": "streaming-output",
+      "our": 136.1699999999255,
+      "comp": "mediabunny",
+      "cw": 92.12999999523163,
+      "ratio": 1.4780201889392515
+    },
+    {
+      "s": "audio-dsp/upmix_mono_to_stereo",
+      "fam": "audio-dsp",
+      "our": 40.25,
+      "comp": "ffmpeg.wasm",
+      "cw": 27.25499999523163,
+      "ratio": 1.4767932492035185
+    },
+    {
+      "s": "remux/vp8_720p_10s_webm_to_mkv",
+      "fam": "remux",
+      "our": 19.179999999701977,
+      "comp": "ffmpeg.wasm",
+      "cw": 13.11999997496605,
+      "ratio": 1.4618902466691208
+    },
+    {
+      "s": "audio-dsp/downmix_stereo_to_mono",
+      "fam": "audio-dsp",
+      "our": 32.6750000002794,
+      "comp": "ffmpeg.wasm",
+      "cw": 22.540000021457672,
+      "ratio": 1.4496450740538327
+    },
+    {
+      "s": "remux/prop_adts_to_mp4_duration_invariant",
+      "fam": "remux",
+      "our": 9.579999999143183,
+      "comp": "mediabunny",
+      "cw": 6.655000001192093,
+      "ratio": 1.4395191581408178
+    },
+    {
+      "s": "remux/h264_1080p_30s_mp4_to_ts",
+      "fam": "remux",
+      "our": 210.14000000013039,
+      "comp": "ffmpeg.wasm",
+      "cw": 145.9849999845028,
+      "ratio": 1.439462958676837
+    },
+    {
+      "s": "performance/size-ladder-iterate-packets-large4k",
+      "fam": "performance",
+      "our": 48.19500000029802,
+      "comp": "mediabunny",
+      "cw": 34.07499998807907,
+      "ratio": 1.4143800445241013
+    },
+    {
+      "s": "transcode/multitrack_select_default_audio",
+      "fam": "transcode",
+      "our": 702.2900000000373,
+      "comp": "remotion-webcodecs",
+      "cw": 497.6650000214577,
+      "ratio": 1.4111701646082342
+    },
+    {
+      "s": "audio-dsp/gain_minus6db_s16",
+      "fam": "audio-dsp",
+      "our": 36.03000000026077,
+      "comp": "ffmpeg.wasm",
+      "cw": 25.53499999642372,
+      "ratio": 1.411004503830308
+    },
+    {
+      "s": "transcode/h264_rotate_270_dimswap",
+      "fam": "transcode",
+      "our": 957.910000000149,
+      "comp": "mediabunny",
+      "cw": 682.7999999821186,
+      "ratio": 1.4029144698670695
+    },
+    {
+      "s": "audio-dsp/throughput_decode_s24",
+      "fam": "audio-dsp",
+      "our": 41.67999999993481,
+      "comp": "mediabunny",
+      "cw": 29.759999990463257,
+      "ratio": 1.400537634855221
+    },
+    {
+      "s": "encryption/cenc_ctr_decrypt",
+      "fam": "encryption",
+      "our": 42.37999999988824,
+      "comp": "ffmpeg.wasm",
+      "cw": 30.344999998807907,
+      "ratio": 1.3966057011551531
+    },
+    {
+      "s": "trim/fmp4_fragment_boundary_copy",
+      "fam": "trim",
+      "our": 145.9550000000745,
+      "comp": "ffmpeg.wasm",
+      "cw": 105.01499998569489,
+      "ratio": 1.3898490693706276
+    },
+    {
+      "s": "probe/vp9_1080p_10s",
+      "fam": "probe",
+      "our": 22.924999999813735,
+      "comp": "remotion-webcodecs",
+      "cw": 16.50499999523163,
+      "ratio": 1.3889730388631853
+    },
+    {
+      "s": "remux/av1_720p_5s_webm_to_mkv",
+      "fam": "remux",
+      "our": 14.915000000037253,
+      "comp": "mediabunny",
+      "cw": 10.76000002026558,
+      "ratio": 1.3861524137496348
+    },
+    {
+      "s": "demux/h264_multitrack",
+      "fam": "demux",
+      "our": 31.805000000167638,
+      "comp": "mp4box",
+      "cw": 23.134999990463257,
+      "ratio": 1.374756862471508
+    },
+    {
+      "s": "transcode/h264_resize_720p",
+      "fam": "transcode",
+      "our": 2464.149999999907,
+      "comp": "mediabunny",
+      "cw": 1794.125,
+      "ratio": 1.3734550268236088
+    },
+    {
+      "s": "mux/prop_vp9_mux_duration_webm_to_webm",
+      "fam": "mux",
+      "our": 61.58499999996275,
+      "comp": "mediabunny",
+      "cw": 45.16499999165535,
+      "ratio": 1.3635558510205057
+    },
+    {
+      "s": "demux/h264_ts",
+      "fam": "demux",
+      "our": 76.87999999988824,
+      "comp": "ffmpeg.wasm",
+      "cw": 56.82499998807907,
+      "ratio": 1.3529256492039836
+    },
+    {
+      "s": "remux/h264_1080p_5s_mov_to_mp4",
+      "fam": "remux",
+      "our": 48.66499999957159,
+      "comp": "mp4box",
+      "cw": 36.019999980926514,
+      "ratio": 1.351054970164934
+    },
+    {
+      "s": "transcode/ladder_tiny_h264_360p_resize_180p",
+      "fam": "transcode",
+      "our": 255.90999999968335,
+      "comp": "mediabunny",
+      "cw": 190.41999998688698,
+      "ratio": 1.343923957658367
+    },
+    {
+      "s": "streaming-output/prop_faststart_reserve_duration_invariant",
+      "fam": "streaming-output",
+      "our": 104.04999999981374,
+      "comp": "mediabunny",
+      "cw": 77.73499998450279,
+      "ratio": 1.3385219015958973
+    },
+    {
+      "s": "decode-seek/seek_h264_nonkeyframe",
+      "fam": "decode-seek",
+      "our": 93.43999999994412,
+      "comp": "mediabunny",
+      "cw": 70.43500000238419,
+      "ratio": 1.3266131894197661
+    },
+    {
+      "s": "decode-seek/seek_av1_keyframe",
+      "fam": "decode-seek",
+      "our": 30.805000000167638,
+      "comp": "mediabunny",
+      "cw": 23.24500000476837,
+      "ratio": 1.3252312322584832
+    },
+    {
+      "s": "trim/ts_keyframe_aligned",
+      "fam": "trim",
+      "our": 109.40999999968335,
+      "comp": "ffmpeg.wasm",
+      "cw": 83.68500000238419,
+      "ratio": 1.3074027603102858
+    },
+    {
+      "s": "decode-seek/decode_extreme_fps_1",
+      "fam": "decode-seek",
+      "our": 63.70999999996275,
+      "comp": "web-demuxer",
+      "cw": 48.875,
+      "ratio": 1.3035294117639438
+    },
+    {
+      "s": "probe/h264_ts",
+      "fam": "probe",
+      "our": 40.3699999996461,
+      "comp": "mediabunny",
+      "cw": 31.030000001192093,
+      "ratio": 1.3009990331322974
+    },
+    {
+      "s": "probe/h264_multitrack",
+      "fam": "probe",
+      "our": 17.069999999832362,
+      "comp": "remotion-webcodecs",
+      "cw": 13.125,
+      "ratio": 1.300571428558656
+    },
+    {
+      "s": "decode-seek/decode_mov_h264",
+      "fam": "decode-seek",
+      "our": 1318.5150000001304,
+      "comp": "remotion-webcodecs",
+      "cw": 1020.6950000226498,
+      "ratio": 1.291781580169269
+    },
+    {
+      "s": "transcode/av_downmix_stereo_to_mono",
+      "fam": "transcode",
+      "our": 3354.5,
+      "comp": "mediabunny",
+      "cw": 2598.0750000178814,
+      "ratio": 1.2911482539868604
+    },
+    {
+      "s": "transcode/h264_pad_letterbox_4x3_to_16x9",
+      "fam": "transcode",
+      "our": 4071.100000000559,
+      "comp": "mediabunny",
+      "cw": 3179.6349999904633,
+      "ratio": 1.2803670861632763
+    },
+    {
+      "s": "transcode/h264_to_ts",
+      "fam": "transcode",
+      "our": 3435.0400000000373,
+      "comp": "mediabunny",
+      "cw": 2684.014999985695,
+      "ratio": 1.2798140099881503
+    },
+    {
+      "s": "transcode/extreme_fps_240",
+      "fam": "transcode",
+      "our": 21105.095000000205,
+      "comp": "mediabunny",
+      "cw": 16589.960000008345,
+      "ratio": 1.2721606923699387
+    },
+    {
+      "s": "audio-dsp/edge_variable_channel_count_downmix",
+      "fam": "audio-dsp",
+      "our": 79.28499999968335,
+      "comp": "ffmpeg.wasm",
+      "cw": 62.53499999642372,
+      "ratio": 1.267850004065204
+    },
+    {
+      "s": "remux/mp3_xing_mp3_to_mkv",
+      "fam": "remux",
+      "our": 9.910000000149012,
+      "comp": "mediabunny",
+      "cw": 7.819999992847443,
+      "ratio": 1.2672634282881312
+    },
+    {
+      "s": "performance/seek-ms",
+      "fam": "performance",
+      "our": 72.38499999977648,
+      "comp": "mediabunny",
+      "cw": 57.439999997615814,
+      "ratio": 1.2601845404383878
+    },
+    {
+      "s": "decode-seek/seek_negative",
+      "fam": "decode-seek",
+      "our": 56.890000000130385,
+      "comp": "mediabunny",
+      "cw": 45.144999980926514,
+      "ratio": 1.260161701720369
+    },
+    {
+      "s": "transcode/h264_bitrate_2mbps",
+      "fam": "transcode",
+      "our": 2625.1749999998137,
+      "comp": "remotion-webcodecs",
+      "cw": 2092.719999998808,
+      "ratio": 1.2544320310415675
+    },
+    {
+      "s": "transcode/metamorphic_resize_same_1080p_idempotent",
+      "fam": "transcode",
+      "our": 3790.0849999999627,
+      "comp": "mediabunny",
+      "cw": 3055.8499999940395,
+      "ratio": 1.2402719374338909
+    },
+    {
+      "s": "performance/convert-longtasks",
+      "fam": "performance",
+      "our": 2187.5449999999255,
+      "comp": "mediabunny",
+      "cw": 1764.530000001192,
+      "ratio": 1.2397323933276554
+    },
+    {
+      "s": "decode-seek/decode_h264_10bit",
+      "fam": "decode-seek",
+      "our": 627.6650000000373,
+      "comp": "mediabunny",
+      "cw": 509.3149999976158,
+      "ratio": 1.2323709295877314
+    },
+    {
+      "s": "probe/metamorphic-duration-across-containers",
+      "fam": "probe",
+      "our": 30.889999999664724,
+      "comp": "remotion-media-parser",
+      "cw": 25.42500001192093,
+      "ratio": 1.214945918787864
+    },
+    {
+      "s": "remux/prop_recorder_headerless_duration_materialized",
+      "fam": "remux",
+      "our": 9.664999999571592,
+      "comp": "ffmpeg.wasm",
+      "cw": 7.965000003576279,
+      "ratio": 1.2134337721571895
+    },
+    {
+      "s": "streaming-output/prop_faststart_in_memory_duration_invariant",
+      "fam": "streaming-output",
+      "our": 182.7050000000745,
+      "comp": "ffmpeg.wasm",
+      "cw": 150.86499997973442,
+      "ratio": 1.2110496140563891
+    },
+    {
+      "s": "streaming-output/prop_probe_dur_fragmented_shape",
+      "fam": "streaming-output",
+      "our": 166.97500000009313,
+      "comp": "mp4box",
+      "cw": 138.20999997854233,
+      "ratio": 1.2081253167355235
+    },
+    {
+      "s": "transcode/h264_to_vp9_webm",
+      "fam": "transcode",
+      "our": 5507.350000000093,
+      "comp": "mediabunny",
+      "cw": 4571.600000023842,
+      "ratio": 1.204687636707361
+    },
+    {
+      "s": "mux/size_longform_audio_to_mp4",
+      "fam": "mux",
+      "our": 741.6200000001118,
+      "comp": "ffmpeg.wasm",
+      "cw": 617.3050000071526,
+      "ratio": 1.2013834328112016
+    },
+    {
+      "s": "decode-seek/decode_bframes_reorder",
+      "fam": "decode-seek",
+      "our": 1357.0200000000186,
+      "comp": "platform",
+      "cw": 1145.0850000083447,
+      "ratio": 1.1850823301240778
+    },
+    {
+      "s": "trim/h264_keyframe_aligned",
+      "fam": "trim",
+      "our": 161.99000000022352,
+      "comp": "ffmpeg.wasm",
+      "cw": 136.71500000357628,
+      "ratio": 1.1848736422191133
+    },
+    {
+      "s": "decode-seek/decode_multitrack_select_video",
+      "fam": "decode-seek",
+      "our": 363.09999999962747,
+      "comp": "mediabunny",
+      "cw": 307.09999999403954,
+      "ratio": 1.1823510257462548
+    },
+    {
+      "s": "trim/h264_to_eof_copy",
+      "fam": "trim",
+      "our": 145.3050000006333,
+      "comp": "ffmpeg.wasm",
+      "cw": 123.68000000715256,
+      "ratio": 1.1748463776862075
+    },
+    {
+      "s": "transcode/ladder_large_h264_1080p_120s_resize_720p",
+      "fam": "transcode",
+      "our": 8920.689999999944,
+      "comp": "mediabunny",
+      "cw": 7618.8499999940395,
+      "ratio": 1.1708709319657065
+    },
+    {
+      "s": "decode-seek/meta_vfr_seek_lands_on_true_pts",
+      "fam": "decode-seek",
+      "our": 54.71999999973923,
+      "comp": "mediabunny",
+      "cw": 46.90500000119209,
+      "ratio": 1.1666133674096262
+    },
+    {
+      "s": "decode-seek/decode_size_tiny_vp9_360p",
+      "fam": "decode-seek",
+      "our": 137.410000000149,
+      "comp": "remotion-webcodecs",
+      "cw": 117.8449999988079,
+      "ratio": 1.1660231660362257
+    },
+    {
+      "s": "remux/h264_multitrack_mp4_to_mkv",
+      "fam": "remux",
+      "our": 45.644999999552965,
+      "comp": "ffmpeg.wasm",
+      "cw": 39.389999985694885,
+      "ratio": 1.1587966493051456
+    },
+    {
+      "s": "decode-seek/decode_extreme_fps_240",
+      "fam": "decode-seek",
+      "our": 237.12000000011176,
+      "comp": "web-demuxer",
+      "cw": 205.71000000834465,
+      "ratio": 1.1526906810096396
+    },
+    {
+      "s": "transcode/fanout_h264_abr_ladder",
+      "fam": "transcode",
+      "our": 9444.084999999963,
+      "comp": "mediabunny",
+      "cw": 8194.355000019073,
+      "ratio": 1.1525110884234306
+    },
+    {
+      "s": "decode-seek/decode_size_huge_h264_600s",
+      "fam": "decode-seek",
+      "our": 1628.75,
+      "comp": "web-demuxer",
+      "cw": 1421.544999986887,
+      "ratio": 1.1457604226493177
+    },
+    {
+      "s": "audio-dsp/throughput_decode_s16be",
+      "fam": "audio-dsp",
+      "our": 41.06000000005588,
+      "comp": "ffmpeg.wasm",
+      "cw": 35.88499999046326,
+      "ratio": 1.1442106732887816
+    },
+    {
+      "s": "transcode/h264_crop_center",
+      "fam": "transcode",
+      "our": 2266.5699999998324,
+      "comp": "mediabunny",
+      "cw": 1986.625,
+      "ratio": 1.1409148681808758
+    },
+    {
+      "s": "demux/h264_4k_10s",
+      "fam": "demux",
+      "our": 31.625,
+      "comp": "mediabunny",
+      "cw": 27.769999980926514,
+      "ratio": 1.1388188700655832
+    },
+    {
+      "s": "transcode/ladder_large_vp9_1080p_120s_to_h264_720p",
+      "fam": "transcode",
+      "our": 10836.149999999441,
+      "comp": "mediabunny",
+      "cw": 9530.120000004768,
+      "ratio": 1.137042345741084
+    },
+    {
+      "s": "transcode/h264_rotate_180",
+      "fam": "transcode",
+      "our": 3048.5800000000745,
+      "comp": "mediabunny",
+      "cw": 2684.530000001192,
+      "ratio": 1.135610330299427
+    },
+    {
+      "s": "streaming-output/mp4_fragmented_cmaf",
+      "fam": "streaming-output",
+      "our": 174.839999999851,
+      "comp": "mp4box",
+      "cw": 155.22999998927116,
+      "ratio": 1.1263286736580247
+    },
+    {
+      "s": "performance/convert-webm-resize-320x180",
+      "fam": "performance",
+      "our": 1937.5749999997206,
+      "comp": "mediabunny",
+      "cw": 1734.9950000047684,
+      "ratio": 1.1167611434006413
+    },
+    {
+      "s": "decode-seek/decode_size_large_vp9_120s",
+      "fam": "decode-seek",
+      "our": 1510.0849999999627,
+      "comp": "mediabunny",
+      "cw": 1359.6399999856949,
+      "ratio": 1.1106506134093221
+    },
+    {
+      "s": "transcode/h264_to_fragmented_mp4",
+      "fam": "transcode",
+      "our": 4720.095000000671,
+      "comp": "mediabunny",
+      "cw": 4274.199999988079,
+      "ratio": 1.1043224463089782
+    },
+    {
+      "s": "mux/h264_aac_to_mp4",
+      "fam": "mux",
+      "our": 190.79999999981374,
+      "comp": "mediabunny",
+      "cw": 172.81999999284744,
+      "ratio": 1.1040388844329965
+    },
+    {
+      "s": "metadata/read_pcm_s16be",
+      "fam": "metadata",
+      "our": 12.075000000186265,
+      "comp": "ffmpeg.wasm",
+      "cw": 10.939999997615814,
+      "ratio": 1.1037477150656128
+    },
+    {
+      "s": "decode-seek/decode_vp8",
+      "fam": "decode-seek",
+      "our": 291.7399999999907,
+      "comp": "mediabunny",
+      "cw": 264.33500000834465,
+      "ratio": 1.1036752605246407
+    },
+    {
+      "s": "transcode/hevc_to_vp9_webm",
+      "fam": "transcode",
+      "our": 1718.7099999999627,
+      "comp": "mediabunny",
+      "cw": 1559.7400000095367,
+      "ratio": 1.101920832952578
+    },
+    {
+      "s": "metadata/tracks_packet_attribution_multitrack",
+      "fam": "metadata",
+      "our": 26.200000000186265,
+      "comp": "mediabunny",
+      "cw": 23.78499999642372,
+      "ratio": 1.101534580791493
+    },
+    {
+      "s": "trim/vp8_keyframe_aligned",
+      "fam": "trim",
+      "our": 16.59499999973923,
+      "comp": "ffmpeg.wasm",
+      "cw": 15.090000003576279,
+      "ratio": 1.0997349235126754
+    },
+    {
+      "s": "transcode/roundtrip_leg1_h264_to_vp9",
+      "fam": "transcode",
+      "our": 4742.39000000013,
+      "comp": "mediabunny",
+      "cw": 4323.180000007153,
+      "ratio": 1.0969679726479777
+    },
+    {
+      "s": "decode-seek/seek_vfr_arbitrary",
+      "fam": "decode-seek",
+      "our": 58.64999999990687,
+      "comp": "platform",
+      "cw": 53.53499999642372,
+      "ratio": 1.09554497065144
+    },
+    {
+      "s": "audio-dsp/fade_in_out_f32",
+      "fam": "audio-dsp",
+      "our": 34.37999999988824,
+      "comp": "ffmpeg.wasm",
+      "cw": 31.53999999165535,
+      "ratio": 1.0900443883634838
+    },
+    {
+      "s": "decode-seek/decode_vfr_timing",
+      "fam": "decode-seek",
+      "our": 619.5600000000559,
+      "comp": "mediabunny",
+      "cw": 569.1700000166893,
+      "ratio": 1.0885324243756507
+    },
+    {
+      "s": "encryption/perf_cenc_ctr_decrypt_throughput",
+      "fam": "encryption",
+      "our": 42.239999999757856,
+      "comp": "ffmpeg.wasm",
+      "cw": 39.03499999642372,
+      "ratio": 1.0821058025778858
+    },
+    {
+      "s": "mux/prop_vp9_decode_mux_webm_to_webm",
+      "fam": "mux",
+      "our": 60.96499999985099,
+      "comp": "mediabunny",
+      "cw": 56.42499998211861,
+      "ratio": 1.080460788997273
+    },
+    {
+      "s": "metadata/rotation_decode_read_h264_rotated90",
+      "fam": "metadata",
+      "our": 132.3800000003539,
+      "comp": "platform",
+      "cw": 122.53999999165535,
+      "ratio": 1.0803003101792772
+    },
+    {
+      "s": "decode-seek/decode_rotated_display_matrix",
+      "fam": "decode-seek",
+      "our": 368.52499999990687,
+      "comp": "mediabunny",
+      "cw": 341.31999999284744,
+      "ratio": 1.079705261946647
+    },
+    {
+      "s": "decode-seek/decode_hevc",
+      "fam": "decode-seek",
+      "our": 673.089999999851,
+      "comp": "platform",
+      "cw": 625.2350000143051,
+      "ratio": 1.0765392212279399
+    },
+    {
+      "s": "decode-seek/decode_open_gop_first_frame",
+      "fam": "decode-seek",
+      "our": 391.785000000149,
+      "comp": "remotion-webcodecs",
+      "cw": 364,
+      "ratio": 1.076332417582827
+    },
+    {
+      "s": "streaming-output/prop_decode_equals_buffer_shape",
+      "fam": "streaming-output",
+      "our": 274.17499999981374,
+      "comp": "ffmpeg.wasm",
+      "cw": 255.4200000166893,
+      "ratio": 1.073428079171165
+    },
+    {
+      "s": "decode-seek/seek_bframes_midgop",
+      "fam": "decode-seek",
+      "our": 115.65499999979511,
+      "comp": "platform",
+      "cw": 108.10499998927116,
+      "ratio": 1.0698395079901322
+    },
+    {
+      "s": "transcode/roundtrip_leg2_vp9_to_h264",
+      "fam": "transcode",
+      "our": 1062.1049999999814,
+      "comp": "mediabunny",
+      "cw": 993.1599999964237,
+      "ratio": 1.0694198316523078
+    },
+    {
+      "s": "demux/h264_in_mkv",
+      "fam": "demux",
+      "our": 24.399999999906868,
+      "comp": "mediabunny",
+      "cw": 22.83500000834465,
+      "ratio": 1.0685351430256325
+    },
+    {
+      "s": "decode-seek/decode_size_large_h264_120s",
+      "fam": "decode-seek",
+      "our": 1245.1499999999069,
+      "comp": "mediabunny",
+      "cw": 1170.3100000023842,
+      "ratio": 1.0639488682463367
+    },
+    {
+      "s": "mux/vp9_video_plus_opus_audio_to_webm",
+      "fam": "mux",
+      "our": 100.88000000012107,
+      "comp": "mediabunny",
+      "cw": 94.93500000238419,
+      "ratio": 1.062621793833545
+    },
+    {
+      "s": "decode-seek/decode_h264_first_frames",
+      "fam": "decode-seek",
+      "our": 1398.279999999795,
+      "comp": "platform",
+      "cw": 1316.594999998808,
+      "ratio": 1.0620426175103665
+    },
+    {
+      "s": "decode-seek/seek_backward_then_forward",
+      "fam": "decode-seek",
+      "our": 62.39999999990687,
+      "comp": "mediabunny",
+      "cw": 59.12000000476837,
+      "ratio": 1.0554803788036864
+    },
+    {
+      "s": "transcode/extreme_fps_1",
+      "fam": "transcode",
+      "our": 866.25,
+      "comp": "mediabunny",
+      "cw": 821.7100000083447,
+      "ratio": 1.0542040379102153
+    },
+    {
+      "s": "demux/size_large_large_vp9_1080p_120s",
+      "fam": "demux",
+      "our": 282.9550000000745,
+      "comp": "ffmpeg.wasm",
+      "cw": 268.4950000047684,
+      "ratio": 1.0538557514853137
+    },
+    {
+      "s": "trim/hevc_frame_accurate",
+      "fam": "trim",
+      "our": 506.57500000018626,
+      "comp": "mediabunny",
+      "cw": 480.80500000715256,
+      "ratio": 1.053597612322356
+    },
+    {
+      "s": "decode-seek/decode_av1",
+      "fam": "decode-seek",
+      "our": 287.62000000011176,
+      "comp": "mediabunny",
+      "cw": 273.7150000035763,
+      "ratio": 1.0508010156416485
+    },
+    {
+      "s": "decode-seek/decode_vp9",
+      "fam": "decode-seek",
+      "our": 642.679999999702,
+      "comp": "platform",
+      "cw": 613.4600000083447,
+      "ratio": 1.0476314673996021
+    },
+    {
+      "s": "remux/prop_multitrack_survives_mp4_mkv",
+      "fam": "remux",
+      "our": 40.31500000040978,
+      "comp": "ffmpeg.wasm",
+      "cw": 38.54999998211861,
+      "ratio": 1.045784695696754
+    },
+    {
+      "s": "transcode/av1_to_vp9_webm",
+      "fam": "transcode",
+      "our": 517.0500000002794,
+      "comp": "mediabunny",
+      "cw": 495.8100000023842,
+      "ratio": 1.0428389907379703
+    },
+    {
+      "s": "transcode/h264_to_mov",
+      "fam": "transcode",
+      "our": 2705.8050000001676,
+      "comp": "mediabunny",
+      "cw": 2596.2000000178814,
+      "ratio": 1.0422174716822785
+    },
+    {
+      "s": "transcode/vp9_to_av1_webm",
+      "fam": "transcode",
+      "our": 2811.0849999999627,
+      "comp": "mediabunny",
+      "cw": 2733.669999986887,
+      "ratio": 1.028319072899599
+    },
+    {
+      "s": "encryption/cenc_ctr_decrypt_eq_cleartext",
+      "fam": "encryption",
+      "our": 27.375,
+      "comp": "ffmpeg.wasm",
+      "cw": 26.83500000834465,
+      "ratio": 1.020122973411121
+    },
+    {
+      "s": "performance/decode-fps",
+      "fam": "performance",
+      "our": 352.91500000003725,
+      "comp": "web-demuxer",
+      "cw": 346.4099999964237,
+      "ratio": 1.0187783262714145
+    },
+    {
+      "s": "transcode/av1_to_h264_mp4",
+      "fam": "transcode",
+      "our": 312.0649999999441,
+      "comp": "remotion-webcodecs",
+      "cw": 307.8449999988079,
+      "ratio": 1.0137081973108304
+    },
+    {
+      "s": "trim/h264_open_gop_frame_accurate",
+      "fam": "trim",
+      "our": 507.66500000003725,
+      "comp": "mediabunny",
+      "cw": 502.8250000178814,
+      "ratio": 1.0096256152378735
+    },
+    {
+      "s": "trim/hevc_keyframe_aligned",
+      "fam": "trim",
+      "our": 43.44500000029802,
+      "comp": "ffmpeg.wasm",
+      "cw": 43.20000001788139,
+      "ratio": 1.0056712958869263
+    }
+  ],
+  "parityExemptions": []
+}

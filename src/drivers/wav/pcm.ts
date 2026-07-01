@@ -24,10 +24,12 @@ export interface WavPcm extends PcmAudio {
   readonly format: SampleFormat;
 }
 
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
-  return out;
+function tagEquals(bytes: Uint8Array, offset: number, tag: string): boolean {
+  if (offset + tag.length > bytes.byteLength) return false;
+  for (let i = 0; i < tag.length; i++) {
+    if (bytes[offset + i] !== tag.charCodeAt(i)) return false;
+  }
+  return true;
 }
 
 function sampleFormat(formatTag: number, bits: number): SampleFormat {
@@ -53,6 +55,14 @@ interface WavFmt {
   bits: number;
 }
 
+interface WavPcmData {
+  readonly fmt: WavFmt;
+  readonly format: SampleFormat;
+  readonly data: Uint8Array;
+  readonly dataOffset: number;
+  readonly dataSize: number;
+}
+
 function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   let formatTag = dv.getUint16(body, true);
   const bits = dv.getUint16(body + 14, true);
@@ -66,9 +76,8 @@ function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   };
 }
 
-/** Read a RIFF/WAVE file's PCM into canonical planar audio (little-endian wire format). */
-export function readWavPcm(bytes: Uint8Array): WavPcm {
-  if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
+function parseWavPcmData(bytes: Uint8Array): WavPcmData {
+  if (bytes.byteLength < 12 || !tagEquals(bytes, 0, 'RIFF') || !tagEquals(bytes, 8, 'WAVE')) {
     throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -77,15 +86,14 @@ export function readWavPcm(bytes: Uint8Array): WavPcm {
   let dataSize = 0;
   let pos = 12;
   while (pos + 8 <= bytes.byteLength) {
-    const id = ascii(bytes, pos, 4);
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
-    if (id === 'fmt ' && size >= 16) {
+    if (tagEquals(bytes, pos, 'fmt ') && size >= 16) {
       if (body + 16 > bytes.byteLength) {
         throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
       }
       fmt = parseFmt(dv, body, size);
-    } else if (id === 'data') {
+    } else if (tagEquals(bytes, pos, 'data')) {
       dataOffset = body;
       dataSize = Math.min(size, Math.max(0, bytes.byteLength - body));
       break;
@@ -96,12 +104,88 @@ export function readWavPcm(bytes: Uint8Array): WavPcm {
   const format = sampleFormat(fmt.formatTag, fmt.bits);
   const data =
     dataOffset < 0 ? new Uint8Array(0) : bytes.subarray(dataOffset, dataOffset + dataSize);
+  return { fmt, format, data, dataOffset, dataSize };
+}
+
+/** Read a RIFF/WAVE file's PCM into canonical planar audio (little-endian wire format). */
+export function readWavPcm(bytes: Uint8Array): WavPcm {
+  const { fmt, format, data } = parseWavPcmData(bytes);
   const audio = decodePcm(data, format, fmt.channels, fmt.sampleRate);
   return { ...audio, format };
 }
 
 function writeFourCC(view: DataView, offset: number, tag: string): void {
   for (let i = 0; i < 4; i++) view.setUint8(offset + i, tag.charCodeAt(i));
+}
+
+function writeWavHeader(
+  out: Uint8Array,
+  dataBytes: number,
+  channels: number,
+  sampleRate: number,
+  format: SampleFormat,
+): void {
+  const sampleBytes = bytesPerSample(format);
+  const blockAlign = channels * sampleBytes;
+  const byteRate = sampleRate * blockAlign;
+  const formatTag = format === 'f32' || format === 'f64' ? FORMAT_FLOAT : FORMAT_PCM;
+  const dv = new DataView(out.buffer);
+  writeFourCC(dv, 0, 'RIFF');
+  dv.setUint32(4, 36 + dataBytes, true);
+  writeFourCC(dv, 8, 'WAVE');
+  writeFourCC(dv, 12, 'fmt ');
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, formatTag, true);
+  dv.setUint16(22, channels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, sampleBytes * 8, true);
+  writeFourCC(dv, 36, 'data');
+  dv.setUint32(40, dataBytes, true);
+}
+
+function writeWavContainer(
+  data: Uint8Array,
+  channels: number,
+  sampleRate: number,
+  format: SampleFormat,
+): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(44 + data.byteLength);
+  writeWavHeader(out, data.byteLength, channels, sampleRate, format);
+  out.set(data, 44);
+  return out;
+}
+
+function isCanonicalWavPcmEnvelope(bytes: Uint8Array, parsed: WavPcmData): boolean {
+  return (
+    parsed.dataOffset === 44 &&
+    bytes.byteLength === 44 + parsed.dataSize &&
+    tagEquals(bytes, 12, 'fmt ') &&
+    tagEquals(bytes, 36, 'data')
+  );
+}
+
+/**
+ * Re-author a WAV file by copying its raw PCM payload into a fresh canonical RIFF/WAVE envelope. This is
+ * the no-DSP/no-format-change fast path: it still parses the source and writes a new header, but avoids
+ * decoding every PCM sample into the planar DSP representation just to encode it back unchanged.
+ */
+export function rewriteWavPcmCopy(
+  bytes: Uint8Array,
+  requestedFormat?: SampleFormat,
+  endian: Endianness = 'le',
+): Uint8Array<ArrayBuffer> | undefined {
+  if (endian !== 'le') return undefined;
+  const parsed = parseWavPcmData(bytes);
+  const { fmt, format, data } = parsed;
+  if (requestedFormat !== undefined && requestedFormat !== format) return undefined;
+  if (isCanonicalWavPcmEnvelope(bytes, parsed)) {
+    const out = bytes.slice() as Uint8Array<ArrayBuffer>;
+    writeWavHeader(out, data.byteLength, fmt.channels, fmt.sampleRate, format);
+    return out;
+  }
+  return writeWavContainer(data, fmt.channels, fmt.sampleRate, format);
 }
 
 /** Serialize canonical audio to a canonical 44-byte-header RIFF/WAVE file (little-endian). */
@@ -117,24 +201,5 @@ export function writeWav(
     });
   }
   const data = encodePcm(audio, format, endian);
-  const blockAlign = audio.channels * bytesPerSample(format);
-  const byteRate = audio.sampleRate * blockAlign;
-  const formatTag = format === 'f32' || format === 'f64' ? FORMAT_FLOAT : FORMAT_PCM;
-  const out = new Uint8Array(44 + data.byteLength);
-  const dv = new DataView(out.buffer);
-  writeFourCC(dv, 0, 'RIFF');
-  dv.setUint32(4, 36 + data.byteLength, true);
-  writeFourCC(dv, 8, 'WAVE');
-  writeFourCC(dv, 12, 'fmt ');
-  dv.setUint32(16, 16, true);
-  dv.setUint16(20, formatTag, true);
-  dv.setUint16(22, audio.channels, true);
-  dv.setUint32(24, audio.sampleRate, true);
-  dv.setUint32(28, byteRate, true);
-  dv.setUint16(32, blockAlign, true);
-  dv.setUint16(34, bytesPerSample(format) * 8, true);
-  writeFourCC(dv, 36, 'data');
-  dv.setUint32(40, data.byteLength, true);
-  out.set(data, 44);
-  return out;
+  return writeWavContainer(data, audio.channels, audio.sampleRate, format);
 }

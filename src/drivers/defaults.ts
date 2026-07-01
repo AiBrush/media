@@ -15,6 +15,7 @@ import type {
   CodecSupport,
   ContainerDriver,
   ContainerQuery,
+  DecryptParams,
   DecoderConfig,
   Demuxer,
   DriverModule,
@@ -27,6 +28,7 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  StreamCopyOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
@@ -41,7 +43,6 @@ import { CafModule } from './caf/caf-driver.ts';
 import { matchesFlac } from './flac/flac-sniff.ts';
 import { Mp3Module } from './mp3/mp3-driver.ts';
 import { Mp4Module } from './mp4/mp4-driver.ts';
-import { MpegTsModule } from './mpegts/mpegts-driver.ts';
 import { OggModule } from './ogg/ogg-driver.ts';
 import { WavModule } from './wav/wav-driver.ts';
 import { WebmModule } from './webm/webm-driver.ts';
@@ -60,7 +61,6 @@ export function registerDefaultDrivers(reg: Registry): void {
     OggModule,
     WebmModule,
     AdtsModule,
-    MpegTsModule,
     AiffModule,
     CafModule,
     WebcodecsVideoModule,
@@ -74,6 +74,7 @@ export function registerDefaultDrivers(reg: Registry): void {
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
   for (const mod of modules) mod.register(reg);
+  reg.addContainer(lazyMpegTsContainerDriver());
   reg.addContainer(lazyFlacContainerDriver());
   reg.addContainer(lazyAviContainerDriver());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
@@ -102,6 +103,59 @@ function videoDecode(q: CodecQuery): boolean {
 
 type LazyContainerLoader = () => Promise<ContainerDriver>;
 
+const TS_MIMES = new Set([
+  'video/mp2t',
+  'video/MP2T',
+  'video/mpeg',
+  'application/x-mpegts',
+  'audio/mp2t',
+]);
+const TS_EXTENSIONS = new Set(['ts', 'm2ts', 'mts', 'm2t']);
+
+function lazyMpegTsContainerDriver(): ContainerDriver {
+  let driver: ContainerDriver | undefined;
+  let loadPromise: Promise<ContainerDriver> | undefined;
+  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
+    if (driver !== undefined) return driver;
+    loadPromise ??= import('./mpegts/mpegts-driver.ts').then((m) => m.MpegTsDriver);
+    driver = await loadPromise;
+    return driver;
+  };
+  return {
+    id: 'mpegts',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['ts', 'm2ts', 'mts'],
+    supports: matchesMpegTs,
+    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+      return (driver ?? (await load())).demux(src, o);
+    },
+    async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+      const loaded = driver ?? (await load());
+      if (loaded.streamCopy === undefined) throw missingLazyMethod('mpegts', 'streamCopy');
+      return loaded.streamCopy(src, o);
+    },
+    async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
+      const loaded = driver ?? (await load());
+      if (loaded.decrypt === undefined) throw missingLazyMethod('mpegts', 'decrypt');
+      return loaded.decrypt(src, o);
+    },
+    createMuxer(o?: MuxOptions): Muxer {
+      return new LazyContainerMuxer(load, o);
+    },
+  };
+}
+
+function matchesMpegTs(q: ContainerQuery): boolean {
+  if (q.mime !== undefined && TS_MIMES.has(q.mime)) return true;
+  if (q.extension !== undefined && TS_EXTENSIONS.has(q.extension.toLowerCase())) return true;
+  const head = q.head;
+  if (head !== undefined && head.byteLength >= 189) {
+    return head[0] === 0x47 && head[188] === 0x47;
+  }
+  return false;
+}
+
 function lazyFlacContainerDriver(): ContainerDriver {
   let driver: ContainerDriver | undefined;
   let loadPromise: Promise<ContainerDriver> | undefined;
@@ -127,17 +181,17 @@ function lazyFlacContainerDriver(): ContainerDriver {
     },
     async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
       const decodePcm = (await load()).decodePcm;
-      if (decodePcm === undefined) throw missingFlacMethod('decodePcm');
+      if (decodePcm === undefined) throw missingLazyMethod('flac', 'decodePcm');
       return decodePcm(src, o);
     },
     async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
       const decodePcmAudio = (await load()).decodePcmAudio;
-      if (decodePcmAudio === undefined) throw missingFlacMethod('decodePcmAudio');
+      if (decodePcmAudio === undefined) throw missingLazyMethod('flac', 'decodePcmAudio');
       return decodePcmAudio(src, o);
     },
     async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
       const transformPcm = (await load()).transformPcm;
-      if (transformPcm === undefined) throw missingFlacMethod('transformPcm');
+      if (transformPcm === undefined) throw missingLazyMethod('flac', 'transformPcm');
       return transformPcm(src, o);
     },
   };
@@ -187,10 +241,10 @@ function matchesAvi(q: ContainerQuery): boolean {
   );
 }
 
-function missingFlacMethod(method: string): CapabilityError {
-  return new CapabilityError('capability-miss', `lazy FLAC driver did not expose ${method}`, {
-    op: 'flac',
-    tried: ['flac'],
+function missingLazyMethod(id: string, method: string): CapabilityError {
+  return new CapabilityError('capability-miss', `lazy ${id} driver lacks ${method}`, {
+    op: id,
+    tried: [id],
   });
 }
 

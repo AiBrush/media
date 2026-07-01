@@ -24,7 +24,7 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import type { PcmAudio } from '../../dsp/pcm.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
-import { readWavPcm } from './pcm.ts';
+import { readWavPcm, rewriteWavPcmCopy } from './pcm.ts';
 import { WavMuxer } from './wav-mux.ts';
 
 const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
@@ -154,6 +154,20 @@ function matches(q: ContainerQuery): boolean {
   );
 }
 
+function canRewriteWavPcm(o: PcmTransform | undefined, container: string): boolean {
+  return (
+    container === 'wav' &&
+    o?.channels === undefined &&
+    o?.sampleRate === undefined &&
+    o?.gainDb === undefined &&
+    o?.fade === undefined &&
+    o?.dynamics === undefined &&
+    o?.biquad === undefined &&
+    o?.timeBounds === undefined &&
+    (o?.endian === undefined || o.endian === 'le')
+  );
+}
+
 export const WavDriver: ContainerDriver = {
   id: 'wav',
   apiVersion: DRIVER_API_VERSION,
@@ -183,10 +197,23 @@ export const WavDriver: ContainerDriver = {
     };
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-    const wav = readWavPcm(await readAll(src));
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const container = o?.container ?? 'wav';
+    if (canRewriteWavPcm(o, container)) {
+      const copied = rewriteWavPcmCopy(bytes, o?.sampleFormat, o?.endian);
+      if (copied !== undefined) {
+        return new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(copied);
+            c.close();
+          },
+        });
+      }
+    }
+    const wav = readWavPcm(bytes);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const audio = applyPcmTransform(wav, o);
-    const container = o?.container ?? 'wav';
     const out = writePcmContainer(
       audio,
       container,

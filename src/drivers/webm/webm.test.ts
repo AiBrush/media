@@ -123,7 +123,7 @@ describe('probe WebM across the real corpus', () => {
     },
   );
 
-  it('WebmDriver.probe uses range-backed metadata bytes without opening a stream', async () => {
+  it('WebmDriver.probe uses a bounded range prefix without opening a stream', async () => {
     const bytes = await loadFixture('movie_5.webm');
     const calls: Array<readonly [number, number]> = [];
     const src: ByteSource = {
@@ -138,7 +138,7 @@ describe('probe WebM across the real corpus', () => {
     };
 
     const tracks = await probeWithWebmDriver(src);
-    expect(calls).toEqual([[0, bytes.byteLength]]);
+    expect(calls).toEqual([[0, 4096]]);
     expect(tracks.find((track) => track.mediaType === 'video')?.codec).toBe('vp9');
     expect(tracks.find((track) => track.mediaType === 'audio')?.codec).toBe('opus');
   });

@@ -16,6 +16,7 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketInfoTable,
   PacketMetadata,
   Registry,
   StageOptions,
@@ -51,6 +52,7 @@ import {
   applyFragmentTiming,
   parseMovie,
   parseMovieMetadata,
+  parseMoviePacketInfo,
 } from './parse.ts';
 import { Reader } from './reader.ts';
 import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
@@ -194,6 +196,38 @@ export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
   throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
 }
 
+/** Read track metadata plus timeline packet tables; payload byte offsets remain unmaterialized. */
+export async function readMoviePacketInfo(ra: RandomAccess): Promise<Movie> {
+  let offset = 0;
+  let brand = 'mp42';
+  const limit = ra.size ?? Number.MAX_SAFE_INTEGER;
+
+  while (offset + 8 <= limit) {
+    const header = await ra.read(offset, 16);
+    if (header.byteLength < 8) break;
+    const r = new Reader(header);
+    let size = r.u32();
+    const type = r.fourcc();
+    let headerSize = 8;
+    if (size === 1) {
+      size = r.u64();
+      headerSize = 16;
+    } else if (size === 0) {
+      size = limit - offset;
+    }
+    if (size < headerSize || size <= 0) break;
+
+    if (type === 'ftyp' && header.byteLength >= 12) {
+      brand = r.fourcc();
+    }
+    if (type === 'moov') {
+      return parseMoviePacketInfo(brand, (await ra.read(offset, size)).subarray(headerSize));
+    }
+    offset += size;
+  }
+  throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
+}
+
 /** The full source bytes (fragments can follow `moov`); the size is known once we have reached `moov`. */
 async function readWholeFile(ra: RandomAccess, limit: number): Promise<Uint8Array> {
   const size = ra.size ?? limit;
@@ -273,18 +307,22 @@ function validateSampleRanges(
     // A sample whose byte range escapes the source (truncated/corrupt mdat, or a bit-flipped
     // stsz/stco/co64 entry) would otherwise be read as a silently clamped short buffer and copied as
     // garbage. Reject it as corrupt input rather than emit a wrong file (graceful-failure, doc 11 §6.3).
-    if (
-      s.offset < 0 ||
-      s.size < 0 ||
-      (sourceSize !== undefined && s.offset + s.size > sourceSize)
-    ) {
-      const sizeNote = sourceSize !== undefined ? ` size ${sourceSize}` : '';
-      throw new MediaError(
-        'demux-error',
-        `sample ${s.index} byte range [${s.offset}, ${s.offset + s.size}) is outside the source${sizeNote} (truncated or corrupt MP4)`,
-      );
-    }
+    validateSampleRange(s.index, s.offset, s.size, sourceSize);
   }
+}
+
+function validateSampleRange(
+  index: number,
+  offset: number,
+  size: number,
+  sourceSize: number | undefined,
+): void {
+  if (offset >= 0 && size >= 0 && (sourceSize === undefined || offset + size <= sourceSize)) return;
+  const sizeNote = sourceSize !== undefined ? ` size ${sourceSize}` : '';
+  throw new MediaError(
+    'demux-error',
+    `sample ${index} byte range [${offset}, ${offset + size}) is outside the source${sizeNote} (truncated or corrupt MP4)`,
+  );
 }
 
 interface SampleReadItem<T extends SampleRange = SampleData> {
@@ -343,23 +381,293 @@ function hasCompleteSampleTables(movie: Movie): boolean {
   });
 }
 
-export function mp4PacketMetadata(movie: Movie, sourceSize?: number): readonly PacketMetadata[] {
-  const packets: PacketMetadata[] = [];
-  for (const track of movie.tracks) {
-    const samples = buildSamples(track);
-    validateSampleRanges(samples, sourceSize);
-    for (const sample of samples) {
-      packets.push({
+type PacketMetadataRow = PacketMetadata & { trackIndex: number; size: number };
+
+export interface Mp4PacketInfoMetadata {
+  trackIndex: number;
+  size: number;
+  ptsUs: number;
+  dtsUs: number;
+  keyframe: boolean;
+}
+
+interface SampleTableRunCursor {
+  index: number;
+  remaining: number;
+  value: number;
+}
+
+function nextPacketTimeDelta(
+  entries: ParsedTrack['samples']['timeToSample'],
+  cursor: SampleTableRunCursor,
+): number {
+  while (cursor.remaining <= 0) {
+    const entry = entries[cursor.index];
+    if (entry === undefined) return cursor.value;
+    cursor.index++;
+    if (entry.count <= 0) continue;
+    cursor.remaining = entry.count;
+    cursor.value = entry.delta;
+  }
+  cursor.remaining--;
+  return cursor.value;
+}
+
+function nextPacketCompositionOffset(
+  entries: ParsedTrack['samples']['compositionOffsets'],
+  cursor: SampleTableRunCursor,
+): number {
+  while (cursor.remaining <= 0) {
+    const entry = entries[cursor.index];
+    if (entry === undefined) return cursor.value;
+    cursor.index++;
+    if (entry.count <= 0) continue;
+    cursor.remaining = entry.count;
+    cursor.value = entry.offset;
+  }
+  cursor.remaining--;
+  return cursor.value;
+}
+
+function sampleNumbersAreAscending(values: readonly number[]): boolean {
+  let previous = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    if (value < previous) return false;
+    previous = value;
+  }
+  return true;
+}
+
+function appendTrackPacketMetadata(
+  packets: PacketMetadataRow[],
+  packetIndex: number,
+  track: ParsedTrack,
+  trackIndex: number,
+  sourceSize: number | undefined,
+): number {
+  const st = track.samples;
+  const sizes = st.sampleSizes;
+  const timeToSample = st.timeToSample;
+  const compositionOffsets = st.compositionOffsets;
+  const syncSamples = st.syncSamples;
+  const sampleToChunk = st.sampleToChunk;
+  const chunkOffsets = st.chunkOffsets;
+  const count = sizes.length;
+  const timescale = track.timescale;
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  const hasCtts = compositionOffsets.length > 0;
+  const allSync = syncSamples.length === 0;
+  const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
+  const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
+  const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+
+  let stscIndex = 0;
+  let samplesPerChunk = 0;
+  let syncIndex = 0;
+  let sampleIndex = 0;
+  let dtsTicks = 0;
+  for (let c = 0; c < chunkOffsets.length && sampleIndex < count; c++) {
+    const chunkOffset = chunkOffsets[c];
+    if (chunkOffset === undefined) break;
+    const chunkNumber = c + 1;
+    while (true) {
+      const entry = sampleToChunk[stscIndex];
+      if (entry === undefined || entry.firstChunk > chunkNumber) break;
+      samplesPerChunk = entry.samplesPerChunk;
+      stscIndex++;
+    }
+    let offset = chunkOffset;
+    for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
+      const size = sizes[sampleIndex] ?? 0;
+      const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
+      const cttsTicks = hasCtts ? nextPacketCompositionOffset(compositionOffsets, cttsCursor) : 0;
+      validateSampleRange(sampleIndex, offset, size, sourceSize);
+
+      const sampleNumber = sampleIndex + 1;
+      let syncSample = syncSamples[syncIndex];
+      while (syncSample !== undefined && syncSample < sampleNumber) {
+        syncIndex++;
+        syncSample = syncSamples[syncIndex];
+      }
+      const dtsUs = ticksToUs(dtsTicks - editOffsetTicks, timescale);
+      packets[packetIndex] = {
         trackId: track.id,
-        sizeBytes: sample.size,
-        ptsUs: sample.ptsUs,
-        dtsUs: sample.dtsUs,
-        durationUs: sample.durationUs,
-        keyframe: sample.keyframe,
-      });
+        trackIndex,
+        size,
+        sizeBytes: size,
+        ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+        dtsUs,
+        durationUs: ticksToUs(durationTicks, timescale),
+        keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+      };
+
+      packetIndex++;
+      offset += size;
+      dtsTicks += durationTicks;
+      sampleIndex++;
     }
   }
+  return packetIndex;
+}
+
+export function mp4PacketMetadata(movie: Movie, sourceSize?: number): readonly PacketMetadata[] {
+  const packetCount = movie.tracks.reduce(
+    (sum, track) => sum + track.samples.sampleSizes.length,
+    0,
+  );
+  const packets = new Array<PacketMetadataRow>(packetCount);
+  let packetIndex = 0;
+  for (let trackIndex = 0; trackIndex < movie.tracks.length; trackIndex++) {
+    const track = movie.tracks[trackIndex];
+    if (track === undefined) continue;
+    packetIndex = appendTrackPacketMetadata(packets, packetIndex, track, trackIndex, sourceSize);
+  }
+  packets.length = packetIndex;
   return packets;
+}
+
+function appendTrackPacketInfoBySampleOrder(
+  packets: Mp4PacketInfoMetadata[],
+  packetIndex: number,
+  track: ParsedTrack,
+  trackIndex: number,
+): number {
+  const st = track.samples;
+  const sizes = st.sampleSizes;
+  const timeToSample = st.timeToSample;
+  const compositionOffsets = st.compositionOffsets;
+  const syncSamples = st.syncSamples;
+  const timescale = track.timescale;
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  const hasCtts = compositionOffsets.length > 0;
+  const allSync = syncSamples.length === 0;
+  const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
+  const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
+  const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  let syncIndex = 0;
+  let dtsTicks = 0;
+
+  for (let sampleIndex = 0; sampleIndex < sizes.length; sampleIndex++) {
+    const size = sizes[sampleIndex] ?? 0;
+    const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
+    const cttsTicks = hasCtts ? nextPacketCompositionOffset(compositionOffsets, cttsCursor) : 0;
+    if (size < 0) validateSampleRange(sampleIndex, 0, size, undefined);
+
+    const sampleNumber = sampleIndex + 1;
+    let syncSample = syncSamples[syncIndex];
+    while (syncSample !== undefined && syncSample < sampleNumber) {
+      syncIndex++;
+      syncSample = syncSamples[syncIndex];
+    }
+    packets[packetIndex] = {
+      trackIndex,
+      size,
+      ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+      dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+      keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+    };
+
+    packetIndex++;
+    dtsTicks += durationTicks;
+  }
+  return packetIndex;
+}
+
+function appendTrackPacketInfoMetadata(
+  packets: Mp4PacketInfoMetadata[],
+  packetIndex: number,
+  track: ParsedTrack,
+  trackIndex: number,
+  sourceSize: number | undefined,
+): number {
+  const st = track.samples;
+  const sizes = st.sampleSizes;
+  const timeToSample = st.timeToSample;
+  const compositionOffsets = st.compositionOffsets;
+  const syncSamples = st.syncSamples;
+  const sampleToChunk = st.sampleToChunk;
+  const chunkOffsets = st.chunkOffsets;
+  const count = sizes.length;
+  const timescale = track.timescale;
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  const hasCtts = compositionOffsets.length > 0;
+  const allSync = syncSamples.length === 0;
+  const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
+  const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
+  const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+
+  let stscIndex = 0;
+  let samplesPerChunk = 0;
+  let syncIndex = 0;
+  let sampleIndex = 0;
+  let dtsTicks = 0;
+  for (let c = 0; c < chunkOffsets.length && sampleIndex < count; c++) {
+    const chunkOffset = chunkOffsets[c];
+    if (chunkOffset === undefined) break;
+    const chunkNumber = c + 1;
+    while (true) {
+      const entry = sampleToChunk[stscIndex];
+      if (entry === undefined || entry.firstChunk > chunkNumber) break;
+      samplesPerChunk = entry.samplesPerChunk;
+      stscIndex++;
+    }
+    let offset = chunkOffset;
+    for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
+      const size = sizes[sampleIndex] ?? 0;
+      const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
+      const cttsTicks = hasCtts ? nextPacketCompositionOffset(compositionOffsets, cttsCursor) : 0;
+      validateSampleRange(sampleIndex, offset, size, sourceSize);
+
+      const sampleNumber = sampleIndex + 1;
+      let syncSample = syncSamples[syncIndex];
+      while (syncSample !== undefined && syncSample < sampleNumber) {
+        syncIndex++;
+        syncSample = syncSamples[syncIndex];
+      }
+      packets[packetIndex] = {
+        trackIndex,
+        size,
+        ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+        dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+        keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+      };
+
+      packetIndex++;
+      offset += size;
+      dtsTicks += durationTicks;
+      sampleIndex++;
+    }
+  }
+  return packetIndex;
+}
+
+export function mp4PacketInfoMetadata(
+  movie: Movie,
+  sourceSize?: number,
+): readonly Mp4PacketInfoMetadata[] {
+  const packetCount = movie.tracks.reduce(
+    (sum, track) => sum + track.samples.sampleSizes.length,
+    0,
+  );
+  const packets = new Array<Mp4PacketInfoMetadata>(packetCount);
+  let packetIndex = 0;
+  for (let trackIndex = 0; trackIndex < movie.tracks.length; trackIndex++) {
+    const track = movie.tracks[trackIndex];
+    if (track === undefined) continue;
+    packetIndex =
+      track.samples.chunkOffsets.length === 0 && track.samples.sampleToChunk.length === 0
+        ? appendTrackPacketInfoBySampleOrder(packets, packetIndex, track, trackIndex)
+        : appendTrackPacketInfoMetadata(packets, packetIndex, track, trackIndex, sourceSize);
+  }
+  packets.length = packetIndex;
+  return packets;
+}
+
+function ticksToUs(ticks: number, timescale: number): number {
+  return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
 }
 
 /**
@@ -1546,6 +1854,17 @@ export const Mp4Driver: ContainerDriver = {
     throwIfAborted(signal);
     return movie.tracks.map(toTrackInfo);
   },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const signal = o?.signal;
+    const ra = await randomAccess(src);
+    throwIfAborted(signal);
+    const movie = await readMoviePacketInfo(ra);
+    throwIfAborted(signal);
+    return {
+      tracks: movie.tracks.map(toTrackInfo),
+      packets: mp4PacketInfoMetadata(movie),
+    };
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);
     const movie = await readMovie(ra);
@@ -1554,7 +1873,12 @@ export const Mp4Driver: ContainerDriver = {
     const supportsPacketTable = hasCompleteSampleTables(movie);
     return {
       tracks: movie.tracks.map(toTrackInfo),
-      ...(supportsPacketTable ? { packetTable: () => mp4PacketMetadata(movie, ra.size) } : {}),
+      ...(supportsPacketTable
+        ? {
+            packetTable: () => mp4PacketMetadata(movie, ra.size),
+            packetInfoTable: () => mp4PacketInfoMetadata(movie, ra.size),
+          }
+        : {}),
       packets(trackId: number): ReadableStream<Packet> {
         const track = byId.get(trackId);
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);

@@ -15,6 +15,7 @@ import {
   type TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { WebmModule } from '../drivers/webm/webm-driver.ts';
 import { type MediaInput, type Source, fromBytes, fromStream } from '../sources/source.ts';
 import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
@@ -265,7 +266,9 @@ function delayedDecodeFrameModule(
 }
 
 const NOOP_BYTES = fromBytes(new Uint8Array([1, 2, 3, 4]), { mime: 'application/x-noop' });
+const MEDIA = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media');
 const IMG = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media-derived/img');
+const loadMedia = (name: string): Uint8Array => Uint8Array.from(readFileSync(resolve(MEDIA, name)));
 const loadImage = (name: string): Uint8Array => Uint8Array.from(readFileSync(resolve(IMG, name)));
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new ArrayBuffer(bytes.byteLength);
@@ -400,6 +403,93 @@ describe('createMedia', () => {
           channels: 2,
         },
       ],
+    });
+  });
+
+  it('probe shares the seekable prefix across image sniff, container route, and metadata hook', async () => {
+    const bytes = loadMedia('bear-vp9-alpha.webm');
+    const calls: Array<readonly [number, number]> = [];
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/webm',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable metadata probe must not open the full stream');
+      },
+    };
+
+    const info = await createMedia().use(WebmModule).probe(src);
+    expect(calls).toEqual([[0, 4 * 1024]]);
+    expect(info.tracks.find((track) => track.type === 'video')?.codec).toBe('vp9');
+  });
+
+  it('probeContainer routes by known container token without sniffing source bytes', async () => {
+    const calls = { range: 0, stream: 0 };
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'video',
+        codec: 'vp9',
+        durationSec: 12,
+        config: { codec: 'vp09.00.10.08', codedWidth: 640, codedHeight: 360 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'known-mp4',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp4'],
+      supports: (q) => q.extension === 'mp4' && q.head === undefined,
+      probe: () => Promise.resolve(tracks),
+      demux: () => {
+        throw new Error('known-container probe must not demux when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      filename: 'fixture.mp4',
+      size: 123,
+      range: (start, end) => {
+        calls.range++;
+        return Promise.resolve(new Uint8Array(Math.max(0, end - start)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        calls.stream++;
+        return new ReadableStream<Uint8Array>({ start: (controller) => controller.close() });
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    }) as unknown as {
+      probeContainer(
+        input: MediaInput,
+        container: 'mp4',
+      ): Promise<{
+        readonly container: string;
+        readonly durationSec: number;
+        readonly sizeBytes?: number;
+        readonly tracks: readonly { readonly codec: string }[];
+      }>;
+    };
+
+    const info = await media.probeContainer(src, 'mp4');
+    expect(calls).toEqual({ range: 0, stream: 0 });
+    expect(info).toEqual({
+      container: 'mp4',
+      durationSec: 12,
+      sizeBytes: 123,
+      tracks: [{ id: 1, type: 'video', codec: 'vp9', durationSec: 12, width: 640, height: 360 }],
     });
   });
 
