@@ -76,7 +76,10 @@ function withJunkChunk(bytes: Uint8Array): Uint8Array {
   const insertAt = 20 + fmtSize + (fmtSize & 1);
   const junkPayload = new Uint8Array([1, 2, 3, 4]);
   const junk = new Uint8Array(8 + junkPayload.byteLength);
-  junk.set([...'JUNK'].map((c) => c.charCodeAt(0)), 0);
+  junk.set(
+    [...'JUNK'].map((c) => c.charCodeAt(0)),
+    0,
+  );
   new DataView(junk.buffer).setUint32(4, junkPayload.byteLength, true);
   junk.set(junkPayload, 8);
   const out = new Uint8Array(bytes.byteLength + junk.byteLength);
@@ -444,7 +447,12 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
 
   it('re-authors a no-op WAV transform with a fresh canonical header instead of passing input through', async () => {
     const canonical = writeWav(
-      { sampleRate: 48_000, channels: 1, frames: 4, planar: [Float64Array.of(0, 0.25, -0.25, 0.5)] },
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
       's16',
     );
     const withJunk = withJunkChunk(canonical);

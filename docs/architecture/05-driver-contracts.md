@@ -32,11 +32,15 @@ export interface Progress { done: number; total?: number; stage: string }
 export type EncodedChunk = EncodedVideoChunk | EncodedAudioChunk   // sealed coded unit (PTS in .timestamp)
 export type RawFrame     = VideoFrame | AudioData                  // codec <-> filter
 
-// The container <-> codec seam packet: a sealed chunk plus optional side data (ADR-045/055). The sealed
-// Encoded*Chunk exposes only `timestamp` (PTS); reordered streams also need DTS, and some container
-// oracles need the on-disk packet size when the decoder access unit strips container headers.
+// The container <-> codec seam packet: a sealed chunk plus optional side data (ADR-045/055/107/125/126).
+// The sealed Encoded*Chunk exposes only `timestamp` (PTS); reordered streams also need DTS, muxers may
+// reuse already-owned payload bytes instead of copying from the host chunk again, VPx alpha may travel as
+// a paired encoded chunk, and some container oracles need the on-disk packet size when the decoder access
+// unit strips container headers.
 export interface Packet {
   readonly chunk: EncodedChunk
+  readonly data?: Uint8Array    // owned payload bytes equal to chunk.copyTo(); optional mux copy-elision hint
+  readonly alpha?: EncodedVideoChunk // WebM/Matroska VPx BlockAdditions alpha side data, when present
   readonly dtsUs?: number        // undefined ⇒ DTS == PTS (no reordering)
   readonly sizeBytes?: number    // undefined ⇒ chunk.byteLength
 }
@@ -47,6 +51,19 @@ export interface PacketMetadata {
   readonly dtsUs: number
   readonly durationUs: number
   readonly keyframe: boolean
+}
+export interface PacketInfoMetadata {
+  readonly trackIndex: number
+  readonly offset?: number       // source byte offset when known without payload materialization
+  readonly size: number
+  readonly ptsUs: number
+  readonly dtsUs: number
+  readonly durationUs?: number   // packet duration when known without payload materialization
+  readonly keyframe: boolean
+}
+export interface PacketInfoTable {
+  readonly tracks: readonly TrackInfo[]
+  readonly packets: readonly PacketInfoMetadata[]
 }
 
 export interface DriverBase {

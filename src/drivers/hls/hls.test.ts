@@ -203,6 +203,74 @@ describe('parseM3u8 — tag semantics + robustness', () => {
     const p = asMedia(parseM3u8(text));
     expect(p.segments).toHaveLength(1);
   });
+
+  it('tolerates malformed optional attributes while preserving valid media state', () => {
+    const master = asMaster(
+      parseM3u8(
+        [
+          '#EXTM3U',
+          '#EXT-X-VERSION:not-a-number',
+          '#EXT-X-STREAM-INF:BANDWIDTH=oops,AVERAGE-BANDWIDTH=nope,RESOLUTION=bad,CODECS="avc1.42e01e,mp4a.40.2",BROKEN',
+          'low/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=42,FRAME-RATE=nope',
+          'hi/index.m3u8',
+        ].join('\n'),
+        'not a valid url',
+      ),
+    );
+    expect(master.version).toBeUndefined();
+    expect(master.variants).toEqual([
+      {
+        uri: 'low/index.m3u8',
+        bandwidth: 0,
+        codecs: 'avc1.42e01e,mp4a.40.2',
+      },
+      {
+        uri: 'hi/index.m3u8',
+        bandwidth: 42,
+      },
+    ]);
+
+    const media = asMedia(
+      parseM3u8(
+        [
+          '#EXTM3U',
+          'orphan.ts',
+          '#EXT-X-TARGETDURATION:not-a-number',
+          '#EXT-X-MEDIA-SEQUENCE:7',
+          '#EXT-X-PLAYLIST-TYPE:EVENT',
+          '#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="key.bin",IV=0xnothex,KEYFORMAT="com.example"',
+          '#EXT-X-MAP:URI="init.mp4",BYTERANGE=bad-range',
+          '#EXT-X-BYTERANGE:bad-range',
+          '#EXTINF:3',
+          'seg0.m4s',
+          '#EXT-X-KEY:METHOD=NONE',
+          '#EXTINF:not-a-number,',
+          'seg1.m4s',
+        ].join('\n'),
+      ),
+    );
+    expect(media.targetDuration).toBeUndefined();
+    expect(media.mediaSequence).toBe(7);
+    expect(media.playlistType).toBe('EVENT');
+    expect(media.segments).toHaveLength(2);
+    expect(media.segments[0]).toMatchObject({
+      uri: 'seg0.m4s',
+      durationSec: 3,
+      sequence: 7,
+      map: { uri: 'init.mp4' },
+    });
+    expect(media.segments[0]?.byteRange).toBeUndefined();
+    expect(media.segments[0]?.key).toMatchObject({
+      method: 'SAMPLE-AES-CTR',
+      uri: 'key.bin',
+      keyFormat: 'com.example',
+    });
+    expect(media.segments[0]?.key?.iv).toBeUndefined();
+    expect(media.segments[1]).toMatchObject({ uri: 'seg1.m4s', durationSec: 0, sequence: 8 });
+    expect(media.segments[1]?.key).toBeUndefined();
+    expect(media.durationSec).toBe(3);
+  });
 });
 
 describe('HlsModule — reuses the MPEG-TS driver to demux HLS segments', () => {

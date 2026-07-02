@@ -72,6 +72,8 @@ export type RawFrame = VideoFrame | AudioData;
  * needs DTS to (a) enumerate packets in decode order and (b) remux losslessly — MP4 stores DTS + a
  * per-sample composition offset, and a Matroska/WebM muxer must lay blocks down in decode order. `dtsUs`
  * carries it alongside the sealed chunk; **`undefined` ⇒ DTS equals the chunk's PTS** (no reordering).
+ * `data`, when present, is an owned immutable byte view of the same payload exposed by `chunk.copyTo()`;
+ * packet-copy muxers may read it directly instead of copying out of the WebCodecs host object again.
  * `sizeBytes`, when present, is the container packet's byte size for oracles/diagnostics whose packet
  * unit is wider than the decoder access unit (e.g. ADTS: header+payload on disk, raw AAC AU in
  * WebCodecs). `alpha`, when present, is the VPx alpha side-data chunk carried by WebM/Matroska
@@ -83,6 +85,8 @@ export type RawFrame = VideoFrame | AudioData;
 export interface Packet {
   /** The sealed WebCodecs encoded unit: the coded bytes, the keyframe flag, and `timestamp` = PTS. */
   readonly chunk: EncodedChunk;
+  /** Optional owned byte payload for packet-copy muxers; equal in content to `chunk.copyTo()`. */
+  readonly data?: Uint8Array;
   /** VPx alpha side-data chunk for WebM/Matroska BlockAdditions (BlockAddID=1), when present. */
   readonly alpha?: EncodedVideoChunk;
   /** Decode timestamp (µs); omitted ⇒ equals the chunk's presentation `timestamp` (no reorder). */
@@ -109,9 +113,13 @@ export interface PacketMetadata {
 /** Lightweight packet table shape for consumers that only need timeline facts, not track ids/durations. */
 export interface PacketInfoMetadata {
   readonly trackIndex: number;
+  /** Source byte offset for this packet when the container can expose it without payload materialization. */
+  readonly offset?: number;
   readonly size: number;
   readonly ptsUs: number;
   readonly dtsUs: number;
+  /** Packet duration in microseconds when known without payload materialization. */
+  readonly durationUs?: number;
   readonly keyframe: boolean;
 }
 

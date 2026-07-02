@@ -199,10 +199,7 @@ export class WavMuxer implements Muxer {
       if (track.audioBytes === 0) {
         throw new MediaError('mux-error', `track ${track.id} received no PCM packets`);
       }
-      if (
-        track.wire.sourceEndian === 'le' &&
-        track.wire.sourceFormat === track.wire.outputFormat
-      ) {
+      if (track.wire.sourceEndian === 'le' && track.wire.sourceFormat === track.wire.outputFormat) {
         controller.enqueue(writeRawPcmWav(track));
         controller.close();
         return;

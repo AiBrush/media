@@ -73,6 +73,7 @@ const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
+const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
 const FASTSTART_METADATA_HEAD_BYTES = 64;
 
@@ -210,7 +211,10 @@ export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
   const faststart = await readFaststartMetadata(ra);
   if (faststart !== undefined) {
     if (faststart.needsFragmentTiming) {
-      return applyFragmentTiming(faststart, await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
+      return applyFragmentTiming(
+        faststart,
+        await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER),
+      );
     }
     return faststart;
   }
@@ -439,9 +443,11 @@ type PacketMetadataRow = PacketMetadata & { trackIndex: number; size: number };
 
 export interface Mp4PacketInfoMetadata {
   trackIndex: number;
+  offset?: number;
   size: number;
   ptsUs: number;
   dtsUs: number;
+  durationUs?: number;
   keyframe: boolean;
 }
 
@@ -516,6 +522,7 @@ function appendTrackPacketMetadata(
   const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
 
+  let writeIndex = packetIndex;
   let stscIndex = 0;
   let samplesPerChunk = 0;
   let syncIndex = 0;
@@ -545,7 +552,7 @@ function appendTrackPacketMetadata(
         syncSample = syncSamples[syncIndex];
       }
       const dtsUs = ticksToUs(dtsTicks - editOffsetTicks, timescale);
-      packets[packetIndex] = {
+      packets[writeIndex] = {
         trackId: track.id,
         trackIndex,
         size,
@@ -556,13 +563,13 @@ function appendTrackPacketMetadata(
         keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
       };
 
-      packetIndex++;
+      writeIndex++;
       offset += size;
       dtsTicks += durationTicks;
       sampleIndex++;
     }
   }
-  return packetIndex;
+  return writeIndex;
 }
 
 export function mp4PacketMetadata(movie: Movie, sourceSize?: number): readonly PacketMetadata[] {
@@ -600,6 +607,7 @@ function appendTrackPacketInfoBySampleOrder(
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
   const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  let writeIndex = packetIndex;
   let syncIndex = 0;
   let dtsTicks = 0;
 
@@ -615,18 +623,19 @@ function appendTrackPacketInfoBySampleOrder(
       syncIndex++;
       syncSample = syncSamples[syncIndex];
     }
-    packets[packetIndex] = {
+    packets[writeIndex] = {
       trackIndex,
       size,
       ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
       dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+      durationUs: ticksToUs(durationTicks, timescale),
       keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
     };
 
-    packetIndex++;
+    writeIndex++;
     dtsTicks += durationTicks;
   }
-  return packetIndex;
+  return writeIndex;
 }
 
 function appendTrackPacketInfoMetadata(
@@ -653,6 +662,7 @@ function appendTrackPacketInfoMetadata(
   const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
 
+  let writeIndex = packetIndex;
   let stscIndex = 0;
   let samplesPerChunk = 0;
   let syncIndex = 0;
@@ -681,21 +691,23 @@ function appendTrackPacketInfoMetadata(
         syncIndex++;
         syncSample = syncSamples[syncIndex];
       }
-      packets[packetIndex] = {
+      packets[writeIndex] = {
         trackIndex,
+        offset,
         size,
         ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
         dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+        durationUs: ticksToUs(durationTicks, timescale),
         keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
       };
 
-      packetIndex++;
+      writeIndex++;
       offset += size;
       dtsTicks += durationTicks;
       sampleIndex++;
     }
   }
-  return packetIndex;
+  return writeIndex;
 }
 
 export function mp4PacketInfoMetadata(
@@ -1814,6 +1826,11 @@ function trimmedProgressiveSourceBufferStream(
   );
 }
 
+function trimCoversMovie(movie: Movie, trim: NonNullable<StreamCopyOptions['trim']>): boolean {
+  const durationSec = movie.tracks.reduce((max, track) => Math.max(max, track.durationSec), 0);
+  return trim.startSec === 0 && durationSec > 0 && trim.endSec >= durationSec;
+}
+
 /**
  * Same-container MP4/MOV streaming copy, lazy on both output and sample payload reads. The init segment is
  * emitted before any mdat bytes are read; each later pull reads only that fragment's source sample windows
@@ -1912,11 +1929,12 @@ export const Mp4Driver: ContainerDriver = {
     const signal = o?.signal;
     const ra = await randomAccess(src);
     throwIfAborted(signal);
-    const movie = await readMoviePacketInfo(ra);
+    const wantsOffsets = ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES;
+    const movie = wantsOffsets ? await readMovie(ra) : await readMoviePacketInfo(ra);
     throwIfAborted(signal);
     return {
       tracks: movie.tracks.map(toTrackInfo),
-      packets: mp4PacketInfoMetadata(movie),
+      packets: mp4PacketInfoMetadata(movie, wantsOffsets ? ra.size : undefined),
     };
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
@@ -1944,7 +1962,11 @@ export const Mp4Driver: ContainerDriver = {
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     const ra = await randomAccess(src);
     const movie = await readMovie(ra);
-    const trim = o?.trim;
+    const requestedTrim = o?.trim;
+    const trim =
+      requestedTrim !== undefined && !trimCoversMovie(movie, requestedTrim)
+        ? requestedTrim
+        : undefined;
     if (o?.fragmented === true && trim === undefined) {
       return fragmentedSourceStream(ra, movie, o?.signal);
     }

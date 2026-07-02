@@ -17,6 +17,7 @@ import {
   type MuxOptions,
   type Muxer,
   type Packet,
+  type PacketInfoTable,
   type Registry,
   type StageOptions,
   type TrackInfo,
@@ -479,6 +480,21 @@ export interface OggInfo {
   durationSec: number;
 }
 
+function trackFromInfo(info: OggInfo, description?: Uint8Array): TrackInfo {
+  return {
+    id: 0,
+    mediaType: info.mediaType,
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: {
+      codec: info.codec,
+      sampleRate: info.sampleRate,
+      numberOfChannels: info.channels,
+      ...(description !== undefined ? { description } : {}),
+    },
+  };
+}
+
 /** Parse Ogg metadata: identify the first stream from `head`, derive duration from `head`+`tail`. */
 export function parseOgg(head: Uint8Array, tail?: Uint8Array): OggInfo {
   const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
@@ -509,17 +525,46 @@ export function parseOgg(head: Uint8Array, tail?: Uint8Array): OggInfo {
   };
 }
 
+export function oggPacketInfoTable(data: Uint8Array): PacketInfoTable {
+  const info = parseOgg(data);
+  const packets = oggAudioPackets(data).map((packet) => ({
+    trackIndex: 0,
+    offset: packet.offset,
+    size: packet.size,
+    ptsUs: packet.ptsUs,
+    dtsUs: packet.ptsUs,
+    durationUs: packet.durationUs,
+    keyframe: true,
+  }));
+  return {
+    tracks: [trackFromInfo(info, codecPrivateDescription(data))],
+    packets,
+  };
+}
+
+export function oggPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
+  return oggPacketInfoTable(bytes);
+}
+
 const HEAD_BYTES = 1 << 16;
+const SMALL_PROBE_BYTES = 256 * 1024;
 
 async function readHead(src: ByteSource): Promise<Uint8Array> {
-  if (src.range) return src.range(0, Math.min(HEAD_BYTES, src.size ?? HEAD_BYTES));
+  if (src.range) {
+    const end =
+      src.size !== undefined && src.size > 0 && src.size <= SMALL_PROBE_BYTES
+        ? src.size
+        : Math.min(HEAD_BYTES, src.size ?? HEAD_BYTES);
+    return src.range(0, end);
+  }
   const reader = src.stream().getReader();
   const { value } = await reader.read();
   await reader.cancel().catch(() => {});
   return value ?? new Uint8Array(0);
 }
 
-async function readTail(src: ByteSource): Promise<Uint8Array | undefined> {
+async function readTail(src: ByteSource, head: Uint8Array): Promise<Uint8Array | undefined> {
+  if (src.size !== undefined && head.byteLength >= src.size) return undefined;
   if (src.range && src.size !== undefined && src.size > HEAD_BYTES) {
     return src.range(src.size - HEAD_BYTES, src.size);
   }
@@ -603,25 +648,24 @@ export const OggDriver: ContainerDriver = {
   kind: 'container',
   formats: ['ogg'],
   supports: matches,
+  async probe(src: ByteSource): Promise<readonly TrackInfo[]> {
+    const head = await readHead(src);
+    return [trackFromInfo(parseOgg(head, await readTail(src, head)))];
+  },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const table = oggPacketInfoTable(await readAll(src));
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return table;
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-    // Probe `info` from head+tail (unchanged: cheap duration via the moov-at-tail granule strategy).
+    // Probe `info` from one bounded small-source read or from head+tail for larger sources.
     // packets() de-laces the WHOLE file, so additionally read every byte once for the packet stream.
-    const info = parseOgg(await readHead(src), await readTail(src));
+    const head = await readHead(src);
+    const info = parseOgg(head, await readTail(src, head));
     const all = await readAll(src);
     const signal = o?.signal;
     const description = codecPrivateDescription(all);
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: info.mediaType,
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: {
-        codec: info.codec,
-        sampleRate: info.sampleRate,
-        numberOfChannels: info.channels,
-        ...(description !== undefined ? { description } : {}),
-      },
-    };
+    const track = trackFromInfo(info, description);
     return {
       tracks: [track],
       packets(trackId: number): ReadableStream<Packet> {

@@ -167,10 +167,7 @@ export function fastFlacFrames(bytes: Uint8Array, layout: FlacMetadataLayout): F
   return frames;
 }
 
-export function flacTrackInfo(
-  info: FlacStreamInfo,
-  metadata?: Uint8Array,
-): TrackInfo {
+export function flacTrackInfo(info: FlacStreamInfo, metadata?: Uint8Array): TrackInfo {
   return {
     id: 0,
     mediaType: 'audio',
@@ -190,9 +187,11 @@ export function flacPacketInfoRows(
 ): readonly PacketInfoMetadata[] {
   return frames.map((frame) => ({
     trackIndex: 0,
+    offset: frame.offset,
     size: frame.size,
     ptsUs: frame.ptsUs,
     dtsUs: frame.ptsUs,
+    durationUs: frame.durationUs,
     keyframe: true,
   }));
 }
@@ -288,20 +287,5 @@ function flacCrc8(bytes: Uint8Array, start: number, end: number): number {
 }
 
 const FLAC_BLOCK_SIZE_TABLE = [
-  0,
-  192,
-  576,
-  1152,
-  2304,
-  4608,
-  0,
-  0,
-  256,
-  512,
-  1024,
-  2048,
-  4096,
-  8192,
-  16384,
-  32768,
+  0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
 ] as const;

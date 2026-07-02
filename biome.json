@@ -14,6 +14,7 @@
       "**/*-wasm.js",
       "**/*-wasm.cjs",
       "**/*.generated.mjs",
+      "docs/perf/stored-test-data-*.json",
       "**/*_wasm_bg.wasm",
       "**/*.head.ts"
     ]

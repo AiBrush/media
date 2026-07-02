@@ -282,13 +282,19 @@ export interface MediaStreams {
  * One caller-owned encoded packet stream passed to `mux`.
  *
  * `track` is mandatory because a muxer cannot safely infer codec-private boxes/headers, dimensions,
- * sample-rate, channel layout, duration, or DTS/B-frame policy from chunks alone. `packets` accepts both
- * demuxed {@link Packet}s (verbatim remux, preserving `dtsUs`) and encoder-produced bare
+ * sample-rate, channel layout, duration, or DTS/B-frame policy from chunks alone. `packets`/`packetsArray`
+ * accept both demuxed {@link Packet}s (verbatim remux, preserving `dtsUs`) and encoder-produced bare
  * {@link EncodedChunk}s (PTS-only, as in the encoder seam).
  */
 export interface PacketStream {
   readonly track: TrackInfo;
-  readonly packets: ReadableStream<EncodedChunk | Packet>;
+  readonly packets?: ReadableStream<EncodedChunk | Packet>;
+  /**
+   * Optional materialized packet list for callers that already hold a small prepared packet set. Stream
+   * inputs remain the general contract; specialized fast muxers may consume this directly to avoid a
+   * redundant one-shot `ReadableStream` wrapper.
+   */
+  readonly packetsArray?: readonly (EncodedChunk | Packet)[];
 }
 
 /**

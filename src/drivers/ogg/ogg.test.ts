@@ -3,7 +3,13 @@ import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { InputError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
-import { OggDriver, OggModule, oggAudioPackets, parseOgg } from './ogg-driver.ts';
+import {
+  OggDriver,
+  OggModule,
+  oggAudioPackets,
+  oggPacketInfoFromBytes,
+  parseOgg,
+} from './ogg-driver.ts';
 import { OggMuxer } from './ogg-write.ts';
 
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
@@ -210,6 +216,28 @@ describe('OggDriver — demux seam + muxer', () => {
     await demuxed.close();
   });
 
+  it('exposes Opus packet-info offsets without constructing WebCodecs chunks', async () => {
+    const bytes = await loadFixture('sfx-opus.ogg');
+    const table = oggPacketInfoFromBytes(bytes);
+    const packets = oggAudioPackets(bytes);
+    expect(table.tracks[0]?.codec).toBe('opus');
+    expect(table.tracks[0]?.config?.description).toBeInstanceOf(Uint8Array);
+    expect(table.packets.length).toBe(packets.length);
+    for (let i = 0; i < packets.length; i++) {
+      const packet = packets[i];
+      const row = table.packets[i];
+      if (packet === undefined || row === undefined)
+        throw new Error('packet table length mismatch');
+      expect(row.trackIndex).toBe(0);
+      expect(row.offset).toBe(packet.offset);
+      expect(row.size).toBe(packet.size);
+      expect(row.ptsUs).toBe(packet.ptsUs);
+      expect(row.dtsUs).toBe(packet.ptsUs);
+      expect(row.durationUs).toBe(packet.durationUs);
+      expect(row.keyframe).toBe(true);
+    }
+  });
+
   it('createMuxer returns a working OggMuxer (round-trip validated in ogg-write.test.ts)', () => {
     expect(OggDriver.createMuxer()).toBeInstanceOf(OggMuxer);
   });
@@ -224,6 +252,27 @@ describe('OggDriver — demux seam + muxer', () => {
     };
     const demuxed = await OggDriver.demux(fake);
     expect(demuxed.tracks[0]?.durationSec).toBeCloseTo(1, 5);
+  });
+
+  it('probes a small known-size source with one bounded range read', async () => {
+    const headPage = new Uint8Array(page({ bos: true, data: opusId(2) }));
+    const tailPage = new Uint8Array(page({ granule: 48000, data: [0] }));
+    const bytes = new Uint8Array(70000);
+    bytes.set(headPage, 0);
+    bytes.set(tailPage, bytes.byteLength - tailPage.byteLength);
+    const ranges: Array<{ start: number; end: number }> = [];
+    const fake: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+      range: (start, end) => {
+        ranges.push({ start, end });
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    const tracks = await OggDriver.probe?.(fake);
+    expect(tracks?.[0]?.codec).toBe('opus');
+    expect(tracks?.[0]?.durationSec).toBeCloseTo(1, 5);
+    expect(ranges).toEqual([{ start: 0, end: bytes.byteLength }]);
   });
 });
 

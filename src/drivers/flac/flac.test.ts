@@ -187,7 +187,10 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
       },
     };
     const media = createMedia() as unknown as {
-      probeContainer(input: Source, container: 'flac'): Promise<{ readonly tracks: readonly unknown[] }>;
+      probeContainer(
+        input: Source,
+        container: 'flac',
+      ): Promise<{ readonly tracks: readonly unknown[] }>;
     };
 
     const info = await media.probeContainer(src, 'flac');
@@ -271,10 +274,7 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
       },
     };
     const media = createMedia() as unknown as {
-      packetInfo(
-        input: Source,
-        o: { readonly container: 'flac' },
-      ): Promise<PacketInfoTable>;
+      packetInfo(input: Source, o: { readonly container: 'flac' }): Promise<PacketInfoTable>;
     };
 
     const table = await media.packetInfo(src, { container: 'flac' });

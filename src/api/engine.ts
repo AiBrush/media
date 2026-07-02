@@ -113,6 +113,11 @@ const CONTAINER_MIME: Record<string, string> = {
 };
 const PCM_AUDIO_DATA_CHUNK_FRAMES = 4096;
 
+interface StreamCopySinkMode {
+  readonly streaming?: true;
+  readonly buffered?: true;
+}
+
 /** The developer-facing engine surface (ADR-009). */
 export interface MediaEngine {
   probe(input: MediaInput, o?: CallOptions): Cancellable<MediaInfo>;
@@ -435,10 +440,14 @@ export class MediaEngineImpl implements MediaEngine {
       const wantsTrackSelection = hasTrackSelection(opts.trackSelect);
       if (opts.tags !== undefined) {
         if (wantsTrackSelection) {
-          throw new CapabilityError('capability-miss', 'tags+selection unsupported', {
-            op: 'remux',
-            tried: [container.id, opts.to],
-          });
+          throw new CapabilityError(
+            'capability-miss',
+            'metadata tag rewrite does not combine with track selection',
+            {
+              op: 'remux',
+              tried: [container.id, opts.to],
+            },
+          );
         }
         const bytes = await this.#writeMetadataTags(src, opts.to, opts.tags, signal);
         return materializeOutput(
@@ -455,8 +464,7 @@ export class MediaEngineImpl implements MediaEngine {
           container: opts.to,
           ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
           ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
-          ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
-          ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
+          ...streamCopySinkMode(opts.sink),
         });
         return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
       }
@@ -528,9 +536,7 @@ export class MediaEngineImpl implements MediaEngine {
       const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
         ...this.#stageOptions(signal, o),
         trim: { startSec: opts.start, endSec: opts.end },
-        faststart: true,
-        ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
-        ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
+        ...streamCopySinkMode(opts.sink),
       });
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     });
@@ -654,8 +660,14 @@ export class MediaEngineImpl implements MediaEngine {
           tried: [target],
         });
       }
-      if (target === 'mkv' && opts.fragmented !== true) {
-        const stream = await (await import('./flac-mkv-mux.ts')).muxFlacMkv(streams, {
+      if (
+        opts.fragmented !== true &&
+        (target === 'mp4' ? opts.faststart !== false : target === 'webm' || target === 'mkv')
+      ) {
+        const fastMux = await import('./flac-mkv-mux.ts');
+        const muxPrepared =
+          target === 'mp4' ? fastMux.muxSingleTrackMp4 : fastMux.muxSingleTrackWebmAudio;
+        const stream = await muxPrepared(streams, {
           ...this.#stageOptions(signal, o),
           container: target,
         });
@@ -1280,7 +1292,7 @@ export class MediaEngineImpl implements MediaEngine {
         return writeCafTags(bytes, tags);
       }
       default:
-        throw new CapabilityError('capability-miss', `no tag writer for '${target}'`, {
+        throw new CapabilityError('capability-miss', 'metadata tag rewrite is not available', {
           op: 'remux',
           tried: [target],
         });
@@ -1329,8 +1341,7 @@ export class MediaEngineImpl implements MediaEngine {
         ...this.#stageOptions(signal, o),
         ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
         ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
-        ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : {}),
-        ...(opts.sink?.kind !== 'stream-target' ? { buffered: true } : {}),
+        ...streamCopySinkMode(opts.sink),
       });
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
     }
@@ -1701,6 +1712,10 @@ async function materializeOutput(
 ): Promise<Output> {
   const { materialize } = await import('../sinks/materialize.ts');
   return materialize(sink, stream, opts);
+}
+
+function streamCopySinkMode(sink: Sink | undefined): StreamCopySinkMode {
+  return sink?.kind === 'stream-target' ? { streaming: true } : { buffered: true };
 }
 
 interface ImageDecodeRoute {

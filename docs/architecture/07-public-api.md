@@ -89,7 +89,11 @@ interface RemuxOptions {
 }
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
 interface DecryptOptions { scheme: 'cenc' | 'cens' | 'cbcs' | 'hls-aes128' | 'hls-sample-aes'; keys: KeyMap; sink?: Sink }
-interface PacketStream { track: TrackInfo; packets: ReadableStream<Packet | EncodedChunk> }
+interface PacketStream {
+  track: TrackInfo
+  packets?: ReadableStream<Packet | EncodedChunk>
+  packetsArray?: readonly (Packet | EncodedChunk)[]    // bounded prepared-packet callers
+}
 interface PacketStreams { video?: PacketStream; audio?: PacketStream; tracks?: readonly PacketStream[] }
 interface MuxSpec { container: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }
 interface H264AbrRung { name?: string; width: number; height: number; bitrate: number; fps?: number }
@@ -103,7 +107,8 @@ surface as typed errors; the op never falls back to returning the input bytes.
 `mux()` is the low-level packet seam. Each stream must include the source or encoder `TrackInfo`; the
 muxer needs codec-private data (`description` boxes/headers), dimensions or sample layout, duration, and
 media type before it can write a legal container. Bare `ReadableStream<EncodedChunk>` inputs are rejected
-with `InputError` and cancelled rather than guessed.
+with `InputError` and cancelled rather than guessed. Streams may be live `ReadableStream`s, while bounded
+prepared callers may provide `packetsArray` to avoid wrapping an already-materialized packet list.
 
 ### `MediaInfo` (probe result)
 

@@ -102,6 +102,11 @@ export { type MediaEngine, MediaEngineImpl } from './api/engine.ts';
 // internal segment/run builders (`buildMediaSegment`/`planFragmentRuns`/`SegmentTrackRun`) stay private.
 export { fragmentMp4 } from './drivers/mp4/fragment.ts';
 export type { FragmentOptions, FragmentTrackInput } from './drivers/mp4/fragment.ts';
+export { muxPreparedWebmAudioPacketTrack } from './api/flac-mkv-mux.ts';
+export type { PreparedWebmAudioPacketMuxInput } from './api/flac-mkv-mux.ts';
+export { mp4PacketInfoFromBytes, muxPreparedMp4PacketTrack } from './api/mp4-prepared-mux.ts';
+export type { PreparedMp4PacketMuxInput } from './api/mp4-prepared-mux.ts';
+export { oggPacketInfoFromBytes } from './drivers/ogg/ogg-driver.ts';
 
 // HLS input resolution (RFC 8216). HLS `.m3u8` is a manifest, not a byte container — `resolveHlsSource`
 // parses the playlist, fetches + AES-128-decrypts + stitches the segments into ONE demuxable `Source` the

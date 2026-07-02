@@ -19,14 +19,14 @@ import type {
   PcmTransform,
   StageOptions,
 } from '../contracts/driver.ts';
+import { CapabilityError } from '../contracts/errors.ts';
+import { rewriteWavPcmCopy, writeWavHeader } from '../drivers/wav/pcm.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { Sink } from '../sinks/sink.ts';
 import type { Source } from '../sources/source.ts';
-import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
 import { isPcmContainer } from './codec-routing.ts';
-import { CapabilityError } from '../contracts/errors.ts';
-import { rewriteWavPcmCopy, writeWavHeader } from '../drivers/wav/pcm.ts';
+import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
 
 /**
  * The engine capabilities {@link convertPcmNative} needs, threaded in so the routine never reaches into the
@@ -126,14 +126,22 @@ export async function pcm(
   }
   const audio = opts.audio;
   if (audio === false || !isPcmCodec(audio?.codec)) {
-    throw new CapabilityError('capability-miss', 'PCM container transform requires a PCM audio target', {
-      op: 'convert',
-      tried: [target],
-    });
+    throw new CapabilityError(
+      'capability-miss',
+      'PCM container transform requires a PCM audio target',
+      {
+        op: 'convert',
+        tried: [target],
+      },
+    );
   }
   if (src instanceof Uint8Array) {
     if (sourceContainer === 'wav' && target === 'wav' && opts.sink?.kind !== 'stream-target') {
-      const copied = rewriteWavPcmCopy(src, deps.pcmSampleFormat(audio?.codec), deps.pcmEndian(audio?.codec));
+      const copied = rewriteWavPcmCopy(
+        src,
+        deps.pcmSampleFormat(audio?.codec),
+        deps.pcmEndian(audio?.codec),
+      );
       if (copied !== undefined) return copied;
     }
     throw new CapabilityError('capability-miss', 'PCM byte rewrite path not registered', {
@@ -165,22 +173,34 @@ export function wavPcmPacketCopy(
   const format = deps.pcmSampleFormat(input.codec);
   const endian = deps.pcmEndian(input.codec) ?? 'le';
   if (format === undefined || endian !== 'le') {
-    throw new CapabilityError('capability-miss', 'WAV packet copy requires little-endian PCM packets', {
-      op: 'mux',
-      tried: [input.codec],
-    });
+    throw new CapabilityError(
+      'capability-miss',
+      'WAV packet copy requires little-endian PCM packets',
+      {
+        op: 'mux',
+        tried: [input.codec],
+      },
+    );
   }
   if (!Number.isSafeInteger(input.sampleRate) || input.sampleRate <= 0) {
-    throw new CapabilityError('capability-miss', 'WAV packet copy requires a positive sample rate', {
-      op: 'mux',
-      tried: [input.codec],
-    });
+    throw new CapabilityError(
+      'capability-miss',
+      'WAV packet copy requires a positive sample rate',
+      {
+        op: 'mux',
+        tried: [input.codec],
+      },
+    );
   }
   if (!Number.isSafeInteger(input.channels) || input.channels <= 0) {
-    throw new CapabilityError('capability-miss', 'WAV packet copy requires a positive channel count', {
-      op: 'mux',
-      tried: [input.codec],
-    });
+    throw new CapabilityError(
+      'capability-miss',
+      'WAV packet copy requires a positive channel count',
+      {
+        op: 'mux',
+        tried: [input.codec],
+      },
+    );
   }
   const sourceBytes = input.sourceBytes;
   if (sourceBytes !== undefined && input.payload.buffer === sourceBytes.buffer) {

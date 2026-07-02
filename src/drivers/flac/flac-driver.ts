@@ -94,7 +94,10 @@ function writeFlacPacketCopy(
   if (trim !== undefined) {
     if (trim.startSec < 0) throw new InputError('unsupported-input', 'trim start < 0');
     if (trim.endSec <= trim.startSec) {
-      throw new InputError('unsupported-input', trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range');
+      throw new InputError(
+        'unsupported-input',
+        trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range',
+      );
     }
     if (trim.startSec >= layout.info.durationSec) {
       throw new InputError('unsupported-input', 'trim start >= duration');
@@ -106,7 +109,8 @@ function writeFlacPacketCopy(
   const frames = fastFlacFrames(bytes, layout);
   const startSample =
     trim === undefined ? undefined : Math.round(trim.startSec * layout.info.sampleRate);
-  const endSample = trim === undefined ? undefined : Math.round(trim.endSec * layout.info.sampleRate);
+  const endSample =
+    trim === undefined ? undefined : Math.round(trim.endSec * layout.info.sampleRate);
   const selected =
     trim === undefined
       ? frames
@@ -232,7 +236,7 @@ function packetStream(
         duration: frame.durationUs,
         data: frame.data,
       });
-      controller.enqueue({ chunk, sizeBytes: frame.size });
+      controller.enqueue({ chunk, data: frame.data, sizeBytes: frame.size });
     },
   });
   /* v8 ignore stop */

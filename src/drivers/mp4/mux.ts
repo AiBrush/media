@@ -1003,8 +1003,7 @@ export class Mp4Muxer implements Muxer {
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
     const chunk = packet.chunk;
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
+    const data = packetBytes(packet);
     this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
       durationUs: chunk.duration ?? undefined,
@@ -1070,4 +1069,31 @@ export class Mp4Muxer implements Muxer {
       throw new MediaError('mux-error', 'muxer already finalized');
     }
   }
+}
+
+export function writeMp4PacketTrack(
+  info: TrackInfo,
+  chunks: readonly ChunkStruct[],
+  options?: MuxOptions,
+): Uint8Array {
+  const state = trackStateFrom(info);
+  for (const chunk of chunks) state.chunks.push(chunk);
+  if (state.chunks.length === 0) {
+    throw new MediaError('mux-error', 'MP4 mux received no packets');
+  }
+  const brand = options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
+  return writeMp4([toMuxTrack(state)], {
+    faststart: options?.faststart ?? true,
+    brand,
+  });
+}
+
+function packetBytes(packet: Packet): Uint8Array {
+  const { chunk, data } = packet;
+  if (data !== undefined && data.byteLength === chunk.byteLength) {
+    return data;
+  }
+  const copied = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(copied);
+  return copied;
 }

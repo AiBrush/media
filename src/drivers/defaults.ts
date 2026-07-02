@@ -15,8 +15,8 @@ import type {
   CodecSupport,
   ContainerDriver,
   ContainerQuery,
-  DecryptParams,
   DecoderConfig,
+  DecryptParams,
   Demuxer,
   DriverModule,
   EncodedChunk,
@@ -288,7 +288,7 @@ function flacPacketStream(
         duration: frame.durationUs,
         data,
       });
-      controller.enqueue({ chunk, sizeBytes: frame.size });
+      controller.enqueue({ chunk, data, sizeBytes: frame.size });
     },
   });
 }

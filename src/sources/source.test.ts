@@ -157,6 +157,11 @@ describe('fromURL', () => {
   it('omits range() when rangeRequests is disabled', () => {
     expect(fromURL(DATA_URL, { rangeRequests: false }).range).toBeUndefined();
   });
+
+  it('uses a caller-provided size without a network size probe', () => {
+    const src = fromURL(DATA_URL, { size: FIVE.byteLength });
+    expect(src.size).toBe(FIVE.byteLength);
+  });
 });
 
 describe('fromElement', () => {

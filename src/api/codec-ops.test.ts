@@ -11,13 +11,14 @@
 
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import type { EncodedChunk, TrackInfo } from '../contracts/driver.ts';
+import type { EncodedChunk, Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { parseAdts } from '../drivers/adts/adts-driver.ts';
 import { FlacDriver, parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
+import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
-import { parseOgg } from '../drivers/ogg/ogg-driver.ts';
+import { OggDriver, parseOgg } from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { demuxWebm, parseWebm } from '../drivers/webm/webm-driver.ts';
 import { channelAt } from '../dsp/pcm.ts';
@@ -25,6 +26,12 @@ import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
+import {
+  muxFlacMkv,
+  muxPreparedWebmAudioPacketTrack,
+  muxSingleTrackMp4,
+  muxSingleTrackWebmAudio,
+} from './flac-mkv-mux.ts';
 import type { PacketStreams } from './types.ts';
 
 /** Real, stream-copyable MP4s (h264 + aac), ≥3 distinct files of varied duration/tracks. */
@@ -90,6 +97,120 @@ class TestEncodedChunk {
       : new Uint8Array(destination);
     view.set(this.#data);
   }
+}
+
+function testChunk(
+  data: Uint8Array = new Uint8Array([0xf8, 0xff, 0xfe]),
+  init: Partial<TestChunkInit> = {},
+): EncodedChunk {
+  return new TestEncodedChunk({
+    type: init.type ?? 'key',
+    timestamp: init.timestamp ?? 0,
+    duration: init.duration ?? 20_000,
+    data,
+  }) as EncodedChunk;
+}
+
+function testPacket(
+  data: Uint8Array = new Uint8Array([0xf8, 0xff, 0xfe]),
+  init: Partial<TestChunkInit> & {
+    readonly dtsUs?: number;
+    readonly dataOverride?: Uint8Array;
+  } = {},
+): Packet {
+  return {
+    chunk: testChunk(data, init),
+    data: init.dataOverride ?? data,
+    ...(init.dtsUs !== undefined ? { dtsUs: init.dtsUs } : {}),
+    sizeBytes: data.byteLength,
+  };
+}
+
+function audioTrack(
+  codec: string,
+  description: AllowSharedBufferSource | undefined = new Uint8Array([1, 2, 3]),
+): TrackInfo {
+  return {
+    id: 1,
+    mediaType: 'audio',
+    codec,
+    durationSec: 0.02,
+    config: {
+      codec,
+      sampleRate: 48_000,
+      numberOfChannels: 2,
+      ...(description !== undefined ? { description } : {}),
+    },
+  };
+}
+
+function videoTrack(codec = 'avc1.42E01E'): TrackInfo {
+  return {
+    id: 2,
+    mediaType: 'video',
+    codec,
+    durationSec: 0.02,
+    config: {
+      codec,
+      codedWidth: 16,
+      codedHeight: 16,
+      description: new Uint8Array([1, 100, 0, 30]),
+    },
+  };
+}
+
+function packetStream(packets: readonly Packet[]): ReadableStream<Packet> {
+  return new ReadableStream<Packet>({
+    start(controller): void {
+      for (const packet of packets) controller.enqueue(packet);
+      controller.close();
+    },
+  });
+}
+
+async function streamBytes(stream: ReadableStream<Uint8Array> | undefined): Promise<Uint8Array> {
+  if (stream === undefined) throw new Error('expected byte stream');
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function encodedChunkFromPacketInfo(row: PacketInfoMetadata, data: Uint8Array): EncodedChunk {
+  return testChunk(data, {
+    type: row.keyframe ? 'key' : 'delta',
+    timestamp: row.ptsUs,
+    duration: row.durationUs ?? null,
+  });
+}
+
+function packetFromPacketInfo(row: PacketInfoMetadata, bytes: Uint8Array): Packet | undefined {
+  if (row.offset === undefined) return undefined;
+  const end = row.offset + row.size;
+  if (row.offset < 0 || row.size <= 0 || end > bytes.byteLength) return undefined;
+  const data = bytes.slice(row.offset, end);
+  return {
+    chunk: encodedChunkFromPacketInfo(row, data),
+    data,
+    dtsUs: row.dtsUs,
+    sizeBytes: row.size,
+  };
 }
 
 function installEncodedChunkShims(): () => void {
@@ -347,6 +468,353 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     } finally {
       restore();
     }
+  });
+
+  it('public mux (opus packet array → webm) authors WebM through the single-audio fast path', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const demuxed = await OggDriver.demux(await fixtureSource('sfx-opus.ogg'));
+      try {
+        const track = demuxed.tracks[0];
+        if (track === undefined) throw new Error('expected Opus track');
+        const reader = demuxed.packets(track.id).getReader();
+        const packets: Packet[] = [];
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            packets.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        const out = await outputBytes(
+          await media().mux({ audio: { track, packetsArray: packets } }, { container: 'webm' }),
+        );
+        const info = parseWebm(out);
+        expect(info.container).toBe('webm');
+        expect(info.tracks[0]?.codec).toBe('opus');
+        expect(info.durationSec).toBeGreaterThan(0);
+      } finally {
+        await demuxed.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('prepared WebM audio packet mux authors Opus WebM directly', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const demuxed = await OggDriver.demux(await fixtureSource('sfx-opus.ogg'));
+      try {
+        const track = demuxed.tracks[0];
+        if (track === undefined) throw new Error('expected Opus track');
+        const reader = demuxed.packets(track.id).getReader();
+        const packets: Packet[] = [];
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            packets.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        const out = muxPreparedWebmAudioPacketTrack({ track, packets, container: 'webm' });
+        const info = parseWebm(out);
+        expect(info.container).toBe('webm');
+        expect(info.tracks[0]?.codec).toBe('opus');
+        expect(info.durationSec).toBeGreaterThan(0);
+      } finally {
+        await demuxed.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('prepared WebM audio packet mux validates target, media type, codec, and packet presence', () => {
+    const track = audioTrack('opus');
+    expect(() =>
+      muxPreparedWebmAudioPacketTrack({
+        track,
+        packets: [testChunk()],
+        container: 'mp4',
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      muxPreparedWebmAudioPacketTrack({
+        track: videoTrack(),
+        packets: [testChunk()],
+        container: 'webm',
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      muxPreparedWebmAudioPacketTrack({
+        track: audioTrack('aac'),
+        packets: [testChunk()],
+        container: 'webm',
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      muxPreparedWebmAudioPacketTrack({
+        track,
+        packets: [],
+        container: 'webm',
+      }),
+    ).toThrow(MediaError);
+  });
+
+  it('prepared WebM audio packet mux authors WebM/MKV codec variants from encoded chunks and packets', () => {
+    const opus = muxPreparedWebmAudioPacketTrack({
+      track: audioTrack('opus', new Uint8Array([9, 8]).buffer),
+      packets: [testChunk(new Uint8Array([0xf8, 0xff, 0xfe]), { duration: null })],
+      container: 'webm',
+    });
+    expect(parseWebm(opus).tracks[0]?.codec).toBe('opus');
+
+    const vorbisData = new Uint8Array([1, 2, 3, 4]);
+    const vorbis = muxPreparedWebmAudioPacketTrack({
+      track: audioTrack('vorbis'),
+      packets: [
+        testPacket(vorbisData, {
+          dtsUs: 0,
+          dataOverride: vorbisData.subarray(0, vorbisData.byteLength - 1),
+        }),
+      ],
+      container: 'webm',
+    });
+    expect(parseWebm(vorbis).tracks[0]?.codec).toBe('vorbis');
+
+    const flac = muxPreparedWebmAudioPacketTrack({
+      track: audioTrack('flac', new Uint8Array([0x66, 0x4c, 0x61, 0x43]).buffer),
+      packets: [testPacket(new Uint8Array([0xff, 0xf8, 0, 0]))],
+      container: 'mkv',
+    });
+    const info = parseWebm(flac);
+    expect(info.container).toBe('mkv');
+    expect(info.tracks[0]?.codec).toBe('flac');
+  });
+
+  it('single-track WebM audio mux handles arrays, streams, misses, abort, and stream errors', async () => {
+    const opusTrack = audioTrack('opus');
+    const opusPacket = testPacket();
+    await expect(
+      muxSingleTrackWebmAudio(
+        { audio: { track: opusTrack, packetsArray: [opusPacket] } },
+        {
+          container: 'mp4',
+        },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackWebmAudio(
+        { audio: { track: opusTrack, packetsArray: [opusPacket] } },
+        {
+          container: 'webm',
+          fragmented: true,
+        },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackWebmAudio({ tracks: {} } as unknown as PacketStreams, { container: 'webm' }),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackWebmAudio(
+        { video: { track: opusTrack, packetsArray: [opusPacket] } },
+        {
+          container: 'webm',
+        },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackWebmAudio(
+        {
+          audio: { track: opusTrack, packetsArray: [opusPacket] },
+          video: { track: videoTrack(), packetsArray: [opusPacket] },
+        },
+        { container: 'webm' },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackWebmAudio(
+        { audio: { track: audioTrack('aac'), packetsArray: [opusPacket] } },
+        {
+          container: 'webm',
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    const webm = await streamBytes(
+      await muxSingleTrackWebmAudio(
+        { audio: { track: opusTrack, packetsArray: [opusPacket] } },
+        { container: 'webm' },
+      ),
+    );
+    expect(parseWebm(webm).tracks[0]?.codec).toBe('opus');
+
+    const vorbis = await streamBytes(
+      await muxSingleTrackWebmAudio(
+        {
+          tracks: [
+            {
+              track: audioTrack('vorbis'),
+              packets: packetStream([testPacket(new Uint8Array([1, 2, 3]))]),
+            },
+          ],
+        },
+        { container: 'webm' },
+      ),
+    );
+    expect(parseWebm(vorbis).tracks[0]?.codec).toBe('vorbis');
+
+    await expect(
+      muxSingleTrackWebmAudio(
+        { audio: { track: opusTrack, packetsArray: [] } },
+        {
+          container: 'webm',
+        },
+      ),
+    ).rejects.toThrow(MediaError);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      muxSingleTrackWebmAudio(
+        { audio: { track: opusTrack, packetsArray: [opusPacket] } },
+        {
+          container: 'webm',
+          signal: aborted.signal,
+        },
+      ),
+    ).rejects.toThrow(MediaError);
+
+    const boom = new Error('packet stream failed');
+    await expect(
+      muxSingleTrackWebmAudio(
+        {
+          audio: {
+            track: opusTrack,
+            packets: new ReadableStream<Packet>({
+              pull(): void {
+                throw boom;
+              },
+            }),
+          },
+        },
+        { container: 'webm' },
+      ),
+    ).rejects.toThrow(boom);
+  });
+
+  it('single-track FLAC MKV mux handles stream forms and rejects unsupported shapes honestly', async () => {
+    const flacTrack = audioTrack('flac', new Uint8Array([0x66, 0x4c, 0x61, 0x43]).buffer);
+    const packet = testPacket(new Uint8Array([0xff, 0xf8, 0, 0]));
+    await expect(
+      muxFlacMkv({ video: { track: videoTrack(), packetsArray: [packet] } }, { container: 'mkv' }),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxFlacMkv(
+        { audio: { track: audioTrack('opus'), packetsArray: [packet] } },
+        {
+          container: 'mkv',
+        },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(muxFlacMkv({ tracks: [] }, { container: 'mkv' })).resolves.toBeUndefined();
+
+    const fromAudioSlot = await streamBytes(
+      await muxFlacMkv(
+        { audio: { track: flacTrack, packetsArray: [packet] } },
+        {
+          container: 'mkv',
+        },
+      ),
+    );
+    expect(parseWebm(fromAudioSlot).tracks[0]?.codec).toBe('flac');
+
+    const fromTrackList = await streamBytes(
+      await muxFlacMkv(
+        { tracks: [{ track: flacTrack, packets: packetStream([packet]) }] },
+        { container: 'mkv' },
+      ),
+    );
+    expect(parseWebm(fromTrackList).tracks[0]?.codec).toBe('flac');
+
+    await expect(
+      muxFlacMkv({ tracks: [{ track: flacTrack, packetsArray: [] }] }, { container: 'mkv' }),
+    ).rejects.toThrow(MediaError);
+  });
+
+  it('single-track MP4 packet mux handles real offset packets plus miss, empty, abort, and stream errors', async () => {
+    if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+    const input = await loadFixture('movie_5.mp4');
+    const table = await Mp4Driver.packetInfo(fromBytes(input, { mime: 'video/mp4' }));
+    const track = table.tracks[0];
+    if (track === undefined) throw new Error('expected a source track');
+    const packets = table.packets
+      .filter((row) => row.trackIndex === 0)
+      .slice(0, 1)
+      .map((row) => packetFromPacketInfo(row, input))
+      .filter((packet): packet is Packet => packet !== undefined);
+    expect(packets).toHaveLength(1);
+
+    await expect(
+      muxSingleTrackMp4({ tracks: [{ track, packetsArray: packets }] }, { container: 'webm' }),
+    ).resolves.toBeUndefined();
+    await expect(
+      muxSingleTrackMp4(
+        { tracks: [{ track, packetsArray: packets }] },
+        {
+          container: 'mp4',
+          fragmented: true,
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    const streamOutput = await streamBytes(
+      await muxSingleTrackMp4(
+        { tracks: [{ track, packets: packetStream(packets) }] },
+        { container: 'mp4', faststart: false },
+      ),
+    );
+    const reparsed = await Mp4Driver.packetInfo(fromBytes(streamOutput, { mime: 'video/mp4' }));
+    expect(reparsed.tracks[0]?.codec).toBe(track.codec);
+    expect(reparsed.packets).toHaveLength(1);
+
+    await expect(
+      muxSingleTrackMp4({ tracks: [{ track, packetsArray: [] }] }, { container: 'mp4' }),
+    ).rejects.toThrow(MediaError);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      muxSingleTrackMp4(
+        { tracks: [{ track, packetsArray: packets }] },
+        {
+          container: 'mp4',
+          signal: aborted.signal,
+        },
+      ),
+    ).rejects.toThrow(MediaError);
+
+    const boom = new Error('mp4 packet stream failed');
+    await expect(
+      muxSingleTrackMp4(
+        {
+          tracks: [
+            {
+              track,
+              packets: new ReadableStream<Packet>({
+                pull(): void {
+                  throw boom;
+                },
+              }),
+            },
+          ],
+        },
+        { container: 'mp4' },
+      ),
+    ).rejects.toThrow(boom);
   });
 
   it('cross-container remux (webm vorbis → ogg) preserves declared duration despite laced packet cadence', async () => {

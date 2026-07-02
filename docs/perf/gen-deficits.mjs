@@ -11,7 +11,10 @@ import { basename } from 'node:path';
 const [SRC, ...OVERLAY_SRCS] = process.argv.slice(2);
 if (!SRC) throw new Error('usage: node gen-deficits.mjs <export.json> [overlay-export.json ...]');
 const raw = JSON.parse(readFileSync(SRC, 'utf8'));
-const overlays = OVERLAY_SRCS.map((path) => ({ path, raw: JSON.parse(readFileSync(path, 'utf8')) }));
+const overlays = OVERLAY_SRCS.map((path) => ({
+  path,
+  raw: JSON.parse(readFileSync(path, 'utf8')),
+}));
 const US = 'aibrush-media@dev';
 const EXEMPTIONS_PATH = 'docs/perf/performance-parity-exemptions.json';
 
@@ -59,7 +62,9 @@ for (const overlay of overlays) {
   }
 }
 const generatedAtIso = overlays.at(-1)?.raw.generatedAtIso ?? raw.generatedAtIso;
-const sourceLabel = [basename(SRC), ...overlays.map((overlay) => basename(overlay.path))].join(' + ');
+const sourceLabel = [basename(SRC), ...overlays.map((overlay) => basename(overlay.path))].join(
+  ' + ',
+);
 
 /** scenario -> engine -> { wall, family, status } (only oracle-passing, timed cells) */
 const idx = {};
@@ -67,7 +72,8 @@ for (const x of mergedResults.values()) {
   const w = x.bench?.wall?.median;
   if (x.status !== 'PASS') continue;
   if (typeof w !== 'number') continue;
-  (idx[x.scenarioId] ||= {})[x.engineId] = { w, fam: x.family, status: x.status };
+  if (idx[x.scenarioId] === undefined) idx[x.scenarioId] = {};
+  idx[x.scenarioId][x.engineId] = { w, fam: x.family, status: x.status };
 }
 
 const losses = [];
@@ -98,14 +104,15 @@ losses.sort((a, b) => b.ratio - a.ratio);
 const activeLosses = losses.filter((l) => !l.exemption);
 const exemptLosses = losses.filter((l) => l.exemption);
 const tier = (lo, hi) => activeLosses.filter((l) => l.ratio >= lo && l.ratio < hi);
-const T1 = tier(100, Infinity),
-  T2 = tier(10, 100),
-  T3 = tier(3, 10),
-  T4 = tier(0, 3);
+const T1 = tier(100, Number.POSITIVE_INFINITY);
+const T2 = tier(10, 100);
+const T3 = tier(3, 10);
+const T4 = tier(0, 3);
 
 const famStat = {};
 for (const l of activeLosses) {
-  const f = (famStat[l.fam] ||= { n: 0, worst: 0 });
+  if (famStat[l.fam] === undefined) famStat[l.fam] = { n: 0, worst: 0 };
+  const f = famStat[l.fam];
   f.n++;
   f.worst = Math.max(f.worst, l.ratio);
 }
@@ -235,4 +242,4 @@ if (activeLosses.length > 0) {
   console.error(summary);
   process.exit(1);
 }
-console.log(summary);
+console.info(summary);

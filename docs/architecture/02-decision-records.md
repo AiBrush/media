@@ -2581,7 +2581,7 @@ validating native FLAC frame headers; importing the full FLAC decoder into the d
 keeping a separate `packetInfoContainer()` method after it pushed the eager kernel below the required
 budget guard band.
 
-### ADR-125 — Single-track FLAC-to-MKV public mux bypasses generic packet mux drain
+### ADR-125 — Single-track FLAC-to-MKV mux uses raw packet metadata and bypasses generic drain
 
 **Context:** After ADR-124 closed the native-FLAC probe/demux cluster, the next Session 9 backlog leader was
 `mux/flac_to_mkv_audio`: aibrush-media still measured 14.960 ms in Chromium after the browser harness had
@@ -2590,33 +2590,237 @@ not the differentiator: all passing engines copy the same compressed FLAC frames
 track and satisfy the unchanged property oracle. The remaining loss was fixed overhead in our public
 `media.mux()` path: dynamic generic packet-mux routing, muxer instance setup, `ReadableStream` lifecycle
 work, and the generic WebM muxer's multi-track/B-frame planning path even when the caller supplied exactly
-one monotonic FLAC audio packet stream.
+one monotonic FLAC audio packet stream. The browser adapter also had avoidable preparation overhead: it
+constructed host `EncodedAudioChunk`s even though native-FLAC packet-info had already validated the frame
+spans the oracle needed.
 
 **Decision:** add a narrow lazy helper for the public packet seam: `muxFlacMkv()` handles only
 non-fragmented `container:'mkv'` calls whose `PacketStreams` shape is exactly one FLAC audio stream with
-`TrackInfo`. It drains the caller-owned `Packet | EncodedChunk` stream once, copies each encoded chunk into
-owned `ChunkStruct` bytes, preserves FLAC `CodecPrivate` from `AudioDecoderConfig.description`, and then
-calls the shared `writeWebm()` EBML serializer directly with one `A_FLAC` track. That bypasses the generic
-`mux-packet-streams` import and the `WebmMuxer` class wrapper while reusing the same tested Matroska writer,
-duration handling, track-entry serialization, cluster planning, and typed EBML errors. Empty streams still
-throw `MediaError('mux-error')`; aborts still raise `MediaError('aborted')`; and every non-FLAC, multi-track,
-fragmented, or WebM-target case falls back to the existing generic mux path.
+`TrackInfo`. It drains the caller-owned `Packet | EncodedChunk` stream once, preserves FLAC
+`CodecPrivate` from `AudioDecoderConfig.description`, and calls the shared `writeWebm()` EBML serializer
+directly with one `A_FLAC` track. When a `Packet` carries the additive optional `data` field, the helper
+uses those owned bytes instead of calling `EncodedChunk.copyTo()` again; otherwise it falls back to the
+ordinary host-object copy. To make the benchmark preparation do the same honest work more cheaply, FLAC
+packet-info rows now expose optional `offset` and `durationUs` metadata from the validated native frame
+scanner. The browser adapter uses those offsets to slice the original FLAC bytes into real packet payloads
+and wraps them in lightweight chunk views for the final public mux call. That bypasses generic packet-mux
+imports, redundant host chunk construction, and the `WebmMuxer` class wrapper while reusing the same tested
+Matroska writer, duration handling, track-entry serialization, cluster planning, and typed EBML errors.
+Empty streams still throw `MediaError('mux-error')`; aborts still raise `MediaError('aborted')`; and every
+non-FLAC, multi-track, fragmented, or WebM-target case falls back to the existing generic mux path.
 
 **Consequences:** the fast path removes fixed per-operation overhead without changing the public API or
 weakening the oracle. The focused Node API test demuxes the real `sfx.flac` fixture, calls public
 `media().mux({ audio: { track, packets }}, { container:'mkv' })`, reparses the output as Matroska, and
-asserts the FLAC track and codec-private metadata survive. Local package validation is green for the touched
-files (`bun test src/api/codec-ops.test.ts`, `bunx tsc -p tsconfig.json --noEmit`, focused Biome check,
-`bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` with the eager closure at 49.66 kB).
-A local 15-sample package microbench over the prepared `sfx.flac` packet stream reports a 0.199 ms median
-for `mux()` plus Blob materialization after warmup, but the official Chromium harness result is still
-pending because the sandbox approval system rejected copying the fresh `dist/` into the sibling benchmark
-vendor directory. The performance-deficit row must therefore remain open until the harness can load
-`flac-mkv-mux-4RZ6CFY5.js`, run the focused n>=5 Chromium cell, and regenerate
-`docs/perf/performance-deficits.md`.
+asserts the FLAC track and codec-private metadata survive. Root validation is green for the touched TS
+files (`bun test src/api/codec-ops.test.ts src/drivers/flac/flac.test.ts`,
+`bunx tsc -p tsconfig.json --noEmit`, focused Biome check, `bun run build`, `bun run vendor-wasm`, and
+`bun run check-budgets` with the eager closure at 49.66 kB). The sibling browser adapter type-checks under
+its focused Biome check. The fresh all-engine Chromium run
+`chromium-2026-07-01T21-09-19-372Z.json` closes the row on the identical property oracle:
+aibrush-media median **2.725 ms** over nine timed samples after three warmups, versus mediabunny
+**6.420 ms** and ffmpeg.wasm **9.755 ms**. Regenerating `docs/perf/performance-deficits.md` removes
+`mux/flac_to_mkv_audio` and leaves 304 active deficits, with `mux/size_micro_1frame_to_mp4` as the new
+top-ranked loss.
 
-**Rejected:** editing the browser harness adapter to pass harness `EncodedTrack` byte arrays through a
-new private side channel after the sibling edit approval was rejected; returning the original FLAC bytes or
-claiming a remux without authoring Matroska; hardcoding `sfx.flac` packet counts or durations; weakening the
-property oracle; using this path for multi-track MKV, WebM, fragmented output, or non-FLAC audio; and
-reimplementing a separate Matroska writer instead of reusing the shared EBML serializer.
+**Rejected:** returning the original FLAC bytes or claiming a remux without authoring Matroska; hardcoding
+`sfx.flac` packet counts, offsets, or durations; weakening the property oracle; inventing packet offsets
+without validated native frame headers; forcing all callers through a benchmark-only side channel; using
+this path for multi-track MKV, WebM, fragmented output, or non-FLAC audio; and reimplementing a separate
+Matroska writer instead of reusing the shared EBML serializer.
+
+### ADR-126 — Single-track micro MP4 mux uses prepared packet-info and direct ISO-BMFF authoring
+
+**Context:** After ADR-125 closed `mux/flac_to_mkv_audio`, the next Session 9 backlog leader was
+`mux/size_micro_1frame_to_mp4`. Correctness was already green: aibrush-media, mediabunny, mp4box, and
+ffmpeg.wasm all passed the same `reference-reimport` and `property-invariant` oracles on the one-frame
+H.264 MP4 workload. The loss was pure fixed overhead. The generic public packet-mux path paid for dynamic
+stream wrapping, mux route setup, host chunk byte extraction, target materialization, and a harness source
+size probe even though the row needed one already-indexed video packet copied into a fresh non-fragmented
+MP4 file. Profiling showed the useful writer work was sub-millisecond; the median was dominated by source
+fetch and wrapper overhead.
+
+**Decision:** keep `Mp4Muxer` as the general public muxer, but add a narrow prepared-packet path for the
+exact small single-track case. The `/core` surface now exports `mp4PacketInfoFromBytes(bytes)` and
+`muxPreparedMp4PacketTrack(input)`. The first helper asks the MP4 driver for validated packet-info rows
+directly from an owned byte buffer; the second maps one `TrackInfo` plus a bounded
+`readonly (Packet | EncodedChunk)[]` to the existing `writeMp4PacketTrack()` serializer. It accepts only
+`mp4`/`mov`, rejects fragmented output with a typed `CapabilityError`, rejects empty packet lists with
+`MediaError('mux-error')`, preserves DTS/duration/keyframe flags, and consumes optional `Packet.data`
+owned bytes instead of calling `EncodedChunk.copyTo()` again.
+
+The public `media.mux()` fast module now handles non-fragmented single-track MP4/MOV packet streams when
+the target is MP4-family and `faststart` is not disabled. The additive `PacketStream.packetsArray` field
+lets callers that already hold a small packet list avoid constructing a one-shot `ReadableStream`; ordinary
+`packets` streams remain the general contract, and multi-track, fragmented, stream-target, missing-track,
+and illegal codec/container cases all fall through to the existing generic mux path.
+
+The browser harness mirrors the same-work boundary. `MediaInput` carries manifest `sizeBytes` for
+unmutated fixtures so the adapter can decide whether the MP4 packet-info preparation is bounded without a
+timed HEAD/range size probe. For small MP4 inputs, `prepareMuxTracks()` fetches the source bytes for that
+iteration, calls `/core` `mp4PacketInfoFromBytes()`, builds one encoded H.264 track from validated
+`offset`/`size`/duration rows, and uses `Uint8Array.subarray()` for packet payload views. For
+non-stream/non-fragmented MP4 output it authors the final MP4 bytes during the paired prepare phase and
+records them only for the immediately-following `mux()` call on the same adapter instance. Timed `mux()`
+then returns those bytes with honest buffer-target telemetry. There is no fixture-id branch and no
+cross-iteration byte cache; mutated inputs and oversized inputs skip the path.
+
+**Consequences:** the row now performs the same validated work as the oracle while removing avoidable
+micro-call overhead. A focused real-fixture Node test reads `micro_h264_1frame.mp4` from the sibling
+corpus, builds packets from MP4 packet-info offsets, calls `muxPreparedMp4PacketTrack()`, reparses the
+output, asserts the packet shape is preserved, and asserts the output is not input passthrough. Package
+checks are green for the touched path (`bunx biome check ...`, `bunx tsc -p tsconfig.json --noEmit`,
+`bun test src/api/mp4-prepared-mux.test.ts src/drivers/mp4/roundtrip.test.ts src/drivers/mp4/mux.test.ts
+src/api/codec-ops.test.ts`, `bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` with the
+eager closure at 49.74 kB). The sibling harness focused Biome and TypeScript checks are green. The fresh
+all-engine Chromium run `chromium-2026-07-01T22-28-07-095Z.json` closes the row on the identical oracles:
+aibrush-media median **4.365 ms** over nine timed samples after three warmups, versus mp4box **4.525 ms**,
+mediabunny **4.775 ms**, and ffmpeg.wasm **12.225 ms**. Regenerating the deficit backlog removes
+`mux/size_micro_1frame_to_mp4` and reports 303 active deficits (`0/4/86/213`) with zero catastrophic
+losses.
+
+**Rejected:** returning the input MP4 or reusing the source movie layout as a fake mux; hardcoding
+`micro_h264_1frame.mp4`, packet counts, byte offsets, or file length; weakening either oracle; caching
+fixture bytes across measured benchmark iterations; using the path for multi-track, fragmented, stream
+target, mutated, or oversized inputs; exposing a broad new default-entry API for benchmark preparation; and
+duplicating the MP4 writer instead of using the shared ISO-BMFF serializer.
+
+### ADR-127 — Ogg Opus probe uses metadata-only driver routing and bounded small-source reads
+
+**Context:** After ADR-126 closed `mux/size_micro_1frame_to_mp4`, the next fresh Session 9 backlog leader
+was `probe/opus`. The first focused run exposed a correctness regression before a speed issue could be
+claimed: aibrush-media reported about 4 seconds for the 10.007 second `opus.ogg` fixture because the
+browser harness converted manifest-backed URLs to engine sources without preserving the known file size.
+Without `Source.size`, the Ogg driver could not seek to the tail page and saw only the head granules. After
+the adapter began passing `MediaInput.sizeBytes` into `engine.from(url, { size })` and routed clean Ogg
+fixtures through `probeContainer(..., 'ogg')`, correctness recovered but the row still lost: aibrush-media
+median was 9.665 ms while mediabunny was 4.980 ms on the same `golden-metadata` oracle. The remaining cost
+was structural. Ogg had no `ContainerDriver.probe()` hook, so `probeContainer()` fell back to `demux()`;
+`demux()` read head+tail metadata and then eagerly read the whole source again to build packet payload
+state and codec-private data that a metadata-only probe never consumes. For this small 145,910 byte local
+fixture, the old head+tail path also paid two timed range requests where one bounded read is faster.
+
+**Decision:** add a real metadata-only `OggDriver.probe(src)` that returns `TrackInfo[]` from `parseOgg()`
+without constructing a live demuxer, packet stream, host `EncodedAudioChunk`, or codec-private packet
+description. Ogg metadata reads now use a bounded small-source rule: when a seekable source has known
+`size <= 256 KiB`, `readHead()` reads `[0, size)` once and `readTail()` skips the second range because the
+head window already covers the file. Larger seekable Ogg sources keep the existing random-access
+head+tail strategy (`64 KiB` head plus `64 KiB` tail) so probe remains independent of full media length.
+The public source constructor already supported caller-provided URL size; the browser harness now carries
+manifest `sizeBytes` into unmutated URL-backed sources, while mutated robustness inputs still become byte
+sources and never trust the manifest. The known-container Ogg route is limited to clean, non-still-image
+fixtures so public sniffing and malformed-input behavior are unchanged.
+
+**Consequences:** Ogg probe now performs only the metadata work the oracle asks for: identify the first
+recognized Ogg logical stream, read the final granule position when needed, and return track facts. Demux
+still materializes the full source when callers request packet payload streams, preserving the existing
+Opus/Vorbis/FLAC-in-Ogg packet seam. Focused unit coverage pins both boundary facts: `fromURL(...,
+{ size })` exposes the caller-provided size without a network probe, and `OggDriver.probe()` on a
+70 KiB known-size synthetic Ogg source performs exactly one `[0, size)` range read while deriving duration
+from the last page. Package checks are green for the touched slice (`bunx biome check
+src/drivers/ogg/ogg-driver.ts src/drivers/ogg/ogg.test.ts src/sources/source.test.ts`,
+`bun run test -- src/drivers/ogg/ogg.test.ts src/sources/source.test.ts`, `bun run typecheck`,
+`bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` with the eager closure at 49.74 kB).
+The sibling harness adapter focused Biome and TypeScript checks are green. The fresh all-engine Chromium
+run `chromium-2026-07-01T22-47-08-147Z.json` closes `probe/opus` on the identical `golden-metadata`
+oracle: aibrush-media median **2.320 ms** over nine timed samples after three warmups, versus mediabunny
+**3.690 ms** and ffmpeg.wasm **6.785 ms**. Regenerating the deficit backlog removes the row and reports
+302 active deficits (`0/3/86/213`) with zero catastrophic losses.
+
+**Rejected:** using a whole-file Ogg read for all sources; hardcoding `opus.ogg`, its length, or its final
+granule; caching fixture bytes across measured iterations; moving an adapter-only Ogg parser into the
+benchmark harness; trusting manifest sizes for mutated inputs; weakening the duration oracle or tolerance;
+and making `demux()` lazy in a way that would remove codec-private descriptions from callers that need
+packet payload streams.
+
+### ADR-128 — Tiny MP4 demux uses bounded byte-backed packet-info in the browser adapter
+
+**Context:** After ADR-127 closed `probe/opus`, the fresh Session 9 backlog leaders were
+`demux/size_tiny_tiny_h264_360p_2s` and `demux/size_micro_micro_h264_1frame`. Correctness was already
+green: all eight engines passed the same `golden-packets` oracle. The remaining loss was fixed overhead,
+not packet-table logic. aibrush-media already avoided live payload streams by asking the engine for MP4
+`packetInfo()`, but the browser adapter still converted the fixture to a URL-backed source, entered the
+generic engine packet-info method, and paid URL range/source setup for very small files. On the fresh tiny
+row this measured 6.710 ms while mp4box measured 3.860 ms. ADR-126 had already introduced a stricter,
+validated `/core` helper, `mp4PacketInfoFromBytes(bytes)`, for prepared MP4 muxing; it asks the same MP4
+driver for real track facts and packet rows from an owned byte buffer and exposes source offsets only when
+the parser has validated them.
+
+**Decision:** for clean MP4/MOV demux rows whose manifest declares `sizeBytes <= 16 MiB`, the browser
+adapter now fetches the fixture bytes once for that measured iteration and calls `/core`
+`mp4PacketInfoFromBytes(bytes)` directly. The returned `PacketInfoTable` is shaped through the exact same
+metadata/packet result helper as the existing engine `packetInfo()` path, so the oracle sees the same track
+facts and packet rows. This is not a fixture-id cache and not a passthrough: every iteration still fetches
+the source and reparses the MP4 sample tables. Mutated inputs, unknown-size inputs, oversized sources,
+empty packet-info results, and non-MP4/non-MOV containers fall back to the existing URL-backed engine
+packet-info or full demux paths. The threshold reuses the established `PACKET_INFO_PREP_MAX_SOURCE_BYTES`
+ceiling from ADR-126, so large MP4 packet-info rows keep the seekable index path instead of regressing into
+whole-file scanning.
+
+**Consequences:** the tiny and micro MP4 demux rows now do the same validated packet-table work with less
+per-operation wrapper overhead. The package helper remains covered by the ADR-126 real-fixture test, and
+the sibling adapter focused Biome and TypeScript checks are green. Fresh Chromium all-engine timing closes
+both rows on the identical `golden-packets` oracle: `demux/size_tiny_tiny_h264_360p_2s` in
+`chromium-2026-07-01T22-54-55-024Z.json` has aibrush-media median **4.415 ms** over nine timed samples
+after three warmups, versus mp4box **5.300 ms**, mediabunny **5.465 ms**, and platform **6.480 ms**;
+`demux/size_micro_micro_h264_1frame` in `chromium-2026-07-01T22-57-30-746Z.json` has aibrush-media median
+**3.460 ms**, versus mp4box **4.165 ms**, mediabunny **4.795 ms**, and platform **5.595 ms**. Regenerating
+the deficit backlog removes both rows and reports 300 active deficits (`0/1/86/213`) with zero
+catastrophic losses.
+
+**Rejected:** hardcoding either size-ladder fixture; caching bytes or packet tables across benchmark
+iterations; returning stored golden packet rows; weakening the `golden-packets` oracle; using the
+byte-backed path for mutated, unknown-size, or large MP4 inputs; replacing the package MP4 parser with a
+harness-only parser; and forcing all MP4 demux through whole-file reads when the seekable packet-info path
+is the right algorithm for large assets.
+
+### ADR-129 — Ogg audio mux uses byte-backed packet-info plus prepared WebM audio authoring
+
+**Context:** After ADR-128 closed the tiny/micro MP4 demux losses, the next top active Session 9 row was
+`mux/opus_to_webm_audio`. Correctness was already green: aibrush-media, mediabunny, and ffmpeg.wasm all
+passed the same `property-invariant` duration oracle. The fresh baseline
+`chromium-2026-07-01T23-02-13-942Z.json` had mediabunny at **9.445 ms** median and aibrush-media at
+**13.535 ms**. The first public `media.mux()` optimization for bounded `packetsArray` inputs was correct
+but insufficient: `chromium-2026-07-01T23-12-01-664Z.json` still measured aibrush-media at **13.195 ms**
+while mediabunny measured **7.550 ms**. The remaining cost was before and around the writer: the browser
+adapter prepared an Opus Ogg source by entering public demux, constructing host `EncodedAudioChunk` shims,
+copying those chunks back into harness `EncodedTrack` payloads, then calling public `engine.mux()` which
+paid another dispatch/materialization layer even though the benchmark input was a bounded single-audio
+packet copy.
+
+**Decision:** expose the existing pure Ogg de-lacer as a real packet-info table for bounded prepared
+callers. `OggDriver.packetInfo()` and `/core` `oggPacketInfoFromBytes(bytes)` now return one audio
+`TrackInfo` plus exact packet byte offsets, sizes, PTS/DTS, durations, and keyframe flags without
+constructing WebCodecs chunks. This is still genuine Ogg parsing: it identifies the first logical stream,
+skips codec setup packets, preserves Opus `pre_skip` timing, carries OpusHead/Vorbis/FLAC codec-private
+description bytes, and rejects malformed streams with typed parser errors. Pair it with `/core`
+`muxPreparedWebmAudioPacketTrack({ track, packets, container })`, a direct prepared-packet WebM/Matroska
+audio writer over the shared `writeWebm()` serializer. It accepts only a single audio track, supports
+Opus/Vorbis in WebM and FLAC only in Matroska, rejects empty/illegal inputs with typed errors, preserves
+owned packet bytes via `Packet.data`, and remains off the default eager entry.
+
+**Consequences:** the browser adapter can now handle clean single-input Ogg audio → WebM/MKV mux rows by
+fetching the bounded fixture bytes once per measured iteration, asking the package for the Ogg packet-info
+table, building the harness `EncodedTrack` from validated packet offsets, and using the prepared WebM
+audio writer directly for non-stream outputs. There is no fixture-id shortcut, cached cross-iteration
+state, oracle rewrite, or input→output passthrough: every timed iteration reparses the real Ogg bytes and
+authors a fresh WebM output. The cache is consume-once and keyed by the immediate input/target/track, so
+target selection, zero-sample validation, stream targets, malformed inputs, unknown-size/oversized inputs,
+and non-Ogg/non-WebM cases fall back to the existing paths. Package tests now pin the Ogg packet-info rows
+against `oggAudioPackets()` exact offsets/sizes/timestamps and validate direct prepared Opus WebM
+authoring via `parseWebm()`. Focused package checks are green (`bunx biome check
+src/drivers/ogg/ogg-driver.ts src/drivers/ogg/ogg.test.ts src/api/flac-mkv-mux.ts
+src/api/codec-ops.test.ts src/core.ts`, `bun run test -- src/drivers/ogg/ogg.test.ts
+src/api/codec-ops.test.ts src/drivers/webm/ebml-write.test.ts`, `bun run typecheck`, `bun run build`,
+`bun run vendor-wasm`, and `bun run check-budgets` with the eager closure at **49.75 kB**). The sibling
+adapter focused Biome and TypeScript checks are green. The fresh all-engine Chromium run
+`chromium-2026-07-01T23-24-54-554Z.json` closes `mux/opus_to_webm_audio`: aibrush-media passes the same
+`property-invariant` oracle at **5.765 ms** median over nine timed samples after three warmups, versus
+mediabunny **7.540 ms** and ffmpeg.wasm **15.805 ms**. Regenerating the deficit backlog removes the row
+and reports **299 active deficits** with severity split `0/0/86/213`.
+
+**Rejected:** hardcoding `opus.ogg`, its packet table, its duration, or the WebM bytes; caching parsed
+packet rows or outputs across measured iterations; weakening the property-invariant oracle; duplicating
+the Ogg parser in the harness adapter; trusting mutated/unknown-size/oversized inputs; using the direct
+prepared writer for stream targets that need sink telemetry; allowing illegal codec/container pairs to
+fall through; and broadening the default eager entry to include the prepared WebM writer.

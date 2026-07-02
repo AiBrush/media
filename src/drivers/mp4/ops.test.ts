@@ -139,6 +139,29 @@ describe('media.trim (mp4 keyframe-copy)', () => {
     }
   });
 
+  it('full-range keyframe trim reimports as an idempotent packet copy', async () => {
+    const m = media();
+    const input = await loadFixture('movie_5.mp4');
+    const orig = await readMovie(ra(input));
+    const out = await bytesOf(
+      await m.trim(await fixtureSource('movie_5.mp4'), {
+        start: 0,
+        end: orig.durationSec,
+        mode: 'keyframe',
+      }),
+    );
+
+    expect(equalBytes(out, input)).toBe(false);
+    const re = await readMovie(ra(out));
+    expect(re.tracks.length).toBe(orig.tracks.length);
+    for (let i = 0; i < orig.tracks.length; i++) {
+      const a = orig.tracks[i];
+      const b = re.tracks[i];
+      expect(b?.codec).toBe(a?.codec);
+      if (a && b) expect(buildSampleData(b).map(strip)).toEqual(buildSampleData(a).map(strip));
+    }
+  });
+
   it('rejects frame-accurate trim with a typed CapabilityError (needs the codec seam)', async () => {
     await expect(
       media().trim(await fixtureSource('movie_5.mp4'), { start: 1, end: 3, mode: 'accurate' }),

@@ -317,6 +317,24 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(equalBytes(output, expected)).toBe(true);
   });
 
+  it('full-range trim uses the ordinary buffered stream-copy layout', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const movie = await readMovie(ra(input));
+    const untrimmed = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), { buffered: true }),
+    );
+    const fullRange = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), {
+        trim: { startSec: 0, endSec: movie.durationSec },
+        buffered: true,
+      }),
+    );
+
+    expect(equalBytes(fullRange, input)).toBe(false);
+    expect(equalBytes(fullRange, untrimmed)).toBe(true);
+  });
+
   it('keyframe trim range-reads only metadata and selected sample windows', async () => {
     if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
     const input = await loadFixture('movie_5.mp4');
@@ -419,11 +437,13 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
 
     expect(contractRows).toEqual(expected);
     expect(infoTable).toEqual(
-      expected.map((packet) => ({
+      expected.map((packet, index) => ({
         trackIndex: 0,
+        offset: [100, 104, 109][index],
         size: packet.sizeBytes,
         ptsUs: packet.ptsUs,
         dtsUs: packet.dtsUs,
+        durationUs: packet.durationUs,
         keyframe: packet.keyframe,
       })),
     );

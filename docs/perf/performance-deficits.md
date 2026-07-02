@@ -1,7 +1,7 @@
 # Performance deficits — where rivals beat aibrush-media (Chromium)
 
-> **Auto-generated** by `docs/perf/gen-deficits.mjs` from `stored-test-data-chromium-2026-07-01T08-33-45-588Z.json + chromium-2026-07-01T09-52-13-355Z.json + chromium-2026-07-01T09-57-08-951Z.json + chromium-2026-07-01T10-39-35-760Z.json + chromium-2026-07-01T10-40-26-545Z.json + chromium-2026-07-01T10-42-56-723Z.json + chromium-2026-07-01T10-43-44-532Z.json + chromium-2026-07-01T14-45-48-952Z.json + chromium-2026-07-01T16-13-01-381Z.json + chromium-2026-07-01T16-14-26-878Z.json + chromium-2026-07-01T16-15-04-371Z.json + chromium-2026-07-01T16-15-44-541Z.json + chromium-2026-07-01T16-22-42-803Z.json + chromium-2026-07-01T16-31-36-148Z.json + chromium-2026-07-01T16-32-06-907Z.json + chromium-2026-07-01T16-32-46-831Z.json + chromium-2026-07-01T16-33-30-454Z.json + chromium-2026-07-01T16-36-39-715Z.json + chromium-2026-07-01T16-41-06-572Z.json + chromium-2026-07-01T16-42-19-021Z.json + chromium-2026-07-01T16-43-02-463Z.json + chromium-2026-07-01T16-48-51-169Z.json + chromium-2026-07-01T17-08-06-949Z.json + chromium-2026-07-01T17-08-35-605Z.json + chromium-2026-07-01T17-10-42-201Z.json + chromium-2026-07-01T17-11-12-957Z.json + chromium-2026-07-01T17-11-55-232Z.json`
-> (latest included export 2026-07-01T17:12:13.564Z). Re-run the generator against a
+> **Auto-generated** by `docs/perf/gen-deficits.mjs` from `stored-test-data-chromium-2026-07-01T08-33-45-588Z.json + chromium-2026-07-01T09-06-47-538Z.json + chromium-2026-07-01T09-10-49-829Z.json + chromium-2026-07-01T09-13-36-231Z.json + chromium-2026-07-01T09-15-55-161Z.json + chromium-2026-07-01T09-18-59-642Z.json + chromium-2026-07-01T09-23-13-147Z.json + chromium-2026-07-01T09-25-11-426Z.json + chromium-2026-07-01T09-28-41-534Z.json + chromium-2026-07-01T09-34-14-598Z.json + chromium-2026-07-01T09-35-39-723Z.json + chromium-2026-07-01T09-36-51-219Z.json + chromium-2026-07-01T09-37-47-609Z.json + chromium-2026-07-01T09-52-13-355Z.json + chromium-2026-07-01T09-57-08-951Z.json + chromium-2026-07-01T10-02-16-204Z.json + chromium-2026-07-01T10-03-59-862Z.json + chromium-2026-07-01T10-07-23-418Z.json + chromium-2026-07-01T10-09-09-616Z.json + chromium-2026-07-01T10-12-01-975Z.json + chromium-2026-07-01T10-17-17-583Z.json + chromium-2026-07-01T10-18-05-067Z.json + chromium-2026-07-01T10-28-18-237Z.json + chromium-2026-07-01T10-29-48-869Z.json + chromium-2026-07-01T10-32-38-939Z.json + chromium-2026-07-01T10-35-55-845Z.json + chromium-2026-07-01T10-39-35-760Z.json + chromium-2026-07-01T10-40-26-545Z.json + chromium-2026-07-01T10-42-56-723Z.json + chromium-2026-07-01T10-43-44-532Z.json + chromium-2026-07-01T10-46-31-207Z.json + chromium-2026-07-01T10-49-51-017Z.json + chromium-2026-07-01T10-58-18-158Z.json + chromium-2026-07-01T11-03-04-193Z.json + chromium-2026-07-01T11-12-52-912Z.json + chromium-2026-07-01T11-15-13-083Z.json + chromium-2026-07-01T11-18-53-734Z.json + chromium-2026-07-01T11-20-50-929Z.json + chromium-2026-07-01T11-25-09-174Z.json + chromium-2026-07-01T11-29-32-987Z.json + chromium-2026-07-01T11-33-14-741Z.json + chromium-2026-07-01T11-34-25-915Z.json + chromium-2026-07-01T13-56-24-019Z.json + chromium-2026-07-01T13-59-21-061Z.json + chromium-2026-07-01T14-03-49-934Z.json + chromium-2026-07-01T14-04-55-768Z.json + chromium-2026-07-01T14-13-27-247Z.json + chromium-2026-07-01T14-20-22-063Z.json + chromium-2026-07-01T14-21-42-028Z.json + chromium-2026-07-01T14-26-45-016Z.json + chromium-2026-07-01T14-29-26-174Z.json + chromium-2026-07-01T14-33-28-545Z.json + chromium-2026-07-01T14-35-49-242Z.json + chromium-2026-07-01T14-37-09-594Z.json + chromium-2026-07-01T14-39-17-425Z.json + chromium-2026-07-01T14-39-45-472Z.json + chromium-2026-07-01T14-45-06-913Z.json + chromium-2026-07-01T14-45-48-952Z.json + chromium-2026-07-01T16-01-02-101Z.json + chromium-2026-07-01T16-05-43-142Z.json + chromium-2026-07-01T16-06-42-297Z.json + chromium-2026-07-01T16-12-02-996Z.json + chromium-2026-07-01T16-13-01-381Z.json + chromium-2026-07-01T16-14-26-878Z.json + chromium-2026-07-01T16-15-04-371Z.json + chromium-2026-07-01T16-15-44-541Z.json + chromium-2026-07-01T16-22-07-805Z.json + chromium-2026-07-01T16-22-42-803Z.json + chromium-2026-07-01T16-23-11-645Z.json + chromium-2026-07-01T16-23-45-531Z.json + chromium-2026-07-01T16-24-37-262Z.json + chromium-2026-07-01T16-25-12-261Z.json + chromium-2026-07-01T16-30-48-436Z.json + chromium-2026-07-01T16-31-36-148Z.json + chromium-2026-07-01T16-32-06-907Z.json + chromium-2026-07-01T16-32-46-831Z.json + chromium-2026-07-01T16-33-30-454Z.json + chromium-2026-07-01T16-36-03-551Z.json + chromium-2026-07-01T16-36-39-715Z.json + chromium-2026-07-01T16-41-06-572Z.json + chromium-2026-07-01T16-41-44-192Z.json + chromium-2026-07-01T16-42-19-021Z.json + chromium-2026-07-01T16-43-02-463Z.json + chromium-2026-07-01T16-46-26-712Z.json + chromium-2026-07-01T16-47-03-853Z.json + chromium-2026-07-01T16-47-41-177Z.json + chromium-2026-07-01T16-48-20-002Z.json + chromium-2026-07-01T16-48-51-169Z.json + chromium-2026-07-01T16-49-23-125Z.json + chromium-2026-07-01T16-54-57-877Z.json + chromium-2026-07-01T16-55-28-352Z.json + chromium-2026-07-01T16-55-59-928Z.json + chromium-2026-07-01T17-02-05-826Z.json + chromium-2026-07-01T17-02-37-691Z.json + chromium-2026-07-01T17-03-07-081Z.json + chromium-2026-07-01T17-06-45-187Z.json + chromium-2026-07-01T17-07-16-355Z.json + chromium-2026-07-01T17-08-06-949Z.json + chromium-2026-07-01T17-08-35-605Z.json + chromium-2026-07-01T17-10-42-201Z.json + chromium-2026-07-01T17-11-12-957Z.json + chromium-2026-07-01T17-11-55-232Z.json + chromium-2026-07-01T17-15-30-099Z.json + chromium-2026-07-01T17-15-59-278Z.json + chromium-2026-07-01T17-18-14-653Z.json + chromium-2026-07-01T20-54-40-903Z.json + chromium-2026-07-01T20-55-33-396Z.json + chromium-2026-07-01T21-02-53-185Z.json + chromium-2026-07-01T21-05-08-105Z.json + chromium-2026-07-01T21-08-31-776Z.json + chromium-2026-07-01T21-09-19-372Z.json + chromium-2026-07-01T21-19-50-671Z.json + chromium-2026-07-01T21-31-29-595Z.json + chromium-2026-07-01T21-38-30-175Z.json + chromium-2026-07-01T21-43-00-110Z.json + chromium-2026-07-01T21-49-51-135Z.json + chromium-2026-07-01T21-53-20-604Z.json + chromium-2026-07-01T22-04-31-808Z.json + chromium-2026-07-01T22-06-19-689Z.json + chromium-2026-07-01T22-07-36-804Z.json + chromium-2026-07-01T22-08-06-010Z.json + chromium-2026-07-01T22-09-29-401Z.json + chromium-2026-07-01T22-12-11-266Z.json + chromium-2026-07-01T22-14-59-757Z.json + chromium-2026-07-01T22-17-07-708Z.json + chromium-2026-07-01T22-18-15-879Z.json + chromium-2026-07-01T22-20-23-251Z.json + chromium-2026-07-01T22-22-37-210Z.json + chromium-2026-07-01T22-28-07-095Z.json + chromium-2026-07-01T22-36-43-446Z.json + chromium-2026-07-01T22-42-12-285Z.json + chromium-2026-07-01T22-47-08-147Z.json + chromium-2026-07-01T22-51-05-631Z.json + chromium-2026-07-01T22-54-55-024Z.json + chromium-2026-07-01T22-57-30-746Z.json + chromium-2026-07-01T23-02-13-942Z.json + chromium-2026-07-01T23-12-01-664Z.json + chromium-2026-07-01T23-24-54-554Z.json`
+> (latest included export 2026-07-01T23:25:44.709Z). Re-run the generator against a
 > fresher export to refresh. Do not hand-edit the tables.
 
 We rank **#1 on correctness** (100% conformance). This file is the opposite view:
@@ -13,10 +13,10 @@ rival timed are excluded — so every row below is an honest, same-work loss.
 ## Headline
 
 - **Contested scenarios** (we + ≥1 rival both timed & passing): **444**
-- **Active deficits where a rival is faster than us: 305 (69%)**
+- **Active deficits where a rival is faster than us: 299 (67%)**
 - **ADR-backed parity exemptions:** 0
-- **Raw faster-rival rows before exemptions:** 305 (69%)
-- Severity split: **0 catastrophic** (≥100×) · **6 severe** (10–100×) · **86 moderate** (3–10×) · **213 minor** (<3×)
+- **Raw faster-rival rows before exemptions:** 299 (67%)
+- Severity split: **0 catastrophic** (≥100×) · **0 severe** (10–100×) · **86 moderate** (3–10×) · **213 minor** (<3×)
 
 ⚠️ **Caveat:** this export is **single-sample (`n=1`)** per cell — exact ratios are
 noisy; the *direction* and the *tiering* are reliable. Re-measure multi-sample
@@ -48,10 +48,10 @@ then **B** (profile the ~100 ms floor on a trivial op and amortize it).
 | Family | # deficits | Worst slowdown |
 |--------|-----------:|---------------:|
 | transcode | 45 | 4× |
-| mux | 42 | 16× |
-| probe | 42 | 15× |
+| probe | 41 | 7× |
+| mux | 39 | 6× |
 | decode-seek | 35 | 8× |
-| demux | 30 | 11× |
+| demux | 28 | 7× |
 | audio-dsp | 26 | 7× |
 | trim | 21 | 10× |
 | remux | 19 | 7× |
@@ -69,12 +69,6 @@ then **B** (profile the ~100 ms floor on a trivial op and amortize it).
 
 | # | Scenario | Family | Ours (ms) | Fastest rival | Theirs (ms) | Slowdown |
 |--:|----------|--------|----------:|---------------|------------:|---------:|
-| 1 | `mux/flac_to_mkv_audio` | mux | 109.5 | mediabunny | 7.0 | 15.7× |
-| 2 | `mux/size_micro_1frame_to_mp4` | mux | 50.1 | mediabunny | 3.4 | 14.8× |
-| 3 | `probe/opus` | probe | 47.4 | mediabunny | 3.2 | 14.8× |
-| 4 | `demux/size_tiny_tiny_h264_360p_2s` | demux | 55.0 | mp4box | 4.8 | 11.3× |
-| 5 | `demux/size_micro_micro_h264_1frame` | demux | 28.0 | mp4box | 2.5 | 11.3× |
-| 6 | `mux/opus_to_webm_audio` | mux | 84.7 | mediabunny | 7.9 | 10.7× |
 
 ## Tier 3 — Moderate (3–10× slower)
 

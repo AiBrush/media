@@ -16,6 +16,7 @@ import {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { WebmModule } from '../drivers/webm/webm-driver.ts';
+import { toStreamTarget } from '../sinks/stream-target.ts';
 import { type MediaInput, type Source, fromBytes, fromStream } from '../sources/source.ts';
 import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
@@ -276,6 +277,78 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return copy;
 }
 
+function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+function frameStream<T>(): ReadableStream<T> {
+  return new ReadableStream<T>({
+    start(controller): void {
+      controller.close();
+    },
+  });
+}
+
+function streamCopyModule(calls: Array<unknown>): DriverModule {
+  const tracks: TrackInfo[] = [
+    {
+      id: 1,
+      mediaType: 'video',
+      codec: 'noop',
+      durationSec: 2,
+      config: { codec: 'noop', codedWidth: 16, codedHeight: 16 },
+    },
+  ];
+  const driver: ContainerDriver = {
+    id: 'copy-mp4',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (q) => q.mime === 'video/x-copy-mp4',
+    probe: () => Promise.resolve(tracks),
+    demux: () =>
+      Promise.resolve({
+        tracks,
+        packets: () => new ReadableStream({ start: (c) => c.close() }),
+        close: () => Promise.resolve(),
+      }),
+    streamCopy: (_src, o) => {
+      calls.push(o);
+      return Promise.resolve(byteStream(new Uint8Array([7, 8, 9])));
+    },
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  return { apiVersion: DRIVER_API_VERSION, register: (reg) => reg.addContainer(driver) };
+}
+
+function packetInfoModule(): DriverModule {
+  const driver: ContainerDriver = {
+    id: 'packet-info-mp4',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (q) => q.mime === 'video/x-packet-info',
+    packetInfo: () => Promise.resolve({ tracks: [], packets: [] }),
+    demux: () =>
+      Promise.resolve({
+        tracks: [],
+        packets: () => new ReadableStream({ start: (c) => c.close() }),
+        close: () => Promise.resolve(),
+      }),
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  return { apiVersion: DRIVER_API_VERSION, register: (reg) => reg.addContainer(driver) };
+}
+
 /** Pull the first item from a frame stream (forces a lazy `decode` to run its demux/codec route). */
 async function readFirst<T>(stream: ReadableStream<T> | undefined): Promise<T | undefined> {
   if (!stream) return undefined;
@@ -334,6 +407,20 @@ describe('createMedia', () => {
     const reader = demuxed.packets(0).getReader();
     expect((await reader.read()).done).toBe(true);
     await demuxed.close();
+  });
+
+  it('packetInfo routes to the fast metadata hook and rejects drivers without one', async () => {
+    const withPacketInfo = createMedia().use(packetInfoModule()) as unknown as {
+      packetInfo(input: MediaInput): Promise<{ readonly tracks: readonly TrackInfo[] }>;
+    };
+    await expect(
+      withPacketInfo.packetInfo(fromBytes(new Uint8Array([1]), { mime: 'video/x-packet-info' })),
+    ).resolves.toEqual({ tracks: [], packets: [] });
+
+    const withoutPacketInfo = createMedia().use(NoopDriverModule) as unknown as {
+      packetInfo(input: MediaInput): Promise<unknown>;
+    };
+    await expect(withoutPacketInfo.packetInfo(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
   });
 
   it('probe maps demuxer tracks into MediaInfo (dims + audio params + duration)', async () => {
@@ -588,6 +675,55 @@ describe('createMedia', () => {
     await expect(media.encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
     await expect(media.h264AbrLadder(NOOP_BYTES, [])).rejects.toBeInstanceOf(InputError);
     await expect(readFirst(media.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('same-container remux and trim pass streaming options to stream-target sinks', async () => {
+    const calls: Array<unknown> = [];
+    const chunks: Array<readonly [number, Uint8Array]> = [];
+    const media = createMedia().use(streamCopyModule(calls));
+    const input = fromBytes(new Uint8Array([1]), { mime: 'video/x-copy-mp4' });
+    const sink = toStreamTarget((chunk, position) => {
+      chunks.push([position, chunk.slice()]);
+    });
+
+    await expect(media.remux(input, { to: 'mp4', sink })).resolves.toBeUndefined();
+    await expect(media.trim(input, { start: 0, end: 2, sink })).resolves.toBeUndefined();
+
+    expect(chunks).toEqual([
+      [0, new Uint8Array([7, 8, 9])],
+      [0, new Uint8Array([7, 8, 9])],
+    ]);
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call).toMatchObject({ streaming: true });
+      expect(call).not.toMatchObject({ buffered: true });
+    }
+  });
+
+  it('encode validates unsupported targets and missing stream targets before opening codecs', async () => {
+    const media = createMedia().use(NoopDriverModule);
+    await expect(
+      media.encode({ audio: frameStream<AudioData>() }, { to: 'wav', audio: { codec: 'opus' } }),
+    ).rejects.toBeInstanceOf(CapabilityError);
+    await expect(
+      media.encode({ audio: frameStream<AudioData>() }, { to: 'aac', audio: { codec: 'opus' } }),
+    ).rejects.toBeInstanceOf(CapabilityError);
+    await expect(
+      media.encode({ video: frameStream<VideoFrame>() }, { to: 'mp4' }),
+    ).rejects.toBeInstanceOf(InputError);
+    await expect(
+      media.encode({ audio: frameStream<AudioData>() }, { to: 'mp4' }),
+    ).rejects.toBeInstanceOf(InputError);
+  });
+
+  it('decrypt rejects a routed container that has no decrypt capability', async () => {
+    const media = createMedia().use(NoopDriverModule);
+    await expect(
+      media.decrypt(NOOP_BYTES, {
+        scheme: 'cenc',
+        keys: { '00112233445566778899aabbccddeeff': '000102030405060708090a0b0c0d0e0f' },
+      }),
+    ).rejects.toBeInstanceOf(CapabilityError);
   });
 
   it('reads the head of a non-seekable custom source, then routes', async () => {
