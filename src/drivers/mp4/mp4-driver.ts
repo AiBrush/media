@@ -24,8 +24,9 @@ import type {
   TrackInfo,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
+import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import {
   CBCS_SCHEME,
   CENC_SCHEME,
@@ -39,6 +40,7 @@ import {
   parseSenc,
   parseTenc,
 } from './cenc.ts';
+import { parseEsds } from './codec-strings.ts';
 import {
   type FragmentInitTrackInput,
   buildMediaSegment,
@@ -55,7 +57,7 @@ import {
   parseMovieMetadata,
   parseMoviePacketInfo,
 } from './parse.ts';
-import { Reader } from './reader.ts';
+import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import {
   type ContainerBrand,
@@ -75,7 +77,14 @@ const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
 const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
-const FASTSTART_METADATA_HEAD_BYTES = 64;
+const FASTSTART_METADATA_PREFETCH_BYTES = 32 * 1024;
+const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
+const FULL_RANGE_EOF_SLACK_SEC = 0.05;
+const SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES = 1024 * 1024;
+const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
+const PROGRESSIVE_SINGLE_READ_MAX_BYTES = 64 * 1024 * 1024;
+const PROGRESSIVE_SINGLE_READ_MAX_GAP_BYTES = 1024 * 1024;
+const TRIM_END_RANGE_SLACK_SEC = 1;
 
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
@@ -87,6 +96,13 @@ interface RandomAccess {
   read(offset: number, length: number): Promise<Uint8Array>;
   size?: number;
 }
+
+interface MovieParseHandoff {
+  readonly movie: Movie;
+  readonly token: object;
+}
+
+const movieParseHandoff = new Map<string, MovieParseHandoff>();
 
 async function randomAccess(src: ByteSource): Promise<RandomAccess> {
   const range = src.range;
@@ -101,6 +117,62 @@ async function randomAccess(src: ByteSource): Promise<RandomAccess> {
     read: (o, l) => Promise.resolve(buffered.subarray(o, o + l)),
     size: buffered.byteLength,
   };
+}
+
+function sourceCacheKey(src: ByteSource): string | undefined {
+  return (src as ByteSource & { readonly [SOURCE_CACHE_KEY]?: string })[SOURCE_CACHE_KEY];
+}
+
+function sourceMimeHint(src: ByteSource): string | undefined {
+  return (src as ByteSource & { readonly mimeHint?: string }).mimeHint;
+}
+
+function shouldTryTinyAudioFaststartProbe(src: ByteSource, ra: RandomAccess): boolean {
+  if (ra.size === undefined || ra.size > TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES) return false;
+  const mime = sourceMimeHint(src)?.toLowerCase();
+  if (mime !== undefined && (mime === 'audio/mp4' || mime === 'audio/x-m4a')) return true;
+  const key = sourceCacheKey(src);
+  return key !== undefined && /\.m4a(?:[?#]|$)/i.test(key);
+}
+
+function canHandoffFullMovie(src: ByteSource, ra: RandomAccess): boolean {
+  return (
+    sourceCacheKey(src) !== undefined &&
+    ra.size !== undefined &&
+    ra.size <= SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES
+  );
+}
+
+function storeMovieParseHandoff(key: string, movie: Movie): void {
+  const token = {};
+  movieParseHandoff.set(key, { movie, token });
+  setTimeout(() => {
+    if (movieParseHandoff.get(key)?.token === token) {
+      movieParseHandoff.delete(key);
+    }
+  }, MOVIE_PARSE_HANDOFF_TTL_MS);
+}
+
+async function readMovieForProbe(src: ByteSource, ra: RandomAccess): Promise<Movie> {
+  const key = sourceCacheKey(src);
+  if (key !== undefined && canHandoffFullMovie(src, ra)) {
+    const movie = await readMovie(ra);
+    storeMovieParseHandoff(key, movie);
+    return movie;
+  }
+  return readMovieMetadata(ra);
+}
+
+async function readMovieForDemux(src: ByteSource, ra: RandomAccess): Promise<Movie> {
+  const key = sourceCacheKey(src);
+  if (key !== undefined) {
+    const cached = movieParseHandoff.get(key);
+    if (cached !== undefined) {
+      movieParseHandoff.delete(key);
+      return cached.movie;
+    }
+  }
+  return readMovie(ra);
 }
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -146,7 +218,11 @@ function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefin
 }
 
 async function readFaststartMetadata(ra: RandomAccess): Promise<MovieMetadata | undefined> {
-  const head = await ra.read(0, FASTSTART_METADATA_HEAD_BYTES);
+  const prefetchBytes = Math.min(
+    FASTSTART_METADATA_PREFETCH_BYTES,
+    ra.size ?? FASTSTART_METADATA_PREFETCH_BYTES,
+  );
+  const head = await ra.read(0, prefetchBytes);
   let offset = 0;
   let brand = 'mp42';
 
@@ -157,9 +233,287 @@ async function readFaststartMetadata(ra: RandomAccess): Promise<MovieMetadata | 
       brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
     }
     if (header.type === 'moov') {
+      if (offset + header.size <= head.byteLength) {
+        return parseMovieMetadata(
+          brand,
+          head.subarray(offset + header.headerSize, offset + header.size),
+        );
+      }
       const box = await ra.read(offset, header.size);
       if (box.byteLength < header.headerSize) return undefined;
       return parseMovieMetadata(brand, box.subarray(header.headerSize));
+    }
+    offset += header.size;
+    if (offset + 8 > head.byteLength) return undefined;
+  }
+}
+
+interface ProbeEdit {
+  readonly mediaTimeTicks: number;
+  readonly durationSec: number;
+}
+
+interface ProbeAudioEntry {
+  readonly type: string;
+  readonly codec: string;
+  readonly sampleRate: number;
+  readonly channels: number;
+  readonly config: AudioDecoderConfig;
+}
+
+function probeBoxAt(r: Reader): BoxHeader | undefined {
+  if (r.pos + 8 > r.length) return undefined;
+  const start = r.pos;
+  let size = r.u32();
+  const type = r.fourcc();
+  let headerSize = 8;
+  if (size === 1) {
+    if (r.pos + 8 > r.length) return undefined;
+    size = r.u64();
+    headerSize = 16;
+  } else if (size === 0) {
+    size = r.length - start;
+  }
+  if (size < headerSize || start + size > r.length) return undefined;
+  return { type, size, headerSize, start, payloadStart: start + headerSize, end: start + size };
+}
+
+function probeChild(r: Reader, parent: BoxHeader, type: string): BoxHeader | undefined {
+  r.seek(parent.payloadStart);
+  for (const box of boxes(r, parent.end)) {
+    if (box.type === type) return box;
+  }
+  return undefined;
+}
+
+function probeChildren(r: Reader, parent: BoxHeader, type: string): BoxHeader[] {
+  r.seek(parent.payloadStart);
+  const out: BoxHeader[] = [];
+  for (const box of boxes(r, parent.end)) {
+    if (box.type === type) out.push(box);
+  }
+  return out;
+}
+
+function probeBoxFrom(r: Reader, start: number, end: number, type: string): BoxHeader | undefined {
+  r.seek(start);
+  for (const box of boxes(r, end)) {
+    if (box.type === type) return box;
+  }
+  return undefined;
+}
+
+function probeMovieTimescale(r: Reader, mvhd: BoxHeader): number {
+  r.seek(mvhd.payloadStart);
+  const { version } = readFullBoxHeader(r);
+  r.skip(version === 1 ? 16 : 8);
+  return r.u32();
+}
+
+function probeTrackId(r: Reader, tkhd: BoxHeader): number {
+  r.seek(tkhd.payloadStart);
+  const { version } = readFullBoxHeader(r);
+  r.skip(version === 1 ? 16 : 8);
+  return r.u32();
+}
+
+function probeMdhd(r: Reader, mdhd: BoxHeader): { timescale: number; durationSec: number } {
+  r.seek(mdhd.payloadStart);
+  const { version } = readFullBoxHeader(r);
+  r.skip(version === 1 ? 16 : 8);
+  const timescale = r.u32();
+  const duration = version === 1 ? r.u64() : r.u32();
+  return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
+}
+
+function probeHandler(r: Reader, hdlr: BoxHeader): string {
+  r.seek(hdlr.payloadStart);
+  readFullBoxHeader(r);
+  r.skip(4);
+  return r.fourcc();
+}
+
+function probeTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): ProbeEdit | undefined {
+  const edts = probeChild(r, trak, 'edts');
+  const elst = edts === undefined ? undefined : probeChild(r, edts, 'elst');
+  if (elst === undefined) return undefined;
+
+  r.seek(elst.payloadStart);
+  const { version } = readFullBoxHeader(r);
+  const entryCount = r.u32();
+  let active: ProbeEdit | undefined;
+  for (let i = 0; i < entryCount; i++) {
+    const segmentDuration = version === 1 ? r.u64() : r.u32();
+    const mediaTime = version === 1 ? readSigned64(r) : r.i32();
+    const mediaRateInteger = r.i16();
+    const mediaRateFraction = r.i16();
+    if (mediaTime < 0) continue;
+    if (mediaRateInteger !== 1 || mediaRateFraction !== 0 || active !== undefined) return undefined;
+    active = {
+      mediaTimeTicks: mediaTime,
+      durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
+    };
+  }
+  return active;
+}
+
+function readSigned64(r: Reader): number {
+  const hi = r.i32();
+  const lo = r.u32();
+  return hi * 2 ** 32 + lo;
+}
+
+function probeAudioEntry(r: Reader, stsd: BoxHeader): ProbeAudioEntry | undefined {
+  r.seek(stsd.payloadStart);
+  readFullBoxHeader(r);
+  if (r.u32() !== 1) return undefined;
+  const entry = probeBoxAt(r);
+  if (entry === undefined || entry.type !== 'mp4a') return undefined;
+  const { channels, sampleRate, childStart } = probeAudioGeometry(r, entry);
+  const esds = probeAudioConfigBox(r, childStart, entry.end, 'esds');
+  if (esds === undefined) return undefined;
+  const info = parseEsds(r.bytesAt(esds.payloadStart, esds.end));
+  const config: AudioDecoderConfig = {
+    codec: info.codec,
+    sampleRate,
+    numberOfChannels: channels,
+    ...(info.asc ? { description: info.asc } : {}),
+  };
+  return { type: entry.type, codec: info.codec, sampleRate, channels, config };
+}
+
+function probeAudioGeometry(
+  r: Reader,
+  entry: BoxHeader,
+): { channels: number; sampleRate: number; childStart: number } {
+  const base = entry.payloadStart;
+  r.seek(base + 6 + 2);
+  const version = r.u16();
+  r.skip(2 + 4);
+  const v0Channels = r.u16();
+  r.skip(2 + 2 + 2);
+  const v0SampleRate = r.u32() >>> 16;
+  if (version === 2) {
+    const f64 = r.bytesAt(base + 32, base + 40);
+    const sampleRate = Math.round(
+      new DataView(f64.buffer, f64.byteOffset, f64.byteLength).getFloat64(0),
+    );
+    r.seek(base + 40);
+    return { channels: r.u32(), sampleRate, childStart: base + 64 };
+  }
+  return {
+    channels: v0Channels,
+    sampleRate: v0SampleRate,
+    childStart: base + 28 + (version === 1 ? 16 : 0),
+  };
+}
+
+function probeAudioConfigBox(
+  r: Reader,
+  childStart: number,
+  end: number,
+  type: string,
+): BoxHeader | undefined {
+  const direct = probeBoxFrom(r, childStart, end, type);
+  if (direct !== undefined) return direct;
+  const wave = probeBoxFrom(r, childStart, end, 'wave');
+  return wave === undefined ? undefined : probeBoxFrom(r, wave.payloadStart, wave.end, type);
+}
+
+function probeSttsDurationTicks(r: Reader, stbl: BoxHeader): number | undefined {
+  const stts = probeChild(r, stbl, 'stts');
+  if (stts === undefined) return undefined;
+  r.seek(stts.payloadStart);
+  readFullBoxHeader(r);
+  const entryCount = r.u32();
+  let durationTicks = 0;
+  for (let i = 0; i < entryCount; i++) {
+    durationTicks += r.u32() * r.u32();
+  }
+  return durationTicks;
+}
+
+function probeGapless(
+  edit: ProbeEdit | undefined,
+  sampleRate: number,
+  timescale: number,
+  durationTicks: number | undefined,
+): TrackInfo['gapless'] | undefined {
+  if (edit === undefined || durationTicks === undefined || sampleRate <= 0 || timescale <= 0) {
+    return undefined;
+  }
+  const scale = sampleRate / timescale;
+  const codedSamples = Math.max(0, Math.round(durationTicks * scale));
+  const leadingSamples = Math.max(0, Math.round(edit.mediaTimeTicks * scale));
+  const totalSamples = Math.max(0, Math.round(edit.durationSec * sampleRate));
+  const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
+  return { leadingSamples, trailingSamples, totalSamples };
+}
+
+function parseTinyAudioFaststartProbeTracks(moov: Uint8Array): readonly TrackInfo[] | undefined {
+  const r = new Reader(moov);
+  const root: BoxHeader = {
+    type: 'moov',
+    size: moov.byteLength,
+    headerSize: 0,
+    start: 0,
+    payloadStart: 0,
+    end: moov.byteLength,
+  };
+  const mvhd = probeChild(r, root, 'mvhd');
+  if (mvhd === undefined) return undefined;
+  const movieTimescale = probeMovieTimescale(r, mvhd);
+  const traks = probeChildren(r, root, 'trak');
+  if (traks.length === 0) return undefined;
+  const tracks: TrackInfo[] = [];
+  for (const trak of traks) {
+    const tkhd = probeChild(r, trak, 'tkhd');
+    const mdia = probeChild(r, trak, 'mdia');
+    if (tkhd === undefined || mdia === undefined) return undefined;
+    const mdhd = probeChild(r, mdia, 'mdhd');
+    const hdlr = probeChild(r, mdia, 'hdlr');
+    if (mdhd === undefined || hdlr === undefined) return undefined;
+    if (probeHandler(r, hdlr) !== 'soun') return undefined;
+    const minf = probeChild(r, mdia, 'minf');
+    const stbl = minf === undefined ? undefined : probeChild(r, minf, 'stbl');
+    const stsd = stbl === undefined ? undefined : probeChild(r, stbl, 'stsd');
+    if (stbl === undefined || stsd === undefined) return undefined;
+    const id = probeTrackId(r, tkhd);
+    const timing = probeMdhd(r, mdhd);
+    const entry = probeAudioEntry(r, stsd);
+    if (entry === undefined || entry.type !== 'mp4a') return undefined;
+    const edit = probeTrackEdit(r, trak, movieTimescale);
+    const gapless = probeGapless(
+      edit,
+      entry.sampleRate,
+      timing.timescale,
+      probeSttsDurationTicks(r, stbl),
+    );
+    tracks.push({
+      id,
+      mediaType: 'audio',
+      codec: entry.codec,
+      durationSec: timing.durationSec,
+      ...(gapless !== undefined ? { gapless } : {}),
+      config: entry.config,
+    });
+  }
+  return tracks;
+}
+
+async function readTinyAudioFaststartProbeTracks(
+  ra: RandomAccess,
+): Promise<readonly TrackInfo[] | undefined> {
+  const head = await ra.read(0, Math.min(ra.size ?? 0, TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES));
+  let offset = 0;
+  for (;;) {
+    const header = topBoxHeader(head, offset);
+    if (header === undefined) return undefined;
+    if (header.type === 'moov') {
+      if (offset + header.size > head.byteLength) return undefined;
+      return parseTinyAudioFaststartProbeTracks(
+        head.subarray(offset + header.headerSize, offset + header.size),
+      );
     }
     offset += header.size;
     if (offset + 8 > head.byteLength) return undefined;
@@ -1573,35 +1927,10 @@ async function materializeProgressiveTracksBytes(
   out.set(layout.mdatHeader, p);
   p += layout.mdatHeader.byteLength;
   const payloadStart = p;
-
-  for (const track of tracks) {
-    for (const window of planOrderedSampleReadWindows(track.samples)) {
-      throwIfAborted(signal);
-      const span = await ra.read(window.start, window.end - window.start);
-      if (span.byteLength !== window.end - window.start) {
-        throw new MediaError(
-          'demux-error',
-          `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
-            window.end - window.start
-          } bytes (truncated MP4)`,
-        );
-      }
-      throwIfAborted(signal);
-      for (const item of window.items) {
-        const rel = item.sample.offset - window.start;
-        out.set(span.subarray(rel, rel + item.sample.size), p);
-        p += item.sample.size;
-      }
-    }
-  }
-
   const payloadEnd = payloadStart + layout.mdatPayloadLen;
-  if (p !== payloadEnd) {
-    throw new MediaError(
-      'mux-error',
-      `internal MP4 layout mismatch: wrote ${p - payloadStart} payload bytes, expected ${layout.mdatPayloadLen}`,
-    );
-  }
+
+  await copyProgressivePayload(out, ra, progressivePayloadCopies(tracks, payloadStart), signal);
+  p = payloadEnd;
   if (layout.mdatBeforeMoov) {
     out.set(layout.moov, p);
     p += layout.moov.byteLength;
@@ -1613,6 +1942,99 @@ async function materializeProgressiveTracksBytes(
     );
   }
   return out;
+}
+
+interface ProgressivePayloadCopy extends SampleRange {
+  readonly outputOffset: number;
+}
+
+interface SourceReadWindow {
+  readonly start: number;
+  readonly end: number;
+}
+
+function progressivePayloadCopies(
+  tracks: readonly LazyProgressiveTrack[],
+  payloadStart: number,
+): ProgressivePayloadCopy[] {
+  const copies: ProgressivePayloadCopy[] = [];
+  let outputOffset = payloadStart;
+  for (const track of tracks) {
+    for (const sample of track.samples) {
+      copies.push({
+        index: sample.index,
+        offset: sample.offset,
+        size: sample.size,
+        outputOffset,
+      });
+      outputOffset += sample.size;
+    }
+  }
+  copies.sort((a, b) => a.offset - b.offset || a.outputOffset - b.outputOffset);
+  return copies;
+}
+
+async function copyProgressivePayload(
+  out: Uint8Array,
+  ra: RandomAccess,
+  copies: readonly ProgressivePayloadCopy[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const singleRead = denseSingleReadWindow(copies);
+  if (singleRead !== undefined) {
+    throwIfAborted(signal);
+    const span = await ra.read(singleRead.start, singleRead.end - singleRead.start);
+    if (span.byteLength !== singleRead.end - singleRead.start) {
+      throw new MediaError(
+        'demux-error',
+        `sample window [${singleRead.start}, ${singleRead.end}) short read: got ${
+          span.byteLength
+        } of ${singleRead.end - singleRead.start} bytes (truncated MP4)`,
+      );
+    }
+    throwIfAborted(signal);
+    for (const copy of copies) {
+      const rel = copy.offset - singleRead.start;
+      out.set(span.subarray(rel, rel + copy.size), copy.outputOffset);
+    }
+    return;
+  }
+
+  for (const window of planSampleReadWindows(copies)) {
+    throwIfAborted(signal);
+    const span = await ra.read(window.start, window.end - window.start);
+    if (span.byteLength !== window.end - window.start) {
+      throw new MediaError(
+        'demux-error',
+        `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+          window.end - window.start
+        } bytes (truncated MP4)`,
+      );
+    }
+    throwIfAborted(signal);
+    for (const item of window.items) {
+      const rel = item.sample.offset - window.start;
+      out.set(span.subarray(rel, rel + item.sample.size), item.sample.outputOffset);
+    }
+  }
+}
+
+function denseSingleReadWindow(
+  copies: readonly ProgressivePayloadCopy[],
+): SourceReadWindow | undefined {
+  if (copies.length === 0) return undefined;
+  let start = Number.POSITIVE_INFINITY;
+  let end = 0;
+  let payloadBytes = 0;
+  for (const copy of copies) {
+    start = Math.min(start, copy.offset);
+    end = Math.max(end, copy.offset + copy.size);
+    payloadBytes += copy.size;
+  }
+  const spanBytes = end - start;
+  if (spanBytes <= 0 || spanBytes > PROGRESSIVE_SINGLE_READ_MAX_BYTES) return undefined;
+  if (spanBytes - payloadBytes > PROGRESSIVE_SINGLE_READ_MAX_GAP_BYTES) return undefined;
+  return { start, end };
 }
 
 function planOrderedSampleReadWindows(samples: readonly SampleData[]): SampleReadWindow[] {
@@ -1827,8 +2249,41 @@ function trimmedProgressiveSourceBufferStream(
 }
 
 function trimCoversMovie(movie: Movie, trim: NonNullable<StreamCopyOptions['trim']>): boolean {
+  if (trim.startSec !== 0) return false;
+  const trackDurationSec = movie.tracks.reduce((max, track) => Math.max(max, track.durationSec), 0);
+  if (trackDurationSec <= 0) return false;
+  if (trim.endSec >= trackDurationSec) return true;
+  return (
+    movie.durationSec > 0 &&
+    trim.endSec >= movie.durationSec &&
+    trackDurationSec - trim.endSec <= FULL_RANGE_EOF_SLACK_SEC
+  );
+}
+
+function validateStreamCopyTrimRange(
+  movie: Movie,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+): void {
+  const startSec = trim.startSec;
+  const endSec = trim.endSec;
+  if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
+    throw new InputError('unsupported-input', 'bad trim');
+  }
+  if (startSec < 0) {
+    throw new InputError('unsupported-input', 'start<0');
+  }
+  if (endSec <= startSec) {
+    throw new InputError('unsupported-input', 'empty trim');
+  }
   const durationSec = movie.tracks.reduce((max, track) => Math.max(max, track.durationSec), 0);
-  return trim.startSec === 0 && durationSec > 0 && trim.endSec >= durationSec;
+  if (durationSec > 0) {
+    if (startSec >= durationSec) {
+      throw new InputError('unsupported-input', 'start>=duration');
+    }
+    if (endSec > durationSec + TRIM_END_RANGE_SLACK_SEC) {
+      throw new InputError('unsupported-input', 'end>duration');
+    }
+  }
 }
 
 /**
@@ -1916,12 +2371,18 @@ export const Mp4Driver: ContainerDriver = {
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['mp4', 'mov'],
+  validatesStreamCopyTrim: true,
   supports: matches,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
     const ra = await randomAccess(src);
     throwIfAborted(signal);
-    const movie = await readMovieMetadata(ra);
+    if (shouldTryTinyAudioFaststartProbe(src, ra)) {
+      const tracks = await readTinyAudioFaststartProbeTracks(ra);
+      throwIfAborted(signal);
+      if (tracks !== undefined) return tracks;
+    }
+    const movie = await readMovieForProbe(src, ra);
     throwIfAborted(signal);
     return movie.tracks.map(toTrackInfo);
   },
@@ -1939,7 +2400,7 @@ export const Mp4Driver: ContainerDriver = {
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);
-    const movie = await readMovie(ra);
+    const movie = await readMovieForDemux(src, ra);
     const byId = new Map(movie.tracks.map((t) => [t.id, t]));
     const signal = o?.signal;
     const supportsPacketTable = hasCompleteSampleTables(movie);
@@ -1963,6 +2424,7 @@ export const Mp4Driver: ContainerDriver = {
     const ra = await randomAccess(src);
     const movie = await readMovie(ra);
     const requestedTrim = o?.trim;
+    if (requestedTrim !== undefined) validateStreamCopyTrimRange(movie, requestedTrim);
     const trim =
       requestedTrim !== undefined && !trimCoversMovie(movie, requestedTrim)
         ? requestedTrim

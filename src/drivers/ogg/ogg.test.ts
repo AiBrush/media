@@ -238,20 +238,66 @@ describe('OggDriver — demux seam + muxer', () => {
     }
   });
 
+  it('demux exposes packet tables from one full-source read', async () => {
+    const bytes = await loadFixture('sfx-opus.ogg');
+    const expected = oggPacketInfoFromBytes(bytes);
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable Ogg demux should use one full range read');
+      },
+    };
+
+    const demuxed = await OggDriver.demux(source);
+    const packetInfoRows = (
+      demuxed as typeof demuxed & { packetInfoTable?: () => typeof expected.packets }
+    ).packetInfoTable?.();
+    const packetRows = demuxed.packetTable?.();
+
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    expect(demuxed.tracks).toEqual(expected.tracks);
+    expect(packetInfoRows).toEqual(expected.packets);
+    expect(packetRows).toEqual(
+      expected.packets.map((packet) => ({
+        trackId: 0,
+        sizeBytes: packet.size,
+        ptsUs: packet.ptsUs,
+        dtsUs: packet.dtsUs,
+        durationUs: packet.durationUs,
+        keyframe: packet.keyframe,
+      })),
+    );
+    await demuxed.close();
+  });
+
   it('createMuxer returns a working OggMuxer (round-trip validated in ogg-write.test.ts)', () => {
     expect(OggDriver.createMuxer()).toBeInstanceOf(OggMuxer);
   });
 
-  it('reads head + tail via range for a large (>64 kB) source', async () => {
+  it('probe reads head + tail via range for a large (>64 kB) source', async () => {
     const headPage = new Uint8Array(page({ bos: true, data: vorbisId(1, 44100) }));
     const tailPage = new Uint8Array(page({ granule: 44100, data: [0] }));
+    const sourceSize = 300000;
+    const ranges: Array<readonly [number, number]> = [];
     const fake: ByteSource = {
-      size: 70000,
+      size: sourceSize,
       stream: () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
-      range: (start) => Promise.resolve(start === 0 ? headPage : tailPage),
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(start === 0 ? headPage : tailPage);
+      },
     };
-    const demuxed = await OggDriver.demux(fake);
-    expect(demuxed.tracks[0]?.durationSec).toBeCloseTo(1, 5);
+    const tracks = await OggDriver.probe?.(fake);
+    expect(tracks?.[0]?.durationSec).toBeCloseTo(1, 5);
+    expect(ranges).toEqual([
+      [0, 65536],
+      [sourceSize - 65536, sourceSize],
+    ]);
   });
 
   it('probes a small known-size source with one bounded range read', async () => {

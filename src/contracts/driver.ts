@@ -334,11 +334,25 @@ export interface ContainerDriver extends DriverBase {
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
   createMuxer(o?: MuxOptions): Muxer;
   /**
-   * Optional lossless same-container stream-copy — a full remux, or a keyframe-aligned trim when
-   * `trim` is given — bypassing the PTS-only codec seam so DTS/B-frames/codec-private survive
-   * (ADR-021). The router uses it when in/out are the same container; absent ⇒ fall back to the seam.
+   * Optional lossless driver-native stream-copy targets outside {@link formats}. A driver lists only
+   * target containers it can author itself while preserving coded packets and the target's strict layout
+   * rules (for example native FLAC frames into Ogg-FLAC). Unlisted cross-container targets use the generic
+   * demux→mux packet seam.
+   */
+  streamCopyTargets?: readonly string[];
+  /**
+   * Optional lossless stream-copy — a full remux, or a keyframe-aligned trim when `trim` is given —
+   * bypassing the PTS-only codec seam so DTS/B-frames/codec-private survive (ADR-021). The router uses it
+   * when in/out are the same container or when {@link streamCopyTargets} declares the requested target;
+   * absent ⇒ fall back to the seam.
    */
   streamCopy?(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * True when `streamCopy(..., { trim })` performs the same typed range validation as the public trim
+   * router before emitting bytes. The engine may then skip its generic pre-trim duration demux and let the
+   * native driver validate against the movie metadata it already parsed for the copy.
+   */
+  validatesStreamCopyTrim?: boolean;
   /**
    * Optional PCM-native audio transform (ADR-022) for raw-PCM containers (e.g. WAV) — applies
    * {@link PcmTransform} in the TS audio-dsp path and re-serializes the same container. Source

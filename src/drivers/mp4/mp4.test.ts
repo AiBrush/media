@@ -2,15 +2,115 @@ import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import { Mp4Driver, Mp4Module, readMovie, readMovieMetadata } from './mp4-driver.ts';
 import { buildSamples } from './samples.ts';
+import { writeMp4 } from './write.ts';
+
+type CacheKeyedByteSource = ByteSource & { readonly [SOURCE_CACHE_KEY]: string };
+type MimeHintedByteSource = ByteSource & { readonly mimeHint: string };
 
 function makeRA(bytes: Uint8Array) {
   return {
     read: (o: number, l: number) => Promise.resolve(bytes.subarray(o, o + l)),
     size: bytes.byteLength,
   };
+}
+
+function streamBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
+}
+
+function byteSource(bytes: Uint8Array): ByteSource {
+  return {
+    size: bytes.byteLength,
+    stream: () => streamBytes(bytes),
+    range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+  };
+}
+
+function ascii(text: string): Uint8Array {
+  const out = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i);
+  return out;
+}
+
+function u32(n: number): Uint8Array {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, n);
+  return out;
+}
+
+function zeros(length: number): Uint8Array {
+  return new Uint8Array(length);
+}
+
+function joinBytes(parts: readonly Uint8Array[]): Uint8Array {
+  const total = parts.reduce((n, part) => n + part.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+function box(type: string, ...payload: Uint8Array[]): Uint8Array {
+  const body = joinBytes(payload);
+  const out = new Uint8Array(8 + body.byteLength);
+  new DataView(out.buffer).setUint32(0, out.byteLength);
+  out.set(ascii(type), 4);
+  out.set(body, 8);
+  return out;
+}
+
+function fullBox(
+  type: string,
+  version: number,
+  flags: number,
+  ...payload: Uint8Array[]
+): Uint8Array {
+  return box(
+    type,
+    new Uint8Array([version, (flags >>> 16) & 0xff, (flags >>> 8) & 0xff, flags & 0xff]),
+    ...payload,
+  );
+}
+
+function mvhd(): Uint8Array {
+  return fullBox('mvhd', 0, 0, zeros(8), u32(1000), u32(1000));
+}
+
+function tkhd(): Uint8Array {
+  return fullBox('tkhd', 0, 0, zeros(8), u32(1));
+}
+
+function mdhd(): Uint8Array {
+  return fullBox('mdhd', 0, 0, zeros(8), u32(44100), u32(4410));
+}
+
+function hdlr(handlerType: string): Uint8Array {
+  return fullBox('hdlr', 0, 0, zeros(4), ascii(handlerType));
+}
+
+function stsd(...entries: Uint8Array[]): Uint8Array {
+  return fullBox('stsd', 0, 0, u32(entries.length), ...entries);
+}
+
+function audioEntry(type: string, ...children: Uint8Array[]): Uint8Array {
+  return box(
+    type,
+    new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 16, 0, 0, 0, 0]),
+    u32(44100 * 65536),
+    ...children,
+  );
 }
 
 async function blobBytes(
@@ -124,10 +224,256 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     const tracks = await Mp4Driver.probe?.(src);
     expect(tracks?.length).toBeGreaterThan(0);
     expect(tracks?.some((track) => track.mediaType === 'video')).toBe(true);
-    expect(reads).toEqual([
-      [0, 64],
-      [24, 2206],
-    ]);
+    expect(reads).toEqual([[0, 32 * 1024]]);
+  });
+
+  it('metadata-only probe clamps faststart prefetch to known tiny source size', async () => {
+    const bytes = await loadFixture('2x2-green.mp4');
+    expect(bytes.byteLength).toBeLessThan(32 * 1024);
+    const reads: Array<[number, number]> = [];
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(tracks?.length).toBeGreaterThan(0);
+    expect(reads[0]).toEqual([0, bytes.byteLength]);
+  });
+
+  it('metadata-only probe uses the tiny M4A audio fast path only when the source is known audio', async () => {
+    const bytes = writeMp4(
+      [
+        {
+          mediaType: 'audio',
+          sampleEntryType: 'mp4a',
+          timescale: 44100,
+          sampleRate: 44100,
+          channels: 1,
+          description: new Uint8Array([0x12, 0x08]),
+          edit: { mediaTimeTicks: 1024, durationTicks: 4410 },
+          samples: [
+            { data: new Uint8Array([0x21]), durationTicks: 5434, cttsTicks: 0, keyframe: true },
+          ],
+        },
+      ],
+      { faststart: true },
+    );
+    expect(bytes.byteLength).toBeLessThan(16 * 1024);
+    const baselineSource: ByteSource = {
+      size: bytes.byteLength,
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    const expected = await Mp4Driver.probe?.(baselineSource);
+    const reads: Array<readonly [number, number]> = [];
+    const fastSource: CacheKeyedByteSource = {
+      ...baselineSource,
+      [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/tiny.m4a',
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(fastSource);
+
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    expect(tracks).toEqual(expected);
+    expect(tracks?.[0]?.gapless).toEqual({
+      leadingSamples: 1024,
+      trailingSamples: 0,
+      totalSamples: 4410,
+    });
+  });
+
+  it('metadata-only probe uses an audio MIME hint for tiny M4A and omits gapless without edit timing', async () => {
+    const bytes = writeMp4(
+      [
+        {
+          mediaType: 'audio',
+          sampleEntryType: 'mp4a',
+          timescale: 44100,
+          sampleRate: 44100,
+          channels: 1,
+          description: new Uint8Array([0x12, 0x08]),
+          samples: [
+            { data: new Uint8Array([0x21]), durationTicks: 4410, cttsTicks: 0, keyframe: true },
+          ],
+        },
+      ],
+      { faststart: true },
+    );
+    const reads: Array<readonly [number, number]> = [];
+    const src: MimeHintedByteSource = {
+      ...byteSource(bytes),
+      mimeHint: 'audio/mp4',
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    expect(tracks).toHaveLength(1);
+    expect(tracks?.[0]?.mediaType).toBe('audio');
+    expect(tracks?.[0]?.gapless).toBeUndefined();
+  });
+
+  it('metadata-only probe rejects malformed tiny M4A candidates through typed fallback errors', async () => {
+    const malformedCases: Array<readonly [string, Uint8Array]> = [
+      ['short-header', new Uint8Array([0, 0, 0, 1])],
+      ['zero-size-top-box', joinBytes([u32(0), ascii('free')])],
+      ['ftyp-only', box('ftyp', ascii('isom'))],
+      ['truncated-moov', joinBytes([u32(100), ascii('moov')])],
+      ['empty-moov', box('moov')],
+      ['mvhd-no-trak', box('moov', mvhd())],
+      ['empty-trak', box('moov', mvhd(), box('trak'))],
+      ['trak-missing-mdhd-hdlr', box('moov', mvhd(), box('trak', tkhd(), box('mdia')))],
+      [
+        'video-handler',
+        box('moov', mvhd(), box('trak', tkhd(), box('mdia', mdhd(), hdlr('vide')))),
+      ],
+      [
+        'audio-no-stbl',
+        box('moov', mvhd(), box('trak', tkhd(), box('mdia', mdhd(), hdlr('soun')))),
+      ],
+      [
+        'stsd-entry-count-zero',
+        box(
+          'moov',
+          mvhd(),
+          box('trak', tkhd(), box('mdia', mdhd(), hdlr('soun'), box('minf', box('stbl', stsd())))),
+        ),
+      ],
+    ];
+
+    for (const [label, bytes] of malformedCases) {
+      const reads: Array<readonly [number, number]> = [];
+      const src: CacheKeyedByteSource = {
+        ...byteSource(bytes),
+        [SOURCE_CACHE_KEY]: `url:https://fixtures.test/${label}.m4a`,
+        range: (start, end) => {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+      };
+
+      await expect(Mp4Driver.probe?.(src), label).rejects.toBeInstanceOf(MediaError);
+      expect(reads[0], label).toEqual([0, bytes.byteLength]);
+    }
+  });
+
+  it('metadata-only probe defers tiny M4A misses to the full parser when the file is otherwise valid', async () => {
+    const fallbackCases: Array<readonly [string, Uint8Array, string]> = [
+      [
+        'non-mp4a-audio-entry',
+        box(
+          'moov',
+          mvhd(),
+          box(
+            'trak',
+            tkhd(),
+            box('mdia', mdhd(), hdlr('soun'), box('minf', box('stbl', stsd(audioEntry('alac'))))),
+          ),
+        ),
+        'alac',
+      ],
+      [
+        'mp4a-without-esds',
+        box(
+          'moov',
+          mvhd(),
+          box(
+            'trak',
+            tkhd(),
+            box('mdia', mdhd(), hdlr('soun'), box('minf', box('stbl', stsd(audioEntry('mp4a'))))),
+          ),
+        ),
+        'mp4a',
+      ],
+    ];
+
+    for (const [label, bytes, codec] of fallbackCases) {
+      const reads: Array<readonly [number, number]> = [];
+      const src: CacheKeyedByteSource = {
+        ...byteSource(bytes),
+        [SOURCE_CACHE_KEY]: `url:https://fixtures.test/${label}.m4a`,
+        range: (start, end) => {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+      };
+
+      const tracks = await Mp4Driver.probe?.(src);
+
+      expect(reads[0], label).toEqual([0, bytes.byteLength]);
+      expect(tracks).toHaveLength(1);
+      expect(tracks?.[0]?.codec).toBe(codec);
+    }
+  });
+
+  it('hands a small parsed movie from probe to an immediately following demux', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const firstReads: Array<readonly [number, number]> = [];
+    const cacheKey = 'url:https://fixtures.test/movie_5.mp4';
+    const probeSource: CacheKeyedByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: cacheKey,
+      range: (start, end) => {
+        firstReads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    const demuxSource: CacheKeyedByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: cacheKey,
+      range: () => {
+        throw new Error('demux should consume the parsed movie handoff before reading ranges');
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(probeSource);
+    const demuxer = await Mp4Driver.demux(demuxSource);
+    try {
+      expect(demuxer.tracks).toEqual(tracks);
+      expect(firstReads.length).toBeGreaterThan(0);
+    } finally {
+      await demuxer.close();
+    }
   });
 
   it('metadata-only probe honors cancellation before and after the metadata read', async () => {
@@ -159,13 +505,13 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
         source((start, end) => {
           reads++;
           const out = bytes.subarray(start, end);
-          if (reads >= 2) controller.abort();
+          controller.abort();
           return Promise.resolve(out);
         }),
         { signal: controller.signal },
       ),
     ).rejects.toThrow(MediaError);
-    expect(reads).toBe(2);
+    expect(reads).toBe(1);
   });
 
   it('omits packetTable for fragmented MP4s whose init sample tables are empty', async () => {

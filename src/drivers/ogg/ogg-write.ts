@@ -10,8 +10,8 @@
  * Page CRC is the Ogg variant — polynomial **0x04C11DB7, MSB-first, init 0, no reflection, no final XOR**
  * — computed over the whole page with the CRC field zeroed (this is what the round-trip oracle's
  * independent page/CRC scan re-verifies). The packet→page lacing + granule timing is pure and
- * Node-testable ({@link buildPages}); only the `write()` extraction of a real `EncodedChunk` (`copyTo`)
- * is browser-only and guarded.
+ * Node-testable ({@link buildPages}); `write()` uses a demuxer-supplied {@link Packet.data} view when
+ * present and only falls back to `EncodedChunk.copyTo()` for bare encoder chunks.
  */
 
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
@@ -614,8 +614,8 @@ export class OggMuxer implements Muxer {
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
     const chunk = packet.chunk;
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
+    const data = packet.data ?? new Uint8Array(chunk.byteLength);
+    if (packet.data === undefined) chunk.copyTo(data);
     // Ogg audio is never reordered (no B-frames), so the packet's `dtsUs` is ignored — PTS granule
     // positions fully describe the page timing.
     this.addChunkStruct(trackId, {

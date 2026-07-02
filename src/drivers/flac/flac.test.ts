@@ -12,13 +12,14 @@ import { encodeFlac, flacPcmFromDecoded } from '../../codecs/flac/encode.ts';
 import type { ByteSource, PacketInfoTable } from '../../contracts/driver.ts';
 import { InputError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
-import type { Source } from '../../sources/source.ts';
+import { type Source, fromBytes } from '../../sources/source.ts';
 import {
   fixtureSource,
   fixturesByContainer,
   loadFixture,
   loadGoldenMetadata,
 } from '../../test-support/corpus.ts';
+import { parseOgg } from '../ogg/ogg-driver.ts';
 import { readWavPcm } from '../wav/pcm.ts';
 import {
   FlacDriver,
@@ -460,6 +461,24 @@ describe('media.trim — native FLAC keyframe packet-copy', () => {
 });
 
 describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
+  it('driver-native FLAC to Ogg stream-copy works without WebCodecs packet shims', async () => {
+    const streamCopy = FlacDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('FlacDriver must expose streamCopy');
+    const sourceBytes = await loadFixture('sfx.flac');
+    const sourceInfo = parseFlac(sourceBytes);
+
+    const out = await collectBytes(
+      await streamCopy(fromBytes(sourceBytes, { mime: 'audio/flac' }), { container: 'ogg' }),
+    );
+    const ogg = parseOgg(out);
+
+    expect(out.byteLength).toBeGreaterThan(0);
+    expect(ogg.codec).toBe('flac');
+    expect(ogg.sampleRate).toBe(sourceInfo.sampleRate);
+    expect(ogg.channels).toBe(sourceInfo.channels);
+    expect(ogg.durationSec).toBeCloseTo(sourceInfo.durationSec, 5);
+  });
+
   it('enumerates byte-exact native FLAC frames across the real corpus', async () => {
     const entries = (await fixturesByContainer('flac')).slice(0, 5);
     expect(entries.length).toBeGreaterThanOrEqual(5);

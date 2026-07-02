@@ -55,6 +55,7 @@ import type { MaterializeOptions, Sink } from '../sinks/sink.ts';
 import {
   type FromOptions,
   type MediaInput,
+  SOURCE_CACHE_KEY,
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
@@ -112,10 +113,16 @@ const CONTAINER_MIME: Record<string, string> = {
   ts: 'video/mp2t',
 };
 const PCM_AUDIO_DATA_CHUNK_FRAMES = 4096;
+const SOURCE_PREFIX_HANDOFF_TTL_MS = 250;
 
 interface StreamCopySinkMode {
   readonly streaming?: true;
   readonly buffered?: true;
+}
+
+interface SourcePrefixHandoff {
+  readonly bytes: Uint8Array;
+  readonly token: object;
 }
 
 /** The developer-facing engine surface (ADR-009). */
@@ -196,6 +203,7 @@ export class MediaEngineImpl implements MediaEngine {
    * is what lets concurrent `convert`/`trim` calls and ABR ladders fan across N workers.
    */
   readonly #poolCache: OffloadPoolCache = {};
+  readonly #sourcePrefixHandoff = new Map<string, SourcePrefixHandoff>();
 
   constructor(opts: CreateMediaOptions = {}) {
     this.#opts = opts;
@@ -227,7 +235,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const src = cacheProbeRanges(normalizeInput(input));
+      const src = cacheProbeRanges(normalizeInput(input), this.#sourcePrefixHandoff, 'store');
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
@@ -458,7 +466,12 @@ export class MediaEngineImpl implements MediaEngine {
       }
       // (1) Same-container stream-copy — a lossless byte re-serialization that preserves DTS/B-frames/
       // codec-private (ADR-021), and works in pure TS (Node) for the drivers that implement it (MP4↔MOV).
-      if (!wantsTrackSelection && container.streamCopy && container.formats.includes(opts.to)) {
+      if (
+        !wantsTrackSelection &&
+        container.streamCopy &&
+        (container.formats.includes(opts.to) ||
+          container.streamCopyTargets?.includes(opts.to) === true)
+      ) {
         const stream = await container.streamCopy(src, {
           ...this.#stageOptions(signal, o),
           container: opts.to,
@@ -483,14 +496,27 @@ export class MediaEngineImpl implements MediaEngine {
       const src = normalizeInput(input);
       const container = await this.#routeContainer(src, 'demux');
       const target = (container.formats[0] ?? 'mp4') as Container;
-      // Native FLAC keyframe trim validates against STREAMINFO while packet-copying, so it does not need
-      // the generic duration demux that would parse every frame once before parsing it again to write.
-      if (opts.mode !== 'accurate' && target === 'flac' && container.streamCopy) {
-        const stream = await container.streamCopy(src, {
-          ...this.#stageOptions(signal, o),
-          trim: { startSec: opts.start, endSec: opts.end },
-        });
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      if (opts.mode !== 'accurate' && container.streamCopy) {
+        // Native FLAC keyframe trim validates against STREAMINFO while packet-copying, so it does not need
+        // the generic duration demux that would parse every frame once before parsing it again to write.
+        if (target === 'flac') {
+          const stream = await container.streamCopy(src, {
+            ...this.#stageOptions(signal, o),
+            trim: { startSec: opts.start, endSec: opts.end },
+          });
+          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        }
+        // Drivers that validate native stream-copy trim ranges can avoid the generic duration demux here:
+        // MP4 already has to parse `moov` before copy, so it validates `start/end` against that movie and
+        // then reuses the same metadata for no-op/full-range detection and payload planning.
+        if (container.validatesStreamCopyTrim) {
+          const stream = await container.streamCopy(src, {
+            ...this.#stageOptions(signal, o),
+            trim: { startSec: opts.start, endSec: opts.end },
+            ...streamCopySinkMode(opts.sink),
+          });
+          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        }
       }
       // Validate the requested range against the media's real duration BEFORE any cut, so a malformed
       // range (negative / inverted / zero-length / past-EOF) rejects with a typed `InputError` instead
@@ -543,7 +569,7 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   decode(input: MediaInput, o: CallOptions = {}): MediaStreams {
-    const src = normalizeInput(input); // validate the input shape eagerly (throws InputError on bad input)
+    const src = cacheProbeRanges(normalizeInput(input), this.#sourcePrefixHandoff, 'consume'); // validate the input shape eagerly (throws InputError on bad input)
     // The `decode` contract returns frame streams synchronously; the async demux + codec routing happens
     // lazily when each stream is first pulled. A track without a decode `config` (codec unknown) is
     // simply absent. Cancellation rides `o.signal` threaded into each decoder's StageOptions; a frame
@@ -551,7 +577,9 @@ export class MediaEngineImpl implements MediaEngine {
     const ctrl = new AbortController();
     bridgeSignal(o.signal, ctrl);
     const stage = this.#stageOptions(ctrl.signal, o);
-    const imageRoute = memoizeAsync(() => this.#imageDecodeRoute(src, ctrl.signal));
+    const imageRoute = shouldSniffImageForDecode(src)
+      ? memoizeAsync(() => this.#imageDecodeRoute(src, ctrl.signal))
+      : noImageDecodeRoute;
     const video = deferredStream<VideoFrame>(() =>
       this.#decodeVideoOrImage(src, stage, imageRoute),
     );
@@ -1724,6 +1752,12 @@ interface ImageDecodeRoute {
 }
 
 type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
+const noImageDecodeRoute: ImageDecodeRouteLoader = () => Promise.resolve(undefined);
+
+function shouldSniffImageForDecode(src: Source): boolean {
+  const mime = src.mimeHint?.toLowerCase();
+  return mime === undefined || (!mime.startsWith('video/') && !mime.startsWith('audio/'));
+}
 
 const MICROS_PER_SECOND = 1_000_000;
 const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
@@ -2174,21 +2208,55 @@ async function startAtSeekKeyframePackets(
 }
 /* v8 ignore stop */
 
-function cacheProbeRanges(src: Source): Source {
+function cacheProbeRanges(
+  src: Source,
+  handoff?: Map<string, SourcePrefixHandoff>,
+  mode: 'local' | 'store' | 'consume' = 'local',
+): Source {
   const range = src.range;
   if (range === undefined) return src;
-  let cached: Uint8Array | undefined;
+  const cacheKey = src[SOURCE_CACHE_KEY];
+  let cached =
+    mode === 'consume' && cacheKey !== undefined && handoff !== undefined
+      ? handoff.get(cacheKey)?.bytes
+      : undefined;
+  if (mode === 'consume' && cacheKey !== undefined) {
+    handoff?.delete(cacheKey);
+  }
   return {
     ...src,
     range: async (start, end) => {
-      if (cached !== undefined && start >= 0 && end <= cached.byteLength) {
+      const cachedCoversEnd =
+        cached !== undefined &&
+        (end <= cached.byteLength ||
+          (src.size !== undefined && cached.byteLength >= src.size && end >= src.size));
+      if (cached !== undefined && start >= 0 && cachedCoversEnd) {
         return cached.subarray(start, end);
       }
       const bytes = await range.call(src, start, end);
-      if (start === 0) cached = bytes;
+      if (start === 0 && (cached === undefined || bytes.byteLength > cached.byteLength)) {
+        cached = bytes;
+        if (mode === 'store' && cacheKey !== undefined && handoff !== undefined) {
+          storeSourcePrefixHandoff(handoff, cacheKey, bytes);
+        }
+      }
       return bytes;
     },
   };
+}
+
+function storeSourcePrefixHandoff(
+  handoff: Map<string, SourcePrefixHandoff>,
+  cacheKey: string,
+  bytes: Uint8Array,
+): void {
+  const token = {};
+  handoff.set(cacheKey, { bytes, token });
+  setTimeout(() => {
+    if (handoff.get(cacheKey)?.token === token) {
+      handoff.delete(cacheKey);
+    }
+  }, SOURCE_PREFIX_HANDOFF_TTL_MS);
 }
 
 function routeHeadBytes(src: Source): number {

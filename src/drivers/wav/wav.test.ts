@@ -198,6 +198,106 @@ describe('probe WAV across the real corpus', () => {
     expect(info).toEqual(await loadGoldenMetadata(id));
   });
 
+  it('metadata-only probe reads a small WAV header when fmt and data are both visible', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = await loadFixture('speech.wav');
+    expect(bytes.byteLength).toBeGreaterThan(4096);
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('metadata-only probe should use range reads');
+      },
+    };
+
+    const tracks = await probe(source);
+
+    expect(reads).toEqual([[0, 4096]]);
+    expect(tracks[0]?.codec).toBe('pcm-s16');
+    expect(tracks[0]?.durationSec).toBeGreaterThan(0);
+  });
+
+  it('metadata-only probe falls back to the bounded demux window when data is after a large chunk', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const fmt = [
+      ...[...'fmt '].map((c) => c.charCodeAt(0)),
+      16,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0x44,
+      0xac,
+      0,
+      0,
+      0x88,
+      0x58,
+      1,
+      0,
+      2,
+      0,
+      16,
+      0,
+    ];
+    const junkSize = 5000;
+    const junk = [
+      ...[...'JUNK'].map((c) => c.charCodeAt(0)),
+      junkSize & 0xff,
+      (junkSize >> 8) & 0xff,
+      0,
+      0,
+      ...new Array<number>(junkSize).fill(0),
+    ];
+    const data = [
+      ...[...'data'].map((c) => c.charCodeAt(0)),
+      8,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ];
+    const bytes = new Uint8Array([...riffWave(), ...fmt, ...junk, ...data]);
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('metadata-only probe should use range reads');
+      },
+    };
+
+    const tracks = await probe(source);
+
+    expect(reads).toEqual([
+      [0, 4096],
+      [0, 65536],
+    ]);
+    expect(tracks[0]?.durationSec).toBeGreaterThan(0);
+  });
+
   it('the demux packet seam is a typed capability gap in node (PCM → audio-dsp)', async () => {
     const demuxed = await WavDriver.demux(await fixtureSource('speech.wav'));
     expect(demuxed.tracks).toHaveLength(1);

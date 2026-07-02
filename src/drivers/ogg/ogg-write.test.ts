@@ -14,6 +14,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import type { Packet } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { enumerateFlacFrames, nativeFlacMetadata, parseFlac } from '../flac/flac-driver.ts';
@@ -211,6 +212,30 @@ describe('buildPages — lacing (pure)', () => {
 });
 
 describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', () => {
+  it('write reuses demuxer packet.data without copying the host chunk again', async () => {
+    const muxer = new OggMuxer();
+    const trackId = muxer.addTrack(opusTrack);
+    const payload = audio(0, 12, 0x4a).data;
+    const packet: Packet = {
+      data: payload,
+      chunk: {
+        byteLength: 999,
+        timestamp: 0,
+        duration: 20_000,
+        type: 'key',
+        copyTo(_destination: AllowSharedBufferSource): void {
+          throw new Error('copyTo should not run when packet.data is present');
+        },
+      } as unknown as EncodedAudioChunk,
+    };
+
+    await muxer.write(trackId, packet);
+    await muxer.finalize();
+    const packets = delacePackets(scanPages(await collect(muxer.output)));
+
+    expect(packets.at(-1)).toEqual(payload);
+  });
+
   it('re-parses as opus with the right rate/channels/duration; pages + CRC + de-lace all check out', async () => {
     const muxer = new OggMuxer();
     const t = muxer.addTrack(opusTrack);

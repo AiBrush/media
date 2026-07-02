@@ -166,8 +166,13 @@ export interface ContainerDriver extends DriverBase {
   probe?(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]>
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>
   createMuxer(o?: MuxOptions): Muxer
-  // Optional lossless same-container stream-copy (remux + keyframe-trim), bypassing the PTS-only
-  // codec seam so DTS/B-frames/codec-private survive (ADR-021/068). Absent ⇒ fall back to demux→mux.
+  // Optional cross-target stream-copy declarations. A source driver lists only target containers it
+  // can author natively while preserving coded packets and the target layout rules (ADR-133).
+  // Unlisted cross-container targets fall back to demux→mux.
+  streamCopyTargets?: readonly string[]
+  // Optional lossless stream-copy (remux + keyframe-trim), bypassing the PTS-only codec seam so
+  // DTS/B-frames/codec-private survive (ADR-021/068/133). Used for same-container targets and for
+  // explicit streamCopyTargets. Absent ⇒ fall back to demux→mux.
   streamCopy?(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>>
   // Optional PCM-native audio transform for raw-PCM containers (ADR-022/054/059/061/074): apply target
   // wrapper/sample-format/endianness, gain/fade, mix/resample, biquad/EQ, and dynamics in the TS

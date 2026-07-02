@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import type { ImageOps } from '../codecs/image/index.ts';
 import { NoopDriverModule } from '../conformance/noop-driver.ts';
 import {
   type CodecDriver,
@@ -17,7 +18,13 @@ import {
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { WebmModule } from '../drivers/webm/webm-driver.ts';
 import { toStreamTarget } from '../sinks/stream-target.ts';
-import { type MediaInput, type Source, fromBytes, fromStream } from '../sources/source.ts';
+import {
+  type MediaInput,
+  SOURCE_CACHE_KEY,
+  type Source,
+  fromBytes,
+  fromStream,
+} from '../sources/source.ts';
 import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
 
@@ -158,6 +165,32 @@ function throwingWarmupModule(): DriverModule {
     register(reg): void {
       reg.addContainer(container);
       reg.addCodec(codec);
+    },
+  };
+}
+
+function imageSniffCounterModule(counts: { sniff: number }): DriverModule {
+  const ops: ImageOps = {
+    formats: ['png'],
+    sniff: () => {
+      counts.sniff++;
+      return undefined;
+    },
+    probe: () => {
+      throw new Error('unused');
+    },
+    canDecode: () => false,
+    decode: () => {
+      throw new Error('unused');
+    },
+    decodeFrames(): AsyncGenerator<VideoFrame, void, undefined> {
+      throw new Error('unused');
+    },
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(reg): void {
+      (reg as { addImageOps?: (imageOps: ImageOps) => void }).addImageOps?.(ops);
     },
   };
 }
@@ -320,6 +353,28 @@ function streamCopyModule(calls: Array<unknown>): DriverModule {
     streamCopy: (_src, o) => {
       calls.push(o);
       return Promise.resolve(byteStream(new Uint8Array([7, 8, 9])));
+    },
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  return { apiVersion: DRIVER_API_VERSION, register: (reg) => reg.addContainer(driver) };
+}
+
+function crossTargetStreamCopyModule(calls: Array<unknown>): DriverModule {
+  const driver: ContainerDriver = {
+    id: 'copy-flac',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['flac'],
+    streamCopyTargets: ['ogg'],
+    supports: (q) => q.mime === 'audio/x-copy-flac',
+    demux: () => {
+      throw new Error('streamCopyTargets remux should not open the generic packet seam');
+    },
+    streamCopy: (_src, o) => {
+      calls.push(o);
+      return Promise.resolve(byteStream(new Uint8Array([0x4f, 0x67, 0x67, 0x53])));
     },
     createMuxer: () => {
       throw new Error('unused');
@@ -628,6 +683,79 @@ describe('createMedia', () => {
     await expect(readFirst(streams.audio)).resolves.toBeUndefined();
   });
 
+  it('decode skips image sniffing for definite video MIME sources', async () => {
+    const bytes = new Uint8Array(8192);
+    const calls: Array<readonly [number, number]> = [];
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/x-delayed',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable decode must not open the full stream');
+      },
+    };
+    const frame = new CancelRaceFrame();
+    const counts = { sniff: 0 };
+    const media = createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use(delayedDecodeFrameModule(frame, Promise.resolve(), () => {}));
+
+    const got = await readFirst(media.decode(src).video);
+    expect(got).toBe(frame);
+    frame.close();
+    expect(calls).toEqual([[0, 4 * 1024]]);
+    expect(counts.sniff).toBe(0);
+    expect(frame.closeCount).toBe(1);
+  });
+
+  it('decode consumes the prefix cached by an immediately preceding URL probe', async () => {
+    const bytes = new Uint8Array(8192);
+    const firstCalls: Array<readonly [number, number]> = [];
+    const srcForProbe: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/x-delayed',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
+      range: (start, end) => {
+        firstCalls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable probe must not open the full stream');
+      },
+    };
+    const srcForDecode: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/x-delayed',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
+      range: () => {
+        throw new Error('decode should use the probe prefix handoff');
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable decode must not open the full stream');
+      },
+    };
+    const frame = new CancelRaceFrame();
+    const media = createMedia().use(delayedDecodeFrameModule(frame, Promise.resolve(), () => {}));
+
+    await expect(media.probe(srcForProbe)).resolves.toMatchObject({
+      tracks: [{ id: 1, type: 'video', codec: 'fake-video' }],
+    });
+    const got = await readFirst(media.decode(srcForDecode).video);
+    expect(got).toBe(frame);
+    frame.close();
+    expect(firstCalls).toEqual([[0, 4 * 1024]]);
+    expect(frame.closeCount).toBe(1);
+  });
+
   it('decode closes a late frame when the lazy public stream is cancelled first', async () => {
     let releaseDemux: (() => void) | undefined;
     const demuxGate = new Promise<void>((resolve) => {
@@ -698,6 +826,21 @@ describe('createMedia', () => {
       expect(call).toMatchObject({ streaming: true });
       expect(call).not.toMatchObject({ buffered: true });
     }
+  });
+
+  it('cross-target remux uses a driver-declared streamCopy target before the generic packet seam', async () => {
+    const calls: Array<unknown> = [];
+    const media = createMedia().use(crossTargetStreamCopyModule(calls));
+    const input = fromBytes(new Uint8Array([1]), { mime: 'audio/x-copy-flac' });
+
+    const out = await media.remux(input, { to: 'ogg' });
+
+    if (!(out instanceof Blob)) throw new Error('expected Blob output');
+    expect(new Uint8Array(await out.arrayBuffer())).toEqual(
+      new Uint8Array([0x4f, 0x67, 0x67, 0x53]),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ container: 'ogg' });
   });
 
   it('encode validates unsupported targets and missing stream targets before opening codecs', async () => {

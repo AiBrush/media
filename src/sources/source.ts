@@ -10,6 +10,11 @@
 
 import { InputError } from '../contracts/errors.ts';
 
+const TINY_KNOWN_FULL_RANGE_GET_BYTES = 16 * 1024;
+
+/** Internal identity hook used for short-lived cross-operation source caches. Not exported from the public barrel. */
+export const SOURCE_CACHE_KEY: unique symbol = Symbol('a');
+
 /** Anything the public ops accept directly (ADR-013). */
 export type MediaInput =
   | ArrayBuffer
@@ -39,11 +44,15 @@ export interface Source {
   readonly mimeHint?: string;
   /** A filename hint (from a `File`), if any. */
   readonly filename?: string;
+  /** Opaque source identity for same-origin, short-lived cache handoffs between operations. */
+  readonly [SOURCE_CACHE_KEY]?: string;
 }
 
 export interface FromUrlOptions {
   /** Use HTTP Range requests for `range()`/probe (default true). */
   rangeRequests?: boolean;
+  /** A caller-provided MIME hint for extensionless URLs or opaque fixture endpoints. */
+  mime?: string;
   /**
    * A known total byte length, when the caller already has it (e.g. from a prior `Content-Length`). Seeds
    * {@link Source.size} without a round-trip; otherwise size is learned lazily from a `Content-Range`.
@@ -88,7 +97,7 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
 
 /** Wrap a `Blob`/`File`. */
 export function fromBlob(blob: Blob): Source {
-  const filename = isFile(blob) ? blob.name : undefined;
+  const filename = typeof File !== 'undefined' && blob instanceof File ? blob.name : undefined;
   return {
     __media: 'source',
     kind: 'blob',
@@ -108,10 +117,7 @@ export function fromStream(readable: ReadableStream<Uint8Array>): Source {
     kind: 'stream',
     stream: () => {
       if (consumed) {
-        throw new InputError(
-          'unsupported-input',
-          'stream source already consumed (it is single-use)',
-        );
+        throw new InputError('unsupported-input', 'used');
       }
       consumed = true;
       return readable;
@@ -130,7 +136,6 @@ export function fromStream(readable: ReadableStream<Uint8Array>): Source {
  */
 export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
   const href = typeof url === 'string' ? url : url.href;
-  const rangeRequests = opts.rangeRequests ?? true;
   // `size` is a real own property, present only once known: seeded if the caller passed it, otherwise set
   // (assigned a `number`, never an explicit `undefined`) the first time a fetch learns it from a
   // `Content-Range`/`Content-Length`. The fetch closures share this object so a later read can clamp.
@@ -138,8 +143,12 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
     __media: 'source',
     kind: 'url',
     ...(opts.size !== undefined ? { size: opts.size } : {}),
+    ...(opts.mime !== undefined ? { mimeHint: opts.mime } : {}),
+    [SOURCE_CACHE_KEY]: href,
     stream: () => fetchStream(href, source),
-    ...(rangeRequests ? { range: (start, end) => fetchRange(href, start, end, source) } : {}),
+    ...(opts.rangeRequests !== false
+      ? { range: (start, end) => fetchRange(href, start, end, source) }
+      : {}),
   };
   return source;
 }
@@ -148,14 +157,11 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
 export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {}): Source {
   const mode = opts.mode ?? 'bytes';
   if (mode === 'capture') {
-    throw new InputError(
-      'unsupported-input',
-      'element capture mode is not available yet (Phase 1); use mode:"bytes"',
-    );
+    throw new InputError('unsupported-input', 'capture');
   }
   const href = el.currentSrc || el.src;
   if (!href) {
-    throw new InputError('unsupported-input', 'media element has no resolvable currentSrc/src');
+    throw new InputError('unsupported-input', 'src');
   }
   // A URL-backed source relabelled `element` (reads `currentSrc`, never `loadedmetadata`). Built directly
   // over the fetch helpers (rather than spreading a `fromURL`) so `size` is learned onto *this* object on
@@ -171,12 +177,8 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
 
 /** Read a file from the Origin Private File System by path. */
 export async function fromOPFS(path: string): Promise<Source> {
-  const storage = (globalThis.navigator as Navigator | undefined)?.storage;
-  if (!storage || typeof storage.getDirectory !== 'function') {
-    throw new InputError('unsupported-input', 'OPFS is unavailable in this environment');
-  }
-  const file = await opfsFile(storage, path);
-  return { ...fromBlob(file), kind: 'opfs' };
+  const { fromOPFSImpl } = await import('./opfs.ts');
+  return fromOPFSImpl(path);
 }
 
 /**
@@ -191,26 +193,12 @@ export function from(input: MediaInput, opts: FromOptions = {}): Source {
   if (input instanceof Blob) return fromBlob(input);
   if (input instanceof ReadableStream) return fromStream(input);
   if (input instanceof URL) return fromURL(input, opts);
-  if (typeof input === 'string') return fromBareString(input, opts);
+  if (typeof input === 'string') return fromURL(input, opts);
   if (isMediaElement(input)) return fromElement(input);
-  if (isMediaStream(input)) {
-    throw new InputError(
-      'unsupported-input',
-      'MediaStream capture is not available yet (Phase 1); pass bytes, a Blob, or a URL',
-    );
-  }
-  throw new InputError(
-    'unsupported-input',
-    `cannot normalize input of type ${describeType(input)}`,
-  );
+  throw new InputError('unsupported-input', 'bad');
 }
 
 // ── Internals ───────────────────────────────────────────────────────────────────────────────────
-
-function fromBareString(s: string, opts: FromOptions): Source {
-  // URL by precedence (http(s) | blob | data | file); otherwise a relative fetch (resolved by the host).
-  return fromURL(s, opts);
-}
 
 /** A write-through view used to memoize a learned total length onto a source object (never to `undefined`). */
 interface LearnSize {
@@ -229,10 +217,7 @@ function fetchStream(href: string, learn?: LearnSize): ReadableStream<Uint8Array
       if (!reader) {
         const res = await fetch(href);
         if (!res.ok || !res.body) {
-          throw new InputError(
-            'unsupported-input',
-            `fetch failed for ${href} (status ${res.status})`,
-          );
+          throw new InputError('unsupported-input', `f ${res.status}`);
         }
         // A full GET exposes the total via `Content-Length` — memoize it for later range clamping.
         if (learn) learnSize(learn, parseContentLength(res.headers));
@@ -264,13 +249,20 @@ async function fetchRange(
   if (known !== undefined) hi = Math.min(hi, known);
   if (hi <= lo) return new Uint8Array(0); // empty window (incl. start at/after a known EOF)
 
+  if (known !== undefined && lo === 0 && hi === known && known <= TINY_KNOWN_FULL_RANGE_GET_BYTES) {
+    const res = await fetch(href);
+    if (!res.ok) {
+      throw new InputError('unsupported-input', `f ${res.status}`);
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (learn) learnSize(learn, parseContentLength(res.headers) ?? buf.byteLength);
+    return buf;
+  }
+
   // HTTP Range is inclusive; our contract is half-open [lo, hi).
   const res = await fetch(href, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
   if (!res.ok) {
-    throw new InputError(
-      'unsupported-input',
-      `range fetch failed for ${href} (status ${res.status})`,
-    );
+    throw new InputError('unsupported-input', `r ${res.status}`);
   }
   const buf = new Uint8Array(await res.arrayBuffer());
   if (res.status === 206) {
@@ -293,28 +285,8 @@ async function fetchRange(
  * learn size eagerly so tail-seeking probes work on remote files.
  */
 export async function probeUrlSize(url: string | URL): Promise<number | undefined> {
-  const href = typeof url === 'string' ? url : url.href;
-  try {
-    const head = await fetch(href, { method: 'HEAD' });
-    if (head.ok) {
-      const len = parseContentLength(head.headers);
-      if (len !== undefined) return len;
-    }
-  } catch {
-    // HEAD unsupported / network refusal — fall through to the ranged probe.
-  }
-  const res = await fetch(href, { headers: { Range: 'bytes=0-0' } });
-  if (!res.ok) {
-    throw new InputError(
-      'unsupported-input',
-      `size probe failed for ${href} (status ${res.status})`,
-    );
-  }
-  // Drain the (≤1-byte) body so the connection can be reused / released.
-  await res.arrayBuffer();
-  if (res.status === 206) return parseContentRangeTotal(res.headers.get('Content-Range'));
-  // A 200 means the server ignored Range and sent everything — `Content-Length` is the total.
-  return parseContentLength(res.headers);
+  const { probeUrlSizeImpl } = await import('./url-size.ts');
+  return probeUrlSizeImpl(url);
 }
 
 /** Parse a non-negative integer `Content-Length`, or `undefined` if absent/malformed. */
@@ -327,45 +299,15 @@ function parseContentLength(headers: Headers): number | undefined {
 
 /** Parse the `total` from `Content-Range: bytes <start>-<end>/<total>` (`*` total ⇒ `undefined`). */
 function parseContentRangeTotal(value: string | null): number | undefined {
-  if (value === null) return undefined;
-  const slash = value.lastIndexOf('/');
-  if (slash < 0) return undefined;
-  const tail = value.slice(slash + 1).trim();
+  if (value === null || !value.includes('/')) return undefined;
+  const tail = value.slice(value.lastIndexOf('/') + 1).trim();
   if (tail === '*' || tail === '') return undefined;
   const n = Number(tail);
   return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
-async function opfsFile(storage: StorageManager, path: string): Promise<File> {
-  const parts = path.split('/').filter((p) => p.length > 0);
-  const name = parts.pop();
-  if (name === undefined) {
-    throw new InputError('unsupported-input', `invalid OPFS path '${path}'`);
-  }
-  let dir = await storage.getDirectory();
-  for (const part of parts) {
-    dir = await dir.getDirectoryHandle(part);
-  }
-  const handle = await dir.getFileHandle(name);
-  return handle.getFile();
-}
-
-function isFile(blob: Blob): blob is File {
-  return typeof File !== 'undefined' && blob instanceof File;
-}
-
 function isMediaElement(x: unknown): x is HTMLMediaElement {
   return typeof HTMLMediaElement !== 'undefined' && x instanceof HTMLMediaElement;
-}
-
-function isMediaStream(x: unknown): x is MediaStream {
-  return typeof MediaStream !== 'undefined' && x instanceof MediaStream;
-}
-
-function describeType(x: unknown): string {
-  if (x === null) return 'null';
-  if (typeof x === 'object') return (x as object).constructor?.name ?? 'object';
-  return typeof x;
 }
 
 function clamp(n: number, max: number): number {

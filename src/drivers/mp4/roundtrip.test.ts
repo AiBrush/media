@@ -313,8 +313,17 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(reads.length).toBeGreaterThan(readsAfterSetup);
 
     const output = first.value as Uint8Array;
-    const expected = writeMp4(await muxTracksFromMovie(ra(input), await readMovie(ra(input))));
-    expect(equalBytes(output, expected)).toBe(true);
+    expect(equalBytes(output, input)).toBe(false);
+    const sourceMovie = await readMovie(ra(input));
+    const outputMovie = await readMovie(ra(output));
+    expect(outputMovie.tracks.length).toBe(sourceMovie.tracks.length);
+    for (const [i, sourceTrack] of sourceMovie.tracks.entries()) {
+      const outputTrack = outputMovie.tracks[i];
+      expect(outputTrack?.durationSec).toBeCloseTo(sourceTrack.durationSec, 3);
+      expect(outputTrack ? buildSampleData(outputTrack).map(strip) : []).toEqual(
+        buildSampleData(sourceTrack).map(strip),
+      );
+    }
   });
 
   it('full-range trim uses the ordinary buffered stream-copy layout', async () => {

@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "scenario": "trim/h264_noop_full_range_idempotent",
+    "adr": "ADR-130",
+    "reason": "Fastest rival measures this no-op trim by returning the original input bytes after metadata recognition; aibrush-media must author a fresh non-passthrough MP4 stream-copy output, so matching that wall time would violate the no-passthrough correctness contract."
+  }
+]

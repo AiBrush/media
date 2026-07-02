@@ -17,7 +17,9 @@ import {
   type MuxOptions,
   type Muxer,
   type Packet,
+  type PacketInfoMetadata,
   type PacketInfoTable,
+  type PacketMetadata,
   type Registry,
   type StageOptions,
   type TrackInfo,
@@ -546,6 +548,29 @@ export function oggPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
   return oggPacketInfoTable(bytes);
 }
 
+function oggPacketMetadata(table: PacketInfoTable): readonly PacketMetadata[] {
+  return table.packets.map((packet) => {
+    const track = table.tracks[packet.trackIndex];
+    if (track === undefined) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg packet references missing track index ${packet.trackIndex}`,
+      );
+    }
+    if (packet.durationUs === undefined) {
+      throw new MediaError('demux-error', 'Ogg packet is missing duration metadata');
+    }
+    return {
+      trackId: track.id,
+      sizeBytes: packet.size,
+      ptsUs: packet.ptsUs,
+      dtsUs: packet.dtsUs,
+      durationUs: packet.durationUs,
+      keyframe: packet.keyframe,
+    };
+  });
+}
+
 const HEAD_BYTES = 1 << 16;
 const SMALL_PROBE_BYTES = 256 * 1024;
 
@@ -599,7 +624,11 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
  * Ogg audio frame is a sync sample, so `type:'key'`; audio has no reorder, so we emit `{ chunk }` (DTS ==
  * PTS, `dtsUs` omitted per ADR-045).
  */
-function packetStream(data: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
+function packetStreamFromInfo(
+  data: Uint8Array,
+  packets: readonly PacketInfoMetadata[],
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
       'capability-miss',
@@ -608,7 +637,6 @@ function packetStream(data: Uint8Array, signal: AbortSignal | undefined): Readab
     );
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
-  const frames = oggAudioPackets(data);
   let i = 0;
   return new ReadableStream<Packet>({
     pull(controller): void {
@@ -616,18 +644,23 @@ function packetStream(data: Uint8Array, signal: AbortSignal | undefined): Readab
         controller.error(new MediaError('aborted', 'operation aborted'));
         return;
       }
-      const frame = frames[i];
-      if (frame === undefined) {
+      const packet = packets[i];
+      if (packet === undefined) {
         controller.close();
         return;
       }
+      if (packet.offset === undefined) {
+        controller.error(new MediaError('demux-error', 'Ogg packet is missing source byte offset'));
+        return;
+      }
       i++;
-      const chunk = new EncodedAudioChunk({
+      const init: EncodedAudioChunkInit = {
         type: 'key', // every Ogg audio packet is independently a sync sample
-        timestamp: frame.ptsUs,
-        duration: frame.durationUs,
-        data: data.subarray(frame.offset, frame.offset + frame.size),
-      });
+        timestamp: packet.ptsUs,
+        data: data.subarray(packet.offset, packet.offset + packet.size),
+      };
+      if (packet.durationUs !== undefined) init.duration = packet.durationUs;
+      const chunk = new EncodedAudioChunk(init);
       controller.enqueue({ chunk });
     },
   });
@@ -658,19 +691,25 @@ export const OggDriver: ContainerDriver = {
     return table;
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-    // Probe `info` from one bounded small-source read or from head+tail for larger sources.
-    // packets() de-laces the WHOLE file, so additionally read every byte once for the packet stream.
-    const head = await readHead(src);
-    const info = parseOgg(head, await readTail(src, head));
     const all = await readAll(src);
+    const table = oggPacketInfoTable(all);
+    const packetTable = oggPacketMetadata(table);
     const signal = o?.signal;
-    const description = codecPrivateDescription(all);
-    const track = trackFromInfo(info, description);
+    if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return {
-      tracks: [track],
+      tracks: table.tracks,
+      packetTable: () => packetTable,
+      ...({ packetInfoTable: () => table.packets } as {
+        packetInfoTable: () => readonly PacketInfoMetadata[];
+      }),
       packets(trackId: number): ReadableStream<Packet> {
-        if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
-        return packetStream(all, signal);
+        const trackIndex = table.tracks.findIndex((track) => track.id === trackId);
+        if (trackIndex < 0) throw new MediaError('demux-error', `no track ${trackId}`);
+        return packetStreamFromInfo(
+          all,
+          table.packets.filter((packet) => packet.trackIndex === trackIndex),
+          signal,
+        );
       },
       close: () => Promise.resolve(),
     };

@@ -52,6 +52,14 @@ export interface WavInfo {
   durationSec: number;
 }
 
+interface ParsedWavHeader {
+  info: WavInfo;
+  dataFound: boolean;
+}
+
+const WAV_PROBE_HEAD_BYTES = 4096;
+const WAV_DEMUX_HEAD_BYTES = 65536;
+
 /** PCM/float codec token per WebCodecs/harness vocabulary (LE; WAV BE variants are out of scope). */
 function pcmCodec(fmt: WavFormat): string {
   if (fmt.formatTag === 3) return fmt.bitsPerSample === 64 ? 'pcm-f64' : 'pcm-f32';
@@ -74,14 +82,14 @@ function parseFormat(dv: DataView, body: number, size: number): WavFormat {
   };
 }
 
-/** Parse a RIFF/WAVE header into the audio layout + duration. Pure; little-endian. */
-export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
+function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWavHeader {
   if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
     throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let format: WavFormat | undefined;
   let dataSize = 0;
+  let dataFound = false;
   let pos = 12;
   while (pos + 8 <= bytes.byteLength) {
     const id = ascii(bytes, pos, 4);
@@ -95,6 +103,7 @@ export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
     } else if (id === 'data') {
       // Trust the declared size for duration, but never exceed the real file length.
       dataSize = totalSize !== undefined ? Math.min(size, Math.max(0, totalSize - body)) : size;
+      dataFound = true;
       break;
     }
     pos = body + size + (size & 1); // chunks are padded to an even size
@@ -106,10 +115,28 @@ export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
   const byteRate = format.byteRate > 0 ? format.byteRate : bytesPerFrame * format.sampleRate;
 
   return {
-    codec: pcmCodec(format),
-    sampleRate: format.sampleRate,
-    channels: format.channels,
-    durationSec: byteRate > 0 ? dataSize / byteRate : 0,
+    info: {
+      codec: pcmCodec(format),
+      sampleRate: format.sampleRate,
+      channels: format.channels,
+      durationSec: byteRate > 0 ? dataSize / byteRate : 0,
+    },
+    dataFound,
+  };
+}
+
+/** Parse a RIFF/WAVE header into the audio layout + duration. Pure; little-endian. */
+export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
+  return parseWavHeader(bytes, totalSize).info;
+}
+
+function wavTrackInfo(info: WavInfo): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
   };
 }
 
@@ -174,16 +201,21 @@ export const WavDriver: ContainerDriver = {
   kind: 'container',
   formats: ['wav'],
   supports: matches,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    let head = await readHead(src, WAV_PROBE_HEAD_BYTES);
+    let parsed = parseWavHeader(head, src.size);
+    const maxFallback = Math.min(src.size ?? WAV_DEMUX_HEAD_BYTES, WAV_DEMUX_HEAD_BYTES);
+    if (!parsed.dataFound && head.byteLength < maxFallback) {
+      head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
+      parsed = parseWavHeader(head, src.size);
+    }
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return [wavTrackInfo(parsed.info)];
+  },
   async demux(src: ByteSource): Promise<Demuxer> {
-    const head = await readHead(src, 65536);
+    const head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
     const info = parseWav(head, src.size);
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
-    };
+    const track = wavTrackInfo(info);
     return {
       tracks: [track],
       packets(): ReadableStream<Packet> {

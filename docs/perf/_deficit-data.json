@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-01T23:25:44.709Z",
+  "generatedFrom": "2026-07-02T11:16:58.876Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-07-01T09-06-47-538Z.json",
@@ -138,115 +138,37 @@
     "chromium-2026-07-01T22-57-30-746Z.json",
     "chromium-2026-07-01T23-02-13-942Z.json",
     "chromium-2026-07-01T23-12-01-664Z.json",
-    "chromium-2026-07-01T23-24-54-554Z.json"
+    "chromium-2026-07-01T23-24-54-554Z.json",
+    "chromium-2026-07-01T23-29-41-364Z.json",
+    "chromium-2026-07-02T08-05-09-506Z.json",
+    "chromium-2026-07-02T08-20-47-498Z.json",
+    "chromium-2026-07-02T08-24-54-065Z.json",
+    "chromium-2026-07-02T08-28-22-373Z.json",
+    "chromium-2026-07-02T08-33-04-467Z.json",
+    "chromium-2026-07-02T09-03-18-585Z.json",
+    "chromium-2026-07-02T09-42-26-983Z.json",
+    "chromium-2026-07-02T09-46-34-236Z.json",
+    "chromium-2026-07-02T09-54-53-147Z.json",
+    "chromium-2026-07-02T09-57-50-258Z.json",
+    "chromium-2026-07-02T10-31-33-813Z.json",
+    "chromium-2026-07-02T10-34-23-942Z.json",
+    "chromium-2026-07-02T10-35-55-773Z.json",
+    "chromium-2026-07-02T10-49-15-283Z.json",
+    "chromium-2026-07-02T11-02-48-670Z.json",
+    "chromium-2026-07-02T11-06-24-519Z.json",
+    "chromium-2026-07-02T11-16-15-767Z.json"
   ],
   "contested": 444,
-  "rawLossCount": 299,
-  "activeLossCount": 299,
-  "exemptLossCount": 0,
+  "rawLossCount": 290,
+  "activeLossCount": 289,
+  "exemptLossCount": 1,
   "tiers": {
     "catastrophic": 0,
     "severe": 0,
-    "moderate": 86,
-    "minor": 213
+    "moderate": 74,
+    "minor": 215
   },
   "losses": [
-    {
-      "s": "trim/h264_noop_full_range_idempotent",
-      "fam": "trim",
-      "our": 799.2550000003539,
-      "comp": "mediabunny",
-      "cw": 80.23500001430511,
-      "ratio": 9.961425809906581
-    },
-    {
-      "s": "performance/size-ladder-iterate-packets-tiny",
-      "fam": "performance",
-      "our": 33.83499999996275,
-      "comp": "mediabunny",
-      "cw": 4.259999990463257,
-      "ratio": 7.942488280682681
-    },
-    {
-      "s": "decode-seek/decode_size_micro_h264_1frame",
-      "fam": "decode-seek",
-      "our": 38.5,
-      "comp": "platform",
-      "cw": 4.854999989271164,
-      "ratio": 7.929969121540544
-    },
-    {
-      "s": "metadata/read_h264_1080p_30s",
-      "fam": "metadata",
-      "our": 31.764999999664724,
-      "comp": "remotion-media-parser",
-      "cw": 4.060000002384186,
-      "ratio": 7.8238916209386975
-    },
-    {
-      "s": "decode-seek/decode_tiny_dims_2x2_h264",
-      "fam": "decode-seek",
-      "our": 39.419999999925494,
-      "comp": "platform",
-      "cw": 5.0450000166893005,
-      "ratio": 7.81367688196644
-    },
-    {
-      "s": "metadata/tagedit_no_corrupt_audio_flac",
-      "fam": "metadata",
-      "our": 45.575000000186265,
-      "comp": "mediabunny",
-      "cw": 5.939999997615814,
-      "ratio": 7.672558925669877
-    },
-    {
-      "s": "demux/empty_audio_zero_packets",
-      "fam": "demux",
-      "our": 19.16499999957159,
-      "comp": "remotion-media-parser",
-      "cw": 2.600000023841858,
-      "ratio": 7.371153778395996
-    },
-    {
-      "s": "probe/h264_1080p_30s",
-      "fam": "probe",
-      "our": 31.570000000298023,
-      "comp": "mediabunny",
-      "cw": 4.324999988079071,
-      "ratio": 7.2994219855061075
-    },
-    {
-      "s": "remux/flac_seektable_flac_to_ogg",
-      "fam": "remux",
-      "our": 36.3000000002794,
-      "comp": "ffmpeg.wasm",
-      "cw": 4.990000009536743,
-      "ratio": 7.274549084349477
-    },
-    {
-      "s": "audio-dsp/edge_longform_audio_probe",
-      "fam": "audio-dsp",
-      "our": 17.46000000042841,
-      "comp": "mediabunny",
-      "cw": 2.5049999952316284,
-      "ratio": 6.970059893678341
-    },
-    {
-      "s": "metadata/read_flac_seektable",
-      "fam": "metadata",
-      "our": 32.359999999869615,
-      "comp": "remotion-webcodecs",
-      "cw": 4.834999978542328,
-      "ratio": 6.692864559148481
-    },
-    {
-      "s": "demux/opus",
-      "fam": "demux",
-      "our": 35.53500000014901,
-      "comp": "mediabunny",
-      "cw": 5.455000013113022,
-      "ratio": 6.514207133772332
-    },
     {
       "s": "probe/micro_audio_short",
       "fam": "probe",
@@ -1072,6 +994,14 @@
       "ratio": 2.429447859844943
     },
     {
+      "s": "decode-seek/decode_size_micro_h264_1frame",
+      "fam": "decode-seek",
+      "our": 15.794999986886978,
+      "comp": "platform",
+      "cw": 6.564999997615814,
+      "ratio": 2.4059405929357482
+    },
+    {
       "s": "transcode/vp9_alpha_to_vp8_keepalpha",
       "fam": "transcode",
       "our": 1327.054999999702,
@@ -1718,6 +1648,14 @@
       "comp": "ffmpeg.wasm",
       "cw": 27.25499999523163,
       "ratio": 1.4767932492035185
+    },
+    {
+      "s": "demux/empty_audio_zero_packets",
+      "fam": "demux",
+      "our": 4.425000011920929,
+      "comp": "mediabunny",
+      "cw": 3.0199999809265137,
+      "ratio": 1.4652318012807972
     },
     {
       "s": "remux/vp8_720p_10s_webm_to_mkv",
@@ -2544,5 +2482,18 @@
       "ratio": 1.0056712958869263
     }
   ],
-  "parityExemptions": []
+  "parityExemptions": [
+    {
+      "s": "trim/h264_noop_full_range_idempotent",
+      "fam": "trim",
+      "our": 79.26499998569489,
+      "comp": "mediabunny",
+      "cw": 47.12000000476837,
+      "ratio": 1.6821943968097104,
+      "exemption": {
+        "reason": "Fastest rival measures this no-op trim by returning the original input bytes after metadata recognition; aibrush-media must author a fresh non-passthrough MP4 stream-copy output, so matching that wall time would violate the no-passthrough correctness contract.",
+        "adr": "ADR-130"
+      }
+    }
+  ]
 }

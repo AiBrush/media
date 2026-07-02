@@ -162,6 +162,11 @@ describe('fromURL', () => {
     const src = fromURL(DATA_URL, { size: FIVE.byteLength });
     expect(src.size).toBe(FIVE.byteLength);
   });
+
+  it('carries a caller-provided MIME hint', () => {
+    const src = fromURL(DATA_URL, { mime: 'video/mp4' });
+    expect(src.mimeHint).toBe('video/mp4');
+  });
 });
 
 describe('fromElement', () => {
@@ -195,6 +200,7 @@ describe('from (universal dispatch)', () => {
     expect(from(fromBytes(FIVE).stream()).kind).toBe('stream');
     expect(from(new URL(DATA_URL)).kind).toBe('url');
     expect(from(DATA_URL).kind).toBe('url');
+    expect(from(new URL(DATA_URL), { mime: 'video/mp4' }).mimeHint).toBe('video/mp4');
   });
 
   it('returns an existing source unchanged (idempotent)', () => {
@@ -296,12 +302,63 @@ describe('probeUrlSize — body-free size detection', () => {
     expect(await probeUrlSize(HREF)).toBe(truth.byteLength);
   });
 
+  it('falls back when HEAD has a malformed Content-Length', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'HEAD') {
+        return Promise.resolve(
+          new Response(null, { status: 200, headers: { 'Content-Length': 'x' } }),
+        );
+      }
+      return Promise.resolve(
+        new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: { 'Content-Range': `bytes 0-0/${FIVE.byteLength}` },
+        }),
+      );
+    }) as typeof fetch);
+    expect(await probeUrlSize(HREF)).toBe(FIVE.byteLength);
+  });
+
   it('returns undefined for an unknown-length resource (no headers)', async () => {
     vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
       const method = (init?.method ?? 'GET').toUpperCase();
       if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
       return Promise.resolve(new Response(new Uint8Array([0]), { status: 200 }));
     }) as typeof fetch);
+    expect(await probeUrlSize(HREF)).toBeUndefined();
+  });
+
+  it('falls back after a throwing HEAD and accepts an unknown Content-Range total', async () => {
+    const methods: string[] = [];
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      methods.push(method);
+      if (method === 'HEAD') return Promise.reject(new Error('HEAD refused'));
+      return Promise.resolve(
+        new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: { 'Content-Range': 'bytes 0-0/*' },
+        }),
+      );
+    }) as typeof fetch);
+
+    expect(await probeUrlSize(new URL(HREF))).toBeUndefined();
+    expect(methods).toEqual(['HEAD', 'GET']);
+  });
+
+  it('returns undefined when the ranged size probe omits the Content-Range total', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
+      return Promise.resolve(
+        new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: { 'Content-Range': 'bytes 0-0' },
+        }),
+      );
+    }) as typeof fetch);
+
     expect(await probeUrlSize(HREF)).toBeUndefined();
   });
 
@@ -340,6 +397,57 @@ describe('fromURL — learns size from a range read and clamps past-EOF', () => 
     }
   });
 
+  it('leaves size unknown when a 206 range response lacks a Content-Range total', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(toBody(FIVE.subarray(0, 2)), {
+          status: 206,
+          headers: { 'Content-Range': 'bytes 0-1' },
+        }),
+      )) as typeof fetch);
+    const src = fromURL(HREF);
+
+    expectBytesEqual(await src.range?.(0, 2), FIVE.subarray(0, 2));
+    expect(src.size).toBeUndefined();
+  });
+
+  it('trims an over-returning 206 range body to the requested window', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(toBody(FIVE), {
+          status: 206,
+          headers: { 'Content-Range': `bytes 0-1/${FIVE.byteLength}` },
+        }),
+      )) as typeof fetch);
+    const src = fromURL(HREF);
+
+    expectBytesEqual(await src.range?.(0, 2), FIVE.subarray(0, 2));
+    expect(src.size).toBe(FIVE.byteLength);
+  });
+
+  it('leaves size unknown for malformed URL length headers', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(toBody(FIVE), { headers: { 'Content-Length': 'x' } }),
+      )) as typeof fetch);
+    const streamed = fromURL(HREF);
+    expectBytesEqual(await readAll(streamed.stream()), FIVE);
+    expect(streamed.size).toBeUndefined();
+
+    for (const value of ['bytes 0-1/*', 'bytes 0-1/', 'bytes 0-1/x']) {
+      vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+        Promise.resolve(
+          new Response(toBody(FIVE.subarray(0, 2)), {
+            status: 206,
+            headers: { 'Content-Range': value },
+          }),
+        )) as typeof fetch);
+      const ranged = fromURL(HREF);
+      expectBytesEqual(await ranged.range?.(0, 2), FIVE.subarray(0, 2));
+      expect(ranged.size).toBeUndefined();
+    }
+  });
+
   it('clamps a past-EOF range once size is known (returns only real bytes, empty at/after EOF)', async () => {
     const truth = await loadFixture(FIXTURE);
     const { fetch } = rangeServer(truth);
@@ -357,6 +465,39 @@ describe('fromURL — learns size from a range read and clamps past-EOF', () => 
     expect(src.size).toBe(12345);
   });
 
+  it('uses a plain GET for a tiny known-size full-window range', async () => {
+    const { fetch, calls } = rangeServer(FIVE);
+    vi.stubGlobal('fetch', fetch);
+    const src = fromURL(HREF, { size: FIVE.byteLength });
+
+    expectBytesEqual(await src.range?.(0, FIVE.byteLength), FIVE);
+
+    expect(calls).toEqual([{ method: 'GET', range: null }]);
+  });
+
+  it('learns tiny full-window GET size from the body when Content-Length is absent', async () => {
+    const calls: { method: string; range: string | null }[] = [];
+    vi.stubGlobal('fetch', ((_input: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const headers = init?.headers as { Range?: string } | undefined;
+      calls.push({ method, range: headers?.Range ?? null });
+      return Promise.resolve(new Response(toBody(FIVE), { status: 200 }));
+    }) as typeof fetch);
+    const src = fromURL(HREF, { size: FIVE.byteLength });
+
+    expectBytesEqual(await src.range?.(0, FIVE.byteLength), FIVE);
+
+    expect(src.size).toBe(FIVE.byteLength);
+    expect(calls).toEqual([{ method: 'GET', range: null }]);
+  });
+
+  it('rejects a failed tiny full-window GET with a typed InputError', async () => {
+    vi.stubGlobal('fetch', () => Promise.resolve(new Response('err', { status: 503 })));
+    const src = fromURL(HREF, { size: FIVE.byteLength });
+
+    await expect(src.range?.(0, FIVE.byteLength)).rejects.toBeInstanceOf(InputError);
+  });
+
   it('learns size from a full stream() Content-Length', async () => {
     const truth = await loadFixture(FIXTURE);
     const { fetch } = rangeServer(truth);
@@ -364,6 +505,33 @@ describe('fromURL — learns size from a range read and clamps past-EOF', () => 
     const src = fromURL(HREF);
     await readAll(src.stream());
     expect(src.size).toBe(truth.byteLength);
+  });
+
+  it('cancels URL streams before and after the response reader exists', async () => {
+    let responseCancels = 0;
+    vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller): void {
+              controller.enqueue(FIVE);
+            },
+            cancel(): void {
+              responseCancels++;
+            },
+          }),
+        ),
+      )) as typeof fetch);
+
+    const src = fromURL(HREF);
+    await src.stream().cancel('unused');
+    expect(responseCancels).toBe(0);
+
+    const reader = src.stream().getReader();
+    const first = await reader.read();
+    expect(first.value).toEqual(FIVE);
+    await reader.cancel('stop');
+    expect(responseCancels).toBe(1);
   });
 });
 

@@ -39,6 +39,7 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio, SampleFormat } from '../../dsp/index.ts';
+import { OggMuxer } from '../ogg/ogg-write.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
 import {
@@ -182,6 +183,24 @@ export function enumerateFlacFrames(bytes: Uint8Array): FlacFrame[] {
     durationUs: frame.durationUs,
     data: bytes.slice(frame.offset, frame.offset + frame.size) as Uint8Array<ArrayBuffer>,
   }));
+}
+
+async function writeFlacOggPacketCopy(bytes: Uint8Array): Promise<ReadableStream<Uint8Array>> {
+  const layout = flacMetadataLayout(bytes);
+  const metadata = bytes.slice(layout.start, layout.audioStart) as Uint8Array<ArrayBuffer>;
+  const track = flacTrackInfo(layout.info, metadata);
+  const muxer = new OggMuxer();
+  const trackId = muxer.addTrack(track);
+  for (const frame of fastFlacFrames(bytes, layout)) {
+    muxer.addChunkStruct(trackId, {
+      timestampUs: frame.ptsUs,
+      durationUs: frame.durationUs,
+      key: true,
+      data: bytes.subarray(frame.offset, frame.offset + frame.size),
+    });
+  }
+  await muxer.finalize();
+  return muxer.output;
 }
 
 /** Read the whole source — FLAC decode needs every frame (bounded by file size). */
@@ -652,6 +671,7 @@ export const FlacDriver: ContainerDriver = {
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['flac'],
+  streamCopyTargets: ['ogg'],
   supports: matchesFlac,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const info = parseFlac(await readAll(src));
@@ -682,6 +702,19 @@ export const FlacDriver: ContainerDriver = {
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     const bytes = await readAll(src);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (o?.container === 'ogg') {
+      if (o.trim !== undefined) {
+        throw new CapabilityError(
+          'capability-miss',
+          'FLAC to Ogg packet-copy trim is not declared',
+          {
+            op: { op: 'streamCopy', container: 'ogg', trim: true },
+            tried: ['flac', 'ogg'],
+          },
+        );
+      }
+      return await writeFlacOggPacketCopy(bytes);
+    }
     const out = writeFlacPacketCopy(bytes, o?.trim);
     return new ReadableStream<Uint8Array>({
       start(c): void {

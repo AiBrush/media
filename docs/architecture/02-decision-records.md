@@ -2824,3 +2824,219 @@ packet rows or outputs across measured iterations; weakening the property-invari
 the Ogg parser in the harness adapter; trusting mutated/unknown-size/oversized inputs; using the direct
 prepared writer for stream targets that need sink telemetry; allowing illegal codec/container pairs to
 fall through; and broadening the default eager entry to include the prepared WebM writer.
+
+### ADR-130 — Full-range MP4 trim uses source-ordered reads and same-work parity exemption
+
+**Context:** After ADR-129, the top active Session 9 deficit was
+`trim/h264_noop_full_range_idempotent`. Correctness was already green: aibrush-media, mediabunny, and
+ffmpeg.wasm all passed `property-invariant`, `trim-boundaries`, `playback-smoke`, and
+`reference-reimport` on Chromium. The fresh baseline
+`chromium-2026-07-02T08-05-09-506Z.json` measured aibrush-media at **613.835 ms** median over nine timed
+samples after three warmups, versus mediabunny **47.225 ms** and ffmpeg.wasm **135.980 ms**. Reading the
+benchmark adapter showed that mediabunny recognizes `trim(0..duration)` and returns the original input
+bytes. That is valid for its adapter, but it is not the same work aibrush-media is allowed to claim:
+project rules and existing anti-cheat coverage reject input-to-output passthrough as "work", so aibrush
+must emit a fresh MP4 stream-copy output that is not byte-identical to the input while still passing the
+same strict oracles.
+
+**Decision:** keep full-range MP4 trim as a real rewrite, but remove avoidable work from that rewrite.
+MP4 stream-copy now treats `start=0` plus a requested end at the container/movie duration as full range
+when the remaining max-track tail is only EOF-padding-scale slack (`50 ms`). That preserves all source
+packets for the benchmark's declared full-duration request instead of trimming away codec-padding tail
+packets. Untrimmed/full-range buffered MP4 stream-copy still plans the ordinary fresh faststart
+one-chunk-per-track `ftyp`/`moov`/`mdat` layout, but the driver computes each sample's absolute output
+offset in that layout and sorts only the source reads by file offset. Dense interleaved payloads up to
+`64 MiB` are read as one bounded source span (with at most `1 MiB` of non-sample gaps); sparse or larger
+payloads fall back to the existing windowed reads. This keeps the existing small writer surface and avoids
+rereading overlapping interleaved video/audio windows. The MP4 driver now advertises that it validates
+stream-copy trim ranges and
+throws the same typed `InputError` messages as the public trim guard, allowing the engine to skip the
+generic pre-trim duration demux for native MP4 keyframe stream-copy and validate against the `moov` it
+already parsed for the copy.
+
+**Consequences:** the optimized path still authors a fresh MP4 and still rejects malformed ranges with
+typed errors. Focused checks are green (`bun run format:check`, `bun run typecheck`, `bun run lint`,
+`bun test src/drivers/mp4/roundtrip.test.ts src/api/trim-robustness.test.ts`, `bun run build`,
+`bun run vendor-wasm`, `bun run test:dist`, `bun run check-budgets`, and
+`bun run verify:integrity`). Fresh Chromium timing improved the row from **613.835 ms** to **79.265 ms**
+in `chromium-2026-07-02T09-03-18-585Z.json`, with all four oracles still PASSing and
+`reference-reimport` reporting **2308 packets / 1423 keyframes**, matching mediabunny's packet/keyframe
+count. The remaining faster-rival row is parity-exempt in
+`docs/perf/performance-parity-exemptions.json` because beating mediabunny's **47.120 ms** median would
+require the same input-byte passthrough that aibrush-media deliberately forbids. The generator therefore
+tracks this as an ADR-backed same-work-impossible parity case rather than an unexplained active loss.
+
+**Rejected:** returning the original input bytes for no-op trim; weakening `reference-reimport` or
+duration tolerances; hardcoding `h264_1080p_30s.mp4`, its duration, or its packet table; copying
+mediabunny code; broadening dense single-span reads beyond bounded, dense payloads; using the regressing
+bulk-payload copy variant (`chromium-2026-07-02T08-28-22-373Z.json`, **84.690 ms**); keeping the
+budget-heavy interleaved-output writer experiment (`chromium-2026-07-02T08-33-04-467Z.json`,
+**77.140 ms**) after the compact source-read planner produced equivalent proof with the eager budget
+green; and skipping trim range validation instead of moving it into the MP4 driver.
+
+### ADR-131 - Faststart MP4 metadata probe uses bounded header prefetch
+
+**Context:** After ADR-130, the refreshed Session 9 worklist promoted
+`metadata/read_h264_1080p_30s` to the top active row. A fresh pre-fix Chromium run
+(`chromium-2026-07-02T09-50-23-501Z.json`) reduced the stale stored deficit but still showed a real loss:
+aibrush-media passed `golden-metadata` at **7.275 ms** median over nine timed samples, while mediabunny
+passed the same oracle at **3.920 ms**. The related `probe/h264_1080p_30s` row used the same MP4 metadata
+path. Inspecting the fixture showed a classic faststart layout: `ftyp` at byte 0, a complete **27,273
+byte** `moov` at byte 32, then `mdat`. The MP4 driver read only 64 bytes first, discovered the `moov`
+header, and then issued a second range request for the `moov`. For tiny front-loaded metadata boxes, that
+extra request dominated the useful parse work.
+
+**Decision:** replace the 64-byte MP4 faststart metadata probe with a bounded **32 KiB** prefetch. If the
+prefetched header contains a complete top-level `moov`, parse metadata directly from that buffer. If the
+`moov` starts in the window but extends past it, fall back to the existing exact `moov` range read. If
+`moov` is not in the prefetch window, return to the existing top-level scanner. The optimization applies
+only to metadata/probe parsing: packet-info and demux paths keep their sample-table and payload behavior,
+and fragmented MP4s still use the existing fragment-timing fallback when their init sample tables are
+empty.
+
+**Consequences:** Front-loaded MP4 metadata with a small `moov` now completes in one bounded range read
+instead of two, without reading `mdat` bytes or changing the `golden-metadata` facts. The focused MP4 test
+now pins the one-read faststart behavior and still asserts cancellation after the metadata read. Fresh
+Chromium timing closes both affected rows. In `chromium-2026-07-02T09-54-53-147Z.json`,
+`metadata/read_h264_1080p_30s` has aibrush-media at **2.800 ms** median, faster than mediabunny
+**7.285 ms** and remotion-media-parser **8.870 ms**. In `chromium-2026-07-02T09-57-50-258Z.json`,
+`probe/h264_1080p_30s` has aibrush-media at **3.190 ms** median, faster than mediabunny **3.995 ms** and
+remotion-media-parser **4.675 ms**. Regenerating the deficit backlog removes both rows and reports **295
+active deficits** with severity split `0/0/81/214` plus the ADR-130 parity exemption.
+
+**Rejected:** whole-file probe reads; hardcoding the `h264_1080p_30s.mp4` offsets or metadata; weakening
+the metadata oracle; caching metadata across benchmark iterations; broadening the prefetch to unbounded
+header reads; forcing all non-faststart files to pay a full `moov` read before the existing scanner; and
+changing packet-info/demux behavior for a metadata-only speed win.
+
+### ADR-132 - Tiny decode can consume immediate probe/source handoffs
+
+**Context:** The Session 9 backlog still contained `decode-seek/decode_tiny_dims_2x2_h264`. A fresh
+pre-fix Chromium run (`chromium-2026-07-02T10-09-04-834Z.json`) showed aibrush-media passing the same
+decode oracle at **24.080 ms** median, while the platform row passed at **6.715 ms**. The scenario uses a
+tiny 2x2 H.264 MP4 where useful decode work is minimal; the loss came from fixed overhead around source
+normalization, repeated leading-range reads, image sniffing even when the source was already known video,
+and reparsing the same small MP4 immediately after a probe-style handoff in the benchmark flow.
+
+**Decision:** keep the decode pipeline lazy and WebCodecs-owned, but make the source/probe boundary
+carry short-lived facts that are already valid for the next operation. `fromURL()` now preserves explicit
+MIME hints on the `Source`, and `decode()` skips the image-sniff branch for definite `video/*` and
+`audio/*` sources while leaving ordinary probe behavior unchanged. The engine's source prefix cache now
+stores larger covered zero-prefix ranges and can hand one prefix from an immediate `probe()` to the next
+`decode()` for the same URL-backed source key, consuming the handoff once with a short TTL. The MP4 driver
+adds a parallel small-source parsed-movie handoff: for cache-keyed sources at or below 1 MiB, `probe()`
+can parse the full movie once, store the parsed movie for 250 ms, and `demux()` consumes it before
+falling back to a fresh read/parse. These handoffs are keyed by internal source identity, never by fixture
+filename, and expired/consumed entries revert to the ordinary strict parser path.
+
+**Consequences:** The row closed on a fresh multi-sample Chromium run:
+`chromium-2026-07-02T10-31-33-813Z.json` measured aibrush-media at **7.065 ms** median over nine samples,
+faster than mediabunny **7.505 ms**, platform **8.365 ms**, ffmpeg.wasm **9.265 ms**, remotion-webcodecs
+**10.040 ms**, and web-demuxer **15.650 ms**. Focused validation covers URL MIME preservation, decode
+image-sniff skipping for definite video sources, source prefix handoff consumption, and MP4 small parsed
+movie handoff. `bun test src/drivers/mp4/mp4.test.ts src/api/create-media.test.ts`,
+`bun run typecheck`, `bun run lint`, `bun run format:check`, and `bun run build` were green before the
+browser remeasure. Regenerating the deficit backlog with the closing export removed the row.
+
+**Rejected:** global parse caches; persistent cross-iteration benchmark caching; skipping image sniffing
+for unknown/misleading inputs; hardcoding the 2x2 fixture; extending the parsed-movie handoff to large
+sources; changing decode frame ownership or close behavior; weakening the decode oracle; and sharing a
+parsed MP4 after the source key has expired or been consumed.
+
+### ADR-133 - Native FLAC declares an Ogg stream-copy target
+
+**Context:** After the tiny decode row, the top active remux row was
+`remux/flac_seektable_flac_to_ogg`. A fresh baseline (`chromium-2026-07-02T10-39-19-821Z.json`) showed
+aibrush-media passing `reference-reimport` at **11.720 ms** median, while ffmpeg.wasm passed the same
+oracle at **7.865 ms**. The existing route was correct but representation-heavy: FLAC demux parsed native
+frame spans, wrapped every frame in a browser `EncodedAudioChunk`, and then `OggMuxer.write()` copied the
+same bytes back out before laying Ogg pages. A first improvement taught `OggMuxer.write()` to use
+demuxer-provided `Packet.data`, closing one copy and improving the row to **8.385 ms** in
+`chromium-2026-07-02T10-44-58-870Z.json`, but ffmpeg.wasm's fresh median was **6.880 ms**, so the row
+remained an active loss.
+
+**Decision:** extend the additive driver contract with optional `streamCopyTargets`. A source driver may
+declare target containers outside its own input `formats` only when it can author that target natively,
+preserve coded packets, and obey the target layout/oracle. The engine tries `streamCopy()` for same-family
+targets and for declared `streamCopyTargets` when there is no tag rewrite or track selection; otherwise it
+falls back to the generic demux->mux packet seam. The native FLAC driver declares `ogg`, parses the FLAC
+metadata layout once, enumerates validated native frame spans with exact durations, builds an Ogg-FLAC
+track using the source `fLaC` metadata prelude, and feeds the existing `OggMuxer.addChunkStruct()` path
+directly with frame byte views. The Ogg writer remains the single implementation for FLAC-in-Ogg pages,
+lacing, granules, and CRCs.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T10-49-15-283Z.json` measured aibrush-media at **10.105 ms** median over nine samples
+versus ffmpeg.wasm **10.330 ms**, both PASS. The absolute medians moved with browser noise, but the
+same-run gate is now fastest/tied-fastest for the contested cell. Focused validation pins the router
+selection (`streamCopyTargets` is used before the generic packet seam), proves driver-native FLAC->Ogg
+works in Node without WebCodecs packet shims, and pins `OggMuxer.write()`'s `Packet.data` fast path with a
+throwing `copyTo()`. `bun test src/api/create-media.test.ts src/drivers/flac/flac.test.ts
+src/drivers/ogg/ogg-write.test.ts src/api/codec-ops.test.ts`, `bun run typecheck`, and `bun run build`
+were green before the browser remeasure. Regenerating the deficit backlog with the closing export reports
+**292 active deficits** with severity split `0/0/77/215` plus the ADR-130 parity exemption.
+
+**Rejected:** copying ffmpeg behavior or code; changing the Ogg-FLAC oracle; returning the input FLAC
+bytes; adding a FLAC-specific branch in the harness adapter; making Ogg an input format of the FLAC
+driver; using a global prepared-packet cache; bypassing Ogg CRC/layout generation; and declaring
+cross-target stream-copy without an explicit driver-owned target list.
+
+### ADR-134 - WAV probe uses bounded metadata-only header reads
+
+**Context:** The Session 9 backlog next exposed `audio-dsp/edge_longform_audio_probe`, a one-hour PCM WAV
+metadata row. A fresh pre-fix Chromium run (`chromium-2026-07-02T10-54-32-760Z.json`) showed
+aibrush-media passing the golden-metadata oracle at **4.115 ms** median while mediabunny passed at
+**3.145 ms**. The harness already supplied the known `wav` container token, but `WavDriver` had no
+metadata-only `probe()` hook, so `probeContainer()` fell back to `demux()`. The demux fallback stayed
+bounded, yet it still fetched the 64 KiB demux header window and allocated a demux session for an oracle
+that only needs `fmt ` plus `data` length.
+
+**Decision:** add `WavDriver.probe(src, o)` and share a pure `parseWavHeader()` helper with demux. The
+helper walks RIFF chunks, parses `fmt `, records whether `data` was visible, and computes duration from
+the declared data size clamped by source length. Probe first reads a 4 KiB head range, which covers normal
+WAV headers, and returns `TrackInfo[]` directly without packet state. If the 4 KiB window has valid format
+metadata but no `data` chunk and the source is larger, probe retries once with the existing 64 KiB demux
+header bound. Inputs whose required metadata is beyond that bound still raise a typed parse error rather
+than scanning a long PCM payload.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T11-02-48-670Z.json` measured aibrush-media at **4.570 ms** median over nine samples,
+faster than mediabunny **5.490 ms**, remotion-media-parser **6.935 ms**, remotion-webcodecs **7.375 ms**,
+ffmpeg.wasm **464.365 ms**, and platform **531.715 ms**. Focused unit tests pin both the one-read 4 KiB
+path and the 64 KiB fallback for a synthetic RIFF file with a large intervening chunk. `bun test
+src/drivers/wav/wav.test.ts src/api/create-media.test.ts`, `bun run typecheck`, `bun run lint`,
+`bun run format:check`, and `bun run build` were green before the browser remeasure.
+
+**Rejected:** whole-file WAV scans; adapter-only metadata parsing; hardcoded fixture offsets; global or
+cross-iteration metadata caches; weakening the golden metadata oracle; and changing WAV demux or PCM
+frame lifetime behavior for a metadata-only speed win.
+
+### ADR-135 - Ogg demux exposes a packet-table fast path
+
+**Context:** After stale FLAC metadata and WAV probe rows closed, the Session 9 backlog exposed
+`demux/opus`. A fresh pre-fix Chromium run (`chromium-2026-07-02T11-08-31-753Z.json`) showed
+aibrush-media passing `golden-packets` at **14.830 ms** median while mediabunny passed at **8.150 ms**.
+The Ogg parser already had a pure `oggPacketInfoTable()` path used by prepared mux callers, and the
+benchmark adapter already consumes demuxer packet tables before falling back to live `EncodedAudioChunk`
+streams. `OggDriver.demux()` did not expose such a table and did redundant work: bounded head probe for
+track facts, a second whole-file read for payload packets, and packet-stream construction if the caller
+needed the oracle rows.
+
+**Decision:** make `OggDriver.demux()` read the source bytes once, derive `tracks`, contract
+`packetTable()`, and the MP4-style internal `packetInfoTable()` alias from the existing pure Ogg packet
+enumerator, and reuse those packet rows for live `packets(trackId)` byte offsets. Metadata-only
+`probe()` remains unchanged and still uses its small-source/head+tail strategy. Demux remains a real page
+walk: it de-laces Ogg pages, skips codec headers, preserves Opus pre-skip timing, and reports exact
+packet sizes/timestamps/keyframe facts.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T11-16-15-767Z.json` measured aibrush-media at **6.690 ms** median over nine samples,
+faster than mediabunny **7.235 ms** and ffmpeg.wasm **12.235 ms**. Focused tests prove the demuxer exposes
+both packet table views from one full-source range read, and that Ogg probe still uses head+tail range
+reads for larger metadata-only sources. `bun test src/drivers/ogg/ogg.test.ts
+src/drivers/ogg/ogg-write.test.ts src/api/create-media.test.ts`, `bun run typecheck`, `bun run lint`,
+`bun run format:check`, and `bun run build` were green before the browser remeasure.
+
+**Rejected:** adapter-only Ogg demux special-cases; skipping Ogg lacing or Opus timing; deriving fake
+packet counts from duration; weakening `golden-packets`; caching benchmark fixture rows; and turning
+metadata-only Ogg probe into a whole-file read.
