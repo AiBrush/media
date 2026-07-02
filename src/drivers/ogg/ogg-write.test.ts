@@ -14,11 +14,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { Packet } from '../../contracts/driver.ts';
+import type { EncodedChunk, Packet } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { enumerateFlacFrames, nativeFlacMetadata, parseFlac } from '../flac/flac-driver.ts';
 import { OggDriver, parseOgg } from './ogg-driver.ts';
+import { muxPreparedOggAudioPacketTrack } from './ogg-prepared-mux.ts';
 import { type ChunkStruct, OggMuxer, buildPages } from './ogg-write.ts';
 
 // ── an independent Ogg-CRC (bit-by-bit MSB-first; a different implementation from the writer's table) ──
@@ -166,6 +167,40 @@ function audio(timestampUs: number, n: number, fill: number): ChunkStruct {
   return { timestampUs, durationUs: 20_000, key: true, data };
 }
 
+function packetFromChunk(chunk: ChunkStruct): Packet {
+  return {
+    data: chunk.data,
+    chunk: {
+      byteLength: chunk.data.byteLength,
+      timestamp: chunk.timestampUs,
+      duration: chunk.durationUs,
+      type: 'key',
+      copyTo(_destination: AllowSharedBufferSource): void {
+        throw new Error('copyTo should not run when packet.data is present');
+      },
+    } as unknown as EncodedAudioChunk,
+  };
+}
+
+function viewOf(destination: AllowSharedBufferSource): Uint8Array {
+  return ArrayBuffer.isView(destination)
+    ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+    : new Uint8Array(destination);
+}
+
+function encodedChunkFromChunk(chunk: ChunkStruct, onCopy?: () => void): EncodedChunk {
+  return {
+    byteLength: chunk.data.byteLength,
+    timestamp: chunk.timestampUs,
+    duration: chunk.durationUs,
+    type: 'key',
+    copyTo(destination: AllowSharedBufferSource): void {
+      onCopy?.();
+      viewOf(destination).set(chunk.data);
+    },
+  } as unknown as EncodedChunk;
+}
+
 const opusTrack = {
   id: 0,
   mediaType: 'audio' as const,
@@ -212,6 +247,57 @@ describe('buildPages — lacing (pure)', () => {
 });
 
 describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', () => {
+  it('prepared packet arrays reject empty inputs with a typed mux error', () => {
+    expect(() => muxPreparedOggAudioPacketTrack({ track: opusTrack, packets: [] })).toThrow(
+      MediaError,
+    );
+  });
+
+  it('prepared packet arrays author Ogg through the same page writer without host chunk copies', () => {
+    const inputs = [audio(0, 80, 0x11), audio(20_000, 120, 0x22), audio(40_000, 200, 0x33)];
+    const bytes = muxPreparedOggAudioPacketTrack({
+      track: opusTrack,
+      packets: inputs.map(packetFromChunk),
+    });
+
+    const info = parseOgg(bytes);
+    expect(info.codec).toBe('opus');
+    expect(info.durationSec).toBeCloseTo(2880 / 48_000, 5);
+    const pages = scanPages(bytes);
+    for (const p of pages) expect(p.computedCrc).toBe(p.storedCrc);
+    expect(
+      delacePackets(pages)
+        .slice(2)
+        .map((p) => [...p]),
+    ).toEqual(inputs.map((c) => [...c.data]));
+  });
+
+  it('prepared packet arrays copy bare encoded chunks only when no owned packet data exists', () => {
+    let copies = 0;
+    const input = audio(0, 80, 0x55);
+    const bytes = muxPreparedOggAudioPacketTrack({
+      track: opusTrack,
+      packets: [encodedChunkFromChunk(input, () => copies++)],
+    });
+
+    expect(copies).toBe(1);
+    expect(delacePackets(scanPages(bytes)).at(-1)).toEqual(input.data);
+  });
+
+  it('prepared packet arrays fall back to chunk bytes when packet data length is stale', () => {
+    let copies = 0;
+    const input = audio(0, 80, 0x66);
+    const packet: Packet = {
+      data: input.data.subarray(0, input.data.byteLength - 1),
+      chunk: encodedChunkFromChunk(input, () => copies++) as EncodedAudioChunk,
+    };
+
+    const bytes = muxPreparedOggAudioPacketTrack({ track: opusTrack, packets: [packet] });
+
+    expect(copies).toBe(1);
+    expect(delacePackets(scanPages(bytes)).at(-1)).toEqual(input.data);
+  });
+
   it('write reuses demuxer packet.data without copying the host chunk again', async () => {
     const muxer = new OggMuxer();
     const trackId = muxer.addTrack(opusTrack);

@@ -690,11 +690,17 @@ export class MediaEngineImpl implements MediaEngine {
       }
       if (
         opts.fragmented !== true &&
-        (target === 'mp4' ? opts.faststart !== false : target === 'webm' || target === 'mkv')
+        (target === 'mp4'
+          ? opts.faststart !== false
+          : target === 'webm' || target === 'mkv' || target === 'ogg')
       ) {
         const fastMux = await import('./flac-mkv-mux.ts');
         const muxPrepared =
-          target === 'mp4' ? fastMux.muxSingleTrackMp4 : fastMux.muxSingleTrackWebmAudio;
+          target === 'mp4'
+            ? fastMux.muxSingleTrackMp4
+            : target === 'ogg'
+              ? fastMux.muxSingleTrackOggAudio
+              : fastMux.muxSingleTrackWebmAudio;
         const stream = await muxPrepared(streams, {
           ...this.#stageOptions(signal, o),
           container: target,

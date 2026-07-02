@@ -563,6 +563,30 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(readWavPcm(out).planar).toEqual(readWavPcm(canonical).planar);
   });
 
+  it('re-authors explicit same-rate/same-channel/same-format WAV requests without PCM decode', async () => {
+    const canonical = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      's16',
+    );
+    const withJunk = withJunkChunk(canonical);
+    const out = await drain(
+      await transformPcm(streamOnly(withJunk), {
+        container: 'wav',
+        sampleFormat: 's16',
+        endian: 'le',
+        channels: 1,
+        sampleRate: 48_000,
+      }),
+    );
+    expect(out).toEqual(canonical);
+    expect(out).not.toEqual(withJunk);
+  });
+
   it('applies gain in the PCM domain (≈ ×0.5 at -6.02 dB)', async () => {
     const bytes = await loadFixture(SIN);
     const out = await drain(await transformPcm(streamOnly(bytes), { gainDb: -6.020599913279624 }));

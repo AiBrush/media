@@ -15,10 +15,6 @@ import {
   encodePcm,
 } from '../../dsp/pcm.ts';
 
-const FORMAT_PCM = 1;
-const FORMAT_FLOAT = 3;
-const FORMAT_EXTENSIBLE = 0xfffe;
-
 /** PCM audio plus the on-the-wire {@link SampleFormat} it was decoded from (for a bit-exact rewrite). */
 export interface WavPcm extends PcmAudio {
   readonly format: SampleFormat;
@@ -33,12 +29,12 @@ function tagEquals(bytes: Uint8Array, offset: number, tag: string): boolean {
 }
 
 function sampleFormat(formatTag: number, bits: number): SampleFormat {
-  if (formatTag === FORMAT_PCM) {
+  if (formatTag === 1) {
     if (bits === 8) return 'u8';
     if (bits === 16) return 's16';
     if (bits === 24) return 's24';
     if (bits === 32) return 's32';
-  } else if (formatTag === FORMAT_FLOAT) {
+  } else if (formatTag === 3) {
     if (bits === 32) return 'f32';
     if (bits === 64) return 'f64';
   }
@@ -67,7 +63,7 @@ function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   let formatTag = dv.getUint16(body, true);
   const bits = dv.getUint16(body + 14, true);
   // WAVE_FORMAT_EXTENSIBLE: the effective tag is the first 2 bytes of the SubFormat GUID (offset +24).
-  if (formatTag === FORMAT_EXTENSIBLE && size >= 40) formatTag = dv.getUint16(body + 24, true);
+  if (formatTag === 0xfffe && size >= 40) formatTag = dv.getUint16(body + 24, true);
   return {
     formatTag,
     channels: dv.getUint16(body + 2, true),
@@ -128,7 +124,7 @@ export function writeWavHeader(
   const sampleBytes = bytesPerSample(format);
   const blockAlign = channels * sampleBytes;
   const byteRate = sampleRate * blockAlign;
-  const formatTag = format === 'f32' || format === 'f64' ? FORMAT_FLOAT : FORMAT_PCM;
+  const formatTag = format === 'f32' || format === 'f64' ? 3 : 1;
   const dv = new DataView(out.buffer);
   writeFourCC(dv, 0, 'RIFF');
   dv.setUint32(4, 36 + dataBytes, true);
@@ -175,11 +171,15 @@ export function rewriteWavPcmCopy(
   bytes: Uint8Array,
   requestedFormat?: SampleFormat,
   endian: Endianness = 'le',
+  requestedChannels?: number,
+  requestedSampleRate?: number,
 ): Uint8Array<ArrayBuffer> | undefined {
   if (endian !== 'le') return undefined;
   const parsed = parseWavPcmData(bytes);
   const { fmt, format, data } = parsed;
   if (requestedFormat !== undefined && requestedFormat !== format) return undefined;
+  if (requestedChannels !== undefined && requestedChannels !== fmt.channels) return undefined;
+  if (requestedSampleRate !== undefined && requestedSampleRate !== fmt.sampleRate) return undefined;
   if (isCanonicalWavPcmEnvelope(bytes, parsed)) {
     const out = bytes.slice() as Uint8Array<ArrayBuffer>;
     writeWavHeader(out, data.byteLength, fmt.channels, fmt.sampleRate, format);

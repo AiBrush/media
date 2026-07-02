@@ -14,6 +14,7 @@ type PacketStreamSlot = 'video' | 'audio';
 interface MuxPacketDescriptorRecord {
   readonly track?: unknown;
   readonly packets?: unknown;
+  readonly packetsArray?: unknown;
 }
 
 interface ReadableStreamLikeRecord {
@@ -61,16 +62,22 @@ function appendMuxPacketStream(
   const descriptor = input as MuxPacketDescriptorRecord;
   const track = descriptor.track;
   const packets = descriptor.packets;
+  const packetsArray = descriptor.packetsArray;
   // `isTrackInfoLike` already narrows mediaType to 'video'|'audio'. A slotted entry must additionally match
   // its slot; a `tracks[]` entry (slot `undefined`) accepts either, so the list may carry >=2 of one type.
   if (
     !isTrackInfoLike(track) ||
     (slot !== undefined && track.mediaType !== slot) ||
     track.config === undefined ||
-    !isReadableStreamLike(packets)
+    (!isReadableStreamLike(packets) && !Array.isArray(packetsArray))
   )
     throw invalidMuxPacketStream();
-  out.push({ track, packets: packets as ReadableStream<EncodedChunk | Packet> });
+  out.push({
+    track,
+    packets: isReadableStreamLike(packets)
+      ? (packets as ReadableStream<EncodedChunk | Packet>)
+      : packetArrayStream(packetsArray as readonly (EncodedChunk | Packet)[]),
+  });
 }
 
 function collectReadablePacketStream(out: ReadableStream<unknown>[], input: unknown): void {
@@ -95,6 +102,23 @@ function isReadableStreamLike(value: unknown): value is ReadableStream<unknown> 
   if (!isObject(value)) return false;
   const stream = value as ReadableStreamLikeRecord;
   return typeof stream.getReader === 'function';
+}
+
+function packetArrayStream(
+  packets: readonly (EncodedChunk | Packet)[],
+): ReadableStream<EncodedChunk | Packet> {
+  let index = 0;
+  return new ReadableStream<EncodedChunk | Packet>({
+    pull(controller): void {
+      const packet = packets[index];
+      if (packet === undefined) {
+        controller.close();
+        return;
+      }
+      index++;
+      controller.enqueue(packet);
+    },
+  });
 }
 
 function isTrackInfoLike(value: unknown): value is TrackInfo {

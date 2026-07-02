@@ -375,7 +375,7 @@ export interface ChunkStruct {
   data: Uint8Array;
 }
 
-interface TrackState {
+export interface TrackState {
   readonly codec: 'opus' | 'vorbis' | 'flac';
   readonly channels: number;
   readonly sampleRate: number;
@@ -392,7 +392,7 @@ function finitePositiveDurationSec(durationSec: number | undefined): number | un
 }
 
 /** Resolve the codec + audio geometry from a track's {@link TrackInfo}; reject non-Ogg codecs. */
-function trackStateFrom(info: TrackInfo): TrackState {
+export function trackStateFrom(info: TrackInfo): TrackState {
   if (info.mediaType !== 'audio') {
     throw new CapabilityError('capability-miss', 'the ogg muxer writes audio only', {
       op: { op: 'mux', mediaType: info.mediaType },
@@ -578,7 +578,7 @@ export class OggMuxer implements Muxer {
 
   constructor(options?: MuxOptions) {
     if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'fragmented ogg mux is not a thing', {
+      throw new CapabilityError('capability-miss', 'fragmented ogg unsupported', {
         op: { op: 'mux', fragmented: true },
         tried: ['ogg'],
       });
@@ -597,14 +597,13 @@ export class OggMuxer implements Muxer {
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
     if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'the ogg muxer writes a single audio stream', {
+      throw new CapabilityError('capability-miss', 'ogg muxer writes one stream', {
         op: { op: 'mux' },
         tried: ['ogg'],
       });
     }
-    const id = 0;
-    this.#track = { id, state: trackStateFrom(info) };
-    return id;
+    this.#track = { id: 0, state: trackStateFrom(info) };
+    return 0;
   }
 
   /**
@@ -643,11 +642,11 @@ export class OggMuxer implements Muxer {
     await this.#ready;
     const controller = this.#controller;
     if (controller === undefined) {
-      throw new MediaError('mux-error', 'muxer output stream was not initialized');
+      throw new MediaError('mux-error', 'output not initialized');
     }
     try {
       if (this.#track === undefined) {
-        throw new MediaError('mux-error', 'cannot finalize a muxer with no tracks');
+        throw new MediaError('mux-error', 'no tracks');
       }
       if (this.#track.state.chunks.length === 0) {
         throw new MediaError('mux-error', `track ${this.#track.id} received no packets`);

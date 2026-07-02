@@ -19,7 +19,7 @@ import type {
   PcmTransform,
   StageOptions,
 } from '../contracts/driver.ts';
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { rewriteWavPcmCopy, writeWavHeader } from '../drivers/wav/pcm.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
@@ -50,6 +50,86 @@ export interface WavPcmPacketCopyInput {
   readonly channels: number;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new MediaError('aborted', 'operation aborted');
+}
+
+function canRewritePcmBytes(o: PcmTransform): boolean {
+  return (
+    o.container === 'wav' &&
+    o.gainDb === undefined &&
+    o.fade === undefined &&
+    o.dynamics === undefined &&
+    o.biquad === undefined &&
+    o.timeBounds === undefined &&
+    (o.endian === undefined || o.endian === 'le')
+  );
+}
+
+function wavHint(src: Source): boolean {
+  const mime = src.mimeHint?.toLowerCase();
+  if (
+    mime !== undefined &&
+    (mime === 'audio/wav' || mime === 'audio/wave' || mime === 'audio/x-wav')
+  ) {
+    return true;
+  }
+  const filename = src.filename?.toLowerCase();
+  return filename !== undefined && (filename.endsWith('.wav') || filename.endsWith('.wave'));
+}
+
+function oneChunk(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
+}
+
+function blobParts(type: string | undefined): BlobPropertyBag | undefined {
+  return type ? { type } : undefined;
+}
+
+function outputBytes(
+  sink: Sink,
+  bytes: Uint8Array<ArrayBuffer>,
+  opts: { readonly signal?: AbortSignal; readonly mime?: string },
+): Promise<Output> | Output {
+  switch (sink.kind) {
+    case 'blob':
+      return new Blob([bytes], blobParts(opts.mime));
+    case 'file':
+      return new File([bytes], sink.name, blobParts(opts.mime));
+    case 'stream':
+      return oneChunk(bytes);
+    case 'opfs':
+    case 'element':
+    case 'stream-target':
+      return materialize(sink, oneChunk(bytes), opts);
+  }
+}
+
+async function tryDirectWavPcmCopy(
+  src: Source,
+  o: PcmTransform,
+): Promise<Uint8Array<ArrayBuffer> | undefined> {
+  if (
+    !canRewritePcmBytes(o) ||
+    !wavHint(src) ||
+    src.range === undefined ||
+    src.size === undefined
+  ) {
+    return undefined;
+  }
+  throwIfAborted(o.signal);
+  const bytes = await src.range(0, src.size);
+  throwIfAborted(o.signal);
+  const copied = rewriteWavPcmCopy(bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+  throwIfAborted(o.signal);
+  return copied;
+}
+
 /**
  * Re-serialize a raw-PCM target (WAV/AIFF/CAF) through the source container's own `transformPcm` (or the
  * `decodePcm` bridge for a WAV target from a compressed source), returning the materialized {@link Output} —
@@ -67,8 +147,12 @@ export async function convertPcmNative(
   signal: AbortSignal,
   o: CallOptions,
 ): Promise<Output | undefined> {
-  const container = await deps.routeContainer(src, 'demux');
   const pcmOpts = pcmTransformOptions(deps, audio, target, signal, o);
+  const direct = await tryDirectWavPcmCopy(src, pcmOpts);
+  if (direct !== undefined) {
+    return outputBytes(opts.sink ?? toBlob(), direct, deps.mimeOpts(signal, target));
+  }
+  const container = await deps.routeContainer(src, 'demux');
   // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its own bytes,
   // applies sample format / channel / rate transforms, then serializes the requested raw-PCM target. A WAV
   // target may also be produced by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADTS AAC→WAV).
@@ -135,14 +219,21 @@ export async function pcm(
       },
     );
   }
+  const activeSignal = signal ?? new AbortController().signal;
   if (src instanceof Uint8Array) {
-    if (sourceContainer === 'wav' && target === 'wav' && opts.sink?.kind !== 'stream-target') {
+    const pcmOpts = pcmTransformOptions(deps, audio, target, activeSignal, o);
+    if (sourceContainer === 'wav' && canRewritePcmBytes(pcmOpts)) {
       const copied = rewriteWavPcmCopy(
         src,
-        deps.pcmSampleFormat(audio?.codec),
-        deps.pcmEndian(audio?.codec),
+        pcmOpts.sampleFormat,
+        pcmOpts.endian,
+        pcmOpts.channels,
+        pcmOpts.sampleRate,
       );
-      if (copied !== undefined) return copied;
+      if (copied !== undefined) {
+        if (opts.sink === undefined) return copied;
+        return outputBytes(opts.sink, copied, deps.mimeOpts(activeSignal, target));
+      }
     }
     throw new CapabilityError('capability-miss', 'PCM byte rewrite path not registered', {
       op: 'convert',
@@ -150,7 +241,6 @@ export async function pcm(
     });
   }
   const container = await routeContainerToken(sourceContainer, 'demux');
-  const activeSignal = signal ?? new AbortController().signal;
   const pcmOpts = pcmTransformOptions(deps, audio, target, activeSignal, o);
   const stream = container.transformPcm
     ? await container.transformPcm(src, pcmOpts)

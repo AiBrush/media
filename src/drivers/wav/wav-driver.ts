@@ -184,8 +184,6 @@ function matches(q: ContainerQuery): boolean {
 function canRewriteWavPcm(o: PcmTransform | undefined, container: string): boolean {
   return (
     container === 'wav' &&
-    o?.channels === undefined &&
-    o?.sampleRate === undefined &&
     o?.gainDb === undefined &&
     o?.fade === undefined &&
     o?.dynamics === undefined &&
@@ -233,7 +231,13 @@ export const WavDriver: ContainerDriver = {
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const container = o?.container ?? 'wav';
     if (canRewriteWavPcm(o, container)) {
-      const copied = rewriteWavPcmCopy(bytes, o?.sampleFormat, o?.endian);
+      const copied = rewriteWavPcmCopy(
+        bytes,
+        o?.sampleFormat,
+        o?.endian,
+        o?.channels,
+        o?.sampleRate,
+      );
       if (copied !== undefined) {
         return new ReadableStream<Uint8Array>({
           start(c): void {

@@ -6,6 +6,7 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { muxPreparedOggAudioPacketTrack } from '../drivers/ogg/ogg-prepared-mux.ts';
 import type { ChunkStruct as WebmChunkStruct } from '../drivers/webm/ebml-write.ts';
 import { writeWebm } from '../drivers/webm/ebml-write.ts';
 import { muxPreparedMp4PacketTrack } from './mp4-prepared-mux.ts';
@@ -56,7 +57,7 @@ export async function muxSingleTrackMp4(
     return undefined;
   }
   if (packets.length === 0) {
-    throw new MediaError('mux-error', 'single-track MP4 mux received no packets');
+    throw new MediaError('mux-error', 'MP4 mux received no packets');
   }
   const muxOptions = {
     track: input.track,
@@ -77,39 +78,46 @@ export async function muxFlacMkv(
   if (input === undefined) return undefined;
   const chunks = await packetChunks(input, options.signal);
   if (chunks.length === 0) {
-    throw new MediaError('mux-error', 'FLAC MKV mux received no packets');
+    throw new MediaError('mux-error', 'MKV mux received no packets');
   }
   return streamFromBytes(writeWebm([flacTrackState(input, chunks)], 'matroska'));
+}
+
+/** Fast single-track Ogg audio packet mux for prepared packet callers. */
+export async function muxSingleTrackOggAudio(
+  streams: PacketStreams,
+  options: MuxOptions & StageOptions,
+): Promise<ReadableStream<Uint8Array> | undefined> {
+  if (options.fragmented === true || options.container !== 'ogg') return undefined;
+  const input = singlePacketStream(streams);
+  if (input === undefined || input.track.mediaType !== 'audio') return undefined;
+  const packets = await packetValues(input, options.signal);
+  if (packets.length === 0) {
+    throw new MediaError('mux-error', 'Ogg mux received no packets');
+  }
+  return streamFromBytes(muxPreparedOggAudioPacketTrack({ track: input.track, packets }));
 }
 
 export function muxPreparedWebmAudioPacketTrack(
   input: PreparedWebmAudioPacketMuxInput,
 ): Uint8Array {
   if (input.container !== 'webm' && input.container !== 'mkv') {
-    throw new CapabilityError(
-      'capability-miss',
-      `prepared WebM audio packet mux cannot write '${input.container}'`,
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['webm', 'mkv'],
-      },
-    );
+    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
+      op: { op: 'mux', container: input.container },
+      tried: ['webm', 'mkv'],
+    });
   }
   if (input.track.mediaType !== 'audio') {
-    throw new CapabilityError(
-      'capability-miss',
-      'prepared WebM audio packet mux requires one audio track',
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['webm', 'mkv'],
-      },
-    );
+    throw new CapabilityError('capability-miss', 'WebM mux requires one audio track', {
+      op: { op: 'mux', container: input.container },
+      tried: ['webm', 'mkv'],
+    });
   }
   const codecId = webmAudioCodecId(input.track.codec, input.container);
   if (codecId === undefined) {
     throw new CapabilityError(
       'capability-miss',
-      `prepared WebM audio packet mux cannot carry '${input.track.codec}' in '${input.container}'`,
+      `WebM mux cannot carry '${input.track.codec}' in '${input.container}'`,
       {
         op: { op: 'mux', container: input.container },
         tried: ['webm', 'mkv'],
@@ -117,7 +125,7 @@ export function muxPreparedWebmAudioPacketTrack(
     );
   }
   if (input.packets.length === 0) {
-    throw new MediaError('mux-error', 'prepared WebM audio packet mux received no packets');
+    throw new MediaError('mux-error', 'WebM mux received no packets');
   }
   const chunks: WebmChunkStruct[] = [];
   for (const packet of input.packets) chunks.push(chunkStructFrom(packet));
@@ -134,7 +142,7 @@ export async function muxSingleTrackWebmAudio(
   if (input === undefined) return undefined;
   const chunks = await packetChunks(input.stream, options.signal);
   if (chunks.length === 0) {
-    throw new MediaError('mux-error', 'single-track WebM audio mux received no packets');
+    throw new MediaError('mux-error', 'WebM mux received no packets');
   }
   return streamFromBytes(
     writePreparedWebmAudioTrack(input.stream.track, input.codecId, chunks, options.container),
@@ -219,6 +227,36 @@ async function packetChunks(
     reader.releaseLock();
   }
   return chunks;
+}
+
+async function packetValues(
+  input: PacketStream,
+  signal: AbortSignal | undefined,
+): Promise<Array<EncodedChunk | Packet>> {
+  const packets: Array<EncodedChunk | Packet> = [];
+  if (input.packetsArray !== undefined) {
+    for (const packet of input.packetsArray) {
+      assertNotAborted(signal);
+      packets.push(packet);
+    }
+    return packets;
+  }
+  if (input.packets === undefined) return packets;
+  const reader = input.packets.getReader();
+  try {
+    for (;;) {
+      assertNotAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      packets.push(value);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return packets;
 }
 
 function singleFlacAudioStream(streams: PacketStreams): PacketStream | undefined {

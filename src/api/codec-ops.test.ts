@@ -503,6 +503,40 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     }
   });
 
+  it('public mux accepts prepared Opus packet arrays through the generic Ogg mux seam', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const sourceInfo = parseOgg(await loadFixture('sfx-opus.ogg'));
+      const demuxed = await OggDriver.demux(await fixtureSource('sfx-opus.ogg'));
+      try {
+        const track = demuxed.tracks[0];
+        if (track === undefined) throw new Error('expected Opus track');
+        const reader = demuxed.packets(track.id).getReader();
+        const packets: Packet[] = [];
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            packets.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        const out = await outputBytes(
+          await media().mux({ audio: { track, packetsArray: packets } }, { container: 'ogg' }),
+        );
+        const info = parseOgg(out);
+        expect(info.codec).toBe('opus');
+        expect(info.durationSec).toBeCloseTo(sourceInfo.durationSec, 5);
+      } finally {
+        await demuxed.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   it('prepared WebM audio packet mux authors Opus WebM directly', async () => {
     const restore = installEncodedChunkShims();
     try {

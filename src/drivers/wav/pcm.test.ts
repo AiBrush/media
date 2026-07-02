@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { wavPcmPacketCopy } from '../../api/pcm-convert-plan.ts';
-import { InputError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { gain } from '../../dsp/index.ts';
 import { channelAt, encodePcm } from '../../dsp/pcm.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
-import { readWavPcm, writeWav } from './pcm.ts';
+import { readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
 import { parseWav } from './wav-driver.ts';
 
 /** Independent `data`-chunk locator — the byte-exact oracle must not depend on the code under test. */
@@ -108,6 +108,36 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(dataChunk(out)).toEqual(dataChunk(file));
   });
 
+  it('declines WAV byte-copy when explicit identity constraints do not match', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 2,
+        planar: [Float64Array.of(0.25, -0.25)],
+      },
+      's16',
+    );
+    expect(rewriteWavPcmCopy(wav, 's24')).toBeUndefined();
+    expect(rewriteWavPcmCopy(wav, 's16', 'be')).toBeUndefined();
+    expect(rewriteWavPcmCopy(wav, 's16', 'le', 2)).toBeUndefined();
+    expect(rewriteWavPcmCopy(wav, 's16', 'le', 1, 44_100)).toBeUndefined();
+  });
+
+  it('rejects signed 8-bit WAV authoring instead of writing mislabeled bytes', () => {
+    expect(() =>
+      writeWav(
+        {
+          sampleRate: 8_000,
+          channels: 1,
+          frames: 1,
+          planar: [Float64Array.of(0)],
+        },
+        's8',
+      ),
+    ).toThrow(CapabilityError);
+  });
+
   it('round-trips a float WAV (tag 3) it wrote', () => {
     const audio = {
       sampleRate: 8000,
@@ -156,6 +186,17 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     const junk = new Uint8Array(8);
     junk.set([0x4a, 0x55, 0x4e, 0x4b], 0); // 'JUNK'
     expect(() => readWavPcm(craftWav(junk, new Uint8Array(0), 'JUNK'))).toThrow(MediaError);
+  });
+
+  it('throws a typed demux error when the fmt chunk is truncated', () => {
+    const wav = new Uint8Array(24);
+    const dv = new DataView(wav.buffer);
+    for (let i = 0; i < 4; i++) dv.setUint8(i, 'RIFF'.charCodeAt(i));
+    dv.setUint32(4, 16, true);
+    for (let i = 0; i < 4; i++) dv.setUint8(8 + i, 'WAVE'.charCodeAt(i));
+    for (let i = 0; i < 4; i++) dv.setUint8(12 + i, 'fmt '.charCodeAt(i));
+    dv.setUint32(16, 16, true);
+    expect(() => readWavPcm(wav)).toThrow(MediaError);
   });
 
   it('treats a fmt-only file (no data chunk) as empty audio', () => {

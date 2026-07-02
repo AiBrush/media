@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-02T11:16:58.876Z",
+  "generatedFrom": "2026-07-02T14:57:33.029Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-07-01T09-06-47-538Z.json",
@@ -156,51 +156,24 @@
     "chromium-2026-07-02T10-49-15-283Z.json",
     "chromium-2026-07-02T11-02-48-670Z.json",
     "chromium-2026-07-02T11-06-24-519Z.json",
-    "chromium-2026-07-02T11-16-15-767Z.json"
+    "chromium-2026-07-02T11-16-15-767Z.json",
+    "chromium-2026-07-02T12-59-35-544Z.json",
+    "chromium-2026-07-02T13-18-33-377Z.json",
+    "chromium-2026-07-02T13-55-04-311Z.json",
+    "chromium-2026-07-02T14-28-48-718Z.json",
+    "chromium-2026-07-02T14-55-46-012Z.json"
   ],
   "contested": 444,
-  "rawLossCount": 290,
-  "activeLossCount": 289,
+  "rawLossCount": 286,
+  "activeLossCount": 285,
   "exemptLossCount": 1,
   "tiers": {
     "catastrophic": 0,
     "severe": 0,
-    "moderate": 74,
+    "moderate": 70,
     "minor": 215
   },
   "losses": [
-    {
-      "s": "probe/micro_audio_short",
-      "fam": "probe",
-      "our": 15.020000000018626,
-      "comp": "remotion-media-parser",
-      "cw": 2.350000023841858,
-      "ratio": 6.391489296865382
-    },
-    {
-      "s": "mux/opus_to_ogg",
-      "fam": "mux",
-      "our": 65.4750000005588,
-      "comp": "mediabunny",
-      "cw": 10.395000010728836,
-      "ratio": 6.29870129225407
-    },
-    {
-      "s": "audio-dsp/meta_idempotent_resample_same_rate",
-      "fam": "audio-dsp",
-      "our": 33.29000000003725,
-      "comp": "mediabunny",
-      "cw": 5.28999999165535,
-      "ratio": 6.293005681011377
-    },
-    {
-      "s": "probe/tiny_h264_360p_2s",
-      "fam": "probe",
-      "our": 20.43500000005588,
-      "comp": "mediabunny",
-      "cw": 3.274999976158142,
-      "ratio": 6.239694701930318
-    },
     {
       "s": "demux/h264_vfr",
       "fam": "demux",

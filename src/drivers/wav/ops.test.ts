@@ -78,6 +78,22 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(readWavPcm(out).sampleRate).toBe(44100);
   });
 
+  it('keeps explicit identity PCM targets bit-exact through the public convert path', async () => {
+    const input = await loadFixture(SIN);
+    const orig = readWavPcm(input);
+    const out = await bytesOf(
+      await media().convert(wavSource(input), {
+        to: 'wav',
+        audio: { codec: 'pcm-s16' as never, sampleRate: orig.sampleRate, channels: orig.channels },
+      }),
+    );
+    const re = readWavPcm(out);
+    expect(re.format).toBe(orig.format);
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+  });
+
   it('applies public gainDb through the PCM-native transform path', async () => {
     const orig = readWavPcm(await loadFixture(SIN));
     const out = await bytesOf(

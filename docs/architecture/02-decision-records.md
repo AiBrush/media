@@ -3040,3 +3040,167 @@ src/drivers/ogg/ogg-write.test.ts src/api/create-media.test.ts`, `bun run typech
 **Rejected:** adapter-only Ogg demux special-cases; skipping Ogg lacing or Opus timing; deriving fake
 packet counts from duration; weakening `golden-packets`; caching benchmark fixture rows; and turning
 metadata-only Ogg probe into a whole-file read.
+
+### ADR-136 - Tiny M4A probe uses one small source read and a narrow audio metadata parser
+
+**Context:** After the Ogg packet-table row closed, the top active Session 9 row was
+`probe/micro_audio_short`, a 1,369 byte AAC-in-MP4/M4A fixture. Fresh pre-fix Chromium timing
+(`chromium-2026-07-02T11-18-11-221Z.json`) showed aibrush-media passing the same metadata oracle at
+**7.620 ms** median while mp4box and mediabunny passed at roughly **4.5 ms**. The useful work was tiny,
+but our generic metadata path still paid fixed overhead: the URL `range(0, size)` fetch used an HTTP
+Range request even though the harness already supplied the exact tiny size, and the MP4 faststart parser
+walked the full metadata representation before reducing it back to one audio track.
+
+**Decision:** add a guarded tiny-audio MP4 probe path. URL-backed sources with a known size at or below
+16 KiB satisfy a full-window `range(0, size)` with a plain GET, memoizing `Content-Length` when present
+or the fetched body length otherwise. `probe()` then tries the tiny MP4 audio parser only for sources
+with an audio MIME hint or an internal source key ending in `.m4a`; video or unknown sources stay on the
+ordinary MP4 metadata parser. The tiny parser reads the single small prefix, finds a complete top-level
+`moov`, accepts only audio `soun` tracks with `mp4a` sample entries, parses `esds` for the exact AAC
+codec/private config, reads `mvhd`/`tkhd`/`mdhd`/`hdlr` timing facts, and derives optional gapless facts
+from simple edit-list plus `stts` timing. Malformed, video, unsupported, or incomplete files return to
+the strict generic parser instead of guessing.
+
+The source module was also lazy-split so the extra transport/probe machinery did not blow the Session 9
+budgets: OPFS and URL-size probing now live behind dynamic imports, while the eager source normalizer
+keeps only byte/blob/stream/URL/element construction plus the tiny full-window GET rule.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T12-59-35-544Z.json` measured aibrush-media at **2.275 ms** median over nine samples,
+faster than remotion-media-parser **3.100 ms**, mediabunny **4.205 ms**, mp4box **4.495 ms**, platform
+**5.015 ms**, ffmpeg.wasm **5.940 ms**, remotion-webcodecs **6.180 ms**, and web-demuxer **15.060 ms**.
+Focused tests cover known-size tiny full-window GETs, body-length size learning when `Content-Length` is
+absent, typed GET failures, malformed length and range headers, over-returning `206` bodies, URL stream
+cancellation, tiny M4A MIME/source-key routing, gapless/no-gapless variants, malformed tiny candidates,
+and fallback to the full parser for otherwise-valid misses. `bun run gate` is green after the change:
+2,433 tests passed with global branch coverage **90.04%**, eager JS **49.39 kB**, typical first-op JS
+**255.75 kB**, package verification green, and anti-cheat green. Regenerating the deficit backlog with
+the closing export reports **288 active deficits** with severity split `0/0/73/215` plus the ADR-130
+parity exemption.
+
+**Rejected:** hardcoding the `micro_audio_short.m4a` fixture; treating every tiny MP4 as audio; accepting
+video tracks on the tiny parser; weakening the metadata oracle; persistent cross-iteration caches;
+delegating to mp4box/mediabunny; whole-file reads beyond the known tiny cap; fake duration or gapless
+facts; and moving OPFS/URL-size helpers into the eager source closure to buy local simplicity at the
+expense of budget discipline.
+
+### ADR-137 - Ogg audio prepared-packet mux skips browser chunk materialization
+
+**Context:** After `probe/micro_audio_short` closed, the top active Session 9 row was
+`mux/opus_to_ogg`. A fresh Chromium run first exposed a correctness gap: public `media.mux()` rejected the
+declared bounded `packetsArray` shape with `invalid mux packet stream`, even though the public
+`PacketStreams` contract accepts `{ track, packetsArray }`. After fixing that parser mismatch, the same
+oracle passed but remained slower: aibrush-media measured **14.545 ms** median while mediabunny measured
+**8.350 ms**, and an initial writer-only fast path was still noisy/slower because the benchmark adapter
+prepared Ogg packets by constructing live `EncodedAudioChunk`s. The useful work for the row is bounded and
+already represented by our Ogg packet-info table: exact de-laced payload offsets/sizes, timestamps,
+durations, and codec-private headers.
+
+**Decision:** make the generic public mux parser honor `packetsArray` by wrapping bounded arrays in a lazy
+one-shot stream when the generic path is used. Add a narrow same-work Ogg fast path for one non-fragmented
+audio track targeting `ogg`: the engine's lazy mux module drains a prepared stream/array once and calls
+`muxPreparedOggAudioPacketTrack()`, which reuses `trackStateFrom()` and `writeOgg()` so Opus TOC granules,
+declared final trims, Vorbis/FLAC headers, page lacing, and CRC behavior stay identical to `OggMuxer`.
+The browser benchmark adapter now routes Ogg-source/Ogg-target preparation through
+`oggPacketInfoFromBytes()` so measured iterations build harness packet arrays from first-party packet
+metadata and owned bytes instead of host chunk wrappers. Authoring still goes through public
+`engine.mux()`, not adapter byte writing.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T13-18-33-377Z.json` measured aibrush-media at **9.655 ms** median over nine samples,
+faster than mediabunny **11.765 ms** and ffmpeg.wasm **15.965 ms**, all PASS on the same
+`reference-reimport` oracle. Regenerating the deficit backlog with the closing export reports
+**287 active deficits** with severity split `0/0/72/215` plus the ADR-130 parity exemption. Focused tests
+prove public Ogg `packetsArray` mux reparses to the source duration, and prepared Ogg packet arrays use the
+same page writer without calling `EncodedChunk.copyTo()` when `Packet.data` is present; an independent
+page/CRC/de-lacing scan remains the can-fail layout oracle.
+
+**Rejected:** adapter-authored Ogg bytes; returning the input Ogg file unchanged; weakening the duration
+or reference-reimport oracle; ignoring `packetsArray` in generic mux; persistent fixture caches;
+constructing fake packet durations; broad multi-track Ogg mux; and copying competitor source code.
+
+### ADR-138 - Prepared WAV identity transcode skips planar PCM decode
+
+**Context:** After `mux/opus_to_ogg` closed, the top active Session 9 row was
+`audio-dsp/meta_idempotent_resample_same_rate`. The scenario asks for WAV `pcm-s16` at the same sample
+rate and channel count as the source, and the oracle compares decoded PCM digest against the source.
+Fresh pre-fix Chromium timing (`chromium-2026-07-02T13-33-23-345Z.json`) showed aibrush-media passing at
+**22.170 ms** median while mediabunny passed at **4.465 ms**. The first fix, allowing explicit identity
+`sampleRate`/`channels` constraints into the WAV canonical-copy helper, removed sample-domain
+decode/re-encode and improved the median to about **10 ms**, but the public transcode path still paid
+fixed overhead for source routing, stream materialization, Blob conversion, and the benchmark adapter's
+generic pre-transcode probe guard.
+
+**Decision:** treat explicit same-format WAV PCM transcodes as a real identity authoring operation, not a
+codec-seam or sample-DSP job. `rewriteWavPcmCopy()` now accepts optional requested sample format,
+endianness, channel count, and sample rate; it parses RIFF/WAVE, rejects mismatches by returning
+`undefined`, and otherwise writes a fresh canonical 44-byte WAV header over copied payload bytes. The WAV
+driver lets requests with identity `sampleRate`/`channels` reach that helper when no gain, fade,
+dynamics, biquad, trim, endian conversion, or container change is requested. The lazy PCM convert module
+also tries the same guarded rewrite directly for hinted, sized WAV sources and returns the requested sink
+without constructing a one-chunk stream when possible.
+
+For the browser benchmark adapter, neutral WAV→WAV PCM transcodes now prepare canonical WAV bytes from the
+runner's per-iteration `MediaInput.arrayBuffer()` path and call the engine's PCM authoring helper before
+the generic mismatch probe. The guard is metadata-based and general: it requires WAV input/output, no video
+target or variants, no bitrate or harness-only audio transforms, and any explicit codec/rate/channel must
+match the parsed source. Real resample, remix, format conversion, gain/fade/dynamics/biquad, malformed
+WAV, non-canonical WAV, and non-WAV sources fall back to the normal engine path or typed errors.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T13-55-04-311Z.json` measured aibrush-media at **8.010 ms** median over nine samples,
+faster than mediabunny **9.635 ms** and ffmpeg.wasm **35.770 ms**, all PASS on the same
+`property-invariant` audio PCM digest oracle. Regenerating the deficit backlog with the closing export
+reports **286 active deficits** with severity split `0/0/71/215` plus the ADR-130 parity exemption.
+Focused tests prove explicit identity WAV transforms re-author non-canonical input with a fresh canonical
+header, public convert keeps decoded PCM bit-exact, and true gain/fade/resample/conversion requests still
+use the existing PCM transform path. The sibling harness typecheck is green for the prepared-WAV adapter
+route.
+
+**Rejected:** returning arbitrary input bytes unchanged; hardcoding `wav_s16.wav`; weakening the PCM digest
+oracle; treating `sampleRate` or `channels` mismatches as identity; persistent cross-iteration byte caches;
+skipping RIFF/WAVE validation; bypassing real gain/fade/resample/remix work; and copying competitor code.
+
+### ADR-139 - Tiny H.264 faststart probe parses simple video metadata from one prefix read
+
+**Context:** After the prepared WAV identity row closed, the top active Session 9 row was
+`probe/tiny_h264_360p_2s`, a 172,807 byte faststart MP4 with a complete `moov` in the first few
+kilobytes. A fresh pre-fix Chromium run (`chromium-2026-07-02T14-15-27-896Z.json`) showed
+aibrush-media passing the same golden-metadata oracle at **6.440 ms** median while mediabunny passed at
+**3.000 ms** and mp4box at **3.480 ms**. The benchmark adapter already supplied a URL source with the
+known `mp4` container token, so the loss was no longer a whole-file scan. The remaining fixed cost came
+from the generic MP4 metadata path: a 32 KiB faststart prefetch plus full movie metadata parsing before the
+probe reduced the result back to a small H.264/AAC track list.
+
+**Decision:** add a guarded simple-video MP4 faststart probe for known-size video-like MP4/MOV inputs at
+or below 256 KiB. The path performs one bounded 8 KiB prefix read, requires a complete top-level `moov`,
+accepts only non-fragmented sample tables with at least one `vide` track, supports `avc1`/`avc3` video
+entries plus optional `mp4a` audio entries, and directly parses the metadata the oracle needs: track id,
+rotation matrix, dimensions, H.264 `avcC` codec string/config, AAC `esds` config, media timescale/duration,
+sample count, simple `stts` cadence, and edit-list timing used for gapless audio facts. Unsupported,
+malformed, fragmented, non-faststart, empty-table, audio-only, or non-video-ish sources return
+`undefined` and fall back to the existing strict MP4 parser.
+
+The shortcut also preserves the established probe-to-demux handoff without making metadata probe do a full
+movie parse. When the source is eligible for the short-lived handoff map, the fast path stores the already
+read `moov` payload and brand. A following demux parses that cached `moov` into the normal `Movie`
+structure, avoiding another source read while keeping packet/sample-table semantics centralized in the
+generic demux code. The tiny-audio and simple-video faststart parsers live in a lazy probe chunk so the
+default first-operation bundle stays under the Session 9 budget; warmed benchmark iterations still execute
+the same one-prefix-read parser.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-02T14-55-46-012Z.json` measured aibrush-media at **3.420 ms** median over nine samples,
+faster than remotion-media-parser **3.775 ms**, mp4box **3.940 ms**, mediabunny **4.145 ms**,
+remotion-webcodecs **4.945 ms**, platform **7.440 ms**, ffmpeg.wasm **7.445 ms**, and web-demuxer
+**19.525 ms**, all PASS on the same `golden-metadata` oracle. Regenerating the deficit backlog with the
+closing export reports **285 active deficits** with severity split `0/0/70/215` plus the ADR-130 parity
+exemption. Focused tests prove the metadata-only path uses one small faststart read, supports the MIME and
+source-key guards, preserves the cached-`moov` demux handoff, and falls back to the generic parser for
+unsupported, malformed, no-video, empty-sample, incomplete, or oversize shapes. The final budget check
+reports eager JS **49.43 kB** and typical first-operation JS **253.39 kB**.
+
+**Rejected:** hardcoding `tiny_h264_360p_2s`; treating every tiny MP4 as video; accepting fragmented or
+empty sample tables; guessing metadata when `moov` is incomplete; weakening the golden metadata oracle;
+persistent cross-iteration caches; dropping the probe-to-demux handoff; delegating to competitor parsers;
+and copying competitor source code.
