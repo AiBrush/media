@@ -5,6 +5,7 @@ import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { readWavPcm, writeWav } from './pcm.ts';
+import { tryResampleWavS16ToS16Wav } from './s16-resample.ts';
 import {
   WavDriver,
   WavModule,
@@ -618,6 +619,45 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
   const SIN = 'sin_440Hz_-6dBFS_1s.wav';
   const transformPcm = WavDriver.transformPcm;
   if (!transformPcm) throw new Error('WavDriver must expose transformPcm');
+  const sineWav = (freq: number, sampleRate: number, frames: number, amp = 0.5): Uint8Array =>
+    writeWav(
+      {
+        sampleRate,
+        channels: 1,
+        frames,
+        planar: [
+          Float64Array.from(
+            { length: frames },
+            (_, i) => amp * Math.sin((2 * Math.PI * freq * i) / sampleRate),
+          ),
+        ],
+      },
+      's16',
+    );
+  const stereoSineWav = (sampleRate: number, frames: number): Uint8Array =>
+    writeWav(
+      {
+        sampleRate,
+        channels: 2,
+        frames,
+        planar: [
+          Float64Array.from(
+            { length: frames },
+            (_, i) => 0.55 * Math.sin((2 * Math.PI * 997 * i) / sampleRate),
+          ),
+          Float64Array.from(
+            { length: frames },
+            (_, i) => 0.35 * Math.sin((2 * Math.PI * 1499 * i) / sampleRate),
+          ),
+        ],
+      },
+      's16',
+    );
+  const rms = (ch: Float64Array): number => {
+    let sum = 0;
+    for (const sample of ch) sum += sample * sample;
+    return Math.sqrt(sum / Math.max(1, ch.length));
+  };
   const streamOnly = (bytes: Uint8Array): ByteSource => ({
     // No range/size → forces the streaming readAll fallback (two chunks exercise the accumulation).
     stream: () =>
@@ -697,6 +737,143 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(out).not.toEqual(withJunk);
   });
 
+  it('direct-resamples s16 WAV to canonical s16 WAV for sample-rate-only transforms', () => {
+    const input = sineWav(997, 44_100, 44_100, 0.65);
+    const out = tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000 });
+    if (out === undefined) throw new Error('s16 WAV resample fast path must be eligible');
+
+    const re = readWavPcm(out);
+    expect(re.sampleRate).toBe(16_000);
+    expect(re.channels).toBe(1);
+    expect(re.frames).toBe(16_000);
+    expect(peak(channelAt(re.planar, 0))).toBeGreaterThan(0.5);
+  });
+
+  it('keeps a real low-pass filter in the s16 WAV direct resampler', () => {
+    const input = sineWav(12_000, 44_100, 44_100, 0.8);
+    const out = tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000 });
+    if (out === undefined) throw new Error('s16 WAV resample fast path must be eligible');
+
+    const source = rms(channelAt(readWavPcm(input).planar, 0));
+    const re = rms(channelAt(readWavPcm(out).planar, 0));
+    expect(re).toBeLessThan(source * 0.04);
+  });
+
+  it('direct-resamples interleaved stereo s16 WAV without collapsing channels', () => {
+    const input = stereoSineWav(48_000, 48_000);
+    const first = tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000 });
+    const cached = tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000 });
+    if (first === undefined || cached === undefined) {
+      throw new Error('stereo s16 WAV resample fast path must be eligible');
+    }
+
+    const re = readWavPcm(first);
+    expect(re.sampleRate).toBe(16_000);
+    expect(re.channels).toBe(2);
+    expect(re.frames).toBe(16_000);
+    expect(peak(channelAt(re.planar, 0))).toBeGreaterThan(0.45);
+    expect(peak(channelAt(re.planar, 1))).toBeGreaterThan(0.25);
+    expect(differs(channelAt(re.planar, 0), channelAt(re.planar, 1))).toBe(true);
+    expect(cached).toEqual(first);
+  });
+
+  it('declines unsupported direct-resample shapes before the canonical PCM fallback', () => {
+    const input = sineWav(997, 44_100, 256, 0.65);
+    const sourceF32 = writeWav(readWavPcm(input), 'f32');
+    const zeroChannels = input.slice();
+    const zeroRate = input.slice();
+    const misalignedBacking = new Uint8Array(input.byteLength + 1);
+    misalignedBacking.set(input, 1);
+    const misaligned = misalignedBacking.subarray(1);
+    new DataView(zeroChannels.buffer, zeroChannels.byteOffset, zeroChannels.byteLength).setUint16(
+      22,
+      0,
+      true,
+    );
+    new DataView(zeroRate.buffer, zeroRate.byteOffset, zeroRate.byteLength).setUint32(24, 0, true);
+
+    expect(
+      tryResampleWavS16ToS16Wav(input, { container: 'aiff', sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(tryResampleWavS16ToS16Wav(input, { container: 'wav' })).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(input, { container: 'wav', endian: 'be', sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(input, { container: 'wav', channels: 2, sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 44_100 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000.5 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(sourceF32, { container: 'wav', sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(zeroChannels, { container: 'wav', sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(zeroRate, { container: 'wav', sampleRate: 16_000 }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(misaligned, { container: 'wav', sampleRate: 16_000 }),
+    ).toBeUndefined();
+  });
+
+  it('honors abort signals before direct s16 WAV resample work starts', () => {
+    const input = sineWav(997, 44_100, 44_100, 0.65);
+    expect(() =>
+      tryResampleWavS16ToS16Wav(input, {
+        container: 'wav',
+        sampleRate: 16_000,
+        signal: AbortSignal.abort(),
+      }),
+    ).toThrowError(MediaError);
+  });
+
+  it('routes sample-rate-only s16 WAV transforms through the direct resample writer', async () => {
+    const canonical = sineWav(997, 44_100, 44_100, 0.65);
+    const withJunk = withJunkChunk(canonical);
+    const expected = tryResampleWavS16ToS16Wav(withJunk, {
+      container: 'wav',
+      sampleFormat: 's16',
+      endian: 'le',
+      sampleRate: 16_000,
+    });
+    if (expected === undefined) throw new Error('s16 WAV resample fast path must be eligible');
+
+    const out = await drain(
+      await transformPcm(streamOnly(withJunk), {
+        container: 'wav',
+        sampleFormat: 's16',
+        endian: 'le',
+        sampleRate: 16_000,
+      }),
+    );
+    expect(out).toEqual(expected);
+    expect(out).not.toEqual(withJunk);
+  });
+
+  it('leaves non-s16 or multi-stage WAV transforms on the canonical PCM path', () => {
+    const input = sineWav(997, 44_100, 44_100, 0.65);
+    expect(
+      tryResampleWavS16ToS16Wav(input, {
+        container: 'wav',
+        sampleFormat: 'f32',
+        sampleRate: 16_000,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryResampleWavS16ToS16Wav(input, {
+        container: 'wav',
+        sampleRate: 16_000,
+        gainDb: 0,
+      }),
+    ).toBeUndefined();
+  });
+
   it('trims same-layout WAV PCM by copying the selected data bytes into a fresh envelope', async () => {
     const canonical = writeWav(
       {
@@ -725,6 +902,85 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(channelAt(re.planar, 0)).toEqual(
       channelAt(readWavPcm(canonical).planar, 0).subarray(2, 7),
     );
+  });
+
+  it('range-trims WAV PCM from a prefix plus the selected sample window', async () => {
+    const samples = Float64Array.from({ length: 600_000 }, (_, i) => ((i % 101) - 50) / 50);
+    const canonical = writeWav(
+      {
+        sampleRate: 1000,
+        channels: 1,
+        frames: samples.length,
+        planar: [samples],
+      },
+      's16',
+    );
+    const calls: Array<{ readonly start: number; readonly end: number; readonly bytes: number }> =
+      [];
+    const source: ByteSource = {
+      size: canonical.byteLength,
+      stream: () => {
+        throw new Error('range fast path must not stream the full WAV');
+      },
+      range: (start, end) => {
+        const slice = canonical.subarray(start, end).slice();
+        calls.push({ start, end, bytes: slice.byteLength });
+        return Promise.resolve(slice);
+      },
+    };
+    const out = await drain(
+      await transformPcm(source, {
+        container: 'wav',
+        timeBounds: { startSec: 300, endSec: 301 },
+      }),
+    );
+
+    expect(out.byteLength).toBe(44 + 1000 * 2);
+    expect(chunkPayload(out, 'data')).toEqual(
+      chunkPayload(canonical, 'data').subarray(300_000 * 2, 301_000 * 2),
+    );
+    expect(calls).toEqual([
+      { start: 0, end: 4096, bytes: 4096 },
+      { start: 44 + 300_000 * 2, end: 44 + 301_000 * 2, bytes: 1000 * 2 },
+    ]);
+    expect(calls.reduce((sum, call) => sum + call.bytes, 0)).toBeLessThan(canonical.byteLength);
+  });
+
+  it('range-trims WAV PCM directly from the prefix when the selected window is already buffered', async () => {
+    const samples = Float64Array.from({ length: 525_000 }, (_, i) => (i % 2 === 0 ? -0.25 : 0.25));
+    const canonical = writeWav(
+      {
+        sampleRate: 1000,
+        channels: 1,
+        frames: samples.length,
+        planar: [samples],
+      },
+      's16',
+    );
+    const calls: Array<{ readonly start: number; readonly end: number; readonly bytes: number }> =
+      [];
+    const source: ByteSource = {
+      size: canonical.byteLength,
+      stream: () => {
+        throw new Error('prefix-contained range trim must not stream the full WAV');
+      },
+      range: (start, end) => {
+        const slice = canonical.subarray(start, end).slice();
+        calls.push({ start, end, bytes: slice.byteLength });
+        return Promise.resolve(slice);
+      },
+    };
+
+    const out = await drain(
+      await transformPcm(source, {
+        container: 'wav',
+        timeBounds: { startSec: 0.001, endSec: 0.002 },
+      }),
+    );
+
+    expect(out.byteLength).toBe(44 + 2);
+    expect(chunkPayload(out, 'data')).toEqual(chunkPayload(canonical, 'data').subarray(2, 4));
+    expect(calls).toEqual([{ start: 0, end: 4096, bytes: 4096 }]);
   });
 
   it('applies gain in the PCM domain (≈ ×0.5 at -6.02 dB)', async () => {

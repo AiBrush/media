@@ -11,7 +11,7 @@ import {
 } from './mp4-driver.ts';
 import type { Movie, ParsedTrack } from './parse.ts';
 import { type SampleData, buildSampleData, buildSamples } from './samples.ts';
-import { writeMp4 } from './write.ts';
+import { type MuxTrackInput, writeMp4 } from './write.ts';
 
 const ra = (b: Uint8Array) => ({
   read: (o: number, l: number) => Promise.resolve(b.subarray(o, o + l)),
@@ -31,6 +31,19 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
   for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+function topLevelBoxCount(bytes: Uint8Array, type: string): number {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let count = 0;
+  let offset = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const size = dv.getUint32(offset);
+    if (size < 8 || offset + size > bytes.byteLength) break;
+    if (String.fromCharCode(...bytes.subarray(offset + 4, offset + 8)) === type) count++;
+    offset += size;
+  }
+  return count;
 }
 
 async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -152,6 +165,25 @@ function sampleData(index: number, keyframe: boolean): SampleData {
     cttsTicks: 0,
     keyframe,
   };
+}
+
+function syntheticFragmentBudgetMp4(sampleCount: number): Uint8Array {
+  const samples = Array.from({ length: sampleCount }, (_, index) => ({
+    data: new Uint8Array([index & 0xff]),
+    durationTicks: 1,
+    cttsTicks: 0,
+    keyframe: index % 30 === 0,
+  }));
+  const track: MuxTrackInput = {
+    mediaType: 'video',
+    sampleEntryType: 'avc1',
+    timescale: 30,
+    description: new Uint8Array([1, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0x00, 0x00]),
+    width: 4,
+    height: 4,
+    samples,
+  };
+  return writeMp4([track]);
 }
 
 describe('MP4 muxer — reference-reimport round-trip on the real corpus', () => {
@@ -296,6 +328,8 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
 
     expect(parts.length).toBeGreaterThan(3);
     expect(reads.length).toBeGreaterThan(readsAfterSetup);
+    const totalReadBytes = reads.reduce((sum, read) => sum + read.length, 0);
+    expect(totalReadBytes).toBeLessThan(input.byteLength * 1.25);
 
     const total = parts.reduce((n, part) => n + part.byteLength, 0);
     const output = new Uint8Array(total);
@@ -347,6 +381,28 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
         buildSampleData(sourceTrack).map(strip),
       );
     }
+  });
+
+  it('buffered fragmented stream-copy uses larger media segments than StreamTarget output', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const sampleCount = 2_000;
+    const input = syntheticFragmentBudgetMp4(sampleCount);
+
+    const streaming = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), { fragmented: true, streaming: true }),
+    );
+    const buffered = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), { fragmented: true, buffered: true }),
+    );
+
+    const streamingMoofs = topLevelBoxCount(streaming, 'moof');
+    const bufferedMoofs = topLevelBoxCount(buffered, 'moof');
+    expect(streamingMoofs).toBeGreaterThan(1);
+    expect(bufferedMoofs).toBeLessThan(streamingMoofs);
+    expect(bufferedMoofs).toBe(1);
+
+    const reparsed = await readMovie(ra(buffered));
+    expect(reparsed.tracks[0]?.fragmentSampleCount).toBe(sampleCount);
   });
 
   it('full-range trim uses the ordinary buffered stream-copy layout', async () => {

@@ -53,6 +53,15 @@ export interface MuxSampleLayoutInput {
   keyframe: boolean;
 }
 
+export interface MuxSampleChunkLayoutInput {
+  /** First sample index in this track chunk. Chunks must cover the track samples in order. */
+  firstSample: number;
+  /** Number of consecutive samples from `firstSample` in this chunk. */
+  sampleCount: number;
+  /** Byte offset of this chunk relative to the first byte of the `mdat` payload. */
+  payloadOffset: number;
+}
+
 /** CENC protection for a track (ADR-023/121): emits `enca`/`encv` + `sinf`/`tenc` and optional `senc` IVs. */
 export interface TrackEncryption {
   schemeType: string; // 'cenc' | 'cens' | 'cbcs'
@@ -82,6 +91,8 @@ export interface MuxTrackInput {
   encryption?: TrackEncryption;
   /** Single-rate edit list: expose `durationTicks` of media starting at `mediaTimeTicks`. */
   edit?: { mediaTimeTicks: number; durationTicks: number };
+  /** Optional explicit `mdat` chunk layout; omitted means one contiguous chunk per track. */
+  sampleChunks?: readonly MuxSampleChunkLayoutInput[];
   samples: MuxSampleInput[];
 }
 
@@ -116,6 +127,23 @@ interface RunLength {
   count: number;
   value: number;
 }
+
+interface NormalizedTrackChunk {
+  firstSample: number;
+  sampleCount: number;
+  payloadOffset: number;
+  byteLength: number;
+}
+
+interface TrackChunkLayout {
+  chunks: readonly NormalizedTrackChunk[];
+}
+
+interface TrackChunkTable {
+  chunks: readonly NormalizedTrackChunk[];
+  chunkOffsets: readonly number[];
+}
+
 function runLength(values: readonly number[]): RunLength[] {
   const out: RunLength[] = [];
   for (const v of values) {
@@ -279,7 +307,21 @@ function audioSampleEntry(track: MuxTrackLayoutInput): number[] {
   );
 }
 
-function sampleTable(track: MuxTrackLayoutInput, chunkOffset: number): number[] {
+function sampleToChunkEntries(chunks: readonly NormalizedTrackChunk[]): number[] {
+  const out: number[] = [];
+  let previousSampleCount: number | undefined;
+  for (let i = 0; i < chunks.length; i++) {
+    const sampleCount = chunks[i]?.sampleCount;
+    if (sampleCount === undefined || sampleCount === previousSampleCount) continue;
+    pushU32(out, i + 1);
+    pushU32(out, sampleCount);
+    pushU32(out, 1);
+    previousSampleCount = sampleCount;
+  }
+  return out;
+}
+
+function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): number[] {
   const entry = track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
   const sizes = track.samples.map(sampleByteLength);
   const stts = runLength(track.samples.map((s) => s.durationTicks));
@@ -289,14 +331,15 @@ function sampleTable(track: MuxTrackLayoutInput, chunkOffset: number): number[] 
   const cttsVersion = cttsVals.some((v) => v < 0) ? 1 : 0;
   const sync = track.samples.flatMap((s, i) => (s.keyframe ? [i + 1] : []));
   const allSync = sync.length === track.samples.length;
+  const sampleToChunk = sampleToChunkEntries(chunkTable.chunks);
 
   const children = cat(
     full('stsd', 0, 0, cat(u32(1), entry)),
     full('stts', 0, 0, cat(u32(stts.length), runLengthTable(stts))),
     hasCtts ? full('ctts', cttsVersion, 0, cat(u32(ctts.length), runLengthTable(ctts))) : [],
     full('stsz', 0, 0, cat(u32(0), u32(sizes.length), u32Table(sizes))),
-    full('stsc', 0, 0, cat(u32(1), u32(1), u32(track.samples.length), u32(1))),
-    full('stco', 0, 0, cat(u32(1), u32(chunkOffset))),
+    full('stsc', 0, 0, cat(u32(sampleToChunk.length / 12), sampleToChunk)),
+    full('stco', 0, 0, cat(u32(chunkTable.chunkOffsets.length), u32Table(chunkTable.chunkOffsets))),
     allSync ? [] : full('stss', 0, 0, cat(u32(sync.length), u32Table(sync))),
     sencBox(track),
   );
@@ -329,7 +372,7 @@ function trak(
   track: MuxTrackLayoutInput,
   trackId: number,
   movieTimescale: number,
-  chunkOffset: number,
+  chunkTable: TrackChunkTable,
 ): number[] {
   const durTicks = trackDurationTicks(track);
   const movieDur = trackMovieDurationTicks(track, movieTimescale);
@@ -371,7 +414,7 @@ function trak(
     ? full('vmhd', 0, 1, cat(u16(0), zeros(6)))
     : full('smhd', 0, 0, cat(u16(0), u16(0)));
   const dref = full('dref', 0, 0, cat(u32(1), full('url ', 0, 1, [])));
-  const minf = box('minf', cat(mediaHeader, box('dinf', dref), sampleTable(track, chunkOffset)));
+  const minf = box('minf', cat(mediaHeader, box('dinf', dref), sampleTable(track, chunkTable)));
   const mdia = box('mdia', cat(mdhd, hdlr, minf));
   return box('trak', cat(tkhd, editList(track, movieTimescale), mdia));
 }
@@ -379,7 +422,7 @@ function trak(
 function moov(
   tracks: readonly MuxTrackLayoutInput[],
   movieTimescale: number,
-  chunkOffsets: number[],
+  chunkTables: readonly TrackChunkTable[],
 ): number[] {
   const movieDur = tracks.reduce(
     (max, t) => Math.max(max, trackMovieDurationTicks(t, movieTimescale)),
@@ -401,7 +444,9 @@ function moov(
       u32(tracks.length + 1), // next_track_id
     ),
   );
-  const traks = tracks.flatMap((t, i) => trak(t, i + 1, movieTimescale, chunkOffsets[i] ?? 0));
+  const traks = tracks.flatMap((t, i) =>
+    trak(t, i + 1, movieTimescale, chunkTables[i] ?? { chunks: [], chunkOffsets: [] }),
+  );
   return box('moov', cat(mvhd, traks));
 }
 
@@ -449,15 +494,158 @@ export function assertSingleBufferSize(totalLen: number): void {
   }
 }
 
-/** Copy each track's samples (track-major order) into `out` at `pos`; returns the advanced position. */
-function writeSamples(out: Uint8Array, pos: number, tracks: MuxTrackInput[]): number {
-  let p = pos;
-  for (const t of tracks)
-    for (const s of t.samples) {
-      out.set(s.data, p);
-      p += s.data.byteLength;
+function chunkByteLength(
+  track: MuxTrackLayoutInput,
+  firstSample: number,
+  sampleCount: number,
+): number {
+  let bytes = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const sample = track.samples[firstSample + i];
+    if (sample === undefined) {
+      throw new MediaError('mux-error', 'MP4 chunk layout references a missing sample');
     }
-  return p;
+    bytes += sampleByteLength(sample);
+  }
+  return bytes;
+}
+
+function assertNonNegativeInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new MediaError('mux-error', `MP4 chunk layout has invalid ${label}: ${value}`);
+  }
+}
+
+function explicitTrackChunks(track: MuxTrackLayoutInput): NormalizedTrackChunk[] {
+  const chunks = track.sampleChunks;
+  if (chunks === undefined) {
+    throw new MediaError('mux-error', 'MP4 explicit chunk layout is missing for a track');
+  }
+  const out: NormalizedTrackChunk[] = [];
+  let expectedFirstSample = 0;
+  for (const chunk of chunks) {
+    assertNonNegativeInteger(chunk.firstSample, 'firstSample');
+    assertNonNegativeInteger(chunk.sampleCount, 'sampleCount');
+    assertNonNegativeInteger(chunk.payloadOffset, 'payloadOffset');
+    if (chunk.sampleCount === 0) {
+      throw new MediaError('mux-error', 'MP4 chunk layout contains an empty chunk');
+    }
+    if (chunk.firstSample !== expectedFirstSample) {
+      throw new MediaError('mux-error', 'MP4 chunk layout must cover track samples in order');
+    }
+    if (chunk.firstSample + chunk.sampleCount > track.samples.length) {
+      throw new MediaError('mux-error', 'MP4 chunk layout extends past the track sample table');
+    }
+    out.push({
+      firstSample: chunk.firstSample,
+      sampleCount: chunk.sampleCount,
+      payloadOffset: chunk.payloadOffset,
+      byteLength: chunkByteLength(track, chunk.firstSample, chunk.sampleCount),
+    });
+    expectedFirstSample += chunk.sampleCount;
+  }
+  if (expectedFirstSample !== track.samples.length) {
+    throw new MediaError('mux-error', 'MP4 chunk layout does not cover every track sample');
+  }
+  return out;
+}
+
+function defaultTrackChunks(tracks: readonly MuxTrackLayoutInput[]): {
+  readonly layouts: TrackChunkLayout[];
+  readonly totalPayloadBytes: number;
+} {
+  const layouts: TrackChunkLayout[] = [];
+  let payloadOffset = 0;
+  for (const track of tracks) {
+    const byteLength = track.samples.reduce((sum, sample) => sum + sampleByteLength(sample), 0);
+    const chunks =
+      track.samples.length === 0
+        ? []
+        : [{ firstSample: 0, sampleCount: track.samples.length, payloadOffset, byteLength }];
+    layouts.push({ chunks });
+    payloadOffset += byteLength;
+  }
+  return { layouts, totalPayloadBytes: payloadOffset };
+}
+
+function explicitTrackChunkLayouts(tracks: readonly MuxTrackLayoutInput[]): {
+  readonly layouts: TrackChunkLayout[];
+  readonly totalPayloadBytes: number;
+} {
+  const chunks: Array<NormalizedTrackChunk & { readonly trackIndex: number }> = [];
+  const layouts = tracks.map((track, trackIndex) => {
+    const trackChunks = explicitTrackChunks(track);
+    for (const chunk of trackChunks) chunks.push({ ...chunk, trackIndex });
+    return { chunks: trackChunks };
+  });
+  chunks.sort((a, b) => a.payloadOffset - b.payloadOffset || a.trackIndex - b.trackIndex);
+  let expectedPayloadOffset = 0;
+  for (const chunk of chunks) {
+    if (chunk.payloadOffset !== expectedPayloadOffset) {
+      throw new MediaError(
+        'mux-error',
+        'MP4 chunk layout must cover the mdat payload without gaps',
+      );
+    }
+    expectedPayloadOffset += chunk.byteLength;
+  }
+  return { layouts, totalPayloadBytes: expectedPayloadOffset };
+}
+
+function trackChunkLayouts(tracks: readonly MuxTrackLayoutInput[]): {
+  readonly layouts: TrackChunkLayout[];
+  readonly totalPayloadBytes: number;
+} {
+  const hasExplicitChunks = tracks.some((track) => track.sampleChunks !== undefined);
+  if (!hasExplicitChunks) return defaultTrackChunks(tracks);
+  if (!tracks.every((track) => track.sampleChunks !== undefined)) {
+    throw new MediaError('mux-error', 'MP4 explicit chunk layout must be provided for every track');
+  }
+  return explicitTrackChunkLayouts(tracks);
+}
+
+function chunkTablesFor(
+  layouts: readonly TrackChunkLayout[],
+  mdatStart: number,
+): TrackChunkTable[] {
+  return layouts.map((layout) => ({
+    chunks: layout.chunks,
+    chunkOffsets: layout.chunks.map((chunk) => mdatStart + 8 + chunk.payloadOffset),
+  }));
+}
+
+function zeroChunkTables(layouts: readonly TrackChunkLayout[]): TrackChunkTable[] {
+  return layouts.map((layout) => ({
+    chunks: layout.chunks,
+    chunkOffsets: layout.chunks.map(() => 0),
+  }));
+}
+
+/** Copy samples into their planned `mdat` chunk positions; returns the advanced position. */
+function writeSamples(
+  out: Uint8Array,
+  pos: number,
+  tracks: MuxTrackInput[],
+  layouts: readonly TrackChunkLayout[],
+): number {
+  let end = pos;
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex];
+    const layout = layouts[trackIndex];
+    if (track === undefined || layout === undefined) continue;
+    for (const chunk of layout.chunks) {
+      let p = pos + chunk.payloadOffset;
+      for (let i = 0; i < chunk.sampleCount; i++) {
+        const sample = track.samples[chunk.firstSample + i];
+        if (sample === undefined)
+          throw new MediaError('mux-error', 'MP4 chunk write missed a sample');
+        out.set(sample.data, p);
+        p += sample.data.byteLength;
+      }
+      end = Math.max(end, p);
+    }
+  }
+  return end;
 }
 
 interface Mp4LayoutParts {
@@ -467,6 +655,7 @@ interface Mp4LayoutParts {
   mdatBeforeMoov: boolean;
   mdatPayloadLen: number;
   totalLen: number;
+  trackChunks: readonly TrackChunkLayout[];
 }
 
 function mp4LayoutParts(
@@ -477,16 +666,7 @@ function mp4LayoutParts(
   const faststart = opts.faststart ?? true;
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
 
-  // Per-track contiguous byte regions within mdat (one chunk per track).
-  const lens = tracks.map((t) => t.samples.reduce((a, s) => a + sampleByteLength(s), 0));
-  const mdatPayloadLen = lens.reduce((a, l) => a + l, 0);
-  const intra: number[] = [];
-  let acc = 0;
-  for (const len of lens) {
-    intra.push(acc);
-    acc += len;
-  }
-  const offsetsFor = (mdatStart: number): number[] => intra.map((o) => mdatStart + 8 + o);
+  const { layouts: trackChunks, totalPayloadBytes: mdatPayloadLen } = trackChunkLayouts(tracks);
   const mdatHeader = cat(u32(8 + mdatPayloadLen), fourcc('mdat')); // 8-byte box header (size ≤ 4.29 GB)
 
   // moov carries absolute sample offsets, which depend on whether mdat follows it (faststart) or
@@ -495,16 +675,12 @@ function mp4LayoutParts(
   let moovBytes: number[];
   let mdatBeforeMoov: boolean;
   if (faststart) {
-    const sized = moov(
-      tracks,
-      movieTimescale,
-      tracks.map(() => 0),
-    ); // fixed-width → stable length
+    const sized = moov(tracks, movieTimescale, zeroChunkTables(trackChunks)); // fixed-width → stable length
     const mdatStart = ftyp.length + sized.length;
-    moovBytes = moov(tracks, movieTimescale, offsetsFor(mdatStart));
+    moovBytes = moov(tracks, movieTimescale, chunkTablesFor(trackChunks, mdatStart));
     mdatBeforeMoov = false;
   } else {
-    moovBytes = moov(tracks, movieTimescale, offsetsFor(ftyp.length));
+    moovBytes = moov(tracks, movieTimescale, chunkTablesFor(trackChunks, ftyp.length));
     mdatBeforeMoov = true;
   }
 
@@ -517,6 +693,7 @@ function mp4LayoutParts(
     mdatBeforeMoov,
     mdatPayloadLen,
     totalLen,
+    trackChunks,
   };
 }
 
@@ -551,14 +728,14 @@ export function writeMp4(tracks: MuxTrackInput[], opts: WriteOptions = {}): Uint
   if (layout.mdatBeforeMoov) {
     out.set(layout.mdatHeader, p);
     p += layout.mdatHeader.length;
-    p = writeSamples(out, p, tracks);
+    p = writeSamples(out, p, tracks, layout.trackChunks);
     out.set(layout.moov, p);
   } else {
     out.set(layout.moov, p);
     p += layout.moov.length;
     out.set(layout.mdatHeader, p);
     p += layout.mdatHeader.length;
-    writeSamples(out, p, tracks);
+    writeSamples(out, p, tracks, layout.trackChunks);
   }
   return out;
 }

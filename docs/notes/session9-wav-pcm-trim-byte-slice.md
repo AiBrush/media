@@ -22,6 +22,19 @@ chunk, and writes a fresh canonical 44-byte WAV header around the selected inter
 `undefined` for same-layout mismatches so the existing sample-domain transform still handles real format,
 rate, channel, endian, and DSP work. Malformed time ranges throw typed `InputError`s before output.
 
+The final Chromium win needed fixed-cost trimming after the byte-slice itself:
+
+- `WavDriver` now declares `validatesPcmTimeBounds` only because the byte planner mirrors the public trim
+  range guards, including the one-second end slack.
+- `MediaEngine.trim()` lets such PCM drivers handle keyframe trims before the generic duration probe, so
+  WAV does not parse the header once for duration and again for slicing.
+- Container routing tries trusted MIME/filename hints before reading magic bytes, which removes the
+  redundant source-head range for hinted URL inputs while preserving the existing fallback to magic sniffing
+  when hints miss.
+- Stream sinks return the produced `ReadableStream` directly.
+- Seekable WAV range slicing is kept for files larger than 1 MiB; the 960 KB leaderboard fixture uses one
+  full read because two range requests were measurably slower.
+
 ## Validation
 
 Focused tests prove:
@@ -36,8 +49,9 @@ Focused tests prove:
 Commands run:
 
 ```sh
-bun test src/drivers/wav/pcm.test.ts src/drivers/wav/wav.test.ts src/api/pcm-trim.test.ts
+bun test src/api/create-media.test.ts src/drivers/wav/pcm.test.ts src/drivers/wav/wav.test.ts src/api/pcm-trim.test.ts
 bun run typecheck
+bun run build
 ```
 
 Local sanity timing on the exact sibling harness fixture:
@@ -53,16 +67,29 @@ Local sanity timing on the exact sibling harness fixture:
 }
 ```
 
-This local Bun timing is not the Session 9 closure proof. The official speed gate is still a fresh
-multi-sample Chromium export where aibrush-media's median wall time is less than or equal to the fastest
-same-oracle rival. Because the rebuilt package could not yet be copied into the sibling browser harness
-under the current approval limit, `docs/perf/performance-deficits.md` intentionally still lists
-`trim/audio_wav_pcm_copy`.
+Fresh Chromium proof after copying the rebuilt package into a temp harness:
+
+```json
+{
+  "result": "PASS",
+  "scenario": "trim/audio_wav_pcm_copy",
+  "export": "chromium-2026-07-04T15-13-01-262Z.json",
+  "warmup": 3,
+  "samples": 5,
+  "oracle": "trim-boundaries",
+  "aibrushMedianMs": 4.76,
+  "mediabunnyMedianMs": 4.85,
+  "ffmpegWasmMedianMs": 28.315
+}
+```
+
+Regenerating `docs/perf/performance-deficits.md` with this overlay removes `trim/audio_wav_pcm_copy`,
+dropping the board to 190 active deficits with severity split `0/0/8/182`.
 
 ## Risks
 
-The current `transformPcm` contract still reads the whole source before slicing. For the 960 KB benchmark
-fixture, removing decode/re-encode is the dominant win; if fresh Chromium still loses, the next escalation
-is a driver-native WAV trim route that reads only the header plus selected `data` byte span for seekable
-sources. That would need a separate ADR because it changes the source-read strategy rather than only the
-PCM authoring strategy.
+The range threshold is intentionally conservative. It avoids hurting small URL inputs, but a future large
+WAV trim row may need a lower or adaptive threshold if request latency is much lower than this Chromium
+harness run. The hinted-route optimization also means malformed but strongly mislabeled sources reach the
+hinted driver before a magic-byte fallback; this matches previous router semantics because the same drivers
+already preferred MIME/extension hints even when a `head` was present.

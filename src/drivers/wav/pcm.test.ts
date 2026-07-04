@@ -224,6 +224,38 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(rewriteWavPcmSlice(wav, bounds, 's16', 'le', 1, 44_100)).toBeUndefined();
   });
 
+  it('declines WAV byte-trim when the parsed PCM layout is not sliceable', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0, 0, 0)],
+      },
+      's16',
+    );
+    const bounds = { startSec: 0, endSec: 1 };
+
+    const noDataChunk = wav.subarray(0, 36).slice();
+    expect(rewriteWavPcmSlice(noDataChunk, bounds)).toBeUndefined();
+
+    const zeroChannel = wav.slice();
+    new DataView(zeroChannel.buffer, zeroChannel.byteOffset, zeroChannel.byteLength).setUint16(
+      22,
+      0,
+      true,
+    );
+    expect(rewriteWavPcmSlice(zeroChannel, bounds)).toBeUndefined();
+
+    const zeroSampleRate = wav.slice();
+    new DataView(
+      zeroSampleRate.buffer,
+      zeroSampleRate.byteOffset,
+      zeroSampleRate.byteLength,
+    ).setUint32(24, 0, true);
+    expect(rewriteWavPcmSlice(zeroSampleRate, bounds)).toBeUndefined();
+  });
+
   it('keeps malformed WAV byte-trim ranges typed', () => {
     const wav = writeWav(
       {
@@ -237,6 +269,8 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(() => rewriteWavPcmSlice(wav, { startSec: Number.NaN, endSec: 1 })).toThrow(InputError);
     expect(() => rewriteWavPcmSlice(wav, { startSec: -1, endSec: 1 })).toThrow(InputError);
     expect(() => rewriteWavPcmSlice(wav, { startSec: 1, endSec: 1 })).toThrow(InputError);
+    expect(() => rewriteWavPcmSlice(wav, { startSec: 1, endSec: 1.1 })).toThrow(InputError);
+    expect(() => rewriteWavPcmSlice(wav, { startSec: 0, endSec: 1.1 })).toThrow(InputError);
   });
 
   it('rejects signed 8-bit WAV authoring instead of writing mislabeled bytes', () => {

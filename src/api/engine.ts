@@ -508,7 +508,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   trim(input: MediaInput, opts: TrimOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = cacheProbeRanges(normalizeInput(input));
       const container = await this.#routeContainer(src, 'demux');
       const target = (container.formats[0] ?? 'mp4') as Container;
       if (opts.mode !== 'accurate' && container.streamCopy) {
@@ -532,6 +532,19 @@ export class MediaEngineImpl implements MediaEngine {
           });
           return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
         }
+      }
+      if (
+        opts.mode !== 'accurate' &&
+        isPcmContainer(target) &&
+        container.transformPcm &&
+        container.validatesPcmTrim
+      ) {
+        const stream = await container.transformPcm(src, {
+          ...this.#stageOptions(signal, o),
+          container: target,
+          timeBounds: { startSec: opts.start, endSec: opts.end },
+        });
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       // Validate the requested range against the media's real duration BEFORE any cut, so a malformed
       // range (negative / inverted / zero-length / past-EOF) rejects with a typed `InputError` instead
@@ -827,15 +840,7 @@ export class MediaEngineImpl implements MediaEngine {
     };
   }
 
-  async #routeContainer(src: Source, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
-    const head = await readHead(src, routeHeadBytes(src));
-    const ext = extensionOf(src.filename);
-    const q: ContainerQuery = {
-      direction,
-      head,
-      ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
-      ...(ext !== undefined ? { extension: ext } : {}),
-    };
+  async #pickContainer(q: ContainerQuery): Promise<ContainerDriver> {
     try {
       return this.#router.pickContainer(q);
     } catch (e) {
@@ -847,18 +852,34 @@ export class MediaEngineImpl implements MediaEngine {
     }
   }
 
-  async #routeContainerToken(target: string, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
+  async #routeContainer(src: Source, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
+    const ext = extensionOf(src.filename);
+    if (src.mimeHint !== undefined || ext !== undefined) {
+      try {
+        return await this.#pickContainer({
+          direction,
+          ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
+          ...(ext !== undefined ? { extension: ext } : {}),
+        });
+      } catch (e) {
+        if (!(e instanceof CapabilityError)) throw e;
+      }
+    }
+    const head = await readHead(src, routeHeadBytes(src));
     const q: ContainerQuery = {
       direction,
-      extension: target,
+      head,
+      ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
+      ...(ext !== undefined ? { extension: ext } : {}),
     };
-    try {
-      return this.#router.pickContainer(q);
-    } catch (e) {
-      if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
-      await this.#ensureDefaultDrivers();
-      return this.#router.pickContainer(q);
-    }
+    return this.#pickContainer(q);
+  }
+
+  async #routeContainerToken(target: string, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
+    return this.#pickContainer({
+      direction,
+      extension: target,
+    });
   }
 
   /**
@@ -1771,6 +1792,7 @@ async function materializeOutput(
   stream: ReadableStream<Uint8Array>,
   opts: MaterializeOptions,
 ): Promise<Output> {
+  if (sink.kind === 'stream') return stream;
   const { materialize } = await import('../sinks/materialize.ts');
   return materialize(sink, stream, opts);
 }

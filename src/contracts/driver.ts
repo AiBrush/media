@@ -361,6 +361,12 @@ export interface ContainerDriver extends DriverBase {
    */
   transformPcm?(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>>;
   /**
+   * True when `transformPcm(..., { timeBounds })` performs the same typed time-range validation as the
+   * public trim router before emitting bytes. The engine may then skip its generic duration probe for a
+   * PCM-native keyframe trim and let the driver validate against the container metadata it already parses.
+   */
+  validatesPcmTrim?: boolean;
+  /**
    * Optional driver-native sample decryption (ADR-023): parse the container's protection boxes,
    * decrypt with the caller's keys (WebCrypto), and re-serialize cleartext. Absent ⇒ typed miss.
    */

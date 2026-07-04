@@ -28,19 +28,6 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import {
-  CBCS_SCHEME,
-  CENC_SCHEME,
-  CENS_SCHEME,
-  type CencScheme,
-  type SencSample,
-  decryptSamples,
-  decryptSamplesCbcs,
-  decryptSamplesCens,
-  kidHex,
-  parseSenc,
-  parseTenc,
-} from './cenc.ts';
-import {
   type FragmentInitTrackInput,
   buildMediaSegment,
   fragmentMp4,
@@ -61,6 +48,7 @@ import { type Sample, type SampleData, buildSampleData, buildSamples } from './s
 import {
   type ContainerBrand,
   type Mp4ByteStreamLayout,
+  type MuxSampleChunkLayoutInput,
   type MuxSampleInput,
   type MuxTrackInput,
   type MuxTrackLayoutInput,
@@ -74,8 +62,12 @@ const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
+const LAZY_FRAGMENT_BUFFERED_SEGMENT_MULTIPLIER = 32;
+const LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES =
+  LAZY_FRAGMENT_TARGET_SAMPLES * LAZY_FRAGMENT_BUFFERED_SEGMENT_MULTIPLIER;
 const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
+const LAZY_FRAGMENT_BUFFERED_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES * 4;
 const FASTSTART_METADATA_PREFETCH_BYTES = 32 * 1024;
 const SMALL_FASTSTART_METADATA_PREFETCH_BYTES = 4 * 1024;
 const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
@@ -92,6 +84,9 @@ const TRIM_DECODE_VALIDATION_CACHE_TTL_MS = 60_000;
 const TRIM_DECODE_VALIDATION_CACHE_MAX_ENTRIES = 128;
 const FNV1A_32_OFFSET_BASIS = 0x811c9dc5;
 const FNV1A_32_PRIME = 0x01000193;
+const CENC_SCHEME = 'cenc' as const;
+const CENS_SCHEME = 'cens' as const;
+const CBCS_SCHEME = 'cbcs' as const;
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
   return container === 'mov' || container === 'qt' ? 'mov' : 'mp4';
@@ -122,12 +117,22 @@ const movieParseHandoff = new Map<string, MovieParseHandoff>();
 const trimDecodeValidationCache = new Map<string, number>();
 let faststartProbeModulePromise: Promise<typeof import('./simple-video-probe.ts')> | undefined;
 let faststartProbeModule: typeof import('./simple-video-probe.ts') | undefined;
+type CencScheme = typeof CENC_SCHEME | typeof CENS_SCHEME | typeof CBCS_SCHEME;
+type CencModule = typeof import('./cenc.ts');
+type TencInfo = ReturnType<CencModule['parseTenc']>;
+type SencSamples = ReturnType<CencModule['parseSenc']>;
+let cencModulePromise: Promise<CencModule> | undefined;
 
 async function loadFaststartProbeModule(): Promise<typeof import('./simple-video-probe.ts')> {
   if (faststartProbeModule !== undefined) return faststartProbeModule;
   faststartProbeModulePromise ??= import('./simple-video-probe.ts');
   faststartProbeModule = await faststartProbeModulePromise;
   return faststartProbeModule;
+}
+
+function loadCencModule(): Promise<CencModule> {
+  cencModulePromise ??= import('./cenc.ts');
+  return cencModulePromise;
 }
 
 function sourceKind(src: ByteSource): string | undefined {
@@ -1573,10 +1578,15 @@ function assertSampleRangesInBounds(track: ParsedTrack, sourceSize: number): voi
 }
 
 /** Look up the AES key (bytes) for a track's KID, or raise a typed miss if the caller didn't supply it. */
-function resolveKey(keys: Record<string, string>, kid: Uint8Array): Uint8Array<ArrayBuffer> {
-  const hexKey = keys[kidHex(kid)];
+function resolveKey(
+  keys: Record<string, string>,
+  kid: Uint8Array,
+  formatKid: (kid: Uint8Array) => string,
+): Uint8Array<ArrayBuffer> {
+  const kidId = formatKid(kid);
+  const hexKey = keys[kidId];
   if (hexKey === undefined) {
-    throw new CapabilityError('capability-miss', `no key provided for KID ${kidHex(kid)}`, {
+    throw new CapabilityError('capability-miss', `no key provided for KID ${kidId}`, {
       op: 'decrypt',
       tried: ['mp4'],
     });
@@ -1585,12 +1595,13 @@ function resolveKey(keys: Record<string, string>, kid: Uint8Array): Uint8Array<A
 }
 
 function cencSamplesForTrack(
+  cenc: Pick<CencModule, 'parseSenc'>,
   enc: NonNullable<ParsedTrack['encryption']>,
-  tenc: ReturnType<typeof parseTenc>,
+  tenc: TencInfo,
   containerScheme: CencScheme,
   trackId: number,
-): SencSample[] | undefined {
-  if (enc.senc) return parseSenc(enc.senc, tenc.perSampleIvSize, containerScheme);
+): SencSamples | undefined {
+  if (enc.senc) return cenc.parseSenc(enc.senc, tenc.perSampleIvSize, containerScheme);
   if (
     containerScheme === CBCS_SCHEME &&
     tenc.perSampleIvSize === 0 &&
@@ -1623,6 +1634,7 @@ function supportedCencScheme(schemeType: string): CencScheme | undefined {
  * wrapper after key resolution rather than corrupting already-clear samples.
  */
 async function decryptCencTrack(
+  cenc: CencModule,
   parsed: ParsedTrack,
   track: MuxTrackInput,
   enc: NonNullable<ParsedTrack['encryption']>,
@@ -1650,9 +1662,9 @@ async function decryptCencTrack(
       `${containerScheme} track ${parsed.id} has no decryptable samples`,
     );
   }
-  const tenc = parseTenc(enc.tenc, containerScheme);
-  const key = resolveKey(keys, tenc.kid);
-  const senc = cencSamplesForTrack(enc, tenc, containerScheme, parsed.id);
+  const tenc = cenc.parseTenc(enc.tenc, containerScheme);
+  const key = resolveKey(keys, tenc.kid, cenc.kidHex);
+  const senc = cencSamplesForTrack(cenc, enc, tenc, containerScheme, parsed.id);
   if (senc === undefined) return track;
   // A protected track's ciphertext must lie entirely within the file; a truncated mdat (sample bytes
   // promised by the index but missing) is rejected rather than decrypted from a clamped short buffer.
@@ -1666,7 +1678,7 @@ async function decryptCencTrack(
   const cipher = track.samples.map((s) => s.data);
   const clear =
     containerScheme === CBCS_SCHEME
-      ? await decryptSamplesCbcs(
+      ? await cenc.decryptSamplesCbcs(
           key,
           cipher,
           senc,
@@ -1674,13 +1686,13 @@ async function decryptCencTrack(
           tenc.constantIv,
         )
       : containerScheme === CENS_SCHEME
-        ? await decryptSamplesCens(
+        ? await cenc.decryptSamplesCens(
             key,
             cipher,
             senc,
             tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 },
           )
-        : await decryptSamples(key, cipher, senc);
+        : await cenc.decryptSamples(key, cipher, senc);
   return { ...track, samples: track.samples.map((s, j) => ({ ...s, data: clear[j] ?? s.data })) };
 }
 
@@ -1828,6 +1840,23 @@ interface LazyProgressiveTrack {
   readonly samples: readonly SampleData[];
 }
 
+interface InterleavedPayloadSample extends SampleRange {
+  readonly trackIndex: number;
+  readonly sampleIndex: number;
+}
+
+interface OpenInterleavedChunk {
+  trackIndex: number;
+  firstSample: number;
+  sampleCount: number;
+  payloadOffset: number;
+}
+
+interface InterleavedProgressivePlan {
+  readonly tracks: readonly LazyProgressiveTrack[];
+  readonly samples: readonly InterleavedPayloadSample[];
+}
+
 function lazyProgressiveTracksFromMovie(ra: RandomAccess, movie: Movie): LazyProgressiveTrack[] {
   const tracks = movie.tracks.map((track): LazyProgressiveTrack => {
     const samples = buildSampleData(track);
@@ -1854,6 +1883,85 @@ function lazyProgressiveTracksFromMovie(ra: RandomAccess, movie: Movie): LazyPro
     }
   }
   return tracks;
+}
+
+function sourceOrderInterleavedPlan(
+  tracks: readonly LazyProgressiveTrack[],
+): InterleavedProgressivePlan | undefined {
+  if (tracks.length < 2) return undefined;
+  const samples: InterleavedPayloadSample[] = [];
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex];
+    if (track === undefined) continue;
+    for (let sampleIndex = 0; sampleIndex < track.samples.length; sampleIndex++) {
+      const sample = track.samples[sampleIndex];
+      if (sample === undefined) continue;
+      samples.push({
+        index: sample.index,
+        offset: sample.offset,
+        size: sample.size,
+        trackIndex,
+        sampleIndex,
+      });
+    }
+  }
+  samples.sort(
+    (a, b) => a.offset - b.offset || a.trackIndex - b.trackIndex || a.sampleIndex - b.sampleIndex,
+  );
+
+  const nextSampleByTrack = new Array<number>(tracks.length).fill(0);
+  const chunksByTrack: MuxSampleChunkLayoutInput[][] = tracks.map(() => []);
+  let open: OpenInterleavedChunk | undefined;
+  let payloadOffset = 0;
+
+  const closeOpenChunk = (): void => {
+    if (open === undefined) return;
+    chunksByTrack[open.trackIndex]?.push({
+      firstSample: open.firstSample,
+      sampleCount: open.sampleCount,
+      payloadOffset: open.payloadOffset,
+    });
+    open = undefined;
+  };
+
+  for (const sample of samples) {
+    const expectedSample = nextSampleByTrack[sample.trackIndex];
+    if (sample.sampleIndex !== expectedSample) return undefined;
+    nextSampleByTrack[sample.trackIndex] = expectedSample + 1;
+
+    if (
+      open !== undefined &&
+      open.trackIndex === sample.trackIndex &&
+      open.firstSample + open.sampleCount === sample.sampleIndex
+    ) {
+      open.sampleCount++;
+    } else {
+      closeOpenChunk();
+      open = {
+        trackIndex: sample.trackIndex,
+        firstSample: sample.sampleIndex,
+        sampleCount: 1,
+        payloadOffset,
+      };
+    }
+    payloadOffset += sample.size;
+  }
+  closeOpenChunk();
+
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    if (nextSampleByTrack[trackIndex] !== tracks[trackIndex]?.samples.length) return undefined;
+  }
+
+  return {
+    tracks: tracks.map((track, trackIndex) => ({
+      ...track,
+      metadata: {
+        ...track.metadata,
+        sampleChunks: chunksByTrack[trackIndex] ?? [],
+      },
+    })),
+    samples,
+  };
 }
 
 async function lazyProgressiveTrimTracksFromMovie(
@@ -1922,10 +2030,24 @@ async function* progressivePayloadSegments(
   }
 }
 
+async function* interleavedProgressivePayloadSegments(
+  ra: RandomAccess,
+  samples: readonly InterleavedPayloadSample[],
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  for (const window of planSampleReadWindows(samples)) {
+    throwIfAborted(signal);
+    const chunk = await readProgressivePayloadChunk(ra, window);
+    throwIfAborted(signal);
+    yield chunk;
+  }
+}
+
 async function* progressiveSegmentsFromTracks(
   ra: RandomAccess,
   tracks: readonly LazyProgressiveTrack[],
   o: StreamCopyOptions | undefined,
+  payloadSamples?: readonly InterleavedPayloadSample[],
 ): AsyncGenerator<Uint8Array, void, undefined> {
   const signal = o?.signal;
   const layout = progressiveLayoutFromTracks(tracks, o);
@@ -1934,12 +2056,20 @@ async function* progressiveSegmentsFromTracks(
   yield layout.ftyp;
   if (layout.mdatBeforeMoov) {
     yield layout.mdatHeader;
-    yield* progressivePayloadSegments(ra, tracks, signal);
+    if (payloadSamples !== undefined) {
+      yield* interleavedProgressivePayloadSegments(ra, payloadSamples, signal);
+    } else {
+      yield* progressivePayloadSegments(ra, tracks, signal);
+    }
     yield layout.moov;
     return;
   }
   yield layout.moov;
   yield layout.mdatHeader;
+  if (payloadSamples !== undefined) {
+    yield* interleavedProgressivePayloadSegments(ra, payloadSamples, signal);
+    return;
+  }
   yield* progressivePayloadSegments(ra, tracks, signal);
 }
 
@@ -2106,7 +2236,7 @@ function planOrderedSampleReadWindows(samples: readonly SampleData[]): SampleRea
 
 async function readProgressivePayloadChunk(
   ra: RandomAccess,
-  window: SampleReadWindow,
+  window: SampleReadWindow<SampleRange>,
 ): Promise<Uint8Array> {
   const span = await ra.read(window.start, window.end - window.start);
   if (span.byteLength !== window.end - window.start) {
@@ -2148,7 +2278,13 @@ async function* progressiveSourceSegments(
   movie: Movie,
   o: StreamCopyOptions | undefined,
 ): AsyncGenerator<Uint8Array, void, undefined> {
-  yield* progressiveSegmentsFromTracks(ra, lazyProgressiveTracksFromMovie(ra, movie), o);
+  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
+  const interleaved = sourceOrderInterleavedPlan(tracks);
+  if (interleaved !== undefined) {
+    yield* progressiveSegmentsFromTracks(ra, interleaved.tracks, o, interleaved.samples);
+    return;
+  }
+  yield* progressiveSegmentsFromTracks(ra, tracks, o);
 }
 
 async function* trimmedProgressiveSourceSegments(
@@ -2361,15 +2497,22 @@ function validateStreamCopyTrimRange(
 function fragmentedSourceStream(
   ra: RandomAccess,
   movie: Movie,
-  signal: AbortSignal | undefined,
+  o: StreamCopyOptions | undefined,
 ): ReadableStream<Uint8Array> {
+  const signal = o?.signal;
   const tracks = lazyFragmentTracksFromMovie(ra, movie);
+  const targetSamples =
+    o?.buffered === true ? LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES : LAZY_FRAGMENT_TARGET_SAMPLES;
+  const hardVideoSamples =
+    o?.buffered === true
+      ? LAZY_FRAGMENT_BUFFERED_HARD_VIDEO_SAMPLES
+      : LAZY_FRAGMENT_HARD_VIDEO_SAMPLES;
   const plans = tracks.map((track) =>
     planLazySampleDataFragmentRuns(
       track.samples,
-      LAZY_FRAGMENT_TARGET_SAMPLES,
+      targetSamples,
       track.metadata.mediaType === 'video',
-      LAZY_FRAGMENT_HARD_VIDEO_SAMPLES,
+      hardVideoSamples,
     ),
   );
   const cursors = new Array<number>(tracks.length).fill(0);
@@ -2519,7 +2662,7 @@ export const Mp4Driver: ContainerDriver = {
       if (compatibleBrandRewrite !== undefined) return oneShot(compatibleBrandRewrite);
     }
     if (o?.fragmented === true && trim === undefined) {
-      return fragmentedSourceStream(ra, movie, o?.signal);
+      return fragmentedSourceStream(ra, movie, o);
     }
     if (o?.streaming === true && trim === undefined) {
       return progressiveSourceStream(ra, movie, o);
@@ -2566,6 +2709,7 @@ export const Mp4Driver: ContainerDriver = {
     const movie = await readMovie(ra);
     const sourceSize = ra.size;
     const tracks = await muxTracksFromMovie(ra, movie); // clear-structured (mp4a), ciphertext samples
+    const cenc = await loadCencModule();
     const out: MuxTrackInput[] = [];
     for (const [i, parsed] of movie.tracks.entries()) {
       const track = tracks[i];
@@ -2579,7 +2723,7 @@ export const Mp4Driver: ContainerDriver = {
       // decision. That path rejects undecryptable protected input (empty sample table / scheme mismatch /
       // missing required aux data) and only strips protection metadata without AES when the file has no
       // sample auxiliary encryption data (Bento4 mp4decrypt leaves those bytes unchanged too).
-      out.push(await decryptCencTrack(parsed, track, enc, o.keys, o.scheme, sourceSize));
+      out.push(await decryptCencTrack(cenc, parsed, track, enc, o.keys, o.scheme, sourceSize));
     }
     return oneShot(writeMp4(out, { faststart: true }));
   },

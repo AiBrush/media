@@ -103,6 +103,22 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
   });
 
+  it('authors explicit f64 PCM targets through the public convert path', async () => {
+    const input = await loadFixture(SIN);
+    const orig = readWavPcm(input);
+    const out = await bytesOf(
+      await media().convert(wavSource(input), {
+        to: 'wav',
+        audio: { codec: 'pcm-f64' as never },
+      }),
+    );
+    const re = readWavPcm(out);
+    expect(re.format).toBe('f64');
+    expect(re.sampleRate).toBe(orig.sampleRate);
+    expect(re.channels).toBe(orig.channels);
+    expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+  });
+
   it('applies public gainDb through the PCM-native transform path', async () => {
     const orig = readWavPcm(await loadFixture(SIN));
     const out = await bytesOf(
@@ -321,7 +337,7 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     ).rejects.toBeInstanceOf(CapabilityError);
   });
 
-  it('resamples PCM to a new sample rate via the windowed-sinc tail (ADR-022)', async () => {
+  it('resamples PCM to a new sample rate in the WAV PCM path (ADR-022)', async () => {
     const orig = readWavPcm(
       await bytesOf(await media().convert(await fixtureSource(SIN), { to: 'wav' })),
     );

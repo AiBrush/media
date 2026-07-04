@@ -243,10 +243,7 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
       expect(got.dtsUs, `frame ${i}: dts`).toBe(expected.ptsUs);
       expect(got.keyframe, `frame ${i}: keyframe`).toBe(true);
     }
-    expect(reads).toEqual([
-      [0, 4096],
-      [0, bytes.byteLength],
-    ]);
+    expect(reads).toEqual([[0, bytes.byteLength]]);
     expect(streamReads).toBe(0);
   });
 
@@ -410,7 +407,7 @@ describe('media.trim — native FLAC keyframe packet-copy', () => {
     );
 
     expect(parseFlac(out).totalSamples).toBeGreaterThan(0);
-    expect(rangeReads).toBe(2);
+    expect(rangeReads).toBe(1);
     expect(streamReads).toBe(0);
   });
 

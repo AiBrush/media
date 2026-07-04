@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-04T10:06:17.228Z",
+  "generatedFrom": "2026-07-04T16:33:14.940Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-06-22T17-27-07-652Z.json",
@@ -444,83 +444,48 @@
     "chromium-2026-07-04T10-00-37-355Z.json",
     "chromium-2026-07-04T10-01-00-590Z.json",
     "chromium-2026-07-04T10-03-16-592Z.json",
-    "chromium-2026-07-04T10-06-00-532Z.json"
+    "chromium-2026-07-04T10-06-00-532Z.json",
+    "chromium-2026-07-04T16-33-55-970Z.json",
+    "chromium-2026-07-04T16-34-28-504Z.json",
+    "chromium-2026-07-04T16-37-02-535Z.json",
+    "chromium-2026-07-04T16-38-14-173Z.json",
+    "chromium-2026-07-04T16-42-02-902Z.json",
+    "chromium-2026-07-04T16-44-17-223Z.json",
+    "chromium-2026-07-04T16-55-56-242Z.json",
+    "chromium-2026-07-04T17-07-41-510Z.json",
+    "chromium-2026-07-04T17-09-44-086Z.json",
+    "chromium-2026-07-04T17-19-02-555Z.json",
+    "chromium-2026-07-04T17-22-40-041Z.json",
+    "chromium-2026-07-04T14-27-06-069Z.json",
+    "chromium-2026-07-04T14-32-20-693Z.json",
+    "chromium-2026-07-04T14-39-47-464Z.json",
+    "chromium-2026-07-04T14-46-24-529Z.json",
+    "chromium-2026-07-04T15-13-01-262Z.json",
+    "chromium-2026-07-04T15-20-32-071Z.json",
+    "chromium-2026-07-04T15-34-20-479Z.json",
+    "chromium-2026-07-04T15-36-24-157Z.json",
+    "chromium-2026-07-04T15-58-11-435Z.json",
+    "chromium-2026-07-04T15-58-44-306Z.json",
+    "chromium-2026-07-04T15-59-05-483Z.json",
+    "chromium-2026-07-04T16-03-50-763Z.json",
+    "chromium-2026-07-04T16-10-14-687Z.json",
+    "chromium-2026-07-04T16-20-01-411Z.json",
+    "chromium-2026-07-04T16-21-53-844Z.json",
+    "chromium-2026-07-04T16-27-33-067Z.json",
+    "chromium-2026-07-04T16-30-12-331Z.json",
+    "chromium-2026-07-04T16-33-13-068Z.json"
   ],
-  "contested": 446,
-  "rawLossCount": 192,
-  "activeLossCount": 191,
+  "contested": 445,
+  "rawLossCount": 184,
+  "activeLossCount": 183,
   "exemptLossCount": 1,
   "tiers": {
     "catastrophic": 0,
     "severe": 0,
-    "moderate": 9,
+    "moderate": 1,
     "minor": 182
   },
   "losses": [
-    {
-      "s": "trim/audio_wav_pcm_copy",
-      "fam": "trim",
-      "our": 29.174999997019768,
-      "comp": "mediabunny",
-      "cw": 7.4000000059604645,
-      "ratio": 3.9425675639892206
-    },
-    {
-      "s": "mux/mp4_faststart_reserve",
-      "fam": "mux",
-      "our": 274.5050000101328,
-      "comp": "mediabunny",
-      "cw": 70.57499998807907,
-      "ratio": 3.8895501247821445
-    },
-    {
-      "s": "performance/metamorphic-vfr-probe-duration",
-      "fam": "performance",
-      "our": 11.490000009536743,
-      "comp": "mediabunny",
-      "cw": 3.070000022649765,
-      "ratio": 3.7426709852658386
-    },
-    {
-      "s": "transcode/aac_to_pcm_wav_extract",
-      "fam": "transcode",
-      "our": 72.14499999582767,
-      "comp": "ffmpeg.wasm",
-      "cw": 19.604999989271164,
-      "ratio": 3.67992859144652
-    },
-    {
-      "s": "mux/audio_only_aac_to_mp4",
-      "fam": "mux",
-      "our": 27.65999999642372,
-      "comp": "ffmpeg.wasm",
-      "cw": 7.784999996423721,
-      "ratio": 3.5529865136968777
-    },
-    {
-      "s": "demux/mp3_xing",
-      "fam": "demux",
-      "our": 20.32999999821186,
-      "comp": "mediabunny",
-      "cw": 5.96000000834465,
-      "ratio": 3.4110738204274567
-    },
-    {
-      "s": "streaming-output/buffer_massive_h264_mp4",
-      "fam": "streaming-output",
-      "our": 20606.75,
-      "comp": "ffmpeg.wasm",
-      "cw": 6705.324999988079,
-      "ratio": 3.0731918288877327
-    },
-    {
-      "s": "audio-dsp/edge_longform_audio_resample_16k",
-      "fam": "audio-dsp",
-      "our": 12466.405000001192,
-      "comp": "ffmpeg.wasm",
-      "cw": 4117.009999990463,
-      "ratio": 3.0280239785742733
-    },
     {
       "s": "transcode/opus_to_aac_mp4",
       "fam": "transcode",

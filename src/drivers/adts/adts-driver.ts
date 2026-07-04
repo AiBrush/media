@@ -4,7 +4,8 @@
  * sampling-frequency index, and channel configuration. Duration comes from walking the frames (each is
  * `frame_length` bytes and 1024 samples per raw block). Probe and framing are pure TS; AAC packet decode
  * is capability-routed through native WebCodecs first and the vendored `wasm-aac` tail second, except for
- * Firefox/force-software PCM extraction where the wasm tail owns the route up front. The
+ * Firefox/force-software PCM extraction and small no-DSP WAV-s16 extraction where the wasm tail owns the
+ * route up front. The
  * `decodePcm` bridge exposes ADTS → WAV extraction without pretending WAV is an `EncodedChunk` muxer.
  */
 
@@ -44,6 +45,7 @@ const ADTS_TRIM_END_SLACK_SEC = 1;
 const ADTS_TRIM_URL_CACHE_TTL_MS = 60_000;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRIES = 16;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRY_BYTES = 1 * 1024 * 1024;
+const ADTS_DIRECT_WASM_S16_MAX_BYTES = 256 * 1024;
 
 export type AdtsAacPcmDecodeRung = (typeof AAC_PCM_NATIVE_FIRST_PLAN)[number];
 
@@ -64,6 +66,17 @@ interface CachedAdtsTrimBytes {
 }
 
 const adtsTrimUrlByteCache = new Map<string, CachedAdtsTrimBytes>();
+let adtsPcmDirectModule: typeof import('./adts-pcm-direct.ts') | undefined;
+let adtsPcmDirectModulePromise: Promise<typeof import('./adts-pcm-direct.ts')> | undefined;
+
+async function loadAdtsPcmDirectModule(): Promise<typeof import('./adts-pcm-direct.ts')> {
+  if (adtsPcmDirectModule !== undefined) return adtsPcmDirectModule;
+  adtsPcmDirectModulePromise ??= import('./adts-pcm-direct.ts').then((module) => {
+    adtsPcmDirectModule = module;
+    return module;
+  });
+  return adtsPcmDirectModulePromise;
+}
 
 // MPEG-4 sampling-frequency-index table (Hz); index 13–15 are reserved/explicit (unsupported here).
 const SAMPLE_RATES = [
@@ -91,6 +104,8 @@ export interface AdtsPacket {
   readonly ptsUs: number;
   /** Frame duration in microseconds (rawBlocks · 1024 ÷ sampleRate). */
   readonly durationUs: number;
+  /** Decoded PCM samples per channel carried by this ADTS frame. */
+  readonly samples: number;
 }
 
 /**
@@ -133,6 +148,7 @@ export function enumerateAdtsFrames(bytes: Uint8Array): readonly AdtsPacket[] {
       // µs from the integer sample clock — rounding keeps us within ±1µs of ffprobe's pts_time.
       ptsUs: Math.round((cumulativeSamples * 1_000_000) / sampleRate),
       durationUs: Math.round((samples * 1_000_000) / sampleRate),
+      samples,
     });
     cumulativeSamples += samples;
     pos += frameLen;
@@ -155,7 +171,7 @@ function audioSpecificConfig(aot: number, freqIndex: number, channelConfig: numb
   ]);
 }
 
-interface AdtsLayout {
+export interface AdtsLayout {
   readonly info: AdtsInfo;
   readonly frames: readonly AdtsPacket[];
   readonly asc: Uint8Array;
@@ -385,6 +401,19 @@ export function concatPcmChunks(
     offset += chunk.frames;
   }
   return { sampleRate, channels, frames, planar };
+}
+
+function mayUseAdtsDirectWasmS16Wav(
+  byteLength: number,
+  o: PcmTransform | undefined,
+  wasmOnlyRuntime: boolean,
+): boolean {
+  if (!Number.isFinite(byteLength) || byteLength < 0) return false;
+  return (
+    wasmOnlyRuntime ||
+    o?.determinism === 'force-software' ||
+    byteLength <= ADTS_DIRECT_WASM_S16_MAX_BYTES
+  );
 }
 
 function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
@@ -660,10 +689,14 @@ async function firefoxRuntimeForAdtsPcm(): Promise<boolean> {
   return runtime.isFirefoxRuntime();
 }
 
-async function decodeAacToPcm(bytes: Uint8Array, o: PcmTransform | undefined): Promise<PcmAudio> {
+async function decodeAacToPcmWithLayout(
+  bytes: Uint8Array,
+  layout: AdtsLayout,
+  firefoxRuntime: boolean,
+  o: PcmTransform | undefined,
+): Promise<PcmAudio> {
   throwIfAborted(o?.signal);
-  const layout = readLayout(bytes);
-  const plan = adtsAacPcmDecodePlan(await firefoxRuntimeForAdtsPcm(), o?.determinism);
+  const plan = adtsAacPcmDecodePlan(firefoxRuntime, o?.determinism);
   let nativeMiss: CapabilityError | undefined;
   let wasmMiss: CapabilityError | undefined;
   for (const rung of plan) {
@@ -806,8 +839,29 @@ export const AdtsDriver = {
     return new AdtsMuxer(o);
   },
   async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-    const pcm = applyPcmTransform(await decodeAacToPcm(await readAll(src), o), o);
-    const out = writeWav(pcm, PCM_OUTPUT_FORMAT);
+    const bytes = await readAll(src);
+    throwIfAborted(o?.signal);
+    const layout = readLayout(bytes);
+    const firefoxRuntime = await firefoxRuntimeForAdtsPcm();
+    let directWav: Uint8Array<ArrayBuffer> | undefined;
+    if (mayUseAdtsDirectWasmS16Wav(bytes.byteLength, o, firefoxRuntime)) {
+      const direct = adtsPcmDirectModule ?? (await loadAdtsPcmDirectModule());
+      directWav = direct.canUseAdtsWasmDirectS16Wav(
+        bytes.byteLength,
+        layout.info.sampleRate,
+        layout.info.channels,
+        o,
+        firefoxRuntime,
+      )
+        ? await direct.tryDecodeWasmAacToS16Wav(bytes, layout, o)
+        : undefined;
+    }
+    const out =
+      directWav ??
+      writeWav(
+        applyPcmTransform(await decodeAacToPcmWithLayout(bytes, layout, firefoxRuntime, o), o),
+        PCM_OUTPUT_FORMAT,
+      );
     return new ReadableStream<Uint8Array>({
       start(c): void {
         c.enqueue(out);

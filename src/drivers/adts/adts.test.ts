@@ -15,6 +15,7 @@ import {
   parseAdts,
   pcmFromInterleavedF32,
 } from './adts-driver.ts';
+import { canUseAdtsWasmDirectS16Wav, writeInterleavedF32S16le } from './adts-pcm-direct.ts';
 
 async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -368,6 +369,12 @@ describe('enumerateAdtsFrames — strict can-fail oracle vs ffprobe (sfx.adts)',
     expect(bytes[f.offset]).toBe(0xff); // the stripped header began with the syncword
   });
 
+  it('carries exact decoded sample counts per ADTS frame for direct PCM sizing', async () => {
+    const frames = enumerateAdtsFrames(await loadFixture('sfx.adts'));
+    expect(frames.length).toBeGreaterThan(0);
+    expect(frames.every((frame) => frame.samples === 1024)).toBe(true);
+  });
+
   it('rejects truncated / garbage input (the oracle can fail on bad bytes)', () => {
     expect(() => enumerateAdtsFrames(new Uint8Array(6))).toThrowError(InputError); // too short
     expect(() =>
@@ -392,6 +399,58 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
     expect(adtsAacPcmDecodePlan(true)).toEqual(['wasm-aac']);
     expect(adtsAacPcmDecodePlan(false, 'force-software')).toEqual(['wasm-aac']);
     expect(adtsAacPcmDecodePlan(true, 'force-software')).toEqual(['wasm-aac']);
+  });
+
+  it('uses the direct wasm-s16 WAV route only for no-DSP same-layout extraction', () => {
+    expect(
+      canUseAdtsWasmDirectS16Wav(
+        163_811,
+        48_000,
+        2,
+        { container: 'wav', sampleFormat: 's16' },
+        false,
+      ),
+    ).toBe(true);
+    expect(
+      canUseAdtsWasmDirectS16Wav(
+        300_000,
+        48_000,
+        2,
+        { container: 'wav', sampleFormat: 's16' },
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      canUseAdtsWasmDirectS16Wav(
+        300_000,
+        48_000,
+        2,
+        { container: 'wav', sampleFormat: 's16' },
+        true,
+      ),
+    ).toBe(true);
+    expect(canUseAdtsWasmDirectS16Wav(163_811, 48_000, 2, { sampleRate: 44_100 }, false)).toBe(
+      false,
+    );
+    expect(canUseAdtsWasmDirectS16Wav(163_811, 48_000, 2, { channels: 1 }, false)).toBe(false);
+    expect(canUseAdtsWasmDirectS16Wav(163_811, 48_000, 2, { gainDb: -3 }, false)).toBe(false);
+    expect(canUseAdtsWasmDirectS16Wav(163_811, 48_000, 2, { sampleFormat: 'f32' }, false)).toBe(
+      false,
+    );
+  });
+
+  it('writes direct interleaved f32 samples with the canonical s16 clamp and rounding rule', () => {
+    const out = new Uint8Array(14);
+    const dv = new DataView(out.buffer);
+    const end = writeInterleavedF32S16le(
+      dv,
+      0,
+      new Float32Array([-1.25, -1, -0.5, 0, 0.5, 1, 1.25]),
+    );
+    expect(end).toBe(out.byteLength);
+    expect(Array.from({ length: 7 }, (_, index) => dv.getInt16(index * 2, true))).toEqual([
+      -32768, -32768, -16384, 0, 16384, 32767, 32767,
+    ]);
   });
 
   it('converts interleaved f32 decoder output into canonical planar PCM', () => {

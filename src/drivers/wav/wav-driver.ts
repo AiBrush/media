@@ -74,6 +74,7 @@ const WAV_DEMUX_HEAD_BYTES = 65536;
 const WAV_PACKET_FRAMES = 4096;
 const WAV_PACKET_INFO_PREFIX_TTL_MS = 60_000;
 const WAV_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES = 64;
+const OPERATION_ABORTED = 'operation aborted';
 
 interface WavPacketInfoPrefixCacheEntry {
   readonly bytes: Uint8Array;
@@ -255,7 +256,7 @@ export async function wavPacketInfoFromUrl(
       0,
       opts.size !== undefined ? Math.min(opts.size, WAV_PROBE_HEAD_BYTES) : WAV_PROBE_HEAD_BYTES,
     );
-    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     const parsed = parseWavHeader(prefix, opts.size);
     if (parsed.dataFound) {
       storeWavPacketInfoPrefix(key, prefix);
@@ -325,6 +326,7 @@ export const WavDriver: ContainerDriver = {
   kind: 'container',
   formats: ['wav'],
   supports: matches,
+  validatesPcmTrim: true,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     let head = await readHead(src, WAV_PROBE_HEAD_BYTES);
     let parsed = parseWavHeader(head, src.size);
@@ -333,7 +335,7 @@ export const WavDriver: ContainerDriver = {
       head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
       parsed = parseWavHeader(head, src.size);
     }
-    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     return [wavTrackInfo(parsed.info)];
   },
   async demux(src: ByteSource): Promise<Demuxer> {
@@ -364,14 +366,13 @@ export const WavDriver: ContainerDriver = {
       head = await readAll(src);
       parsed = parseWavHeader(head, src.size);
     }
-    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     return wavPacketInfoFromHeader(parsed);
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const opts: PcmTransform = o ?? {};
-    const bytes = await readAll(src);
-    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const container = opts.container ?? 'wav';
+    let bytes: Uint8Array | undefined;
     if (
       container === 'wav' &&
       opts.gainDb === undefined &&
@@ -379,23 +380,34 @@ export const WavDriver: ContainerDriver = {
       opts.dynamics === undefined &&
       opts.biquad === undefined
     ) {
-      const copied =
-        opts.timeBounds === undefined
-          ? rewriteWavPcmCopy(bytes, opts.sampleFormat, opts.endian, opts.channels, opts.sampleRate)
-          : (await import('./pcm-slice.ts')).slice(
-              bytes,
-              opts.timeBounds,
-              opts.sampleFormat,
-              opts.endian,
-              opts.channels,
-              opts.sampleRate,
-            );
-      if (copied !== undefined) {
-        return byteStream(copied);
+      if (opts.timeBounds !== undefined) {
+        const { tryTimeSlice } = await import('./pcm-range-slice.ts');
+        const sliced = await tryTimeSlice(src, opts);
+        if (sliced !== undefined) return sliced;
+      } else {
+        bytes = await readAll(src);
+        if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+        const copied = rewriteWavPcmCopy(
+          bytes,
+          opts.sampleFormat,
+          opts.endian,
+          opts.channels,
+          opts.sampleRate,
+        );
+        if (copied !== undefined) {
+          return byteStream(copied);
+        }
+        const { tryResampleWavS16ToS16Wav } = await import('./s16-resample.ts');
+        const resampled = tryResampleWavS16ToS16Wav(bytes, opts);
+        if (resampled !== undefined) {
+          return byteStream(resampled);
+        }
       }
     }
+    bytes ??= await readAll(src);
+    if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     const wav = readWavPcm(bytes);
-    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     const audio = applyPcmTransform(wav, opts);
     const out = writePcmContainer(
       audio,
@@ -407,7 +419,7 @@ export const WavDriver: ContainerDriver = {
   },
   async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
     const wav = readWavPcm(await readAll(src));
-    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     return wav;
   },
   createMuxer(o?: MuxOptions): Muxer {

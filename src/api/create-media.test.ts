@@ -820,7 +820,7 @@ describe('createMedia', () => {
     const got = await readFirst(media.decode(src).video);
     expect(got).toBe(frame);
     frame.close();
-    expect(calls).toEqual([[0, 4 * 1024]]);
+    expect(calls).toEqual([]);
     expect(counts.sniff).toBe(0);
     expect(frame.closeCount).toBe(1);
   });
@@ -1079,6 +1079,51 @@ describe('createMedia', () => {
     const media = createMedia().use(NoopDriverModule);
     const file = new File([new Uint8Array([1, 2, 3, 4])], 'clip.noop');
     expect((await media.probe(file)).container).toBe('noop');
+  });
+
+  it('trim routes a hinted PCM container without a separate source-head read', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const calls: Array<readonly [number, number]> = [];
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/wav',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('hinted trim should use the transform range read only');
+      },
+    };
+    const driver: ContainerDriver = {
+      id: 'hinted-wav',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['wav'],
+      supports: (q) => q.mime === 'audio/wav' && q.head === undefined,
+      validatesPcmTrim: true,
+      transformPcm: async (source) => {
+        if (source.range === undefined) throw new Error('expected a seekable source');
+        return byteStream(await source.range(0, source.size ?? 0));
+      },
+      demux: () => {
+        throw new Error('validated PCM trim should not demux');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+
+    const out = await media.trim(src, { start: 0, end: 1 });
+    expect(out).toBeInstanceOf(Blob);
+    expect(new Uint8Array(await (out as Blob).arrayBuffer())).toEqual(bytes);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
   it('codec ops reject an invalid input shape with InputError', async () => {

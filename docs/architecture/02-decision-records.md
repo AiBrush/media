@@ -6,7 +6,7 @@ Format per ADR: **Context** (why) · **Decision** (what) · **Consequences** (re
 
 ---
 
-### ADR-001 — A single capability-routed engine
+## ADR-001 — A single capability-routed engine
 
 **Context:** Each benchmarked engine is mono-substrate; no one engine spans the substrates that win, yet "best-of-the-best = union of substrates" [data: Findings 1–2]. **Decision:** Build one engine that routes each operation to the best available substrate, rather than another mono-substrate library. **Consequences:** A router + pluggable backends become the core (ADR-015). Rejected: extend a single substrate (would inherit that substrate's losses, e.g. mediabunny loses audio-dsp + browser-missing codecs).
 
@@ -475,7 +475,7 @@ bitflipped/empty fixture-derived inputs, a parser may either return a correct pa
 a typed `MediaError` subclass, but it must not leak host exceptions such as `RangeError` from a fixed-width
 `DataView` read past EOF. The implementation still had a scratch inventory test that only printed escapes
 and asserted `true`. Running that inventory on real fixtures exposed raw `RangeError` paths in MP4 table
-parsing, WAV `fmt ` chunk probing, Ogg short-page identification, AIFF `SSND` prefix reading, and AVI
+parsing, WAV `fmt` chunk probing, Ogg short-page identification, AIFF `SSND` prefix reading, and AVI
 `avih`/`strh`/`strf` header decoding. Leaving those as a non-binding report would make robustness a weak
 "did not crash in this run" gate rather than a CI-enforced contract.
 
@@ -485,7 +485,7 @@ full-file MP4 `readMovie`, and pure container parsers (WAV, MP3, Ogg, FLAC, ADTS
 MPEG-TS, WebM), and fails on any `crash` or `hang` outcome with the first class/label/error/hex preview.
 The parser fixes are deliberately structural rather than blanket `try/catch`: `Reader` now bounds MP4
 seeks/skips/reads and throws `MediaError('demux-error')` on truncated boxes/tables; WAV verifies the fixed
-16-byte `fmt ` prefix before reading it; Ogg rejects pages whose lacing table points past available bytes
+16-byte `fmt` prefix before reading it; Ogg rejects pages whose lacing table points past available bytes
 and bounds Vorbis/Opus ID packet reads; AIFF verifies the fixed eight-byte `SSND` prefix; AVI verifies the
 fixed `avih`, `strh`, and `strf` prefixes before decoding them.
 
@@ -1087,6 +1087,7 @@ import.meta.url), {type:'module'})` as one literal makes Vite *recognize* the wo
 which **fails the whole build** for a code-split worker (`Invalid value "iife" … UMD and IIFE output formats are
 not supported for code-splitting builds`). So `worker-host.ts` deliberately keeps the URL in a `workerMainUrl()`
 helper (hiding the pattern from the re-bundler), and the **fix is consumer-side**: the prebuilt vendor (worker
+
 + its chunks + wasm) must be served/copied **raw, never re-processed** by the app bundler — the established
 `*-vendor-static` Vite-plugin pattern (the ffmpeg engine already does this for its Emscripten worker), extended
 to also emit the vendor as static assets for `vite build` (not just the dev/preview middleware). **Rejected:**
@@ -1144,6 +1145,7 @@ minified prebuilts (`opus-recorder`/eshaz `opus-decoder` — internalized export
 contract without adopting their worker runtime); a runtime CDN (breaks self-hosted/offline); declaring Opus
 support the engine cannot perform (a dishonest NA→fake); blocking on the unbuildable C toolchain. A
 from-source Rust/Emscripten build remains the future-clean path if the toolchain becomes available — the glue
+
 + contract are unchanged by that swap.
 
 ### ADR-089 — Lossy-seam stream-stateful audio filters: fade/biquad/dynamics across the codec seam
@@ -1964,7 +1966,7 @@ colorspace, tonemap, rotate 90/180, fps downsample, 10-bit output, two-pass, mas
 one unsupported H.264 encode profile).
 
 Two focused WebKit artifacts anchor specific fixes. `webkit-2026-06-28T12-56-53-501Z.json` proves
-`robustness/edge_rotated_remux` passes after MOV authoring stopped using QuickTime major brand `qt  ` for
+`robustness/edge_rotated_remux` passes after MOV authoring stopped using QuickTime major brand `qt` for
 an ISO-BMFF layout; WebKit playback accepted the same structure when the `ftyp` brand set was ISO/MP4
 compatible. `webkit-2026-06-28T12-57-08-525Z.json` proves the rotated row passes while the remaining
 focused rows settle as honest NAs for AAC gapless sample-count evidence, MKV playback-smoke, and
@@ -2043,7 +2045,7 @@ extraction through wasm-AAC before touching native `AudioDecoder`. The focused w
 
 | Scope | Disposition |
 | --- | --- |
-| MOV target brand | Author MOV output with the ISO-compatible MP4 brand set used by the actual writer layout. Do not emit `qt  ` for this path, because WebKit playback-smoke rejects that brand/layout combination while the ISO-compatible file passes. |
+| MOV target brand | Author MOV output with the ISO-compatible MP4 brand set used by the actual writer layout. Do not emit `qt` for this path, because WebKit playback-smoke rejects that brand/layout combination while the ISO-compatible file passes. |
 | WebKit strict pixels | Treat WebKit committed-golden and source-reference RGBA pixel strictness as `NA_BROWSER` where the oracle requires browser-stable RGBA readback. Do not weaken the oracle or count unreadable pixels as zero drift. |
 | WebKit AAC gapless sample count | Keep the AAC priming/padding sample-count rows `NA_BROWSER` on WebKit until the browser exposes exact evidence compatible with the strict oracle. |
 | WebKit MKV playback-smoke | Keep MKV output playback-smoke rows `NA_BROWSER` on WebKit because the browser cannot validate Matroska output through a plain `<video>` element even when the bytes are structurally authored. |
@@ -2065,7 +2067,7 @@ requires.
 
 **Rejected:** weakening pixel digest thresholds; counting missing/unreadable pixels as black or zero drift;
 hardcoding scenario ids instead of browser/runtime predicates; treating Mediabunny's Firefox VPx alpha pass
-as proof that this package may leave timeout rows declared; emitting QuickTime `qt  ` branding for an
+as proof that this package may leave timeout rows declared; emitting QuickTime `qt` branding for an
 ISO-BMFF writer layout; and reusing Chromium pixel assumptions for WebKit/Firefox committed-golden rows.
 
 ### ADR-111 — Session-7 package verification and exact WASM fallback support envelopes
@@ -2287,7 +2289,7 @@ from `#writeMetadataTags` by lazy import so the eager engine budget stays unchan
 `RIFF/WAVE`, removes prior top-level `LIST/INFO` and `bext` chunks, writes normalized INFO fields plus
 `TXXX:` custom keys, and emits a minimal 602-byte Broadcast Wave `bext` chunk for broad metadata
 compatibility. AIFF/AIFC validates `FORM AIFF/AIFC`, replaces standard text chunks (`NAME`, `AUTH`,
-`ANNO`, `(c) `) and writes an `ID3 ` chunk using the existing ID3v2.4 frame builder so the full tag set
+`ANNO`, `(c)`) and writes an `ID3` chunk using the existing ID3v2.4 frame builder so the full tag set
 round-trips exactly. CAF validates `caff`, replaces or inserts an `info` chunk of NUL-terminated UTF-8
 key/value pairs, and inserts it before an indefinite `data` chunk so the file remains legal.
 
@@ -2316,7 +2318,7 @@ a raw PCM token (`pcm-u8`, `pcm-s16`, `pcm-s24`, `pcm-s32`, `pcm-f32`, `pcm-f64`
 input variants). `TrackInfo.config` must carry `sampleRate` and `numberOfChannels`; fragmented output,
 video tracks, compressed codecs, multiple tracks, empty tracks, and partial sample-frame packets reject
 with typed errors. The muxer copies packet bytes, decodes them through the existing deterministic PCM
-bridge, and serializes canonical RIFF/WAVE `fmt ` + `data` with `writeWav`. The routing predicate marks
+bridge, and serializes canonical RIFF/WAVE `fmt` + `data` with `writeWav`. The routing predicate marks
 `wav` as explicitly packet-muxable for `media.mux`, while `chooseOutputContainer()` still keeps ordinary
 WAV-source conversion on the PCM-native `transformPcm` path.
 
@@ -2334,7 +2336,7 @@ missing seam.
 
 ### ADR-117 — AVI mux writes RIFF hdrl/strl/movi/idx1 with OpenDML AVIX segmentation
 
-**Context:** The AVI driver could probe and demux real RIFF `AVI ` files, including MJPEG+PCM and
+**Context:** The AVI driver could probe and demux real RIFF `AVI` files, including MJPEG+PCM and
 MPEG-4+MP3 fixtures, but `createMuxer()` still threw "not yet implemented." AVI is not part of the core
 DoD container set, yet the missing feature was pure TypeScript container authoring: write the headers,
 interleaved `movi` chunks, and index from caller-supplied packet bytes. Returning input bytes, weakening
@@ -2473,7 +2475,7 @@ decoding to canonical samples and encoding back to the same wire format. Big-end
 
 Second, the browser benchmark adapter uses a narrower source-level optimization for clean, single-source
 WAV-to-WAV mux rows. It fetches the source response body into one owned `Uint8Array` sized from
-`Content-Length`, accepts only canonical `RIFF/WAVE` files with a 16-byte `fmt ` chunk and `data` at byte 44,
+`Content-Length`, accepts only canonical `RIFF/WAVE` files with a 16-byte `fmt` chunk and `data` at byte 44,
 validates codec/sample-rate/channel/block-align facts, rewrites the RIFF and data lengths in that owned
 buffer, and exposes `bytes.subarray(44)` as the `EncodedTrack` payload. The paired `mux()` call returns that
 buffer only when the prepared payload aliases the same buffer at offset 44 and the prepared state is marked
@@ -2989,10 +2991,10 @@ aibrush-media passing the golden-metadata oracle at **4.115 ms** median while me
 **3.145 ms**. The harness already supplied the known `wav` container token, but `WavDriver` had no
 metadata-only `probe()` hook, so `probeContainer()` fell back to `demux()`. The demux fallback stayed
 bounded, yet it still fetched the 64 KiB demux header window and allocated a demux session for an oracle
-that only needs `fmt ` plus `data` length.
+that only needs `fmt` plus `data` length.
 
 **Decision:** add `WavDriver.probe(src, o)` and share a pure `parseWavHeader()` helper with demux. The
-helper walks RIFF chunks, parses `fmt `, records whether `data` was visible, and computes duration from
+helper walks RIFF chunks, parses `fmt`, records whether `data` was visible, and computes duration from
 the declared data size clamped by source length. Probe first reads a 4 KiB head range, which covers normal
 WAV headers, and returns `TrackInfo[]` directly without packet state. If the 4 KiB window has valid format
 metadata but no `data` chunk and the source is larger, probe retries once with the existing 64 KiB demux
@@ -3466,7 +3468,7 @@ QuickTime-only sample entries, mdat-before-moov layouts, edit/tag shapes, or off
 
 **Decision:** add a guarded driver-native branch inside `Mp4Driver.streamCopy()` for full, untrimmed,
 non-fragmented, buffered MOV->MP4 remux only. The branch requires all of the following structural facts:
-target container `mp4`; source major brand `qt  `; default/non-false faststart; top-level layout `ftyp`
+target container `mp4`; source major brand `qt`; default/non-false faststart; top-level layout `ftyp`
 immediately followed by `moov`; known source size; no tag rewrite, track selection, stream target,
 fragmentation, encryption, or trim; complete sample tables; video sample entries limited to
 `avc1`/`avc3` with `avcC`; and audio sample entries limited to `mp4a` with `esds`.
@@ -3512,20 +3514,31 @@ That also meant the hot path paid a full PCM decode and interleave encode even w
 sample-format, channel-count, sample-rate, endian, gain, fade, dynamics, or EQ change.
 
 **Decision:** add a same-layout WAV byte-slice branch to the WAV PCM bridge and keep it lazy-split out of
-the default WAV driver closure. The lazy slice helper parses the RIFF/WAVE `fmt ` and `data` chunks,
+the default WAV driver closure. The lazy slice helper parses the RIFF/WAVE `fmt` and `data` chunks,
 verifies the requested target is canonical little-endian WAV with matching sample format/channel
 count/sample rate when those constraints are present, computes the exact source frame window using the same
 `Math.round(sec * sampleRate)` rule as `applyPcmTransform()`, clamps that window to the real complete PCM
 frames, and writes a fresh 44-byte RIFF/WAVE envelope around the selected interleaved `data` bytes.
 `WavDriver.transformPcm()` dynamically imports that helper only when `timeBounds` is present and no
 DSP/layout change is requested; mismatched explicit layout returns `undefined` and falls back to the
-existing sample-domain path, while malformed time ranges throw typed `InputError`s before any output.
+existing sample-domain path.
+
+The first Chromium proof showed decode/re-encode was gone but fixed per-op overhead still lost, so the
+final closure also removes redundant setup in the public keyframe-trim path. `WavDriver` declares
+`validatesPcmTimeBounds` only after the byte planner mirrors the public `assertTrimRange()` guards,
+including `start>=duration`, `end>duration`, and the existing one-second end slack. `MediaEngine.trim()`
+therefore lets validated PCM drivers perform keyframe trims before the generic duration probe, and
+`materializeOutput()` returns stream sinks directly instead of importing the generic materializer for a
+no-op stream handoff. Container routing now tries MIME/filename hints before reading magic bytes; this
+preserves the existing trust semantics because drivers already accepted those hints when `head` was also
+present, but avoids an otherwise redundant source-head range read on hinted benchmark inputs. A seekable
+WAV range-slice path remains available for files larger than **1 MiB**; the 960 KB benchmark fixture stays
+on the cheaper single full-read byte slice because two HTTP range requests were slower at that size.
 
 This is not an input passthrough and it is not a loose packet-boundary approximation: partial trims still
 produce newly authored WAV bytes, but the kept PCM payload is copied from exactly the selected sample-frame
-byte window. The path intentionally keeps the current `transformPcm` source contract, so it still reads the
-WAV source once before slicing; a narrower range-reading trim API remains a future escalation only if fresh
-Chromium timing shows whole-source read overhead is still material.
+byte window. Large sources may read only the header and selected PCM span; small sources read the WAV once
+and slice locally to avoid request overhead.
 
 **Consequences:** Focused Node coverage now proves the raw helper copies the exact interleaved byte window,
 declines explicit format/endian/channel/rate mismatches, keeps malformed ranges typed, and the public WAV
@@ -3533,18 +3546,25 @@ declines explicit format/endian/channel/rate mismatches, keeps malformed ranges 
 The existing `PCM-native trim (WAV)` corpus test continues to compare every kept sample across `speech.wav`,
 `sfx-pcm-s16.wav`, `sfx-pcm-s24.wav`, `sfx-pcm-f32.wav`, and `stereo-48000.wav`.
 
+Focused coverage also proves hinted keyframe PCM trim routes without a separate source-head read, stream
+sinks bypass the materializer import, the large-source range path reads only the prefix plus selected sample
+window, and small sources decline that range path.
+
 A local Bun sanity benchmark on the exact sibling harness fixture (`wav_s16.wav`, range 1.0..4.0 s, nine
-timed samples after three warmups) measured **0.277 ms** median and produced a **576,044-byte** WAV. This is
-only a local package sanity check, not the Session 9 closure proof: the official Chromium n>=5
-multi-engine row still must run after the harness can consume the rebuilt package. Until that fresh export
-exists, `docs/perf/performance-deficits.md` remains unchanged and `trim/audio_wav_pcm_copy` stays active in
-the living backlog.
+timed samples after three warmups) measured **0.277 ms** median and produced a **576,044-byte** WAV. The
+official closure proof is the fresh Chromium run
+`chromium-2026-07-04T15-13-01-262Z.json`: aibrush-media measured **4.760 ms** median over five samples
+after three warmups, faster than mediabunny **4.850 ms** and ffmpeg.wasm **28.315 ms**, with all three
+passing the same `trim-boundaries` oracle. Regenerating the deficit backlog with that overlay removes
+`trim/audio_wav_pcm_copy` and reports **190 active deficits** with severity split `0/0/8/182` plus the
+ADR-130 parity exemption.
 
 **Rejected:** returning original input bytes; weakening `trim-boundaries` or the stronger PCM sample-exact
 tests; hardcoding `wav_s16.wav`, byte totals, or trim times; caching outputs, parsed layouts, or oracle
 results; applying the shortcut to DSP transforms, sample-rate/channel/format/endian changes, non-WAV
-targets, malformed WAV envelopes, or unsupported time ranges; replacing exact sample-frame math with a
-looser packet-duration cut; and copying competitor source code.
+targets, malformed WAV envelopes, or unsupported time ranges; forcing the range-slice path on small files
+where extra request overhead loses; replacing exact sample-frame math with a looser packet-duration cut; and
+copying competitor source code.
 
 ### ADR-146 - MP4 URL packet-info primes one metadata prefix
 
@@ -3590,7 +3610,7 @@ top active Session 9 loss: aibrush-media at **14.5 ms** median while mediabunny 
 `golden-packets` oracle at **3.0 ms**. A fresh Chromium baseline after earlier fixed-overhead work still
 measured **7.355 ms** median. The row is a WAV PCM aggregate oracle: it validates one audio track, **59**
 PCM chunks, **1,440,000** total payload bytes, first PTS at zero, and exact duration. No decoder,
-WebCodecs chunk, or PCM payload inspection is needed to compute those facts; the WAV `fmt ` and `data`
+WebCodecs chunk, or PCM payload inspection is needed to compute those facts; the WAV `fmt` and `data`
 headers contain sample format, channel count, sample rate, payload offset, and payload byte length.
 
 **Decision:** add first-party WAV packet-info support. `WavDriver.packetInfo()` reads a bounded **4 KiB**
@@ -3929,3 +3949,263 @@ offsets, byte totals, or benchmark timings; raising offset parsing for all GB-sc
 callers; caching prepared outputs, packet tables, or oracle outcomes; applying the shortcut when any packet
 lacks a validated offset; treating a one-chunk buffer flush as streaming; and copying competitor source
 code.
+
+### ADR-157 - MP4 progressive streaming copy preserves source interleave
+
+**Context:** The Session 9 backlog promoted `mux/mp4_faststart_reserve` after correctness was already green.
+The harness row prepares H.264/AAC tracks from `h264_1080p_30s.mp4`, then asks the adapter to write an MP4
+stream target with `fastStart:'reserve'`. In the current harness contract, reserve is validated by final
+layout and reimport (`moov` before `mdat`, same packet/keyframe counts, same duration tolerance), not by a
+sparse patch telemetry oracle. The aibrush adapter honestly falls back to public same-container
+`engine.remux()` for the single-source MP4/MOV mux case, so the hot path is
+`Mp4Driver.streamCopy(src, { streaming:true, faststart:true })`.
+
+The old progressive streaming writer emitted the `mdat` payload in track-major order, because `writeMp4()`
+historically authored each track as one contiguous chunk. That is valid MP4, but it is slow for interleaved
+sources: the source sample bytes are laid out video/audio/video/audio, while the streaming writer had to
+scan the source once for the video track and again for the audio track. A local probe on the 31.3 MiB
+workhorse measured **62,358,041** bytes read by the streaming path versus **31,258,774** bytes read by the
+buffered path. The row's wall time was therefore dominated by duplicate payload reads, not by correctness
+or oracle work.
+
+**Decision:** Keep same-container MP4 stream-copy as a fresh authoring operation, but teach the byte writer a
+typed explicit chunk layout. `MuxTrackInput` now accepts optional `sampleChunks` entries with
+`firstSample`, `sampleCount`, and `payloadOffset`. When absent, `writeMp4()` and
+`planMp4ByteStreamLayout()` keep the original one-chunk-per-track layout. When present, `write.ts`
+validates that each track's chunks cover samples in order, validates that all chunks cover the `mdat`
+payload without gaps, emits compact multi-entry `stsc` tables, emits all `stco` offsets, and writes samples
+to their planned payload offsets. This keeps the existing API shape and adds no oracle-specific behavior.
+
+`Mp4Driver.streamCopy()` now attempts a source-order interleaved plan for untrimmed progressive multi-track
+streaming output. It builds validated `SampleData` for every track, sorts samples by source byte offset,
+requires that the sorted order never moves backwards within a track, and then builds explicit per-track
+chunks at the source-order payload offsets. The output stream still emits `ftyp`, `moov`, `mdat`, then
+bounded coalesced source windows; it simply reads those windows once in source order instead of once per
+track. Fragmented output, trimmed output, single-track output, non-monotonic track sample order, and any
+malformed sample range stay on the existing conservative paths or typed errors.
+
+**Consequences:** The reserve row's hot public remux path no longer double-scans interleaved MP4 payloads.
+The output remains a genuine MP4 rewrite, not an input passthrough: the `moov` is freshly authored, `stsc`
+and `stco` describe the new interleaved chunks, and `reference-reimport` sees the same coded samples.
+Focused tests prove the new stream-copy output re-parses to the same track/sample facts and that a
+multi-track progressive stream-copy reads less than 1.25x the source size. A local split over the real
+31.3 MiB fixture measured the streaming path at **7** chunks, **31,258,515** bytes out, **7** source reads,
+and **31,258,774** source bytes read.
+
+The cell closes once paired with the harness adapter's prepared reserve route (the same prepared MP4
+stream helper already used for the plain MP4 streaming-target row). Fresh Chromium timing in
+`chromium-2026-07-04T15-36-24-157Z.json` measured aibrush-media at **57.800 ms** median over five samples,
+faster than mediabunny **66.875 ms**, while both engines passed `reference-reimport` (2308 packets, 1423
+keyframes), the duration invariant (`deltaSec=0.021333333333334537 <= 0.041666666666666664`), and
+`mp4-box-layout`. The aibrush output wrote **136** stream-target chunks and **31,241,860** bytes. Regenerating
+the deficit backlog with that overlay removes `mux/mp4_faststart_reserve` and reports **189 active deficits**
+with severity split `0/0/7/182` plus the ADR-130 parity exemption.
+
+**Rejected:** returning the original MP4 bytes; weakening `reference-reimport`, `property-invariant`, or
+`mp4-box-layout`; buffering a whole stream-target output and flushing it as fake streaming; hardcoding
+`h264_1080p_30s.mp4`, packet counts, byte offsets, chunk counts, output sizes, or benchmark timings;
+applying interleaving when source byte order would reorder samples inside a track; and copying competitor
+source code.
+
+### ADR-158 - MP4 CENC decrypt helpers stay lazy from the default probe bundle
+
+**Context:** The MP4 progressive stream-copy and writer-coverage work kept correctness green and pushed
+global branch coverage over the 90% gate, but the package budget then caught a real first-operation
+regression: the default-driver closure measured **259.44 kB** against the **256.00 kB** ceiling. The largest
+default/probe chunk was the MP4 bundle. It statically imported CENC decrypt helpers (`parseTenc`,
+`parseSenc`, AES-CTR/AES-CBC sample decryptors, and KID formatting) even though ordinary MP4 probe, demux,
+remux, mux, and stream-copy do not execute sample decryption. This made every default MP4 first operation
+pay for CENC code that belongs only to `media.decrypt()`.
+
+**Decision:** Keep CENC support first-party and exact, but move the CENC helper module behind a dynamic
+import in the MP4 decrypt path. `mp4-driver.ts` now keeps only local string-literal scheme guards
+(`'cenc' | 'cens' | 'cbcs'`) in the eager MP4 chunk. When a caller requests MP4 sample decryption, the driver
+loads `./cenc.ts` once, then passes the module through the existing typed decrypt helpers. The helper
+functions still use the same `parseTenc`, `parseSenc`, `kidHex`, `decryptSamples`,
+`decryptSamplesCens`, and `decryptSamplesCbcs` implementations; only the load boundary moved.
+
+HLS AES-128 full-segment MP4 decrypt remains on the existing path because it uses the generic AES helper
+directly and is materially smaller than the CENC sample-decrypt module. Probe/remux paths still parse raw
+protection metadata as bytes in `parse.ts`, so protected files can be inspected without loading the CENC
+decrypt implementation.
+
+**Consequences:** `tsup` now emits a separate lazy `cenc-*.js` chunk on the default/probe lazy frontier.
+After `bun run build` and `bun run scripts/vendor-wasm.ts`, `bun run scripts/check-budgets.ts` reports the
+typical app first-operation closure at **254.31 kB** against the **256.00 kB** budget, with **1.69 kB**
+margin, while the eager kernel remains **47.73 kB** against the **50.00 kB** budget. Focused decrypt
+validation still passes for CENC, CENS, CBCS, robustness fixtures, HLS AES-128 MP4 segments, and MP4
+round-trip stream-copy:
+
+```bash
+bun test src/drivers/mp4/cenc.test.ts src/drivers/mp4/cenc-ops.test.ts \
+  src/drivers/mp4/cenc-robustness.test.ts src/drivers/mp4/cbcs.test.ts \
+  src/drivers/mp4/roundtrip.test.ts
+```
+
+This is a load-boundary change only: it does not alter protection parsing, key lookup, decrypt math,
+sample validation, or typed error behavior.
+
+**Rejected:** raising the package budget; removing CENC/CBCS support; weakening decrypt robustness tests;
+duplicating CENC parsing/decrypt code inside `mp4-driver.ts`; delaying raw protection metadata parsing so
+protected files could no longer be probed; and lazy-loading the whole MP4 driver, which would hurt common
+probe/remux paths instead of isolating the uncommon decrypt branch.
+
+### ADR-159 - ADTS AAC to WAV s16 extraction uses a direct wasm writer for small no-DSP jobs
+
+**Context:** After correctness reached 557 PASS / 0 FAIL / 0 ERROR, the Session 9 speed backlog promoted
+`transcode/aac_to_pcm_wav_extract`. The row decodes a 163,811 byte raw ADTS AAC-LC elementary stream to
+WAV `pcm-s16` with no gain, fade, remix, resample, dynamics, biquad, or time slice. The existing
+`AdtsDriver.decodePcm()` bridge was correct, but Chromium used native `AudioDecoder` first, then copied
+each `AudioData` block into canonical Float64 planar PCM, concatenated all blocks, and encoded the final
+WAV payload. Fresh pre-fix Chromium timing measured aibrush-media at **52.865 ms** median over five samples
+while ffmpeg.wasm passed the same structural oracle at **24.440 ms**. The rival's advantage was not an
+oracle difference; both engines reported one WAV PCM track and the same duration delta
+(`0.0043333333333333 s <= 0.041666666666666664 s`). The cost was fixed per-operation overhead and JS
+sample-copy churn around a small AAC decode, not whole-file scanning.
+
+**Decision:** Keep the generic ADTS PCM bridge and typed capability ladder, but add a narrow direct path for
+small no-DSP WAV-s16 extraction. When the caller requests a WAV target with `sampleFormat` omitted or `s16`,
+little-endian output, unchanged sample rate and channel count, no PCM-domain transforms, and either
+`determinism:'force-software'`, a Firefox/wasm-only runtime, or an input at or below **256 KiB**,
+`AdtsDriver.decodePcm()` tries the vendored `wasm-aac` core before touching native `AudioDecoder`. The
+direct route still parses the ADTS stream with the first-party frame walker, synthesizes the ASC from the
+header, decodes each raw AAC payload through the real Symphonia wasm core, and then writes a canonical
+44-byte RIFF/WAVE header plus interleaved little-endian s16 samples directly. The quantizer matches the
+existing PCM encoder exactly: `round(sample * 32768)` clamped to `[-32768, 32767]`.
+
+If the wasm core is unavailable, if decoded geometry differs from an explicit requested sample rate or
+channel count, or if the request asks for any DSP/remix/resample/time-bound work, the driver falls back to
+the existing canonical path: native WebCodecs first where allowed, then wasm fallback, followed by
+`applyPcmTransform()` and `writeWav()`. No scenario id, fixture name, output hash, oracle result, or
+benchmark timing participates in routing.
+
+**Consequences:** The hot row no longer pays WebCodecs setup or per-frame `AudioData` -> Float64 planar
+copying when the requested output is the same s16 WAV shape the row validates. The output remains a real
+decode and WAV authoring operation, not a passthrough or canned fixture. Focused Node tests cover the new
+eligibility predicate, ADTS per-frame sample counts, and direct s16 clamp/round behavior; the existing
+clean-process wasm-AAC oracle still proves the core decodes real ADTS AAC-LC frames. Fresh Chromium timing
+in `chromium-2026-07-04T16-10-14-687Z.json` measured aibrush-media at **23.735 ms** median over five
+samples, faster than ffmpeg.wasm **28.240 ms**, while both engines passed `property-invariant` with the
+same measurements. After the direct writer was kept lazy from the default bundle and its loaded module was
+cached across warmups, the final focused proof in `chromium-2026-07-04T16-21-53-844Z.json` measured
+aibrush-media at **17.455 ms** median over five samples, faster than ffmpeg.wasm **23.760 ms**. The aibrush
+samples were `[26.260, 17.235, 16.810, 17.455, 20.235]` ms and the rival samples were
+`[20.865, 26.405, 21.240, 23.760, 27.520]` ms. `check-budgets` stayed green with the default/probe
+first-operation closure at **254.75 kB** against the **256.00 kB** budget.
+
+**Rejected:** weakening the metadata invariant or adding a PCM-sample shortcut oracle; returning a WAV
+wrapper with fake or silent samples; routing by the `aac_adts.aac` fixture name; using WebCodecs native
+decode for this small no-DSP shape after the measured setup/copy loss; making wasm first for all AAC decode
+sizes and transforms without evidence; and copying ffmpeg.wasm or mediabunny source code.
+
+### ADR-160 - Buffered fragmented MP4 stream-copy uses a larger segment budget
+
+**Context:** The Session 9 backlog promoted `streaming-output/buffer_massive_h264_mp4` after the
+same-container MP4 streaming and massive-remux rows had been made correct and fast. The row asks for the
+massive H.264/AAC MP4 fixture to be emitted as an MP4-family buffered output, with the browser harness
+using the ISO-BMFF fragmented buffer path to stay inside the explicit GB-scale cap. Correctness was already
+green: `reference-reimport` had to see **553,501** packets, **2** media tracks, and the same duration
+tolerance. The remaining loss was speed. The aibrush path range-read payload bytes lazily and wrote a real
+fragmented MP4, but it reused the low-latency `StreamTarget` fragment cadence: roughly **900** samples per
+media segment, with a video hard cap derived from that target. That cadence is desirable for live output,
+but on a final buffered target it pays repeated `moof`/`trun` planning, segment allocation, source-read
+coordination, and browser glue without improving the observable sink behavior.
+
+**Decision:** Keep one fragmented MP4 writer, but split its segment budget by sink semantics. When
+`Mp4Driver.streamCopy()` receives `fragmented:true` without `buffered:true`, the lazy source stream keeps
+the original **900-sample** target and hard video cap so `StreamTarget` rows preserve time-to-first-byte and
+backpressure behavior. When the same fragmented source-copy path is explicitly `buffered:true`, it uses a
+**32x** media-segment sample budget and a matching hard video cap. The route remains source-lazy and
+range-backed: each segment still reads only the samples in that planned run, builds real `moof`/`mdat`
+bytes through `fragmentMp4`, carries DTS, durations, composition offsets, keyframe flags, and `tfdt`, and
+honors the caller's `AbortSignal` between planned runs.
+
+This is a sink-aware performance parameter, not a new oracle path. It does not change progressive
+stream-copy, keyframe trim, prepared packet muxing, sample table parsing, payload validation, or the public
+fragmented muxer semantics. The final buffered result is still a freshly authored fragmented MP4, never the
+input bytes and never a fixture-specific output.
+
+**Consequences:** The massive buffered row closed on a fresh Chromium PASS/PASS comparison. Before the
+change, `chromium-2026-07-04T16-37-02-535Z.json` measured aibrush-media at **5447.055 ms** median over five
+samples. The fastest fresh same-oracle rival proof was ffmpeg.wasm in
+`chromium-2026-07-04T16-38-14-173Z.json` at **5041.060 ms** median over five samples. With the 32x buffered
+fragment budget, `chromium-2026-07-04T16-55-56-242Z.json` measured aibrush-media at **4848.775 ms** median
+over five samples after one warmup, with samples
+`[4832.925, 4797.755, 4848.775, 4875.230, 4855.090]` ms. The run passed `reference-reimport`
+(**553,501** packets, **2** media tracks, `durationDeltaSec=0.021333333333132032 <= 0.1`), measured
+**1484.911x** median realtime throughput, emitted **1,144,819,183** bytes, and kept `targetWrites=1` for the
+buffered materialization.
+
+Focused coverage proves that the buffered fragmented route emits fewer media segments than the
+StreamTarget-shaped route while reparsing to the same fragment sample count. The proof uses a synthetic
+2,000-sample AVC MP4, not a benchmark fixture. `bun test src/drivers/mp4/roundtrip.test.ts`,
+`bunx biome check src/drivers/mp4/mp4-driver.ts src/drivers/mp4/roundtrip.test.ts`, `bun run build`, and
+`bun run vendor-wasm` pass with the change.
+
+**Rejected:** returning the original MP4 bytes; weakening `reference-reimport`; hardcoding
+`streaming-output/buffer_massive_h264_mp4`, the massive fixture name, packet counts, byte counts, or timing
+values into routing; applying the larger fragment budget to `StreamTarget` output; routing the row through a
+browser-only progressive-buffer experiment that closed the page before stable proof; raising global memory
+caps; caching outputs, oracles, or packet tables; and copying competitor source code.
+
+### ADR-161 - WAV s16 sample-rate-only transforms use a direct interleaved FIR writer
+
+**Context:** The Session 9 speed backlog promoted `audio-dsp/edge_longform_audio_resample_16k` after the
+catastrophic MP4 rows were closed. The row transcodes a one-hour mono canonical WAV (`pcm-s16`, 44.1 kHz)
+to WAV `pcm-s16` at 16 kHz with no gain, fade, remix, time slice, dynamics, or biquad. Correctness was
+already green: the oracle is `property-invariant`, requiring a WAV output with one matching audio track and
+unchanged duration (`durationDeltaSec=0`). The speed loss was in the implementation substrate, not in the
+work. The generic WAV PCM path decoded **317,520,000** source payload bytes into a giant planar Float64
+buffer, ran the high-quality public windowed-sinc resampler, then encoded a new s16 WAV. That path is
+correct and remains the general contract, but it expands the input 4x and performs a ~177-tap MAC for each
+of **57.6 million** output frames on this 44.1 kHz -> 16 kHz ratio. Fresh pre-fix Chromium timing measured
+aibrush-media at **12415.135 ms** median over five samples, while ffmpeg.wasm passed the same oracle at
+**3998.530 ms** median over five samples using libswresample and direct PCM I/O.
+
+**Decision:** Keep `src/dsp/resample.ts` as the canonical high-quality Float64 resampler, but add a narrow
+WAV-driver fast path for no-DSP `s16` -> `s16` sample-rate-only transforms. When `WavDriver.transformPcm`
+is targeting WAV, the request has no time bounds, gain, fade, remix, dynamics, or biquad, the source is
+little-endian RIFF/WAVE `pcm-s16`, the requested or preserved sample format is `s16`, the requested or
+preserved endianness is little-endian, the channel count is unchanged, and the target sample rate is a
+positive integer different from the source rate, the driver parses the RIFF header and resamples directly
+from an interleaved `Int16Array` view into a new interleaved `Int16Array` payload. It writes a fresh
+canonical 44-byte RIFF/WAVE header around that payload; it never returns the input bytes or a canned output.
+The FIR helper is loaded with `import()` only after the cheaper same-layout WAV copy path misses, so ordinary
+default-driver startup and non-resample WAV operations do not pull the polyphase bank code into the typical
+first-operation JS closure.
+
+The direct resampler is a cached rational-rate polyphase FIR: **6** Kaiser-windowed sinc zero crossings,
+`beta=8.6`, per-phase DC normalization, `outFrames=round(inputFrames * outRate / inRate)`, zero extension
+at the boundaries, and abort checks every **4096** output frames. On little-endian browsers the hot loop
+uses aligned `Int16Array` source/output views and an unrolled interior MAC; if the native endianness,
+alignment, format, requested shape, or phase count is unsupported, the route returns `undefined` before
+output and the existing canonical PCM path handles or rejects the request. Routing is based only on the
+source container layout and transform options, never scenario id, fixture name, oracle, output hash, or
+timing.
+
+**Consequences:** The longform WAV row now avoids Float64 materialization, high-tap public resampling, and
+a separate encode pass for the exact structural no-DSP s16 shape. Focused tests prove that the helper
+authors canonical WAV metadata, preserves a low-frequency tone, applies a real low-pass filter to an
+above-output-Nyquist tone, preserves distinct stereo channels through the interleaved path, is selected by
+`WavDriver.transformPcm` for sample-rate-only s16 WAV transforms, declines unsupported shapes back to the
+canonical path, and keeps its helper lazy-split from the default bundle. `bun test
+src/drivers/wav/wav.test.ts src/drivers/wav/ops.test.ts`, `bunx biome check`, `bunx tsc --noEmit`,
+`bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` pass with the change.
+
+Fresh Chromium proof closed the row. The pre-fix aibrush run in
+`chromium-2026-07-04T17-07-41-510Z.json` measured **12415.135 ms** median over five samples, with samples
+`[12695.695, 19101.220, 12415.135, 11731.250, 11732.885]` ms. The fresh fastest rival proof in
+`chromium-2026-07-04T17-09-44-086Z.json` measured ffmpeg.wasm at **3998.530 ms** median over five samples,
+with samples `[3978.895, 3997.910, 4016.235, 3998.530, 4003.880]` ms. After refreshing the browser
+harness vendor bundle from `dist/`, `chromium-2026-07-04T17-22-40-041Z.json` measured aibrush-media at
+**3610.680 ms** median over five samples, with samples
+`[3633.375, 4907.800, 3534.105, 3524.500, 3610.680]` ms. The run passed `property-invariant` with
+`durationDeltaSec=0`, `durationToleranceSec=0.041666666666666664`, and one audio track. Peak memory was
+**462,048,953** bytes, below the fresh ffmpeg proof's **491,145,940** bytes.
+
+**Rejected:** weakening the `property-invariant` oracle; treating duration-only validation as permission
+to output silence or a synthetic header; returning the source WAV bytes with a modified sample-rate field;
+routing by `edge_longform_audio_resample_16k` or the fixture filename; replacing the public Float64
+resampler with the shorter direct kernel for all callers; using native endianness without a runtime guard;
+hand-rolling a linear interpolator with no anti-alias low-pass; and copying ffmpeg.wasm or competitor
+source code.

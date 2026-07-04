@@ -72,7 +72,7 @@ function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   };
 }
 
-export function parseWavPcmData(bytes: Uint8Array): WavPcmData {
+export function parseWavPcmData(bytes: Uint8Array, totalSize = bytes.byteLength): WavPcmData {
   if (bytes.byteLength < 12 || !tagEquals(bytes, 0, 'RIFF') || !tagEquals(bytes, 8, 'WAVE')) {
     throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
   }
@@ -91,7 +91,7 @@ export function parseWavPcmData(bytes: Uint8Array): WavPcmData {
       fmt = parseFmt(dv, body, size);
     } else if (tagEquals(bytes, pos, 'data')) {
       dataOffset = body;
-      dataSize = Math.min(size, Math.max(0, bytes.byteLength - body));
+      dataSize = Math.min(size, Math.max(0, totalSize - body));
       break;
     }
     pos = body + size + (size & 1); // chunks are word-aligned (padded to even length)
