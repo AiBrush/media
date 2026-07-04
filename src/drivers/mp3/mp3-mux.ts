@@ -54,6 +54,18 @@ interface Mp3MuxTrack {
   firstHeader: Mp3FrameHeader | undefined;
 }
 
+export interface PreparedMp3Packet {
+  readonly data: Uint8Array;
+  readonly ptsUs: number;
+  readonly durationUs?: number;
+  readonly keyframe?: boolean;
+}
+
+export interface PreparedMp3PacketMuxInput {
+  readonly track: TrackInfo;
+  readonly packets: readonly PreparedMp3Packet[];
+}
+
 /** `Muxer` that serializes one MP3 track to a complete `.mp3` elementary stream on {@link finalize}. */
 export class Mp3Muxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
@@ -132,14 +144,7 @@ export class Mp3Muxer implements Muxer {
     if (this.#track === undefined || this.#track.id !== trackId) {
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
     }
-    const run = parseMp3FrameRun(chunk.data);
-    if (run === undefined) {
-      throw new MediaError('mux-error', 'MP3 mux: chunk is not a valid MPEG Layer III audio frame');
-    }
-    this.#track.frameCount += run.frames;
-    this.#track.audioBytes += run.bytes;
-    this.#track.firstHeader ??= run.firstHeader;
-    this.#track.chunks.push(chunk);
+    appendMp3Chunk(this.#track, chunk);
   }
 
   async finalize(): Promise<void> {
@@ -168,6 +173,36 @@ export class Mp3Muxer implements Muxer {
       throw new MediaError('mux-error', 'muxer already finalized');
     }
   }
+}
+
+export function muxPreparedMp3PacketTrack(input: PreparedMp3PacketMuxInput): Uint8Array {
+  const { track: info } = input;
+  if (info.mediaType !== 'audio' || info.codec !== 'mp3') {
+    throw new CapabilityError(
+      'capability-miss',
+      `MP3 container carries a single MP3 audio track, not ${info.mediaType}/${info.codec}`,
+      { op: { op: 'mux' }, tried: ['mp3'] },
+    );
+  }
+  const track: Mp3MuxTrack = {
+    id: 0,
+    chunks: [],
+    frameCount: 0,
+    audioBytes: 0,
+    firstHeader: undefined,
+  };
+  for (const packet of input.packets) {
+    appendMp3Chunk(track, {
+      timestampUs: packet.ptsUs,
+      durationUs: packet.durationUs,
+      key: packet.keyframe ?? true,
+      data: packet.data,
+    });
+  }
+  if (track.chunks.length === 0) {
+    throw new MediaError('mux-error', 'track 0 received no packets');
+  }
+  return assembleMp3(track);
 }
 
 function parseFrameHeader(bytes: Uint8Array, at: number): Mp3FrameHeader | undefined {
@@ -236,6 +271,17 @@ function parseMp3FrameRun(bytes: Uint8Array): Mp3FrameRun | undefined {
   }
   if (firstHeader === undefined || at !== bytes.byteLength) return undefined;
   return { frames, bytes: bytes.byteLength, firstHeader };
+}
+
+function appendMp3Chunk(track: Mp3MuxTrack, chunk: ChunkStruct): void {
+  const run = parseMp3FrameRun(chunk.data);
+  if (run === undefined) {
+    throw new MediaError('mux-error', 'MP3 mux: chunk is not a valid MPEG Layer III audio frame');
+  }
+  track.frameCount += run.frames;
+  track.audioBytes += run.bytes;
+  track.firstHeader ??= run.firstHeader;
+  track.chunks.push(chunk);
 }
 
 function frameLength(version: number, bitrateKbps: number, sampleRate: number): number {

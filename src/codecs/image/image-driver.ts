@@ -37,7 +37,7 @@ export interface ImageOps {
   /** Format from magic bytes, or `undefined` if the bytes are not a supported image. */
   sniff(bytes: Uint8Array): ImageFormat | undefined;
   /** Pure, bit-exact header probe (dimensions/frame count/animated/duration/bit depth/colour/loop). */
-  probe(bytes: Uint8Array): ImageInfo;
+  probe(bytes: Uint8Array): ImageInfo | Promise<ImageInfo>;
   /** Whether the live decode path is available here (a real WebCodecs `ImageDecoder`). */
   canDecode(): boolean;
   /** Decode to a `ReadableStream<VideoFrame>` (consumer closes each frame). Browser-only; typed miss in Node. */

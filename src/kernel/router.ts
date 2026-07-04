@@ -172,12 +172,11 @@ function isTinyFilterSpec(spec: FilterSpec): boolean {
       // tiny/GPU re-ranking is moot — never "tiny" in the video-pixel sense.
       return false;
     default:
-      return spec;
+      return false;
   }
 }
 
-function isTinyCost(cost: RouteCost | undefined): boolean {
-  if (cost === undefined) return false;
+function isTinyCost(cost: RouteCost): boolean {
   return (
     within(cost.inputBytes, TINY_INPUT_BYTES) ||
     within(cost.outputPixels, TINY_VIDEO_PIXELS) ||

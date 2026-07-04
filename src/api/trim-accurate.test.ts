@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import type { Packet } from '../contracts/driver.ts';
 import {
   type TimedFrameForTrim,
+  trimAudioPacketStream,
   trimTimedFrameStream,
   trimVideoEncodeTarget,
 } from './trim-streams.ts';
@@ -56,6 +58,57 @@ async function collect(stream: ReadableStream<FakeFrame>): Promise<FakeFrame[]> 
   }
 }
 
+async function collectPackets(stream: ReadableStream<Packet>): Promise<Packet[]> {
+  const reader = stream.getReader();
+  const out: Packet[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return out;
+    out.push(value);
+  }
+}
+
+class TestEncodedAudioChunk {
+  readonly type: EncodedAudioChunkType;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+
+  constructor(init: EncodedAudioChunkInit) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    const source = init.data;
+    const view = ArrayBuffer.isView(source)
+      ? new Uint8Array(source.buffer as ArrayBufferLike, source.byteOffset, source.byteLength)
+      : new Uint8Array(source as ArrayBufferLike);
+    this.#data = view.slice();
+    this.byteLength = this.#data.byteLength;
+  }
+
+  copyTo(destination: Uint8Array): void {
+    destination.set(this.#data);
+  }
+}
+
+function audioPacket(
+  timestamp: number,
+  duration: number | null,
+  data: readonly number[],
+  extra: Partial<Pick<Packet, 'dtsUs' | 'sizeBytes'>> = {},
+): Packet {
+  return {
+    chunk: new TestEncodedAudioChunk({
+      type: 'key',
+      timestamp,
+      ...(duration !== null ? { duration } : {}),
+      data: new Uint8Array(data),
+    }) as unknown as EncodedAudioChunk,
+    ...extra,
+  };
+}
+
 function restampFake(frame: FakeFrame, timestamp: number, duration: number | null): FakeFrame {
   if (frame.timestamp === timestamp && frame.duration === duration) return frame;
   return new FakeFrame(timestamp, duration, `rebased:${frame.label}`);
@@ -108,6 +161,75 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
         config: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 },
       }),
     ).toEqual({ bitrate: 27_993_600, bitrateMode: 'variable' });
+  });
+
+  it('falls back and clamps the accurate video trim bitrate from real geometry', () => {
+    expect(
+      trimVideoEncodeTarget({
+        id: 1,
+        mediaType: 'video',
+        codec: 'avc1.640028',
+        config: { codec: 'avc1.640028' },
+      }),
+    ).toEqual({ bitrate: 20_000_000, bitrateMode: 'variable' });
+    expect(
+      trimVideoEncodeTarget({
+        id: 2,
+        mediaType: 'video',
+        codec: 'avc1.640028',
+        config: { codec: 'avc1.640028', codedWidth: 2, codedHeight: 2 },
+      }),
+    ).toEqual({ bitrate: 4_000_000, bitrateMode: 'variable' });
+    expect(
+      trimVideoEncodeTarget({
+        id: 3,
+        mediaType: 'video',
+        codec: 'avc1.640028',
+        fps: 120,
+        config: { codec: 'avc1.640028', codedWidth: 8192, codedHeight: 4320 },
+      }),
+    ).toEqual({ bitrate: 50_000_000, bitrateMode: 'variable' });
+  });
+
+  it('packet-copy trims audio packets by overlap and preserves packet metadata', async () => {
+    const originalEncodedAudioChunk = globalThis.EncodedAudioChunk;
+    Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+      configurable: true,
+      value: TestEncodedAudioChunk as unknown as typeof EncodedAudioChunk,
+    });
+    try {
+      const packets = [
+        audioPacket(0, 10, [0]),
+        audioPacket(12, null, [1, 2]),
+        audioPacket(20, 5, [3], { dtsUs: 18.4, sizeBytes: 1 }),
+        audioPacket(40, 5, [4]),
+      ];
+      const source = new ReadableStream<Packet>({
+        start(controller): void {
+          for (const packet of packets) controller.enqueue(packet);
+          controller.close();
+        },
+      });
+
+      const out = await collectPackets(trimAudioPacketStream(source, { startUs: 10, endUs: 30 }));
+
+      expect(out).toHaveLength(2);
+      expect(out.map((packet) => packet.chunk.timestamp)).toEqual([0, 8]);
+      expect(out.map((packet) => packet.chunk.duration)).toEqual([null, 5]);
+      expect(out[0]?.dtsUs).toBeUndefined();
+      expect(out[0]?.sizeBytes).toBeUndefined();
+      expect(out[1]?.dtsUs).toBe(6);
+      expect(out[1]?.sizeBytes).toBe(1);
+    } finally {
+      if (originalEncodedAudioChunk === undefined) {
+        Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+      } else {
+        Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+          configurable: true,
+          value: originalEncodedAudioChunk,
+        });
+      }
+    }
   });
 
   it('closes preroll/end-boundary source frames, stops at end, and rebases kept frames', async () => {
@@ -268,6 +390,25 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     expect(out).toEqual(input);
     expect(input.map((frame) => frame.closeCount)).toEqual([0, 0]);
     expect(source.canceled()).toBe(false);
+
+    for (const frame of out) frame.close();
+    expect(input.map((frame) => frame.closeCount)).toEqual([1, 1]);
+  });
+
+  it('reads through source EOF, preserves null durations, and closes only downstream-owned frames', async () => {
+    const input = [new FakeFrame(0, null), new FakeFrame(40, 40)];
+    const source = fakeFrameStream(input);
+
+    const out = await collect(
+      trimTimedFrameStream(source.stream, { startUs: 0, endUs: 100 }, restampFake),
+    );
+
+    expect(out.map((frame) => [frame.timestamp, frame.duration])).toEqual([
+      [0, null],
+      [40, 40],
+    ]);
+    expect(source.canceled()).toBe(false);
+    expect(input.map((frame) => frame.closeCount)).toEqual([0, 0]);
 
     for (const frame of out) frame.close();
     expect(input.map((frame) => frame.closeCount)).toEqual([1, 1]);

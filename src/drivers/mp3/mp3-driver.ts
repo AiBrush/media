@@ -15,15 +15,19 @@ import {
   type DriverModule,
   type MuxOptions,
   type Packet,
+  type PacketInfoTable,
   type Registry,
   type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { Mp3Muxer } from './mp3-mux.ts';
+import { Mp3Muxer, muxPreparedMp3PacketTrack } from './mp3-mux.ts';
+export { muxPreparedMp3PacketTrack };
+export type { PreparedMp3Packet, PreparedMp3PacketMuxInput } from './mp3-mux.ts';
 
 const MP3_MIMES = new Set(['audio/mpeg', 'audio/mp3', 'audio/mpeg3', 'audio/x-mpeg-3']);
 const MP3_EXTENSIONS = new Set(['mp3']);
+const MP3_PROBE_HEAD_BYTES = 16 * 1024;
 
 // version: 3=MPEG1, 2=MPEG2, 0=MPEG2.5 (1=reserved). Layer III only (the only one MP3 uses in practice).
 const SAMPLE_RATES: Record<number, readonly number[]> = {
@@ -262,6 +266,63 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
   return out;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+}
+
+function isInputError(error: unknown): error is InputError {
+  return error instanceof InputError;
+}
+
+async function readMp3ProbeInfo(
+  src: ByteSource,
+  signal: AbortSignal | undefined,
+): Promise<Mp3Info> {
+  throwIfAborted(signal);
+  if (src.range !== undefined && src.size !== undefined && src.size > 0) {
+    const headLength = Math.min(src.size, MP3_PROBE_HEAD_BYTES);
+    const head = await src.range(0, headLength);
+    throwIfAborted(signal);
+    try {
+      return parseMp3(head, src.size);
+    } catch (error) {
+      if (!isInputError(error) || head.byteLength >= src.size) throw error;
+      const bytes = await readAll(src);
+      throwIfAborted(signal);
+      return parseMp3(bytes, bytes.byteLength);
+    }
+  }
+  const bytes = await readAll(src);
+  throwIfAborted(signal);
+  return parseMp3(bytes, bytes.byteLength);
+}
+
+function mp3TrackInfo(info: Mp3Info): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: 'mp3',
+    durationSec: info.durationSec,
+    config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  };
+}
+
+export function mp3PacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
+  const info = parseMp3(bytes, bytes.byteLength);
+  return {
+    tracks: [mp3TrackInfo(info)],
+    packets: enumerateMp3Packets(bytes).map((frame) => ({
+      trackIndex: 0,
+      offset: frame.offset,
+      size: frame.size,
+      ptsUs: frame.ptsUs,
+      dtsUs: frame.ptsUs,
+      durationUs: frame.durationUs,
+      keyframe: true,
+    })),
+  };
+}
+
 /**
  * Stream a fully-parsed MP3's frames as WebCodecs `EncodedAudioChunk`s. Browser-only: the
  * `EncodedAudioChunk` constructor does not exist in Node, so we raise a typed `CapabilityError` there
@@ -324,19 +385,23 @@ export const Mp3Driver = {
   kind: 'container',
   formats: ['mp3'],
   supports: matches,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const info = await readMp3ProbeInfo(src, o?.signal);
+    throwIfAborted(o?.signal);
+    return [mp3TrackInfo(info)];
+  },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const bytes = await readAll(src);
+    throwIfAborted(o?.signal);
+    return mp3PacketInfoFromBytes(bytes);
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     // Read the whole file once: `packets()` needs every frame, and parsing the full buffer also lets the
     // probe info reflect the real (Xing-counted or byte-summed) duration without a second pass.
     const bytes = await readAll(src);
     const info = parseMp3(bytes, bytes.byteLength);
     const signal = o?.signal;
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: 'mp3',
-      durationSec: info.durationSec,
-      config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
-    };
+    const track = mp3TrackInfo(info);
     return {
       tracks: [track],
       packets(trackId: number): ReadableStream<Packet> {

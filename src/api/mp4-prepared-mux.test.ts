@@ -1,10 +1,14 @@
 import { readFile } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, PacketInfoMetadata } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { fromBytes } from '../sources/source.ts';
-import { mp4PacketInfoFromBytes, muxPreparedMp4PacketTrack } from './mp4-prepared-mux.ts';
+import {
+  mp4PacketInfoFromBytes,
+  mp4PacketInfoFromUrl,
+  muxPreparedMp4PacketTrack,
+} from './mp4-prepared-mux.ts';
 
 const MEDIA_TEST = new URL(
   '../../../media-test/media-browser-test/fixtures/media/',
@@ -13,6 +17,45 @@ const MEDIA_TEST = new URL(
 
 async function mediaTestBytes(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+}
+
+function rangeServer(bytes: Uint8Array): {
+  readonly fetch: typeof fetch;
+  readonly calls: Array<{
+    readonly method: string;
+    readonly range: string | null;
+    readonly bytes: number;
+  }>;
+} {
+  const calls: Array<{ method: string; range: string | null; bytes: number }> = [];
+  const total = bytes.byteLength;
+  const fetchImpl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = init?.headers as { Range?: string } | undefined;
+    const range = headers?.Range ?? null;
+    if (method === 'HEAD') {
+      calls.push({ method, range, bytes: 0 });
+      return new Response(null, { status: 200, headers: { 'Content-Length': String(total) } });
+    }
+    if (range !== null) {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (match === null) return new Response('bad range', { status: 416 });
+      const start = Number(match[1]);
+      const end = Math.min(Number(match[2]) + 1, total);
+      const slice = bytes.subarray(start, Math.max(start, end));
+      calls.push({ method, range, bytes: slice.byteLength });
+      return new Response(slice.slice().buffer, {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${start + slice.byteLength - 1}/${total}` },
+      });
+    }
+    calls.push({ method, range, bytes: total });
+    return new Response(bytes.slice().buffer, {
+      status: 200,
+      headers: { 'Content-Length': String(total) },
+    });
+  }) as typeof fetch;
+  return { fetch: fetchImpl, calls };
 }
 
 function bufferSourceBytes(dst: AllowSharedBufferSource): Uint8Array {
@@ -67,6 +110,12 @@ function packetShape(packet: PacketInfoMetadata): {
 }
 
 describe('prepared MP4 packet mux', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
   it('authors a fresh MP4 from real packet-info offsets and preserves the single sample', async () => {
     if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
     const input = await mediaTestBytes('micro_h264_1frame.mp4');
@@ -131,6 +180,99 @@ describe('prepared MP4 packet mux', () => {
     );
     expect(reparsed.tracks[0]?.codec).toBe(track.codec);
     expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+  });
+
+  it('recovers prepared packet durations when WebCodecs chunks omit duration', async () => {
+    if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    const track = table.tracks[0];
+    const row = table.packets[0];
+    if (track === undefined || row === undefined || row.offset === undefined) {
+      throw new Error('expected one offset-backed source packet');
+    }
+    const data = input.slice(row.offset, row.offset + row.size);
+    const { durationUs: _durationUs, ...rowWithoutDuration } = row;
+    const first: PacketInfoMetadata = {
+      ...rowWithoutDuration,
+      ptsUs: 0,
+      dtsUs: 0,
+      keyframe: true,
+    };
+    const second: PacketInfoMetadata = {
+      ...rowWithoutDuration,
+      ptsUs: 33_333,
+      dtsUs: 33_333,
+      keyframe: false,
+    };
+
+    const output = muxPreparedMp4PacketTrack({
+      track,
+      packets: [
+        encodedChunkView(first, data),
+        {
+          chunk: encodedChunkView(second, data),
+          data,
+          dtsUs: second.dtsUs,
+          sizeBytes: second.size,
+        },
+      ],
+      container: 'mp4',
+      faststart: false,
+    });
+
+    const reparsed = await Mp4Driver.packetInfo(fromBytes(output, { mime: 'video/mp4' }));
+    expect(reparsed.packets).toHaveLength(2);
+    expect(reparsed.packets[0]?.durationUs).toBeGreaterThan(0);
+  });
+
+  it('reads MP4 packet info from URLs through byte ranges without fetching the whole file', async () => {
+    const input = await mediaTestBytes('h264_vfr.mp4');
+    const expected = await mp4PacketInfoFromBytes(input);
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+
+    const table = await mp4PacketInfoFromUrl('https://example.test/h264_vfr.mp4', {
+      mime: 'video/mp4',
+      size: input.byteLength,
+    });
+
+    expect(table.tracks).toEqual(expected.tracks);
+    expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
+    expect(calls).toHaveLength(1);
+    expect(calls.every((call) => call.range !== null)).toBe(true);
+    expect(calls.reduce((sum, call) => sum + call.bytes, 0)).toBeLessThan(input.byteLength);
+  });
+
+  it('reads URL packet info with default MIME, discovered size, and an explicit signal', async () => {
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const expected = await mp4PacketInfoFromBytes(input);
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+    const controller = new AbortController();
+
+    const table = await mp4PacketInfoFromUrl(
+      new URL('https://example.test/micro_h264_1frame.mp4'),
+      { signal: controller.signal },
+    );
+
+    expect(table.tracks).toEqual(expected.tracks);
+    expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
+    expect(calls.some((call) => call.range === 'bytes=0-8191')).toBe(true);
+    expect(calls.some((call) => call.range !== null)).toBe(true);
+  });
+
+  it('reports a typed miss when MP4 packet-info is not registered', async () => {
+    const originalPacketInfo = Mp4Driver.packetInfo;
+    Object.defineProperty(Mp4Driver, 'packetInfo', { configurable: true, value: undefined });
+    try {
+      await expect(mp4PacketInfoFromBytes(new Uint8Array([0]))).rejects.toThrow(CapabilityError);
+    } finally {
+      Object.defineProperty(Mp4Driver, 'packetInfo', {
+        configurable: true,
+        value: originalPacketInfo,
+      });
+    }
   });
 
   it('rejects unsupported prepared MP4 packet mux requests with typed errors', async () => {

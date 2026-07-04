@@ -24,8 +24,6 @@ export interface ChainStep {
 
 type ChainTerminal = 'run' | 'blob' | 'file' | 'stream';
 
-const TERMINALS = new Set<string>(['run', 'blob', 'file', 'stream']);
-
 export function createMediaChain(engine: ChainEngine, input: MediaInput): MediaChain {
   return makeChain(engine, input, []);
 }
@@ -41,12 +39,16 @@ function makeChain(
       get(_target, prop): unknown {
         if (typeof prop !== 'string') return undefined;
         return (...args: readonly unknown[]) =>
-          TERMINALS.has(prop)
-            ? runLazy(engine, input, steps, prop as ChainTerminal, args)
+          isChainTerminal(prop)
+            ? runLazy(engine, input, steps, prop, args)
             : makeChain(engine, input, [...steps, { method: prop, args }]);
       },
     },
   ) as MediaChain;
+}
+
+function isChainTerminal(prop: string): prop is ChainTerminal {
+  return prop === 'run' || prop === 'blob' || prop === 'file' || prop === 'stream';
 }
 
 function runLazy<T>(

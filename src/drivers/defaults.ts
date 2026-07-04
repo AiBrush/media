@@ -5,7 +5,12 @@
  * never part of the eager bundle.
  */
 
-import { ImageModule } from '../codecs/image/image-driver.ts';
+import type {
+  DecodeImageOptions,
+  ImageFormat,
+  ImageInfo,
+  ImageOps,
+} from '../codecs/image/index.ts';
 import { WebCodecsAudioModule } from '../codecs/webcodecs-audio.ts';
 import { WebcodecsVideoModule } from '../codecs/webcodecs-video.ts';
 import type {
@@ -78,16 +83,134 @@ export function registerDefaultDrivers(reg: Registry): void {
     GpuVideoFilterModule,
     AudioDspFilterModule, // audio filters (resample/remix/gain) over AudioData (ADR-033)
     CpuVideoFilterModule, // CPU video filter fallback (no-WebGPU browsers): colorspace/tonemap/geometry (ADR-038)
-    ImageModule, // still/animated image probe + browser ImageDecoder decode capability (ADR-049)
     // All software codec tails now co-vendor their wasm via scripts/vendor-wasm.ts (rust both-files pairs:
     // Vorbis/AAC/MP3 + dav1d AV1; self-contained inlined tails: Opus/VPx) for the lazy import.meta.url load
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
   for (const mod of modules) mod.register(reg);
+  (reg as Registry & { addImageOps?: (ops: ImageOps) => void }).addImageOps?.(lazyImageOps());
   reg.addContainer(lazyMpegTsContainerDriver());
   reg.addContainer(lazyFlacContainerDriver());
   reg.addContainer(lazyAviContainerDriver());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
+}
+
+const IMAGE_FORMATS: readonly ImageFormat[] = ['gif', 'png', 'jpeg', 'webp', 'avif'];
+
+let imageOpsPromise: Promise<ImageOps> | undefined;
+
+function loadImageOps(): Promise<ImageOps> {
+  imageOpsPromise ??= import('../codecs/image/image-driver.ts').then((m) => m.imageOps);
+  return imageOpsPromise;
+}
+
+function lazyImageOps(): ImageOps {
+  return {
+    formats: IMAGE_FORMATS,
+    sniff: sniffImageFormat,
+    probe(bytes: Uint8Array): Promise<ImageInfo> {
+      return loadImageOps().then((ops) => ops.probe(bytes));
+    },
+    canDecode(): boolean {
+      return typeof ImageDecoder !== 'undefined';
+    },
+    decode(bytes: Uint8Array, options?: DecodeImageOptions): ReadableStream<VideoFrame> {
+      let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
+      return new ReadableStream<VideoFrame>(
+        {
+          async pull(controller): Promise<void> {
+            try {
+              reader ??= (await loadImageOps()).decode(bytes, options).getReader();
+              const { done, value } = await reader.read();
+              if (done) {
+                controller.close();
+                return;
+              }
+              try {
+                controller.enqueue(value);
+              } catch (e) {
+                value.close();
+                throw e;
+              }
+            } catch (e) {
+              controller.error(e);
+            }
+          },
+          async cancel(reason): Promise<void> {
+            await reader?.cancel(reason).catch(() => {});
+          },
+        },
+        { highWaterMark: 0 },
+      );
+    },
+    async *decodeFrames(
+      bytes: Uint8Array,
+      options?: DecodeImageOptions,
+    ): AsyncGenerator<VideoFrame, void, undefined> {
+      yield* (await loadImageOps()).decodeFrames(bytes, options);
+    },
+  };
+}
+
+function sniffImageFormat(bytes: Uint8Array): ImageFormat | undefined {
+  if (bytes.byteLength >= 6 && (tag(bytes, 0, 'GIF87a') || tag(bytes, 0, 'GIF89a'))) {
+    return 'gif';
+  }
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return 'png';
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'jpeg';
+  }
+  if (bytes.byteLength >= 12 && tag(bytes, 0, 'RIFF') && tag(bytes, 8, 'WEBP')) {
+    return 'webp';
+  }
+  if (bytes.byteLength >= 12 && tag(bytes, 4, 'ftyp') && hasAvifBrand(bytes)) {
+    return 'avif';
+  }
+  return undefined;
+}
+
+function hasAvifBrand(bytes: Uint8Array): boolean {
+  if (brand(bytes, 8)) return true;
+  const size = u32be(bytes, 0);
+  const end = Math.min(size > 0 ? size : bytes.byteLength, bytes.byteLength);
+  for (let offset = 16; offset + 4 <= end; offset += 4) {
+    if (brand(bytes, offset)) return true;
+  }
+  return false;
+}
+
+function brand(bytes: Uint8Array, offset: number): boolean {
+  return tag(bytes, offset, 'avif') || tag(bytes, offset, 'avis');
+}
+
+function tag(bytes: Uint8Array, offset: number, value: string): boolean {
+  if (offset + value.length > bytes.byteLength) return false;
+  for (let i = 0; i < value.length; i++) {
+    if (bytes[offset + i] !== value.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+function u32be(bytes: Uint8Array, offset: number): number {
+  return (
+    (((bytes[offset] ?? 0) << 24) |
+      ((bytes[offset + 1] ?? 0) << 16) |
+      ((bytes[offset + 2] ?? 0) << 8) |
+      (bytes[offset + 3] ?? 0)) >>>
+    0
+  );
 }
 
 type LazyCodecLoader = () => Promise<CodecDriver>;

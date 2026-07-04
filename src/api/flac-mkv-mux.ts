@@ -8,7 +8,7 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { muxPreparedOggAudioPacketTrack } from '../drivers/ogg/ogg-prepared-mux.ts';
 import type { ChunkStruct as WebmChunkStruct } from '../drivers/webm/ebml-write.ts';
-import { writeWebm } from '../drivers/webm/ebml-write.ts';
+import { webmCodecIdForTrack, writeWebm } from '../drivers/webm/ebml-write.ts';
 import { muxPreparedMp4PacketTrack } from './mp4-prepared-mux.ts';
 import type { Container, PacketStream, PacketStreams } from './types.ts';
 
@@ -21,6 +21,16 @@ interface ReadableStreamLike {
 export interface PreparedWebmAudioPacketMuxInput {
   readonly track: TrackInfo;
   readonly packets: readonly (EncodedChunk | Packet)[];
+  readonly container: Container | string;
+}
+
+export interface PreparedWebmPacketTrackInput {
+  readonly track: TrackInfo;
+  readonly packets: readonly (EncodedChunk | Packet)[];
+}
+
+export interface PreparedWebmPacketMuxInput {
+  readonly tracks: readonly PreparedWebmPacketTrackInput[];
   readonly container: Container | string;
 }
 
@@ -130,6 +140,54 @@ export function muxPreparedWebmAudioPacketTrack(
   const chunks: WebmChunkStruct[] = [];
   for (const packet of input.packets) chunks.push(chunkStructFrom(packet));
   return writePreparedWebmAudioTrack(input.track, codecId, chunks, input.container);
+}
+
+/** Fast WebM/Matroska packet mux for callers that already hold prepared packet bytes. */
+export function muxPreparedWebmPacketTracks(input: PreparedWebmPacketMuxInput): Uint8Array {
+  if (input.container !== 'webm' && input.container !== 'mkv') {
+    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
+      op: { op: 'mux', container: input.container },
+      tried: ['webm', 'mkv'],
+    });
+  }
+  if (input.tracks.length === 0) {
+    throw new MediaError('mux-error', 'WebM mux received no tracks');
+  }
+  const states: WebmTrackState[] = [];
+  for (let i = 0; i < input.tracks.length; i++) {
+    const entry = input.tracks[i];
+    if (entry === undefined) continue;
+    const chunks = packetStructs(entry.packets);
+    if (chunks.length === 0) {
+      throw new MediaError('mux-error', `WebM mux track ${i + 1} received no packets`);
+    }
+    states.push(webmTrackStateFromPreparedTrack(entry.track, i + 1, chunks));
+  }
+  if (states.length === 0) {
+    throw new MediaError('mux-error', 'WebM mux received no tracks');
+  }
+  return writeWebm(states, input.container === 'mkv' ? 'matroska' : 'webm');
+}
+
+/** Fast WebM/Matroska mux for packet-array callers. Stream callers fall back to the general muxer. */
+export async function muxPreparedWebmPacketStreams(
+  streams: PacketStreams,
+  options: MuxOptions & StageOptions,
+): Promise<ReadableStream<Uint8Array> | undefined> {
+  if (options.fragmented === true || !isWebmFamily(options.container)) return undefined;
+  const packetStreams = webmPreparedPacketStreams(streams, options.container);
+  if (packetStreams === undefined) return undefined;
+  const tracks: PreparedWebmPacketTrackInput[] = [];
+  for (const stream of packetStreams) {
+    const packets = await packetValues(stream, options.signal);
+    if (packets.length === 0) {
+      throw new MediaError('mux-error', 'WebM mux received no packets');
+    }
+    tracks.push({ track: stream.track, packets });
+  }
+  return streamFromBytes(
+    muxPreparedWebmPacketTracks({ tracks, container: options.container ?? 'webm' }),
+  );
 }
 
 /** Fast single-track WebM/Matroska audio packet mux for prepared packet callers. */
@@ -290,6 +348,54 @@ function singleWebmAudioStream(
   return codecId === undefined ? undefined : { stream, codecId };
 }
 
+function webmPreparedPacketStreams(
+  streams: PacketStreams,
+  container: string | undefined,
+): PacketStream[] | undefined {
+  const out: PacketStream[] = [];
+  if (streams.video !== undefined) {
+    if (!isWebmPreparedPacketStream(streams.video, 'video', container)) return undefined;
+    out.push(streams.video);
+  }
+  if (streams.audio !== undefined) {
+    if (!isWebmPreparedPacketStream(streams.audio, 'audio', container)) return undefined;
+    out.push(streams.audio);
+  }
+  if (streams.tracks !== undefined) {
+    if (!Array.isArray(streams.tracks)) return undefined;
+    for (const stream of streams.tracks) {
+      if (!isWebmPreparedPacketStream(stream, undefined, container)) return undefined;
+      out.push(stream);
+    }
+  }
+  return out.length === 0 ? undefined : out;
+}
+
+function isWebmPreparedPacketStream(
+  value: unknown,
+  slot: 'video' | 'audio' | undefined,
+  container: string | undefined,
+): value is PacketStream {
+  if (!isPacketStream(value)) return false;
+  if (slot !== undefined && value.track.mediaType !== slot) return false;
+  if (!Array.isArray(value.packetsArray)) return false;
+  return webmCodecId(value.track.mediaType, value.track.codec, container) !== undefined;
+}
+
+function webmCodecId(
+  mediaType: 'video' | 'audio',
+  codec: string,
+  container: string | undefined,
+): string | undefined {
+  if (container !== 'webm' && container !== 'mkv') return undefined;
+  try {
+    return webmCodecIdForTrack(mediaType, codec);
+  } catch (error) {
+    if (error instanceof CapabilityError) return undefined;
+    throw error;
+  }
+}
+
 function webmAudioCodecId(codec: string, container: string | undefined): string | undefined {
   const c = codec.toLowerCase();
   if (c.startsWith('opus')) return 'A_OPUS';
@@ -331,6 +437,52 @@ function writePreparedWebmAudioTrack(
   );
 }
 
+function packetStructs(packets: readonly (EncodedChunk | Packet)[]): WebmChunkStruct[] {
+  const chunks: WebmChunkStruct[] = [];
+  for (const packet of packets) chunks.push(chunkStructFrom(packet));
+  return chunks;
+}
+
+function webmTrackStateFromPreparedTrack(
+  track: TrackInfo,
+  trackNumber: number,
+  chunks: WebmChunkStruct[],
+): WebmTrackState {
+  const config = track.config;
+  const codecPrivate =
+    config?.description === undefined ? undefined : ownedBytes(config.description);
+  if (track.mediaType === 'video') {
+    const videoConfig = config as VideoDecoderConfig | undefined;
+    return {
+      trackNumber,
+      mediaType: 'video',
+      codecId: webmCodecIdForTrack(track.mediaType, track.codec),
+      codecPrivate,
+      width: videoConfig?.codedWidth,
+      height: videoConfig?.codedHeight,
+      fps: track.fps,
+      durationSec: track.durationSec,
+      sampleRate: undefined,
+      channels: undefined,
+      chunks,
+    };
+  }
+  const audioConfig = config as AudioDecoderConfig | undefined;
+  return {
+    trackNumber,
+    mediaType: 'audio',
+    codecId: webmCodecIdForTrack(track.mediaType, track.codec),
+    codecPrivate,
+    width: undefined,
+    height: undefined,
+    fps: undefined,
+    durationSec: track.durationSec,
+    sampleRate: audioConfig?.sampleRate,
+    channels: audioConfig?.numberOfChannels,
+    chunks,
+  };
+}
+
 function flacTrackState(input: PacketStream, chunks: WebmChunkStruct[]): WebmTrackState {
   const config = input.track.config as AudioDecoderConfig | undefined;
   return {
@@ -353,6 +505,7 @@ function chunkStructFrom(value: Packet | EncodedChunk): {
   durationUs: number | undefined;
   key: boolean;
   data: Uint8Array;
+  alpha?: Uint8Array;
   dtsUs?: number;
 } {
   if (isPacket(value)) {
@@ -361,6 +514,7 @@ function chunkStructFrom(value: Packet | EncodedChunk): {
       durationUs: value.chunk.duration ?? undefined,
       key: value.chunk.type === 'key',
       data: packetBytes(value),
+      ...(value.alpha !== undefined ? { alpha: encodedChunkBytes(value.alpha) } : {}),
       ...(value.dtsUs !== undefined ? { dtsUs: value.dtsUs } : {}),
     };
   }

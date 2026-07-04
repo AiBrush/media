@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MediaError } from '../contracts/errors.ts';
 import { type AudioSampleFrameForTrim, trimAudioGaplessFrameStream } from './trim-streams.ts';
 
 class FakeAudioFrame implements AudioSampleFrameForTrim {
@@ -69,6 +70,22 @@ function restampFakeAudioRange(
 }
 
 describe('Session 6 R2 AAC gapless sample-window trimming', () => {
+  it('returns the original frame stream when no gapless windowing is needed', async () => {
+    const input = [new FakeAudioFrame(0, 21_333, 1024, 48_000, 'program')];
+    const source = fakeAudioStream(input);
+
+    const outStream = trimAudioGaplessFrameStream(
+      source.stream,
+      { leadingSamples: 0 },
+      restampFakeAudioRange,
+    );
+    const out = await collect(outStream);
+
+    expect(out).toEqual(input);
+    expect(source.canceled()).toBe(false);
+    expect(input.map((frame) => frame.closeCount)).toEqual([0]);
+  });
+
   it('drops priming, trims trailing padding by samples, rebases timestamps, and closes replaced frames', async () => {
     const input = [
       new FakeAudioFrame(0, 21_333, 1024, 48_000, 'f0'),
@@ -154,5 +171,97 @@ describe('Session 6 R2 AAC gapless sample-window trimming', () => {
 
     out[0]?.close();
     expect(out[0]?.closeCount).toBe(1);
+  });
+
+  it('closes and cancels immediately when the gapless content window is empty', async () => {
+    const input = [new FakeAudioFrame(0, 21_333, 1024, 48_000, 'padding')];
+    const source = fakeAudioStream(input);
+
+    const out = await collect(
+      trimAudioGaplessFrameStream(
+        source.stream,
+        { leadingSamples: 0, totalSamples: 0 },
+        restampFakeAudioRange,
+      ),
+    );
+
+    expect(out).toEqual([]);
+    expect(input[0]?.closeCount).toBe(1);
+    expect(source.canceled()).toBe(false);
+  });
+
+  it('supports open-ended gapless content and closes naturally at source EOF', async () => {
+    const input = [
+      new FakeAudioFrame(0, 21_333, 1024, 48_000, 'priming'),
+      new FakeAudioFrame(21_333, 21_333, 1024, 48_000, 'program'),
+    ];
+    const source = fakeAudioStream(input);
+
+    const out = await collect(
+      trimAudioGaplessFrameStream(source.stream, { leadingSamples: 1024 }, restampFakeAudioRange),
+    );
+
+    expect(out.map((frame) => [frame.label, frame.timestamp, frame.numberOfFrames])).toEqual([
+      ['program:0+1024', 0, 1024],
+    ]);
+    expect(input.map((frame) => frame.closeCount)).toEqual([1, 1]);
+    expect(source.canceled()).toBe(false);
+
+    out[0]?.close();
+    expect(out[0]?.closeCount).toBe(1);
+  });
+
+  it('keeps zero-rate audio timestamps deterministic while sample-windowing', async () => {
+    const input = [new FakeAudioFrame(0, null, 4, 0, 'a'), new FakeAudioFrame(0, null, 4, 0, 'b')];
+    const source = fakeAudioStream(input);
+
+    const out = await collect(
+      trimAudioGaplessFrameStream(
+        source.stream,
+        { leadingSamples: 2, totalSamples: 4 },
+        restampFakeAudioRange,
+      ),
+    );
+
+    expect(out.map((frame) => [frame.label, frame.timestamp, frame.numberOfFrames])).toEqual([
+      ['a:2+2', 0, 2],
+      ['b:0+2', 0, 2],
+    ]);
+  });
+
+  it('closes the source frame and cancels upstream if gapless restamping fails', async () => {
+    const input = [
+      new FakeAudioFrame(0, 21_333, 1024, 48_000, 'program'),
+      new FakeAudioFrame(21_333, 21_333, 1024, 48_000, 'unused'),
+    ];
+    const source = fakeAudioStream(input);
+    const boom = new Error('audio restamp failed');
+    const trimmed = trimAudioGaplessFrameStream(source.stream, { totalSamples: 1024 }, () => {
+      throw boom;
+    });
+
+    await expect(trimmed.getReader().read()).rejects.toThrow('audio restamp failed');
+    expect(input[0]?.closeCount).toBe(1);
+    expect(input[1]?.closeCount).toBe(0);
+    expect(source.canceled()).toBe(true);
+  });
+
+  it('rejects non-finite and negative gapless sample counts with typed errors', () => {
+    const source = fakeAudioStream([new FakeAudioFrame(0, 21_333, 1024, 48_000, 'program')]);
+
+    expect(() =>
+      trimAudioGaplessFrameStream(
+        source.stream,
+        { leadingSamples: -1, totalSamples: 1024 },
+        restampFakeAudioRange,
+      ),
+    ).toThrow(MediaError);
+    expect(() =>
+      trimAudioGaplessFrameStream(
+        fakeAudioStream([new FakeAudioFrame(0, 21_333, 1024, 48_000, 'program')]).stream,
+        { leadingSamples: 0, totalSamples: Number.POSITIVE_INFINITY },
+        restampFakeAudioRange,
+      ),
+    ).toThrow(/gapless totalSamples/);
   });
 });

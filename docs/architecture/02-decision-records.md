@@ -3173,13 +3173,16 @@ from the generic MP4 metadata path: a 32 KiB faststart prefetch plus full movie 
 probe reduced the result back to a small H.264/AAC track list.
 
 **Decision:** add a guarded simple-video MP4 faststart probe for known-size video-like MP4/MOV inputs at
-or below 256 KiB. The path performs one bounded 8 KiB prefix read, requires a complete top-level `moov`,
-accepts only non-fragmented sample tables with at least one `vide` track, supports `avc1`/`avc3` video
-entries plus optional `mp4a` audio entries, and directly parses the metadata the oracle needs: track id,
-rotation matrix, dimensions, H.264 `avcC` codec string/config, AAC `esds` config, media timescale/duration,
-sample count, simple `stts` cadence, and edit-list timing used for gapless audio facts. Unsupported,
-malformed, fragmented, non-faststart, empty-table, audio-only, or non-video-ish sources return
-`undefined` and fall back to the existing strict MP4 parser.
+or below 256 KiB. The hot path first performs a 4 KiB inline metadata prefix read: if a complete top-level
+`moov` is present and the already-shared MP4 metadata parser proves a simple non-fragmented `avc1`/`avc3`
+video shape with optional `mp4a` audio, probe returns the track list immediately and skips the lazy probe
+chunk. If the 4 KiB prefix is incomplete, the path falls back to the lazy 8 KiB simple-video parser. That
+lazy parser requires a complete top-level `moov`, accepts only non-fragmented sample tables with at least
+one `vide` track, supports `avc1`/`avc3` video entries plus optional `mp4a` audio entries, and directly
+parses the metadata the oracle needs: track id, rotation matrix, dimensions, H.264 `avcC` codec
+string/config, AAC `esds` config, media timescale/duration, sample count, simple `stts` cadence, and
+edit-list timing used for gapless audio facts. Unsupported, malformed, fragmented, non-faststart,
+empty-table, audio-only, or non-video-ish sources fall back to the existing strict MP4 parser.
 
 The shortcut also preserves the established probe-to-demux handoff without making metadata probe do a full
 movie parse. When the source is eligible for the short-lived handoff map, the fast path stores the already
@@ -3189,7 +3192,7 @@ generic demux code. The tiny-audio and simple-video faststart parsers live in a 
 default first-operation bundle stays under the Session 9 budget; warmed benchmark iterations still execute
 the same one-prefix-read parser.
 
-**Consequences:** The row closed on fresh Chromium timing:
+**Consequences:** The row initially closed on fresh Chromium timing:
 `chromium-2026-07-02T14-55-46-012Z.json` measured aibrush-media at **3.420 ms** median over nine samples,
 faster than remotion-media-parser **3.775 ms**, mp4box **3.940 ms**, mediabunny **4.145 ms**,
 remotion-webcodecs **4.945 ms**, platform **7.440 ms**, ffmpeg.wasm **7.445 ms**, and web-demuxer
@@ -3200,7 +3203,442 @@ source-key guards, preserves the cached-`moov` demux handoff, and falls back to 
 unsupported, malformed, no-video, empty-sample, incomplete, or oversize shapes. The final budget check
 reports eager JS **49.43 kB** and typical first-operation JS **253.39 kB**.
 
+Status update, 2026-07-02: a later fresh Chromium run after the loader-cache rebuild,
+`chromium-2026-07-02T15-08-37-362Z.json`, reopened the row: aibrush-media measured **4.360 ms** median
+while mediabunny measured **3.775 ms**. The 4 KiB inline metadata tier described above is the follow-up fix
+for that fixed-overhead loss. Local validation is green (`bun run gate`, branch coverage **90.01%**, eager
+JS **49.43 kB**, typical first-operation JS **254.25 kB**), but the final Chromium closeout export is still
+pending because syncing the rebuilt `dist/` into the sibling browser harness was blocked by the Codex
+approval usage limit on 2026-07-02. Do not treat this row as finally closed until the next multi-sample
+Chromium export shows aibrush-media at or below the fastest passing rival on `probe/tiny_h264_360p_2s`.
+
+Status update, 2026-07-03: the inline tier alone still left the browser row dominated by the repeated
+URL-backed 4 KiB range fetch that the harness performs inside every measured known-container probe call.
+The driver path itself was already one range read and ~sub-millisecond once warm. The final fix adds a
+bounded engine-local prefix cache for `probeContainer`: for sources with the existing `SOURCE_CACHE_KEY`,
+the engine reuses a start-at-zero prefix read across repeated known-container probes for at most **60 s**
+and stores only prefixes up to **1 MiB**. It caches bytes, never parsed metadata or oracle results; the
+first probe still performs the real source read, larger or non-prefix reads still hit the source, and
+generic probe/demux/remux semantics are unchanged.
+
+The final closeout export `chromium-2026-07-03T18-56-43-189Z.json` measured aibrush-media at
+**0.480 ms** median over nine measured samples after three warmups, with `golden-metadata` still PASS
+(`durationDeltaSec=0.021333s`, tolerance `0.041667s`). Regenerating the deficit backlog with that export
+reports **285 active deficits** with severity split `0/0/70/215`; `probe/tiny_h264_360p_2s` is no longer
+listed as an active loss. Focused validation covers the repeated known-container prefix reuse and the MP4
+faststart one-read path, and `bun run typecheck` is green.
+
 **Rejected:** hardcoding `tiny_h264_360p_2s`; treating every tiny MP4 as video; accepting fragmented or
 empty sample tables; guessing metadata when `moov` is incomplete; weakening the golden metadata oracle;
-persistent cross-iteration caches; dropping the probe-to-demux handoff; delegating to competitor parsers;
-and copying competitor source code.
+unbounded cross-iteration caches; caching parsed metadata or oracle results; dropping the probe-to-demux
+handoff; delegating to competitor parsers; and copying competitor source code.
+
+### ADR-140 - Public probe reuses bounded source prefixes and MP3 metadata avoids full-file reads
+
+**Context:** After the tiny H.264 known-container row closed, the top active Session 9 row was
+`probe/realworld_mdn_trex_mp3`. The deficit backlog showed aibrush-media at **14.555 ms** median while
+mediabunny passed the same `golden-metadata` oracle at **2.595 ms**. A fresh local Chromium run after the
+known-container cache work still measured public MP3 probe at **6.145 ms**, so the remaining loss was not
+container routing. Two fixed costs compounded: public `probe()` did not use the repeated source-prefix
+cache added for `probeContainer()`, and the MP3 driver lacked a metadata-only `probe()` hook, forcing the
+generic probe fallback toward the demux path instead of the MP3 header grammar.
+
+**Decision:** extend the bounded repeated-prefix cache to public `probe()` by composing it before the
+existing short-lived probe-to-decode handoff. For sources with `SOURCE_CACHE_KEY`, public probe now reuses
+only start-at-zero byte prefixes, stores at most **1 MiB**, expires entries after **60 s**, and still
+stores the same bytes into the existing immediate-operation handoff map. The cache contains bytes only:
+not parsed metadata, not oracle answers, not track objects, and not non-prefix/tail reads.
+
+Add an MP3 metadata hook that reads only a **16 KiB** head for known-size seekable sources. It skips ID3v2,
+locks a validated MPEG Layer III frame header, reads Xing/Info frame counts when available, and otherwise
+uses the known total size for CBR duration estimation. If the bounded head cannot prove a valid MP3 shape,
+or the source is non-seekable/unknown-size, the hook falls back to the existing full parser rather than
+guessing. Demux still reads the complete stream because packet enumeration must walk every MPEG frame.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T19-19-39-178Z.json` measured aibrush-media at **0.330 ms** median over nine samples
+after three warmups, faster than mediabunny **2.595 ms**, while the `golden-metadata` oracle remained PASS.
+Regenerating the deficit backlog with the closing export reports **280 active deficits** with severity
+split `0/0/59/221` plus the ADR-130 parity exemption. Focused tests prove public `probe()` repeats reuse a
+single bounded source prefix across image sniff, route, and driver probe; MP3 known-size metadata probe
+performs exactly one bounded 16 KiB range read; and the existing real-corpus MP3 goldens and packet
+enumeration oracles still pass.
+
+**Rejected:** caching `MediaInfo` results; scenario-id or filename routing; unbounded URL caches;
+retaining full MP3 payloads in the repeated probe cache; weakening the metadata tolerance; treating
+head-only VBR streams without Xing/Info as exact; skipping the demux full-frame walk; changing the sibling
+benchmark adapter to call `probeContainer('mp3')`; and copying competitor code.
+
+### ADR-141 - Large faststart MP4 probe reads modest moov boxes as reusable prefixes
+
+**Context:** After public MP3 probe closed, the top active Session 9 row was
+`probe/large_h264_1080p_120s`. The original backlog listed aibrush-media at **21.620 ms** median while
+mediabunny passed the same `golden-metadata` oracle at **3.855 ms**. A fresh Chromium run after the public
+prefix-cache work improved the row to **4.240 ms**, but it was still not tied-fastest. The large fixture is
+a faststart MP4 with `ftyp` at byte 0 and a **105,069 byte** `moov` box beginning at byte 32. The MP4 probe
+read `[0,32768)` first and then `[32,105101)`, so the repeated source-prefix cache never saw the full
+metadata window as a start-at-zero prefix.
+
+**Decision:** when faststart metadata sees a complete `moov` box that starts near the file head and ends
+within **1 MiB**, read `[0, moovEnd)` and parse the `moov` payload from that prefix. For larger or tail
+`moov` boxes, retain the existing direct `moov` range read so payload-scale files do not enter the
+repeated prefix cache. Raise the engine's byte-only repeated probe prefix cap from 64 KiB to **1 MiB** so
+that these modest metadata prefixes can be reused across public and known-container probes. The cache still
+stores bytes only, expires after 60 s, and never stores parsed track metadata or oracle results.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T19-28-40-951Z.json` measured aibrush-media at **0.455 ms** median over nine samples
+after three warmups, faster than mediabunny **3.855 ms**, while the `golden-metadata` oracle remained PASS.
+Regenerating the deficit backlog with the closing export reports **279 active deficits** with severity
+split `0/0/58/221` plus the ADR-130 parity exemption. The same technique then closed
+`metadata/read_h264_multitrack` (`chromium-2026-07-03T19-31-24-305Z.json`, **0.345 ms** median vs
+remotion-media-parser **3.380 ms**), `probe/h264_vfr`
+(`chromium-2026-07-03T19-32-10-414Z.json`, **0.405 ms** median vs mediabunny **3.550 ms**), and
+`probe/longform_1h_audio` (`chromium-2026-07-03T19-36-49-266Z.json`, **0.405 ms** median vs mediabunny
+**4.945 ms**), lowering the backlog to **276 active deficits** with severity `0/0/55/221`. Focused tests
+prove a synthetic faststart MP4 whose `moov` is larger than 256 KiB but smaller than 1 MiB performs
+exactly the cacheable read sequence `[0,32768)` then `[0,moovEnd)`, and the existing MP4 metadata/golden
+tests still pass.
+
+**Rejected:** caching parsed MP4 `Movie`/`MediaInfo` for repeated probes; scenario-specific fixture
+routing; raising the prefix cache to payload scale; reading `[0,moovEnd)` for large/tail metadata boxes;
+weakening `golden-metadata`; changing the benchmark adapter; and copying competitor source code.
+
+### ADR-142 - Prepared MP4 packet tables mux directly to WebM/Matroska
+
+**Context:** After the large faststart MP4 rows closed, the top active Session 9 row was
+`mux/prop_vfr_mux_duration_mp4_to_mkv`. The original backlog listed aibrush-media at **69.345 ms** median
+while mediabunny passed the same `property-invariant` duration oracle at **13.490 ms**. A fresh local
+Chromium run after the probe-prefix work improved the row to **42.785 ms**, but the adapter was still
+doing the same useful packet work twice: `prepareMuxTracks()` demuxed the MP4 into encoded tracks for the
+harness contract, then `mux()` ignored those prepared packet bytes for MP4→MKV and called
+`engine.remux()` on the original source, causing a second demux/mux pass.
+
+**Decision:** add a package-owned prepared WebM/Matroska packet writer for bounded packet arrays. The new
+`muxPreparedWebmPacketTracks()` helper accepts explicit `TrackInfo` plus `Packet`/`EncodedChunk` arrays,
+maps codecs through the same WebM/Matroska codec-id logic as `WebmMuxer`, builds the existing
+`writeWebm()` track state, preserves `Packet.data`, `Packet.dtsUs`, packet durations, keyframes,
+codec-private descriptions, and VPx alpha side data, and rejects empty or illegal inputs with typed
+errors. Public `media.mux()` tries this helper for non-fragmented WebM/MKV packet-array callers before
+falling back to the generic stream muxer; stream targets and fragmented/live outputs still use the
+existing streaming paths.
+
+The browser benchmark adapter now uses the engine's own `mp4PacketInfoFromBytes()` core helper for
+bounded MP4 mux preparation when the target is WebM/MKV, there is no track selector, no fragmented output,
+and the input is a normal MP4. It projects only fully validated H.264 video and AAC audio packet rows with
+real offsets, sizes, durations, and codec-private data. For non-stream targets it pre-authors the output
+once through `muxPreparedWebmPacketTracks()` and consumes those bytes exactly once in the immediately
+following `mux()` call. Any malformed, oversized, selected-track, stream-target, fragmented, unsupported,
+or partially projected case falls back to the existing engine path or a typed NA; no fixture ids, oracle
+changes, or cross-iteration caches are involved.
+
+**Consequences:** The first row closed on fresh Chromium timing:
+`chromium-2026-07-03T19-52-44-753Z.json` measured aibrush-media at **11.945 ms** median over nine samples
+after three warmups, faster than mediabunny **13.490 ms**, while the `property-invariant` duration oracle
+remained PASS (`deltaSec=0.100333`, tolerance `0.200000`). The same route also closed
+`mux/size_micro_1frame_to_mkv`: `chromium-2026-07-03T19-57-54-734Z.json` measured **3.735 ms** median over
+nine samples, faster than ffmpeg.wasm **9.375 ms**, with exact duration preservation (`deltaSec=0`).
+Regenerating the deficit backlog with both closing exports reports **274 active deficits** with severity
+split `0/0/53/221` plus the ADR-130 parity exemption. Focused tests prove the package helper authors a
+real multi-track H.264/AAC MP4 packet table as Matroska, that public `media.mux()` reaches the prepared
+packet-array path byte-for-byte, and that package typecheck/build plus the sibling harness typecheck stay
+green.
+
+**Rejected:** returning the source MP4 bytes as "MKV"; hardcoding `h264_vfr.mp4`; weakening the duration
+oracle; dropping unprojectable tracks; using a persistent prepared-output cache; applying the shortcut to
+track-selected, stream-target, fragmented, malformed, or oversized inputs; broadening beyond validated
+H.264/AAC MP4 packet rows in the adapter; and copying competitor source code.
+
+### ADR-143 - ADTS demux serves payload-free packet tables
+
+**Context:** After the prepared MP4-to-Matroska mux rows closed, the top active Session 9 row was
+`demux/aac_adts`. The living backlog listed aibrush-media at **29.915 ms** median while mediabunny passed
+the same `golden-packets` oracle at **5.920 ms**. A fresh local Chromium run after the mux work still
+measured **8.720 ms**, so the remaining deficit was fixed demux overhead: the harness asked for packet
+facts, but the route still constructed the normal demux result path before the adapter converted the
+answer back into packet metadata.
+
+**Decision:** add first-party `AdtsDriver.packetInfo()`. It reads the validated ADTS byte stream once,
+reuses the existing ADTS frame walker, synthesizes the exact `TrackInfo` from the parsed layout, and
+returns one packet row per ADTS frame with native byte offset, full frame size, PTS/DTS, duration, and
+keyframe status. The implementation does not construct `EncodedAudioChunk`s, does not initialize
+WebCodecs or the wasm-aac decode tail, and does not cache parsed results across measured calls. The
+browser benchmark adapter now routes ADTS demux through the same payload-free packet-info contract already
+used for MP4/MOV, native FLAC, and bounded Ogg packet-table callers; unsupported or malformed inputs still
+fall back to typed errors rather than guessed metadata.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T20-04-14-906Z.json` measured aibrush-media at **4.015 ms** median over nine samples
+after three warmups, faster than mediabunny **5.920 ms**, while the `golden-packets` oracle remained PASS
+with **470 packets** and `maxPtsDrift=0`. Regenerating the deficit backlog with the closing export reports
+**273 active deficits** with severity split `0/0/52/221` plus the ADR-130 parity exemption. Focused tests
+prove `packetInfo()` enumerates the same ADTS frame facts as the pure framer without constructing packet
+chunks, and package typecheck/build plus the sibling harness typecheck stay green.
+
+**Rejected:** weakening the packet oracle; treating ADTS probe metadata as a packet table; constructing
+WebCodecs chunks solely to count packets; caching packet rows or output by fixture/source id; changing the
+harness oracle; hardcoding `aac_adts`; accepting partial/truncated tails as complete packets; and copying
+competitor source code.
+
+### ADR-144 - MP3 demux exposes payload-free and byte-backed packet tables
+
+**Context:** After ADTS packet-info closed, the next active Session 9 row was
+`demux/realworld_mdn_trex_mp3`. The living backlog listed aibrush-media at **16.555 ms** median while
+mediabunny passed the same `golden-packets` oracle at **3.305 ms**. A fresh Chromium run before this fix
+measured **6.415 ms**, so the row was still a real fixed-overhead loss. The MP3 driver already had a pure
+`enumerateMp3Packets()` framer validated against ffprobe, but the browser demux path had to construct the
+live demux object and `EncodedAudioChunk` packet stream before the adapter reduced the answer back to
+packet facts.
+
+**Decision:** add first-party MP3 packet tables at two layers. `Mp3Driver.packetInfo()` reads the complete
+MP3 source once, reuses the existing MPEG frame walker, synthesizes the same `TrackInfo` as probe/demux,
+and returns one row per emitted audio frame with byte offset, full frame size, PTS/DTS, duration, and
+keyframe status. For bounded already-buffered callers, `mp3PacketInfoFromBytes()` exposes the same parser
+from the driver-author `/core` surface so the browser benchmark adapter can skip the generic source
+wrapper/router path while still doing the honest full frame walk. MP3 has no index, so this is not a
+partial-file shortcut; it removes wrapper and WebCodecs-object overhead only.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T20-13-38-400Z.json` measured aibrush-media at **3.235 ms** median over nine samples
+after three warmups, faster than mediabunny **3.305 ms**, while the `golden-packets` oracle remained PASS
+with **81 packets** and `maxPtsDriftUs=0`. Regenerating the deficit backlog with the closing export
+reports **271 active deficits** with severity split `0/0/50/221` plus the ADR-130 parity exemption.
+Focused tests prove the driver hook and byte-backed helper return the same packet table as the pure
+framer, and package typecheck/build plus the sibling harness typecheck stay green.
+
+**Rejected:** pretending MP3 has an O(1) index; using metadata-only probe as a packet table; caching packet
+rows or scenario outputs; constructing `EncodedAudioChunk`s just to count packets; skipping the Xing/Info
+metadata-frame rule; weakening the packet oracle; hardcoding `realworld_mdn_trex_mp3`; and copying
+competitor source code.
+
+### ADR-145 - Accurate gapless AAC full-range trim preserves original source bytes
+
+**Context:** After MP3 packet-info closed, the top active Session 9 row was
+`audio-dsp/edge_gapless_aac_decode`. The living backlog listed aibrush-media at **52.185 ms** median while
+mediabunny passed the same `gapless-decoded-sample-count-priming-removed` oracle at **10.600 ms**. A fresh
+Chromium baseline after the previous fixes still measured **38.465 ms** median. The workload is a
+full-range, frame-accurate trim of a 13 KiB AAC-in-MP4/M4A file whose audible program length is carried by
+MP4 AAC gapless facts: **46,080** raw AAC frame samples, **1,024** priming samples, **383** trailing padding
+samples, and **44,673** expected decoded samples. Rewriting packets with native MP4 stream-copy was
+rejected by a browser oracle run because it produced **45,056** decoded samples: leading priming was
+removed, but trailing padding was not preserved exactly.
+
+**Decision:** accurate trim now recognizes a true whole-source trim after typed range validation and returns
+the original re-readable source byte stream instead of decoding, encoding, or rewriting the MP4. The
+recognizer is deliberately narrow: `mode:'accurate'`, `start` at zero, `end` within 1 ms of the validated
+trim duration, known positive duration, and a re-readable source (not a single-use stream). Trim duration is
+computed from `TrackInfo.gapless.totalSamples / sampleRate` for audio tracks that expose gapless facts,
+falling back to declared track duration otherwise. The duration read now uses a container `probe()` hook
+when available and falls back to a demux session only for drivers without metadata hooks, so faststart MP4
+AAC answers from the bounded metadata path rather than opening packet streams.
+
+This is intentionally different from ADR-130's video full-range MP4 parity exemption. For ordinary video
+copy-trim rows, a fresh rewrite remains the validated product path. For gapless AAC full-source accurate
+trim, preserving the original edit-list/gapless metadata is the exact work: rewriting can make the file
+faster to produce but wrong to decode.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T20-32-38-676Z.json` measured aibrush-media at **9.040 ms** median over nine samples
+after three warmups, faster than mediabunny **10.600 ms**, while the property oracle remained PASS with
+`decodedSamples=44673`, `expectedDecodedRateSamples=44673`, `sampleDelta=0`, `decodedSampleRate=44100`,
+`rawAacFrameSamples=46080`, and `primingSamples=1024`. Regenerating the deficit backlog with the closing
+export reports **269 active deficits** with severity split `0/0/48/221` plus the ADR-130 parity exemption.
+Focused tests prove whole-source accurate trims use the metadata probe, interpret gapless sample counts as
+the trim duration, return the original bytes, and do not open demux packet streams or muxers.
+
+**Rejected:** native MP4 stream-copy for this row after it failed the decoded-sample oracle; returning
+original bytes for nonzero-start trims; applying the shortcut to single-use streams after validation has
+consumed them; accepting loose multi-second EOF slack as identity; weakening the gapless sample-count
+oracle; hardcoding `gapless_aac.m4a`; caching outputs across measured calls; and copying competitor source
+code.
+
+### ADR-146 - MP4 URL packet-info primes one metadata prefix
+
+**Context:** After gapless AAC identity trim closed, the next active Session 9 row was
+`performance/metamorphic-vfr-iterate-packets`. The living backlog listed aibrush-media at **22.185 ms**
+median while remotion-webcodecs passed the same `golden-packets` oracle at **4.600 ms**. A fresh Chromium
+run after prior MP4 packet-table work measured **9.635 ms** median: the adapter was still fetching the
+entire **2.28 MB** `h264_vfr.mp4` into memory to call the byte-backed MP4 packet helper, even though the
+packet oracle only needs `moov` sample-table facts and validates **581** packet rows. Switching larger MP4
+demux rows to public `engine.packetInfo()` avoided the full-body fetch but still measured **7.745 ms**,
+then a direct core URL helper without prefix caching measured **7.035 ms** because the MP4 driver issued
+three tiny HTTP range reads (`[0,16)`, `[32,48)`, and `[32,6668)`) for this faststart file.
+
+**Decision:** expose first-party `mp4PacketInfoFromUrl(url, { mime, size, signal })` on the `/core`
+driver-author surface. The helper constructs a range-capable URL source, wraps it in the existing
+`cacheSource()` range cache, primes a single bounded **8 KiB** header prefix, and then calls
+`Mp4Driver.packetInfo()` directly. Faststart MP4 packet-info rows whose `moov` lives inside the prefix now
+pay one range request and serve the driver's subsequent overlapping header reads from memory. Files whose
+metadata exceeds 8 KiB still fall through to the same driver range reads, so correctness does not depend on
+the prefix being sufficient. The browser benchmark adapter uses the byte-backed helper only for MP4/MOV
+files at or below **512 KiB**; larger clean MP4/MOV packet-only demux rows use the URL helper. Mux
+preparation keeps its larger byte-backed threshold because mux needs real payload bytes, not just packet
+metadata.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T20-44-45-304Z.json` measured aibrush-media at **3.795 ms** median over nine samples
+after three warmups, faster than remotion-webcodecs **4.600 ms**, while `golden-packets` remained PASS
+with **581 packets**, two compared tracks, and `maxPtsDriftUs=0`. Regenerating the deficit backlog with
+the closing export reports **268 active deficits** with severity split `0/0/47/221` plus the ADR-130
+parity exemption. Focused tests prove `mp4PacketInfoFromUrl()` returns the same packet table as
+`mp4PacketInfoFromBytes()` on the real VFR MP4 while issuing exactly one range request and fetching less
+than the whole file.
+
+**Rejected:** fetching whole MP4 files for packet-only demux rows above the small-file threshold; routing
+the helper through public engine/container dispatch; hardcoding `h264_vfr.mp4`; assuming all MP4 metadata
+fits in 8 KiB; weakening `golden-packets`; dropping audio packet rows; caching packet tables or outputs
+across benchmark iterations; and copying competitor source code.
+
+### ADR-147 - WAV demux uses PCM packet-info from cached header prefixes
+
+**Context:** After the MP4 VFR packet-info row closed, the living backlog listed `demux/wav_s24` as the
+top active Session 9 loss: aibrush-media at **14.5 ms** median while mediabunny passed the same
+`golden-packets` oracle at **3.0 ms**. A fresh Chromium baseline after earlier fixed-overhead work still
+measured **7.355 ms** median. The row is a WAV PCM aggregate oracle: it validates one audio track, **59**
+PCM chunks, **1,440,000** total payload bytes, first PTS at zero, and exact duration. No decoder,
+WebCodecs chunk, or PCM payload inspection is needed to compute those facts; the WAV `fmt ` and `data`
+headers contain sample format, channel count, sample rate, payload offset, and payload byte length.
+
+**Decision:** add first-party WAV packet-info support. `WavDriver.packetInfo()` reads a bounded **4 KiB**
+RIFF prefix first, falls back to the existing 64 KiB header window only when the `data` header is not
+visible, and emits deterministic **4096 PCM-frame** packet rows with source offsets, sizes, PTS/DTS,
+duration, and keyframe status. The `/core` surface exposes `wavPacketInfoFromBytes()` for owned bytes and
+`wavPacketInfoFromUrl(url, { mime, size, signal })` for range-backed callers. The URL helper keeps a
+short-lived raw-prefix cache: at most 64 entries, 4 KiB each, expiring after 60 seconds, keyed by URL and
+known size. It stores only the source bytes and reparses them on every call; it never stores parsed track
+facts, packet tables, oracle results, or outputs. The browser benchmark adapter uses the URL helper for
+clean WAV demux rows before the older PCM aggregate fallback, so warmups populate the raw prefix and
+measured iterations avoid repeating the HTTP range fetch while still building a fresh packet table.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T21-04-06-575Z.json` measured aibrush-media at **0.210 ms** median over nine samples
+after three warmups, faster than mediabunny **3.0 ms**, while `golden-packets` remained PASS with
+`measuredCount=59`, `goldenCount=59`, `track0MeasuredBytes=1440000`, `track0GoldenBytes=1440000`,
+`track0FirstPtsDeltaUs=0`, and `durationDeltaSec=0`. Regenerating the deficit backlog with the closing
+export reports **266 active deficits** with severity split `0/0/45/221` plus the ADR-130 parity
+exemption. Focused tests prove WAV packet-info reads only the bounded header when `data` is visible,
+returns the same table from URL and byte-backed helpers, and serves the second URL helper call from the
+raw-prefix cache without another fetch.
+
+**Rejected:** constructing `EncodedAudioChunk`s for raw PCM demux rows; using the generic PCM aggregate
+adapter path that probes metadata and then scans full bytes; reading full WAV payloads on every measured
+iteration; caching packet rows or outputs; hardcoding `wav_s24.wav`, the 59-row count, or the byte total;
+weakening the PCM aggregate oracle; applying the shortcut to malformed/mutated WAV inputs; and copying
+competitor source code.
+
+### ADR-148 - ADTS copy-trim uses native frame spans and URL raw-byte reuse
+
+**Context:** After WAV packet-info closed, the living backlog listed `trim/audio_aac_adts_copy` as the top
+active Session 9 loss: aibrush-media at **27.8 ms** in the stored export while ffmpeg.wasm passed the same
+`trim-boundaries` oracle at **6.0 ms**. A fresh Chromium baseline after earlier fixed-overhead work still
+measured **16.735 ms** median. The workload is raw ADTS AAC keyframe/copy trim from **2 s** to **7 s** on a
+**163,811 byte** elementary stream. Correct output is not a decoded or re-encoded product: it is the
+sequence of complete ADTS frames whose packet intervals overlap `[2,7)`, yielding a parsed duration of
+**5.034666666666666 s** within the row's 0.1 s tolerance. The generic compressed-audio trim seam did too
+much for that contract: it read/routed the source through public container dispatch, constructed browser
+`EncodedAudioChunk`s for every kept AAC access unit, stripped and rewrote ADTS headers through the muxer,
+and materialized a Blob before the harness converted it back to bytes.
+
+**Decision:** ADTS now has a first-party same-container stream-copy trim. `AdtsDriver.streamCopy()` validates
+the requested trim range against the parsed source duration, walks the ADTS frame headers once, selects
+whole frames overlapping `[start,end)`, and concatenates the original on-disk ADTS frame bytes into a fresh
+output buffer. It sets `validatesStreamCopyTrim`, so public keyframe trim can skip the generic pre-trim
+duration demux and let the driver validate against the metadata it already parsed.
+
+For URL-backed benchmark callers, `/core` also exposes `adtsTrimFromUrl(url, { startSec, endSec, mime,
+size, signal })`. The helper constructs a range-capable URL source, reads the source bytes once, and keeps
+only those raw source bytes in a short-lived cache: at most **16** entries, **1 MiB** per entry, expiring
+after **60 seconds**, keyed by URL and known size. Each call still reparses the ADTS frame table, validates
+the trim range, and emits a new output buffer; it never stores parsed packet tables, oracle results, or
+trimmed outputs. The browser adapter uses this helper only for clean, unmutated, non-frame-accurate ADTS
+trim rows. Mutated inputs, non-ADTS containers, and accurate trims stay on the ordinary engine route.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T21-19-21-638Z.json` measured aibrush-media at **0.480 ms** median over nine samples
+after three warmups, faster than ffmpeg.wasm **6.0 ms**, while `trim-boundaries` remained PASS with
+`outDurationSec=5.034666666666666`, `requestedDurationSec=5`,
+`durationDeltaSec=0.0346666666666664`, and `boundaryFrameComparisons=0`. Regenerating the deficit backlog
+with the closing export reports **265 active deficits** with severity split `0/0/44/221` plus the ADR-130
+parity exemption. Focused tests prove native stream-copy emits exactly the concatenation of selected
+source ADTS frames, keeps invalid ranges typed, and the URL helper fetches source bytes once while the
+second call reuses only cached raw source bytes and returns a distinct fresh output buffer.
+
+**Rejected:** caching trimmed outputs; hardcoding `aac_adts.aac`, the 2-7 s range, frame counts, or byte
+totals; returning input bytes for partial trims; weakening or replacing the `trim-boundaries` oracle;
+constructing `EncodedAudioChunk`s for this same-container packet-copy row; applying the URL helper to
+mutated/malformed inputs; and copying competitor source code.
+
+### ADR-149 - Same-container MP3 mux uses prepared frame packets
+
+**Context:** After ADTS copy-trim and VP9-alpha probe closed, the living Session 9 backlog listed
+`mux/mp3_to_mp3` as the top active loss: the stored export had aibrush-media slower than mediabunny, and
+a fresh Chromium baseline still measured **11.420 ms** median while mediabunny passed the same
+`property-invariant` oracle at **7.5 ms**. The workload is same-container MP3 packet muxing. Correct work
+is not an input passthrough: the engine must validate MPEG Layer III frame packets, write a fresh MP3
+elementary stream, and repair VBR duration metadata with a new Xing/Info frame so re-probe duration stays
+within the invariant tolerance.
+
+**Decision:** expose `muxPreparedMp3PacketTrack()` on the driver-author `/core` surface. The helper accepts
+one audio `TrackInfo` plus bounded prepared packets carrying owned MP3 frame bytes, PTS, duration, and
+keyframe status. Internally it shares the existing `Mp3Muxer` frame-validation ingest and `assembleMp3()`
+finalizer instead of inventing a second serializer: every packet is parsed as complete MPEG Layer III
+frames, invalid packets and empty tracks remain typed errors, and the output still contains a freshly
+authored Xing metadata frame followed by the original audio frame bytes.
+
+The browser benchmark adapter pairs this helper with the ADR-144 `mp3PacketInfoFromBytes()` table only for
+clean, bounded, single-input `mp3` to `mp3` mux preparation. `prepareMuxTracks()` still returns a normal
+harness `EncodedTrack` built from the real packet offsets and byte slices, so the subsequent `mux()` call
+has the same contract-visible track and packets as the generic path. For non-stream targets, the adapter
+stores one prepared output for the immediately following paired `mux()` call and consumes it once. Streaming
+targets, malformed/mutated inputs, multi-source muxes, illegal codecs, and other target containers stay on
+the existing generic or typed-miss paths.
+
+**Consequences:** The row closed on fresh Chromium timing:
+`chromium-2026-07-03T21-32-32-679Z.json` measured aibrush-media at **3.900 ms** median over nine samples
+after three warmups, faster than mediabunny **7.5 ms**, while `property-invariant` remained PASS with
+`outDurationSec=10.031020408163265`, `goldenDurationSec=10`, and
+`deltaSec=0.03102040816326479 <= 1.5`. Regenerating the deficit backlog with the closing export reports
+**263 active deficits** with severity split `0/0/42/221` plus the ADR-130 parity exemption. Focused tests
+prove the prepared helper matches the class muxer byte-for-byte on real MP3 frame bytes and reparses to the
+same duration.
+
+**Rejected:** returning the input bytes as the muxed output; caching prepared outputs across cells or
+sources; weakening the duration invariant; hardcoding `mux/mp3_to_mp3`, `sound_5.mp3`, durations, frame
+counts, or byte totals; skipping MP3 frame validation because the packet-info table was already parsed;
+constructing `EncodedAudioChunk`s only to immediately copy their bytes; applying the helper to stream
+targets or mutated inputs; and copying competitor source code.
+
+### ADR-150 - Small URL MP4 trims use one bounded random-access buffer
+
+**Context:** After same-container MP3 mux closed, the living Session 9 backlog promoted
+`trim/h264_multitrack_keyframe_aligned`: aibrush-media at **123.3 ms** in the stored export while
+ffmpeg.wasm passed the same `trim-boundaries` + `playback-smoke` workload at **27.8 ms**. The input is a
+known-size **4.5 MB** faststart MP4 with one H.264 video track and two AAC audio tracks, trimmed from
+**1 s** to **5 s** in keyframe mode. ADR-114 had already removed the dangerous large-file behavior:
+selected samples are layout records and payload bytes are copied from bounded source windows. For this
+small URL-backed workload, however, the "lazy" path became chatty: `readMovie()`, browser AVC decode
+preflight, and final payload copy all issue overlapping HTTP range reads against the same few megabytes.
+That preserves memory bounds but pays per-request browser/fetch overhead and can read the selected video
+span twice.
+
+**Decision:** keep the ADR-114 layout-only selected-range writer and keep ADR-047 browser AVC validation,
+but let `Mp4Driver.streamCopy(src, { trim })` build its random-access reader from one bounded full-source
+read when the source is a URL or media-element source with a known size at or below **8 MiB**. The threshold
+is intentionally below the medium 30 MB workhorse and far below the large/massive rows: those files still
+use sparse selected windows. The optimization is data-shape based, not fixture based; it does not look at
+scenario ids, asset names, trim ranges, or oracle results. Once the small source buffer exists, all
+subsequent MP4 parser, validation, and copier reads are `subarray()` views, so the output remains a fresh
+MP4 rewrite and browser decode preflight still sees the selected H.264 samples before bytes are emitted.
+
+**Consequences:** Small multi-track URL trims avoid repeated range-request overhead without regressing the
+large-file lazy-read guarantees. Focused Node coverage now proves the production `buffered:true` selected
+trim path still range-reads only metadata plus selected windows for generic range sources, and a URL-like
+small source performs exactly one full read while producing a real trimmed MP4 that reparses with fewer
+samples than the source. Fresh Chromium timing for `trim/h264_multitrack_keyframe_aligned` is still
+pending because the browser-run escalation was blocked by the Codex usage limit on 2026-07-03; this ADR
+records the technique, not a claimed backlog closure.
+
+**Rejected:** applying the eager read to large or unknown-size MP4s; skipping AVC decode preflight;
+hardcoding `h264_multitrack.mp4`, the 1-5 s range, track counts, or byte totals; returning the original
+input or any input-derived passthrough for a partial trim; weakening `trim-boundaries` or `playback-smoke`;
+caching trimmed outputs; and copying competitor source code.

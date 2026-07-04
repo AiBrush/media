@@ -77,6 +77,8 @@ const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
 const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
 const FASTSTART_METADATA_PREFETCH_BYTES = 32 * 1024;
+const SMALL_FASTSTART_METADATA_PREFETCH_BYTES = 4 * 1024;
+const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 const SIMPLE_VIDEO_FASTSTART_PROBE_MAX_SOURCE_BYTES = 256 * 1024;
 const FULL_RANGE_EOF_SLACK_SEC = 0.05;
@@ -84,6 +86,7 @@ const SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES = 1024 * 1024;
 const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
 const PROGRESSIVE_SINGLE_READ_MAX_BYTES = 64 * 1024 * 1024;
 const PROGRESSIVE_SINGLE_READ_MAX_GAP_BYTES = 1024 * 1024;
+const SMALL_URL_TRIM_RANDOM_ACCESS_MAX_BYTES = 8 * 1024 * 1024;
 const TRIM_END_RANGE_SLACK_SEC = 1;
 
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
@@ -95,6 +98,12 @@ function brandFor(container: string | undefined): ContainerBrand {
 interface RandomAccess {
   read(offset: number, length: number): Promise<Uint8Array>;
   size?: number;
+}
+
+type SizedRandomAccess = RandomAccess & { readonly size: number };
+
+interface RandomAccessOptions {
+  readonly eagerReadMaxBytes?: number;
 }
 
 interface MovieParseHandoff {
@@ -117,9 +126,36 @@ async function loadFaststartProbeModule(): Promise<typeof import('./simple-video
   return faststartProbeModule;
 }
 
-async function randomAccess(src: ByteSource): Promise<RandomAccess> {
+function sourceKind(src: ByteSource): string | undefined {
+  return (src as ByteSource & { readonly kind?: string }).kind;
+}
+
+function shouldEagerReadRandomAccess(
+  src: ByteSource,
+  maxBytes: number | undefined,
+): src is ByteSource & {
+  readonly range: NonNullable<ByteSource['range']>;
+  readonly size: number;
+} {
+  if (maxBytes === undefined || src.range === undefined || src.size === undefined) return false;
+  if (src.size > maxBytes) return false;
+  const kind = sourceKind(src);
+  return kind === 'url' || kind === 'element';
+}
+
+async function randomAccess(
+  src: ByteSource,
+  opts: RandomAccessOptions = {},
+): Promise<RandomAccess> {
   const range = src.range;
   if (range) {
+    if (shouldEagerReadRandomAccess(src, opts.eagerReadMaxBytes)) {
+      const buffered = await range.call(src, 0, src.size);
+      return {
+        read: (offset, length) => Promise.resolve(buffered.subarray(offset, offset + length)),
+        size: buffered.byteLength,
+      };
+    }
     return {
       read: (offset, length) => range.call(src, offset, offset + length),
       ...(src.size !== undefined ? { size: src.size } : {}),
@@ -148,7 +184,10 @@ function shouldTryTinyAudioFaststartProbe(src: ByteSource, ra: RandomAccess): bo
   return key !== undefined && /\.m4a(?:[?#]|$)/i.test(key);
 }
 
-function shouldTrySimpleVideoFaststartProbe(src: ByteSource, ra: RandomAccess): boolean {
+function shouldTrySimpleVideoFaststartProbe(
+  src: ByteSource,
+  ra: RandomAccess,
+): ra is SizedRandomAccess {
   if (
     ra.size === undefined ||
     ra.size > SIMPLE_VIDEO_FASTSTART_PROBE_MAX_SOURCE_BYTES ||
@@ -279,9 +318,75 @@ async function readFaststartMetadata(ra: RandomAccess): Promise<MovieMetadata | 
           head.subarray(offset + header.headerSize, offset + header.size),
         );
       }
+      const moovEnd = offset + header.size;
+      if (moovEnd <= FASTSTART_PREFIX_CACHE_READ_MAX_BYTES) {
+        const prefix = await ra.read(0, moovEnd);
+        if (prefix.byteLength >= moovEnd) {
+          return parseMovieMetadata(brand, prefix.subarray(offset + header.headerSize, moovEnd));
+        }
+      }
       const box = await ra.read(offset, header.size);
       if (box.byteLength < header.headerSize) return undefined;
       return parseMovieMetadata(brand, box.subarray(header.headerSize));
+    }
+    offset += header.size;
+    if (offset + 8 > head.byteLength) return undefined;
+  }
+}
+
+type SmallFaststartMetadataProbeTracks = readonly TrackInfo[] | false | undefined;
+
+function isSmallFaststartMetadataTrack(track: ParsedTrack): boolean {
+  if (track.mediaType === 'video') {
+    return (
+      (track.sampleEntryType === 'avc1' || track.sampleEntryType === 'avc3') &&
+      track.width !== undefined &&
+      track.height !== undefined &&
+      track.fps !== undefined &&
+      track.fps > 0
+    );
+  }
+  return (
+    track.mediaType === 'audio' &&
+    track.sampleEntryType === 'mp4a' &&
+    track.sampleRate !== undefined &&
+    track.channels !== undefined
+  );
+}
+
+async function readSmallFaststartMetadataProbeTracks(
+  src: ByteSource,
+  ra: SizedRandomAccess,
+): Promise<SmallFaststartMetadataProbeTracks> {
+  const head = await ra.read(0, Math.min(ra.size, SMALL_FASTSTART_METADATA_PREFETCH_BYTES));
+  let offset = 0;
+  let brand = 'mp42';
+  for (;;) {
+    const header = topBoxHeader(head, offset);
+    if (header === undefined) return undefined;
+    if (header.type === 'ftyp' && offset + 12 <= head.byteLength) {
+      brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
+    }
+    if (header.type === 'moov') {
+      if (offset + header.size > head.byteLength) return undefined;
+      const moov = head.subarray(offset + header.headerSize, offset + header.size);
+      try {
+        const movie = parseMovieMetadata(brand, moov);
+        if (
+          movie.needsFragmentTiming ||
+          !movie.tracks.some((track) => track.mediaType === 'video') ||
+          !movie.tracks.every(isSmallFaststartMetadataTrack)
+        ) {
+          return false;
+        }
+        const key = sourceCacheKey(src);
+        if (key !== undefined && canHandoffFullMovie(src, ra)) {
+          storeFaststartMoovParseHandoff(key, brand, moov.slice());
+        }
+        return movie.tracks.map(toTrackInfo);
+      } catch {
+        return false;
+      }
     }
     offset += header.size;
     if (offset + 8 > head.byteLength) return undefined;
@@ -2167,7 +2272,13 @@ export const Mp4Driver: ContainerDriver = {
     const ra = await randomAccess(src);
     throwIfAborted(signal);
     if (shouldTrySimpleVideoFaststartProbe(src, ra)) {
-      const tracks = await readSimpleVideoFaststartProbeTracks(src, ra);
+      const metadataTracks = await readSmallFaststartMetadataProbeTracks(src, ra);
+      if (metadataTracks !== false) {
+        throwIfAborted(signal);
+        if (metadataTracks !== undefined) return metadataTracks;
+      }
+      const tracks =
+        metadataTracks === false ? undefined : await readSimpleVideoFaststartProbeTracks(src, ra);
       throwIfAborted(signal);
       if (tracks !== undefined) return tracks;
     }
@@ -2215,7 +2326,11 @@ export const Mp4Driver: ContainerDriver = {
     };
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
-    const ra = await randomAccess(src);
+    const ra = await randomAccess(src, {
+      ...(o?.trim !== undefined
+        ? { eagerReadMaxBytes: SMALL_URL_TRIM_RANDOM_ACCESS_MAX_BYTES }
+        : {}),
+    });
     const movie = await readMovie(ra);
     const requestedTrim = o?.trim;
     if (requestedTrim !== undefined) validateStreamCopyTrimRange(movie, requestedTrim);

@@ -1,7 +1,7 @@
 # Performance deficits — where rivals beat aibrush-media (Chromium)
 
-> **Auto-generated** by `docs/perf/gen-deficits.mjs` from `stored-test-data-chromium-2026-07-01T08-33-45-588Z.json + chromium-2026-07-01T09-06-47-538Z.json + chromium-2026-07-01T09-10-49-829Z.json + chromium-2026-07-01T09-13-36-231Z.json + chromium-2026-07-01T09-15-55-161Z.json + chromium-2026-07-01T09-18-59-642Z.json + chromium-2026-07-01T09-23-13-147Z.json + chromium-2026-07-01T09-25-11-426Z.json + chromium-2026-07-01T09-28-41-534Z.json + chromium-2026-07-01T09-34-14-598Z.json + chromium-2026-07-01T09-35-39-723Z.json + chromium-2026-07-01T09-36-51-219Z.json + chromium-2026-07-01T09-37-47-609Z.json + chromium-2026-07-01T09-52-13-355Z.json + chromium-2026-07-01T09-57-08-951Z.json + chromium-2026-07-01T10-02-16-204Z.json + chromium-2026-07-01T10-03-59-862Z.json + chromium-2026-07-01T10-07-23-418Z.json + chromium-2026-07-01T10-09-09-616Z.json + chromium-2026-07-01T10-12-01-975Z.json + chromium-2026-07-01T10-17-17-583Z.json + chromium-2026-07-01T10-18-05-067Z.json + chromium-2026-07-01T10-28-18-237Z.json + chromium-2026-07-01T10-29-48-869Z.json + chromium-2026-07-01T10-32-38-939Z.json + chromium-2026-07-01T10-35-55-845Z.json + chromium-2026-07-01T10-39-35-760Z.json + chromium-2026-07-01T10-40-26-545Z.json + chromium-2026-07-01T10-42-56-723Z.json + chromium-2026-07-01T10-43-44-532Z.json + chromium-2026-07-01T10-46-31-207Z.json + chromium-2026-07-01T10-49-51-017Z.json + chromium-2026-07-01T10-58-18-158Z.json + chromium-2026-07-01T11-03-04-193Z.json + chromium-2026-07-01T11-12-52-912Z.json + chromium-2026-07-01T11-15-13-083Z.json + chromium-2026-07-01T11-18-53-734Z.json + chromium-2026-07-01T11-20-50-929Z.json + chromium-2026-07-01T11-25-09-174Z.json + chromium-2026-07-01T11-29-32-987Z.json + chromium-2026-07-01T11-33-14-741Z.json + chromium-2026-07-01T11-34-25-915Z.json + chromium-2026-07-01T13-56-24-019Z.json + chromium-2026-07-01T13-59-21-061Z.json + chromium-2026-07-01T14-03-49-934Z.json + chromium-2026-07-01T14-04-55-768Z.json + chromium-2026-07-01T14-13-27-247Z.json + chromium-2026-07-01T14-20-22-063Z.json + chromium-2026-07-01T14-21-42-028Z.json + chromium-2026-07-01T14-26-45-016Z.json + chromium-2026-07-01T14-29-26-174Z.json + chromium-2026-07-01T14-33-28-545Z.json + chromium-2026-07-01T14-35-49-242Z.json + chromium-2026-07-01T14-37-09-594Z.json + chromium-2026-07-01T14-39-17-425Z.json + chromium-2026-07-01T14-39-45-472Z.json + chromium-2026-07-01T14-45-06-913Z.json + chromium-2026-07-01T14-45-48-952Z.json + chromium-2026-07-01T16-01-02-101Z.json + chromium-2026-07-01T16-05-43-142Z.json + chromium-2026-07-01T16-06-42-297Z.json + chromium-2026-07-01T16-12-02-996Z.json + chromium-2026-07-01T16-13-01-381Z.json + chromium-2026-07-01T16-14-26-878Z.json + chromium-2026-07-01T16-15-04-371Z.json + chromium-2026-07-01T16-15-44-541Z.json + chromium-2026-07-01T16-22-07-805Z.json + chromium-2026-07-01T16-22-42-803Z.json + chromium-2026-07-01T16-23-11-645Z.json + chromium-2026-07-01T16-23-45-531Z.json + chromium-2026-07-01T16-24-37-262Z.json + chromium-2026-07-01T16-25-12-261Z.json + chromium-2026-07-01T16-30-48-436Z.json + chromium-2026-07-01T16-31-36-148Z.json + chromium-2026-07-01T16-32-06-907Z.json + chromium-2026-07-01T16-32-46-831Z.json + chromium-2026-07-01T16-33-30-454Z.json + chromium-2026-07-01T16-36-03-551Z.json + chromium-2026-07-01T16-36-39-715Z.json + chromium-2026-07-01T16-41-06-572Z.json + chromium-2026-07-01T16-41-44-192Z.json + chromium-2026-07-01T16-42-19-021Z.json + chromium-2026-07-01T16-43-02-463Z.json + chromium-2026-07-01T16-46-26-712Z.json + chromium-2026-07-01T16-47-03-853Z.json + chromium-2026-07-01T16-47-41-177Z.json + chromium-2026-07-01T16-48-20-002Z.json + chromium-2026-07-01T16-48-51-169Z.json + chromium-2026-07-01T16-49-23-125Z.json + chromium-2026-07-01T16-54-57-877Z.json + chromium-2026-07-01T16-55-28-352Z.json + chromium-2026-07-01T16-55-59-928Z.json + chromium-2026-07-01T17-02-05-826Z.json + chromium-2026-07-01T17-02-37-691Z.json + chromium-2026-07-01T17-03-07-081Z.json + chromium-2026-07-01T17-06-45-187Z.json + chromium-2026-07-01T17-07-16-355Z.json + chromium-2026-07-01T17-08-06-949Z.json + chromium-2026-07-01T17-08-35-605Z.json + chromium-2026-07-01T17-10-42-201Z.json + chromium-2026-07-01T17-11-12-957Z.json + chromium-2026-07-01T17-11-55-232Z.json + chromium-2026-07-01T17-15-30-099Z.json + chromium-2026-07-01T17-15-59-278Z.json + chromium-2026-07-01T17-18-14-653Z.json + chromium-2026-07-01T20-54-40-903Z.json + chromium-2026-07-01T20-55-33-396Z.json + chromium-2026-07-01T21-02-53-185Z.json + chromium-2026-07-01T21-05-08-105Z.json + chromium-2026-07-01T21-08-31-776Z.json + chromium-2026-07-01T21-09-19-372Z.json + chromium-2026-07-01T21-19-50-671Z.json + chromium-2026-07-01T21-31-29-595Z.json + chromium-2026-07-01T21-38-30-175Z.json + chromium-2026-07-01T21-43-00-110Z.json + chromium-2026-07-01T21-49-51-135Z.json + chromium-2026-07-01T21-53-20-604Z.json + chromium-2026-07-01T22-04-31-808Z.json + chromium-2026-07-01T22-06-19-689Z.json + chromium-2026-07-01T22-07-36-804Z.json + chromium-2026-07-01T22-08-06-010Z.json + chromium-2026-07-01T22-09-29-401Z.json + chromium-2026-07-01T22-12-11-266Z.json + chromium-2026-07-01T22-14-59-757Z.json + chromium-2026-07-01T22-17-07-708Z.json + chromium-2026-07-01T22-18-15-879Z.json + chromium-2026-07-01T22-20-23-251Z.json + chromium-2026-07-01T22-22-37-210Z.json + chromium-2026-07-01T22-28-07-095Z.json + chromium-2026-07-01T22-36-43-446Z.json + chromium-2026-07-01T22-42-12-285Z.json + chromium-2026-07-01T22-47-08-147Z.json + chromium-2026-07-01T22-51-05-631Z.json + chromium-2026-07-01T22-54-55-024Z.json + chromium-2026-07-01T22-57-30-746Z.json + chromium-2026-07-01T23-02-13-942Z.json + chromium-2026-07-01T23-12-01-664Z.json + chromium-2026-07-01T23-24-54-554Z.json + chromium-2026-07-01T23-29-41-364Z.json + chromium-2026-07-02T08-05-09-506Z.json + chromium-2026-07-02T08-20-47-498Z.json + chromium-2026-07-02T08-24-54-065Z.json + chromium-2026-07-02T08-28-22-373Z.json + chromium-2026-07-02T08-33-04-467Z.json + chromium-2026-07-02T09-03-18-585Z.json + chromium-2026-07-02T09-42-26-983Z.json + chromium-2026-07-02T09-46-34-236Z.json + chromium-2026-07-02T09-54-53-147Z.json + chromium-2026-07-02T09-57-50-258Z.json + chromium-2026-07-02T10-31-33-813Z.json + chromium-2026-07-02T10-34-23-942Z.json + chromium-2026-07-02T10-35-55-773Z.json + chromium-2026-07-02T10-49-15-283Z.json + chromium-2026-07-02T11-02-48-670Z.json + chromium-2026-07-02T11-06-24-519Z.json + chromium-2026-07-02T11-16-15-767Z.json + chromium-2026-07-02T12-59-35-544Z.json + chromium-2026-07-02T13-18-33-377Z.json + chromium-2026-07-02T13-55-04-311Z.json + chromium-2026-07-02T14-28-48-718Z.json + chromium-2026-07-02T14-55-46-012Z.json`
-> (latest included export 2026-07-02T14:57:33.029Z). Re-run the generator against a
+> **Auto-generated** by `docs/perf/gen-deficits.mjs` from `stored-test-data-chromium-2026-07-01T08-33-45-588Z.json + chromium-2026-07-01T09-06-47-538Z.json + chromium-2026-07-01T09-10-49-829Z.json + chromium-2026-07-01T09-13-36-231Z.json + chromium-2026-07-01T09-15-55-161Z.json + chromium-2026-07-01T09-18-59-642Z.json + chromium-2026-07-01T09-23-13-147Z.json + chromium-2026-07-01T09-25-11-426Z.json + chromium-2026-07-01T09-28-41-534Z.json + chromium-2026-07-01T09-34-14-598Z.json + chromium-2026-07-01T09-35-39-723Z.json + chromium-2026-07-01T09-36-51-219Z.json + chromium-2026-07-01T09-37-47-609Z.json + chromium-2026-07-01T09-52-13-355Z.json + chromium-2026-07-01T09-57-08-951Z.json + chromium-2026-07-01T10-02-16-204Z.json + chromium-2026-07-01T10-03-59-862Z.json + chromium-2026-07-01T10-07-23-418Z.json + chromium-2026-07-01T10-09-09-616Z.json + chromium-2026-07-01T10-12-01-975Z.json + chromium-2026-07-01T10-17-17-583Z.json + chromium-2026-07-01T10-18-05-067Z.json + chromium-2026-07-01T10-28-18-237Z.json + chromium-2026-07-01T10-29-48-869Z.json + chromium-2026-07-01T10-32-38-939Z.json + chromium-2026-07-01T10-35-55-845Z.json + chromium-2026-07-01T10-39-35-760Z.json + chromium-2026-07-01T10-40-26-545Z.json + chromium-2026-07-01T10-42-56-723Z.json + chromium-2026-07-01T10-43-44-532Z.json + chromium-2026-07-01T10-46-31-207Z.json + chromium-2026-07-01T10-49-51-017Z.json + chromium-2026-07-01T10-58-18-158Z.json + chromium-2026-07-01T11-03-04-193Z.json + chromium-2026-07-01T11-12-52-912Z.json + chromium-2026-07-01T11-15-13-083Z.json + chromium-2026-07-01T11-18-53-734Z.json + chromium-2026-07-01T11-20-50-929Z.json + chromium-2026-07-01T11-25-09-174Z.json + chromium-2026-07-01T11-29-32-987Z.json + chromium-2026-07-01T11-33-14-741Z.json + chromium-2026-07-01T11-34-25-915Z.json + chromium-2026-07-01T13-56-24-019Z.json + chromium-2026-07-01T13-59-21-061Z.json + chromium-2026-07-01T14-03-49-934Z.json + chromium-2026-07-01T14-04-55-768Z.json + chromium-2026-07-01T14-13-27-247Z.json + chromium-2026-07-01T14-20-22-063Z.json + chromium-2026-07-01T14-21-42-028Z.json + chromium-2026-07-01T14-26-45-016Z.json + chromium-2026-07-01T14-29-26-174Z.json + chromium-2026-07-01T14-33-28-545Z.json + chromium-2026-07-01T14-35-49-242Z.json + chromium-2026-07-01T14-37-09-594Z.json + chromium-2026-07-01T14-39-17-425Z.json + chromium-2026-07-01T14-39-45-472Z.json + chromium-2026-07-01T14-45-06-913Z.json + chromium-2026-07-01T14-45-48-952Z.json + chromium-2026-07-01T16-01-02-101Z.json + chromium-2026-07-01T16-05-43-142Z.json + chromium-2026-07-01T16-06-42-297Z.json + chromium-2026-07-01T16-12-02-996Z.json + chromium-2026-07-01T16-13-01-381Z.json + chromium-2026-07-01T16-14-26-878Z.json + chromium-2026-07-01T16-15-04-371Z.json + chromium-2026-07-01T16-15-44-541Z.json + chromium-2026-07-01T16-22-07-805Z.json + chromium-2026-07-01T16-22-42-803Z.json + chromium-2026-07-01T16-23-11-645Z.json + chromium-2026-07-01T16-23-45-531Z.json + chromium-2026-07-01T16-24-37-262Z.json + chromium-2026-07-01T16-25-12-261Z.json + chromium-2026-07-01T16-30-48-436Z.json + chromium-2026-07-01T16-31-36-148Z.json + chromium-2026-07-01T16-32-06-907Z.json + chromium-2026-07-01T16-32-46-831Z.json + chromium-2026-07-01T16-33-30-454Z.json + chromium-2026-07-01T16-36-03-551Z.json + chromium-2026-07-01T16-36-39-715Z.json + chromium-2026-07-01T16-41-06-572Z.json + chromium-2026-07-01T16-41-44-192Z.json + chromium-2026-07-01T16-42-19-021Z.json + chromium-2026-07-01T16-43-02-463Z.json + chromium-2026-07-01T16-46-26-712Z.json + chromium-2026-07-01T16-47-03-853Z.json + chromium-2026-07-01T16-47-41-177Z.json + chromium-2026-07-01T16-48-20-002Z.json + chromium-2026-07-01T16-48-51-169Z.json + chromium-2026-07-01T16-49-23-125Z.json + chromium-2026-07-01T16-54-57-877Z.json + chromium-2026-07-01T16-55-28-352Z.json + chromium-2026-07-01T16-55-59-928Z.json + chromium-2026-07-01T17-02-05-826Z.json + chromium-2026-07-01T17-02-37-691Z.json + chromium-2026-07-01T17-03-07-081Z.json + chromium-2026-07-01T17-06-45-187Z.json + chromium-2026-07-01T17-07-16-355Z.json + chromium-2026-07-01T17-08-06-949Z.json + chromium-2026-07-01T17-08-35-605Z.json + chromium-2026-07-01T17-10-42-201Z.json + chromium-2026-07-01T17-11-12-957Z.json + chromium-2026-07-01T17-11-55-232Z.json + chromium-2026-07-01T17-15-30-099Z.json + chromium-2026-07-01T17-15-59-278Z.json + chromium-2026-07-01T17-18-14-653Z.json + chromium-2026-07-01T20-54-40-903Z.json + chromium-2026-07-01T20-55-33-396Z.json + chromium-2026-07-01T21-02-53-185Z.json + chromium-2026-07-01T21-05-08-105Z.json + chromium-2026-07-01T21-08-31-776Z.json + chromium-2026-07-01T21-09-19-372Z.json + chromium-2026-07-01T21-19-50-671Z.json + chromium-2026-07-01T21-31-29-595Z.json + chromium-2026-07-01T21-38-30-175Z.json + chromium-2026-07-01T21-43-00-110Z.json + chromium-2026-07-01T21-49-51-135Z.json + chromium-2026-07-01T21-53-20-604Z.json + chromium-2026-07-01T22-04-31-808Z.json + chromium-2026-07-01T22-06-19-689Z.json + chromium-2026-07-01T22-07-36-804Z.json + chromium-2026-07-01T22-08-06-010Z.json + chromium-2026-07-01T22-09-29-401Z.json + chromium-2026-07-01T22-12-11-266Z.json + chromium-2026-07-01T22-14-59-757Z.json + chromium-2026-07-01T22-17-07-708Z.json + chromium-2026-07-01T22-18-15-879Z.json + chromium-2026-07-01T22-20-23-251Z.json + chromium-2026-07-01T22-22-37-210Z.json + chromium-2026-07-01T22-28-07-095Z.json + chromium-2026-07-01T22-36-43-446Z.json + chromium-2026-07-01T22-42-12-285Z.json + chromium-2026-07-01T22-47-08-147Z.json + chromium-2026-07-01T22-51-05-631Z.json + chromium-2026-07-01T22-54-55-024Z.json + chromium-2026-07-01T22-57-30-746Z.json + chromium-2026-07-01T23-02-13-942Z.json + chromium-2026-07-01T23-12-01-664Z.json + chromium-2026-07-01T23-24-54-554Z.json + chromium-2026-07-01T23-29-41-364Z.json + chromium-2026-07-02T08-05-09-506Z.json + chromium-2026-07-02T08-20-47-498Z.json + chromium-2026-07-02T08-24-54-065Z.json + chromium-2026-07-02T08-28-22-373Z.json + chromium-2026-07-02T08-33-04-467Z.json + chromium-2026-07-02T09-03-18-585Z.json + chromium-2026-07-02T09-42-26-983Z.json + chromium-2026-07-02T09-46-34-236Z.json + chromium-2026-07-02T09-54-53-147Z.json + chromium-2026-07-02T09-57-50-258Z.json + chromium-2026-07-02T10-31-33-813Z.json + chromium-2026-07-02T10-34-23-942Z.json + chromium-2026-07-02T10-35-55-773Z.json + chromium-2026-07-02T10-49-15-283Z.json + chromium-2026-07-02T11-02-48-670Z.json + chromium-2026-07-02T11-06-24-519Z.json + chromium-2026-07-02T11-16-15-767Z.json + chromium-2026-07-02T12-59-35-544Z.json + chromium-2026-07-02T13-18-33-377Z.json + chromium-2026-07-02T13-55-04-311Z.json + chromium-2026-07-02T14-28-48-718Z.json + chromium-2026-07-02T14-55-46-012Z.json + chromium-2026-07-02T15-02-28-533Z.json + chromium-2026-07-02T15-08-37-362Z.json + chromium-2026-07-03T18-51-19-503Z.json + chromium-2026-07-03T18-56-43-189Z.json + chromium-2026-07-03T18-59-37-205Z.json + chromium-2026-07-03T19-00-28-937Z.json + chromium-2026-07-03T19-01-18-530Z.json + chromium-2026-07-03T19-02-08-219Z.json + chromium-2026-07-03T19-02-59-438Z.json + chromium-2026-07-03T19-03-55-282Z.json + chromium-2026-07-03T19-04-53-138Z.json + chromium-2026-07-03T19-05-52-252Z.json + chromium-2026-07-03T19-08-32-565Z.json + chromium-2026-07-03T19-10-07-959Z.json + chromium-2026-07-03T19-19-39-178Z.json + chromium-2026-07-03T19-28-40-951Z.json + chromium-2026-07-03T19-31-24-305Z.json + chromium-2026-07-03T19-32-10-414Z.json + chromium-2026-07-03T19-36-49-266Z.json + chromium-2026-07-03T19-52-44-753Z.json + chromium-2026-07-03T19-57-54-734Z.json + chromium-2026-07-03T20-04-14-906Z.json + chromium-2026-07-03T20-07-02-183Z.json + chromium-2026-07-03T20-13-38-400Z.json + chromium-2026-07-03T20-16-07-469Z.json + chromium-2026-07-03T20-25-21-134Z.json + chromium-2026-07-03T20-32-38-676Z.json + chromium-2026-07-03T20-44-45-304Z.json + chromium-2026-07-03T20-48-56-273Z.json + chromium-2026-07-03T21-04-06-575Z.json + chromium-2026-07-03T21-19-21-638Z.json + chromium-2026-07-03T21-22-31-036Z.json + chromium-2026-07-03T21-32-32-679Z.json`
+> (latest included export 2026-07-03T21:32:52.105Z). Re-run the generator against a
 > fresher export to refresh. Do not hand-edit the tables.
 
 We rank **#1 on correctness** (100% conformance). This file is the opposite view:
@@ -13,10 +13,10 @@ rival timed are excluded — so every row below is an honest, same-work loss.
 ## Headline
 
 - **Contested scenarios** (we + ≥1 rival both timed & passing): **444**
-- **Active deficits where a rival is faster than us: 285 (64%)**
+- **Active deficits where a rival is faster than us: 263 (59%)**
 - **ADR-backed parity exemptions:** 1
-- **Raw faster-rival rows before exemptions:** 286 (64%)
-- Severity split: **0 catastrophic** (≥100×) · **0 severe** (10–100×) · **70 moderate** (3–10×) · **215 minor** (<3×)
+- **Raw faster-rival rows before exemptions:** 264 (59%)
+- Severity split: **0 catastrophic** (≥100×) · **0 severe** (10–100×) · **42 moderate** (3–10×) · **221 minor** (<3×)
 
 ⚠️ **Caveat:** this export is **single-sample (`n=1`)** per cell — exact ratios are
 noisy; the *direction* and the *tiering* are reliable. Re-measure multi-sample
@@ -37,7 +37,7 @@ payload bytes. Any full-body read on these rows is a real speed loss.
 probe, demux, and one-frame decode/seek rows where init / WASM / WebCodecs
 config / worker spin-up / buffer copies with no reuse can dominate the useful
 work.
-This explains the 215 "minor" losses smeared across *every* family.
+This explains the 221 "minor" losses smeared across *every* family.
 
 Fixing **A** collapses the tail of the distribution; fixing **B** shifts the whole
 curve left. Attack **A first** (algorithmic, few code paths, 100–1000× cells),
@@ -48,15 +48,15 @@ then **B** (profile the ~100 ms floor on a trivial op and amortize it).
 | Family | # deficits | Worst slowdown |
 |--------|-----------:|---------------:|
 | transcode | 45 | 4× |
-| mux | 38 | 6× |
-| probe | 38 | 6× |
-| decode-seek | 34 | 6× |
-| demux | 27 | 6× |
-| audio-dsp | 24 | 5× |
-| trim | 20 | 5× |
-| remux | 18 | 6× |
-| performance | 17 | 6× |
-| metadata | 13 | 5× |
+| mux | 35 | 4× |
+| decode-seek | 34 | 3× |
+| probe | 29 | 4× |
+| audio-dsp | 23 | 3× |
+| demux | 22 | 4× |
+| trim | 19 | 4× |
+| remux | 18 | 4× |
+| performance | 15 | 4× |
+| metadata | 12 | 4× |
 | streaming-output | 8 | 3× |
 | encryption | 3 | 1× |
 
@@ -74,76 +74,48 @@ then **B** (profile the ~100 ms floor on a trivial op and amortize it).
 
 | # | Scenario | Family | Ours (ms) | Fastest rival | Theirs (ms) | Slowdown |
 |--:|----------|--------|----------:|---------------|------------:|---------:|
-| 1 | `demux/h264_vfr` | demux | 44.5 | remotion-media-parser | 7.2 | 6.1× |
-| 2 | `mux/size_tiny_360p_to_mp4` | mux | 84.4 | mp4box | 13.7 | 6.1× |
-| 3 | `demux/h264_1080p_30s` | demux | 33.6 | web-demuxer | 5.5 | 6.1× |
-| 4 | `probe/big_buck_bunny_1080p_h264` | probe | 28.9 | mediabunny | 4.8 | 6.1× |
-| 5 | `decode-seek/decode_tiny_dims_1x1` | decode-seek | 24.7 | platform | 4.1 | 6.0× |
-| 6 | `performance/size-ladder-extract-metadata-large` | performance | 34.0 | mediabunny | 5.8 | 5.9× |
-| 7 | `probe/realworld_mdn_flower_webm` | probe | 25.4 | mediabunny | 4.3 | 5.9× |
-| 8 | `demux/size_micro_micro_audio_short` | demux | 25.1 | mp4box | 4.4 | 5.7× |
-| 9 | `remux/flac_seektable_flac_to_mkv` | remux | 43.2 | ffmpeg.wasm | 7.6 | 5.7× |
-| 10 | `probe/h264_bframes_1080p` | probe | 16.2 | mediabunny | 2.9 | 5.7× |
-| 11 | `probe/realworld_mdn_trex_mp3` | probe | 14.6 | mediabunny | 2.6 | 5.6× |
-| 12 | `probe/large_h264_1080p_120s` | probe | 21.6 | mediabunny | 3.9 | 5.6× |
-| 13 | `metadata/read_h264_multitrack` | metadata | 17.8 | remotion-media-parser | 3.4 | 5.3× |
-| 14 | `probe/h264_vfr` | probe | 18.5 | mediabunny | 3.6 | 5.2× |
-| 15 | `probe/longform_1h_audio` | probe | 25.6 | mediabunny | 4.9 | 5.2× |
-| 16 | `mux/prop_vfr_mux_duration_mp4_to_mkv` | mux | 69.3 | mediabunny | 13.5 | 5.1× |
-| 17 | `mux/size_micro_1frame_to_mkv` | mux | 48.1 | ffmpeg.wasm | 9.4 | 5.1× |
-| 18 | `demux/aac_adts` | demux | 29.9 | mediabunny | 5.9 | 5.1× |
-| 19 | `demux/realworld_mdn_flower_mp4` | demux | 35.3 | mp4box | 7.1 | 5.0× |
-| 20 | `demux/realworld_mdn_trex_mp3` | demux | 16.6 | mediabunny | 3.3 | 5.0× |
-| 21 | `probe/perf-extract-metadata-large` | probe | 18.1 | mediabunny | 3.6 | 5.0× |
-| 22 | `audio-dsp/edge_gapless_aac_decode` | audio-dsp | 52.2 | mediabunny | 10.6 | 4.9× |
-| 23 | `performance/metamorphic-vfr-iterate-packets` | performance | 22.2 | remotion-webcodecs | 4.6 | 4.8× |
-| 24 | `probe/hevc_1080p_10s` | probe | 24.1 | mediabunny | 5.0 | 4.8× |
-| 25 | `demux/wav_s24` | demux | 14.5 | mediabunny | 3.0 | 4.8× |
-| 26 | `trim/audio_aac_adts_copy` | trim | 27.8 | ffmpeg.wasm | 6.0 | 4.6× |
-| 27 | `probe/vp9_alpha` | probe | 13.6 | mediabunny | 3.0 | 4.5× |
-| 28 | `mux/mp3_to_mp3` | mux | 33.6 | mediabunny | 7.5 | 4.5× |
-| 29 | `trim/h264_multitrack_keyframe_aligned` | trim | 123.3 | ffmpeg.wasm | 27.8 | 4.4× |
-| 30 | `performance/extract-metadata` | performance | 15.3 | remotion-media-parser | 3.5 | 4.4× |
-| 31 | `metadata/read_opus` | metadata | 18.4 | ffmpeg.wasm | 4.3 | 4.3× |
-| 32 | `transcode/aac_to_pcm_wav_extract` | transcode | 84.0 | ffmpeg.wasm | 19.6 | 4.3× |
-| 33 | `metadata/tracks_attribution_multitrack` | metadata | 17.1 | remotion-media-parser | 4.0 | 4.2× |
-| 34 | `probe/metamorphic-recorder-headerless-sane-duration` | probe | 14.6 | mediabunny | 3.5 | 4.2× |
-| 35 | `probe/tiny_vp9_360p_2s` | probe | 13.3 | mediabunny | 3.2 | 4.1× |
-| 36 | `mux/mp3_to_mp4_audio` | mux | 26.1 | mediabunny | 6.5 | 4.0× |
-| 37 | `performance/op-sweep-demux` | performance | 30.7 | remotion-media-parser | 7.7 | 4.0× |
-| 38 | `transcode/mp3_to_aac_mp4` | transcode | 341.2 | mediabunny | 85.7 | 4.0× |
-| 39 | `mux/mp4_streaming_target` | mux | 264.9 | mediabunny | 66.8 | 4.0× |
-| 40 | `mux/aac_to_adts` | mux | 28.8 | mediabunny | 7.4 | 3.9× |
-| 41 | `performance/size-ladder-extract-metadata-medium` | performance | 14.0 | mediabunny | 3.7 | 3.8× |
-| 42 | `performance/op-sweep-probe` | performance | 14.4 | mediabunny | 3.8 | 3.8× |
-| 43 | `probe/mp3_xing` | probe | 11.2 | mediabunny | 3.0 | 3.8× |
-| 44 | `remux/aac_adts_adts_to_ts` | remux | 27.2 | mediabunny | 7.3 | 3.7× |
-| 45 | `probe/aac_adts` | probe | 15.3 | mediabunny | 4.2 | 3.6× |
-| 46 | `metadata/read_mp3_xing` | metadata | 13.8 | remotion-webcodecs | 3.8 | 3.6× |
-| 47 | `transcode/hdr10_to_sdr_tonemap` | transcode | 145.6 | ffmpeg.wasm | 40.9 | 3.6× |
-| 48 | `demux/mp3_cbr_notoc` | demux | 18.0 | mediabunny | 5.1 | 3.5× |
-| 49 | `remux/huge_h264_1080p_600s_mov_to_mp4` | remux | 1478.7 | remotion-webcodecs | 423.5 | 3.5× |
-| 50 | `trim/h264_rotated_keyframe_aligned` | trim | 119.7 | ffmpeg.wasm | 34.4 | 3.5× |
-| 51 | `mux/audio_only_aac_to_mp4` | mux | 26.9 | ffmpeg.wasm | 7.8 | 3.5× |
-| 52 | `probe/micro_h264_1frame` | probe | 17.6 | mediabunny | 5.1 | 3.5× |
-| 53 | `trim/mov_keyframe_aligned` | trim | 147.6 | ffmpeg.wasm | 42.7 | 3.5× |
-| 54 | `mux/prop_h264_decode_mux_mp4_to_mp4` | mux | 326.2 | mediabunny | 95.5 | 3.4× |
-| 55 | `trim/audio_wav_pcm_copy` | trim | 25.2 | mediabunny | 7.4 | 3.4× |
-| 56 | `trim/h264_start_zero_copy` | trim | 134.2 | mediabunny | 39.6 | 3.4× |
-| 57 | `transcode/opus_to_aac_mp4` | transcode | 323.6 | mediabunny | 96.8 | 3.3× |
-| 58 | `performance/size-ladder-iterate-packets-medium` | performance | 43.6 | web-demuxer | 13.1 | 3.3× |
-| 59 | `performance/size-ladder-extract-metadata-tiny` | performance | 14.8 | mediabunny | 4.5 | 3.3× |
-| 60 | `probe/realworld_mdn_flower_mp4` | probe | 13.0 | mp4box | 4.0 | 3.3× |
-| 61 | `metadata/read_no_tags_wav` | metadata | 14.1 | mediabunny | 4.4 | 3.2× |
-| 62 | `decode-seek/decode_size_tiny_h264_360p` | decode-seek | 334.2 | ffmpeg.wasm | 105.9 | 3.2× |
-| 63 | `transcode/wav_to_flac` | transcode | 127.4 | ffmpeg.wasm | 40.5 | 3.1× |
-| 64 | `audio-dsp/edge_longform_audio_resample_16k` | audio-dsp | 12843.1 | ffmpeg.wasm | 4117.0 | 3.1× |
-| 65 | `metadata/read_h264_1080p_5s` | metadata | 29.2 | mp4box | 9.4 | 3.1× |
-| 66 | `demux/size_tiny_tiny_vp9_360p_2s` | demux | 30.1 | ffmpeg.wasm | 9.7 | 3.1× |
-| 67 | `probe/recorder_headerless` | probe | 17.0 | mediabunny | 5.5 | 3.1× |
-| 68 | `mux/drop_audio_track_subset_to_mp4` | mux | 122.3 | mediabunny | 40.2 | 3.0× |
-| 69 | `mux/edge_bframes_decode_mux_mkv` | mux | 131.1 | mediabunny | 43.2 | 3.0× |
-| 70 | `probe/av1_720p_5s` | probe | 20.9 | mediabunny | 6.9 | 3.0× |
+| 1 | `trim/h264_multitrack_keyframe_aligned` | trim | 123.3 | ffmpeg.wasm | 27.8 | 4.4× |
+| 2 | `performance/extract-metadata` | performance | 15.3 | remotion-media-parser | 3.5 | 4.4× |
+| 3 | `metadata/read_opus` | metadata | 18.4 | ffmpeg.wasm | 4.3 | 4.3× |
+| 4 | `transcode/aac_to_pcm_wav_extract` | transcode | 84.0 | ffmpeg.wasm | 19.6 | 4.3× |
+| 5 | `metadata/tracks_attribution_multitrack` | metadata | 17.1 | remotion-media-parser | 4.0 | 4.2× |
+| 6 | `probe/metamorphic-recorder-headerless-sane-duration` | probe | 14.6 | mediabunny | 3.5 | 4.2× |
+| 7 | `probe/tiny_vp9_360p_2s` | probe | 13.3 | mediabunny | 3.2 | 4.1× |
+| 8 | `mux/mp3_to_mp4_audio` | mux | 26.1 | mediabunny | 6.5 | 4.0× |
+| 9 | `performance/op-sweep-demux` | performance | 30.7 | remotion-media-parser | 7.7 | 4.0× |
+| 10 | `transcode/mp3_to_aac_mp4` | transcode | 341.2 | mediabunny | 85.7 | 4.0× |
+| 11 | `mux/mp4_streaming_target` | mux | 264.9 | mediabunny | 66.8 | 4.0× |
+| 12 | `mux/aac_to_adts` | mux | 28.8 | mediabunny | 7.4 | 3.9× |
+| 13 | `performance/size-ladder-extract-metadata-medium` | performance | 14.0 | mediabunny | 3.7 | 3.8× |
+| 14 | `performance/op-sweep-probe` | performance | 14.4 | mediabunny | 3.8 | 3.8× |
+| 15 | `probe/mp3_xing` | probe | 11.2 | mediabunny | 3.0 | 3.8× |
+| 16 | `remux/aac_adts_adts_to_ts` | remux | 27.2 | mediabunny | 7.3 | 3.7× |
+| 17 | `probe/aac_adts` | probe | 15.3 | mediabunny | 4.2 | 3.6× |
+| 18 | `metadata/read_mp3_xing` | metadata | 13.8 | remotion-webcodecs | 3.8 | 3.6× |
+| 19 | `transcode/hdr10_to_sdr_tonemap` | transcode | 145.6 | ffmpeg.wasm | 40.9 | 3.6× |
+| 20 | `demux/mp3_cbr_notoc` | demux | 18.0 | mediabunny | 5.1 | 3.5× |
+| 21 | `remux/huge_h264_1080p_600s_mov_to_mp4` | remux | 1478.7 | remotion-webcodecs | 423.5 | 3.5× |
+| 22 | `trim/h264_rotated_keyframe_aligned` | trim | 119.7 | ffmpeg.wasm | 34.4 | 3.5× |
+| 23 | `mux/audio_only_aac_to_mp4` | mux | 26.9 | ffmpeg.wasm | 7.8 | 3.5× |
+| 24 | `probe/micro_h264_1frame` | probe | 17.6 | mediabunny | 5.1 | 3.5× |
+| 25 | `trim/mov_keyframe_aligned` | trim | 147.6 | ffmpeg.wasm | 42.7 | 3.5× |
+| 26 | `mux/prop_h264_decode_mux_mp4_to_mp4` | mux | 326.2 | mediabunny | 95.5 | 3.4× |
+| 27 | `trim/audio_wav_pcm_copy` | trim | 25.2 | mediabunny | 7.4 | 3.4× |
+| 28 | `trim/h264_start_zero_copy` | trim | 134.2 | mediabunny | 39.6 | 3.4× |
+| 29 | `transcode/opus_to_aac_mp4` | transcode | 323.6 | mediabunny | 96.8 | 3.3× |
+| 30 | `performance/size-ladder-iterate-packets-medium` | performance | 43.6 | web-demuxer | 13.1 | 3.3× |
+| 31 | `performance/size-ladder-extract-metadata-tiny` | performance | 14.8 | mediabunny | 4.5 | 3.3× |
+| 32 | `probe/realworld_mdn_flower_mp4` | probe | 13.0 | mp4box | 4.0 | 3.3× |
+| 33 | `metadata/read_no_tags_wav` | metadata | 14.1 | mediabunny | 4.4 | 3.2× |
+| 34 | `decode-seek/decode_size_tiny_h264_360p` | decode-seek | 334.2 | ffmpeg.wasm | 105.9 | 3.2× |
+| 35 | `transcode/wav_to_flac` | transcode | 127.4 | ffmpeg.wasm | 40.5 | 3.1× |
+| 36 | `audio-dsp/edge_longform_audio_resample_16k` | audio-dsp | 12843.1 | ffmpeg.wasm | 4117.0 | 3.1× |
+| 37 | `metadata/read_h264_1080p_5s` | metadata | 29.2 | mp4box | 9.4 | 3.1× |
+| 38 | `demux/size_tiny_tiny_vp9_360p_2s` | demux | 30.1 | ffmpeg.wasm | 9.7 | 3.1× |
+| 39 | `probe/recorder_headerless` | probe | 17.0 | mediabunny | 5.5 | 3.1× |
+| 40 | `mux/drop_audio_track_subset_to_mp4` | mux | 122.3 | mediabunny | 40.2 | 3.0× |
+| 41 | `mux/edge_bframes_decode_mux_mkv` | mux | 131.1 | mediabunny | 43.2 | 3.0× |
+| 42 | `probe/av1_720p_5s` | probe | 20.9 | mediabunny | 6.9 | 3.0× |
 
 ## Tier 4 — Minor (<3× slower) — the long tail (mostly root-cause B)
 
@@ -229,141 +201,147 @@ then **B** (profile the ~100 ms floor on a trivial op and amortize it).
 | 78 | `audio-dsp/pcm_f32_to_s16` | audio-dsp | 28.8 | ffmpeg.wasm | 16.1 | 1.8× |
 | 79 | `probe/vp8_720p_10s` | probe | 9.1 | ffmpeg.wasm | 5.2 | 1.8× |
 | 80 | `audio-dsp/throughput_encode_s24` | audio-dsp | 36.0 | ffmpeg.wasm | 20.6 | 1.8× |
-| 81 | `audio-dsp/upmix_stereo_to_5_1` | audio-dsp | 60.6 | ffmpeg.wasm | 34.7 | 1.7× |
-| 82 | `probe/pcm_s16be` | probe | 10.8 | ffmpeg.wasm | 6.2 | 1.7× |
-| 83 | `streaming-output/mp4_faststart_none_control` | streaming-output | 266.7 | ffmpeg.wasm | 155.0 | 1.7× |
-| 84 | `probe/h264_in_mkv` | probe | 17.3 | mediabunny | 10.1 | 1.7× |
-| 85 | `mux/prop_h264_mux_duration_mp4_to_ts` | mux | 319.1 | mediabunny | 186.0 | 1.7× |
-| 86 | `demux/hls_vod` | demux | 110.4 | ffmpeg.wasm | 64.9 | 1.7× |
-| 87 | `remux/aac_adts_adts_to_mp4` | remux | 13.2 | ffmpeg.wasm | 7.8 | 1.7× |
-| 88 | `transcode/selfcheck_h264_resize_720p_tie` | transcode | 3297.4 | mediabunny | 1953.9 | 1.7× |
-| 89 | `trim/audio_mp3_copy` | trim | 10.1 | mediabunny | 6.1 | 1.7× |
-| 90 | `mux/pcm_f32_to_wav` | mux | 30.2 | mediabunny | 18.3 | 1.6× |
-| 91 | `transcode/wav_to_aac_mp4` | transcode | 65.5 | mediabunny | 39.9 | 1.6× |
-| 92 | `decode-seek/seek_hevc_keyframe` | decode-seek | 62.6 | mediabunny | 38.2 | 1.6× |
-| 93 | `decode-seek/meta_seek_vs_linear_decode` | decode-seek | 70.1 | mediabunny | 42.8 | 1.6× |
-| 94 | `audio-dsp/pcm_s16_to_f32` | audio-dsp | 50.1 | ffmpeg.wasm | 30.8 | 1.6× |
-| 95 | `audio-dsp/pcm_s16le_to_s16be` | audio-dsp | 48.1 | ffmpeg.wasm | 29.6 | 1.6× |
-| 96 | `transcode/wav_to_opus_ogg` | transcode | 75.3 | mediabunny | 46.5 | 1.6× |
-| 97 | `remux/mp3_xing_mp3_to_mp4` | remux | 12.6 | ffmpeg.wasm | 7.9 | 1.6× |
-| 98 | `probe/flac_noseektable` | probe | 4.1 | mediabunny | 2.6 | 1.6× |
-| 99 | `transcode/gapless_pcm_to_aac_priming` | transcode | 57.6 | mediabunny | 36.3 | 1.6× |
-| 100 | `demux/hevc_1080p_10s` | demux | 39.6 | mediabunny | 25.0 | 1.6× |
-| 101 | `transcode/vp8_to_vp9_webm` | transcode | 136.8 | remotion-webcodecs | 87.0 | 1.6× |
-| 102 | `transcode/h264_rotate_90_dimswap` | transcode | 3995.0 | mediabunny | 2558.6 | 1.6× |
-| 103 | `metadata/write_ogg_vorbiscomment` | metadata | 13.0 | ffmpeg.wasm | 8.5 | 1.5× |
-| 104 | `transcode/vp9_alpha_to_vp9_keepalpha` | transcode | 1627.3 | mediabunny | 1068.4 | 1.5× |
-| 105 | `trim/h264_single_gop_frame_accurate` | trim | 244.3 | mediabunny | 162.3 | 1.5× |
-| 106 | `transcode/h264_fps_15_to_30` | transcode | 1077.5 | mediabunny | 717.2 | 1.5× |
-| 107 | `performance/op-sweep-transcode-webm` | performance | 2615.5 | mediabunny | 1757.7 | 1.5× |
-| 108 | `transcode/ladder_tiny_vp9_360p_to_h264_180p` | transcode | 225.9 | mediabunny | 152.1 | 1.5× |
-| 109 | `mux/video_plus_audio_to_mp4` | mux | 219.5 | mediabunny | 148.0 | 1.5× |
-| 110 | `streaming-output/mp4_faststart_reserve` | streaming-output | 136.2 | mediabunny | 92.1 | 1.5× |
-| 111 | `audio-dsp/upmix_mono_to_stereo` | audio-dsp | 40.3 | ffmpeg.wasm | 27.3 | 1.5× |
-| 112 | `demux/empty_audio_zero_packets` | demux | 4.4 | mediabunny | 3.0 | 1.5× |
-| 113 | `remux/vp8_720p_10s_webm_to_mkv` | remux | 19.2 | ffmpeg.wasm | 13.1 | 1.5× |
-| 114 | `audio-dsp/downmix_stereo_to_mono` | audio-dsp | 32.7 | ffmpeg.wasm | 22.5 | 1.4× |
-| 115 | `remux/prop_adts_to_mp4_duration_invariant` | remux | 9.6 | mediabunny | 6.7 | 1.4× |
-| 116 | `remux/h264_1080p_30s_mp4_to_ts` | remux | 210.1 | ffmpeg.wasm | 146.0 | 1.4× |
-| 117 | `performance/size-ladder-iterate-packets-large4k` | performance | 48.2 | mediabunny | 34.1 | 1.4× |
-| 118 | `transcode/multitrack_select_default_audio` | transcode | 702.3 | remotion-webcodecs | 497.7 | 1.4× |
-| 119 | `audio-dsp/gain_minus6db_s16` | audio-dsp | 36.0 | ffmpeg.wasm | 25.5 | 1.4× |
-| 120 | `transcode/h264_rotate_270_dimswap` | transcode | 957.9 | mediabunny | 682.8 | 1.4× |
-| 121 | `audio-dsp/throughput_decode_s24` | audio-dsp | 41.7 | mediabunny | 29.8 | 1.4× |
-| 122 | `encryption/cenc_ctr_decrypt` | encryption | 42.4 | ffmpeg.wasm | 30.3 | 1.4× |
-| 123 | `trim/fmp4_fragment_boundary_copy` | trim | 146.0 | ffmpeg.wasm | 105.0 | 1.4× |
-| 124 | `probe/vp9_1080p_10s` | probe | 22.9 | remotion-webcodecs | 16.5 | 1.4× |
-| 125 | `remux/av1_720p_5s_webm_to_mkv` | remux | 14.9 | mediabunny | 10.8 | 1.4× |
-| 126 | `demux/h264_multitrack` | demux | 31.8 | mp4box | 23.1 | 1.4× |
-| 127 | `transcode/h264_resize_720p` | transcode | 2464.1 | mediabunny | 1794.1 | 1.4× |
-| 128 | `mux/prop_vp9_mux_duration_webm_to_webm` | mux | 61.6 | mediabunny | 45.2 | 1.4× |
-| 129 | `demux/h264_ts` | demux | 76.9 | ffmpeg.wasm | 56.8 | 1.4× |
-| 130 | `remux/h264_1080p_5s_mov_to_mp4` | remux | 48.7 | mp4box | 36.0 | 1.4× |
-| 131 | `transcode/ladder_tiny_h264_360p_resize_180p` | transcode | 255.9 | mediabunny | 190.4 | 1.3× |
-| 132 | `streaming-output/prop_faststart_reserve_duration_invariant` | streaming-output | 104.0 | mediabunny | 77.7 | 1.3× |
-| 133 | `decode-seek/seek_h264_nonkeyframe` | decode-seek | 93.4 | mediabunny | 70.4 | 1.3× |
-| 134 | `decode-seek/seek_av1_keyframe` | decode-seek | 30.8 | mediabunny | 23.2 | 1.3× |
-| 135 | `trim/ts_keyframe_aligned` | trim | 109.4 | ffmpeg.wasm | 83.7 | 1.3× |
-| 136 | `decode-seek/decode_extreme_fps_1` | decode-seek | 63.7 | web-demuxer | 48.9 | 1.3× |
-| 137 | `probe/h264_ts` | probe | 40.4 | mediabunny | 31.0 | 1.3× |
-| 138 | `probe/h264_multitrack` | probe | 17.1 | remotion-webcodecs | 13.1 | 1.3× |
-| 139 | `decode-seek/decode_mov_h264` | decode-seek | 1318.5 | remotion-webcodecs | 1020.7 | 1.3× |
-| 140 | `transcode/av_downmix_stereo_to_mono` | transcode | 3354.5 | mediabunny | 2598.1 | 1.3× |
-| 141 | `transcode/h264_pad_letterbox_4x3_to_16x9` | transcode | 4071.1 | mediabunny | 3179.6 | 1.3× |
-| 142 | `transcode/h264_to_ts` | transcode | 3435.0 | mediabunny | 2684.0 | 1.3× |
-| 143 | `transcode/extreme_fps_240` | transcode | 21105.1 | mediabunny | 16590.0 | 1.3× |
-| 144 | `audio-dsp/edge_variable_channel_count_downmix` | audio-dsp | 79.3 | ffmpeg.wasm | 62.5 | 1.3× |
-| 145 | `remux/mp3_xing_mp3_to_mkv` | remux | 9.9 | mediabunny | 7.8 | 1.3× |
-| 146 | `performance/seek-ms` | performance | 72.4 | mediabunny | 57.4 | 1.3× |
-| 147 | `decode-seek/seek_negative` | decode-seek | 56.9 | mediabunny | 45.1 | 1.3× |
-| 148 | `transcode/h264_bitrate_2mbps` | transcode | 2625.2 | remotion-webcodecs | 2092.7 | 1.3× |
-| 149 | `transcode/metamorphic_resize_same_1080p_idempotent` | transcode | 3790.1 | mediabunny | 3055.8 | 1.2× |
-| 150 | `performance/convert-longtasks` | performance | 2187.5 | mediabunny | 1764.5 | 1.2× |
-| 151 | `decode-seek/decode_h264_10bit` | decode-seek | 627.7 | mediabunny | 509.3 | 1.2× |
-| 152 | `probe/metamorphic-duration-across-containers` | probe | 30.9 | remotion-media-parser | 25.4 | 1.2× |
-| 153 | `remux/prop_recorder_headerless_duration_materialized` | remux | 9.7 | ffmpeg.wasm | 8.0 | 1.2× |
-| 154 | `streaming-output/prop_faststart_in_memory_duration_invariant` | streaming-output | 182.7 | ffmpeg.wasm | 150.9 | 1.2× |
-| 155 | `streaming-output/prop_probe_dur_fragmented_shape` | streaming-output | 167.0 | mp4box | 138.2 | 1.2× |
-| 156 | `transcode/h264_to_vp9_webm` | transcode | 5507.4 | mediabunny | 4571.6 | 1.2× |
-| 157 | `mux/size_longform_audio_to_mp4` | mux | 741.6 | ffmpeg.wasm | 617.3 | 1.2× |
-| 158 | `decode-seek/decode_bframes_reorder` | decode-seek | 1357.0 | platform | 1145.1 | 1.2× |
-| 159 | `trim/h264_keyframe_aligned` | trim | 162.0 | ffmpeg.wasm | 136.7 | 1.2× |
-| 160 | `decode-seek/decode_multitrack_select_video` | decode-seek | 363.1 | mediabunny | 307.1 | 1.2× |
-| 161 | `trim/h264_to_eof_copy` | trim | 145.3 | ffmpeg.wasm | 123.7 | 1.2× |
-| 162 | `transcode/ladder_large_h264_1080p_120s_resize_720p` | transcode | 8920.7 | mediabunny | 7618.8 | 1.2× |
-| 163 | `decode-seek/meta_vfr_seek_lands_on_true_pts` | decode-seek | 54.7 | mediabunny | 46.9 | 1.2× |
-| 164 | `decode-seek/decode_size_tiny_vp9_360p` | decode-seek | 137.4 | remotion-webcodecs | 117.8 | 1.2× |
-| 165 | `remux/h264_multitrack_mp4_to_mkv` | remux | 45.6 | ffmpeg.wasm | 39.4 | 1.2× |
-| 166 | `decode-seek/decode_extreme_fps_240` | decode-seek | 237.1 | web-demuxer | 205.7 | 1.2× |
-| 167 | `transcode/fanout_h264_abr_ladder` | transcode | 9444.1 | mediabunny | 8194.4 | 1.2× |
-| 168 | `decode-seek/decode_size_huge_h264_600s` | decode-seek | 1628.8 | web-demuxer | 1421.5 | 1.1× |
-| 169 | `audio-dsp/throughput_decode_s16be` | audio-dsp | 41.1 | ffmpeg.wasm | 35.9 | 1.1× |
-| 170 | `transcode/h264_crop_center` | transcode | 2266.6 | mediabunny | 1986.6 | 1.1× |
-| 171 | `demux/h264_4k_10s` | demux | 31.6 | mediabunny | 27.8 | 1.1× |
-| 172 | `transcode/ladder_large_vp9_1080p_120s_to_h264_720p` | transcode | 10836.1 | mediabunny | 9530.1 | 1.1× |
-| 173 | `transcode/h264_rotate_180` | transcode | 3048.6 | mediabunny | 2684.5 | 1.1× |
-| 174 | `streaming-output/mp4_fragmented_cmaf` | streaming-output | 174.8 | mp4box | 155.2 | 1.1× |
-| 175 | `performance/convert-webm-resize-320x180` | performance | 1937.6 | mediabunny | 1735.0 | 1.1× |
-| 176 | `decode-seek/decode_size_large_vp9_120s` | decode-seek | 1510.1 | mediabunny | 1359.6 | 1.1× |
-| 177 | `transcode/h264_to_fragmented_mp4` | transcode | 4720.1 | mediabunny | 4274.2 | 1.1× |
-| 178 | `mux/h264_aac_to_mp4` | mux | 190.8 | mediabunny | 172.8 | 1.1× |
-| 179 | `metadata/read_pcm_s16be` | metadata | 12.1 | ffmpeg.wasm | 10.9 | 1.1× |
-| 180 | `decode-seek/decode_vp8` | decode-seek | 291.7 | mediabunny | 264.3 | 1.1× |
-| 181 | `transcode/hevc_to_vp9_webm` | transcode | 1718.7 | mediabunny | 1559.7 | 1.1× |
-| 182 | `metadata/tracks_packet_attribution_multitrack` | metadata | 26.2 | mediabunny | 23.8 | 1.1× |
-| 183 | `trim/vp8_keyframe_aligned` | trim | 16.6 | ffmpeg.wasm | 15.1 | 1.1× |
-| 184 | `transcode/roundtrip_leg1_h264_to_vp9` | transcode | 4742.4 | mediabunny | 4323.2 | 1.1× |
-| 185 | `decode-seek/seek_vfr_arbitrary` | decode-seek | 58.6 | platform | 53.5 | 1.1× |
-| 186 | `audio-dsp/fade_in_out_f32` | audio-dsp | 34.4 | ffmpeg.wasm | 31.5 | 1.1× |
-| 187 | `decode-seek/decode_vfr_timing` | decode-seek | 619.6 | mediabunny | 569.2 | 1.1× |
-| 188 | `encryption/perf_cenc_ctr_decrypt_throughput` | encryption | 42.2 | ffmpeg.wasm | 39.0 | 1.1× |
-| 189 | `mux/prop_vp9_decode_mux_webm_to_webm` | mux | 61.0 | mediabunny | 56.4 | 1.1× |
-| 190 | `metadata/rotation_decode_read_h264_rotated90` | metadata | 132.4 | platform | 122.5 | 1.1× |
-| 191 | `decode-seek/decode_rotated_display_matrix` | decode-seek | 368.5 | mediabunny | 341.3 | 1.1× |
-| 192 | `decode-seek/decode_hevc` | decode-seek | 673.1 | platform | 625.2 | 1.1× |
-| 193 | `decode-seek/decode_open_gop_first_frame` | decode-seek | 391.8 | remotion-webcodecs | 364.0 | 1.1× |
-| 194 | `streaming-output/prop_decode_equals_buffer_shape` | streaming-output | 274.2 | ffmpeg.wasm | 255.4 | 1.1× |
-| 195 | `decode-seek/seek_bframes_midgop` | decode-seek | 115.7 | platform | 108.1 | 1.1× |
-| 196 | `transcode/roundtrip_leg2_vp9_to_h264` | transcode | 1062.1 | mediabunny | 993.2 | 1.1× |
-| 197 | `demux/h264_in_mkv` | demux | 24.4 | mediabunny | 22.8 | 1.1× |
-| 198 | `decode-seek/decode_size_large_h264_120s` | decode-seek | 1245.1 | mediabunny | 1170.3 | 1.1× |
-| 199 | `mux/vp9_video_plus_opus_audio_to_webm` | mux | 100.9 | mediabunny | 94.9 | 1.1× |
-| 200 | `decode-seek/decode_h264_first_frames` | decode-seek | 1398.3 | platform | 1316.6 | 1.1× |
-| 201 | `decode-seek/seek_backward_then_forward` | decode-seek | 62.4 | mediabunny | 59.1 | 1.1× |
-| 202 | `transcode/extreme_fps_1` | transcode | 866.3 | mediabunny | 821.7 | 1.1× |
-| 203 | `demux/size_large_large_vp9_1080p_120s` | demux | 283.0 | ffmpeg.wasm | 268.5 | 1.1× |
-| 204 | `trim/hevc_frame_accurate` | trim | 506.6 | mediabunny | 480.8 | 1.1× |
-| 205 | `decode-seek/decode_av1` | decode-seek | 287.6 | mediabunny | 273.7 | 1.1× |
-| 206 | `decode-seek/decode_vp9` | decode-seek | 642.7 | platform | 613.5 | 1.0× |
-| 207 | `remux/prop_multitrack_survives_mp4_mkv` | remux | 40.3 | ffmpeg.wasm | 38.5 | 1.0× |
-| 208 | `transcode/av1_to_vp9_webm` | transcode | 517.1 | mediabunny | 495.8 | 1.0× |
-| 209 | `transcode/h264_to_mov` | transcode | 2705.8 | mediabunny | 2596.2 | 1.0× |
-| 210 | `transcode/vp9_to_av1_webm` | transcode | 2811.1 | mediabunny | 2733.7 | 1.0× |
-| 211 | `encryption/cenc_ctr_decrypt_eq_cleartext` | encryption | 27.4 | ffmpeg.wasm | 26.8 | 1.0× |
-| 212 | `performance/decode-fps` | performance | 352.9 | web-demuxer | 346.4 | 1.0× |
-| 213 | `transcode/av1_to_h264_mp4` | transcode | 312.1 | remotion-webcodecs | 307.8 | 1.0× |
-| 214 | `trim/h264_open_gop_frame_accurate` | trim | 507.7 | mediabunny | 502.8 | 1.0× |
-| 215 | `trim/hevc_keyframe_aligned` | trim | 43.4 | ffmpeg.wasm | 43.2 | 1.0× |
+| 81 | `decode-seek/decode_tiny_dims_1x1` | decode-seek | 7.1 | platform | 4.1 | 1.7× |
+| 82 | `audio-dsp/upmix_stereo_to_5_1` | audio-dsp | 60.6 | ffmpeg.wasm | 34.7 | 1.7× |
+| 83 | `probe/pcm_s16be` | probe | 10.8 | ffmpeg.wasm | 6.2 | 1.7× |
+| 84 | `streaming-output/mp4_faststart_none_control` | streaming-output | 266.7 | ffmpeg.wasm | 155.0 | 1.7× |
+| 85 | `probe/h264_in_mkv` | probe | 17.3 | mediabunny | 10.1 | 1.7× |
+| 86 | `mux/prop_h264_mux_duration_mp4_to_ts` | mux | 319.1 | mediabunny | 186.0 | 1.7× |
+| 87 | `demux/hls_vod` | demux | 110.4 | ffmpeg.wasm | 64.9 | 1.7× |
+| 88 | `remux/aac_adts_adts_to_mp4` | remux | 13.2 | ffmpeg.wasm | 7.8 | 1.7× |
+| 89 | `transcode/selfcheck_h264_resize_720p_tie` | transcode | 3297.4 | mediabunny | 1953.9 | 1.7× |
+| 90 | `trim/audio_mp3_copy` | trim | 10.1 | mediabunny | 6.1 | 1.7× |
+| 91 | `mux/pcm_f32_to_wav` | mux | 30.2 | mediabunny | 18.3 | 1.6× |
+| 92 | `transcode/wav_to_aac_mp4` | transcode | 65.5 | mediabunny | 39.9 | 1.6× |
+| 93 | `decode-seek/seek_hevc_keyframe` | decode-seek | 62.6 | mediabunny | 38.2 | 1.6× |
+| 94 | `decode-seek/meta_seek_vs_linear_decode` | decode-seek | 70.1 | mediabunny | 42.8 | 1.6× |
+| 95 | `audio-dsp/pcm_s16_to_f32` | audio-dsp | 50.1 | ffmpeg.wasm | 30.8 | 1.6× |
+| 96 | `audio-dsp/pcm_s16le_to_s16be` | audio-dsp | 48.1 | ffmpeg.wasm | 29.6 | 1.6× |
+| 97 | `transcode/wav_to_opus_ogg` | transcode | 75.3 | mediabunny | 46.5 | 1.6× |
+| 98 | `remux/mp3_xing_mp3_to_mp4` | remux | 12.6 | ffmpeg.wasm | 7.9 | 1.6× |
+| 99 | `probe/flac_noseektable` | probe | 4.1 | mediabunny | 2.6 | 1.6× |
+| 100 | `transcode/gapless_pcm_to_aac_priming` | transcode | 57.6 | mediabunny | 36.3 | 1.6× |
+| 101 | `demux/hevc_1080p_10s` | demux | 39.6 | mediabunny | 25.0 | 1.6× |
+| 102 | `transcode/vp8_to_vp9_webm` | transcode | 136.8 | remotion-webcodecs | 87.0 | 1.6× |
+| 103 | `transcode/h264_rotate_90_dimswap` | transcode | 3995.0 | mediabunny | 2558.6 | 1.6× |
+| 104 | `metadata/write_ogg_vorbiscomment` | metadata | 13.0 | ffmpeg.wasm | 8.5 | 1.5× |
+| 105 | `transcode/vp9_alpha_to_vp9_keepalpha` | transcode | 1627.3 | mediabunny | 1068.4 | 1.5× |
+| 106 | `trim/h264_single_gop_frame_accurate` | trim | 244.3 | mediabunny | 162.3 | 1.5× |
+| 107 | `transcode/h264_fps_15_to_30` | transcode | 1077.5 | mediabunny | 717.2 | 1.5× |
+| 108 | `performance/op-sweep-transcode-webm` | performance | 2615.5 | mediabunny | 1757.7 | 1.5× |
+| 109 | `transcode/ladder_tiny_vp9_360p_to_h264_180p` | transcode | 225.9 | mediabunny | 152.1 | 1.5× |
+| 110 | `mux/video_plus_audio_to_mp4` | mux | 219.5 | mediabunny | 148.0 | 1.5× |
+| 111 | `streaming-output/mp4_faststart_reserve` | streaming-output | 136.2 | mediabunny | 92.1 | 1.5× |
+| 112 | `audio-dsp/upmix_mono_to_stereo` | audio-dsp | 40.3 | ffmpeg.wasm | 27.3 | 1.5× |
+| 113 | `demux/empty_audio_zero_packets` | demux | 4.4 | mediabunny | 3.0 | 1.5× |
+| 114 | `remux/vp8_720p_10s_webm_to_mkv` | remux | 19.2 | ffmpeg.wasm | 13.1 | 1.5× |
+| 115 | `audio-dsp/downmix_stereo_to_mono` | audio-dsp | 32.7 | ffmpeg.wasm | 22.5 | 1.4× |
+| 116 | `remux/prop_adts_to_mp4_duration_invariant` | remux | 9.6 | mediabunny | 6.7 | 1.4× |
+| 117 | `remux/h264_1080p_30s_mp4_to_ts` | remux | 210.1 | ffmpeg.wasm | 146.0 | 1.4× |
+| 118 | `performance/size-ladder-iterate-packets-large4k` | performance | 48.2 | mediabunny | 34.1 | 1.4× |
+| 119 | `transcode/multitrack_select_default_audio` | transcode | 702.3 | remotion-webcodecs | 497.7 | 1.4× |
+| 120 | `audio-dsp/gain_minus6db_s16` | audio-dsp | 36.0 | ffmpeg.wasm | 25.5 | 1.4× |
+| 121 | `transcode/h264_rotate_270_dimswap` | transcode | 957.9 | mediabunny | 682.8 | 1.4× |
+| 122 | `audio-dsp/throughput_decode_s24` | audio-dsp | 41.7 | mediabunny | 29.8 | 1.4× |
+| 123 | `encryption/cenc_ctr_decrypt` | encryption | 42.4 | ffmpeg.wasm | 30.3 | 1.4× |
+| 124 | `trim/fmp4_fragment_boundary_copy` | trim | 146.0 | ffmpeg.wasm | 105.0 | 1.4× |
+| 125 | `probe/vp9_1080p_10s` | probe | 22.9 | remotion-webcodecs | 16.5 | 1.4× |
+| 126 | `remux/av1_720p_5s_webm_to_mkv` | remux | 14.9 | mediabunny | 10.8 | 1.4× |
+| 127 | `demux/h264_multitrack` | demux | 31.8 | mp4box | 23.1 | 1.4× |
+| 128 | `transcode/h264_resize_720p` | transcode | 2464.1 | mediabunny | 1794.1 | 1.4× |
+| 129 | `mux/prop_vp9_mux_duration_webm_to_webm` | mux | 61.6 | mediabunny | 45.2 | 1.4× |
+| 130 | `demux/h264_ts` | demux | 76.9 | ffmpeg.wasm | 56.8 | 1.4× |
+| 131 | `remux/h264_1080p_5s_mov_to_mp4` | remux | 48.7 | mp4box | 36.0 | 1.4× |
+| 132 | `transcode/ladder_tiny_h264_360p_resize_180p` | transcode | 255.9 | mediabunny | 190.4 | 1.3× |
+| 133 | `streaming-output/prop_faststart_reserve_duration_invariant` | streaming-output | 104.0 | mediabunny | 77.7 | 1.3× |
+| 134 | `decode-seek/seek_h264_nonkeyframe` | decode-seek | 93.4 | mediabunny | 70.4 | 1.3× |
+| 135 | `decode-seek/seek_av1_keyframe` | decode-seek | 30.8 | mediabunny | 23.2 | 1.3× |
+| 136 | `demux/h264_vfr` | demux | 9.5 | remotion-media-parser | 7.2 | 1.3× |
+| 137 | `trim/ts_keyframe_aligned` | trim | 109.4 | ffmpeg.wasm | 83.7 | 1.3× |
+| 138 | `decode-seek/decode_extreme_fps_1` | decode-seek | 63.7 | web-demuxer | 48.9 | 1.3× |
+| 139 | `mux/size_tiny_360p_to_mp4` | mux | 17.9 | mp4box | 13.7 | 1.3× |
+| 140 | `probe/h264_ts` | probe | 40.4 | mediabunny | 31.0 | 1.3× |
+| 141 | `probe/h264_multitrack` | probe | 17.1 | remotion-webcodecs | 13.1 | 1.3× |
+| 142 | `decode-seek/decode_mov_h264` | decode-seek | 1318.5 | remotion-webcodecs | 1020.7 | 1.3× |
+| 143 | `transcode/av_downmix_stereo_to_mono` | transcode | 3354.5 | mediabunny | 2598.1 | 1.3× |
+| 144 | `transcode/h264_pad_letterbox_4x3_to_16x9` | transcode | 4071.1 | mediabunny | 3179.6 | 1.3× |
+| 145 | `transcode/h264_to_ts` | transcode | 3435.0 | mediabunny | 2684.0 | 1.3× |
+| 146 | `transcode/extreme_fps_240` | transcode | 21105.1 | mediabunny | 16590.0 | 1.3× |
+| 147 | `audio-dsp/edge_variable_channel_count_downmix` | audio-dsp | 79.3 | ffmpeg.wasm | 62.5 | 1.3× |
+| 148 | `remux/mp3_xing_mp3_to_mkv` | remux | 9.9 | mediabunny | 7.8 | 1.3× |
+| 149 | `performance/seek-ms` | performance | 72.4 | mediabunny | 57.4 | 1.3× |
+| 150 | `decode-seek/seek_negative` | decode-seek | 56.9 | mediabunny | 45.1 | 1.3× |
+| 151 | `transcode/h264_bitrate_2mbps` | transcode | 2625.2 | remotion-webcodecs | 2092.7 | 1.3× |
+| 152 | `demux/h264_1080p_30s` | demux | 6.8 | web-demuxer | 5.5 | 1.2× |
+| 153 | `transcode/metamorphic_resize_same_1080p_idempotent` | transcode | 3790.1 | mediabunny | 3055.8 | 1.2× |
+| 154 | `performance/convert-longtasks` | performance | 2187.5 | mediabunny | 1764.5 | 1.2× |
+| 155 | `decode-seek/decode_h264_10bit` | decode-seek | 627.7 | mediabunny | 509.3 | 1.2× |
+| 156 | `probe/metamorphic-duration-across-containers` | probe | 30.9 | remotion-media-parser | 25.4 | 1.2× |
+| 157 | `remux/prop_recorder_headerless_duration_materialized` | remux | 9.7 | ffmpeg.wasm | 8.0 | 1.2× |
+| 158 | `streaming-output/prop_faststart_in_memory_duration_invariant` | streaming-output | 182.7 | ffmpeg.wasm | 150.9 | 1.2× |
+| 159 | `streaming-output/prop_probe_dur_fragmented_shape` | streaming-output | 167.0 | mp4box | 138.2 | 1.2× |
+| 160 | `transcode/h264_to_vp9_webm` | transcode | 5507.4 | mediabunny | 4571.6 | 1.2× |
+| 161 | `mux/size_longform_audio_to_mp4` | mux | 741.6 | ffmpeg.wasm | 617.3 | 1.2× |
+| 162 | `decode-seek/decode_bframes_reorder` | decode-seek | 1357.0 | platform | 1145.1 | 1.2× |
+| 163 | `trim/h264_keyframe_aligned` | trim | 162.0 | ffmpeg.wasm | 136.7 | 1.2× |
+| 164 | `decode-seek/decode_multitrack_select_video` | decode-seek | 363.1 | mediabunny | 307.1 | 1.2× |
+| 165 | `trim/h264_to_eof_copy` | trim | 145.3 | ffmpeg.wasm | 123.7 | 1.2× |
+| 166 | `transcode/ladder_large_h264_1080p_120s_resize_720p` | transcode | 8920.7 | mediabunny | 7618.8 | 1.2× |
+| 167 | `probe/big_buck_bunny_1080p_h264` | probe | 5.6 | mediabunny | 4.8 | 1.2× |
+| 168 | `decode-seek/meta_vfr_seek_lands_on_true_pts` | decode-seek | 54.7 | mediabunny | 46.9 | 1.2× |
+| 169 | `decode-seek/decode_size_tiny_vp9_360p` | decode-seek | 137.4 | remotion-webcodecs | 117.8 | 1.2× |
+| 170 | `remux/h264_multitrack_mp4_to_mkv` | remux | 45.6 | ffmpeg.wasm | 39.4 | 1.2× |
+| 171 | `decode-seek/decode_extreme_fps_240` | decode-seek | 237.1 | web-demuxer | 205.7 | 1.2× |
+| 172 | `transcode/fanout_h264_abr_ladder` | transcode | 9444.1 | mediabunny | 8194.4 | 1.2× |
+| 173 | `decode-seek/decode_size_huge_h264_600s` | decode-seek | 1628.8 | web-demuxer | 1421.5 | 1.1× |
+| 174 | `audio-dsp/throughput_decode_s16be` | audio-dsp | 41.1 | ffmpeg.wasm | 35.9 | 1.1× |
+| 175 | `transcode/h264_crop_center` | transcode | 2266.6 | mediabunny | 1986.6 | 1.1× |
+| 176 | `demux/h264_4k_10s` | demux | 31.6 | mediabunny | 27.8 | 1.1× |
+| 177 | `transcode/ladder_large_vp9_1080p_120s_to_h264_720p` | transcode | 10836.1 | mediabunny | 9530.1 | 1.1× |
+| 178 | `transcode/h264_rotate_180` | transcode | 3048.6 | mediabunny | 2684.5 | 1.1× |
+| 179 | `streaming-output/mp4_fragmented_cmaf` | streaming-output | 174.8 | mp4box | 155.2 | 1.1× |
+| 180 | `performance/convert-webm-resize-320x180` | performance | 1937.6 | mediabunny | 1735.0 | 1.1× |
+| 181 | `decode-seek/decode_size_large_vp9_120s` | decode-seek | 1510.1 | mediabunny | 1359.6 | 1.1× |
+| 182 | `transcode/h264_to_fragmented_mp4` | transcode | 4720.1 | mediabunny | 4274.2 | 1.1× |
+| 183 | `mux/h264_aac_to_mp4` | mux | 190.8 | mediabunny | 172.8 | 1.1× |
+| 184 | `metadata/read_pcm_s16be` | metadata | 12.1 | ffmpeg.wasm | 10.9 | 1.1× |
+| 185 | `decode-seek/decode_vp8` | decode-seek | 291.7 | mediabunny | 264.3 | 1.1× |
+| 186 | `transcode/hevc_to_vp9_webm` | transcode | 1718.7 | mediabunny | 1559.7 | 1.1× |
+| 187 | `metadata/tracks_packet_attribution_multitrack` | metadata | 26.2 | mediabunny | 23.8 | 1.1× |
+| 188 | `trim/vp8_keyframe_aligned` | trim | 16.6 | ffmpeg.wasm | 15.1 | 1.1× |
+| 189 | `transcode/roundtrip_leg1_h264_to_vp9` | transcode | 4742.4 | mediabunny | 4323.2 | 1.1× |
+| 190 | `remux/flac_seektable_flac_to_mkv` | remux | 8.3 | ffmpeg.wasm | 7.6 | 1.1× |
+| 191 | `decode-seek/seek_vfr_arbitrary` | decode-seek | 58.6 | platform | 53.5 | 1.1× |
+| 192 | `audio-dsp/fade_in_out_f32` | audio-dsp | 34.4 | ffmpeg.wasm | 31.5 | 1.1× |
+| 193 | `decode-seek/decode_vfr_timing` | decode-seek | 619.6 | mediabunny | 569.2 | 1.1× |
+| 194 | `encryption/perf_cenc_ctr_decrypt_throughput` | encryption | 42.2 | ffmpeg.wasm | 39.0 | 1.1× |
+| 195 | `mux/prop_vp9_decode_mux_webm_to_webm` | mux | 61.0 | mediabunny | 56.4 | 1.1× |
+| 196 | `metadata/rotation_decode_read_h264_rotated90` | metadata | 132.4 | platform | 122.5 | 1.1× |
+| 197 | `decode-seek/decode_rotated_display_matrix` | decode-seek | 368.5 | mediabunny | 341.3 | 1.1× |
+| 198 | `decode-seek/decode_hevc` | decode-seek | 673.1 | platform | 625.2 | 1.1× |
+| 199 | `decode-seek/decode_open_gop_first_frame` | decode-seek | 391.8 | remotion-webcodecs | 364.0 | 1.1× |
+| 200 | `streaming-output/prop_decode_equals_buffer_shape` | streaming-output | 274.2 | ffmpeg.wasm | 255.4 | 1.1× |
+| 201 | `decode-seek/seek_bframes_midgop` | decode-seek | 115.7 | platform | 108.1 | 1.1× |
+| 202 | `transcode/roundtrip_leg2_vp9_to_h264` | transcode | 1062.1 | mediabunny | 993.2 | 1.1× |
+| 203 | `demux/h264_in_mkv` | demux | 24.4 | mediabunny | 22.8 | 1.1× |
+| 204 | `decode-seek/decode_size_large_h264_120s` | decode-seek | 1245.1 | mediabunny | 1170.3 | 1.1× |
+| 205 | `mux/vp9_video_plus_opus_audio_to_webm` | mux | 100.9 | mediabunny | 94.9 | 1.1× |
+| 206 | `decode-seek/decode_h264_first_frames` | decode-seek | 1398.3 | platform | 1316.6 | 1.1× |
+| 207 | `decode-seek/seek_backward_then_forward` | decode-seek | 62.4 | mediabunny | 59.1 | 1.1× |
+| 208 | `transcode/extreme_fps_1` | transcode | 866.3 | mediabunny | 821.7 | 1.1× |
+| 209 | `demux/size_large_large_vp9_1080p_120s` | demux | 283.0 | ffmpeg.wasm | 268.5 | 1.1× |
+| 210 | `trim/hevc_frame_accurate` | trim | 506.6 | mediabunny | 480.8 | 1.1× |
+| 211 | `decode-seek/decode_av1` | decode-seek | 287.6 | mediabunny | 273.7 | 1.1× |
+| 212 | `decode-seek/decode_vp9` | decode-seek | 642.7 | platform | 613.5 | 1.0× |
+| 213 | `remux/prop_multitrack_survives_mp4_mkv` | remux | 40.3 | ffmpeg.wasm | 38.5 | 1.0× |
+| 214 | `transcode/av1_to_vp9_webm` | transcode | 517.1 | mediabunny | 495.8 | 1.0× |
+| 215 | `transcode/h264_to_mov` | transcode | 2705.8 | mediabunny | 2596.2 | 1.0× |
+| 216 | `transcode/vp9_to_av1_webm` | transcode | 2811.1 | mediabunny | 2733.7 | 1.0× |
+| 217 | `encryption/cenc_ctr_decrypt_eq_cleartext` | encryption | 27.4 | ffmpeg.wasm | 26.8 | 1.0× |
+| 218 | `performance/decode-fps` | performance | 352.9 | web-demuxer | 346.4 | 1.0× |
+| 219 | `transcode/av1_to_h264_mp4` | transcode | 312.1 | remotion-webcodecs | 307.8 | 1.0× |
+| 220 | `trim/h264_open_gop_frame_accurate` | trim | 507.7 | mediabunny | 502.8 | 1.0× |
+| 221 | `trim/hevc_keyframe_aligned` | trim | 43.4 | ffmpeg.wasm | 43.2 | 1.0× |
 
 ## ADR-backed parity exemptions
 

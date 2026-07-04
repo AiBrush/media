@@ -75,14 +75,65 @@ function flacTrackInfo(description: Uint8Array): TrackInfo {
 }
 
 describe('registerDefaultDrivers', () => {
-  it('registers image support on the default registry host', () => {
+  it('registers image support on the default registry host', async () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);
     const images = reg.imageOps();
     expect(images).toBeDefined();
-    expect(images?.sniff(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(
-      'png',
+    expect(images?.formats).toEqual(['gif', 'png', 'jpeg', 'webp', 'avif']);
+    expect(images?.sniff(await derivedBytes('img/anim2.gif'))).toBe('gif');
+    expect(images?.sniff(await derivedBytes('img/test.png'))).toBe('png');
+    expect(images?.sniff(await derivedBytes('img/test.jpeg'))).toBe('jpeg');
+    expect(images?.sniff(await derivedBytes('img/test.webp'))).toBe('webp');
+    expect(images?.sniff(await derivedBytes('img/test.avif'))).toBe('avif');
+    expect(images?.sniff(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41]))).toBe(
+      undefined,
     );
+    expect(
+      images?.sniff(
+        new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45]),
+      ),
+    ).toBe(undefined);
+    expect(
+      images?.sniff(
+        new Uint8Array([
+          0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00,
+          0x00, 0x61, 0x76, 0x69, 0x66,
+        ]),
+      ),
+    ).toBe('avif');
+    expect(
+      images?.sniff(
+        new Uint8Array([
+          0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00,
+          0x00, 0x6d, 0x70, 0x34, 0x32,
+        ]),
+      ),
+    ).toBe(undefined);
+  });
+
+  it('lazy-loads image probe while keeping decode as a typed Node miss', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const images = reg.imageOps();
+    if (images === undefined) throw new Error('default drivers must register image ops');
+
+    await expect(images.probe(await derivedBytes('img/anim2.gif'))).resolves.toMatchObject({
+      format: 'gif',
+      width: 480,
+      height: 360,
+      frameCount: 36,
+      animated: true,
+    });
+    expect(images.canDecode()).toBe(false);
+
+    const still = await derivedBytes('img/test.png');
+    await expect(images.decode(still).getReader().read()).rejects.toBeInstanceOf(CapabilityError);
+    await expect(
+      (async () => {
+        for await (const frame of images.decodeFrames(still)) frame.close();
+      })(),
+    ).rejects.toBeInstanceOf(CapabilityError);
   });
 
   it('registers the real software video-decode wasm tails (AV1/VPx) now that their cores are vendored', () => {

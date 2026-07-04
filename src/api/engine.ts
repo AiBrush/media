@@ -32,7 +32,6 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { audioDataToPcm, pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
 import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
@@ -155,8 +154,11 @@ export interface MediaEngine {
 
 const HEAD_BYTES = 64 * 1024;
 const HINTED_HEAD_BYTES = 4 * 1024;
+const REPEATED_PROBE_PREFIX_CACHE_TTL_MS = 60_000;
+const REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES = 1024 * 1024;
 type PacketInfoCallOptions = CallOptions & { readonly container?: Container };
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
+type PcmRangeToPlanarInit = typeof import('../dsp/audio-data.ts')['pcmRangeToPlanarInit'];
 type AbrFanoutRendition = {
   readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
 };
@@ -204,6 +206,7 @@ export class MediaEngineImpl implements MediaEngine {
    */
   readonly #poolCache: OffloadPoolCache = {};
   readonly #sourcePrefixHandoff = new Map<string, SourcePrefixHandoff>();
+  readonly #repeatedProbePrefixCache = new Map<string, SourcePrefixHandoff>();
 
   constructor(opts: CreateMediaOptions = {}) {
     this.#opts = opts;
@@ -235,7 +238,16 @@ export class MediaEngineImpl implements MediaEngine {
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const src = cacheProbeRanges(normalizeInput(input), this.#sourcePrefixHandoff, 'store');
+      const repeated = cacheProbeRanges(
+        normalizeInput(input),
+        this.#repeatedProbePrefixCache,
+        'reuse',
+        {
+          maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
+          ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
+        },
+      );
+      const src = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
@@ -258,7 +270,10 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions = {},
   ): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = cacheProbeRanges(normalizeInput(input), this.#repeatedProbePrefixCache, 'reuse', {
+        maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
+        ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
+      });
       const driver = await this.#routeContainerToken(container, 'demux');
       const stage = this.#stageOptions(signal, o);
       if (driver.probe) {
@@ -524,6 +539,9 @@ export class MediaEngineImpl implements MediaEngine {
       // same way `probe` does — demux once, take the longest track — then the demuxer is released.
       const durationSec = await this.#probeDurationSec(container, src, signal, o);
       assertTrimRange(opts.start, opts.end, durationSec);
+      if (opts.mode === 'accurate' && isWholeSourceTrim(src, opts, durationSec)) {
+        return materializeOutput(opts.sink ?? toBlob(), src.stream(), mimeOpts(signal, target));
+      }
       if (opts.mode === 'accurate') {
         if (target === 'flac' && container.transformPcm) {
           const stream = await container.transformPcm(src, {
@@ -700,7 +718,7 @@ export class MediaEngineImpl implements MediaEngine {
             ? fastMux.muxSingleTrackMp4
             : target === 'ogg'
               ? fastMux.muxSingleTrackOggAudio
-              : fastMux.muxSingleTrackWebmAudio;
+              : fastMux.muxPreparedWebmPacketStreams;
         const stream = await muxPrepared(streams, {
           ...this.#stageOptions(signal, o),
           container: target,
@@ -931,7 +949,7 @@ export class MediaEngineImpl implements MediaEngine {
     const ops = await this.#imageOpsForSource(src);
     if (ops === undefined) return undefined;
     const bytes = await readAllSource(src, signal);
-    return imageToMediaInfo(ops.probe(bytes), src);
+    return imageToMediaInfo(await ops.probe(bytes), src);
   }
 
   /** Sniff an image source once and, if matched, keep the bytes shared by the video/audio decode streams. */
@@ -1197,8 +1215,13 @@ export class MediaEngineImpl implements MediaEngine {
     /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
     if (offloaded !== undefined) return offloaded;
 
-    const { trimBoundsUs, trimEncodeTrack, trimTimedFrameStream, trimVideoEncodeTarget } =
-      await import('./trim-streams.ts');
+    const {
+      restampAudioData,
+      trimBoundsUs,
+      trimEncodeTrack,
+      trimTimedFrameStream,
+      trimVideoEncodeTarget,
+    } = await import('./trim-streams.ts');
     const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
     const bounds = trimBoundsUs(opts.start, endSec);
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
@@ -1694,9 +1717,13 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<number> {
-    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+    const stage = this.#stageOptions(signal, o);
+    if (container.probe !== undefined) {
+      return trimDurationSecFromTracks(await container.probe(src, stage));
+    }
+    const demuxer = await container.demux(src, stage);
     try {
-      return demuxer.tracks.reduce((max, t) => Math.max(max, t.durationSec ?? 0), 0);
+      return trimDurationSecFromTracks(demuxer.tracks);
     } finally {
       await demuxer.close();
     }
@@ -1767,9 +1794,42 @@ function shouldSniffImageForDecode(src: Source): boolean {
 
 const MICROS_PER_SECOND = 1_000_000;
 const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
+const TRIM_IDENTITY_START_EPSILON_SEC = 1e-9;
+const TRIM_IDENTITY_END_EPSILON_SEC = 0.001;
 
 function canTrimAudioPackets(container: Container): boolean {
   return AUDIO_PACKET_TRIM_CONTAINERS.has(container);
+}
+
+function isWholeSourceTrim(src: Source, opts: TrimOptions, durationSec: number): boolean {
+  if (src.kind === 'stream') return false;
+  if (durationSec <= 0) return false;
+  return (
+    Math.abs(opts.start) <= TRIM_IDENTITY_START_EPSILON_SEC &&
+    Math.abs(opts.end - durationSec) <= TRIM_IDENTITY_END_EPSILON_SEC
+  );
+}
+
+function trimDurationSecFromTracks(tracks: readonly TrackInfo[]): number {
+  return tracks.reduce((max, track) => Math.max(max, trimDurationSecOfTrack(track)), 0);
+}
+
+function trimDurationSecOfTrack(track: TrackInfo): number {
+  const totalSamples = track.gapless?.totalSamples;
+  const sampleRate = audioGeometryOf(track).sampleRate;
+  if (
+    track.mediaType === 'audio' &&
+    totalSamples !== undefined &&
+    sampleRate !== undefined &&
+    sampleRate > 0
+  ) {
+    return totalSamples / sampleRate;
+  }
+  return track.durationSec !== undefined &&
+    Number.isFinite(track.durationSec) &&
+    track.durationSec > 0
+    ? track.durationSec
+    : 0;
 }
 
 function assertTrimTrackDecodable(track: TrackInfo): void {
@@ -1782,7 +1842,7 @@ async function decodedAudioStreamWithGapless(
   track: TrackInfo,
 ): Promise<ReadableStream<AudioData>> {
   if (track.gapless === undefined) return frames;
-  const { trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
+  const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
   return trimAudioGaplessFrameStream(frames, track.gapless, restampAudioDataRange);
 }
 
@@ -1797,26 +1857,6 @@ function restampVideoFrame(
   return new VideoFrame(frame, init);
 }
 
-function restampAudioData(
-  frame: AudioData,
-  timestamp: number,
-  _duration: number | null,
-): AudioData {
-  return restampAudioDataRange(frame, 0, frame.numberOfFrames, timestamp);
-}
-
-function restampAudioDataRange(
-  frame: AudioData,
-  startFrame: number,
-  frameCount: number,
-  timestamp: number,
-): AudioData {
-  if (startFrame === 0 && frameCount === frame.numberOfFrames && frame.timestamp === timestamp) {
-    return frame;
-  }
-  const { init } = pcmRangeToPlanarInit(audioDataToPcm(frame), startFrame, frameCount, timestamp);
-  return new AudioData(init);
-}
 /* v8 ignore stop */
 
 function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
@@ -1924,9 +1964,14 @@ function pcmAudioToAudioDataStream(
   assertPcmAudioDataAvailable(label);
   /* v8 ignore start -- requires the browser `AudioData` constructor; validated in the browser harness. */
   let cursor = 0;
+  let initRange: PcmRangeToPlanarInit | undefined;
+  const loadInitRange = async (): Promise<PcmRangeToPlanarInit> => {
+    initRange ??= (await import('../dsp/audio-data.ts')).pcmRangeToPlanarInit;
+    return initRange;
+  };
   return new ReadableStream<AudioData>(
     {
-      pull(controller): void {
+      async pull(controller): Promise<void> {
         try {
           throwIfAborted(stage.signal);
           if (cursor >= audio.frames) {
@@ -1935,7 +1980,7 @@ function pcmAudioToAudioDataStream(
           }
           const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
           const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
-          const { init } = pcmRangeToPlanarInit(audio, cursor, frames, timestamp);
+          const { init } = (await loadInitRange())(audio, cursor, frames, timestamp);
           const frame = new AudioData(init);
           try {
             controller.enqueue(frame);
@@ -2217,13 +2262,14 @@ async function startAtSeekKeyframePackets(
 function cacheProbeRanges(
   src: Source,
   handoff?: Map<string, SourcePrefixHandoff>,
-  mode: 'local' | 'store' | 'consume' = 'local',
+  mode: 'local' | 'store' | 'consume' | 'reuse' = 'local',
+  options: { readonly maxBytes?: number; readonly ttlMs?: number } = {},
 ): Source {
   const range = src.range;
   if (range === undefined) return src;
   const cacheKey = src[SOURCE_CACHE_KEY];
   let cached =
-    mode === 'consume' && cacheKey !== undefined && handoff !== undefined
+    (mode === 'consume' || mode === 'reuse') && cacheKey !== undefined && handoff !== undefined
       ? handoff.get(cacheKey)?.bytes
       : undefined;
   if (mode === 'consume' && cacheKey !== undefined) {
@@ -2240,10 +2286,19 @@ function cacheProbeRanges(
         return cached.subarray(start, end);
       }
       const bytes = await range.call(src, start, end);
-      if (start === 0 && (cached === undefined || bytes.byteLength > cached.byteLength)) {
+      const cacheable = options.maxBytes === undefined || bytes.byteLength <= options.maxBytes;
+      if (
+        start === 0 &&
+        cacheable &&
+        (cached === undefined || bytes.byteLength > cached.byteLength)
+      ) {
         cached = bytes;
-        if (mode === 'store' && cacheKey !== undefined && handoff !== undefined) {
-          storeSourcePrefixHandoff(handoff, cacheKey, bytes);
+        if (
+          (mode === 'store' || mode === 'reuse') &&
+          cacheKey !== undefined &&
+          handoff !== undefined
+        ) {
+          storeSourcePrefixHandoff(handoff, cacheKey, bytes, options.ttlMs);
         }
       }
       return bytes;
@@ -2255,6 +2310,7 @@ function storeSourcePrefixHandoff(
   handoff: Map<string, SourcePrefixHandoff>,
   cacheKey: string,
   bytes: Uint8Array,
+  ttlMs: number = SOURCE_PREFIX_HANDOFF_TTL_MS,
 ): void {
   const token = {};
   handoff.set(cacheKey, { bytes, token });
@@ -2262,7 +2318,7 @@ function storeSourcePrefixHandoff(
     if (handoff.get(cacheKey)?.token === token) {
       handoff.delete(cacheKey);
     }
-  }, SOURCE_PREFIX_HANDOFF_TTL_MS);
+  }, ttlMs);
 }
 
 function routeHeadBytes(src: Source): number {

@@ -8,7 +8,7 @@ Correctness is won — **#1, 557 PASS / 0 FAIL / 0 ERROR** on Chromium. This ses
 
 ## The work (one feature at a time)
 
-1. **Generate the to-do backlog** — run `docs/perf/gen-deficits.mjs` on the latest export to write `docs/perf/performance-deficits.md`: every deficit cell, ranked, our ms vs the fastest rival's. Regenerate it every round; it is the living worklist and the speed gate.
+1. **Generate the to-do backlog** — run `docs/perf/gen-deficits.mjs` on the latest export to write @docs/perf/performance-deficits.md: every deficit cell, ranked, our ms vs the fastest rival's. Regenerate it every round; it is the living worklist and the speed gate.
 2. **Close each deficit, top-down, one at a time.** Two root causes cover almost all:
    - **A — whole-file scanning** (we read the whole file where rivals seek to `moov`/index): all 6 catastrophic + most severe cells. Biggest wins.
    - **B — fixed per-op overhead** (init/worker/WebCodecs-config/copies dominate on tiny inputs): the 211-cell tail.

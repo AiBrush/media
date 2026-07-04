@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
+import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import {
   Mp3Driver,
+  type Mp3Info,
   Mp3Module,
   enumerateMp3Packets,
   isMpegLayer3Frame,
+  mp3PacketInfoFromBytes,
+  muxPreparedMp3PacketTrack,
   parseMp3,
 } from './mp3-driver.ts';
 
@@ -48,6 +51,15 @@ function frameLen(version = 3, bitrateKbps = 128, sampleRate = 44100): number {
 function pad(head: number[], to: number): number[] {
   return [...head, ...new Array<number>(Math.max(0, to - head.length)).fill(0)];
 }
+function mp3TrackInfoForTest(info: Mp3Info): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: 'mp3',
+    durationSec: info.durationSec,
+    config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  };
+}
 
 describe('Mp3Driver.supports', () => {
   it('recognizes frame-sync + ID3, mime, and extension; rejects others', async () => {
@@ -85,6 +97,39 @@ describe('probe MP3 on the real corpus', () => {
       .use(Mp3Module)
       .probe(await fixtureSource('sound_5.mp3'));
     expect(info).toEqual(await loadGoldenMetadata('sound_5.mp3'));
+  });
+
+  it('metadata-only probe range-reads one bounded head for known-size sources', async () => {
+    const bytes = await loadFixture('sound_5.mp3');
+    const ranges: Array<readonly [number, number]> = [];
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      range: (start, end): Promise<Uint8Array> => {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('metadata-only MP3 probe must not open the full stream');
+      },
+    };
+
+    const tracks = await Mp3Driver.probe?.(src);
+    const expected = parseMp3(bytes.subarray(0, 16 * 1024), bytes.byteLength);
+
+    expect(ranges).toEqual([[0, 16 * 1024]]);
+    expect(tracks).toEqual([
+      {
+        id: 0,
+        mediaType: 'audio',
+        codec: 'mp3',
+        durationSec: expected.durationSec,
+        config: {
+          codec: 'mp3',
+          sampleRate: expected.sampleRate,
+          numberOfChannels: expected.channels,
+        },
+      },
+    ]);
   });
 });
 
@@ -161,6 +206,64 @@ describe('parseMp3 — frame variants + duration', () => {
 });
 
 describe('Mp3Driver — demux seam + muxer', () => {
+  it('packetInfo enumerates MP3 frame facts without constructing packet chunks', async () => {
+    const bytes = await loadFixture('sound_5.mp3');
+    const expected = mp3PacketInfoFromBytes(bytes);
+    const table = await Mp3Driver.packetInfo?.({
+      size: bytes.byteLength,
+      range: (start, end): Promise<Uint8Array> => Promise.resolve(bytes.subarray(start, end)),
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('packetInfo should prefer the exact range for known-size MP3 sources');
+      },
+    });
+    const frames = enumerateMp3Packets(bytes);
+
+    expect(table).toBeDefined();
+    expect(table).toEqual(expected);
+    expect(table?.tracks).toEqual([mp3TrackInfoForTest(parseMp3(bytes, bytes.byteLength))]);
+    expect(table?.packets).toEqual(
+      frames.map((frame) => ({
+        trackIndex: 0,
+        offset: frame.offset,
+        size: frame.size,
+        ptsUs: frame.ptsUs,
+        dtsUs: frame.ptsUs,
+        durationUs: frame.durationUs,
+        keyframe: true,
+      })),
+    );
+  });
+
+  it('prepared MP3 packet mux matches the class muxer on real frame bytes', async () => {
+    const bytes = await loadFixture('sound_5.mp3');
+    const info = parseMp3(bytes, bytes.byteLength);
+    const track = mp3TrackInfoForTest(info);
+    const packets = enumerateMp3Packets(bytes).map((frame) => ({
+      data: bytes.subarray(frame.offset, frame.offset + frame.size),
+      ptsUs: frame.ptsUs,
+      durationUs: frame.durationUs,
+      keyframe: true,
+    }));
+
+    const muxer = Mp3Driver.createMuxer();
+    const trackId = muxer.addTrack(track);
+    for (const packet of packets) {
+      muxer.addChunkStruct(trackId, {
+        timestampUs: packet.ptsUs,
+        durationUs: packet.durationUs,
+        key: packet.keyframe,
+        data: packet.data,
+      });
+    }
+    await muxer.finalize();
+
+    const classMuxed = await collectBytes(muxer.output);
+    const prepared = muxPreparedMp3PacketTrack({ track, packets });
+    expect(prepared).toEqual(classMuxed);
+    expect(parseMp3(prepared).durationSec).toBeCloseTo(info.durationSec, 3);
+    expect(enumerateMp3Packets(prepared)).toHaveLength(packets.length);
+  });
+
   it('demuxes a non-seekable stream source; the packet seam is a typed gap in node', async () => {
     const bytes = await loadFixture('sound_5.mp3');
     const streamSource: ByteSource = {

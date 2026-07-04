@@ -119,6 +119,29 @@ function rangeSource(
   };
 }
 
+function urlRangeSource(
+  bytes: Uint8Array,
+  reads: Array<{ offset: number; length: number }>,
+  kind: 'url' | 'element' = 'url',
+  size = bytes.byteLength,
+): ByteSource & { readonly kind: 'url' | 'element' } {
+  return { ...rangeSource(bytes, reads), kind, size };
+}
+
+function unknownSizeUrlRangeSource(
+  bytes: Uint8Array,
+  reads: Array<{ offset: number; length: number }>,
+): ByteSource & { readonly kind: 'url' } {
+  const source = rangeSource(bytes, reads);
+  const range = source.range;
+  if (range === undefined) throw new Error('expected range source');
+  return {
+    stream: source.stream,
+    range,
+    kind: 'url',
+  };
+}
+
 function sampleData(index: number, keyframe: boolean): SampleData {
   return {
     index,
@@ -351,6 +374,7 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     const stream = await Mp4Driver.streamCopy(rangeSource(input, reads), {
       trim: { startSec: 1, endSec: 3 },
       faststart: true,
+      buffered: true,
     });
     const output = await collectBytes(stream);
 
@@ -374,6 +398,89 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(reads.length).toBeLessThan(sourceSampleCount);
     expect(reads.every((read) => read.length <= 8 * 1024 * 1024)).toBe(true);
     expect(totalReadBytes).toBeLessThan(input.byteLength);
+  });
+
+  it.each(['url', 'element'] as const)(
+    'small %s keyframe trim reuses one source buffer for metadata, validation, and copy windows',
+    async (kind) => {
+      if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+      const input = await loadFixture('movie_5.mp4');
+      const reads: Array<{ offset: number; length: number }> = [];
+      const stream = await Mp4Driver.streamCopy(urlRangeSource(input, reads, kind), {
+        trim: { startSec: 1, endSec: 3 },
+        faststart: true,
+        buffered: true,
+      });
+      const output = await collectBytes(stream);
+
+      const sourceMovie = await readMovie(ra(input));
+      const trimmedMovie = await readMovie(ra(output));
+      const sourceSampleCount = sourceMovie.tracks.reduce(
+        (sum, track) => sum + buildSampleData(track).length,
+        0,
+      );
+      const trimmedSampleCount = trimmedMovie.tracks.reduce(
+        (sum, track) => sum + buildSampleData(track).length,
+        0,
+      );
+
+      expect(reads).toEqual([{ offset: 0, length: input.byteLength }]);
+      expect(output.byteLength).toBeGreaterThan(0);
+      expect(output.byteLength).toBeLessThan(input.byteLength);
+      expect(trimmedSampleCount).toBeGreaterThan(0);
+      expect(trimmedSampleCount).toBeLessThan(sourceSampleCount);
+    },
+  );
+
+  it('large URL keyframe trim keeps the sparse selected-window path', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const claimedLargeSize = 9 * 1024 * 1024;
+    const reads: Array<{ offset: number; length: number }> = [];
+    const stream = await Mp4Driver.streamCopy(
+      urlRangeSource(input, reads, 'url', claimedLargeSize),
+      {
+        trim: { startSec: 1, endSec: 3 },
+        faststart: true,
+        buffered: true,
+      },
+    );
+    const output = await collectBytes(stream);
+
+    const trimmedMovie = await readMovie(ra(output));
+    const trimmedSampleCount = trimmedMovie.tracks.reduce(
+      (sum, track) => sum + buildSampleData(track).length,
+      0,
+    );
+
+    expect(reads).not.toEqual([{ offset: 0, length: claimedLargeSize }]);
+    expect(reads.length).toBeGreaterThan(1);
+    expect(output.byteLength).toBeGreaterThan(0);
+    expect(output.byteLength).toBeLessThan(input.byteLength);
+    expect(trimmedSampleCount).toBeGreaterThan(0);
+  });
+
+  it('unknown-size URL keyframe trim keeps the sparse selected-window path', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const reads: Array<{ offset: number; length: number }> = [];
+    const stream = await Mp4Driver.streamCopy(unknownSizeUrlRangeSource(input, reads), {
+      trim: { startSec: 1, endSec: 3 },
+      faststart: true,
+      buffered: true,
+    });
+    const output = await collectBytes(stream);
+    const trimmedMovie = await readMovie(ra(output));
+    const trimmedSampleCount = trimmedMovie.tracks.reduce(
+      (sum, track) => sum + buildSampleData(track).length,
+      0,
+    );
+
+    expect(reads).not.toEqual([{ offset: 0, length: input.byteLength }]);
+    expect(reads.length).toBeGreaterThan(1);
+    expect(output.byteLength).toBeGreaterThan(0);
+    expect(output.byteLength).toBeLessThan(input.byteLength);
+    expect(trimmedSampleCount).toBeGreaterThan(0);
   });
 
   it('lazy source fragments group GOPs until the target sample budget', () => {

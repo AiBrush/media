@@ -8,8 +8,11 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { type ChunkStruct, writeMp4PacketTrack } from '../drivers/mp4/mux.ts';
-import { fromBytes } from '../sources/source.ts';
+import { cacheSource } from '../sources/cache.ts';
+import { fromBytes, fromURL } from '../sources/source.ts';
 import type { Container } from './types.ts';
+
+const MP4_PACKET_INFO_URL_PRIME_BYTES = 8 * 1024;
 
 export interface PreparedMp4PacketMuxInput {
   readonly track: TrackInfo;
@@ -17,6 +20,12 @@ export interface PreparedMp4PacketMuxInput {
   readonly container: Container | string;
   readonly faststart?: boolean;
   readonly fragmented?: boolean;
+}
+
+export interface Mp4PacketInfoFromUrlOptions {
+  readonly mime?: string;
+  readonly size?: number;
+  readonly signal?: AbortSignal;
 }
 
 export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uint8Array {
@@ -54,6 +63,35 @@ export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uin
 }
 
 export async function mp4PacketInfoFromBytes(bytes: Uint8Array): Promise<PacketInfoTable> {
+  return mp4PacketInfoFromSource(fromBytes(bytes, { mime: 'video/mp4' }));
+}
+
+export async function mp4PacketInfoFromUrl(
+  url: string | URL,
+  opts: Mp4PacketInfoFromUrlOptions = {},
+): Promise<PacketInfoTable> {
+  const src = cacheSource(
+    fromURL(url, {
+      mime: opts.mime ?? 'video/mp4',
+      ...(opts.size !== undefined ? { size: opts.size } : {}),
+    }),
+  );
+  await src.prime([
+    {
+      start: 0,
+      end:
+        opts.size !== undefined
+          ? Math.min(opts.size, MP4_PACKET_INFO_URL_PRIME_BYTES)
+          : MP4_PACKET_INFO_URL_PRIME_BYTES,
+    },
+  ]);
+  return mp4PacketInfoFromSource(src, opts.signal);
+}
+
+async function mp4PacketInfoFromSource(
+  src: Parameters<NonNullable<typeof Mp4Driver.packetInfo>>[0],
+  signal?: AbortSignal,
+): Promise<PacketInfoTable> {
   const packetInfo = Mp4Driver.packetInfo;
   if (packetInfo === undefined) {
     throw new CapabilityError('capability-miss', 'MP4 packet-info is not available', {
@@ -61,7 +99,7 @@ export async function mp4PacketInfoFromBytes(bytes: Uint8Array): Promise<PacketI
       tried: ['mp4'],
     });
   }
-  return packetInfo.call(Mp4Driver, fromBytes(bytes, { mime: 'video/mp4' }));
+  return packetInfo.call(Mp4Driver, src, signal !== undefined ? { signal } : undefined);
 }
 
 function chunkStructFrom(value: Packet | EncodedChunk): ChunkStruct {

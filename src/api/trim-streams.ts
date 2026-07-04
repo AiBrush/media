@@ -1,5 +1,6 @@
 import type { Packet, TrackInfo } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
+import { audioDataToPcm, pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
 import type { VideoTarget } from './types.ts';
 
 const MICROS_PER_SECOND = 1_000_000;
@@ -273,6 +274,29 @@ export function trimAudioGaplessFrameStream<T extends AudioSampleFrameForTrim>(
     { highWaterMark: 0 },
   );
 }
+
+/* v8 ignore start -- browser-only AudioData constructors; stream ownership is tested with fakes. */
+export function restampAudioData(
+  frame: AudioData,
+  timestamp: number,
+  _duration: number | null,
+): AudioData {
+  return restampAudioDataRange(frame, 0, frame.numberOfFrames, timestamp);
+}
+
+export function restampAudioDataRange(
+  frame: AudioData,
+  startFrame: number,
+  frameCount: number,
+  timestamp: number,
+): AudioData {
+  if (startFrame === 0 && frameCount === frame.numberOfFrames && frame.timestamp === timestamp) {
+    return frame;
+  }
+  const { init } = pcmRangeToPlanarInit(audioDataToPcm(frame), startFrame, frameCount, timestamp);
+  return new AudioData(init);
+}
+/* v8 ignore stop */
 
 function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number): Packet {
   const chunk = packet.chunk;

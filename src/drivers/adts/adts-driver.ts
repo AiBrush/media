@@ -18,14 +18,17 @@ import {
   type DriverModule,
   type MuxOptions,
   type Packet,
+  type PacketInfoTable,
   type PcmTransform,
   type Registry,
   type StageOptions,
+  type StreamCopyOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
+import { fromURL } from '../../sources/source.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
 import { AdtsMuxer } from './adts-mux.ts';
@@ -37,8 +40,30 @@ const WASM_AAC_TRIED = ['wasm-aac'] as const;
 const PCM_OUTPUT_FORMAT = 's16' as const;
 const AAC_PCM_NATIVE_FIRST_PLAN = ['webcodecs-audio', 'wasm-aac'] as const;
 const AAC_PCM_WASM_ONLY_PLAN = ['wasm-aac'] as const;
+const ADTS_TRIM_END_SLACK_SEC = 1;
+const ADTS_TRIM_URL_CACHE_TTL_MS = 60_000;
+const ADTS_TRIM_URL_CACHE_MAX_ENTRIES = 16;
+const ADTS_TRIM_URL_CACHE_MAX_ENTRY_BYTES = 1 * 1024 * 1024;
 
 export type AdtsAacPcmDecodeRung = (typeof AAC_PCM_NATIVE_FIRST_PLAN)[number];
+
+export interface AdtsTrimRange {
+  readonly startSec: number;
+  readonly endSec: number;
+}
+
+export interface AdtsTrimFromUrlOptions extends AdtsTrimRange {
+  readonly mime?: string;
+  readonly size?: number;
+  readonly signal?: AbortSignal;
+}
+
+interface CachedAdtsTrimBytes {
+  readonly bytes: Uint8Array;
+  readonly expiresAtMs: number;
+}
+
+const adtsTrimUrlByteCache = new Map<string, CachedAdtsTrimBytes>();
 
 // MPEG-4 sampling-frequency-index table (Hz); index 13–15 are reserved/explicit (unsupported here).
 const SAMPLE_RATES = [
@@ -283,6 +308,21 @@ function readLayout(bytes: Uint8Array): AdtsLayout {
   };
 }
 
+function trackInfoFromLayout(layout: AdtsLayout): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: layout.info.codec,
+    durationSec: layout.info.durationSec,
+    config: {
+      codec: layout.info.codec,
+      sampleRate: layout.info.sampleRate,
+      numberOfChannels: layout.info.channels,
+      description: layout.asc,
+    },
+  };
+}
+
 /** Convert interleaved f32 decoder output into the engine's canonical planar Float64 PCM. */
 export function pcmFromInterleavedF32(
   interleaved: Float32Array,
@@ -349,6 +389,131 @@ export function concatPcmChunks(
 
 function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
   return bytes.subarray(frame.offset + frame.headerBytes, frame.offset + frame.size);
+}
+
+function assertAdtsStreamCopyTarget(container: string | undefined): void {
+  if (container === undefined || container === 'adts') return;
+  throw new CapabilityError('capability-miss', `ADTS stream-copy cannot write '${container}'`, {
+    op: { op: 'streamCopy', container },
+    tried: ['adts'],
+  });
+}
+
+function assertAdtsTrimRange(
+  trim: StreamCopyOptions['trim'] | undefined,
+  durationSec: number,
+): void {
+  if (trim === undefined) return;
+  if (!Number.isFinite(trim.startSec) || !Number.isFinite(trim.endSec)) {
+    throw new InputError('unsupported-input', 'bad trim');
+  }
+  if (trim.startSec < 0) {
+    throw new InputError('unsupported-input', 'start<0');
+  }
+  if (trim.endSec <= trim.startSec) {
+    throw new InputError('unsupported-input', 'empty trim');
+  }
+  if (durationSec > 0) {
+    if (trim.startSec >= durationSec) {
+      throw new InputError('unsupported-input', 'start>=duration');
+    }
+    if (trim.endSec > durationSec + ADTS_TRIM_END_SLACK_SEC) {
+      throw new InputError('unsupported-input', 'end>duration');
+    }
+  }
+}
+
+function selectAdtsFrames(
+  frames: readonly AdtsPacket[],
+  trim: StreamCopyOptions['trim'] | undefined,
+): readonly AdtsPacket[] {
+  if (trim === undefined) return frames;
+  const startUs = Math.round(trim.startSec * 1_000_000);
+  const endUs = Math.round(trim.endSec * 1_000_000);
+  return frames.filter((frame) => frame.ptsUs + frame.durationUs > startUs && frame.ptsUs < endUs);
+}
+
+function adtsFramesDurationSec(frames: readonly AdtsPacket[]): number {
+  const last = frames[frames.length - 1];
+  return last === undefined ? 0 : (last.ptsUs + last.durationUs) / 1_000_000;
+}
+
+function writeAdtsPacketCopy(
+  bytes: Uint8Array,
+  trim: StreamCopyOptions['trim'] | undefined,
+): Uint8Array {
+  const frames = enumerateAdtsFrames(bytes);
+  assertAdtsTrimRange(trim, adtsFramesDurationSec(frames));
+  const selected = selectAdtsFrames(frames, trim);
+  if (selected.length === 0) {
+    throw new InputError('unsupported-input', 'ADTS trim selected no audio frames');
+  }
+  let total = 0;
+  for (const frame of selected) total += frame.size;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const frame of selected) {
+    const packet = bytes.subarray(frame.offset, frame.offset + frame.size);
+    out.set(packet, offset);
+    offset += packet.byteLength;
+  }
+  return out;
+}
+
+function adtsTrimUrlCacheKey(url: string | URL, opts: AdtsTrimFromUrlOptions): string {
+  const href = typeof url === 'string' ? url : url.href;
+  return `${href}#${opts.size ?? 'unknown'}`;
+}
+
+function getCachedAdtsTrimBytes(key: string, nowMs: number): Uint8Array | undefined {
+  const cached = adtsTrimUrlByteCache.get(key);
+  if (cached === undefined) return undefined;
+  if (cached.expiresAtMs <= nowMs) {
+    adtsTrimUrlByteCache.delete(key);
+    return undefined;
+  }
+  adtsTrimUrlByteCache.delete(key);
+  adtsTrimUrlByteCache.set(key, cached);
+  return cached.bytes;
+}
+
+function rememberAdtsTrimBytes(key: string, bytes: Uint8Array, nowMs: number): void {
+  if (bytes.byteLength > ADTS_TRIM_URL_CACHE_MAX_ENTRY_BYTES) return;
+  adtsTrimUrlByteCache.set(key, {
+    bytes,
+    expiresAtMs: nowMs + ADTS_TRIM_URL_CACHE_TTL_MS,
+  });
+  while (adtsTrimUrlByteCache.size > ADTS_TRIM_URL_CACHE_MAX_ENTRIES) {
+    const oldest = adtsTrimUrlByteCache.keys().next().value;
+    if (oldest === undefined) break;
+    adtsTrimUrlByteCache.delete(oldest);
+  }
+}
+
+export function adtsTrimFromBytes(bytes: Uint8Array, trim: AdtsTrimRange): Uint8Array {
+  return writeAdtsPacketCopy(bytes, trim);
+}
+
+export async function adtsTrimFromUrl(
+  url: string | URL,
+  opts: AdtsTrimFromUrlOptions,
+): Promise<Uint8Array> {
+  throwIfAborted(opts.signal);
+  const key = adtsTrimUrlCacheKey(url, opts);
+  const nowMs = Date.now();
+  const cached = getCachedAdtsTrimBytes(key, nowMs);
+  if (cached !== undefined) {
+    return writeAdtsPacketCopy(cached, { startSec: opts.startSec, endSec: opts.endSec });
+  }
+  const source = fromURL(url, {
+    rangeRequests: true,
+    ...(opts.mime !== undefined ? { mime: opts.mime } : {}),
+    ...(opts.size !== undefined ? { size: opts.size } : {}),
+  });
+  const bytes = await readAll(source);
+  throwIfAborted(opts.signal);
+  rememberAdtsTrimBytes(key, bytes, Date.now());
+  return writeAdtsPacketCopy(bytes, { startSec: opts.startSec, endSec: opts.endSec });
 }
 
 function nativeDecoderUnavailable(reason: string): CapabilityError {
@@ -589,32 +754,31 @@ export const AdtsDriver = {
   kind: 'container',
   formats: ['adts'],
   supports: matches,
+  validatesStreamCopyTrim: true,
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const layout = readLayout(bytes);
+    return {
+      tracks: [trackInfoFromLayout(layout)],
+      packets: layout.frames.map((frame) => ({
+        trackIndex: 0,
+        offset: frame.offset,
+        size: frame.size,
+        ptsUs: frame.ptsUs,
+        dtsUs: frame.ptsUs,
+        durationUs: frame.durationUs,
+        keyframe: true,
+      })),
+    };
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     // A raw ADTS stream has no front index — every frame's geometry lives inline, so `packets()` needs the
     // whole file. We read it once here and parse the head from it (the existing probe path is unchanged).
     const bytes = await readAll(src);
-    const info = parseAdts(bytes, bytes.byteLength);
+    const layout = readLayout(bytes);
     const signal = o?.signal;
-    // Re-derive the header fields the synthesized ASC needs (parseAdts validated the syncword already).
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const start = adtsOffset(dv);
-    const b2 = dv.getUint8(start + 2);
-    const aot = ((b2 >> 6) & 0x3) + 1;
-    const freqIndex = (b2 >> 2) & 0xf;
-    const channelConfig = ((b2 & 0x1) << 2) | ((dv.getUint8(start + 3) >> 6) & 0x3);
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: {
-        codec: info.codec,
-        sampleRate: info.sampleRate,
-        numberOfChannels: info.channels,
-        // The explicit ASC makes AAC decode robust on browsers that don't sniff it from the raw AU.
-        description: audioSpecificConfig(aot, freqIndex, channelConfig),
-      },
-    };
+    const track = trackInfoFromLayout(layout);
     return {
       tracks: [track],
       packets(trackId: number): ReadableStream<Packet> {
@@ -623,6 +787,18 @@ export const AdtsDriver = {
       },
       close: () => Promise.resolve(),
     };
+  },
+  async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+    assertAdtsStreamCopyTarget(o?.container);
+    throwIfAborted(o?.signal);
+    const out = writeAdtsPacketCopy(await readAll(src), o?.trim);
+    throwIfAborted(o?.signal);
+    return new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(out);
+        c.close();
+      },
+    });
   },
   createMuxer(o?: MuxOptions): AdtsMuxer {
     // ADTS is an elementary stream: wrap each raw AAC access unit in a 7-byte ADTS header (no re-encode;

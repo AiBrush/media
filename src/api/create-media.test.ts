@@ -570,6 +570,61 @@ describe('createMedia', () => {
     expect(info.tracks.find((track) => track.type === 'video')?.codec).toBe('vp9');
   });
 
+  it('probe reuses bounded source prefixes across repeated public probes', async () => {
+    const calls: Array<readonly [number, number]> = [];
+    const bytes = new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]);
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp3',
+        durationSec: 1,
+        config: { codec: 'mp3', sampleRate: 44100, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'cached-public-mp3',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp3'],
+      supports: (q) => q.mime === 'audio/mpeg' || q.head?.[0] === 0xff,
+      probe: async (src) => {
+        const head = await src.range?.(0, bytes.byteLength);
+        expect(head).toEqual(bytes);
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('public probe must not demux when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/mpeg',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'https://example.test/tiny.mp3',
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('repeated public probe must not stream');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+
+    await media.probe(src);
+    await media.probe(src);
+
+    expect(calls).toEqual([[0, 4 * 1024]]);
+  });
+
   it('probeContainer routes by known container token without sniffing source bytes', async () => {
     const calls = { range: 0, stream: 0 };
     const tracks: TrackInfo[] = [
@@ -633,6 +688,63 @@ describe('createMedia', () => {
       sizeBytes: 123,
       tracks: [{ id: 1, type: 'video', codec: 'vp9', durationSec: 12, width: 640, height: 360 }],
     });
+  });
+
+  it('probeContainer reuses bounded source prefixes across repeated known-container probes', async () => {
+    const calls: Array<readonly [number, number]> = [];
+    const bytes = new Uint8Array([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]);
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'video',
+        codec: 'avc1.42001f',
+        durationSec: 1,
+        config: { codec: 'avc1.42001f', codedWidth: 2, codedHeight: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'known-mp4',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp4'],
+      supports: () => true,
+      probe: async (src) => {
+        const head = await src.range?.(0, bytes.byteLength);
+        expect(head).toEqual(bytes);
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('known-container probe must not demux when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'https://example.test/tiny.mp4',
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('repeated known-container probe must not stream');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    }) as unknown as {
+      probeContainer(input: MediaInput, container: 'mp4'): Promise<unknown>;
+    };
+
+    await media.probeContainer(src, 'mp4');
+    await media.probeContainer(src, 'mp4');
+
+    expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
   it('probe routes still images through the registered image capability', async () => {
@@ -826,6 +938,53 @@ describe('createMedia', () => {
       expect(call).toMatchObject({ streaming: true });
       expect(call).not.toMatchObject({ buffered: true });
     }
+  });
+
+  it('accurate whole-source trim returns original re-readable source bytes after duration validation', async () => {
+    const bytes = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
+    const calls: string[] = [];
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp4a.40.2',
+        durationSec: 2.04,
+        gapless: { leadingSamples: 1024, trailingSamples: 571, totalSamples: 88_200 },
+        config: { codec: 'mp4a.40.2', sampleRate: 44_100, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'identity-trim-mp4',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp4'],
+      supports: (q) => q.mime === 'video/x-identity-trim-mp4',
+      probe: () => {
+        calls.push('probe');
+        return Promise.resolve(tracks);
+      },
+      demux: () => {
+        throw new Error('identity trim must not open a demuxer when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('identity trim must not create a muxer');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+
+    const out = await media.trim(fromBytes(bytes, { mime: 'video/x-identity-trim-mp4' }), {
+      start: 0,
+      end: 2.0004,
+      mode: 'accurate',
+    });
+
+    expect(out).toBeInstanceOf(Blob);
+    if (!(out instanceof Blob)) throw new Error('expected trim to materialize a Blob');
+    expect(new Uint8Array(await out.arrayBuffer())).toEqual(bytes);
+    expect(calls).toEqual(['probe']);
   });
 
   it('cross-target remux uses a driver-declared streamCopy target before the generic packet seam', async () => {

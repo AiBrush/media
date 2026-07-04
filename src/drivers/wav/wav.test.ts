@@ -5,7 +5,13 @@ import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { readWavPcm, writeWav } from './pcm.ts';
-import { WavDriver, WavModule, parseWav } from './wav-driver.ts';
+import {
+  WavDriver,
+  WavModule,
+  parseWav,
+  wavPacketInfoFromBytes,
+  wavPacketInfoFromUrl,
+} from './wav-driver.ts';
 import { WavMuxer } from './wav-mux.ts';
 
 const WAVS = [
@@ -69,6 +75,41 @@ function u32le(bytes: Uint8Array, offset: number): number {
       ((bytes[offset + 3] ?? 0) << 24)) >>>
     0
   );
+}
+
+function rangeServer(bytes: Uint8Array): {
+  readonly fetch: typeof fetch;
+  readonly calls: Array<{
+    readonly method: string;
+    readonly range: string | null;
+    readonly bytes: number;
+  }>;
+} {
+  const calls: Array<{ method: string; range: string | null; bytes: number }> = [];
+  const total = bytes.byteLength;
+  const fetchImpl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = init?.headers as { Range?: string } | undefined;
+    const range = headers?.Range ?? null;
+    if (range !== null) {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (match === null) return new Response('bad range', { status: 416 });
+      const start = Number(match[1]);
+      const end = Math.min(Number(match[2]) + 1, total);
+      const slice = bytes.subarray(start, Math.max(start, end));
+      calls.push({ method, range, bytes: slice.byteLength });
+      return new Response(slice.slice(), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${start + slice.byteLength - 1}/${total}` },
+      });
+    }
+    calls.push({ method, range, bytes: total });
+    return new Response(bytes.slice(), {
+      status: 200,
+      headers: { 'Content-Length': String(total) },
+    });
+  }) as typeof fetch;
+  return { fetch: fetchImpl, calls };
 }
 
 function withJunkChunk(bytes: Uint8Array): Uint8Array {
@@ -303,6 +344,75 @@ describe('probe WAV across the real corpus', () => {
     expect(demuxed.tracks).toHaveLength(1);
     expect(() => demuxed.packets(0)).toThrowError(/audio-dsp/);
     await demuxed.close();
+  });
+
+  it('packetInfo enumerates WAV PCM chunks from the bounded header without payload fetch', async () => {
+    const packetInfo = WavDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WavDriver must expose packetInfo');
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error(
+          'packetInfo should not fetch the WAV payload when the data header is visible',
+        );
+      },
+    };
+
+    const table = await packetInfo(source);
+    const track = table.tracks[0];
+    const config = track?.config;
+    const channels =
+      config !== undefined && 'numberOfChannels' in config ? config.numberOfChannels : undefined;
+    const payload = chunkPayload(bytes, 'data');
+    const bytesPerFrame = 3 * (channels ?? 0);
+
+    expect(reads).toEqual([[0, 4096]]);
+    expect(track?.codec).toBe('pcm-s24');
+    expect(channels).toBeGreaterThan(0);
+    expect(table.packets).toHaveLength(Math.ceil(payload.byteLength / (4096 * bytesPerFrame)));
+    expect(table.packets.reduce((total, packet) => total + packet.size, 0)).toBe(
+      payload.byteLength,
+    );
+    expect(table.packets[0]).toMatchObject({
+      trackIndex: 0,
+      offset: bytes.byteLength - payload.byteLength,
+      size: 4096 * bytesPerFrame,
+      ptsUs: 0,
+      dtsUs: 0,
+      keyframe: true,
+    });
+  });
+
+  it('wavPacketInfoFromUrl uses one small range for header-visible data chunks', async () => {
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const server = rangeServer(bytes);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const table = await wavPacketInfoFromUrl('https://fixtures.invalid/sfx-pcm-s24.wav', {
+        mime: 'audio/wav',
+        size: bytes.byteLength,
+      });
+      expect(table).toEqual(wavPacketInfoFromBytes(bytes));
+      await expect(
+        wavPacketInfoFromUrl('https://fixtures.invalid/sfx-pcm-s24.wav', {
+          mime: 'audio/wav',
+          size: bytes.byteLength,
+        }),
+      ).resolves.toEqual(table);
+      expect(table.packets.reduce((total, packet) => total + packet.size, 0)).toBe(
+        chunkPayload(bytes, 'data').byteLength,
+      );
+      expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-4095', bytes: 4096 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('demuxes a non-seekable stream source (reads the header from the first chunk)', async () => {

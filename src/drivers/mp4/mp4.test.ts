@@ -47,6 +47,14 @@ function u32(n: number): Uint8Array {
   return out;
 }
 
+function u64(n: number): Uint8Array {
+  const out = new Uint8Array(8);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, Math.floor(n / 0x100000000));
+  view.setUint32(4, n >>> 0);
+  return out;
+}
+
 function zeros(length: number): Uint8Array {
   return new Uint8Array(length);
 }
@@ -68,6 +76,16 @@ function box(type: string, ...payload: Uint8Array[]): Uint8Array {
   new DataView(out.buffer).setUint32(0, out.byteLength);
   out.set(ascii(type), 4);
   out.set(body, 8);
+  return out;
+}
+
+function box64(type: string, ...payload: Uint8Array[]): Uint8Array {
+  const body = joinBytes(payload);
+  const out = new Uint8Array(16 + body.byteLength);
+  new DataView(out.buffer).setUint32(0, 1);
+  out.set(ascii(type), 4);
+  out.set(u64(out.byteLength), 8);
+  out.set(body, 16);
   return out;
 }
 
@@ -143,6 +161,52 @@ function smallAacTrack(overrides: Partial<MuxTrackInput> = {}): MuxTrackInput {
     ],
     ...overrides,
   };
+}
+
+function u32At(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0);
+}
+
+function fourccAt(bytes: Uint8Array, offset: number): string {
+  return String.fromCharCode(
+    bytes[offset] ?? 0,
+    bytes[offset + 1] ?? 0,
+    bytes[offset + 2] ?? 0,
+    bytes[offset + 3] ?? 0,
+  );
+}
+
+function topLevelBoxRange(bytes: Uint8Array, type: string): readonly [number, number] {
+  let offset = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const size = u32At(bytes, offset);
+    if (size < 8 || offset + size > bytes.byteLength) break;
+    if (fourccAt(bytes, offset + 4) === type) return [offset, offset + size];
+    offset += size;
+  }
+  throw new Error(`missing ${type} box`);
+}
+
+function replaceMoovWithExtendedSize(bytes: Uint8Array): Uint8Array {
+  const [start, end] = topLevelBoxRange(bytes, 'moov');
+  return joinBytes([
+    bytes.subarray(0, start),
+    box64('moov', bytes.subarray(start + 8, end)),
+    bytes.subarray(end),
+  ]);
+}
+
+function delayMoovPastSmallFaststartRead(bytes: Uint8Array): Uint8Array {
+  const [ftypStart, ftypEnd] = topLevelBoxRange(bytes, 'ftyp');
+  if (ftypStart !== 0) throw new Error('expected ftyp first');
+  const [moovStart, moovEnd] = topLevelBoxRange(bytes, 'moov');
+  return joinBytes([
+    bytes.subarray(0, ftypEnd),
+    box('free', zeros(4088)),
+    bytes.subarray(moovStart, moovEnd),
+    bytes.subarray(ftypEnd, moovStart),
+    bytes.subarray(moovEnd),
+  ]);
 }
 
 async function blobBytes(
@@ -237,6 +301,38 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     }
   });
 
+  it('metadata readers report typed errors on short unknown-size random-access inputs', async () => {
+    await expect(
+      readMovie({
+        read: () => Promise.resolve(new Uint8Array()),
+      }),
+    ).rejects.toBeInstanceOf(MediaError);
+    await expect(
+      readMovie({
+        read: () => Promise.resolve(joinBytes([u32(4), ascii('free')])),
+      }),
+    ).rejects.toBeInstanceOf(MediaError);
+
+    const declaredMoovAfterFtyp = joinBytes([
+      box('ftyp', ascii('isom')),
+      u32(40_000),
+      ascii('moov'),
+      zeros(32 * 1024 - 20),
+    ]);
+    await expect(
+      readMovieMetadata({
+        size: 40_000,
+        read: (offset: number) =>
+          Promise.resolve(offset === 0 ? declaredMoovAfterFtyp : new Uint8Array(4)),
+      }),
+    ).rejects.toBeInstanceOf(MediaError);
+    await expect(
+      readMovieMetadata({
+        read: () => Promise.resolve(joinBytes([u32(0), ascii('free')])),
+      }),
+    ).rejects.toBeInstanceOf(MediaError);
+  });
+
   it('metadata-only probe accepts a range source whose total size is not known yet', async () => {
     const bytes = await loadFixture('movie_5.mp4');
     const reads: Array<[number, number]> = [];
@@ -282,6 +378,35 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
 
     expect(tracks?.length).toBeGreaterThan(0);
     expect(reads[0]).toEqual([0, bytes.byteLength]);
+  });
+
+  it('metadata-only probe reads modest faststart moov boxes as a cacheable prefix', async () => {
+    const samples = Array.from({ length: 100_000 }, (_, i) => ({
+      data: new Uint8Array([i & 0xff]),
+      durationTicks: 1,
+      cttsTicks: 0,
+      keyframe: i % 60 === 0,
+    }));
+    const bytes = writeMp4([smallH264Track({ timescale: 30, samples })], { faststart: true });
+    const [, moovEnd] = topLevelBoxRange(bytes, 'moov');
+    expect(moovEnd).toBeGreaterThan(256 * 1024);
+    expect(moovEnd).toBeLessThan(1024 * 1024);
+    const reads: Array<readonly [number, number]> = [];
+    const src: ByteSource = {
+      ...byteSource(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(tracks?.some((track) => track.mediaType === 'video')).toBe(true);
+    expect(reads).toEqual([
+      [0, 32 * 1024],
+      [0, moovEnd],
+    ]);
   });
 
   it('metadata-only probe uses the tiny M4A audio fast path only when the source is known audio', async () => {
@@ -451,6 +576,74 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     expect(tracks?.[0]?.mediaType).toBe('video');
   });
 
+  it('metadata-only video faststart probe accepts a 64-bit top-level moov header', async () => {
+    const original = writeMp4([smallH264Track(), smallAacTrack()], { faststart: true });
+    const bytes = replaceMoovWithExtendedSize(original);
+    expect(bytes.byteLength).toBeLessThan(4 * 1024);
+    const expected = await Mp4Driver.probe?.({
+      stream: () => streamBytes(original),
+      range: (start, end) => Promise.resolve(original.subarray(start, end)),
+    });
+    const reads: Array<readonly [number, number]> = [];
+    const src: MimeHintedByteSource = {
+      ...byteSource(bytes),
+      mimeHint: 'video/mp4',
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    expect(tracks).toEqual(expected);
+  });
+
+  it('metadata-only video faststart probe hands off delayed-moov lazy parses to demux', async () => {
+    const bytes = delayMoovPastSmallFaststartRead(
+      writeMp4([smallH264Track(), smallAacTrack()], { faststart: true }),
+    );
+    expect(bytes.byteLength).toBeLessThan(8 * 1024);
+    const expected = await Mp4Driver.probe?.({
+      stream: () => streamBytes(bytes),
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    });
+    const cacheKey = 'url:https://fixtures.test/delayed-moov-faststart.mp4';
+    const reads: Array<readonly [number, number]> = [];
+    const probeSource: CacheKeyedByteSource & MimeHintedByteSource = {
+      ...byteSource(bytes),
+      [SOURCE_CACHE_KEY]: cacheKey,
+      mimeHint: 'video/mp4',
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(probeSource);
+
+    expect(reads).toEqual([
+      [0, 4 * 1024],
+      [0, bytes.byteLength],
+    ]);
+    expect(tracks).toEqual(expected);
+
+    const demuxSource: CacheKeyedByteSource = {
+      ...byteSource(bytes),
+      [SOURCE_CACHE_KEY]: cacheKey,
+      range: () => {
+        throw new Error('demux should consume the lazy faststart moov before reading ranges');
+      },
+    };
+    const demuxer = await Mp4Driver.demux(demuxSource);
+    try {
+      expect(demuxer.tracks).toEqual(tracks);
+    } finally {
+      await demuxer.close();
+    }
+  });
+
   it('metadata-only probe falls back when the small video faststart parser cannot prove the track shape', async () => {
     const bytes = writeMp4([smallH264Track({ sampleEntryType: 'xxxx' })], { faststart: true });
     const reads: Array<readonly [number, number]> = [];
@@ -510,6 +703,8 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     const malformedCases: Array<readonly [string, Uint8Array]> = [
       ['short-header', new Uint8Array([0, 0, 0, 1])],
       ['zero-size-top-box', joinBytes([u32(0), ascii('free')])],
+      ['short-extended-size-box', joinBytes([u32(1), ascii('free')])],
+      ['too-small-extended-size-box', joinBytes([u32(1), ascii('free'), u64(8)])],
       ['ftyp-only', box('ftyp', ascii('isom'))],
       ['truncated-moov', joinBytes([u32(100), ascii('moov')])],
       ['empty-moov', box('moov')],
@@ -640,9 +835,9 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
   });
 
   it('hands a small parsed movie from probe to an immediately following demux', async () => {
-    const bytes = await loadFixture('movie_5.mp4');
+    const bytes = writeMp4([smallH264Track({ sampleEntryType: 'xxxx' })], { faststart: true });
     const firstReads: Array<readonly [number, number]> = [];
-    const cacheKey = 'url:https://fixtures.test/movie_5.mp4';
+    const cacheKey = 'memory:small-parsed-movie';
     const probeSource: CacheKeyedByteSource = {
       stream: () =>
         new ReadableStream<Uint8Array>({

@@ -29,6 +29,8 @@ import { createMedia } from './create-media.ts';
 import {
   muxFlacMkv,
   muxPreparedWebmAudioPacketTrack,
+  muxPreparedWebmPacketStreams,
+  muxPreparedWebmPacketTracks,
   muxSingleTrackMp4,
   muxSingleTrackWebmAudio,
 } from './flac-mkv-mux.ts';
@@ -211,6 +213,27 @@ function packetFromPacketInfo(row: PacketInfoMetadata, bytes: Uint8Array): Packe
     dtsUs: row.dtsUs,
     sizeBytes: row.size,
   };
+}
+
+async function preparedMp4PacketTracks(fixture: string): Promise<{
+  readonly tracks: Array<{ readonly track: TrackInfo; readonly packets: readonly Packet[] }>;
+}> {
+  const bytes = await loadFixture(fixture);
+  if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+  const table = await Mp4Driver.packetInfo(fromBytes(bytes, { mime: 'video/mp4' }));
+  const tracks: Array<{ readonly track: TrackInfo; readonly packets: readonly Packet[] }> = [];
+  for (let trackIndex = 0; trackIndex < table.tracks.length; trackIndex++) {
+    const track = table.tracks[trackIndex];
+    if (track === undefined) continue;
+    const packets: Packet[] = [];
+    for (const row of table.packets) {
+      if (row.trackIndex !== trackIndex) continue;
+      const packet = packetFromPacketInfo(row, bytes);
+      if (packet !== undefined) packets.push(packet);
+    }
+    if (packets.length > 0) tracks.push({ track, packets });
+  }
+  return { tracks };
 }
 
 function installEncodedChunkShims(): () => void {
@@ -629,6 +652,38 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     const info = parseWebm(flac);
     expect(info.container).toBe('mkv');
     expect(info.tracks[0]?.codec).toBe('flac');
+  });
+
+  it('prepared WebM packet mux authors real MP4 H.264/AAC packet tables as Matroska', async () => {
+    const prepared = await preparedMp4PacketTracks('movie_5.mp4');
+    expect(prepared.tracks.length).toBeGreaterThan(1);
+    const out = muxPreparedWebmPacketTracks({ tracks: prepared.tracks, container: 'mkv' });
+    const info = parseWebm(out);
+    const codecs = new Set(info.tracks.map((track) => track.codec));
+    const videoDurationSec = prepared.tracks.find((entry) => entry.track.mediaType === 'video')
+      ?.track.durationSec;
+
+    expect(info.container).toBe('mkv');
+    expect(codecs.has('h264')).toBe(true);
+    expect(codecs.has('aac')).toBe(true);
+    expect(info.durationSec).toBeCloseTo(videoDurationSec ?? 0, 2);
+  });
+
+  it('public mux uses the prepared WebM packet-array path for real MP4 packet tables', async () => {
+    const prepared = await preparedMp4PacketTracks('movie_5.mp4');
+    const streams = {
+      tracks: prepared.tracks.map((entry) => ({
+        track: entry.track,
+        packetsArray: entry.packets,
+      })),
+    };
+    const direct = await streamBytes(
+      await muxPreparedWebmPacketStreams(streams, { container: 'mkv' }),
+    );
+    const routed = await outputBytes(await media().mux(streams, { container: 'mkv' }));
+
+    expect(routed).toEqual(direct);
+    expect(parseWebm(routed).tracks.map((track) => track.codec)).toEqual(['h264', 'aac']);
   });
 
   it('single-track WebM audio mux handles arrays, streams, misses, abort, and stream errors', async () => {

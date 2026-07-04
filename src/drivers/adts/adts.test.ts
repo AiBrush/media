@@ -8,11 +8,67 @@ import { Mp3Driver } from '../mp3/mp3-driver.ts';
 import {
   AdtsDriver,
   adtsAacPcmDecodePlan,
+  adtsTrimFromBytes,
+  adtsTrimFromUrl,
   concatPcmChunks,
   enumerateAdtsFrames,
   parseAdts,
   pcmFromInterleavedF32,
 } from './adts-driver.ts';
+
+async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function rangeServer(bytes: Uint8Array): {
+  readonly fetch: typeof fetch;
+  readonly calls: Array<{
+    readonly method: string;
+    readonly range: string | null;
+    readonly bytes: number;
+  }>;
+} {
+  const calls: Array<{ method: string; range: string | null; bytes: number }> = [];
+  const total = bytes.byteLength;
+  const fetchImpl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = init?.headers as { Range?: string } | undefined;
+    const range = headers?.Range ?? null;
+    if (range !== null) {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (match === null) return new Response('bad range', { status: 416 });
+      const start = Number(match[1]);
+      const end = Math.min(Number(match[2]) + 1, total);
+      const slice = bytes.subarray(start, Math.max(start, end));
+      calls.push({ method, range, bytes: slice.byteLength });
+      return new Response(slice.slice(), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${start + slice.byteLength - 1}/${total}` },
+      });
+    }
+    calls.push({ method, range, bytes: total });
+    return new Response(bytes.slice(), {
+      status: 200,
+      headers: { 'Content-Length': String(total) },
+    });
+  }) as typeof fetch;
+  return { fetch: fetchImpl, calls };
+}
 
 /** Build a crafted ADTS stream of `count` AAC frames (7-byte headers + zero payload). */
 function buildAdts(
@@ -131,6 +187,100 @@ describe('probe ADTS — real corpus', () => {
     };
     const demuxed = await AdtsDriver.demux(streamSource);
     expect(demuxed.tracks[0]?.codec).toBe('mp4a.40.2');
+  });
+
+  it('packetInfo enumerates ADTS frame facts without constructing packet chunks', async () => {
+    if (AdtsDriver.packetInfo === undefined) throw new Error('expected ADTS packetInfo');
+    const bytes = await loadFixture('sfx.adts');
+    const table = await AdtsDriver.packetInfo(fromBytes(bytes, { mime: 'audio/aac' }));
+    const frames = enumerateAdtsFrames(bytes);
+
+    expect(table.tracks[0]?.codec).toBe('mp4a.40.2');
+    expect(table.tracks[0]?.config?.description).toBeInstanceOf(Uint8Array);
+    expect(table.packets).toHaveLength(frames.length);
+    for (let i = 0; i < frames.length; i++) {
+      const row = table.packets[i];
+      const frame = frames[i];
+      if (row === undefined || frame === undefined) throw new Error(`missing packet row ${i}`);
+      expect(row).toEqual({
+        trackIndex: 0,
+        offset: frame.offset,
+        size: frame.size,
+        ptsUs: frame.ptsUs,
+        dtsUs: frame.ptsUs,
+        durationUs: frame.durationUs,
+        keyframe: true,
+      });
+    }
+  });
+
+  it('streamCopy trim emits the original complete ADTS frames overlapping the requested range', async () => {
+    if (AdtsDriver.streamCopy === undefined) throw new Error('expected ADTS streamCopy');
+    expect(AdtsDriver.validatesStreamCopyTrim).toBe(true);
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    const startSec = 0.04;
+    const endSec = 0.16;
+    const selected = frames.filter(
+      (frame) =>
+        frame.ptsUs + frame.durationUs > Math.round(startSec * 1_000_000) &&
+        frame.ptsUs < Math.round(endSec * 1_000_000),
+    );
+
+    let total = 0;
+    for (const frame of selected) total += frame.size;
+    const expected = new Uint8Array(total);
+    let offset = 0;
+    for (const frame of selected) {
+      const packet = bytes.subarray(frame.offset, frame.offset + frame.size);
+      expected.set(packet, offset);
+      offset += packet.byteLength;
+    }
+
+    const out = await collectBytes(
+      await AdtsDriver.streamCopy(fromBytes(bytes, { mime: 'audio/aac' }), {
+        trim: { startSec, endSec },
+      }),
+    );
+    expect(out).toEqual(expected);
+    expect(enumerateAdtsFrames(out)).toHaveLength(selected.length);
+  });
+
+  it('streamCopy trim keeps invalid ranges typed before emitting bytes', async () => {
+    if (AdtsDriver.streamCopy === undefined) throw new Error('expected ADTS streamCopy');
+    await expect(
+      AdtsDriver.streamCopy(await fixtureSource('sfx.adts'), {
+        trim: { startSec: 0.1, endSec: 0.1 },
+      }),
+    ).rejects.toThrowError(InputError);
+  });
+
+  it('adtsTrimFromUrl fetches source bytes once and re-emits a fresh exact frame trim', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const server = rangeServer(bytes);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const trim = { startSec: 0.04, endSec: 0.16 };
+      const expected = adtsTrimFromBytes(bytes, trim);
+      const first = await adtsTrimFromUrl('https://fixtures.invalid/sfx.adts', {
+        ...trim,
+        mime: 'audio/aac',
+        size: bytes.byteLength,
+      });
+      const second = await adtsTrimFromUrl('https://fixtures.invalid/sfx.adts', {
+        ...trim,
+        mime: 'audio/aac',
+        size: bytes.byteLength,
+      });
+      expect(first).toEqual(expected);
+      expect(second).toEqual(expected);
+      expect(second).not.toBe(first);
+      expect(server.calls).toHaveLength(1);
+      expect(server.calls[0]).toMatchObject({ method: 'GET', bytes: bytes.byteLength });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

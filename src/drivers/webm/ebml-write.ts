@@ -244,6 +244,11 @@ function toCodecId(mediaType: 'video' | 'audio', codec: string): string {
   );
 }
 
+/** Public codec-id projection for prepared-packet WebM/Matroska helpers. */
+export function webmCodecIdForTrack(mediaType: 'video' | 'audio', codec: string): string {
+  return toCodecId(mediaType, codec);
+}
+
 // ============ chunk struct + block timeline (pure) ============
 
 /**
