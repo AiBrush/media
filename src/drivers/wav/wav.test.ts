@@ -697,6 +697,36 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(out).not.toEqual(withJunk);
   });
 
+  it('trims same-layout WAV PCM by copying the selected data bytes into a fresh envelope', async () => {
+    const canonical = writeWav(
+      {
+        sampleRate: 10,
+        channels: 1,
+        frames: 10,
+        planar: [Float64Array.of(-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9)],
+      },
+      's16',
+    );
+    const withJunk = withJunkChunk(canonical);
+    const out = await drain(
+      await transformPcm(streamOnly(withJunk), {
+        container: 'wav',
+        timeBounds: { startSec: 0.21, endSec: 0.74 },
+      }),
+    );
+
+    expect(out.byteLength).toBe(44 + 5 * 2);
+    expect(out).not.toEqual(withJunk);
+    expect(chunkPayload(out, 'data')).toEqual(
+      chunkPayload(canonical, 'data').subarray(2 * 2, 7 * 2),
+    );
+    const re = readWavPcm(out);
+    expect(re.frames).toBe(5);
+    expect(channelAt(re.planar, 0)).toEqual(
+      channelAt(readWavPcm(canonical).planar, 0).subarray(2, 7),
+    );
+  });
+
   it('applies gain in the PCM domain (≈ ×0.5 at -6.02 dB)', async () => {
     const bytes = await loadFixture(SIN);
     const out = await drain(await transformPcm(streamOnly(bytes), { gainDb: -6.020599913279624 }));

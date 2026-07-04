@@ -74,7 +74,7 @@ const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
-const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 16 * 1024 * 1024;
+const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
 const FASTSTART_METADATA_PREFETCH_BYTES = 32 * 1024;
 const SMALL_FASTSTART_METADATA_PREFETCH_BYTES = 4 * 1024;
@@ -88,7 +88,10 @@ const PROGRESSIVE_SINGLE_READ_MAX_BYTES = 64 * 1024 * 1024;
 const PROGRESSIVE_SINGLE_READ_MAX_GAP_BYTES = 1024 * 1024;
 const SMALL_URL_TRIM_RANDOM_ACCESS_MAX_BYTES = 8 * 1024 * 1024;
 const TRIM_END_RANGE_SLACK_SEC = 1;
-
+const TRIM_DECODE_VALIDATION_CACHE_TTL_MS = 60_000;
+const TRIM_DECODE_VALIDATION_CACHE_MAX_ENTRIES = 128;
+const FNV1A_32_OFFSET_BASIS = 0x811c9dc5;
+const FNV1A_32_PRIME = 0x01000193;
 /** Target container token → the `ftyp` brand writeMp4 emits ('mov'/'qt' ⇒ QuickTime; else ISO mp4). */
 function brandFor(container: string | undefined): ContainerBrand {
   return container === 'mov' || container === 'qt' ? 'mov' : 'mp4';
@@ -116,6 +119,7 @@ interface MovieParseHandoff {
 }
 
 const movieParseHandoff = new Map<string, MovieParseHandoff>();
+const trimDecodeValidationCache = new Map<string, number>();
 let faststartProbeModulePromise: Promise<typeof import('./simple-video-probe.ts')> | undefined;
 let faststartProbeModule: typeof import('./simple-video-probe.ts') | undefined;
 
@@ -174,6 +178,126 @@ function sourceCacheKey(src: ByteSource): string | undefined {
 
 function sourceMimeHint(src: ByteSource): string | undefined {
   return (src as ByteSource & { readonly mimeHint?: string }).mimeHint;
+}
+
+function trimDecodeValidationCacheBase(src: ByteSource, ra: RandomAccess): string | undefined {
+  const key = sourceCacheKey(src);
+  if (key === undefined || ra.size === undefined) return undefined;
+  return `${key.length}:${key}:${ra.size}`;
+}
+
+function mixHashByte(hash: number, byte: number): number {
+  return Math.imul(hash ^ (byte & 0xff), FNV1A_32_PRIME) >>> 0;
+}
+
+function mixHashWord(hash: number, word: number): number {
+  let out = hash;
+  out = mixHashByte(out, word);
+  out = mixHashByte(out, word >>> 8);
+  out = mixHashByte(out, word >>> 16);
+  return mixHashByte(out, word >>> 24);
+}
+
+function mixHashNumber(hash: number, value: number): number {
+  const finite = Math.trunc(value);
+  return mixHashWord(mixHashWord(hash, finite >>> 0), Math.floor(finite / 0x1_0000_0000) >>> 0);
+}
+
+function mixHashString(hash: number, value: string): number {
+  let out = hash;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    out = mixHashByte(out, code);
+    out = mixHashByte(out, code >>> 8);
+  }
+  return out;
+}
+
+function mixHashBytes(hash: number, value: Uint8Array): number {
+  let out = hash;
+  for (const byte of value) out = mixHashByte(out, byte);
+  return out;
+}
+
+function trimDecodeValidationSampleDigest(
+  track: ParsedTrack,
+  selected: readonly SampleData[],
+): string {
+  let hash = FNV1A_32_OFFSET_BASIS;
+  hash = mixHashNumber(hash, track.id);
+  hash = mixHashString(hash, track.sampleEntryType);
+  hash = mixHashString(hash, track.codec);
+  hash = mixHashNumber(hash, track.timescale);
+  if (track.codecPrivate !== undefined) {
+    hash = mixHashString(hash, track.codecPrivate.boxType);
+    hash = mixHashBytes(hash, track.codecPrivate.data);
+  }
+  for (const sample of selected) {
+    hash = mixHashNumber(hash, sample.index);
+    hash = mixHashNumber(hash, sample.offset);
+    hash = mixHashNumber(hash, sample.size);
+    hash = mixHashNumber(hash, sample.dtsTicks);
+    hash = mixHashNumber(hash, sample.durationTicks);
+    hash = mixHashNumber(hash, sample.cttsTicks);
+    hash = mixHashByte(hash, sample.keyframe ? 1 : 0);
+  }
+  return hash.toString(36);
+}
+
+function trimDecodeValidationCacheKey(
+  base: string | undefined,
+  track: ParsedTrack,
+  selected: readonly SampleData[],
+): string | undefined {
+  if (base === undefined || selected.length === 0) return undefined;
+  const first = selected[0] as SampleData;
+  const last = selected[selected.length - 1] as SampleData;
+  return [
+    base,
+    track.id,
+    track.mediaType,
+    track.sampleEntryType,
+    track.codec,
+    track.timescale,
+    selected.length,
+    first.index,
+    first.offset,
+    first.size,
+    last.index,
+    last.offset,
+    last.size,
+    trimDecodeValidationSampleDigest(track, selected),
+  ].join('|');
+}
+
+function pruneTrimDecodeValidationCache(nowMs: number): void {
+  for (const [key, expiresAtMs] of trimDecodeValidationCache) {
+    if (expiresAtMs > nowMs) continue;
+    trimDecodeValidationCache.delete(key);
+  }
+  while (trimDecodeValidationCache.size >= TRIM_DECODE_VALIDATION_CACHE_MAX_ENTRIES) {
+    const oldest = trimDecodeValidationCache.keys().next().value as string;
+    trimDecodeValidationCache.delete(oldest);
+  }
+}
+
+function hasTrimDecodeValidationCacheHit(key: string | undefined): boolean {
+  if (key === undefined) return false;
+  const nowMs = Date.now();
+  const expiresAtMs = trimDecodeValidationCache.get(key);
+  if (expiresAtMs === undefined) return false;
+  if (expiresAtMs <= nowMs) {
+    trimDecodeValidationCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function rememberTrimDecodeValidation(key: string | undefined): void {
+  if (key === undefined) return;
+  const nowMs = Date.now();
+  pruneTrimDecodeValidationCache(nowMs);
+  trimDecodeValidationCache.set(key, nowMs + TRIM_DECODE_VALIDATION_CACHE_TTL_MS);
 }
 
 function shouldTryTinyAudioFaststartProbe(src: ByteSource, ra: RandomAccess): boolean {
@@ -1108,8 +1232,12 @@ async function verifyTrimmedAvcDecodeIfAvailable(
   selected: readonly SampleData[],
   samples: readonly MuxSampleInput[],
   signal: AbortSignal | undefined,
+  validationCacheBase: string | undefined,
 ): Promise<void> {
+  if (selected.length === 0) return;
   const config = avcDecodeConfig(track);
+  const validationCacheKey = trimDecodeValidationCacheKey(validationCacheBase, track, selected);
+  if (hasTrimDecodeValidationCacheHit(validationCacheKey)) return;
   if (!config || !(await canBrowserDecodeForTrim(config))) return;
 
   let decoder: VideoDecoder | undefined;
@@ -1153,6 +1281,7 @@ async function verifyTrimmedAvcDecodeIfAvailable(
       );
     }
     await Promise.race([decoder.flush(), errorPromise]);
+    rememberTrimDecodeValidation(validationCacheKey);
   } catch (e) {
     throw e instanceof MediaError ? e : trimDecodeValidationError(track, e);
   } finally {
@@ -1167,10 +1296,14 @@ async function verifyTrimmedAvcDecodeFromSourceIfAvailable(
   selected: readonly SampleData[],
   ra: RandomAccess,
   signal: AbortSignal | undefined,
+  validationCacheBase: string | undefined,
 ): Promise<void> {
+  if (selected.length === 0) return;
   const config = avcDecodeConfig(track);
-  if (!config || !(await canBrowserDecodeForTrim(config))) return;
   validateSampleRanges(selected, ra.size);
+  const validationCacheKey = trimDecodeValidationCacheKey(validationCacheBase, track, selected);
+  if (hasTrimDecodeValidationCacheHit(validationCacheKey)) return;
+  if (!config || !(await canBrowserDecodeForTrim(config))) return;
 
   const windows = planSampleReadWindows(selected);
   const windowByOrdinal = new Array<SampleReadWindow<SampleData> | undefined>(selected.length);
@@ -1248,6 +1381,7 @@ async function verifyTrimmedAvcDecodeFromSourceIfAvailable(
       );
     }
     await Promise.race([decoder.flush(), errorPromise]);
+    rememberTrimDecodeValidation(validationCacheKey);
   } catch (e) {
     throw e instanceof MediaError ? e : trimDecodeValidationError(track, e);
   } finally {
@@ -1263,12 +1397,13 @@ async function trimMuxTracks(
   startSec: number,
   endSec: number,
   signal: AbortSignal | undefined,
+  validationCacheBase: string | undefined,
 ): Promise<MuxTrackInput[]> {
   const out: MuxTrackInput[] = [];
   for (const track of movie.tracks) {
     const selected = selectTrimmed(track, startSec, endSec);
     const samples = await readSamples(ra, selected);
-    await verifyTrimmedAvcDecodeIfAvailable(track, selected, samples, signal);
+    await verifyTrimmedAvcDecodeIfAvailable(track, selected, samples, signal, validationCacheBase);
     out.push({
       ...muxTrackMeta(track),
       samples,
@@ -1397,7 +1532,7 @@ function packetStream(
         data,
       };
       const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
-      controller.enqueue({ chunk, dtsUs: sample.dtsUs });
+      controller.enqueue({ chunk, data, dtsUs: sample.dtsUs, sizeBytes: sample.size });
     },
   });
   /* v8 ignore stop */
@@ -1727,12 +1862,19 @@ async function lazyProgressiveTrimTracksFromMovie(
   startSec: number,
   endSec: number,
   signal: AbortSignal | undefined,
+  validationCacheBase: string | undefined,
 ): Promise<LazyProgressiveTrack[]> {
   const tracks: LazyProgressiveTrack[] = [];
   for (const track of movie.tracks) {
     const samples = selectTrimmed(track, startSec, endSec);
     validateSampleRanges(samples, ra.size);
-    await verifyTrimmedAvcDecodeFromSourceIfAvailable(track, samples, ra, signal);
+    await verifyTrimmedAvcDecodeFromSourceIfAvailable(
+      track,
+      samples,
+      ra,
+      signal,
+      validationCacheBase,
+    );
     tracks.push({
       metadata: {
         ...muxTrackMeta(track),
@@ -1990,6 +2132,17 @@ async function readProgressivePayloadChunk(
   return chunk;
 }
 
+function shouldLoadCompatibleMovToMp4Rewrite(
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): boolean {
+  if ((o?.container ?? 'mp4') !== 'mp4') return false;
+  if (o?.trim !== undefined || o?.fragmented === true || o?.streaming === true) return false;
+  if (o?.buffered !== true) return false;
+  if (o?.faststart === false) return false;
+  return movie.brand === 'qt  ' && movie.tracks.length > 0;
+}
+
 async function* progressiveSourceSegments(
   ra: RandomAccess,
   movie: Movie,
@@ -2003,10 +2156,18 @@ async function* trimmedProgressiveSourceSegments(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
+  validationCacheBase: string | undefined,
 ): AsyncGenerator<Uint8Array, void, undefined> {
   yield* progressiveSegmentsFromTracks(
     ra,
-    await lazyProgressiveTrimTracksFromMovie(ra, movie, trim.startSec, trim.endSec, o?.signal),
+    await lazyProgressiveTrimTracksFromMovie(
+      ra,
+      movie,
+      trim.startSec,
+      trim.endSec,
+      o?.signal,
+      validationCacheBase,
+    ),
     o,
   );
 }
@@ -2041,8 +2202,9 @@ function trimmedProgressiveSourceStream(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
+  validationCacheBase: string | undefined,
 ): ReadableStream<Uint8Array> {
-  const segments = trimmedProgressiveSourceSegments(ra, movie, trim, o);
+  const segments = trimmedProgressiveSourceSegments(ra, movie, trim, o, validationCacheBase);
   return new ReadableStream<Uint8Array>(
     {
       async pull(controller): Promise<void> {
@@ -2075,10 +2237,18 @@ async function materializeTrimmedProgressiveSourceBytes(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
+  validationCacheBase: string | undefined,
 ): Promise<Uint8Array> {
   return materializeProgressiveTracksBytes(
     ra,
-    await lazyProgressiveTrimTracksFromMovie(ra, movie, trim.startSec, trim.endSec, o?.signal),
+    await lazyProgressiveTrimTracksFromMovie(
+      ra,
+      movie,
+      trim.startSec,
+      trim.endSec,
+      o?.signal,
+      validationCacheBase,
+    ),
     o,
   );
 }
@@ -2117,6 +2287,7 @@ function trimmedProgressiveSourceBufferStream(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
+  validationCacheBase: string | undefined,
 ): ReadableStream<Uint8Array> {
   let emitted = false;
   return new ReadableStream<Uint8Array>(
@@ -2128,7 +2299,9 @@ function trimmedProgressiveSourceBufferStream(
         }
         emitted = true;
         try {
-          controller.enqueue(await materializeTrimmedProgressiveSourceBytes(ra, movie, trim, o));
+          controller.enqueue(
+            await materializeTrimmedProgressiveSourceBytes(ra, movie, trim, o, validationCacheBase),
+          );
           controller.close();
         } catch (error) {
           controller.error(error);
@@ -2338,6 +2511,13 @@ export const Mp4Driver: ContainerDriver = {
       requestedTrim !== undefined && !trimCoversMovie(movie, requestedTrim)
         ? requestedTrim
         : undefined;
+    const validationCacheBase =
+      trim !== undefined ? trimDecodeValidationCacheBase(src, ra) : undefined;
+    if (shouldLoadCompatibleMovToMp4Rewrite(movie, o)) {
+      const { materializeCompatibleMovToMp4Bytes } = await import('./compatible-mov-rewrite.ts');
+      const compatibleBrandRewrite = await materializeCompatibleMovToMp4Bytes(src, ra, movie, o);
+      if (compatibleBrandRewrite !== undefined) return oneShot(compatibleBrandRewrite);
+    }
     if (o?.fragmented === true && trim === undefined) {
       return fragmentedSourceStream(ra, movie, o?.signal);
     }
@@ -2348,13 +2528,13 @@ export const Mp4Driver: ContainerDriver = {
       return progressiveSourceBufferStream(ra, movie, o);
     }
     if (o?.streaming === true && trim !== undefined) {
-      return trimmedProgressiveSourceStream(ra, movie, trim, o);
+      return trimmedProgressiveSourceStream(ra, movie, trim, o, validationCacheBase);
     }
     if (o?.buffered === true && trim !== undefined) {
-      return trimmedProgressiveSourceBufferStream(ra, movie, trim, o);
+      return trimmedProgressiveSourceBufferStream(ra, movie, trim, o, validationCacheBase);
     }
     const tracks = trim
-      ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal)
+      ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal, validationCacheBase)
       : await muxTracksFromMovie(ra, movie);
     // Fragmented/CMAF output (ADR-034): a sequence of self-describing `moof`+`mdat` segments after the
     // init segment, streamed one at a time so a StreamTarget never buffers the whole movie. The lossless

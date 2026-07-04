@@ -107,10 +107,12 @@ export const AiffDriver: ContainerDriver = {
     };
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-    const aiff = readAiffPcm(await readAll(src));
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const container = o?.container ?? 'aiff';
+    const aiff = readAiffPcm(bytes);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const audio = applyPcmTransform(aiff, o);
-    const container = o?.container ?? 'aiff';
     const out = writePcmContainer(
       audio,
       container,

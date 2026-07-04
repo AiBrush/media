@@ -7,7 +7,8 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
-import { type ChunkStruct, writeMp4PacketTrack } from '../drivers/mp4/mux.ts';
+import type { ChunkStruct, Mp4PacketTrackInput } from '../drivers/mp4/mux.ts';
+import { streamMp4PacketTracks, writeMp4PacketTracks } from '../drivers/mp4/prepared-stream.ts';
 import { cacheSource } from '../sources/cache.ts';
 import { fromBytes, fromURL } from '../sources/source.ts';
 import type { Container } from './types.ts';
@@ -22,6 +23,18 @@ export interface PreparedMp4PacketMuxInput {
   readonly fragmented?: boolean;
 }
 
+export interface PreparedMp4PacketTrackMuxInput {
+  readonly track: TrackInfo;
+  readonly packets: readonly (EncodedChunk | Packet)[];
+}
+
+export interface PreparedMp4PacketTracksMuxInput {
+  readonly tracks: readonly PreparedMp4PacketTrackMuxInput[];
+  readonly container: Container | string;
+  readonly faststart?: boolean;
+  readonly fragmented?: boolean;
+}
+
 export interface Mp4PacketInfoFromUrlOptions {
   readonly mime?: string;
   readonly size?: number;
@@ -29,6 +42,13 @@ export interface Mp4PacketInfoFromUrlOptions {
 }
 
 export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uint8Array {
+  return muxPreparedMp4PacketTracks({
+    ...input,
+    tracks: [{ track: input.track, packets: input.packets }],
+  });
+}
+
+export function muxPreparedMp4PacketTracks(input: PreparedMp4PacketTracksMuxInput): Uint8Array {
   if (input.fragmented === true) {
     throw new CapabilityError(
       'capability-miss',
@@ -49,17 +69,49 @@ export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uin
       },
     );
   }
-  if (input.packets.length === 0) {
-    throw new MediaError('mux-error', 'prepared MP4 packet mux received no packets');
+  if (input.tracks.length === 0) {
+    throw new MediaError('mux-error', 'prepared MP4 packet mux received no tracks');
   }
-  const chunks: ChunkStruct[] = [];
-  for (const packet of input.packets) chunks.push(chunkStructFrom(packet));
   const options: MuxOptions = {
     container: input.container,
     fragmented: false,
     ...(input.faststart !== undefined ? { faststart: input.faststart } : {}),
   };
-  return writeMp4PacketTrack(input.track, chunks, options);
+  return writeMp4PacketTracks(packetTrackInputsFrom(input.tracks), options);
+}
+
+export function muxPreparedMp4PacketTracksStream(
+  input: PreparedMp4PacketTracksMuxInput,
+): ReadableStream<Uint8Array> {
+  if (input.fragmented === true) {
+    throw new CapabilityError(
+      'capability-miss',
+      'prepared MP4 packet stream mux does not author fragmented output',
+      {
+        op: { op: 'mux', container: input.container },
+        tried: ['mp4'],
+      },
+    );
+  }
+  if (input.container !== 'mp4' && input.container !== 'mov') {
+    throw new CapabilityError(
+      'capability-miss',
+      `prepared MP4 packet stream mux cannot write '${input.container}'`,
+      {
+        op: { op: 'mux', container: input.container },
+        tried: ['mp4'],
+      },
+    );
+  }
+  if (input.tracks.length === 0) {
+    throw new MediaError('mux-error', 'prepared MP4 packet stream mux received no tracks');
+  }
+  const options: MuxOptions = {
+    container: input.container,
+    fragmented: false,
+    ...(input.faststart !== undefined ? { faststart: input.faststart } : {}),
+  };
+  return streamMp4PacketTracks(packetTrackInputsFrom(input.tracks), options);
 }
 
 export async function mp4PacketInfoFromBytes(bytes: Uint8Array): Promise<PacketInfoTable> {
@@ -118,6 +170,18 @@ function chunkStructFrom(value: Packet | EncodedChunk): ChunkStruct {
     key: value.type === 'key',
     data: encodedChunkBytes(value),
   };
+}
+
+function packetTrackInputsFrom(
+  tracks: readonly PreparedMp4PacketTrackMuxInput[],
+): Mp4PacketTrackInput[] {
+  const out: Mp4PacketTrackInput[] = [];
+  for (const track of tracks) {
+    const chunks: ChunkStruct[] = [];
+    for (const packet of track.packets) chunks.push(chunkStructFrom(packet));
+    out.push({ track: track.track, chunks });
+  }
+  return out;
 }
 
 function isPacket(value: Packet | EncodedChunk): value is Packet {

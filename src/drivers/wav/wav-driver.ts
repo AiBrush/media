@@ -310,16 +310,13 @@ function matches(q: ContainerQuery): boolean {
   );
 }
 
-function canRewriteWavPcm(o: PcmTransform | undefined, container: string): boolean {
-  return (
-    container === 'wav' &&
-    o?.gainDb === undefined &&
-    o?.fade === undefined &&
-    o?.dynamics === undefined &&
-    o?.biquad === undefined &&
-    o?.timeBounds === undefined &&
-    (o?.endian === undefined || o.endian === 'le')
-  );
+function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
 }
 
 export const WavDriver: ContainerDriver = {
@@ -371,41 +368,42 @@ export const WavDriver: ContainerDriver = {
     return wavPacketInfoFromHeader(parsed);
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
+    const opts: PcmTransform = o ?? {};
     const bytes = await readAll(src);
-    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    const container = o?.container ?? 'wav';
-    if (canRewriteWavPcm(o, container)) {
-      const copied = rewriteWavPcmCopy(
-        bytes,
-        o?.sampleFormat,
-        o?.endian,
-        o?.channels,
-        o?.sampleRate,
-      );
+    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const container = opts.container ?? 'wav';
+    if (
+      container === 'wav' &&
+      opts.gainDb === undefined &&
+      opts.fade === undefined &&
+      opts.dynamics === undefined &&
+      opts.biquad === undefined
+    ) {
+      const copied =
+        opts.timeBounds === undefined
+          ? rewriteWavPcmCopy(bytes, opts.sampleFormat, opts.endian, opts.channels, opts.sampleRate)
+          : (await import('./pcm-slice.ts')).slice(
+              bytes,
+              opts.timeBounds,
+              opts.sampleFormat,
+              opts.endian,
+              opts.channels,
+              opts.sampleRate,
+            );
       if (copied !== undefined) {
-        return new ReadableStream<Uint8Array>({
-          start(c): void {
-            c.enqueue(copied);
-            c.close();
-          },
-        });
+        return byteStream(copied);
       }
     }
     const wav = readWavPcm(bytes);
-    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    const audio = applyPcmTransform(wav, o);
+    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const audio = applyPcmTransform(wav, opts);
     const out = writePcmContainer(
       audio,
       container,
-      resolvePcmSampleFormat(container, wav.format, o?.sampleFormat),
-      o?.endian ?? 'le',
+      resolvePcmSampleFormat(container, wav.format, opts.sampleFormat),
+      opts.endian ?? 'le',
     );
-    return new ReadableStream<Uint8Array>({
-      start(c): void {
-        c.enqueue(out);
-        c.close();
-      },
-    });
+    return byteStream(out);
   },
   async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
     const wav = readWavPcm(await readAll(src));

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
-import { type Source, fromBytes } from '../../sources/source.ts';
+import { SOURCE_CACHE_KEY, type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import { readAiffPcm } from '../aiff/aiff.ts';
 import { readCafPcm } from '../caf/caf.ts';
@@ -24,6 +24,15 @@ const aiffSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audi
 const cafSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/x-caf' });
 const loadDerived = async (id: string): Promise<Uint8Array> =>
   new Uint8Array(await readFile(`${DERIVED}${id}`));
+
+function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c): void {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
+}
 
 describe('media.convert — PCM-native audio path (ADR-022)', () => {
   it('up-mixes mono → stereo (re-probes as 2ch; both channels are the source, bit-exact)', async () => {
@@ -192,6 +201,34 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     const info = await media().probe(wavSource(out));
     expect(info.container).toBe('wav');
     expect(info.tracks[0]?.codec).toBe('pcm-s16');
+  });
+
+  it('reuses raw URL bytes for repeated identical AIFF → WAV byte rewrites', async () => {
+    const input = await loadDerived('sfx.aiff');
+    let rangeReads = 0;
+    const keyedAiff: Source = {
+      __media: 'source',
+      kind: 'url',
+      size: input.byteLength,
+      mimeHint: 'audio/aiff',
+      [SOURCE_CACHE_KEY]: `test:aiff:${input.byteLength}`,
+      stream: () => streamOf(input),
+      range: (start, end) => {
+        rangeReads += 1;
+        return Promise.resolve(input.subarray(start, end));
+      },
+    };
+    const engine = media();
+    const opts = { to: 'wav', audio: { codec: 'pcm-s16' as never } } as const;
+
+    const first = await bytesOf(await engine.convert(keyedAiff, opts));
+    const second = await bytesOf(await engine.convert(keyedAiff, opts));
+
+    expect(rangeReads).toBe(1);
+    expect(second).toEqual(first);
+    const original = readAiffPcm(input);
+    const reparsed = readWavPcm(second);
+    expect(channelAt(reparsed.planar, 0)).toEqual(channelAt(original.planar, 0));
   });
 
   it('converts little-endian WAV PCM to big-endian AIFF without changing samples', async () => {

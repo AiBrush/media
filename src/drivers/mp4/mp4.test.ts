@@ -27,6 +27,25 @@ function streamBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+async function collectStreamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 function byteSource(bytes: Uint8Array): ByteSource {
   return {
     size: bytes.byteLength,
@@ -914,6 +933,280 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       ),
     ).rejects.toThrow(MediaError);
     expect(reads).toBe(1);
+  });
+
+  it('caches successful AVC trim decode validation for identical keyed sample windows', async () => {
+    const streamCopy = Mp4Driver.streamCopy;
+    if (!streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const bytes = writeMp4([smallH264Track()], { faststart: true });
+    let decodeCalls = 0;
+    let supportCalls = 0;
+
+    class FakeTrimEncodedVideoChunk {
+      constructor(readonly init: EncodedVideoChunkInit) {}
+    }
+    class FakeTrimVideoDecoder {
+      static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        supportCalls++;
+        return Promise.resolve({ config, supported: true });
+      }
+
+      readonly decodeQueueSize = 0;
+      state: CodecState = 'unconfigured';
+
+      configure(_config: VideoDecoderConfig): void {
+        this.state = 'configured';
+      }
+
+      decode(_chunk: EncodedVideoChunk): void {
+        decodeCalls++;
+      }
+
+      flush(): Promise<void> {
+        return Promise.resolve();
+      }
+
+      reset(): void {
+        this.state = 'unconfigured';
+      }
+
+      close(): void {
+        this.state = 'closed';
+      }
+
+      addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+
+      removeEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+    }
+
+    const originalVideoDecoder = globalThis.VideoDecoder;
+    const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
+    const originalDateNow = Date.now;
+    let nowMs = 1_000_000;
+    Object.defineProperty(globalThis, 'VideoDecoder', {
+      configurable: true,
+      value: FakeTrimVideoDecoder as unknown as typeof VideoDecoder,
+    });
+    Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+      configurable: true,
+      value: FakeTrimEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
+    });
+    Object.defineProperty(Date, 'now', {
+      configurable: true,
+      value: () => nowMs,
+    });
+
+    const keyedSource = (label: string): CacheKeyedByteSource => ({
+      ...byteSource(bytes),
+      [SOURCE_CACHE_KEY]: `url:https://fixtures.test/${label}.mp4`,
+    });
+    const runTrim = async (src: ByteSource, endSec: number): Promise<void> => {
+      const stream = await streamCopy(src, {
+        trim: { startSec: 0, endSec },
+        buffered: true,
+      });
+      expect((await collectStreamBytes(stream)).byteLength).toBeGreaterThan(0);
+    };
+    const runMaterializedTrim = async (
+      src: ByteSource,
+      endSec: number,
+      signal?: AbortSignal,
+    ): Promise<void> => {
+      const stream = await streamCopy(src, {
+        trim: { startSec: 0, endSec },
+        ...(signal !== undefined ? { signal } : {}),
+      });
+      expect((await collectStreamBytes(stream)).byteLength).toBeGreaterThan(0);
+    };
+
+    try {
+      await runTrim(keyedSource('trim-cache'), 0.75);
+      expect(decodeCalls).toBe(2);
+      expect(supportCalls).toBe(1);
+
+      await runTrim(keyedSource('trim-cache'), 0.75);
+      expect(decodeCalls).toBe(2);
+      expect(supportCalls).toBe(1);
+
+      await runMaterializedTrim(
+        keyedSource('trim-cache-materialized'),
+        0.75,
+        new AbortController().signal,
+      );
+      expect(decodeCalls).toBe(4);
+      expect(supportCalls).toBe(2);
+
+      await runMaterializedTrim(keyedSource('trim-cache-materialized'), 0.75);
+      expect(decodeCalls).toBe(4);
+      expect(supportCalls).toBe(2);
+
+      await runTrim(keyedSource('trim-cache'), 0.25);
+      expect(decodeCalls).toBe(5);
+      expect(supportCalls).toBe(3);
+
+      nowMs += 60_001;
+      await runTrim(keyedSource('trim-cache'), 0.75);
+      expect(decodeCalls).toBe(7);
+      expect(supportCalls).toBe(4);
+
+      await runTrim(keyedSource('trim-cache'), 0.75);
+      expect(decodeCalls).toBe(7);
+      expect(supportCalls).toBe(4);
+
+      await runTrim(byteSource(bytes), 0.75);
+      await runTrim(byteSource(bytes), 0.75);
+      expect(decodeCalls).toBe(11);
+      expect(supportCalls).toBe(6);
+
+      const decodeBeforeBulk = decodeCalls;
+      const supportBeforeBulk = supportCalls;
+      for (let i = 0; i < 128; i++) {
+        await runTrim(keyedSource(`trim-cache-bulk-${i}`), 0.25);
+      }
+      expect(decodeCalls).toBe(decodeBeforeBulk + 128);
+      expect(supportCalls).toBe(supportBeforeBulk + 128);
+
+      await runTrim(keyedSource('trim-cache'), 0.75);
+      expect(decodeCalls).toBe(decodeBeforeBulk + 130);
+      expect(supportCalls).toBe(supportBeforeBulk + 129);
+    } finally {
+      if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
+      else
+        Object.defineProperty(globalThis, 'VideoDecoder', {
+          configurable: true,
+          value: originalVideoDecoder,
+        });
+      if (originalEncodedVideoChunk === undefined)
+        Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+      else
+        Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+          configurable: true,
+          value: originalEncodedVideoChunk,
+        });
+      Object.defineProperty(Date, 'now', {
+        configurable: true,
+        value: originalDateNow,
+      });
+    }
+  });
+
+  it('does not cache AVC trim decode validation when WebCodecs support probing declines', async () => {
+    const streamCopy = Mp4Driver.streamCopy;
+    if (!streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const bytes = writeMp4([smallH264Track()], { faststart: true });
+    let unsupportedCalls = 0;
+    let throwingCalls = 0;
+    let configureThrows = 0;
+
+    class FakeTrimEncodedVideoChunk {}
+    class ConfigureThrowingVideoDecoder {
+      static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        return Promise.resolve({ config, supported: true });
+      }
+
+      readonly decodeQueueSize = 0;
+      state: CodecState = 'unconfigured';
+
+      configure(_config: VideoDecoderConfig): void {
+        configureThrows++;
+        throw new Error('configure failed');
+      }
+
+      decode(_chunk: EncodedVideoChunk): void {
+        throw new Error('decode should not run after configure failure');
+      }
+
+      flush(): Promise<void> {
+        return Promise.resolve();
+      }
+
+      close(): void {
+        this.state = 'closed';
+      }
+
+      addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+
+      removeEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+    }
+    const UnsupportedVideoDecoder = Object.assign(function UnsupportedVideoDecoder(): void {}, {
+      isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        unsupportedCalls++;
+        return Promise.resolve({ config, supported: false });
+      },
+    });
+    const ThrowingVideoDecoder = Object.assign(function ThrowingVideoDecoder(): void {}, {
+      isConfigSupported(_config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        throwingCalls++;
+        return Promise.reject(new Error('unsupported'));
+      },
+    });
+
+    const originalVideoDecoder = globalThis.VideoDecoder;
+    const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
+    Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+      configurable: true,
+      value: FakeTrimEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
+    });
+
+    const source = (label: string): CacheKeyedByteSource => ({
+      ...byteSource(bytes),
+      [SOURCE_CACHE_KEY]: `url:https://fixtures.test/${label}.mp4`,
+    });
+    const runTrim = async (label: string): Promise<void> => {
+      const stream = await streamCopy(source(label), {
+        trim: { startSec: 0, endSec: 0.75 },
+        buffered: true,
+      });
+      expect((await collectStreamBytes(stream)).byteLength).toBeGreaterThan(0);
+    };
+    const runMaterializedTrim = async (label: string): Promise<void> => {
+      const stream = await streamCopy(source(label), {
+        trim: { startSec: 0, endSec: 0.75 },
+      });
+      expect((await collectStreamBytes(stream)).byteLength).toBeGreaterThan(0);
+    };
+
+    try {
+      Object.defineProperty(globalThis, 'VideoDecoder', {
+        configurable: true,
+        value: UnsupportedVideoDecoder as unknown as typeof VideoDecoder,
+      });
+      await runTrim('unsupported-trim-cache');
+      await runTrim('unsupported-trim-cache');
+      expect(unsupportedCalls).toBe(2);
+
+      Object.defineProperty(globalThis, 'VideoDecoder', {
+        configurable: true,
+        value: ThrowingVideoDecoder as unknown as typeof VideoDecoder,
+      });
+      await runTrim('throwing-trim-cache');
+      expect(throwingCalls).toBe(1);
+
+      Object.defineProperty(globalThis, 'VideoDecoder', {
+        configurable: true,
+        value: ConfigureThrowingVideoDecoder as unknown as typeof VideoDecoder,
+      });
+      await runTrim('configure-throwing-trim-cache');
+      await runTrim('configure-throwing-trim-cache');
+      expect(configureThrows).toBe(2);
+      await runMaterializedTrim('configure-throwing-materialized-trim-cache');
+      await runMaterializedTrim('configure-throwing-materialized-trim-cache');
+      expect(configureThrows).toBe(4);
+    } finally {
+      if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
+      else
+        Object.defineProperty(globalThis, 'VideoDecoder', {
+          configurable: true,
+          value: originalVideoDecoder,
+        });
+      if (originalEncodedVideoChunk === undefined)
+        Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+      else
+        Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+          configurable: true,
+          value: originalEncodedVideoChunk,
+        });
+    }
   });
 
   it('omits packetTable for fragmented MP4s whose init sample tables are empty', async () => {

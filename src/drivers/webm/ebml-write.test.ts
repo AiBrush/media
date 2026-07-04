@@ -21,6 +21,7 @@ import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import type { Packet } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { writeToStreamTarget } from '../../sinks/stream-target.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
@@ -1196,6 +1197,42 @@ describe('WebmStreamingMuxer — true Cluster-on-write streaming output', () => 
     expect(topLevelClusterCount(bytes)).toBe(2);
     expect(scanBlocks(bytes).map((block) => block.size)).toEqual([20, 21, 22]);
     expect(parseWebm(bytes).tracks[0]?.codec).toBe('vp9');
+  });
+
+  it('uses packet.data directly and does not copy bytes back out of the EncodedChunk', async () => {
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      fps: 30,
+      config: { codec: 'vp09.00.10.08', codedWidth: 32, codedHeight: 18 },
+    });
+    const partsPromise = collectChunks(muxer.output);
+    const copied = { value: false };
+    const data = Uint8Array.from([0xde, 0xad, 0xbe, 0xef]);
+    const fakeChunk = {
+      timestamp: 0,
+      duration: 33_333,
+      type: 'key',
+      copyTo(): void {
+        copied.value = true;
+        throw new Error('packet.data should bypass EncodedChunk.copyTo');
+      },
+    } as unknown as EncodedVideoChunk;
+    const packet: Packet = {
+      chunk: fakeChunk,
+      data,
+      dtsUs: 0,
+      sizeBytes: data.byteLength,
+    };
+
+    await muxer.write(vid, packet);
+    await muxer.finalize();
+    const bytes = concatBytes(await partsPromise);
+
+    expect(copied.value).toBe(false);
+    expect(scanBlocks(bytes).map((block) => block.size)).toEqual([data.byteLength]);
   });
 
   it('splits long audio-only streams at the bounded max-block count without buffering the tail', async () => {

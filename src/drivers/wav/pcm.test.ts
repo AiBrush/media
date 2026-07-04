@@ -4,6 +4,7 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import { gain } from '../../dsp/index.ts';
 import { channelAt, encodePcm } from '../../dsp/pcm.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
+import { slice as rewriteWavPcmSlice } from './pcm-slice.ts';
 import { readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
 import { parseWav } from './wav-driver.ts';
 
@@ -108,6 +109,69 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(dataChunk(out)).toEqual(dataChunk(file));
   });
 
+  it('packet-copy writes a fresh WAV when the payload is not the full source data view', () => {
+    const sourceBytes = new Uint8Array(46);
+    const payload = sourceBytes.subarray(0, 2);
+    payload.set([0x34, 0x12]);
+    const out = wavPcmPacketCopy(
+      {
+        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
+        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
+      },
+      {
+        payload,
+        sourceBytes,
+        codec: 'pcm-s16',
+        sampleRate: 8000,
+        channels: 1,
+      },
+    );
+    expect(dataChunk(out)).toEqual(payload);
+  });
+
+  it('packet-copy refreshes the header when payload is the canonical source data view', () => {
+    const sourceBytes = new Uint8Array(46);
+    const payload = sourceBytes.subarray(44);
+    payload.set([0x34, 0x12]);
+    const out = wavPcmPacketCopy(
+      {
+        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
+        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
+      },
+      {
+        payload,
+        sourceBytes,
+        codec: 'pcm-s16',
+        sampleRate: 8000,
+        channels: 1,
+      },
+    );
+    expect(out).not.toBe(sourceBytes);
+    expect(dataChunk(out)).toEqual(payload);
+  });
+
+  it('packet-copy rejects metadata that would mislabel raw WAV payloads', () => {
+    const deps = {
+      pcmSampleFormat: (codec: string | undefined) =>
+        codec === 'pcm-s16' || codec === 'pcm-s16be' ? 's16' : undefined,
+      pcmEndian: (codec: string | undefined) =>
+        codec === 'pcm-s16be' ? 'be' : codec === 'pcm-s16' ? 'le' : undefined,
+    } satisfies Parameters<typeof wavPcmPacketCopy>[0];
+    const payload = Uint8Array.of(0, 0);
+    expect(() =>
+      wavPcmPacketCopy(deps, { payload, codec: 'pcm-unknown', sampleRate: 8000, channels: 1 }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16be', sampleRate: 8000, channels: 1 }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16', sampleRate: 0, channels: 1 }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16', sampleRate: 8000, channels: 0 }),
+    ).toThrow(CapabilityError);
+  });
+
   it('declines WAV byte-copy when explicit identity constraints do not match', () => {
     const wav = writeWav(
       {
@@ -122,6 +186,57 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(rewriteWavPcmCopy(wav, 's16', 'be')).toBeUndefined();
     expect(rewriteWavPcmCopy(wav, 's16', 'le', 2)).toBeUndefined();
     expect(rewriteWavPcmCopy(wav, 's16', 'le', 1, 44_100)).toBeUndefined();
+  });
+
+  it('packet-copy trims WAV PCM by an exact interleaved byte window', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 10,
+        channels: 1,
+        frames: 10,
+        planar: [Float64Array.of(-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9)],
+      },
+      's16',
+    );
+    const out = rewriteWavPcmSlice(wav, { startSec: 0.21, endSec: 0.74 }, 's16', 'le', 1, 10);
+    if (out === undefined) throw new Error('expected same-layout WAV slice');
+    expect(dataChunk(out)).toEqual(dataChunk(wav).subarray(2 * 2, 7 * 2));
+    const re = readWavPcm(out);
+    expect(re.sampleRate).toBe(10);
+    expect(re.channels).toBe(1);
+    expect(re.frames).toBe(5);
+  });
+
+  it('declines WAV byte-trim when explicit identity constraints do not match', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0.25, -0.25, 0.5, -0.5)],
+      },
+      's16',
+    );
+    const bounds = { startSec: 0, endSec: 1 };
+    expect(rewriteWavPcmSlice(wav, bounds, 's24')).toBeUndefined();
+    expect(rewriteWavPcmSlice(wav, bounds, 's16', 'be')).toBeUndefined();
+    expect(rewriteWavPcmSlice(wav, bounds, 's16', 'le', 2)).toBeUndefined();
+    expect(rewriteWavPcmSlice(wav, bounds, 's16', 'le', 1, 44_100)).toBeUndefined();
+  });
+
+  it('keeps malformed WAV byte-trim ranges typed', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0, 0, 0)],
+      },
+      's16',
+    );
+    expect(() => rewriteWavPcmSlice(wav, { startSec: Number.NaN, endSec: 1 })).toThrow(InputError);
+    expect(() => rewriteWavPcmSlice(wav, { startSec: -1, endSec: 1 })).toThrow(InputError);
+    expect(() => rewriteWavPcmSlice(wav, { startSec: 1, endSec: 1 })).toThrow(InputError);
   });
 
   it('rejects signed 8-bit WAV authoring instead of writing mislabeled bytes', () => {

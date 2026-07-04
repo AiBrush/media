@@ -41,11 +41,14 @@ Focused coverage now includes:
 
 ## Browser Status
 
-Fresh Chromium timing for `trim/h264_multitrack_keyframe_aligned` is still pending. The benchmark command
-could not be rerun on 2026-07-03 because the required browser-run escalation was rejected by the Codex
-usage-limit guard. This note records the technique and local validation only; `docs/perf/performance-deficits.md`
-should not remove the row until a fresh multi-sample benchmark proves the median wall time is at or below
-the fastest passing rival.
+Fresh Chromium timing after this bounded-buffer change, before the follow-up validation-cache change,
+measured aibrush-media at 75.010 ms median over nine samples after three warmups:
+
+`/Users/tarekbadr/Home/software/projects/aibrush/aibrush.lib/media-test/media-browser-test/results/raw/chromium-2026-07-04T06-45-10-014Z.json`
+
+That was a large improvement from the stored 123.3 ms row, but it was still slower than ffmpeg.wasm at
+33.915 ms on the same PASS workload. The remaining repeated WebCodecs AVC validation overhead is closed
+by ADR-151, not by this buffer change alone.
 
 ## Rejected
 

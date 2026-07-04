@@ -8,6 +8,8 @@ import {
   mp4PacketInfoFromBytes,
   mp4PacketInfoFromUrl,
   muxPreparedMp4PacketTrack,
+  muxPreparedMp4PacketTracks,
+  muxPreparedMp4PacketTracksStream,
 } from './mp4-prepared-mux.ts';
 
 const MEDIA_TEST = new URL(
@@ -93,7 +95,34 @@ function isPacket(value: Packet | undefined): value is Packet {
   return value !== undefined;
 }
 
+async function collectChunks(stream: ReadableStream<Uint8Array>): Promise<{
+  readonly chunks: Uint8Array[];
+  readonly bytes: Uint8Array;
+}> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { chunks, bytes };
+}
+
 function packetShape(packet: PacketInfoMetadata): {
+  readonly trackIndex: number;
   readonly size: number;
   readonly ptsUs: number;
   readonly dtsUs: number;
@@ -101,6 +130,7 @@ function packetShape(packet: PacketInfoMetadata): {
   readonly keyframe: boolean;
 } {
   return {
+    trackIndex: packet.trackIndex,
     size: packet.size,
     ptsUs: packet.ptsUs,
     dtsUs: packet.dtsUs,
@@ -138,7 +168,7 @@ describe('prepared MP4 packet mux', () => {
         output.every((byte, index) => byte === input[index]),
     ).toBe(false);
 
-    const reparsed = await Mp4Driver.packetInfo(fromBytes(output, { mime: 'video/mp4' }));
+    const reparsed = await mp4PacketInfoFromBytes(output);
     expect(reparsed.tracks).toHaveLength(1);
     expect(reparsed.tracks[0]?.codec).toBe(track.codec);
     expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
@@ -221,9 +251,113 @@ describe('prepared MP4 packet mux', () => {
       faststart: false,
     });
 
-    const reparsed = await Mp4Driver.packetInfo(fromBytes(output, { mime: 'video/mp4' }));
+    const reparsed = await mp4PacketInfoFromBytes(output);
     expect(reparsed.packets).toHaveLength(2);
     expect(reparsed.packets[0]?.durationUs).toBeGreaterThan(0);
+  });
+
+  it('authors a multi-track MP4 from prepared video and audio packets', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    expect(table.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+    const tracks = table.tracks.map((track, trackIndex) => ({
+      track,
+      packets: table.packets
+        .filter((row) => row.trackIndex === trackIndex)
+        .map((row) => packetFromRow(row, input))
+        .filter(isPacket),
+    }));
+
+    const output = muxPreparedMp4PacketTracks({
+      tracks,
+      container: 'mp4',
+      faststart: true,
+    });
+
+    const reparsed = await mp4PacketInfoFromBytes(output);
+    expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+    expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+  });
+
+  it('exposes payload offsets for medium MP4 packet-table mux preparation', async () => {
+    const input = await mediaTestBytes('h264_1080p_30s.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+
+    expect(table.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+    expect(table.packets).toHaveLength(2308);
+    expect(table.packets.every((row) => row.offset !== undefined)).toBe(true);
+    for (const row of table.packets) {
+      expect(row.offset).toBeGreaterThanOrEqual(0);
+      expect((row.offset ?? 0) + row.size).toBeLessThanOrEqual(input.byteLength);
+    }
+  });
+
+  it('streams prepared multi-track MP4 payloads as incremental chunks', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    const tracks = table.tracks.map((track, trackIndex) => ({
+      track,
+      packets: table.packets
+        .filter((row) => row.trackIndex === trackIndex)
+        .map((row) => packetFromRow(row, input))
+        .filter(isPacket),
+    }));
+
+    const { chunks, bytes } = await collectChunks(
+      muxPreparedMp4PacketTracksStream({
+        tracks,
+        container: 'mp4',
+        faststart: false,
+      }),
+    );
+
+    expect(chunks.length).toBeGreaterThan(3);
+    expect(chunks[0]?.byteLength).toBeLessThan(64);
+    const reparsed = await mp4PacketInfoFromBytes(bytes);
+    expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+    expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+  });
+
+  it('rolls prepared MP4 stream payload chunks at the bounded target size', async () => {
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    const track = table.tracks[0];
+    const row = table.packets[0];
+    if (track === undefined || row === undefined || row.offset === undefined) {
+      throw new Error('expected one offset-backed source packet');
+    }
+    const data = input.slice(row.offset, row.offset + row.size);
+    const repeatedPackets = Array.from({ length: 80 }, (_, index): Packet => {
+      const timestampUs = index * 33_333;
+      const repeatedRow: PacketInfoMetadata = {
+        ...row,
+        ptsUs: timestampUs,
+        dtsUs: timestampUs,
+        durationUs: 33_333,
+        keyframe: true,
+      };
+      return {
+        chunk: encodedChunkView(repeatedRow, data),
+        data,
+        dtsUs: repeatedRow.dtsUs,
+        sizeBytes: data.byteLength,
+      };
+    });
+
+    const { chunks, bytes } = await collectChunks(
+      muxPreparedMp4PacketTracksStream({
+        tracks: [{ track, packets: repeatedPackets }],
+        container: 'mp4',
+      }),
+    );
+
+    const boundedPayloadBytes = data.byteLength * Math.floor((256 * 1024) / data.byteLength);
+    expect(chunks.map((chunk) => chunk.byteLength)).toContain(boundedPayloadBytes);
+    const reparsed = await mp4PacketInfoFromBytes(bytes);
+    expect(reparsed.packets).toHaveLength(repeatedPackets.length);
+    expect(reparsed.packets.map((packet) => packet.size)).toEqual(
+      Array.from({ length: repeatedPackets.length }, () => data.byteLength),
+    );
   });
 
   it('reads MP4 packet info from URLs through byte ranges without fetching the whole file', async () => {
@@ -302,6 +436,35 @@ describe('prepared MP4 packet mux', () => {
       muxPreparedMp4PacketTrack({
         track,
         packets: [],
+        container: 'mp4',
+      }),
+    ).toThrow(MediaError);
+  });
+
+  it('rejects unsupported prepared MP4 packet stream mux requests with typed errors', async () => {
+    if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const table = await Mp4Driver.packetInfo(fromBytes(input, { mime: 'video/mp4' }));
+    const track = table.tracks[0];
+    const packet = table.packets.map((row) => packetFromRow(row, input)).find(isPacket);
+    if (track === undefined || packet === undefined) throw new Error('expected a packet');
+
+    expect(() =>
+      muxPreparedMp4PacketTracksStream({
+        tracks: [{ track, packets: [packet] }],
+        container: 'mp4',
+        fragmented: true,
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      muxPreparedMp4PacketTracksStream({
+        tracks: [{ track, packets: [packet] }],
+        container: 'webm',
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      muxPreparedMp4PacketTracksStream({
+        tracks: [],
         container: 'mp4',
       }),
     ).toThrow(MediaError);

@@ -1,8 +1,10 @@
 /**
  * Raw-PCM-container convert route (ADR-022/059) — the PCM-native path that re-serializes a raw-PCM target
  * (WAV/AIFF/CAF) straight through the TS audio-dsp `transformPcm` (channel up/down-mix, sample format,
- * sample-rate, gain/fade/dynamics/biquad), never the WebCodecs chunk seam. A WAV target may also be produced
- * by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADR-024; ADTS AAC→WAV, ADR-050).
+ * sample-rate, gain/fade/dynamics/biquad), never the WebCodecs chunk seam. Identity WAV copies and
+ * identity AIFF→WAV byte-order rewrites can author the target buffer before the sample-domain path. A WAV
+ * target may also be produced by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADR-024; ADTS
+ * AAC→WAV, ADR-050).
  *
  * Why a SEPARATE module (split out of `engine.ts`): this routine runs ONLY for a raw-PCM-container target.
  * Keeping it behind the engine's lazy `import('./pcm-convert-plan.ts')` rather than inline in the engine
@@ -24,9 +26,20 @@ import { rewriteWavPcmCopy, writeWavHeader } from '../drivers/wav/pcm.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { Sink } from '../sinks/sink.ts';
-import type { Source } from '../sources/source.ts';
+import { SOURCE_CACHE_KEY, type Source } from '../sources/source.ts';
 import { isPcmContainer } from './codec-routing.ts';
 import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
+
+const PCM_REWRITE_SOURCE_CACHE_TTL_MS = 60_000;
+const PCM_REWRITE_SOURCE_CACHE_MAX_ENTRIES = 32;
+const PCM_REWRITE_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+interface PcmRewriteSourceCacheEntry {
+  readonly bytes: Uint8Array;
+  readonly expiresAtMs: number;
+}
+
+const pcmRewriteSourceCache = new Map<string, PcmRewriteSourceCacheEntry>();
 
 /**
  * The engine capabilities {@link convertPcmNative} needs, threaded in so the routine never reaches into the
@@ -78,6 +91,24 @@ function wavHint(src: Source): boolean {
   return filename !== undefined && (filename.endsWith('.wav') || filename.endsWith('.wave'));
 }
 
+function aiffHint(src: Source): boolean {
+  const mime = src.mimeHint?.toLowerCase();
+  if (
+    mime !== undefined &&
+    (mime === 'audio/aiff' ||
+      mime === 'audio/x-aiff' ||
+      mime === 'audio/aifc' ||
+      mime === 'audio/x-aifc')
+  ) {
+    return true;
+  }
+  const filename = src.filename?.toLowerCase();
+  return (
+    filename !== undefined &&
+    (filename.endsWith('.aiff') || filename.endsWith('.aif') || filename.endsWith('.aifc'))
+  );
+}
+
 function oneChunk(bytes: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(c): void {
@@ -110,22 +141,68 @@ function outputBytes(
   }
 }
 
+function pcmRewriteSourceCacheKey(src: Source): string | undefined {
+  const key = src[SOURCE_CACHE_KEY];
+  const size = src.size;
+  if (key === undefined || size === undefined || size > PCM_REWRITE_SOURCE_CACHE_MAX_BYTES) {
+    return undefined;
+  }
+  return `${key}#${size}`;
+}
+
+function cachedPcmRewriteSourceBytes(src: Source): Uint8Array | undefined {
+  const key = pcmRewriteSourceCacheKey(src);
+  if (key === undefined) return undefined;
+  const entry = pcmRewriteSourceCache.get(key);
+  if (entry === undefined) return undefined;
+  if (entry.expiresAtMs <= Date.now()) {
+    pcmRewriteSourceCache.delete(key);
+    return undefined;
+  }
+  return entry.bytes;
+}
+
+function rememberPcmRewriteSourceBytes(src: Source, bytes: Uint8Array): void {
+  const key = pcmRewriteSourceCacheKey(src);
+  if (key === undefined || bytes.byteLength !== src.size) return;
+  const now = Date.now();
+  if (pcmRewriteSourceCache.size >= PCM_REWRITE_SOURCE_CACHE_MAX_ENTRIES) {
+    const oldestKey = pcmRewriteSourceCache.keys().next().value;
+    if (oldestKey !== undefined) pcmRewriteSourceCache.delete(oldestKey);
+  }
+  pcmRewriteSourceCache.set(key, {
+    bytes,
+    expiresAtMs: now + PCM_REWRITE_SOURCE_CACHE_TTL_MS,
+  });
+}
+
+async function readPcmRewriteSourceBytes(src: Source): Promise<Uint8Array> {
+  const cached = cachedPcmRewriteSourceBytes(src);
+  if (cached !== undefined) return cached;
+  const size = src.size;
+  if (src.range === undefined || size === undefined) return new Uint8Array(0);
+  const bytes = await src.range(0, size);
+  rememberPcmRewriteSourceBytes(src, bytes);
+  return bytes;
+}
+
 async function tryDirectWavPcmCopy(
   src: Source,
   o: PcmTransform,
 ): Promise<Uint8Array<ArrayBuffer> | undefined> {
-  if (
-    !canRewritePcmBytes(o) ||
-    !wavHint(src) ||
-    src.range === undefined ||
-    src.size === undefined
-  ) {
+  if (!canRewritePcmBytes(o) || src.range === undefined || src.size === undefined) {
     return undefined;
   }
   throwIfAborted(o.signal);
-  const bytes = await src.range(0, src.size);
+  const bytes = await readPcmRewriteSourceBytes(src);
   throwIfAborted(o.signal);
-  const copied = rewriteWavPcmCopy(bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+  let copied: Uint8Array<ArrayBuffer> | undefined;
+  if (wavHint(src)) {
+    copied = rewriteWavPcmCopy(bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+  } else if (aiffHint(src)) {
+    const { rewriteAiffPcmToWav } = await import('../drivers/aiff/aiff-wav-rewrite.ts');
+    copied = rewriteAiffPcmToWav(bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+  }
   throwIfAborted(o.signal);
   return copied;
 }
@@ -224,6 +301,20 @@ export async function pcm(
     const pcmOpts = pcmTransformOptions(deps, audio, target, activeSignal, o);
     if (sourceContainer === 'wav' && canRewritePcmBytes(pcmOpts)) {
       const copied = rewriteWavPcmCopy(
+        src,
+        pcmOpts.sampleFormat,
+        pcmOpts.endian,
+        pcmOpts.channels,
+        pcmOpts.sampleRate,
+      );
+      if (copied !== undefined) {
+        if (opts.sink === undefined) return copied;
+        return outputBytes(opts.sink, copied, deps.mimeOpts(activeSignal, target));
+      }
+    }
+    if (sourceContainer === 'aiff' && canRewritePcmBytes(pcmOpts)) {
+      const { rewriteAiffPcmToWav } = await import('../drivers/aiff/aiff-wav-rewrite.ts');
+      const copied = rewriteAiffPcmToWav(
         src,
         pcmOpts.sampleFormat,
         pcmOpts.endian,

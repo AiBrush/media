@@ -50,6 +50,11 @@ export interface ChunkStruct {
   dtsUs?: number;
 }
 
+export interface Mp4PacketTrackInput {
+  readonly track: TrackInfo;
+  readonly chunks: readonly ChunkStruct[];
+}
+
 /** How a track's codec config is carried into {@link MuxTrackInput} once the sample entry is known. */
 type ConfigKind =
   | { kind: 'avcC-from-description' } // video AVC: writeMp4 synthesizes `avcC` from `description`
@@ -798,7 +803,7 @@ export function buildMuxSamples(
 }
 
 /** Per-track recording state, accumulated across `addTrack`/`write` until `finalize`. */
-interface TrackState {
+export interface TrackState {
   readonly mediaType: 'video' | 'audio';
   readonly codec: string;
   readonly sampleEntryType: string;
@@ -814,7 +819,7 @@ interface TrackState {
 }
 
 /** Resolve geometry/config fields from a track's WebCodecs `DecoderConfig` (narrowed by `mediaType`). */
-function trackStateFrom(info: TrackInfo): TrackState {
+export function trackStateFrom(info: TrackInfo): TrackState {
   const { sampleEntryType, config } = mapCodec(info.mediaType, info.codec);
   const decoderConfig = info.config;
   const description =
@@ -913,7 +918,7 @@ function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): Ga
 }
 
 /** Turn a finalized {@link TrackState} into the {@link MuxTrackInput} {@link writeMp4} consumes. */
-function toMuxTrack(t: TrackState): MuxTrackInput {
+export function toMuxTrack(t: TrackState): MuxTrackInput {
   const prepared =
     t.mediaType === 'video' && t.sampleEntryType === 'avc1'
       ? prepareAvcSamples(t.chunks, t.description)
@@ -1069,23 +1074,6 @@ export class Mp4Muxer implements Muxer {
       throw new MediaError('mux-error', 'muxer already finalized');
     }
   }
-}
-
-export function writeMp4PacketTrack(
-  info: TrackInfo,
-  chunks: readonly ChunkStruct[],
-  options?: MuxOptions,
-): Uint8Array {
-  const state = trackStateFrom(info);
-  for (const chunk of chunks) state.chunks.push(chunk);
-  if (state.chunks.length === 0) {
-    throw new MediaError('mux-error', 'MP4 mux received no packets');
-  }
-  const brand = options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
-  return writeMp4([toMuxTrack(state)], {
-    faststart: options?.faststart ?? true,
-    brand,
-  });
 }
 
 function packetBytes(packet: Packet): Uint8Array {

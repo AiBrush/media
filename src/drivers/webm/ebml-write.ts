@@ -94,6 +94,24 @@ function idBytes(id: number): number[] {
   return bytes;
 }
 
+function idByteLength(id: number): number {
+  if (id > 0xffffff) return 4;
+  if (id > 0xffff) return 3;
+  if (id > 0xff) return 2;
+  return 1;
+}
+
+function vintByteLength(n: number): number {
+  if (n < 0 || !Number.isFinite(n)) {
+    throw new MediaError('mux-error', `cannot EBML-encode a negative/invalid length ${n}`);
+  }
+  for (let length = 1; length <= 8; length++) {
+    const capacity = 2 ** (7 * length) - 1; // all-ones (reserved) → usable range is [0, capacity)
+    if (n < capacity) return length;
+  }
+  throw new MediaError('mux-error', `length ${n} does not fit an 8-byte EBML vint`);
+}
+
 /**
  * Encode a non-negative magnitude as an EBML size/value vint: the smallest width L∈[1,8] whose value
  * range can hold `n` (the all-ones value of a width is reserved for "unknown size", so a magnitude that
@@ -101,23 +119,15 @@ function idBytes(id: number): number[] {
  * This is the exact inverse of {@link readVint} with `keepMarker=false`.
  */
 function vintBytes(n: number): number[] {
-  if (n < 0 || !Number.isFinite(n)) {
-    throw new MediaError('mux-error', `cannot EBML-encode a negative/invalid length ${n}`);
+  const length = vintByteLength(n);
+  const out = new Array<number>(length).fill(0);
+  let v = n;
+  for (let i = length - 1; i >= 1; i--) {
+    out[i] = v & 0xff;
+    v = Math.floor(v / 256);
   }
-  for (let length = 1; length <= 8; length++) {
-    const capacity = 2 ** (7 * length) - 1; // all-ones (reserved) → usable range is [0, capacity)
-    if (n < capacity) {
-      const out = new Array<number>(length).fill(0);
-      let v = n;
-      for (let i = length - 1; i >= 1; i--) {
-        out[i] = v & 0xff;
-        v = Math.floor(v / 256);
-      }
-      out[0] = (v & 0xff) | (0x80 >> (length - 1)); // remaining high bits + the length marker
-      return out;
-    }
-  }
-  throw new MediaError('mux-error', `length ${n} does not fit an 8-byte EBML vint`);
+  out[0] = (v & 0xff) | (0x80 >> (length - 1)); // remaining high bits + the length marker
+  return out;
 }
 
 /** Concatenate `parts` (each a byte array) into one `Uint8Array`. */
@@ -199,6 +209,34 @@ class ByteWriter {
   write(part: Uint8Array | readonly number[]): void {
     this.#bytes.set(part, this.#offset);
     this.#offset += part.length;
+  }
+
+  writeByte(value: number): void {
+    this.#bytes[this.#offset++] = value & 0xff;
+  }
+
+  writeInt16(value: number): void {
+    if (value < INT16_MIN || value > INT16_MAX || !Number.isFinite(value)) {
+      throw new MediaError(
+        'mux-error',
+        `SimpleBlock relative timecode ${value}ms exceeds int16 range`,
+      );
+    }
+    const unsigned = value < 0 ? value + 0x10000 : value;
+    this.writeByte(unsigned >>> 8);
+    this.writeByte(unsigned);
+  }
+
+  writeVint(value: number): void {
+    const length = vintByteLength(value);
+    let remaining = value;
+    const start = this.#offset;
+    for (let i = length - 1; i >= 1; i--) {
+      this.#bytes[start + i] = remaining & 0xff;
+      remaining = Math.floor(remaining / 256);
+    }
+    this.#bytes[start] = (remaining & 0xff) | (0x80 >> (length - 1));
+    this.#offset += length;
   }
 
   finish(): Uint8Array {
@@ -541,7 +579,7 @@ function tracksElement(tracks: readonly TrackState[]): Uint8Array {
 }
 
 function blockPayloadLength(block: TimelineBlock): number {
-  return vintBytes(block.trackNumber).length + 2 + 1 + block.data.byteLength;
+  return vintByteLength(block.trackNumber) + 2 + 1 + block.data.byteLength;
 }
 
 function blockPayloadBytes(
@@ -578,40 +616,48 @@ function blockElementLength(block: TimelineBlock): number {
   const rawBlockPayloadLength = blockPayloadLength(block);
   if (block.alpha === undefined) {
     return (
-      idBytes(EBML_ID.SimpleBlock).length +
-      vintBytes(rawBlockPayloadLength).length +
+      idByteLength(EBML_ID.SimpleBlock) +
+      vintByteLength(rawBlockPayloadLength) +
       rawBlockPayloadLength
     );
   }
   const blockElementLength =
-    idBytes(EBML_ID.Block).length + vintBytes(rawBlockPayloadLength).length + rawBlockPayloadLength;
+    idByteLength(EBML_ID.Block) + vintByteLength(rawBlockPayloadLength) + rawBlockPayloadLength;
   const referenceElementLength = block.key
     ? 0
-    : idBytes(EBML_ID.ReferenceBlock).length + vintBytes(1).length + 1;
+    : idByteLength(EBML_ID.ReferenceBlock) + vintByteLength(1) + 1;
   const blockAddId = uintEl(EBML_ID.BlockAddID, 1);
   const blockAdditionalLength =
-    idBytes(EBML_ID.BlockAdditional).length +
-    vintBytes(block.alpha.byteLength).length +
+    idByteLength(EBML_ID.BlockAdditional) +
+    vintByteLength(block.alpha.byteLength) +
     block.alpha.byteLength;
   const blockMorePayloadLength = blockAddId.byteLength + blockAdditionalLength;
   const blockMoreLength =
-    idBytes(EBML_ID.BlockMore).length +
-    vintBytes(blockMorePayloadLength).length +
+    idByteLength(EBML_ID.BlockMore) +
+    vintByteLength(blockMorePayloadLength) +
     blockMorePayloadLength;
   const blockAdditionsLength =
-    idBytes(EBML_ID.BlockAdditions).length + vintBytes(blockMoreLength).length + blockMoreLength;
+    idByteLength(EBML_ID.BlockAdditions) + vintByteLength(blockMoreLength) + blockMoreLength;
   const blockGroupPayloadLength =
     blockElementLength + referenceElementLength + blockAdditionsLength;
   return (
-    idBytes(EBML_ID.BlockGroup).length +
-    vintBytes(blockGroupPayloadLength).length +
+    idByteLength(EBML_ID.BlockGroup) +
+    vintByteLength(blockGroupPayloadLength) +
     blockGroupPayloadLength
   );
 }
 
 function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
   if (block.alpha === undefined) {
-    writer.write(element(EBML_ID.SimpleBlock, blockPayloadBytes(block, clusterTimeMs, true)));
+    const rel = block.timeMs - clusterTimeMs;
+    const flags = block.key ? 0x80 : 0x00;
+    const payloadLength = vintByteLength(block.trackNumber) + 2 + 1 + block.data.byteLength;
+    writer.writeByte(EBML_ID.SimpleBlock);
+    writer.writeVint(payloadLength);
+    writer.writeVint(block.trackNumber);
+    writer.writeInt16(rel);
+    writer.writeByte(flags);
+    writer.write(block.data);
     return;
   }
 
@@ -968,10 +1014,15 @@ export class WebmStreamingMuxer {
     return trackNumber;
   }
 
+  async start(): Promise<void> {
+    this.#assertOpen();
+    await this.#ensureStarted();
+  }
+
   async write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; browser-harness validated. */
     const chunk = packet.chunk;
-    const data = encodedChunkBytes(chunk);
+    const data = packet.data ?? encodedChunkBytes(chunk);
     await this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
       durationUs: chunk.duration ?? undefined,
@@ -985,15 +1036,30 @@ export class WebmStreamingMuxer {
 
   async addChunkStruct(trackId: number, chunk: ChunkStruct): Promise<void> {
     this.#assertOpen();
+    await this.#ensureStarted();
+    const pendingFlush = this.addChunkStructStarted(trackId, chunk);
+    if (pendingFlush !== undefined) await pendingFlush;
+  }
+
+  addChunkStructStarted(trackId: number, chunk: ChunkStruct): Promise<void> | undefined {
+    this.#assertOpen();
+    if (!this.#started) {
+      throw new MediaError('mux-error', 'streaming muxer has not started');
+    }
     const track = this.#tracks.get(trackId);
     if (track === undefined) {
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
     }
-    await this.#ensureStarted();
     const block = this.#blockFromChunk(track, chunk);
-    if (this.#shouldFlushBefore(block)) await this.#flushCurrentCluster();
+    if (this.#shouldFlushBefore(block)) {
+      return this.#flushCurrentCluster().then(() => {
+        this.#appendBlock(block);
+        this.#writtenTrackNumbers.add(trackId);
+      });
+    }
     this.#appendBlock(block);
     this.#writtenTrackNumbers.add(trackId);
+    return undefined;
   }
 
   async finalize(): Promise<void> {
@@ -1173,7 +1239,7 @@ export class WebmMuxer implements Muxer {
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
     const chunk = packet.chunk;
-    const data = encodedChunkBytes(chunk);
+    const data = packet.data ?? encodedChunkBytes(chunk);
     this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
       durationUs: chunk.duration ?? undefined,

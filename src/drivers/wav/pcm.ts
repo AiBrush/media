@@ -44,14 +44,14 @@ function sampleFormat(formatTag: number, bits: number): SampleFormat {
   );
 }
 
-interface WavFmt {
+export interface WavFmt {
   formatTag: number;
   channels: number;
   sampleRate: number;
   bits: number;
 }
 
-interface WavPcmData {
+export interface WavPcmData {
   readonly fmt: WavFmt;
   readonly format: SampleFormat;
   readonly data: Uint8Array;
@@ -72,7 +72,7 @@ function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   };
 }
 
-function parseWavPcmData(bytes: Uint8Array): WavPcmData {
+export function parseWavPcmData(bytes: Uint8Array): WavPcmData {
   if (bytes.byteLength < 12 || !tagEquals(bytes, 0, 'RIFF') || !tagEquals(bytes, 8, 'WAVE')) {
     throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
   }

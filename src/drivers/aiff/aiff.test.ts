@@ -16,7 +16,9 @@ import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { readCafPcm } from '../caf/caf.ts';
+import { readWavPcm } from '../wav/pcm.ts';
 import { AiffDriver, AiffModule } from './aiff-driver.ts';
+import { rewriteAiffPcmToWav } from './aiff-wav-rewrite.ts';
 import {
   type AiffKind,
   aiffCodec,
@@ -53,6 +55,21 @@ function ssndSamples(b: Uint8Array): Uint8Array {
     pos += 8 + size + (size & 1);
   }
   throw new Error('no SSND chunk');
+}
+
+/** Independent RIFF/WAVE data-chunk locator for the AIFF→WAV byte-swap fast-path oracle. */
+function wavDataChunk(b: Uint8Array): Uint8Array {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let pos = 12; // RIFF + size + WAVE
+  while (pos + 8 <= b.byteLength) {
+    const id = String.fromCharCode(b[pos] ?? 0, b[pos + 1] ?? 0, b[pos + 2] ?? 0, b[pos + 3] ?? 0);
+    const size = dv.getUint32(pos + 4, true);
+    if (id === 'data') {
+      return b.subarray(pos + 8, pos + 8 + Math.min(size, Math.max(0, b.byteLength - pos - 8)));
+    }
+    pos += 8 + size + (size & 1);
+  }
+  throw new Error('no data chunk');
 }
 
 interface AiffGolden {
@@ -212,6 +229,95 @@ describe('readAiffPcm / writeAiff — byte-exact SSND round-trip on real AIFF (d
   }
 });
 
+describe('rewriteAiffPcmToWav — no-DSP cross-wrapper fast path', () => {
+  it('byte-swaps a real big-endian s16 AIFF into canonical WAV while preserving samples', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const source = readAiffPcm(file);
+    expect(source.format).toBe('s16');
+    expect(source.endian).toBe('be');
+
+    const rewritten = rewriteAiffPcmToWav(file, 's16', 'le', source.channels, source.sampleRate);
+    expect(rewritten).toBeDefined();
+    const out = rewritten ?? new Uint8Array();
+    const wav = readWavPcm(out);
+    expect(wav.format).toBe('s16');
+    expect(wav.sampleRate).toBe(source.sampleRate);
+    expect(wav.channels).toBe(source.channels);
+    expect(wav.frames).toBe(source.frames);
+    for (let c = 0; c < source.channels; c++) {
+      expect(channelAt(wav.planar, c)).toEqual(channelAt(source.planar, c));
+    }
+
+    const sourceBytes = ssndSamples(file);
+    const wavBytes = wavDataChunk(out);
+    expect(wavBytes.byteLength).toBe(sourceBytes.byteLength);
+    for (let i = 0; i < Math.min(sourceBytes.byteLength, 512); i += 2) {
+      expect(wavBytes[i]).toBe(sourceBytes[i + 1]);
+      expect(wavBytes[i + 1]).toBe(sourceBytes[i]);
+    }
+  });
+
+  it('byte-swaps real big-endian s24 AIFF through the generic fixed-width path', async () => {
+    const file = await loadHarness('pcm_s24be.aiff');
+    const source = readAiffPcm(file);
+    expect(source.format).toBe('s24');
+    expect(source.endian).toBe('be');
+
+    const rewritten = rewriteAiffPcmToWav(file, 's24', 'le', source.channels, source.sampleRate);
+    expect(rewritten).toBeDefined();
+    const out = rewritten ?? new Uint8Array();
+    const wav = readWavPcm(out);
+    expect(wav.format).toBe('s24');
+    expect(wav.sampleRate).toBe(source.sampleRate);
+    expect(wav.channels).toBe(source.channels);
+    expect(wav.frames).toBe(source.frames);
+    for (let c = 0; c < source.channels; c++) {
+      expect(channelAt(wav.planar, c)).toEqual(channelAt(source.planar, c));
+    }
+  });
+
+  it('copies little-endian AIFF-C PCM directly into canonical WAV payload bytes', () => {
+    const samples = Uint8Array.of(0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde);
+    const ssnd = new Uint8Array(8 + samples.byteLength);
+    ssnd.set(samples, 8);
+    const file = form('AIFC', [chunk('COMM', comm(1, 16, 8000, 'sowt', 4)), chunk('SSND', ssnd)]);
+
+    const rewritten = rewriteAiffPcmToWav(file, 's16', 'le', 1, 8000);
+    expect(rewritten).toBeDefined();
+    const out = rewritten ?? new Uint8Array();
+    const wav = readWavPcm(out);
+    expect(wav.format).toBe('s16');
+    expect(wav.frames).toBe(4);
+    expect(wavDataChunk(out)).toEqual(samples);
+  });
+
+  it('authors an empty canonical WAV when AIFF has COMM but no SSND samples', () => {
+    const file = form('AIFF', [chunk('COMM', comm(1, 16, 8000, undefined, 0))]);
+
+    const rewritten = rewriteAiffPcmToWav(file, 's16', 'le', 1, 8000);
+    expect(rewritten).toBeDefined();
+    const out = rewritten ?? new Uint8Array();
+    const wav = readWavPcm(out);
+    expect(wav.format).toBe('s16');
+    expect(wav.frames).toBe(0);
+    expect(wavDataChunk(out)).toHaveLength(0);
+  });
+
+  it('declines targets that require DSP, value conversion, or non-WAV byte order', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    expect(rewriteAiffPcmToWav(file, 's24')).toBeUndefined();
+    expect(rewriteAiffPcmToWav(file, 's16', 'be')).toBeUndefined();
+    expect(rewriteAiffPcmToWav(file, 's16', 'le', 1)).toBeUndefined();
+    expect(rewriteAiffPcmToWav(file, 's16', 'le', 2, 44_100)).toBeUndefined();
+
+    const samples = Uint8Array.of(0x80, 0x00, 0x7f, 0x40);
+    const ssnd = new Uint8Array(8 + samples.byteLength);
+    ssnd.set(samples, 8);
+    const s8 = form('AIFF', [chunk('COMM', comm(1, 8, 8000)), chunk('SSND', ssnd)]);
+    expect(rewriteAiffPcmToWav(s8)).toBeUndefined();
+  });
+});
+
 describe('AIFF ↔ CAF cross-endian equivalence (same source, opposite byte order)', () => {
   it('AIFF(BE) sfx.aiff and CAF(LE) sfx.caf decode to identical planar samples', async () => {
     const aiff = readAiffPcm(await loadDerived('sfx.aiff'));
@@ -270,6 +376,32 @@ describe('AiffDriver.transformPcm — PCM-native audio-dsp path (ADR-022)', () =
     if (!fn) throw new Error('AiffDriver must expose transformPcm');
     const out = await drain(await fn({ stream: () => streamOf(file) }));
     expect(ssndSamples(out)).toEqual(ssndSamples(file)); // identity, byte-exact, via the stream path
+  });
+});
+
+describe('AiffDriver.decodePcmAudio — abort handling', () => {
+  it('observes an abort that arrives while source bytes are being read', async () => {
+    const file = await loadDerived('sfx.aiff');
+    const controller = new AbortController();
+    const decode = AiffDriver.decodePcmAudio;
+    if (decode === undefined) throw new Error('AiffDriver must expose decodePcmAudio');
+    const source = {
+      stream: () => streamOf(file),
+      size: file.byteLength,
+      range: (s: number, e: number): Promise<Uint8Array> => {
+        controller.abort();
+        return Promise.resolve(file.subarray(s, e));
+      },
+    };
+
+    await expect(decode(source, { signal: controller.signal })).rejects.toThrow(MediaError);
+  });
+});
+
+describe('writeAiff — container-specific PCM legality', () => {
+  it('rejects unsigned 8-bit AIFF because AIFF 8-bit PCM is signed', async () => {
+    const pcm = readAiffPcm(await loadDerived('sfx.aiff'));
+    expect(() => writeAiff(pcm, 'u8')).toThrowError(CapabilityError);
   });
 });
 

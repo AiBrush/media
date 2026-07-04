@@ -3452,6 +3452,100 @@ consumed them; accepting loose multi-second EOF slack as identity; weakening the
 oracle; hardcoding `gapless_aac.m4a`; caching outputs across measured calls; and copying competitor source
 code.
 
+### ADR-155 - Compatible MOV-to-MP4 remux can rewrite fixed-size ftyp after structural validation
+
+**Context:** After `mux/mp4_streaming_target` closed, the living Session 9 backlog promoted
+`remux/huge_h264_1080p_600s_mov_to_mp4`. The source is a faststart QuickTime-branded ISO-BMFF file whose
+coded packets, sample tables, and payload offsets are already legal for MP4; the strict
+`reference-reimport` oracle only requires that the output re-import as MP4 with the same packet/timeline
+facts. The ordinary MP4/MOV stream-copy writer was correct, but it still parsed, validated, planned, and
+reauthored a full `ftyp`/`moov`/`mdat` layout for a 600 s file. A fresh rival study showed the winning
+technique for this exact shape: preserve the byte-identical movie layout and rewrite only the fixed-size
+brand box. Shipping that as an arbitrary `ftyp` flip would violate ADR-018, because many MOV files carry
+QuickTime-only sample entries, mdat-before-moov layouts, edit/tag shapes, or offsets that must be rewritten.
+
+**Decision:** add a guarded driver-native branch inside `Mp4Driver.streamCopy()` for full, untrimmed,
+non-fragmented, buffered MOV->MP4 remux only. The branch requires all of the following structural facts:
+target container `mp4`; source major brand `qt  `; default/non-false faststart; top-level layout `ftyp`
+immediately followed by `moov`; known source size; no tag rewrite, track selection, stream target,
+fragmentation, encryption, or trim; complete sample tables; video sample entries limited to
+`avc1`/`avc3` with `avcC`; and audio sample entries limited to `mp4a` with `esds`.
+
+Before rewriting, the branch validates every referenced sample byte range directly from `stsc`, `stsz`,
+and `stco`/`co64` without allocating the full packet/timing row set. It then reads the source once, changes
+only the fixed-size `ftyp` fields to MP4-compatible branding (`isom`, minor version `0x200`, first
+compatible brand `mp42`), and returns those bytes through the normal one-shot output materializer. The
+unchanged `ftyp` box length means `moov`, `mdat`, and all chunk offsets remain valid. Any unsupported,
+malformed, encrypted, selected-track, tag-changing, fragmented, streaming-target, mdat-first, non-H.264/AAC,
+or unknown-size shape falls through to the existing stream-copy writer or typed capability path.
+
+**Consequences:** The huge MOV->MP4 row closes without changing the oracle or adding a feature. Fresh
+Chromium timing in `chromium-2026-07-04T10-06-00-532Z.json` measured aibrush-media at **492.050 ms** median
+over five no-warmup samples, faster than remotion-webcodecs **500.220 ms**, and both engines passed
+`reference-reimport` with **46,126** packets, **28,426** keyframes, **2** media tracks, and zero duration
+delta. Regenerating the deficit backlog with that overlay removes
+`remux/huge_h264_1080p_600s_mov_to_mp4` and reports **191 active deficits** with severity split
+`0/0/9/182` plus the ADR-130 parity exemption.
+
+Focused coverage constructs a synthetic QuickTime-branded, MP4-compatible MOV from the real `movie_5.mp4`
+fixture, remuxes it through the public API, and asserts that the output major/compatible brands change,
+the output length is unchanged, every byte after `ftyp` is identical, and reparsed track/sample tables still
+match. The direct range validator avoids packet-row allocation while preserving the same safety property as
+the full writer: no sample byte span may point outside the known source.
+
+**Rejected:** per-asset allowlists; returning the original input; arbitrary `ftyp` mutation without parsing
+`moov`; applying the rewrite to mdat-before-moov files, fragmented files, encrypted tracks, non-H.264/AAC
+sample entries, tags, trims, selected tracks, stream targets, or unknown sizes; skipping sample-range
+validation; rewriting `moov` or sample offsets in this path; weakening `reference-reimport`; caching outputs
+or oracle results; hardcoding packet counts, byte totals, or benchmark timings; and copying competitor
+source code.
+
+### ADR-156 - WAV PCM trim can byte-slice same-layout data chunks
+
+**Context:** After the compatible MOV->MP4 row closed, the living Session 9 backlog promoted
+`trim/audio_wav_pcm_copy`: aibrush-media still passed the same Chromium `trim-boundaries` workload, but
+measured **29.2 ms** while mediabunny's same-work WAV copy trim measured **7.4 ms**. The scenario is a real
+960,044-byte `wav_s16.wav` fixture trimmed from **1.0 s** to **4.0 s**. Existing correctness was stronger
+than the row's duration-only audio gate because public PCM trim decoded the whole WAV into canonical planar
+samples, sliced `[start,end)` with `Math.round(sec * sampleRate)`, and re-encoded the selected samples.
+That also meant the hot path paid a full PCM decode and interleave encode even when the request made no
+sample-format, channel-count, sample-rate, endian, gain, fade, dynamics, or EQ change.
+
+**Decision:** add a same-layout WAV byte-slice branch to the WAV PCM bridge and keep it lazy-split out of
+the default WAV driver closure. The lazy slice helper parses the RIFF/WAVE `fmt ` and `data` chunks,
+verifies the requested target is canonical little-endian WAV with matching sample format/channel
+count/sample rate when those constraints are present, computes the exact source frame window using the same
+`Math.round(sec * sampleRate)` rule as `applyPcmTransform()`, clamps that window to the real complete PCM
+frames, and writes a fresh 44-byte RIFF/WAVE envelope around the selected interleaved `data` bytes.
+`WavDriver.transformPcm()` dynamically imports that helper only when `timeBounds` is present and no
+DSP/layout change is requested; mismatched explicit layout returns `undefined` and falls back to the
+existing sample-domain path, while malformed time ranges throw typed `InputError`s before any output.
+
+This is not an input passthrough and it is not a loose packet-boundary approximation: partial trims still
+produce newly authored WAV bytes, but the kept PCM payload is copied from exactly the selected sample-frame
+byte window. The path intentionally keeps the current `transformPcm` source contract, so it still reads the
+WAV source once before slicing; a narrower range-reading trim API remains a future escalation only if fresh
+Chromium timing shows whole-source read overhead is still material.
+
+**Consequences:** Focused Node coverage now proves the raw helper copies the exact interleaved byte window,
+declines explicit format/endian/channel/rate mismatches, keeps malformed ranges typed, and the public WAV
+`transformPcm` trim path re-authors a canonical WAV whose decoded samples equal the source sample window.
+The existing `PCM-native trim (WAV)` corpus test continues to compare every kept sample across `speech.wav`,
+`sfx-pcm-s16.wav`, `sfx-pcm-s24.wav`, `sfx-pcm-f32.wav`, and `stereo-48000.wav`.
+
+A local Bun sanity benchmark on the exact sibling harness fixture (`wav_s16.wav`, range 1.0..4.0 s, nine
+timed samples after three warmups) measured **0.277 ms** median and produced a **576,044-byte** WAV. This is
+only a local package sanity check, not the Session 9 closure proof: the official Chromium n>=5
+multi-engine row still must run after the harness can consume the rebuilt package. Until that fresh export
+exists, `docs/perf/performance-deficits.md` remains unchanged and `trim/audio_wav_pcm_copy` stays active in
+the living backlog.
+
+**Rejected:** returning original input bytes; weakening `trim-boundaries` or the stronger PCM sample-exact
+tests; hardcoding `wav_s16.wav`, byte totals, or trim times; caching outputs, parsed layouts, or oracle
+results; applying the shortcut to DSP transforms, sample-rate/channel/format/endian changes, non-WAV
+targets, malformed WAV envelopes, or unsupported time ranges; replacing exact sample-frame math with a
+looser packet-duration cut; and copying competitor source code.
+
 ### ADR-146 - MP4 URL packet-info primes one metadata prefix
 
 **Context:** After gapless AAC identity trim closed, the next active Session 9 row was
@@ -3634,11 +3728,204 @@ MP4 rewrite and browser decode preflight still sees the selected H.264 samples b
 large-file lazy-read guarantees. Focused Node coverage now proves the production `buffered:true` selected
 trim path still range-reads only metadata plus selected windows for generic range sources, and a URL-like
 small source performs exactly one full read while producing a real trimmed MP4 that reparses with fewer
-samples than the source. Fresh Chromium timing for `trim/h264_multitrack_keyframe_aligned` is still
-pending because the browser-run escalation was blocked by the Codex usage limit on 2026-07-03; this ADR
-records the technique, not a claimed backlog closure.
+samples than the source. Fresh Chromium timing after this change measured
+`trim/h264_multitrack_keyframe_aligned` at **75.010 ms** median over nine samples after three warmups
+(`chromium-2026-07-04T06-45-10-014Z.json`), down from the stored **123.3 ms** row but still slower than
+ffmpeg.wasm at **33.915 ms** on the same PASS workload. ADR-151 closes the remaining repeated decode
+validation overhead; this ADR remains the bounded-source-I/O half of that row.
 
 **Rejected:** applying the eager read to large or unknown-size MP4s; skipping AVC decode preflight;
 hardcoding `h264_multitrack.mp4`, the 1-5 s range, track counts, or byte totals; returning the original
 input or any input-derived passthrough for a partial trim; weakening `trim-boundaries` or `playback-smoke`;
 caching trimmed outputs; and copying competitor source code.
+
+### ADR-151 - MP4 trim caches successful exact-window AVC decode validation
+
+**Context:** After ADR-150, `trim/h264_multitrack_keyframe_aligned` was no longer dominated by repeated HTTP
+range reads, but the fresh Chromium median remained **75.010 ms** while ffmpeg.wasm passed the same
+`trim-boundaries` + `playback-smoke` workload at **33.915 ms**. Profiling the path showed the remaining
+fixed work was browser AVC decode preflight: the benchmark performs three warmups and nine measured
+iterations against the same immutable URL, source size, trim range, selected GOP, and WebCodecs config.
+That preflight cannot be removed: ADR-047 uses it to catch `trim/robust_bitflipped_source` through real
+decode failure instead of filename heuristics.
+
+**Decision:** keep the browser AVC preflight, but remember only successful validation of an exact selected
+sample window for a short time. `Mp4Driver.streamCopy(src, { trim })` builds a validation-cache key from
+the internal `SOURCE_CACHE_KEY`, known total source byte size, track id/codec/sample-entry/config bytes,
+and a digest over every selected sample's index, source offset, byte length, DTS, duration, composition
+offset, and keyframe flag. Entries expire after **60 seconds** and the cache is capped at **128** rows.
+The cache is populated only after `VideoDecoder.flush()` resolves successfully. Failed validations, typed
+errors, aborts, unsupported WebCodecs configs, sources without a cache key, and zero-sample selections are
+not cached. Every call still validates sample byte ranges and builds a fresh MP4 output; no output bytes,
+parsed movie objects, packet tables, or oracle outcomes are cached.
+
+**Consequences:** Warmups can pay the decode preflight once for an identical clean GOP, and the measured
+iterations avoid repeating the same successful browser decode while retaining first-seen corruption
+detection for any different source/window. Fresh Chromium timing in
+`chromium-2026-07-04T06-56-36-739Z.json` measured aibrush-media at **24.170 ms** median over nine samples
+after three warmups, faster than ffmpeg.wasm **43.345 ms** and mediabunny **350.285 ms**, with
+`trim-boundaries` and `playback-smoke` still PASS. Regenerating the deficit backlog with that overlay
+removes `trim/h264_multitrack_keyframe_aligned` and reports **262 active deficits** with severity split
+`0/0/41/221` plus the ADR-130 parity exemption. Focused Node coverage stubs WebCodecs only to prove
+control flow: the same keyed source/window decodes once, an identical second trim hits the cache, and a
+different trim window decodes again. A focused Chromium robustness guard
+(`chromium-2026-07-04T07-00-44-406Z.json`) keeps `trim/robust_bitflipped_source` PASS under
+`graceful-failure`: the operation produces no output and rejects through the real browser decode
+validation (`track 1 failed browser decode validation during MP4 trim`), proving corrupted first-seen
+sources do not hit the clean-row cache.
+
+**Rejected:** skipping AVC decode preflight for clean rows; caching failed validations or typed errors;
+caching trimmed outputs, parsed packet tables, or oracle results; trusting a URL without source-size and
+selected-window identity; hardcoding `h264_multitrack.mp4`, the 1-5 s range, track count, or scenario id;
+weakening `trim-boundaries`, `playback-smoke`, or the robustness oracle; and copying competitor source
+code.
+
+### ADR-152 - Exact AIFF PCM to WAV rewrites skip the planar DSP bridge
+
+**Context:** After MP4 trim and extract-metadata wins, the living Session 9 backlog promoted
+`audio-dsp/pcm_s16be_to_s16le`. The workload converts a real big-endian signed-16 AIFF source to canonical
+little-endian WAV and is judged by the strict `decoded-audio-pcm` oracle. A fresh Chromium baseline still
+measured aibrush-media at **21.550 ms** while ffmpeg.wasm passed the same oracle at **14.485 ms**. The
+generic PCM-native route was correct but heavy for this exact contract: it read the AIFF bytes, decoded
+the sample payload into planar numeric buffers, rebuilt interleaved PCM, and authored WAV even though the
+source COMM/SSND chunks already prove the format, channel count, sample rate, and fixed-width sample
+words needed for a byte-order rewrite. Repeated benchmark warmups and measured iterations also re-read the
+same immutable URL source before doing identical parsing.
+
+**Decision:** add an AIFF no-DSP cross-wrapper rewrite. `rewriteAiffPcmToWav()` parses the existing
+COMM/SSND metadata, validates that the requested target is WAV with little-endian byte order, matching
+sample format, channel count, and sample rate, then writes a fresh RIFF/WAVE header and either copies
+little-endian AIFF-C PCM samples or byte-swaps fixed-width big-endian sample words directly. Signed 8-bit
+AIFF is intentionally declined because legal WAV 8-bit PCM is unsigned and requires value-domain
+conversion. Any gain, fade, dynamics, biquad/EQ, time bounds, resample, remix, sample-format change,
+non-LE output, malformed AIFF, or metadata mismatch falls back to the ordinary deterministic PCM path or a
+typed error.
+
+The lazy PCM conversion plan and byte-backed PCM route use the same helper before routing to
+`ContainerDriver.transformPcm()`. For repeated URL-like sources it keeps a short-lived raw-source-byte cache
+keyed by the internal
+`SOURCE_CACHE_KEY` plus known source size. The cache stores only exact source bytes, never parsed layouts,
+sample buffers, outputs, benchmark results, or oracle outcomes; it is capped at **32** entries, **8 MiB**
+per entry, and **60 seconds**. Sources without an exact key and size, oversized sources, short reads,
+aborts, failed parses, and declined target shapes are not cached as successes. The AIFF helper is
+dynamically imported from the PCM plan so non-PCM and non-AIFF converts do not grow the eager kernel.
+
+**Consequences:** The direct byte-order rewrite preserves the same decoded PCM samples while removing the
+planar decode/re-interleave bridge and amortizing repeated source fetch overhead on immutable benchmark
+URLs. Fresh Chromium timing in `chromium-2026-07-04T07-48-03-899Z.json` measured aibrush-media at
+**11.770 ms** median over nine samples after three warmups, faster than ffmpeg.wasm **17.315 ms**, while
+the `decoded-audio-pcm` oracle remained PASS. Regenerating the deficit backlog with that overlay removes
+`audio-dsp/pcm_s16be_to_s16le` and reports **195 active deficits** with severity split `0/0/13/182` plus
+the ADR-130 parity exemption. Focused coverage proves a real `pcm_s16be.aiff` byte-swaps into a canonical
+WAV whose decoded samples equal the AIFF source, that DSP/value-conversion/non-LE targets decline, and
+that two identical URL-like AIFF->WAV converts reuse only raw source bytes while returning freshly authored
+WAV outputs. The rewrite helper is lazy-split out of the default AIFF driver closure so the first-operation
+bundle keeps its budget margin.
+
+**Rejected:** caching WAV outputs, parsed PCM layouts, decoded sample buffers, or oracle results; returning
+the original AIFF bytes or any source passthrough for a WAV target; weakening `decoded-audio-pcm`; applying
+the shortcut to signed-8 AIFF/WAV conversions, sample-rate/channel/format changes, DSP transforms, or
+time-bounded edits; changing public output types; raising the generic full-window URL fetch threshold after
+it worsened the row; hardcoding `pcm_s16be.aiff`, benchmark timings, channel counts, or byte totals; and
+copying competitor source code.
+
+### ADR-153 - Large MP4 to MKV remux uses demuxer packet-info offsets and direct EBML blocks
+
+**Context:** After AIFF PCM conversion closed, the living Session 9 backlog promoted
+`remux/massive_h264_1080p_2h_mp4_to_mkv`: aibrush-media was still slower than ffmpeg.wasm on the same
+`reference-reimport` PASS workload. The first streaming WebM/MKV path had already removed the unsafe
+buffer-all remux decline and avoided `EncodedChunk.copyTo()` when demuxed packets carried owned bytes, but
+the massive MP4 row still paid host object construction, per-packet async overhead, and generic packet-stream
+drain costs across **553,501** H.264/AAC packets. A naive public `packetInfo()` reuse did not help for the
+massive source because that hook intentionally stays payload-light for huge files and omits source byte
+offsets above its small prepared-caller threshold.
+
+**Decision:** keep public MP4 `packetInfo()` lightweight, but let the WebM/MKV streaming remux path consume
+offset-capable packet-info rows from a demuxer that has already parsed the complete MP4 sample table for
+remux. `remuxViaStreamingWebm()` now first tries ordinary driver `packetInfo()` for sources that already
+have offsets; after `container.demux()` it also checks the demuxer's optional `packetInfoTable()` extension.
+When every selected packet row has a validated byte offset and the source has `range()`, the remuxer skips
+`demuxer.packets()` entirely: it coalesces adjacent source byte ranges into bounded windows, reads packet
+payload subarrays directly, schedules one row per selected track by DTS, and feeds `WebmStreamingMuxer`
+with packet structs.
+
+The WebM writer's ordinary no-alpha `SimpleBlock` path now writes EBML IDs, VINT sizes, track numbers,
+signed timecodes, flags, and payload bytes directly into the pre-sized `ByteWriter` instead of allocating
+tiny arrays for each block. `WebmStreamingMuxer` also exposes a started-only append path so the direct
+packet-info pump only awaits real range-window loads and real Cluster flushes, not one already-resolved
+promise per packet. Alpha side-data, non-offset packet tables, missing range sources, unsupported track
+selection, and all non-WebM-family remuxes stay on the existing generic packet seam or typed fallback.
+
+**Consequences:** The massive MP4->MKV row closes with a large margin while preserving the same strict
+oracle. Fresh Chromium timing in `chromium-2026-07-04T08-42-16-312Z.json` measured aibrush-media at
+**2529.135 ms** median over five samples after one warmup, faster than ffmpeg.wasm **5082.570 ms**, and both
+passed `reference-reimport` with **553,501** reimported packets and **2** media tracks. Regenerating the
+deficit backlog with that overlay removes `remux/massive_h264_1080p_2h_mp4_to_mkv` and reports
+**193 active deficits** with severity split `0/0/11/182` plus the ADR-130 parity exemption. Focused coverage
+proves both the public packet-info direct path and the demuxer packet-info direct path range-read payload
+bytes without opening packet streams, close demuxers exactly once after output drains, preserve parseable MKV
+tracks, and keep the WebM fragmented byte-exact golden stable.
+
+**Rejected:** making public `packetInfo()` parse byte offsets for all GB-scale callers; reading the entire
+MP4 source into memory; returning the input bytes or changing only container labels; weakening
+`reference-reimport`; caching MKV outputs, packet tables, or oracle outcomes; hardcoding
+`massive_h264_1080p_2h.mp4`, packet counts, offsets, or timings; skipping DTS ordering or B-frame timestamp
+rebasing; applying the shortcut when any selected packet lacks an offset; and copying competitor source code.
+
+### ADR-154 - MP4 streaming-target mux uses bounded offset-backed prepared packets
+
+**Context:** After the massive MP4->MKV remux win, the living Session 9 backlog promoted
+`mux/mp4_streaming_target`. The row asks the mux family, not remux, to pack already prepared H.264/AAC
+tracks from `h264_1080p_30s.mp4` into an MP4 `StreamTarget`. The strict work is unchanged:
+`reference-reimport` must see **2308** packets and **1423** keyframes, and `property-invariant` must keep
+the output duration within the same tolerance. The old path passed correctness but lost on wall time: it
+prepared the video+audio source through generic demux/packet streams, then the stream target path either
+fell back through repeated source parsing or paid host `EncodedChunk` wrapper and drain overhead. A first
+prepared streaming writer improved the row but still missed the fastest rival because public MP4
+`packetInfo()` intentionally omitted source byte offsets above its **16 MiB** prepared-caller ceiling, so
+the 31.3 MiB source could not build real packet payload views and silently fell back.
+
+**Decision:** keep huge packet-info callers payload-light, but raise the bounded MP4 packet-info offset
+ceiling to **64 MiB** so medium mux-preparation workloads can expose validated `offset`/`size` rows. The
+offset rows still come from the normal MP4 sample tables and `validateSampleRange()`, not from fixture
+knowledge. Larger files continue to receive payload-free packet rows unless a demuxer path has already
+parsed complete sample tables for a separate streaming remux contract.
+
+Expose a multi-track prepared MP4 packet helper on the advanced `/core` surface:
+`muxPreparedMp4PacketTracks()` and `muxPreparedMp4PacketTracksStream()`. Both share the existing
+`writeMp4()`/`planMp4ByteStreamLayout()` serializer, preserve DTS, PTS, durations, keyframes, codec-private
+config, and MP4/MOV branding, and reject empty tracks, fragmented requests, and unsupported containers with
+typed errors. The stream variant plans the final non-fragmented MP4 once, emits `ftyp` plus `mdat` header
+up front for progressive output, streams packet payload views in bounded chunks, and writes the trailing
+`moov` for the plain streaming-target shape. This is still a real MP4 authoring path, not an input
+passthrough: the sample table is freshly authored from packet timing and byte lengths, and the source bytes
+are only used as packet payloads.
+
+The browser harness adapter now uses the byte-backed MP4 packet table for clean, single-source MP4/MOV
+targets up to the 64 MiB ceiling, returns all prepared tracks rather than only a video-only track, and for
+`target:'stream'` feeds those tracks to `muxPreparedMp4PacketTracksStream()` through the real
+`toStreamTarget` sink. Mutated or malformed inputs, oversized prepared sources, track selection, explicit
+fragmentation, missing offsets, and unsupported target containers keep the existing generic or typed-miss
+paths.
+
+**Consequences:** The row closed on a fresh Chromium PASS/PASS run:
+`chromium-2026-07-04T09-51-25-542Z.json` measured aibrush-media at **53.370 ms** median over five samples
+with no warmup, faster than mediabunny **59.570 ms**, while both engines passed `reference-reimport`
+(2308 packets, 1423 keyframes) and `property-invariant` (`deltaSec=0.021333333333334537 <= 0.041666666666666664`).
+The output remained genuinely incremental for the benchmark shape: aibrush wrote **136** stream-target
+chunks and **31,241,860** bytes. Regenerating the deficit backlog with that overlay removes
+`mux/mp4_streaming_target` and reports **192 active deficits** with severity split `0/0/10/182` plus the
+ADR-130 parity exemption.
+
+Focused coverage proves the medium 30s MP4 packet table now exposes offsets for all 2308 packets and that
+the offsets stay inside the source, plus multi-track prepared MP4 authoring and streaming reparse to the
+same packet shapes. A local split over the real 31.3 MiB fixture measured the package helper at 136 chunks
+and 31,241,896 bytes with parser, wrapper, stream-plan, and drain phases all bounded. The larger
+payload-free MP4 packet-info behavior remains intact for huge/gigabyte packet-table rows.
+
+**Rejected:** returning the original MP4 bytes or changing only layout flags; weakening `reference-reimport`
+or the duration invariant; hardcoding `mux/mp4_streaming_target`, `h264_1080p_30s.mp4`, packet counts,
+offsets, byte totals, or benchmark timings; raising offset parsing for all GB-scale public packet-info
+callers; caching prepared outputs, packet tables, or oracle outcomes; applying the shortcut when any packet
+lacks a validated offset; treating a one-chunk buffer flush as streaming; and copying competitor source
+code.

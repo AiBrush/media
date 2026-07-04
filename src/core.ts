@@ -115,10 +115,14 @@ export {
   mp4PacketInfoFromBytes,
   mp4PacketInfoFromUrl,
   muxPreparedMp4PacketTrack,
+  muxPreparedMp4PacketTracks,
+  muxPreparedMp4PacketTracksStream,
 } from './api/mp4-prepared-mux.ts';
 export type {
   Mp4PacketInfoFromUrlOptions,
   PreparedMp4PacketMuxInput,
+  PreparedMp4PacketTrackMuxInput,
+  PreparedMp4PacketTracksMuxInput,
 } from './api/mp4-prepared-mux.ts';
 export { adtsTrimFromBytes, adtsTrimFromUrl } from './drivers/adts/adts-driver.ts';
 export type { AdtsTrimFromUrlOptions, AdtsTrimRange } from './drivers/adts/adts-driver.ts';
