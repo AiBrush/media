@@ -380,6 +380,7 @@ interface DecodeSummary {
   everyFrame1024: boolean;
   allFinite: boolean;
   nonSilent: boolean;
+  batchMatchesPerFrame: boolean;
 }
 
 /**
@@ -420,5 +421,6 @@ describe('Symphonia wasm AAC core — decodes real sfx.adts (the real wasm tail)
     expect(s.totalSamples).toBe(s.decodedFrames * AAC_LC_FRAME_SAMPLES);
     expect(s.allFinite).toBe(true); // real PCM in ~[-1,1], not garbage
     expect(s.nonSilent).toBe(true); // the clip is not pure silence
+    expect(s.batchMatchesPerFrame).toBe(true); // batched decode is the same real PCM
   });
 });

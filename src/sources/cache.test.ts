@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadFixture } from '../test-support/corpus.ts';
 import { cacheSource } from './cache.ts';
-import { fromBytes } from './source.ts';
+import { fromBlob, fromBytes } from './source.ts';
 
 /** Drain a readable fully into one contiguous array (test util — distinct from the impl's internal copy). */
 async function readAll(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -110,6 +110,16 @@ describe('cacheSource — bit-exact reads over a real corpus file (URL via mock 
     expect(calls.filter((c) => c.method === 'GET').length).toBe(1);
   });
 
+  it('accepts URL objects and can stream without a size-only prime first', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch, calls } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+
+    const src = cacheSource(new URL(URL_HREF));
+    expectBytesEqual(await readAll(src.stream()), truth);
+    expect(calls.map((call) => call.method)).toEqual(['GET']);
+  });
+
   it('range() returns bit-identical windows at arbitrary offsets/lengths', async () => {
     const truth = await loadFixture(FIXTURE);
     const { fetch } = rangeServer(truth);
@@ -187,6 +197,24 @@ describe('cacheSource — preload serves the second read from cache (no duplicat
     expect(src.cachedBytes).toBe(6000); // one contiguous coalesced interval, not 7000
   });
 
+  it('keeps disjoint cached intervals ordered and coalesces when a later range contains one', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const { fetch, calls } = rangeServer(truth);
+    vi.stubGlobal('fetch', fetch);
+    const src = cacheSource(URL_HREF);
+
+    await src.range(2000, 3000);
+    const beforeLeadingRead = calls.length;
+    expectBytesEqual(await src.range(0, 100), truth.subarray(0, 100));
+    expect(calls.length).toBe(beforeLeadingRead + 1);
+
+    await src.range(0, 5000);
+    expect(src.cachedBytes).toBe(5000);
+    const afterContainingRead = calls.length;
+    expectBytesEqual(await src.range(2500, 2600), truth.subarray(2500, 2600));
+    expect(calls.length).toBe(afterContainingRead);
+  });
+
   it('de-duplicates concurrent identical range fetches into one request', async () => {
     const truth = await loadFixture(FIXTURE);
     const { fetch, calls } = rangeServer(truth);
@@ -207,6 +235,21 @@ describe('cacheSource — wrapping non-URL sources (no network)', () => {
     expect(src.size).toBe(truth.byteLength); // size known immediately from the bytes source
     expectBytesEqual(await src.range(10, 50), truth.subarray(10, 50));
     expectBytesEqual(await readAll(src.stream()), truth);
+  });
+
+  it('preserves known Blob metadata and handles empty eager sources', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const file = new File([truth], 'clip.mp4', { type: 'video/mp4' });
+    const fileSource = cacheSource(fromBlob(file));
+    expect(fileSource.mimeHint).toBe('video/mp4');
+    expect(fileSource.filename).toBe('clip.mp4');
+    await fileSource.prime();
+    expectBytesEqual(await fileSource.range(0, 32), truth.subarray(0, 32));
+
+    const empty = cacheSource(fromBytes(new Uint8Array()), { eager: true });
+    await empty.prime();
+    expect(empty.cachedBytes).toBe(0);
+    expect((await empty.range(0, 10)).byteLength).toBe(0);
   });
 
   it('materializes a range-less stream source once, then serves all ranges + re-reads from cache', async () => {
@@ -235,5 +278,58 @@ describe('cacheSource — wrapping non-URL sources (no network)', () => {
     expectBytesEqual(await readAll(src.stream()), truth); // replayed from the materialized buffer
     expect(consumptions).toBe(1); // the single-use stream was consumed exactly once
     expect(src.size).toBe(truth.byteLength); // size discovered on materialization
+  });
+
+  it('materializes an unknown-length stream once for a past-EOF range and returns no invented bytes', async () => {
+    const truth = await loadFixture(FIXTURE);
+    let consumptions = 0;
+    const src = cacheSource({
+      __media: 'source',
+      kind: 'stream',
+      stream: (): ReadableStream<Uint8Array> => {
+        consumptions++;
+        return new ReadableStream<Uint8Array>({
+          start(c): void {
+            c.enqueue(truth);
+            c.close();
+          },
+        });
+      },
+    });
+
+    expect((await src.range(truth.byteLength + 5, truth.byteLength + 9)).byteLength).toBe(0);
+    expect(consumptions).toBe(1);
+    expect(src.size).toBe(truth.byteLength);
+  });
+
+  it('replays an in-flight full materialization when stream() is requested concurrently', async () => {
+    const truth = await loadFixture(FIXTURE);
+    let release: (() => void) | undefined;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let consumptions = 0;
+    const src = cacheSource({
+      __media: 'source',
+      kind: 'stream',
+      stream: (): ReadableStream<Uint8Array> => {
+        consumptions++;
+        return new ReadableStream<Uint8Array>({
+          async start(c): Promise<void> {
+            await hold;
+            c.enqueue(truth);
+            c.close();
+          },
+        });
+      },
+    });
+
+    const rangeRead = src.range(0, 4);
+    const streamed = readAll(src.stream());
+    release?.();
+
+    expectBytesEqual(await rangeRead, truth.subarray(0, 4));
+    expectBytesEqual(await streamed, truth);
+    expect(consumptions).toBe(1);
   });
 });

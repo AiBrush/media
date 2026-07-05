@@ -12,6 +12,25 @@ import {
 } from './ogg-driver.ts';
 import { OggMuxer } from './ogg-write.ts';
 
+async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 const u16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
 const u32 = (n: number): number[] => [
@@ -236,6 +255,23 @@ describe('OggDriver — demux seam + muxer', () => {
       expect(row.durationUs).toBe(packet.durationUs);
       expect(row.keyframe).toBe(true);
     }
+  });
+
+  it('streamCopy trims Opus packets through the prepared Ogg writer without WebCodecs chunks', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    expect(OggDriver.validatesStreamCopyTrim).toBe(true);
+
+    const out = await collect(
+      await streamCopy(await fixtureSource('sfx-opus.ogg'), {
+        container: 'ogg',
+        trim: { startSec: 0.04, endSec: 0.16 },
+      }),
+    );
+
+    const info = parseOgg(out, out);
+    expect(info.codec).toBe('opus');
+    expect(info.durationSec).toBeCloseTo(0.12, 1);
   });
 
   it('demux exposes packet tables from one full-source read', async () => {

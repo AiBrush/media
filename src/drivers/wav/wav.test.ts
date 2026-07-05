@@ -6,6 +6,7 @@ import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { readWavPcm, writeWav } from './pcm.ts';
 import { tryResampleWavS16ToS16Wav } from './s16-resample.ts';
+import { wavTrimFromUrl } from './url-trim.ts';
 import {
   WavDriver,
   WavModule,
@@ -411,6 +412,46 @@ describe('probe WAV across the real corpus', () => {
         chunkPayload(bytes, 'data').byteLength,
       );
       expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-4095', bytes: 4096 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('wavTrimFromUrl caches bounded raw source bytes and authors a fresh exact slice', async () => {
+    const bytes = writeWav(
+      {
+        sampleRate: 10,
+        channels: 1,
+        frames: 10,
+        planar: [Float64Array.of(-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9)],
+      },
+      's16',
+    );
+    const server = rangeServer(bytes);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const trim = { startSec: 0.21, endSec: 0.74 };
+      const first = await wavTrimFromUrl('https://fixtures.invalid/sfx-pcm-s16.wav', {
+        ...trim,
+        mime: 'audio/wav',
+        size: bytes.byteLength,
+      });
+      const second = await wavTrimFromUrl('https://fixtures.invalid/sfx-pcm-s16.wav', {
+        ...trim,
+        mime: 'audio/wav',
+        size: bytes.byteLength,
+      });
+
+      expect(first).toEqual(second);
+      expect(second).not.toBe(first);
+      expect(first).not.toEqual(bytes);
+      expect(first.byteLength).toBe(44 + 5 * 2);
+      expect(chunkPayload(first, 'data')).toEqual(
+        chunkPayload(bytes, 'data').subarray(2 * 2, 7 * 2),
+      );
+      expect(readWavPcm(first).frames).toBe(5);
+      expect(server.calls).toEqual([{ method: 'GET', range: null, bytes: bytes.byteLength }]);
     } finally {
       globalThis.fetch = originalFetch;
     }

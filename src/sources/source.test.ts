@@ -362,6 +362,43 @@ describe('probeUrlSize — body-free size detection', () => {
     expect(await probeUrlSize(HREF)).toBeUndefined();
   });
 
+  it('returns undefined for empty Content-Range totals after ignoring a negative HEAD length', async () => {
+    vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'HEAD') {
+        return Promise.resolve(
+          new Response(null, { status: 200, headers: { 'Content-Length': '-1' } }),
+        );
+      }
+      return Promise.resolve(
+        new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: { 'Content-Range': 'bytes 0-0/' },
+        }),
+      );
+    }) as typeof fetch);
+
+    expect(await probeUrlSize(HREF)).toBeUndefined();
+  });
+
+  it('returns undefined for missing or negative Content-Range totals', async () => {
+    for (const value of [null, 'bytes 0-0/-1'] as const) {
+      vi.unstubAllGlobals();
+      vi.stubGlobal('fetch', ((_i: unknown, init?: RequestInit) => {
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
+        return Promise.resolve(
+          new Response(new Uint8Array([0]), {
+            status: 206,
+            ...(value !== null ? { headers: { 'Content-Range': value } } : {}),
+          }),
+        );
+      }) as typeof fetch);
+
+      expect(await probeUrlSize(HREF)).toBeUndefined();
+    }
+  });
+
   it('rejects a failed size probe with a typed InputError', async () => {
     // Both HEAD and the ranged-GET fallback 404 → a typed InputError (never a leaked raw fetch error).
     vi.stubGlobal('fetch', ((_i: unknown, _init?: RequestInit) =>

@@ -236,18 +236,21 @@ async function preparedMp4PacketTracks(fixture: string): Promise<{
   return { tracks };
 }
 
-function installEncodedChunkShims(): () => void {
+function installEncodedChunkConstructors(
+  videoConstructor: typeof EncodedVideoChunk,
+  audioConstructor: typeof EncodedAudioChunk,
+): () => void {
   const originalVideo = globalThis.EncodedVideoChunk;
   const originalAudio = globalThis.EncodedAudioChunk;
   Object.defineProperty(globalThis, 'EncodedVideoChunk', {
     configurable: true,
     writable: true,
-    value: TestEncodedChunk as unknown as typeof EncodedVideoChunk,
+    value: videoConstructor,
   });
   Object.defineProperty(globalThis, 'EncodedAudioChunk', {
     configurable: true,
     writable: true,
-    value: TestEncodedChunk as unknown as typeof EncodedAudioChunk,
+    value: audioConstructor,
   });
   return () => {
     if (originalVideo === undefined) {
@@ -269,6 +272,24 @@ function installEncodedChunkShims(): () => void {
       });
     }
   };
+}
+
+function installEncodedChunkShims(): () => void {
+  const chunkConstructor = TestEncodedChunk as unknown as typeof EncodedVideoChunk &
+    typeof EncodedAudioChunk;
+  return installEncodedChunkConstructors(chunkConstructor, chunkConstructor);
+}
+
+function installThrowingEncodedChunkConstructors(message: string): () => void {
+  class ThrowingEncodedChunk {
+    constructor() {
+      throw new Error(message);
+    }
+  }
+
+  const chunkConstructor = ThrowingEncodedChunk as unknown as typeof EncodedVideoChunk &
+    typeof EncodedAudioChunk;
+  return installEncodedChunkConstructors(chunkConstructor, chunkConstructor);
 }
 
 async function outputBytes(output: Blob | File | ReadableStream<Uint8Array> | undefined) {
@@ -440,6 +461,30 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
           }
         }
       }
+    } finally {
+      restore();
+    }
+  });
+
+  it('cross-container remux (mp4 → ts) can feed MPEG-TS directly from MP4 packet-info offsets', async () => {
+    const restore = installThrowingEncodedChunkConstructors(
+      'mp4-to-ts packet-info remux must not construct EncodedChunk objects',
+    );
+    try {
+      const input = await loadFixture('movie_5.mp4');
+      const out = await outputBytes(
+        await media().remux(await fixtureSource('movie_5.mp4'), { to: 'ts' }),
+      );
+      expect(out.byteLength).toBeGreaterThan(0);
+      expect(out.byteLength % 188).toBe(0);
+      expect(
+        out.byteLength === input.byteLength && out.every((b, index) => b === input[index]),
+      ).toBe(false);
+
+      const parsed = parseTs(out);
+      expect(parsed.tracks.find((track) => track.stream.codec === 'h264')).toBeDefined();
+      expect(parsed.tracks.find((track) => track.stream.codec === 'aac')).toBeDefined();
+      for (const track of parsed.tracks) expect(track.units.length).toBeGreaterThan(0);
     } finally {
       restore();
     }

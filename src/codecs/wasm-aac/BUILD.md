@@ -60,7 +60,8 @@ cp pkg/aac_wasm.js      ../aac-core.js   # rename to the specifier the driver im
 
 A `#[wasm_bindgen]` `AacWasm` matching `aac-core.d.ts`: `new AacWasm(extra_data, channels, sample_rate)`
 → `AacDecoder::try_new`; `.decode(rawPacket) → Float32Array` (interleaved f32, 1024×channels for AAC-LC);
-`.channels` / `.sampleRate` getters; `.reset()`; `.free()`.
+`.decodeMany(concatenatedRawPackets, offsets) → Float32Array` for bounded packet batches; `.channels` /
+`.sampleRate` getters; `.reset()`; `.free()`.
 
 > **Heap-object-table caution.** Read the `.channels`/`.sampleRate` getters **once** after construction and
 > reuse the values — calling them repeatedly *interleaved with* `decode` round-trips corrupts the
@@ -80,10 +81,10 @@ A `#[wasm_bindgen]` `AacWasm` matching `aac-core.d.ts`: `new AacWasm(extra_data,
   `.wasm`, de-frames the real `sfx.adts` (ADTS/AAC-LC), decodes every frame, and gates on AAC-LC's
   exact-frame oracle: the decoder reports the header's AAC-LC profile + rate + channels, **every decoded
   frame is exactly 1024 samples/channel** (so total = decodedFrames × 1024), every sample is a finite f32
-  in ~[-1, 1], and the clip is non-silent. The child process is used because Vitest's V8-coverage
-  instrumentation corrupts the wasm-bindgen heap-object table when the module is driven inside the worker;
-  the codec runs correctly in plain Node and Bun (verified), so the decode is validated there on real bytes
-  — not stubbed.
+  in ~[-1, 1], the clip is non-silent, and `decodeMany()` produces the same interleaved PCM as repeated
+  per-frame `decode()` calls. The child process is used because Vitest's V8-coverage instrumentation
+  corrupts the wasm-bindgen heap-object table when the module is driven inside the worker; the codec runs
+  correctly in plain Node and Bun (verified), so the decode is validated there on real bytes — not stubbed.
 
 The browser-only part — the `createDecoder` `TransformStream` wrapping the core's output in WebCodecs
 `AudioData`, and the driver's `import.meta.url` fetch path — is validated in the Playwright harness

@@ -3,10 +3,17 @@ import { bytesPerSample } from '../../dsp/pcm.ts';
 import { writeWavHeader } from '../wav/pcm.ts';
 import { locate } from './aiff.ts';
 
+export interface AiffPcmToWavOptions {
+  readonly sampleFormat?: SampleFormat;
+  readonly endian?: Endianness;
+  readonly channels?: number;
+  readonly sampleRate?: number;
+}
+
 /**
  * Re-author unmodified AIFF/AIFF-C PCM as canonical little-endian WAV without decoding samples into the
  * planar DSP representation. This is the no-DSP cross-wrapper fast path: it parses COMM/SSND, validates
- * the requested identity constraints, writes a fresh RIFF/WAVE header, and copies or byte-swaps each
+ * the requested constraints, writes a fresh RIFF/WAVE header, and copies, byte-swaps, or narrows each
  * fixed-width sample word directly. Signed 8-bit AIFF is intentionally declined because legal WAV 8-bit
  * PCM is unsigned and needs value-domain conversion.
  */
@@ -21,29 +28,44 @@ export function rewriteAiffPcmToWav(
   const { layout, ssndSampleOffset, ssndSampleBytes } = locate(bytes);
   const sampleRate = Math.round(layout.sampleRate);
   if (layout.format === 's8') return undefined;
-  if (requestedFormat !== undefined && requestedFormat !== layout.format) return undefined;
+  const outputFormat = requestedFormat ?? layout.format;
+  const canNarrowS24ToS16 = layout.format === 's24' && outputFormat === 's16';
+  if (outputFormat !== layout.format && !canNarrowS24ToS16) return undefined;
   if (requestedChannels !== undefined && requestedChannels !== layout.channels) return undefined;
   if (requestedSampleRate !== undefined && requestedSampleRate !== sampleRate) return undefined;
 
-  const bytesPer = bytesPerSample(layout.format);
-  const frameBytes = layout.channels * bytesPer;
-  const dataBytes =
-    ssndSampleOffset < 0 || frameBytes <= 0
+  const sourceBytesPer = bytesPerSample(layout.format);
+  const sourceFrameBytes = layout.channels * sourceBytesPer;
+  const frames =
+    ssndSampleOffset < 0 || sourceFrameBytes <= 0
       ? 0
-      : Math.floor(ssndSampleBytes / frameBytes) * frameBytes;
-  const out = new Uint8Array(44 + dataBytes);
-  writeWavHeader(out, dataBytes, layout.channels, sampleRate, layout.format);
-  if (dataBytes === 0) return out;
+      : Math.floor(ssndSampleBytes / sourceFrameBytes);
+  const sourceDataBytes = frames * sourceFrameBytes;
+  const outputDataBytes = frames * layout.channels * bytesPerSample(outputFormat);
+  const out = new Uint8Array(44 + outputDataBytes);
+  writeWavHeader(out, outputDataBytes, layout.channels, sampleRate, outputFormat);
+  if (sourceDataBytes === 0) return out;
 
   const sampleStart = ssndSampleOffset;
-  const sampleEnd = sampleStart + dataBytes;
-  if (layout.endian === 'le' || bytesPer === 1) {
+  const sampleEnd = sampleStart + sourceDataBytes;
+  if (canNarrowS24ToS16) {
+    copyS24ToS16Samples(bytes, sampleStart, out, 44, sourceDataBytes, layout.endian);
+    return out;
+  }
+  if (layout.endian === 'le' || sourceBytesPer === 1) {
     out.set(bytes.subarray(sampleStart, sampleEnd), 44);
     return out;
   }
 
-  copyByteSwappedSamples(bytes, sampleStart, out, 44, dataBytes, bytesPer);
+  copyByteSwappedSamples(bytes, sampleStart, out, 44, sourceDataBytes, sourceBytesPer);
   return out;
+}
+
+export function aiffPcmToWavFromBytes(
+  bytes: Uint8Array,
+  opts: AiffPcmToWavOptions = {},
+): Uint8Array<ArrayBuffer> | undefined {
+  return rewriteAiffPcmToWav(bytes, opts.sampleFormat, opts.endian, opts.channels, opts.sampleRate);
 }
 
 function copyByteSwappedSamples(
@@ -72,5 +94,31 @@ function copyByteSwappedSamples(
     }
     srcOffset += bytesPerSampleValue;
     dstOffset += bytesPerSampleValue;
+  }
+}
+
+function copyS24ToS16Samples(
+  src: Uint8Array,
+  srcStart: number,
+  dst: Uint8Array,
+  dstStart: number,
+  sourceByteLength: number,
+  endian: Endianness,
+): void {
+  let srcOffset = srcStart;
+  let dstOffset = dstStart;
+  const srcEnd = srcStart + sourceByteLength;
+  const littleEndian = endian === 'le';
+  while (srcOffset + 2 < srcEnd) {
+    const b0 = src[srcOffset] ?? 0;
+    const b1 = src[srcOffset + 1] ?? 0;
+    const b2 = src[srcOffset + 2] ?? 0;
+    const raw = littleEndian ? b0 | (b1 << 8) | (b2 << 16) : b2 | (b1 << 8) | (b0 << 16);
+    const signed = raw & 0x800000 ? raw - 0x1000000 : raw;
+    const narrowed = Math.min(32767, Math.max(-32768, Math.round(signed / 256)));
+    dst[dstOffset] = narrowed & 0xff;
+    dst[dstOffset + 1] = (narrowed >> 8) & 0xff;
+    srcOffset += 3;
+    dstOffset += 2;
   }
 }

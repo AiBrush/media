@@ -6,8 +6,10 @@ import type { AdtsLayout, AdtsPacket } from './adts-driver.ts';
 
 const PCM_OUTPUT_FORMAT = 's16' as const;
 const ADTS_DIRECT_WASM_S16_MAX_BYTES = 256 * 1024;
+const ADTS_DIRECT_DECODE_BATCH_FRAMES = 32;
 const WAV_HEADER_BYTES = 44;
 const S16_BYTES_PER_SAMPLE = 2;
+const HOST_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([0x0102]).buffer)[0] === 0x02;
 
 function hasPcmDomainWork(o: PcmTransform | undefined): boolean {
   return (
@@ -62,6 +64,13 @@ export function writeInterleavedF32S16le(
   offset: number,
   interleaved: Float32Array,
 ): number {
+  if (HOST_LITTLE_ENDIAN && (dv.byteOffset + offset) % S16_BYTES_PER_SAMPLE === 0) {
+    const out = new Int16Array(dv.buffer, dv.byteOffset + offset, interleaved.length);
+    for (let i = 0; i < interleaved.length; i++) {
+      out[i] = s16FromUnitFloat(interleaved[i] ?? 0);
+    }
+    return offset + interleaved.length * S16_BYTES_PER_SAMPLE;
+  }
   let pos = offset;
   for (let i = 0; i < interleaved.length; i++) {
     dv.setInt16(pos, s16FromUnitFloat(interleaved[i] ?? 0), true);
@@ -72,6 +81,31 @@ export function writeInterleavedF32S16le(
 
 function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
   return bytes.subarray(frame.offset + frame.headerBytes, frame.offset + frame.size);
+}
+
+function payloadBatch(
+  bytes: Uint8Array,
+  frames: readonly AdtsPacket[],
+  start: number,
+  end: number,
+): { readonly data: Uint8Array; readonly offsets: Uint32Array } {
+  let total = 0;
+  for (let i = start; i < end; i++) {
+    const frame = frames[i];
+    if (frame === undefined) continue;
+    total += frame.size - frame.headerBytes;
+  }
+  const data = new Uint8Array(total);
+  const offsets = new Uint32Array(end - start + 1);
+  let pos = 0;
+  for (let i = start; i < end; i++) {
+    const frame = frames[i];
+    if (frame === undefined) continue;
+    data.set(payload(bytes, frame), pos);
+    pos += frame.size - frame.headerBytes;
+    offsets[i - start + 1] = pos;
+  }
+  return { data, offsets };
 }
 
 export async function tryDecodeWasmAacToS16Wav(
@@ -96,9 +130,11 @@ export async function tryDecodeWasmAacToS16Wav(
     const out = new Uint8Array(WAV_HEADER_BYTES + expectedFrames * channels * S16_BYTES_PER_SAMPLE);
     const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
     let offset = WAV_HEADER_BYTES;
-    for (const frame of layout.frames) {
+    for (let start = 0; start < layout.frames.length; start += ADTS_DIRECT_DECODE_BATCH_FRAMES) {
       throwIfAborted(o?.signal);
-      const interleaved = decoder.decode(payload(bytes, frame));
+      const end = Math.min(layout.frames.length, start + ADTS_DIRECT_DECODE_BATCH_FRAMES);
+      const batch = payloadBatch(bytes, layout.frames, start, end);
+      const interleaved = decoder.decodeMany(batch.data, batch.offsets);
       if (interleaved.length % channels !== 0) {
         throw new MediaError(
           'decode-error',

@@ -54,7 +54,12 @@ impl AacWasm {
         let decoder = AacDecoder::try_new(&params, &AudioDecoderOptions::default())
             .map_err(|e| format!("aac init: {e}"))?;
 
-        Ok(AacWasm { decoder, channels, sample_rate, scratch: Vec::new() })
+        Ok(AacWasm {
+            decoder,
+            channels,
+            sample_rate,
+            scratch: Vec::new(),
+        })
     }
 
     /// Channel count of the decoded PCM (container-declared, reconciled with the decoded spec).
@@ -74,8 +79,10 @@ impl AacWasm {
     /// for a typed JS error.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>, String> {
         let packet = PacketRef::new(0, Timestamp::from(0i64), Duration::from(0u64), data);
-        let decoded: GenericAudioBufferRef<'_> =
-            self.decoder.decode_ref(&packet).map_err(|e| format!("aac decode: {e}"))?;
+        let decoded: GenericAudioBufferRef<'_> = self
+            .decoder
+            .decode_ref(&packet)
+            .map_err(|e| format!("aac decode: {e}"))?;
 
         let frames = decoded.frames();
         let spec = decoded.spec();
@@ -92,6 +99,55 @@ impl AacWasm {
         // Symphonia converts its internal sample format to f32 and interleaves L,R,L,R… for us.
         decoded.copy_to_vec_interleaved::<f32>(&mut self.scratch);
         Ok(self.scratch.clone())
+    }
+
+    /// Decode many raw AAC packets from one concatenated payload buffer. `offsets` is a packet-boundary
+    /// table into `data` with one extra sentinel entry, so packet i is `data[offsets[i]..offsets[i+1]]`.
+    /// This preserves the exact same decode order and PCM shape as repeated `decode()` calls, but crosses
+    /// the JS/WASM boundary once per batch instead of once per ADTS frame.
+    #[wasm_bindgen(js_name = decodeMany)]
+    pub fn decode_many(&mut self, data: &[u8], offsets: &[u32]) -> Result<Vec<f32>, String> {
+        if offsets.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        out.reserve((offsets.len() - 1) * 1024 * self.channels.max(1) as usize);
+
+        for i in 0..(offsets.len() - 1) {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            if start > end || end > data.len() {
+                return Err(format!(
+                    "aac decodeMany: invalid packet offsets {start}..{end} for {} bytes",
+                    data.len()
+                ));
+            }
+            let packet = PacketRef::new(
+                0,
+                Timestamp::from(0i64),
+                Duration::from(0u64),
+                &data[start..end],
+            );
+            let decoded: GenericAudioBufferRef<'_> = self
+                .decoder
+                .decode_ref(&packet)
+                .map_err(|e| format!("aac decode: {e}"))?;
+
+            let frames = decoded.frames();
+            let spec = decoded.spec();
+            let channels = spec.channels().count();
+            if channels > 0 {
+                self.channels = channels as u32;
+            }
+            if spec.rate() > 0 {
+                self.sample_rate = spec.rate();
+            }
+            self.scratch.clear();
+            self.scratch.reserve(frames * channels);
+            decoded.copy_to_vec_interleaved::<f32>(&mut self.scratch);
+            out.extend_from_slice(&self.scratch);
+        }
+        Ok(out)
     }
 
     /// Reset decoder state at a discontinuity (seek).

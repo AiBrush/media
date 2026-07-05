@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import type { Packet } from '../contracts/driver.ts';
+import type { Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import {
   type TimedFrameForTrim,
+  estimateTrackBitrateFromPacketInfo,
+  planTrimAudioPacketInfoRows,
+  planTrimVideoPacketInfoRows,
+  trimAudioPacketInfoStream,
+  trimAudioPacketInfoTrack,
   trimAudioPacketStream,
   trimTimedFrameStream,
   trimVideoEncodeTarget,
+  trimVideoPacketInfoChunkStream,
 } from './trim-streams.ts';
 
 class FakeFrame implements TimedFrameForTrim {
@@ -68,6 +74,18 @@ async function collectPackets(stream: ReadableStream<Packet>): Promise<Packet[]>
   }
 }
 
+async function collectVideoChunks(
+  stream: ReadableStream<EncodedVideoChunk>,
+): Promise<EncodedVideoChunk[]> {
+  const reader = stream.getReader();
+  const out: EncodedVideoChunk[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return out;
+    out.push(value);
+  }
+}
+
 class TestEncodedAudioChunk {
   readonly type: EncodedAudioChunkType;
   readonly timestamp: number;
@@ -76,6 +94,30 @@ class TestEncodedAudioChunk {
   readonly #data: Uint8Array;
 
   constructor(init: EncodedAudioChunkInit) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    const source = init.data;
+    const view = ArrayBuffer.isView(source)
+      ? new Uint8Array(source.buffer as ArrayBufferLike, source.byteOffset, source.byteLength)
+      : new Uint8Array(source as ArrayBufferLike);
+    this.#data = view.slice();
+    this.byteLength = this.#data.byteLength;
+  }
+
+  copyTo(destination: Uint8Array): void {
+    destination.set(this.#data);
+  }
+}
+
+class TestEncodedVideoChunk {
+  readonly type: EncodedVideoChunkType;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+
+  constructor(init: EncodedVideoChunkInit) {
     this.type = init.type;
     this.timestamp = init.timestamp;
     this.duration = init.duration ?? null;
@@ -152,15 +194,25 @@ async function trimLabelsAndTimings(
 
 describe('trimTimedFrameStream — accurate trim frame-window core', () => {
   it('chooses a high-quality VBR target for accurate video trim composition', () => {
-    expect(
-      trimVideoEncodeTarget({
-        id: 1,
-        mediaType: 'video',
-        codec: 'avc1.640028',
-        fps: 30,
-        config: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 },
-      }),
-    ).toEqual({ bitrate: 27_993_600, bitrateMode: 'variable' });
+    const sourceTrack: TrackInfo = {
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.640028',
+      fps: 30,
+      config: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 },
+    };
+    expect(trimVideoEncodeTarget(sourceTrack)).toEqual({
+      bitrate: 27_993_600,
+      bitrateMode: 'variable',
+    });
+    expect(trimVideoEncodeTarget(sourceTrack, 5_836_579)).toEqual({
+      bitrate: 8_754_869,
+      bitrateMode: 'variable',
+    });
+    expect(trimVideoEncodeTarget(sourceTrack, 40_000_000)).toEqual({
+      bitrate: 27_993_600,
+      bitrateMode: 'variable',
+    });
   });
 
   it('falls back and clamps the accurate video trim bitrate from real geometry', () => {
@@ -230,6 +282,367 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
         });
       }
     }
+  });
+
+  it('plans packet-info audio trim rows with validated byte ranges and rebased timing', () => {
+    const packets: PacketInfoMetadata[] = [
+      {
+        trackIndex: 0,
+        offset: 1_000,
+        size: 10,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 2_000,
+        size: 20,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 2_020,
+        size: 20,
+        ptsUs: 10,
+        dtsUs: 9,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 2_040,
+        size: 20,
+        ptsUs: 20,
+        dtsUs: 19,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 2_060,
+        size: 20,
+        ptsUs: 40,
+        dtsUs: 39,
+        durationUs: 10,
+        keyframe: true,
+      },
+    ];
+
+    const rows = planTrimAudioPacketInfoRows(packets, 1, { startUs: 15, endUs: 30 });
+
+    expect(rows?.map((row) => [row.offset, row.size, row.timestampUs, row.dtsUs])).toEqual([
+      [2_020, 20, 0, 0],
+      [2_040, 20, 10, 9],
+    ]);
+    expect(rows?.map((row) => row.window)).toEqual([
+      { start: 2_020, end: 2_060 },
+      { start: 2_020, end: 2_060 },
+    ]);
+  });
+
+  it('estimates source track bitrate from packet-info rows', () => {
+    const packets: PacketInfoMetadata[] = [
+      {
+        trackIndex: 0,
+        offset: 100,
+        size: 1_000,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 500_000,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 10_000,
+        size: 99_000,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 1_000_000,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 1_100,
+        size: 2_000,
+        ptsUs: 500_000,
+        dtsUs: 500_000,
+        durationUs: 500_000,
+        keyframe: false,
+      },
+    ];
+
+    expect(estimateTrackBitrateFromPacketInfo(packets, 0)).toBe(24_000);
+    expect(estimateTrackBitrateFromPacketInfo(packets, 2)).toBeUndefined();
+  });
+
+  it('plans packet-info video trim rows from seek keyframe through the next end keyframe', () => {
+    const packets: PacketInfoMetadata[] = [
+      {
+        trackIndex: 0,
+        offset: 100,
+        size: 10,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 110,
+        size: 10,
+        ptsUs: 20,
+        dtsUs: 10,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 0,
+        offset: 120,
+        size: 10,
+        ptsUs: 50,
+        dtsUs: 20,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 130,
+        size: 10,
+        ptsUs: 60,
+        dtsUs: 30,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 0,
+        offset: 140,
+        size: 10,
+        ptsUs: 65,
+        dtsUs: 40,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 0,
+        offset: 150,
+        size: 10,
+        ptsUs: 68,
+        dtsUs: 50,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 1,
+        offset: 10_000,
+        size: 10,
+        ptsUs: 60,
+        dtsUs: 60,
+        durationUs: 10,
+        keyframe: true,
+      },
+    ];
+
+    const rows = planTrimVideoPacketInfoRows(packets, 0, { startUs: 60, endUs: 66 });
+
+    expect(rows?.map((row) => [row.timestampUs, row.dtsUs, row.keyframe])).toEqual([
+      [50, 20, true],
+      [60, 30, false],
+      [65, 40, false],
+      [68, 50, true],
+    ]);
+    expect(rows?.map((row) => row.window)).toEqual([
+      { start: 120, end: 160 },
+      { start: 120, end: 160 },
+      { start: 120, end: 160 },
+      { start: 120, end: 160 },
+    ]);
+  });
+
+  it('streams packet-info video chunks from coalesced source ranges', async () => {
+    const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
+    Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+      configurable: true,
+      value: TestEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
+    });
+    try {
+      const rows = planTrimVideoPacketInfoRows(
+        [
+          {
+            trackIndex: 0,
+            offset: 20,
+            size: 2,
+            ptsUs: 100,
+            dtsUs: 100,
+            durationUs: 10,
+            keyframe: true,
+          },
+          {
+            trackIndex: 0,
+            offset: 24,
+            size: 1,
+            ptsUs: 110,
+            dtsUs: 108,
+            durationUs: 10,
+            keyframe: false,
+          },
+        ],
+        0,
+        { startUs: 100, endUs: 110 },
+      );
+      expect(rows).toBeDefined();
+      const calls: Array<readonly [start: number, end: number]> = [];
+      const source = {
+        async range(start: number, end: number): Promise<Uint8Array> {
+          calls.push([start, end]);
+          return Uint8Array.from({ length: end - start }, (_value, index) => start + index);
+        },
+      };
+
+      const out = await collectVideoChunks(
+        trimVideoPacketInfoChunkStream(source, rows ?? [], undefined),
+      );
+      const copied = out.map((chunk) => {
+        const bytes = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(bytes);
+        return [...bytes];
+      });
+
+      expect(calls).toEqual([[20, 25]]);
+      expect(out.map((chunk) => chunk.type)).toEqual(['key', 'delta']);
+      expect(out.map((chunk) => chunk.timestamp)).toEqual([100, 110]);
+      expect(out.map((chunk) => chunk.duration)).toEqual([10, 10]);
+      expect(copied).toEqual([[20, 21], [24]]);
+    } finally {
+      if (originalEncodedVideoChunk === undefined) {
+        Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+      } else {
+        Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+          configurable: true,
+          value: originalEncodedVideoChunk,
+        });
+      }
+    }
+  });
+
+  it('declines packet-info audio trim when selected rows lack exact range or duration facts', () => {
+    expect(
+      planTrimAudioPacketInfoRows(
+        [
+          {
+            trackIndex: 0,
+            size: 10,
+            ptsUs: 10,
+            dtsUs: 10,
+            durationUs: 10,
+            keyframe: true,
+          },
+        ],
+        0,
+        { startUs: 10, endUs: 20 },
+      ),
+    ).toBeUndefined();
+    expect(
+      planTrimAudioPacketInfoRows(
+        [
+          {
+            trackIndex: 0,
+            offset: 10,
+            size: 10,
+            ptsUs: 10,
+            dtsUs: 10,
+            keyframe: true,
+          },
+        ],
+        0,
+        { startUs: 10, endUs: 20 },
+      ),
+    ).toBeUndefined();
+  });
+
+  it('streams packet-info audio trim rows from coalesced source ranges', async () => {
+    const originalEncodedAudioChunk = globalThis.EncodedAudioChunk;
+    Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+      configurable: true,
+      value: TestEncodedAudioChunk as unknown as typeof EncodedAudioChunk,
+    });
+    try {
+      const rows = planTrimAudioPacketInfoRows(
+        [
+          {
+            trackIndex: 0,
+            offset: 10,
+            size: 2,
+            ptsUs: 100,
+            dtsUs: 100,
+            durationUs: 10,
+            keyframe: true,
+          },
+          {
+            trackIndex: 0,
+            offset: 14,
+            size: 1,
+            ptsUs: 110,
+            dtsUs: 108,
+            durationUs: 10,
+            keyframe: true,
+          },
+        ],
+        0,
+        { startUs: 100, endUs: 130 },
+      );
+      expect(rows).toBeDefined();
+      const calls: Array<readonly [start: number, end: number]> = [];
+      const source = {
+        async range(start: number, end: number): Promise<Uint8Array> {
+          calls.push([start, end]);
+          return Uint8Array.from({ length: end - start }, (_value, index) => start + index);
+        },
+      };
+
+      const out = await collectPackets(trimAudioPacketInfoStream(source, rows ?? [], undefined));
+
+      expect(calls).toEqual([[10, 15]]);
+      expect(out.map((packet) => packet.chunk.timestamp)).toEqual([0, 10]);
+      expect(out.map((packet) => packet.chunk.duration)).toEqual([10, 10]);
+      expect(out.map((packet) => packet.dtsUs)).toEqual([0, 8]);
+      expect(out.map((packet) => [...(packet.data ?? [])])).toEqual([[10, 11], [14]]);
+      expect(out.map((packet) => packet.sizeBytes)).toEqual([2, 1]);
+    } finally {
+      if (originalEncodedAudioChunk === undefined) {
+        Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+      } else {
+        Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+          configurable: true,
+          value: originalEncodedAudioChunk,
+        });
+      }
+    }
+  });
+
+  it('strips source gapless metadata from packet-info audio subclips', () => {
+    const sourceTrack: TrackInfo = {
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      durationSec: 120,
+      config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+      gapless: { leadingSamples: 1024, trailingSamples: 0, totalSamples: 5_760_000 },
+    };
+
+    expect(
+      trimAudioPacketInfoTrack(sourceTrack, { startUs: 60_000_000, endUs: 66_000_000 }),
+    ).toEqual({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      durationSec: 6,
+      config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+    });
   });
 
   it('closes preroll/end-boundary source frames, stops at end, and rebases kept frames', async () => {

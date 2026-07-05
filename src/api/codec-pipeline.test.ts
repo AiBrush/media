@@ -15,6 +15,7 @@ import {
   audioCodecToken,
   audioEncodeNeedsSoftwareRuntime,
   audioEncoderCodecString,
+  audioTargetCanBypassFilterPlanner,
   audioTrackInfoFromDecoderConfig,
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
@@ -657,6 +658,26 @@ describe('retimeTimedFrameStream', () => {
 });
 
 // ── audio filter chain (gain / stereo→mono / resample shaping before the encoder) ─────────────────
+
+describe('audioTargetCanBypassFilterPlanner', () => {
+  it('bypasses the lazy planner for codec/bitrate-only audio transcodes', () => {
+    expect(audioTargetCanBypassFilterPlanner({})).toBe(true);
+    expect(audioTargetCanBypassFilterPlanner({ codec: 'aac', bitrate: 128_000 })).toBe(true);
+  });
+
+  it('keeps every declared audio-shaping field on the planner path, even no-ops', () => {
+    expect(audioTargetCanBypassFilterPlanner({ gainDb: 0 })).toBe(false);
+    expect(audioTargetCanBypassFilterPlanner({ channels: 2 })).toBe(false);
+    expect(audioTargetCanBypassFilterPlanner({ sampleRate: 48000 })).toBe(false);
+    expect(audioTargetCanBypassFilterPlanner({ fade: {} })).toBe(false);
+    expect(audioTargetCanBypassFilterPlanner({ biquad: [] })).toBe(false);
+    expect(
+      audioTargetCanBypassFilterPlanner({
+        dynamics: { normalize: { mode: 'peak', targetDbfs: -1 } },
+      }),
+    ).toBe(false);
+  });
+});
 
 describe('audioFilterSpecs', () => {
   const src = { sampleRate: 48000, channels: 2 };

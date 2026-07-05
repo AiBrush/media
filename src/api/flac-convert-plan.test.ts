@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { decodeFlac, interleavedPcmBytes } from '../codecs/flac/decode.ts';
 import type { ContainerDriver, Demuxer, Muxer, PcmTransform } from '../contracts/driver.ts';
+import { InputError } from '../contracts/errors.ts';
+import { tryAuthorWavS16Flac } from '../drivers/wav/flac-s16.ts';
+import { parseWavPcmData, writeWav } from '../drivers/wav/pcm.ts';
 import type { PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 import { type Source, fromBytes } from '../sources/source.ts';
 import { type FlacConvertDeps, convertToFlac } from './flac-convert-plan.ts';
@@ -97,6 +101,52 @@ function pcmAudio(): PcmAudio {
   };
 }
 
+function stereoPcmAudio(): PcmAudio {
+  return {
+    sampleRate: 48_000,
+    channels: 2,
+    frames: 4,
+    planar: [Float64Array.from([0, 0.25, -0.25, 0.5]), Float64Array.from([0.5, -0.5, 0, 0.25])],
+  };
+}
+
+function monoPcmAudio(frames: number): PcmAudio {
+  const samples = new Float64Array(frames);
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = ((index % 17) - 8) / 16;
+  }
+  return {
+    sampleRate: 48_000,
+    channels: 1,
+    frames,
+    planar: [samples],
+  };
+}
+
+function patchU16LE(bytes: Uint8Array, offset: number, value: number): void {
+  new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint16(offset, value, true);
+}
+
+function patchU32LE(bytes: Uint8Array, offset: number, value: number): void {
+  new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(offset, value, true);
+}
+
+function appendOneDataByte(wav: Uint8Array): Uint8Array {
+  const out = new Uint8Array(wav.byteLength + 1);
+  out.set(wav);
+  out[out.length - 1] = 0x7f;
+  patchU32LE(out, 4, out.byteLength - 8);
+  patchU32LE(out, 40, out.byteLength - 44);
+  return out;
+}
+
+function emptyDataWav(wav: Uint8Array): Uint8Array {
+  const out = wav.slice(0, 44);
+  patchU32LE(out, 4, 36);
+  patchU32LE(out, 40, 0);
+  return out;
+}
+
 async function convertRawPcm(
   container: ContainerDriver,
   audio: AudioTarget | undefined,
@@ -190,6 +240,119 @@ describe('convertToFlac — lazy FLAC authoring route planner', () => {
     const bytes = await collect(output as ReadableStream<Uint8Array>);
     expect([...bytes.subarray(0, 4)]).toEqual([0x66, 0x4c, 0x61, 0x43]);
     expect(requestedFormats).toEqual(['s16']);
+  });
+
+  it('authors no-DSP WAV s16 sources directly to verbatim FLAC without demuxing or Float64 decode', async () => {
+    const wav = writeWav(stereoPcmAudio(), 's16');
+    const wavPayload = parseWavPcmData(wav).data;
+    let demuxed = false;
+    let decoded = false;
+    const container = containerDriver({
+      id: 'wav',
+      formats: ['wav'],
+      demux: () => {
+        demuxed = true;
+        return Promise.resolve(emptyDemuxer('pcm-s16'));
+      },
+      decodePcmAudio: () => {
+        decoded = true;
+        return Promise.resolve(stereoPcmAudio());
+      },
+    });
+
+    const output = await convertToFlac(
+      depsFor(container),
+      fromBytes(wav, { mime: 'audio/wav' }),
+      { to: 'flac', sink: { kind: 'stream' } },
+      { codec: 'flac' },
+      new AbortController().signal,
+      {},
+    );
+
+    expect(output).toBeInstanceOf(ReadableStream);
+    const flac = await collect(output as ReadableStream<Uint8Array>);
+    const decodedFlac = decodeFlac(flac);
+    expect(decodedFlac.sampleRate).toBe(48_000);
+    expect(decodedFlac.channels).toBe(2);
+    expect(decodedFlac.bitsPerSample).toBe(16);
+    expect(interleavedPcmBytes(decodedFlac)).toEqual(wavPayload);
+    expect(demuxed).toBe(false);
+    expect(decoded).toBe(false);
+  });
+
+  it('keeps DSP-shaped WAV s16 FLAC requests on the canonical PCM route', async () => {
+    const wav = writeWav(pcmAudio(), 's16');
+    let demuxed = false;
+    let decoded = false;
+    const container = containerDriver({
+      id: 'wav',
+      formats: ['wav'],
+      demux: () => {
+        demuxed = true;
+        return Promise.resolve(emptyDemuxer('pcm-s16'));
+      },
+      decodePcmAudio: () => {
+        decoded = true;
+        return Promise.resolve(pcmAudio());
+      },
+    });
+
+    const output = await convertToFlac(
+      depsFor(container),
+      fromBytes(wav, { mime: 'audio/wav' }),
+      { to: 'flac', sink: { kind: 'stream' } },
+      { codec: 'flac', channels: 1 },
+      new AbortController().signal,
+      {},
+    );
+
+    expect(output).toBeInstanceOf(ReadableStream);
+    const flac = await collect(output as ReadableStream<Uint8Array>);
+    expect([...flac.subarray(0, 4)]).toEqual([0x66, 0x4c, 0x61, 0x43]);
+    expect(demuxed).toBe(true);
+    expect(decoded).toBe(true);
+  });
+
+  it('keeps unsupported or malformed direct WAV s16 FLAC inputs honest', () => {
+    const wav = writeWav(pcmAudio(), 's16');
+    expect(tryAuthorWavS16Flac(writeWav(pcmAudio(), 'f32'))).toBeUndefined();
+
+    const badChannels = wav.slice();
+    patchU16LE(badChannels, 22, 0);
+    expect(() => tryAuthorWavS16Flac(badChannels)).toThrowError(InputError);
+
+    const badRate = wav.slice();
+    patchU32LE(badRate, 24, 0);
+    expect(() => tryAuthorWavS16Flac(badRate)).toThrowError(InputError);
+
+    expect(() => tryAuthorWavS16Flac(appendOneDataByte(wav))).toThrowError(InputError);
+    expect(() => tryAuthorWavS16Flac(emptyDataWav(wav))).toThrowError(InputError);
+  });
+
+  it('authors direct FLAC frames for standard and explicit block-size branches', () => {
+    const standardBlockSizes = [192, 256, 512, 576, 1024, 1152, 2048, 2304, 4096] as const;
+    for (const frames of [300, 4097, ...standardBlockSizes] as const) {
+      const wav = writeWav(monoPcmAudio(frames), 's16');
+      const flac = tryAuthorWavS16Flac(wav);
+      expect(flac).toBeDefined();
+      if (flac === undefined) throw new Error('expected direct FLAC output');
+      const decoded = decodeFlac(flac);
+      expect(decoded.totalSamples).toBe(frames);
+      expect(decoded.bitsPerSample).toBe(16);
+      expect(decoded.sampleRate).toBe(48_000);
+    }
+  });
+
+  it('authors direct FLAC streams once fixed-block frame numbers require multibyte UTF-8 coding', () => {
+    const frames = 4096 * 130 + 17;
+    const wav = writeWav(monoPcmAudio(frames), 's16');
+    const flac = tryAuthorWavS16Flac(wav);
+    expect(flac).toBeDefined();
+    if (flac === undefined) throw new Error('expected direct FLAC output');
+    const decoded = decodeFlac(flac);
+    expect(decoded.totalSamples).toBe(frames);
+    expect(decoded.bitsPerSample).toBe(16);
+    expect(interleavedPcmBytes(decoded)).toEqual(parseWavPcmData(wav).data);
   });
 
   it('derives raw PCM depth from demux metadata and closes the demuxer', async () => {

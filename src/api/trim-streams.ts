@@ -1,4 +1,4 @@
-import type { Packet, TrackInfo } from '../contracts/driver.ts';
+import type { Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
 import { audioDataToPcm, pcmRangeToPlanarInit } from '../dsp/audio-data.ts';
 import type { VideoTarget } from './types.ts';
@@ -8,6 +8,9 @@ const TRIM_VIDEO_BITS_PER_PIXEL = 0.45;
 const TRIM_VIDEO_MIN_BITRATE = 4_000_000;
 const TRIM_VIDEO_MAX_BITRATE = 50_000_000;
 const TRIM_VIDEO_DEFAULT_BITRATE = 20_000_000;
+const TRIM_VIDEO_SOURCE_BITRATE_HEADROOM = 1.5;
+const TRIM_AUDIO_PACKET_INFO_WINDOW_BYTES = 8 * 1024 * 1024;
+const TRIM_AUDIO_PACKET_INFO_GAP_BYTES = 256 * 1024;
 
 export interface TrimBoundsUs {
   readonly startUs: number;
@@ -23,6 +26,41 @@ export interface TimedFrameForTrim {
 export interface AudioSampleFrameForTrim extends TimedFrameForTrim {
   readonly numberOfFrames: number;
   readonly sampleRate: number;
+}
+
+export interface TrimAudioPacketInfoSource {
+  range?(start: number, end: number): Promise<Uint8Array>;
+}
+
+interface TrimAudioPacketInfoWindow {
+  start: number;
+  end: number;
+}
+
+interface TrimPacketInfoRangeRow {
+  readonly offset: number;
+  readonly size: number;
+  window: TrimAudioPacketInfoWindow | undefined;
+}
+
+export interface TrimAudioPacketInfoRow {
+  readonly offset: number;
+  readonly size: number;
+  readonly sourceTimestampUs: number;
+  readonly timestampUs: number;
+  readonly dtsUs: number;
+  readonly durationUs: number;
+  window: TrimAudioPacketInfoWindow | undefined;
+}
+
+export interface TrimVideoPacketInfoRow {
+  readonly offset: number;
+  readonly size: number;
+  readonly timestampUs: number;
+  readonly dtsUs: number;
+  readonly durationUs: number;
+  readonly keyframe: boolean;
+  window: TrimAudioPacketInfoWindow | undefined;
 }
 
 type RestampFrame<T extends TimedFrameForTrim> = (
@@ -52,6 +90,14 @@ export function trimPacketCopyTrack(track: TrackInfo, bounds: TrimBoundsUs): Tra
   };
 }
 
+export function trimAudioPacketInfoTrack(track: TrackInfo, bounds: TrimBoundsUs): TrackInfo {
+  const { gapless: _gapless, ...trackWithoutGapless } = track;
+  return {
+    ...trackWithoutGapless,
+    durationSec: Math.max(0, bounds.endUs - bounds.startUs) / MICROS_PER_SECOND,
+  };
+}
+
 export function trimAudioPacketStream(
   packets: ReadableStream<Packet>,
   bounds: TrimBoundsUs,
@@ -72,6 +118,172 @@ export function trimAudioPacketStream(
   );
 }
 
+export function planTrimAudioPacketInfoRows(
+  packets: readonly PacketInfoMetadata[],
+  trackIndex: number,
+  bounds: TrimBoundsUs,
+): readonly TrimAudioPacketInfoRow[] | undefined {
+  const rows: TrimAudioPacketInfoRow[] = [];
+  let baseUs: number | undefined;
+
+  for (const packet of packets) {
+    if (packet.trackIndex !== trackIndex) continue;
+    const row = trimAudioPacketInfoRow(packet, bounds, baseUs);
+    if (row === undefined) continue;
+    if (row === false) return undefined;
+    baseUs ??= row.sourceTimestampUs;
+    rows.push(row);
+  }
+
+  if (rows.length === 0) return undefined;
+  assignTrimPacketInfoWindows(rows);
+  return rows;
+}
+
+export function planTrimVideoPacketInfoRows(
+  packets: readonly PacketInfoMetadata[],
+  trackIndex: number,
+  bounds: TrimBoundsUs,
+): readonly TrimVideoPacketInfoRow[] | undefined {
+  const trackRows: TrimVideoPacketInfoRow[] = [];
+  for (const packet of packets) {
+    if (packet.trackIndex !== trackIndex) continue;
+    const row = trimVideoPacketInfoRow(packet);
+    if (row === undefined) return undefined;
+    trackRows.push(row);
+  }
+  if (trackRows.length === 0) return undefined;
+
+  let startIndex = -1;
+  for (let i = 0; i < trackRows.length; i++) {
+    const row = trackRows[i];
+    if (row === undefined) continue;
+    if (row.keyframe && row.timestampUs <= bounds.startUs) startIndex = i;
+    if (row.timestampUs > bounds.startUs && startIndex >= 0) break;
+  }
+  if (startIndex < 0) return undefined;
+
+  let endIndex = trackRows.length;
+  for (let i = startIndex + 1; i < trackRows.length; i++) {
+    const row = trackRows[i];
+    if (row?.keyframe && row.timestampUs >= bounds.endUs) {
+      endIndex = i + 1;
+      break;
+    }
+  }
+  const rows = trackRows.slice(startIndex, endIndex);
+  if (rows.length === 0) return undefined;
+  assignTrimPacketInfoWindows(rows);
+  return rows;
+}
+
+export function estimateTrackBitrateFromPacketInfo(
+  packets: readonly PacketInfoMetadata[],
+  trackIndex: number,
+): number | undefined {
+  let bytes = 0;
+  let minDtsUs = Number.POSITIVE_INFINITY;
+  let maxEndUs = Number.NEGATIVE_INFINITY;
+  for (const packet of packets) {
+    if (packet.trackIndex !== trackIndex) continue;
+    if (
+      !validByteSize(packet.size) ||
+      !Number.isFinite(packet.dtsUs) ||
+      packet.durationUs === undefined ||
+      !Number.isFinite(packet.durationUs) ||
+      packet.durationUs <= 0
+    ) {
+      return undefined;
+    }
+    const dtsUs = Math.round(packet.dtsUs);
+    const endUs = dtsUs + Math.round(packet.durationUs);
+    bytes += packet.size;
+    minDtsUs = Math.min(minDtsUs, dtsUs);
+    maxEndUs = Math.max(maxEndUs, endUs);
+  }
+  if (bytes <= 0 || !Number.isFinite(minDtsUs) || !Number.isFinite(maxEndUs)) return undefined;
+  const durationSec = (maxEndUs - minDtsUs) / MICROS_PER_SECOND;
+  if (!(durationSec > 0)) return undefined;
+  return Math.round((bytes * 8) / durationSec);
+}
+
+export function trimAudioPacketInfoStream(
+  source: TrimAudioPacketInfoSource,
+  rows: readonly TrimAudioPacketInfoRow[],
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
+  const reader = new TrimPacketInfoWindowReader(source);
+  let index = 0;
+  return new ReadableStream<Packet>(
+    {
+      async pull(controller): Promise<void> {
+        if (index >= rows.length) {
+          controller.close();
+          return;
+        }
+        throwIfAborted(signal);
+        const row = rows[index];
+        index++;
+        if (row === undefined) {
+          controller.close();
+          return;
+        }
+        const data = await reader.bytesFor(row, signal);
+        throwIfAborted(signal);
+        controller.enqueue({
+          chunk: new EncodedAudioChunk({
+            type: 'key',
+            timestamp: row.timestampUs,
+            duration: row.durationUs,
+            data,
+          }),
+          data,
+          dtsUs: row.dtsUs,
+          sizeBytes: row.size,
+        });
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+export function trimVideoPacketInfoChunkStream(
+  source: TrimAudioPacketInfoSource,
+  rows: readonly TrimVideoPacketInfoRow[],
+  signal: AbortSignal | undefined,
+): ReadableStream<EncodedVideoChunk> {
+  const reader = new TrimPacketInfoWindowReader(source);
+  let index = 0;
+  return new ReadableStream<EncodedVideoChunk>(
+    {
+      async pull(controller): Promise<void> {
+        if (index >= rows.length) {
+          controller.close();
+          return;
+        }
+        throwIfAborted(signal);
+        const row = rows[index];
+        index++;
+        if (row === undefined) {
+          controller.close();
+          return;
+        }
+        const data = await reader.bytesFor(row, signal);
+        throwIfAborted(signal);
+        controller.enqueue(
+          new EncodedVideoChunk({
+            type: row.keyframe ? 'key' : 'delta',
+            timestamp: row.timestampUs,
+            duration: row.durationUs,
+            data,
+          }),
+        );
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 export function trimEncodeTrack(track: TrackInfo): TrackInfo {
   const { durationSec: _durationSec, ...rest } = track;
   return rest;
@@ -82,7 +294,7 @@ export function trimEncodeTrack(track: TrackInfo): TrackInfo {
  * VBR target from source geometry so adjacent separately-trimmed segments remain perceptually stable
  * when concatenated and compared against one direct trim.
  */
-export function trimVideoEncodeTarget(track: TrackInfo): VideoTarget {
+export function trimVideoEncodeTarget(track: TrackInfo, sourceBitrate?: number): VideoTarget {
   const width = track.config && 'codedWidth' in track.config ? track.config.codedWidth : undefined;
   const height =
     track.config && 'codedHeight' in track.config ? track.config.codedHeight : undefined;
@@ -90,12 +302,21 @@ export function trimVideoEncodeTarget(track: TrackInfo): VideoTarget {
     return { bitrate: TRIM_VIDEO_DEFAULT_BITRATE, bitrateMode: 'variable' };
   }
   const fps = positiveFinite(track.fps) ? track.fps : 30;
+  const geometryBitrate = clampInt(
+    width * height * fps * TRIM_VIDEO_BITS_PER_PIXEL,
+    TRIM_VIDEO_MIN_BITRATE,
+    TRIM_VIDEO_MAX_BITRATE,
+  );
+  const sourceAwareBitrate =
+    sourceBitrate !== undefined && Number.isFinite(sourceBitrate) && sourceBitrate > 0
+      ? clampInt(
+          sourceBitrate * TRIM_VIDEO_SOURCE_BITRATE_HEADROOM,
+          TRIM_VIDEO_MIN_BITRATE,
+          geometryBitrate,
+        )
+      : undefined;
   return {
-    bitrate: clampInt(
-      width * height * fps * TRIM_VIDEO_BITS_PER_PIXEL,
-      TRIM_VIDEO_MIN_BITRATE,
-      TRIM_VIDEO_MAX_BITRATE,
-    ),
+    bitrate: sourceAwareBitrate ?? geometryBitrate,
     bitrateMode: 'variable',
   };
 }
@@ -316,6 +537,149 @@ function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number)
       : {}),
     ...(packet.sizeBytes !== undefined ? { sizeBytes: packet.sizeBytes } : {}),
   };
+}
+
+function trimVideoPacketInfoRow(packet: PacketInfoMetadata): TrimVideoPacketInfoRow | undefined {
+  const offset = packet.offset;
+  if (
+    offset === undefined ||
+    !validByteOffset(offset) ||
+    !validByteSize(packet.size) ||
+    !Number.isFinite(packet.ptsUs) ||
+    !Number.isFinite(packet.dtsUs) ||
+    packet.durationUs === undefined ||
+    !Number.isFinite(packet.durationUs) ||
+    packet.durationUs <= 0
+  ) {
+    return undefined;
+  }
+  return {
+    offset: Math.round(offset),
+    size: Math.round(packet.size),
+    timestampUs: Math.round(packet.ptsUs),
+    dtsUs: Math.round(packet.dtsUs),
+    durationUs: Math.round(packet.durationUs),
+    keyframe: packet.keyframe,
+    window: undefined,
+  };
+}
+
+function trimAudioPacketInfoRow(
+  packet: PacketInfoMetadata,
+  bounds: TrimBoundsUs,
+  baseUs: number | undefined,
+): TrimAudioPacketInfoRow | undefined | false {
+  const offset = packet.offset;
+  if (
+    offset === undefined ||
+    !validByteOffset(offset) ||
+    !validByteSize(packet.size) ||
+    !Number.isFinite(packet.ptsUs) ||
+    !Number.isFinite(packet.dtsUs) ||
+    packet.durationUs === undefined ||
+    !Number.isFinite(packet.durationUs) ||
+    packet.durationUs <= 0
+  ) {
+    return false;
+  }
+  const timestampUs = Math.round(packet.ptsUs);
+  const durationUs = Math.round(packet.durationUs);
+  const endUs = timestampUs + durationUs;
+  if (endUs <= bounds.startUs || timestampUs >= bounds.endUs) return undefined;
+  const base = baseUs ?? timestampUs;
+  return {
+    offset: Math.round(offset),
+    size: Math.round(packet.size),
+    sourceTimestampUs: timestampUs,
+    timestampUs: Math.max(0, timestampUs - base),
+    dtsUs: Math.max(0, Math.round(packet.dtsUs) - base),
+    durationUs,
+    window: undefined,
+  };
+}
+
+function assignTrimPacketInfoWindows(rows: readonly TrimPacketInfoRangeRow[]): void {
+  const byOffset = [...rows].sort((a, b) => a.offset - b.offset);
+  let current: TrimAudioPacketInfoWindow | undefined;
+  for (const row of byOffset) {
+    const end = packetInfoByteEnd(row);
+    if (current === undefined) {
+      current = { start: row.offset, end };
+      row.window = current;
+      continue;
+    }
+    const gap = row.offset - current.end;
+    const combinedSpan = end - current.start;
+    if (
+      gap <= TRIM_AUDIO_PACKET_INFO_GAP_BYTES &&
+      combinedSpan <= TRIM_AUDIO_PACKET_INFO_WINDOW_BYTES
+    ) {
+      current.end = Math.max(current.end, end);
+      row.window = current;
+      continue;
+    }
+    current = { start: row.offset, end };
+    row.window = current;
+  }
+}
+
+class TrimPacketInfoWindowReader {
+  readonly #source: TrimAudioPacketInfoSource;
+  #currentWindow: TrimAudioPacketInfoWindow | undefined;
+  #currentBytes: Uint8Array | undefined;
+
+  constructor(source: TrimAudioPacketInfoSource) {
+    this.#source = source;
+  }
+
+  async bytesFor(
+    row: TrimPacketInfoRangeRow,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    const range = this.#source.range;
+    if (range === undefined) {
+      throw new MediaError('demux-error', 'packet-info trim needs range reads');
+    }
+    const window = row.window;
+    if (window === undefined) {
+      throw new MediaError('demux-error', 'packet-info trim row has no read window');
+    }
+    if (window !== this.#currentWindow) {
+      const bytes = await range.call(this.#source, window.start, window.end);
+      throwIfAborted(signal);
+      const expected = window.end - window.start;
+      if (bytes.byteLength !== expected) {
+        throw new MediaError(
+          'demux-error',
+          `packet-info trim window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes`,
+        );
+      }
+      this.#currentWindow = window;
+      this.#currentBytes = bytes;
+    }
+    const bytes = this.#currentBytes;
+    if (bytes === undefined) {
+      throw new MediaError('demux-error', 'packet-info trim window bytes are missing');
+    }
+    const rel = row.offset - window.start;
+    return bytes.subarray(rel, rel + row.size);
+  }
+}
+
+function packetInfoByteEnd(row: TrimPacketInfoRangeRow): number {
+  return row.offset + row.size;
+}
+
+function validByteOffset(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function validByteSize(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
 }
 
 function clampInt(value: number, min: number, max: number): number {

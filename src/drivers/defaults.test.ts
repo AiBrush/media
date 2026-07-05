@@ -1,6 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import type { CodecDriver, ContainerDriver, Packet, TrackInfo } from '../contracts/driver.ts';
+import type {
+  CodecDriver,
+  ContainerDriver,
+  FilterDriver,
+  FilterSpec,
+  Packet,
+  TrackInfo,
+} from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Registry } from '../kernel/registry.ts';
 import { fromBytes } from '../sources/source.ts';
@@ -19,6 +26,42 @@ function findCodec(reg: Registry, id: string): CodecDriver {
   const driver = reg.codecs().find((d) => d.id === id);
   if (driver === undefined) throw new Error(`missing codec driver '${id}'`);
   return driver;
+}
+
+function findFilter(reg: Registry, id: string): FilterDriver {
+  const driver = reg.filters().find((d) => d.id === id);
+  if (driver === undefined) throw new Error(`missing filter driver '${id}'`);
+  return driver;
+}
+
+function defineGlobal(key: string, value: unknown): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+  Object.defineProperty(globalThis, key, {
+    configurable: true,
+    writable: true,
+    value,
+  });
+  return () => {
+    if (descriptor === undefined) {
+      Reflect.deleteProperty(globalThis, key);
+    } else {
+      Object.defineProperty(globalThis, key, descriptor);
+    }
+  };
+}
+
+async function closeEmptyFilterStream(
+  stream: TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData>,
+): Promise<void> {
+  const generic = stream as TransformStream<unknown, unknown>;
+  const writer = generic.writable.getWriter();
+  const reader = generic.readable.getReader();
+  try {
+    await writer.close();
+    await expect(reader.read()).resolves.toMatchObject({ done: true });
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function collectBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -86,6 +129,8 @@ describe('registerDefaultDrivers', () => {
     expect(images?.sniff(await derivedBytes('img/test.jpeg'))).toBe('jpeg');
     expect(images?.sniff(await derivedBytes('img/test.webp'))).toBe('webp');
     expect(images?.sniff(await derivedBytes('img/test.avif'))).toBe('avif');
+    expect(images?.sniff(new TextEncoder().encode('GIF87a'))).toBe('gif');
+    expect(images?.sniff(new TextEncoder().encode('GIF89a'))).toBe('gif');
     expect(images?.sniff(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41]))).toBe(
       undefined,
     );
@@ -99,6 +144,14 @@ describe('registerDefaultDrivers', () => {
         new Uint8Array([
           0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00,
           0x00, 0x61, 0x76, 0x69, 0x66,
+        ]),
+      ),
+    ).toBe('avif');
+    expect(
+      images?.sniff(
+        new Uint8Array([
+          0x00, 0x00, 0x00, 0x00, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00,
+          0x00, 0x61, 0x76, 0x69, 0x73,
         ]),
       ),
     ).toBe('avif');
@@ -163,6 +216,24 @@ describe('registerDefaultDrivers', () => {
     expect(flac.supports({ direction: 'demux', extension: 'mp3' })).toBe(false);
   });
 
+  it('registers MPEG-TS as a lazy container proxy with cheap support checks', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+
+    const ts = findContainer(reg, 'mpegts');
+    expect(ts.formats).toEqual(['ts', 'm2ts', 'mts']);
+    expect(ts.supports({ direction: 'demux', mime: 'video/mp2t' })).toBe(true);
+    expect(ts.supports({ direction: 'demux', mime: 'audio/mp2t' })).toBe(true);
+    expect(ts.supports({ direction: 'demux', extension: 'M2TS' })).toBe(true);
+    const head = new Uint8Array(189);
+    head[0] = 0x47;
+    head[188] = 0x47;
+    expect(ts.supports({ direction: 'demux', head })).toBe(true);
+    expect(ts.supports({ direction: 'demux', head: head.slice(0, 188) })).toBe(false);
+    head[188] = 0x00;
+    expect(ts.supports({ direction: 'demux', head })).toBe(false);
+  });
+
   it('lazy-loads the FLAC container only when demux or PCM helpers are invoked', async () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);
@@ -221,6 +292,9 @@ describe('registerDefaultDrivers', () => {
     expect(() => duplicate.addTrack(flacTrackInfo(description))).toThrowError(CapabilityError);
 
     await expect(flac.createMuxer().finalize()).rejects.toThrowError(MediaError);
+    await expect(
+      flac.createMuxer().write(9, { chunk: fakeEncodedAudioChunk(new Uint8Array([0xff, 0xf8])) }),
+    ).rejects.toThrowError(MediaError);
     await expect(flac.createMuxer({ fragmented: true }).finalize()).rejects.toThrowError(
       CapabilityError,
     );
@@ -289,6 +363,123 @@ describe('registerDefaultDrivers', () => {
     ).rejects.toThrowError(MediaError);
   });
 
+  it('registers tracks added after a lazy muxer has loaded', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const ts = findContainer(reg, 'mpegts');
+    const muxer = ts.createMuxer();
+    const audioTrack = (id: number): TrackInfo => ({
+      id,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+
+    const firstId = muxer.addTrack(audioTrack(10));
+    await muxer.write(firstId, {
+      chunk: fakeEncodedAudioChunk(new Uint8Array([0x21, 0x10])),
+    });
+
+    const lateId = muxer.addTrack(audioTrack(20));
+    await expect(
+      muxer.write(lateId, {
+        chunk: fakeEncodedAudioChunk(new Uint8Array([0x21, 0x10])),
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('registers lazy filter proxies with cheap Node misses', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    expect(reg.filters().map((driver) => driver.id)).toEqual([
+      'webgpu-video-filter',
+      'canvas2d-video-filter',
+      'audio-dsp-filter',
+      'cpu-video-filter',
+    ]);
+
+    const audioGain = { mediaType: 'audio', type: 'gain', db: 0 } as const;
+    const videoResize = {
+      mediaType: 'video',
+      type: 'resize',
+      width: 16,
+      height: 16,
+    } as const;
+    for (const filter of reg.filters()) {
+      const spec = filter.id === 'audio-dsp-filter' ? audioGain : videoResize;
+      expect(filter.supports(spec)).toBe(false);
+      expect(() => filter.createFilter(spec)).toThrowError(CapabilityError);
+    }
+  });
+
+  it('keeps lazy filter support predicates cheap under browser-like globals', async () => {
+    const restores = [
+      defineGlobal('navigator', { userAgent: 'Chrome/149', gpu: {} }),
+      defineGlobal('OffscreenCanvas', class FakeOffscreenCanvas {}),
+      defineGlobal(
+        'VideoFrame',
+        class FakeVideoFrame {
+          close(): void {}
+        },
+      ),
+      defineGlobal(
+        'AudioData',
+        class FakeAudioData {
+          close(): void {}
+        },
+      ),
+    ];
+    try {
+      const reg = new Registry();
+      registerDefaultDrivers(reg);
+      const resize: FilterSpec = { mediaType: 'video', type: 'resize', width: 16, height: 16 };
+      const displayColor: FilterSpec = { mediaType: 'video', type: 'colorspace', to: 'BT.709' };
+      const wideColor: FilterSpec = { mediaType: 'video', type: 'colorspace', to: 'display-p3' };
+      const tonemap: FilterSpec = { mediaType: 'video', type: 'tonemap', to: 'sdr' };
+      const gain: FilterSpec = { mediaType: 'audio', type: 'gain', db: 0 };
+
+      const webgpu = findFilter(reg, 'webgpu-video-filter');
+      const canvas = findFilter(reg, 'canvas2d-video-filter');
+      const audio = findFilter(reg, 'audio-dsp-filter');
+      const cpu = findFilter(reg, 'cpu-video-filter');
+
+      expect(webgpu.supports(resize)).toBe(true);
+      expect(webgpu.supports(gain)).toBe(false);
+      expect(canvas.supports(resize)).toBe(true);
+      expect(canvas.supports(displayColor)).toBe(true);
+      expect(canvas.supports(wideColor)).toBe(false);
+      expect(canvas.supports(tonemap)).toBe(false);
+      expect(audio.supports(gain)).toBe(true);
+      expect(audio.supports(resize)).toBe(false);
+      expect(cpu.supports(resize)).toBe(true);
+      expect(cpu.supports(gain)).toBe(false);
+
+      await closeEmptyFilterStream(webgpu.createFilter(resize));
+    } finally {
+      for (const restore of restores.reverse()) restore();
+    }
+
+    const restoreFirefox = defineGlobal('navigator', { userAgent: 'Firefox/149', gpu: {} });
+    const restoreCanvas = defineGlobal('OffscreenCanvas', class FakeOffscreenCanvas {});
+    const restoreFrame = defineGlobal(
+      'VideoFrame',
+      class FakeVideoFrame {
+        close(): void {}
+      },
+    );
+    try {
+      const reg = new Registry();
+      registerDefaultDrivers(reg);
+      const resize: FilterSpec = { mediaType: 'video', type: 'resize', width: 16, height: 16 };
+      expect(findFilter(reg, 'webgpu-video-filter').supports(resize)).toBe(false);
+      expect(findFilter(reg, 'canvas2d-video-filter').supports(resize)).toBe(true);
+    } finally {
+      restoreFrame();
+      restoreCanvas();
+      restoreFirefox();
+    }
+  });
+
   it('registers lazy codec proxies that load only after a matching support query', async () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);
@@ -330,5 +521,142 @@ describe('registerDefaultDrivers', () => {
     expect(() =>
       vpx.createDecoder({ codec: 'vp09.00.10.08', codedWidth: 16, codedHeight: 16 }),
     ).toThrowError(CapabilityError);
+  });
+
+  it('exercises default lazy codec match predicates without running codec streams', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+
+    const cases: Array<{
+      readonly id: string;
+      readonly query: Parameters<CodecDriver['supports']>[0];
+    }> = [
+      {
+        id: 'flac-encode',
+        query: {
+          mediaType: 'audio',
+          direction: 'encode',
+          config: { codec: 'flac.16', sampleRate: 48_000, numberOfChannels: 1 },
+        },
+      },
+      {
+        id: 'wasm-vorbis-enc',
+        query: {
+          mediaType: 'audio',
+          direction: 'encode',
+          config: { codec: 'vorbis', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-vorbis',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'vorbis', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-aac',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-aac',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-mp3',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'mp4a.6b', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-mp3',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'mp3', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-mp3',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'mp4a.69', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-opus',
+        query: {
+          mediaType: 'audio',
+          direction: 'decode',
+          config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      },
+      {
+        id: 'wasm-av1',
+        query: {
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec: 'av01.0.04M.08', codedWidth: 16, codedHeight: 16 },
+        },
+      },
+      {
+        id: 'wasm-av1',
+        query: {
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec: 'av1', codedWidth: 16, codedHeight: 16 },
+        },
+      },
+      {
+        id: 'wasm-vpx',
+        query: {
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+        },
+      },
+      {
+        id: 'wasm-vpx',
+        query: {
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec: 'vp9', codedWidth: 16, codedHeight: 16 },
+        },
+      },
+      {
+        id: 'wasm-vpx',
+        query: {
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec: 'vp09.00.10.08', codedWidth: 16, codedHeight: 16 },
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      await expect(findCodec(reg, testCase.id).supports(testCase.query)).resolves.toHaveProperty(
+        'supported',
+      );
+    }
+
+    await expect(
+      findCodec(reg, 'wasm-opus').supports({
+        mediaType: 'video',
+        direction: 'decode',
+        config: { codec: 'opus', codedWidth: 16, codedHeight: 16 },
+      }),
+    ).resolves.toMatchObject({ supported: false, reason: 'wasm-opus does not match' });
   });
 });

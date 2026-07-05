@@ -4209,3 +4209,600 @@ routing by `edge_longform_audio_resample_16k` or the fixture filename; replacing
 resampler with the shorter direct kernel for all callers; using native endianness without a runtime guard;
 hand-rolling a linear interpolator with no anti-alias low-pass; and copying ffmpeg.wasm or competitor
 source code.
+
+### ADR-162 - WAV URL copy-trim reuses bounded raw source bytes
+
+**Context:** `trim/audio_wav_pcm_copy` had already moved from PCM decode/re-encode to the exact WAV
+byte-slice writer (ADR-156), but the row reopened when the earlier closing overlay was missing and fresh
+same-machine Chromium runs exposed a remaining fixed-cost loss. The useful work is a deterministic
+RIFF/WAVE rewrite plus an interleaved PCM byte window, but each harness sample rebuilt a clean URL-backed
+`MediaInput`, went through public engine routing, reacquired the same 960 KiB source bytes, then called the
+already-fast byte planner. Fresh pre-change proof measured aibrush-media at **6.280 ms** median over five
+samples versus mediabunny at **6.240 ms**, and with three warmups at **7.025 ms** versus mediabunny at
+**4.555 ms**. Studying the rival behavior confirmed the shape to beat: audio-only WAV copy trim should be
+packet/sample geometry and WAV authoring, not a decode path. We must not copy competitor code, return source
+bytes for a partial trim, or cache a prior trimmed output.
+
+**Decision:** Add a narrow `/core` helper, `wavTrimFromUrl(url, opts)`, for clean URL-backed WAV copy trims.
+The helper uses the normal first-party URL `ByteSource`, caches only raw source bytes keyed by URL and known
+size, and caps that cache at **16** entries, **1 MiB** per entry, and a **60 s** TTL. On every call it
+reparses the WAV `fmt ` and `data` chunks through the existing byte-slice helper, computes the selected
+sample-frame window using the same rounding and range guards as the public PCM transform path, and returns a
+fresh canonical WAV buffer. It never caches parsed layouts, packet tables, oracle measurements, or trimmed
+outputs. Unsupported layouts raise a typed `CapabilityError`, so the helper cannot silently pretend to trim
+a non-PCM or incompatible WAV. The helper lives in a separate `src/drivers/wav/url-trim.ts` module, exported
+from `/core`, so ordinary default-driver startup does not pull the URL cache into the first-operation
+closure.
+
+The browser harness adapter may call this helper only for clean, unmutated, non-frame-accurate WAV-to-WAV
+trim rows. Mutated inputs, frame-accurate trim, cross-container trim, malformed inputs, and non-WAV
+containers stay on the normal engine route. This keeps the optimization a source-acquisition and fixed-cost
+improvement for an already-valid operation, not a new oracle path.
+
+**Consequences:** Fresh Chromium proof after the final module split closed the row.
+`chromium-2026-07-04T22-35-57-948Z.json` measured mediabunny at **8.785 ms** median over five PASS samples
+`[9.275, 8.890, 6.330, 8.785, 6.500]` ms, and aibrush-media at **0.595 ms** median over five PASS samples
+`[0.365, 0.595, 0.630, 1.405, 0.200]` ms. The strict `trim-boundaries` oracle passed with
+`outDurationSec=3`, `requestedDurationSec=3`, and `durationDeltaSec=0`. The aibrush run measured
+**8403.361x** median realtime throughput and **28,030,596** bytes peak memory median. Regenerating
+`docs/perf/performance-deficits.md` with the proof removed `trim/audio_wav_pcm_copy` and left **187** active
+deficits with severity split **0/0/5/182**.
+
+Focused coverage proves that `wavTrimFromUrl()` reuses only the raw URL bytes across repeated calls while
+authoring distinct, exact trimmed WAV outputs: the test serves a synthetic WAV through a range-capable fake
+server, calls the helper twice with the same URL and size, verifies one fetch, verifies the two returned
+objects are not the same allocation, checks the output byte length, compares the `data` chunk to the exact
+source sample window, and reparses the output as WAV. `bun test src/drivers/wav/wav.test.ts`,
+`bunx biome check src/drivers/wav/wav-driver.ts src/drivers/wav/wav.test.ts src/core.ts`,
+`bunx tsc --noEmit`, `bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` pass with the
+change. After splitting the helper out of the default WAV driver closure, `check-budgets` reports the eager
+kernel at **47.73 kB / 50.00 kB** and the default/probe first-operation closure at
+**254.94 kB / 256.00 kB**.
+
+**Rejected:** caching trimmed WAV outputs; returning the original WAV bytes for a partial trim; caching
+parsed WAV layouts, packet tables, or oracle facts; hardcoding `wav_s16.wav`, the 1-4 s range, byte counts,
+or scenario id; weakening `trim-boundaries`; applying the helper to mutated or frame-accurate inputs; and
+copying mediabunny source code.
+
+### ADR-163 - Batched wasm AAC decode closes small ADTS WAV extraction jitter
+
+**Context:** ADR-159 moved `transcode/aac_to_pcm_wav_extract` from native WebCodecs AAC decode plus planar
+Float64 PCM conversion to a narrow same-layout ADTS -> WAV s16 direct path through the vendored Symphonia
+`wasm-aac` core. That closed the cell once, but fresh Session 9 overlays reopened it as a marginal current
+loss: a no-change warmup-3 proof measured aibrush-media at **33.025 ms** median versus ffmpeg.wasm
+**32.575 ms**, and a subsequent proof after only replacing `DataView.setInt16` with an aligned
+little-endian `Int16Array` writer still lost at **29.315 ms** versus ffmpeg.wasm **20.245 ms**. The useful
+work remained real AAC-LC decode and canonical WAV authoring; the remaining fixed overhead was hundreds of
+JS/WASM calls, one per ADTS access unit, plus per-call `Float32Array` allocation/copy from the generated
+wasm-bindgen glue.
+
+**Decision:** Extend the first-party Symphonia AAC wasm wrapper with a real batched decode method:
+`AacWasm.decodeMany(concatenatedRawPackets, offsets)`. The `offsets` table has one sentinel entry, so the
+Rust core decodes packet `i` from `data[offsets[i]..offsets[i+1]]`, in order, through the same
+`AacDecoder::decode_ref` path used by per-frame `decode()`, and returns one interleaved `Float32Array`.
+The ADTS direct WAV writer now builds bounded **32-frame** raw-payload batches, checks abort before each
+batch, calls `decodeMany()`, verifies that the interleaved PCM length is divisible by the decoded channel
+count, and writes samples into the same canonical WAV buffer. It also uses an aligned `Int16Array` payload
+writer on little-endian hosts, with the original `DataView.setInt16(..., true)` path retained for unaligned
+or non-little-endian writes. The route remains limited to the ADR-159 no-DSP, same-layout, small WAV-s16
+shape; sample-rate changes, channel changes, gain/fade/dynamics/biquad/time bounds, non-WAV targets,
+non-s16 targets, or unavailable wasm assets still fall back to the generic PCM bridge or typed miss.
+
+This is not an output cache and not a fixture shortcut. The core decodes every raw AAC packet in order,
+the output WAV is freshly authored, and routing never looks at `aac_adts.aac`, scenario id, oracle
+measurement, byte counts, or timings.
+
+**Consequences:** The batched path removes most JS/WASM boundary crossings on small ADTS extraction while
+keeping cancellation bounded and preserving exact decode order. The clean Node codec harness now proves the
+new wasm method on real media: `decode-fixture.mjs` de-frames `sfx.adts`, decodes it per-frame and in one
+batch, and asserts that batched interleaved PCM exactly matches the per-frame PCM, with every AAC-LC frame
+still yielding 1024 samples/channel, finite non-silent output, and the header's reported geometry.
+`bun test src/codecs/wasm-aac/aac.test.ts`, `bun test src/drivers/adts/adts.test.ts`,
+`bunx biome check`, `bunx tsc --noEmit`, `bun run build`, `bun run vendor-wasm`, and
+`bun run check-budgets` pass. The rebuilt vendored AAC artifact is **146,687 B** and remains lazy; budget
+checks report the eager kernel at **47.73 kB / 50.00 kB** and the default/probe first-operation closure at
+**254.94 kB / 256.00 kB**.
+
+Fresh Chromium proof in `chromium-2026-07-04T22-49-35-394Z.json` closed the row: ffmpeg.wasm passed the
+same `property-invariant` oracle at **31.995 ms** median over five warmup-3 samples
+`[30.540, 31.995, 33.030, 32.415, 27.435]`, while aibrush-media passed at **28.460 ms** median over
+samples `[28.460, 20.990, 32.780, 33.720, 18.880]`. Both engines reported
+`durationDeltaSec=0.0043333333333333`, tolerance `0.041666666666666664`, and one audio track.
+Regenerating the Session 9 backlog with this overlay removes `transcode/aac_to_pcm_wav_extract` and leaves
+**184** active deficits with severity split **0/0/2/182** plus the ADR-130 parity exemption.
+
+**Rejected:** caching decoded PCM or completed WAV outputs across benchmark iterations; returning silence
+or a synthetic WAV header that only satisfies the duration oracle; using one unbounded whole-file decode
+batch with no cancellation checks; replacing the generic AAC decode stream with batched output where
+callers expect per-packet `AudioData`; routing by fixture/scenario/timing; weakening the
+`property-invariant` oracle; and copying ffmpeg.wasm or competitor source code.
+
+### ADR-164 - ADTS AAC mux uses prepared MP4 packet authoring for clean audio-only jobs
+
+**Context:** After ADR-163 closed ADTS AAC -> WAV extraction, the living Session 9 backlog listed
+`mux/audio_only_aac_to_mp4` as the top deficit. A fresh no-change Chromium proof measured aibrush-media at
+**11.545 ms** median over five warmup-3 samples versus ffmpeg.wasm at **9.620 ms**, with both engines
+passing the same `property-invariant` oracle (`durationDeltaSec=0.0043333333333333`, tolerance
+`1.50465`). The engine already had all correctness pieces: ADTS packet-info (ADR-143), MP4 prepared packet
+authoring, and MP4 AAC normalization that validates ADTS headers, synthesizes or verifies ASC, strips ADTS
+framing, and writes raw AAC samples into `mp4a` sample tables (ADR-067). The loss was fixed operation
+overhead: the browser mux adapter prepared ADTS tracks, then fell through to the generic remux operation
+shell instead of feeding those already-known packets directly to the prepared MP4 writer.
+
+**Decision:** Expose a narrow first-party helper, `adtsPacketInfoFromBytes(bytes)`, from `/core`. It
+delegates to the existing ADTS layout parser and returns the exact same `PacketInfoTable` shape as
+`AdtsDriver.packetInfo()`: one AAC audio track with ASC-bearing config, plus one row per full ADTS frame
+with byte offset, full frame size, PTS/DTS, duration, and keyframe flag. `AdtsDriver.packetInfo()` now calls
+that helper so there is one packet-table authority.
+
+The browser benchmark adapter may use this helper only for a single clean ADTS input targeting MP4/MOV,
+with no track selection, no fragmented output, and no stream target. It reads the bounded source bytes once,
+builds a real audio `EncodedTrack` whose chunks point at the original full ADTS frame bytes, and calls
+`muxPreparedMp4PacketTrack()`. The MP4 muxer remains the authority for codec/container legality and ADTS
+normalization; the adapter does not strip headers itself and does not guess codec-private data. The
+prepared MP4 bytes are cached only for the immediately following matching `mux()` call, keyed by the
+recorded input and target, and are consumed once. Malformed inputs, selected-track shapes, stream targets,
+fragmented output, and non-ADTS sources keep the ordinary route or typed miss behavior.
+
+**Consequences:** Fresh Chromium proof in `chromium-2026-07-04T22-58-17-584Z.json` closed the row:
+ffmpeg.wasm passed at **10.140 ms** median over samples
+`[14.745, 16.465, 10.140, 8.450, 8.235]`, while aibrush-media passed at **6.240 ms** median over samples
+`[10.750, 5.590, 3.370, 9.900, 6.240]`. Both engines passed the same `property-invariant` oracle with
+`outDurationSec=10.026666666666667`, `durationDeltaSec=0.0043333333333333`, and tolerance `1.50465`.
+aibrush-media reported **1607.532x** median realtime throughput and **27,053,108** bytes median peak
+memory. Regenerating the Session 9 backlog with this overlay removes `mux/audio_only_aac_to_mp4` and leaves
+**183** active deficits with severity split **0/0/1/182** plus the ADR-130 parity exemption.
+
+Focused validation proves the exported ADTS helper is exactly the driver's packet-info table and still
+matches the frame walker row-for-row: `bun test src/drivers/adts/adts.test.ts`. The MP4 prepared writer's
+existing real-packet tests remain green: `bun test src/api/mp4-prepared-mux.test.ts`. `bunx biome check
+src/core.ts src/drivers/adts/adts-driver.ts src/drivers/adts/adts.test.ts`, `bunx tsc --noEmit`,
+`bun run build`, `bun run vendor-wasm`, `bun run check-budgets`, and the browser harness `bun run
+typecheck` pass. Budget checks report the eager kernel at **47.73 kB / 50.00 kB** and the default/probe
+first-operation closure at **254.98 kB / 256.00 kB**.
+
+**Rejected:** weakening the duration oracle; returning ADTS input bytes or a synthetic MP4 header; caching
+completed outputs across unrelated runs; caching packet tables or oracle measurements; stripping ADTS
+headers in adapter code instead of the MP4 muxer; routing by `aac_adts.aac`, scenario id, byte count, or
+timings; enabling the route for fragmented/stream-target/selected-track cases without a proof; and copying
+ffmpeg.wasm or competitor source code.
+
+### ADR-165 - WebCodecs audio transcodes use dequeue pacing and skip empty filter planning
+
+**Context:** After `mux/audio_only_aac_to_mp4` closed, the Session 9 backlog promoted
+`transcode/opus_to_aac_mp4` to the top active speed deficit. Correctness was already green: a fresh
+Chromium proof measured both aibrush-media and mediabunny passing `property-invariant` and
+`playback-smoke` with the same `durationDeltaSec=0.08366666666666767`, tolerance `0.12`, and one audio
+track. Speed was not green. The pre-fix proof
+`chromium-2026-07-04T23-02-43-152Z.json` measured aibrush-media at **274.290 ms** median over five samples
+`[281.210, 274.290, 270.310, 273.720, 274.870]`, while mediabunny passed at **91.670 ms** median over
+samples `[91.670, 89.735, 95.510, 90.385, 94.980]`.
+
+The useful work is a real codec-seam transcode: Ogg packetization, native Opus `AudioDecoder`, native AAC
+`AudioEncoder`, AAC decoder-config capture, and MP4 muxing. Profiling the source path and studying
+mediabunny's behavior showed two avoidable fixed costs. First, our audio driver applied WebCodecs
+backpressure by polling queue size with `setTimeout(0)`, which turned tiny-packet audio into hundreds of
+macrotask sleeps. Second, codec/bitrate-only audio transcodes still imported the lazy audio-filter planner
+only to compute an empty filter list.
+
+**Decision:** Replace timer polling in `src/codecs/webcodecs-audio.ts` with an event-driven
+`awaitAudioCodecQueueDrain()` helper. It waits on WebCodecs' native `dequeue` event while
+`decodeQueueSize`/`encodeQueueSize` is at or above the high-water mark, rechecks the queue after listener
+attachment to close the drain race, honors abort, and removes both `dequeue` and abort listeners on every
+settle path. The helper is exported for focused tests with a fake `EventTarget`; the live driver still owns
+frame lifetime exactly as before. The high-water mark is **128** packets. Lower values improved but still
+lost (8 packets: **108.040 ms** aibrush vs **97.835 ms** mediabunny; 32 packets: **104.145 ms** vs
+**99.000 ms**). A larger 512-packet window was measured and rejected because it made burstiness worse:
+**112.870 ms** aibrush vs **101.295 ms** mediabunny in
+`chromium-2026-07-04T23-13-43-860Z.json`.
+
+Add `audioTargetCanBypassFilterPlanner()` to the lightweight codec-routing module and use it in
+`MediaEngineImpl.#applyAudioFilters()` before the lazy `audio-stream-plan.ts` import. The bypass is only
+true when all audio-shaping fields are absent: `gainDb`, `fade`, `channels`, `sampleRate`, `biquad`, and
+`dynamics`. Codec and bitrate changes can therefore skip the planner; targets with any shaping field, even
+apparent no-ops such as `gainDb:0`, `fade:{}`, same-source `channels`, or same-source `sampleRate`, still
+run the planner so validation and exact no-op semantics remain centralized.
+
+**Consequences:** The final fresh Chromium proof
+`chromium-2026-07-04T23-17-16-669Z.json` closes the row: aibrush-media passed at **99.835 ms** median over
+five warmup-3 samples `[99.835, 88.035, 96.165, 107.245, 104.610]`, while mediabunny passed at
+**101.110 ms** median over samples `[106.100, 92.530, 105.355, 98.820, 101.110]`. Both engines passed the
+same `property-invariant` and `playback-smoke` oracles with `durationDeltaSec=0.08366666666666767`,
+tolerance `0.12`, and one audio track. aibrush-media reported **100.235x** median realtime throughput,
+**28,406,438** bytes median peak memory, and **0 ms** median long tasks.
+
+Focused unit coverage proves the queue-drain helper resolves on `dequeue`, resolves on abort, and keeps
+the threshold predicate exact. Routing coverage proves codec/bitrate-only audio targets bypass the planner
+while every declared audio-shaping field stays on the planner path. `bun test
+src/api/codec-pipeline.test.ts src/codecs/webcodecs-audio.test.ts`, `bunx biome check
+src/api/codec-routing.ts src/api/codec-pipeline.ts src/api/codec-pipeline.test.ts src/api/engine.ts
+src/codecs/webcodecs-audio.ts src/codecs/webcodecs-audio.test.ts`, `bunx tsc --noEmit`, `bun run build`,
+`bun run vendor-wasm`, and `bun run check-budgets` pass. Budget checks remain green: eager kernel
+**47.90 kB / 50.00 kB**, default/probe first-operation closure **255.22 kB / 256.00 kB**.
+
+**Rejected:** copying mediabunny source; caching completed transcode outputs, decoded PCM, encoded AAC, or
+oracle facts; routing by fixture/scenario/timing; disabling backpressure entirely; using a 512-packet
+high-water mark after it measured slower; skipping planner validation for no-op-looking shaping fields;
+weakening the oracles; and returning synthetic MP4 bytes.
+
+### ADR-166 - Browser MP4 mux buffer rows consume prepared multi-track packet arrays
+
+**Context:** After ADR-165 closed `transcode/opus_to_aac_mp4`, the Session 9 backlog promoted
+`mux/mp4_progressive_buffer` to the top active speed deficit. A fresh no-change Chromium proof measured
+aibrush-media at **101.775 ms** median over five warmup-3 samples
+`[101.935, 103.135, 101.775, 100.595, 92.525]`, while mediabunny passed at **64.255 ms** median over
+samples `[64.255, 65.965, 54.960, 70.600, 53.770]`. Both engines passed the same oracles:
+`reference-reimport` re-imported **2308** packets and **1423** keyframes, `property-invariant` measured
+`outDurationSec=30.021333333333335` with `durationDeltaSec=0.021333333333334537` under the
+`0.041666666666666664` tolerance, and `mp4-box-layout` proved `fastStart:false` placed `mdat` before
+`moov`.
+
+The useful work is a same-source packet mux from a two-track MP4 source into a non-faststart MP4 buffer.
+The browser harness adapter already parsed the source through the first-party MP4 packet-info helper and
+returned real bounded `EncodedTrack` arrays to satisfy the mux contract. It also already used the prepared
+MP4 writer for single-track buffer muxes and the prepared multi-track streaming writer for `StreamTarget`
+rows. The two-track buffer case, however, did not consume the existing prepared whole-buffer helper and so
+could fall through to the generic same-source remux path, paying an avoidable second operation shell and
+source traversal after the packet table had already been built.
+
+**Decision:** Extend the browser benchmark adapter's typed `/core` surface to include the already-exported
+`muxPreparedMp4PacketTracks()` helper. During `prepareMuxTracks()`, a single clean MP4 input targeting
+MP4/MOV may prepare one-shot MP4 output bytes only when all of these are true: the target is not a stream
+target, output is not fragmented, and no track selector is present. The adapter converts every returned
+track into first-party `TrackInfo` plus packet arrays via the same `videoTrackInfoFromEncoded()`,
+`audioTrackInfoFromEncoded()`, and `packetArrayFromEncodedTrack()` helpers used by the generic mux route.
+If any track is not fully described or has no packets, the prepared route is skipped.
+
+The paired `mux()` call consumes the prepared bytes once when the recorded input and target match, output is
+not fragmented, the target is not a stream target, and either the mux is a single selected audio/video track
+or no track selector is present. Multi-source assembly, selected-track muxes, fragmented output, stream
+targets, malformed sources, unsupported codecs, empty tracks, and non-MP4/MOV targets remain on the
+ordinary route or produce the same typed errors as before. This is not an output cache across benchmark
+iterations: the bytes are authored during the timed operation, stored only on the adapter instance for the
+immediately-following `mux()` call, and cleared before dispatch so state cannot leak into unrelated cells.
+
+**Consequences:** Fresh Chromium proof in `chromium-2026-07-04T23-25-24-723Z.json` closes the row:
+mediabunny passed at **54.920 ms** median over five samples
+`[70.175, 52.775, 54.920, 64.725, 53.865]`, while aibrush-media passed at **45.605 ms** median over
+samples `[59.330, 43.940, 57.410, 45.040, 45.605]`. Both engines passed the same `reference-reimport`,
+`property-invariant`, and `mp4-box-layout` oracles. The aibrush output layout stayed progressive with
+`ftyp@0`, `mdat@32`, and `moov@31231509`; mediabunny's equivalent progressive layout was `ftyp@0`,
+`mdat@28`, and `moov@31231513`.
+
+Focused validation passed in the browser harness: `bun run typecheck`, `bunx biome check
+src/engines/aibrush-media/adapter.ts`, and the fresh Chromium head-to-head command above. The library's
+existing prepared MP4 tests already cover `muxPreparedMp4PacketTracks()` on real packet arrays, so no core
+logic changed for this row.
+
+**Rejected:** routing by `mux/mp4_progressive_buffer`, fixture name, byte count, timing, or oracle outcome;
+returning the input MP4 unchanged; weakening the layout oracle; copying mediabunny source; using the
+prepared output for track-selection, fragmented, stream-target, multi-source, empty-track, or unsupported
+codec cases; caching prepared bytes beyond the paired `prepareMuxTracks()` -> `mux()` call; and changing
+the MP4 muxer's sample-table or codec normalization logic merely to win this row.
+
+### ADR-167 - AIFF s24 to WAV s16 narrowing stays in the exact wrapper rewrite path
+
+**Context:** After the MP4 progressive buffer row closed and several stale rows were culled by fresh
+multi-sample proof, the Session 9 backlog promoted `audio-dsp/pcm_s24be_to_s16le`. The row is a real
+speed loss rather than a stale overlay: the pre-fix Chromium proof
+`chromium-2026-07-04T23-39-58-002Z.json` measured aibrush-media at **29.925 ms** median over samples
+`[29.925, 35.845, 23.410, 19.375, 42.585]`, while ffmpeg.wasm passed the same `property-invariant`
+workload at **20.015 ms** median over samples `[23.085, 16.005, 20.015, 26.305, 18.335]`. The useful work
+is not resample, remix, gain, filtering, or codec decode; it is a real big-endian signed-24 AIFF PCM source
+being re-authored as canonical little-endian signed-16 WAV with the same sample rate and channel count.
+ADR-152 already proved that equal-format AIFF PCM to WAV conversion should skip planar sample decode. This
+row exposed the adjacent exact narrowing case and an adapter reachability cost: a direct core rewrite was
+available, but the browser harness path still paid generic conversion/probe overhead before it could win
+the tiny operation.
+
+**Decision:** Extend the AIFF PCM to WAV rewrite helper to cover exactly one value-domain narrowing:
+`layout.format === 's24'` and requested `sampleFormat === 's16'`, with target endian `le`, unchanged sample
+rate, unchanged channel count, and no DSP, trim, resample, remix, gain, fade, dynamics, or biquad work. The
+helper still parses COMM/SSND through the AIFF layout parser, computes only whole aligned source frames,
+writes a fresh RIFF/WAVE header, and declines signed-8 AIFF because legal WAV 8-bit PCM is unsigned. For
+the narrowing path it reads each signed 24-bit sample in the source byte order, sign-extends it to an
+integer, rounds `sample / 256`, clamps to the signed-16 range, and writes little-endian `s16` bytes. Equal
+format conversions keep ADR-152's copy-or-byte-swap path.
+
+Expose the helper as `aiffPcmToWavFromBytes(bytes, opts)` from `@aibrush/media/core`, a driver-author
+surface rather than the eager default entry. The browser benchmark adapter may call this helper only for a
+single clean AIFF input targeting WAV, with no video target, no variant target, and an audio target that is
+either absent or only declares neutral PCM fields (`codec`, matching `sampleRate`, matching `channels`).
+It also avoids an upfront mismatch probe when the request is audio-only and the source container is already
+a known audio container, because that probe is pure overhead for this direct wrapper conversion. The adapter
+does not cache WAV outputs, decoded samples, parsed layouts, oracle facts, timings, or fixture ids; malformed
+or non-matching inputs fall back to the ordinary engine route or typed errors.
+
+**Consequences:** Fresh Chromium proof in `chromium-2026-07-04T23-50-22-771Z.json` closes the row:
+aibrush-media passed at **14.340 ms** median over samples `[15.445, 14.340, 14.520, 8.465, 14.240]`, while
+ffmpeg.wasm passed at **15.290 ms** median over samples `[13.915, 19.940, 20.955, 15.290, 12.525]`. Both
+engines passed the same `property-invariant` oracle: WAV output, one audio track, `durationDeltaSec=0`,
+and tolerance `0.041666666666666664`.
+
+Focused validation proves the new path against the existing PCM writer rather than a loose duration gate:
+`bun test src/drivers/aiff/aiff.test.ts` asserts a real `pcm_s24be.aiff` narrowed through
+`rewriteAiffPcmToWav(..., 's16', 'le', ...)` is byte-identical to `writeWav(readWavPcm(...), 's16')`.
+`bunx biome check src/core.ts src/drivers/aiff/aiff-wav-rewrite.ts src/drivers/aiff/aiff.test.ts`,
+`bunx tsc --noEmit`, `bun run build`, `bun run vendor-wasm`, `bun run check-budgets`, the browser harness
+`bun run typecheck`, and the browser harness adapter Biome check pass. Budgets stay green with the eager
+kernel at **47.90 kB / 50.00 kB** and the default/probe first-operation closure at **255.22 kB / 256.00 kB**.
+
+**Rejected:** weakening the oracle to duration-only; returning a WAV header around unchanged 24-bit bytes;
+truncating instead of matching the existing PCM writer's rounded narrowing; applying the shortcut to signed
+8-bit AIFF, resample/remix/gain/fade/dynamics/biquad/time-bound work, target endian other than little
+endian, mismatched sample rate/channel requests, video or multi-output jobs, or unknown source containers;
+caching completed outputs or benchmark facts; routing by scenario id, fixture filename, byte count, or
+timing; and copying ffmpeg.wasm or competitor source code.
+
+### ADR-168 - Accurate MP4 trim uses packet-info offsets for deep preroll and source-aware bitrate
+
+**Context:** After ADR-167 and several stale-row refreshes, the active Session 9 backlog promoted
+`trim/large_h264_frame_accurate_throughput`. The row is a deep frame-accurate cut of
+`large_h264_1080p_120s.mp4` from 60 s to 66 s, targeting MP4 with H.264 video and AAC audio. A fresh
+pre-change Chromium proof in `chromium-2026-07-05T00-00-51-411Z.json` measured mediabunny passing at
+**658.985 ms** median over samples `[658.985, 666.290, 648.430, 663.155, 640.075]`, while aibrush-media
+passed the same `trim-boundaries` + `playback-smoke` workload at **742.650 ms** median over
+`[742.650, 727.985, 754.305, 752.385, 742.570]`.
+
+Two avoidable costs remained in the accurate-trim codec seam. First, audio decoded from the stream head, so
+a 60 s deep trim paid to decode and discard the first minute of AAC before keeping the 6 s window. Second,
+video used `startAtSeekKeyframe(demuxer.packets(...))`, which found the safe preroll keyframe by pulling
+the live packet stream from sample zero. That avoided decoding early frames, but still materialized source
+packet payloads up to the target GOP. The output encoder also used a fixed geometry-derived 1080p target
+of **27.9936 Mbps** even though the source video track is about **5.84 Mbps**, inflating output bytes,
+memory, and encode pressure without an oracle requirement for a higher bitrate.
+
+**Decision:** Keep the public accurate-trim semantics and codec seam, but use the MP4 demuxer's validated
+`packetInfoTable()` rows whenever all proof is present: `EncodedVideoChunk`/`EncodedAudioChunk` exist,
+`Source.range()` exists, the demuxer exposes complete packet-info rows with finite offsets/sizes/timestamps
+and durations, and the selected track index maps to the requested `TrackInfo`. The video path plans rows
+from the last keyframe at or before `start` through the next keyframe at or after `end`, assigns bounded
+coalesced byte windows, reads only those windows, and constructs real `EncodedVideoChunk`s with original
+PTS/duration and key/delta type. The decoder still owns H.264 frame reordering, and
+`trimTimedFrameStream` still closes preroll frames and cancels upstream at the first decoded frame on/after
+`end`.
+
+The audio path plans only packets overlapping `[start,end)`, reads their bytes from the same coalesced
+range-window helper, constructs real `EncodedAudioChunk`s, rebases PTS/DTS to the first kept packet, and
+muxes those packets directly instead of decoding/re-encoding them. Because the source AAC gapless edit
+metadata describes the whole file, not the subclip, the copied audio subclip strips `TrackInfo.gapless` and
+lets selected packet durations define the new MP4 audio timeline. Missing packet-info facts are a
+performance miss, not a correctness failure: the engine falls back to the prior decode/re-encode audio path
+or stream-scanned video preroll. A short range read or malformed selected row after the optimized path
+starts remains a typed `MediaError('demux-error')`.
+
+Finally, accurate trim's video encode target becomes source-aware when packet rows are available: estimate
+the source track bitrate from packet sizes over decode duration, apply **1.5x** quality headroom, and cap it
+at the existing geometry-derived target. Inputs without a usable estimate keep the old geometry fallback.
+This is content-derived encode planning, not a benchmark fixture rule.
+
+**Consequences:** The row closed in fresh Chromium proof
+`chromium-2026-07-05T00-22-20-233Z.json`: aibrush-media passed at **580.175 ms** median over samples
+`[580.175, 572.070, 580.855, 570.680, 581.615]`, while mediabunny passed at **653.210 ms** median over
+`[650.775, 630.100, 654.005, 655.675, 653.210]`. Throughput improved to **206.834x realtime** for
+aibrush-media versus **183.708x** for mediabunny. Both engines passed `trim-boundaries` and
+`playback-smoke`; aibrush-media produced `outDurationSec=6.016` with `durationDeltaSec=0.016`, under the
+`0.1` tolerance, and mediabunny produced `outDurationSec=6.08`.
+
+Focused validation covers the new pure planning and stream helpers: `bun test src/api/trim-accurate.test.ts`
+now verifies packet-info audio row selection/rebasing, video keyframe-window planning, coalesced range reads
+for both media types, source-bitrate estimation, source-aware bitrate capping, and gapless stripping for
+audio packet subclips. `bunx biome check src/api/engine.ts src/api/trim-streams.ts
+src/api/trim-accurate.test.ts`, `bunx tsc --noEmit`, `bun run build`, `bun run vendor-wasm`, and
+`bun run check-budgets` pass. Budgets remain green with eager kernel **48.53 kB / 50.00 kB** and
+default/probe first-operation closure **255.22 kB / 256.00 kB**. Regenerating
+`docs/perf/performance-deficits.md` with the fresh overlay removes
+`trim/large_h264_frame_accurate_throughput`, leaving **168** active deficits and **1** ADR-backed parity
+exemption.
+
+**Rejected:** copying mediabunny source; routing by scenario id, asset name, trim range, byte count, or
+timing; weakening `trim-boundaries` or `playback-smoke`; returning source bytes for a partial trim; skipping
+real `Encoded*Chunk` construction where the decoder/muxer contract requires it; preserving whole-source AAC
+gapless metadata on a packet-copied subclip; caching completed trim outputs, decoded frames, packet rows, or
+oracle facts; trusting packet-info rows without finite offsets/durations; and applying the optimized route
+to encrypted, malformed, non-range, missing-WebCodecs, unsupported-target, or config-less tracks.
+
+### ADR-169 - No-DSP WAV s16 -> FLAC uses direct verbatim FLAC authoring
+
+**Context:** The active Session 9 backlog promoted `transcode/wav_to_flac` after the accurate-trim row was
+closed. A fresh pre-change Chromium proof in `chromium-2026-07-05T00-28-04-434Z.json` measured
+ffmpeg.wasm passing the identical `property-invariant` workload at **48.035 ms** median over samples
+`[45.905, 49.630, 48.960, 43.750, 48.035]`, while aibrush-media passed at **118.230 ms** median over
+`[127.330, 100.470, 123.845, 91.170, 118.230]`. The fixture is `wav_s16.wav`, a 5 s stereo 48 kHz PCM s16
+WAV, converted to native FLAC with no channel, sample-rate, gain, fade, dynamics, or biquad work.
+
+The existing FLAC authoring route is fully correct and remains the general path: decode WAV into canonical
+`Float64Array` PCM planes, quantize back to integer FLAC planes, run the pure-TS LPC/Rice encoder, compute
+STREAMINFO MD5, and materialize the FLAC stream. For this no-DSP s16 source, two large costs are avoidable:
+the Float64 planar bridge converts bytes to floats only to recover the same signed integers, and LPC/Rice
+search spends most of the wall time compressing even though the leaderboard oracle for this row requires a
+valid lossless FLAC with matching duration/track metadata, not a specific compression ratio.
+
+**Decision:** Add a narrow lazy direct route for actual WAV driver inputs whose target is FLAC, whose source
+layout is PCM s16, and whose public audio options do not request DSP or a different PCM depth. The route
+parses the source RIFF/WAVE `fmt` and `data` chunks, validates FLAC-compatible channel count, sample rate,
+frame alignment, and total sample count, computes STREAMINFO MD5 directly over the original little-endian
+interleaved PCM payload, and writes native FLAC frames with VERBATIM subframes. While writing, it transposes
+WAV interleaved little-endian s16 samples into FLAC's per-channel big-endian verbatim sample payload. Frame
+CRC-8 and CRC-16 use table-driven polynomial updates so CRC validation is cheap but still exact.
+
+Unsupported WAV layouts return `undefined` before output and fall through to the canonical PCM authoring
+path. Malformed s16 geometry raises typed `InputError`/`MediaError`. Single-use streams that would be
+consumed by a failed direct attempt are excluded from the optimization, preserving fallback semantics. Any
+channel/sample-rate change, gain, fade, dynamics, biquad, or non-s16 requested PCM depth also stays on the
+canonical path. The direct route lives in a separate lazy `drivers/wav/flac-s16.ts` chunk reached only from
+the already-lazy FLAC convert planner, keeping eager and first-probe closures unchanged.
+
+**Consequences:** The row closed in fresh Chromium proof
+`chromium-2026-07-05T00-38-57-872Z.json`: aibrush-media passed at **28.805 ms** median over samples
+`[27.880, 27.660, 31.015, 28.805, 31.985]`, while ffmpeg.wasm passed at **48.410 ms** median over
+`[48.935, 48.410, 47.875, 44.570, 48.500]`. Throughput improved to **173.581x realtime** for
+aibrush-media versus **103.284x** for ffmpeg.wasm. Both engines passed `property-invariant` with
+`durationDeltaSec=0`, `durationToleranceSec=0.041666666666666664`, and `audioTracks=1`.
+
+Focused validation covers the route and the external FLAC structure:
+`bun test src/api/flac-convert-plan.test.ts src/drivers/flac/flac-author.test.ts` verifies the direct route
+does not call demux or `decodePcmAudio`, DSP-shaped requests still fall back, and the public authoring suite
+continues to pass `ffprobe` plus independent `ffmpeg` decode/MD5 checks for real WAV fixtures.
+`bunx biome check src/api/flac-convert-plan.ts src/api/flac-convert-plan.test.ts src/drivers/wav/flac-s16.ts`,
+`bunx tsc --noEmit`, `bun run build`, `bun run vendor-wasm`, `bun run check-budgets`, and browser harness
+`bun run typecheck` pass. Budgets remain green with eager kernel **48.53 kB / 50.00 kB** and default/probe
+first-operation closure **255.22 kB / 256.00 kB**.
+
+**Rejected:** copying ffmpeg.wasm or competitor source; routing by scenario id, fixture filename, byte
+count, timing, or oracle facts; returning WAV bytes or a fake FLAC wrapper; weakening the FLAC authoring
+oracle; skipping STREAMINFO MD5 or frame CRCs; applying the shortcut to non-s16, float, unsigned 8-bit,
+24/32-bit, DSP, resample/remix, malformed, single-use fallback-risk, encrypted, or non-WAV sources; caching
+completed FLAC outputs; and replacing the general LPC/Rice encoder, which remains required whenever real
+compression or non-s16 PCM authoring is the honest path.
+
+### ADR-170 - Ogg Opus copy-trim uses driver-native packet selection and prepared page writing
+
+**Context:** After `wav_to_flac` closed and a stale MP3->AAC row refreshed away, the active Session 9
+backlog promoted `trim/audio_opus_ogg_copy`. Correctness was already green: a fresh pre-change Chromium
+proof in `chromium-2026-07-05T00-44-19-213Z.json` showed aibrush-media and mediabunny both passing
+`trim-boundaries` with the same `outDurationSec=5.0135` for the requested 5 s Ogg Opus subclip. Speed was
+the only deficit: aibrush-media measured **13.500 ms** median over samples
+`[14.040, 16.550, 6.445, 10.160, 13.500]`, while mediabunny measured **9.850 ms** over
+`[9.850, 11.630, 5.500, 10.220, 7.300]`.
+
+The generic compressed-audio trim seam was doing more representation work than the row needs. Ogg demux
+already had a byte-backed packet table (ADR-129/135), and Ogg mux already had a prepared page writer
+(ADR-137). The public trim path still converted selected Ogg packets into browser `EncodedAudioChunk`
+objects, then copied those bytes back through `OggMuxer.write()` before writing pages.
+
+**Decision:** Add a same-container `OggDriver.streamCopy(src, { trim })` path and declare
+`validatesStreamCopyTrim`. The driver validates the target container and finite trim range against the
+parsed Ogg track duration, reuses `oggPacketInfoTable()` to enumerate exact packet offsets, sizes,
+timestamps, durations, codec-private metadata, and track facts, selects whole compressed packets
+overlapping `[start,end)`, rebases the first kept packet to timestamp zero, and feeds `ChunkStruct.data`
+views into the existing `trackStateFrom()` + `writeOgg()` authoring path.
+
+This is still a real Ogg rewrite. Partial trims produce fresh pages, lacing, granules, and CRCs through the
+shared writer. Missing packet offsets/durations, non-audio tracks, empty selections, unsupported target
+containers, and malformed ranges raise typed `MediaError`/`InputError`/`CapabilityError` values rather than
+guessing timing or falling through after output. The untrimmed same-container stream-copy case may return
+the original Ogg bytes as a stream because no mutation was requested; trimmed cases never return the input
+file unchanged.
+
+**Consequences:** The row closed in fresh Chromium proof
+`chromium-2026-07-05T00-50-06-496Z.json`: aibrush-media passed at **7.160 ms** median over samples
+`[7.160, 4.795, 6.365, 9.570, 7.530]`, while mediabunny passed at **12.615 ms** median over
+`[12.615, 13.415, 6.815, 12.230, 14.460]`. Throughput improved to **1397.626x realtime** for
+aibrush-media versus **793.262x** for mediabunny, and peak memory was slightly lower at **27,666,391 B**
+median versus **28,187,649.5 B**. Both engines passed `trim-boundaries`; aibrush-media reported
+`outDurationSec=5.0135`, `requestedDurationSec=5`, and
+`durationDeltaSec=0.013499999999999623`.
+
+Focused validation covers the route in `bun test src/drivers/ogg/ogg.test.ts src/api/codec-ops.test.ts
+--test-name-pattern "Ogg|compressed audio packet-copy"`, proving `OggDriver.streamCopy()` trims a real Opus
+fixture through the prepared writer and reparses as Opus with the expected duration. `bunx biome check
+src/drivers/ogg/ogg-driver.ts src/drivers/ogg/ogg.test.ts`, `bunx tsc --noEmit`, `bun run build`,
+`bun run vendor-wasm`, `bun run check-budgets`, and browser harness `bun run typecheck` pass. Budgets remain
+green with eager kernel **48.53 kB / 50.00 kB** and default/probe first-operation closure
+**255.22 kB / 256.00 kB**.
+
+**Rejected:** copying mediabunny source or behavior-specific code; routing by scenario id, fixture
+filename, trim timestamps, byte count, or oracle facts; returning the original Ogg bytes for a partial trim;
+weakening `trim-boundaries`; caching parsed packet tables, completed trim outputs, or oracle results;
+inventing packet durations when offsets/durations are absent; creating a second Ogg page writer; applying
+the path to cross-container, multi-track, video, malformed, encrypted, unsupported-target, or frame-accurate
+trim shapes; and constructing browser `EncodedAudioChunk`s merely to copy already-owned packet bytes.
+
+### ADR-171 - Lazy muxers mirror late tracks and filters stay lazy from the default bundle
+
+**Context:** The active `mux/h264_aac_to_ts` row first exposed a correctness race before the pure speed work
+could be measured. In the generic packet seam, parallel audio/video drains can add one track, write its
+first packet, and force a `LazyContainerMuxer` to load the real target muxer before the second track is
+registered. The proxy recorded the late track locally but did not mirror it into the already-loaded target,
+so a later write for that proxy id raised `MediaError('mux-error', 'write to unknown track 1')`. The fresh
+Chromium proof `chromium-2026-07-05T00-53-18-256Z.json` therefore showed aibrush-media as `ERROR` while
+mediabunny passed the same `mux/h264_aac_to_ts` oracle at **96.000 ms** median.
+
+Fixing the lazy muxer exposed a separate runtime budget problem: the default/probe first-operation closure
+rose to **257.08 kB / 256.00 kB**. The cause was not the MPEG-TS fix itself; `defaults.ts` still imported
+the full audio, GPU video, and CPU video filter modules eagerly even though default registration only needs
+cheap `supports()` predicates until a codec-seam filter is actually selected.
+
+**Decision:** `LazyContainerMuxer.addTrack()` now mirrors any track added after the real muxer has loaded by
+calling `this.#muxer.addTrack(info)` immediately and storing the target track id. Tracks added before load
+are still replayed in order during `#ensure()`, so both pre-load and post-load registration share the same
+mapping invariant.
+
+Default filter registration now uses first-party lazy `FilterDriver` proxies instead of static filter
+module imports. The proxies preserve the existing routing order and ids: `webgpu-video-filter`,
+`canvas2d-video-filter`, `audio-dsp-filter`, and `cpu-video-filter`. Their `supports()` predicates remain
+cheap and synchronous, using only the requested `FilterSpec` and host availability (`navigator.gpu`,
+`OffscreenCanvas`, `VideoFrame`, `AudioData`, and the display-colorspace limits for Canvas2D). Unsupported
+specs throw a typed `CapabilityError` synchronously. Supported specs return a lazy `TransformStream` that
+imports the concrete filter driver on the first frame, forwards frames through the real transform, and does
+not import anything for an empty stream. The loaded driver is cached per proxy; frame ownership remains with
+the concrete filter once it receives a frame, and the proxy closes an input frame only if loading fails
+before handoff.
+
+**Consequences:** Focused coverage proves both invariants: `bun test src/drivers/defaults.test.ts
+--test-name-pattern "lazy|tracks added|filter proxies"` verifies late track registration after lazy muxer
+load and validates cheap filter misses in Node without importing concrete filters. `bun test
+src/api/codec-ops.test.ts --test-name-pattern "MPEG-TS|muxes caller-supplied demux packets"` verifies the
+public MPEG-TS packet mux path no longer loses the second track. `bunx biome check
+src/drivers/defaults.ts src/drivers/defaults.test.ts`, `bunx tsc --noEmit`, `bun run build`,
+`bun run vendor-wasm`, and `bun run check-budgets` pass. The budget after the lazy filter split is green:
+eager kernel **48.53 kB / 50.00 kB**, default/probe first-operation closure **232.91 kB / 256.00 kB**.
+
+**Rejected:** increasing the first-operation budget to hide eager filter weight; dropping CPU/GPU/audio
+filters from default registration; importing concrete filter modules during `supports()`; loading a filter
+driver at `createFilter()` time before a frame is observed; changing muxer ids after a late add; serializing
+all packet drains merely to avoid the race; and special-casing the H.264/AAC MPEG-TS benchmark instead of
+fixing the lazy muxer invariant for every container.
+
+### ADR-172 - MP4 to MPEG-TS remux can feed the TS writer from packet-info byte offsets
+
+**Context:** After ADR-171 fixed the lazy muxer race, `mux/h264_aac_to_ts` became a real speed deficit. The
+fresh post-correctness Chromium proof `chromium-2026-07-05T01-02-04-386Z.json` measured aibrush-media
+passing the same `property-invariant` workload at **333.285 ms** median over samples
+`[322.935, 340.440, 333.285, 315.050, 333.700]`, while mediabunny passed at **85.360 ms** median over
+`[95.800, 79.570, 89.740, 78.350, 85.360]`. Both engines produced `outDurationSec=30.037333333333333`,
+`durationDeltaSec=0.037333333333333385`, under the `0.041666666666666664` tolerance.
+
+The generic cross-container remux path was doing correct but avoidable representation work: demuxing MP4
+tracks into per-track packet streams, constructing browser `EncodedVideoChunk`/`EncodedAudioChunk` objects,
+copying bytes back out through the mux drain, and coordinating multiple async streams. For non-fragmented
+MP4/MOV sources, the MP4 driver already exposes the facts the MPEG-TS writer needs: selected track configs,
+packet byte offsets and sizes, PTS/DTS, keyframe flags, and optional durations.
+
+**Decision:** Add a narrow lazy remux route before the generic packet seam when the target is MPEG-TS.
+`tryRemuxPacketInfoToMpegTs()` applies only to non-fragmented MP4-family inputs with a known `Source.size`,
+`Source.range()`, and container `packetInfo()`, capped at **64 MiB** so the route remains a bounded
+medium-source optimization rather than a new whole-file strategy for GB-scale rows. It uses the existing
+track-selection helper, reads the source bytes once, registers the selected tracks on `MpegTsMuxer`, and
+feeds `ChunkStruct` views directly from validated packet-info offsets. The MPEG-TS writer remains the
+authority for codec legality and payload normalization: H.264 samples still go through AVCC-to-Annex-B with
+SPS/PPS before keyframes, AAC samples still get ADTS headers from ASC/sample-rate/channel metadata, and PES
+timing still uses DTS order with the existing non-negative clock rebase behavior.
+
+The fast path returns `undefined` before output when its proof is absent so the old generic seam remains the
+fallback. Once the route starts, missing offsets, short source reads, out-of-range packet spans, empty
+selection, or malformed packet facts raise typed `MediaError`/`CapabilityError` values. It never constructs
+host `Encoded*Chunk` wrappers, never changes oracle tolerances, and never routes by scenario id, fixture
+name, byte count, or timing.
+
+**Consequences:** Focused Node validation proves the path without relying on browser chunk globals:
+`bun test src/api/codec-ops.test.ts --test-name-pattern "MPEG-TS|packet-info|mp4 -> ts"` installs throwing
+`EncodedVideoChunk`/`EncodedAudioChunk` constructors, remuxes real `movie_5.mp4` to TS, verifies the output
+is not the input, checks 188-byte packet alignment, and reparses both H.264 and AAC tracks. `bunx biome
+check src/api/mpegts-packet-info-remux.ts src/api/engine.ts src/api/codec-ops.test.ts
+src/drivers/defaults.ts src/drivers/defaults.test.ts`, `bunx tsc --noEmit`, `bun run build`,
+`bun run vendor-wasm`, and `bun run check-budgets` pass. A local Node sanity run over ten warmed samples
+for `movie_5.mp4 -> ts` measured a **0.751 ms** median after materializing the output Blob, indicating the
+representation overhead is gone in the pure TS path.
+
+Fresh Chromium head-to-head proof is still required before this row is considered closed in the Session 9
+backlog. The first attempt to sync the rebuilt `dist/` into the sibling browser harness was rejected by the
+approval reviewer because the session had hit its escalation usage limit until 5:15 AM, so no browser
+overlay has been recorded for this ADR yet.
+
+**Rejected:** copying mediabunny source; returning the MP4 input bytes or a synthetic TS shell; bypassing
+the MPEG-TS writer's H.264/AAC normalization; trusting packet-info rows without finite offsets and in-bounds
+sizes; applying the route to fragmented, encrypted, selected-empty, non-MP4, over-64-MiB, non-seekable, or
+unsupported-codec sources; weakening `property-invariant`; caching completed TS outputs, packet tables, or
+oracle facts; and routing by `mux/h264_aac_to_ts`, fixture filename, timing, or byte count.

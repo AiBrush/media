@@ -59,7 +59,7 @@ import { CapabilityError, MediaError } from '../contracts/errors.ts';
  * pacing threshold ({@link shouldApplyBackpressure}). A small window keeps the pipeline full without
  * hoarding native memory.
  */
-export const BACKPRESSURE_THRESHOLD = 8 as const;
+export const BACKPRESSURE_THRESHOLD = 128 as const;
 
 /** True when the coder's queue is at/over {@link BACKPRESSURE_THRESHOLD} and the producer should wait. */
 export function shouldApplyBackpressure(
@@ -67,6 +67,15 @@ export function shouldApplyBackpressure(
   threshold: number = BACKPRESSURE_THRESHOLD,
 ): boolean {
   return queueSize >= threshold;
+}
+
+export interface CodecQueueEventTarget {
+  addEventListener(
+    type: 'dequeue',
+    listener: EventListener,
+    options?: AddEventListenerOptions,
+  ): void;
+  removeEventListener(type: 'dequeue', listener: EventListener): void;
 }
 
 /**
@@ -301,11 +310,34 @@ function codecError(code: 'decode-error' | 'encode-error', e: DOMException): Med
   return new MediaError(code, `webcodecs-audio ${code}: ${e.message}`, e);
 }
 
-/** Spin until the coder's internal queue drains below the backpressure threshold (or `signal` aborts). */
-async function awaitDrain(queueSize: () => number, signal: AbortSignal | undefined): Promise<void> {
-  while (shouldApplyBackpressure(queueSize())) {
+/**
+ * Wait until a WebCodecs audio coder's queue drops below the backpressure threshold. `dequeue` is the
+ * browser's native signal for this exact state change; using it avoids one macrotask sleep per drain cycle
+ * on tiny-packet audio transcodes while still bounding native queue growth.
+ */
+export async function awaitAudioCodecQueueDrain(
+  target: CodecQueueEventTarget,
+  queueSize: () => number,
+  signal: AbortSignal | undefined,
+  threshold: number = BACKPRESSURE_THRESHOLD,
+): Promise<void> {
+  while (shouldApplyBackpressure(queueSize(), threshold)) {
     if (signal?.aborted) return;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        target.removeEventListener('dequeue', onDequeue);
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onDequeue: EventListener = () => finish();
+      const onAbort = (): void => finish();
+      target.addEventListener('dequeue', onDequeue, { once: true });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (!shouldApplyBackpressure(queueSize(), threshold) || signal?.aborted) finish();
+    });
   }
 }
 
@@ -416,7 +448,7 @@ function createDecoder(
     async transform(chunk): Promise<void> {
       const dec = decoder;
       if (!dec) throw new MediaError('decode-error', 'decoder not configured');
-      await awaitDrain(() => dec.decodeQueueSize, signal);
+      await awaitAudioCodecQueueDrain(dec, () => dec.decodeQueueSize, signal);
       if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
       dec.decode(asAudioChunk(chunk));
     },
@@ -505,7 +537,7 @@ function createEncoder(
         throw new MediaError('encode-error', 'encoder not configured');
       }
       try {
-        await awaitDrain(() => enc.encodeQueueSize, signal);
+        await awaitAudioCodecQueueDrain(enc, () => enc.encodeQueueSize, signal);
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         enc.encode(data); // copies the planes it needs synchronously
       } finally {

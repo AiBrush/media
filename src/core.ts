@@ -124,13 +124,24 @@ export type {
   PreparedMp4PacketTrackMuxInput,
   PreparedMp4PacketTracksMuxInput,
 } from './api/mp4-prepared-mux.ts';
-export { adtsTrimFromBytes, adtsTrimFromUrl } from './drivers/adts/adts-driver.ts';
+export {
+  adtsPacketInfoFromBytes,
+  adtsTrimFromBytes,
+  adtsTrimFromUrl,
+} from './drivers/adts/adts-driver.ts';
 export type { AdtsTrimFromUrlOptions, AdtsTrimRange } from './drivers/adts/adts-driver.ts';
 export { mp3PacketInfoFromBytes, muxPreparedMp3PacketTrack } from './drivers/mp3/mp3-driver.ts';
 export type { PreparedMp3PacketMuxInput } from './drivers/mp3/mp3-driver.ts';
 export { oggPacketInfoFromBytes } from './drivers/ogg/ogg-driver.ts';
-export { wavPacketInfoFromBytes, wavPacketInfoFromUrl } from './drivers/wav/wav-driver.ts';
+export {
+  wavPacketInfoFromBytes,
+  wavPacketInfoFromUrl,
+} from './drivers/wav/wav-driver.ts';
 export type { WavPacketInfoFromUrlOptions } from './drivers/wav/wav-driver.ts';
+export { wavTrimFromUrl } from './drivers/wav/url-trim.ts';
+export type { WavTrimFromUrlOptions } from './drivers/wav/url-trim.ts';
+export { aiffPcmToWavFromBytes } from './drivers/aiff/aiff-wav-rewrite.ts';
+export type { AiffPcmToWavOptions } from './drivers/aiff/aiff-wav-rewrite.ts';
 
 // HLS input resolution (RFC 8216). HLS `.m3u8` is a manifest, not a byte container — `resolveHlsSource`
 // parses the playlist, fetches + AES-128-decrypts + stitches the segments into ONE demuxable `Source` the

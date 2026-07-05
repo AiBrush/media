@@ -185,10 +185,6 @@ class RangeCache implements CachingSource {
   }
 
   async #probeSize(): Promise<number | undefined> {
-    if (this.#src.size !== undefined) {
-      this.size = this.#src.size;
-      return this.size;
-    }
     // A URL we built ourselves can learn its length via HEAD/Content-Range without consuming the body.
     if (this.#href !== undefined) {
       const total = await probeUrlSize(this.#href);
@@ -221,8 +217,7 @@ class RangeCache implements CachingSource {
     const key = `${lo}:${hi}`;
     const existing = this.#inflight.get(key);
     if (existing) return existing;
-    const range = this.#src.range;
-    if (range === undefined) return this.#loadFull(); // unreachable (guarded by caller), but type-safe.
+    const range = this.#src.range as NonNullable<Source['range']>;
     const p = range(lo, hi).finally(() => this.#inflight.delete(key));
     this.#inflight.set(key, p);
     return p;
@@ -279,7 +274,6 @@ function coalesce(a: Interval, b: Interval): Interval {
   const start = Math.min(a.start, b.start);
   const end = Math.max(a.end, b.end);
   if (start === a.start && end === a.end) return a; // `a` already contains `b`.
-  if (start === b.start && end === b.end) return b; // `b` already contains `a`.
   const bytes = new Uint8Array(end - start);
   // Lay `a` then `b`; the overlap is identical bytes from the same source, so write order is immaterial.
   bytes.set(a.bytes, a.start - start);

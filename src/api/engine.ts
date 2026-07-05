@@ -26,6 +26,7 @@ import type {
   FilterSpec,
   Muxer,
   Packet,
+  PacketInfoMetadata,
   PacketInfoTable,
   StageOptions,
   StreamCopyOptions,
@@ -60,6 +61,7 @@ import {
 } from '../sources/source.ts';
 import { createMediaChain } from './chain.ts';
 import {
+  audioTargetCanBypassFilterPlanner,
   chooseOutputContainer,
   containerHasChunkMuxer,
   hasTrackSelection,
@@ -122,6 +124,10 @@ interface StreamCopySinkMode {
 interface SourcePrefixHandoff {
   readonly bytes: Uint8Array;
   readonly token: object;
+}
+
+interface DemuxerWithPacketInfoTable extends Demuxer {
+  packetInfoTable?: () => readonly PacketInfoMetadata[];
 }
 
 /** The developer-facing engine surface (ADR-009). */
@@ -1102,6 +1108,16 @@ export class MediaEngineImpl implements MediaEngine {
       const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
       return remuxViaStreamingWebm(container, src, opts, this.#stageOptions(signal, o));
     }
+    if (opts.to === 'ts') {
+      const { tryRemuxPacketInfoToMpegTs } = await import('./mpegts-packet-info-remux.ts');
+      const stream = await tryRemuxPacketInfoToMpegTs(
+        container,
+        src,
+        opts,
+        this.#stageOptions(signal, o),
+      );
+      if (stream !== undefined) return stream;
+    }
     // Decline an oversize buffer-all remux UP FRONT (ADR-094): the cross-container seam copies every packet
     // into a muxer that serializes the whole file at finalize (no incremental Cluster emit), so a
     // multi-GB output would OOM/hang. The output of a verbatim stream-copy is ~the source media size, so a
@@ -1237,11 +1253,17 @@ export class MediaEngineImpl implements MediaEngine {
     if (offloaded !== undefined) return offloaded;
 
     const {
+      estimateTrackBitrateFromPacketInfo,
       restampAudioData,
+      planTrimAudioPacketInfoRows,
+      planTrimVideoPacketInfoRows,
+      trimAudioPacketInfoStream,
+      trimAudioPacketInfoTrack,
       trimBoundsUs,
       trimEncodeTrack,
       trimTimedFrameStream,
       trimVideoEncodeTarget,
+      trimVideoPacketInfoChunkStream,
     } = await import('./trim-streams.ts');
     const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
     const bounds = trimBoundsUs(opts.start, endSec);
@@ -1251,6 +1273,7 @@ export class MediaEngineImpl implements MediaEngine {
     const openStreams: ReadableStream<unknown>[] = [];
     let drainsStarted = false;
     try {
+      const demuxerPacketInfoRows = (demuxer as DemuxerWithPacketInfoTable).packetInfoTable?.();
       const videoTrack = demuxer.tracks.find(
         (t) => t.mediaType === 'video' && t.config !== undefined,
       );
@@ -1262,11 +1285,26 @@ export class MediaEngineImpl implements MediaEngine {
         assertTrimTrackDecodable(videoTrack);
         const codec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
         const { unwrapPackets } = await loadCodecPipeline();
+        const videoTrackIndex = demuxer.tracks.findIndex((track) => track.id === videoTrack.id);
+        const sourceBitrate =
+          demuxerPacketInfoRows === undefined || videoTrackIndex < 0
+            ? undefined
+            : estimateTrackBitrateFromPacketInfo(demuxerPacketInfoRows, videoTrackIndex);
+        const packetInfoVideoRows =
+          typeof EncodedVideoChunk === 'undefined' ||
+          src.range === undefined ||
+          demuxerPacketInfoRows === undefined ||
+          videoTrackIndex < 0
+            ? undefined
+            : planTrimVideoPacketInfoRows(demuxerPacketInfoRows, videoTrackIndex, bounds);
         /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
-        const packets = await startAtSeekKeyframe(
-          unwrapPackets(demuxer.packets(videoTrack.id)),
-          bounds.startUs,
-        );
+        const packets =
+          packetInfoVideoRows === undefined
+            ? await startAtSeekKeyframe(
+                unwrapPackets(demuxer.packets(videoTrack.id)),
+                bounds.startUs,
+              )
+            : trimVideoPacketInfoChunkStream(src, packetInfoVideoRows, signal);
         const config = await decodeConfigOf(videoTrack);
         const decoded = packets.pipeThrough(
           codec.createDecoder(config, this.#stageOptions(signal, o)),
@@ -1276,7 +1314,7 @@ export class MediaEngineImpl implements MediaEngine {
         tasks.push(
           this.#encodeVideoStream(
             trimmed,
-            trimVideoEncodeTarget(videoTrack),
+            trimVideoEncodeTarget(videoTrack, sourceBitrate),
             trimEncodeTrack(videoTrack),
             muxer,
             signal,
@@ -1288,20 +1326,34 @@ export class MediaEngineImpl implements MediaEngine {
 
       if (audioTrack) {
         assertTrimTrackDecodable(audioTrack);
-        const codec = await this.#routeCodec(await decodeQueryFor(audioTrack), o);
-        const { unwrapPackets } = await loadCodecPipeline();
-        /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
-        const config = await decodeConfigOf(audioTrack);
-        const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
-          codec.createDecoder(config, this.#stageOptions(signal, o)),
-        ) as ReadableStream<AudioData>;
-        const programAudio = await decodedAudioStreamWithGapless(decoded, audioTrack);
-        const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
-        openStreams.push(trimmed);
-        tasks.push(
-          this.#encodeAudioStream(trimmed, {}, trimEncodeTrack(audioTrack), muxer, signal, o),
-        );
-        /* v8 ignore stop */
+        const audioTrackIndex = demuxer.tracks.findIndex((track) => track.id === audioTrack.id);
+        const packetInfoRows =
+          typeof EncodedAudioChunk === 'undefined' || src.range === undefined || audioTrackIndex < 0
+            ? undefined
+            : planTrimAudioPacketInfoRows(demuxerPacketInfoRows ?? [], audioTrackIndex, bounds);
+        if (packetInfoRows !== undefined) {
+          const packets = trimAudioPacketInfoStream(src, packetInfoRows, signal);
+          openStreams.push(packets);
+          const { drainEncoderToMuxer } = await loadCodecPipeline();
+          tasks.push(
+            drainEncoderToMuxer(packets, muxer, () => trimAudioPacketInfoTrack(audioTrack, bounds)),
+          );
+        } else {
+          const codec = await this.#routeCodec(await decodeQueryFor(audioTrack), o);
+          const { unwrapPackets } = await loadCodecPipeline();
+          /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
+          const config = await decodeConfigOf(audioTrack);
+          const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
+            codec.createDecoder(config, this.#stageOptions(signal, o)),
+          ) as ReadableStream<AudioData>;
+          const programAudio = await decodedAudioStreamWithGapless(decoded, audioTrack);
+          const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
+          openStreams.push(trimmed);
+          tasks.push(
+            this.#encodeAudioStream(trimmed, {}, trimEncodeTrack(audioTrack), muxer, signal, o),
+          );
+          /* v8 ignore stop */
+        }
       }
 
       if (tasks.length === 0) {
@@ -1594,6 +1646,7 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<AudioData>> {
+    if (audioTargetCanBypassFilterPlanner(target)) return frames;
     // The lossy-seam audio-filter PLANNER lives in a lazily-imported chunk (`audio-stream-plan.ts`), so the
     // eager kernel never statically pulls the audio-spec code + its audio-dsp type imports (doc 08 §7).
     // Reached only here, on the live convert audio re-encode — already a browser-only, async path.

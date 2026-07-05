@@ -137,6 +137,23 @@ export function isPureStreamCopy(opts: {
   return true;
 }
 
+/**
+ * True when the audio target has no fields that can create, validate, or reject an `AudioData→AudioData`
+ * filter stage. Codec/bitrate-only audio transcodes do not need the lazy audio-filter planner; targets
+ * with even no-op filter fields (`gainDb:0`, same `channels`, same `sampleRate`, empty `fade`) still go
+ * through the planner so its validation and exact no-op semantics remain the single source of truth.
+ */
+export function audioTargetCanBypassFilterPlanner(t: AudioTarget): boolean {
+  return (
+    t.gainDb === undefined &&
+    t.fade === undefined &&
+    t.channels === undefined &&
+    t.sampleRate === undefined &&
+    t.biquad === undefined &&
+    t.dynamics === undefined
+  );
+}
+
 function videoTargetRequestsReencode(t: VideoTarget): boolean {
   return (
     t.codec !== undefined ||

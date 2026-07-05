@@ -16,7 +16,7 @@ import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { readCafPcm } from '../caf/caf.ts';
-import { readWavPcm } from '../wav/pcm.ts';
+import { readWavPcm, writeWav } from '../wav/pcm.ts';
 import { AiffDriver, AiffModule } from './aiff-driver.ts';
 import { rewriteAiffPcmToWav } from './aiff-wav-rewrite.ts';
 import {
@@ -274,6 +274,25 @@ describe('rewriteAiffPcmToWav — no-DSP cross-wrapper fast path', () => {
     for (let c = 0; c < source.channels; c++) {
       expect(channelAt(wav.planar, c)).toEqual(channelAt(source.planar, c));
     }
+  });
+
+  it('narrows real big-endian s24 AIFF to canonical s16 WAV exactly like the PCM path', async () => {
+    const file = await loadHarness('pcm_s24be.aiff');
+    const source = readAiffPcm(file);
+    expect(source.format).toBe('s24');
+    expect(source.endian).toBe('be');
+
+    const rewritten = rewriteAiffPcmToWav(file, 's16', 'le', source.channels, source.sampleRate);
+    expect(rewritten).toBeDefined();
+    const out = rewritten ?? new Uint8Array();
+    const canonical = writeWav(source, 's16');
+    expect(out).toEqual(canonical);
+
+    const wav = readWavPcm(out);
+    expect(wav.format).toBe('s16');
+    expect(wav.sampleRate).toBe(source.sampleRate);
+    expect(wav.channels).toBe(source.channels);
+    expect(wav.frames).toBe(source.frames);
   });
 
   it('copies little-endian AIFF-C PCM directly into canonical WAV payload bytes', () => {

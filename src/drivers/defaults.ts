@@ -26,6 +26,9 @@ import type {
   DriverModule,
   EncodedChunk,
   EncoderConfig,
+  FilterDriver,
+  FilterSpec,
+  FilterSubstrate,
   MuxOptions,
   Muxer,
   Packet,
@@ -40,9 +43,6 @@ import type {
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import type { PcmAudio } from '../dsp/index.ts';
-import { AudioDspFilterModule } from '../filters/audio-dsp.ts';
-import { CpuVideoFilterModule } from '../filters/cpu-video.ts';
-import { GpuVideoFilterModule } from '../filters/gpu-video.ts';
 import { AdtsModule } from './adts/adts-driver.ts';
 import { AiffModule } from './aiff/aiff-driver.ts';
 import { CafModule } from './caf/caf-driver.ts';
@@ -80,14 +80,12 @@ export function registerDefaultDrivers(reg: Registry): void {
     CafModule,
     WebcodecsVideoModule,
     WebCodecsAudioModule,
-    GpuVideoFilterModule,
-    AudioDspFilterModule, // audio filters (resample/remix/gain) over AudioData (ADR-033)
-    CpuVideoFilterModule, // CPU video filter fallback (no-WebGPU browsers): colorspace/tonemap/geometry (ADR-038)
     // All software codec tails now co-vendor their wasm via scripts/vendor-wasm.ts (rust both-files pairs:
     // Vorbis/AAC/MP3 + dav1d AV1; self-contained inlined tails: Opus/VPx) for the lazy import.meta.url load
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
   for (const mod of modules) mod.register(reg);
+  for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
   (reg as Registry & { addImageOps?: (ops: ImageOps) => void }).addImageOps?.(lazyImageOps());
   reg.addContainer(lazyMpegTsContainerDriver());
   reg.addContainer(lazyFlacContainerDriver());
@@ -235,6 +233,7 @@ function videoDecode(q: CodecQuery): boolean {
 }
 
 type LazyContainerLoader = () => Promise<ContainerDriver>;
+type LazyFilterLoader = () => Promise<FilterDriver>;
 
 const TS_MIMES = new Set([
   'video/mp2t',
@@ -486,6 +485,173 @@ function missingLazyMethod(id: string, method: string): CapabilityError {
   });
 }
 
+function lazyFilterDrivers(): readonly FilterDriver[] {
+  return [
+    lazyFilter({
+      id: 'webgpu-video-filter',
+      substrate: 'webgpu',
+      supports: webgpuFilterSupports,
+      load: () => import('../filters/gpu-video.ts').then((m) => m.webgpuVideoFilterDriver),
+    }),
+    lazyFilter({
+      id: 'canvas2d-video-filter',
+      substrate: 'canvas2d',
+      supports: canvas2dFilterSupports,
+      load: () => import('../filters/gpu-video.ts').then((m) => m.canvas2dVideoFilterDriver),
+    }),
+    lazyFilter({
+      id: 'audio-dsp-filter',
+      substrate: 'native',
+      supports: (spec) => spec.mediaType === 'audio' && typeof AudioData !== 'undefined',
+      load: () => import('../filters/audio-dsp.ts').then((m) => m.audioDspFilterDriver),
+    }),
+    lazyFilter({
+      id: 'cpu-video-filter',
+      substrate: 'native',
+      supports: (spec) => spec.mediaType === 'video' && typeof VideoFrame !== 'undefined',
+      load: () => import('../filters/cpu-video.ts').then((m) => m.cpuVideoFilterDriver),
+    }),
+  ];
+}
+
+function lazyFilter(options: {
+  readonly id: string;
+  readonly substrate: FilterSubstrate;
+  readonly supports: (spec: FilterSpec) => boolean;
+  readonly load: LazyFilterLoader;
+}): FilterDriver {
+  let driver: FilterDriver | undefined;
+  let loadPromise: Promise<FilterDriver> | undefined;
+  const load = async (): Promise<FilterDriver> => {
+    if (driver !== undefined) return driver;
+    loadPromise ??= options.load();
+    driver = await loadPromise;
+    return driver;
+  };
+  return {
+    id: options.id,
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'filter',
+    substrate: options.substrate,
+    supports: options.supports,
+    createFilter(
+      spec: FilterSpec,
+      stage?: StageOptions,
+    ): TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData> {
+      if (!options.supports(spec)) {
+        throw new CapabilityError(
+          'capability-miss',
+          `${options.id} does not support ${spec.type}`,
+          {
+            op: 'filter',
+            tried: [options.id],
+          },
+        );
+      }
+      return createLazyFilterStream(async () => (await load()).createFilter(spec, stage));
+    },
+  };
+}
+
+function createLazyFilterStream(
+  create: () => Promise<
+    TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData>
+  >,
+): TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData> {
+  let writer: WritableStreamDefaultWriter<RawFrame> | undefined;
+  let reader: ReadableStreamDefaultReader<RawFrame> | undefined;
+  let pump: Promise<void> | undefined;
+
+  const ensure = async (
+    controller: TransformStreamDefaultController<RawFrame>,
+  ): Promise<WritableStreamDefaultWriter<RawFrame>> => {
+    if (writer !== undefined) return writer;
+    const stream = (await create()) as TransformStream<RawFrame, RawFrame>;
+    writer = stream.writable.getWriter();
+    reader = stream.readable.getReader();
+    pump = (async (): Promise<void> => {
+      const activeReader = reader;
+      if (activeReader === undefined) return;
+      try {
+        for (;;) {
+          const { done, value } = await activeReader.read();
+          if (done) return;
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        activeReader.releaseLock();
+      }
+    })();
+    return writer;
+  };
+
+  return new TransformStream<RawFrame, RawFrame>(
+    {
+      async transform(frame, controller): Promise<void> {
+        let activeWriter: WritableStreamDefaultWriter<RawFrame>;
+        try {
+          activeWriter = await ensure(controller);
+        } catch (error) {
+          frame.close();
+          throw error;
+        }
+        await activeWriter.write(frame);
+      },
+      async flush(): Promise<void> {
+        if (writer === undefined) return;
+        await writer.close();
+        await pump;
+      },
+    },
+    { highWaterMark: 0 },
+    { highWaterMark: 0 },
+  ) as TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData>;
+}
+
+function webgpuFilterSupports(spec: FilterSpec): boolean {
+  return spec.mediaType === 'video' && webgpuAvailable();
+}
+
+function canvas2dFilterSupports(spec: FilterSpec): boolean {
+  if (!canvas2dAvailable()) return false;
+  if (isGeometricVideoFilterSpec(spec)) return true;
+  return spec.mediaType === 'video' && spec.type === 'colorspace' && isDisplayColorToken(spec.to);
+}
+
+function webgpuAvailable(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  if (/\bFirefox\//.test(ua)) return false;
+  return (
+    typeof navigator !== 'undefined' &&
+    typeof (navigator as Navigator & { gpu?: unknown }).gpu !== 'undefined' &&
+    typeof OffscreenCanvas !== 'undefined' &&
+    typeof VideoFrame !== 'undefined'
+  );
+}
+
+function canvas2dAvailable(): boolean {
+  return typeof OffscreenCanvas !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+function isGeometricVideoFilterSpec(spec: FilterSpec): boolean {
+  return (
+    spec.mediaType === 'video' &&
+    (spec.type === 'resize' ||
+      spec.type === 'crop' ||
+      spec.type === 'rotate' ||
+      spec.type === 'flip')
+  );
+}
+
+function isDisplayColorToken(token: string): boolean {
+  const key = token.toLowerCase().replace(/[\s._-]/g, '');
+  return (
+    key === 'srgb' || key === 'iec6196621' || key === 'bt709' || key === 'rec709' || key === '709'
+  );
+}
+
 class LazyFlacMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
   readonly #load: LazyContainerLoader;
@@ -611,6 +777,9 @@ class LazyContainerMuxer implements Muxer {
   addTrack(info: TrackInfo): number {
     const id = this.#tracks.length;
     this.#tracks.push(info);
+    if (this.#muxer !== undefined) {
+      this.#targetTrackIds[id] = this.#muxer.addTrack(info);
+    }
     return id;
   }
 

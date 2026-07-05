@@ -22,10 +22,11 @@ import {
   type PacketMetadata,
   type Registry,
   type StageOptions,
+  type StreamCopyOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import { OggMuxer } from './ogg-write.ts';
+import { type ChunkStruct, OggMuxer, trackStateFrom, writeOgg } from './ogg-write.ts';
 
 const OGG_MIMES = new Set(['audio/ogg', 'video/ogg', 'application/ogg', 'audio/opus']);
 const OGG_EXTENSIONS = new Set(['ogg', 'oga', 'ogv', 'opus', 'spx']);
@@ -571,6 +572,97 @@ function oggPacketMetadata(table: PacketInfoTable): readonly PacketMetadata[] {
   });
 }
 
+function validateOggStreamCopyTarget(container: string | undefined): void {
+  if (container === undefined || container === 'ogg') return;
+  throw new CapabilityError('capability-miss', `Ogg stream-copy cannot write '${container}'`, {
+    op: { op: 'streamCopy', container },
+    tried: ['ogg'],
+  });
+}
+
+function validateOggTrimRange(
+  durationSec: number | undefined,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+): void {
+  if (!Number.isFinite(trim.startSec) || !Number.isFinite(trim.endSec)) {
+    throw new InputError('unsupported-input', 'bad trim');
+  }
+  if (durationSec === undefined || !Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new MediaError('demux-error', 'Ogg trim needs a finite source duration');
+  }
+  if (trim.startSec < 0) throw new InputError('unsupported-input', 'trim start < 0');
+  if (trim.endSec <= trim.startSec) {
+    throw new InputError(
+      'unsupported-input',
+      trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range',
+    );
+  }
+  if (trim.startSec >= durationSec) {
+    throw new InputError('unsupported-input', 'trim start >= duration');
+  }
+  if (trim.endSec > durationSec + 1e-3) {
+    throw new InputError('unsupported-input', 'trim end > duration');
+  }
+}
+
+function writeOggPacketCopyTrim(
+  bytes: Uint8Array,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+): Uint8Array {
+  const table = oggPacketInfoTable(bytes);
+  const track = table.tracks[0];
+  if (track === undefined || track.mediaType !== 'audio') {
+    throw new CapabilityError('capability-miss', 'Ogg trim needs one audio track', {
+      op: 'trim',
+      tried: ['ogg'],
+    });
+  }
+  validateOggTrimRange(track.durationSec, trim);
+
+  const startUs = Math.round(trim.startSec * MICROS_PER_SECOND);
+  const endUs = Math.round(trim.endSec * MICROS_PER_SECOND);
+  const chunks: ChunkStruct[] = [];
+  let baseUs: number | undefined;
+  for (const packet of table.packets) {
+    const offset = packet.offset;
+    const durationUs = packet.durationUs;
+    if (offset === undefined || durationUs === undefined) {
+      throw new MediaError(
+        'demux-error',
+        'Ogg trim packet table is missing byte or duration facts',
+      );
+    }
+    const packetStartUs = Math.round(packet.ptsUs);
+    const packetDurationUs = Math.round(durationUs);
+    const packetEndUs = packetStartUs + packetDurationUs;
+    if (packetEndUs <= startUs || packetStartUs >= endUs) continue;
+    baseUs ??= packetStartUs;
+    chunks.push({
+      timestampUs: Math.max(0, packetStartUs - baseUs),
+      durationUs: packetDurationUs,
+      key: packet.keyframe,
+      data: bytes.subarray(offset, offset + packet.size),
+    });
+  }
+  if (chunks.length === 0) throw new MediaError('mux-error', 'Ogg trim selected no audio packets');
+
+  const state = trackStateFrom({
+    ...track,
+    durationSec: Math.max(0, endUs - startUs) / MICROS_PER_SECOND,
+  });
+  state.chunks.push(...chunks);
+  return writeOgg(state);
+}
+
+function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
 const HEAD_BYTES = 1 << 16;
 const SMALL_PROBE_BYTES = 256 * 1024;
 
@@ -681,6 +773,7 @@ export const OggDriver: ContainerDriver = {
   kind: 'container',
   formats: ['ogg'],
   supports: matches,
+  validatesStreamCopyTrim: true,
   async probe(src: ByteSource): Promise<readonly TrackInfo[]> {
     const head = await readHead(src);
     return [trackFromInfo(parseOgg(head, await readTail(src, head)))];
@@ -718,6 +811,16 @@ export const OggDriver: ContainerDriver = {
     // The EncodedChunk-seam adapter over the Ogg page writer ({@link OggMuxer}); the packet→page lacing
     // + granule timing is pure + Node-validated, only the per-chunk `copyTo` is browser-only (ogg-write.ts).
     return new OggMuxer(o);
+  },
+  async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
+    validateOggStreamCopyTarget(o?.container);
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const trim = o?.trim;
+    if (trim === undefined) return byteStream(bytes);
+    const out = writeOggPacketCopyTrim(bytes, trim);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return byteStream(out);
   },
 };
 

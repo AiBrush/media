@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-04T16:33:14.940Z",
+  "generatedFrom": "2026-07-05T00:50:27.780Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-06-22T17-27-07-652Z.json",
@@ -456,180 +456,64 @@
     "chromium-2026-07-04T17-09-44-086Z.json",
     "chromium-2026-07-04T17-19-02-555Z.json",
     "chromium-2026-07-04T17-22-40-041Z.json",
-    "chromium-2026-07-04T14-27-06-069Z.json",
-    "chromium-2026-07-04T14-32-20-693Z.json",
-    "chromium-2026-07-04T14-39-47-464Z.json",
-    "chromium-2026-07-04T14-46-24-529Z.json",
-    "chromium-2026-07-04T15-13-01-262Z.json",
-    "chromium-2026-07-04T15-20-32-071Z.json",
-    "chromium-2026-07-04T15-34-20-479Z.json",
-    "chromium-2026-07-04T15-36-24-157Z.json",
-    "chromium-2026-07-04T15-58-11-435Z.json",
-    "chromium-2026-07-04T15-58-44-306Z.json",
-    "chromium-2026-07-04T15-59-05-483Z.json",
-    "chromium-2026-07-04T16-03-50-763Z.json",
-    "chromium-2026-07-04T16-10-14-687Z.json",
-    "chromium-2026-07-04T16-20-01-411Z.json",
-    "chromium-2026-07-04T16-21-53-844Z.json",
-    "chromium-2026-07-04T16-27-33-067Z.json",
-    "chromium-2026-07-04T16-30-12-331Z.json",
-    "chromium-2026-07-04T16-33-13-068Z.json"
+    "chromium-2026-07-04T22-16-41-889Z.json",
+    "chromium-2026-07-04T22-17-54-875Z.json",
+    "chromium-2026-07-04T22-21-17-575Z.json",
+    "chromium-2026-07-04T22-23-41-586Z.json",
+    "chromium-2026-07-04T22-30-21-023Z.json",
+    "chromium-2026-07-04T22-35-57-948Z.json",
+    "chromium-2026-07-04T22-38-44-233Z.json",
+    "chromium-2026-07-04T22-40-20-723Z.json",
+    "chromium-2026-07-04T22-42-01-335Z.json",
+    "chromium-2026-07-04T22-42-45-025Z.json",
+    "chromium-2026-07-04T22-45-01-457Z.json",
+    "chromium-2026-07-04T22-49-35-394Z.json",
+    "chromium-2026-07-04T22-53-40-329Z.json",
+    "chromium-2026-07-04T22-58-17-584Z.json",
+    "chromium-2026-07-04T23-02-43-152Z.json",
+    "chromium-2026-07-04T23-05-58-192Z.json",
+    "chromium-2026-07-04T23-07-37-888Z.json",
+    "chromium-2026-07-04T23-12-00-574Z.json",
+    "chromium-2026-07-04T23-13-43-860Z.json",
+    "chromium-2026-07-04T23-17-16-669Z.json",
+    "chromium-2026-07-04T23-20-09-730Z.json",
+    "chromium-2026-07-04T23-25-24-723Z.json",
+    "chromium-2026-07-04T23-29-40-016Z.json",
+    "chromium-2026-07-04T23-31-25-215Z.json",
+    "chromium-2026-07-04T23-32-21-777Z.json",
+    "chromium-2026-07-04T23-37-26-801Z.json",
+    "chromium-2026-07-04T23-38-12-466Z.json",
+    "chromium-2026-07-04T23-39-05-338Z.json",
+    "chromium-2026-07-04T23-39-58-002Z.json",
+    "chromium-2026-07-04T23-43-38-514Z.json",
+    "chromium-2026-07-04T23-46-36-129Z.json",
+    "chromium-2026-07-04T23-50-22-771Z.json",
+    "chromium-2026-07-04T23-56-19-801Z.json",
+    "chromium-2026-07-04T23-57-21-268Z.json",
+    "chromium-2026-07-04T23-58-14-196Z.json",
+    "chromium-2026-07-04T23-59-06-062Z.json",
+    "chromium-2026-07-04T23-59-50-679Z.json",
+    "chromium-2026-07-05T00-00-51-411Z.json",
+    "chromium-2026-07-05T00-12-12-846Z.json",
+    "chromium-2026-07-05T00-16-37-763Z.json",
+    "chromium-2026-07-05T00-22-20-233Z.json",
+    "chromium-2026-07-05T00-28-04-434Z.json",
+    "chromium-2026-07-05T00-38-57-872Z.json",
+    "chromium-2026-07-05T00-42-45-168Z.json",
+    "chromium-2026-07-05T00-44-19-213Z.json",
+    "chromium-2026-07-05T00-50-06-496Z.json"
   ],
-  "contested": 445,
-  "rawLossCount": 184,
-  "activeLossCount": 183,
+  "contested": 446,
+  "rawLossCount": 166,
+  "activeLossCount": 165,
   "exemptLossCount": 1,
   "tiers": {
     "catastrophic": 0,
     "severe": 0,
-    "moderate": 1,
-    "minor": 182
+    "moderate": 0,
+    "minor": 165
   },
   "losses": [
-    {
-      "s": "transcode/opus_to_aac_mp4",
-      "fam": "transcode",
-      "our": 292.75,
-      "comp": "mediabunny",
-      "cw": 96.78499999642372,
-      "ratio": 3.0247455701897747
-    },
-    {
-      "s": "mux/mp4_progressive_buffer",
-      "fam": "mux",
-      "our": 268.0600000023842,
-      "comp": "mediabunny",
-      "cw": 89.45999997854233,
-      "ratio": 2.9964229830838414
-    },
-    {
-      "s": "trim/h264_start_zero_copy",
-      "fam": "trim",
-      "our": 117.5,
-      "comp": "mediabunny",
-      "cw": 39.58500000834465,
-      "ratio": 2.968296071118621
-    },
-    {
-      "s": "probe/tiny_vp9_360p_2s",
-      "fam": "probe",
-      "our": 9.560000002384186,
-      "comp": "mediabunny",
-      "cw": 3.225000023841858,
-      "ratio": 2.964341064095748
-    },
-    {
-      "s": "trim/massive_h264_copy_sustained",
-      "fam": "trim",
-      "our": 15491.45000000298,
-      "comp": "mediabunny",
-      "cw": 5321.009999990463,
-      "ratio": 2.911373968481688
-    },
-    {
-      "s": "mux/h264_aac_to_mkv",
-      "fam": "mux",
-      "our": 280.52500000596046,
-      "comp": "mediabunny",
-      "cw": 96.36000001430511,
-      "ratio": 2.911218347491855
-    },
-    {
-      "s": "probe/h264_rotated90",
-      "fam": "probe",
-      "our": 15.834999993443489,
-      "comp": "remotion-media-parser",
-      "cw": 5.484999984502792,
-      "ratio": 2.8869644554573157
-    },
-    {
-      "s": "audio-dsp/meta_roundtrip_endianness_s16",
-      "fam": "audio-dsp",
-      "our": 29.134999990463257,
-      "comp": "mediabunny",
-      "cw": 10.094999998807907,
-      "ratio": 2.886082218316368
-    },
-    {
-      "s": "audio-dsp/pcm_s24be_to_s16le",
-      "fam": "audio-dsp",
-      "our": 40.820000007748604,
-      "comp": "ffmpeg.wasm",
-      "cw": 14.629999995231628,
-      "ratio": 2.7901572126488796
-    },
-    {
-      "s": "mux/prop_h264_decode_mux_mp4_to_mp4",
-      "fam": "mux",
-      "our": 266.1050000041723,
-      "comp": "mediabunny",
-      "cw": 95.52500000596046,
-      "ratio": 2.7857105468470893
-    },
-    {
-      "s": "probe/av1_720p_5s",
-      "fam": "probe",
-      "our": 19.219999998807907,
-      "comp": "mediabunny",
-      "cw": 6.909999996423721,
-      "ratio": 2.7814761228299916
-    },
-    {
-      "s": "probe/wav_s24",
-      "fam": "probe",
-      "our": 11.53999999165535,
-      "comp": "remotion-webcodecs",
-      "cw": 4.185000002384186,
-      "ratio": 2.7574671409990525
-    },
-    {
-      "s": "mux/h264_aac_to_mov",
-      "fam": "mux",
-      "our": 299.6350000053644,
-      "comp": "mediabunny",
-      "cw": 110.45999997854233,
-      "ratio": 2.7126109004487664
-    },
-    {
-      "s": "probe/micro_h264_1frame",
-      "fam": "probe",
-      "our": 13.694999992847443,
-      "comp": "mediabunny",
-      "cw": 5.094999998807907,
-      "ratio": 2.6879293417177044
-    },
-    {
-      "s": "trim/large_h264_frame_accurate_throughput",
-      "fam": "trim",
-      "our": 1948.5450000017881,
-      "comp": "mediabunny",
-      "cw": 738.2150000035763,
-      "ratio": 2.6395359075504405
-    },
-    {
-      "s": "transcode/wav_to_flac",
-      "fam": "transcode",
-      "our": 106.3999999910593,
-      "comp": "ffmpeg.wasm",
-      "cw": 40.53000000119209,
-      "ratio": 2.625215889166785
-    },
-    {
-      "s": "transcode/mp3_to_aac_mp4",
-      "fam": "transcode",
-      "our": 224.22000001370907,
-      "comp": "mediabunny",
-      "cw": 85.72999998927116,
-      "ratio": 2.615420506727744
-    },
-    {
-      "s": "trim/audio_opus_ogg_copy",
-      "fam": "trim",
-      "our": 18.810000002384186,
-      "comp": "mediabunny",
-      "cw": 7.259999990463257,
-      "ratio": 2.590909094640912
-    },
     {
       "s": "mux/h264_aac_to_ts",
       "fam": "mux",

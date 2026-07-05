@@ -77,9 +77,11 @@ async function main() {
   let everyFrame1024 = true;
   let allFinite = true;
   let nonSilent = false;
+  const perFramePcm = [];
 
   for (const payload of frames) {
     const pcm = dec.decode(payload);
+    perFramePcm.push(pcm);
     const n = decChannels > 0 ? pcm.length / decChannels : 0;
     if (n === 0) continue;
     decodedFrames++;
@@ -92,6 +94,37 @@ async function main() {
     }
   }
   dec.free();
+
+  let payloadBytes = 0;
+  for (const payload of frames) payloadBytes += payload.byteLength;
+  const batchData = new Uint8Array(payloadBytes);
+  const batchOffsets = new Uint32Array(frames.length + 1);
+  let payloadOffset = 0;
+  for (let i = 0; i < frames.length; i++) {
+    const payload = frames[i];
+    batchData.set(payload, payloadOffset);
+    payloadOffset += payload.byteLength;
+    batchOffsets[i + 1] = payloadOffset;
+  }
+  const batchDec = new mod.AacWasm(new Uint8Array(0), channels, sampleRate);
+  const batchPcm = batchDec.decodeMany(batchData, batchOffsets);
+  batchDec.free();
+  let perFrameLength = 0;
+  for (const pcm of perFramePcm) perFrameLength += pcm.length;
+  let batchMatchesPerFrame = batchPcm.length === perFrameLength;
+  if (batchMatchesPerFrame) {
+    let offset = 0;
+    for (const pcm of perFramePcm) {
+      for (let i = 0; i < pcm.length; i++) {
+        if (batchPcm[offset + i] !== pcm[i]) {
+          batchMatchesPerFrame = false;
+          break;
+        }
+      }
+      if (!batchMatchesPerFrame) break;
+      offset += pcm.length;
+    }
+  }
 
   process.stdout.write(
     JSON.stringify({
@@ -106,6 +139,7 @@ async function main() {
       everyFrame1024,
       allFinite,
       nonSilent,
+      batchMatchesPerFrame,
     }),
   );
 }

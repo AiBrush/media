@@ -18,6 +18,8 @@ declare module './aac-core.js' {
     readonly sampleRate: number;
     /** Decode one raw AAC packet (no ADTS header) → interleaved f32 (`frames × channels`). */
     decode(data: Uint8Array): Float32Array;
+    /** Decode many concatenated raw AAC packets using a packet-boundary offset table. */
+    decodeMany(data: Uint8Array, offsets: Uint32Array): Float32Array;
     /** Reset decoder state at a discontinuity. */
     reset(): void;
     /** Release the native decoder. */

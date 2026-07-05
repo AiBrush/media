@@ -324,6 +324,22 @@ function readLayout(bytes: Uint8Array): AdtsLayout {
   };
 }
 
+export function adtsPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
+  const layout = readLayout(bytes);
+  return {
+    tracks: [trackInfoFromLayout(layout)],
+    packets: layout.frames.map((frame) => ({
+      trackIndex: 0,
+      offset: frame.offset,
+      size: frame.size,
+      ptsUs: frame.ptsUs,
+      dtsUs: frame.ptsUs,
+      durationUs: frame.durationUs,
+      keyframe: true,
+    })),
+  };
+}
+
 function trackInfoFromLayout(layout: AdtsLayout): TrackInfo {
   return {
     id: 0,
@@ -791,19 +807,7 @@ export const AdtsDriver = {
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
     const bytes = await readAll(src);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    const layout = readLayout(bytes);
-    return {
-      tracks: [trackInfoFromLayout(layout)],
-      packets: layout.frames.map((frame) => ({
-        trackIndex: 0,
-        offset: frame.offset,
-        size: frame.size,
-        ptsUs: frame.ptsUs,
-        dtsUs: frame.ptsUs,
-        durationUs: frame.durationUs,
-        keyframe: true,
-      })),
-    };
+    return adtsPacketInfoFromBytes(bytes);
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     // A raw ADTS stream has no front index — every frame's geometry lives inline, so `packets()` needs the

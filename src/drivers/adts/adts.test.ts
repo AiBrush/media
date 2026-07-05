@@ -8,6 +8,7 @@ import { Mp3Driver } from '../mp3/mp3-driver.ts';
 import {
   AdtsDriver,
   adtsAacPcmDecodePlan,
+  adtsPacketInfoFromBytes,
   adtsTrimFromBytes,
   adtsTrimFromUrl,
   concatPcmChunks,
@@ -194,6 +195,7 @@ describe('probe ADTS — real corpus', () => {
     if (AdtsDriver.packetInfo === undefined) throw new Error('expected ADTS packetInfo');
     const bytes = await loadFixture('sfx.adts');
     const table = await AdtsDriver.packetInfo(fromBytes(bytes, { mime: 'audio/aac' }));
+    expect(adtsPacketInfoFromBytes(bytes)).toEqual(table);
     const frames = enumerateAdtsFrames(bytes);
 
     expect(table.tracks[0]?.codec).toBe('mp4a.40.2');
@@ -451,6 +453,14 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
     expect(Array.from({ length: 7 }, (_, index) => dv.getInt16(index * 2, true))).toEqual([
       -32768, -32768, -16384, 0, 16384, 32767, 32767,
     ]);
+  });
+
+  it('writes direct s16 samples correctly when the destination is not Int16Array-aligned', () => {
+    const out = new Uint8Array(7);
+    const dv = new DataView(out.buffer);
+    const end = writeInterleavedF32S16le(dv, 1, new Float32Array([-0.25, 0.25, 1.25]));
+    expect(end).toBe(out.byteLength);
+    expect(Array.from(out)).toEqual([0, 0, 224, 0, 32, 255, 127]);
   });
 
   it('converts interleaved f32 decoder output into canonical planar PCM', () => {

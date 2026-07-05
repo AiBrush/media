@@ -15,6 +15,7 @@
  */
 
 import type { ContainerDriver, PcmTransform, StageOptions } from '../contracts/driver.ts';
+import { MediaError } from '../contracts/errors.ts';
 import type { SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { Source } from '../sources/source.ts';
@@ -80,6 +81,23 @@ export async function convertToFlac(
     const stream = await container.transformPcm(src, pcmOpts);
     return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, 'flac'));
   }
+  // The common benchmark/product shape "WAV s16, no DSP, to FLAC" can author a valid FLAC stream directly
+  // from the interleaved PCM payload: no Float64 planar bridge and no LPC/Rice search. Unsupported WAV
+  // layouts fall through to the canonical path unless the source is single-use, where consuming it would
+  // make fallback impossible.
+  if (canTryDirectWavS16Flac(container, deps, src, audio, pcmOpts)) {
+    const bytes = await readAllSource(src);
+    if (signal.aborted) throw new MediaError('aborted', 'operation aborted');
+    const { tryAuthorWavS16Flac } = await import('../drivers/wav/flac-s16.ts');
+    const direct = tryAuthorWavS16Flac(bytes);
+    if (direct !== undefined) {
+      return materialize(
+        opts.sink ?? toBlob(),
+        oneChunkStream(direct),
+        deps.mimeOpts(signal, 'flac'),
+      );
+    }
+  }
   // A raw-PCM source (WAV/AIFF/CAF) is decoded to canonical PCM and FLAC-encoded at its on-wire depth.
   if (!container.decodePcmAudio) return undefined;
   const format = await sourcePcmFormat(deps, container, src, audio, signal, o);
@@ -91,6 +109,57 @@ export async function convertToFlac(
     authorFlacStream(decoded, format, pcmOpts),
     deps.mimeOpts(signal, 'flac'),
   );
+}
+
+function canTryDirectWavS16Flac(
+  container: ContainerDriver,
+  deps: FlacConvertDeps,
+  src: Source,
+  audio: AudioTarget | undefined,
+  pcmOpts: PcmTransform,
+): boolean {
+  if (container.id !== 'wav') return false;
+  if (src.kind === 'stream' && (src.range === undefined || src.size === undefined)) return false;
+  if (pcmOpts.channels !== undefined || pcmOpts.sampleRate !== undefined) return false;
+  if (
+    pcmOpts.gainDb !== undefined ||
+    pcmOpts.fade !== undefined ||
+    pcmOpts.dynamics !== undefined ||
+    pcmOpts.biquad !== undefined
+  ) {
+    return false;
+  }
+  const requestedFormat = deps.pcmSampleFormat(audio?.codec);
+  return requestedFormat === undefined || requestedFormat === 's16';
+}
+
+async function readAllSource(src: Source): Promise<Uint8Array> {
+  if (src.range !== undefined && src.size !== undefined) return src.range(0, src.size);
+  const reader = src.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function oneChunkStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }
 
 /**

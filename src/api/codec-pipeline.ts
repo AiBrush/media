@@ -23,6 +23,7 @@ import { closeFrame } from '../kernel/frames.ts';
 import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
 
 export {
+  audioTargetCanBypassFilterPlanner,
   chooseOutputContainer,
   containerHasChunkMuxer,
   hasTrackSelection,

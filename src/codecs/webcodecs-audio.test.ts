@@ -13,6 +13,7 @@ import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import WebCodecsAudioModule, {
   AUDIO_CODEC_PREFIXES,
   BACKPRESSURE_THRESHOLD,
+  awaitAudioCodecQueueDrain,
   type EnqueueSink,
   decoderConfigFromEncoderMeta,
   decoderErrorToCapabilityMiss,
@@ -262,6 +263,50 @@ describe('shouldApplyBackpressure — pace against the coder queue', () => {
   it('honors an explicit threshold override', () => {
     expect(shouldApplyBackpressure(2, 4)).toBe(false);
     expect(shouldApplyBackpressure(4, 4)).toBe(true);
+  });
+});
+
+describe('awaitAudioCodecQueueDrain — event-driven WebCodecs audio pacing', () => {
+  class FakeCodecQueue extends EventTarget {
+    queueSize: number = BACKPRESSURE_THRESHOLD;
+
+    drainTo(queueSize: number): void {
+      this.queueSize = queueSize;
+      this.dispatchEvent(new Event('dequeue'));
+    }
+  }
+
+  it('resolves on dequeue once the queue falls below the threshold', async () => {
+    const codec = new FakeCodecQueue();
+    let resolved = false;
+    const pending = awaitAudioCodecQueueDrain(codec, () => codec.queueSize, undefined).then(() => {
+      resolved = true;
+    });
+
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    codec.drainTo(BACKPRESSURE_THRESHOLD - 1);
+    await pending;
+    expect(resolved).toBe(true);
+  });
+
+  it('resolves on abort even when no dequeue event fires', async () => {
+    const codec = new FakeCodecQueue();
+    const controller = new AbortController();
+    let resolved = false;
+    const pending = awaitAudioCodecQueueDrain(codec, () => codec.queueSize, controller.signal).then(
+      () => {
+        resolved = true;
+      },
+    );
+
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    controller.abort();
+    await pending;
+    expect(resolved).toBe(true);
   });
 });
 

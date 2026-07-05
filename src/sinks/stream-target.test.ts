@@ -129,6 +129,44 @@ describe('writeToStreamTarget — callback destination', () => {
     expect((err as MediaError).code).toBe('mux-error');
     expect(cancelled).toBe(true);
   });
+
+  it('preserves typed callback failures without remapping their code', async () => {
+    const writer: StreamTargetWriter = () => {
+      throw new MediaError('encode-error', 'typed callback failure');
+    };
+    const err = await writeToStreamTarget(toStreamTarget(writer), bytesStream([1])).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('encode-error');
+  });
+
+  it('maps abort-shaped and non-Error callback throws into typed errors', async () => {
+    const abortLike =
+      typeof DOMException !== 'undefined'
+        ? new DOMException('callback aborted', 'AbortError')
+        : Object.assign(new Error('callback aborted'), { name: 'AbortError' });
+    const abortingWriter: StreamTargetWriter = () => {
+      throw abortLike;
+    };
+    const abortErr = await writeToStreamTarget(
+      toStreamTarget(abortingWriter),
+      bytesStream([1]),
+    ).catch((e: unknown) => e);
+    expect(abortErr).toBeInstanceOf(MediaError);
+    expect((abortErr as MediaError).code).toBe('aborted');
+
+    const stringWriter: StreamTargetWriter = () => {
+      throw 'plain callback failure';
+    };
+    const stringErr = await writeToStreamTarget(
+      toStreamTarget(stringWriter),
+      bytesStream([1]),
+    ).catch((e: unknown) => e);
+    expect(stringErr).toBeInstanceOf(MediaError);
+    expect((stringErr as MediaError).code).toBe('mux-error');
+    expect((stringErr as MediaError).message).toContain('plain callback failure');
+  });
 });
 
 describe('writeToStreamTarget — cancellation', () => {
