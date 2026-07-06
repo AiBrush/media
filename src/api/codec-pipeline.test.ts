@@ -8,8 +8,16 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { EncodedChunk, FilterSpec, Packet, TrackInfo } from '../contracts/driver.ts';
-import { CapabilityError, InputError } from '../contracts/errors.ts';
+import type {
+  DecoderConfig,
+  EncodedChunk,
+  FilterSpec,
+  Packet,
+  RawFrame,
+  StageOptions,
+  TrackInfo,
+} from '../contracts/driver.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { audioFilterSpecs } from './audio-stream-plan.ts';
 import {
   audioCodecToken,
@@ -20,6 +28,7 @@ import {
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
   buildVideoEncoderConfigForRuntime,
+  canUseVpxAlphaPacketTranscode,
   chooseOutputContainer,
   containerHasChunkMuxer,
   drainEncoderToMuxer,
@@ -40,9 +49,12 @@ import {
   seekFrame,
   selectTrackInfos,
   splitRgbaForVpxAlpha,
+  transcodeVpxAlphaPackets,
   videoCodecToken,
   videoEncoderCodecString,
   videoTrackInfoFromDecoderConfig,
+  vpxAlphaI420FromPackedRgba,
+  vpxAlphaI420FromPlane,
   webkitVideoTranscodeDeclineReason,
 } from './codec-pipeline.ts';
 import {
@@ -51,6 +63,7 @@ import {
   planVideoBitDepthConversion,
   planVideoRateControl,
   retimeTimedFrameStream,
+  videoFilterRouteCost,
   videoFilterSpecs,
 } from './video-stream-plan.ts';
 
@@ -81,6 +94,235 @@ describe('splitRgbaForVpxAlpha', () => {
 
     expect([...split.color.data]).toEqual([10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255]);
     expect([...split.alpha.data]).toEqual([0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+  });
+});
+
+describe('vpxAlphaI420FromPackedRgba', () => {
+  it('packs alpha bytes into an I420 luma plane with neutral chroma', () => {
+    const source = new Uint8Array([
+      99, 10, 20, 30, 1, 40, 50, 60, 2, 0, 0, 0, 0, 70, 80, 90, 3, 100, 110, 120, 4,
+    ]);
+    const split = vpxAlphaI420FromPackedRgba(source, 2, 2, { offset: 1, stride: 12 }, 'RGBA');
+
+    expect(split.layout).toEqual([
+      { offset: 0, stride: 2 },
+      { offset: 4, stride: 1 },
+      { offset: 5, stride: 1 },
+    ]);
+    expect([...split.data]).toEqual([1, 2, 3, 4, 128, 128]);
+  });
+
+  it('accepts BGRA and rejects malformed packed alpha sources with typed errors', () => {
+    const bgra = Uint8Array.from([1, 2, 3, 4]);
+    const split = vpxAlphaI420FromPackedRgba(bgra, 1, 1, { offset: 0, stride: 4 }, 'BGRA');
+
+    expect([...split.data]).toEqual([4, 128, 128]);
+    expect(() => vpxAlphaI420FromPackedRgba(bgra, 0, 1, { offset: 0, stride: 4 }, 'RGBA')).toThrow(
+      MediaError,
+    );
+    expect(() => vpxAlphaI420FromPackedRgba(bgra, 1, 1, { offset: 0, stride: 3 }, 'RGBA')).toThrow(
+      MediaError,
+    );
+    expect(() => vpxAlphaI420FromPackedRgba(bgra, 2, 1, { offset: 0, stride: 8 }, 'RGBA')).toThrow(
+      MediaError,
+    );
+    expect(() =>
+      vpxAlphaI420FromPackedRgba(bgra, 1, 1, { offset: 0, stride: 4 }, 'ARGB' as never),
+    ).toThrow(MediaError);
+  });
+});
+
+describe('vpxAlphaI420FromPlane', () => {
+  it('copies a padded full-resolution alpha plane into compact odd-dimension I420', () => {
+    const source = Uint8Array.from([0, 0, 11, 12, 13, 0, 0, 21, 22, 23, 0, 0]);
+    const split = vpxAlphaI420FromPlane(source, 3, 2, { offset: 2, stride: 5 });
+
+    expect(split.layout).toEqual([
+      { offset: 0, stride: 3 },
+      { offset: 6, stride: 2 },
+      { offset: 8, stride: 2 },
+    ]);
+    expect([...split.data]).toEqual([11, 12, 13, 21, 22, 23, 128, 128, 128, 128]);
+  });
+
+  it('rejects invalid alpha plane geometry with typed errors', () => {
+    expect(() => vpxAlphaI420FromPlane(Uint8Array.of(1), 1, 0, { offset: 0, stride: 1 })).toThrow(
+      MediaError,
+    );
+    expect(() => vpxAlphaI420FromPlane(Uint8Array.of(1), 1, 1, { offset: -1, stride: 1 })).toThrow(
+      MediaError,
+    );
+    expect(() => vpxAlphaI420FromPlane(Uint8Array.of(1), 1, 1, { offset: 0, stride: 0 })).toThrow(
+      MediaError,
+    );
+    expect(() => vpxAlphaI420FromPlane(Uint8Array.of(1), 2, 1, { offset: 0, stride: 2 })).toThrow(
+      MediaError,
+    );
+  });
+});
+
+describe('canUseVpxAlphaPacketTranscode', () => {
+  it('allows only unfiltered alpha-preserving packet-plane transcodes', () => {
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp8', alpha: 'keep' }, true)).toBe(true);
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp8', alpha: 'discard' }, true)).toBe(false);
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp8', alpha: 'keep' }, false)).toBe(false);
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', width: 320 }, true)).toBe(
+      false,
+    );
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', fps: 24 }, true)).toBe(
+      false,
+    );
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', rotate: 90 }, true)).toBe(
+      false,
+    );
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', height: 180 }, true)).toBe(
+      false,
+    );
+    expect(
+      canUseVpxAlphaPacketTranscode(
+        { codec: 'vp9', alpha: 'keep', crop: { x: 0, y: 0, width: 16, height: 16 } },
+        true,
+      ),
+    ).toBe(false);
+    expect(canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', flip: 'h' }, true)).toBe(
+      false,
+    );
+    expect(
+      canUseVpxAlphaPacketTranscode(
+        { codec: 'vp9', alpha: 'keep', colorspace: { to: 'bt709' } },
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      canUseVpxAlphaPacketTranscode({ codec: 'vp9', alpha: 'keep', tonemap: { to: 'sdr' } }, true),
+    ).toBe(false);
+  });
+});
+
+describe('transcodeVpxAlphaPackets', () => {
+  interface FakeChunk {
+    readonly label: string;
+    readonly timestamp: number;
+  }
+
+  const chunk = (label: string, timestamp: number): EncodedChunk =>
+    ({ label, timestamp }) as unknown as EncodedChunk;
+
+  const labels = (packets: readonly Packet[]): readonly (readonly [string, string | undefined])[] =>
+    packets.map((packet) => [
+      (packet.chunk as unknown as FakeChunk).label,
+      packet.alpha === undefined ? undefined : (packet.alpha as unknown as FakeChunk).label,
+    ]);
+
+  const passDecoder = (
+    _config: DecoderConfig,
+    _options?: StageOptions,
+  ): TransformStream<EncodedChunk, RawFrame> =>
+    new TransformStream<EncodedChunk, RawFrame>({
+      transform(value, controller): void {
+        controller.enqueue(value as unknown as RawFrame);
+      },
+    });
+
+  const passEncoder = (
+    _config: VideoEncoderConfig,
+    _options?: StageOptions,
+  ): TransformStream<RawFrame, EncodedChunk> =>
+    new TransformStream<RawFrame, EncodedChunk>({
+      transform(value, controller): void {
+        controller.enqueue(value as unknown as EncodedChunk);
+      },
+    });
+
+  const packetTranscodeOptions = {
+    decodeConfig: { codec: 'vp09.00.10.08' },
+    encodeConfig: { codec: 'vp8', width: 2, height: 2 },
+    createDecoder: passDecoder,
+    createEncoder: passEncoder,
+  } satisfies Parameters<typeof transcodeVpxAlphaPackets>[1];
+
+  async function collectPackets(stream: ReadableStream<Packet>): Promise<Packet[]> {
+    const reader = stream.getReader();
+    const packets: Packet[] = [];
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) return packets;
+      packets.push(item.value);
+    }
+  }
+
+  it('pairs independently re-encoded alpha chunks by timestamp and preserves no-alpha color packets', async () => {
+    const out = await collectPackets(
+      transcodeVpxAlphaPackets(
+        streamOf<Packet>([
+          { chunk: chunk('c100', 100), alpha: chunk('a50', 50) as EncodedVideoChunk },
+          { chunk: chunk('c200', 200) },
+          { chunk: chunk('c300', 300), alpha: chunk('a300', 300) as EncodedVideoChunk },
+        ]),
+        packetTranscodeOptions,
+      ),
+    );
+
+    expect(labels(out)).toEqual([
+      ['c100', undefined],
+      ['c200', undefined],
+      ['c300', 'a300'],
+    ]);
+  });
+
+  it('drops cached alpha chunks that are older than the next color timestamp', async () => {
+    const out = await collectPackets(
+      transcodeVpxAlphaPackets(
+        streamOf<Packet>([
+          { chunk: chunk('c100', 100), alpha: chunk('a200', 200) as EncodedVideoChunk },
+          { chunk: chunk('c300', 300) },
+        ]),
+        packetTranscodeOptions,
+      ),
+    );
+
+    expect(labels(out)).toEqual([
+      ['c100', undefined],
+      ['c300', undefined],
+    ]);
+  });
+
+  it('propagates transform errors and cancels the sibling packet branch', async () => {
+    const failingDecoder = (): TransformStream<EncodedChunk, RawFrame> =>
+      new TransformStream<EncodedChunk, RawFrame>({
+        transform(value, controller): void {
+          if ((value as unknown as FakeChunk).label === 'c100') {
+            throw new Error('decode boom');
+          }
+          controller.enqueue(value as unknown as RawFrame);
+        },
+      });
+
+    await expect(
+      collectPackets(
+        transcodeVpxAlphaPackets(
+          streamOf<Packet>([
+            { chunk: chunk('c100', 100), alpha: chunk('a100', 100) as EncodedVideoChunk },
+          ]),
+          { ...packetTranscodeOptions, createDecoder: failingDecoder },
+        ),
+      ),
+    ).rejects.toThrow('decode boom');
+  });
+
+  it('allows downstream cancellation after yielding a packet', async () => {
+    const reader = transcodeVpxAlphaPackets(
+      streamOf<Packet>([
+        { chunk: chunk('c100', 100), alpha: chunk('a200', 200) as EncodedVideoChunk },
+        { chunk: chunk('c300', 300) },
+      ]),
+      packetTranscodeOptions,
+    ).getReader();
+
+    const first = await reader.read();
+    if (first.done) throw new Error('expected a packet before cancellation');
+    expect((first.value.chunk as unknown as FakeChunk).label).toBe('c100');
+    await expect(reader.cancel('test stop')).resolves.toBeUndefined();
   });
 });
 
@@ -358,6 +600,26 @@ describe('videoFilterSpecs', () => {
       typeof videoFilterSpecs
     >[0];
     expect(() => videoFilterSpecs(badTonemap, src)).toThrow(InputError);
+  });
+});
+
+describe('videoFilterRouteCost', () => {
+  it('derives positive finite pixel area and duration for router tiny-workload selection', () => {
+    expect(videoFilterRouteCost({ width: 64, height: 32, durationSec: 0.5 })).toEqual({
+      outputPixels: 2048,
+      mediaSeconds: 0.5,
+    });
+  });
+
+  it('omits unknown or invalid geometry and duration rather than forcing a tiny route', () => {
+    expect(
+      videoFilterRouteCost({
+        width: undefined,
+        height: 1080,
+        durationSec: Number.NaN,
+      }),
+    ).toEqual({});
+    expect(videoFilterRouteCost({ width: 0, height: 1080, durationSec: -1 })).toEqual({});
   });
 });
 

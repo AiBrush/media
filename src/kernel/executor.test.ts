@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Progress } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
-import { collect, composeChain, runToSink } from './executor.ts';
+import { collect, composeChain, lazyPipeThrough, runToSink } from './executor.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -42,6 +42,58 @@ describe('composeChain + collect', () => {
     expect([...out]).toEqual([1, 2, 3, 4, 5]);
     expect(seen.map((p) => p.done)).toEqual([2, 5]);
     expect(seen.every((p) => p.stage === 'collect')).toBe(true);
+  });
+});
+
+describe('lazyPipeThrough', () => {
+  it('does not create or start the stage until a downstream reader pulls', async () => {
+    let created = 0;
+    let transformed = 0;
+    const stream = lazyPipeThrough(bytesStream([1]), () => {
+      created++;
+      return new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, c): void {
+          transformed++;
+          c.enqueue(chunk.map((b) => b + 1));
+        },
+      });
+    });
+
+    await delay(0);
+    expect(created).toBe(0);
+    expect(transformed).toBe(0);
+
+    const reader = stream.getReader();
+    try {
+      await expect(reader.read()).resolves.toMatchObject({
+        done: false,
+        value: new Uint8Array([2]),
+      });
+      expect(created).toBe(1);
+      expect(transformed).toBe(1);
+    } finally {
+      reader.releaseLock();
+    }
+  });
+
+  it('propagates cancellation to the lazily-created pipe once started', async () => {
+    let cancelled = false;
+    const source = new ReadableStream<Uint8Array>({
+      pull(c): void {
+        c.enqueue(new Uint8Array([1]));
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    const reader = lazyPipeThrough(source, inc).getReader();
+    try {
+      await expect(reader.read()).resolves.toMatchObject({ done: false });
+      await reader.cancel('stop');
+      expect(cancelled).toBe(true);
+    } finally {
+      reader.releaseLock();
+    }
   });
 });
 

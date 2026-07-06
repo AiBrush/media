@@ -11,7 +11,10 @@
 
 import type { ImageInfo, ImageOps } from '../codecs/image/index.ts';
 import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
-import type { VideoEncoderStageOptions } from '../codecs/webcodecs-video.ts';
+import type {
+  VideoDecoderStageOptions,
+  VideoEncoderStageOptions,
+} from '../codecs/webcodecs-video.ts';
 import type {
   CodecDriver,
   CodecQuery,
@@ -34,9 +37,10 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
-import { composeChain } from '../kernel/executor.ts';
+import { composeChain, lazyPipeThrough } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
-import { Router } from '../kernel/router.ts';
+import { Router, type StageSelectOptions } from '../kernel/router.ts';
+import type { RouteCost } from '../kernel/tier-thresholds.ts';
 // Only the tiny, DEPENDENCY-FREE worker-mode selectors are statically imported here, from the dedicated
 // `worker-mode.ts` (NOT `worker-bridge.ts`) so the eager kernel never pulls the heavy worker pump/pool or
 // the offload protocol into its closure (doc 08 §7 budget). The actual worker spawn + ensure-pool + offload
@@ -699,15 +703,40 @@ export class MediaEngineImpl implements MediaEngine {
         const { decodeVideoPacketsWithAlpha, seekFrame, unwrapPackets } = await loadCodecPipeline();
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
         const config = await decodeConfigOf(track);
+        const packetInfoRows = (demuxer as DemuxerWithPacketInfoTable).packetInfoTable?.();
+        const trackIndex = demuxer.tracks.findIndex((candidate) => candidate.id === track.id);
+        let packetInfoSeekStream: ReadableStream<EncodedVideoChunk> | undefined;
+        if (
+          track.alpha !== true &&
+          src.range !== undefined &&
+          packetInfoRows !== undefined &&
+          trackIndex >= 0
+        ) {
+          const { planSeekVideoPacketInfoRows, trimVideoPacketInfoChunkStream } = await import(
+            './trim-streams.ts'
+          );
+          const packetInfoSeekRows = planSeekVideoPacketInfoRows(
+            packetInfoRows,
+            trackIndex,
+            timeUs,
+          );
+          if (packetInfoSeekRows !== undefined) {
+            packetInfoSeekStream = trimVideoPacketInfoChunkStream(src, packetInfoSeekRows, signal);
+          }
+        }
         const out =
-          track.alpha === true
-            ? decodeVideoPacketsWithAlpha(
-                await startAtSeekKeyframePackets(demuxer.packets(track.id), timeUs),
-                () => codec.createDecoder(config, stage),
-              )
-            : ((
-                await startAtSeekKeyframe(unwrapPackets(demuxer.packets(track.id)), timeUs)
-              ).pipeThrough(codec.createDecoder(config, stage)) as ReadableStream<VideoFrame>);
+          packetInfoSeekStream !== undefined
+            ? (packetInfoSeekStream.pipeThrough(
+                codec.createDecoder(config, stage),
+              ) as ReadableStream<VideoFrame>)
+            : track.alpha === true
+              ? decodeVideoPacketsWithAlpha(
+                  await startAtSeekKeyframePackets(demuxer.packets(track.id), timeUs),
+                  () => codec.createDecoder(config, stage),
+                )
+              : ((
+                  await startAtSeekKeyframe(unwrapPackets(demuxer.packets(track.id)), timeUs)
+                ).pipeThrough(codec.createDecoder(config, stage)) as ReadableStream<VideoFrame>);
         return await seekFrame(out, timeUs);
         /* v8 ignore stop */
       } finally {
@@ -739,6 +768,16 @@ export class MediaEngineImpl implements MediaEngine {
               ? fastMux.muxSingleTrackOggAudio
               : fastMux.muxPreparedWebmPacketStreams;
         const stream = await muxPrepared(streams, {
+          ...this.#stageOptions(signal, o),
+          container: target,
+        });
+        if (stream) {
+          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+        }
+      }
+      if (opts.fragmented !== true && target === 'ts') {
+        const { muxPreparedMpegTsPacketStreams } = await import('./mpegts-prepared-mux.ts');
+        const stream = await muxPreparedMpegTsPacketStreams(streams, {
           ...this.#stageOptions(signal, o),
           container: target,
         });
@@ -950,8 +989,15 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /** Resolve a filter driver for a spec, loading the first-party defaults on a miss then retrying once. */
-  async #routeFilter(spec: FilterSpec, o: CallOptions): Promise<FilterDriver> {
-    const opts = { determinism: this.#determinism(o) };
+  async #routeFilter(
+    spec: FilterSpec,
+    o: CallOptions,
+    cost?: RouteCost,
+  ): Promise<FilterDriver> {
+    const opts: StageSelectOptions = {
+      determinism: this.#determinism(o),
+      ...(cost !== undefined ? { cost } : {}),
+    };
     try {
       return this.#router.pickFilter(spec, opts);
     } catch (e) {
@@ -1511,36 +1557,54 @@ export class MediaEngineImpl implements MediaEngine {
         // Fail target encode-config errors before creating decode/filter streams. Otherwise a synchronous
         // config miss (for example the benchmark's 1x1 H.264 edge) can reject the encode task while an
         // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
-        const { buildVideoEncoderConfigForRuntime } = await loadCodecPipeline();
+        const {
+          buildVideoEncoderConfigForRuntime,
+          canUseVpxAlphaPacketTranscode,
+          decodeVideoPacketsWithAlpha,
+          unwrapPackets,
+        } = await loadCodecPipeline();
         const videoTarget = opts.video || {};
         const sourceGeometry = sourceGeometryOf(videoTrack);
         await buildVideoEncoderConfigForRuntime(videoTarget, sourceGeometry, videoTrack.codec);
-        // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
-        // the composition below is the live path, browser-validated.
-        const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
-        const { decodeVideoPacketsWithAlpha, unwrapPackets } = await loadCodecPipeline();
-        const config = await decodeConfigOf(videoTrack);
-        /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
-        const decoded =
-          videoTrack.alpha === true
-            ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
-                videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
-              )
-            : unwrapPackets(demuxer.packets(videoTrack.id)).pipeThrough(
-                videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
-              );
-        const filtered = await this.#applyVideoFilters(
-          decoded as ReadableStream<VideoFrame>,
-          opts.video || {},
-          videoTrack,
-          signal,
-          o,
-        );
-        openStreams.push(filtered);
-        tasks.push(
-          this.#encodeVideoStream(filtered, opts.video || {}, videoTrack, muxer, signal, o),
-        );
-        /* v8 ignore stop */
+        if (canUseVpxAlphaPacketTranscode(videoTarget, videoTrack.alpha === true)) {
+          const packets = demuxer.packets(videoTrack.id);
+          openStreams.push(packets);
+          tasks.push(
+            this.#transcodeVpxAlphaPacketStream(packets, videoTarget, videoTrack, muxer, signal, o),
+          );
+        } else {
+          // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
+          // the composition below is the live path, browser-validated.
+          const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
+          const config = await decodeConfigOf(videoTrack);
+          /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
+          const decoded =
+            videoTrack.alpha === true
+              ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
+                  videoCodec.createDecoder(config, this.#stageOptions(signal, o)),
+                )
+              : lazyPipeThrough<EncodedChunk, VideoFrame>(
+                  unwrapPackets(demuxer.packets(videoTrack.id)),
+                  () =>
+                    videoCodec.createDecoder(
+                      config,
+                      this.#stageOptions(signal, o),
+                    ) as TransformStream<EncodedChunk, VideoFrame>,
+                  { closeValue: closeIfClosable },
+                );
+          const filtered = await this.#applyVideoFilters(
+            decoded as ReadableStream<VideoFrame>,
+            opts.video || {},
+            videoTrack,
+            signal,
+            o,
+          );
+          openStreams.push(filtered);
+          tasks.push(
+            this.#encodeVideoStream(filtered, opts.video || {}, videoTrack, muxer, signal, o),
+          );
+          /* v8 ignore stop */
+        }
       }
       if (audioTrack) {
         const { resolveAudioEncodeTargetForRuntime } = await loadCodecPipeline();
@@ -1600,12 +1664,16 @@ export class MediaEngineImpl implements MediaEngine {
     // The video filter-spec PLANNER lives in a lazily-imported chunk (`video-stream-plan.ts`), so the eager
     // kernel never statically pulls the video-spec code (doc 08 §7). Reached only here, on the live convert
     // video re-encode — already a browser-only, async path.
-    const { retimeVideoFrameStream, videoFilterSpecs } = await import('./video-stream-plan.ts');
-    const specs = videoFilterSpecs(target, sourceGeometryOf(track));
+    const { retimeVideoFrameStream, videoFilterRouteCost, videoFilterSpecs } = await import(
+      './video-stream-plan.ts'
+    );
+    const sourceGeometry = sourceGeometryOf(track);
+    const specs = videoFilterSpecs(target, sourceGeometry);
+    const routeCost = videoFilterRouteCost(sourceGeometry);
     let out = frames;
     const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
     for (const spec of specs) {
-      const driver = await this.#routeFilter(spec, o);
+      const driver = await this.#routeFilter(spec, o, routeCost);
       stages.push(
         driver.createFilter(spec, this.#stageOptions(signal, o)) as TransformStream<
           VideoFrame,
@@ -1666,6 +1734,66 @@ export class MediaEngineImpl implements MediaEngine {
     return composeChain(frames, stages);
   }
   /* v8 ignore stop */
+
+  /** Transcode an unfiltered VPx-alpha packet stream without merging/splitting RGBA frames. */
+  async #transcodeVpxAlphaPacketStream(
+    packets: ReadableStream<Packet>,
+    target: VideoTarget,
+    sourceTrack: TrackInfo,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const {
+      buildVideoEncoderConfig,
+      drainEncoderToMuxer,
+      transcodeVpxAlphaPackets,
+      videoTrackInfoFromDecoderConfig,
+    } = await loadCodecPipeline();
+    const decodeCodec = await this.#routeCodec(await decodeQueryFor(sourceTrack), o);
+    const encodeConfig = buildVideoEncoderConfig(
+      target,
+      sourceGeometryOf(sourceTrack),
+      sourceTrack.codec,
+    );
+    const encoderConfig: VideoEncoderConfig = { ...encodeConfig, alpha: 'discard' };
+    const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
+    const decodeConfig = await decodeConfigOf(sourceTrack);
+    /* v8 ignore start -- requires live WebCodecs decoders/encoders; browser-harness validated. */
+    let decoderConfig: VideoDecoderConfig | undefined;
+    const colorStage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      onDecoderConfig: (c) => {
+        decoderConfig = c;
+      },
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    };
+    const alphaStage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    };
+    const decodeStage: VideoDecoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      alpha: 'discard',
+    };
+    const chunks = transcodeVpxAlphaPackets(packets, {
+      decodeConfig,
+      encodeConfig: encoderConfig,
+      createDecoder: (c, stageOptions) => decodeCodec.createDecoder(c, stageOptions),
+      createEncoder: (c, stageOptions) => encodeCodec.createEncoder(c, stageOptions),
+      decodeStage,
+      colorStage,
+      alphaStage,
+    });
+    await drainEncoderToMuxer(chunks, muxer, () =>
+      videoTrackInfoFromDecoderConfig(
+        requireConfig(decoderConfig, 'video'),
+        target.fps,
+        sourceTrack.durationSec,
+      ),
+    );
+    /* v8 ignore stop */
+  }
 
   /** Encode one video stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
   async #encodeVideoStream(
@@ -1730,7 +1858,7 @@ export class MediaEngineImpl implements MediaEngine {
             createEncoder: (c, stageOptions) => codec.createEncoder(c, stageOptions),
             colorStage: stage,
             alphaStage,
-          })
+      })
         : encodeInput.pipeThrough(codec.createEncoder(encoderConfig, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
       videoTrackInfoFromDecoderConfig(

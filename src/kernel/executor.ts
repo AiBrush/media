@@ -31,6 +31,54 @@ export function composeChain<T>(
   return out;
 }
 
+export interface LazyPipeThroughOptions<U> {
+  /** Called if a downstream enqueue loses a cancellation/error race and the produced value owns resources. */
+  closeValue?: (value: U) => void;
+}
+
+/**
+ * Defer a `source.pipeThrough(createStage())` link until a downstream reader actually pulls. Native
+ * `pipeThrough()` starts piping immediately; that is ideal for steady-state chains, but a live media graph
+ * may need to finish composing downstream filters/encoders before a WebCodecs decoder starts draining
+ * packets. This wrapper preserves backpressure by reading at most one output item per downstream pull.
+ */
+export function lazyPipeThrough<T, U>(
+  source: ReadableStream<T>,
+  createStage: () => TransformStream<T, U>,
+  opts: LazyPipeThroughOptions<U> = {},
+): ReadableStream<U> {
+  let reader: ReadableStreamDefaultReader<U> | undefined;
+
+  const ensureReader = (): ReadableStreamDefaultReader<U> => {
+    if (reader !== undefined) return reader;
+    reader = source.pipeThrough(createStage()).getReader();
+    return reader;
+  };
+
+  return new ReadableStream<U>(
+    {
+      async pull(controller): Promise<void> {
+        const active = ensureReader();
+        const { done, value } = await active.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        try {
+          controller.enqueue(value);
+        } catch (e) {
+          opts.closeValue?.(value);
+          throw e;
+        }
+      },
+      async cancel(reason): Promise<void> {
+        await reader?.cancel(reason).catch(() => {});
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 /** Collect a byte stream into one `Uint8Array` (the Blob/File sink path), honoring abort + progress. */
 export async function collect(
   readable: ReadableStream<Uint8Array>,

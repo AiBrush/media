@@ -2,10 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { gain } from '../../dsp/gain.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
+import { readAiffPcm, writeAiff } from '../aiff/aiff.ts';
+import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
+import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
+import { tryConvertWavPcmFormatToWav } from './format-convert.ts';
 import { readWavPcm, writeWav } from './pcm.ts';
-import { tryResampleWavS16ToS16Wav } from './s16-resample.ts';
+import { tryResampleWavS16ToS16Wav, wavS16ResampleToWavFromBytes } from './s16-resample.ts';
 import { wavTrimFromUrl } from './url-trim.ts';
 import {
   WavDriver,
@@ -818,6 +823,21 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(cached).toEqual(first);
   });
 
+  it('exposes the same direct s16 resampler through the core byte helper', () => {
+    const input = stereoSineWav(48_000, 48_000);
+    const direct = tryResampleWavS16ToS16Wav(input, {
+      container: 'wav',
+      sampleFormat: 's16',
+      endian: 'le',
+      sampleRate: 16_000,
+    });
+    const helper = wavS16ResampleToWavFromBytes(input, { sampleRate: 16_000 });
+    if (direct === undefined || helper === undefined) {
+      throw new Error('s16 WAV resample byte helper must be eligible');
+    }
+    expect(helper).toEqual(direct);
+  });
+
   it('declines unsupported direct-resample shapes before the canonical PCM fallback', () => {
     const input = sineWav(997, 44_100, 256, 0.65);
     const sourceF32 = writeWav(readWavPcm(input), 'f32');
@@ -1029,6 +1049,358 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     const out = await drain(await transformPcm(streamOnly(bytes), { gainDb: -6.020599913279624 }));
     const orig = peak(channelAt(readWavPcm(bytes).planar, 0));
     expect(peak(channelAt(readWavPcm(out).planar, 0))).toBeCloseTo(orig * 0.5, 2);
+  });
+
+  it('direct-applies f32 WAV gain into the same canonical output as the PCM reference', () => {
+    const canonical = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5), Float64Array.of(-0, -0.75, 0.75, -1)],
+      },
+      'f32',
+    );
+    const withJunk = withJunkChunk(canonical);
+    const direct = tryGainWavF32ToF32Wav(withJunk, {
+      container: 'wav',
+      sampleFormat: 'f32',
+      endian: 'le',
+      gainDb: -6.020599913279624,
+    });
+    const reference = writeWav(gain(readWavPcm(withJunk), -6.020599913279624), 'f32');
+
+    expect(direct).toEqual(reference);
+    expect(direct).not.toEqual(withJunk);
+  });
+
+  it('routes clean f32 WAV gain transforms through the direct writer', async () => {
+    const bytes = await loadFixture('sfx-pcm-f32.wav');
+    const expected = tryGainWavF32ToF32Wav(bytes, {
+      container: 'wav',
+      sampleFormat: 'f32',
+      endian: 'le',
+      gainDb: -6.020599913279624,
+    });
+    if (expected === undefined) throw new Error('f32 WAV gain fast path must be eligible');
+
+    const out = await drain(
+      await transformPcm(streamOnly(bytes), {
+        container: 'wav',
+        sampleFormat: 'f32',
+        endian: 'le',
+        gainDb: -6.020599913279624,
+      }),
+    );
+    expect(out).toEqual(expected);
+  });
+
+  it('declines unsupported f32 WAV gain fast-path shapes before the canonical PCM fallback', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      'f32',
+    );
+    const sourceS16 = writeWav(readWavPcm(input), 's16');
+
+    expect(tryGainWavF32ToF32Wav(input, { container: 'aiff', gainDb: -6 })).toBeUndefined();
+    expect(tryGainWavF32ToF32Wav(input, { container: 'wav' })).toBeUndefined();
+    expect(tryGainWavF32ToF32Wav(input, { container: 'wav', gainDb: 0 })).toBeUndefined();
+    expect(tryGainWavF32ToF32Wav(input, { container: 'wav', gainDb: Number.NaN })).toBeUndefined();
+    expect(
+      tryGainWavF32ToF32Wav(input, { container: 'wav', endian: 'be', gainDb: -6 }),
+    ).toBeUndefined();
+    expect(
+      tryGainWavF32ToF32Wav(input, { container: 'wav', sampleFormat: 's16', gainDb: -6 }),
+    ).toBeUndefined();
+    expect(
+      tryGainWavF32ToF32Wav(input, { container: 'wav', channels: 2, gainDb: -6 }),
+    ).toBeUndefined();
+    expect(
+      tryGainWavF32ToF32Wav(input, { container: 'wav', sampleRate: 44_100, gainDb: -6 }),
+    ).toBeUndefined();
+    expect(
+      tryGainWavF32ToF32Wav(input, {
+        container: 'wav',
+        gainDb: -6,
+        fade: { inSec: 0.1 },
+      }),
+    ).toBeUndefined();
+    expect(tryGainWavF32ToF32Wav(sourceS16, { container: 'wav', gainDb: -6 })).toBeUndefined();
+  });
+
+  it.each([
+    ['f32', 's16'],
+    ['s24', 's16'],
+    ['s24', 'f32'],
+    ['s16', 'f32'],
+  ] as const)(
+    'direct-converts %s WAV to %s bytes equal to the canonical PCM reference',
+    (sourceFormat, targetFormat) => {
+      const canonical = writeWav(
+        {
+          sampleRate: 48_000,
+          channels: 2,
+          frames: 6,
+          planar: [
+            Float64Array.of(-1.25, -1, -0.5001, 0, 0.4999, 1.25),
+            Float64Array.of(1, 0.75, 0.5, -0.5, -0.75, -1),
+          ],
+        },
+        sourceFormat,
+      );
+      const withJunk = withJunkChunk(canonical);
+      const direct = tryConvertWavPcmFormatToWav(withJunk, {
+        container: 'wav',
+        sampleFormat: targetFormat,
+        endian: 'le',
+      });
+      const reference = writeWav(readWavPcm(withJunk), targetFormat);
+
+      expect(direct).toEqual(reference);
+      expect(direct).not.toEqual(withJunk);
+    },
+  );
+
+  it('routes clean WAV sample-format-only transforms through the direct converter', async () => {
+    const bytes = withJunkChunk(await loadFixture('sfx-pcm-s24.wav'));
+    const expected = tryConvertWavPcmFormatToWav(bytes, {
+      container: 'wav',
+      sampleFormat: 's16',
+      endian: 'le',
+    });
+    if (expected === undefined) throw new Error('s24→s16 WAV format fast path must be eligible');
+
+    const out = await drain(
+      await transformPcm(streamOnly(bytes), {
+        container: 'wav',
+        sampleFormat: 's16',
+        endian: 'le',
+      }),
+    );
+    expect(out).toEqual(expected);
+  });
+
+  it('declines unsupported WAV sample-format fast-path shapes before the canonical PCM fallback', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      'f32',
+    );
+    const sourceU8 = writeWav(readWavPcm(input), 'u8');
+
+    expect(
+      tryConvertWavPcmFormatToWav(input, { container: 'aiff', sampleFormat: 's16' }),
+    ).toBeUndefined();
+    expect(tryConvertWavPcmFormatToWav(input, { container: 'wav' })).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, { container: 'wav', sampleFormat: 's24' }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, { container: 'wav', sampleFormat: 'f32' }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        endian: 'be',
+      }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        channels: 2,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        sampleRate: 44_100,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        gainDb: 0,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        timeBounds: { startSec: 0, endSec: 0.001 },
+      }),
+    ).toBeUndefined();
+    expect(
+      tryConvertWavPcmFormatToWav(sourceU8, { container: 'wav', sampleFormat: 's16' }),
+    ).toBeUndefined();
+  });
+
+  it('honors abort signals before direct WAV sample-format conversion starts', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      'f32',
+    );
+    expect(() =>
+      tryConvertWavPcmFormatToWav(input, {
+        container: 'wav',
+        sampleFormat: 's16',
+        signal: AbortSignal.abort(),
+      }),
+    ).toThrowError(MediaError);
+  });
+
+  it.each(['s16', 's24'] as const)(
+    'direct-rewrites %s WAV to big-endian AIFF bytes equal to the canonical PCM reference',
+    (format) => {
+      const canonical = writeWav(
+        {
+          sampleRate: 48_000,
+          channels: 2,
+          frames: 6,
+          planar: [
+            Float64Array.of(-1, -0.75, -0.5, 0, 0.5, 1),
+            Float64Array.of(1, 0.75, 0.25, -0.25, -0.75, -1),
+          ],
+        },
+        format,
+      );
+      const withJunk = withJunkChunk(canonical);
+      const direct = tryRewriteWavPcmToAiffBe(withJunk, {
+        container: 'aiff',
+        sampleFormat: format,
+        endian: 'be',
+      });
+      const reference = writeAiff(readWavPcm(withJunk), format, { endian: 'be' });
+
+      expect(direct).toEqual(reference);
+      expect(direct).not.toEqual(withJunk);
+      const source = readWavPcm(withJunk);
+      const aiff = readAiffPcm(direct ?? new Uint8Array());
+      expect(aiff.sampleRate).toBe(source.sampleRate);
+      expect(aiff.channels).toBe(source.channels);
+      expect(aiff.frames).toBe(source.frames);
+      for (let c = 0; c < source.channels; c++) {
+        expect(channelAt(aiff.planar, c)).toEqual(channelAt(source.planar, c));
+      }
+    },
+  );
+
+  it('routes clean WAV to big-endian AIFF transforms through the direct byte-swap writer', async () => {
+    const bytes = withJunkChunk(await loadFixture('sfx-pcm-s16.wav'));
+    const expected = tryRewriteWavPcmToAiffBe(bytes, {
+      container: 'aiff',
+      sampleFormat: 's16',
+      endian: 'be',
+    });
+    if (expected === undefined) throw new Error('WAV s16→AIFF s16be fast path must be eligible');
+
+    const out = await drain(
+      await transformPcm(streamOnly(bytes), {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+      }),
+    );
+    expect(out).toEqual(expected);
+  });
+
+  it('declines unsupported WAV to AIFF byte-swap shapes before the canonical PCM fallback', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      's16',
+    );
+    const sourceF32 = writeWav(readWavPcm(input), 'f32');
+
+    expect(
+      tryRewriteWavPcmToAiffBe(input, { container: 'wav', sampleFormat: 's16', endian: 'be' }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, { container: 'aiff', sampleFormat: 's16' }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, { container: 'aiff', sampleFormat: 's24', endian: 'be' }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        channels: 2,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        sampleRate: 44_100,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        gainDb: 0,
+      }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        timeBounds: { startSec: 0, endSec: 0.001 },
+      }),
+    ).toBeUndefined();
+    expect(
+      tryRewriteWavPcmToAiffBe(sourceF32, {
+        container: 'aiff',
+        sampleFormat: 'f32',
+        endian: 'be',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('honors abort signals before direct WAV to AIFF byte-swap work starts', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5)],
+      },
+      's16',
+    );
+    expect(() =>
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        signal: AbortSignal.abort(),
+      }),
+    ).toThrowError(MediaError);
   });
 
   it.each(WAVS)(

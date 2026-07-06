@@ -29,11 +29,13 @@ import { createMedia } from './create-media.ts';
 import {
   muxFlacMkv,
   muxPreparedWebmAudioPacketTrack,
+  muxPreparedWebmChunkTracks,
   muxPreparedWebmPacketStreams,
   muxPreparedWebmPacketTracks,
   muxSingleTrackMp4,
   muxSingleTrackWebmAudio,
 } from './flac-mkv-mux.ts';
+import type { PreparedWebmChunk } from './flac-mkv-mux.ts';
 import type { PacketStreams } from './types.ts';
 
 /** Real, stream-copyable MP4s (h264 + aac), ≥3 distinct files of varied duration/tracks. */
@@ -232,6 +234,37 @@ async function preparedMp4PacketTracks(fixture: string): Promise<{
       if (packet !== undefined) packets.push(packet);
     }
     if (packets.length > 0) tracks.push({ track, packets });
+  }
+  return { tracks };
+}
+
+async function preparedMp4ChunkTracks(fixture: string): Promise<{
+  readonly tracks: Array<{
+    readonly track: TrackInfo;
+    readonly chunks: readonly PreparedWebmChunk[];
+  }>;
+}> {
+  const bytes = await loadFixture(fixture);
+  if (Mp4Driver.packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+  const table = await Mp4Driver.packetInfo(fromBytes(bytes, { mime: 'video/mp4' }));
+  const tracks: Array<{ readonly track: TrackInfo; readonly chunks: PreparedWebmChunk[] }> = [];
+  for (let trackIndex = 0; trackIndex < table.tracks.length; trackIndex++) {
+    const track = table.tracks[trackIndex];
+    if (track === undefined) continue;
+    const chunks: PreparedWebmChunk[] = [];
+    for (const row of table.packets) {
+      if (row.trackIndex !== trackIndex || row.offset === undefined) continue;
+      const end = row.offset + row.size;
+      if (row.offset < 0 || row.size <= 0 || end > bytes.byteLength) continue;
+      chunks.push({
+        timestampUs: row.ptsUs,
+        key: row.keyframe,
+        data: bytes.subarray(row.offset, end),
+        ...(row.durationUs !== undefined ? { durationUs: row.durationUs } : {}),
+        ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
+      });
+    }
+    if (chunks.length > 0) tracks.push({ track, chunks });
   }
   return { tracks };
 }
@@ -712,6 +745,62 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     expect(codecs.has('h264')).toBe(true);
     expect(codecs.has('aac')).toBe(true);
     expect(info.durationSec).toBeCloseTo(videoDurationSec ?? 0, 2);
+  });
+
+  it('prepared WebM chunk mux authors real MP4 H.264/AAC packet tables without packet facades', async () => {
+    const prepared = await preparedMp4ChunkTracks('movie_5.mp4');
+    expect(prepared.tracks.length).toBeGreaterThan(1);
+    const out = muxPreparedWebmChunkTracks({ tracks: prepared.tracks, container: 'mkv' });
+    const info = parseWebm(out);
+    const codecs = new Set(info.tracks.map((track) => track.codec));
+    const videoDurationSec = prepared.tracks.find((entry) => entry.track.mediaType === 'video')
+      ?.track.durationSec;
+
+    expect(info.container).toBe('mkv');
+    expect(codecs.has('h264')).toBe(true);
+    expect(codecs.has('aac')).toBe(true);
+    expect(info.durationSec).toBeCloseTo(videoDurationSec ?? 0, 2);
+  });
+
+  it('prepared WebM chunk mux rejects unsupported containers and empty inputs', () => {
+    const track = videoTrack();
+    const chunk: PreparedWebmChunk = {
+      timestampUs: 0,
+      durationUs: 33_333,
+      key: true,
+      data: new Uint8Array([1, 2, 3]),
+      dtsUs: 0,
+    };
+
+    expect(() =>
+      muxPreparedWebmChunkTracks({
+        tracks: [{ track, chunks: [chunk] }],
+        container: 'mp4',
+      }),
+    ).toThrow(CapabilityError);
+    expect(() => muxPreparedWebmChunkTracks({ tracks: [], container: 'mkv' })).toThrow(MediaError);
+    expect(() =>
+      muxPreparedWebmChunkTracks({ tracks: [{ track, chunks: [] }], container: 'mkv' }),
+    ).toThrow(MediaError);
+    expect(() =>
+      muxPreparedWebmChunkTracks({
+        tracks: [{ track, chunks: [{ ...chunk, data: new Uint8Array() }] }],
+        container: 'mkv',
+      }),
+    ).toThrow(MediaError);
+    for (const invalidChunk of [
+      { ...chunk, timestampUs: Number.NaN },
+      { ...chunk, durationUs: Number.NaN },
+      { ...chunk, durationUs: -1 },
+      { ...chunk, dtsUs: Number.NaN },
+    ]) {
+      expect(() =>
+        muxPreparedWebmChunkTracks({
+          tracks: [{ track, chunks: [invalidChunk] }],
+          container: 'mkv',
+        }),
+      ).toThrow(MediaError);
+    }
   });
 
   it('public mux uses the prepared WebM packet-array path for real MP4 packet tables', async () => {

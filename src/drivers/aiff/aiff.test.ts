@@ -11,13 +11,19 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { readCafPcm } from '../caf/caf.ts';
 import { readWavPcm, writeWav } from '../wav/pcm.ts';
-import { AiffDriver, AiffModule } from './aiff-driver.ts';
+import {
+  AiffDriver,
+  AiffModule,
+  aiffPacketInfoFromBytes,
+  aiffPacketInfoFromUrl,
+} from './aiff-driver.ts';
+import { trySliceAiffPcm } from './aiff-slice.ts';
 import { rewriteAiffPcmToWav } from './aiff-wav-rewrite.ts';
 import {
   type AiffKind,
@@ -43,6 +49,11 @@ const loadHarness = async (n: string): Promise<Uint8Array> =>
 
 /** Independent SSND sample-byte locator — the byte-exact oracle must not depend on the code under test. */
 function ssndSamples(b: Uint8Array): Uint8Array {
+  const range = ssndSampleRange(b);
+  return b.subarray(range.offset, range.offset + range.size);
+}
+
+function ssndSampleRange(b: Uint8Array): { offset: number; size: number } {
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   let pos = 12; // FORM + size + formType
   while (pos + 8 <= b.byteLength) {
@@ -50,7 +61,7 @@ function ssndSamples(b: Uint8Array): Uint8Array {
     const size = dv.getUint32(pos + 4);
     if (id === 'SSND') {
       const offset = dv.getUint32(pos + 8); // alignment bytes before the first sample
-      return b.subarray(pos + 8 + 8 + offset, pos + 8 + size);
+      return { offset: pos + 8 + 8 + offset, size: size - 8 - offset };
     }
     pos += 8 + size + (size & 1);
   }
@@ -210,6 +221,242 @@ describe('AiffDriver.demux — TrackInfo + audio-dsp seam', () => {
   });
 });
 
+describe('AiffDriver.packetInfo — metadata-only PCM packet table', () => {
+  it('enumerates real big-endian PCM packets from SSND facts without WebCodecs packets', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const table = aiffPacketInfoFromBytes(file);
+    const fromDriver = await AiffDriver.packetInfo?.(bytesSource(file));
+    const range = ssndSampleRange(file);
+    expect(fromDriver).toEqual(table);
+    expect(table.tracks).toHaveLength(1);
+    expect(table.tracks[0]).toMatchObject({
+      mediaType: 'audio',
+      codec: 'pcm-s16be',
+      durationSec: 5,
+      config: { sampleRate: 48000, numberOfChannels: 2 },
+    });
+    expect(table.packets).toHaveLength(235);
+    expect(table.packets[0]).toEqual({
+      trackIndex: 0,
+      offset: range.offset,
+      size: 4096,
+      ptsUs: 0,
+      dtsUs: 0,
+      durationUs: 21333,
+      keyframe: true,
+    });
+    expect(table.packets[1]?.ptsUs).toBe(21333);
+    expect(table.packets.at(-1)).toEqual({
+      trackIndex: 0,
+      offset: range.offset + 234 * 4096,
+      size: range.size - 234 * 4096,
+      ptsUs: 4_992_000,
+      dtsUs: 4_992_000,
+      durationUs: 8000,
+      keyframe: true,
+    });
+  });
+
+  it('falls back to a full stream read when a non-seekable first chunk is shorter than COMM/SSND', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const packetInfo = AiffDriver.packetInfo;
+    if (!packetInfo) throw new Error('AiffDriver must expose packetInfo');
+
+    const table = await packetInfo({
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(file.subarray(0, 12));
+            controller.enqueue(file.subarray(12));
+            controller.close();
+          },
+        }),
+    });
+
+    expect(table).toEqual(aiffPacketInfoFromBytes(file));
+  });
+
+  it('preserves typed parser errors for malformed sized sources', async () => {
+    const packetInfo = AiffDriver.packetInfo;
+    if (!packetInfo) throw new Error('AiffDriver must expose packetInfo');
+
+    await expect(packetInfo(bytesSource(new Uint8Array([0])))).rejects.toBeInstanceOf(InputError);
+  });
+
+  it('honors an already-aborted packet-info signal', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const packetInfo = AiffDriver.packetInfo;
+    if (!packetInfo) throw new Error('AiffDriver must expose packetInfo');
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(packetInfo(bytesSource(file), { signal: abort.signal })).rejects.toMatchObject({
+      code: 'aborted',
+      message: 'operation aborted',
+    });
+  });
+
+  it('aiffPacketInfoFromUrl uses one bounded range for header-visible SSND chunks', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const table = await aiffPacketInfoFromUrl('https://fixtures.invalid/pcm_s16be.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      expect(table).toEqual(aiffPacketInfoFromBytes(file));
+      await expect(
+        aiffPacketInfoFromUrl('https://fixtures.invalid/pcm_s16be.aiff', {
+          mime: 'audio/aiff',
+          size: file.byteLength,
+        }),
+      ).resolves.toEqual(table);
+      expect(table.packets.reduce((total, packet) => total + packet.size, 0)).toBe(
+        ssndSampleRange(file).size,
+      );
+      expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-65535', bytes: 65536 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl learns total size from Content-Range when size is omitted', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const table = await aiffPacketInfoFromUrl(
+        'https://fixtures.invalid/unknown-size-pcm_s16be.aiff',
+        { mime: 'audio/aiff' },
+      );
+      expect(table).toEqual(aiffPacketInfoFromBytes(file));
+      await expect(
+        aiffPacketInfoFromUrl('https://fixtures.invalid/unknown-size-pcm_s16be.aiff', {
+          mime: 'audio/aiff',
+        }),
+      ).resolves.toEqual(table);
+      expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-65535', bytes: 65536 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl falls back to the driver packet-info path for empty AIFF audio', async () => {
+    const file = form('AIFF', [chunk('COMM', comm(1, 16, 8000, undefined, 0))]);
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const table = await aiffPacketInfoFromUrl('https://fixtures.invalid/empty-pcm.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      expect(table).toEqual(aiffPacketInfoFromBytes(file));
+      expect(table.packets).toHaveLength(0);
+      expect(server.calls).toHaveLength(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl expires cached prefixes and prunes old rows on store', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    const now = 1_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    globalThis.fetch = server.fetch;
+    try {
+      await aiffPacketInfoFromUrl('https://fixtures.invalid/cache-a.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      await aiffPacketInfoFromUrl('https://fixtures.invalid/cache-b.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      expect(server.calls).toHaveLength(2);
+
+      clock.mockReturnValue(now + 60_001);
+      await aiffPacketInfoFromUrl('https://fixtures.invalid/cache-a.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      await aiffPacketInfoFromUrl('https://fixtures.invalid/cache-c.aiff', {
+        mime: 'audio/aiff',
+        size: file.byteLength,
+      });
+      expect(server.calls).toHaveLength(4);
+    } finally {
+      clock.mockRestore();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl caps cached prefixes with oldest-entry eviction', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(2_000_000);
+    globalThis.fetch = server.fetch;
+    try {
+      for (let i = 0; i < 65; i++) {
+        await aiffPacketInfoFromUrl(`https://fixtures.invalid/cache-fill-${i}.aiff`, {
+          mime: 'audio/aiff',
+          size: file.byteLength,
+        });
+      }
+      expect(server.calls).toHaveLength(65);
+    } finally {
+      clock.mockRestore();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl honors already-aborted signals before range fetch', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const server = rangeServer(file);
+    const originalFetch = globalThis.fetch;
+    const abort = new AbortController();
+    abort.abort();
+    globalThis.fetch = server.fetch;
+    try {
+      await expect(
+        aiffPacketInfoFromUrl('https://fixtures.invalid/aborted-pcm_s16be.aiff', {
+          mime: 'audio/aiff',
+          size: file.byteLength,
+          signal: abort.signal,
+        }),
+      ).rejects.toMatchObject({ code: 'aborted', message: 'operation aborted' });
+      expect(server.calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aiffPacketInfoFromUrl reports a typed miss if the driver packet-info hook is absent', async () => {
+    const originalPacketInfo = AiffDriver.packetInfo;
+    if (originalPacketInfo === undefined) throw new Error('AiffDriver must expose packetInfo');
+    Reflect.deleteProperty(AiffDriver, 'packetInfo');
+    try {
+      await expect(
+        aiffPacketInfoFromUrl('https://fixtures.invalid/no-packet-info.aiff', {
+          mime: 'audio/aiff',
+          size: 128,
+        }),
+      ).rejects.toMatchObject({
+        code: 'capability-miss',
+        message: 'AIFF packet-info is not available',
+      });
+    } finally {
+      AiffDriver.packetInfo = originalPacketInfo;
+    }
+  });
+});
+
 describe('readAiffPcm / writeAiff — byte-exact SSND round-trip on real AIFF (decoded-audio-pcm oracle)', () => {
   for (const a of AIFFS) {
     it(`${a.id}: re-encoding reproduces the source SSND samples byte-for-byte`, async () => {
@@ -356,6 +603,75 @@ describe('AiffDriver.transformPcm — PCM-native audio-dsp path (ADR-022)', () =
     const file = await loadDerived('sfx.aiff');
     const out = await drain(await transform(file));
     expect(ssndSamples(out)).toEqual(ssndSamples(file));
+  });
+
+  it.each(['pcm_s16be.aiff', 'pcm_s24be.aiff'] as const)(
+    'direct-slices real %s AIFF PCM bytes equal to the canonical PCM trim reference',
+    async (id) => {
+      const file = await loadHarness(id);
+      const bounds = { startSec: 1, endSec: 3.5 };
+      const direct = trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds });
+      const reference = sliceAiffReference(file, bounds);
+
+      expect(direct).toEqual(reference);
+      expect(direct).not.toEqual(file);
+      const source = readAiffPcm(file);
+      const out = readAiffPcm(direct ?? new Uint8Array());
+      expect(out.sampleRate).toBe(source.sampleRate);
+      expect(out.channels).toBe(source.channels);
+      expect(out.frames).toBe(Math.round((bounds.endSec - bounds.startSec) * source.sampleRate));
+    },
+  );
+
+  it('routes clean AIFF PCM trims through the direct SSND byte-slice writer', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const bounds = { startSec: 1, endSec: 3.5 };
+    const expected = trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds });
+    if (expected === undefined) throw new Error('AIFF PCM trim fast path must be eligible');
+
+    const out = await drain(await transform(file, { container: 'aiff', timeBounds: bounds }));
+    expect(out).toEqual(expected);
+  });
+
+  it('declines unsupported AIFF byte-slice shapes before the canonical PCM fallback', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    const aifc = await loadDerived('sfx-fl32.aifc');
+    const bounds = { startSec: 0, endSec: 0.01 };
+
+    expect(trySliceAiffPcm(file, { container: 'wav', timeBounds: bounds })).toBeUndefined();
+    expect(
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds, sampleFormat: 's24' }),
+    ).toBeUndefined();
+    expect(
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds, endian: 'le' }),
+    ).toBeUndefined();
+    expect(
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds, channels: 1 }),
+    ).toBeUndefined();
+    expect(
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds, sampleRate: 44_100 }),
+    ).toBeUndefined();
+    expect(
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: bounds, gainDb: 0 }),
+    ).toBeUndefined();
+    expect(trySliceAiffPcm(aifc, { container: 'aiff', timeBounds: bounds })).toBeUndefined();
+  });
+
+  it('preserves typed trim errors and aborts on the direct AIFF byte-slice path', async () => {
+    const file = await loadHarness('pcm_s16be.aiff');
+    expect(() =>
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: { startSec: -1, endSec: 1 } }),
+    ).toThrowError(InputError);
+    expect(() =>
+      trySliceAiffPcm(file, { container: 'aiff', timeBounds: { startSec: 4, endSec: 4 } }),
+    ).toThrowError(InputError);
+    expect(() =>
+      trySliceAiffPcm(file, {
+        container: 'aiff',
+        timeBounds: { startSec: 1, endSec: 2 },
+        signal: AbortSignal.abort(),
+      }),
+    ).toThrowError(MediaError);
   });
 
   it('applies gain in the PCM domain (≈ ×0.5 at -6.02 dB) and stays AIFF', async () => {
@@ -617,6 +933,41 @@ function bytesSource(bytes: Uint8Array): {
   };
 }
 
+function rangeServer(bytes: Uint8Array): {
+  readonly fetch: typeof fetch;
+  readonly calls: Array<{
+    readonly method: string;
+    readonly range: string | null;
+    readonly bytes: number;
+  }>;
+} {
+  const calls: Array<{ method: string; range: string | null; bytes: number }> = [];
+  const total = bytes.byteLength;
+  const fetchImpl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = init?.headers as { Range?: string } | undefined;
+    const range = headers?.Range ?? null;
+    if (range !== null) {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (match === null) return new Response('bad range', { status: 416 });
+      const start = Number(match[1]);
+      const end = Math.min(Number(match[2]) + 1, total);
+      const slice = bytes.subarray(start, Math.max(start, end));
+      calls.push({ method, range, bytes: slice.byteLength });
+      return new Response(slice.slice(), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${start + slice.byteLength - 1}/${total}` },
+      });
+    }
+    calls.push({ method, range, bytes: total });
+    return new Response(bytes.slice(), {
+      status: 200,
+      headers: { 'Content-Length': String(total) },
+    });
+  }) as typeof fetch;
+  return { fetch: fetchImpl, calls };
+}
+
 async function transform(
   bytes: Uint8Array,
   o?: Parameters<NonNullable<typeof AiffDriver.transformPcm>>[1],
@@ -649,6 +1000,31 @@ function peak(ch: Float64Array): number {
   let m = 0;
   for (const s of ch) m = Math.max(m, Math.abs(s));
   return m;
+}
+
+function sliceAiffReference(
+  bytes: Uint8Array,
+  bounds: { readonly startSec: number; readonly endSec: number },
+): Uint8Array {
+  const source = readAiffPcm(bytes);
+  const start = Math.min(
+    source.frames,
+    Math.max(0, Math.round(bounds.startSec * source.sampleRate)),
+  );
+  const end = Math.min(
+    source.frames,
+    Math.max(start, Math.round(bounds.endSec * source.sampleRate)),
+  );
+  return writeAiff(
+    {
+      sampleRate: source.sampleRate,
+      channels: source.channels,
+      frames: end - start,
+      planar: source.planar.map((ch) => ch.subarray(start, end)),
+    },
+    source.format,
+    { kind: source.kind, endian: source.endian },
+  );
 }
 
 // ── crafted-AIFF builders (test-only; real bytes for the field under test) ─────────────────────────

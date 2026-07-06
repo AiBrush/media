@@ -173,7 +173,10 @@ function parseComm(
 
 /** Locate the `COMM` layout + `SSND` sample bytes in an AIFF/AIFF-C file (pure; big-endian). */
 /** @internal Locate the `COMM` layout + `SSND` sample bytes in an AIFF/AIFF-C file. */
-export function locate(bytes: Uint8Array): {
+export function locate(
+  bytes: Uint8Array,
+  totalSize = bytes.byteLength,
+): {
   layout: AiffLayout;
   ssndBody: number;
   ssndSampleOffset: number;
@@ -203,7 +206,7 @@ export function locate(bytes: Uint8Array): {
       ssnd = {
         body: c.body,
         sampleOffset: samples,
-        sampleBytes: Math.max(0, Math.min(declared, bytes.byteLength - samples)),
+        sampleBytes: Math.max(0, Math.min(declared, totalSize - samples)),
       };
     }
   }

@@ -252,6 +252,17 @@ describe('Router.pickFilter', () => {
     expect(router.pickFilter(resizeSpec).id).toBe('gpu');
   });
 
+  it('uses caller-supplied media cost for dimensionless video colour filters', () => {
+    const tonemap: FilterSpec = { mediaType: 'video', type: 'tonemap', to: 'sdr' };
+    const { router } = routerWith((reg) => {
+      reg.addFilter(makeFilter('gpu', 'webgpu', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
+    });
+
+    expect(router.pickFilter(tonemap, { cost: { mediaSeconds: 0.5 } }).id).toBe('native');
+    expect(router.pickFilter(tonemap, { cost: { mediaSeconds: 5 } }).id).toBe('gpu');
+  });
+
   it('keeps separate cached filter verdicts for tiny and normal work', () => {
     const tinyResize: FilterSpec = {
       mediaType: 'video',

@@ -1,5 +1,5 @@
 {
-  "generatedFrom": "2026-07-05T00:50:27.780Z",
+  "generatedFrom": "2026-07-05T17:09:45.879Z",
   "source": "stored-test-data-chromium-2026-07-01T08-33-45-588Z.json",
   "overlays": [
     "chromium-2026-06-22T17-27-07-652Z.json",
@@ -501,219 +501,102 @@
     "chromium-2026-07-05T00-38-57-872Z.json",
     "chromium-2026-07-05T00-42-45-168Z.json",
     "chromium-2026-07-05T00-44-19-213Z.json",
-    "chromium-2026-07-05T00-50-06-496Z.json"
+    "chromium-2026-07-05T00-50-06-496Z.json",
+    "chromium-2026-07-05T00-53-18-256Z.json",
+    "chromium-2026-07-05T01-02-04-386Z.json",
+    "chromium-2026-07-05T09-48-05-249Z.json",
+    "chromium-2026-07-05T10-02-27-029Z.json",
+    "chromium-2026-07-05T10-05-35-799Z.json",
+    "chromium-2026-07-05T10-18-21-130Z.json",
+    "chromium-2026-07-05T10-27-46-344Z.json",
+    "chromium-2026-07-05T10-37-40-759Z.json",
+    "chromium-2026-07-05T10-47-31-592Z.json",
+    "chromium-2026-07-05T11-00-55-655Z.json",
+    "chromium-2026-07-05T11-03-53-947Z.json",
+    "chromium-2026-07-05T11-05-44-787Z.json",
+    "chromium-2026-07-05T11-14-17-615Z.json",
+    "chromium-2026-07-05T11-17-51-908Z.json",
+    "chromium-2026-07-05T11-19-49-329Z.json",
+    "chromium-2026-07-05T11-23-45-644Z.json",
+    "chromium-2026-07-05T11-30-43-428Z.json",
+    "chromium-2026-07-05T11-38-55-976Z.json",
+    "chromium-2026-07-05T11-42-21-628Z.json",
+    "chromium-2026-07-05T11-43-18-785Z.json",
+    "chromium-2026-07-05T11-46-41-310Z.json",
+    "chromium-2026-07-05T11-52-01-839Z.json",
+    "chromium-2026-07-05T11-57-27-927Z.json",
+    "chromium-2026-07-05T12-01-57-888Z.json",
+    "chromium-2026-07-05T12-10-27-354Z.json",
+    "chromium-2026-07-05T12-33-49-945Z.json",
+    "chromium-2026-07-05T12-42-14-894Z.json",
+    "chromium-2026-07-05T12-45-09-699Z.json",
+    "chromium-2026-07-05T12-45-46-458Z.json",
+    "chromium-2026-07-05T12-46-41-234Z.json",
+    "chromium-2026-07-05T12-47-32-644Z.json",
+    "chromium-2026-07-05T12-49-43-812Z.json",
+    "chromium-2026-07-05T12-51-44-009Z.json",
+    "chromium-2026-07-05T14-49-11-571Z.json",
+    "chromium-2026-07-05T15-03-09-273Z.json",
+    "chromium-2026-07-05T15-11-07-385Z.json",
+    "chromium-2026-07-05T15-15-26-003Z.json",
+    "chromium-2026-07-05T15-17-30-547Z.json",
+    "chromium-2026-07-05T15-22-07-226Z.json",
+    "chromium-2026-07-05T15-23-54-781Z.json",
+    "chromium-2026-07-05T15-26-36-083Z.json",
+    "chromium-2026-07-05T15-34-37-150Z.json",
+    "chromium-2026-07-05T15-41-09-037Z.json",
+    "chromium-2026-07-05T15-50-02-785Z.json",
+    "chromium-2026-07-05T15-53-34-991Z.json",
+    "chromium-2026-07-05T15-55-27-711Z.json",
+    "chromium-2026-07-05T15-58-22-787Z.json",
+    "chromium-2026-07-05T16-01-46-607Z.json",
+    "chromium-2026-07-05T16-07-18-365Z.json",
+    "chromium-2026-07-05T16-09-41-874Z.json",
+    "chromium-2026-07-05T16-10-47-453Z.json",
+    "chromium-2026-07-05T16-14-38-270Z.json",
+    "chromium-2026-07-05T16-18-02-961Z.json",
+    "chromium-2026-07-05T16-23-42-718Z.json",
+    "chromium-2026-07-05T16-24-15-074Z.json",
+    "chromium-2026-07-05T16-26-42-577Z.json",
+    "chromium-2026-07-05T16-32-08-313Z.json",
+    "chromium-2026-07-05T16-33-01-124Z.json",
+    "chromium-2026-07-05T16-33-31-602Z.json",
+    "chromium-2026-07-05T16-34-38-467Z.json",
+    "chromium-2026-07-05T16-35-05-064Z.json",
+    "chromium-2026-07-05T16-37-31-292Z.json",
+    "chromium-2026-07-05T16-38-19-539Z.json",
+    "chromium-2026-07-05T16-39-10-871Z.json",
+    "chromium-2026-07-05T16-40-32-337Z.json",
+    "chromium-2026-07-05T16-41-38-420Z.json",
+    "chromium-2026-07-05T16-42-19-500Z.json",
+    "chromium-2026-07-05T16-43-02-092Z.json",
+    "chromium-2026-07-05T16-45-13-899Z.json",
+    "chromium-2026-07-05T16-46-06-580Z.json",
+    "chromium-2026-07-05T16-47-12-683Z.json",
+    "chromium-2026-07-05T16-48-17-746Z.json",
+    "chromium-2026-07-05T16-53-25-128Z.json",
+    "chromium-2026-07-05T16-53-59-171Z.json",
+    "chromium-2026-07-05T16-55-04-859Z.json",
+    "chromium-2026-07-05T16-58-20-273Z.json",
+    "chromium-2026-07-05T17-02-12-142Z.json",
+    "chromium-2026-07-05T17-03-23-810Z.json",
+    "chromium-2026-07-05T17-05-04-110Z.json",
+    "chromium-2026-07-05T17-06-04-157Z.json",
+    "chromium-2026-07-05T17-08-04-679Z.json",
+    "chromium-2026-07-05T17-08-31-738Z.json",
+    "chromium-2026-07-05T17-09-30-728Z.json"
   ],
   "contested": 446,
-  "rawLossCount": 166,
-  "activeLossCount": 165,
+  "rawLossCount": 134,
+  "activeLossCount": 133,
   "exemptLossCount": 1,
   "tiers": {
     "catastrophic": 0,
     "severe": 0,
     "moderate": 0,
-    "minor": 165
+    "minor": 133
   },
   "losses": [
-    {
-      "s": "mux/h264_aac_to_ts",
-      "fam": "mux",
-      "our": 362.16499999165535,
-      "comp": "mediabunny",
-      "cw": 141.54499998688698,
-      "ratio": 2.5586562579053096
-    },
-    {
-      "s": "mux/size_large_1080p_to_mp4",
-      "fam": "mux",
-      "our": 788.4399999976158,
-      "comp": "mediabunny",
-      "cw": 317.2349999845028,
-      "ratio": 2.4853499772601757
-    },
-    {
-      "s": "mux/edge_bframes_decode_mux_mkv",
-      "fam": "mux",
-      "our": 105.99500000476837,
-      "comp": "mediabunny",
-      "cw": 43.23999997973442,
-      "ratio": 2.4513182251259424
-    },
-    {
-      "s": "trim/mov_keyframe_aligned",
-      "fam": "trim",
-      "our": 104.7199999988079,
-      "comp": "ffmpeg.wasm",
-      "cw": 42.73499998450279,
-      "ratio": 2.4504504513111747
-    },
-    {
-      "s": "mux/mp3_to_mp4_audio",
-      "fam": "mux",
-      "our": 15.900000005960464,
-      "comp": "mediabunny",
-      "cw": 6.5,
-      "ratio": 2.446153847070841
-    },
-    {
-      "s": "audio-dsp/gain_half_f32",
-      "fam": "audio-dsp",
-      "our": 38.519999995827675,
-      "comp": "ffmpeg.wasm",
-      "cw": 15.780000001192093,
-      "ratio": 2.441064638334455
-    },
-    {
-      "s": "transcode/vp9_alpha_to_vp8_keepalpha",
-      "fam": "transcode",
-      "our": 1337.75,
-      "comp": "mediabunny",
-      "cw": 551.8550000190735,
-      "ratio": 2.424096909430492
-    },
-    {
-      "s": "mux/prop_vp9_decode_mux_webm_to_webm",
-      "fam": "mux",
-      "our": 136.66000001132488,
-      "comp": "mediabunny",
-      "cw": 56.42499998211861,
-      "ratio": 2.421976075403335
-    },
-    {
-      "s": "decode-seek/seek_past_eof",
-      "fam": "decode-seek",
-      "our": 139.07999999821186,
-      "comp": "mediabunny",
-      "cw": 57.50499999523163,
-      "ratio": 2.4185722982304934
-    },
-    {
-      "s": "demux/pcm_s16be",
-      "fam": "demux",
-      "our": 17.430000007152557,
-      "comp": "ffmpeg.wasm",
-      "cw": 7.234999984502792,
-      "ratio": 2.4091223281945027
-    },
-    {
-      "s": "trim/h264_rotated_keyframe_aligned",
-      "fam": "trim",
-      "our": 82.79500000178814,
-      "comp": "ffmpeg.wasm",
-      "cw": 34.38500002026558,
-      "ratio": 2.407881342241996
-    },
-    {
-      "s": "decode-seek/decode_size_micro_h264_1frame",
-      "fam": "decode-seek",
-      "our": 15.794999986886978,
-      "comp": "platform",
-      "cw": 6.564999997615814,
-      "ratio": 2.4059405929357482
-    },
-    {
-      "s": "transcode/hdr10_to_sdr_tonemap",
-      "fam": "transcode",
-      "our": 98.29999999701977,
-      "comp": "ffmpeg.wasm",
-      "cw": 40.90500000119209,
-      "ratio": 2.4031292016661783
-    },
-    {
-      "s": "mux/prop_vfr_mux_duration_mp4_to_mp4",
-      "fam": "mux",
-      "our": 57.894999995827675,
-      "comp": "mediabunny",
-      "cw": 24.21000000834465,
-      "ratio": 2.3913672026382713
-    },
-    {
-      "s": "demux/h264_rotated90",
-      "fam": "demux",
-      "our": 25.07999999821186,
-      "comp": "mediabunny",
-      "cw": 10.564999997615814,
-      "ratio": 2.3738760060455864
-    },
-    {
-      "s": "mux/prop_h264_mux_duration_mp4_to_mkv",
-      "fam": "mux",
-      "our": 293.4800000041723,
-      "comp": "mediabunny",
-      "cw": 125.06499999761581,
-      "ratio": 2.3466197578040786
-    },
-    {
-      "s": "probe/mp3_cbr_notoc",
-      "fam": "probe",
-      "our": 9.520000010728836,
-      "comp": "remotion-webcodecs",
-      "cw": 4.139999985694885,
-      "ratio": 2.2995169187496836
-    },
-    {
-      "s": "mux/mp4_fragmented_cmaf",
-      "fam": "mux",
-      "our": 304.7399999946356,
-      "comp": "mediabunny",
-      "cw": 132.5649999976158,
-      "ratio": 2.2987968166568575
-    },
-    {
-      "s": "transcode/aac_to_opus_webm",
-      "fam": "transcode",
-      "our": 268.3400000035763,
-      "comp": "remotion-webcodecs",
-      "cw": 117.48499998450279,
-      "ratio": 2.2840362602798012
-    },
-    {
-      "s": "mux/three_track_assembly_to_mkv",
-      "fam": "mux",
-      "our": 277.6899999976158,
-      "comp": "mediabunny",
-      "cw": 121.74500000476837,
-      "ratio": 2.2809150272022634
-    },
-    {
-      "s": "performance/iterate-video-packets",
-      "fam": "performance",
-      "our": 22.859999999403954,
-      "comp": "web-demuxer",
-      "cw": 10.094999998807907,
-      "ratio": 2.264487370193505
-    },
-    {
-      "s": "audio-dsp/resample_44k1_to_48k",
-      "fam": "audio-dsp",
-      "our": 110.04999999701977,
-      "comp": "ffmpeg.wasm",
-      "cw": 49.400000005960464,
-      "ratio": 2.2277327931931468
-    },
-    {
-      "s": "mux/video_a_plus_audio_b_to_mkv",
-      "fam": "mux",
-      "our": 256.90000000596046,
-      "comp": "mediabunny",
-      "cw": 115.66999998688698,
-      "ratio": 2.22097345928144
-    },
-    {
-      "s": "mux/prop_av1_mux_duration_webm_to_mp4",
-      "fam": "mux",
-      "our": 36.15999999642372,
-      "comp": "mediabunny",
-      "cw": 16.34000000357628,
-      "ratio": 2.212974295502418
-    },
-    {
-      "s": "streaming-output/prop_webm_headerless_duration_materialized",
-      "fam": "streaming-output",
-      "our": 9.479999989271164,
-      "comp": "mediabunny",
-      "cw": 4.395000010728836,
-      "ratio": 2.1569965793240278
-    },
     {
       "s": "probe/hls_vod",
       "fam": "probe",
@@ -875,30 +758,6 @@
       "ratio": 1.7399103085076937
     },
     {
-      "s": "audio-dsp/resample_48k_to_16k",
-      "fam": "audio-dsp",
-      "our": 58.064999997615814,
-      "comp": "remotion-webcodecs",
-      "cw": 33.78000000119209,
-      "ratio": 1.7189165185188486
-    },
-    {
-      "s": "audio-dsp/pcm_f32_to_s16",
-      "fam": "audio-dsp",
-      "our": 27.54500000178814,
-      "comp": "ffmpeg.wasm",
-      "cw": 16.12999999523163,
-      "ratio": 1.707687539363362
-    },
-    {
-      "s": "audio-dsp/pcm_s24_to_s16",
-      "fam": "audio-dsp",
-      "our": 20.385000005364418,
-      "comp": "ffmpeg.wasm",
-      "cw": 12.175000011920929,
-      "ratio": 1.6743326476718536
-    },
-    {
       "s": "mux/pcm_f32_to_wav",
       "fam": "mux",
       "our": 30.58500000834465,
@@ -955,14 +814,6 @@
       "ratio": 1.6371967452972789
     },
     {
-      "s": "trim/audio_aiff_pcm_be_copy",
-      "fam": "trim",
-      "our": 18.695000007748604,
-      "comp": "ffmpeg.wasm",
-      "cw": 11.465000003576279,
-      "ratio": 1.6306149151257803
-    },
-    {
       "s": "audio-dsp/throughput_decode_s24",
       "fam": "audio-dsp",
       "our": 48.04500000178814,
@@ -1011,14 +862,6 @@
       "ratio": 1.559911923089299
     },
     {
-      "s": "audio-dsp/resample_48k_to_44k1",
-      "fam": "audio-dsp",
-      "our": 55.185000002384186,
-      "comp": "ffmpeg.wasm",
-      "cw": 35.7950000166893,
-      "ratio": 1.5416957669130986
-    },
-    {
       "s": "performance/op-sweep-demux",
       "fam": "performance",
       "our": 11.75,
@@ -1057,14 +900,6 @@
       "comp": "mediabunny",
       "cw": 172.81999999284744,
       "ratio": 1.4900185164957194
-    },
-    {
-      "s": "audio-dsp/pcm_s24_to_f32",
-      "fam": "audio-dsp",
-      "our": 21.555000007152557,
-      "comp": "ffmpeg.wasm",
-      "cw": 14.520000010728836,
-      "ratio": 1.4845041316271044
     },
     {
       "s": "decode-seek/meta_vfr_seek_lands_on_true_pts",
@@ -1281,14 +1116,6 @@
       "comp": "remotion-webcodecs",
       "cw": 2.794999986886978,
       "ratio": 1.3398926681349739
-    },
-    {
-      "s": "audio-dsp/pcm_s16le_to_s16be",
-      "fam": "audio-dsp",
-      "our": 39.439999997615814,
-      "comp": "ffmpeg.wasm",
-      "cw": 29.640000015497208,
-      "ratio": 1.3306342772265418
     },
     {
       "s": "performance/size-ladder-extract-metadata-tiny",

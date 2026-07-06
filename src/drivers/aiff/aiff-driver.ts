@@ -15,19 +15,42 @@ import {
   type DriverModule,
   type Muxer,
   type Packet,
+  type PacketInfoMetadata,
+  type PacketInfoTable,
   type PcmTransform,
   type Registry,
   type StageOptions,
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import type { PcmAudio } from '../../dsp/pcm.ts';
+import { type PcmAudio, bytesPerSample } from '../../dsp/pcm.ts';
+import { fromURL } from '../../sources/source.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
-import { parseAiff, readAiffPcm } from './aiff.ts';
+import { trySliceAiffPcm } from './aiff-slice.ts';
+import { locate, parseAiff, readAiffPcm } from './aiff.ts';
 
 const AIFF_MIMES = new Set(['audio/aiff', 'audio/x-aiff', 'audio/aifc', 'audio/x-aifc']);
 const AIFF_EXTENSIONS = new Set(['aiff', 'aif', 'aifc']);
+const AIFF_PACKET_INFO_HEAD_BYTES = 65536;
+const AIFF_PACKET_FRAMES = 1024;
+const AIFF_PACKET_INFO_PREFIX_TTL_MS = 60_000;
+const AIFF_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES = 64;
+const OPERATION_ABORTED = 'operation aborted';
+
+export interface AiffPacketInfoFromUrlOptions {
+  readonly mime?: string;
+  readonly size?: number;
+  readonly signal?: AbortSignal;
+}
+
+interface AiffPacketInfoPrefixCacheEntry {
+  readonly bytes: Uint8Array;
+  readonly totalSize?: number;
+  readonly expiresAtMs: number;
+}
+
+const aiffPacketInfoPrefixCache = new Map<string, AiffPacketInfoPrefixCacheEntry>();
 
 function ascii(bytes: Uint8Array, offset: number, length: number): string {
   let out = '';
@@ -73,6 +96,151 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
   return out;
 }
 
+function aiffTrackInfo(info: ReturnType<typeof parseAiff>): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  };
+}
+
+function aiffPacketInfoFromLocatedBytes(
+  bytes: Uint8Array,
+  totalSize = bytes.byteLength,
+): PacketInfoTable {
+  const { layout, ssndSampleOffset, ssndSampleBytes } = locate(bytes, totalSize);
+  const codec =
+    layout.format === 'f32'
+      ? 'pcm-f32'
+      : layout.format === 'f64'
+        ? 'pcm-f64'
+        : layout.format === 's8'
+          ? 'pcm-s8'
+          : layout.endian === 'be'
+            ? `pcm-${layout.format}be`
+            : `pcm-${layout.format}`;
+  const sampleRate = Math.round(layout.sampleRate);
+  const track: TrackInfo = {
+    id: 0,
+    mediaType: 'audio',
+    codec,
+    durationSec: layout.sampleRate > 0 ? layout.frames / layout.sampleRate : 0,
+    config: { codec, sampleRate, numberOfChannels: layout.channels },
+  };
+  const packets: PacketInfoMetadata[] = [];
+  const bytesPerFrame = bytesPerSample(layout.format) * layout.channels;
+  if (ssndSampleOffset >= 0 && bytesPerFrame > 0 && sampleRate > 0 && ssndSampleBytes > 0) {
+    const totalFrames = Math.floor(ssndSampleBytes / bytesPerFrame);
+    for (let frame = 0; frame < totalFrames; frame += AIFF_PACKET_FRAMES) {
+      const frames = Math.min(AIFF_PACKET_FRAMES, totalFrames - frame);
+      const ptsUs = Math.round((frame / sampleRate) * 1_000_000);
+      packets.push({
+        trackIndex: 0,
+        offset: ssndSampleOffset + frame * bytesPerFrame,
+        size: frames * bytesPerFrame,
+        ptsUs,
+        dtsUs: ptsUs,
+        durationUs: Math.round((frames / sampleRate) * 1_000_000),
+        keyframe: true,
+      });
+    }
+  }
+  return { tracks: [track], packets };
+}
+
+export function aiffPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
+  return aiffPacketInfoFromLocatedBytes(bytes);
+}
+
+function aiffPacketInfoUrlCacheKey(url: string | URL, opts: AiffPacketInfoFromUrlOptions): string {
+  const href = typeof url === 'string' ? url : url.href;
+  return `${href}#${opts.size ?? 'unknown'}`;
+}
+
+function cachedAiffPacketInfoPrefix(
+  key: string,
+  totalSize: number | undefined,
+): PacketInfoTable | undefined {
+  const entry = aiffPacketInfoPrefixCache.get(key);
+  if (entry === undefined) return undefined;
+  if (entry.expiresAtMs <= Date.now()) {
+    aiffPacketInfoPrefixCache.delete(key);
+    return undefined;
+  }
+  const table = aiffPacketInfoFromLocatedBytes(
+    entry.bytes,
+    totalSize ?? entry.totalSize ?? entry.bytes.byteLength,
+  );
+  return table.packets.length > 0 ? table : undefined;
+}
+
+function storeAiffPacketInfoPrefix(
+  key: string,
+  bytes: Uint8Array,
+  totalSize: number | undefined,
+): void {
+  const now = Date.now();
+  for (const [entryKey, entry] of aiffPacketInfoPrefixCache) {
+    if (entry.expiresAtMs <= now) aiffPacketInfoPrefixCache.delete(entryKey);
+  }
+  while (aiffPacketInfoPrefixCache.size >= AIFF_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES) {
+    const oldest = aiffPacketInfoPrefixCache.keys().next().value as string;
+    aiffPacketInfoPrefixCache.delete(oldest);
+  }
+  aiffPacketInfoPrefixCache.set(key, {
+    bytes: bytes.slice(),
+    ...(totalSize !== undefined ? { totalSize } : {}),
+    expiresAtMs: now + AIFF_PACKET_INFO_PREFIX_TTL_MS,
+  });
+}
+
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+}
+
+export async function aiffPacketInfoFromUrl(
+  url: string | URL,
+  opts: AiffPacketInfoFromUrlOptions = {},
+): Promise<PacketInfoTable> {
+  assertNotAborted(opts.signal);
+  const packetInfo = AiffDriver.packetInfo;
+  if (packetInfo === undefined) {
+    throw new CapabilityError('capability-miss', 'AIFF packet-info is not available', {
+      op: { op: 'demux', container: 'aiff' },
+      tried: ['aiff'],
+    });
+  }
+  const key = aiffPacketInfoUrlCacheKey(url, opts);
+  const cached = cachedAiffPacketInfoPrefix(key, opts.size);
+  if (cached !== undefined) return cached;
+  const src = fromURL(url, {
+    mime: opts.mime ?? 'audio/aiff',
+    ...(opts.size !== undefined ? { size: opts.size } : {}),
+  });
+  if (src.range !== undefined) {
+    const prefix = await src.range(
+      0,
+      opts.size !== undefined
+        ? Math.min(opts.size, AIFF_PACKET_INFO_HEAD_BYTES)
+        : AIFF_PACKET_INFO_HEAD_BYTES,
+    );
+    assertNotAborted(opts.signal);
+    const totalSize = src.size ?? opts.size;
+    const table = aiffPacketInfoFromLocatedBytes(prefix, totalSize ?? prefix.byteLength);
+    if (table.packets.length > 0 && totalSize !== undefined) {
+      storeAiffPacketInfoPrefix(key, prefix, totalSize);
+      return table;
+    }
+  }
+  return packetInfo.call(
+    AiffDriver,
+    src,
+    opts.signal !== undefined ? { signal: opts.signal } : undefined,
+  );
+}
+
 function matches(q: ContainerQuery): boolean {
   if (q.mime !== undefined && AIFF_MIMES.has(q.mime)) return true;
   if (q.extension !== undefined && AIFF_EXTENSIONS.has(q.extension.toLowerCase())) return true;
@@ -87,13 +255,7 @@ export const AiffDriver: ContainerDriver = {
   supports: matches,
   async demux(src: ByteSource): Promise<Demuxer> {
     const info = parseAiff(await readHead(src, 65536));
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
-    };
+    const track = aiffTrackInfo(info);
     return {
       tracks: [track],
       packets(): ReadableStream<Packet> {
@@ -106,10 +268,32 @@ export const AiffDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const head = await readHead(src, 65536);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    try {
+      const table = aiffPacketInfoFromLocatedBytes(head, src.size ?? head.byteLength);
+      if (table.packets.length > 0 || src.size !== undefined) return table;
+    } catch (error) {
+      if (src.size !== undefined) throw error;
+    }
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    return aiffPacketInfoFromLocatedBytes(bytes);
+  },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const bytes = await readAll(src);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const container = o?.container ?? 'aiff';
+    const sliced = trySliceAiffPcm(bytes, o ?? {});
+    if (sliced !== undefined) {
+      return new ReadableStream<Uint8Array>({
+        start(c): void {
+          c.enqueue(sliced);
+          c.close();
+        },
+      });
+    }
     const aiff = readAiffPcm(bytes);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const audio = applyPcmTransform(aiff, o);

@@ -25,4 +25,14 @@ describe('WebCodecs video alpha normalization', () => {
     expect((config as DecoderConfigWithAlpha).alpha).toBeUndefined();
     expect(videoCodecCanCarryAlpha('avc1.64001f')).toBe(false);
   });
+
+  it('honors a VPx decode alpha override for packet-plane alpha routes', () => {
+    const config = normalizeVideoDecoderConfig(
+      { codec: 'vp09.00.10.08', codedWidth: 32, codedHeight: 18 },
+      'no-preference',
+      'discard',
+    );
+    expect(config.hardwareAcceleration).toBe('no-preference');
+    expect((config as DecoderConfigWithAlpha).alpha).toBe('discard');
+  });
 });

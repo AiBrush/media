@@ -444,14 +444,16 @@ describe('registerDefaultDrivers', () => {
       const cpu = findFilter(reg, 'cpu-video-filter');
 
       expect(webgpu.supports(resize)).toBe(true);
+      expect(webgpu.supports(tonemap)).toBe(false);
       expect(webgpu.supports(gain)).toBe(false);
       expect(canvas.supports(resize)).toBe(true);
       expect(canvas.supports(displayColor)).toBe(true);
       expect(canvas.supports(wideColor)).toBe(false);
-      expect(canvas.supports(tonemap)).toBe(false);
+      expect(canvas.supports(tonemap)).toBe(true);
       expect(audio.supports(gain)).toBe(true);
       expect(audio.supports(resize)).toBe(false);
       expect(cpu.supports(resize)).toBe(true);
+      expect(cpu.supports(tonemap)).toBe(true);
       expect(cpu.supports(gain)).toBe(false);
 
       await closeEmptyFilterStream(webgpu.createFilter(resize));
@@ -471,8 +473,11 @@ describe('registerDefaultDrivers', () => {
       const reg = new Registry();
       registerDefaultDrivers(reg);
       const resize: FilterSpec = { mediaType: 'video', type: 'resize', width: 16, height: 16 };
+      const tonemap: FilterSpec = { mediaType: 'video', type: 'tonemap', to: 'sdr' };
       expect(findFilter(reg, 'webgpu-video-filter').supports(resize)).toBe(false);
       expect(findFilter(reg, 'canvas2d-video-filter').supports(resize)).toBe(true);
+      expect(findFilter(reg, 'canvas2d-video-filter').supports(tonemap)).toBe(false);
+      expect(findFilter(reg, 'cpu-video-filter').supports(tonemap)).toBe(true);
     } finally {
       restoreFrame();
       restoreCanvas();

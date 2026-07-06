@@ -34,6 +34,25 @@ export interface PreparedWebmPacketMuxInput {
   readonly container: Container | string;
 }
 
+export interface PreparedWebmChunk {
+  readonly timestampUs: number;
+  readonly durationUs?: number;
+  readonly key: boolean;
+  readonly data: Uint8Array;
+  readonly dtsUs?: number;
+  readonly alpha?: Uint8Array;
+}
+
+export interface PreparedWebmChunkTrackInput {
+  readonly track: TrackInfo;
+  readonly chunks: readonly PreparedWebmChunk[];
+}
+
+export interface PreparedWebmChunkMuxInput {
+  readonly tracks: readonly PreparedWebmChunkTrackInput[];
+  readonly container: Container | string;
+}
+
 /** Fast single-track MP4/MOV packet mux for callers that already hold prepared packet bytes. */
 export async function muxSingleTrackMp4(
   streams: PacketStreams,
@@ -158,6 +177,33 @@ export function muxPreparedWebmPacketTracks(input: PreparedWebmPacketMuxInput): 
     const entry = input.tracks[i];
     if (entry === undefined) continue;
     const chunks = packetStructs(entry.packets);
+    if (chunks.length === 0) {
+      throw new MediaError('mux-error', `WebM mux track ${i + 1} received no packets`);
+    }
+    states.push(webmTrackStateFromPreparedTrack(entry.track, i + 1, chunks));
+  }
+  if (states.length === 0) {
+    throw new MediaError('mux-error', 'WebM mux received no tracks');
+  }
+  return writeWebm(states, input.container === 'mkv' ? 'matroska' : 'webm');
+}
+
+/** Fast WebM/Matroska mux for callers that already hold timestamped packet byte views. */
+export function muxPreparedWebmChunkTracks(input: PreparedWebmChunkMuxInput): Uint8Array {
+  if (input.container !== 'webm' && input.container !== 'mkv') {
+    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
+      op: { op: 'mux', container: input.container },
+      tried: ['webm', 'mkv'],
+    });
+  }
+  if (input.tracks.length === 0) {
+    throw new MediaError('mux-error', 'WebM mux received no tracks');
+  }
+  const states: WebmTrackState[] = [];
+  for (let i = 0; i < input.tracks.length; i++) {
+    const entry = input.tracks[i];
+    if (entry === undefined) continue;
+    const chunks = preparedChunkStructs(entry.chunks, i + 1);
     if (chunks.length === 0) {
       throw new MediaError('mux-error', `WebM mux track ${i + 1} received no packets`);
     }
@@ -441,6 +487,63 @@ function packetStructs(packets: readonly (EncodedChunk | Packet)[]): WebmChunkSt
   const chunks: WebmChunkStruct[] = [];
   for (const packet of packets) chunks.push(chunkStructFrom(packet));
   return chunks;
+}
+
+function preparedChunkStructs(
+  chunks: readonly PreparedWebmChunk[],
+  trackNumber: number,
+): WebmChunkStruct[] {
+  const out = new Array<WebmChunkStruct>(chunks.length);
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (chunk === undefined) {
+      throw new MediaError('mux-error', `WebM mux track ${trackNumber} has a missing packet`);
+    }
+    validatePreparedChunk(chunk, trackNumber, i + 1);
+    out[i] = {
+      timestampUs: chunk.timestampUs,
+      durationUs: chunk.durationUs,
+      key: chunk.key,
+      data: chunk.data,
+      ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
+      ...(chunk.alpha !== undefined ? { alpha: chunk.alpha } : {}),
+    };
+  }
+  return out;
+}
+
+function validatePreparedChunk(
+  chunk: PreparedWebmChunk,
+  trackNumber: number,
+  packetNumber: number,
+): void {
+  if (!Number.isFinite(chunk.timestampUs)) {
+    throw new MediaError(
+      'mux-error',
+      `WebM mux track ${trackNumber} packet ${packetNumber} has an invalid timestamp`,
+    );
+  }
+  if (
+    chunk.durationUs !== undefined &&
+    (!Number.isFinite(chunk.durationUs) || chunk.durationUs < 0)
+  ) {
+    throw new MediaError(
+      'mux-error',
+      `WebM mux track ${trackNumber} packet ${packetNumber} has an invalid duration`,
+    );
+  }
+  if (chunk.dtsUs !== undefined && !Number.isFinite(chunk.dtsUs)) {
+    throw new MediaError(
+      'mux-error',
+      `WebM mux track ${trackNumber} packet ${packetNumber} has an invalid decode timestamp`,
+    );
+  }
+  if (chunk.data.byteLength === 0) {
+    throw new MediaError(
+      'mux-error',
+      `WebM mux track ${trackNumber} packet ${packetNumber} has no payload`,
+    );
+  }
 }
 
 function webmTrackStateFromPreparedTrack(

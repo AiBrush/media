@@ -12,6 +12,7 @@
  */
 
 import type {
+  DecoderConfig,
   EncodedChunk,
   Packet,
   RawFrame,
@@ -21,6 +22,12 @@ import type {
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
+import {
+  RGBA_BYTES_PER_PIXEL,
+  type VpxAlphaPackedSourceFormat,
+  vpxAlphaI420FromPackedRgba,
+  vpxAlphaI420FromPlane,
+} from './vpx-alpha-pixels.ts';
 
 export {
   audioTargetCanBypassFilterPlanner,
@@ -31,6 +38,12 @@ export {
   isPureStreamCopy,
   selectTrackInfos,
 } from './codec-routing.ts';
+export {
+  type VpxAlphaI420Plane,
+  type VpxAlphaPackedSourceFormat,
+  vpxAlphaI420FromPackedRgba,
+  vpxAlphaI420FromPlane,
+} from './vpx-alpha-pixels.ts';
 
 // ============ codec-string mapping (public token → WebCodecs codec string) ============
 
@@ -455,6 +468,28 @@ export function outputDimensions(
     height = w;
   }
   return { width, height };
+}
+
+/**
+ * True when a VPx-alpha transcode can preserve the alpha side stream without decoding to merged RGBA
+ * frames. Any pixel/timing transform must use the general decoded-frame path instead.
+ */
+export function canUseVpxAlphaPacketTranscode(
+  target: VideoTarget,
+  sourceHasAlpha: boolean,
+): boolean {
+  return (
+    sourceHasAlpha &&
+    target.alpha === 'keep' &&
+    target.width === undefined &&
+    target.height === undefined &&
+    target.crop === undefined &&
+    target.rotate === undefined &&
+    target.flip === undefined &&
+    target.colorspace === undefined &&
+    target.tonemap === undefined &&
+    target.fps === undefined
+  );
 }
 
 /**
@@ -954,7 +989,6 @@ export function unwrapPackets(packets: ReadableStream<Packet>): ReadableStream<E
   );
 }
 
-const RGBA_BYTES_PER_PIXEL = 4;
 const RGBA_PIXEL_SIDECAR_PROPERTY = '__aibrushRgbaPixels';
 
 export interface RgbaFramePixels {
@@ -1057,6 +1091,46 @@ function rgbaPixelsToFrame(pixels: RgbaFramePixels, color: VideoFrame): VideoFra
   return frame;
 }
 
+function bufferInitFromSourceFrame(
+  frame: VideoFrame,
+  format: VideoPixelFormat,
+  width: number,
+  height: number,
+  layout: readonly PlaneLayout[],
+): VideoFrameBufferInit {
+  const base: VideoFrameBufferInit = {
+    format,
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: frame.timestamp,
+    layout: [...layout],
+  };
+  return frame.duration === null ? base : { ...base, duration: frame.duration };
+}
+
+function packedSourceFormat(
+  format: VideoPixelFormat | null,
+): VpxAlphaPackedSourceFormat | undefined {
+  if (format === 'RGBA' || format === 'BGRA') return format;
+  return undefined;
+}
+
+function compactAlphaSplitCanUseNativeLayout(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+): boolean {
+  return frame.codedWidth === width && frame.codedHeight === height;
+}
+
+function requiredPlaneLayout(layout: readonly PlaneLayout[], index: number): PlaneLayout {
+  const plane = layout[index];
+  if (plane === undefined) {
+    throw new MediaError('encode-error', `VPx alpha copy returned no plane ${index}`);
+  }
+  return plane;
+}
+
 export function splitRgbaForVpxAlpha(pixels: RgbaFramePixels): VpxAlphaSplitPixels {
   assertRgbaPixelsShape(pixels, 'encode');
   const minimumSize = pixels.width * pixels.height * RGBA_BYTES_PER_PIXEL;
@@ -1079,9 +1153,70 @@ export function splitRgbaForVpxAlpha(pixels: RgbaFramePixels): VpxAlphaSplitPixe
   };
 }
 
+async function splitPackedFrameForVpxAlphaInline(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+  sourceFormat: VpxAlphaPackedSourceFormat,
+): Promise<{ color: VideoFrame; alpha: VideoFrame }> {
+  const source = new Uint8Array(frame.allocationSize());
+  const sourceLayout = await frame.copyTo(source);
+  const colorPlane = requiredPlaneLayout(sourceLayout, 0);
+  const alpha = vpxAlphaI420FromPackedRgba(source, width, height, colorPlane, sourceFormat);
+  let colorFrame: VideoFrame | undefined;
+  let alphaFrame: VideoFrame | undefined;
+  try {
+    colorFrame = frame.clone();
+    alphaFrame = new VideoFrame(
+      alpha.data,
+      bufferInitFromSourceFrame(frame, 'I420', width, height, alpha.layout),
+    );
+    return { color: colorFrame, alpha: alphaFrame };
+  } catch (error) {
+    if (colorFrame !== undefined) closeFrame(colorFrame);
+    if (alphaFrame !== undefined) closeFrame(alphaFrame);
+    throw error;
+  }
+}
+
+async function splitI420AFrameForVpxAlpha(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+): Promise<{ color: VideoFrame; alpha: VideoFrame }> {
+  const source = new Uint8Array(frame.allocationSize());
+  const sourceLayout = await frame.copyTo(source);
+  const alpha = vpxAlphaI420FromPlane(source, width, height, requiredPlaneLayout(sourceLayout, 3));
+  let colorFrame: VideoFrame | undefined;
+  let alphaFrame: VideoFrame | undefined;
+  try {
+    colorFrame = frame.clone();
+    alphaFrame = new VideoFrame(
+      alpha.data,
+      bufferInitFromSourceFrame(frame, 'I420', width, height, alpha.layout),
+    );
+    return { color: colorFrame, alpha: alphaFrame };
+  } catch (error) {
+    if (colorFrame !== undefined) closeFrame(colorFrame);
+    if (alphaFrame !== undefined) closeFrame(alphaFrame);
+    throw error;
+  }
+}
+
 async function splitFrameForVpxAlpha(
   frame: VideoFrame,
 ): Promise<{ color: VideoFrame; alpha: VideoFrame }> {
+  const width = frameDimension(frame, 'width');
+  const height = frameDimension(frame, 'height');
+  if (compactAlphaSplitCanUseNativeLayout(frame, width, height)) {
+    const sourceFormat = packedSourceFormat(frame.format);
+    if (sourceFormat !== undefined) {
+      return splitPackedFrameForVpxAlphaInline(frame, width, height, sourceFormat);
+    }
+    if (frame.format === 'I420A') {
+      return splitI420AFrameForVpxAlpha(frame, width, height);
+    }
+  }
   const split = splitRgbaForVpxAlpha(await rgbaPixelsFromFrame(frame));
   return {
     color: rgbaPixelsToFrame(split.color, frame),
@@ -1113,6 +1248,22 @@ export interface VpxAlphaEncodeOptions {
     config: VideoEncoderConfig,
     o?: StageOptions,
   ) => TransformStream<RawFrame, EncodedChunk>;
+  readonly colorStage?: StageOptions;
+  readonly alphaStage?: StageOptions;
+}
+
+export interface VpxAlphaPacketTranscodeOptions {
+  readonly decodeConfig: DecoderConfig;
+  readonly encodeConfig: VideoEncoderConfig;
+  readonly createDecoder: (
+    config: DecoderConfig,
+    o?: StageOptions,
+  ) => TransformStream<EncodedChunk, RawFrame>;
+  readonly createEncoder: (
+    config: VideoEncoderConfig,
+    o?: StageOptions,
+  ) => TransformStream<RawFrame, EncodedChunk>;
+  readonly decodeStage?: StageOptions;
   readonly colorStage?: StageOptions;
   readonly alphaStage?: StageOptions;
 }
@@ -1239,6 +1390,81 @@ export function encodeVideoFramesWithAlpha(
         alphaWriter.abort(reason),
       ]);
       await pumpPromise?.catch(() => undefined);
+    },
+  });
+}
+
+/**
+ * Transcode a WebM/Matroska VPx-alpha packet stream without materializing merged RGBA frames. The demuxer
+ * already exposes color chunks and alpha side chunks separately, so an unfiltered alpha-preserving VPx
+ * transcode can decode+encode each elementary stream independently and pair the re-encoded packets by PTS.
+ */
+export function transcodeVpxAlphaPackets(
+  packets: ReadableStream<Packet>,
+  options: VpxAlphaPacketTranscodeOptions,
+): ReadableStream<Packet> {
+  const [colorPackets, alphaPackets] = packets.tee();
+  const colorChunks = unwrapPackets(colorPackets)
+    .pipeThrough(options.createDecoder(options.decodeConfig, options.decodeStage))
+    .pipeThrough(options.createEncoder(options.encodeConfig, options.colorStage));
+  const alphaChunks = alphaChunkStream(alphaPackets)
+    .pipeThrough(options.createDecoder(options.decodeConfig, options.decodeStage))
+    .pipeThrough(options.createEncoder(options.encodeConfig, options.alphaStage));
+  const colorReader = colorChunks.getReader();
+  const alphaReader = alphaChunks.getReader();
+  const alphaByTimestamp = new Map<number, EncodedChunk>();
+  let alphaDone = false;
+
+  const alphaForTimestamp = async (timestamp: number): Promise<EncodedChunk | undefined> => {
+    for (const [alphaTimestamp] of alphaByTimestamp) {
+      if (alphaTimestamp >= timestamp) continue;
+      alphaByTimestamp.delete(alphaTimestamp);
+    }
+    const cached = alphaByTimestamp.get(timestamp);
+    if (cached !== undefined) {
+      alphaByTimestamp.delete(timestamp);
+      return cached;
+    }
+    while (!alphaDone) {
+      const { done, value } = await alphaReader.read();
+      if (done) {
+        alphaDone = true;
+        return undefined;
+      }
+      if (value.timestamp < timestamp) continue;
+      if (value.timestamp === timestamp) return value;
+      alphaByTimestamp.set(value.timestamp, value);
+      return undefined;
+    }
+    return undefined;
+  };
+
+  const cancelReaders = async (reason: unknown): Promise<void> => {
+    await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
+  };
+
+  return new ReadableStream<Packet>({
+    async pull(controller): Promise<void> {
+      try {
+        const { done, value: color } = await colorReader.read();
+        if (done) {
+          await alphaReader.cancel('color stream ended');
+          controller.close();
+          return;
+        }
+        const alpha = await alphaForTimestamp(color.timestamp);
+        controller.enqueue(
+          alpha === undefined
+            ? { chunk: color }
+            : { chunk: color, alpha: alpha as EncodedVideoChunk },
+        );
+      } catch (error) {
+        await cancelReaders(error);
+        controller.error(error);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await cancelReaders(reason);
     },
   });
 }

@@ -22,6 +22,12 @@ interface FastBank {
   readonly nextPhases: Int32Array;
 }
 
+export interface WavS16ResampleOptions {
+  readonly sampleRate: number;
+  readonly channels?: number;
+  readonly signal?: AbortSignal;
+}
+
 const FAST_BANK_CACHE = new Map<string, FastBank>();
 
 const nativeLittleEndian = new Uint8Array(new Uint16Array([0x00ff]).buffer)[0] === 0xff;
@@ -277,4 +283,16 @@ export function tryResampleWavS16ToS16Wav(
   writeWavHeader(out, outputDataBytes, fmt.channels, outRate, 's16');
   throwIfAborted(opts.signal);
   return out;
+}
+
+export function wavS16ResampleToWavFromBytes(
+  bytes: Uint8Array,
+  opts: WavS16ResampleOptions,
+): Uint8Array<ArrayBuffer> | undefined {
+  return tryResampleWavS16ToS16Wav(bytes, {
+    container: 'wav',
+    sampleFormat: 's16',
+    endian: 'le',
+    ...opts,
+  });
 }

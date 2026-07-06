@@ -1432,6 +1432,13 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
   };
 }
 
+export function mp4PacketInfoTable(movie: Movie, sourceSize?: number): PacketInfoTable {
+  return {
+    tracks: movie.tracks.map(toTrackInfo),
+    packets: mp4PacketInfoMetadata(movie, sourceSize),
+  };
+}
+
 function isAacTrack(track: ParsedTrack): boolean {
   return track.mediaType === 'audio' && track.codec.startsWith('mp4a');
 }
@@ -2614,10 +2621,7 @@ export const Mp4Driver: ContainerDriver = {
     const wantsOffsets = ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES;
     const movie = wantsOffsets ? await readMovie(ra) : await readMoviePacketInfo(ra);
     throwIfAborted(signal);
-    return {
-      tracks: movie.tracks.map(toTrackInfo),
-      packets: mp4PacketInfoMetadata(movie, wantsOffsets ? ra.size : undefined),
-    };
+    return mp4PacketInfoTable(movie, wantsOffsets ? ra.size : undefined);
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);

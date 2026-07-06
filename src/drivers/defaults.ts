@@ -606,17 +606,18 @@ function createLazyFilterStream(
       },
     },
     { highWaterMark: 0 },
-    { highWaterMark: 0 },
+    { highWaterMark: 1 },
   ) as TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData>;
 }
 
 function webgpuFilterSupports(spec: FilterSpec): boolean {
-  return spec.mediaType === 'video' && webgpuAvailable();
+  return spec.mediaType === 'video' && spec.type !== 'tonemap' && webgpuAvailable();
 }
 
 function canvas2dFilterSupports(spec: FilterSpec): boolean {
   if (!canvas2dAvailable()) return false;
   if (isGeometricVideoFilterSpec(spec)) return true;
+  if (spec.mediaType === 'video' && spec.type === 'tonemap') return chromiumCanvasTonemapAvailable();
   return spec.mediaType === 'video' && spec.type === 'colorspace' && isDisplayColorToken(spec.to);
 }
 
@@ -633,6 +634,11 @@ function webgpuAvailable(): boolean {
 
 function canvas2dAvailable(): boolean {
   return typeof OffscreenCanvas !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+function chromiumCanvasTonemapAvailable(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  return /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
 }
 
 function isGeometricVideoFilterSpec(spec: FilterSpec): boolean {

@@ -65,7 +65,7 @@ type GeometricVideoSpec = Extract<
   { mediaType: 'video'; type: 'resize' | 'crop' | 'rotate' | 'flip' }
 >;
 
-/** The colour video specs handled by the second (colour) pipeline (colorspace/tonemap) — ADR-032. */
+/** The colour video specs handled by the second (colour) pipeline. */
 type ColorVideoSpec = Extract<FilterSpec, { mediaType: 'video'; type: 'colorspace' | 'tonemap' }>;
 
 /** True for the four geometric video filter specs (single quad pipeline). */
@@ -84,11 +84,11 @@ function isColorVideoSpec(f: FilterSpec): f is ColorVideoSpec {
 /**
  * Whether a *Canvas2D* substrate can honestly perform a colour spec. Canvas2D `drawImage(VideoFrame)`
  * yields UA-colour-managed pixels in the display space, so it can correctly satisfy a `colorspace`
- * conversion **to the display gamut** (srgb/bt709) — a passthrough — but it cannot produce a wider gamut
- * (709→2020) nor tonemap HDR (it clamps). Those decline here so the router falls through (ADR-032).
+ * conversion **to the display gamut** (srgb/bt709). On Chromium it also performs the HDR→SDR display
+ * mapping for `VideoFrame` draws without `copyTo()`; wide-gamut output still declines here.
  */
 function canvas2dCanColor(f: ColorVideoSpec): boolean {
-  if (f.type === 'tonemap') return false;
+  if (f.type === 'tonemap') return chromiumCanvasTonemapAvailable();
   const dst = parseColorSpace(f.to);
   return dst !== null && isDisplayColorSpace(dst);
 }
@@ -110,6 +110,11 @@ function webgpuAvailable(): boolean {
 /** Canvas2D rendering is usable when `OffscreenCanvas` and `VideoFrame` are present. */
 function canvas2dAvailable(): boolean {
   return typeof OffscreenCanvas !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+function chromiumCanvasTonemapAvailable(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  return /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
 }
 
 // ============ per-frame draw recipe (substrate-independent) ============
@@ -197,9 +202,9 @@ function ensureCanvas(canvas: OffscreenCanvas | undefined, dims: Dims): Offscree
 
 /**
  * Canvas2D renderer: `drawImage` with the op's source/destination rects or affine transform. Colour ops
- * are a full-frame 1:1 passthrough — the driver only routes a colorspace conversion *to the display space*
- * here (ADR-032/`canvas2dCanColor`), and Canvas2D `drawImage(VideoFrame)` already yields UA-colour-managed
- * display pixels, so the passthrough is the correct result (tonemap/wide-gamut are declined upstream).
+ * are a full-frame 1:1 draw — the driver only routes display-space colorspace conversions, plus Chromium
+ * HDR→SDR tonemap, here (ADR-032/`canvas2dCanColor`), and Canvas2D `drawImage(VideoFrame)` yields
+ * UA-colour-managed display pixels. Wide-gamut output is declined upstream.
  */
 class Canvas2DRenderer implements Renderer {
   private canvas: OffscreenCanvas | undefined;
@@ -668,9 +673,13 @@ function createFilterStream(
 
 // ============ drivers ============
 
-/** A spec the WebGPU driver can handle: every geometric op + both colour ops (all targets), ADR-032. */
+/**
+ * A spec the WebGPU driver can handle: every geometric op + colorspace. Tonemap intentionally falls
+ * through to the CPU colour path because Chromium WebGPU external-texture tonemap has proven unstable on
+ * the tiny HDR10 benchmark path, while the CPU path uses the same validated colour science.
+ */
 function webgpuHandles(f: FilterSpec): f is VideoFilterSpec {
-  return isGeometricVideoSpec(f) || isColorVideoSpec(f);
+  return isGeometricVideoSpec(f) || (isColorVideoSpec(f) && f.type === 'colorspace');
 }
 
 /**
@@ -685,7 +694,7 @@ function canvas2dHandles(f: FilterSpec): f is VideoFilterSpec {
 
 /**
  * The primary WebGPU video filter driver (`substrate:'webgpu'`). `supports()` is honest: it returns
- * `false` (so the router falls through to Canvas2D) unless this is a geometric **or** colour video spec
+ * `false` (so the router falls through to Canvas2D/CPU) unless this is a geometric or colorspace video spec
  * **and** WebGPU + `OffscreenCanvas` + `VideoFrame` are present. Heavy device acquisition happens lazily in
  * `createFilter`'s stream `start`, never in `supports()` (doc 04: probing stays cheap).
  */
@@ -716,8 +725,8 @@ export const webgpuVideoFilterDriver: FilterDriver = {
 /**
  * The Canvas2D fallback video filter driver (`substrate:'canvas2d'`, ranked after WebGPU). Geometric ops
  * via an `OffscreenCanvas` 2D context — exact for crop/rotate/flip and bilinear for resize — plus a
- * display-space `colorspace` passthrough. `supports()` is honest about `OffscreenCanvas`/`VideoFrame`
- * availability and declines tonemap / wide-gamut colorspace (ADR-032).
+ * display-space colour draw. `supports()` is honest about `OffscreenCanvas`/`VideoFrame` availability,
+ * permits Chromium HDR→SDR tonemap, and declines wide-gamut colorspace (ADR-032).
  */
 export const canvas2dVideoFilterDriver: FilterDriver = {
   id: 'canvas2d-video-filter',

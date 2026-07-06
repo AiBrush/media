@@ -276,11 +276,14 @@ export function videoCodecCanCarryAlpha(codec: string): boolean {
 export function normalizeVideoDecoderConfig(
   config: VideoDecoderConfig,
   hardwareAcceleration: HardwareAcceleration,
+  alpha: AlphaOption | undefined = undefined,
 ): VideoDecoderConfigWithAlpha {
   return {
     ...config,
     hardwareAcceleration,
-    ...(videoCodecCanCarryAlpha(config.codec) ? { alpha: 'keep' as const } : {}),
+    ...(videoCodecCanCarryAlpha(config.codec)
+      ? { alpha: alpha ?? (config as VideoDecoderConfigWithAlpha).alpha ?? ('keep' as const) }
+      : {}),
   };
 }
 
@@ -360,7 +363,17 @@ function asVideoEncoderConfig(c: EncoderConfig): VideoEncoderConfig | undefined 
   return 'width' in c && 'height' in c ? (c as VideoEncoderConfig) : undefined;
 }
 
-// ── driver-local encoder options (additive; the public method keeps the `StageOptions` signature) ─
+// ── driver-local codec options (additive; the public method keeps the `StageOptions` signature) ─────
+
+/**
+ * Optional decoder controls layered onto {@link StageOptions}. VPx-alpha decode normally keeps alpha so the
+ * public decode path can emit RGBA frames. Packet-plane alpha transcodes decode color and alpha elementary
+ * streams separately, so they can explicitly request `alpha:'discard'` and avoid an unnecessary RGBA layout.
+ */
+export interface VideoDecoderStageOptions extends StageOptions {
+  /** Override VP8/VP9 decode alpha handling for specialized packet-plane routes. */
+  alpha?: AlphaOption;
+}
 
 /**
  * Optional encoder controls layered onto {@link StageOptions} (the contract parameter type is unchanged
@@ -393,6 +406,11 @@ function readDecoderConfigSink(
 ): ((config: VideoDecoderConfig) => void) | undefined {
   const v = (o as VideoEncoderStageOptions | undefined)?.onDecoderConfig;
   return typeof v === 'function' ? v : undefined;
+}
+
+function readDecoderAlpha(o: StageOptions | undefined): AlphaOption | undefined {
+  const v = (o as VideoDecoderStageOptions | undefined)?.alpha;
+  return v === 'keep' || v === 'discard' ? v : undefined;
 }
 
 // ── environment guards ───────────────────────────────────────────────────────────────────────────
@@ -699,7 +717,11 @@ function createVideoDecoder(
             },
           });
           decoder.configure({
-            ...normalizeVideoDecoderConfig(config, normalizeHardwareAcceleration(o?.determinism)),
+            ...normalizeVideoDecoderConfig(
+              config,
+              normalizeHardwareAcceleration(o?.determinism),
+              readDecoderAlpha(o),
+            ),
           });
         } catch (e) {
           const error = new MediaError('decode-error', describeError(e), e);
@@ -853,7 +875,7 @@ function createVideoEncoder(
   return new TransformStream<RawFrame, EncodedChunk>(
     transformer,
     { highWaterMark: 1 },
-    { highWaterMark: 0 },
+    { highWaterMark: 1 },
   );
 }
 

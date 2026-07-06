@@ -15,6 +15,7 @@
 import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
+import type { RouteCost } from '../kernel/tier-thresholds.ts';
 import { type SourceGeometry, buildVideoEncoderConfig, videoCodecToken } from './codec-pipeline.ts';
 import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
 
@@ -77,6 +78,31 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
   }
   return specs;
+}
+
+/**
+ * Cost evidence for router selection of browser video filters. Some filter specs, notably full-frame
+ * colour ops (`colorspace`/`tonemap`) do not carry dimensions themselves, so the engine passes the source
+ * track geometry and duration here rather than letting the router assume a normal-sized workload.
+ */
+export function videoFilterRouteCost(src: SourceGeometry): RouteCost {
+  const outputPixels =
+    src.width !== undefined &&
+    src.height !== undefined &&
+    Number.isFinite(src.width) &&
+    Number.isFinite(src.height) &&
+    src.width > 0 &&
+    src.height > 0
+      ? src.width * src.height
+      : undefined;
+  const mediaSeconds =
+    src.durationSec !== undefined && Number.isFinite(src.durationSec) && src.durationSec > 0
+      ? src.durationSec
+      : undefined;
+  return {
+    ...(outputPixels !== undefined ? { outputPixels } : {}),
+    ...(mediaSeconds !== undefined ? { mediaSeconds } : {}),
+  };
 }
 
 // ============ video fps retiming (decoded presentation frames → CFR) ============

@@ -3,6 +3,7 @@ import type { Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.
 import {
   type TimedFrameForTrim,
   estimateTrackBitrateFromPacketInfo,
+  planSeekVideoPacketInfoRows,
   planTrimAudioPacketInfoRows,
   planTrimVideoPacketInfoRows,
   trimAudioPacketInfoStream,
@@ -460,6 +461,81 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
       { start: 120, end: 160 },
       { start: 120, end: 160 },
       { start: 120, end: 160 },
+    ]);
+  });
+
+  it('plans packet-info seek rows from the target GOP, including past EOF', () => {
+    const packets: PacketInfoMetadata[] = [
+      {
+        trackIndex: 0,
+        offset: 100,
+        size: 10,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 110,
+        size: 10,
+        ptsUs: 20,
+        dtsUs: 10,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 0,
+        offset: 120,
+        size: 10,
+        ptsUs: 50,
+        dtsUs: 20,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 130,
+        size: 10,
+        ptsUs: 60,
+        dtsUs: 30,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 0,
+        offset: 140,
+        size: 10,
+        ptsUs: 68,
+        dtsUs: 40,
+        durationUs: 10,
+        keyframe: true,
+      },
+      {
+        trackIndex: 0,
+        offset: 150,
+        size: 10,
+        ptsUs: 80,
+        dtsUs: 50,
+        durationUs: 10,
+        keyframe: false,
+      },
+      {
+        trackIndex: 1,
+        offset: 10_000,
+        size: 10,
+        ptsUs: 80,
+        dtsUs: 80,
+        durationUs: 10,
+        keyframe: true,
+      },
+    ];
+
+    expect(planSeekVideoPacketInfoRows(packets, 0, 60)?.map((row) => row.timestampUs)).toEqual([
+      50, 60, 68,
+    ]);
+    expect(planSeekVideoPacketInfoRows(packets, 0, 300)?.map((row) => row.timestampUs)).toEqual([
+      68, 80,
     ]);
   });
 

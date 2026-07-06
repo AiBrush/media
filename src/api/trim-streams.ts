@@ -177,6 +177,17 @@ export function planTrimVideoPacketInfoRows(
   return rows;
 }
 
+export function planSeekVideoPacketInfoRows(
+  packets: readonly PacketInfoMetadata[],
+  trackIndex: number,
+  targetUs: number,
+): readonly TrimVideoPacketInfoRow[] | undefined {
+  if (!Number.isFinite(targetUs) || targetUs < 0) return undefined;
+  const startUs = Math.round(targetUs);
+  const endUs = startUs < Number.MAX_SAFE_INTEGER ? startUs + 1 : Number.MAX_SAFE_INTEGER;
+  return planTrimVideoPacketInfoRows(packets, trackIndex, { startUs, endUs });
+}
+
 export function estimateTrackBitrateFromPacketInfo(
   packets: readonly PacketInfoMetadata[],
   trackIndex: number,

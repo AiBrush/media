@@ -16,6 +16,7 @@ import {
   type MuxOptions,
   type Muxer,
   type Packet,
+  type PacketInfoMetadata,
   type Registry,
   type StageOptions,
   type StreamCopyOptions,
@@ -613,6 +614,18 @@ export interface WebmDemux {
   framesByIndex: WebmFrame[][];
 }
 
+export interface WebmPacketPayloadMetadata extends PacketInfoMetadata {
+  /** Packet bytes as a view into the parsed source buffer. */
+  readonly data: Uint8Array;
+  /** VPx alpha side-data bytes as a source-buffer view, when present. */
+  readonly alpha?: Uint8Array;
+}
+
+export interface WebmPacketPayloadInfoTable {
+  readonly tracks: readonly TrackInfo[];
+  readonly packets: readonly WebmPacketPayloadMetadata[];
+}
+
 /**
  * Parse the whole file: metadata ({@link parseWebm}) + every Cluster's blocks → per-track frames. The
  * blocks are keyed in Matroska by `TrackNumber`; we remap them to the public **track index** (the array
@@ -637,6 +650,60 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
     t.trackNumber !== undefined ? (byTrackNumber.get(t.trackNumber) ?? []) : [],
   );
   return { info, framesByIndex };
+}
+
+function sourceViewOffset(source: Uint8Array, view: Uint8Array): number | undefined {
+  if (view.buffer !== source.buffer) return undefined;
+  const offset = view.byteOffset - source.byteOffset;
+  if (offset < 0 || offset + view.byteLength > source.byteLength) return undefined;
+  return offset;
+}
+
+function packetPayloadRows(
+  bytes: Uint8Array,
+  framesByIndex: readonly (readonly WebmFrame[])[],
+  sourceDurationUs: number | undefined,
+): WebmPacketPayloadMetadata[] {
+  const rows: WebmPacketPayloadMetadata[] = [];
+  for (let trackIndex = 0; trackIndex < framesByIndex.length; trackIndex++) {
+    const frames = framesByIndex[trackIndex];
+    if (frames === undefined) continue;
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
+      if (frame === undefined) continue;
+      const offset = sourceViewOffset(bytes, frame.data);
+      const durationUs = frameDurationUs(frames, i, sourceDurationUs);
+      rows.push({
+        trackIndex,
+        ...(offset !== undefined ? { offset } : {}),
+        size: frame.data.byteLength,
+        ptsUs: frame.timestampUs,
+        dtsUs: frame.timestampUs,
+        ...(durationUs !== undefined ? { durationUs } : {}),
+        keyframe: frame.keyframe,
+        data: frame.data,
+        ...(frame.alpha !== undefined ? { alpha: frame.alpha } : {}),
+      });
+    }
+  }
+  return rows;
+}
+
+export function webmPacketPayloadInfoFromBytes(bytes: Uint8Array): WebmPacketPayloadInfoTable {
+  const { info, framesByIndex } = demuxWebm(bytes);
+  const sourceDurationUs =
+    info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
+  return {
+    tracks: info.tracks.map((track, index) =>
+      toTrackInfo(
+        track,
+        index,
+        info.durationSec,
+        framesByIndex[index]?.some((frame) => frame.alpha !== undefined) === true,
+      ),
+    ),
+    packets: packetPayloadRows(bytes, framesByIndex, sourceDurationUs),
+  };
 }
 
 function toTrackInfo(
@@ -1096,7 +1163,12 @@ function packetStream(
         isVideo && frame.alpha !== undefined
           ? new EncodedVideoChunk({ ...init, data: frame.alpha })
           : undefined;
-      controller.enqueue({ chunk, ...(alpha !== undefined ? { alpha } : {}) });
+      controller.enqueue({
+        chunk,
+        data: frame.data,
+        sizeBytes: frame.data.byteLength,
+        ...(alpha !== undefined ? { alpha } : {}),
+      });
     },
   });
   /* v8 ignore stop */

@@ -104,9 +104,13 @@ export { fragmentMp4 } from './drivers/mp4/fragment.ts';
 export type { FragmentOptions, FragmentTrackInput } from './drivers/mp4/fragment.ts';
 export {
   muxPreparedWebmAudioPacketTrack,
+  muxPreparedWebmChunkTracks,
   muxPreparedWebmPacketTracks,
 } from './api/flac-mkv-mux.ts';
 export type {
+  PreparedWebmChunk,
+  PreparedWebmChunkMuxInput,
+  PreparedWebmChunkTrackInput,
   PreparedWebmAudioPacketMuxInput,
   PreparedWebmPacketMuxInput,
   PreparedWebmPacketTrackInput,
@@ -118,12 +122,17 @@ export {
   muxPreparedMp4PacketTracks,
   muxPreparedMp4PacketTracksStream,
 } from './api/mp4-prepared-mux.ts';
+export { muxPreparedMpegTsPacketTracks } from './api/mpegts-prepared-mux.ts';
 export type {
   Mp4PacketInfoFromUrlOptions,
   PreparedMp4PacketMuxInput,
   PreparedMp4PacketTrackMuxInput,
   PreparedMp4PacketTracksMuxInput,
 } from './api/mp4-prepared-mux.ts';
+export type {
+  PreparedMpegTsPacketMuxInput,
+  PreparedMpegTsPacketTrackInput,
+} from './api/mpegts-prepared-mux.ts';
 export {
   adtsPacketInfoFromBytes,
   adtsTrimFromBytes,
@@ -133,13 +142,29 @@ export type { AdtsTrimFromUrlOptions, AdtsTrimRange } from './drivers/adts/adts-
 export { mp3PacketInfoFromBytes, muxPreparedMp3PacketTrack } from './drivers/mp3/mp3-driver.ts';
 export type { PreparedMp3PacketMuxInput } from './drivers/mp3/mp3-driver.ts';
 export { oggPacketInfoFromBytes } from './drivers/ogg/ogg-driver.ts';
+export { webmPacketPayloadInfoFromBytes } from './drivers/webm/webm-driver.ts';
+export type {
+  WebmPacketPayloadInfoTable,
+  WebmPacketPayloadMetadata,
+} from './drivers/webm/webm-driver.ts';
 export {
   wavPacketInfoFromBytes,
   wavPacketInfoFromUrl,
 } from './drivers/wav/wav-driver.ts';
 export type { WavPacketInfoFromUrlOptions } from './drivers/wav/wav-driver.ts';
+export { wavF32GainToWavFromBytes } from './drivers/wav/f32-gain.ts';
+export type { WavF32GainOptions } from './drivers/wav/f32-gain.ts';
+export { wavPcmFormatToWavFromBytes } from './drivers/wav/format-convert.ts';
+export type { WavPcmFormatConvertOptions } from './drivers/wav/format-convert.ts';
+export { wavS16ResampleToWavFromBytes } from './drivers/wav/s16-resample.ts';
+export type { WavS16ResampleOptions } from './drivers/wav/s16-resample.ts';
 export { wavTrimFromUrl } from './drivers/wav/url-trim.ts';
 export type { WavTrimFromUrlOptions } from './drivers/wav/url-trim.ts';
+export {
+  aiffPacketInfoFromBytes,
+  aiffPacketInfoFromUrl,
+} from './drivers/aiff/aiff-driver.ts';
+export type { AiffPacketInfoFromUrlOptions } from './drivers/aiff/aiff-driver.ts';
 export { aiffPcmToWavFromBytes } from './drivers/aiff/aiff-wav-rewrite.ts';
 export type { AiffPcmToWavOptions } from './drivers/aiff/aiff-wav-rewrite.ts';
 

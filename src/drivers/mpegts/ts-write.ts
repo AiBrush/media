@@ -52,6 +52,11 @@ interface TrackState {
   readonly chunks: MpegTsChunk[];
 }
 
+export interface MpegTsPacketTrackInput {
+  readonly track: TrackInfo;
+  readonly chunks: readonly MpegTsChunk[];
+}
+
 interface TimedAccessUnit {
   readonly track: TrackState;
   readonly chunk: MpegTsChunk;
@@ -140,49 +145,9 @@ export class MpegTsMuxer implements Muxer {
 
   addTrack(info: TrackInfo): number {
     this.#assertWritable();
-    const codec = normalizeCodec(info.codec);
-    const muxTrackId = this.#tracks.length + 1;
-    const pid = FIRST_ES_PID + this.#tracks.length;
-    const videoCount = this.#tracks.filter((track) => track.mediaType === 'video').length;
-    const audioCount = this.#tracks.filter((track) => track.mediaType === 'audio').length;
-
-    const track: TrackState =
-      codec === 'h264'
-        ? {
-            muxTrackId,
-            inputTrackId: info.id,
-            mediaType: 'video',
-            codec,
-            pid,
-            streamType: STREAM_TYPE_H264,
-            streamId: VIDEO_STREAM_ID_BASE + videoCount,
-            avcConfig: parseAvcDecoderConfig(descriptionBytes(info.config)),
-            aacConfig: undefined,
-            chunks: [],
-          }
-        : {
-            muxTrackId,
-            inputTrackId: info.id,
-            mediaType: 'audio',
-            codec,
-            pid,
-            streamType: STREAM_TYPE_AAC,
-            streamId: AUDIO_STREAM_ID_BASE + audioCount,
-            avcConfig: undefined,
-            aacConfig: parseAacEncoderConfig(info),
-            chunks: [],
-          };
-
-    if (track.mediaType !== info.mediaType) {
-      throw new CapabilityError(
-        'capability-miss',
-        'Track media type does not match MPEG-TS codec support.',
-        capabilityDetail({ codec: info.codec, mediaType: info.mediaType }),
-      );
-    }
-
+    const track = mpegTsTrackStateFromInfo(info, this.#tracks);
     this.#tracks.push(track);
-    return muxTrackId;
+    return track.muxTrackId;
   }
 
   async write(trackId: number, packet: Packet): Promise<void> {
@@ -217,13 +182,7 @@ export class MpegTsMuxer implements Muxer {
     if (chunk.data.byteLength === 0) {
       throw new MediaError('mux-error', 'Cannot mux an empty MPEG-TS access unit.', { trackId });
     }
-    track.chunks.push({
-      data: copyBytes(chunk.data),
-      timestampUs: chunk.timestampUs,
-      key: chunk.key,
-      ...(chunk.durationUs !== undefined ? { durationUs: chunk.durationUs } : {}),
-      ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
-    });
+    track.chunks.push(storedChunk(chunk, true));
   }
 
   async finalize(): Promise<void> {
@@ -255,6 +214,90 @@ export function writeMpegTs(tracks: readonly TrackState[]): Uint8Array {
   ]);
 }
 
+export function writeMpegTsPacketTracks(inputs: readonly MpegTsPacketTrackInput[]): Uint8Array {
+  if (inputs.length === 0) {
+    throw new MediaError('mux-error', 'MPEG-TS packet mux received no tracks.');
+  }
+  const tracks: TrackState[] = [];
+  for (const input of inputs) {
+    const track = mpegTsTrackStateFromInfo(input.track, tracks);
+    for (const chunk of input.chunks) {
+      validateTimestamp(chunk.timestampUs, 'timestampUs');
+      if (chunk.dtsUs !== undefined) {
+        validateTimestamp(chunk.dtsUs, 'dtsUs');
+      }
+      if (chunk.durationUs !== undefined) {
+        validateDuration(chunk.durationUs, 'durationUs');
+      }
+      if (chunk.data.byteLength === 0) {
+        throw new MediaError('mux-error', 'Cannot mux an empty MPEG-TS access unit.', {
+          trackId: track.muxTrackId,
+        });
+      }
+      track.chunks.push(storedChunk(chunk, false));
+    }
+    tracks.push(track);
+  }
+  return writeMpegTs(tracks);
+}
+
+function mpegTsTrackStateFromInfo(
+  info: TrackInfo,
+  existingTracks: readonly TrackState[],
+): TrackState {
+  const codec = normalizeCodec(info.codec);
+  const muxTrackId = existingTracks.length + 1;
+  const pid = FIRST_ES_PID + existingTracks.length;
+  const videoCount = existingTracks.filter((track) => track.mediaType === 'video').length;
+  const audioCount = existingTracks.filter((track) => track.mediaType === 'audio').length;
+
+  const track: TrackState =
+    codec === 'h264'
+      ? {
+          muxTrackId,
+          inputTrackId: info.id,
+          mediaType: 'video',
+          codec,
+          pid,
+          streamType: STREAM_TYPE_H264,
+          streamId: VIDEO_STREAM_ID_BASE + videoCount,
+          avcConfig: parseAvcDecoderConfig(descriptionBytes(info.config)),
+          aacConfig: undefined,
+          chunks: [],
+        }
+      : {
+          muxTrackId,
+          inputTrackId: info.id,
+          mediaType: 'audio',
+          codec,
+          pid,
+          streamType: STREAM_TYPE_AAC,
+          streamId: AUDIO_STREAM_ID_BASE + audioCount,
+          avcConfig: undefined,
+          aacConfig: parseAacEncoderConfig(info),
+          chunks: [],
+        };
+
+  if (track.mediaType !== info.mediaType) {
+    throw new CapabilityError(
+      'capability-miss',
+      'Track media type does not match MPEG-TS codec support.',
+      capabilityDetail({ codec: info.codec, mediaType: info.mediaType }),
+    );
+  }
+  return track;
+}
+
+function storedChunk(chunk: MpegTsChunk, copyData: boolean): MpegTsChunk {
+  return {
+    data: copyData ? copyBytes(chunk.data) : chunk.data,
+    timestampUs: chunk.timestampUs,
+    key: chunk.key,
+    ...(chunk.durationUs !== undefined ? { durationUs: chunk.durationUs } : {}),
+    ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
+  };
+}
+
 function prepareMpegTsSerialization(tracks: readonly TrackState[]): MpegTsSerialization {
   if (tracks.length === 0) {
     throw new MediaError('mux-error', 'MPEG-TS muxing requires at least one track.');
@@ -281,34 +324,14 @@ function* mpegTsChunks(
   writeChunkPackets: number,
 ): Generator<Uint8Array> {
   const continuity = new Map<number, number>();
-  const packetGroup: Uint8Array[] = [];
-  const maxPackets = Math.max(1, Math.floor(writeChunkPackets));
-  const flushGroup = (): Uint8Array | undefined => {
-    if (packetGroup.length === 0) return undefined;
-    const chunk = concatBytes(packetGroup);
-    packetGroup.length = 0;
-    return chunk;
-  };
-  const pushPacket = (packet: Uint8Array): Uint8Array | undefined => {
-    packetGroup.push(packet);
-    return packetGroup.length >= maxPackets ? flushGroup() : undefined;
-  };
+  const writer = new TsPacketChunkWriter(Math.max(1, Math.floor(writeChunkPackets)));
   const pushPayload = function* (
     pid: number,
     payloadUnitStart: boolean,
     payload: Uint8Array,
     pcrTicks?: number,
   ): Generator<Uint8Array> {
-    for (const packet of packetizePayloadPackets(
-      pid,
-      payloadUnitStart,
-      payload,
-      continuity,
-      pcrTicks,
-    )) {
-      const chunk = pushPacket(packet);
-      if (chunk !== undefined) yield chunk;
-    }
+    yield* packetizePayloadPackets(pid, payloadUnitStart, payload, continuity, writer, pcrTicks);
   };
 
   yield* pushPayload(PAT_PID, true, psiPayload(patSection()));
@@ -325,8 +348,43 @@ function* mpegTsChunks(
     yield* pushPayload(unit.track.pid, true, pes, pcrTicks);
   }
 
-  const finalChunk = flushGroup();
+  const finalChunk = writer.flush();
   if (finalChunk !== undefined) yield finalChunk;
+}
+
+class TsPacketChunkWriter {
+  readonly #maxPackets: number;
+  #buffer: Uint8Array;
+  #packets = 0;
+
+  constructor(maxPackets: number) {
+    this.#maxPackets = maxPackets;
+    this.#buffer = new Uint8Array(maxPackets * TS_PACKET_SIZE);
+  }
+
+  get buffer(): Uint8Array {
+    return this.#buffer;
+  }
+
+  packetOffset(): number {
+    return this.#packets * TS_PACKET_SIZE;
+  }
+
+  commitPacket(): Uint8Array | undefined {
+    this.#packets += 1;
+    return this.#packets >= this.#maxPackets ? this.flush() : undefined;
+  }
+
+  flush(): Uint8Array | undefined {
+    if (this.#packets === 0) return undefined;
+    const emitted =
+      this.#packets === this.#maxPackets
+        ? this.#buffer
+        : this.#buffer.slice(0, this.#packets * TS_PACKET_SIZE);
+    this.#buffer = new Uint8Array(this.#maxPackets * TS_PACKET_SIZE);
+    this.#packets = 0;
+    return emitted;
+  }
 }
 
 function validateAccessUnits(units: readonly TimedAccessUnit[]): void {
@@ -488,6 +546,7 @@ function* packetizePayloadPackets(
   payloadUnitStart: boolean,
   payload: Uint8Array,
   continuity: Map<number, number>,
+  writer: TsPacketChunkWriter,
   pcrTicks?: number,
 ): Generator<Uint8Array> {
   let offset = 0;
@@ -508,30 +567,32 @@ function* packetizePayloadPackets(
       );
     }
 
-    const packet = new Uint8Array(TS_PACKET_SIZE);
-    packet.fill(0xff);
+    const packet = writer.buffer;
+    const base = writer.packetOffset();
+    packet.fill(0xff, base, base + TS_PACKET_SIZE);
     const continuityCounter = continuity.get(pid) ?? 0;
     continuity.set(pid, (continuityCounter + 1) & 0x0f);
-    packet[0] = 0x47;
-    packet[1] = (first && payloadUnitStart ? 0x40 : 0x00) | ((pid >> 8) & 0x1f);
-    packet[2] = pid & 0xff;
-    packet[3] =
+    packet[base] = 0x47;
+    packet[base + 1] = (first && payloadUnitStart ? 0x40 : 0x00) | ((pid >> 8) & 0x1f);
+    packet[base + 2] = pid & 0xff;
+    packet[base + 3] =
       adaptationLength === undefined ? 0x10 | continuityCounter : 0x30 | continuityCounter;
 
     let payloadOffset = 4;
     if (adaptationLength !== undefined) {
-      packet[4] = adaptationLength;
+      packet[base + 4] = adaptationLength;
       payloadOffset = 5 + adaptationLength;
       if (adaptationLength > 0) {
-        packet[5] = wantPcr ? 0x10 : 0x00;
+        packet[base + 5] = wantPcr ? 0x10 : 0x00;
         if (wantPcr && pcrTicks !== undefined) {
-          writePcr(packet, 6, pcrTicks);
+          writePcr(packet, base + 6, pcrTicks);
         }
       }
     }
 
-    packet.set(payload.subarray(offset, offset + payloadBytes), payloadOffset);
-    yield packet;
+    packet.set(payload.subarray(offset, offset + payloadBytes), base + payloadOffset);
+    const chunk = writer.commitPacket();
+    if (chunk !== undefined) yield chunk;
     offset += payloadBytes;
     first = false;
   }

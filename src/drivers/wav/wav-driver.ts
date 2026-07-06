@@ -27,6 +27,9 @@ import type { PcmAudio } from '../../dsp/pcm.ts';
 import { fromURL } from '../../sources/source.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
+import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
+import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
+import { tryConvertWavPcmFormatToWav } from './format-convert.ts';
 import { readWavPcm, rewriteWavPcmCopy } from './pcm.ts';
 import { WavMuxer } from './wav-mux.ts';
 
@@ -402,10 +405,22 @@ export const WavDriver: ContainerDriver = {
         if (resampled !== undefined) {
           return byteStream(resampled);
         }
+        const converted = tryConvertWavPcmFormatToWav(bytes, opts);
+        if (converted !== undefined) {
+          return byteStream(converted);
+        }
       }
     }
     bytes ??= await readAll(src);
     if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+    const aiff = tryRewriteWavPcmToAiffBe(bytes, opts);
+    if (aiff !== undefined) {
+      return byteStream(aiff);
+    }
+    const gained = tryGainWavF32ToF32Wav(bytes, opts);
+    if (gained !== undefined) {
+      return byteStream(gained);
+    }
     const wav = readWavPcm(bytes);
     if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     const audio = applyPcmTransform(wav, opts);

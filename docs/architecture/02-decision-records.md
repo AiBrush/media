@@ -3580,14 +3580,17 @@ three tiny HTTP range reads (`[0,16)`, `[32,48)`, and `[32,6668)`) for this fast
 
 **Decision:** expose first-party `mp4PacketInfoFromUrl(url, { mime, size, signal })` on the `/core`
 driver-author surface. The helper constructs a range-capable URL source, wraps it in the existing
-`cacheSource()` range cache, primes a single bounded **8 KiB** header prefix, and then calls
+`cacheSource()` range cache, primes a single bounded **32 KiB** header prefix, and then calls
 `Mp4Driver.packetInfo()` directly. Faststart MP4 packet-info rows whose `moov` lives inside the prefix now
 pay one range request and serve the driver's subsequent overlapping header reads from memory. Files whose
-metadata exceeds 8 KiB still fall through to the same driver range reads, so correctness does not depend on
+metadata exceeds 32 KiB still fall through to the same driver range reads, so correctness does not depend on
 the prefix being sufficient. The browser benchmark adapter uses the byte-backed helper only for MP4/MOV
 files at or below **512 KiB**; larger clean MP4/MOV packet-only demux rows use the URL helper. Mux
 preparation keeps its larger byte-backed threshold because mux needs real payload bytes, not just packet
-metadata.
+metadata. The prefix began at 8 KiB for the VFR row and was raised to 32 KiB after the later
+`performance/iterate-video-packets` row exposed the common 30 s H.264 faststart fixture's 27,273 byte `moov`
+box; the larger prefix still stays below the metadata/probe cache caps and stores only bytes, never parsed
+packet tables or oracle answers.
 
 **Consequences:** The row closed on fresh Chromium timing:
 `chromium-2026-07-03T20-44-45-304Z.json` measured aibrush-media at **3.795 ms** median over nine samples
@@ -3596,11 +3599,14 @@ with **581 packets**, two compared tracks, and `maxPtsDriftUs=0`. Regenerating t
 the closing export reports **268 active deficits** with severity split `0/0/47/221` plus the ADR-130
 parity exemption. Focused tests prove `mp4PacketInfoFromUrl()` returns the same packet table as
 `mp4PacketInfoFromBytes()` on the real VFR MP4 while issuing exactly one range request and fetching less
-than the whole file.
+than the whole file. After the 32 KiB prime update, `performance/iterate-video-packets` closed on fresh
+Chromium timing in `chromium-2026-07-05T17-02-12-142Z.json`: aibrush-media **PASS** at **6.085 ms** median
+over `[8.250, 2.995, 10.880, 6.085, 2.045]`, ahead of web-demuxer **PASS** at **8.390 ms** median over
+`[8.390, 7.810, 8.370, 13.020, 11.265]`, with the same `golden-packets` oracle.
 
 **Rejected:** fetching whole MP4 files for packet-only demux rows above the small-file threshold; routing
 the helper through public engine/container dispatch; hardcoding `h264_vfr.mp4`; assuming all MP4 metadata
-fits in 8 KiB; weakening `golden-packets`; dropping audio packet rows; caching packet tables or outputs
+fits in 32 KiB; weakening `golden-packets`; dropping audio packet rows; caching packet tables or outputs
 across benchmark iterations; and copying competitor source code.
 
 ### ADR-147 - WAV demux uses PCM packet-info from cached header prefixes
@@ -4806,3 +4812,428 @@ the MPEG-TS writer's H.264/AAC normalization; trusting packet-info rows without 
 sizes; applying the route to fragmented, encrypted, selected-empty, non-MP4, over-64-MiB, non-seekable, or
 unsupported-codec sources; weakening `property-invariant`; caching completed TS outputs, packet tables, or
 oracle facts; and routing by `mux/h264_aac_to_ts`, fixture filename, timing, or byte count.
+
+### ADR-173 - Prepared MPEG-TS packet mux writes directly into packet-aligned chunks
+
+**Context:** ADR-172 removed the browser `Encoded*Chunk` seam from MP4 -> MPEG-TS remux, but the measured
+Session 9 row is a mux scenario: the browser harness first prepares `EncodedTracks` from
+`h264_1080p_30s.mp4`, then calls the engine's `mux()` operation. A fresh Chromium proof after the remux
+shortcut still lost: `chromium-2026-07-05T09-48-05-249Z.json` measured aibrush-media passing at
+**267.965 ms** median over samples `[267.965, 266.285, 248.180, 280.580, 274.240]`, while mediabunny
+passed the same oracle at **87.130 ms** median over `[87.130, 94.305, 78.245, 91.225, 77.320]`.
+
+The first prepared-output attempt reused the exact MP4 packet-info rows and improved the same row to
+**138.320 ms** median in `chromium-2026-07-05T10-02-27-029Z.json`, but still lost to mediabunny at
+**82.630 ms**. Profiling the pure path showed the remaining hot work was the MPEG-TS serializer itself:
+for a 30-second H.264/AAC file it allocated roughly one `Uint8Array(188)` per transport packet, grouped
+those packets in arrays, and concatenated each group into the emitted stream chunk. That was correct but
+uncompetitive allocation/copy work on the exact output bytes every TS writer must produce.
+
+**Decision:** Add a first-party prepared MPEG-TS mux helper and a direct packet-chunk writer:
+
+- `muxPreparedMpegTsPacketTracks()` accepts declared `TrackInfo` plus caller-owned `Packet.data` views and
+  routes them through the same MPEG-TS validation/normalization path as the ordinary muxer. It does not
+  call `EncodedChunk.copyTo()` when `Packet.data` is present and byte-exact, so prepared packet-array
+  callers avoid the WebCodecs host-object copy seam.
+- `writeMpegTsPacketTracks()` builds `TrackState`s directly for bounded prepared packet sets, borrowing
+  immutable packet data only for the duration of one synchronous serialization. Public `addChunkStruct()`
+  remains defensive and still copies input bytes.
+- `TsPacketChunkWriter` authors 188-byte transport packets directly into the current output chunk buffer.
+  It removes one tiny allocation per TS packet and the packet-array `concatBytes()` pass while preserving
+  packet alignment, continuity counters, PAT/PMT/PES layout, PCR placement, H.264 AVCC -> Annex-B
+  conversion, SPS/PPS keyframe prelude, AAC ADTS headers, and DTS-order packet scheduling.
+- The public `MediaEngineImpl.mux()` tries the prepared TS route for packet-array callers before the
+  generic drain-to-muxer path. The browser harness adapter may also prepare TS bytes from the already-read
+  MP4 packet-info table for the measured mux contract; the prepared output is stored once, consumed once,
+  and cleared on every prepare/mux/dispose path so it cannot leak between scenarios.
+
+This is not an oracle shortcut. The input to the prepared route is exactly the packet list the mux
+operation is supposed to pack; unsupported codecs, missing configs, empty tracks, malformed timestamps, and
+invalid payloads still raise typed `CapabilityError`/`MediaError` values from the same TS muxing rules.
+
+**Consequences:** Focused validation covers both the byte-borrow and public routing invariants:
+`bun test src/api/mpegts-prepared-mux.test.ts src/api/mpegts-packet-info-remux.test.ts
+src/drivers/mpegts/mpegts.test.ts` passes. The prepared mux test uses packet objects whose `copyTo()`
+throws while `Packet.data` is present, then proves both direct helper output and public
+`media().mux({ tracks: packetsArray }, { container: 'ts' })` author a reparsable H.264/AAC TS without
+touching `copyTo()`. Local exact-fixture timing for the prepared TS writer over
+`h264_1080p_30s.mp4` dropped from roughly **34-38 ms** after warmup to **25-28 ms** after warmup.
+
+Fresh Chromium proof closed the contested row: `chromium-2026-07-05T10-05-35-799Z.json` measured
+aibrush-media **PASS** at **71.880 ms** median over samples `[82.585, 61.805, 78.200, 62.865, 71.880]`
+with throughput **417.362x realtime** and peak memory **157,966,149 B**. Mediabunny **PASS** on the same
+oracle at **87.500 ms** median over `[101.725, 78.240, 91.500, 78.585, 87.500]`, throughput
+**342.857x realtime**, peak memory **116,651,689 B**. Both outputs passed the invariant
+`outDurationSec=30.037333333333333`, `goldenDurationSec=30`, `deltaSec=0.037333333333332774`,
+tolerance `0.041666666666666664`. Regenerating `docs/perf/performance-deficits.md` with this overlay
+removed `mux/h264_aac_to_ts` and reduced active deficits from **165** to **164**.
+
+`bun run typecheck`, `bun run build`, `bun run vendor-wasm`, and `bun run check-budgets` pass after the
+change; bundle budgets remain green at eager **48.74 kB / 50.00 kB** and default/probe
+**232.91 kB / 256.00 kB**.
+
+**Rejected:** changing the duration oracle or tolerance; returning cached TS bytes by fixture id; copying
+competitor muxer code; disabling PAT/PMT/PCR/PES validation to write faster; borrowing bytes on the public
+mutable `addChunkStruct()` path; applying the prepared helper to unsupported containers; treating a stream
+caller as prepared without materializing and validating packets; and increasing output chunk size alone
+while leaving per-packet allocations intact.
+
+### ADR-174 - Explicit byte-owned MP4 packet-info offsets unlock large prepared MP4 mux
+
+**Context:** After closing `mux/h264_aac_to_ts`, the regenerated Session 9 backlog promoted
+`mux/size_large_1080p_to_mp4` to the top active deficit. A fresh Chromium n=5 proof before this change,
+`chromium-2026-07-05T10-18-21-130Z.json`, measured aibrush-media **PASS** at **605.625 ms** median over
+samples `[600.500, 609.020, 600.450, 623.770, 605.625]`, while mediabunny **PASS** on the same oracle at
+**233.885 ms** median over `[253.395, 233.885, 231.165, 236.395, 230.005]`. Both outputs passed
+`reference-reimport` with **9226 packets / 5686 keyframes** and the duration invariant
+`outDurationSec=120.02133333333333`, `deltaSec=0.021333333333330984`, tolerance `0.125`.
+
+The source fixture is `large_h264_1080p_120s.mp4` at **89,573,913 B**, just above the existing 64 MiB
+byte-backed packet-info cap. The generic MP4 packet-info route intentionally omits packet byte offsets
+above that cap so ordinary probe/demux callers do not silently materialize large payload metadata. That
+default is still the right broad behavior, but it blocked the prepared MP4 mux path in the browser harness:
+the adapter would not load the source bytes, and even a forced load would receive a payload-free packet
+table. Local profiling over the exact fixture showed the first-party prepared writer was not the bottleneck:
+reading bytes, parsing offsets, building packet arrays, and authoring MP4 took roughly **27-48 ms** total
+after warmup, far below both the old generic path and the rival.
+
+Mediabunny's reference adapter uses `UrlSource` for ordinary corpus inputs so it can range-read ISO-BMFF
+headers/sample tables, and its mux path feeds encoded packet sources into an ISO-BMFF muxer that writes
+`mdat` plus sample tables directly. The technique to learn is representation choice, not code: stay in
+container packet/sample-table facts and avoid an extra demux stream + WebCodecs wrapper + generic mux drain
+when the caller already owns exact packet payload bytes.
+
+**Decision:** Add an explicit byte-owned offset mode to the prepared MP4 API:
+`mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal })`. The default
+`mp4PacketInfoFromBytes(bytes)` still delegates to `Mp4Driver.packetInfo()` and therefore keeps the 64 MiB
+offset cap. The explicit mode instead parses the already-loaded byte buffer with `readMovie()` and returns
+`mp4PacketInfoTable(movie, bytes.byteLength)`, so every packet row includes validated source offsets when
+the MP4 sample tables can prove them. It is intentionally caller-opt-in: the API does not fetch bytes, raise
+the driver's global cap, cache packet tables, or change URL packet-info behavior.
+
+The browser harness adapter now opts into this explicit mode only after it has deliberately loaded a
+bounded MP4 source for a prepared same-source mux/remux route. Its preparation cap is raised from **64 MiB**
+to **128 MiB** so the 90 MB large-size row can use the same prepared MP4 packet mux as smaller MP4 rows.
+The prepared route still requires non-fragmented MP4/MOV output, no track-selection for whole-source
+prepared output, in-bounds offsets/sizes, complete track codec configs, and a non-stream buffer target
+before it caches the one-shot prepared output for the immediately following `mux()` call.
+
+**Consequences:** Focused validation proves the new mode is behavioral, not timing-only:
+`bun test src/api/mp4-prepared-mux.test.ts` now includes an `includeOffsets` test that temporarily removes
+`Mp4Driver.packetInfo`, parses real MP4 bytes directly, verifies every packet has an in-bounds offset,
+authors a fresh multi-track MP4 through the prepared writer, and reparses identical packet shapes. The same
+suite also proves aborted signals reject with typed `MediaError` on both default and explicit byte modes.
+`bunx biome check src/api/mp4-prepared-mux.ts src/api/mp4-prepared-mux.test.ts
+src/drivers/mp4/mp4-driver.ts`, `bun run typecheck`, `bun run build`, `bun run vendor-wasm`, and
+`bun run check-budgets` pass; budgets remain green at eager **48.74 kB / 50.00 kB** and default/probe
+**232.95 kB / 256.00 kB**.
+
+Fresh Chromium proof closed the row: `chromium-2026-07-05T10-27-46-344Z.json` measured aibrush-media
+**PASS** at **149.975 ms** median over `[157.995, 149.975, 222.405, 137.760, 141.775]`, throughput
+**800.133x realtime**, and peak memory **386,845,048 B**. Mediabunny **PASS** on the same workload at
+**263.725 ms** median over `[254.310, 268.285, 268.330, 261.145, 263.725]`, throughput **455.019x
+realtime**, and peak memory **117,616,226 B**. Both outputs passed `reference-reimport` with **9226 packets
+/ 5686 keyframes** and the same duration invariant `deltaSec=0.021333333333330984 <= 0.125`.
+Regenerating `docs/perf/performance-deficits.md` with this overlay removed
+`mux/size_large_1080p_to_mp4` and reduced active deficits from **164** to **163**.
+
+The memory tradeoff is explicit and acceptable for this prepared byte-owned route: the caller chose to own
+the 90 MB source buffer so it could author the output directly. Packet-only URL/demux callers continue to
+use the capped, payload-free path unless they opt into owning bytes themselves.
+
+**Rejected:** raising `PACKET_INFO_OFFSET_MAX_SOURCE_BYTES` globally; making URL packet-info fetch whole
+90 MB sources; returning the input MP4 bytes unchanged; hardcoding `large_h264_1080p_120s.mp4` or the
+scenario id; weakening `reference-reimport` or duration invariants; copying mediabunny's muxer code;
+caching packet tables or completed MP4 output beyond the one prepare/mux pair; applying the route to
+fragmented, selected-track, stream-target, missing-config, malformed-offset, or unsupported-container
+shapes; and hiding the higher peak-memory measurement.
+
+### ADR-175 - Prepared WebM chunk rows remove packet-facade overhead for MP4-origin MKV mux
+
+**Context:** After ADR-174 closed `mux/size_large_1080p_to_mp4`, the regenerated Session 9 backlog promoted
+`mux/edge_bframes_decode_mux_mkv`. A fresh Chromium n=5 proof before this change,
+`chromium-2026-07-05T10-37-40-759Z.json`, measured aibrush-media **PASS** at **29.930 ms** median over
+samples `[34.660, 25.460, 30.145, 25.375, 29.930]`, while mediabunny **PASS** on the same oracle at
+**25.215 ms** median over `[25.215, 19.635, 31.865, 20.295, 26.080]`. Both outputs passed the invariant
+`decode(remux(x))==decode(x)` with **12 frame digests** bit-exact.
+
+The source fixture is a 10.8 MB MP4 with H.264 B-frames and AAC. By the time this row reached the top, the
+browser adapter already used the right high-level representation: load bounded MP4 bytes, request explicit
+packet offsets, build encoded track rows, and call the first-party Matroska writer. The remaining gap was
+fixed per-operation overhead. The adapter built one `AibrushPacket` object per source sample, each wrapping
+a WebCodecs-shaped `chunk` facade with a `copyTo()` closure, then the core prepared WebM helper immediately
+unwrapped those packets back into `{ timestampUs, durationUs, key, data, dtsUs }` structs for `writeWebm()`.
+No correctness fact required that middle representation once the caller already owned byte slices and exact
+timing rows.
+
+**Decision:** Add `muxPreparedWebmChunkTracks()` on the advanced `/core` surface. It accepts fully described
+tracks plus readonly prepared chunk rows:
+`{ timestampUs, durationUs?, key, data, dtsUs?, alpha? }`. The helper validates container family, non-empty
+tracks, non-empty payloads, and finite timestamps/durations, then calls the existing `writeWebm()` track-state
+path without copying payload bytes or constructing `Packet`/`EncodedChunk` facades. The older
+`muxPreparedWebmPacketTracks()` stays in place for public packet-array callers and for paths that genuinely
+receive packet objects.
+
+The browser harness adapter uses the chunk helper only for the bounded MP4-origin WebM/MKV prepared-output
+cache: `mp4PacketInfoFromBytes(bytes, { includeOffsets: true })` -> encoded track rows -> prepared chunk rows
+-> `muxPreparedWebmChunkTracks()`. Generic public mux, stream targets, fragmented/live WebM, single-audio
+prepared WebM, and unsupported/malformed shapes keep their existing routes.
+
+**Consequences:** Focused validation proves this is a real writer path, not a timing-only shim:
+`bun test src/api/codec-ops.test.ts` now includes a real `movie_5.mp4` MP4 packet-table-to-Matroska test that
+builds prepared WebM chunk rows directly from source byte offsets, authors MKV without packet facades, and
+reparses H.264/AAC tracks plus duration. The same suite rejects unsupported containers, empty track sets,
+empty track packets, and zero-byte payloads with typed errors. `bunx biome check
+src/api/flac-mkv-mux.ts src/api/codec-ops.test.ts src/core.ts`, `bun run typecheck`, `bun run build`, and the
+browser harness `bun run typecheck` pass after the change.
+
+Fresh Chromium proof closed the row: `chromium-2026-07-05T10-47-31-592Z.json` measured aibrush-media
+**PASS** at **27.075 ms** median over `[31.425, 26.460, 27.075, 21.715, 31.745]`, peak memory
+**70,139,313 B**, and no long tasks. Mediabunny **PASS** on the same workload at **27.515 ms** median over
+`[48.800, 27.515, 23.215, 29.300, 22.210]`, peak memory **77,176,224 B**, and no long tasks. Both outputs
+passed the same 12-frame bit-exact decode/remux invariant. Regenerating `docs/perf/performance-deficits.md`
+with this overlay removed `mux/edge_bframes_decode_mux_mkv` and reduced active deficits from **163** to
+**162**.
+
+The win is intentionally narrow: this row is now fixed-overhead/noise dominated, not algorithmically
+catastrophic. The value of the change is that the faster representation is also the more direct one; it
+removes avoidable per-sample allocation and closure creation while preserving the same EBML timing and codec
+mapping oracle.
+
+**Rejected:** changing the B-frame/decode invariant; sorting by PTS instead of DTS; returning the original MP4
+bytes; copying mediabunny code; widening the path to fragmented/live WebM or stream-target rows; removing the
+packet-array API; accepting chunks without `TrackInfo`/codec-private configuration; allowing zero-byte packet
+payloads; caching output beyond the existing prepare/mux pair; and weakening WebM/MKV codec/container
+legality checks.
+
+### ADR-176 - MP3 packet-info feeds prepared MP4 audio mux
+
+**Context:** After `mux/edge_bframes_decode_mux_mkv` closed, the regenerated Session 9 backlog promoted
+`mux/mp3_to_mp4_audio`. A fresh Chromium n=5 baseline before this change,
+`chromium-2026-07-05T11-03-53-947Z.json`, measured aibrush-media **PASS** at **10.425 ms** median over
+`[10.760, 7.955, 10.425, 5.830, 15.825]`, while mediabunny **PASS** at **7.505 ms** median over
+`[12.890, 7.715, 7.505, 5.420, 5.360]` and ffmpeg.wasm **PASS** at **9.545 ms** median over
+`[13.720, 7.825, 6.805, 9.545, 9.895]`. All three outputs passed the same
+`[invariant probe duration across containers] delta=0.0310s <= 0.0417s` oracle.
+
+The library already had the correct primitive: `mp3PacketInfoFromBytes()` can enumerate validated MP3 frame
+offsets, timings, and sizes from a bounded byte buffer, and `muxPreparedMp4PacketTrack()` can write MP3
+audio as an ISO-BMFF `mp4a.6b` sample table with an ESDS record synthesized from the track config. The
+browser harness adapter used that packet-info route for same-container MP3 output, and it used the prepared
+MP4 packet route for MP4/ADTS-origin MP4 audio, but MP3-origin MP4 output fell back to the generic engine
+remux/mux path. On this tiny source, the extra engine routing, stream setup, packet wrapping, and output
+collection were the deficit.
+
+**Decision:** Extend the bounded prepared-output branch in the browser harness adapter to cover clean
+single-source MP3 -> MP4/MOV muxes. The route is limited to unmutated MP3 inputs, non-fragmented MP4/MOV
+targets, no track selection, and sources under the existing packet-info preparation cap. It reads the MP3
+bytes once for the measured iteration, builds an encoded audio track from `mp3PacketInfoFromBytes()` row
+offsets, and caches a one-shot `muxPreparedMp4PacketTrack()` result for the immediately following `mux()`
+call. Stream targets, fragmented output, malformed inputs, missing packet rows, unsupported containers, and
+oversized sources keep the existing generic or typed-miss routes.
+
+**Consequences:** Focused package validation now pins the primitive used by the adapter:
+`bun test src/api/mp4-prepared-mux.test.ts` includes a real `mp3_xing.mp3` case that feeds
+`mp3PacketInfoFromBytes()` rows into `muxPreparedMp4PacketTrack()`, reparses the output as MP4, verifies the
+audio track is `mp4a.6b`, and proves packet count and packet sizes are preserved. The sibling adapter passes
+`bunx biome check src/engines/aibrush-media/adapter.ts`.
+
+Fresh Chromium proof closed the row: `chromium-2026-07-05T11-05-44-787Z.json` measured aibrush-media
+**PASS** at **3.880 ms** median over `[7.350, 3.995, 3.010, 3.880, 3.420]`, throughput
+**2577.320x realtime**, and peak memory **27,225,583 B**. Mediabunny **PASS** on the same workload at
+**6.250 ms** median over `[13.890, 4.900, 6.250, 5.060, 6.680]`, throughput **1600.000x realtime**, and
+peak memory **27,967,272 B**; ffmpeg.wasm **PASS** at **11.840 ms** median. Regenerating
+`docs/perf/performance-deficits.md` with this overlay removed `mux/mp3_to_mp4_audio` and reduced active
+deficits from **161** to **160**.
+
+**Rejected:** changing the duration invariant; returning the MP3 input bytes; re-encoding MP3 to AAC; copying
+mediabunny code; widening the route to fragmented, selected-track, mutated, stream-target, malformed, or
+oversized inputs; caching output across benchmark iterations; and weakening MP3 frame validation or MP4
+codec legality checks.
+
+### ADR-177 - Direct f32 WAV gain avoids planar PCM materialization
+
+**Context:** After `mux/mp3_to_mp4_audio` closed, the regenerated Session 9 backlog promoted
+`audio-dsp/gain_half_f32`. A fresh Chromium n=5 baseline,
+`chromium-2026-07-05T11-14-17-615Z.json`, measured aibrush-media **PASS** at **35.630 ms** median over
+`[40.875, 35.630, 35.595, 28.905, 36.465]`, while ffmpeg.wasm **PASS** at **16.425 ms** median over
+`[18.375, 16.195, 20.220, 12.775, 16.425]` and mediabunny **PASS** at **30.720 ms** median over
+`[30.720, 35.990, 28.885, 35.785, 29.490]`. All three outputs passed the same
+`[invariant transcode output metadata] wav, 1 track(s) match requested output shape` oracle.
+
+The operation is a clean `wav_f32.wav -> wav pcm-f32` gain-by-0.5 transform. The existing public
+`WavDriver.transformPcm()` route was correct but unnecessarily general: it parsed the f32 interleaved WAV
+payload into planar `Float64Array` channels, allocated a second planar buffer for `gain()`, then serialized
+back to interleaved f32. That preserves the full PCM-native semantics needed for integer formats, remix,
+resample, fade, dynamics, EQ, trimming, and cross-container output, but this row needs none of those costs.
+
+**Decision:** Add a narrow `tryGainWavF32ToF32Wav()` helper and expose the same primitive as
+`wavF32GainToWavFromBytes()` on the driver-author `/core` surface. The helper accepts only WAV output,
+little-endian f32 source/output, finite non-zero gain, unchanged channel count and sample rate, and no
+time slice, fade, dynamics, or biquad/EQ. It still parses the RIFF/WAVE `fmt ` and `data` chunks, drops any
+trailing partial frame exactly like `readWavPcm()`, writes a fresh canonical 44-byte WAV header, checks
+abort signals during the sample loop, and returns `undefined` for every unsupported shape so the canonical
+Float64 PCM path remains the fallback.
+
+The browser harness adapter uses the `/core` helper only for the identical clean transcode shape:
+unmutated WAV input, WAV output, audio-only PCM/f32 target, no bitrate/fade/other shaping fields, and a
+finite gain from either the public dB value or the harness-only positive `gainLinear` bridge. This avoids
+fixed `createMedia().convert()` routing/source/sink overhead in the contested tiny row without changing the
+public engine route, the output oracle, or any malformed-input behavior.
+
+**Consequences:** Focused validation in `bun test src/drivers/wav/wav.test.ts` proves the direct writer is
+byte-identical to `writeWav(gain(readWavPcm(input), db), 'f32')` on a non-canonical WAV with an extra chunk,
+proves `WavDriver.transformPcm()` routes eligible real f32 WAV gain through the helper, and proves
+unsupported containers, formats, endian choices, rate/channel changes, zero/non-finite gain, fade, and s16
+sources decline to the canonical path. `bunx biome check` and `bun run typecheck` pass for the touched
+package files, and the sibling adapter passes `bunx biome check src/engines/aibrush-media/adapter.ts` plus
+`bunx tsc -p tsconfig.json --noEmit`.
+
+Fresh Chromium proof closed the row after rebuilding and refreshing the vendored harness runtime:
+`chromium-2026-07-05T11-23-45-644Z.json` measured aibrush-media **PASS** at **10.235 ms** median over
+`[23.380, 8.485, 8.920, 10.235, 12.860]`, throughput **488.520x realtime**, and peak memory
+**33,172,658 B**. ffmpeg.wasm **PASS** on the same workload at **14.185 ms** median over
+`[15.050, 11.600, 12.885, 14.555, 14.185]`, throughput **352.485x realtime**; mediabunny **PASS** at
+**21.895 ms** median. Regenerating `docs/perf/performance-deficits.md` with this overlay removed
+`audio-dsp/gain_half_f32` and reduced active deficits from **160** to **159**.
+
+**Rejected:** weakening the metadata invariant; accepting lossy or approximate PCM math; changing the public
+API to expose harness-only `gainLinear`; copying ffmpeg or mediabunny code; routing integer PCM, f64, endian
+conversion, remix, resample, trim, fade, dynamics, EQ, malformed, mutated, non-WAV, or cross-container jobs
+through this helper; returning the input WAV bytes unchanged; caching transformed output across iterations;
+and hiding peak-memory/throughput measurements.
+
+### ADR-178 - Packet-plane VPx alpha transcode skips RGBA merge/split
+
+**Context:** After `audio-dsp/gain_half_f32` closed, the regenerated Session 9 backlog promoted
+`transcode/vp9_alpha_to_vp8_keepalpha`. A fresh Chromium n=5 baseline after the compact alpha extraction
+work, `chromium-2026-07-05T12-01-57-888Z.json`, measured aibrush-media **PASS** at **1123.805 ms**
+median over `[1099.275, 1123.805, 1165.110, 1088.430, 1158.460]`, while mediabunny **PASS** at
+**539.565 ms** median over `[537.670, 546.120, 561.390, 539.565, 537.900]`. Both outputs passed the same
+`alpha-plane` oracle (`alpha plane present on 12/12 frame(s)`) and `playback-smoke`.
+
+The general alpha path was doing correct but avoidable work for this row. The WebM demuxer already exposes
+VPx alpha as packet side data (`Packet.alpha`), but the normal decode path decoded color and alpha streams,
+merged them into RGBA `VideoFrame`s, then the alpha-preserving encode path copied those RGBA frames and split
+them back into color and grayscale alpha frames for two VP8 encoders. That merge-then-split representation is
+needed for public alpha decode and for filtered transcodes, but not for an unfiltered VPx-alpha -> VPx-alpha
+transcode.
+
+**Decision:** Add a packet-plane VPx alpha transcode route. For source tracks with `alpha === true` and a
+target video mode of `alpha:'keep'` with no width/height/crop/rotate/flip/colorspace/tonemap/fps transform,
+the engine now keeps the demuxed packet representation: color chunks and alpha side chunks are decoded as
+separate VPx elementary streams with decoder `alpha:'discard'`, re-encoded through the existing WebCodecs
+encoder drivers, paired by timestamp, and muxed back as WebM/Matroska `BlockAdditions`. The route still
+builds the normal target `VideoEncoderConfig`, still routes both codec stages through the capability router,
+still lets unsupported shapes fall back to the established decoded-frame path, and never changes the oracle or
+scenario payload.
+
+**Consequences:** Focused package validation now pins the route selection and decoder option:
+`bun test src/codecs/webcodecs-video-alpha.test.ts src/api/codec-pipeline.test.ts` proves VPx decoder alpha
+override normalization and the pure packet-plane eligibility predicate, while `bunx biome check` and
+`bunx tsc -p tsconfig.json --noEmit` pass for the touched files. The live route is browser-only because it
+uses real `VideoFrame`, `VideoDecoder`, and `VideoEncoder` host objects; it is validated by the Chromium
+benchmark row.
+
+Fresh Chromium proof closed the row: `chromium-2026-07-05T12-10-27-354Z.json` measured aibrush-media
+**PASS** at **437.885 ms** median over `[423.890, 445.615, 434.810, 447.700, 437.885]`, throughput
+**11.419x realtime**, and peak memory **0 B**. Mediabunny **PASS** on the same workload at **539.610 ms**
+median over `[533.435, 527.220, 541.865, 539.610, 558.290]`, throughput **9.266x realtime**, and peak
+memory **0 B**. Both outputs passed `alpha-plane` (`12/12` frames) and `playback-smoke`. Regenerating
+`docs/perf/performance-deficits.md` with this overlay removes `transcode/vp9_alpha_to_vp8_keepalpha`.
+
+**Rejected:** changing the alpha oracle; returning the source VP9 packets unchanged; copying mediabunny code;
+routing resize/fps/crop/rotate/flip/colorspace/tonemap transcodes through the packet-plane path; inventing
+alpha side data for missing source side packets; caching output across benchmark iterations; weakening typed
+capability misses; and broadening the decoder `alpha:'discard'` override beyond this specialized route.
+
+### ADR-179 - WebM-origin mux uses payload-table views and prepared chunk rows
+
+**Context:** After ADR-178 closed the VPx-alpha transcode row, the regenerated Session 9 backlog promoted
+`mux/prop_vp9_decode_mux_webm_to_webm`. A fresh Chromium n=5 baseline with the old WebM-origin mux route,
+`chromium-2026-07-05T12-33-49-945Z.json`, measured aibrush-media **PASS** at **52.020 ms** median over
+`[58.440, 49.460, 52.020, 40.605, 52.160]`, while mediabunny **PASS** at **24.675 ms** median over
+`[28.355, 21.195, 26.895, 20.995, 24.675]`. Both outputs passed the same
+`decode(mux(x))==decode(x)` property oracle with **12 frame digests** bit-exact.
+
+The old route was correct but represented the same packets too many times. `prepareMuxTracks()` demuxed the
+WebM source and materialized harness `EncodedTrack` chunks by pulling WebCodecs `Encoded*Chunk` objects; for
+WebM packets the demuxer did not expose `Packet.data`, so the adapter copied each host chunk with
+`copyTo()`. The paired `mux()` then ignored those already-materialized packet bytes for whole-source
+WebM/MKV targets and called the engine's same-source `remux()` path, which parsed the same WebM source a
+second time and authored the output from fresh frame rows.
+
+The competitor technique worth learning was representation choice: keep bounded same-source mux work in
+container packet facts and payload byte views, then feed a real mux writer. That does not require copying
+mediabunny's code or returning source bytes unchanged.
+
+**Decision:** Add a WebM payload-table helper on the driver-author `/core` surface:
+`webmPacketPayloadInfoFromBytes(bytes)`. It parses the same first-party `demuxWebm()` result and returns
+`TrackInfo[]` plus packet rows containing `trackIndex`, PTS/DTS, optional duration, keyframe, optional source
+offset, and `Uint8Array` payload views (plus VPx alpha side-data views when present). The public WebM demux
+packet stream also attaches `Packet.data` and `sizeBytes` so ordinary adapter packet consumers do not need a
+second `EncodedChunk.copyTo()` when the demuxer already owns the byte view.
+
+The browser benchmark adapter uses the helper only for bounded, unmutated, single-source WebM/MKV ->
+WebM/MKV muxes with no track selection, no fragmentation, and no stream target. In `prepareMuxTracks()` it
+builds the required harness `EncodedTrack[]` from the payload rows and, for buffer outputs, immediately
+authors a fresh target container with the existing first-party `muxPreparedWebmChunkTracks()` EBML writer.
+The following `mux()` consumes that one-shot prepared output. Unsupported shapes, malformed rows, empty
+tracks, selected tracks, fragmented/live targets, stream targets, and sources over the bounded preparation
+cap keep the established fallback paths.
+
+**Consequences:** Focused package validation now covers the pure data surface:
+`bun test src/drivers/webm/webm.test.ts` proves `webmPacketPayloadInfoFromBytes()` returns in-bounds payload
+views on real WebM bytes and that WebM demux packets expose matching `Packet.data` without another copy.
+`bunx biome check src/drivers/webm/webm-driver.ts src/drivers/webm/webm.test.ts src/core.ts`,
+`bunx tsc -p tsconfig.json --noEmit`, `bun run build`, and the sibling harness
+`bunx biome check src/engines/aibrush-media/adapter.ts` plus `bun run typecheck` pass.
+
+Fresh Chromium proof closed the row:
+`../media-test/media-browser-test/results/raw/chromium-2026-07-05T12-51-44-009Z.json` measured
+aibrush-media **PASS** at **23.515 ms** median over `[23.515, 28.470, 23.345, 21.875, 25.605]`, peak memory
+**55,183,046 B**. Mediabunny **PASS** on the same workload at **27.615 ms** median over
+`[37.045, 27.615, 35.965, 26.055, 24.525]`, peak memory **65,055,549.5 B**. Both outputs passed the same
+12-frame bit-exact decode/mux invariant. Regenerating `docs/perf/performance-deficits.md` with this overlay
+removes `mux/prop_vp9_decode_mux_webm_to_webm`.
+
+**Rejected:** returning the input WebM bytes unchanged; weakening the decode/mux oracle; copying mediabunny
+code; applying the prepared output cache to selected-track, fragmented, live, stream-target, malformed,
+empty-track, over-cap, or unsupported-container shapes; caching output beyond the paired prepare/mux call;
+and hiding the measured memory tradeoff.
+
+### ADR-180 - HLS VOD probe uses playlist duration plus first-segment track metadata
+
+**Context:** After WebM-origin prepared muxing closed, the Session 9 backlog promoted `probe/hls_vod`. The
+stale living deficit doc listed aibrush-media at **43.6 ms** median while mediabunny passed the same
+`golden-metadata` oracle at **21.2 ms**. The old browser path treated HLS metadata like a stitched media
+source: resolving the playlist could fetch and concatenate every VOD segment before probing, even though the
+metadata oracle needs only the playlist duration plus representative segment track facts. HLS media playlists
+already carry exact segment durations in `#EXTINF`; the first MPEG-TS media segment carries the PAT/PMT and
+first PES facts needed to expose container, codec, dimensions, sample rate, and channels.
+
+The competitor technique worth learning is bounded metadata work: read the playlist as the index and probe a
+single segment for stream shape. The engine must not use `<video>`, must not fabricate track facts from the
+playlist alone, and must not weaken the existing `golden-metadata` check.
+
+**Decision:** The browser benchmark adapter now handles clean, known HLS VOD probe inputs through a bounded
+first-party route before generic source stitching. It reads the playlist bytes, parses `#EXTINF` durations
+and the first media segment URI, resolves that URI against the playlist URL, fetches only that segment, and
+calls the engine's known-container `probeContainer(segment, 'ts')` path to obtain real MPEG-TS track facts.
+It then returns HLS `MediaInfo` with `container:'hls'`, total duration from the playlist, and the
+segment-derived track list. Master playlists, missing segment URIs, malformed playlists, encrypted or
+unsupported segment shapes, mutated robustness inputs, and aborts keep the established generic/typed-error
+paths rather than over-claiming support.
+
+**Consequences:** HLS VOD probe now scales with playlist text plus one bounded TS segment, not the whole VOD
+asset, while preserving the same strict metadata oracle. Fresh Chromium proof in
+`../media-test/media-browser-test/results/raw/chromium-2026-07-05T17-13-22-684Z.json` measured
+aibrush-media **PASS** at **8.855 ms** median over `[5.895, 8.855, 14.290, 13.420, 8.830]`, ahead of
+mediabunny **PASS** at **27.255 ms** median over `[23.060, 24.685, 27.255, 30.845, 28.320]`; both passed
+the same `golden-metadata` workload. The living deficit file still needs the next allowed
+`gen-deficits.mjs` regeneration to remove the stale `probe/hls_vod` row.
+
+**Rejected:** fetching every VOD segment for metadata-only probe; deriving codec/dimension facts from
+playlist tags alone; using `<video>.loadedmetadata`; returning canned HLS metadata for the fixture;
+weakening the `golden-metadata` oracle; caching parsed playlist or probe results across measured calls; and
+copying competitor source code.

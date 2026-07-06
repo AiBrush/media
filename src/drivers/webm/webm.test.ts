@@ -7,7 +7,13 @@ import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { WebmMuxer } from './ebml-write.ts';
-import { WebmDriver, WebmModule, demuxWebm, parseWebm } from './webm-driver.ts';
+import {
+  WebmDriver,
+  WebmModule,
+  demuxWebm,
+  parseWebm,
+  webmPacketPayloadInfoFromBytes,
+} from './webm-driver.ts';
 
 // A real H.264-in-Matroska asset (ffprobe: h264 High 1280×720 + aac 48k/2ch) lives in the sibling
 // acceptance corpus, not this project's manifest, so it is read by direct path — like the mpegts tests.
@@ -25,6 +31,64 @@ async function probeWithWebmDriver(
 ): Promise<readonly TrackInfo[]> {
   if (WebmDriver.probe === undefined) throw new Error('WebmDriver.probe is not registered');
   return WebmDriver.probe(src, signal !== undefined ? { signal } : undefined);
+}
+
+class TestEncodedChunk {
+  readonly type: EncodedVideoChunkType | EncodedAudioChunkType;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+
+  constructor(init: EncodedVideoChunkInit | EncodedAudioChunkInit) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    this.#data = ArrayBuffer.isView(init.data)
+      ? new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength).slice()
+      : new Uint8Array(init.data).slice();
+    this.byteLength = this.#data.byteLength;
+  }
+
+  copyTo(destination: BufferSource): void {
+    const dst = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    dst.set(this.#data);
+  }
+}
+
+async function withEncodedChunkConstructors<T>(fn: () => Promise<T>): Promise<T> {
+  const originalVideo = globalThis.EncodedVideoChunk;
+  const originalAudio = globalThis.EncodedAudioChunk;
+  Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+    configurable: true,
+    value: TestEncodedChunk as unknown as typeof EncodedVideoChunk,
+  });
+  Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+    configurable: true,
+    value: TestEncodedChunk as unknown as typeof EncodedAudioChunk,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (originalVideo === undefined) {
+      Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+    } else {
+      Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+        configurable: true,
+        value: originalVideo,
+      });
+    }
+    if (originalAudio === undefined) {
+      Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+    } else {
+      Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+        configurable: true,
+        value: originalAudio,
+      });
+    }
+  }
 }
 
 // ── EBML builders ────────────────────────────────────────────────────────────────────────────────
@@ -159,6 +223,65 @@ describe('probe WebM across the real corpus', () => {
     await expect(
       probeWithWebmDriver(await fixtureSource('movie_5.webm'), AbortSignal.abort()),
     ).rejects.toMatchObject({ code: 'aborted' });
+  });
+
+  it('webmPacketPayloadInfoFromBytes returns in-bounds packet payload views', async () => {
+    const bytes = await loadFixture('movie_5.webm');
+    const table = webmPacketPayloadInfoFromBytes(bytes);
+    expect(table.tracks.map((track) => track.codec)).toContain('vp9');
+    expect(table.tracks.map((track) => track.codec)).toContain('opus');
+    expect(table.packets.length).toBeGreaterThan(0);
+
+    const first = table.packets[0];
+    expect(first).toBeDefined();
+    if (first === undefined) return;
+    expect(first.size).toBe(first.data.byteLength);
+    expect(first.offset).toBeDefined();
+    if (first.offset !== undefined) {
+      expect(first.offset).toBeGreaterThanOrEqual(0);
+      expect(first.offset + first.size).toBeLessThanOrEqual(bytes.byteLength);
+      expect(first.data).toEqual(bytes.subarray(first.offset, first.offset + first.size));
+    }
+    expect(table.tracks[first.trackIndex]).toBeDefined();
+  });
+
+  it('webmPacketPayloadInfoFromBytes exposes VPx alpha side data', async () => {
+    const table = webmPacketPayloadInfoFromBytes(await loadFixture('bear-vp9-alpha.webm'));
+    const alphaVideo = table.tracks.find(
+      (track) => track.mediaType === 'video' && track.alpha === true,
+    );
+    expect(alphaVideo).toBeDefined();
+    const alphaPackets = table.packets.filter((packet) => packet.alpha !== undefined);
+    expect(alphaPackets.length).toBeGreaterThan(0);
+    expect(alphaPackets[0]?.alpha?.byteLength).toBeGreaterThan(0);
+    expect(alphaPackets[0]?.data.byteLength).toBeGreaterThan(0);
+  });
+
+  it('demux packet streams expose the parsed payload view as Packet.data', async () => {
+    await withEncodedChunkConstructors(async () => {
+      const bytes = await loadFixture('movie_5.webm');
+      const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
+      try {
+        const video = demuxed.tracks.find((track) => track.mediaType === 'video');
+        expect(video).toBeDefined();
+        if (video === undefined) return;
+        const reader = demuxed.packets(video.id).getReader();
+        try {
+          const { done, value } = await reader.read();
+          expect(done).toBe(false);
+          expect(value?.data).toBeDefined();
+          if (value?.data === undefined) return;
+          expect(value.sizeBytes).toBe(value.data.byteLength);
+          const copied = new Uint8Array(value.chunk.byteLength);
+          value.chunk.copyTo(copied);
+          expect(value.data).toEqual(copied);
+        } finally {
+          reader.releaseLock();
+        }
+      } finally {
+        await demuxed.close();
+      }
+    });
   });
 });
 
@@ -367,6 +490,38 @@ describe('WebmDriver — demux seam + muxer', () => {
   it('createMuxer returns a working WebmMuxer (round-trip validated in ebml-write.test.ts)', () => {
     const muxer = WebmDriver.createMuxer();
     expect(muxer).toBeInstanceOf(WebmMuxer);
+  });
+
+  it('streamCopy rejects unsupported target containers with a typed capability miss', async () => {
+    const streamCopy = WebmDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('WebmDriver.streamCopy must be implemented');
+    await expect(
+      streamCopy(fromBytes(await loadFixture('movie_5.webm'), { mime: 'video/webm' }), {
+        container: 'mp4',
+      }),
+    ).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('streamCopy rejects a valid WebM track table with no packets', async () => {
+    const streamCopy = WebmDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('WebmDriver.streamCopy must be implemented');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackType, [1]),
+      ...el(E.TrackNumber, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, uintN(64, 1)), ...el(E.PixelHeight, uintN(64, 1))]),
+    ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4))),
+        ...el(E.Tracks, track),
+      ]),
+    ]);
+
+    await expect(streamCopy(fromBytes(bytes, { mime: 'video/webm' }))).rejects.toBeInstanceOf(
+      MediaError,
+    );
   });
 });
 

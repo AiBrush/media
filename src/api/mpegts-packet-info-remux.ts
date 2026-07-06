@@ -1,12 +1,18 @@
 import type {
   ContainerDriver,
   PacketInfoMetadata,
+  PacketInfoTable,
   StageOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import { MpegTsMuxer } from '../drivers/mpegts/ts-write.ts';
+import {
+  type MpegTsChunk,
+  type MpegTsPacketTrackInput,
+  writeMpegTsPacketTracks,
+} from '../drivers/mpegts/ts-write.ts';
 import type { Source } from '../sources/source.ts';
+import { fromBytes } from '../sources/source.ts';
 import { selectTrackInfos } from './codec-routing.ts';
 import type { RemuxOptions } from './types.ts';
 
@@ -58,7 +64,16 @@ export async function tryRemuxPacketInfoToMpegTs(
   if (src.size > MPEGTS_PACKET_INFO_MAX_SOURCE_BYTES) return undefined;
 
   assertNotAborted(stage.signal);
-  const table = await container.packetInfo(src, stage);
+  const sourceBytes = await src.range(0, src.size);
+  assertNotAborted(stage.signal);
+  if (sourceBytes.byteLength !== src.size) {
+    throw new MediaError('demux-error', 'short MP4 source read for MPEG-TS packet-info remux', {
+      expected: src.size,
+      actual: sourceBytes.byteLength,
+    });
+  }
+
+  const table = await packetInfoFromBytes(container, sourceBytes, stage);
   const describedTracks = table.tracks.filter((track) => track.config !== undefined);
   const selected = selectTrackInfos(describedTracks, opts.trackSelect);
   if (selected.length === 0) {
@@ -69,27 +84,17 @@ export async function tryRemuxPacketInfoToMpegTs(
   }
   const selectedByIndex = packetTrackIndexes(table.tracks, selected);
 
-  const sourceBytes = await src.range(0, src.size);
-  assertNotAborted(stage.signal);
-  if (sourceBytes.byteLength !== src.size) {
-    throw new MediaError('demux-error', 'short MP4 source read for MPEG-TS packet-info remux', {
-      expected: src.size,
-      actual: sourceBytes.byteLength,
-    });
-  }
-
-  const muxer = new MpegTsMuxer();
-  const muxTrackByIndex = new Map<number, number>();
-  for (const [trackIndex, track] of selectedByIndex) {
-    muxTrackByIndex.set(trackIndex, muxer.addTrack(track));
+  const chunksByIndex = new Map<number, MpegTsChunk[]>();
+  for (const trackIndex of selectedByIndex.keys()) {
+    chunksByIndex.set(trackIndex, []);
   }
 
   let packetCount = 0;
   for (const row of table.packets) {
-    const muxTrackId = muxTrackByIndex.get(row.trackIndex);
-    if (muxTrackId === undefined) continue;
+    const chunks = chunksByIndex.get(row.trackIndex);
+    if (chunks === undefined) continue;
     const end = validatePacketRow(row, sourceBytes.byteLength);
-    muxer.addChunkStruct(muxTrackId, {
+    chunks.push({
       data: sourceBytes.subarray(row.offset, end),
       timestampUs: row.ptsUs,
       dtsUs: row.dtsUs,
@@ -102,6 +107,41 @@ export async function tryRemuxPacketInfoToMpegTs(
     throw new MediaError('mux-error', 'MP4 packet-info MPEG-TS remux selected no packets');
   }
   assertNotAborted(stage.signal);
-  await muxer.finalize();
-  return muxer.output;
+  const tracks = packetTracksFromSelected(selectedByIndex, chunksByIndex);
+  return streamFromBytes(writeMpegTsPacketTracks(tracks));
+}
+
+async function packetInfoFromBytes(
+  container: ContainerDriver,
+  sourceBytes: Uint8Array,
+  stage: StageOptions,
+): Promise<PacketInfoTable> {
+  if (container.packetInfo === undefined) {
+    throw new CapabilityError('capability-miss', 'MP4 packet-info is not available', {
+      op: 'remux',
+      tried: [container.id, 'ts'],
+    });
+  }
+  return container.packetInfo(fromBytes(sourceBytes, { mime: 'video/mp4' }), stage);
+}
+
+function packetTracksFromSelected(
+  selectedByIndex: ReadonlyMap<number, TrackInfo>,
+  chunksByIndex: ReadonlyMap<number, readonly MpegTsChunk[]>,
+): MpegTsPacketTrackInput[] {
+  const tracks: MpegTsPacketTrackInput[] = [];
+  for (const [trackIndex, track] of selectedByIndex) {
+    const chunks = chunksByIndex.get(trackIndex);
+    if (chunks !== undefined) tracks.push({ track, chunks });
+  }
+  return tracks;
+}
+
+function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }

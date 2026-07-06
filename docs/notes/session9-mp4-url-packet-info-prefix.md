@@ -15,12 +15,17 @@ faststart file whose `moov` fits near the head.
 
 The final path adds a first-party `/core` helper, `mp4PacketInfoFromUrl(url, { mime, size, signal })`, for
 driver-author and harness-style packet-only callers. It builds a URL source, wraps it in the existing byte
-range cache, primes exactly one 8 KiB start-at-zero prefix, and calls `Mp4Driver.packetInfo()` directly.
+range cache, primes exactly one 32 KiB start-at-zero prefix, and calls `Mp4Driver.packetInfo()` directly.
 Faststart files with metadata inside that prefix pay one range request; files with larger metadata fall
 through to the same strict MP4 driver range reads. The browser adapter keeps byte-backed MP4 packet-info
 only for clean files at or below 512 KiB and sends larger clean MP4/MOV packet-only demux rows through the
 URL helper. No parsed metadata, packet table, oracle result, or output is cached across benchmark
 iterations.
+
+The helper originally used an 8 KiB prime to close the VFR packet-iteration row. It was later raised to
+32 KiB after `performance/iterate-video-packets` exposed the shared 30 s H.264 fixture's 27,273 byte `moov`
+box; the larger prefix still stores only bounded bytes and remains below the broader 1 MiB metadata/probe
+prefix cap.
 
 ## Validation
 
@@ -46,3 +51,12 @@ iterations.
   **7.745 ms**, direct URL helper **7.035 ms**, and prefix-primed URL helper **3.795 ms**
 
 Regenerated backlog: `268 active deficits (0/0/47/221), 1 exempt`.
+
+32 KiB prime follow-up:
+
+- Result: `../media-test/media-browser-test/results/raw/chromium-2026-07-05T17-02-12-142Z.json`
+- Scenario: `performance/iterate-video-packets`
+- aibrush-media: PASS `golden-packets`, median **6.085 ms**, samples
+  `[8.250, 2.995, 10.880, 6.085, 2.045]`
+- web-demuxer: PASS `golden-packets`, median **8.390 ms**, samples
+  `[8.390, 7.810, 8.370, 13.020, 11.265]`

@@ -2,7 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, PacketInfoMetadata } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { mp3PacketInfoFromBytes } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
+import { parseFragments } from '../drivers/mp4/parse.ts';
 import { fromBytes } from '../sources/source.ts';
 import {
   mp4PacketInfoFromBytes,
@@ -137,6 +139,49 @@ function packetShape(packet: PacketInfoMetadata): {
     durationUs: packet.durationUs,
     keyframe: packet.keyframe,
   };
+}
+
+function topLevelBoxTypes(bytes: Uint8Array): string[] {
+  const types: string[] = [];
+  let offset = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const size =
+      (bytes[offset] ?? 0) * 0x1000000 +
+      (bytes[offset + 1] ?? 0) * 0x10000 +
+      (bytes[offset + 2] ?? 0) * 0x100 +
+      (bytes[offset + 3] ?? 0);
+    const type = String.fromCharCode(
+      bytes[offset + 4] ?? 0,
+      bytes[offset + 5] ?? 0,
+      bytes[offset + 6] ?? 0,
+      bytes[offset + 7] ?? 0,
+    );
+    if (size < 8 || offset + size > bytes.byteLength) break;
+    types.push(type);
+    offset += size;
+  }
+  return types;
+}
+
+async function expectFragmentedMp4MatchesPacketInfo(
+  output: Uint8Array,
+  table: Awaited<ReturnType<typeof mp4PacketInfoFromBytes>>,
+): Promise<void> {
+  const reparsed = await mp4PacketInfoFromBytes(output);
+  expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(
+    table.tracks.map((track) => track.mediaType),
+  );
+  const fragments = parseFragments(output);
+  for (let trackIndex = 0; trackIndex < table.tracks.length; trackIndex++) {
+    const sourceTrack = table.tracks[trackIndex];
+    const reparsedTrack = reparsed.tracks[trackIndex];
+    const sourcePackets = table.packets.filter((row) => row.trackIndex === trackIndex);
+    const fragment = fragments.get(trackIndex + 1);
+    expect(fragment?.sampleCount).toBe(sourcePackets.length);
+    if (sourceTrack?.durationSec !== undefined && reparsedTrack?.durationSec !== undefined) {
+      expect(reparsedTrack.durationSec).toBeCloseTo(sourceTrack.durationSec, 3);
+    }
+  }
 }
 
 describe('prepared MP4 packet mux', () => {
@@ -279,6 +324,56 @@ describe('prepared MP4 packet mux', () => {
     expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
   });
 
+  it('authors fragmented CMAF from prepared multi-track packets', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    const tracks = table.tracks.map((track, trackIndex) => ({
+      track,
+      packets: table.packets
+        .filter((row) => row.trackIndex === trackIndex)
+        .map((row) => packetFromRow(row, input))
+        .filter(isPacket),
+    }));
+
+    const output = muxPreparedMp4PacketTracks({
+      tracks,
+      container: 'mp4',
+      fragmented: true,
+    });
+
+    const boxes = topLevelBoxTypes(output);
+    expect(boxes[0]).toBe('ftyp');
+    expect(boxes[1]).toBe('moov');
+    expect(boxes).toContain('moof');
+    expect(boxes).toContain('mdat');
+    await expectFragmentedMp4MatchesPacketInfo(output, table);
+  });
+
+  it('authors real MP3 frame packet-info rows into an MP4 audio sample table', async () => {
+    const input = await mediaTestBytes('mp3_xing.mp3');
+    const table = mp3PacketInfoFromBytes(input);
+    const track = table.tracks[0];
+    if (track === undefined) throw new Error('expected one MP3 source track');
+    const packets = table.packets.map((row) => packetFromRow(row, input)).filter(isPacket);
+    expect(packets).toHaveLength(table.packets.length);
+
+    const output = muxPreparedMp4PacketTrack({
+      track,
+      packets,
+      container: 'mp4',
+      faststart: true,
+      fragmented: false,
+    });
+
+    const reparsed = await mp4PacketInfoFromBytes(output);
+    expect(reparsed.tracks).toHaveLength(1);
+    expect(reparsed.tracks[0]?.mediaType).toBe('audio');
+    expect(reparsed.tracks[0]?.codec).toBe('mp4a.6b');
+    expect(reparsed.packets).toHaveLength(table.packets.length);
+    expect(reparsed.packets.map((row) => row.size)).toEqual(table.packets.map((row) => row.size));
+    expect(reparsed.packets[0]?.ptsUs).toBe(0);
+  });
+
   it('exposes payload offsets for medium MP4 packet-table mux preparation', async () => {
     const input = await mediaTestBytes('h264_1080p_30s.mp4');
     const table = await mp4PacketInfoFromBytes(input);
@@ -289,6 +384,40 @@ describe('prepared MP4 packet mux', () => {
     for (const row of table.packets) {
       expect(row.offset).toBeGreaterThanOrEqual(0);
       expect((row.offset ?? 0) + row.size).toBeLessThanOrEqual(input.byteLength);
+    }
+  });
+
+  it('forces payload offsets from already-loaded MP4 bytes without driver packet-info', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const originalPacketInfo = Mp4Driver.packetInfo;
+    Object.defineProperty(Mp4Driver, 'packetInfo', { configurable: true, value: undefined });
+    try {
+      const table = await mp4PacketInfoFromBytes(input, { includeOffsets: true });
+      expect(table.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+      expect(table.packets.length).toBeGreaterThan(1);
+      expect(table.packets.every((row) => row.offset !== undefined)).toBe(true);
+
+      const tracks = table.tracks.map((track, trackIndex) => ({
+        track,
+        packets: table.packets
+          .filter((row) => row.trackIndex === trackIndex)
+          .map((row) => packetFromRow(row, input))
+          .filter(isPacket),
+      }));
+
+      const output = muxPreparedMp4PacketTracks({
+        tracks,
+        container: 'mp4',
+        faststart: true,
+      });
+      const reparsed = await mp4PacketInfoFromBytes(output, { includeOffsets: true });
+      expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+      expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+    } finally {
+      Object.defineProperty(Mp4Driver, 'packetInfo', {
+        configurable: true,
+        value: originalPacketInfo,
+      });
     }
   });
 
@@ -316,6 +445,31 @@ describe('prepared MP4 packet mux', () => {
     const reparsed = await mp4PacketInfoFromBytes(bytes);
     expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
     expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+  });
+
+  it('streams prepared fragmented MP4 as init and media segments', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input);
+    const tracks = table.tracks.map((track, trackIndex) => ({
+      track,
+      packets: table.packets
+        .filter((row) => row.trackIndex === trackIndex)
+        .map((row) => packetFromRow(row, input))
+        .filter(isPacket),
+    }));
+
+    const { chunks, bytes } = await collectChunks(
+      muxPreparedMp4PacketTracksStream({
+        tracks,
+        container: 'mp4',
+        fragmented: true,
+      }),
+    );
+
+    expect(chunks.length).toBeGreaterThan(2);
+    expect(topLevelBoxTypes(chunks[0] ?? new Uint8Array())).toEqual(['ftyp', 'moov']);
+    expect(topLevelBoxTypes(bytes)).toContain('moof');
+    await expectFragmentedMp4MatchesPacketInfo(bytes, table);
   });
 
   it('rolls prepared MP4 stream payload chunks at the bounded target size', async () => {
@@ -396,6 +550,19 @@ describe('prepared MP4 packet mux', () => {
     expect(calls.some((call) => call.range !== null)).toBe(true);
   });
 
+  it('honors aborted signals for MP4 packet-info byte reads', async () => {
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(mp4PacketInfoFromBytes(input, { signal: controller.signal })).rejects.toThrow(
+      MediaError,
+    );
+    await expect(
+      mp4PacketInfoFromBytes(input, { includeOffsets: true, signal: controller.signal }),
+    ).rejects.toThrow(MediaError);
+  });
+
   it('reports a typed miss when MP4 packet-info is not registered', async () => {
     const originalPacketInfo = Mp4Driver.packetInfo;
     Object.defineProperty(Mp4Driver, 'packetInfo', { configurable: true, value: undefined });
@@ -421,15 +588,15 @@ describe('prepared MP4 packet mux', () => {
       muxPreparedMp4PacketTrack({
         track,
         packets: [packet],
-        container: 'mp4',
-        fragmented: true,
+        container: 'webm',
       }),
     ).toThrow(CapabilityError);
     expect(() =>
       muxPreparedMp4PacketTrack({
         track,
         packets: [packet],
-        container: 'webm',
+        container: 'mov',
+        fragmented: true,
       }),
     ).toThrow(CapabilityError);
     expect(() =>
@@ -452,14 +619,14 @@ describe('prepared MP4 packet mux', () => {
     expect(() =>
       muxPreparedMp4PacketTracksStream({
         tracks: [{ track, packets: [packet] }],
-        container: 'mp4',
-        fragmented: true,
+        container: 'webm',
       }),
     ).toThrow(CapabilityError);
     expect(() =>
       muxPreparedMp4PacketTracksStream({
         tracks: [{ track, packets: [packet] }],
-        container: 'webm',
+        container: 'mov',
+        fragmented: true,
       }),
     ).toThrow(CapabilityError);
     expect(() =>

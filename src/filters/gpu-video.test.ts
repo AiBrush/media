@@ -440,10 +440,16 @@ const AUDIO_SPECS: readonly FilterSpec[] = [
   { mediaType: 'audio', type: 'remix', channels: 2 },
 ];
 
-/** Colour specs the WebGPU driver handles; Canvas2D handles only the display-space colorspace ones. */
-const COLOR_SPECS: readonly FilterSpec[] = [
+/** Colour specs the WebGPU driver handles; Canvas2D handles display-space colorspace plus Chromium tonemap. */
+const WEBGPU_COLOR_SPECS: readonly FilterSpec[] = [
   { mediaType: 'video', type: 'colorspace', to: 'bt709' },
   { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
+];
+
+const TONEMAP_SPEC: FilterSpec = { mediaType: 'video', type: 'tonemap', to: 'sdr' };
+
+const COLOR_SPECS: readonly FilterSpec[] = [
+  ...WEBGPU_COLOR_SPECS,
   { mediaType: 'video', type: 'tonemap', to: 'sdr' },
 ];
 
@@ -453,7 +459,7 @@ const CANVAS2D_COLOR_OK: readonly FilterSpec[] = [
   { mediaType: 'video', type: 'colorspace', to: 'srgb' },
 ];
 
-/** Colour specs Canvas2D must decline (wide gamut / tonemap → router falls through). */
+/** Colour specs Canvas2D must decline without Chromium's colour-managed VideoFrame draw. */
 const CANVAS2D_COLOR_DECLINE: readonly FilterSpec[] = [
   { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
   { mediaType: 'video', type: 'colorspace', to: 'bt601' },
@@ -549,18 +555,31 @@ describe('createFilter() — typed rejection of specs the driver does not handle
     });
   }
 
-  it('canvas2d throws CapabilityError for tonemap / wide-gamut colorspace it cannot honestly do', () => {
+  it('canvas2d throws CapabilityError for tonemap / wide-gamut colorspace without Chromium canvas colour management', () => {
     for (const spec of CANVAS2D_COLOR_DECLINE) {
       expect(() => canvas2dVideoFilterDriver.createFilter(spec)).toThrow(CapabilityError);
     }
   });
 
-  it('webgpu handles every colour spec (it does not reject tonemap / wide-gamut)', () => {
+  it('canvas2d accepts tonemap on Chromium user agents after WebGPU declines it', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Chrome/149' });
+    try {
+      expect(() => canvas2dVideoFilterDriver.createFilter(TONEMAP_SPEC)).not.toThrow();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('webgpu handles colorspace specs, including wide-gamut colorspace', () => {
     // createFilter is gated by the *handler* predicate, not the environment, so it builds a stream in Node
     // for any spec the driver claims (the router gates on supports() + availability separately).
-    for (const spec of COLOR_SPECS) {
+    for (const spec of WEBGPU_COLOR_SPECS) {
       expect(() => webgpuVideoFilterDriver.createFilter(spec)).not.toThrow();
     }
+  });
+
+  it('webgpu declines tonemap so the router can fall through to the CPU colour path', () => {
+    expect(() => webgpuVideoFilterDriver.createFilter(TONEMAP_SPEC)).toThrow(CapabilityError);
   });
 });
 
@@ -590,8 +609,8 @@ describe('createFilter() — builds a TransformStream for a handled spec', () =>
     });
   }
 
-  it('webgpu builds a TransformStream for each colour op', () => {
-    for (const spec of COLOR_SPECS) {
+  it('webgpu builds a TransformStream for each owned colour op', () => {
+    for (const spec of WEBGPU_COLOR_SPECS) {
       const stream = webgpuVideoFilterDriver.createFilter(spec);
       expect(stream).toBeInstanceOf(TransformStream);
     }
