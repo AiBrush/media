@@ -1,11 +1,15 @@
+import { createCipheriv } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { aesCtr, hexToBytes } from '../../crypto/aes.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
+import { toHex } from '../../util/digest.ts';
 import {
   type SencSample,
+  decryptCencFile,
   decryptSample,
   decryptSampleCens,
   decryptSamples,
+  decryptSamplesCens,
   kidHex,
   parseSenc,
   parseTenc,
@@ -130,6 +134,251 @@ describe('CENC cens AES-CTR pattern decryption', () => {
   });
 });
 
+describe('decryptCencFile — fragmented cenc/cens (AES-CTR) generality (openssl twin)', () => {
+  const KID = '00112233445566778899aabbccddeeff';
+  const KIDB = hexToBytes(KID);
+  const KEY_HEX = '000102030405060708090a0b0c0d0e0f';
+
+  // ── minimal independent box construction (plain byte arrays; no SUT/write.ts involvement) ──
+  const u16 = (v: number) => [(v >> 8) & 0xff, v & 0xff];
+  const u32 = (v: number) => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  const u64 = (v: number) => [...u32(Math.floor(v / 2 ** 32)), ...u32(v >>> 0)];
+  const fcc = (s: string) => [...s].map((c) => c.charCodeAt(0));
+  const box = (type: string, ...parts: (number[] | Uint8Array)[]): number[] => {
+    const body = parts.flatMap((p) => [...p]);
+    return [...u32(8 + body.length), ...fcc(type), ...body];
+  };
+  const full = (type: string, v: number, f: number, ...parts: (number[] | Uint8Array)[]) =>
+    box(type, [v, (f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff], ...parts);
+
+  /** Independent CTR transform over a whole buffer (node:crypto/OpenSSL). */
+  function osslCtr(
+    key: Uint8Array,
+    iv8: Uint8Array,
+    blockOffset: number,
+    data: Uint8Array,
+  ): Uint8Array {
+    const counter = new Uint8Array(16);
+    counter.set(iv8, 0);
+    new DataView(counter.buffer).setUint32(12, blockOffset); // fits in tests
+    const c = createCipheriv('aes-128-ctr', Buffer.from(key), Buffer.from(counter));
+    return new Uint8Array(Buffer.concat([c.update(Buffer.from(data)), c.final()]));
+  }
+
+  /** cenc-encrypt one sample per §9.5: protected ranges CTR'd; each range starts on a fresh block. */
+  function osslEncryptCenc(
+    key: Uint8Array,
+    iv8: Uint8Array,
+    data: Uint8Array,
+    subsamples: readonly { clear: number; protected: number }[],
+  ): Uint8Array {
+    const out = data.slice();
+    let pos = 0;
+    let blockOffset = 0;
+    for (const ss of subsamples) {
+      pos += ss.clear;
+      out.set(osslCtr(key, iv8, blockOffset, data.subarray(pos, pos + ss.protected)), pos);
+      blockOffset += Math.ceil(ss.protected / 16);
+      pos += ss.protected;
+    }
+    return out;
+  }
+
+  function buildFile(o: {
+    scheme: string;
+    tencBody: number[];
+    sencFlags: number;
+    sencBody: number[];
+    sencCount: number;
+    samples: Uint8Array[];
+  }): { bytes: Uint8Array; ranges: { start: number; size: number }[] } {
+    const entry = box(
+      'enca',
+      [0, 0, 0, 0, 0, 0],
+      u16(1),
+      u16(0),
+      u16(0),
+      u32(0),
+      u16(1),
+      u16(16),
+      u16(0),
+      u16(0),
+      u32(22050 << 16),
+      box(
+        'sinf',
+        box('frma', fcc('mp4a')),
+        full('schm', 0, 0, fcc(o.scheme), u32(0x00010000)),
+        box('schi', full('tenc', o.tencBody[0] ?? 0, 0, o.tencBody.slice(1))),
+      ),
+    );
+    const matrix = [
+      ...u32(0x00010000),
+      ...u32(0),
+      ...u32(0),
+      ...u32(0),
+      ...u32(0x00010000),
+      ...u32(0),
+      ...u32(0),
+      ...u32(0),
+      ...u32(0x40000000),
+    ];
+    const moov = box(
+      'moov',
+      full(
+        'mvhd',
+        0,
+        0,
+        u32(0),
+        u32(0),
+        u32(1000),
+        u32(0),
+        u32(0x00010000),
+        u16(0x0100),
+        u16(0),
+        u64(0),
+        matrix,
+        new Array(24).fill(0),
+        u32(0xffffffff),
+      ),
+      box(
+        'trak',
+        full(
+          'tkhd',
+          0,
+          7,
+          u32(0),
+          u32(0),
+          u32(1),
+          u32(0),
+          u32(0),
+          u64(0),
+          u16(0),
+          u16(0),
+          u16(0x0100),
+          u16(0),
+          matrix,
+          u32(0),
+          u32(0),
+        ),
+        box(
+          'mdia',
+          full('mdhd', 0, 0, u32(0), u32(0), u32(22050), u32(0), u16(0x55c4), u16(0)),
+          full('hdlr', 0, 0, u32(0), fcc('soun'), u32(0), u32(0), u32(0), [0]),
+          box(
+            'minf',
+            box(
+              'stbl',
+              full('stsd', 0, 0, u32(1), entry),
+              full('stts', 0, 0, u32(0)),
+              full('stsc', 0, 0, u32(0)),
+              full('stsz', 0, 0, u32(0), u32(0)),
+              full('stco', 0, 0, u32(0)),
+            ),
+          ),
+        ),
+      ),
+      box('mvex', full('trex', 0, 0, u32(1), u32(1), u32(1024), u32(0), u32(0))),
+    );
+    const buildMoof = (dataOffset: number) =>
+      box(
+        'moof',
+        full('mfhd', 0, 0, u32(1)),
+        box(
+          'traf',
+          full('tfhd', 0, 0x020002, u32(1), u32(1)),
+          full('tfdt', 1, 0, u64(0)),
+          full(
+            'trun',
+            0,
+            0x000201,
+            u32(o.samples.length),
+            u32(dataOffset),
+            o.samples.flatMap((s) => u32(s.byteLength)),
+          ),
+          full('senc', 0, o.sencFlags, u32(o.sencCount), o.sencBody),
+        ),
+      );
+    const head = [...box('ftyp', fcc('iso5'), u32(0), fcc('iso5'))];
+    const moofSize = buildMoof(0).length;
+    const moof = buildMoof(moofSize + 8);
+    const bytes = [
+      ...head,
+      ...moov,
+      ...moof,
+      ...box(
+        'mdat',
+        o.samples.flatMap((s) => [...s]),
+      ),
+    ];
+    const dataStart = head.length + moov.length + moof.length + 8;
+    const ranges: { start: number; size: number }[] = [];
+    let cursor = dataStart;
+    for (const s of o.samples) {
+      ranges.push({ start: cursor, size: s.byteLength });
+      cursor += s.byteLength;
+    }
+    return { bytes: Uint8Array.from(bytes), ranges };
+  }
+
+  it('decrypts a fragmented cenc file (8-byte senc IVs + subsamples) byte-exact vs node:crypto', async () => {
+    const media = await loadFixture('movie_5.mp4');
+    const plain = [media.slice(6000, 6300), media.slice(6500, 6740)];
+    const subs = plain.map((p) => [{ clear: 9, protected: p.byteLength - 9 }]);
+    const ivs = [ivFor(0), ivFor(1)];
+    const cipher = plain.map((p, i) =>
+      osslEncryptCenc(KEY, ivs[i] ?? new Uint8Array(8), p, subs[i] ?? []),
+    );
+    const sencBody = cipher.flatMap((_, i) => [
+      ...(ivs[i] ?? []),
+      ...u16(1),
+      ...u16(9),
+      ...u32((plain[i]?.byteLength ?? 0) - 9),
+    ]);
+    const file = buildFile({
+      scheme: 'cenc',
+      tencBody: [0, 0, 0, 1, 8, ...KIDB],
+      sencFlags: 2,
+      sencBody,
+      sencCount: 2,
+      samples: cipher,
+    });
+    const out = await decryptCencFile(file.bytes, { scheme: 'cenc', keys: { [KID]: KEY_HEX } });
+    file.ranges.forEach((r, i) => {
+      expect(toHex(out.subarray(r.start, r.start + r.size)), `sample ${i}`).toBe(
+        toHex(plain[i] ?? new Uint8Array()),
+      );
+    });
+  });
+
+  it('decrypts a fragmented cens file (pattern 1:1 CTR over crypt blocks) byte-exact', async () => {
+    const media = await loadFixture('movie_5.mp4');
+    const plain = [media.slice(7000, 7128)]; // 8 whole blocks
+    const iv = ivFor(7);
+    // cens: crypt blocks 0,2,4,6 CTR'd continuously (counter advances only over crypt blocks).
+    const gathered = new Uint8Array(4 * 16);
+    for (const [i, b] of [0, 2, 4, 6].entries()) {
+      gathered.set((plain[0] ?? new Uint8Array()).subarray(b * 16, b * 16 + 16), i * 16);
+    }
+    const enc = osslCtr(KEY, iv, 0, gathered);
+    const cipher0 = (plain[0] ?? new Uint8Array()).slice();
+    for (const [i, b] of [0, 2, 4, 6].entries())
+      cipher0.set(enc.subarray(i * 16, i * 16 + 16), b * 16);
+    const file = buildFile({
+      scheme: 'cens',
+      tencBody: [1, 0, 0x11, 1, 8, ...KIDB], // v1, pattern 1:1, protected, ivSize 8
+      sencFlags: 0,
+      sencBody: [...iv],
+      sencCount: 1,
+      samples: [cipher0],
+    });
+    const out = await decryptCencFile(file.bytes, { scheme: 'cens', keys: { [KID]: KEY_HEX } });
+    const r = file.ranges[0];
+    expect(toHex(out.subarray(r?.start ?? 0, (r?.start ?? 0) + (r?.size ?? 0)))).toBe(
+      toHex(plain[0] ?? new Uint8Array()),
+    );
+  });
+});
+
 describe('CENC box parsing', () => {
   it('parseTenc reads default KID + per-sample IV size', () => {
     const kid = hexToBytes('00112233445566778899aabbccddeeff');
@@ -164,5 +413,48 @@ describe('CENC box parsing', () => {
     const payload = new Uint8Array([0, 0, 0, 2, 0, 0, 0, 1, ...iv, 0, 1, 0, 3, 0, 0, 0, 7]);
     const senc = parseSenc(payload, 8);
     expect(senc[0]?.subsamples).toEqual([{ clear: 3, protected: 7 }]);
+  });
+
+  it('parseSenc rejects a subsample_count field that overruns the box (no room for the u16)', () => {
+    // flags=2 (subsamples), count=1, iv(8), then the box ends → the u16 subsample_count overruns.
+    const payload = new Uint8Array([0, 0, 0, 2, 0, 0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(() => parseSenc(payload, 8)).toThrow();
+  });
+});
+
+describe('CENC cens subsample map + no-pattern tenc + sparse senc (branch coverage)', () => {
+  it('decryptSampleCens with a subsample map (clear prefix + patterned protected range)', async () => {
+    const iv = ivFor(21);
+    const pattern = { cryptByteBlock: 1, skipByteBlock: 1 };
+    const original = Uint8Array.from({ length: 4 + 32 }, (_, i) => (i * 3 + 1) & 0xff);
+    const subsamples = [{ clear: 4, protected: 32 }]; // 2 whole blocks: block 0 crypt, block 1 skip
+    // Encrypt only crypt block 0 (CTR from the sample IV), leaving the clear prefix and skip block clear.
+    const enc = await aesCtr(KEY, counter(iv), original.subarray(4, 20).slice(), 64);
+    const cipher = original.slice();
+    cipher.set(enc, 4);
+    expect([...cipher]).not.toEqual([...original]);
+    const recovered = await decryptSampleCens(KEY, pattern, { iv, subsamples }, cipher);
+    expect([...recovered]).toEqual([...original]);
+  });
+
+  it('parseTenc(cens) on a version-0 box yields no pattern (pattern is a v≥1 field)', () => {
+    const kid = hexToBytes('00112233445566778899aabbccddeeff');
+    const payload = new Uint8Array([0, 0, 0, 0, 0, 0x12, 1, 8, ...kid]); // v0: the pattern byte is ignored
+    expect(parseTenc(payload, 'cens').pattern).toBeUndefined();
+  });
+
+  it('decryptSamples passes through a sample that has no matching senc entry', async () => {
+    const data = [Uint8Array.from([1, 2, 3, 4]), Uint8Array.from([5, 6, 7, 8])];
+    const senc = [{ iv: ivFor(0) }]; // only one senc entry for two samples
+    const out = await decryptSamples(KEY, data, senc);
+    expect(out).toHaveLength(2);
+    expect([...(out[1] ?? [])]).toEqual([5, 6, 7, 8]); // second sample untouched
+  });
+
+  it('decryptSamplesCens passes through a sample that has no matching senc entry', async () => {
+    const data = [Uint8Array.from({ length: 16 }, (_, i) => i), Uint8Array.from([9, 9, 9, 9])];
+    const senc = [{ iv: ivFor(5) }]; // one senc entry for two samples
+    const out = await decryptSamplesCens(KEY, data, senc, { cryptByteBlock: 1, skipByteBlock: 1 });
+    expect([...(out[1] ?? [])]).toEqual([9, 9, 9, 9]); // second sample untouched
   });
 });

@@ -4232,7 +4232,7 @@ bytes for a partial trim, or cache a prior trimmed output.
 **Decision:** Add a narrow `/core` helper, `wavTrimFromUrl(url, opts)`, for clean URL-backed WAV copy trims.
 The helper uses the normal first-party URL `ByteSource`, caches only raw source bytes keyed by URL and known
 size, and caps that cache at **16** entries, **1 MiB** per entry, and a **60 s** TTL. On every call it
-reparses the WAV `fmt ` and `data` chunks through the existing byte-slice helper, computes the selected
+reparses the WAV `fmt` and `data` chunks through the existing byte-slice helper, computes the selected
 sample-frame window using the same rounding and range guards as the public PCM transform path, and returns a
 fresh canonical WAV buffer. It never caches parsed layouts, packet tables, oracle measurements, or trimmed
 outputs. Unsupported layouts raise a typed `CapabilityError`, so the helper cannot silently pretend to trim
@@ -4831,18 +4831,18 @@ uncompetitive allocation/copy work on the exact output bytes every TS writer mus
 
 **Decision:** Add a first-party prepared MPEG-TS mux helper and a direct packet-chunk writer:
 
-- `muxPreparedMpegTsPacketTracks()` accepts declared `TrackInfo` plus caller-owned `Packet.data` views and
++ `muxPreparedMpegTsPacketTracks()` accepts declared `TrackInfo` plus caller-owned `Packet.data` views and
   routes them through the same MPEG-TS validation/normalization path as the ordinary muxer. It does not
   call `EncodedChunk.copyTo()` when `Packet.data` is present and byte-exact, so prepared packet-array
   callers avoid the WebCodecs host-object copy seam.
-- `writeMpegTsPacketTracks()` builds `TrackState`s directly for bounded prepared packet sets, borrowing
++ `writeMpegTsPacketTracks()` builds `TrackState`s directly for bounded prepared packet sets, borrowing
   immutable packet data only for the duration of one synchronous serialization. Public `addChunkStruct()`
   remains defensive and still copies input bytes.
-- `TsPacketChunkWriter` authors 188-byte transport packets directly into the current output chunk buffer.
++ `TsPacketChunkWriter` authors 188-byte transport packets directly into the current output chunk buffer.
   It removes one tiny allocation per TS packet and the packet-array `concatBytes()` pass while preserving
   packet alignment, continuity counters, PAT/PMT/PES layout, PCR placement, H.264 AVCC -> Annex-B
   conversion, SPS/PPS keyframe prelude, AAC ADTS headers, and DTS-order packet scheduling.
-- The public `MediaEngineImpl.mux()` tries the prepared TS route for packet-array callers before the
++ The public `MediaEngineImpl.mux()` tries the prepared TS route for packet-array callers before the
   generic drain-to-muxer path. The browser harness adapter may also prepare TS bytes from the already-read
   MP4 packet-info table for the measured mux contract; the prepared output is stored once, consumed once,
   and cleared on every prepare/mux/dispose path so it cannot leak between scenarios.
@@ -5070,7 +5070,7 @@ resample, fade, dynamics, EQ, trimming, and cross-container output, but this row
 **Decision:** Add a narrow `tryGainWavF32ToF32Wav()` helper and expose the same primitive as
 `wavF32GainToWavFromBytes()` on the driver-author `/core` surface. The helper accepts only WAV output,
 little-endian f32 source/output, finite non-zero gain, unchanged channel count and sample rate, and no
-time slice, fade, dynamics, or biquad/EQ. It still parses the RIFF/WAVE `fmt ` and `data` chunks, drops any
+time slice, fade, dynamics, or biquad/EQ. It still parses the RIFF/WAVE `fmt` and `data` chunks, drops any
 trailing partial frame exactly like `readWavPcm()`, writes a fresh canonical 44-byte WAV header, checks
 abort signals during the sample loop, and returns `undefined` for every unsupported shape so the canonical
 Float64 PCM path remains the fallback.
@@ -5237,3 +5237,51 @@ the same `golden-metadata` workload. The living deficit file still needs the nex
 playlist tags alone; using `<video>.loadedmetadata`; returning canned HLS metadata for the fixture;
 weakening the `golden-metadata` oracle; caching parsed playlist or probe results across measured calls; and
 copying competitor source code.
+
+### ADR-181 - ADTS `.aac` duration from an exact frame walk, not a bitrate estimate
+
+**Context (Session 10, fair harness).** `probe/aac_adts` on a rotated real VBR file measured **19.9924 s** against ffprobe's **17.1360 s** (Δ +2.86 s, +16.7%) — outside even the estimate-only loose band. The previous ADTS probe extrapolated duration from an early-frame bitrate, which is wrong for VBR and inflated by any ID3v2 prefix counted as payload.
+
+**Decision.** Replace the estimate with an exact O(frames) header walk (`src/drivers/adts/adts-frames.ts`): skip a leading ID3v2 (and trailing ID3v1/APE junk), then hop each ADTS frame by its `frame_length`, validating syncword/layer/sampling-index and resyncing on corruption, and sum `frames × 1024 / sampleRate`. HE-AAC/SBR is timed at the **core** sample rate carried in the ADTS header (matching ffmpeg's packet count). The walk is bounded-read (a few header bytes per frame) so it stays cheap on huge files; other probe fields keep their existing fast paths.
+
+**Consequences.** Duration is now exact on CBR, true-VBR, ID3-tagged, HE-AAC, mono/stereo, and 44.1/48 kHz real files (validated to ≤ ffprobe tolerance against baked `ffprobe -count_frames` goldens; 55 tests). Probe wall-time on a long ADTS file did not regress. **Rejected:** bitrate extrapolation; counting ID3 bytes as audio; assuming a fixed frame rate; timing HE-AAC at the doubled SBR rate.
+
+### ADR-183 - HLS AES-128 full-segment decrypt: RFC 8216 conformance across all playlist shapes
+
+**Context.** Our HLS `AES-128` source-decrypt (ADR-023) had only been exercised on one shape (explicit IV, media-sequence 0). A real encrypted playlist failed downstream with "not an MPEG-TS stream (no transport sync run found)" — the decrypt emitted no `0x47` sync run, so key/IV/padding was wrong for that shape.
+
+**Decision.** Bring `src/drivers/hls/{m3u8-parse,hls-source}.ts` to RFC 8216 §4.3.2 conformance without touching the engine, crypto primitive, or container router: (1) §4.3.2.4 the implicit IV is the segment media-sequence number as a **128-bit big-endian** integer — materialize a big-endian **u64** (was a 32-bit write that truncated sequences ≥ 2³² to a zero IV); (2) §4.3.2.2 an `@offset`-less `EXT-X-BYTERANGE` resumes at the previous sub-range's end within the same resource, else `InputError`; (3) §4.2/§4.3.2.4 accept a `0x`-prefixed 1..32-hex IV left-padded to 16 bytes, and treat a malformed IV as a hard `InputError` for decryptable methods (never a silent sequence-IV fallback) while tolerating it for opaque DRM; (4) §4.3.2.5 decrypt an encrypted `EXT-X-MAP` init section with the key in force at its declaration, requiring an explicit IV (a pre-key map stays clear); (5) §3.4 tag packed-audio renditions `audio/aac` by content-sniffing the stitched head rather than assuming `video/mp2t`. Rotation, `METHOD=NONE`, playlist-relative key URIs, per-segment PKCS#7 stripping, and full-segment vs `SAMPLE-AES` were already correct and retained.
+
+**Consequences.** AES-128 is conformant across implicit/explicit/short/malformed IVs, media-sequence ≥ 2³², key rotation, `METHOD=NONE`, byte-range (explicit + continuation), packed audio, and encrypted fMP4 init — validated (10 real playlists) against an independent `openssl enc -d` / `node:crypto` twin byte-exact, `0x47`-sync every 188 bytes, and ffprobe duration/tracks; `crypto/aes.ts` audited and confirmed correct, not the source of the bug; no `core.ts` change. **Rejected:** a 32-bit IV; a silent sequence-IV fallback on a malformed IV; assuming `video/mp2t` for packed audio; editing the AES primitive.
+
+### ADR-184 - MPEG-TS AAC: stateful ADTS de-framer emitting raw access units
+
+**Context.** Remuxing a real MPEG-TS to MP4 (`remux/prop_ts_to_mp4_duration_materialized`) threw "AAC MP4 muxing cannot mix ADTS-framed and raw samples" from the MP4 muxer's mix-detector. The guard is correct: an MP4 AAC sample must be a **raw** access unit with the ASC in `esds`. The fault was in TS demux — real transport streams pack several ADTS frames into one audio PES and split frames across PES packets, so per-PES splitting emitted inconsistently framed samples (some ADTS-framed, some raw, some boundary-corrupted).
+
+**Decision.** For every `stream_type 0x0f` PID, run one stateful `AdtsDeframer` over the reassembled PES payload byte stream in a single streaming pass: buffer a partial frame/header across PES boundaries; resync by hunting and validating the next `0xFFF` candidate (so payload `0xFFF` bytes cannot fake a frame); strip the 7/9-byte header and emit exactly one raw access unit per frame; derive the ASC from the first valid header; and time frames per ISO/IEC 13818-1 §2.4.3.7 — the first PES PTS anchors, subsequent frames advance `samples × 90000 / sampleRate` on the exact rational, a PTS-less PES continues the chain, and a later PES PTS **rebases only on a genuine discontinuity** (> ½ s) so a priming-frame ±1-frame lag keeps strict monotonic cadence (the "bear frame-12 wobble" fix).
+
+**Consequences.** TS→MP4 AAC remux no longer trips the mix-detector; materialized duration is correct. `TsAccessUnit.data` for AAC is now raw. Validated on four structurally distinct real transport streams (byte-exact vs `ffmpeg -c:a copy -f adts`, count vs ffprobe, duration vs the lossless MP4 remux, exact/monotonic cadence) plus synthetic ADTS for CRC/resync/false-sync/boundary/rebase; ~540 MB/s single-pass. The api mpegts fast paths write *to* TS and are unaffected. Note: the harness `golden-packets` fixture records pre-de-framer ADTS-framed audio sizes and must be regenerated to raw sizes. **Rejected:** anchor-once with no rebase (loses discontinuity robustness); reproducing ffmpeg's non-monotonic per-frame PTS verbatim; stripping in the muxer (wrong layer).
+
+### ADR-185 - QuickTime `.mov` enumerates every declared trak and carries container colour/PCM truth
+
+**Context.** A real 596 s QuickTime `.mov` enumerated **2** tracks against ffprobe's **3**, its audio surfaced as type `other`/codec `''`, and real H.264 `.mov` decoded to the wrong colours (SSIM ~0.85). Two compounding container bugs: the sound sample-description parser handled only version 0, so a v2 description was misread (channels→3, rate→1) and `esds` was found only as a direct child (missing QuickTime's `wave`-nested `esds`) → `audio:unknown`; and a non-AV `tmcd` timecode trak (which ffprobe counts) was dropped. Separately, the visual sample entry's `colr`/`pasp`/`clap` were never read, so no `VideoColorSpaceInit` reached the decoder.
+
+**Decision.** `parseTrak` routes on the `hdlr` component subtype: `vide`/`soun` keep the strict decode-grade parse; any other/unreadable handler becomes a lenient `OtherTrack` (id/timing/sample-count + `stsd` first-entry fourcc), so a malformed data trak never breaks AV probing and a header-only file still enumerates. `parseAudioGeometry` reads sound descriptions v0/v1/v2 and resolves the codec box as a direct child or inside a `wave` wrapper; uncompressed QuickTime PCM fourccs classify to the engine's PCM tokens (`sowt`→`pcm-s16`, `twos`→`pcm-s16be`, `fl32`/`in24`… with a sibling `enda` flipping endianness). `parseVisualEntry` parses `colr` (nclc/nclx only; ICC-profile `colr` ignored, not faked), `pasp`, `clap`, maps `colr` through H.273 per-field, and mirrors the mapped `colorSpace` onto `VideoDecoderConfig.colorSpace` (flowing unchanged to `VideoDecoder.configure` via existing passthroughs — no decode-path edit). The H.273 tokens the bundled lib.dom colour enums omit are asserted to their WebCodecs type at the single producing boundary (no `any`).
+
+**Consequences.** The 596 s header enumerates 3 streams (video, `tmcd`, aac); v1/v2 QuickTime audio resolves to `mp4a.40.2`; QuickTime PCM classifies to real tokens; and H.264 carries container colour to the decoder. Validated by an independent ffprobe-8.0 oracle over 10 real files (v0/v1/v2 sound, wave-esds, tmcd, BT.601/709/nclx-full-range/untagged colour, sowt/fl32/lpcm PCM), enumeration O(index) (~0.061 ms on a 395 KB header, no `mdat`). **Rejected:** dropping/`other`-typing non-media traks; a v0-only sound parser; scanning payloads to enumerate; inventing a colorSpace when the container is silent; parsing ICC `colr` as nclc; `any` for the lib.dom enum gap.
+
+### ADR-186 - Fragmented-MP4 (CMAF) per-sample table recovered from `moof`/`traf`/`trun`
+
+**Context (Session 10, fair harness).** Three cells produced empty output on rotated real files — `decode-seek/meta_pts_monotonic_after_reorder` ("no decoded frames"), `audio-dsp/edge_gapless_aac_decode` ("cannot finalize a muxer with no tracks"), and `mux/size_longform_audio_to_mp4` ("no coded samples"). Root cause (one bug): a fragmented/CMAF movie's `moov` sample tables are empty — the samples live in `moof`/`traf`/`trun` fragments — and `parse.ts` recovered only *aggregate* fragment timing (total duration + count) for probe, never the per-sample byte offsets/sizes/PTS/DTS/sync flags. So `buildSampleData` saw a zero-length table and the demuxer emitted **zero packets**: probe worked, but decode/convert of any fragmented input yielded nothing.
+
+**Decision.** A new lead-owned `src/drivers/mp4/fragment-samples.ts` rebuilds the exact flat sample list from every `moof`/`traf`/`trun` (multi-moof, multi-traf, multi-trun), following ISO/IEC 14496-12 §8.8.7 byte-offset resolution exactly — a `tfhd` may pin an explicit `base_data_offset`, request default-base-is-moof (base = the `moof` start), or leave it implicit (first `traf` ⇒ moof start; later `traf`s ⇒ the end of the previous fragment's data); each `trun` `data_offset` is relative to that base with samples contiguous; per-sample values fall back `trun` → `tfhd` → `trex` defaults; `tfdt` seeds decode time (carried across fragments when absent); composition offset is signed in v1 (B-frames); sync from `sample_flags` bit 16. `mp4-driver.ts` (lead-owned) detects a fragmented movie in `demux()`, builds the per-track sample map once, and threads it into `packetStream` (which otherwise uses `buildSampleData`). Samples whose byte range escapes the file are dropped (a truncated fragment tail — some real captures store a final `moof` whose `mdat` never arrived — ffmpeg stops at the same boundary). No edit to mov2-owned `parse.ts`/`samples.ts` (types imported read-only).
+
+**Consequences.** Fragmented CMAF decode/convert works end-to-end: real corpus `bear-av-frag` (82 video / gapless-audio) and `bear-open-gop-frag` (48 open-GOP B-frames) decode with monotonic PTS, and fragmented gapless/longform audio (600 s) transcode to valid MP4. Validated byte-exact against an independent `ffprobe -show_packets` golden (offset/size/DTS/PTS/keyframe) on both CMAF fixtures + the truncation-drop invariant + the mapper's edit-list/microsecond math. **Rejected:** synthesizing a fake `moov` sample table the demuxer would mis-read; throwing on a truncated tail instead of dropping the unreadable samples; editing the aggregate-timing parser in `parse.ts` (concurrent owner).
+
+### ADR-182 - Whole-file CENC engine (`decryptCencFile`) for real-world fragmented cbcs/cenc/cens
+
+**Context.** The `moov`-only driver decrypt path handled a single `cbcs` shape and rejected fragmented CMAF (`sampleSizes.length === 0` → "cbcs track N has no decryptable samples"), which is how virtually all real `cbcs` assets (Apple HLS, DASH-IF, Bento4 `MPEG-CBCS`) are packaged. ISO/IEC 23001-7 §§7–10 also mandate constant-IV-no-`senc` full-sample audio, `saiz`/`saio`-located aux, `sbgp`/`sgpd` 'seig' per-group key/IV/pattern overrides (incl. unprotected groups), multi-`moof` per-fragment `tfhd`/`trun` bases, and mixed clear/encrypted content — none supported. ffmpeg cannot open the layout and is non-conformant for CENC subsample crypto, so it is not a usable oracle.
+
+**Decision.** Add `decryptCencFile(bytes, {scheme, keys}): Promise<Uint8Array>` to `cenc.ts`: a single self-contained pass (via `reader.ts` primitives only — no `parse.ts`/`mp4-driver.ts` coupling, no import cycle) that (1) parses `moov` tracks (protected `stsd` entries, `tenc`, movie-level `sgpd`, `trex` defaults); (2) locates samples both flat (`stsc`/`stsz`/`stco`/`co64`) and fragmented (`tfhd` base resolution; `trun` sizes with all optional fields); (3) resolves per-sample IV/subsample map from `senc`, else `saiz`/`saio` aux, else `default_constant_IV`, applying 'seig' group overrides (traf-local index ≥0x10001, movie-level 1..0xFFFF, 0 = defaults); (4) decrypts in place (cbcs = AES-CBC pattern, cens = AES-CTR pattern, cenc = AES-CTR), preserving byte offsets; (5) neutralizes protection boxes (`enca/encv`→`frma` original, `sinf`/`senc`→`free`, `seig` groups zeroed) so the output probes clear. Malformed/contradictory input → `MediaError`; unsupported capability (unknown scheme, multi-entry `saio`, missing key) → `CapabilityError`. `media.decrypt` routes the buffered whole file through it for `scheme ∈ {cenc,cens,cbcs}` (lead wiring in `mp4-driver.ts`), keeping the HLS-AES-128 branch.
+
+**Consequences.** All documented real-world `cbcs` layouts (and fragmented `cenc`/`cens`) decrypt byte-exactly, self-validated without ffmpeg against an independent openssl / `node:crypto` AES-128 twin across five layouts + flat variants, plus a fully third-party **Bento4** leg (fragment+encrypt a real file with `mp4encrypt --method MPEG-CBCS`; recovered `mdat` must equal the clear original byte-for-byte, wrong key must not). Coverage 98.43% stmt / 90.29% branch; benchmarked in `scripts/bench-cbcs-decrypt.ts`. `saio` is limited to a single aux-offset entry (multi-entry declines typed). **Rejected:** extending `decryptCencTrack` to read `moof` (entangles the driver's mux rebuild, loses byte-exact in-place output); reusing `parse.ts`'s movie model (no per-`traf` `senc`/`saiz`/`saio`/`sbgp`, import cycle); trusting ffmpeg as oracle (cannot open the layout, non-conformant subsample crypto).

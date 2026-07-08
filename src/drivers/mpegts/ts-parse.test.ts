@@ -290,7 +290,7 @@ describe('parseTs — spec-minimal PSI/PES branch fixtures', () => {
     });
   });
 
-  it('keeps a single-frame AAC PES on the whole-payload path', () => {
+  it('de-frames a single-frame AAC PES into one raw access unit (ADTS header stripped, ADR-184)', () => {
     const pmtPid = 0x0100;
     const aacPid = 0x0121;
     const stream = concatBytes(
@@ -301,8 +301,14 @@ describe('parseTs — spec-minimal PSI/PES branch fixtures', () => {
     const track = parseTs(stream).tracks[0];
     expect(track?.stream).toMatchObject({ mediaType: 'audio', codec: 'aac' });
     expect(track?.units).toHaveLength(1);
-    expect([...(track?.units[0]?.data.subarray(0, 12) ?? [])]).toEqual([...adtsFrame(12)]);
-    expect(track?.units[0]?.data.length).toBeGreaterThan(12);
+    // adtsFrame(12) is a 7-byte header (protection_absent=1, no CRC) + 5 payload bytes; the de-framer
+    // strips the header and emits exactly the raw AU — never an ADTS-framed sample.
+    expect([...(track?.units[0]?.data ?? new Uint8Array())]).toEqual([
+      ...adtsFrame(12).subarray(7),
+    ]);
+    expect(track?.units[0]?.data.length).toBe(5);
+    expect(track?.units[0]?.data[0]).not.toBe(0xff); // raw AU, not the 0xFFF ADTS syncword
+    expect(track?.units[0]?.ptsUs).toBe(1_000_000); // the PES PTS (90000 ticks) names the first frame
     expect(track?.config).toMatchObject({ codec: 'aac', sampleRate: 48000, numberOfChannels: 2 });
   });
 });

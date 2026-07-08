@@ -66,6 +66,38 @@ const sourceLabel = [basename(SRC), ...overlays.map((overlay) => basename(overla
   ' + ',
 );
 
+/**
+ * Functional reds (Session 10): every FAIL/ERROR cell of ours is a defect that
+ * outranks any speed deficit. Timeouts and OOMs are classified from the reason
+ * string for triage; the status alone is what gates.
+ */
+const redKind = (reason) => {
+  if (/timed? ?out|timeout/i.test(reason)) return 'timeout';
+  if (/allocation failed|out of memory|\boom\b/i.test(reason)) return 'oom';
+  return 'red';
+};
+const functionalReds = [];
+const bakeBlocked = [];
+for (const x of mergedResults.values()) {
+  if (x.engineId !== US) continue;
+  const reason = x.reason ?? '';
+  const file = x.selection?.file ?? '';
+  if (x.status === 'FAIL' || x.status === 'ERROR') {
+    functionalReds.push({
+      s: x.scenarioId,
+      fam: x.family,
+      status: x.status,
+      kind: redKind(reason),
+      file,
+      reason,
+    });
+  } else if (x.status === 'NA_ASSET') {
+    bakeBlocked.push({ s: x.scenarioId, fam: x.family, file, reason });
+  }
+}
+functionalReds.sort((a, b) => a.fam.localeCompare(b.fam) || a.s.localeCompare(b.s));
+bakeBlocked.sort((a, b) => a.fam.localeCompare(b.fam) || a.s.localeCompare(b.s));
+
 /** scenario -> engine -> { wall, family, status } (only oracle-passing, timed cells) */
 const idx = {};
 for (const x of mergedResults.values()) {
@@ -144,20 +176,53 @@ const exemptionTable = (rows) => {
   return o;
 };
 
-const doc = `# Performance deficits — where rivals beat aibrush-media (Chromium)
+const redTable = (rows) => {
+  if (!rows.length) return '_No functional reds — every scored cell PASSes._\n';
+  let o = '| # | Status | Kind | Scenario | Family | File | Reason |\n';
+  o += '|--:|--------|------|----------|--------|------|--------|\n';
+  rows.forEach((r, i) => {
+    const reason = r.reason.replace(/\|/g, '\\|').slice(0, 160);
+    o += `| ${i + 1} | ${r.status} | ${r.kind} | \`${r.s}\` | ${r.fam} | \`${r.file}\` | ${reason} |\n`;
+  });
+  return o;
+};
+
+const bakeBlockedTable = (rows) => {
+  if (!rows.length) return '_None — the harness corpus/golden bake is complete._\n';
+  let o = '| Scenario | Family | Reason |\n|----------|--------|--------|\n';
+  for (const r of rows) {
+    o += `| \`${r.s}\` | ${r.fam} | ${r.reason.replace(/\|/g, '\\|').slice(0, 120)} |\n`;
+  }
+  return o;
+};
+
+const doc = `# Deficit worklist — functional reds + speed gaps (Chromium)
 
 > **Auto-generated** by \`docs/perf/gen-deficits.mjs\` from \`${sourceLabel}\`
 > (latest included export ${generatedAtIso}). Re-run the generator against a
 > fresher export to refresh. Do not hand-edit the tables.
 
-We rank **#1 on correctness** (100% conformance). This file is the opposite view:
-the **speed** gaps. A cell is a *deficit* iff, on Chromium, we and at least one
+## Functional reds — fix before any speed work
+
+A FAIL/ERROR (including timeout and OOM) is a functional defect and outranks
+every wall-time deficit below. The generator **exits non-zero while any row
+remains here**.
+
+${redTable(functionalReds)}
+### Bake-blocked cells (harness-side \`NA_ASSET\`: golden absent — run the harness bake, not a code fix)
+
+${bakeBlockedTable(bakeBlocked)}
+## Speed deficits
+
+A cell is a *deficit* iff, on Chromium, we and at least one
 competitor **both PASS the identical golden oracle** (same work) and the
 competitor's median wall-time is lower than ours. NA/FAIL cells and cells no
 rival timed are excluded — so every row below is an honest, same-work loss.
 
 ## Headline
 
+- **Functional reds (FAIL/ERROR/timeout/OOM): ${functionalReds.length}** — ${functionalReds.filter((r) => r.kind === 'timeout').length} timeout · ${functionalReds.filter((r) => r.kind === 'oom').length} OOM · ${functionalReds.filter((r) => r.kind === 'red').length} other
+- **Bake-blocked (harness NA_ASSET):** ${bakeBlocked.length}
 - **Contested scenarios** (we + ≥1 rival both timed & passing): **${contested}**
 - **Active deficits where a rival is faster than us: ${activeLosses.length} (${((100 * activeLosses.length) / contested).toFixed(0)}%)**
 - **ADR-backed parity exemptions:** ${exemptLosses.length}
@@ -219,6 +284,8 @@ writeFileSync(
       generatedFrom: generatedAtIso,
       source: basename(SRC),
       overlays: overlays.map((overlay) => basename(overlay.path)),
+      functionalReds,
+      bakeBlocked,
       contested,
       rawLossCount: losses.length,
       activeLossCount: activeLosses.length,
@@ -237,8 +304,8 @@ writeFileSync(
   )}\n`,
 );
 
-const summary = `wrote docs/perf/performance-deficits.md — ${activeLosses.length} active deficits (${T1.length}/${T2.length}/${T3.length}/${T4.length}), ${exemptLosses.length} exempt`;
-if (activeLosses.length > 0) {
+const summary = `wrote docs/perf/performance-deficits.md — ${functionalReds.length} functional reds (${functionalReds.filter((r) => r.kind === 'timeout').length} timeout, ${functionalReds.filter((r) => r.kind === 'oom').length} OOM), ${bakeBlocked.length} bake-blocked, ${activeLosses.length} active speed deficits (${T1.length}/${T2.length}/${T3.length}/${T4.length}), ${exemptLosses.length} exempt`;
+if (functionalReds.length > 0 || activeLosses.length > 0) {
   console.error(summary);
   process.exit(1);
 }

@@ -32,6 +32,13 @@ import { audioDataToPcm } from '../../filters/audio-dsp.ts';
 import { fromURL } from '../../sources/source.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
+import {
+  type AdtsWalkStats,
+  adtsHeadOffset,
+  isAdtsSync,
+  probeAdtsStream,
+  walkAdtsBuffer,
+} from './adts-frames.ts';
 import { AdtsMuxer } from './adts-mux.ts';
 
 const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
@@ -78,14 +85,8 @@ async function loadAdtsPcmDirectModule(): Promise<typeof import('./adts-pcm-dire
   return adtsPcmDirectModulePromise;
 }
 
-// MPEG-4 sampling-frequency-index table (Hz); index 13–15 are reserved/explicit (unsupported here).
-const SAMPLE_RATES = [
-  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-];
 // channel_configuration → channel count (0 = AOT-specific; 7 = 7.1 → 8 channels).
 const CHANNELS = [0, 1, 2, 3, 4, 5, 6, 8];
-
-const SAMPLES_PER_BLOCK = 1024;
 
 /**
  * One enumerated ADTS frame, as the pure framer sees it. `size` is the FULL frame length (header + CRC +
@@ -112,50 +113,13 @@ export interface AdtsPacket {
  * PURE framer (Node-testable, no WebCodecs): walk EVERY ADTS frame across the whole buffer and return its
  * byte geometry + timing. This is the load-bearing logic the oracle validates; `packets()` only maps it to
  * `EncodedAudioChunk`s. Throws {@link InputError} when the head is not ADTS (so truncated/garbage rejects),
- * and {@link MediaError} on a reserved sampling-frequency index. A frame whose declared `frame_length`
- * overruns the buffer (a truncated tail) stops the walk cleanly — we never read past the bytes we have.
+ * and {@link MediaError} on a reserved sampling-frequency index. The walk resyncs across mid-stream junk
+ * (double-syncword confirmed) and ends cleanly at trailing tags or a truncated final frame — packets are
+ * exactly the decodable frames, never estimated (see {@link walkAdtsBuffer}).
  */
 export function enumerateAdtsFrames(bytes: Uint8Array): readonly AdtsPacket[] {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const start = adtsOffset(dv);
-  if (bytes.byteLength < start + 7 || !isSync(dv.getUint8(start), dv.getUint8(start + 1))) {
-    throw new InputError('unsupported-input', 'not an ADTS/AAC stream (no 0xFFF syncword)');
-  }
-  // Sampling rate is fixed by the FIRST header; ADTS keeps it constant across frames of one stream.
-  const freqIndex = (dv.getUint8(start + 2) >> 2) & 0xf;
-  const sampleRate = SAMPLE_RATES[freqIndex];
-  if (sampleRate === undefined) {
-    throw new MediaError('demux-error', `ADTS: reserved sampling-frequency index ${freqIndex}`);
-  }
-
   const packets: AdtsPacket[] = [];
-  let pos = start;
-  let cumulativeSamples = 0;
-  while (pos + 7 <= bytes.byteLength && isSync(dv.getUint8(pos), dv.getUint8(pos + 1))) {
-    const frameLen =
-      ((dv.getUint8(pos + 3) & 0x3) << 11) |
-      (dv.getUint8(pos + 4) << 3) |
-      (dv.getUint8(pos + 5) >> 5);
-    // protection_absent == 0 ⇒ a 2-byte CRC follows the 7-byte fixed header (header = 9 bytes total).
-    const headerBytes = (dv.getUint8(pos + 1) & 0x1) === 0 ? 9 : 7;
-    if (frameLen < headerBytes || pos + frameLen > bytes.byteLength) break; // malformed / truncated tail
-    const rawBlocks = (dv.getUint8(pos + 6) & 0x3) + 1;
-    const samples = rawBlocks * SAMPLES_PER_BLOCK;
-    packets.push({
-      offset: pos,
-      size: frameLen,
-      headerBytes,
-      // µs from the integer sample clock — rounding keeps us within ±1µs of ffprobe's pts_time.
-      ptsUs: Math.round((cumulativeSamples * 1_000_000) / sampleRate),
-      durationUs: Math.round((samples * 1_000_000) / sampleRate),
-      samples,
-    });
-    cumulativeSamples += samples;
-    pos += frameLen;
-  }
-  if (packets.length === 0) {
-    throw new InputError('unsupported-input', 'ADTS: no decodable frames');
-  }
+  walkAdtsBuffer(bytes, (frame) => packets.push(frame));
   return packets;
 }
 
@@ -185,72 +149,27 @@ export interface AdtsInfo {
   frames: number;
 }
 
-/** A valid ADTS sync: byte0 = 0xFF, byte1 top nibble = 0xF, layer bits (b1 & 6) == 0. */
-function isSync(b0: number, b1: number): boolean {
-  return b0 === 0xff && (b1 & 0xf0) === 0xf0 && (b1 & 0x06) === 0;
-}
-
-/** Byte offset of the first ADTS frame, skipping an optional ID3v2 prefix. */
-function adtsOffset(dv: DataView): number {
-  if (
-    dv.byteLength >= 10 &&
-    dv.getUint8(0) === 0x49 &&
-    dv.getUint8(1) === 0x44 &&
-    dv.getUint8(2) === 0x33
-  ) {
-    const size =
-      ((dv.getUint8(6) & 0x7f) << 21) |
-      ((dv.getUint8(7) & 0x7f) << 14) |
-      ((dv.getUint8(8) & 0x7f) << 7) |
-      (dv.getUint8(9) & 0x7f);
-    return 10 + size;
-  }
-  return 0;
-}
-
-/** Parse ADTS headers into the audio layout + duration. `totalSize` (full file) refines a partial head. */
-export function parseAdts(bytes: Uint8Array, totalSize?: number): AdtsInfo {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const start = adtsOffset(dv);
-  if (bytes.byteLength < start + 7 || !isSync(dv.getUint8(start), dv.getUint8(start + 1))) {
-    throw new InputError('unsupported-input', 'not an ADTS/AAC stream (no 0xFFF syncword)');
-  }
-  const b2 = dv.getUint8(start + 2);
-  const objectType = ((b2 >> 6) & 0x3) + 1; // profile + 1 = MPEG-4 audio object type (2 = AAC-LC)
-  const freqIndex = (b2 >> 2) & 0xf;
-  const sampleRate = SAMPLE_RATES[freqIndex];
-  if (sampleRate === undefined) {
-    throw new MediaError('demux-error', `ADTS: reserved sampling-frequency index ${freqIndex}`);
-  }
-  const channelConfig = ((b2 & 0x1) << 2) | ((dv.getUint8(start + 3) >> 6) & 0x3);
-  const channels = CHANNELS[channelConfig] ?? 0;
-
-  // Walk frames within the available bytes to count samples (each frame_length bytes, 1024/block).
-  let pos = start;
-  let frames = 0;
-  let samples = 0;
-  while (pos + 7 <= bytes.byteLength && isSync(dv.getUint8(pos), dv.getUint8(pos + 1))) {
-    const frameLen =
-      ((dv.getUint8(pos + 3) & 0x3) << 11) |
-      (dv.getUint8(pos + 4) << 3) |
-      (dv.getUint8(pos + 5) >> 5);
-    if (frameLen < 7) break; // malformed header guard
-    const rawBlocks = (dv.getUint8(pos + 6) & 0x3) + 1;
-    frames++;
-    samples += rawBlocks * SAMPLES_PER_BLOCK;
-    pos += frameLen;
-  }
-  // If we only saw a head of a larger file, extrapolate by the bytes-per-sample density walked so far.
-  const walked = pos - start;
-  const scale =
-    totalSize !== undefined && walked > 0 ? Math.max(1, (totalSize - start) / walked) : 1;
+/** The stream-level {@link AdtsInfo} facts derived from an exact walk's totals. */
+function infoFromWalkStats(stats: AdtsWalkStats): AdtsInfo {
+  const { aot, sampleRate, channelConfig } = stats.firstHeader;
   return {
-    codec: `mp4a.40.${objectType}`,
+    codec: `mp4a.40.${aot}`,
     sampleRate,
-    channels,
-    durationSec: (samples * scale) / sampleRate,
-    frames,
+    channels: CHANNELS[channelConfig] ?? 0,
+    durationSec: stats.durationSec,
+    frames: stats.frames,
   };
+}
+
+/**
+ * Parse ADTS headers into the audio layout + EXACT duration (every frame header is visited; trailing
+ * tags/junk and a truncated final frame contribute zero seconds — see {@link walkAdtsBuffer}).
+ *
+ * @param _totalSize Deprecated and ignored: the walk is exact, never a byte-density extrapolation.
+ *   Accepted so existing `parseAdts(bytes, bytes.byteLength)` call sites stay source-compatible.
+ */
+export function parseAdts(bytes: Uint8Array, _totalSize?: number): AdtsInfo {
+  return infoFromWalkStats(walkAdtsBuffer(bytes));
 }
 
 /** Read the ENTIRE source — `packets()` must enumerate every frame, not just the probed head. */
@@ -305,18 +224,19 @@ export function adtsAacPcmDecodePlan(
   return AAC_PCM_NATIVE_FIRST_PLAN;
 }
 
-function readLayout(bytes: Uint8Array): AdtsLayout {
-  const info = parseAdts(bytes, bytes.byteLength);
-  if (info.channels <= 0) {
+/** Reject the PCE-carried `channel_configuration 0` (no inline channel map to decode with). */
+function assertKnownChannels(channels: number): void {
+  if (channels <= 0) {
     throw new MediaError('demux-error', 'ADTS: unsupported channel configuration 0');
   }
-  const frames = enumerateAdtsFrames(bytes);
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const start = adtsOffset(dv);
-  const b2 = dv.getUint8(start + 2);
-  const aot = ((b2 >> 6) & 0x3) + 1;
-  const freqIndex = (b2 >> 2) & 0xf;
-  const channelConfig = ((b2 & 0x1) << 2) | ((dv.getUint8(start + 3) >> 6) & 0x3);
+}
+
+function readLayout(bytes: Uint8Array): AdtsLayout {
+  const frames: AdtsPacket[] = [];
+  const stats = walkAdtsBuffer(bytes, (frame) => frames.push(frame));
+  const info = infoFromWalkStats(stats);
+  assertKnownChannels(info.channels);
+  const { aot, freqIndex, channelConfig } = stats.firstHeader;
   return {
     info,
     frames,
@@ -792,9 +712,10 @@ function matches(q: ContainerQuery): boolean {
   if (q.extension !== undefined && ADTS_EXTENSIONS.has(q.extension.toLowerCase())) return true;
   const head = q.head;
   if (head === undefined || head.byteLength < 7) return false;
+  const off = adtsHeadOffset(head);
+  if (off === undefined || off + 2 > head.byteLength) return false;
   const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
-  const off = adtsOffset(dv);
-  return off + 2 <= head.byteLength && isSync(dv.getUint8(off), dv.getUint8(off + 1));
+  return isAdtsSync(dv.getUint8(off), dv.getUint8(off + 1));
 }
 
 export const AdtsDriver = {
@@ -804,6 +725,32 @@ export const AdtsDriver = {
   formats: ['adts'],
   supports: matches,
   validatesStreamCopyTrim: true,
+  /**
+   * Metadata-only probe: EXACT duration from a bounded-read header walk — every ADTS frame header is
+   * visited through fixed-size windows (leading/mid-stream tag bodies are seeked over on range-capable
+   * sources), so huge files never materialize and trailing tags/junk never inflate the duration. Track
+   * facts (codec/rate/channels/ASC) come from the first locked header, exactly like `demux()`.
+   */
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const stats = await probeAdtsStream(src, o?.signal !== undefined ? { signal: o.signal } : {});
+    const info = infoFromWalkStats(stats);
+    assertKnownChannels(info.channels);
+    const { aot, freqIndex, channelConfig } = stats.firstHeader;
+    return [
+      {
+        id: 0,
+        mediaType: 'audio',
+        codec: info.codec,
+        durationSec: info.durationSec,
+        config: {
+          codec: info.codec,
+          sampleRate: info.sampleRate,
+          numberOfChannels: info.channels,
+          description: audioSpecificConfig(aot, freqIndex, channelConfig),
+        },
+      },
+    ];
+  },
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
     const bytes = await readAll(src);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');

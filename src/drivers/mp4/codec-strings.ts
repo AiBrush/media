@@ -1,7 +1,9 @@
 /**
  * Map MP4 sample-entry codec config (`avcC`, `esds`) to WebCodecs codec strings + the `description`
  * bytes a decoder needs. The codec string must carry profile/level (e.g. `avc1.42E01E`,
- * `mp4a.40.2`) so `isConfigSupported` answers precisely (docs/architecture/10 §6).
+ * `mp4a.40.2`) so `isConfigSupported` answers precisely (docs/architecture/10 §6). Also maps the
+ * container colour tags (`colr` nclc/nclx H.273 code points → `VideoColorSpaceInit`) and the QuickTime
+ * PCM sound-description fourccs → engine PCM tokens (ADR-185, docs/notes/qtff-mov-parsing.md).
  */
 
 import { Reader, readFullBoxHeader } from './reader.ts';
@@ -121,4 +123,182 @@ export function parseEsds(esds: Uint8Array): EsdsInfo {
     ...(audioObjectType !== undefined ? { audioObjectType } : {}),
     ...(asc ? { asc } : {}),
   };
+}
+
+/**
+ * The nclc/nclx fields of a `colr` box (ISO/IEC 14496-12 §12.1.5 / QTFF "Color Parameter Atoms"):
+ * raw H.273 code points plus the nclx `full_range_flag`. QuickTime `nclc` carries no range field, so
+ * `fullRange` stays undefined there — the parser must not invent one.
+ */
+export interface ColrInfo {
+  colourType: 'nclc' | 'nclx';
+  primaries: number;
+  transfer: number;
+  matrix: number;
+  fullRange?: boolean;
+}
+
+// The bundled lib.dom colour enums predate several H.273 code points that WebCodecs accepts at runtime
+// (BT.2020, SMPTE-432, PQ/HLG, BT.2020-NCL). Assert those spec-valid tokens to their WebCodecs type at
+// the one boundary that produces them — never `any`; tokens already in lib.dom stay literal-checked so a
+// typo is still caught. (Same idiom used for the colour-space enums elsewhere in the engine.)
+const asColorPrimaries = (token: string): VideoColorPrimaries => token as VideoColorPrimaries;
+const asTransferCharacteristics = (token: string): VideoTransferCharacteristics =>
+  token as VideoTransferCharacteristics;
+const asMatrixCoefficients = (token: string): VideoMatrixCoefficients =>
+  token as VideoMatrixCoefficients;
+
+/**
+ * H.273 (ISO/IEC 23091-2) `ColourPrimaries` → WebCodecs {@link VideoColorPrimaries}. Code 7
+ * (SMPTE-240M) shares BT.601-NTSC/SMPTE-C chromaticities with code 6, so it maps to `smpte170m`;
+ * unspecified (2) and code points WebCodecs cannot name yield undefined — an honest omission the
+ * decoder resolves with its own default, never a guess.
+ */
+export function h273Primaries(code: number): VideoColorPrimaries | undefined {
+  switch (code) {
+    case 1:
+      return 'bt709';
+    case 5:
+      return 'bt470bg';
+    case 6:
+    case 7:
+      return 'smpte170m';
+    case 9:
+      return asColorPrimaries('bt2020');
+    case 12:
+      return asColorPrimaries('smpte432');
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * H.273 `TransferCharacteristics` → WebCodecs {@link VideoTransferCharacteristics}. Codes 1/14/15
+ * (BT.709 / BT.2020-10 / BT.2020-12) are the identical function per H.273, so all map to `bt709`.
+ * SMPTE-240M (7) uses different constants and has no WebCodecs name → undefined.
+ */
+export function h273Transfer(code: number): VideoTransferCharacteristics | undefined {
+  switch (code) {
+    case 1:
+    case 14:
+    case 15:
+      return 'bt709';
+    case 6:
+      return 'smpte170m';
+    case 8:
+      return asTransferCharacteristics('linear');
+    case 13:
+      return 'iec61966-2-1';
+    case 16:
+      return asTransferCharacteristics('pq');
+    case 18:
+      return asTransferCharacteristics('hlg');
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * H.273 `MatrixCoefficients` → WebCodecs {@link VideoMatrixCoefficients}. SMPTE-240M (7) and
+ * BT.2020-CL (10) have no WebCodecs name → undefined (the browser default is a lesser evil than a
+ * wrong matrix, and the raw code point stays available on {@link ColrInfo}).
+ */
+export function h273Matrix(code: number): VideoMatrixCoefficients | undefined {
+  switch (code) {
+    case 0:
+      return 'rgb';
+    case 1:
+      return 'bt709';
+    case 5:
+      return 'bt470bg';
+    case 6:
+      return 'smpte170m';
+    case 9:
+      return asMatrixCoefficients('bt2020-ncl');
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Build the `VideoDecoderConfig.colorSpace` init from a parsed `colr`. Per-field: an unmappable code
+ * point is omitted (the decoder's own default applies field-wise). Returns undefined when *nothing*
+ * maps, so untagged/fully-unspecified tracks carry no empty `colorSpace` object.
+ */
+export function videoColorSpaceFromColr(colr: ColrInfo): VideoColorSpaceInit | undefined {
+  const primaries = h273Primaries(colr.primaries);
+  const transfer = h273Transfer(colr.transfer);
+  const matrix = h273Matrix(colr.matrix);
+  if (
+    primaries === undefined &&
+    transfer === undefined &&
+    matrix === undefined &&
+    colr.fullRange === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...(primaries !== undefined ? { primaries } : {}),
+    ...(transfer !== undefined ? { transfer } : {}),
+    ...(matrix !== undefined ? { matrix } : {}),
+    ...(colr.fullRange !== undefined ? { fullRange: colr.fullRange } : {}),
+  };
+}
+
+/** `lpcm` (v2) token from CoreAudio formatSpecificFlags: 0x1 float, 0x2 big-endian, 0x4 signed. */
+function lpcmToken(bits: number, flags: number): string | undefined {
+  const float = (flags & 0x1) !== 0;
+  const be = (flags & 0x2) !== 0;
+  const signed = (flags & 0x4) !== 0;
+  if (float) {
+    if (bits === 32) return be ? 'pcm-f32be' : 'pcm-f32';
+    if (bits === 64) return be ? 'pcm-f64be' : 'pcm-f64';
+    return undefined;
+  }
+  if (signed) {
+    if (bits === 8) return 'pcm-s8';
+    if (bits === 16) return be ? 'pcm-s16be' : 'pcm-s16';
+    if (bits === 24) return be ? 'pcm-s24be' : 'pcm-s24';
+    if (bits === 32) return be ? 'pcm-s32be' : 'pcm-s32';
+    return undefined;
+  }
+  return bits === 8 ? 'pcm-u8' : undefined;
+}
+
+/**
+ * QuickTime PCM sound-description fourcc → engine PCM token (`pcm-s16`, `pcm-f32be`, … — the same
+ * tokens the WAV/AIFF/CAF drivers use), or undefined when the entry is not uncompressed PCM or the
+ * combination has no representable token (honest fourcc fallback, never a wrong guess).
+ *
+ * Endianness per the QTFF format table: `sowt` is 16-bit little-endian and `twos`/`raw ` are fixed
+ * big-endian/unsigned by definition; the wide integer/float formats (`in24`/`in32`/`fl32`/`fl64`)
+ * default to big-endian unless a sibling `enda` atom (value 1) flips them — pass its value as
+ * `littleEndian`. `lpcm` (v2 entries) encodes everything in `formatSpecificFlags` + bits instead.
+ */
+export function qtPcmCodec(
+  entryType: string,
+  bitsPerSample: number,
+  littleEndian: boolean | undefined,
+  lpcmFlags?: number,
+): string | undefined {
+  switch (entryType) {
+    case 'sowt':
+      return bitsPerSample === 16 ? 'pcm-s16' : undefined;
+    case 'twos':
+      return bitsPerSample === 16 ? 'pcm-s16be' : bitsPerSample === 8 ? 'pcm-s8' : undefined;
+    case 'raw ':
+      return bitsPerSample === 8 ? 'pcm-u8' : undefined;
+    case 'in24':
+      return littleEndian === true ? 'pcm-s24' : 'pcm-s24be';
+    case 'in32':
+      return littleEndian === true ? 'pcm-s32' : 'pcm-s32be';
+    case 'fl32':
+      return littleEndian === true ? 'pcm-f32' : 'pcm-f32be';
+    case 'fl64':
+      return littleEndian === true ? 'pcm-f64' : 'pcm-f64be';
+    case 'lpcm':
+      return lpcmToken(bitsPerSample, lpcmFlags ?? 0);
+    default:
+      return undefined;
+  }
 }

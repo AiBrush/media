@@ -6,6 +6,7 @@
       "dist",
       "coverage",
       "fixtures/media",
+      "fixtures/media-derived",
       "node_modules",
       "*.tsbuildinfo",
       "**/crate/pkg",
@@ -15,6 +16,7 @@
       "**/*-wasm.cjs",
       "**/*.generated.mjs",
       "docs/perf/stored-test-data-*.json",
+      "docs/perf/_deficit-data.json",
       "**/*_wasm_bg.wasm",
       "**/*.head.ts"
     ]

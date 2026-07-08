@@ -546,8 +546,10 @@ describe('prepared MP4 packet mux', () => {
 
     expect(table.tracks).toEqual(expected.tracks);
     expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
-    expect(calls.some((call) => call.range === 'bytes=0-8191')).toBe(true);
-    expect(calls.some((call) => call.range !== null)).toBe(true);
+    // The URL path primes a single bounded prefix range (MP4_PACKET_INFO_URL_PRIME_BYTES = 32 KiB), not an
+    // unbounded full-file GET — so every request is a `bytes=0-…` prefix range, never a rangeless read.
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.range?.startsWith('bytes=0-') === true)).toBe(true);
   });
 
   it('honors aborted signals for MP4 packet-info byte reads', async () => {

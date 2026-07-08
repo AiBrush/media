@@ -63,15 +63,13 @@ import {
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
-import { createMediaChain } from './chain.ts';
+import type { ChainStep } from './chain.ts';
 import {
   audioTargetCanBypassFilterPlanner,
   chooseOutputContainer,
   containerHasChunkMuxer,
-  hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
-  selectTrackInfos,
 } from './codec-routing.ts';
 // Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
 // routines are reached only through lazy `import()`s on an eligible `to:'flac'`/raw-PCM convert. The
@@ -243,7 +241,42 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   load(input: MediaInput): MediaChain {
-    return createMediaChain(this, input);
+    // Inline the fluent-chain proxy so the eager kernel does not statically import `chain.ts`/its runner
+    // (doc 08 §7 budget split): intermediate steps just accumulate synchronously; the terminal lazily
+    // imports the chain runner (which pulls the op implementations only when a chain is actually executed).
+    const engine = this;
+    const build = (steps: readonly ChainStep[]): MediaChain =>
+      new Proxy({} as MediaChain, {
+        get(_t, prop): unknown {
+          if (typeof prop !== 'string') return undefined;
+          return (...args: readonly unknown[]): unknown => {
+            if (prop !== 'run' && prop !== 'blob' && prop !== 'file' && prop !== 'stream') {
+              return build([...steps, { method: prop, args }]);
+            }
+            const terminal = prop;
+            const abort = new AbortController();
+            let active: Cancellable<Output> | undefined;
+            const promise = (async (): Promise<Output> => {
+              const { runMediaChain } = await import('./chain-runner.ts');
+              active = runMediaChain(
+                engine,
+                input,
+                steps,
+                terminal,
+                args,
+                abort.signal,
+              ) as Cancellable<Output>;
+              return active;
+            })() as Cancellable<Output>;
+            promise.cancel = (): void => {
+              abort.abort();
+              active?.cancel();
+            };
+            return promise;
+          };
+        },
+      });
+    return build([]);
   }
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
@@ -257,7 +290,8 @@ export class MediaEngineImpl implements MediaEngine {
           ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
         },
       );
-      const src = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
+      const cached = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
+      const src = await this.#resolveHlsInput(input, cached, signal);
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
@@ -300,7 +334,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   demux(input: MediaInput, o: CallOptions = {}): Cancellable<Demuxed> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
       const container = await this.#routeContainer(src, 'demux');
       return container.demux(src, this.#stageOptions(signal, o));
     });
@@ -308,7 +342,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   packetInfo(input: MediaInput, o: PacketInfoCallOptions = {}): Cancellable<PacketInfoTable> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
       const container =
         o.container === undefined
           ? await this.#routeContainer(src, 'demux')
@@ -368,7 +402,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
       const audio = opts.audio;
       // FLAC authoring (ADR-024): a native-FLAC target authored losslessly in pure TS from canonical PCM —
       // a FLAC source re-encodes through its own `transformPcm`; a raw-PCM source (WAV/AIFF/CAF) is decoded
@@ -468,9 +502,9 @@ export class MediaEngineImpl implements MediaEngine {
 
   remux(input: MediaInput, opts: RemuxOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
       const container = await this.#routeContainer(src, 'demux');
-      const wantsTrackSelection = hasTrackSelection(opts.trackSelect);
+      const wantsTrackSelection = opts.trackSelect !== undefined && opts.trackSelect.length > 0;
       if (opts.tags !== undefined) {
         if (wantsTrackSelection) {
           throw new CapabilityError(
@@ -618,14 +652,17 @@ export class MediaEngineImpl implements MediaEngine {
     const ctrl = new AbortController();
     bridgeSignal(o.signal, ctrl);
     const stage = this.#stageOptions(ctrl.signal, o);
+    // An HLS `.m3u8` manifest is resolved+stitched to its segment source lazily on first pull (decode's
+    // contract is synchronous), memoized so both frame streams share one resolution. Non-HLS is a no-op.
+    const resolvedSrc = memoizeAsync(() => this.#resolveHlsInput(input, src, ctrl.signal));
     const imageRoute = shouldSniffImageForDecode(src)
       ? memoizeAsync(() => this.#imageDecodeRoute(src, ctrl.signal))
       : noImageDecodeRoute;
-    const video = deferredStream<VideoFrame>(() =>
-      this.#decodeVideoOrImage(src, stage, imageRoute),
+    const video = deferredStream<VideoFrame>(async () =>
+      this.#decodeVideoOrImage(await resolvedSrc(), stage, imageRoute),
     );
-    const audio = deferredStream<AudioData>(() =>
-      this.#decodeTrack(src, 'audio', stage, imageRoute),
+    const audio = deferredStream<AudioData>(async () =>
+      this.#decodeTrack(await resolvedSrc(), 'audio', stage, imageRoute),
     );
     return { video, audio };
   }
@@ -897,6 +934,24 @@ export class MediaEngineImpl implements MediaEngine {
     }
   }
 
+  /**
+   * Auto-resolve an HLS `.m3u8` manifest input into its single demuxable, decrypted segment source
+   * (ADR-023): HLS is a **source-level** transform, not a byte container, so probe/demux/decode must stitch
+   * (+ AES-128 decrypt) the segments before the container router ever sees them — otherwise the raw manifest
+   * reaches the MPEG-TS driver and fails "not an MPEG-TS stream". A non-manifest input passes through
+   * unchanged after one cheap head sniff. The hls module is dynamically imported so it stays out of the
+   * eager kernel.
+   */
+  async #resolveHlsInput(input: MediaInput, src: Source, signal: AbortSignal): Promise<Source> {
+    // Eager gate only: skip inputs whose MIME/extension can't be a manifest (an `.m3u8`, an
+    // `application/vnd.apple.mpegurl`, or — as the harness tags them — a `video/mp2t`) so a definite
+    // non-HLS container (mp4/wav/flac/…) costs nothing. The content sniff + stitch live behind the
+    // dynamic import, keeping the whole HLS path out of the eager kernel.
+    if (!sourceMayBeHlsManifest(src)) return src;
+    const hls = await import('../drivers/hls/hls-source.ts');
+    return hls.resolveHlsInputIfManifest(input, src, signal);
+  }
+
   async #routeContainer(src: Source, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
     const ext = extensionOf(src.filename);
     if (src.mimeHint !== undefined || ext !== undefined) {
@@ -989,11 +1044,7 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /** Resolve a filter driver for a spec, loading the first-party defaults on a miss then retrying once. */
-  async #routeFilter(
-    spec: FilterSpec,
-    o: CallOptions,
-    cost?: RouteCost,
-  ): Promise<FilterDriver> {
+  async #routeFilter(spec: FilterSpec, o: CallOptions, cost?: RouteCost): Promise<FilterDriver> {
     const opts: StageSelectOptions = {
       determinism: this.#determinism(o),
       ...(cost !== undefined ? { cost } : {}),
@@ -1178,6 +1229,7 @@ export class MediaEngineImpl implements MediaEngine {
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
     const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
     // Copy only tracks the demuxer fully describes (a `config`-less track cannot be re-muxed faithfully).
+    const { selectTrackInfos } = await import('./track-select.ts');
     const tracks = selectTrackInfos(
       demuxer.tracks.filter((t) => t.config !== undefined),
       opts.trackSelect,
@@ -1858,7 +1910,7 @@ export class MediaEngineImpl implements MediaEngine {
             createEncoder: (c, stageOptions) => codec.createEncoder(c, stageOptions),
             colorStage: stage,
             alphaStage,
-      })
+          })
         : encodeInput.pipeThrough(codec.createEncoder(encoderConfig, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
       videoTrackInfoFromDecoderConfig(
@@ -2700,6 +2752,25 @@ function extensionOf(filename: string | undefined): string | undefined {
   if (filename === undefined) return undefined;
   const dot = filename.lastIndexOf('.');
   return dot >= 0 && dot < filename.length - 1 ? filename.slice(dot + 1).toLowerCase() : undefined;
+}
+
+/**
+ * Whether a source's declared MIME/extension is HLS-plausible enough to warrant a content sniff.
+ * A manifest arrives either self-described (`.m3u8`, `application/vnd.apple.mpegurl`) or — as the
+ * harness labels them — mislabeled as an MPEG-TS stream (`video/mp2t`). Every definite non-HLS
+ * container (mp4/wav/flac/webm/…) returns `false` so the HLS path costs it no extra head read.
+ */
+function sourceMayBeHlsManifest(src: Source): boolean {
+  const ext = extensionOf(src.filename);
+  if (ext === 'm3u8' || ext === 'm3u') return true;
+  const mime = src.mimeHint?.toLowerCase();
+  if (mime === undefined) return false;
+  return (
+    mime.includes('mpegurl') ||
+    mime.includes('m3u8') ||
+    mime === 'video/mp2t' ||
+    mime === 'audio/mp2t'
+  );
 }
 
 /** Materialize options carrying the container's MIME type when known. */

@@ -314,7 +314,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
     for (const frame of pending.splice(0)) closeFrame(frame);
   };
 
-  const processFrameInterval = (frame: F, endUs: number): void => {
+  const processFrameInterval = (frame: F, endUs: number, isFinal = false): void => {
     if (!Number.isFinite(endUs) || endUs <= frame.timestamp) {
       throw new InputError('unsupported-input', 'cannot infer a positive frame duration');
     }
@@ -324,7 +324,16 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
       for (;;) {
         const timestamp = cfrTimestampAt(start, options.fps, outputIndex);
         if (timestamp >= endUs) break;
-        const duration = cfrDurationAt(options.fps, outputIndex);
+        // Uniform CFR cadence, except the stream's very last frame is clamped to the source end so the
+        // materialized duration matches the input (a 22.5 s source at 1 fps ⇒ a 0.5 s tail frame, not a
+        // full 1 s that would over-run by half a second). Only the final interval's final grid point is
+        // clamped, so steady-state cadence — and high-fps cases where the remainder is negligible — are
+        // unchanged.
+        const isLastOfStream =
+          isFinal && cfrTimestampAt(start, options.fps, outputIndex + 1) >= endUs;
+        const duration = isLastOfStream
+          ? endUs - timestamp
+          : cfrDurationAt(options.fps, outputIndex);
         const out = options.restamp(frame, { timestamp, duration });
         if (Object.is(frame, out)) {
           throw new InputError(
@@ -358,7 +367,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
           requestedEnd ??
           frame.timestamp +
             (positiveFrameDuration(frame) ?? previousDelta ?? cfrDurationAt(options.fps, 0));
-        processFrameInterval(frame, end);
+        processFrameInterval(frame, end, true);
         releaseReader();
         return;
       }

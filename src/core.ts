@@ -178,7 +178,9 @@ export {
   type HlsResolveOptions,
   type HlsResourceFetcher,
   type HlsVariantChoice,
+  isHlsPlaylist,
   resolveHlsSource,
+  resolveHlsSourceFromSource,
 } from './drivers/hls/hls-source.ts';
 export { parseM3u8 } from './drivers/hls/m3u8-parse.ts';
 

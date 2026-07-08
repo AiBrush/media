@@ -58,6 +58,23 @@ describe('buildSamples', () => {
     expect(s.some((x) => x.ptsUs !== x.dtsUs)).toBe(true);
   });
 
+  it('honors a negative composition offset — PTS earlier than DTS (real .mov version-0 ctts)', () => {
+    // ffmpeg-authored .mov B-frame reorder carries genuinely-negative ctts offsets (read signed by
+    // parse); buildSamples must let PTS fall below DTS rather than clamp or overflow.
+    const s = buildSamples(
+      track({
+        ...oneChunk,
+        compositionOffsets: [
+          { count: 1, offset: 0 },
+          { count: 1, offset: -250 },
+        ],
+      }),
+    );
+    expect(s[0]?.ptsUs).toBe(0);
+    expect(s[1]?.dtsUs).toBe(500_000);
+    expect(s[1]?.ptsUs).toBe(250_000); // 500 − 250 ticks → composition time precedes decode time
+  });
+
   it('applies an edit-list media_time offset to packet PTS/DTS', () => {
     const s = buildSamples(
       track({ ...oneChunk, compositionOffsets: [{ count: 2, offset: 250 }] }, 1000, {

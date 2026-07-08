@@ -16,6 +16,12 @@ import { InputError } from '../../contracts/errors.ts';
 export interface HlsMap {
   uri: string;
   byteRange?: HlsByteRange;
+  /**
+   * The `#EXT-X-KEY` in force when this `#EXT-X-MAP` was declared (RFC 8216 §4.3.2.4: a KEY applies to
+   * every Media Segment *and* every Media Initialization Section between it and the next KEY). Absent
+   * when the map was declared before any key (or after `METHOD=NONE`) — i.e. the init section is clear.
+   */
+  key?: HlsKey;
 }
 
 /** A `#EXT-X-BYTERANGE` sub-range of a resource: `length` bytes from `offset` (offset defaults per RFC). */
@@ -137,14 +143,39 @@ function parseResolution(value: string | undefined): { width: number; height: nu
   return { width: Number(m[1]), height: Number(m[2]) };
 }
 
-/** Parse a `0x…` / `0X…` hex IV into 16 bytes (RFC 8216 §4.3.2.4); `undefined` if not a 32-hex-digit IV. */
-function parseHexIv(value: string | undefined): Uint8Array | undefined {
-  if (value === undefined) return undefined;
-  const hex = value.trim().replace(/^0[xX]/, '');
-  if (hex.length !== 32 || !/^[0-9a-fA-F]+$/.test(hex)) return undefined;
+/**
+ * Parse an `IV=` attribute (RFC 8216 §4.3.2.4 / §4.2 hexadecimal-sequence): a `0x`/`0X`-prefixed hex
+ * string of 1..32 digits, interpreted as a 128-bit big-endian integer and left-padded with zeros to 16
+ * bytes (so `IV=0X7F` is `00…007f`). Returns `undefined` when the value is not a well-formed sequence —
+ * a missing prefix, a non-hex digit, or wider than 128 bits — leaving the caller to decide tolerance.
+ */
+function parseHexIv(value: string): Uint8Array | undefined {
+  const digits = /^0[xX]([0-9a-fA-F]{1,32})$/.exec(value.trim())?.[1];
+  if (digits === undefined) return undefined;
+  const hex = digits.padStart(32, '0');
   const out = new Uint8Array(16);
   for (let i = 0; i < 16; i++) out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   return out;
+}
+
+/**
+ * Resolve a KEY's `IV=` attribute: `undefined` when absent (⇒ the implicit media-sequence IV per RFC
+ * 8216 §4.3.2.4). A present-but-malformed IV is a hard {@link InputError} for the methods this engine
+ * actually decrypts (`AES-128` / `SAMPLE-AES`) — never a silent fall-back to the sequence IV, which
+ * would decrypt to garbage — but is tolerated (dropped) for opaque DRM methods whose IV is not ours to
+ * interpret (e.g. `SAMPLE-AES-CTR` with a non-`identity` KEYFORMAT).
+ */
+function parseKeyIv(raw: string | undefined, method: HlsKey['method']): Uint8Array | undefined {
+  if (raw === undefined) return undefined;
+  const iv = parseHexIv(raw);
+  if (iv !== undefined) return iv;
+  if (method === 'AES-128' || method === 'SAMPLE-AES') {
+    throw new InputError(
+      'unsupported-input',
+      `malformed EXT-X-KEY IV "${raw.trim()}" for METHOD=${method} (RFC 8216 §4.3.2.4)`,
+    );
+  }
+  return undefined;
 }
 
 /** Parse `#EXT-X-BYTERANGE:length[@offset]`. */
@@ -159,7 +190,7 @@ function parseByteRange(value: string): HlsByteRange | undefined {
 function parseKey(attrs: Map<string, string>): HlsKey {
   const method = (attrs.get('METHOD') ?? 'NONE') as HlsKey['method'];
   const uri = attrs.get('URI');
-  const iv = parseHexIv(attrs.get('IV'));
+  const iv = parseKeyIv(attrs.get('IV'), method);
   const keyFormat = attrs.get('KEYFORMAT');
   return {
     method,
@@ -221,6 +252,9 @@ interface MediaState {
   // Inherited-until-changed state.
   currentKey: HlsKey | undefined;
   currentMap: HlsMap | undefined;
+  // Running end offset of the previous `#EXT-X-BYTERANGE` sub-range, for the §4.3.2.2 continuation form
+  // (a range with no `@offset` resumes at the previous sub-range's end within the *same* resource).
+  byteRangeCursor: { uri: string; end: number } | undefined;
 }
 
 /**
@@ -260,6 +294,7 @@ export function parseM3u8(text: string, baseUrl?: string): HlsPlaylist {
     pendingDiscontinuity: false,
     currentKey: undefined,
     currentMap: undefined,
+    byteRangeCursor: undefined,
   };
 
   for (let i = 1; i < lines.length; i++) {
@@ -333,9 +368,12 @@ export function parseM3u8(text: string, baseUrl?: string): HlsPlaylist {
         if (uri !== undefined) {
           const br = attrs.get('BYTERANGE');
           const byteRange = br !== undefined ? parseByteRange(br) : undefined;
+          // Snapshot the KEY in force NOW: an encrypted init section is decrypted with the key that
+          // applies at the map's declaration point, not the one in force at a later segment (§4.3.2.4).
           media.currentMap = {
             uri: resolveUri(uri, baseUrl),
             ...(byteRange !== undefined ? { byteRange } : {}),
+            ...(media.currentKey !== undefined ? { key: media.currentKey } : {}),
           };
         }
         break;
@@ -385,16 +423,47 @@ function variantFrom(attrs: Map<string, string>, uri: string): HlsVariant {
 
 /** Build an {@link HlsSegment} from the pending per-segment state + its resolved URI. */
 function segmentFrom(media: MediaState, uri: string): HlsSegment {
+  const byteRange = segmentByteRange(media, uri);
   return {
     uri,
     durationSec: media.pendingDuration ?? 0,
     ...(media.pendingTitle !== undefined ? { title: media.pendingTitle } : {}),
     ...(media.currentKey !== undefined ? { key: media.currentKey } : {}),
-    ...(media.pendingByteRange !== undefined ? { byteRange: media.pendingByteRange } : {}),
+    ...(byteRange !== undefined ? { byteRange } : {}),
     ...(media.currentMap !== undefined ? { map: media.currentMap } : {}),
     discontinuity: media.pendingDiscontinuity,
     sequence: media.mediaSequence + media.segments.length,
   };
+}
+
+/**
+ * Materialize this segment's `#EXT-X-BYTERANGE` window and advance the continuation cursor (RFC 8216
+ * §4.3.2.2). An explicit `length@offset` is used verbatim; a bare `length` (no `@offset`) resumes at the
+ * previous sub-range's end within the **same** resource. A first/orphan continuation, or one whose
+ * previous segment is a different resource (or not a sub-range at all), is a typed {@link InputError}.
+ * A segment with no byte range clears the cursor — a following continuation can only follow a sub-range.
+ */
+function segmentByteRange(media: MediaState, uri: string): HlsByteRange | undefined {
+  const pending = media.pendingByteRange;
+  if (pending === undefined) {
+    media.byteRangeCursor = undefined;
+    return undefined;
+  }
+  const offset = pending.offset ?? continuationOffset(media, uri);
+  media.byteRangeCursor = { uri, end: offset + pending.length };
+  return { length: pending.length, offset };
+}
+
+/** The resume offset for an `@offset`-less `#EXT-X-BYTERANGE`: the previous sub-range's end (same resource). */
+function continuationOffset(media: MediaState, uri: string): number {
+  const cursor = media.byteRangeCursor;
+  if (cursor === undefined || cursor.uri !== uri) {
+    throw new InputError(
+      'unsupported-input',
+      'EXT-X-BYTERANGE without an offset must continue a sub-range of the same preceding media resource (RFC 8216 §4.3.2.2)',
+    );
+  }
+  return cursor.end;
 }
 
 /** Parse an integer attribute value (`undefined` when absent / non-numeric). */

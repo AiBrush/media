@@ -1,0 +1,422 @@
+{
+  "note": "Independent ffprobe truth for the QuickTime/.mov parser fixtures (ADR-185). Regenerate with `bun scripts/bake-qtff-mov-goldens.ts`. Tests compare OUR parser output against this — never the other way around.",
+  "ffprobe": "ffprobe version 8.0 Copyright (c) 2007-2025 the FFmpeg developers",
+  "files": [
+    {
+      "file": "big_buck_bunny_1080p_h264.header.mov",
+      "recipe": "verbatim ftyp+moov of big_buck_bunny_1080p_h264.mov (Blender Foundation, CC BY 3.0) — QuickTime-authored: v2 sound description, wave-nested esds, tmcd track, colr nclc 1/1/1",
+      "sha256": "43fe679e70dc1868cbda049ac508bd0aa5c588f8ee8f3f7d9f692b11badc846f",
+      "nbStreams": 3,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 1920,
+          "height": 1080,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": "bt709",
+          "colorTransfer": "bt709",
+          "colorPrimaries": "bt709",
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "014d4029ffe10016274d4029a9180f0044fcb8035010101b6c2b5ef7c04001000428de09c8"
+        },
+        {
+          "index": 1,
+          "codecType": "data",
+          "codecName": null,
+          "codecTag": "tmcd",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": null
+        },
+        {
+          "index": 2,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 48000,
+          "channels": 6,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "h264_1080p_5s.header.mov",
+      "recipe": "verbatim ftyp+moov of h264_1080p_5s.mov — QuickTime-authored: v1 sound description, untagged colour, pasp 1:1",
+      "sha256": "9a54ca6a9e7a9c387075ced6bf30e3557769c05498aec9714aa1adf333aa1b5e",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 1920,
+          "height": 1080,
+          "sampleAspectRatio": "1:1",
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "01640028ffe1001b67640028acb200f0044fcb8088000003000800000301e078c1924001000668ebc132c8b0fdf8f800"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 48000,
+          "channels": 2,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-tmcd-copy.mov",
+      "recipe": "ffmpeg -i movie_5.mp4 -c copy -timecode 01:00:00:00 mov-tmcd-copy.mov  (stream copy + tmcd track, moov at end, mp4a v1 wave-nested esds)",
+      "sha256": "c7aaa876817d82e1f3eb7c72d2bf0c1c2363008cf2a4fbf9e6fa01e3701e5ece",
+      "nbStreams": 3,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 320,
+          "height": 240,
+          "sampleAspectRatio": "1:1",
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c01effe100176742c01e9a720283f60220000003002000000611e2c5c901000568ce06cb20"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 22050,
+          "channels": 1,
+          "extradataHex": null
+        },
+        {
+          "index": 2,
+          "codecType": "data",
+          "codecName": null,
+          "codecTag": "tmcd",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-bt601-aac.mov",
+      "recipe": "ffmpeg -i movie_5.mp4 -t 1 -vf \"scale=192:108,setparams=color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m\" -c:v libx264 -preset ultrafast -crf 35 -movflags +write_colr -c:a aac -b:a 24k mov-bt601-aac.mov  (colr nclc 6/6/6)",
+      "sha256": "d47d4b2a9b8f7c57b6d69249a433693557f807a5f42a56d6dbd6270ceae83391",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 192,
+          "height": 108,
+          "sampleAspectRatio": "3:4",
+          "colorRange": "tv",
+          "colorSpace": "smpte170m",
+          "colorTransfer": "smpte170m",
+          "colorPrimaries": "smpte170m",
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c00bffe1001e6742c00bda0c3fefff000300046a0c0c0c800000030080000018078a155001000568ce025c80"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 22050,
+          "channels": 1,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-bt709matrix-sowt.mov",
+      "recipe": "ffmpeg -i movie_5.mp4 -t 1 -vf \"scale=192:108,setsar=4/3\" -c:v libx264 -preset ultrafast -crf 35 -color_primaries bt709 -color_trc bt709 -colorspace bt709 -movflags +write_colr -c:a pcm_s16le mov-bt709matrix-sowt.mov  (partially-specified colr nclc 2/2/1, pasp 4:3, sowt v0 PCM)",
+      "sha256": "1630d2ace302fe6d20d2b282a3caa03afd62b06212a7c74415f44540d11c04ac",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 192,
+          "height": 108,
+          "sampleAspectRatio": "4:3",
+          "colorRange": "tv",
+          "colorSpace": "bt709",
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c00bffe1001a6742c00bda0c3fef0e6a040402800000030080000018078a155001000568ce025c80"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "pcm_s16le",
+          "codecTag": "sowt",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 22050,
+          "channels": 1,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-fl32-enda.mov",
+      "recipe": "ffmpeg -i movie_5.mp4 -t 0.6 -vf scale=192:108 -c:v libx264 -preset ultrafast -crf 35 -c:a pcm_f32le -ar 16000 mov-fl32-enda.mov  (fl32 v1 + wave{frma,enda=1} little-endian float PCM, untagged colour)",
+      "sha256": "c8fc84db8be352835b5548293b49a43488c90b9668e34b3826d06c9a8ba9a14b",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 192,
+          "height": 108,
+          "sampleAspectRatio": "3:4",
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c00bffe1001b6742c00bda0c3fefff000300041000000300100000030300f142aa01000568ce025c80"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "pcm_f32le",
+          "codecTag": "fl32",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 16000,
+          "channels": 1,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-lpcm-96k-v2.mov",
+      "recipe": "ffmpeg -i movie_5.mp4 -t 0.25 -vn -c:a pcm_s16le -ar 96000 mov-lpcm-96k-v2.mov  (lpcm v2 sound description: float64 rate 96000, formatSpecificFlags signed+packed LE)",
+      "sha256": "9197264fe2346f1fa6a8e734cb3370ea64dd28489fd980077c8e5f8c7fafeb5a",
+      "nbStreams": 1,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "audio",
+          "codecName": "pcm_s16le",
+          "codecTag": "lpcm",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 96000,
+          "channels": 1,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "mov-apple-avconvert.mov",
+      "recipe": "avconvert --preset PresetHighestQuality --source movie_5.mp4 --output mov-apple-avconvert.mov  (Apple AVFoundation-authored: audio-first trak order, mp4a v1 wave-nested esds with plain descriptor lengths, fiel+pasp)",
+      "sha256": "df430841282bf5dadae4e349326842097706f6c7212625afa53cb68e5cdb7dfb",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 22050,
+          "channels": 1,
+          "extradataHex": null
+        },
+        {
+          "index": 1,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 320,
+          "height": 240,
+          "sampleAspectRatio": "1:1",
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c01effe100176742c01e9a720283f60220000003002000000611e2c5c901000568ce06cb20"
+        }
+      ]
+    },
+    {
+      "file": "mp4-nclx-fullrange.mp4",
+      "recipe": "ffmpeg -i movie_5.mp4 -t 1 -vf \"scale=192:108,setparams=range=full:color_primaries=bt709:color_trc=bt709:colorspace=bt709\" -c:v libx264 -preset ultrafast -crf 35 -movflags +write_colr -c:a aac -b:a 24k mp4-nclx-fullrange.mp4  (ISO colr nclx 1/1/1 + full_range bit)",
+      "sha256": "fb54788f2d4f47936d1330a0767ae136459b559886b166f9c327429dbd808d74",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 192,
+          "height": 108,
+          "sampleAspectRatio": "3:4",
+          "colorRange": "pc",
+          "colorSpace": "bt709",
+          "colorTransfer": "bt709",
+          "colorPrimaries": "bt709",
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0142c00bffe1001e6742c00bda0c3fefff000300046e020202800000030080000018078a155001000568ce025c80"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 22050,
+          "channels": 1,
+          "extradataHex": null
+        }
+      ]
+    },
+    {
+      "file": "obs-remux-variable-aac.mp4",
+      "recipe": "corpus fixture (see fixtures/manifest.json) — real OBS remux carrying colr nclx 1/1/1 tv-range",
+      "sha256": "9bd7f8cb1372078f9b23aa4c80751926f8c5e2db6b5587459f0892785175ddcf",
+      "nbStreams": 2,
+      "streams": [
+        {
+          "index": 0,
+          "codecType": "video",
+          "codecName": "h264",
+          "codecTag": "avc1",
+          "width": 1920,
+          "height": 1080,
+          "sampleAspectRatio": "1:1",
+          "colorRange": "tv",
+          "colorSpace": "bt709",
+          "colorTransfer": "bt709",
+          "colorPrimaries": "bt709",
+          "sampleRate": null,
+          "channels": null,
+          "extradataHex": "0164002affe1001e6764002aacd940780227e5c05a808080a0000003002000000f11e30632c001000468efbcb0fdf8f800"
+        },
+        {
+          "index": 1,
+          "codecType": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "width": null,
+          "height": null,
+          "sampleAspectRatio": null,
+          "colorRange": null,
+          "colorSpace": null,
+          "colorTransfer": null,
+          "colorPrimaries": null,
+          "sampleRate": 48000,
+          "channels": 2,
+          "extradataHex": null
+        }
+      ]
+    }
+  ]
+}

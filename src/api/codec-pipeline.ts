@@ -33,11 +33,10 @@ export {
   audioTargetCanBypassFilterPlanner,
   chooseOutputContainer,
   containerHasChunkMuxer,
-  hasTrackSelection,
   isPcmContainer,
   isPureStreamCopy,
-  selectTrackInfos,
 } from './codec-routing.ts';
+export { hasTrackSelection, selectTrackInfos } from './track-select.ts';
 export {
   type VpxAlphaI420Plane,
   type VpxAlphaPackedSourceFormat,

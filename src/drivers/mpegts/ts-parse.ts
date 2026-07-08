@@ -30,6 +30,9 @@ const TS_PTS_MODULUS = 2 ** 33;
 const PID_PAT = 0x0000;
 const PID_NULL = 0x1fff;
 
+/** ADTS-framed AAC audio (ISO/IEC 13818-7) — the one `stream_type` the AAC de-framer engages for. */
+const STREAM_TYPE_ADTS_AAC = 0x0f;
+
 /** PMT `stream_type` → our codec id. Values from ISO/IEC 13818-1 Table 2-34 + registered amendments. */
 const STREAM_TYPE_CODEC: Record<number, string> = {
   1: 'mpeg1video',
@@ -73,9 +76,13 @@ export interface TsStream {
   codec: string;
 }
 
-/** A reassembled PES payload (one access unit) with its WebCodecs-microsecond timestamps. */
+/** A reassembled access unit with its WebCodecs-microsecond timestamps. */
 export interface TsAccessUnit {
-  /** The access-unit bytes (the PES payload — Annex-B for H.264, an ADTS frame for AAC). */
+  /**
+   * The access-unit bytes: Annex-B for H.264/HEVC (the whole PES payload), and for ADTS AAC exactly one
+   * **raw** AAC access unit — the ADTS header (and CRC, when present) is stripped by the stateful
+   * de-framer, matching the raw-sample + AudioSpecificConfig shape WebCodecs and the MP4 muxer expect.
+   */
   data: Uint8Array;
   /** Presentation timestamp in microseconds (PTS), always present (we drop AUs without one). */
   ptsUs: number;
@@ -481,9 +488,11 @@ export function parseTs(bytes: Uint8Array): TsParse {
   let pmtPid: number | undefined;
   const streamsByPid = new Map<number, TsStream>();
   const builders = new Map<number, PesBuilder>();
-  // Per-PID access units (decode order, as reassembled) plus the raw PTS list for duration.
+  // Per-PID access units (decode order, as reassembled) plus the raw PTS list for duration. ADTS AAC
+  // PIDs are handled by a stateful de-framer instead (frames span PES packets), which owns their lists.
   const unitsByPid = new Map<number, TsAccessUnit[]>();
   const ptsByPid = new Map<number, number[]>();
+  const deframers = new Map<number, AdtsDeframer>();
   let sawScrambled = false;
   let sawSync = false;
 
@@ -493,15 +502,31 @@ export function parseTs(bytes: Uint8Array): TsParse {
     const stream = streamsByPid.get(pid);
     if (!builder || !stream) return;
     const split = splitPes(flattenPes(builder));
-    if (!split || split.pts === undefined) return; // no PTS → cannot place on the timeline; drop
-    // One PES → one or many access units: a single AU for video, but one per ADTS frame for AAC audio
-    // (an audio PES packs several frames), so the codec seam gets one EncodedChunk per real access unit.
-    const { units, ptsTicksList } = accessUnitsFromPes(stream, split.payload, split.pts, split.dts);
+    if (!split) return;
+    if (stream.streamType === STREAM_TYPE_ADTS_AAC) {
+      // ADTS AAC: one PES carries several frames and frames cross PES boundaries, so the payload feeds
+      // the PID's de-framer (one raw access unit per ADTS frame). A PTS-less PES continues the chain.
+      let deframer = deframers.get(pid);
+      if (deframer === undefined) {
+        deframer = new AdtsDeframer();
+        deframers.set(pid, deframer);
+      }
+      deframer.push(split.payload, split.pts);
+      return;
+    }
+    if (split.pts === undefined) return; // no PTS → cannot place on the timeline; drop
+    // Everything else (H.264/HEVC video, LATM/AC-3/… audio): the whole PES payload is ONE access unit
+    // with the PES's own PTS/DTS (a separate DTS keeps B-frame decode order intact).
     const list = unitsByPid.get(pid) ?? [];
-    for (const u of units) list.push(u);
+    list.push({
+      data: split.payload,
+      ptsUs: ticksToUs(split.pts),
+      dtsUs: ticksToUs(split.dts ?? split.pts),
+      keyframe: isKeyframe(stream.codec, stream.mediaType, split.payload),
+    });
     unitsByPid.set(pid, list);
     const ptsList = ptsByPid.get(pid) ?? [];
-    for (const p of ptsTicksList) ptsList.push(p);
+    ptsList.push(split.pts);
     ptsByPid.set(pid, ptsList);
   };
 
@@ -556,6 +581,7 @@ export function parseTs(bytes: Uint8Array): TsParse {
     }
   }
   for (const pid of [...builders.keys()]) flush(pid); // EOF flush of the last (unbounded video) PES
+  for (const deframer of deframers.values()) deframer.finish(); // a trailing partial frame is dropped
 
   if (!sawSync) {
     throw new InputError('unsupported-input', 'no readable transport packets (corrupt MPEG-TS)');
@@ -578,14 +604,16 @@ export function parseTs(bytes: Uint8Array): TsParse {
   // engine's max-over-tracks reduction in `toMediaInfo` yields the same value regardless of track order.
   const spanByPid = new Map<number, PtsSpan>();
   for (const stream of streamsByPid.values()) {
-    const span = ptsSpan(ptsByPid.get(stream.pid) ?? []);
+    const ptsTicks = deframers.get(stream.pid)?.ptsTicksList ?? ptsByPid.get(stream.pid) ?? [];
+    const span = ptsSpan(ptsTicks);
     if (span) spanByPid.set(stream.pid, span);
   }
   const durationSec = containerDuration([...spanByPid.values()]);
 
   const tracks: TsTrack[] = [];
   for (const stream of streamsByPid.values()) {
-    const units = unitsByPid.get(stream.pid) ?? [];
+    const deframer = deframers.get(stream.pid);
+    const units = deframer?.units ?? unitsByPid.get(stream.pid) ?? [];
     // fps from this video track's own cadence (its median PTS gap), not the container span.
     const span = spanByPid.get(stream.pid);
     const fps =
@@ -597,7 +625,7 @@ export function parseTs(bytes: Uint8Array): TsParse {
       units,
       durationSec,
       ...(fps !== undefined ? { fps } : {}),
-      config: configForStream(stream, units),
+      config: configForStream(stream, units, deframer?.params),
     });
   }
   // Stable order: video first then audio, each by PID — deterministic across runs (matches probe goldens).
@@ -753,116 +781,263 @@ const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
 ] as const;
 
-/** Read AAC sampleRate/channels from an ADTS frame header (the AU on a 0x0f/0x11 PID). */
-function aacParams(au: Uint8Array): { sampleRate: number; channels: number } | undefined {
-  if (au.byteLength < 4) return undefined;
-  if ((au[0] as number) !== 0xff || ((au[1] as number) & 0xf0) !== 0xf0) return undefined; // ADTS syncword
-  const sampleIndex = ((au[2] as number) >> 2) & 0x0f;
-  const sampleRate = AAC_SAMPLE_RATES[sampleIndex];
-  const channels = (((au[2] as number) & 0x01) << 2) | (((au[3] as number) >> 6) & 0x03);
-  if (sampleRate === undefined || channels === 0) return undefined;
-  return { sampleRate, channels };
-}
+/** Fixed ADTS header length (ISO/IEC 13818-7 §6.2.1); `protection_absent == 0` appends a 2-byte CRC. */
+const ADTS_FIXED_HEADER_LENGTH = 7;
+/** Samples per AAC raw data block (AAC-LC frame). */
+const AAC_SAMPLES_PER_BLOCK = 1024;
+/**
+ * How far (90 kHz ticks) a later PES PTS anchor may sit from the running 1024-sample cadence before it is
+ * treated as a genuine timestamp discontinuity (splice / loop / reset) that rebases the chain — rather
+ * than the ±frame priming/rounding wobble that broadcast muxers (and ffmpeg's own AAC parser) exhibit,
+ * which must NOT perturb the monotonic cadence. Half a second is orders of magnitude above any AAC-LC
+ * cadence rounding or single-frame encoder-delay offset, yet far below a real reset (seconds / a 2^33
+ * wrap), so it cleanly separates the two without reproducing the wobble (e.g. bear's frame-12 anchor sits
+ * exactly one frame behind cadence — smoothed, not rebased).
+ */
+const REBASE_DISCONTINUITY_TICKS = TS_CLOCK_HZ / 2;
 
-/** One ADTS frame carved from a PES payload: its bytes + its sample count + sample rate, for timing. */
-interface AdtsFrame {
-  data: Uint8Array;
-  /** Decoded sample count for this frame (1024 × number_of_raw_data_blocks, AAC-LC = 1024). */
-  samples: number;
+/** Track-level AAC geometry read from the first valid ADTS header (drives the WebCodecs config). */
+export interface AdtsTrackParams {
+  /** MPEG-4 audio object type (`profile + 1`; 2 = AAC-LC). */
+  objectType: number;
+  /** 4-bit `sampling_frequency_index` (0–12; the ASC carries it verbatim). */
+  samplingFrequencyIndex: number;
   sampleRate: number;
+  /** 3-bit `channel_configuration` (0 = PCE in-band, no derivable channel count). */
+  channelConfiguration: number;
+}
+
+/** One validated ADTS header: total header size to strip, whole-frame length, and decoded samples. */
+interface AdtsHeaderInfo {
+  /** Bytes to strip from the frame start: 7, or 9 when a CRC follows (`protection_absent == 0`). */
+  headerLength: number;
+  /** The 13-bit `aac_frame_length` (header + CRC + payload). */
+  frameLength: number;
+  /** `1024 × (number_of_raw_data_blocks_in_frame + 1)` — this frame's decoded sample count. */
+  samples: number;
+  params: AdtsTrackParams;
 }
 
 /**
- * Split an AAC PES payload into its constituent ADTS frames. An audio PES carries **several** ADTS frames
- * (each its own access unit on the codec seam), so the demuxer must emit one `EncodedChunk` per frame —
- * not one per PES — to match the golden packet count + per-frame PTS. Each frame's length is the 13-bit
- * `aac_frame_length`; its duration is `samplesPerFrame / sampleRate`. A run that loses ADTS sync (a non-
- * `0xFFFx` byte where a frame should start) stops, returning the frames parsed so far (robust to garbage).
+ * Parse + validate the ADTS fixed header at `off` (the caller guarantees 7 readable bytes). Returns
+ * `undefined` for anything that cannot be a real frame start — wrong syncword, non-zero `layer`, a
+ * reserved `sampling_frequency_index`, or a `frame_length` that cannot hold its own header — so the
+ * de-framer's resync hunt skips false `0xFFF` matches inside compressed payload bytes.
  */
-function splitAdtsFrames(payload: Uint8Array): AdtsFrame[] {
-  const frames: AdtsFrame[] = [];
-  let i = 0;
-  while (i + 7 <= payload.byteLength) {
-    if ((payload[i] as number) !== 0xff || ((payload[i + 1] as number) & 0xf0) !== 0xf0) break; // ADTS syncword
-    const frameLength =
-      (((payload[i + 3] as number) & 0x03) << 11) |
-      ((payload[i + 4] as number) << 3) |
-      (((payload[i + 5] as number) >> 5) & 0x07);
-    if (frameLength < 7 || i + frameLength > payload.byteLength) break; // truncated / malformed frame
-    const sampleIndex = ((payload[i + 2] as number) >> 2) & 0x0f;
-    const sampleRate = AAC_SAMPLE_RATES[sampleIndex] ?? 0;
-    // number_of_raw_data_blocks_in_frame (byte 6, bits 0-1) + 1 blocks, each 1024 samples (AAC-LC).
-    const blocks = ((payload[i + 6] as number) & 0x03) + 1;
-    frames.push({ data: payload.subarray(i, i + frameLength), samples: 1024 * blocks, sampleRate });
-    i += frameLength;
-  }
-  return frames;
-}
-
-/**
- * Turn one reassembled PES into its access units with per-unit PTS/DTS (µs). For ADTS-framed audio (AAC)
- * the PES holds many frames, so we split and stamp each frame: PTS advances by the running sample count ÷
- * sample rate from the PES PTS, and audio has no reorder so DTS == PTS. For everything else (H.264/HEVC
- * video, and any audio we cannot frame-split) the whole PES payload is a single access unit with the
- * PES's own PTS/DTS (B-frame DTS preserved). Returns the raw PTS list too, so duration sees every unit.
- */
-function accessUnitsFromPes(
-  stream: TsStream,
-  payload: Uint8Array,
-  ptsTicks: number,
-  dtsTicks: number | undefined,
-): { units: TsAccessUnit[]; ptsTicksList: number[] } {
-  if (stream.codec === 'aac') {
-    const frames = splitAdtsFrames(payload);
-    if (frames.length > 1) {
-      const units: TsAccessUnit[] = [];
-      const ptsTicksList: number[] = [];
-      let sampleOffset = 0;
-      for (const frame of frames) {
-        // Frame PTS = PES PTS + (samples emitted so far / sampleRate), in 90 kHz ticks then µs.
-        const offsetTicks =
-          frame.sampleRate > 0 ? (sampleOffset * TS_CLOCK_HZ) / frame.sampleRate : 0;
-        const framePts = ptsTicks + offsetTicks;
-        units.push({
-          data: frame.data,
-          ptsUs: ticksToUs(framePts),
-          dtsUs: ticksToUs(framePts),
-          keyframe: true,
-        });
-        ptsTicksList.push(framePts);
-        sampleOffset += frame.samples;
-      }
-      return { units, ptsTicksList };
-    }
-    // A single-frame (or unparseable) AAC PES falls through to the whole-payload path below.
-  }
+function parseAdtsHeaderAt(bytes: Uint8Array, off: number): AdtsHeaderInfo | undefined {
+  const b1 = bytes[off + 1] as number;
+  if (bytes[off] !== 0xff || (b1 & 0xf0) !== 0xf0) return undefined; // 12-bit syncword
+  if ((b1 & 0x06) !== 0) return undefined; // layer must be '00' for ADTS
+  const b2 = bytes[off + 2] as number;
+  const b3 = bytes[off + 3] as number;
+  const samplingFrequencyIndex = (b2 >> 2) & 0x0f;
+  const sampleRate = AAC_SAMPLE_RATES[samplingFrequencyIndex];
+  if (sampleRate === undefined) return undefined; // reserved/escape index: not a real header
+  const headerLength = (b1 & 0x01) === 1 ? ADTS_FIXED_HEADER_LENGTH : ADTS_FIXED_HEADER_LENGTH + 2;
+  const frameLength =
+    ((b3 & 0x03) << 11) |
+    ((bytes[off + 4] as number) << 3) |
+    (((bytes[off + 5] as number) >> 5) & 0x07);
+  if (frameLength <= headerLength) return undefined; // cannot hold a payload: malformed
+  const blocks = ((bytes[off + 6] as number) & 0x03) + 1;
   return {
-    units: [
-      {
-        data: payload,
-        ptsUs: ticksToUs(ptsTicks),
-        dtsUs: ticksToUs(dtsTicks ?? ptsTicks),
-        keyframe: isKeyframe(stream.codec, stream.mediaType, payload),
-      },
-    ],
-    ptsTicksList: [ptsTicks],
+    headerLength,
+    frameLength,
+    samples: AAC_SAMPLES_PER_BLOCK * blocks,
+    params: {
+      objectType: ((b2 >> 6) & 0x03) + 1,
+      samplingFrequencyIndex,
+      sampleRate,
+      channelConfiguration: ((b2 & 0x01) << 2) | ((b3 >> 6) & 0x03),
+    },
   };
 }
 
-/** Build the probe-facing WebCodecs config (dims for video; sampleRate/channels for audio). */
+/** Concatenate a pending tail with the next PES payload into one scan buffer. */
+function concatPending(pending: Uint8Array, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(pending.byteLength + payload.byteLength);
+  out.set(pending, 0);
+  out.set(payload, pending.byteLength);
+  return out;
+}
+
+/**
+ * Stateful ADTS de-framer for one `stream_type 0x0f` PID (ADR-184). Real transport streams pack
+ * **several** ADTS frames into one audio PES *and* split frames **across** PES packets (broadcast muxers
+ * flush on byte budgets, not frame boundaries), so per-PES splitting emits inconsistently framed — and
+ * boundary-corrupted — samples. This class scans the reassembled PES payload byte stream exactly once:
+ *
+ *  - buffers a partial frame (or partial header) across PES boundaries and resumes on the next payload;
+ *  - resyncs by hunting for the next plausible `0xFFF` header after garbage (validated, not just the
+ *    syncword, so payload bytes that contain `0xFFF` do not fake a frame);
+ *  - emits exactly ONE **raw** AAC access unit per frame — the 7-byte header (9 with CRC) is stripped;
+ *  - times each frame per ISO/IEC 13818-1 §2.4.3.7: a PES PTS names the first access unit that
+ *    *commences* in that PES payload (the first frame starting at/after the payload's first byte). The
+ *    very first such anchor starts the cadence chain; successive frames advance `samples / sampleRate`
+ *    on the exact 90 kHz rational (no per-frame rounding accumulation), and a PES without a PTS simply
+ *    continues the chain. A *later* PES PTS only rebases the chain on a genuine discontinuity — a jump no
+ *    cadence drift can explain ({@link REBASE_DISCONTINUITY_TICKS}); otherwise the monotonic cadence is
+ *    kept, so a muxer's ±frame priming wobble does not derail the timeline (see {@link AdtsDeframer.#rebase});
+ *  - drops frames that precede the first PTS anchor (they cannot be placed on the timeline — the same
+ *    contract as PES-level demux) and drops a trailing partial frame at EOF (ffmpeg does the same, so
+ *    packet counts match `ffprobe nb_read_packets`).
+ *
+ * Exported for direct, byte-level conformance testing of the resync / CRC / boundary-crossing / rebase
+ * branches with synthetic ADTS the real corpus cannot deterministically exercise (ADR-184).
+ */
+export class AdtsDeframer {
+  readonly units: TsAccessUnit[] = [];
+  readonly ptsTicksList: number[] = [];
+  #pending: Uint8Array | undefined;
+  /**
+   * Armed PES PTS anchors, ascending by `minOffset` (the scan-buffer offset a commencing frame must
+   * reach to claim one). A queue — not a single slot — because a frame that crosses several small PES
+   * packets leaves earlier anchors unconsumed while later PES packets arm new ones; each anchor must
+   * survive until the frame commencing in *its* payload region appears. Bounded by the pending frame
+   * size (≤ the 13-bit ADTS frame length), since anchors only accumulate while no frame completes.
+   */
+  #anchors: { minOffset: number; ticks: number }[] = [];
+  /** The cadence chain: PTS ticks of the chain's base anchor + samples emitted since it. */
+  #chainBaseTicks: number | undefined;
+  #chainSamples = 0;
+  #params: AdtsTrackParams | undefined;
+
+  /** Geometry from the first valid ADTS header (undefined when no frame was ever found). */
+  get params(): AdtsTrackParams | undefined {
+    return this.#params;
+  }
+
+  /** Feed one reassembled PES payload (PTS in 90 kHz ticks; `undefined` continues the chain). */
+  push(payload: Uint8Array, ptsTicks: number | undefined): void {
+    const pendingLength = this.#pending?.byteLength ?? 0;
+    if (ptsTicks !== undefined) {
+      // The PTS names the first AU commencing in THIS payload (ISO/IEC 13818-1 §2.4.3.7), i.e. at or
+      // after the pending tail. Offsets are ascending across pushes, so the queue stays sorted.
+      this.#anchors.push({ minOffset: pendingLength, ticks: ptsTicks });
+    }
+    this.#scan(this.#pending === undefined ? payload : concatPending(this.#pending, payload));
+  }
+
+  /** End of stream: a still-incomplete trailing frame is unplayable and dropped. */
+  finish(): void {
+    this.#pending = undefined;
+    this.#anchors = [];
+  }
+
+  /**
+   * Apply a PES PTS anchor (90 kHz ticks) to the cadence chain at a frame that commences now. The very
+   * first anchor starts the chain — the PES PTS names that first access unit. A later anchor rebases the
+   * chain *only* on a genuine discontinuity: one whose PTS is further from the cadence-predicted value
+   * than {@link REBASE_DISCONTINUITY_TICKS} (a splice / loop / reset). Otherwise the anchor is honoured by
+   * keeping the running monotonic 1024-sample cadence — a broadcast muxer's or ffmpeg parser's ±frame
+   * priming wobble does not reset the timeline. `sampleRate` is the commencing frame's own rate.
+   */
+  #rebase(anchorTicks: number, sampleRate: number): void {
+    const base = this.#chainBaseTicks;
+    if (base === undefined) {
+      this.#chainBaseTicks = anchorTicks;
+      this.#chainSamples = 0;
+      return;
+    }
+    const predicted = base + (this.#chainSamples * TS_CLOCK_HZ) / sampleRate;
+    if (Math.abs(anchorTicks - predicted) > REBASE_DISCONTINUITY_TICKS) {
+      this.#chainBaseTicks = anchorTicks;
+      this.#chainSamples = 0;
+    }
+  }
+
+  /** Claim the newest anchor whose payload region covers a frame commencing at `off` (if any). */
+  #consumeAnchor(off: number): number | undefined {
+    let claimed: number | undefined;
+    let taken = 0;
+    for (const anchor of this.#anchors) {
+      if (anchor.minOffset > off) break;
+      claimed = anchor.ticks; // later anchors supersede earlier unconsumed ones
+      taken++;
+    }
+    if (taken > 0) this.#anchors.splice(0, taken);
+    return claimed;
+  }
+
+  #scan(work: Uint8Array): void {
+    const n = work.byteLength;
+    let i = 0;
+    for (;;) {
+      // Resync hunt: the next byte pair that could open a real header (0xFFF sync + layer '00').
+      while (i < n) {
+        if (work[i] === 0xff) {
+          const b1 = work[i + 1];
+          if (b1 === undefined || ((b1 & 0xf0) === 0xf0 && (b1 & 0x06) === 0)) break;
+        }
+        i++;
+      }
+      if (n - i < ADTS_FIXED_HEADER_LENGTH) break; // partial header candidate (or nothing) → pending
+      const header = parseAdtsHeaderAt(work, i);
+      if (header === undefined) {
+        i++; // a false sync inside payload bytes: keep hunting
+        continue;
+      }
+      // A validated frame COMMENCES here: rebase the cadence chain if a PES PTS claims this position
+      // (even when the frame's tail is still in flight — the claim belongs to this frame).
+      const anchorTicks = this.#consumeAnchor(i);
+      if (anchorTicks !== undefined) this.#rebase(anchorTicks, header.params.sampleRate);
+      if (i + header.frameLength > n) break; // frame continues in the next PES payload → pending
+      this.#params ??= header.params;
+      const base = this.#chainBaseTicks;
+      if (base !== undefined) {
+        const ticks = base + (this.#chainSamples * TS_CLOCK_HZ) / header.params.sampleRate;
+        this.units.push({
+          data: work.subarray(i + header.headerLength, i + header.frameLength),
+          ptsUs: ticksToUs(ticks),
+          dtsUs: ticksToUs(ticks), // audio has no reorder
+          keyframe: true,
+        });
+        this.ptsTicksList.push(ticks);
+        this.#chainSamples += header.samples;
+      }
+      i += header.frameLength;
+    }
+    this.#pending = i < n ? work.subarray(i) : undefined;
+    if (i > 0) {
+      for (const anchor of this.#anchors) anchor.minOffset = Math.max(0, anchor.minOffset - i);
+    }
+  }
+}
+
+/** Build the 2-byte AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1) that `esds`/WebCodecs carry. */
+function audioSpecificConfig(params: AdtsTrackParams): Uint8Array {
+  return Uint8Array.of(
+    ((params.objectType & 0x1f) << 3) | (params.samplingFrequencyIndex >> 1),
+    ((params.samplingFrequencyIndex & 0x01) << 7) | ((params.channelConfiguration & 0x0f) << 3),
+  );
+}
+
+/** Build the probe-facing WebCodecs config (dims for video; sampleRate/channels + ASC for audio). */
 function configForStream(
   stream: TsStream,
   units: readonly TsAccessUnit[],
+  adtsParams: AdtsTrackParams | undefined,
 ): VideoDecoderConfig | AudioDecoderConfig {
   const first = units[0]?.data;
   if (stream.mediaType === 'video') {
     const dims = first && stream.codec === 'h264' ? h264Dimensions(first) : undefined;
     return { codec: stream.codec, codedWidth: dims?.width ?? 0, codedHeight: dims?.height ?? 0 };
   }
-  const params = first && (stream.codec === 'aac' ? aacParams(first) : undefined);
+  if (adtsParams !== undefined) {
+    // A `channel_configuration` of 0 means the layout rides in an in-band PCE: there is no honest
+    // channel count or AudioSpecificConfig to declare, so downstream seams see the typed capability gap.
+    const hasChannels =
+      adtsParams.channelConfiguration >= 1 && adtsParams.channelConfiguration <= 7;
+    return {
+      codec: stream.codec,
+      sampleRate: adtsParams.sampleRate,
+      numberOfChannels: hasChannels ? adtsParams.channelConfiguration : 0,
+      ...(hasChannels ? { description: audioSpecificConfig(adtsParams) } : {}),
+    };
+  }
   return {
     codec: stream.codec,
-    sampleRate: params?.sampleRate ?? 0,
-    numberOfChannels: params?.channels ?? 0,
+    sampleRate: 0,
+    numberOfChannels: 0,
   };
 }

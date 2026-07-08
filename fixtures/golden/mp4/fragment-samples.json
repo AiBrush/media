@@ -1,0 +1,920 @@
+{
+  "bear-open-gop-frag.mp4": {
+    "videoTrackSamples": [
+      {
+        "offset": 1074,
+        "size": 5075,
+        "dts": 0,
+        "pts": 1024,
+        "keyframe": true
+      },
+      {
+        "offset": 6149,
+        "size": 2428,
+        "dts": 512,
+        "pts": 3072,
+        "keyframe": false
+      },
+      {
+        "offset": 8577,
+        "size": 1374,
+        "dts": 1024,
+        "pts": 2048,
+        "keyframe": false
+      },
+      {
+        "offset": 9951,
+        "size": 1106,
+        "dts": 1536,
+        "pts": 1536,
+        "keyframe": false
+      },
+      {
+        "offset": 11057,
+        "size": 1161,
+        "dts": 2048,
+        "pts": 2560,
+        "keyframe": false
+      },
+      {
+        "offset": 12218,
+        "size": 2198,
+        "dts": 2560,
+        "pts": 5120,
+        "keyframe": false
+      },
+      {
+        "offset": 14416,
+        "size": 1320,
+        "dts": 3072,
+        "pts": 4096,
+        "keyframe": false
+      },
+      {
+        "offset": 15736,
+        "size": 1062,
+        "dts": 3584,
+        "pts": 3584,
+        "keyframe": false
+      },
+      {
+        "offset": 16798,
+        "size": 886,
+        "dts": 4096,
+        "pts": 4608,
+        "keyframe": false
+      },
+      {
+        "offset": 17684,
+        "size": 1828,
+        "dts": 4608,
+        "pts": 6144,
+        "keyframe": false
+      },
+      {
+        "offset": 19512,
+        "size": 995,
+        "dts": 5120,
+        "pts": 5632,
+        "keyframe": false
+      },
+      {
+        "offset": 20507,
+        "size": 1857,
+        "dts": 5632,
+        "pts": 8192,
+        "keyframe": false
+      },
+      {
+        "offset": 22364,
+        "size": 1396,
+        "dts": 6144,
+        "pts": 7168,
+        "keyframe": false
+      },
+      {
+        "offset": 23760,
+        "size": 983,
+        "dts": 6656,
+        "pts": 6656,
+        "keyframe": false
+      },
+      {
+        "offset": 24743,
+        "size": 1114,
+        "dts": 7168,
+        "pts": 7680,
+        "keyframe": false
+      },
+      {
+        "offset": 25857,
+        "size": 1813,
+        "dts": 7680,
+        "pts": 9216,
+        "keyframe": false
+      },
+      {
+        "offset": 27670,
+        "size": 1234,
+        "dts": 8192,
+        "pts": 8704,
+        "keyframe": false
+      },
+      {
+        "offset": 28904,
+        "size": 2197,
+        "dts": 8704,
+        "pts": 11264,
+        "keyframe": false
+      },
+      {
+        "offset": 31101,
+        "size": 1404,
+        "dts": 9216,
+        "pts": 10240,
+        "keyframe": false
+      },
+      {
+        "offset": 32505,
+        "size": 1032,
+        "dts": 9728,
+        "pts": 9728,
+        "keyframe": false
+      },
+      {
+        "offset": 33537,
+        "size": 1001,
+        "dts": 10240,
+        "pts": 10752,
+        "keyframe": false
+      },
+      {
+        "offset": 34538,
+        "size": 1903,
+        "dts": 10752,
+        "pts": 12288,
+        "keyframe": false
+      },
+      {
+        "offset": 36441,
+        "size": 1175,
+        "dts": 11264,
+        "pts": 11776,
+        "keyframe": false
+      },
+      {
+        "offset": 37928,
+        "size": 5556,
+        "dts": 11776,
+        "pts": 13312,
+        "keyframe": true
+      },
+      {
+        "offset": 43484,
+        "size": 1040,
+        "dts": 12288,
+        "pts": 12800,
+        "keyframe": false
+      },
+      {
+        "offset": 44524,
+        "size": 2279,
+        "dts": 12800,
+        "pts": 15360,
+        "keyframe": false
+      },
+      {
+        "offset": 46803,
+        "size": 988,
+        "dts": 13312,
+        "pts": 14336,
+        "keyframe": false
+      },
+      {
+        "offset": 47791,
+        "size": 1000,
+        "dts": 13824,
+        "pts": 13824,
+        "keyframe": false
+      },
+      {
+        "offset": 48791,
+        "size": 1113,
+        "dts": 14336,
+        "pts": 14848,
+        "keyframe": false
+      },
+      {
+        "offset": 49904,
+        "size": 1925,
+        "dts": 14848,
+        "pts": 17408,
+        "keyframe": false
+      },
+      {
+        "offset": 51829,
+        "size": 1354,
+        "dts": 15360,
+        "pts": 16384,
+        "keyframe": false
+      },
+      {
+        "offset": 53183,
+        "size": 919,
+        "dts": 15872,
+        "pts": 15872,
+        "keyframe": false
+      },
+      {
+        "offset": 54102,
+        "size": 994,
+        "dts": 16384,
+        "pts": 16896,
+        "keyframe": false
+      },
+      {
+        "offset": 55096,
+        "size": 1708,
+        "dts": 16896,
+        "pts": 19456,
+        "keyframe": false
+      },
+      {
+        "offset": 56804,
+        "size": 1336,
+        "dts": 17408,
+        "pts": 18432,
+        "keyframe": false
+      },
+      {
+        "offset": 58140,
+        "size": 1080,
+        "dts": 17920,
+        "pts": 17920,
+        "keyframe": false
+      },
+      {
+        "offset": 59220,
+        "size": 932,
+        "dts": 18432,
+        "pts": 18944,
+        "keyframe": false
+      },
+      {
+        "offset": 60152,
+        "size": 1941,
+        "dts": 18944,
+        "pts": 20992,
+        "keyframe": false
+      },
+      {
+        "offset": 62093,
+        "size": 1407,
+        "dts": 19456,
+        "pts": 19968,
+        "keyframe": false
+      },
+      {
+        "offset": 63500,
+        "size": 1038,
+        "dts": 19968,
+        "pts": 20480,
+        "keyframe": false
+      },
+      {
+        "offset": 64538,
+        "size": 1625,
+        "dts": 20480,
+        "pts": 21504,
+        "keyframe": false
+      },
+      {
+        "offset": 66163,
+        "size": 1738,
+        "dts": 20992,
+        "pts": 23040,
+        "keyframe": false
+      },
+      {
+        "offset": 67901,
+        "size": 1168,
+        "dts": 21504,
+        "pts": 22016,
+        "keyframe": false
+      },
+      {
+        "offset": 69069,
+        "size": 1182,
+        "dts": 22016,
+        "pts": 22528,
+        "keyframe": false
+      },
+      {
+        "offset": 70251,
+        "size": 1264,
+        "dts": 22528,
+        "pts": 23552,
+        "keyframe": false
+      },
+      {
+        "offset": 71515,
+        "size": 1680,
+        "dts": 23040,
+        "pts": 25088,
+        "keyframe": false
+      },
+      {
+        "offset": 73195,
+        "size": 1300,
+        "dts": 23552,
+        "pts": 24064,
+        "keyframe": false
+      },
+      {
+        "offset": 74495,
+        "size": 1117,
+        "dts": 24064,
+        "pts": 24576,
+        "keyframe": false
+      }
+    ]
+  },
+  "bear-av-frag.mp4": {
+    "videoTrackSamples": [
+      {
+        "offset": 1679,
+        "size": 28768,
+        "dts": 0,
+        "pts": 2002,
+        "keyframe": true
+      },
+      {
+        "offset": 30447,
+        "size": 15804,
+        "dts": 1001,
+        "pts": 5005,
+        "keyframe": false
+      },
+      {
+        "offset": 46251,
+        "size": 4789,
+        "dts": 2002,
+        "pts": 4004,
+        "keyframe": false
+      },
+      {
+        "offset": 51040,
+        "size": 2846,
+        "dts": 3003,
+        "pts": 3003,
+        "keyframe": false
+      },
+      {
+        "offset": 53886,
+        "size": 15294,
+        "dts": 4004,
+        "pts": 8008,
+        "keyframe": false
+      },
+      {
+        "offset": 69180,
+        "size": 3613,
+        "dts": 5005,
+        "pts": 7007,
+        "keyframe": false
+      },
+      {
+        "offset": 72793,
+        "size": 4100,
+        "dts": 6006,
+        "pts": 6006,
+        "keyframe": false
+      },
+      {
+        "offset": 76893,
+        "size": 13680,
+        "dts": 7007,
+        "pts": 11011,
+        "keyframe": false
+      },
+      {
+        "offset": 90573,
+        "size": 3528,
+        "dts": 8008,
+        "pts": 10010,
+        "keyframe": false
+      },
+      {
+        "offset": 94101,
+        "size": 3894,
+        "dts": 9009,
+        "pts": 9009,
+        "keyframe": false
+      },
+      {
+        "offset": 97995,
+        "size": 13663,
+        "dts": 10010,
+        "pts": 14014,
+        "keyframe": false
+      },
+      {
+        "offset": 111658,
+        "size": 3667,
+        "dts": 11011,
+        "pts": 13013,
+        "keyframe": false
+      },
+      {
+        "offset": 115325,
+        "size": 3636,
+        "dts": 12012,
+        "pts": 12012,
+        "keyframe": false
+      },
+      {
+        "offset": 118961,
+        "size": 8130,
+        "dts": 13013,
+        "pts": 16016,
+        "keyframe": false
+      },
+      {
+        "offset": 127091,
+        "size": 3916,
+        "dts": 14014,
+        "pts": 15015,
+        "keyframe": false
+      },
+      {
+        "offset": 136460,
+        "size": 38012,
+        "dts": 15015,
+        "pts": 17017,
+        "keyframe": true
+      },
+      {
+        "offset": 174472,
+        "size": 13166,
+        "dts": 16016,
+        "pts": 21021,
+        "keyframe": false
+      },
+      {
+        "offset": 187638,
+        "size": 6031,
+        "dts": 17017,
+        "pts": 19019,
+        "keyframe": false
+      },
+      {
+        "offset": 193669,
+        "size": 3724,
+        "dts": 18018,
+        "pts": 18018,
+        "keyframe": false
+      },
+      {
+        "offset": 197393,
+        "size": 4032,
+        "dts": 19019,
+        "pts": 20020,
+        "keyframe": false
+      },
+      {
+        "offset": 201425,
+        "size": 13565,
+        "dts": 20020,
+        "pts": 25025,
+        "keyframe": false
+      },
+      {
+        "offset": 214990,
+        "size": 7502,
+        "dts": 21021,
+        "pts": 23023,
+        "keyframe": false
+      },
+      {
+        "offset": 222492,
+        "size": 3680,
+        "dts": 22022,
+        "pts": 22022,
+        "keyframe": false
+      },
+      {
+        "offset": 226172,
+        "size": 3759,
+        "dts": 23023,
+        "pts": 24024,
+        "keyframe": false
+      },
+      {
+        "offset": 229931,
+        "size": 9599,
+        "dts": 24024,
+        "pts": 28028,
+        "keyframe": false
+      },
+      {
+        "offset": 239530,
+        "size": 3154,
+        "dts": 25025,
+        "pts": 27027,
+        "keyframe": false
+      },
+      {
+        "offset": 242684,
+        "size": 3373,
+        "dts": 26026,
+        "pts": 26026,
+        "keyframe": false
+      },
+      {
+        "offset": 246057,
+        "size": 10021,
+        "dts": 27027,
+        "pts": 30030,
+        "keyframe": false
+      },
+      {
+        "offset": 256078,
+        "size": 2510,
+        "dts": 28028,
+        "pts": 29029,
+        "keyframe": false
+      },
+      {
+        "offset": 258588,
+        "size": 5374,
+        "dts": 29029,
+        "pts": 31031,
+        "keyframe": false
+      },
+      {
+        "offset": 269491,
+        "size": 31042,
+        "dts": 30030,
+        "pts": 32032,
+        "keyframe": true
+      },
+      {
+        "offset": 300533,
+        "size": 11994,
+        "dts": 31031,
+        "pts": 35035,
+        "keyframe": false
+      },
+      {
+        "offset": 312527,
+        "size": 3336,
+        "dts": 32032,
+        "pts": 34034,
+        "keyframe": false
+      },
+      {
+        "offset": 315863,
+        "size": 2870,
+        "dts": 33033,
+        "pts": 33033,
+        "keyframe": false
+      },
+      {
+        "offset": 318733,
+        "size": 11270,
+        "dts": 34034,
+        "pts": 37037,
+        "keyframe": false
+      },
+      {
+        "offset": 330003,
+        "size": 3726,
+        "dts": 35035,
+        "pts": 36036,
+        "keyframe": false
+      },
+      {
+        "offset": 333729,
+        "size": 12996,
+        "dts": 36036,
+        "pts": 39039,
+        "keyframe": false
+      },
+      {
+        "offset": 346725,
+        "size": 3755,
+        "dts": 37037,
+        "pts": 38038,
+        "keyframe": false
+      },
+      {
+        "offset": 350480,
+        "size": 13374,
+        "dts": 38038,
+        "pts": 41041,
+        "keyframe": false
+      },
+      {
+        "offset": 363854,
+        "size": 4017,
+        "dts": 39039,
+        "pts": 40040,
+        "keyframe": false
+      },
+      {
+        "offset": 367871,
+        "size": 6601,
+        "dts": 40040,
+        "pts": 42042,
+        "keyframe": false
+      },
+      {
+        "offset": 374472,
+        "size": 13279,
+        "dts": 41041,
+        "pts": 44044,
+        "keyframe": false
+      },
+      {
+        "offset": 387751,
+        "size": 3436,
+        "dts": 42042,
+        "pts": 43043,
+        "keyframe": false
+      },
+      {
+        "offset": 391187,
+        "size": 13625,
+        "dts": 43043,
+        "pts": 46046,
+        "keyframe": false
+      },
+      {
+        "offset": 404812,
+        "size": 4210,
+        "dts": 44044,
+        "pts": 45045,
+        "keyframe": false
+      },
+      {
+        "offset": 413906,
+        "size": 31038,
+        "dts": 45045,
+        "pts": 47047,
+        "keyframe": true
+      },
+      {
+        "offset": 444944,
+        "size": 12752,
+        "dts": 46046,
+        "pts": 49049,
+        "keyframe": false
+      },
+      {
+        "offset": 457696,
+        "size": 4493,
+        "dts": 47047,
+        "pts": 48048,
+        "keyframe": false
+      },
+      {
+        "offset": 462189,
+        "size": 13926,
+        "dts": 48048,
+        "pts": 51051,
+        "keyframe": false
+      },
+      {
+        "offset": 476115,
+        "size": 4566,
+        "dts": 49049,
+        "pts": 50050,
+        "keyframe": false
+      },
+      {
+        "offset": 480681,
+        "size": 15935,
+        "dts": 50050,
+        "pts": 54054,
+        "keyframe": false
+      },
+      {
+        "offset": 496616,
+        "size": 5229,
+        "dts": 51051,
+        "pts": 53053,
+        "keyframe": false
+      },
+      {
+        "offset": 501845,
+        "size": 5120,
+        "dts": 52052,
+        "pts": 52052,
+        "keyframe": false
+      },
+      {
+        "offset": 506965,
+        "size": 16368,
+        "dts": 53053,
+        "pts": 57057,
+        "keyframe": false
+      },
+      {
+        "offset": 523333,
+        "size": 5748,
+        "dts": 54054,
+        "pts": 56056,
+        "keyframe": false
+      },
+      {
+        "offset": 529081,
+        "size": 4883,
+        "dts": 55055,
+        "pts": 55055,
+        "keyframe": false
+      },
+      {
+        "offset": 533964,
+        "size": 12571,
+        "dts": 56056,
+        "pts": 60060,
+        "keyframe": false
+      },
+      {
+        "offset": 546535,
+        "size": 4840,
+        "dts": 57057,
+        "pts": 59059,
+        "keyframe": false
+      },
+      {
+        "offset": 551375,
+        "size": 4976,
+        "dts": 58058,
+        "pts": 58058,
+        "keyframe": false
+      },
+      {
+        "offset": 556351,
+        "size": 6465,
+        "dts": 59059,
+        "pts": 61061,
+        "keyframe": false
+      },
+      {
+        "offset": 568277,
+        "size": 35197,
+        "dts": 60060,
+        "pts": 62062,
+        "keyframe": true
+      },
+      {
+        "offset": 603474,
+        "size": 12580,
+        "dts": 61061,
+        "pts": 65065,
+        "keyframe": false
+      },
+      {
+        "offset": 616054,
+        "size": 5382,
+        "dts": 62062,
+        "pts": 64064,
+        "keyframe": false
+      },
+      {
+        "offset": 621436,
+        "size": 4098,
+        "dts": 63063,
+        "pts": 63063,
+        "keyframe": false
+      },
+      {
+        "offset": 625534,
+        "size": 11744,
+        "dts": 64064,
+        "pts": 68068,
+        "keyframe": false
+      },
+      {
+        "offset": 637278,
+        "size": 4102,
+        "dts": 65065,
+        "pts": 67067,
+        "keyframe": false
+      },
+      {
+        "offset": 641380,
+        "size": 4270,
+        "dts": 66066,
+        "pts": 66066,
+        "keyframe": false
+      },
+      {
+        "offset": 645650,
+        "size": 11641,
+        "dts": 67067,
+        "pts": 71071,
+        "keyframe": false
+      },
+      {
+        "offset": 657291,
+        "size": 4185,
+        "dts": 68068,
+        "pts": 70070,
+        "keyframe": false
+      },
+      {
+        "offset": 661476,
+        "size": 3952,
+        "dts": 69069,
+        "pts": 69069,
+        "keyframe": false
+      },
+      {
+        "offset": 665428,
+        "size": 13400,
+        "dts": 70070,
+        "pts": 74074,
+        "keyframe": false
+      },
+      {
+        "offset": 678828,
+        "size": 4073,
+        "dts": 71071,
+        "pts": 73073,
+        "keyframe": false
+      },
+      {
+        "offset": 682901,
+        "size": 3934,
+        "dts": 72072,
+        "pts": 72072,
+        "keyframe": false
+      },
+      {
+        "offset": 686835,
+        "size": 7059,
+        "dts": 73073,
+        "pts": 76076,
+        "keyframe": false
+      },
+      {
+        "offset": 693894,
+        "size": 2715,
+        "dts": 74074,
+        "pts": 75075,
+        "keyframe": false
+      },
+      {
+        "offset": 701345,
+        "size": 31151,
+        "dts": 75075,
+        "pts": 77077,
+        "keyframe": true
+      },
+      {
+        "offset": 732496,
+        "size": 10291,
+        "dts": 76076,
+        "pts": 80080,
+        "keyframe": false
+      },
+      {
+        "offset": 742787,
+        "size": 3210,
+        "dts": 77077,
+        "pts": 79079,
+        "keyframe": false
+      },
+      {
+        "offset": 745997,
+        "size": 3339,
+        "dts": 78078,
+        "pts": 78078,
+        "keyframe": false
+      },
+      {
+        "offset": 749336,
+        "size": 7627,
+        "dts": 79079,
+        "pts": 83083,
+        "keyframe": false
+      },
+      {
+        "offset": 756963,
+        "size": 3531,
+        "dts": 80080,
+        "pts": 82082,
+        "keyframe": false
+      },
+      {
+        "offset": 760494,
+        "size": 3013,
+        "dts": 81081,
+        "pts": 81081,
+        "keyframe": false
+      }
+    ]
+  }
+}

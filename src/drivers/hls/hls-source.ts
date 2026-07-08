@@ -19,9 +19,10 @@
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK } from '../../crypto/aes.ts';
 import { decryptHlsAes128, decryptHlsSampleAesTs } from '../../crypto/hls-aes.ts';
-import { type Source, fromBytes } from '../../sources/source.ts';
+import { type MediaInput, type Source, fromBytes } from '../../sources/source.ts';
 import {
   type HlsKey,
+  type HlsMap,
   type HlsMediaPlaylist,
   type HlsSegment,
   type HlsVariant,
@@ -53,8 +54,44 @@ export interface HlsResolveOptions {
 /** The MIME the stitched bytes are tagged with, so the engine routes them to the right segment container. */
 const TS_MIME = 'video/mp2t';
 const FMP4_MIME = 'video/mp4';
+/** Packed-audio rendition (RFC 8216 §3.4): a raw ADTS AAC elementary stream — NOT an MPEG-TS. */
+const AAC_ADTS_MIME = 'audio/aac';
+const TS_SYNC_BYTE = 0x47;
 const AES128_KEY_LEN = 16;
 type HlsAes128KeyCache = Map<string, Promise<Uint8Array<ArrayBuffer>>>;
+
+/** `#EXTM3U` — the Basic Tag RFC 8216 §4.3.1.1 mandates as the very first line of EVERY playlist. */
+const EXTM3U_TAG = Uint8Array.of(0x23, 0x45, 0x58, 0x54, 0x4d, 0x33, 0x55);
+/** A leading UTF-8 byte-order mark, tolerated before the `#EXTM3U` tag. */
+const UTF8_BOM = Uint8Array.of(0xef, 0xbb, 0xbf);
+
+/**
+ * Detect an HLS playlist **structurally** from its leading bytes: RFC 8216 §4.3.1.1 requires the first
+ * line of every Media/Master Playlist to be exactly the `#EXTM3U` tag, so a manifest is identified by
+ * that signature — never by a `.m3u8` extension or a MIME guess alone (a `video/mp2t`-tagged manifest,
+ * as the fair harness feeds, would otherwise be mis-routed straight into the MPEG-TS driver, which then
+ * finds no `0x47` sync run in the undecrypted manifest/segment bytes — ADR-183). A leading UTF-8 BOM is
+ * tolerated; the tag MUST be followed by a line terminator, ASCII whitespace, or end-of-head, so a longer
+ * token such as `#EXTM3UX` is rejected. `head` is any prefix of the resource — a dozen bytes suffice, so
+ * the engine can pass the same magic-sniff head it routes containers with.
+ */
+export function isHlsPlaylist(head: Uint8Array): boolean {
+  const off =
+    head.length >= UTF8_BOM.length &&
+    head[0] === UTF8_BOM[0] &&
+    head[1] === UTF8_BOM[1] &&
+    head[2] === UTF8_BOM[2]
+      ? UTF8_BOM.length
+      : 0;
+  for (let i = 0; i < EXTM3U_TAG.length; i++) {
+    if (head[off + i] !== EXTM3U_TAG[i]) return false;
+  }
+  const after = head[off + EXTM3U_TAG.length];
+  // End-of-head, or a boundary byte (LF / CR / space / tab) — never a longer identifier like `#EXTM3Ualbum`.
+  return (
+    after === undefined || after === 0x0a || after === 0x0d || after === 0x20 || after === 0x09
+  );
+}
 
 /**
  * Resolve an HLS playlist into a single demuxable {@link Source}: parse → (pick variant) → fetch + decrypt +
@@ -89,7 +126,13 @@ export async function resolveHlsSource(
   const keyCache: HlsAes128KeyCache = new Map();
   // Prepend the fMP4 init section FIRST (awaited before the segment loop) so the `ftyp`+`moov` lead the
   // fragments; for a TS playlist this is a no-op. Then fetch + decrypt + append each segment in order.
-  const fmp4 = await appendInitSection(parts, media.segments[0], fetchResource, opts.signal);
+  const fmp4 = await appendInitSection(
+    parts,
+    media.segments[0],
+    fetchResource,
+    keyCache,
+    opts.signal,
+  );
   for (const segment of media.segments) {
     throwIfAborted(opts.signal);
     const raw = await fetchResource(segment.uri);
@@ -97,7 +140,93 @@ export async function resolveHlsSource(
   }
   throwIfAborted(opts.signal);
 
-  return fromBytes(concat(parts), { mime: fmp4 ? FMP4_MIME : TS_MIME });
+  const stitched = concat(parts);
+  return fromBytes(stitched, { mime: mimeForStitched(stitched, fmp4) });
+}
+
+/**
+ * Resolve an HLS playlist that arrives as a {@link Source} (bytes / URL / Blob) rather than as text:
+ * drain the source to its `.m3u8` document, then delegate to {@link resolveHlsSource}. This is the seam
+ * the engine's input path uses to auto-resolve a manifest input — one it has detected with
+ * {@link isHlsPlaylist} — into the single demuxable segment `Source` its probe/demux/decode already
+ * consume, keeping HLS a **source-level** transform (ADR-023), not a container driver. Pass the manifest's
+ * own URL as `opts.baseUrl` so its relative segment/key URIs resolve; `opts.fetchResource` defaults to the
+ * platform `fetch` (browser), exactly as {@link resolveHlsSource}. The source must be re-readable (a
+ * bytes/URL/Blob source, which every manifest input normalizes to); a single-use stream is drained here.
+ */
+export async function resolveHlsSourceFromSource(
+  src: Source,
+  opts: HlsResolveOptions = {},
+): Promise<Source> {
+  const text = decodeUtf8(await readSourceToBytes(src));
+  return resolveHlsSource(text, opts);
+}
+
+/** Just enough leading bytes to confirm the `#EXTM3U` signature (plus a UTF-8 BOM) via {@link isHlsPlaylist}. */
+const HLS_HEAD_SNIFF_BYTES = 16;
+
+/**
+ * The engine's lazy HLS input seam: the caller has already narrowed to an HLS-plausible MIME/extension,
+ * so confirm from the actual bytes (a bounded head read — never draining a real `video/mp2t` stream that
+ * merely shares the manifest's MIME) and, only on a match, resolve the manifest into its stitched segment
+ * {@link Source}. A non-manifest returns unchanged. `input` supplies the manifest's own URL as the base
+ * for its relative segment/key URIs when it arrived as a string/URL. Kept out of the engine's eager kernel
+ * (loaded behind the same `import()` as the rest of HLS) so non-HLS inputs pay nothing for it.
+ */
+export async function resolveHlsInputIfManifest(
+  input: MediaInput,
+  src: Source,
+  signal: AbortSignal,
+): Promise<Source> {
+  const head = await readSourceHead(src, HLS_HEAD_SNIFF_BYTES);
+  if (!isHlsPlaylist(head)) return src;
+  const baseUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : undefined;
+  return resolveHlsSourceFromSource(src, {
+    signal,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  });
+}
+
+/** A bounded head read that never consumes more than `n` bytes — `range()` when seekable, else one chunk. */
+async function readSourceHead(src: Source, n: number): Promise<Uint8Array> {
+  if (src.range) return src.range(0, Math.min(n, src.size ?? n));
+  const reader = src.stream().getReader();
+  try {
+    const { value } = await reader.read();
+    return value ?? new Uint8Array(0);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** Drain a source's bytes fully (an HLS `.m3u8` manifest is small, so a whole-source read is correct). */
+async function readSourceToBytes(src: Source): Promise<Uint8Array> {
+  const reader = src.stream().getReader();
+  const parts: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return concat(parts);
+}
+
+/**
+ * The MIME to tag the stitched cleartext with so the engine's container router demuxes it verbatim. fMP4
+ * (an `#EXT-X-MAP` was present) is always MP4. Otherwise sniff the segment container: an MPEG-TS stream
+ * leads with the `0x47` sync byte; a packed-audio rendition (RFC 8216 §3.4) leads with the raw ADTS AAC
+ * syncword (`0xFFF`, MPEG layer 0 ⇒ `byte1 & 0xF6 === 0xF0`). Anything else defaults to MPEG-TS, the
+ * dominant HLS segment container — a content-sniffing router still refines from the bytes if needed.
+ */
+function mimeForStitched(bytes: Uint8Array, fmp4: boolean): string {
+  if (fmp4) return FMP4_MIME;
+  if (bytes[0] === TS_SYNC_BYTE) return TS_MIME;
+  if (bytes[0] === 0xff && ((bytes[1] ?? 0) & 0xf6) === 0xf0) return AAC_ADTS_MIME;
+  return TS_MIME;
 }
 
 // ── playlist resolution (master → media) ──────────────────────────────────────────────────────────
@@ -149,27 +278,54 @@ function pickVariant(variants: readonly HlsVariant[], choice: HlsVariantChoice):
 
 /**
  * If the first segment carries an `#EXT-X-MAP` (fMP4 / CMAF), fetch + prepend that init section once (it
- * holds the `ftyp`+`moov` the fragments need). Returns whether the stream is fMP4 (so the caller tags the
- * MIME as MP4). A byte-ranged map is honored. TS segments have no map ⇒ returns false, nothing prepended.
+ * holds the `ftyp`+`moov` the fragments need). When a key was in force at the map's declaration the init
+ * section is encrypted and decrypted here (RFC 8216 §4.3.2.5: an encrypted Media Initialization Section
+ * REQUIRES an explicit `IV=` on its EXT-X-KEY — there is no media-sequence number to derive one from, so
+ * a missing IV is a typed {@link InputError}, never a silent all-zero fallback). A byte-ranged map is
+ * honored. Returns whether the stream is fMP4 (so the caller tags the MIME as MP4). TS segments have no
+ * map ⇒ returns false, nothing prepended.
  */
 async function appendInitSection(
   parts: Uint8Array[],
   first: HlsSegment | undefined,
   fetchResource: HlsResourceFetcher,
+  keyCache: HlsAes128KeyCache,
   signal: AbortSignal | undefined,
 ): Promise<boolean> {
   const map = first?.map;
   if (map === undefined) return false;
-  throwIfAborted(signal);
-  const init = await fetchResource(map.uri);
-  parts.push(map.byteRange ? sliceByteRange(init, map.byteRange) : init);
+  const key = map.key;
+  if (key === undefined || key.method === 'NONE') {
+    parts.push(await fetchMapCipher(map, fetchResource, signal));
+    return true;
+  }
+  const iv = key.iv;
+  if (iv === undefined) {
+    throw new InputError(
+      'unsupported-input',
+      'HLS encrypted EXT-X-MAP (media initialization section) requires an explicit IV on its EXT-X-KEY (RFC 8216 §4.3.2.5)',
+    );
+  }
+  const cipher = await fetchMapCipher(map, fetchResource, signal);
+  parts.push(await decryptWithKey(cipher, key, iv, fetchResource, keyCache, signal));
   return true;
 }
 
+/** Fetch an `#EXT-X-MAP` resource and carve its (optional) byte-range window — the init section's bytes. */
+async function fetchMapCipher(
+  map: HlsMap,
+  fetchResource: HlsResourceFetcher,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  throwIfAborted(signal);
+  const init = await fetchResource(map.uri);
+  return map.byteRange ? sliceByteRange(init, map.byteRange) : init;
+}
+
 /**
- * Decrypt a segment when an encrypted HLS key is in force; pass a clear segment through untouched. The key
- * is fetched once per distinct resolved key URI; the IV is the explicit `IV=` or, per RFC 8216 §4.3.2.4,
- * the segment's 64-bit media-sequence number in the low bytes of a 16-byte big-endian block.
+ * Decrypt a segment when an encrypted HLS key is in force; pass a clear segment through untouched. The IV
+ * is the explicit `IV=` or, per RFC 8216 §4.3.2.4, the segment's media-sequence number as a 128-bit
+ * big-endian integer.
  */
 async function decryptSegmentIfNeeded(
   raw: Uint8Array,
@@ -181,6 +337,29 @@ async function decryptSegmentIfNeeded(
   const ranged = segment.byteRange ? sliceByteRange(raw, segment.byteRange) : raw;
   const key = segment.key;
   if (key === undefined || key.method === 'NONE') return ranged;
+  return decryptWithKey(
+    ranged,
+    key,
+    ivForSegment(key, segment.sequence),
+    fetchResource,
+    keyCache,
+    signal,
+  );
+}
+
+/**
+ * Decrypt one ciphertext window (segment or init section) under an encrypted HLS key + concrete IV. The
+ * key is fetched once per distinct resolved key URI (validated to 16 bytes). Only the `identity` key
+ * format is decryptable here; a DRM key format or an unsupported method is a typed error, never garbage.
+ */
+async function decryptWithKey(
+  cipher: Uint8Array,
+  key: HlsKey,
+  iv: Uint8Array,
+  fetchResource: HlsResourceFetcher,
+  keyCache: HlsAes128KeyCache,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array<ArrayBuffer>> {
   if (key.keyFormat !== undefined && key.keyFormat !== 'identity') {
     throw new MediaError(
       'decode-error',
@@ -196,9 +375,9 @@ async function decryptSegmentIfNeeded(
   throwIfAborted(signal);
   const keyBytes = await fetchAes128Key(key.uri, fetchResource, keyCache);
   throwIfAborted(signal);
-  const iv = toExact(ivForSegment(key, segment.sequence));
-  if (key.method === 'AES-128') return decryptHlsAes128(toExact(ranged), keyBytes, iv);
-  if (key.method === 'SAMPLE-AES') return decryptHlsSampleAesTs(toExact(ranged), keyBytes, iv);
+  const ivExact = toExact(iv);
+  if (key.method === 'AES-128') return decryptHlsAes128(toExact(cipher), keyBytes, ivExact);
+  if (key.method === 'SAMPLE-AES') return decryptHlsSampleAesTs(toExact(cipher), keyBytes, ivExact);
   throw new MediaError('decode-error', `HLS ${key.method} is not supported by source resolution`);
 }
 
@@ -230,10 +409,11 @@ function exactAes128Key(uri: string, bytes: Uint8Array): Uint8Array<ArrayBuffer>
 function ivForSegment(key: HlsKey, sequence: number): Uint8Array {
   if (key.iv !== undefined) return key.iv;
   const iv = new Uint8Array(AES_BLOCK);
-  // The sequence number occupies the low 8 bytes, big-endian (RFC 8216 §4.3.2.4). `sequence` fits in 32
-  // bits for any real corpus, so writing the low 4 bytes is exact; the upper bytes stay zero.
-  const view = new DataView(iv.buffer);
-  view.setUint32(AES_BLOCK - 4, sequence >>> 0, false);
+  // RFC 8216 §4.3.2.4: the implicit IV is the segment's media-sequence number as a 128-bit big-endian
+  // integer, left-padded with zeros. Media-sequence numbers are 64-bit (§4.2), so a big-endian u64 in
+  // the low 8 bytes is exact across the full realistic range — INCLUDING past the 32-bit boundary (e.g.
+  // sequence 2^32 ⇒ …0001_00000000), which a 32-bit write would wrongly truncate to zero.
+  new DataView(iv.buffer).setBigUint64(AES_BLOCK - 8, BigInt(sequence), false);
   return iv;
 }
 

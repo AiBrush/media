@@ -26,6 +26,8 @@ import type { MediaInfo, MediaInfoTrack } from '../../api/types.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { Mp4Module } from './mp4-driver.ts';
+import { type ParsedTrack, parseMovieMetadata } from './parse.ts';
+import { Reader, boxes } from './reader.ts';
 
 const DERIVED_DIR = new URL('../../../fixtures/media-derived/', import.meta.url).pathname;
 
@@ -80,5 +82,75 @@ describe('AudioSampleEntry version parsing (probe, real MOV headers)', () => {
     // asserting against them proves the test would reject a regression to that bug.
     expect(audio.channels).not.toBe(3);
     expect(audio.sampleRate).not.toBe(1);
+  });
+});
+
+// ============ QuickTime PCM sound descriptions (task #11 / ADR-185) ============
+//
+// Real ffmpeg-8-authored `.mov` fixtures (recipes in fixtures/golden/metadata/qtff-mov-truth.json):
+// the QT PCM sample-entry fourccs must classify to the engine's honest PCM tokens matching ffprobe's
+// `codec_name` — `sowt` v0 → pcm-s16 (pcm_s16le), `fl32` v1 + `wave`/`enda`(=1 little-endian) →
+// pcm-f32 (pcm_f32le), `lpcm` v2 (float64 rate, formatSpecificFlags) → pcm-s16 @ 96 kHz — never a raw
+// fourcc with no meaning to the decode/DSP seams, and never a dropped/other-typed audio track.
+
+async function parseAudioTrackOf(name: string): Promise<ParsedTrack> {
+  const file = new Uint8Array(await readFile(`${DERIVED_DIR}${name}`));
+  const r = new Reader(file);
+  let brand = 'mp42';
+  for (const box of boxes(r, file.byteLength)) {
+    if (box.type === 'ftyp') {
+      brand = String.fromCharCode(...file.subarray(box.payloadStart, box.payloadStart + 4));
+    }
+    if (box.type === 'moov') {
+      const movie = parseMovieMetadata(brand, file.subarray(box.payloadStart, box.end));
+      const audio = movie.tracks.find((t) => t.mediaType === 'audio');
+      if (!audio) throw new Error(`${name}: no audio track parsed`);
+      return audio;
+    }
+  }
+  throw new Error(`${name}: no moov`);
+}
+
+describe('QuickTime PCM sample entries classify to honest engine PCM tokens', () => {
+  it("sowt v0 (mov-bt709matrix-sowt.mov) → 'pcm-s16', 22050 Hz mono (ffprobe pcm_s16le)", async () => {
+    const audio = await parseAudioTrackOf('mov-bt709matrix-sowt.mov');
+    expect(audio.sampleEntryType).toBe('sowt');
+    expect(audio.codec).toBe('pcm-s16');
+    expect(audio.config.codec).toBe('pcm-s16');
+    expect(audio.sampleRate).toBe(22050);
+    expect(audio.channels).toBe(1);
+  });
+
+  it("fl32 v1 + wave/enda little-endian (mov-fl32-enda.mov) → 'pcm-f32', 16000 Hz (ffprobe pcm_f32le)", async () => {
+    const audio = await parseAudioTrackOf('mov-fl32-enda.mov');
+    expect(audio.sampleEntryType).toBe('fl32');
+    expect(audio.codec).toBe('pcm-f32'); // enda==1 ⇒ little-endian, NOT the fl32 big-endian default
+    expect(audio.sampleRate).toBe(16000);
+    expect(audio.channels).toBe(1);
+  });
+
+  it("lpcm v2 (mov-lpcm-96k-v2.mov) → 'pcm-s16' from formatSpecificFlags, f64 rate 96000", async () => {
+    const audio = await parseAudioTrackOf('mov-lpcm-96k-v2.mov');
+    expect(audio.sampleEntryType).toBe('lpcm');
+    expect(audio.codec).toBe('pcm-s16'); // flags: signed-integer + packed, LE (no big-endian bit)
+    expect(audio.sampleRate).toBe(96000);
+    expect(audio.channels).toBe(1);
+  });
+
+  it('Apple AVFoundation-authored mp4a v1 (mov-apple-avconvert.mov): wave-nested esds with plain descriptor lengths', async () => {
+    const audio = await parseAudioTrackOf('mov-apple-avconvert.mov');
+    expect(audio.sampleEntryType).toBe('mp4a');
+    expect(audio.codec).toBe('mp4a.40.2'); // esds found through `wave`, lengths without 0x80 padding
+    expect(audio.sampleRate).toBe(22050);
+    expect(audio.channels).toBe(1);
+    const config = audio.config as AudioDecoderConfig;
+    expect(config.description, 'AudioSpecificConfig extracted').toBeDefined();
+  });
+
+  it('ffmpeg-8-authored mp4a v1 wave (mov-tmcd-copy.mov): 0x80-padded descriptor lengths still resolve', async () => {
+    const audio = await parseAudioTrackOf('mov-tmcd-copy.mov');
+    expect(audio.codec).toBe('mp4a.40.2');
+    expect(audio.sampleRate).toBe(22050);
+    expect(audio.channels).toBe(1);
   });
 });

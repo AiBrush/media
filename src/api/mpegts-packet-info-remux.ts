@@ -13,7 +13,7 @@ import {
 } from '../drivers/mpegts/ts-write.ts';
 import type { Source } from '../sources/source.ts';
 import { fromBytes } from '../sources/source.ts';
-import { selectTrackInfos } from './codec-routing.ts';
+import { selectTrackInfos } from './track-select.ts';
 import type { RemuxOptions } from './types.ts';
 
 const MPEGTS_PACKET_INFO_MAX_SOURCE_BYTES = 64 * 1024 * 1024;

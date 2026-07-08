@@ -296,12 +296,14 @@ describe('parseAdts — variants + robustness', () => {
     expect(info.durationSec).toBeCloseTo((4 * 1024) / 44100, 6);
   });
 
-  it('extrapolates duration when only a head of a larger file is seen', () => {
-    const head = buildAdts({ count: 2, payload: 20 }); // 2 frames present...
-    const fullSize = head.byteLength * 5; // ...but the file is ~5× longer
+  it('NEVER extrapolates: duration is exactly the walked frames, whatever totalSize claims', () => {
+    const head = buildAdts({ count: 2, payload: 20 }); // 2 complete frames present...
+    const fullSize = head.byteLength * 5; // ...and a 5×-larger claimed file changes NOTHING
     const partial = parseAdts(head);
-    const extrapolated = parseAdts(head, fullSize);
-    expect(extrapolated.durationSec).toBeGreaterThan(partial.durationSec * 4);
+    const withClaim = parseAdts(head, fullSize); // deprecated arg is inert (exact walk)
+    expect(partial.frames).toBe(2);
+    expect(partial.durationSec).toBe((2 * 1024) / 44_100);
+    expect(withClaim).toEqual(partial);
   });
 
   it('skips an ID3v2 prefix before the first frame', () => {

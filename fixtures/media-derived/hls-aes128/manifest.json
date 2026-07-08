@@ -1,0 +1,544 @@
+{
+  "version": 1,
+  "note": "REAL AES-128 HLS corpus (RFC 8216) baked by scripts/bake-hls-aes128-fixtures.ts from the WPT movie_5.mp4 corpus asset. Encryption by ffmpeg -hls_key_info_file / openssl enc; every playlist ffprobe-verified; per-segment plain MD5s are openssl-CLI goldens. Do not edit by hand.",
+  "recipe": {
+    "source": "fixtures/media/movie_5.mp4",
+    "tools": ["ffmpeg 8.0", "OpenSSL 3.6.2 7 Apr 2026 (Library: OpenSSL 3.6.2 7 Apr 2026)"]
+  },
+  "variants": [
+    {
+      "id": "ffmpeg-explicit-seq47",
+      "playlist": "ffmpeg-explicit-seq47/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg047.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg048.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg049.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "seg050.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "seg051.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "seg052.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "implicit-seq47",
+      "playlist": "implicit-seq47/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg47.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "0000000000000000000000000000002f",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg48.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000030",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg49.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000031",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "seg50.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000032",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "seg51.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000033",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "seg52.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000034",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "implicit-seq0",
+      "playlist": "implicit-seq0/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg0.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg1.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000001",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg2.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000002",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "seg3.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000003",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "seg4.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000004",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "seg5.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "00000000000000000000000000000005",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "rotation",
+      "playlist": "rotation/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg0.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg1.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000001",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg2.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000002",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "seg3.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "seg4.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "seg5.ts",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "none-mid",
+      "playlist": "none-mid/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg0.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg1.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000001",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg2.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000002",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "../clear/seg003.ts",
+          "keyHex": null,
+          "ivHex": null,
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "../clear/seg004.ts",
+          "keyHex": null,
+          "ivHex": null,
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "../clear/seg005.ts",
+          "keyHex": null,
+          "ivHex": null,
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "byterange",
+      "playlist": "byterange/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917",
+          "byteRange": {
+            "length": 6400,
+            "offset": 0
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1",
+          "byteRange": {
+            "length": 6032,
+            "offset": 6400
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82",
+          "byteRange": {
+            "length": 6784,
+            "offset": 12432
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765",
+          "byteRange": {
+            "length": 6032,
+            "offset": 19216
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3",
+          "byteRange": {
+            "length": 6400,
+            "offset": 25248
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45",
+          "byteRange": {
+            "length": 1888,
+            "offset": 31648
+          }
+        }
+      ]
+    },
+    {
+      "id": "byterange-continuation",
+      "playlist": "byterange/continuation.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917",
+          "byteRange": {
+            "length": 6400,
+            "offset": 0
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1",
+          "byteRange": {
+            "length": 6032,
+            "offset": 6400
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82",
+          "byteRange": {
+            "length": 6784,
+            "offset": 12432
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765",
+          "byteRange": {
+            "length": 6032,
+            "offset": 19216
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3",
+          "byteRange": {
+            "length": 6400,
+            "offset": 25248
+          }
+        },
+        {
+          "file": "media.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45",
+          "byteRange": {
+            "length": 1888,
+            "offset": 31648
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq-2pow32",
+      "playlist": "seq-2pow32/media.m3u8",
+      "mime": "video/mp2t",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "bb915db2c15ed545b1b2f399725f5eb7",
+      "segments": [
+        {
+          "file": "seg4294967296.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000000",
+          "plainMd5": "a41e59595328d086c5853096aee4a917"
+        },
+        {
+          "file": "seg4294967297.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000001",
+          "plainMd5": "4a7388928cc51d452f6453bea9b06ea1"
+        },
+        {
+          "file": "seg4294967298.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000002",
+          "plainMd5": "8333ffc487c3029dbd76bb1fa12d2a82"
+        },
+        {
+          "file": "seg4294967299.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000003",
+          "plainMd5": "b8b1833276c0466bb01d3049d9d23765"
+        },
+        {
+          "file": "seg4294967300.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000004",
+          "plainMd5": "75a3b65ce0b0dd8d6f6cabb84372cac3"
+        },
+        {
+          "file": "seg4294967301.ts",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000100000005",
+          "plainMd5": "d394de35293638b27ac6ab11afcaee45"
+        }
+      ]
+    },
+    {
+      "id": "audio-adts",
+      "playlist": "audio-adts/media.m3u8",
+      "mime": "audio/aac",
+      "ffprobe": {
+        "durationSec": 5.20127,
+        "codecs": ["aac"]
+      },
+      "stitchedPlainMd5": "60bf0c21fa7f2164687c933651276aec",
+      "segments": [
+        {
+          "file": "seg000.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000000",
+          "plainMd5": "f58349b3dcea48465836fd4ea8555424"
+        },
+        {
+          "file": "seg001.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000001",
+          "plainMd5": "9a637be046cddeb90a0f1e23e5f669e6"
+        },
+        {
+          "file": "seg002.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000002",
+          "plainMd5": "8e27547bb599bc6d5b386565e1a9153a"
+        },
+        {
+          "file": "seg003.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000003",
+          "plainMd5": "c7fdfc9de9208882676d5767baf85e62"
+        },
+        {
+          "file": "seg004.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000004",
+          "plainMd5": "d3c5792f18647c615a6dcf1b4ee2a572"
+        },
+        {
+          "file": "seg005.aac",
+          "keyHex": "8f2b64a103e75cd94e12bb07f388916c",
+          "ivHex": "00000000000000000000000000000005",
+          "plainMd5": "47d37bbbd8453923c8043be9b463a296"
+        }
+      ]
+    },
+    {
+      "id": "fmp4-encmap",
+      "playlist": "fmp4-encmap/media.m3u8",
+      "mime": "video/mp4",
+      "ffprobe": {
+        "durationSec": 5.2,
+        "codecs": ["h264", "aac"]
+      },
+      "stitchedPlainMd5": "127bd006dec9af419ba6b13b15c1a224",
+      "segments": [
+        {
+          "file": "init.enc.mp4",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "215cfdcfb9dd660cd3b620ad04e83f9a"
+        },
+        {
+          "file": "enc000.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "c99a9db20bfc4cd681049d1e395072aa"
+        },
+        {
+          "file": "enc001.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "61533f3e0ad39ade08987b3399c7aad1"
+        },
+        {
+          "file": "enc002.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "27900f2b86bb6896734bbb1af4671219"
+        },
+        {
+          "file": "enc003.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "598e9b3cbad8c370bdc8845b3513281c"
+        },
+        {
+          "file": "enc004.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "849f25729d56c1fa824b568d1d13949d"
+        },
+        {
+          "file": "enc005.m4s",
+          "keyHex": "21436587a9cbed0f1032547698badcfe",
+          "ivHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "plainMd5": "f64378390d52c4fe57d99e938dc37331"
+        }
+      ]
+    }
+  ]
+}

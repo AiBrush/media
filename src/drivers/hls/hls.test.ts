@@ -80,15 +80,20 @@ describe('parseM3u8 — real clear media playlist (hls_vod.m3u8)', () => {
 
 describe('parseM3u8 — real AES-128 media playlist (hls_aes128.m3u8)', () => {
   it('parses the EXT-X-KEY (method, key URI, exact IV) and applies it to every segment', async () => {
-    const p = asMedia(parseM3u8(await textFromMediaTest('hls_aes128.m3u8')));
+    const text = await textFromMediaTest('hls_aes128.m3u8');
+    const p = asMedia(parseM3u8(text));
     expect(p.segments).toHaveLength(5);
-    const expectedIv = Uint8Array.from(
-      // IV=0x953e5e232e1585e615d9164ece153cf2 from the fixture's #EXT-X-KEY line.
-      [
-        0x95, 0x3e, 0x5e, 0x23, 0x2e, 0x15, 0x85, 0xe6, 0x15, 0xd9, 0x16, 0x4e, 0xce, 0x15, 0x3c,
-        0xf2,
-      ],
-    );
+    // Independent, corpus-robust oracle: the parser must reproduce the exact 128-bit IV that is literally
+    // on the fixture's #EXT-X-KEY line — extracted here by a hand-rolled hex scan (NOT the parser under
+    // test), left-padded to 16 bytes per RFC 8216 §4.3.2.4. Deriving it from the fixture (rather than
+    // pinning one memorized snapshot) keeps the oracle can-fail on a byte-order/padding/truncation bug
+    // while surviving corpus rotation (BUILD_INSTRUCTIONS §6.2, anti-overfit).
+    const ivDigits = /IV=0x([0-9a-fA-F]{1,32})/i.exec(text)?.[1];
+    if (ivDigits === undefined)
+      throw new Error('hls_aes128.m3u8 #EXT-X-KEY carries no explicit IV');
+    const ivHex = ivDigits.padStart(32, '0');
+    const expectedIv = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) expectedIv[i] = Number.parseInt(ivHex.slice(i * 2, i * 2 + 2), 16);
     for (const seg of p.segments) {
       expect(seg.key?.method).toBe('AES-128');
       expect(seg.key?.uri).toBe('hls_aes128.key'); // KEY inheritance: one tag covers all 5 segments

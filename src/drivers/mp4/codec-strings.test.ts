@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { av1CodecString, avcCodecString, hevcCodecString, parseEsds } from './codec-strings.ts';
+import {
+  av1CodecString,
+  avcCodecString,
+  h273Matrix,
+  h273Primaries,
+  h273Transfer,
+  hevcCodecString,
+  parseEsds,
+  qtPcmCodec,
+  videoColorSpaceFromColr,
+} from './codec-strings.ts';
 
 describe('avcCodecString', () => {
   it('formats avc1.PPCCLL from the avcC record', () => {
@@ -97,5 +107,125 @@ describe('parseEsds', () => {
     const bytes = esds({ asc: [0x12, 0x10] });
     bytes[9] = 0x99; // corrupt the DecoderConfigDescriptor tag (after fullbox+ES header)
     expect(parseEsds(bytes)).toEqual({ codec: 'mp4a', objectTypeIndication: 0 });
+  });
+});
+
+// ============ H.273 colour code points → WebCodecs (task #11 / ADR-185) ============
+//
+// Oracles are the ISO/IEC 23091-2 (H.273) tables applied by hand — independent of the mapping code.
+// Unmappable code points (unspecified=2, reserved, or no WebCodecs equivalent) must yield undefined:
+// an honest omission the decoder resolves with its own default, never a guessed value.
+
+describe('h273Primaries', () => {
+  it('maps the WebCodecs-representable code points', () => {
+    expect(h273Primaries(1)).toBe('bt709');
+    expect(h273Primaries(5)).toBe('bt470bg');
+    expect(h273Primaries(6)).toBe('smpte170m');
+    expect(h273Primaries(9)).toBe('bt2020');
+    expect(h273Primaries(12)).toBe('smpte432');
+  });
+  it('maps 7 (SMPTE-240M) to smpte170m — H.273 defines identical chromaticities for 6 and 7', () => {
+    expect(h273Primaries(7)).toBe('smpte170m');
+  });
+  it('returns undefined for unspecified/unknown (2, 0, 13, 99)', () => {
+    for (const code of [2, 0, 13, 99]) expect(h273Primaries(code)).toBeUndefined();
+  });
+});
+
+describe('h273Transfer', () => {
+  it('maps the WebCodecs-representable code points', () => {
+    expect(h273Transfer(1)).toBe('bt709');
+    expect(h273Transfer(6)).toBe('smpte170m');
+    expect(h273Transfer(8)).toBe('linear');
+    expect(h273Transfer(13)).toBe('iec61966-2-1');
+    expect(h273Transfer(16)).toBe('pq');
+    expect(h273Transfer(18)).toBe('hlg');
+  });
+  it('maps 14/15 (BT.2020 10/12-bit) to bt709 — H.273 defines the identical transfer function', () => {
+    expect(h273Transfer(14)).toBe('bt709');
+    expect(h273Transfer(15)).toBe('bt709');
+  });
+  it('returns undefined for unspecified and for curves WebCodecs cannot name (2, 7=SMPTE-240M, 99)', () => {
+    for (const code of [2, 7, 99]) expect(h273Transfer(code)).toBeUndefined();
+  });
+});
+
+describe('h273Matrix', () => {
+  it('maps the WebCodecs-representable code points', () => {
+    expect(h273Matrix(0)).toBe('rgb');
+    expect(h273Matrix(1)).toBe('bt709');
+    expect(h273Matrix(5)).toBe('bt470bg');
+    expect(h273Matrix(6)).toBe('smpte170m');
+    expect(h273Matrix(9)).toBe('bt2020-ncl');
+  });
+  it('returns undefined for unspecified and for matrices WebCodecs cannot name (2, 7=SMPTE-240M, 10=bt2020-cl)', () => {
+    for (const code of [2, 7, 10, 99]) expect(h273Matrix(code)).toBeUndefined();
+  });
+});
+
+describe('videoColorSpaceFromColr', () => {
+  it('builds a full init from nclx with the range flag', () => {
+    expect(
+      videoColorSpaceFromColr({
+        colourType: 'nclx',
+        primaries: 1,
+        transfer: 1,
+        matrix: 1,
+        fullRange: true,
+      }),
+    ).toEqual({ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: true });
+  });
+  it('builds a partial init from a partially-specified nclc (unspecified fields omitted)', () => {
+    expect(
+      videoColorSpaceFromColr({ colourType: 'nclc', primaries: 2, transfer: 2, matrix: 1 }),
+    ).toEqual({ matrix: 'bt709' });
+  });
+  it('returns undefined when nothing maps (all unspecified) — no empty colorSpace object', () => {
+    expect(
+      videoColorSpaceFromColr({ colourType: 'nclc', primaries: 2, transfer: 2, matrix: 2 }),
+    ).toBeUndefined();
+  });
+});
+
+// ============ QuickTime PCM sample-entry fourccs → engine PCM tokens (QTFF sound descriptions) ====
+//
+// Oracle: the QTFF "Sound Sample Description" format table + CoreAudio format flags, cross-checked
+// against ffmpeg's codec_name for the same entries (pcm_s16le ↔ pcm-s16 etc., see the ffprobe-truth
+// golden). `littleEndian` is the `enda` atom value (undefined = absent ⇒ each format's default).
+
+describe('qtPcmCodec', () => {
+  it('maps the fixed-endianness 16-bit formats', () => {
+    expect(qtPcmCodec('sowt', 16, undefined)).toBe('pcm-s16');
+    expect(qtPcmCodec('twos', 16, undefined)).toBe('pcm-s16be');
+  });
+  it('maps the 8-bit formats where endianness is moot', () => {
+    expect(qtPcmCodec('raw ', 8, undefined)).toBe('pcm-u8');
+    expect(qtPcmCodec('twos', 8, undefined)).toBe('pcm-s8');
+  });
+  it('maps float/integer wide formats: big-endian default, enda=1 flips to little-endian', () => {
+    expect(qtPcmCodec('fl32', 32, undefined)).toBe('pcm-f32be');
+    expect(qtPcmCodec('fl32', 32, true)).toBe('pcm-f32');
+    expect(qtPcmCodec('fl64', 64, false)).toBe('pcm-f64be');
+    expect(qtPcmCodec('in24', 24, true)).toBe('pcm-s24');
+    expect(qtPcmCodec('in24', 24, undefined)).toBe('pcm-s24be');
+    expect(qtPcmCodec('in32', 32, true)).toBe('pcm-s32');
+  });
+  it('maps lpcm (v2) from constBitsPerChannel + formatSpecificFlags', () => {
+    // CoreAudio flags: 0x1 float, 0x2 big-endian, 0x4 signed integer, 0x8 packed.
+    expect(qtPcmCodec('lpcm', 16, undefined, 0xc)).toBe('pcm-s16'); // signed+packed, LE
+    expect(qtPcmCodec('lpcm', 16, undefined, 0xe)).toBe('pcm-s16be'); // + big-endian
+    expect(qtPcmCodec('lpcm', 32, undefined, 0x9)).toBe('pcm-f32'); // float+packed, LE
+    expect(qtPcmCodec('lpcm', 64, undefined, 0xb)).toBe('pcm-f64be'); // float+BE
+    expect(qtPcmCodec('lpcm', 8, undefined, 0xc)).toBe('pcm-s8');
+    expect(qtPcmCodec('lpcm', 8, undefined, 0x8)).toBe('pcm-u8'); // unsigned 8-bit
+    expect(qtPcmCodec('lpcm', 24, undefined, 0x6)).toBe('pcm-s24be');
+  });
+  it('returns undefined for non-PCM or unrepresentable combinations (honest fourcc fallback)', () => {
+    expect(qtPcmCodec('mp4a', 16, undefined)).toBeUndefined();
+    expect(qtPcmCodec('alaw', 8, undefined)).toBeUndefined();
+    expect(qtPcmCodec('sowt', 8, undefined)).toBeUndefined(); // sowt is 16-bit by definition
+    expect(qtPcmCodec('lpcm', 16, undefined, 0x8)).toBeUndefined(); // unsigned 16-bit: no token
+    expect(qtPcmCodec('lpcm', 20, undefined, 0xc)).toBeUndefined(); // 20-bit: no token
+    expect(qtPcmCodec('raw ', 16, undefined)).toBeUndefined(); // 16-bit unsigned: no token
   });
 });

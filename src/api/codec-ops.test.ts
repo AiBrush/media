@@ -489,8 +489,15 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
             expect(annexBStart).toBe(true);
           }
           if (track.stream.codec === 'aac') {
-            expect(track.units[0]?.data[0]).toBe(0xff);
-            expect((track.units[0]?.data[1] ?? 0) & 0xf0).toBe(0xf0);
+            // The muxed TS carries ADTS-framed AAC, but ts-parse de-frames each PES to a bare raw
+            // access unit (ADR-184) — so assert the framing at the stream layer and rawness at the AU.
+            const streamHasAdts = out.some(
+              (b, k) => b === 0xff && k + 1 < out.length && ((out[k + 1] ?? 0) & 0xf6) === 0xf0,
+            );
+            expect(streamHasAdts).toBe(true);
+            const au = track.units[0]?.data ?? new Uint8Array();
+            expect(au.byteLength).toBeGreaterThan(0);
+            expect(au[0] === 0xff && ((au[1] ?? 0) & 0xf0) === 0xf0).toBe(false);
           }
         }
       }

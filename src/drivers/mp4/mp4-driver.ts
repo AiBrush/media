@@ -27,6 +27,7 @@ import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
+import { fragmentSamplesToDemuxSamples, parseFragmentSamples } from './fragment-samples.ts';
 import {
   type FragmentInitTrackInput,
   buildMediaSegment,
@@ -801,10 +802,35 @@ function planSampleReadWindows<T extends SampleRange>(
 }
 
 /** Turn a parsed movie + its bytes into mux-ready tracks (lossless stream-copy), for `remux`. */
+/**
+ * For a fragmented movie, recover each track's native-tick {@link SampleData} list from the
+ * `moof`/`traf`/`trun` runs (ADR-186) so every stream-copy/mux/remux path sees real samples instead of an
+ * empty `moov` table. Returns `undefined` for a progressive movie (the common path drives
+ * `buildSampleData` directly). Samples whose bytes escape the file (a truncated final fragment) are dropped
+ * so downstream sample reads never fault.
+ */
+async function buildFragmentSampleDataMap(
+  movie: Movie,
+  ra: RandomAccess,
+): Promise<Map<number, SampleData[]> | undefined> {
+  if (!movieIsFragmented(movie)) return undefined;
+  const file = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+  const out = new Map<number, SampleData[]>();
+  for (const [trackId, data] of parseFragmentSamples(file)) {
+    out.set(
+      trackId,
+      data.filter((s) => s.offset >= 0 && s.offset + s.size <= file.byteLength),
+    );
+  }
+  return out;
+}
+
 export async function muxTracksFromMovie(ra: RandomAccess, movie: Movie): Promise<MuxTrackInput[]> {
+  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
   const out: MuxTrackInput[] = [];
   for (const track of movie.tracks) {
-    out.push({ ...muxTrackMeta(track), samples: await readSamples(ra, buildSampleData(track)) });
+    const data = fragmentSamples?.get(track.id) ?? buildSampleData(track);
+    out.push({ ...muxTrackMeta(track), samples: await readSamples(ra, data) });
   }
   return out;
 }
@@ -1476,6 +1502,7 @@ function packetStream(
   ra: RandomAccess,
   track: ParsedTrack,
   signal: AbortSignal | undefined,
+  precomputedSamples?: readonly Sample[],
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
@@ -1485,7 +1512,9 @@ function packetStream(
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
-  const samples = buildSamples(track);
+  // Fragmented tracks carry no `moov` sample table; the demuxer pre-builds their samples from the
+  // `moof`/`traf`/`trun` runs (fragment-samples.ts) and passes them here.
+  const samples = precomputedSamples ?? buildSamples(track);
   validateSampleRanges(samples, ra.size);
   const windows = planSampleReadWindows(samples);
   const windowByOrdinal = new Array<SampleReadWindow<Sample> | undefined>(samples.length);
@@ -1548,6 +1577,43 @@ function packetStream(
     },
   });
   /* v8 ignore stop */
+}
+
+/** True when the movie is fragmented: at least one track has an empty `moov` sample table. */
+function movieIsFragmented(movie: Movie): boolean {
+  return movie.tracks.some(
+    (t) => t.samples.sampleSizes.length === 0 && (t.fragmentSampleCount ?? 0) > 0,
+  );
+}
+
+/**
+ * For a fragmented movie, read the file once and pre-build every track's demux sample list from the
+ * `moof`/`traf`/`trun` runs (fragment-samples.ts), mapped to the WebCodecs microsecond seam. Returns
+ * `undefined` for a progressive movie (its `moov` sample tables drive `packetStream` directly), so the
+ * common path pays nothing. Samples whose bytes escape the file are dropped inside the mapper.
+ */
+async function buildFragmentSampleMap(
+  movie: Movie,
+  ra: RandomAccess,
+): Promise<Map<number, Sample[]> | undefined> {
+  if (!movieIsFragmented(movie)) return undefined;
+  const file = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+  const byTrack = parseFragmentSamples(file);
+  const out = new Map<number, Sample[]>();
+  for (const track of movie.tracks) {
+    const data = byTrack.get(track.id);
+    if (data === undefined || data.length === 0) continue;
+    out.set(
+      track.id,
+      fragmentSamplesToDemuxSamples(
+        data,
+        track.timescale,
+        track.edit?.mediaTimeTicks ?? 0,
+        file.byteLength,
+      ),
+    );
+  }
+  return out;
 }
 
 function matches(q: ContainerQuery): boolean {
@@ -1864,9 +1930,14 @@ interface InterleavedProgressivePlan {
   readonly samples: readonly InterleavedPayloadSample[];
 }
 
-function lazyProgressiveTracksFromMovie(ra: RandomAccess, movie: Movie): LazyProgressiveTrack[] {
+function lazyProgressiveTracksFromMovie(
+  ra: RandomAccess,
+  movie: Movie,
+  fragmentSamples?: Map<number, SampleData[]>,
+): LazyProgressiveTrack[] {
   const tracks = movie.tracks.map((track): LazyProgressiveTrack => {
-    const samples = buildSampleData(track);
+    // Fragmented tracks carry no `moov` sample table; use the recovered `moof` samples (ADR-186).
+    const samples = fragmentSamples?.get(track.id) ?? buildSampleData(track);
     validateSampleRanges(samples, ra.size);
     return {
       metadata: {
@@ -2285,7 +2356,8 @@ async function* progressiveSourceSegments(
   movie: Movie,
   o: StreamCopyOptions | undefined,
 ): AsyncGenerator<Uint8Array, void, undefined> {
-  const tracks = lazyProgressiveTracksFromMovie(ra, movie);
+  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
+  const tracks = lazyProgressiveTracksFromMovie(ra, movie, fragmentSamples);
   const interleaved = sourceOrderInterleavedPlan(tracks);
   if (interleaved !== undefined) {
     yield* progressiveSegmentsFromTracks(ra, interleaved.tracks, o, interleaved.samples);
@@ -2372,7 +2444,12 @@ async function materializeProgressiveSourceBytes(
   movie: Movie,
   o: StreamCopyOptions | undefined,
 ): Promise<Uint8Array> {
-  return materializeProgressiveTracksBytes(ra, lazyProgressiveTracksFromMovie(ra, movie), o);
+  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
+  return materializeProgressiveTracksBytes(
+    ra,
+    lazyProgressiveTracksFromMovie(ra, movie, fragmentSamples),
+    o,
+  );
 }
 
 async function materializeTrimmedProgressiveSourceBytes(
@@ -2629,6 +2706,10 @@ export const Mp4Driver: ContainerDriver = {
     const byId = new Map(movie.tracks.map((t) => [t.id, t]));
     const signal = o?.signal;
     const supportsPacketTable = hasCompleteSampleTables(movie);
+    // Fragmented/CMAF inputs carry no `moov` sample table — the timeline lives in `moof`/`traf`/`trun`.
+    // Recover each track's flat sample list once so `packets()` streams real samples (without it the
+    // demuxer emits nothing and decode/convert produce empty output). Progressive files skip this.
+    const fragmentSamples = await buildFragmentSampleMap(movie, ra);
     return {
       tracks: movie.tracks.map(toTrackInfo),
       ...(supportsPacketTable
@@ -2640,7 +2721,7 @@ export const Mp4Driver: ContainerDriver = {
       packets(trackId: number): ReadableStream<Packet> {
         const track = byId.get(trackId);
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
-        return packetStream(ra, track, signal);
+        return packetStream(ra, track, signal, fragmentSamples?.get(trackId));
       },
       close: () => Promise.resolve(),
     };
@@ -2711,9 +2792,20 @@ export const Mp4Driver: ContainerDriver = {
       );
     }
     const movie = await readMovie(ra);
+    const cenc = await loadCencModule();
+    // Fragmented/CMAF protected files carry sample-encryption metadata in `moof`/`traf`, not the (empty)
+    // `moov` sample tables — the per-track flat path below cannot see it and would reject the file with
+    // "no decryptable samples". Route those through the whole-file CENC engine (ADR-182), which parses the
+    // fragments directly and decrypts every scheme/layout in place. Flat `moov`-protected files keep the
+    // proven per-track path (no behaviour change for the cells it already passes).
+    if (
+      movie.tracks.some((t) => t.encryption !== undefined && t.samples.sampleSizes.length === 0)
+    ) {
+      const fileBytes = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+      return oneShot(await cenc.decryptCencFile(fileBytes, { scheme: o.scheme, keys: o.keys }));
+    }
     const sourceSize = ra.size;
     const tracks = await muxTracksFromMovie(ra, movie); // clear-structured (mp4a), ciphertext samples
-    const cenc = await loadCencModule();
     const out: MuxTrackInput[] = [];
     for (const [i, parsed] of movie.tracks.entries()) {
       const track = tracks[i];

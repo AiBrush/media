@@ -14,11 +14,15 @@
  *   bun run bench-sources
  */
 
+import { readFileSync, readdirSync } from 'node:fs';
+import { resolveHlsSource } from '../src/drivers/hls/hls-source.ts';
 import { cacheSource } from '../src/sources/cache.ts';
 import { type Source, fromBytes } from '../src/sources/source.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const FILES = ['h264.mp4', 'bear-1280x720.mp4', 'movie_5.mp4'];
+/** Baked AES-128 HLS variants (RFC 8216 shapes) benched for playlist-resolve + decrypt + stitch cost. */
+const HLS_VARIANTS = ['implicit-seq47', 'seq-2pow32', 'byterange', 'audio-adts'];
 const WARMUP = 3;
 const ITERS = 11;
 
@@ -112,6 +116,44 @@ function mibPerSec(bytes: number, ms: number): number {
   return bytes / (1024 * 1024) / (ms / 1000);
 }
 
+/**
+ * Playlist-resolve + AES-128-decrypt + stitch throughput on the baked RFC 8216 corpus. Each iteration
+ * re-parses the `.m3u8`, re-fetches every segment/key from an in-memory map (so the number is the
+ * parse + WebCrypto-decrypt + concat cost, not disk I/O), and drains the stitched cleartext. Reports the
+ * median of N runs and the decrypted MiB/s per variant shape (implicit / past-2^32-sequence IV,
+ * byte-range, packed-audio) — a fresh, multi-sample bench that fails loud if a variant stops resolving.
+ */
+async function benchHls(): Promise<void> {
+  const root = `${ROOT}fixtures/media-derived/hls-aes128/`;
+  console.info(
+    `\nHLS resolve+decrypt throughput (median of ${ITERS} runs; in-memory fetch, baked AES-128 corpus):\n`,
+  );
+  for (const id of HLS_VARIANTS) {
+    const dir = `${root}${id}/`;
+    const files = new Map<string, Uint8Array>();
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isFile())
+        files.set(entry.name, new Uint8Array(readFileSync(`${dir}${entry.name}`)));
+    }
+    const playlistBytes = files.get('media.m3u8');
+    if (playlistBytes === undefined) throw new Error(`bench HLS: ${id}/media.m3u8 is missing`);
+    const playlistText = new TextDecoder().decode(playlistBytes);
+    const baseUrl = `file://${dir}media.m3u8`;
+    const fetchResource = (uri: string): Promise<Uint8Array> => {
+      const bytes = files.get(uri.split('/').pop() ?? uri);
+      if (bytes === undefined) throw new Error(`bench HLS fetch miss: ${uri}`);
+      return Promise.resolve(bytes);
+    };
+    const { ms, bytes } = await timeMedian(async () =>
+      drain((await resolveHlsSource(playlistText, { baseUrl, fetchResource })).stream()),
+    );
+    console.info(
+      `  ${id.padEnd(15)} ${(bytes / 1024).toFixed(0).padStart(5)} KiB decrypted` +
+        ` · ${ms.toFixed(3).padStart(8)} ms · ${mibPerSec(bytes, ms).toFixed(0).padStart(5)} MiB/s`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   console.info(
     `Source read throughput (median of ${ITERS} runs; in-memory range server, real files):\n`,
@@ -151,6 +193,7 @@ async function main(): Promise<void> {
         ` → ${(rangeUrl.ms / Math.max(rangeCached.ms, 1e-6)).toFixed(1)}× faster`,
     );
   }
+  await benchHls();
   console.info(`\n(checksum ${sink})`);
 }
 

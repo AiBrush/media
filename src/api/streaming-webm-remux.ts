@@ -11,7 +11,7 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { WebmStreamingMuxer } from '../drivers/webm/ebml-write.ts';
 import type { Source } from '../sources/source.ts';
-import { selectTrackInfos } from './codec-routing.ts';
+import { selectTrackInfos } from './track-select.ts';
 import type { RemuxOptions } from './types.ts';
 
 const PACKET_INFO_REMUX_WINDOW_BYTES = 8 * 1024 * 1024;
