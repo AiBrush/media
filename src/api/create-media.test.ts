@@ -625,6 +625,64 @@ describe('createMedia', () => {
     expect(calls).toEqual([[0, 4 * 1024]]);
   });
 
+  it('probe never reuses a URL prefix across distinct source snapshots with the same href', async () => {
+    const original = new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]);
+    const mutated = new Uint8Array(original.byteLength);
+    const calls = { original: 0, mutated: 0 };
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp3',
+        durationSec: 1,
+        config: { codec: 'mp3', sampleRate: 44100, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'snapshot-safe-mp3',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp3'],
+      supports: (q) => q.mime === 'audio/mpeg',
+      probe: async (src) => {
+        const head = await src.range?.(0, original.byteLength);
+        if (head?.[0] !== 0xff) throw new InputError('unsupported-input', 'mutated header');
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('snapshot-safety probe must not demux');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source = (bytes: Uint8Array, kind: keyof typeof calls): Source => ({
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/mpeg',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'https://example.test/mutable.mp3',
+      range: (start, end) => {
+        calls[kind]++;
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('snapshot-safety probe must not stream');
+      },
+    });
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+
+    await expect(media.probe(source(original, 'original'))).resolves.toBeDefined();
+    await expect(media.probe(source(mutated, 'mutated'))).rejects.toMatchObject({
+      code: 'unsupported-input',
+      message: 'mutated header',
+    });
+    expect(calls).toEqual({ original: 1, mutated: 1 });
+  });
+
   it('probeContainer routes by known container token without sniffing source bytes', async () => {
     const calls = { range: 0, stream: 0 };
     const tracks: TrackInfo[] = [

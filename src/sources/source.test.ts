@@ -167,6 +167,14 @@ describe('fromURL', () => {
     const src = fromURL(DATA_URL, { mime: 'video/mp4' });
     expect(src.mimeHint).toBe('video/mp4');
   });
+
+  it('retains a query/hash-free URL filename for extension routing', () => {
+    expect(fromURL('https://cdn.test/live/index.m3u8?token=abc#variant').filename).toBe(
+      'index.m3u8',
+    );
+    expect(fromURL('relative/clip.mp4?download=1').filename).toBe('clip.mp4');
+    expect(fromURL(DATA_URL).filename).toBeUndefined();
+  });
 });
 
 describe('fromElement', () => {

@@ -336,6 +336,23 @@ describe('OggDriver — demux seam + muxer', () => {
     ]);
   });
 
+  it('reads an unknown-size stream to EOS before reporting its terminal granule duration', async () => {
+    const head = new Uint8Array(page({ bos: true, data: opusId(2) }));
+    const tail = new Uint8Array(page({ granule: 480_312, data: [0] }));
+    const source: ByteSource = {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(head);
+            controller.enqueue(tail);
+            controller.close();
+          },
+        }),
+    };
+    const tracks = await OggDriver.probe?.(source);
+    expect(tracks?.[0]?.durationSec).toBeCloseTo(10.0065, 6);
+  });
+
   it('probes a small known-size source with one bounded range read', async () => {
     const headPage = new Uint8Array(page({ bos: true, data: opusId(2) }));
     const tailPage = new Uint8Array(page({ granule: 48000, data: [0] }));

@@ -214,7 +214,7 @@ export class MediaEngineImpl implements MediaEngine {
    */
   readonly #poolCache: OffloadPoolCache = {};
   readonly #sourcePrefixHandoff = new Map<string, SourcePrefixHandoff>();
-  readonly #repeatedProbePrefixCache = new Map<string, SourcePrefixHandoff>();
+  readonly #repeatedProbePrefixCache = new WeakMap<Source, SourcePrefixHandoff>();
 
   constructor(opts: CreateMediaOptions = {}) {
     this.#opts = opts;
@@ -281,17 +281,17 @@ export class MediaEngineImpl implements MediaEngine {
 
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const repeated = cacheProbeRanges(
-        normalizeInput(input),
-        this.#repeatedProbePrefixCache,
-        'reuse',
-        {
-          maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
-          ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
-        },
-      );
-      const cached = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
-      const src = await this.#resolveHlsInput(input, cached, signal);
+      // Resolve an HLS `.m3u8` to its (decrypted, concatenated) media source BEFORE the probe-prefix cache
+      // wrappers — exactly as demux/decode do (they pass a fresh `normalizeInput(input)` to the resolver).
+      // Wrapping first put the eager range-cache in front of an *unresolved* manifest, so the HLS content
+      // sniff saw cached/segment bytes, declined to resolve, and probe then mis-read the raw encrypted TS
+      // segment as "not an MPEG-TS stream". For non-HLS inputs the resolver is a cheap no-op (same source).
+      const resolved = await this.#resolveHlsInput(input, normalizeInput(input), signal);
+      const repeated = cacheRepeatedProbeRanges(resolved, this.#repeatedProbePrefixCache, {
+        maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
+        ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
+      });
+      const src = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
       const imageInfo = await this.#probeImageInfo(src, signal);
       if (imageInfo !== undefined) return imageInfo;
       const container = await this.#routeContainer(src, 'demux');
@@ -314,7 +314,11 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions = {},
   ): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
-      const src = cacheProbeRanges(normalizeInput(input), this.#repeatedProbePrefixCache, 'reuse', {
+      // Resolve an HLS `.m3u8` to its decrypted media source first (as `demux`/`probe` do) — a container-
+      // targeted probe of an HLS manifest (e.g. an AES-128 `mpeg-ts` playlist) must sniff the resolved TS,
+      // not the raw encrypted segment (which reads as "not an MPEG-TS stream"). No-op for non-HLS inputs.
+      const resolved = await this.#resolveHlsInput(input, normalizeInput(input), signal);
+      const src = cacheRepeatedProbeRanges(resolved, this.#repeatedProbePrefixCache, {
         maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
         ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
       });
@@ -1653,7 +1657,15 @@ export class MediaEngineImpl implements MediaEngine {
           );
           openStreams.push(filtered);
           tasks.push(
-            this.#encodeVideoStream(filtered, opts.video || {}, videoTrack, muxer, signal, o),
+            this.#encodeVideoStream(
+              filtered,
+              opts.video || {},
+              videoTrack,
+              muxer,
+              signal,
+              o,
+              opts.fragmented === true,
+            ),
           );
           /* v8 ignore stop */
         }
@@ -1855,11 +1867,13 @@ export class MediaEngineImpl implements MediaEngine {
     muxer: Muxer,
     signal: AbortSignal,
     o: CallOptions,
+    fragmented = false,
   ): Promise<void> {
     const {
       buildVideoEncoderConfig,
       drainEncoderToMuxer,
       encodeVideoFramesWithAlpha,
+      periodicVideoKeyFrameInterval,
       videoTrackInfoFromDecoderConfig,
     } = await loadCodecPipeline();
     const config = buildVideoEncoderConfig(
@@ -1876,6 +1890,7 @@ export class MediaEngineImpl implements MediaEngine {
     const encoderConfig: VideoEncoderConfig =
       target.alpha === 'keep' ? { ...config, alpha: 'discard' } : config;
     const codec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
+    const keyFrameInterval = periodicVideoKeyFrameInterval(target.fps, fragmented);
     // The encoder publishes its VideoDecoderConfig (codec box) out-of-band via onDecoderConfig; the muxer
     // needs it before addTrack, so we capture it and build the TrackInfo lazily on the first chunk. Past
     // here is the live WebCodecs path — unreachable in Node (the route above throws first), browser-validated.
@@ -1887,16 +1902,12 @@ export class MediaEngineImpl implements MediaEngine {
         decoderConfig = c;
       },
       ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-      ...(target.fps !== undefined
-        ? { keyFrameInterval: Math.max(1, Math.round(target.fps * 2)) }
-        : {}),
+      ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
     };
     const alphaStage: VideoEncoderStageOptions = {
       ...this.#stageOptions(signal, o),
       ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-      ...(target.fps !== undefined
-        ? { keyFrameInterval: Math.max(1, Math.round(target.fps * 2)) }
-        : {}),
+      ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
     };
     const encodeInput = bitDepthPlan.requiresPixelPath
       ? frames.pipeThrough(
@@ -2517,14 +2528,14 @@ async function startAtSeekKeyframePackets(
 function cacheProbeRanges(
   src: Source,
   handoff?: Map<string, SourcePrefixHandoff>,
-  mode: 'local' | 'store' | 'consume' | 'reuse' = 'local',
+  mode: 'local' | 'store' | 'consume' = 'local',
   options: { readonly maxBytes?: number; readonly ttlMs?: number } = {},
 ): Source {
   const range = src.range;
   if (range === undefined) return src;
   const cacheKey = src[SOURCE_CACHE_KEY];
   let cached =
-    (mode === 'consume' || mode === 'reuse') && cacheKey !== undefined && handoff !== undefined
+    mode === 'consume' && cacheKey !== undefined && handoff !== undefined
       ? handoff.get(cacheKey)?.bytes
       : undefined;
   if (mode === 'consume' && cacheKey !== undefined) {
@@ -2548,13 +2559,50 @@ function cacheProbeRanges(
         (cached === undefined || bytes.byteLength > cached.byteLength)
       ) {
         cached = bytes;
-        if (
-          (mode === 'store' || mode === 'reuse') &&
-          cacheKey !== undefined &&
-          handoff !== undefined
-        ) {
+        if (mode === 'store' && cacheKey !== undefined && handoff !== undefined) {
           storeSourcePrefixHandoff(handoff, cacheKey, bytes, options.ttlMs);
         }
+      }
+      return bytes;
+    },
+  };
+}
+
+/**
+ * Reuse a bounded probe prefix only for repeated calls on the exact same normalized Source snapshot.
+ * An href alone is not byte identity: a server, service worker, or test can legitimately serve different
+ * bytes for the same URL, so cross-Source reuse can turn malformed input into a false successful probe.
+ */
+function cacheRepeatedProbeRanges(
+  src: Source,
+  handoff: WeakMap<Source, SourcePrefixHandoff>,
+  options: { readonly maxBytes: number; readonly ttlMs: number },
+): Source {
+  const range = src.range;
+  if (range === undefined) return src;
+  let cached = handoff.get(src)?.bytes;
+  return {
+    ...src,
+    range: async (start, end) => {
+      const cachedCoversEnd =
+        cached !== undefined &&
+        (end <= cached.byteLength ||
+          (src.size !== undefined && cached.byteLength >= src.size && end >= src.size));
+      if (cached !== undefined && start >= 0 && cachedCoversEnd) {
+        return cached.subarray(start, end);
+      }
+      const bytes = await range.call(src, start, end);
+      if (
+        start === 0 &&
+        bytes.byteLength <= options.maxBytes &&
+        (cached === undefined || bytes.byteLength > cached.byteLength)
+      ) {
+        cached = bytes;
+        const token = {};
+        handoff.set(src, { bytes, token });
+        setTimeout(() => {
+          if (handoff.get(src)?.token === token) handoff.delete(src);
+        }, options.ttlMs);
       }
       return bytes;
     },
@@ -2764,12 +2812,21 @@ function sourceMayBeHlsManifest(src: Source): boolean {
   const ext = extensionOf(src.filename);
   if (ext === 'm3u8' || ext === 'm3u') return true;
   const mime = src.mimeHint?.toLowerCase();
-  if (mime === undefined) return false;
+  if (
+    mime !== undefined &&
+    (mime.includes('mpegurl') ||
+      mime.includes('m3u8') ||
+      mime === 'video/mp2t' ||
+      mime === 'audio/mp2t')
+  ) {
+    return true;
+  }
+  // A caller may have fetched the manifest and passed only its bytes. Sniffing a seekable in-memory
+  // source is a bounded subarray/Blob slice, not a network request. A single-use stream is also eligible:
+  // the HLS resolver retains its peeked chunks and returns a byte-exact one-shot replay on a non-match.
   return (
-    mime.includes('mpegurl') ||
-    mime.includes('m3u8') ||
-    mime === 'video/mp2t' ||
-    mime === 'audio/mp2t'
+    ((src.kind === 'bytes' || src.kind === 'blob') && src.range !== undefined) ||
+    src.kind === 'stream'
   );
 }
 
@@ -2827,7 +2884,11 @@ function imageFrameRate(info: ImageInfo, durationSec: number): number {
 }
 
 function toInfoTrack(t: TrackInfo): MediaInfoTrack {
-  const base: MediaInfoTrack = { id: t.id, type: t.mediaType, codec: t.codec };
+  const base: MediaInfoTrack = {
+    id: t.id,
+    type: t.nonMedia ? 'other' : t.mediaType,
+    codec: t.codec,
+  };
   if (t.durationSec !== undefined) base.durationSec = t.durationSec;
   if (t.fps !== undefined) base.fps = t.fps;
   if (t.rotation !== undefined) base.rotation = t.rotation;

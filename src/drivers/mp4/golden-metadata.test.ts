@@ -1,7 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { MediaInfo } from '../../api/types.ts';
+import type { Source } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { Mp4Module } from './mp4-driver.ts';
 import { type Movie, type ParsedTrack, parseMovieMetadata } from './parse.ts';
@@ -19,6 +20,36 @@ const MP4S = [
   'bear-4k-hevc.mp4',
 ];
 
+const HARNESS_MEDIA = new URL(
+  '../../../../media-test/media-browser-test/fixtures/media/scenarios/performance/',
+  import.meta.url,
+).pathname;
+
+async function probeFilePath(path: string): Promise<MediaInfo> {
+  const file = await open(path, 'r');
+  try {
+    const stat = await file.stat();
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      filename: path.slice(path.lastIndexOf('/') + 1),
+      size: stat.size,
+      range: async (start, end) => {
+        const bytes = new Uint8Array(Math.max(0, end - start));
+        const { bytesRead } = await file.read(bytes, 0, bytes.byteLength, start);
+        return bytesRead === bytes.byteLength ? bytes : bytes.subarray(0, bytesRead);
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('rotated metadata probe must stay range-backed');
+      },
+    };
+    return await createMedia().use(Mp4Module).probe(source);
+  } finally {
+    await file.close();
+  }
+}
+
 const HEVC_MP4S = [
   { id: 'h265.mp4', codec: 'hvc1.1.6.L60.90', width: 320, height: 240, bitDepth: 8 },
   { id: 'bear-4k-hevc.mp4', codec: 'hev1.1.6.L150.90', width: 3840, height: 2160, bitDepth: 8 },
@@ -32,6 +63,27 @@ const HEVC_MP4S = [
 ] as const;
 
 describe('golden-metadata oracle (probe, mp4)', () => {
+  it.each([
+    ['size-ladder-extract-metadata-massive/massive_h264_1080p_2h.mp4', 48_000, 1],
+    ['size-ladder-extract-metadata-massive/01.mp4', 44_100, 2],
+    ['size-ladder-extract-metadata-massive/02.mp4', 44_100, 2],
+    ['size-ladder-extract-metadata-massive/03.mp4', 48_000, 1],
+    ['size-ladder-extract-metadata-tiny/tiny_h264_360p_2s.mp4', 48_000, 2],
+    ['size-ladder-extract-metadata-tiny/01.mp4', 48_000, 2],
+    ['size-ladder-extract-metadata-tiny/02.mp4', 48_000, 2],
+    ['size-ladder-extract-metadata-tiny/03.mp4', 48_000, 2],
+  ] as const)(
+    '%s AAC ASC geometry matches ffprobe across every rotated file',
+    async (path, sampleRate, channels) => {
+      const info = await probeFilePath(`${HARNESS_MEDIA}${path}`);
+      expect(info.tracks.find((track) => track.type === 'audio')).toMatchObject({
+        codec: 'mp4a.40.2',
+        sampleRate,
+        channels,
+      });
+    },
+  );
+
   it.each(MP4S)('%s probe matches the committed golden exactly', async (id) => {
     const info = await createMedia()
       .use(Mp4Module)

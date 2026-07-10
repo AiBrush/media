@@ -23,10 +23,11 @@ import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
  * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → rotate →
  * flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
  * selects a source sub-rect first, then resize scales it to the requested output, then orientation, then
- * full-frame colour conversion. A `resize` is emitted when width/height are given (or implied by a
- * non-identity `fit` against known source dims); `rotate`/`flip` pass straight through. Pure: every spec
- * is a plain object, so the whole chain is Node-validated; the GPU substrate that runs it is
- * browser-only. Empty array ⇒ no filters (the decode→encode is direct).
+ * full-frame colour conversion. A `resize` is emitted when width/height are given and differ from the
+ * post-crop geometry; a geometry-identical resize is omitted so a no-op request does not introduce an
+ * avoidable YUV→RGB→YUV canvas round trip. `rotate`/`flip` pass straight through. Pure: every spec is a
+ * plain object, so the whole chain is Node-validated; the GPU substrate that runs it is browser-only.
+ * Empty array ⇒ no filters (the decode→encode is direct).
  */
 export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): FilterSpec[] {
   const specs: FilterSpec[] = [];
@@ -49,13 +50,17 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     if (width <= 0 || height <= 0) {
       throw new InputError('unsupported-input', `resize ${width}x${height} must be positive`);
     }
-    specs.push({
-      mediaType: 'video',
-      type: 'resize',
-      width,
-      height,
-      ...(target.fit !== undefined ? { fit: target.fit } : {}),
-    });
+    const inputWidth = target.crop?.width ?? src.width;
+    const inputHeight = target.crop?.height ?? src.height;
+    if (width !== inputWidth || height !== inputHeight) {
+      specs.push({
+        mediaType: 'video',
+        type: 'resize',
+        width,
+        height,
+        ...(target.fit !== undefined ? { fit: target.fit } : {}),
+      });
+    }
   }
   if (target.rotate !== undefined && target.rotate !== 0) {
     specs.push({ mediaType: 'video', type: 'rotate', degrees: target.rotate });
@@ -225,7 +230,9 @@ function buildRetimingIntervals(
 /**
  * Plan decoded-frame retiming onto a constant-frame-rate output grid. The planner uses source
  * presentation timestamp intervals, not source-index ratios, so VFR→CFR holds each frame for its true
- * displayed duration. Upsampling duplicates source indexes; downsampling drops source indexes.
+ * displayed duration. Upsampling duplicates source indexes; downsampling drops source indexes. The final
+ * output frame is clamped to the source end so Σ(durations) equals the source duration exactly — a
+ * non-integer-second source at low fps (22.507 s at 1 fps) keeps a short tail rather than over-running.
  */
 export function planCfrFrameRetiming(
   frames: readonly FrameTiming[],
@@ -265,11 +272,17 @@ export function planCfrFrameRetiming(
       throw new InputError('unsupported-input', 'retiming source interval was not found');
     }
     const previous = outputs[outputs.length - 1];
+    // Interior frames hold a uniform 1/fps; the final grid frame is clamped to the source end so
+    // Σ(durations) == the source duration exactly. A non-integer-second source at low fps (a 22.507 s input
+    // at 1 fps) must not pad its tail to a full period, which would over-run the true length (23 s). The
+    // remainder telescopes onto the last frame (`last.end − its timestamp`), so the sum is exact regardless
+    // of rounding; sources whose end lands on the grid are unchanged (the remainder is exactly one period).
+    const isLastOutput = outputIndex === outputCount - 1;
     outputs.push({
       outputIndex,
       sourceIndex: interval.index,
       timestamp,
-      duration: cfrDurationAt(options.fps, outputIndex),
+      duration: isLastOutput ? last.end - timestamp : cfrDurationAt(options.fps, outputIndex),
       duplicate: previous?.sourceIndex === interval.index,
     });
   }
@@ -287,7 +300,10 @@ export function planCfrFrameRetiming(
 /**
  * Streaming CFR retimer with one-frame lookahead and close-once ownership. Each consumed source frame is
  * closed exactly once after all output duplicates for its presentation interval have been restamped and
- * enqueued. Emitted frames are fresh objects owned by the downstream consumer.
+ * enqueued. Emitted frames are fresh objects owned by the downstream consumer. When the caller declares the
+ * source duration (`durationUs`), the last emitted frame is clamped to the source end so the materialized
+ * duration matches the input regardless of how fine-grained the source frames are (a 30 fps → 1 fps
+ * downsample lands its last grid point mid-stream, not on the tiny final source frame).
  */
 export function retimeTimedFrameStream<F extends TimedClosableFrame>(
   frames: ReadableStream<F>,
@@ -320,20 +336,28 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
     }
     const start = startUs ?? frame.timestamp;
     startUs = start;
+    // Authoritative end of the materialized output, which bounds EVERY grid frame — not just those sampled
+    // from the final source frame. A declared source duration is known up front (`start + durationUs`), so
+    // a fine-grained downsample clamps correctly even when its last grid point lands mid-stream: at 30 fps →
+    // 1 fps the true final source frame spans ~1/30 s (far below the 1 s CFR period), so the last grid point
+    // (t = 22 s for a 22.5 s source) is emitted inside an *interior* source interval, never the tiny final
+    // one — a clamp tied only to the final source frame misses it and the output over-runs by ~a full
+    // period (23 s). Absent a declared duration the source end is known only at the final interval (best
+    // effort: the trailing frame still can't over-run its own interval).
+    const hardEndUs =
+      options.durationUs !== undefined ? start + options.durationUs : isFinal ? endUs : undefined;
     try {
       for (;;) {
         const timestamp = cfrTimestampAt(start, options.fps, outputIndex);
         if (timestamp >= endUs) break;
-        // Uniform CFR cadence, except the stream's very last frame is clamped to the source end so the
+        if (hardEndUs !== undefined && timestamp >= hardEndUs) break;
+        // Interior frames hold a uniform 1/fps; the last emitted frame is clamped to the source end so the
         // materialized duration matches the input (a 22.5 s source at 1 fps ⇒ a 0.5 s tail frame, not a
-        // full 1 s that would over-run by half a second). Only the final interval's final grid point is
-        // clamped, so steady-state cadence — and high-fps cases where the remainder is negligible — are
-        // unchanged.
-        const isLastOfStream =
-          isFinal && cfrTimestampAt(start, options.fps, outputIndex + 1) >= endUs;
-        const duration = isLastOfStream
-          ? endUs - timestamp
-          : cfrDurationAt(options.fps, outputIndex);
+        // full 1 s that would over-run). Only the final grid point sees a remainder shorter than one period,
+        // so steady-state cadence — and high-fps cases where the remainder is negligible — are unchanged.
+        const uniform = cfrDurationAt(options.fps, outputIndex);
+        const duration =
+          hardEndUs !== undefined ? Math.min(uniform, hardEndUs - timestamp) : uniform;
         const out = options.restamp(frame, { timestamp, duration });
         if (Object.is(frame, out)) {
           throw new InputError(

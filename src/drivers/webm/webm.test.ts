@@ -112,7 +112,13 @@ const el = (id: number[], data: number[]): number[] => [...id, ...sizeVint(data.
 
 const E = {
   EBML: [0x1a, 0x45, 0xdf, 0xa3],
+  EBMLVersion: [0x42, 0x86],
+  EBMLReadVersion: [0x42, 0xf7],
+  EBMLMaxIDLength: [0x42, 0xf2],
+  EBMLMaxSizeLength: [0x42, 0xf3],
   DocType: [0x42, 0x82],
+  DocTypeVersion: [0x42, 0x87],
+  DocTypeReadVersion: [0x42, 0x85],
   Segment: [0x18, 0x53, 0x80, 0x67],
   Info: [0x15, 0x49, 0xa9, 0x66],
   TimecodeScale: [0x2a, 0xd7, 0xb1],
@@ -219,6 +225,15 @@ describe('probe WebM across the real corpus', () => {
     }
   });
 
+  it('range-probes every TrackEntry when the first bounded prefix truncates Tracks', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/demux/realworld_mdn_flower_webm/02.webm');
+    const tracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+    expect(tracks.map((track) => [track.mediaType, track.codec])).toEqual([
+      ['audio', 'vorbis'],
+      ['video', 'vp8'],
+    ]);
+  });
+
   it('WebmDriver.probe rejects a pre-aborted signal with the typed abort error', async () => {
     await expect(
       probeWithWebmDriver(await fixtureSource('movie_5.webm'), AbortSignal.abort()),
@@ -276,6 +291,31 @@ describe('probe WebM across the real corpus', () => {
           value.chunk.copyTo(copied);
           expect(value.data).toEqual(copied);
         } finally {
+          reader.releaseLock();
+        }
+      } finally {
+        await demuxed.close();
+      }
+    });
+  });
+
+  it('H.264 Matroska packet streams expose SPS-derived DTS without changing chunk PTS', async () => {
+    await withEncodedChunkConstructors(async () => {
+      const bytes = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/01.mkv');
+      const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/x-matroska' }));
+      try {
+        const video = demuxed.tracks.find((track) => track.mediaType === 'video');
+        if (video === undefined) throw new Error('expected H.264 video track');
+        const reader = demuxed.packets(video.id).getReader();
+        try {
+          const first = await reader.read();
+          const second = await reader.read();
+          expect(first.value?.chunk.timestamp).toBe(0);
+          expect(first.value?.dtsUs).toBeUndefined();
+          expect(second.value?.chunk.timestamp).toBe(167_000);
+          expect(second.value?.dtsUs).toBe(0);
+        } finally {
+          await reader.cancel();
           reader.releaseLock();
         }
       } finally {
@@ -422,6 +462,56 @@ describe('parseWebm — EBML parsing', () => {
     expect(() => parseWebm(empty)).toThrowError(/no decodable tracks/);
   });
 
+  it('rejects a Segment when the mandatory leading EBML header id was destroyed', () => {
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, [2]), ...el(E.PixelHeight, [2])]),
+    ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, el(E.Tracks, track)),
+    ]);
+    bytes[0] = 0x1b; // still a structurally parseable 4-byte id, but no longer the EBML header id
+
+    expect(() => parseWebm(bytes)).toThrowError(/EBML header/);
+  });
+
+  it('rejects malformed required values and unknown fields in a complete EBML header', () => {
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, [2]), ...el(E.PixelHeight, [2])]),
+    ]);
+    const segment = el(E.Segment, el(E.Tracks, track));
+    const validFields = [
+      el(E.EBMLVersion, [1]),
+      el(E.EBMLReadVersion, [1]),
+      el(E.EBMLMaxIDLength, [4]),
+      el(E.EBMLMaxSizeLength, [8]),
+      el(E.DocType, str('webm')),
+      el(E.DocTypeVersion, [2]),
+      el(E.DocTypeReadVersion, [2]),
+    ];
+    const file = (fields: readonly number[][]): Uint8Array =>
+      new Uint8Array([...el(E.EBML, fields.flat()), ...segment]);
+    const replace = (index: number, value: number[]): number[][] =>
+      validFields.map((field, fieldIndex) => (fieldIndex === index ? value : field));
+
+    expect(parseWebm(file(validFields)).container).toBe('webm');
+    for (const fields of [
+      replace(0, el(E.EBMLVersion, [2])),
+      replace(1, el(E.EBMLReadVersion, [2])),
+      replace(2, el(E.EBMLMaxIDLength, [5])),
+      replace(3, el(E.EBMLMaxSizeLength, [9])),
+      replace(5, el(E.DocTypeVersion, [1])),
+      [...validFields, el([0x42, 0x80], [1])],
+      [...validFields, el(E.DocTypeReadVersion, [2])],
+    ]) {
+      expect(() => parseWebm(file(fields))).toThrowError(/EBML header/);
+    }
+  });
+
   it('maps codec ids (AVC→h264, HEVC→hevc, MPEG/L3→mp3, unknown→lowercase)', () => {
     const vid = el(E.Video, [...el(E.PixelWidth, [2]), ...el(E.PixelHeight, [2])]);
     const aud = el(E.Audio, el(E.Channels, [2]));
@@ -443,16 +533,25 @@ describe('parseWebm — EBML parsing', () => {
     expect(parseWebm(bytes).tracks.map((t) => t.codec)).toEqual(['h264', 'hevc', 'mp3', 'a_weird']);
   });
 
-  it('handles an unknown-size Segment and a header without DocType', () => {
+  it('handles an unknown-size Segment and rejects a header without mandatory DocType', () => {
     const info = el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4)));
     const track = el(E.TrackEntry, [
       ...el(E.TrackType, [1]),
       ...el(E.CodecID, str('V_VP8')),
       ...el(E.Video, [...el(E.PixelWidth, [4]), ...el(E.PixelHeight, [4])]),
     ]);
-    // EBML header with no DocType child → defaults to 'webm'; Segment with unknown size (0xFF) → EOF.
-    const bytes = new Uint8Array([
+    const missingDocType = new Uint8Array([
       ...el(E.EBML, []),
+      ...E.Segment,
+      0xff,
+      ...info,
+      ...el(E.Tracks, track),
+    ]);
+    expect(() => parseWebm(missingDocType)).toThrowError(/DocType/);
+
+    // A valid EBML header plus an unknown-size Segment (0xFF) extends the segment to EOF.
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
       ...E.Segment,
       0xff,
       ...info,
@@ -526,6 +625,22 @@ describe('WebmDriver — demux seam + muxer', () => {
 });
 
 describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm + .mkv)', () => {
+  it('rejects a real file whose Cluster size header was destroyed instead of returning zero packets', async () => {
+    const bytes = await loadFixture('movie_5.webm');
+    const corrupted = bytes.slice();
+    let clusterOffset = -1;
+    for (let index = 0; index + E.Cluster.length <= corrupted.byteLength; index++) {
+      if (E.Cluster.every((value, offset) => corrupted[index + offset] === value)) {
+        clusterOffset = index;
+        break;
+      }
+    }
+    expect(clusterOffset).toBeGreaterThanOrEqual(0);
+    corrupted[clusterOffset + E.Cluster.length] = 0xff;
+
+    expect(() => demuxWebm(corrupted)).toThrowError(/no media blocks/);
+  });
+
   interface GoldenPacket {
     trackIndex: number;
     size: number;
@@ -542,6 +657,68 @@ describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm +
       await readFile(`${GOLDEN_DIR}${name}.packets.json`, 'utf8'),
     ) as GoldenPacket[];
   }
+
+  const H264_MKV_ROTATIONS = [
+    {
+      media: 'h264_in_mkv.mkv',
+      golden: 'h264_in_mkv.mkv',
+    },
+    ...['01', '02', '03'].map((stem) => ({
+      media: `scenarios/demux/h264_in_mkv/${stem}.mkv`,
+      golden: `scenarios/demux/h264_in_mkv/${stem}.mkv`,
+    })),
+  ] as const;
+
+  it.each(H264_MKV_ROTATIONS)(
+    '$media — packet-info preserves global file order and exact ffprobe PTS/DTS',
+    async ({ media, golden: goldenName }) => {
+      const bytes = await bytesFromMediaTest(media);
+      const table = webmPacketPayloadInfoFromBytes(bytes);
+      const actual = table.packets.map(
+        (packet): GoldenPacket => ({
+          trackIndex: packet.trackIndex,
+          size: packet.size,
+          ptsUs: packet.ptsUs,
+          dtsUs: packet.dtsUs,
+          keyframe: packet.keyframe,
+        }),
+      );
+      expect(actual).toEqual(await golden(goldenName));
+    },
+  );
+
+  it('attachment-bearing Matroska exposes JSON as other + JPEG as one MJPEG stream packet', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/03.mkv');
+    const table = webmPacketPayloadInfoFromBytes(bytes);
+    const probeTracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/x-matroska' }));
+    expect(probeTracks).toEqual(table.tracks);
+    expect(
+      table.tracks.map((track) => ({
+        mediaType: track.mediaType,
+        codec: track.codec,
+        nonMedia: track.nonMedia,
+        fps: track.fps,
+        config: track.config,
+      })),
+    ).toEqual([
+      expect.objectContaining({ mediaType: 'video', codec: 'h264' }),
+      expect.objectContaining({ mediaType: 'audio', codec: 'aac' }),
+      expect.objectContaining({ mediaType: 'audio', codec: '', nonMedia: true }),
+      expect.objectContaining({
+        mediaType: 'video',
+        codec: 'mjpeg',
+        fps: 90_000,
+        config: expect.objectContaining({ codedWidth: 480, codedHeight: 360 }),
+      }),
+    ]);
+    expect(table.packets[0]).toMatchObject({
+      trackIndex: 3,
+      size: 30_915,
+      ptsUs: 0,
+      dtsUs: 0,
+      keyframe: true,
+    });
+  });
 
   // A real H.264 .mkv, a real VP9/Opus .webm, and a real AV1/Opus .webm — Block parsing must reproduce
   // the harness golden packet list exactly: per-track count, byte-exact frame sizes, monotonic
@@ -642,6 +819,15 @@ describe('demuxWebm — lacing (none / Xiph / EBML / fixed) splits one block int
   it('no lacing → a single frame of the whole payload', () => {
     const { framesByIndex } = demuxWebm(webmWithBlock([0x81, 0, 0, 0x80, 0xaa, 0xbb, 0xcc]));
     expect(framesByIndex[0]?.map((f) => f.data.byteLength)).toEqual([3]);
+  });
+
+  it('reports every audio packet as independently decodable even when SimpleBlock omits its key bit', () => {
+    const table = webmPacketPayloadInfoFromBytes(
+      webmWithBlock([0x81, 0, 0, 0x00, 0xaa, 0xbb, 0xcc]),
+    );
+    expect(table.tracks[0]?.mediaType).toBe('audio');
+    expect(table.packets).toHaveLength(1);
+    expect(table.packets[0]?.keyframe).toBe(true);
   });
 
   it('Xiph lacing → frame sizes from the consecutive-byte size table', () => {

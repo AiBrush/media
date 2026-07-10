@@ -85,6 +85,12 @@
     "bench-session6-r4": "bun run scripts/bench-session6-r4.ts",
     "bench-session9-mp4-packet-table": "bun run scripts/bench-session9-mp4-packet-table.ts",
     "bench-session9-webm-probe": "bun run scripts/bench-session9-webm-probe.ts",
+    "bench-session11-mp4-packet-truth": "bun run scripts/bench-session11-mp4-packet-truth.ts",
+    "bench-session11-aiff-packets": "bun run scripts/bench-session11-aiff-packets.ts",
+    "bench-session11-mp4-aac-metadata": "bun run scripts/bench-session11-mp4-aac-metadata.ts",
+    "bench-session11-mp4-vfr-mux": "bun run scripts/bench-session11-mp4-vfr-mux.ts",
+    "bench-session11-video-quality-plan": "bun run scripts/bench-session11-video-quality-plan.ts",
+    "bench-session11-webm-packets": "bun run scripts/bench-session11-webm-packets.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
     "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },

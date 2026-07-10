@@ -385,7 +385,15 @@ export function trimTimedFrameStream<T extends TimedFrameForTrim>(
             return;
           }
           anchorUs ??= frame.timestamp;
-          const duration = frame.duration ?? null;
+          const sourceDuration = frame.duration ?? null;
+          // A VFR timestamp can land microscopically before the exclusive boundary after the container
+          // timescale is rounded (for example 3_999_999 µs for a logical 4 s frame). Keep that frame — its
+          // presentation starts inside the requested window — but do not let its declared duration extend
+          // the authored subclip past `endUs`. The encoder and muxer then receive the exact residual span.
+          const duration =
+            sourceDuration === null
+              ? null
+              : Math.min(sourceDuration, Math.max(0, bounds.endUs - frame.timestamp));
           let out: T;
           try {
             out = restamp(frame, frame.timestamp - anchorUs, duration);

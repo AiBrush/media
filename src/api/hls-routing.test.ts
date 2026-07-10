@@ -10,12 +10,30 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { MediaInput } from '../sources/source.ts';
 import { createMedia } from './create-media.ts';
+import type { Container, MediaInfo } from './types.ts';
 
 const realFetch = globalThis.fetch;
+const MEDIA_TEST = new URL(
+  '../../../media-test/media-browser-test/fixtures/media/',
+  import.meta.url,
+).pathname;
 afterEach(() => {
   globalThis.fetch = realFetch;
 });
+
+async function corpusBytes(name: string): Promise<Uint8Array> {
+  return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+}
+
+interface TargetedProbeEngine {
+  probeContainer(input: MediaInput, container: Container): Promise<MediaInfo>;
+}
+
+function targetedProbeEngine(): TargetedProbeEngine {
+  return createMedia() as ReturnType<typeof createMedia> & TargetedProbeEngine;
+}
 
 /** A real MPEG-TS segment from the corpus (H.264 + AAC), so the stitched output demuxes to real tracks. */
 async function tsSegment(): Promise<Uint8Array> {
@@ -60,6 +78,62 @@ describe('engine HLS input auto-resolution', () => {
     expect(kinds).toContain('audio');
   });
 
+  it('recognizes a URL-form .m3u8 before MIME is known and resolves relative segment URIs', async () => {
+    const seg = await tsSegment();
+    const manifestUrl = 'https://x.test/media/index.m3u8?token=abc#variant';
+    globalThis.fetch = (async (url: unknown): Promise<Response> => {
+      const href = String(url);
+      const bytes = href.endsWith('/media/s0.ts')
+        ? (seg as unknown as BodyInit)
+        : '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\ns0.ts\n#EXT-X-ENDLIST\n';
+      return new Response(bytes, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const info = await createMedia().probe(manifestUrl);
+    expect(info.container).toBe('ts');
+    expect(info.tracks.map((track) => track.type)).toEqual(
+      expect.arrayContaining(['video', 'audio']),
+    );
+  });
+
+  it('recognizes an unhinted Uint8Array manifest and decrypts the real AES-128 VOD', async () => {
+    const manifest = await corpusBytes('hls_aes128.m3u8');
+    globalThis.fetch = (async (url: unknown): Promise<Response> => {
+      const name = String(url).split('/').pop() ?? '';
+      const bytes = await corpusBytes(name);
+      return new Response(bytes as unknown as BodyInit, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const info = await createMedia().probe(manifest);
+    expect(info.container).toBe('ts');
+    expect(info.durationSec).toBeGreaterThan(8);
+    expect(info.tracks.map((track) => track.type)).toEqual(
+      expect.arrayContaining(['video', 'audio']),
+    );
+  });
+
+  it('replays an unhinted manifest stream through targeted MPEG-TS probe before decrypting', async () => {
+    const manifest = await corpusBytes('hls_aes128.m3u8');
+    globalThis.fetch = (async (url: unknown): Promise<Response> => {
+      const name = String(url).split('/').pop() ?? '';
+      const bytes = await corpusBytes(name);
+      return new Response(bytes as unknown as BodyInit, { status: 200 });
+    }) as unknown as typeof fetch;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(manifest.subarray(0, 7));
+        controller.enqueue(manifest.subarray(7));
+        controller.close();
+      },
+    });
+
+    const info = await targetedProbeEngine().probeContainer(stream, 'ts');
+    expect(info.container).toBe('ts');
+    expect(info.tracks.map((track) => track.type)).toEqual(
+      expect.arrayContaining(['video', 'audio']),
+    );
+  });
+
   it('demuxes an HLS manifest to the resolved segment tracks', async () => {
     const seg = await tsSegment();
     serve(seg);
@@ -77,5 +151,20 @@ describe('engine HLS input auto-resolution', () => {
     }) as unknown as typeof fetch;
     const info = await createMedia().probe(mp4);
     expect(info.container).toBe('mp4');
+  });
+
+  it('replays every byte of a non-HLS single-use stream after the manifest peek', async () => {
+    const path = fileURLToPath(new URL('../../fixtures/media/movie_5.mp4', import.meta.url));
+    const mp4 = new Uint8Array(await readFile(path));
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(mp4.subarray(0, 11));
+        controller.enqueue(mp4.subarray(11));
+        controller.close();
+      },
+    });
+    const info = await targetedProbeEngine().probeContainer(stream, 'mp4');
+    expect(info.container).toBe('mp4');
+    expect(info.tracks.some((track) => track.type === 'video')).toBe(true);
   });
 });

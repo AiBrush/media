@@ -39,6 +39,7 @@ import type {
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { addH264AvcCVisibleRightCrop } from './h264-avcc-crop.ts';
 
 // ── pure helpers (Node-unit-tested; real logic on the live path) ─────────────────────────────────
 
@@ -54,6 +55,23 @@ export function normalizeHardwareAcceleration(
   determinism: Determinism | undefined,
 ): HardwareAcceleration {
   return determinism === 'force-software' ? 'prefer-software' : 'no-preference';
+}
+
+/**
+ * Whether an Apple WebCodecs H.264 encode needs a one-pixel horizontal phase pre-compensation.
+ *
+ * Apple H.264 encoders represent widths congruent to 2 (mod 4) with an odd 4:2:0 right-crop unit. In
+ * current Chromium/WebKit this shifts the decoded visible picture one luma pixel right. Widths divisible
+ * by four do not exhibit the phase error. Keep the workaround confined to Apple H.264 so standards-
+ * conforming implementations and every other codec retain their original pixels and zero-copy path.
+ */
+export function needsAppleH264HorizontalPhaseCompensation(
+  config: Pick<VideoEncoderConfig, 'codec' | 'width' | 'height'>,
+  platform: string | undefined,
+): boolean {
+  const codec = config.codec.toLowerCase();
+  const apple = platform !== undefined && /^(?:Mac|iP)/.test(platform);
+  return apple && (codec.startsWith('avc1.') || codec.startsWith('avc3.')) && config.width % 4 === 2;
 }
 
 /**
@@ -781,6 +799,39 @@ function createVideoDecoder(
 
 // ── encoder: VideoFrame → EncodedChunk ───────────────────────────────────────────────────────────
 
+/** Restore the requested visible width in the encoder's out-of-band AVC configuration. */
+function decoderConfigWithVisibleRightCrop(
+  decoderConfig: VideoDecoderConfig,
+  visibleWidth: number,
+  alignedWidth: number,
+): VideoDecoderConfig {
+  if (alignedWidth - visibleWidth !== 2) {
+    throw new MediaError(
+      'encode-error',
+      `invalid H.264 alignment width ${alignedWidth} for ${visibleWidth}px visible picture`,
+    );
+  }
+  const description = decoderConfig.description;
+  if (description === undefined) {
+    throw new MediaError(
+      'encode-error',
+      'Apple H.264 aligned encode did not publish an AVCDecoderConfigurationRecord',
+    );
+  }
+  const bytes = ArrayBuffer.isView(description)
+    ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+    : new Uint8Array(description);
+  const rewritten = addH264AvcCVisibleRightCrop(bytes, alignedWidth - visibleWidth);
+  return {
+    ...decoderConfig,
+    codedWidth: visibleWidth,
+    description: rewritten,
+    ...(decoderConfig.displayAspectWidth === alignedWidth
+      ? { displayAspectWidth: visibleWidth }
+      : {}),
+  };
+}
+
 function createVideoEncoder(
   config: VideoEncoderConfig,
   o: StageOptions | undefined,
@@ -792,6 +843,14 @@ function createVideoEncoder(
 
   let encoder: VideoEncoder | undefined;
   let frameIndex = 0;
+  let alignmentCanvas: OffscreenCanvas | undefined;
+  const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(
+    config,
+    typeof navigator === 'undefined' ? undefined : navigator.platform,
+  );
+  const wireConfig: VideoEncoderConfig = alignHorizontalPhase
+    ? { ...config, width: config.width + 2 }
+    : config;
   // The readable (consumed by the muxer) is dead: once set, the async `output` callback must NOT enqueue
   // — it drops the chunk instead. Prevents the "enqueue into a closed readable" throw when the muxer
   // closes/cancels early (mux error, early-stop trim, abort) while the encoder is still draining.
@@ -800,6 +859,7 @@ function createVideoEncoder(
   const dispose = (): void => {
     closed = true;
     if (encoder && encoder.state !== 'closed') encoder.close(); // stop WebCodecs emitting
+    alignmentCanvas = undefined;
   };
 
   const transformer: TransformerWithCancel<RawFrame, EncodedChunk> = {
@@ -817,7 +877,27 @@ function createVideoEncoder(
           // The encoder emits the decoder config (codec string + `description`) with (typically) the
           // first chunk; hand it to the muxer out-of-band, since the chunk stream is bytes-only.
           const decoderConfig = metadata?.decoderConfig;
-          if (decoderConfig && onDecoderConfig) onDecoderConfig(decoderConfig);
+          if (decoderConfig && onDecoderConfig) {
+            try {
+              onDecoderConfig(
+                alignHorizontalPhase
+                  ? decoderConfigWithVisibleRightCrop(decoderConfig, config.width, wireConfig.width)
+                  : decoderConfig,
+              );
+            } catch (error) {
+              dispose();
+              controller.error(
+                error instanceof MediaError
+                  ? error
+                  : new MediaError(
+                      'encode-error',
+                      `failed to align Apple H.264 visible width: ${describeError(error)}`,
+                      error,
+                    ),
+              );
+              return;
+            }
+          }
           // Never throw out of this async callback: enqueue if the readable is alive, else drop the chunk
           // (a plain byte buffer — nothing to close, GC frees it).
           enqueueOrDrop(controller, chunk, () => closed);
@@ -830,9 +910,9 @@ function createVideoEncoder(
       // Default to the hardware hint (this is the hardware-tier driver) unless the caller pinned one;
       // `force-software` would have routed away from this tier (doc 04 §6), but honor it defensively.
       encoder.configure({
-        ...config,
+        ...wireConfig,
         hardwareAcceleration:
-          config.hardwareAcceleration ?? normalizeHardwareAcceleration(o?.determinism),
+          wireConfig.hardwareAcceleration ?? normalizeHardwareAcceleration(o?.determinism),
       });
     },
     async transform(frame): Promise<void> {
@@ -842,16 +922,62 @@ function createVideoEncoder(
       }
       // The encoder CONSUMES the input frame: encode then close exactly once, even if encode() throws
       // or we abort. encode() reads the frame's pixels synchronously, so closing here is safe.
+      let encodeFrame: VideoFrame = frame;
+      let compensatedFrame: VideoFrame | undefined;
       try {
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
         await drainBelowHighWater(encoder, signal);
+        if (alignHorizontalPhase) {
+          if (frame.displayWidth !== config.width || frame.displayHeight !== config.height) {
+            throw new MediaError(
+              'encode-error',
+              `H.264 alignment expected ${config.width}x${config.height} input, got ${frame.displayWidth}x${frame.displayHeight}`,
+            );
+          }
+          if (
+            alignmentCanvas === undefined ||
+            alignmentCanvas.width !== wireConfig.width ||
+            alignmentCanvas.height !== wireConfig.height
+          ) {
+            alignmentCanvas = new OffscreenCanvas(wireConfig.width, wireConfig.height);
+          }
+          const context = alignmentCanvas.getContext('2d', { alpha: false });
+          if (context === null) {
+            throw new MediaError(
+              'encode-error',
+              'OffscreenCanvas 2D context unavailable for H.264 chroma-phase alignment',
+            );
+          }
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.clearRect(0, 0, wireConfig.width, wireConfig.height);
+          // Keep every requested pixel at its exact coordinate and pad only the two non-display columns.
+          // The rewritten SPS crops these columns after decode, so the visible picture remains exact.
+          context.drawImage(frame, 0, 0);
+          context.drawImage(
+            frame,
+            config.width - 1,
+            0,
+            1,
+            config.height,
+            config.width - 1,
+            0,
+            wireConfig.width - config.width + 1,
+            config.height,
+          );
+          compensatedFrame = new VideoFrame(alignmentCanvas, {
+            timestamp: frame.timestamp,
+            ...(frame.duration === null ? {} : { duration: frame.duration }),
+          });
+          encodeFrame = compensatedFrame;
+        }
         encoder.encode(
-          frame,
+          encodeFrame,
           videoEncodeOptions(frameIndex, keyFrameInterval, config.codec, quantizer),
         );
         frameIndex++;
       } finally {
+        compensatedFrame?.close();
         frame.close();
       }
     },
@@ -865,6 +991,7 @@ function createVideoEncoder(
       }
       closed = true; // the readable is about to close; reject any late `output` (none expected post-flush)
       if (encoder && encoder.state !== 'closed') encoder.close();
+      alignmentCanvas = undefined;
     },
     // The muxer closed/cancelled the readable while the encoder may still be draining: mark closed and
     // dispose the encoder so it stops emitting — no late enqueue. (Chunks are byte buffers; nothing leaks.)

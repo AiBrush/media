@@ -89,8 +89,12 @@ export interface MuxTrackInput {
   channels?: number;
   /** When set, the track is written as CENC-protected (the samples must already be ciphertext). */
   encryption?: TrackEncryption;
-  /** Single-rate edit list: expose `durationTicks` of media starting at `mediaTimeTicks`. */
-  edit?: { mediaTimeTicks: number; durationTicks: number };
+  /** Single-rate edit list, optionally preceded by an empty segment that preserves a delayed track start. */
+  edit?: {
+    mediaTimeTicks: number;
+    durationTicks: number;
+    leadingEmptyDurationTicks?: number;
+  };
   /** Optional explicit `mdat` chunk layout; omitted means one contiguous chunk per track. */
   sampleChunks?: readonly MuxSampleChunkLayoutInput[];
   samples: MuxSampleInput[];
@@ -185,7 +189,11 @@ function trackDurationTicks(track: MuxTrackLayoutInput): number {
 
 function trackMovieDurationTicks(track: MuxTrackLayoutInput, movieTimescale: number): number {
   const durationTicks = track.edit?.durationTicks ?? trackDurationTicks(track);
-  return Math.round((durationTicks * movieTimescale) / track.timescale);
+  const leadingEmptyDurationTicks = track.edit?.leadingEmptyDurationTicks ?? 0;
+  return (
+    Math.round((durationTicks * movieTimescale) / track.timescale) +
+    Math.round((leadingEmptyDurationTicks * movieTimescale) / track.timescale)
+  );
 }
 
 /** Build an `esds` box wrapping an AudioSpecificConfig (the reverse of `parseEsds`). */
@@ -349,7 +357,10 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
 function editList(track: MuxTrackLayoutInput, movieTimescale: number): number[] {
   const edit = track.edit;
   if (edit === undefined) return [];
-  const segmentDuration = trackMovieDurationTicks(track, movieTimescale);
+  const segmentDuration = Math.round((edit.durationTicks * movieTimescale) / track.timescale);
+  const leadingEmptyDuration = Math.round(
+    ((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale,
+  );
   if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
     throw new MediaError(
       'mux-error',
@@ -362,10 +373,18 @@ function editList(track: MuxTrackLayoutInput, movieTimescale: number): number[] 
       `MP4 edit media_time ${edit.mediaTimeTicks} exceeds version-0 elst`,
     );
   }
-  return box(
-    'edts',
-    full('elst', 0, 0, cat(u32(1), u32(segmentDuration), u32(edit.mediaTimeTicks), u16(1), u16(0))),
-  );
+  if (leadingEmptyDuration < 0 || leadingEmptyDuration > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 leading empty edit duration ${leadingEmptyDuration} exceeds version-0 elst`,
+    );
+  }
+  const activeEntry = cat(u32(segmentDuration), u32(edit.mediaTimeTicks), u16(1), u16(0));
+  const entries =
+    leadingEmptyDuration > 0
+      ? cat(u32(2), u32(leadingEmptyDuration), u32(0xffffffff), u16(1), u16(0), activeEntry)
+      : cat(u32(1), activeEntry);
+  return box('edts', full('elst', 0, 0, entries));
 }
 
 function trak(

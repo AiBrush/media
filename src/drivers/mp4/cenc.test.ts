@@ -111,6 +111,18 @@ describe('CENC subsample decryption', () => {
     const recovered = await decryptSample(KEY, { iv, subsamples }, cipher);
     expect([...recovered]).toEqual([...original]);
   });
+
+  it('rejects erased protection — a block-long zero run in protected ciphertext throws (graceful failure)', async () => {
+    // A graceful-failure mutation overwrites a chunk of the encrypted payload with zeros. A run of ≥ one
+    // AES block (16 bytes) of consecutive 0x00 is impossible in genuine AES-CTR ciphertext (p = 2⁻¹²⁸), so
+    // decryptSample rejects with a typed error instead of "decrypting" it into keystream garbage. Here the
+    // 24-byte protected range is all zero (a 24-byte run > one block); the 8 clear bytes are untouched.
+    const data = new Uint8Array(32);
+    data.set([9, 8, 7, 6, 5, 4, 3, 2], 0);
+    await expect(
+      decryptSample(KEY, { iv: ivFor(1), subsamples: [{ clear: 8, protected: 24 }] }, data),
+    ).rejects.toThrow(/all-zero run/);
+  });
 });
 
 describe('CENC cens AES-CTR pattern decryption', () => {

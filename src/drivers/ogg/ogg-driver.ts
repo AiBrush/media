@@ -775,6 +775,11 @@ export const OggDriver: ContainerDriver = {
   supports: matches,
   validatesStreamCopyTrim: true,
   async probe(src: ByteSource): Promise<readonly TrackInfo[]> {
+    // Exact Ogg duration lives in the terminal page granule. Head+tail range probing is valid only when
+    // both a finite size and random access are available; an unknown-size/chunked stream must reach EOS.
+    if (src.range === undefined || src.size === undefined) {
+      return [trackFromInfo(parseOgg(await readAll(src)))];
+    }
     const head = await readHead(src);
     return [trackFromInfo(parseOgg(head, await readTail(src, head)))];
   },

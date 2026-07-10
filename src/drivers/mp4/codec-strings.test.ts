@@ -80,6 +80,24 @@ describe('parseEsds', () => {
     expect(info.objectTypeIndication).toBe(0x40);
     expect(info.audioObjectType).toBe(2);
     expect(info.asc && [...info.asc]).toEqual([0x12, 0x10]);
+    expect(info.sampleRate).toBe(44100);
+    expect(info.channels).toBe(2);
+  });
+
+  it('takes mono channel configuration from AAC ASC instead of a stale MP4 sample-entry default', () => {
+    const info = parseEsds(esds({ asc: [0x11, 0x88] }));
+    expect(info.audioObjectType).toBe(2);
+    expect(info.sampleRate).toBe(48000);
+    expect(info.channels).toBe(1);
+  });
+
+  it('uses the backward-compatible SBR extension output rate for implicit HE-AAC', () => {
+    // Real HE-AAC ASC: AAC-LC core at 24 kHz/stereo, syncExtensionType=0x2b7, SBR output at 48 kHz.
+    const info = parseEsds(esds({ asc: [0x13, 0x08, 0x56, 0xe5, 0x98] }));
+    expect(info.audioObjectType).toBe(2);
+    expect(info.sampleRate).toBe(48000);
+    expect(info.channels).toBe(1); // AAC-LC core; the outer sample entry carries 2-channel output
+    expect(info.sbrPresent).toBe(true);
   });
 
   it('skips ES flag-driven optional fields (streamDependence)', () => {

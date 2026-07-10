@@ -15,6 +15,7 @@ import type { TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { enumerateMp3Packets, parseMp3 } from '../mp3/mp3-driver.ts';
+import { parseTs } from '../mpegts/ts-parse.ts';
 import { demuxWebm } from '../webm/webm-driver.ts';
 import { Mp4Driver, readMovie } from './mp4-driver.ts';
 import { type ChunkStruct, Mp4Muxer, buildMuxSamples } from './mux.ts';
@@ -242,6 +243,21 @@ describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
       Math.round((50_000 * ts) / 1_000_000),
       Math.round((10_000 * ts) / 1_000_000),
     ]);
+  });
+
+  it('monotonic encoder PTS gaps override stale per-frame durations without fabricating reorder', () => {
+    const ts = 90_000;
+    // A 60 fps source with one omitted presentation instant. WebCodecs can retain 16,667 µs on every
+    // output chunk even though the third PTS is 33,333 µs after the second. MP4 must put that real gap in
+    // stts; encoding it as ctts would falsely claim reordered pictures and eventually allow DTS > PTS.
+    const chunks: ChunkStruct[] = [
+      videoChunk(0, 16_667, true, 4),
+      videoChunk(16_667, 16_667, false, 4),
+      videoChunk(50_000, 16_667, false, 4),
+    ];
+    const samples = buildMuxSamples(chunks, ts);
+    expect(samples.map((sample) => sample.durationTicks)).toEqual([1500, 3000, 1500]);
+    expect(samples.map((sample) => sample.cttsTicks)).toEqual([0, 0, 0]);
   });
 
   it('rebases PTS to the minimum so a leading offset does not become a constant ctts', () => {
@@ -847,6 +863,82 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
       Math.round((21_333 * 48_000) / 1_000_000),
       Math.round((21_333 * 48_000) / 1_000_000),
     ]);
+  });
+
+  it('preserves a delayed track start with a leading empty edit on verbatim DTS input', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      config: { codec: 'avc1.42C01E', codedWidth: 32, codedHeight: 18, description: AVCC },
+    });
+    const aud = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2, description: ASC },
+    });
+    muxer.addChunkStruct(vid, { ...videoChunk(1_153_333, 33_333, true, 80), dtsUs: 1_120_000 });
+    muxer.addChunkStruct(vid, {
+      ...videoChunk(1_186_666, 33_333, false, 30),
+      dtsUs: 1_153_333,
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 1_000_000,
+      dtsUs: 1_000_000,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array(17).fill(9),
+    });
+    muxer.addChunkStruct(aud, {
+      timestampUs: 1_021_333,
+      dtsUs: 1_021_333,
+      durationUs: 21_333,
+      key: true,
+      data: new Uint8Array(17).fill(9),
+    });
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const video = movie.tracks.find((track) => track.mediaType === 'video');
+    // Movie/edit durations are represented on the MP4 movie timescale (1 kHz).
+    expect(movie.durationSec).toBe(0.187);
+    expect(video?.edit?.mediaTimeTicks).toBe(0);
+    expect(video?.edit?.durationSec).toBe(0.067);
+  });
+
+  it('materializes the full ffprobe container span of the rotated TS into MP4', async () => {
+    const parsed = parseTs(await bytesFromMediaTest('scenarios/remux/h264_ts_ts_to_mp4/02.ts'));
+    const muxer = new Mp4Muxer();
+    for (let index = 0; index < parsed.tracks.length; index += 1) {
+      const track = parsed.tracks[index];
+      if (track === undefined) continue;
+      const trackId = muxer.addTrack({
+        id: index,
+        mediaType: track.stream.mediaType,
+        codec: track.stream.codec,
+        durationSec: track.durationSec,
+        ...(track.fps !== undefined ? { fps: track.fps } : {}),
+        config: track.config,
+      });
+      for (const unit of track.units) {
+        muxer.addChunkStruct(trackId, {
+          timestampUs: unit.ptsUs,
+          dtsUs: unit.dtsUs,
+          durationUs: undefined,
+          key: unit.keyframe,
+          data: unit.data,
+        });
+      }
+    }
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    expect(movie.durationSec).toBe(10.128);
+    expect(Math.abs(movie.durationSec - (parsed.tracks[0]?.durationSec ?? 0))).toBeLessThan(0.001);
+    expect(movie.tracks.map((track) => buildSampleData(track).length)).toEqual([299, 215]);
   });
 
   it('double-remux stable: re-muxing the parsed output reproduces the same sample table', async () => {

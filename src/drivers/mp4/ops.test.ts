@@ -340,6 +340,32 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     expect(re.tracks.length).toBe(orig.tracks.length);
     expect(re.durationSec).toBeCloseTo(orig.durationSec, 1);
   });
+
+  it('remuxes a FRAGMENTED-input MP4 (empty moov, moof/traf samples) — recovers every sample, not a "no samples" reject', async () => {
+    // A fragmented/CMAF MP4 keeps its per-sample timing in `moof`/`traf`/`trun`, so its `moov` sample
+    // tables are empty and the progressive sample builder yields nothing. Stream-copy must recover those
+    // samples (ADR-186), never reject the file with "track N has no samples to stream-copy" — the
+    // `size_longform_audio_to_mp4` failure, whose real inputs are fragmented long-form audio MP4s.
+    const source = await loadFixture('bear-av-frag.mp4');
+    const sourceMovie = await readMovie(ra(source));
+    // Premise: every track's `moov` table is empty, so the recovery is the only way to see the samples.
+    for (const track of sourceMovie.tracks) {
+      expect(buildSampleData(track).length).toBe(0);
+    }
+    const expected = (await muxTracksFromMovie(ra(source), sourceMovie)).map((t) => t.samples.length);
+    expect(expected.length).toBeGreaterThan(0);
+    expect(expected.every((count) => count > 0)).toBe(true);
+
+    const out = await bytesOf(
+      await media().remux(await fixtureSource('bear-av-frag.mp4'), { to: 'mp4' }),
+    );
+
+    // The output is a plain progressive MP4 whose `moov` now carries the full recovered sample tables —
+    // every track keeps exactly its recovered sample count (no track dropped, no sample lost).
+    const re = await readMovie(ra(out));
+    expect(re.tracks.length).toBe(sourceMovie.tracks.length);
+    expect(re.tracks.map((track) => buildSampleData(track).length)).toEqual(expected);
+  });
 });
 
 describe('media.trim (mp4 keyframe-copy)', () => {

@@ -186,6 +186,25 @@ function syntheticFragmentBudgetMp4(sampleCount: number): Uint8Array {
   return writeMp4([track]);
 }
 
+function syntheticLongGopMp4(): Uint8Array {
+  return writeMp4([
+    {
+      mediaType: 'video',
+      sampleEntryType: 'avc1',
+      timescale: 1_000,
+      description: new Uint8Array([1, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0x00, 0x00]),
+      width: 4,
+      height: 4,
+      samples: Array.from({ length: 12 }, (_, index) => ({
+        data: new Uint8Array([index]),
+        durationTicks: 1_000,
+        cttsTicks: 0,
+        keyframe: index % 4 === 0,
+      })),
+    },
+  ]);
+}
+
 describe('MP4 muxer — reference-reimport round-trip on the real corpus', () => {
   it.each(['2x2-green.mp4', 'movie_5.mp4', 'test.mp4'])(
     '%s: write(parse(x)) re-parses to identical tracks + sample tables, and is a genuine re-layout',
@@ -454,6 +473,41 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(reads.length).toBeLessThan(sourceSampleCount);
     expect(reads.every((read) => read.length <= 8 * 1024 * 1024)).toBe(true);
     expect(totalReadBytes).toBeLessThan(input.byteLength);
+  });
+
+  it('keyframe trim keeps decode pre-roll but presents exactly the requested interval', async () => {
+    if (!Mp4Driver.streamCopy || !Mp4Driver.probe)
+      throw new Error('mp4 trim/probe capability missing');
+    const input = syntheticLongGopMp4();
+    const output = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), {
+        trim: { startSec: 2, endSec: 8 },
+        buffered: true,
+      }),
+    );
+    const movie = await readMovie(ra(output));
+    const video = movie.tracks[0];
+
+    expect(video?.samples.sampleSizes).toHaveLength(8); // keyframe at 0 is retained as decode pre-roll
+    expect(video?.edit).toEqual({ mediaTimeTicks: 2_000, durationSec: 6 });
+    expect((await Mp4Driver.probe(rangeSource(output, [])))[0]?.durationSec).toBe(6);
+  });
+
+  it('fragmented keyframe trim carries the same requested presentation interval', async () => {
+    if (!Mp4Driver.streamCopy || !Mp4Driver.probe)
+      throw new Error('mp4 trim/probe capability missing');
+    const input = syntheticLongGopMp4();
+    const output = await collectBytes(
+      await Mp4Driver.streamCopy(rangeSource(input, []), {
+        trim: { startSec: 2, endSec: 8 },
+        fragmented: true,
+      }),
+    );
+    const movie = await readMovie(ra(output));
+
+    expect(movie.tracks[0]?.fragmentSampleCount).toBe(8);
+    expect(movie.tracks[0]?.edit).toEqual({ mediaTimeTicks: 2_000, durationSec: 6 });
+    expect((await Mp4Driver.probe(rangeSource(output, [])))[0]?.durationSec).toBe(6);
   });
 
   it.each(['url', 'element'] as const)(

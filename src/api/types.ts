@@ -244,7 +244,11 @@ export interface MediaChain {
 /** A probe result (ADR-013). */
 export interface MediaInfoTrack {
   id: number;
-  type: 'video' | 'audio';
+  /**
+   * `'other'` is a declared but non-media track (e.g. a QuickTime `tmcd` timecode trak): enumerated so
+   * the probe track count/order matches ffprobe's `nb_streams`, but not decodable — its `codec` is empty.
+   */
+  type: 'video' | 'audio' | 'other';
   codec: string;
   durationSec?: number;
   width?: number;

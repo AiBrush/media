@@ -153,6 +153,28 @@ export function h264CodecStringForDimensions(
   return `avc1.42E0${idc.toString(16).toUpperCase().padStart(2, '0')}`;
 }
 
+/**
+ * Size an H.264 token encode while retaining a source Main/High profile when one is explicitly known.
+ * Those profiles enable the inter-frame/CABAC tools needed for efficient constrained-rate offline output;
+ * an unknown/Baseline source keeps the broadly compatible Constrained-Baseline default.
+ */
+export function h264CodecStringForSourceProfile(
+  width: number,
+  height: number,
+  fps: number | undefined,
+  sourceCodecString: string | undefined,
+): string {
+  const idc = Math.max(
+    H264_BROWSER_PLAYBACK_MIN_LEVEL_IDC,
+    h264LevelIdcForDimensions(width, height, fps),
+  );
+  const profile = /^(?:avc1|avc3)\.([0-9a-f]{2})/i
+    .exec(sourceCodecString ?? '')?.[1]
+    ?.toUpperCase();
+  const profileAndCompatibility = profile === '64' ? '6400' : profile === '4D' ? '4D00' : '42E0';
+  return `avc1.${profileAndCompatibility}${idc.toString(16).toUpperCase().padStart(2, '0')}`;
+}
+
 type EncodedAudioCodec = Exclude<AudioCodec, PcmCodec>;
 
 /** Default WebCodecs codec strings for each encoded public audio token (AAC-LC, Opus, …). */
@@ -227,13 +249,19 @@ function reverseBits32(x: number): number {
 /**
  * Derive a WebCodecs HEVC codec string from an HEVCDecoderConfigurationRecord (`hvcC`). Matroska/WebM
  * HEVC tracks surface the `hvcC` bytes as `description` but only a bare `hevc` token as `codec`; this
- * expands that pair into an exact RFC-6381 string. `prefix` is the sample-entry style to use when known;
- * bare Matroska defaults to `hev1`, the engine's HEVC encode token. Returns `undefined` for a truncated
- * record so the caller can preserve the typed capability miss instead of throwing a raw RangeError.
+ * expands that pair into an exact RFC-6381 string. A present `hvcC` `description` **is** the signal that
+ * the parameter sets (VPS/SPS/PPS) live out-of-band in the config record, not inline in the samples — the
+ * `hvc1` sample-entry semantic — so bare Matroska defaults to `hvc1`, mirroring how the H.264 sibling
+ * ({@link avcCodecStringFromDescription}) yields `avc1` from an out-of-band `avcC`. Advertising `hev1`
+ * (which signals parameter sets **may** appear inline and array_completeness=0) to a decoder fed an
+ * hvc1-style bitstream with no in-band VPS/SPS/PPS makes some WebCodecs decoders wait for parameter sets
+ * that never arrive and emit zero frames (a 0×0 `decode(mux(x))`); `hvc1` is also the most broadly
+ * decodable HEVC form across browsers. Returns `undefined` for a truncated record so the caller can
+ * preserve the typed capability miss instead of throwing a raw RangeError.
  */
 function hevcCodecStringFromDescription(
   description: AllowSharedBufferSource,
-  prefix: 'hev1' | 'hvc1' = 'hev1',
+  prefix: 'hev1' | 'hvc1' = 'hvc1',
 ): string | undefined {
   const bytes = bufferSourceBytes(description);
   if (bytes.length < 13) return undefined;
@@ -707,7 +735,12 @@ function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
 
 function defaultVideoBitrate(codec: VideoCodec | 'unknown', width: number, height: number): number {
   const minBitrate = 300_000;
-  const bitsPerPixelPerSecond = 10;
+  // Offline transcodes default to a visually transparent quality budget. Ten aggregate bits per output
+  // pixel per second left high-detail H.264 resizes near SSIM 0.96–0.98 even with Chromium's quality
+  // latency mode; 20 gives the hardware encoder enough headroom across independently rotated real-world
+  // sources without changing an explicit bitrate or CRF request. Codec efficiency scales this common
+  // baseline below, while the floor keeps tiny encodes viable.
+  const bitsPerPixelPerSecond = 20;
   const efficiency: Record<VideoCodec | 'unknown', number> = {
     h264: 1,
     hevc: 0.7,
@@ -842,13 +875,15 @@ export function buildVideoEncoderConfig(
   if (width === undefined || height === undefined) {
     throw new InputError('unsupported-input', 'video dims required');
   }
-  // Resolve the codec string. For the `h264` TOKEN (the default Constrained-Baseline profile) we size
-  // the level byte to the OUTPUT dims+fps so e.g. 1080p advertises ≥L4.0 and the UA accepts it (the old
-  // static L3.0 made `isConfigSupported` reject ≥720p). A preserved SOURCE codec or any other token is
-  // left exactly as-is — we never rewrite a profile/level the caller or source pinned.
+  const sourceFps =
+    src.fps !== undefined && Number.isFinite(src.fps) && src.fps > 0 ? src.fps : undefined;
+  const frameRate = target.fps ?? sourceFps;
+  // Resolve the codec string. For the `h264` token, size the level to the actual output geometry/rate
+  // and preserve a known source Main/High profile for compression efficiency. A caller-pinned qualified
+  // target remains exact through `videoEncoderCodecString`; other tokens keep their standard mapping.
   const codec =
     target.codec === 'h264'
-      ? h264CodecStringForDimensions(width, height, target.fps)
+      ? h264CodecStringForSourceProfile(width, height, frameRate, sourceCodecString)
       : videoEncoderCodecString(target.codec, sourceCodecString);
   assertEncodableVideoDimensions(codec, width, height);
   assertSupportedVideoEncodeProfile(codec);
@@ -863,8 +898,21 @@ export function buildVideoEncoderConfig(
     latencyMode: 'quality',
     ...rateControl,
     ...(alpha !== undefined ? { alpha } : {}),
-    ...(target.fps !== undefined ? { framerate: target.fps } : {}),
+    ...(frameRate !== undefined ? { framerate: frameRate } : {}),
   };
+}
+
+/**
+ * Periodic GOP forcing is a container-layout requirement for fragmented output, not a consequence of an
+ * explicit frame rate. Ordinary VOD lets the quality-mode encoder place scene/key frames itself, avoiding
+ * needless I-frame overhead at constrained bitrates; fragments keep deterministic two-second boundaries.
+ */
+export function periodicVideoKeyFrameInterval(
+  fps: number | undefined,
+  fragmented: boolean,
+): number | undefined {
+  if (!fragmented || fps === undefined) return undefined;
+  return Math.max(1, Math.round(fps * 2));
 }
 
 function assertEncodableVideoDimensions(codec: string, width: number, height: number): void {

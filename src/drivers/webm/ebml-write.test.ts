@@ -21,11 +21,12 @@ import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { Packet } from '../../contracts/driver.ts';
+import type { Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { writeToStreamTarget } from '../../sinks/stream-target.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { readMovie } from '../mp4/mp4-driver.ts';
+import type { ParsedTrack } from '../mp4/parse.ts';
 import { buildSamples } from '../mp4/samples.ts';
 import {
   type ChunkStruct,
@@ -123,6 +124,27 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
     off += p.byteLength;
   }
   return out;
+}
+
+function gaplessFromMp4Track(track: ParsedTrack): TrackInfo['gapless'] | undefined {
+  if (
+    track.mediaType !== 'audio' ||
+    track.sampleRate === undefined ||
+    track.sampleRate <= 0 ||
+    track.timescale <= 0 ||
+    track.edit === undefined
+  ) {
+    return undefined;
+  }
+  const scale = track.sampleRate / track.timescale;
+  const codedSamples = track.samples.timeToSample.reduce(
+    (total, entry) => total + Math.round(entry.count * entry.delta * scale),
+    0,
+  );
+  const leadingSamples = Math.max(0, Math.round(track.edit.mediaTimeTicks * scale));
+  const totalSamples = Math.max(0, Math.round(track.edit.durationSec * track.sampleRate));
+  const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
+  return { leadingSamples, trailingSamples, totalSamples };
 }
 
 /** A minimal OpusHead (the bytes a real Opus `description` carries) — round-tripped as CodecPrivate. */
@@ -278,6 +300,7 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     if (video === undefined || audio === undefined) {
       throw new Error('expected h264_1080p_30s.mp4 to carry one video and one audio track');
     }
+    const audioGapless = gaplessFromMp4Track(audio);
 
     const { blocks, endMs } = buildBlockTimeline([
       {
@@ -298,6 +321,8 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
         trackNumber: 2,
         mediaType: 'audio',
         durationSec: audio.durationSec,
+        ...(audio.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
+        ...(audioGapless !== undefined ? { gapless: audioGapless } : {}),
         chunks: buildSamples(audio).map(
           (sample): ChunkStruct => ({
             timestampUs: sample.ptsUs,
@@ -314,6 +339,40 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     expect(audio.durationSec).toBeGreaterThan(video.durationSec);
     expect(blocks.find((block) => block.trackNumber === 1)?.timeMs).toBe(0);
     expect(endMs).toBe(30_000);
+  });
+
+  it('preserves a genuine declared AAC tail when the MP4 has no gapless edit', async () => {
+    const file = await mediaTestFixture(
+      'scenarios/performance/metamorphic-probe-duration-cross-container/03.mp4',
+    );
+    const movie = await readMovie({
+      read: (offset, length) => Promise.resolve(file.subarray(offset, offset + length)),
+      size: file.byteLength,
+    });
+    const tracks = movie.tracks.map((track, index) => {
+      const gapless = gaplessFromMp4Track(track);
+      return {
+        trackNumber: index + 1,
+        mediaType: track.mediaType,
+        durationSec: track.durationSec,
+        ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
+        ...(gapless !== undefined ? { gapless } : {}),
+        chunks: buildSamples(track).map(
+          (sample): ChunkStruct => ({
+            timestampUs: sample.ptsUs,
+            durationUs: sample.durationUs,
+            dtsUs: sample.dtsUs,
+            key: sample.keyframe,
+            data: new Uint8Array([index + 1]),
+          }),
+        ),
+      };
+    });
+    const audio = movie.tracks.find((track) => track.mediaType === 'audio');
+    const gapless = audio === undefined ? undefined : gaplessFromMp4Track(audio);
+    expect(gapless).toBeDefined();
+    expect((gapless?.totalSamples ?? 0) / (audio?.sampleRate ?? 1)).toBe(10.495);
+    expect(buildBlockTimeline(tracks).endMs).toBe(10_495);
   });
 
   it('empty input → no blocks, end 0', () => {
@@ -478,6 +537,7 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     if (video === undefined || audio === undefined) {
       throw new Error('expected h264_1080p_30s.mp4 to carry one video and one audio track');
     }
+    const audioGapless = gaplessFromMp4Track(audio);
 
     const muxer = new WebmMuxer();
     const videoTrack = muxer.addTrack({
@@ -493,6 +553,7 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
       mediaType: 'audio',
       codec: audio.codec,
       durationSec: audio.durationSec,
+      ...(audioGapless !== undefined ? { gapless: audioGapless } : {}),
       config: audio.config,
     });
     for (const sample of buildSamples(video)) {

@@ -741,12 +741,15 @@ function recoverDurationsUs(chunks: readonly ChunkStruct[]): number[] {
 /**
  * Convert buffered chunk-structs (decode order) into {@link MuxSampleInput}s with correct B-frame timing.
  *
- * The DTS timeline is the cumulative sum of durations in decode order (DTS is contiguous; spacing is each
- * frame's own duration). The composition offset is computed in microseconds first — `ctts = (PTS−base) −
- * DTS` — so a non-reordered stream (PTS already in decode order, PTS gaps == durations) yields exactly
- * `ctts == 0` for every sample at any timescale, while a reordered (B-frame) stream carries the true
- * offset (negative offsets are fine — {@link writeMp4} emits a version-1 `ctts`). PTS is rebased to the
- * minimum so a standalone file starts at t=0. Decode order is preserved (samples are stored as arrived).
+ * The DTS timeline is the cumulative sum of durations in decode order. For monotonic encoder output,
+ * adjacent PTS gaps are authoritative: WebCodecs may retain a stale nominal `duration` across a VFR gap,
+ * and putting that discrepancy in `ctts` would fabricate picture reorder (eventually even DTS > PTS).
+ * Only the final sample has no following PTS and therefore uses its declared duration. True reordered
+ * output retains its decode-order duration path. Composition offset is computed in microseconds first —
+ * `ctts = (PTS−base) − DTS` — so a non-reordered stream yields exactly zero at any timescale, while a
+ * reordered (B-frame) stream carries the true offset (negative offsets are fine — {@link writeMp4} emits
+ * a version-1 `ctts`). PTS is rebased to the minimum so a standalone file starts at t=0. Decode order is
+ * preserved (samples are stored as arrived).
  */
 export function buildMuxSamples(
   chunks: readonly ChunkStruct[],
@@ -756,9 +759,20 @@ export function buildMuxSamples(
   if (n === 0) return [];
 
   const hasAllDurations = chunks.every((c) => c.durationUs !== undefined);
-  const durationsUs = hasAllDurations
-    ? chunks.map((c) => c.durationUs as number)
-    : recoverDurationsUs(chunks);
+  const presentationOrderIsDecodeOrder = chunks.every(
+    (chunk, index) =>
+      index === 0 || chunk.timestampUs >= (chunks[index - 1] as ChunkStruct).timestampUs,
+  );
+  const durationsUs = presentationOrderIsDecodeOrder
+    ? chunks.map((chunk, index) => {
+        const next = chunks[index + 1];
+        if (next !== undefined) return next.timestampUs - chunk.timestampUs;
+        if (chunk.durationUs !== undefined) return chunk.durationUs;
+        return index === 0 ? 0 : chunk.timestampUs - (chunks[index - 1] as ChunkStruct).timestampUs;
+      })
+    : hasAllDurations
+      ? chunks.map((c) => c.durationUs as number)
+      : recoverDurationsUs(chunks);
 
   // Verbatim-remux fast path: every packet carries the source's true decode timestamp (the demuxer read
   // it from `stts`). Lay the composition offset down as the exact (PTS − DTS), and derive each sample's
@@ -918,7 +932,7 @@ function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): Ga
 }
 
 /** Turn a finalized {@link TrackState} into the {@link MuxTrackInput} {@link writeMp4} consumes. */
-export function toMuxTrack(t: TrackState): MuxTrackInput {
+export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
   const prepared =
     t.mediaType === 'video' && t.sampleEntryType === 'avc1'
       ? prepareAvcSamples(t.chunks, t.description)
@@ -927,6 +941,17 @@ export function toMuxTrack(t: TrackState): MuxTrackInput {
         : { chunks: t.chunks, description: t.description };
   const gaplessLayout = gaplessLayoutFor(t, buildMuxSamples(prepared.chunks, t.timescale));
   const { samples, edit } = gaplessLayout;
+  const leadingEmptyDurationTicks = ticks(Math.max(0, leadingEmptyUs), t.timescale);
+  const muxEdit =
+    leadingEmptyDurationTicks > 0
+      ? {
+          ...(edit ?? {
+            mediaTimeTicks: 0,
+            durationTicks: samples.reduce((total, sample) => total + sample.durationTicks, 0),
+          }),
+          leadingEmptyDurationTicks,
+        }
+      : edit;
   const base = {
     mediaType: t.mediaType,
     sampleEntryType: t.sampleEntryType,
@@ -936,7 +961,7 @@ export function toMuxTrack(t: TrackState): MuxTrackInput {
     ...(t.height !== undefined ? { height: t.height } : {}),
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
-    ...(edit !== undefined ? { edit } : {}),
+    ...(muxEdit !== undefined ? { edit: muxEdit } : {}),
   };
   if (t.config.kind === 'raw-box') {
     const description = prepared.description ?? synthesizeRawBoxDescription(t);
@@ -1059,12 +1084,29 @@ export class Mp4Muxer implements Muxer {
     if (this.#tracks.size === 0) {
       throw new MediaError('mux-error', 'cannot finalize a muxer with no tracks');
     }
+    const sourceTimed = [...this.#tracks.values()].every((track) =>
+      track.chunks.every((chunk) => chunk.dtsUs !== undefined),
+    );
+    let globalPresentationOriginUs = Number.POSITIVE_INFINITY;
+    if (sourceTimed) {
+      for (const track of this.#tracks.values()) {
+        for (const chunk of track.chunks) {
+          globalPresentationOriginUs = Math.min(globalPresentationOriginUs, chunk.timestampUs);
+        }
+      }
+    }
+
     const out: MuxTrackInput[] = [];
     for (const [id, track] of this.#tracks) {
       if (track.chunks.length === 0) {
         throw new MediaError('mux-error', `track ${id} received no packets`);
       }
-      out.push(toMuxTrack(track));
+      const firstDtsUs = track.chunks[0]?.dtsUs;
+      const leadingEmptyUs =
+        sourceTimed && firstDtsUs !== undefined && Number.isFinite(globalPresentationOriginUs)
+          ? Math.max(0, firstDtsUs - globalPresentationOriginUs)
+          : 0;
+      out.push(toMuxTrack(track, leadingEmptyUs));
     }
     return out;
   }

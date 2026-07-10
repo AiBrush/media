@@ -335,3 +335,48 @@ describe('parseTs on the m2ts (192-byte) and offset variants of the real slice',
     expect(parseTs(shifted).tracks.map((t) => t.stream.codec)).toEqual(['h264', 'aac']);
   });
 });
+
+describe('parseTs H.264 access units spanning PES boundaries', () => {
+  interface GoldenPacket {
+    readonly trackIndex: number;
+    readonly size: number;
+    readonly ptsUs: number;
+    readonly dtsUs: number;
+    readonly keyframe: boolean;
+  }
+
+  it('matches every ffprobe packet on the rotated cross-PES Annex-B fixture', async () => {
+    const mediaPath = new URL(
+      '../../../../media-test/media-browser-test/fixtures/media/scenarios/demux/h264_ts/02.ts',
+      import.meta.url,
+    ).pathname;
+    const goldenPath = new URL(
+      '../../../../media-test/media-browser-test/fixtures/golden/scenarios/demux/h264_ts/02.ts.packets.json',
+      import.meta.url,
+    ).pathname;
+    const parsed = parseTs(new Uint8Array(await readFile(mediaPath)));
+    const video = parsed.tracks.find((track) => track.stream.mediaType === 'video');
+    const expected = (JSON.parse(await readFile(goldenPath, 'utf8')) as GoldenPacket[]).filter(
+      (packet) => packet.trackIndex === 0,
+    );
+    expect(
+      video?.units.map((unit) => ({
+        trackIndex: 0,
+        size: unit.sizeBytes ?? unit.data.byteLength,
+        ptsUs: unit.ptsUs,
+        dtsUs: unit.dtsUs,
+        keyframe: unit.keyframe,
+      })),
+    ).toEqual(expected);
+  });
+
+  it('discovers coded dimensions when a transport-stream slice begins before the next SPS', async () => {
+    const mediaPath = new URL(
+      '../../../../media-test/media-browser-test/fixtures/media/scenarios/probe/h264_ts/03.ts',
+      import.meta.url,
+    ).pathname;
+    const parsed = parseTs(new Uint8Array(await readFile(mediaPath)));
+    const video = parsed.tracks.find((track) => track.stream.mediaType === 'video');
+    expect(video?.config).toMatchObject({ codec: 'h264', codedWidth: 960, codedHeight: 720 });
+  });
+});

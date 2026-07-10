@@ -732,7 +732,13 @@ and browser HEVC encode support is limited and platform-specific.
 **Decision:** keep HEVC decode and encode on the WebCodecs video driver and let
 `VideoDecoder.isConfigSupported` / `VideoEncoder.isConfigSupported` decide exact `hvc1`/`hev1` configs at
 runtime. `codec-pipeline.ts` now expands bare `hevc`/`h265` decode configs from `hvcC` bytes into exact
-`hev1.*` strings before routing; truncated/missing `hvcC` remains a bare token so the normal typed
+`hvc1.*` strings before routing — the `hvc1` (out-of-band parameter sets) form, because a present `hvcC`
+`description` **is** the signal that the VPS/SPS/PPS live in the config record and not inline, mirroring
+how the H.264 sibling yields `avc1` from an out-of-band `avcC`. (Originally `hev1.*`; corrected because
+advertising `hev1` — which permits/expects inline parameter sets, array_completeness=0 — to a Matroska
+HEVC bitstream carrying no in-band VPS/SPS/PPS makes some WebCodecs decoders wait for parameter sets that
+never arrive and emit a 0×0 frame, the `decode(mux(x))` `edge_hevc_decode_mux_mkv` failure; `hvc1` is also
+the most broadly decodable HEVC form.) Truncated/missing `hvcC` remains a bare token so the normal typed
 capability miss is preserved. The public `hevc` encode token maps to Main 8-bit `hev1.1.6.L93.B0`.
 Preserving a source HEVC encode string is allowed only for Main (`profile_idc=1`); Main10/non-Main HEVC
 strings are rejected with `CapabilityError('capability-miss')` before muxing, with a message that no
@@ -5270,6 +5276,14 @@ copying competitor source code.
 
 **Consequences.** The 596 s header enumerates 3 streams (video, `tmcd`, aac); v1/v2 QuickTime audio resolves to `mp4a.40.2`; QuickTime PCM classifies to real tokens; and H.264 carries container colour to the decoder. Validated by an independent ffprobe-8.0 oracle over 10 real files (v0/v1/v2 sound, wave-esds, tmcd, BT.601/709/nclx-full-range/untagged colour, sowt/fl32/lpcm PCM), enumeration O(index) (~0.061 ms on a 395 KB header, no `mdat`). **Rejected:** dropping/`other`-typing non-media traks; a v0-only sound parser; scanning payloads to enumerate; inventing a colorSpace when the container is silent; parsing ICC `colr` as nclc; `any` for the lib.dom enum gap.
 
+### ADR-187 - CENC graceful failure: reject *erased* protected ciphertext (block-long zero run)
+
+**Context (Session 11, fair harness).** Session 10's whole-file `decryptCencFile` (ADR-182) regressed a robustness cell PASS→FAIL: `encryption/cenc_ctr_protection_zeroed_graceful` fed a `cenc_ctr` file whose sample encrypted payload was overwritten with zeros, and our engine byte-decrypted it and **emitted output** instead of the clean throw the graceful-failure contract requires. AES-CTR/CBC carry no integrity, so a *bit-flip* in ciphertext is cryptographically undetectable — but an *erased* (zeroed) region is **structurally** impossible: genuine cipher output is uniform-random. Real-world confirmation: `ffmpeg` (with the key) decodes the zeroed file with **no** decoder errors, so decode-level validation cannot catch it either — the only honest reject signal is the impossible ciphertext itself.
+
+**Decision.** `assertNotErasedProtection` (in `src/drivers/mp4/cenc.ts`) scans each protected subsample range — and whole-sample data on the constant-IV path — for a run of ≥ one AES block (16 bytes) of consecutive `0x00`. Such a run has probability 2⁻¹²⁸ in real AES-CTR/CBC ciphertext, so its presence means the encrypted payload was zeroed (tampered/erased protection); we throw a typed `MediaError('demux-error')` (graceful failure) rather than "decrypt" it into keystream garbage presented as a valid frame. The mutation zeroes a **512-byte chunk inside** a ~13 KB encrypted subsample (verified: 4 samples, each a 512-byte / 32-block zero run), so the check detects a *block-long run*, not an all-zero range. It is one linear pass on bytes we already AES over; real ciphertext never accumulates a 16-byte zero run, so the happy path is untouched.
+
+**Consequences.** `cenc_ctr_protection_zeroed_graceful` restored to PASS on chromium; happy-path `cenc`/`cens`/`cbcs` decrypt and `cenc_ctr_truncated_mdat_graceful` unchanged (15/15 `cenc.test.ts` green, force-software bit-exactness intact). **Not covered:** `cenc_ctr_senc_bitflip_graceful` — single-bit ciphertext flips leave the payload uniform-random (no structural signal) and real decoders *do* error on it, so it needs decode-level validation (browser-gated); tracked as open. **Rejected:** requiring the *whole* protected range to be zero (misses the real chunk-zeroing attack); a MAC (CENC defines none for CTR/CBC-no-pad); weakening the oracle to accept mutated-input output.
+
 ### ADR-186 - Fragmented-MP4 (CMAF) per-sample table recovered from `moof`/`traf`/`trun`
 
 **Context (Session 10, fair harness).** Three cells produced empty output on rotated real files — `decode-seek/meta_pts_monotonic_after_reorder` ("no decoded frames"), `audio-dsp/edge_gapless_aac_decode` ("cannot finalize a muxer with no tracks"), and `mux/size_longform_audio_to_mp4` ("no coded samples"). Root cause (one bug): a fragmented/CMAF movie's `moov` sample tables are empty — the samples live in `moof`/`traf`/`trun` fragments — and `parse.ts` recovered only *aggregate* fragment timing (total duration + count) for probe, never the per-sample byte offsets/sizes/PTS/DTS/sync flags. So `buildSampleData` saw a zero-length table and the demuxer emitted **zero packets**: probe worked, but decode/convert of any fragmented input yielded nothing.
@@ -5285,3 +5299,112 @@ copying competitor source code.
 **Decision.** Add `decryptCencFile(bytes, {scheme, keys}): Promise<Uint8Array>` to `cenc.ts`: a single self-contained pass (via `reader.ts` primitives only — no `parse.ts`/`mp4-driver.ts` coupling, no import cycle) that (1) parses `moov` tracks (protected `stsd` entries, `tenc`, movie-level `sgpd`, `trex` defaults); (2) locates samples both flat (`stsc`/`stsz`/`stco`/`co64`) and fragmented (`tfhd` base resolution; `trun` sizes with all optional fields); (3) resolves per-sample IV/subsample map from `senc`, else `saiz`/`saio` aux, else `default_constant_IV`, applying 'seig' group overrides (traf-local index ≥0x10001, movie-level 1..0xFFFF, 0 = defaults); (4) decrypts in place (cbcs = AES-CBC pattern, cens = AES-CTR pattern, cenc = AES-CTR), preserving byte offsets; (5) neutralizes protection boxes (`enca/encv`→`frma` original, `sinf`/`senc`→`free`, `seig` groups zeroed) so the output probes clear. Malformed/contradictory input → `MediaError`; unsupported capability (unknown scheme, multi-entry `saio`, missing key) → `CapabilityError`. `media.decrypt` routes the buffered whole file through it for `scheme ∈ {cenc,cens,cbcs}` (lead wiring in `mp4-driver.ts`), keeping the HLS-AES-128 branch.
 
 **Consequences.** All documented real-world `cbcs` layouts (and fragmented `cenc`/`cens`) decrypt byte-exactly, self-validated without ffmpeg against an independent openssl / `node:crypto` AES-128 twin across five layouts + flat variants, plus a fully third-party **Bento4** leg (fragment+encrypt a real file with `mp4encrypt --method MPEG-CBCS`; recovered `mdat` must equal the clear original byte-for-byte, wrong key must not). Coverage 98.43% stmt / 90.29% branch; benchmarked in `scripts/bench-cbcs-decrypt.ts`. `saio` is limited to a single aux-offset entry (multi-entry declines typed). **Rejected:** extending `decryptCencTrack` to read `moof` (entangles the driver's mux rebuild, loses byte-exact in-place output); reusing `parse.ts`'s movie model (no per-`traf` `senc`/`saiz`/`saio`/`sbgp`, import cycle); trusting ffmpeg as oracle (cannot open the layout, non-conformant subsample crypto).
+
+### ADR-188 - Browser decode validation for unauthenticated CENC AVC payloads
+
+**Context (Session 11, fair harness).** ADR-187 restored rejection for erased/zeroed ciphertext, but `encryption/cenc_ctr_senc_bitflip_graceful` still returned a clear MP4. Independent Bento4 inspection and byte comparison showed a structurally valid progressive CENC file: `tenc`, `senc`, IVs, subsample maps, sample counts, and byte ranges remained valid while distributed single-bit changes were confined to encrypted `mdat` payload. AES-CTR intentionally has no authentication tag, so neither a CENC parser nor an IV heuristic can distinguish those bytes from legitimate ciphertext. The recovered AVC access units are corrupt, however, and Chromium's real decoder rejects them.
+
+**Decision.** Reuse the existing MP4 AVC decode-validation path after flat-track CENC decryption and before clear-container serialization. When `VideoDecoder` and `EncodedVideoChunk` exist and the real `avcC` configuration is supported and configurable, feed every recovered access unit in decode order with its exact keyframe flag, PTS/DTS-derived timestamp, and duration; keep the decode queue below the existing bounded high-water mark; flush; close every emitted `VideoFrame` immediately; turn decode/flush corruption into typed `MediaError('demux-error')`; and require the complete flat track to emit exactly one output frame per MP4 AVC access unit. Chromium may conceal corruption by silently dropping a unit rather than invoking the error callback, so output cardinality is part of validity. Abort closes the decoder and rejects as `aborted`. Node and unsupported/unconfigurable codecs keep the independent byte-exact crypto path and make no false integrity claim. Trim windows deliberately retain their existing looser output-count rule because leading inter-frame dependencies may be outside the selected window.
+
+**Consequences.** Structurally valid CENC payload damage is rejected at the first seam capable of observing it, before the framework emits output, while valid CENC stays byte-exact. The regression test encrypts the real `bear-1280x720.mp4`, flips protected payload bits without modifying MP4/CENC metadata, proves the clean twin validates and emits all 82 access units byte-exactly, and proves a silently dropped corrupted unit rejects with `MediaError` rather than `CapabilityError`; the Chromium encryption family is the real-decoder gate. The verifier adds no new eager module and reuses audited frame/backpressure/cancellation code. **Rejected:** sequential-IV requirements (not required by ISO/IEC 23001-7); ciphertext fingerprints or fixture hashes (overfitting); pretending CTR has a MAC; an H.264 header-only parser (cannot validate entropy-coded slices); weakening graceful failure; or emitting output and delegating failure to the caller.
+
+### ADR-189 - Offline video quality budget and identity-resize elimination
+
+**Context (Session 11, fair harness).** A real 1080p→720p H.264 rotation produced SSIM `0.968371` with the old implicit 9.216 Mb/s rate, while a source already at 1280×720 remained near `0.9735` even after doubling that rate because the explicitly repeated dimensions still forced a Canvas2D resize and an avoidable YUV→RGB→YUV conversion. The two losses require separate fixes: bitrate cannot repair a colour round trip, and skipping a real scale cannot repair quantization.
+
+**Decision.** Implicit offline video rate control uses 20 aggregate bits per output pixel per second, retains per-codec efficiency scaling and the 300 kb/s floor, and never overrides an explicit bitrate or CRF/quantizer request. The filter planner compares requested resize dimensions with the geometry immediately before resize (post-crop when present) and omits the resize only when both dimensions are identical. Every genuine crop/scale/orientation/colour operation stays on the existing GPU route.
+
+**Consequences.** Rotated real-media H.264 results moved to SSIM `0.981680` (`03.mp4`), `0.986473` (`02.mp4`), and `0.9943` (`01.mp4`, identity pass removed); the identity case also reached 545.99 fps. Fail-first pure tests pin rate scaling, explicit override preservation, and post-crop identity semantics; a nine-sample mixed planner benchmark covers policy overhead; Chromium decoded-pixel comparisons cover the real codec/filter output. B-frame/VFR timing, frame ownership, cancellation, and backpressure are unchanged. **Rejected:** fixture fingerprints; a per-scenario quality branch; weakening SSIM; raising bitrate again to hide the identity colour conversion; treating equal dimensions after a real crop as equal to the original source dimensions.
+
+### ADR-190 - AAC AudioSpecificConfig is authoritative for decoded geometry
+
+**Context (Session 11, fair harness).** Three massive-file metadata cells reported stereo for a real AAC-LC
+mono track because the MP4 `AudioSampleEntry` retained a stale two-channel default, while the tiny-file
+metadata cell reported 24 kHz for HE-AAC whose AAC-LC core runs at 24 kHz but whose implicit SBR
+presentation is 48 kHz. Independent `ffprobe` plus direct AudioSpecificConfig inspection established the
+truth: `11 88` is AAC-LC/48 kHz/channelConfiguration 1, and `13 08 56 e5 98` carries a 24 kHz LC core plus
+the backward-compatible `syncExtensionType=0x2b7` SBR extension to 48 kHz.
+
+**Decision.** `parseEsds()` now parses the MPEG-4 AudioSpecificConfig at the bit level: extended audio
+object types, indexed or explicit sampling frequency, channel configuration, the fixed GA fields, explicit
+SBR/PS object types, and backward-compatible SBR sync extension. Ordinary AAC uses ASC sample rate and
+channel count over stale sample-entry values. An SBR presentation uses the ASC effective output rate but
+retains outer-sample-entry channel geometry because an implicit mono LC core may present stereo through
+Parametric Stereo. ProgramConfigElement-defined channel geometry remains an honest outer-entry fallback.
+
+**Consequences.** Eight range-backed real rotations (four massive, four tiny) now match ffprobe exactly
+without reading media payloads; all four formerly red black-box metadata cells pass, and the complete
+massive size-ladder rotation passed on baked/`01`/`02`/`03`. Focused MP4 suites pass 118 tests. The
+nine-sample real-file benchmark probes all eight files at 3.733 ms median with a 3.95 MiB RSS delta.
+**Rejected:** trusting the outer entry unconditionally; multiplying every low AAC rate by two; treating a
+mono SBR core as necessarily mono output; parsing only the first ASC byte; fixture-specific channel/rate
+overrides; or reading a two-hour payload for header metadata.
+
+### ADR-191 - Monotonic encoder output derives MP4 sample durations from adjacent PTS
+
+**Context (Session 11, real browser capture).** A 626-frame 60 fps/VFR H.264 transcode produced valid
+pixels but authored 609 non-zero composition offsets. Chromium retained a nominal 16,667 µs
+`EncodedVideoChunk.duration` across small source cadence corrections; cumulatively adding that rounded
+duration drifted from monotonic chunk PTS, fabricated `ctts`, and eventually produced DTS one or two 90 kHz
+ticks greater than PTS. FFmpeg reported dozens of `Invalid timestamps` warnings. This was not B-frame
+reorder: callback PTS was monotonic and the encoded stream had one keyframe.
+
+**Decision.** In `buildMuxSamples`, when arrival/decode order is already non-decreasing PTS order, every
+non-final sample duration is the exact gap to the next PTS; the final sample alone uses its declared
+duration (or the prior gap if absent). This telescopes DTS to PTS exactly and emits no `ctts`. A genuinely
+reordered callback sequence retains the existing decode-order duration/CTO model, and verbatim packets that
+carry explicit `dtsUs` retain the ADR-045 exact-DTS path.
+
+**Consequences.** The exact browser output now has 626 packets, one keyframe, zero reordered rows, monotonic
+PTS, and no FFmpeg warnings; bytes/pixels and full-clip SSIM are unchanged. Ninety-nine MP4 mux,
+round-trip, operation, and demux-timing tests pass. A fail-first VFR-gap test pins `stts=[1500,3000,1500]`
+and `ctts=[0,0,0]`; the nine-sample benchmark processes 313,000 packets in 8.739 ms median with a
+0.69 MiB RSS delta. **Rejected:** clamping negative CTOs; dropping frames; forcing CFR; trusting stale
+nominal durations over observable PTS; changing explicit-DTS remux; or hiding FFmpeg warnings.
+
+### ADR-192 - Originless HLS manifests cannot resolve relative encryption resources
+
+**Context (Session 11).** The product's URL-form AES-128 HLS path decrypts and probes the exact real VOD,
+but `probe/hls_aes128` remains red at the harness boundary. RFC 8216 relative key and media URIs are
+relative to the playlist URI. A `Uint8Array`, Blob, File basename, or raw first-segment ciphertext does not
+contain that URI, key, or IV context. The harness corpus also has multiple different same-named
+`hls_aes128.key`/segment sets: root and scenario copies have different SHA-256 hashes, so resolving against
+an ambient directory can silently select another valid encrypted program.
+
+**Decision.** Keep URL/string inputs authoritative for HLS base resolution and keep detached manifest
+support only when its resource resolver can actually supply the referenced names. Do not search server
+directories, try alternate same-named keys, fingerprint ciphertext, or infer a scenario path from a File
+basename. Missing playlist origin/resource context remains a typed input failure; complete URL/context
+continues through the RFC-conformant AES-128 resolver.
+
+**Consequences.** Independent Chromium proof on the selected corpus URL returns H.264 1280×720 plus AAC
+48 kHz stereo. The same bytes at the page root reject because the supposed 16-byte key resolves to a
+30,228-byte HTML fallback; giving detached bytes an ambient `/fixtures/media/` base makes them probe a
+different same-named encrypted program, demonstrating why ambient guessing is unsafe. OpenSSL recovery,
+TS sync, and ffprobe remain byte/structure oracles for every real product path. **Rejected:** weakening TS
+validation; hardcoded harness paths/keys/IVs; trying arbitrary directories; accepting decrypted random
+bytes; or claiming a raw ciphertext segment contains five-segment playlist metadata.
+
+### ADR-193 - Explicit H.264 bitrate remains exact when a quality gate is physically incompatible
+
+**Context (Session 11).** The rotated portrait source is 1080×1920, 60 fps, 626 distinct frames, High
+profile, and 5.72 Mb/s. At an explicit 2,000,000 b/s target, Apple VideoToolbox produces a valid 2.038 Mb/s
+High-profile stream but the black-box eight-frame RGB SSIM is 0.902773 against a 0.95 gate. Every legal
+WebCodecs control was measured: constant/variable/omitted rate mode, quality/default latency, and explicit
+hardware are byte-identical; software is worse; Main profile lowers full-clip SSIM; `L1T2`/`L1T3` improve
+one I-frame but collapse full-clip SSIM; all 626 frames are distinct, so temporal deduplication is invalid.
+Native libx264 `medium` at 1.849 Mb/s improves full-clip YUV SSIM only from 0.954306 to 0.960279 and an
+independent eight-frame local-RGB mean only from 0.921032 to 0.926936. VideoToolbox crosses that independent
+0.95 mean only at 4 Mb/s (0.952893), almost exactly twice the requested rate.
+
+**Decision.** Preserve explicit bitrate, frame rate, dimensions, profile legality, and every frame. Do not
+silently double bitrate, omit the true 60 fps hint (which makes VideoToolbox emit ~4 Mb/s), remux the
+5.72 Mb/s source, drop frames, or add a 31 MB GPL FFmpeg/x264 fallback that still misses the measured RGB
+gate at the stated rate and destroys the fastest/leanest objective. Treat this row as an incompatible
+bitrate/quality contract until the gate or requested rate represents a physically attainable pair.
+
+**Consequences.** Playback, packet count, profile, rate, timestamps, frame lifetime, and source pixels at
+the encoder input remain correct; the red stays visible instead of becoming a fake pass. The experiments
+are recorded in `docs/notes/h264-2mbps-quality-bound.md`. **Rejected:** bitrate inflation; framerate lies;
+source passthrough; per-fixture preprocessing; oracle weakening; frame duplication/drop; accepting a
+one-frame improvement that loses full-clip SSIM; or adding an unlicensed/opaque WASM binary.

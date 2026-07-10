@@ -61,6 +61,19 @@ Coverage: strict TS, zero `any`, typed errors only; `bunx vitest` gate is
 `cbcs.test.ts cenc.test.ts cenc-ops.test.ts cenc-robustness.test.ts` (all green), ≥90% branch on `cenc.ts`.
 Benchmark: `bun scripts/bench-cbcs-decrypt.ts` (fresh, multi-sample, median-of-9 throughput).
 
+## Session 11 correction — constant IV is sufficient sample crypto metadata
+
+ADR-095's later shortcut treated every protected `cbcs` track without `senc`/`saiz`/`saio` as
+clear-signalled and skipped AES. That rule is not valid for ISO/IEC 23001-7 constant-IV tracks:
+`default_Per_Sample_IV_Size = 0` means the `tenc.default_constant_IV` applies to every protected sample,
+so there need not be a per-sample auxiliary IV at all. The general engine already has the necessary
+distinction: a clear sample description or a `seig` group with `isProtected = 0` is left untouched; a
+protected description/group must resolve an IV from its per-sample entry or its constant IV and decrypt.
+The correction therefore restores `constantIv` as the no-aux fallback, preserves the typed missing-IV
+failure, and keeps mixed clear/encrypted groups byte-exact. The fail-first gate is the existing independent
+AES-CBC constant-IV fixture (16- and 8-byte IVs, whole-block transform with clear tail), followed by every
+fragmented/flat/group-override/aux layout and the real Bento4 byte-exact leg.
+
 ## Follow-up for the lead (NOT edited by this task — driver-owned files)
 
 The whole-file engine is complete and validated, but the **acceptance harness feature

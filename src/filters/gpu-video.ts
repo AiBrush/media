@@ -117,6 +117,25 @@ function chromiumCanvasTonemapAvailable(): boolean {
   return /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
 }
 
+/**
+ * Whether a geometric WebGPU draw needs the browser's colour-managed Canvas2D sampling path.
+ *
+ * Chromium's `importExternalTexture(VideoFrame)` currently samples explicitly tagged limited-range YUV
+ * (including BT.709), and BT.601-family matrices (`smpte170m`/`bt470bg`), with a material luma offset,
+ * while `drawImage(VideoFrame)` converts those same decoded pixels to display RGB correctly. Full-range
+ * BT.709/RGB and untagged frames retain the zero-copy WebGPU fast path. The decision depends only on
+ * standards metadata, never an asset identity.
+ */
+export function webgpuGeometryNeedsCanvasColorManagement(
+  colorSpace: Partial<Pick<VideoColorSpace, 'matrix' | 'fullRange'>> | undefined,
+): boolean {
+  const matrix = colorSpace?.matrix;
+  return (
+    colorSpace?.fullRange === false ||
+    (matrix !== undefined && matrix !== null && matrix !== 'bt709' && matrix !== 'rgb')
+  );
+}
+
 // ============ per-frame draw recipe (substrate-independent) ============
 
 /**
@@ -442,6 +461,7 @@ class WebGPURenderer implements Renderer {
   private gpu: GpuContext | undefined;
   private canvas: OffscreenCanvas | undefined;
   private context: GPUCanvasContext | undefined;
+  private readonly colorManagedGeometry = new Canvas2DRenderer();
   private readonly format: GPUTextureFormat;
 
   private constructor(gpu: GpuContext, format: GPUTextureFormat) {
@@ -506,6 +526,12 @@ class WebGPURenderer implements Renderer {
   render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
     const gpu = this.gpu;
     if (gpu === undefined) throw new MediaError('encode-error', 'WebGPU renderer already disposed');
+    if (
+      recipe.kind !== 'color' &&
+      webgpuGeometryNeedsCanvasColorManagement(source.colorSpace)
+    ) {
+      return this.colorManagedGeometry.render(source, recipe);
+    }
     const dims = recipeDims(recipe);
 
     this.canvas = ensureCanvas(this.canvas, dims);
@@ -568,6 +594,7 @@ class WebGPURenderer implements Renderer {
       this.gpu.device.destroy();
       this.gpu = undefined;
     }
+    this.colorManagedGeometry.dispose();
     this.context = undefined;
     this.canvas = undefined;
   }

@@ -222,6 +222,42 @@ describe('AiffDriver.demux — TrackInfo + audio-dsp seam', () => {
 });
 
 describe('AiffDriver.packetInfo — metadata-only PCM packet table', () => {
+  it('matches FFmpeg byte-oriented packet sizing for real mono s16 and non-byte-aligned s24 AIFF', async () => {
+    const s16 = await loadDerived('sfx.aiff');
+    const s16Table = aiffPacketInfoFromBytes(s16);
+    const s16Range = ssndSampleRange(s16);
+    expect(s16Table.packets).toHaveLength(5);
+    expect(s16Table.packets[0]).toMatchObject({
+      offset: s16Range.offset,
+      size: 4096,
+      ptsUs: 0,
+      durationUs: 42_667,
+    });
+    expect(s16Table.packets.at(-1)).toMatchObject({
+      offset: s16Range.offset + 4 * 4096,
+      size: 4096,
+      ptsUs: 170_667,
+      durationUs: 42_667,
+    });
+
+    const s24 = await loadDerived('sfx-s24.aiff');
+    const s24Table = aiffPacketInfoFromBytes(s24);
+    const s24Range = ssndSampleRange(s24);
+    expect(s24Table.packets).toHaveLength(8);
+    expect(s24Table.packets[0]).toMatchObject({
+      offset: s24Range.offset,
+      size: 4095,
+      ptsUs: 0,
+      durationUs: 28_438,
+    });
+    expect(s24Table.packets.at(-1)).toMatchObject({
+      offset: s24Range.offset + 7 * 4095,
+      size: 2055,
+      ptsUs: 199_063,
+      durationUs: 14_271,
+    });
+  });
+
   it('enumerates real big-endian PCM packets from SSND facts without WebCodecs packets', async () => {
     const file = await loadHarness('pcm_s16be.aiff');
     const table = aiffPacketInfoFromBytes(file);

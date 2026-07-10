@@ -234,13 +234,21 @@ function probeAudioEntry(r: Reader, stsd: BoxHeader): ProbeAudioEntry | undefine
   const esds = probeAudioConfigBox(r, childStart, entry.end, 'esds');
   if (esds === undefined) return undefined;
   const info = parseEsds(r.bytesAt(esds.payloadStart, esds.end));
+  const aacSampleRate = info.sampleRate ?? sampleRate;
+  const aacChannels = info.sbrPresent === true ? channels : (info.channels ?? channels);
   const config: AudioDecoderConfig = {
     codec: info.codec,
-    sampleRate,
-    numberOfChannels: channels,
+    sampleRate: aacSampleRate,
+    numberOfChannels: aacChannels,
     ...(info.asc ? { description: info.asc } : {}),
   };
-  return { type: entry.type, codec: info.codec, sampleRate, channels, config };
+  return {
+    type: entry.type,
+    codec: info.codec,
+    sampleRate: aacSampleRate,
+    channels: aacChannels,
+    config,
+  };
 }
 
 function probeVideoEntry(r: Reader, stsd: BoxHeader): ProbeVideoEntry | undefined {

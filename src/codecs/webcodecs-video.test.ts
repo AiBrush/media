@@ -22,6 +22,7 @@ import WebcodecsVideoModule, {
   enqueueOrDrop,
   isVideoCodecString,
   isPresentationOrdered,
+  needsAppleH264HorizontalPhaseCompensation,
   normalizeHardwareAcceleration,
   queueIsBackpressured,
   reorderByTimestamp,
@@ -215,6 +216,44 @@ describe('normalizeHardwareAcceleration — determinism maps to a WebCodecs acce
 
   it('force-software pins prefer-software for cross-machine reproducibility (ADR-007)', () => {
     expect(normalizeHardwareAcceleration('force-software')).toBe('prefer-software');
+  });
+});
+
+describe('needsAppleH264HorizontalPhaseCompensation — odd chroma-crop geometry', () => {
+  it('selects only H.264 widths congruent to 2 modulo 4 on Apple platforms', () => {
+    expect(
+      needsAppleH264HorizontalPhaseCompensation(
+        { codec: 'avc1.64001F', width: 854, height: 480 },
+        'MacIntel',
+      ),
+    ).toBe(true);
+    expect(
+      needsAppleH264HorizontalPhaseCompensation(
+        { codec: 'avc3.4D401F', width: 638, height: 360 },
+        'iPhone',
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps aligned H.264, other codecs, and non-Apple platforms untouched', () => {
+    expect(
+      needsAppleH264HorizontalPhaseCompensation(
+        { codec: 'avc1.64001F', width: 856, height: 480 },
+        'MacIntel',
+      ),
+    ).toBe(false);
+    expect(
+      needsAppleH264HorizontalPhaseCompensation(
+        { codec: 'vp09.00.10.08', width: 854, height: 480 },
+        'MacIntel',
+      ),
+    ).toBe(false);
+    expect(
+      needsAppleH264HorizontalPhaseCompensation(
+        { codec: 'avc1.64001F', width: 854, height: 480 },
+        'Win32',
+      ),
+    ).toBe(false);
   });
 });
 

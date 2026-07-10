@@ -45,6 +45,7 @@ import {
   mapVideoColorSpace,
   planColor,
   planDraw,
+  webgpuGeometryNeedsCanvasColorManagement,
   webgpuVideoFilterDriver,
 } from './gpu-video.ts';
 
@@ -472,6 +473,24 @@ const GEOMETRIC: readonly FilterSpec[] = [
   { mediaType: 'video', type: 'rotate', degrees: 90 },
   { mediaType: 'video', type: 'flip', axis: 'v' },
 ];
+
+describe('WebGPU geometric colour-management routing', () => {
+  it('routes non-BT.709 YUV matrices through Canvas2D for UA colour-managed sampling', () => {
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'smpte170m' })).toBe(true);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt470bg' })).toBe(true);
+    expect(
+      webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: false }),
+    ).toBe(true);
+  });
+
+  it('keeps full-range/untagged BT.709, RGB, unknown, and absent matrices on the WebGPU fast path', () => {
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: true })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709' })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'rgb', fullRange: true })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: null })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement(undefined)).toBe(false);
+  });
+});
 
 describe('FilterDriver identity & metadata', () => {
   it('webgpu driver declares the webgpu substrate and v1 api', () => {

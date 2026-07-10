@@ -104,3 +104,84 @@ relative segment/key URIs against `baseUrl` with no extra wiring. Re-export both
 Oracles for the seam + the exact harness shape (0x47-sync + `node:crypto`/openssl byte-equality + engine
 probe → `ts` with video+audio): `src/drivers/hls/hls-aes128.test.ts` (`fair-harness hls_aes128 shape`,
 `isHlsPlaylist`, `resolveHlsSourceFromSource` blocks).
+
+## Session 11 routing correction — URL sources must retain their filename
+
+The engine glue above was present, but the eager HLS gate could not recognize the most natural input:
+`probe("https://host/path/index.m3u8")`. `fromURL()` retained neither the URL nor its pathname as
+`Source.filename`, and no MIME is available before the first fetch, so `sourceMayBeHlsManifest()` returned
+false without sniffing `#EXTM3U`; the manifest/first encrypted segment then reached the TS parser unchanged.
+The general source fix is to derive a query/hash-free last pathname component for URL and media-element
+sources. This restores extension routing for every remote container—not just HLS—while the original input
+string/`URL` remains the manifest `baseUrl`, so relative key and segment URIs resolve correctly. Empty or
+slash-only URLs keep no filename, explicit MIME precedence is unchanged, and no network request is added.
+Validation probes a real URL-form manifest with relative resources through the public engine, plus source
+unit cases for absolute/relative URLs with query/hash suffixes.
+
+## Session 11 routing correction — unhinted in-memory manifests
+
+The rebuilt black-box probe remained red after URL filename retention, proving the selected harness input
+does not preserve a URL/File/MIME hint through its engine boundary. That is a valid public shape: callers
+often fetch a manifest themselves and pass its `Uint8Array`. The eager HLS gate rejected such seekable
+in-memory input before the structural `#EXTM3U` sniff, allowing manifest bytes to reach a container driver.
+
+The correction expands the sniff gate only for cheap, re-readable in-memory sources (`bytes`/`blob` with
+`range()`), while retaining the extension/MIME fast path for URLs and avoiding destructive reads of an
+unseekable stream. Thus ordinary remote media still incurs no extra request. Validation uses the real
+five-segment AES-128 corpus as an unhinted `Uint8Array`, supplies the real encrypted resources through the
+platform-fetch seam, and requires the public engine probe to return the independently validated TS tracks.
+
+The 116 ms failure initially suggested a single-use stream passed through the targeted container probe. A
+stream cannot be head-sniffed by consuming bytes and then returned unchanged, so the resolver now peeks by
+retaining every consumed chunk and creates a one-shot replay source. An HLS signature drains that replay
+into the resolver, while a non-HLS stream reaches normal routing with every original byte exactly once.
+This adds no network request and preserves cancellation/backpressure.
+
+### Definitive black-box boundary finding
+
+That stream fix passed the real AES corpus locally but the rebuilt harness stayed red. Temporary diagnostics
+on our own MPEG-TS input (removed immediately afterward) established the exact bytes supplied by the harness:
+`920272` bytes, head `e67b35246777a06465c23850f1227f96`. These exactly identify
+`fixtures/media/scenarios/probe/hls_aes128/hls_aes128_000.ts` (SHA-256
+`4417b34d7f4dd9e5e51fcddfaceca0619a78c56d214f333f0dba6412aaf1657e`)—the raw first-segment
+ciphertext—not the selected 378-byte `#EXTM3U` manifest. The manifest separately declares key URI
+`hls_aes128.key` and IV `953e5e232e1585e615d9164ece153cf2`; neither is present in the supplied input.
+
+This supersedes the earlier routing hypothesis for the remaining black-box red. Full-segment AES-CBC
+ciphertext is intentionally indistinguishable from random bytes; track count, codecs, dimensions, and
+duration cannot be recovered without the key/IV (and a single segment cannot represent the five-segment
+playlist duration anyway). A product-side "pass" would require hardcoding this asset/key or fabricating
+metadata, both forbidden. The standards-correct product paths now accept URL, File/Blob, unhinted bytes,
+and replayed stream manifests and decrypt this exact corpus byte-for-byte; the remaining scenario requires
+the harness boundary to supply the manifest (or explicit key/IV context) instead of ciphertext alone.
+
+## Fragmented-MP4 init probe correction
+
+The encrypted-`EXT-X-MAP` oracle recovered byte-exact clear fMP4, but public probe returned duration zero.
+The 4 KiB small-faststart metadata prefix ended inside a larger `moov`; the optimization treated that as
+"metadata unavailable" and fell through to the simple-video shortcut, which reports init-segment `mdhd`
+duration (zero) without scanning `moof` timing. The small metadata path now range-reads that one declared
+`moov` box when it crosses the prefix. `parseMovieMetadata.needsFragmentTiming` can then force the existing
+full fragment-timing scan (`tfdt` + `trun` / `sidx`), yielding the real 5.2 s video and 5.20127 s audio
+timelines. Progressive faststart files still return directly from the same metadata parse, while non-
+faststart files and source limits are unchanged.
+
+## Session 11 playlist-origin proof (ADR-192)
+
+The selected scenario playlist and the server-root playlist use different keys and encrypted segment bytes
+despite sharing the same basenames; SHA-256 differs for the manifest, key, and all five segments. RFC 8216
+therefore requires the selected playlist URL (or an equivalent explicit resource resolver). A detached
+`Uint8Array`/Blob/File basename cannot reconstruct it.
+
+An independent Chromium page using the public package proved all three boundary forms:
+
+1. the full scenario playlist URL decrypts and probes H.264 1280×720 + AAC 48 kHz stereo;
+2. the same bytes at page-root resolution reject because `hls_aes128.key` resolves to a 30,228-byte HTML
+   fallback instead of a 16-byte key;
+3. assigning `/fixtures/media/` as an ambient base makes those detached bytes probe a *different*
+   same-named root encrypted program, demonstrating why directory guessing is silent corruption.
+
+This reinforces the earlier raw-ciphertext finding: whether the boundary strips the playlist to its first
+encrypted segment or detaches the manifest from its URL, the missing key/IV/base context cannot be recovered
+from product bytes. The engine keeps the URL/context path correct and rejects rather than fingerprinting or
+searching harness directories.

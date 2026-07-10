@@ -45,6 +45,7 @@ import {
   isUnsupportedHevcEncodeProfile,
   normalizeDecoderCodec,
   outputDimensions,
+  periodicVideoKeyFrameInterval,
   resolveAudioEncodeTargetForRuntime,
   seekFrame,
   selectTrackInfos,
@@ -568,6 +569,23 @@ describe('videoFilterSpecs', () => {
     ]);
     expect(videoFilterSpecs({ height: 720 }, src)).toEqual<FilterSpec[]>([
       { mediaType: 'video', type: 'resize', width: 1920, height: 720 },
+    ]);
+  });
+
+  it('omits a geometry-identical resize but compares against post-crop dimensions', () => {
+    expect(videoFilterSpecs({ width: 1920, height: 1080 }, src)).toEqual([]);
+    expect(videoFilterSpecs({ width: 1920 }, src)).toEqual([]);
+    expect(
+      videoFilterSpecs(
+        {
+          crop: { x: 100, y: 50, width: 1280, height: 720 },
+          width: 1280,
+          height: 720,
+        },
+        src,
+      ),
+    ).toEqual<FilterSpec[]>([
+      { mediaType: 'video', type: 'crop', x: 100, y: 50, width: 1280, height: 720 },
     ]);
   });
 
@@ -1139,6 +1157,19 @@ describe('audio downmix: encoder config matches the post-remix AudioData layout'
 
 // ── encoder configs ─────────────────────────────────────────────────────────────────────────────
 
+describe('periodicVideoKeyFrameInterval — spend GOP overhead only on fragmented output', () => {
+  it('lets the encoder optimize ordinary VOD GOPs even when an fps target is explicit', () => {
+    expect(periodicVideoKeyFrameInterval(30, false)).toBeUndefined();
+    expect(periodicVideoKeyFrameInterval(undefined, false)).toBeUndefined();
+  });
+
+  it('keeps deterministic two-second keyframe boundaries for fragmented output', () => {
+    expect(periodicVideoKeyFrameInterval(30, true)).toBe(60);
+    expect(periodicVideoKeyFrameInterval(59.94, true)).toBe(120);
+    expect(periodicVideoKeyFrameInterval(undefined, true)).toBeUndefined();
+  });
+});
+
 describe('buildVideoEncoderConfig', () => {
   const src = { width: 1920, height: 1080 };
 
@@ -1169,11 +1200,27 @@ describe('buildVideoEncoderConfig', () => {
     ).toThrow(InputError);
   });
 
+  it('preserves an efficient source H.264 profile and known source fps for constrained-rate output', () => {
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'h264', bitrate: 2_000_000 },
+        { width: 1080, height: 1920, fps: 60 },
+        'avc1.64002A',
+      ),
+    ).toMatchObject({ codec: 'avc1.64002A', framerate: 60, bitrate: 2_000_000 });
+  });
+
   it('uses a resolution-aware default bitrate for offline video encodes', () => {
     expect(
       buildVideoEncoderConfig({ codec: 'vp8', width: 640, height: 360 }, src, undefined),
     ).toMatchObject({
-      bitrate: 2_534_400,
+      bitrate: 5_068_800,
+      bitrateMode: 'variable',
+    });
+    expect(
+      buildVideoEncoderConfig({ codec: 'h264', width: 1280, height: 720, fps: 30 }, src, undefined),
+    ).toMatchObject({
+      bitrate: 18_432_000,
       bitrateMode: 'variable',
     });
   });
@@ -1559,6 +1606,7 @@ describe('planH264AbrLadder', () => {
       video: { codec: 'h264', width: 640, height: 360, bitrate: 800_000 },
     });
   });
+
 });
 
 // ── H.264 level selection (gap #1) ───────────────────────────────────────────────────────────────
@@ -1652,15 +1700,18 @@ describe('normalizeDecoderCodec', () => {
     expect(normalizeDecoderCodec({ codec: 'h264', description: view })).toBe('avc1.42C01F');
   });
 
-  it('derives hev1.* from an HEVC description (hvcC profile/compat/tier/level bytes)', () => {
+  it('derives hvc1.* from an HEVC description (hvcC profile/compat/tier/level bytes)', () => {
+    // A present hvcC description means the parameter sets are out-of-band (the hvc1 sample-entry form),
+    // so the expansion uses the hvc1 prefix — mirroring avc1 for an out-of-band avcC and keeping the
+    // string maximally decodable (advertising hev1 to an hvc1-style bitstream can yield a 0×0 decode).
     // Real h265.mp4 hvcC bytes: Main, compat 6, low tier, level 60, constraint 0x90.
     const hvcC8Bit = Uint8Array.from([0x01, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3c]);
-    expect(normalizeDecoderCodec({ codec: 'hevc', description: hvcC8Bit })).toBe('hev1.1.6.L60.90');
+    expect(normalizeDecoderCodec({ codec: 'hevc', description: hvcC8Bit })).toBe('hvc1.1.6.L60.90');
 
     // Real bear-hevc-10bit-hdr10 shape: Main10, compat 4, low tier, level 93, constraint 0x90.
     const hvcC10Bit = Uint8Array.from([0x01, 0x02, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x5d]);
     expect(normalizeDecoderCodec({ codec: 'h265', description: hvcC10Bit })).toBe(
-      'hev1.2.4.L93.90',
+      'hvc1.2.4.L93.90',
     );
   });
 

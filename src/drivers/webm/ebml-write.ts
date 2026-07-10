@@ -73,12 +73,6 @@ const MICROS_PER_MS = 1_000;
 const MAX_CLUSTER_REL_MS = 30_000;
 const INT16_MIN = -32_768;
 const INT16_MAX = 32_767;
-/**
- * Video+audio MP4 inputs often carry tiny AAC priming/padding that extends the audio track declaration
- * beyond the movie/video duration. For WebM remux metadata, keep that padding from redefining the global
- * Segment duration when a video declaration exists and the overhang is clearly codec padding, not content.
- */
-const DECLARED_AV_PADDING_SLACK_MS = 250;
 const APP_NAME = 'aibrush-media';
 
 // ============ EBML write primitives ============
@@ -335,11 +329,12 @@ interface TrackChunks {
   trackNumber: number;
   mediaType?: 'video' | 'audio';
   durationSec?: number;
+  sampleRate?: number;
+  gapless?: TrackInfo['gapless'];
   chunks: readonly ChunkStruct[];
 }
 
 interface DeclaredTrackDuration {
-  mediaType: 'video' | 'audio' | undefined;
   endMs: number;
 }
 
@@ -352,7 +347,9 @@ interface DeclaredTrackDuration {
  * Cluster front-to-back and submits blocks to the decoder, so storage order must be DECODE order even
  * though each `SimpleBlock` carries a PTS timecode. The end time uses source-declared durations when the
  * demuxer provided them; for video+audio, a small audio overhang is treated as codec padding and the video
- * declaration wins. Unknown-duration tracks fall back to their packet tail.
+ * declaration wins. AAC gapless edits contribute their exact presentation sample count rather than the
+ * longer coded `mdhd` span; an AAC edit whose presentation genuinely outlasts video remains authoritative.
+ * Unknown-duration tracks fall back to their packet tail.
  */
 export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   blocks: TimelineBlock[];
@@ -387,7 +384,17 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
     }
     const declaredEndMs = durationSecToMs(t.durationSec);
     if (declaredEndMs !== undefined) {
-      declaredDurations.push({ mediaType: t.mediaType, endMs: declaredEndMs });
+      const gaplessEndMs =
+        t.mediaType === 'audio' &&
+        t.gapless?.totalSamples !== undefined &&
+        Number.isFinite(t.gapless.totalSamples) &&
+        t.gapless.totalSamples > 0 &&
+        t.sampleRate !== undefined &&
+        Number.isFinite(t.sampleRate) &&
+        t.sampleRate > 0
+          ? (t.gapless.totalSamples * 1000) / t.sampleRate
+          : undefined;
+      declaredDurations.push({ endMs: gaplessEndMs ?? declaredEndMs });
       continue;
     }
     // Track end = last presented chunk's PTS + its duration (recovered from the prior gap if missing).
@@ -412,16 +419,7 @@ function durationSecToMs(durationSec: number | undefined): number | undefined {
 
 function declaredTimelineEndMs(durations: readonly DeclaredTrackDuration[]): number | undefined {
   if (durations.length === 0) return undefined;
-  let maxEndMs = 0;
-  let maxVideoEndMs = 0;
-  for (const duration of durations) {
-    maxEndMs = Math.max(maxEndMs, duration.endMs);
-    if (duration.mediaType === 'video') maxVideoEndMs = Math.max(maxVideoEndMs, duration.endMs);
-  }
-  if (maxVideoEndMs > 0 && maxEndMs <= maxVideoEndMs + DECLARED_AV_PADDING_SLACK_MS) {
-    return maxVideoEndMs;
-  }
-  return maxEndMs;
+  return durations.reduce((maxEndMs, duration) => Math.max(maxEndMs, duration.endMs), 0);
 }
 
 /** The gap between the last two presented chunks (µs), a duration estimate for the final chunk; 0 if <2. */
@@ -446,6 +444,7 @@ interface TrackState {
   readonly height: number | undefined;
   readonly fps: number | undefined;
   readonly durationSec: number | undefined;
+  readonly gapless?: TrackInfo['gapless'];
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
   readonly chunks: ChunkStruct[];
@@ -498,10 +497,23 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     height: undefined,
     fps: undefined,
     durationSec: info.durationSec,
+    ...(info.gapless !== undefined ? { gapless: info.gapless } : {}),
     sampleRate: ac?.sampleRate,
     channels: ac?.numberOfChannels,
     chunks: [],
   };
+}
+
+function timelineTrack(t: TrackState): TrackChunks {
+  const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
+  const base = {
+    trackNumber: t.trackNumber,
+    mediaType: t.mediaType,
+    chunks: t.chunks,
+    ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
+    ...(t.gapless !== undefined ? { gapless: t.gapless } : {}),
+  };
+  return durationSec !== undefined ? { ...base, durationSec } : base;
 }
 
 /** The EBML Header (`EBML`), declaring DocType (`webm`/`matroska`) + version limits. */
@@ -740,14 +752,7 @@ function writeCluster(
 
 /** Assemble the full WebM byte stream from finalized tracks (definite sizes throughout). */
 export function writeWebm(tracks: readonly TrackState[], docType: string): Uint8Array {
-  const { blocks, endMs } = buildBlockTimeline(
-    tracks.map((t): TrackChunks => {
-      const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
-      return durationSec !== undefined
-        ? { trackNumber: t.trackNumber, mediaType: t.mediaType, durationSec, chunks: t.chunks }
-        : { trackNumber: t.trackNumber, mediaType: t.mediaType, chunks: t.chunks };
-    }),
-  );
+  const { blocks, endMs } = buildBlockTimeline(tracks.map(timelineTrack));
   const header = ebmlHeader(docType);
   const info = infoElement(endMs);
   const trackBytes = tracksElement(tracks);
@@ -929,14 +934,7 @@ export function* fragmentWebm(
   docType: string,
   opts: WebmFragmentOptions = {},
 ): Generator<Uint8Array, void, undefined> {
-  const { blocks, endMs } = buildBlockTimeline(
-    tracks.map((t): TrackChunks => {
-      const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
-      return durationSec !== undefined
-        ? { trackNumber: t.trackNumber, mediaType: t.mediaType, durationSec, chunks: t.chunks }
-        : { trackNumber: t.trackNumber, mediaType: t.mediaType, chunks: t.chunks };
-    }),
-  );
+  const { blocks, endMs } = buildBlockTimeline(tracks.map(timelineTrack));
   const videoKeyTrackNumbers = new Set<number>(
     tracks.filter((t) => t.mediaType === 'video').map((t) => t.trackNumber),
   );

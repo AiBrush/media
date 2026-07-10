@@ -155,8 +155,46 @@ function emptyStbl(track: FragmentInitTrackInput): number[] {
   );
 }
 
+/** Presentation trim for an init segment whose real decode duration is recovered from fragments. */
+function editList(track: FragmentInitTrackInput, movieTimescale: number): number[] {
+  const edit = track.edit;
+  if (edit === undefined) return [];
+  const segmentDuration = Math.round((edit.durationTicks * movieTimescale) / track.timescale);
+  const leadingEmptyDuration = Math.round(
+    ((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale,
+  );
+  if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `fragmented MP4 edit segment_duration ${segmentDuration} exceeds version-0 elst`,
+    );
+  }
+  if (edit.mediaTimeTicks < 0 || edit.mediaTimeTicks > 0x7fffffff) {
+    throw new MediaError(
+      'mux-error',
+      `fragmented MP4 edit media_time ${edit.mediaTimeTicks} exceeds version-0 elst`,
+    );
+  }
+  if (leadingEmptyDuration < 0 || leadingEmptyDuration > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `fragmented MP4 leading empty edit duration ${leadingEmptyDuration} exceeds version-0 elst`,
+    );
+  }
+  const activeEntry = cat(u32(segmentDuration), u32(edit.mediaTimeTicks), u16(1), u16(0));
+  const entries =
+    leadingEmptyDuration > 0
+      ? cat(u32(2), u32(leadingEmptyDuration), u32(0xffffffff), u16(1), u16(0), activeEntry)
+      : cat(u32(1), activeEntry);
+  return box('edts', full('elst', 0, 0, entries));
+}
+
 /** An empty (fragmented) `trak`: real codec/geometry in `stsd`, but zero samples in the tables. */
-function emptyTrak(track: FragmentInitTrackInput, trackId: number): number[] {
+function emptyTrak(
+  track: FragmentInitTrackInput,
+  trackId: number,
+  movieTimescale: number,
+): number[] {
   const isVideo = track.mediaType === 'video';
   const tkhd = full(
     'tkhd',
@@ -190,7 +228,7 @@ function emptyTrak(track: FragmentInitTrackInput, trackId: number): number[] {
   const dref = full('dref', 0, 0, cat(u32(1), full('url ', 0, 1, [])));
   const minf = box('minf', cat(mediaHeader, box('dinf', dref), emptyStbl(track)));
   const mdia = box('mdia', cat(mdhd, hdlr, minf));
-  return box('trak', cat(tkhd, mdia));
+  return box('trak', cat(tkhd, editList(track, movieTimescale), mdia));
 }
 
 /** `trex`: per-track defaults for fragments. All zero — each `trun` carries its own per-sample values. */
@@ -231,7 +269,7 @@ function initMoov(tracks: readonly FragmentInitTrackInput[], movieTimescale: num
       u32(tracks.length + 1), // next_track_id
     ),
   );
-  const traks = tracks.flatMap((t, i) => emptyTrak(t, i + 1));
+  const traks = tracks.flatMap((t, i) => emptyTrak(t, i + 1, movieTimescale));
   return box('moov', cat(mvhd, traks, mvexBox(tracks.length)));
 }
 

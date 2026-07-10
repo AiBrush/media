@@ -5,6 +5,7 @@
  * read suffices (docs/architecture/09).
  */
 
+import { probeJpeg } from '../../codecs/image/probe.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -33,10 +34,20 @@ import {
   readUint,
   readVint,
 } from './ebml.ts';
+import { h264MaxNumReorderFramesFromAvcC } from './h264-sps.ts';
 
 const ID = {
   EBML: 0x1a45dfa3,
+  EBMLVersion: 0x4286,
+  EBMLReadVersion: 0x42f7,
+  EBMLMaxIDLength: 0x42f2,
+  EBMLMaxSizeLength: 0x42f3,
   DocType: 0x4282,
+  DocTypeVersion: 0x4287,
+  DocTypeReadVersion: 0x4285,
+  DocTypeExtension: 0x4281,
+  CRC32: 0xbf,
+  Void: 0xec,
   Segment: 0x18538067,
   Info: 0x1549a966,
   TimecodeScale: 0x2ad7b1,
@@ -55,6 +66,12 @@ const ID = {
   BitDepth: 0x6264,
   CodecPrivate: 0x63a2,
   DefaultDuration: 0x23e383,
+  CodecDelay: 0x56aa,
+  Attachments: 0x1941a469,
+  AttachedFile: 0x61a7,
+  FileName: 0x466e,
+  FileMimeType: 0x4660,
+  FileData: 0x465c,
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
   SimpleBlock: 0xa3,
@@ -127,8 +144,16 @@ function mapCodec(codecId: string, bitDepth?: number): string {
 export interface WebmTrack {
   mediaType: MediaType;
   codec: string;
+  /** Declared stream that is enumerable but not decodable (for example a JSON attachment). */
+  nonMedia?: true;
   /** Matroska TrackNumber — the value carried by each (Simple)Block, used to attribute block timing. */
   trackNumber?: number;
+  /** Codec-inherent presentation delay from TrackEntry `CodecDelay`, in nanoseconds. */
+  codecDelayNs?: number;
+  /** H.264 SPS VUI `max_num_reorder_frames`, used to synthesize the absent Matroska DTS clock. */
+  reorderDepth?: number;
+  /** Source-backed bytes for an attached image stream (one key packet, timestamp zero). */
+  attachmentData?: Uint8Array;
   width?: number;
   height?: number;
   fps?: number;
@@ -167,6 +192,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   let bitDepth: number | undefined;
   let codecPrivate: Uint8Array | undefined;
   let defaultDuration = 0;
+  let codecDelayNs = 0;
 
   for (const c of elements(dv, te.dataStart, te.dataEnd)) {
     if (c.id === ID.TrackType) type = readUint(dv, c);
@@ -174,6 +200,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     else if (c.id === ID.CodecID) codecId = readAscii(dv, c);
     else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
     else if (c.id === ID.DefaultDuration) defaultDuration = readUint(dv, c);
+    else if (c.id === ID.CodecDelay) codecDelayNs = readUint(dv, c);
     else if (c.id === ID.Video) {
       for (const v of elements(dv, c.dataStart, c.dataEnd)) {
         if (v.id === ID.PixelWidth) width = readUint(dv, v);
@@ -206,10 +233,16 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     codecPrivate.byteLength > 0
       ? codecPrivate
       : undefined;
+  const reorderDepth =
+    codec === 'h264' && description !== undefined
+      ? h264MaxNumReorderFramesFromAvcC(description)
+      : undefined;
   return {
     mediaType,
     codec,
     ...(trackNumber !== undefined ? { trackNumber } : {}),
+    ...(codecDelayNs > 0 ? { codecDelayNs } : {}),
+    ...(reorderDepth !== undefined ? { reorderDepth } : {}),
     ...(width !== undefined ? { width } : {}),
     ...(height !== undefined ? { height } : {}),
     ...(fps !== undefined ? { fps } : {}),
@@ -217,6 +250,43 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     ...(channels !== undefined ? { channels } : {}),
     ...(description !== undefined ? { description } : {}),
   };
+}
+
+/** Parse Matroska `Attachments` into ffprobe-compatible declared streams, preserving declaration order. */
+function parseAttachments(bytes: Uint8Array, dv: DataView, attachments: EbmlElement): WebmTrack[] {
+  const tracks: WebmTrack[] = [];
+  for (const attachedFile of elements(dv, attachments.dataStart, attachments.dataEnd)) {
+    if (attachedFile.id !== ID.AttachedFile) continue;
+    let filename = '';
+    let mime = '';
+    let data: Uint8Array | undefined;
+    for (const child of elements(dv, attachedFile.dataStart, attachedFile.dataEnd)) {
+      if (child.id === ID.FileName) filename = readAscii(dv, child);
+      else if (child.id === ID.FileMimeType) mime = readAscii(dv, child).toLowerCase();
+      else if (child.id === ID.FileData) data = readBytes(bytes, child);
+    }
+
+    const jpegDeclared = mime === 'image/jpeg' || /\.(?:jpe?g)$/i.test(filename);
+    if (jpegDeclared && data !== undefined) {
+      try {
+        const image = probeJpeg(data);
+        tracks.push({
+          mediaType: 'video',
+          codec: 'mjpeg',
+          width: image.width,
+          height: image.height,
+          // FFmpeg exposes Matroska attached pictures on its 90 kHz synthetic stream clock.
+          fps: 90_000,
+          attachmentData: data,
+        });
+        continue;
+      } catch {
+        // A declared JPEG with invalid bytes is still a real attachment, but not a decodable video.
+      }
+    }
+    tracks.push({ mediaType: 'audio', codec: '', nonMedia: true });
+  }
+  return tracks;
 }
 
 /** A (Simple)Block's timecode relative to its cluster (int16 BE after the track-number vint). */
@@ -396,6 +466,7 @@ function blockFrames(
   block: EbmlElement,
   clusterTimecode: number,
   timecodeScale: number,
+  codecDelayNs: number,
   keyframeOverride: boolean | undefined,
   alpha: Uint8Array | undefined,
 ): { trackNumber: number; frames: WebmFrame[] } | undefined {
@@ -406,7 +477,13 @@ function blockFrames(
   const relTimecode = dv.getInt16(block.dataStart + tn.length, false);
   const flags = bytes[flagsOff] as number;
   const keyframe = keyframeOverride ?? (flags & 0x80) !== 0;
-  const timestampUs = Math.round(((clusterTimecode + relTimecode) * timecodeScale) / 1000);
+  // Track timestamps are `(BlockTimestamp * TimestampScale) - CodecDelay`. The exposed Matroska clock
+  // is quantized to TimestampScale, so subtract in nanoseconds first and round exactly once.
+  const timestampTicks = Math.round(
+    ((clusterTimecode + relTimecode) * timecodeScale - codecDelayNs) / timecodeScale,
+  );
+  const quantizedTimestampUs = Math.round((timestampTicks * timecodeScale) / 1000);
+  const timestampUs = Object.is(quantizedTimestampUs, -0) ? 0 : quantizedTimestampUs;
   const lacing = lacingOf(flags);
   const headerStart = flagsOff + 1;
 
@@ -452,8 +529,13 @@ function collectFrames(
   dv: DataView,
   segment: EbmlElement,
   timecodeScale: number,
+  codecDelayByTrackNumber: ReadonlyMap<number, number>,
 ): Map<number, WebmFrame[]> {
   const byTrack = new Map<number, WebmFrame[]>();
+  const codecDelayForBlock = (block: EbmlElement): number => {
+    const trackNumber = blockTrackNumber(dv, block);
+    return trackNumber === undefined ? 0 : (codecDelayByTrackNumber.get(trackNumber) ?? 0);
+  };
   const push = (parsed: { trackNumber: number; frames: WebmFrame[] } | undefined): void => {
     if (!parsed) return;
     const list = byTrack.get(parsed.trackNumber) ?? [];
@@ -467,7 +549,18 @@ function collectFrames(
       if (c.id === ID.Timecode) {
         clusterTimecode = readUint(dv, c);
       } else if (c.id === ID.SimpleBlock) {
-        push(blockFrames(bytes, dv, c, clusterTimecode, timecodeScale, undefined, undefined));
+        push(
+          blockFrames(
+            bytes,
+            dv,
+            c,
+            clusterTimecode,
+            timecodeScale,
+            codecDelayForBlock(c),
+            undefined,
+            undefined,
+          ),
+        );
       } else if (c.id === ID.BlockGroup) {
         const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
         if (block) {
@@ -480,6 +573,7 @@ function collectFrames(
               block,
               clusterTimecode,
               timecodeScale,
+              codecDelayForBlock(block),
               isKeyframe,
               readMainBlockAdditional(bytes, dv, c.dataStart, c.dataEnd),
             ),
@@ -546,19 +640,156 @@ interface ParseWebmOptions {
   readonly scanClusters?: boolean;
 }
 
+interface EbmlHeaderFacts {
+  readonly docType: 'webm' | 'matroska';
+  readonly maxIdLength: number;
+  readonly maxSizeLength: number;
+}
+
+function ebmlHeaderError(reason: string): InputError {
+  return new InputError(
+    'unsupported-input',
+    `not a WebM/Matroska file (invalid EBML header: ${reason})`,
+  );
+}
+
+function headerUint(dv: DataView, element: EbmlElement, name: string): number {
+  const length = element.dataEnd - element.dataStart;
+  if (!element.complete || length < 1 || length > 8) {
+    throw ebmlHeaderError(`${name} is truncated or has an invalid width`);
+  }
+  return readUint(dv, element);
+}
+
+/** Validate the RFC 8794 header before trusting any Matroska body element. */
+function parseEbmlHeader(dv: DataView, header: EbmlElement): EbmlHeaderFacts {
+  if (!header.complete) throw ebmlHeaderError('the leading header is truncated');
+  let ebmlVersion = 1;
+  let ebmlReadVersion = 1;
+  let maxIdLength = 4;
+  let maxSizeLength = 8;
+  let docType: string | undefined;
+  let docTypeVersion = 1;
+  let docTypeReadVersion = 1;
+  let parsedEnd = header.dataStart;
+  const seen = new Set<number>();
+
+  for (const child of elements(dv, header.dataStart, header.dataEnd)) {
+    parsedEnd = child.dataEnd;
+    const mayRepeat = child.id === ID.Void || child.id === ID.DocTypeExtension;
+    if (!mayRepeat && seen.has(child.id)) {
+      throw ebmlHeaderError(`duplicate element 0x${child.id.toString(16)}`);
+    }
+    seen.add(child.id);
+    switch (child.id) {
+      case ID.EBMLVersion:
+        ebmlVersion = headerUint(dv, child, 'EBMLVersion');
+        break;
+      case ID.EBMLReadVersion:
+        ebmlReadVersion = headerUint(dv, child, 'EBMLReadVersion');
+        break;
+      case ID.EBMLMaxIDLength:
+        maxIdLength = headerUint(dv, child, 'EBMLMaxIDLength');
+        break;
+      case ID.EBMLMaxSizeLength:
+        maxSizeLength = headerUint(dv, child, 'EBMLMaxSizeLength');
+        break;
+      case ID.DocType:
+        if (!child.complete) throw ebmlHeaderError('DocType is truncated');
+        docType = readAscii(dv, child);
+        break;
+      case ID.DocTypeVersion:
+        docTypeVersion = headerUint(dv, child, 'DocTypeVersion');
+        break;
+      case ID.DocTypeReadVersion:
+        docTypeReadVersion = headerUint(dv, child, 'DocTypeReadVersion');
+        break;
+      case ID.CRC32:
+        if (!child.complete || child.dataEnd - child.dataStart !== 4) {
+          throw ebmlHeaderError('CRC-32 must contain exactly four bytes');
+        }
+        break;
+      case ID.Void:
+      case ID.DocTypeExtension:
+        if (!child.complete) throw ebmlHeaderError('contains a truncated extension element');
+        break;
+      default:
+        throw ebmlHeaderError(`contains unknown element 0x${child.id.toString(16)}`);
+    }
+  }
+
+  if (parsedEnd !== header.dataEnd) throw ebmlHeaderError('contains malformed trailing bytes');
+  if (ebmlVersion !== 1 || ebmlReadVersion !== 1) {
+    throw ebmlHeaderError(`unsupported EBML version ${ebmlVersion}/${ebmlReadVersion}`);
+  }
+  if (maxIdLength !== 4) {
+    throw ebmlHeaderError(`EBMLMaxIDLength must be 4, received ${maxIdLength}`);
+  }
+  if (maxSizeLength < 1 || maxSizeLength > 8) {
+    throw ebmlHeaderError(`EBMLMaxSizeLength ${maxSizeLength} is outside 1..8`);
+  }
+  if (docType !== 'webm' && docType !== 'matroska') {
+    throw ebmlHeaderError(`DocType '${docType ?? ''}' is not webm or matroska`);
+  }
+  if (
+    docTypeVersion < 1 ||
+    docTypeReadVersion < 1 ||
+    docTypeReadVersion > docTypeVersion ||
+    docTypeReadVersion > 4
+  ) {
+    throw ebmlHeaderError(`unsupported DocType version ${docTypeVersion}/${docTypeReadVersion}`);
+  }
+  return { docType, maxIdLength, maxSizeLength };
+}
+
 export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): WebmInfo {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const scanClusters = options.scanClusters ?? true;
-  let docType = 'webm';
+  let docType: 'webm' | 'matroska' | undefined;
+  let maxIdLength = 4;
+  let maxSizeLength = 8;
   let segment: EbmlElement | undefined;
+  let expectedSegmentStart: number | undefined;
+  let topLevelIndex = 0;
   for (const el of elements(dv, 0, dv.byteLength)) {
+    if (topLevelIndex === 0 && (el.id !== ID.EBML || !el.complete)) {
+      throw new InputError(
+        'unsupported-input',
+        'not a WebM/Matroska file (missing complete leading EBML header)',
+      );
+    }
+    topLevelIndex += 1;
     if (el.id === ID.EBML) {
-      const dt = findChild(dv, el.dataStart, el.dataEnd, ID.DocType);
-      if (dt) docType = readAscii(dv, dt);
+      const header = parseEbmlHeader(dv, el);
+      docType = header.docType;
+      maxIdLength = header.maxIdLength;
+      maxSizeLength = header.maxSizeLength;
+      expectedSegmentStart = el.dataEnd;
     } else if (el.id === ID.Segment) {
+      if (topLevelIndex !== 2 || expectedSegmentStart === undefined) {
+        throw ebmlHeaderError('the Segment does not immediately follow the EBML header');
+      }
+      const id = readVint(dv, expectedSegmentStart, true);
+      const size =
+        id === undefined ? undefined : readVint(dv, expectedSegmentStart + id.length, false);
+      if (
+        id === undefined ||
+        size === undefined ||
+        id.value !== ID.Segment ||
+        id.length > maxIdLength ||
+        size.length > maxSizeLength
+      ) {
+        throw ebmlHeaderError('the Segment exceeds the declared id/size limits');
+      }
       segment = el;
       break;
     }
+  }
+  if (topLevelIndex === 0 || docType === undefined) {
+    throw new InputError(
+      'unsupported-input',
+      'not a WebM/Matroska file (missing complete leading EBML header)',
+    );
   }
   if (!segment) throw new InputError('unsupported-input', 'not a WebM/Matroska (EBML) file');
 
@@ -580,6 +811,8 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
           if (track) tracks.push(track);
         }
       }
+    } else if (el.id === ID.Attachments) {
+      tracks.push(...parseAttachments(bytes, dv, el));
     } else if (scanClusters && el.id === ID.Cluster) {
       lastEndTicks = Math.max(lastEndTicks, clusterEnd(dv, el));
       collectClusterBlockTimes(dv, el, blockTimes);
@@ -643,12 +876,36 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
     const ts = findChild(dv, infoEl.dataStart, infoEl.dataEnd, ID.TimecodeScale);
     if (ts) timecodeScale = readUint(dv, ts);
   }
-  const byTrackNumber = collectFrames(bytes, dv, segment, timecodeScale);
+  const codecDelayByTrackNumber = new Map<number, number>();
+  for (const track of info.tracks) {
+    if (track.trackNumber !== undefined && track.codecDelayNs !== undefined) {
+      codecDelayByTrackNumber.set(track.trackNumber, track.codecDelayNs);
+    }
+  }
+  const byTrackNumber = collectFrames(bytes, dv, segment, timecodeScale, codecDelayByTrackNumber);
   // Remap TrackNumber → public index. A track without a TrackNumber (or with no blocks) gets an empty
   // list, so `packets()` is always a valid (possibly empty) stream rather than a missing-key surprise.
-  const framesByIndex = info.tracks.map((t) =>
-    t.trackNumber !== undefined ? (byTrackNumber.get(t.trackNumber) ?? []) : [],
+  const framesByIndex = info.tracks.map((track): WebmFrame[] => {
+    if (track.attachmentData !== undefined) {
+      return [{ data: track.attachmentData, timestampUs: 0, keyframe: true }];
+    }
+    return track.trackNumber !== undefined ? (byTrackNumber.get(track.trackNumber) ?? []) : [];
+  });
+  const declaredBlockTrackNumbers = info.tracks.flatMap((track) =>
+    track.trackNumber === undefined ? [] : [track.trackNumber],
   );
+  const hasDeclaredMediaBlock = declaredBlockTrackNumbers.some(
+    (trackNumber) => (byTrackNumber.get(trackNumber)?.length ?? 0) > 0,
+  );
+  if (
+    (declaredBlockTrackNumbers.length > 0 && !hasDeclaredMediaBlock) ||
+    framesByIndex.every((frames) => frames.length === 0)
+  ) {
+    throw new MediaError(
+      'demux-error',
+      'WebM segment declares media tracks but contains no media blocks',
+    );
+  }
   return { info, framesByIndex };
 }
 
@@ -661,6 +918,7 @@ function sourceViewOffset(source: Uint8Array, view: Uint8Array): number | undefi
 
 function packetPayloadRows(
   bytes: Uint8Array,
+  tracks: readonly WebmTrack[],
   framesByIndex: readonly (readonly WebmFrame[])[],
   sourceDurationUs: number | undefined,
 ): WebmPacketPayloadMetadata[] {
@@ -668,25 +926,40 @@ function packetPayloadRows(
   for (let trackIndex = 0; trackIndex < framesByIndex.length; trackIndex++) {
     const frames = framesByIndex[trackIndex];
     if (frames === undefined) continue;
+    const track = tracks[trackIndex];
+    const codecDefinesAudioSync = track?.codec === 'opus' || track?.codec === 'vorbis';
+    const reorderDepth = track?.reorderDepth ?? 0;
+    const presentationTimeline =
+      reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
     for (let i = 0; i < frames.length; i++) {
       const frame = frames[i];
       if (frame === undefined) continue;
       const offset = sourceViewOffset(bytes, frame.data);
       const durationUs = frameDurationUs(frames, i, sourceDurationUs);
+      const dtsUs =
+        presentationTimeline !== undefined && i >= reorderDepth
+          ? (presentationTimeline[i - reorderDepth] ?? frame.timestampUs)
+          : frame.timestampUs;
       rows.push({
         trackIndex,
         ...(offset !== undefined ? { offset } : {}),
         size: frame.data.byteLength,
         ptsUs: frame.timestampUs,
-        dtsUs: frame.timestampUs,
+        dtsUs,
         ...(durationUs !== undefined ? { durationUs } : {}),
-        keyframe: frame.keyframe,
+        // FFmpeg derives sync status from the self-contained Opus/Vorbis packet syntax even when the
+        // video-oriented block key bit is clear. Other Matroska audio codecs retain container flags.
+        keyframe: codecDefinesAudioSync || frame.keyframe,
         data: frame.data,
         ...(frame.alpha !== undefined ? { alpha: frame.alpha } : {}),
       });
     }
   }
-  return rows;
+  // Per-track arrays are useful to `packets(trackId)`, but packet-info is a container-wide table. Sort
+  // source-backed views by their actual byte position to restore Matroska's global block/decode order.
+  return rows.sort(
+    (a, b) => (a.offset ?? Number.POSITIVE_INFINITY) - (b.offset ?? Number.POSITIVE_INFINITY),
+  );
 }
 
 export function webmPacketPayloadInfoFromBytes(bytes: Uint8Array): WebmPacketPayloadInfoTable {
@@ -702,7 +975,7 @@ export function webmPacketPayloadInfoFromBytes(bytes: Uint8Array): WebmPacketPay
         framesByIndex[index]?.some((frame) => frame.alpha !== undefined) === true,
       ),
     ),
-    packets: packetPayloadRows(bytes, framesByIndex, sourceDurationUs),
+    packets: packetPayloadRows(bytes, info.tracks, framesByIndex, sourceDurationUs),
   };
 }
 
@@ -712,6 +985,15 @@ function toTrackInfo(
   durationSec?: number,
   alpha?: boolean,
 ): TrackInfo {
+  if (track.nonMedia === true) {
+    return {
+      id,
+      mediaType: track.mediaType,
+      codec: track.codec,
+      nonMedia: true,
+      ...(durationSec !== undefined ? { durationSec } : {}),
+    };
+  }
   // The CodecPrivate rides in `description`: avcC/hvcC for H.264/HEVC decode config, and Vorbis'
   // Xiph-laced setup headers for cross-container muxing into Ogg. It is a `Uint8Array`, satisfying the
   // WebCodecs `description: AllowSharedBufferSource` field where a decoder consumes it.
@@ -822,6 +1104,15 @@ function metadataComplete(bytes: Uint8Array, info: WebmInfo): boolean {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findSegment(dv);
   if (segment === undefined) return false;
+  const tracks = findChild(dv, segment.dataStart, segment.dataEnd, ID.Tracks);
+  // A bounded prefix may contain one complete TrackEntry while truncating its finite parent Tracks
+  // element and every following entry. Never freeze that partial declaration as the public track list.
+  if (tracks === undefined || !tracks.complete) return false;
+  for (const child of elements(dv, segment.dataStart, segment.dataEnd)) {
+    // A prefix can contain the first AttachedFile while truncating a later one. Do not freeze that
+    // partial stream list; grow the range until the finite Attachments element is wholly available.
+    if (child.id === ID.Attachments && !child.complete) return false;
+  }
   if (!segmentHasDeclaredDuration(dv, segment)) return false;
   if (!videoTracksHaveDefaultDuration(dv, segment)) return false;
   return true;
@@ -1090,7 +1381,15 @@ async function streamCopyWebm(
     assertNotAborted(options?.signal);
     const track = demux.info.tracks[trackIndex];
     const frames = demux.framesByIndex[trackIndex] ?? [];
-    if (track === undefined || frames.length === 0) continue;
+    // Attachments are probe/demux streams, not Block tracks. The current Matroska writer has no
+    // Attachments authoring surface, so keep the pre-existing media-track stream-copy scope.
+    if (
+      track === undefined ||
+      track.nonMedia === true ||
+      track.attachmentData !== undefined ||
+      frames.length === 0
+    )
+      continue;
     const indexes = selectedFrameIndexes(track, frames, range);
     if (indexes.length === 0) continue;
     const muxTrackId = muxer.addTrack(
@@ -1126,7 +1425,7 @@ async function streamCopyWebm(
  */
 function packetStream(
   frames: readonly WebmFrame[],
-  mediaType: MediaType,
+  track: WebmTrack,
   signal: AbortSignal | undefined,
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
@@ -1137,7 +1436,11 @@ function packetStream(
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */
-  const isVideo = mediaType === 'video';
+  const isVideo = track.mediaType === 'video';
+  const codecDefinesAudioSync = track.codec === 'opus' || track.codec === 'vorbis';
+  const reorderDepth = track.reorderDepth ?? 0;
+  const presentationTimeline =
+    reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
   let i = 0;
   return new ReadableStream<Packet>({
     pull(controller): void {
@@ -1151,22 +1454,30 @@ function packetStream(
         return;
       }
       i++;
+      const keyframe = codecDefinesAudioSync || frame.keyframe;
       const init = {
-        type: (frame.keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+        // FFmpeg-compatible semantics: self-contained Opus/Vorbis packets are sync packets even when
+        // the Matroska block bit is clear; other codecs preserve their explicit container verdict.
+        type: (keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
         timestamp: frame.timestampUs,
         data: frame.data,
       };
-      // Matroska `SimpleBlock`s carry only a presentation timecode and are stored in decode order; the
-      // container has no separate DTS, so `dtsUs` is left implicit (== PTS) per the {@link Packet} contract.
+      // Matroska blocks carry PTS in decode order. H.264's SPS reorder restriction reconstructs DTS;
+      // non-reordered frames keep it implicit under the `undefined => DTS equals PTS` Packet contract.
       const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
       const alpha =
         isVideo && frame.alpha !== undefined
           ? new EncodedVideoChunk({ ...init, data: frame.alpha })
           : undefined;
+      const dtsUs =
+        presentationTimeline !== undefined && i - 1 >= reorderDepth
+          ? (presentationTimeline[i - 1 - reorderDepth] ?? frame.timestampUs)
+          : frame.timestampUs;
       controller.enqueue({
         chunk,
         data: frame.data,
         sizeBytes: frame.data.byteLength,
+        ...(dtsUs !== frame.timestampUs ? { dtsUs } : {}),
         ...(alpha !== undefined ? { alpha } : {}),
       });
     },
@@ -1231,7 +1542,7 @@ export const WebmDriver: ContainerDriver = {
         const track = info.tracks[trackId];
         const frames = framesByIndex[trackId];
         if (!track || !frames) throw new MediaError('demux-error', `no track ${trackId}`);
-        return packetStream(frames, track.mediaType, signal);
+        return packetStream(frames, track, signal);
       },
       close: () => Promise.resolve(),
     };

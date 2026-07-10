@@ -189,6 +189,13 @@ export interface TrackInfo {
   id: number;
   mediaType: MediaType;
   codec: string;
+  /**
+   * Marks a declared non-media trak (e.g. a QuickTime `tmcd` timecode trak). It is enumerated by
+   * `probe()` for stream count/order parity with ffprobe/mediainfo but carries no decodable `config`,
+   * so it never appears in `demux()`/decode/mux output; `mediaType` is a nominal placeholder for such an
+   * entry (consumers key off this flag) and `probe` surfaces it as `MediaInfoTrack.type: 'other'`.
+   */
+  nonMedia?: true;
   durationSec?: number;
   /** Video frame rate (frames ÷ duration) and display rotation in degrees, when known. */
   fps?: number;

@@ -20,8 +20,10 @@ import { loadFixture } from '../../test-support/corpus.ts';
 import {
   AAC_LC_FRAME_SAMPLES,
   MPEG4_SAMPLE_RATES,
+  aacObjectTypeFromCodecString,
   deinterleaveF32,
   descriptionBytes,
+  explicitHeAacObjectType,
   isAacCodec,
   normalizeAacDecoderConfig,
   parseAdtsFrame,
@@ -250,6 +252,72 @@ describe('normalizeAacDecoderConfig — validate + carry ASC', () => {
     expect(() =>
       normalizeAacDecoderConfig({ codec: 'mp4a.40.2', sampleRate: 0, numberOfChannels: 2 }),
     ).toThrow(/sampleRate/);
+  });
+});
+
+describe('HE-AAC/SBR honest decline (the AAC-LC-only wasm core)', () => {
+  // The real 25-byte AudioSpecificConfig (esds DecoderSpecificInfo) from the fragmented HE-AAC scenario
+  // fixtures: audioObjectType 5 (SBR) · core 22.05 kHz · stereo · extension 44.1 kHz · trailing padding.
+  const HE_AAC_ASC = Uint8Array.of(0x2b, 0x92, 0x08, 0x00, 0x00);
+
+  it('aacObjectTypeFromCodecString reads the RFC 6381 object type', () => {
+    expect(aacObjectTypeFromCodecString('mp4a.40.2')).toBe(2);
+    expect(aacObjectTypeFromCodecString('mp4a.40.5')).toBe(5);
+    expect(aacObjectTypeFromCodecString('mp4a.40.29')).toBe(29);
+    expect(aacObjectTypeFromCodecString('mp4a')).toBeUndefined();
+    expect(aacObjectTypeFromCodecString('opus')).toBeUndefined();
+  });
+
+  it('explicitHeAacObjectType flags SBR (5) / PS (29) from the ASC or codec string, ASC winning', () => {
+    expect(explicitHeAacObjectType('mp4a.40.5', new Uint8Array(0))).toBe(5);
+    expect(explicitHeAacObjectType('mp4a.40.29', new Uint8Array(0))).toBe(29);
+    expect(explicitHeAacObjectType('mp4a.40.2', HE_AAC_ASC)).toBe(5); // ASC is authoritative
+    expect(explicitHeAacObjectType('mp4a.40.2', Uint8Array.of(0x12, 0x10))).toBeUndefined(); // AAC-LC
+    expect(explicitHeAacObjectType('mp4a.40.2', new Uint8Array(0))).toBeUndefined();
+  });
+
+  it('normalizeAacDecoderConfig declines explicit HE-AAC (mp4a.40.5) / HE-AACv2 (mp4a.40.29)', () => {
+    for (const codec of ['mp4a.40.5', 'mp4a.40.29']) {
+      expect(() =>
+        normalizeAacDecoderConfig({ codec, sampleRate: 44100, numberOfChannels: 2 }),
+      ).toThrow(/HE-AAC/);
+    }
+    // A real fragmented-MP4 explicit-SBR ASC is declined even when the codec string claims plain LC.
+    expect(() =>
+      normalizeAacDecoderConfig({
+        codec: 'mp4a.40.2',
+        sampleRate: 44100,
+        numberOfChannels: 2,
+        description: HE_AAC_ASC,
+      }),
+    ).toThrow(/HE-AAC/);
+  });
+
+  it('still admits implicit-SBR AAC-LC (mp4a.40.2 with an LC ASC) — the core decodes the LC layer', () => {
+    const cfg = normalizeAacDecoderConfig({
+      codec: 'mp4a.40.2',
+      sampleRate: 44100,
+      numberOfChannels: 2,
+      description: Uint8Array.of(0x12, 0x10),
+    });
+    expect(cfg.channels).toBe(2);
+    expect(cfg.sampleRate).toBe(44100);
+  });
+
+  it('supports(): honest false with an HE-AAC reason (never a hard crash)', async () => {
+    const support = await WasmAacDriver.supports({
+      mediaType: 'audio',
+      direction: 'decode',
+      config: { codec: 'mp4a.40.5', sampleRate: 44100, numberOfChannels: 2, description: HE_AAC_ASC },
+    });
+    expect(support.supported).toBe(false);
+    expect(support.reason ?? '').toMatch(/HE-AAC/);
+  });
+
+  it('createDecoder raises the typed HE-AAC miss up front (before instantiating the wasm core)', () => {
+    expect(() =>
+      WasmAacDriver.createDecoder({ codec: 'mp4a.40.5', sampleRate: 44100, numberOfChannels: 2 }),
+    ).toThrow(MediaError);
   });
 });
 

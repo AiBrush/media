@@ -29,6 +29,16 @@ export const AAC_LC_FRAME_SAMPLES = 1024 as const;
 /** This driver decodes AAC-LC mono/stereo (Symphonia's AAC scope; it rejects SBR/HE/>2ch). */
 export const AAC_MAX_CHANNELS = 2 as const;
 
+/**
+ * MPEG-4 audio object types that layer SBR/PS on top of the AAC-LC core and so exceed this LC-only wasm
+ * decoder (ISO/IEC 14496-3 Table 1.17): 5 = SBR (HE-AAC v1), 29 = PS (HE-AAC v2). Symphonia rejects an
+ * *explicit* SBR/PS `AudioSpecificConfig` as "too complex" at construction, so the driver declines these
+ * honestly up front (a typed capability miss) instead of advertising support and hard-crashing on init.
+ * Implicit (in-band) SBR — an AAC-LC ASC (`mp4a.40.2`) whose bitstream carries an SBR extension — is NOT
+ * flagged here: its ASC object type is 2 and Symphonia decodes the LC core, so it stays on the LC path.
+ */
+export const HE_AAC_OBJECT_TYPES: ReadonlySet<number> = new Set([5, 29]);
+
 /** True when a codec string names AAC (`mp4a.40.x`, or the bare `mp4a`). */
 export function isAacCodec(codec: string): boolean {
   return codec === AAC_CODEC_PREFIX || codec.startsWith(`${AAC_CODEC_PREFIX}.`);
@@ -234,15 +244,52 @@ export interface AacDecodeConfig {
   extraData: Uint8Array;
 }
 
+/** The AAC audio object type an RFC 6381 codec string pins (`mp4a.40.<oti>` → `<oti>`), or `undefined`. */
+export function aacObjectTypeFromCodecString(codec: string): number | undefined {
+  const match = /^mp4a\.40\.(\d+)$/.exec(codec);
+  if (match === null) return undefined;
+  const oti = Number.parseInt(match[1] as string, 10);
+  return Number.isFinite(oti) ? oti : undefined;
+}
+
+/**
+ * The explicit HE-AAC/SBR (or HE-AACv2/PS) audio object type a decode config declares — read from the
+ * AudioSpecificConfig's leading 5-bit object type when a `description` is present, else the RFC 6381
+ * codec string (`mp4a.40.5`/`mp4a.40.29`) — or `undefined` for plain AAC-LC. The ASC is authoritative
+ * (the container's `esds`), so it wins over the codec string. Used to decline HE-AAC honestly: the wasm
+ * core is AAC-LC only (see {@link HE_AAC_OBJECT_TYPES}).
+ */
+export function explicitHeAacObjectType(codec: string, asc: Uint8Array): number | undefined {
+  const ascObjectType = asc.length >= 1 ? (asc[0] as number) >> 3 : undefined;
+  if (ascObjectType !== undefined && HE_AAC_OBJECT_TYPES.has(ascObjectType)) return ascObjectType;
+  const codecObjectType = aacObjectTypeFromCodecString(codec);
+  if (codecObjectType !== undefined && HE_AAC_OBJECT_TYPES.has(codecObjectType)) {
+    return codecObjectType;
+  }
+  return undefined;
+}
+
 /**
  * Validate + normalize an {@link AudioDecoderConfig} for the wasm AAC core. Requires an AAC codec id and
  * a known sample rate + channel count (1–2). The `description` (ASC) is optional — Symphonia synthesizes
- * a default AAC-LC ASC from the rate/channels when it is absent (the ADTS case). A bad config is a typed
- * {@link MediaError} (`decode-error`).
+ * a default AAC-LC ASC from the rate/channels when it is absent (the ADTS case). Explicit HE-AAC/SBR
+ * (`mp4a.40.5`) and HE-AACv2/PS (`mp4a.40.29`) are declined here: the LC-only core rejects them as "too
+ * complex" at construction, so surfacing the miss *before* touching the wasm keeps `supports()` honest
+ * (it answers `false`) and the router degrades to a typed capability miss instead of a hard crash. A bad
+ * config is a typed {@link MediaError} (`decode-error`).
  */
 export function normalizeAacDecoderConfig(config: AudioDecoderConfig): AacDecodeConfig {
   if (!isAacCodec(config.codec)) {
     throw new MediaError('decode-error', `aac: wasm-aac cannot decode codec '${config.codec}'`);
+  }
+  const extraData = descriptionBytes(config.description);
+  const heAacObjectType = explicitHeAacObjectType(config.codec, extraData);
+  if (heAacObjectType !== undefined) {
+    throw new MediaError(
+      'decode-error',
+      `aac: wasm-aac (AAC-LC core) cannot decode HE-AAC/SBR (audioObjectType ${heAacObjectType}); ` +
+        'a native AAC decoder is required',
+    );
   }
   const channels = config.numberOfChannels;
   if (channels < 1 || channels > AAC_MAX_CHANNELS) {
@@ -257,7 +304,7 @@ export function normalizeAacDecoderConfig(config: AudioDecoderConfig): AacDecode
   return {
     channels,
     sampleRate: config.sampleRate,
-    extraData: descriptionBytes(config.description),
+    extraData,
   };
 }
 

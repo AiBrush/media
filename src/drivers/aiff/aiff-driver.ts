@@ -33,7 +33,7 @@ import { locate, parseAiff, readAiffPcm } from './aiff.ts';
 const AIFF_MIMES = new Set(['audio/aiff', 'audio/x-aiff', 'audio/aifc', 'audio/x-aifc']);
 const AIFF_EXTENSIONS = new Set(['aiff', 'aif', 'aifc']);
 const AIFF_PACKET_INFO_HEAD_BYTES = 65536;
-const AIFF_PACKET_FRAMES = 1024;
+const AIFF_PACKET_TARGET_BYTES = 4096;
 const AIFF_PACKET_INFO_PREFIX_TTL_MS = 60_000;
 const AIFF_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES = 64;
 const OPERATION_ABORTED = 'operation aborted';
@@ -133,8 +133,13 @@ function aiffPacketInfoFromLocatedBytes(
   const bytesPerFrame = bytesPerSample(layout.format) * layout.channels;
   if (ssndSampleOffset >= 0 && bytesPerFrame > 0 && sampleRate > 0 && ssndSampleBytes > 0) {
     const totalFrames = Math.floor(ssndSampleBytes / bytesPerFrame);
-    for (let frame = 0; frame < totalFrames; frame += AIFF_PACKET_FRAMES) {
-      const frames = Math.min(AIFF_PACKET_FRAMES, totalFrames - frame);
+    // FFmpeg's PCM demuxers target a 4 KiB packet payload, rounded down to a complete interleaved
+    // sample frame. Keeping the policy byte-oriented is important: mono s16 is 2,048 frames/packet,
+    // stereo s16 is 1,024, and mono s24 is 1,365 (4,095 bytes). A frame-oriented constant gives the
+    // wrong packet table for every layout except stereo s16.
+    const packetFrames = Math.max(1, Math.floor(AIFF_PACKET_TARGET_BYTES / bytesPerFrame));
+    for (let frame = 0; frame < totalFrames; frame += packetFrames) {
+      const frames = Math.min(packetFrames, totalFrames - frame);
       const ptsUs = Math.round((frame / sampleRate) * 1_000_000);
       packets.push({
         trackIndex: 0,

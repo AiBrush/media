@@ -83,8 +83,9 @@ export interface ClapInfo {
 /**
  * A declared `trak` whose handler is not audio/video — surfaced honestly instead of dropped
  * (ADR-185): QuickTime files routinely carry `tmcd` timecode traks that ffprobe counts as streams.
- * Parsed leniently (a malformed non-media trak still enumerates with what could be read) and cheaply
- * (stsd fourcc + count headers only — never sample payloads, so enumeration stays O(index)).
+ * Parsed leniently (a malformed non-media trak still enumerates with what could be read). Metadata
+ * mode reads only count headers; full/packet-info modes retain sample tables so packet-bearing `tmcd`
+ * and metadata tracks are enumerated without ever reading their payload bytes.
  */
 export interface OtherTrack {
   id: number;
@@ -95,6 +96,10 @@ export interface OtherTrack {
   timescale: number;
   durationSec: number;
   sampleCount: number;
+  /** Present in full/packet-info parses when a readable packet table exists. */
+  samples?: SampleTable;
+  /** Present for a normal single-rate edit list, just as on decodable tracks. */
+  edit?: TrackEdit;
   /** 0-based position of this trak in `moov` — ffprobe's stream order for file-order listings. */
   trakIndex: number;
 }
@@ -324,7 +329,12 @@ function parseTraf(
   r: Reader,
   traf: BoxHeader,
   trexDefaults: Map<number, number>,
-): { trackId: number; sampleCount: number; durationTicks: number; baseDecodeTime: number } {
+): {
+  trackId: number;
+  sampleCount: number;
+  durationTicks: number;
+  baseDecodeTime: number;
+} {
   const tfhd = child(r, traf, 'tfhd');
   let trackId = 0;
   let tfhdDefaultDuration: number | undefined;
@@ -530,14 +540,16 @@ function stsdFirstEntryType(r: Reader, stsd: BoxHeader): string | undefined {
 }
 
 /**
- * Surface a declared non-media trak (`tmcd`/`text`/…) with whatever structure is readable — count
- * headers only (stsz sample count, stts fallback), never payload bytes, so enumeration is O(index).
- * Every field degrades independently: a malformed data trak must never break AV probing.
+ * Surface a declared non-media trak (`tmcd`/`text`/…) with whatever structure is readable. Metadata
+ * mode reads count headers only; full and packet-info modes retain the real sample table. Every field
+ * degrades independently: a malformed data trak must never break AV probing or AV packet enumeration.
  */
 function parseOtherTrak(
   r: Reader,
   trak: BoxHeader,
   handler: string,
+  movieTimescale: number,
+  mode: ParseMode,
   trakIndex: number,
 ): OtherTrack {
   const id = attempt(() => {
@@ -560,20 +572,34 @@ function parseOtherTrak(
         return stsd ? stsdFirstEntryType(r, stsd) : undefined;
       })
     : undefined;
-  const sampleCount = stbl
+  const parsedSamples = stbl
+    ? attempt(() =>
+        mode === 'full'
+          ? parseSampleTableWithCount(r, stbl)
+          : mode === 'packet-info'
+            ? parsePacketInfoSampleTable(r, stbl)
+            : undefined,
+      )
+    : undefined;
+  const sampleCountFallback = stbl
     ? attempt(
         () =>
           parseStszSampleCount(r, child(r, stbl, 'stsz')) ??
           sampleCountFromStts(parseStts(r, child(r, stbl, 'stts'))),
       )
     : undefined;
+  const edit = attempt(() => parseTrackEdit(r, trak, movieTimescale));
   return {
     id: id ?? 0,
     handler,
     codec: codec ?? '',
     timescale: timing?.timescale ?? 0,
     durationSec: timing?.durationSec ?? 0,
-    sampleCount: sampleCount ?? 0,
+    sampleCount: parsedSamples?.sampleCount ?? sampleCountFallback ?? 0,
+    ...(parsedSamples !== undefined && parsedSamples.sampleCount > 0
+      ? { samples: parsedSamples.samples }
+      : {}),
+    ...(edit !== undefined ? { edit } : {}),
     trakIndex,
   };
 }
@@ -591,7 +617,10 @@ function parseTrak(
   const mediaType: MediaType | undefined =
     handler === 'vide' ? 'video' : handler === 'soun' ? 'audio' : undefined;
   if (mediaType === undefined) {
-    return { kind: 'other', track: parseOtherTrak(r, trak, handler ?? '', trakIndex) };
+    return {
+      kind: 'other',
+      track: parseOtherTrak(r, trak, handler ?? '', movieTimescale, mode, trakIndex),
+    };
   }
 
   const tkhd = child(r, trak, 'tkhd') ?? fail('trak has no tkhd');
@@ -799,14 +828,25 @@ function parseProtection(
   r.seek(schi.payloadStart);
   const tenc = boxFrom(r, schi.end, 'tenc');
   if (!tenc) return undefined;
-  return { originalType, schemeType, tenc: r.bytesAt(tenc.payloadStart, tenc.end).slice() };
+  return {
+    originalType,
+    schemeType,
+    tenc: r.bytesAt(tenc.payloadStart, tenc.end).slice(),
+  };
 }
 
 function readBoxHeaderAt(r: Reader): BoxHeader {
   const start = r.pos;
   const size = r.u32();
   const type = r.fourcc();
-  return { type, size, headerSize: 8, start, payloadStart: start + 8, end: start + size };
+  return {
+    type,
+    size,
+    headerSize: 8,
+    start,
+    payloadStart: start + 8,
+    end: start + size,
+  };
 }
 
 function vp9CodecString(vpcC: Uint8Array): string {
@@ -870,7 +910,13 @@ function parseColr(r: Reader, childStart: number, end: number): ColrInfo | undef
   const transfer = r.u16();
   const matrix = r.u16();
   if (colourType === 'nclx') {
-    return { colourType, primaries, transfer, matrix, fullRange: (r.u8() & 0x80) !== 0 };
+    return {
+      colourType,
+      primaries,
+      transfer,
+      matrix,
+      fullRange: (r.u8() & 0x80) !== 0,
+    };
   }
   return { colourType, primaries, transfer, matrix };
 }
@@ -1010,7 +1056,13 @@ function parseAudioGeometry(r: Reader, entry: BoxHeader): AudioGeometry {
     r.seek(base + 48);
     const bitsPerSample = r.u32(); // constBitsPerChannel
     const lpcmFlags = r.u32(); // formatSpecificFlags
-    return { channels, sampleRate, bitsPerSample, lpcmFlags, childStart: base + 64 };
+    return {
+      channels,
+      sampleRate,
+      bitsPerSample,
+      lpcmFlags,
+      childStart: base + 64,
+    };
   }
 
   // v1 appends samplesPerPacket/bytesPerPacket/bytesPerFrame/bytesPerSample (4×u32 = 16 bytes) before
@@ -1085,18 +1137,20 @@ function parseAudioEntry(r: Reader, entry: BoxHeader): SampleEntry {
   if (esds && entry.type === 'mp4a') {
     const esdsPayload = r.bytesAt(esds.payloadStart, esds.end);
     const info = parseEsds(esdsPayload);
+    const aacSampleRate = info.sampleRate ?? sampleRate;
+    const aacChannels = info.sbrPresent === true ? channels : (info.channels ?? channels);
     const config: AudioDecoderConfig = {
       codec: info.codec,
-      sampleRate,
-      numberOfChannels: channels,
+      sampleRate: aacSampleRate,
+      numberOfChannels: aacChannels,
       ...(info.asc ? { description: info.asc } : {}),
     };
     return {
       type: entry.type,
       codec: info.codec,
       config,
-      sampleRate,
-      channels,
+      sampleRate: aacSampleRate,
+      channels: aacChannels,
       codecPrivate: { boxType: 'esds', data: esdsPayload },
     };
   }
@@ -1255,7 +1309,11 @@ function parseStsc(r: Reader, box: BoxHeader | undefined): SampleToChunk[] {
   const n = r.u32();
   const out: SampleToChunk[] = [];
   for (let i = 0; i < n; i++) {
-    out.push({ firstChunk: r.u32(), samplesPerChunk: r.u32(), descIndex: r.u32() });
+    out.push({
+      firstChunk: r.u32(),
+      samplesPerChunk: r.u32(),
+      descIndex: r.u32(),
+    });
   }
   return out;
 }

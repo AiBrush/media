@@ -13,7 +13,9 @@
  *   partial keystream tails are not carried across the clear gap.
  * - **cens (AES-CTR pattern):** the CTR counterpart to `cbcs`: only full 16-byte crypt blocks selected
  *   by the `tenc` crypt:skip pattern are transformed; skipped blocks and trailing partial blocks stay
- *   clear. The CTR counter advances over encrypted crypt blocks only, continuously within a sample.
+ *   clear, and the CTR counter advances over encrypted crypt blocks only, continuously within a sample.
+ *   A 0:0 (absent) pattern means *no* pattern — the whole range is one continuous CTR stream, partial tail
+ *   included (i.e. `cenc`-style full-sample encryption, how `cens` audio is written).
  * - **cbcs (AES-CBC pattern, 23001-7 §10.4):** AES-128-CBC over the protected bytes, but within each
  *   protected subsample only a repeating `crypt:skip` block **pattern** (e.g. 1:9) is encrypted — the
  *   skip blocks and any trailing bytes that don't fill a whole 16-byte block stay clear. The CBC chain
@@ -172,6 +174,40 @@ const SENC_HEADER_LEN = 8;
 /** Bytes per subsample entry: BytesOfClearData (u16) + BytesOfProtectedData (u32). */
 const SUBSAMPLE_ENTRY_LEN = 6;
 
+/** Compare `candidate` with `base + increment` as a wrapping unsigned big-endian IV counter. */
+function ivEqualsIncremented(base: Uint8Array, increment: 1 | 2, candidate: Uint8Array): boolean {
+  if (base.byteLength === 0 || candidate.byteLength !== base.byteLength) return false;
+  let carry: number = increment;
+  for (let i = base.byteLength - 1; i >= 0; i--) {
+    const sum = (base[i] ?? 0) + carry;
+    if (candidate[i] !== (sum & 0xff)) return false;
+    carry = Math.floor(sum / 256);
+  }
+  return true;
+}
+
+/**
+ * Reject a single corrupted IV sandwiched between two intact consecutive-counter neighbours. This does
+ * NOT require a `senc` to use sequential IVs: arbitrary/random series never enter the premise. When
+ * IV[i+1] is exactly IV[i-1]+2, however, there is one unambiguous midpoint; a different IV[i] means the
+ * auxiliary metadata was damaged. A random series triggers the premise with probability 2^-64 (8-byte
+ * IV) or 2^-128 (16-byte IV), while a one-bit mutation inside a normal producer counter run is caught.
+ */
+function assertNoSandwichedIvCorruption(samples: readonly SencSample[]): void {
+  for (let i = 1; i + 1 < samples.length; i++) {
+    const previous = samples[i - 1]?.iv;
+    const current = samples[i]?.iv;
+    const next = samples[i + 1]?.iv;
+    if (!previous || !current || !next) continue;
+    if (ivEqualsIncremented(previous, 2, next) && !ivEqualsIncremented(previous, 1, current)) {
+      throw new MediaError(
+        'demux-error',
+        `senc IV for sample ${i} is corrupt: its neighbours form a consecutive counter pair but it is not their midpoint`,
+      );
+    }
+  }
+}
+
 /**
  * Parse a `senc` (Sample Encryption Box) payload into per-sample IVs (+ optional subsample maps) for the
  * given `scheme`, validating that the declared sample count and its IV / subsample data actually fit the
@@ -244,6 +280,7 @@ export function parseSenc(
     }
     out.push({ iv, subsamples });
   }
+  assertNoSandwichedIvCorruption(out);
   return out;
 }
 
@@ -282,6 +319,29 @@ function asArrayBufferBytes(data: Uint8Array): Uint8Array<ArrayBuffer> {
   return data.slice();
 }
 
+/**
+ * Reject *erased* CENC protection. Genuine AES-CTR/CBC ciphertext of coded media is uniform random, so a
+ * run of a whole AES block (16 bytes) of consecutive `0x00` is impossible (probability 2⁻¹²⁸) — it signals
+ * the sample's encrypted payload was overwritten with zeros (tampered/erased protection), not decryptable
+ * content. Note the erasure need not span the *whole* protected range (a real attack zeroes a chunk of a
+ * larger encrypted subsample), so this scans for any block-long zero run, not an all-zero range.
+ * "Decrypting" such input silently emits keystream garbage as if it were a valid frame; per ISO/IEC
+ * 23001-7 the metadata no longer describes decryptable content, so it is rejected with a typed error (the
+ * graceful-failure contract). One linear pass; real ciphertext never accumulates a 16-byte zero run.
+ */
+function assertNotErasedProtection(protectedBytes: Uint8Array): void {
+  let zeroRun = 0;
+  for (const byte of protectedBytes) {
+    zeroRun = byte === 0 ? zeroRun + 1 : 0;
+    if (zeroRun >= AES_BLOCK) {
+      throw new MediaError(
+        'demux-error',
+        `CENC protected data contains a ${AES_BLOCK}-byte all-zero run — erased/tampered ciphertext, not decryptable content`,
+      );
+    }
+  }
+}
+
 /** AES-CTR-decrypt one sample (whole-sample, or only the protected subsample ranges). */
 export async function decryptSample(
   key: Uint8Array<ArrayBuffer>,
@@ -290,6 +350,7 @@ export async function decryptSample(
 ): Promise<Uint8Array<ArrayBuffer>> {
   const counter = counterBlock(sample.iv);
   if (!sample.subsamples || sample.subsamples.length === 0) {
+    assertNotErasedProtection(data);
     return aesCtr(key, counter, asArrayBufferBytes(data), 64);
   }
   const out = asArrayBufferBytes(data);
@@ -298,6 +359,7 @@ export async function decryptSample(
   for (const ss of sample.subsamples) {
     pos += ss.clear;
     if (ss.protected > 0) {
+      assertNotErasedProtection(data.subarray(pos, pos + ss.protected));
       const decrypted = await aesCtr(
         key,
         counterBlockAt(sample.iv, blockOffset),
@@ -313,9 +375,14 @@ export async function decryptSample(
 }
 
 /**
- * AES-CTR-**pattern**-decrypt one `cens` sample. Only full 16-byte crypt blocks selected by the
- * crypt:skip pattern are transformed; skipped full blocks and trailing partial blocks stay clear. Whole
- * sample protected data (no subsample map) is treated as one protected range. Output length === input
+ * AES-CTR-**pattern**-decrypt one `cens` sample. With a real crypt:skip pattern (`skipByteBlock > 0`) only
+ * the full 16-byte crypt blocks selected by the pattern are transformed; skipped full blocks and trailing
+ * partial blocks stay clear, and the CTR counter advances over crypt blocks only. When `skipByteBlock === 0`
+ * there is **no** pattern (ISO/IEC 23001-7 §9.6): the whole protected range is one continuous AES-CTR stream
+ * — including any trailing partial block, since CTR is a stream cipher — exactly like `cenc`. mp4encrypt /
+ * Bento4 write `cens` **audio** this way (`tenc` pattern 0:0, whole-sample, non-block-aligned), so treating
+ * that as a "1:0 whole-blocks-only" pattern would wrongly leave each sample's partial tail encrypted.
+ * Whole-sample protected data (no subsample map) is treated as one protected range. Output length === input
  * length.
  */
 export async function decryptSampleCens(
@@ -329,11 +396,26 @@ export async function decryptSampleCens(
     sample.subsamples && sample.subsamples.length > 0
       ? sample.subsamples
       : [{ clear: 0, protected: data.byteLength }];
+  const fullSample = pattern.skipByteBlock === 0; // no skip ⇒ continuous full-range CTR (incl. partial tail)
   let pos = 0;
   let encryptedBlockOffset = 0;
   for (const ss of ranges) {
     pos += ss.clear;
     const base = pos;
+    if (fullSample) {
+      if (ss.protected > 0) {
+        const decrypted = await aesCtr(
+          key,
+          counterBlockAt(sample.iv, encryptedBlockOffset),
+          asArrayBufferBytes(data.subarray(base, base + ss.protected)),
+          64,
+        );
+        out.set(decrypted, base);
+        encryptedBlockOffset += Math.ceil(ss.protected / AES_BLOCK);
+      }
+      pos += ss.protected;
+      continue;
+    }
     const offsets = cryptBlockOffsets(ss.protected, pattern);
     if (offsets.length > 0) {
       const gathered = new Uint8Array(offsets.length * AES_BLOCK);
@@ -480,7 +562,7 @@ export async function decryptSamplesCbcs(
 // result probes as a clear file. Unlike the `moov`-only driver path, this handles the full spread of
 // real-world layouts declared by ISO/IEC 23001-7 §§7–10:
 //   (i)   `cbcs` constant-IV (`tenc` `default_constant_IV`, Per_Sample_IV_Size 0) with NO `senc`/aux —
-//         full-sample audio (Apple/Bento4 write `tenc` v1 pattern 0:0 here);
+//         the constant IV is the sample crypto metadata and applies to every protected sample;
 //   (ii)  per-sample-IV `senc` + subsample maps (video), across multiple `moof` fragments;
 //   (iii) `sbgp`/`sgpd` 'seig' sample-group overrides (unprotected groups, per-group KID/IV/pattern),
 //         both traf-local (index ≥ 0x10001) and movie-level (index ≤ 0xFFFF) group descriptions;
@@ -1043,6 +1125,9 @@ async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<
       subsamples = perSample.subsamples;
       iv = perSample.iv.byteLength > 0 ? perSample.iv : constantIv;
     } else {
+      // With Per_Sample_IV_Size 0, `tenc.default_constant_IV` is the IV for every protected sample; no
+      // per-sample auxiliary entry is required. Clear sample descriptions and `seig isProtected = 0`
+      // groups returned above, so reaching this branch means the sample must be decrypted.
       iv = constantIv;
     }
     if (!iv || iv.byteLength === 0) {
@@ -1162,6 +1247,12 @@ export async function decryptCencFile(
     const sencBox = findChild(bytes, def.stbl.payloadStart, def.stbl.end, 'senc');
     const saiz = findChild(bytes, def.stbl.payloadStart, def.stbl.end, 'saiz');
     const saio = findChild(bytes, def.stbl.payloadStart, def.stbl.end, 'saio');
+    // After decrypt the samples are clear, so the sample-auxiliary-info boxes must be neutralized too:
+    // a leftover `saiz`/`saio` still advertises per-sample crypto aux, which a CENC-aware demuxer can read
+    // as "this track is still encrypted" and mis-drive decode. Rename them to `free` (size-preserving),
+    // exactly like `senc`/`sinf` (mp4decrypt removes them outright).
+    if (saiz) renames.push({ offset: saiz.start + 4, fourcc: 'free' });
+    if (saio) renames.push({ offset: saio.start + 4, fourcc: 'free' });
     let senc: SencSample[] | undefined;
     let aux: SencSample[] | undefined;
     if (sencBox) {
@@ -1236,6 +1327,10 @@ export async function decryptCencFile(
         const sencBox = findChild(bytes, traf.payloadStart, traf.end, 'senc');
         const saiz = findChild(bytes, traf.payloadStart, traf.end, 'saiz');
         const saio = findChild(bytes, traf.payloadStart, traf.end, 'saio');
+        // Neutralize the per-fragment sample-auxiliary-info boxes too (see the flat path): a leftover
+        // `saiz`/`saio` advertises crypto aux a CENC-aware demuxer can act on after the samples are clear.
+        if (saiz) renames.push({ offset: saiz.start + 4, fourcc: 'free' });
+        if (saio) renames.push({ offset: saio.start + 4, fourcc: 'free' });
         if (sencBox) {
           senc = parseSenc(bytes.subarray(sencBox.payloadStart, sencBox.end), ivSize, opts.scheme);
           renames.push({ offset: sencBox.start + 4, fourcc: 'free' });

@@ -125,6 +125,16 @@ export function fromStream(readable: ReadableStream<Uint8Array>): Source {
   };
 }
 
+/** Derive a query/hash-free last pathname component without mistaking opaque data/blob URLs for files. */
+function filenameFromHref(href: string): string | undefined {
+  if (/^(?:data|blob):/i.test(href)) return undefined;
+  const end = href.search(/[?#]/);
+  const path = end >= 0 ? href.slice(0, end) : href;
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  const filename = path.slice(slash + 1);
+  return filename.length > 0 && !filename.includes(':') ? filename : undefined;
+}
+
 /**
  * Wrap a URL (or URL string). `stream()` is returned synchronously, backed by `fetch`; `range()` issues
  * an HTTP `Range` request and, when the server answers `206`, learns the resource's total length from the
@@ -136,6 +146,7 @@ export function fromStream(readable: ReadableStream<Uint8Array>): Source {
  */
 export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
   const href = typeof url === 'string' ? url : url.href;
+  const filename = filenameFromHref(href);
   // `size` is a real own property, present only once known: seeded if the caller passed it, otherwise set
   // (assigned a `number`, never an explicit `undefined`) the first time a fetch learns it from a
   // `Content-Range`/`Content-Length`. The fetch closures share this object so a later read can clamp.
@@ -144,6 +155,7 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
     kind: 'url',
     ...(opts.size !== undefined ? { size: opts.size } : {}),
     ...(opts.mime !== undefined ? { mimeHint: opts.mime } : {}),
+    ...(filename !== undefined ? { filename } : {}),
     [SOURCE_CACHE_KEY]: href,
     stream: () => fetchStream(href, source),
     ...(opts.rangeRequests !== false
@@ -163,6 +175,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
   if (!href) {
     throw new InputError('unsupported-input', 'src');
   }
+  const filename = filenameFromHref(href);
   // A URL-backed source relabelled `element` (reads `currentSrc`, never `loadedmetadata`). Built directly
   // over the fetch helpers (rather than spreading a `fromURL`) so `size` is learned onto *this* object on
   // the first range/stream read, exactly like a plain URL source.
@@ -171,6 +184,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
     kind: 'element',
     stream: () => fetchStream(href, element),
     range: (start, end) => fetchRange(href, start, end, element),
+    ...(filename !== undefined ? { filename } : {}),
   };
   return element;
 }

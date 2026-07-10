@@ -732,7 +732,7 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     );
 
     expect(out.map((frame) => frame.timestamp)).toEqual([0, 33_334]);
-    expect(out.map((frame) => frame.duration)).toEqual([33_333, 33_333]);
+    expect(out.map((frame) => frame.duration)).toEqual([33_333, 20_000]);
     expect(input.map((frame) => frame.closeCount)).toEqual([1, 1, 1, 1, 1, 0]);
     expect(out.map((frame) => frame.closeCount)).toEqual([0, 0]);
 
@@ -778,6 +778,31 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
 
     expect(out.map((frame) => frame.timestamp)).toEqual([0]);
     expect(input.map((frame) => frame.closeCount)).toEqual([1, 1, 1, 0]);
+  });
+
+  it('clips a kept VFR frame duration at the exclusive end boundary', async () => {
+    const input = [
+      new FakeFrame(1_000_000, 100_000),
+      new FakeFrame(3_999_999, 100_000),
+      new FakeFrame(4_099_999, 100_000),
+    ];
+    const source = fakeFrameStream(input);
+
+    const out = await collect(
+      trimTimedFrameStream(
+        source.stream,
+        { startUs: 1_000_000, endUs: 4_000_000 },
+        restampFake,
+      ),
+    );
+
+    expect(out.map((frame) => [frame.timestamp, frame.duration])).toEqual([
+      [0, 100_000],
+      [2_999_999, 1],
+    ]);
+    expect(input.map((frame) => frame.closeCount)).toEqual([1, 1, 1]);
+
+    for (const frame of out) frame.close();
   });
 
   it('is additive across adjacent windows without duplicating the boundary frame', async () => {

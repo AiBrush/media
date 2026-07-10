@@ -1,9 +1,13 @@
 {
-  "generatedFrom": "2026-07-08T16:29:04.830Z",
+  "generatedFrom": "2026-07-10T07:02:31.350Z",
   "source": "chromium-2026-07-08T08-48-05-624Z.json",
   "overlays": [
     "chromium-2026-07-08T16-14-20-821Z.json",
-    "chromium-2026-07-08T16-23-11-213Z.json"
+    "chromium-2026-07-08T16-23-11-213Z.json",
+    "chromium-2026-07-08T17-47-10-038Z.json",
+    "chromium-2026-07-09T19-31-28-117Z.json",
+    "chromium-2026-07-09T20-38-13-594Z.json",
+    "chromium-2026-07-10T06-42-40-459Z.json"
   ],
   "functionalReds": [
     {
@@ -11,47 +15,31 @@
       "fam": "audio-dsp",
       "status": "FAIL",
       "kind": "red",
-      "file": "02.mp4",
-      "reason": "oracle 'property-invariant' failed: [invariant gapless sample count] decoded samples 48128 vs priming-removed expected 2654203 at 44100Hz (delta 2606075 > 1); decoded duration 1.091338s vs golden 60.186000s"
+      "file": "01.mp4",
+      "reason": "oracle 'property-invariant' failed: [invariant gapless sample count] decoded samples 52384 vs priming-removed expected 2886720 at 48000Hz (delta 2834336 > 1); decoded duration 1.091333s vs golden 60.140000s"
     },
     {
-      "s": "decode-seek/decode_mov_h264",
-      "fam": "decode-seek",
+      "s": "audio-dsp/throughput_decode_s24",
+      "fam": "audio-dsp",
       "status": "FAIL",
       "kind": "red",
-      "file": "03.mov",
-      "reason": "oracle 'ssim-psnr' failed: SSIM min 0.8539 < 0.99 (mean 0.9350); 0/12 frames digest-exact"
+      "file": "01.wav",
+      "reason": "oracle 'decoded-audio-pcm' failed: [audio PCM decode] 4096/4096 frame digests differ; frame 0: sha256 2c3498ed…3e41 vs golden c660ee15…0d79; frame 1: sha256 a8b8bc09…1817 vs golden b7ba8e3f…3f97; frame 2: sha256 3e772010…932f vs golden 9db3420c…8123; frame 3: sha256 59ae4e00…9303 vs golden e016f4e4…4356; frame 4: sha256 54b201ac…71d1 vs golden 14f213a3…27fc; frame 5: sha256 371f47de…24ec vs golden 9cfd7c8d…cdb8"
     },
     {
-      "s": "encryption/cenc_cbcs_decrypt",
-      "fam": "encryption",
+      "s": "demux/graceful_mp4_header_destroyed",
+      "fam": "demux",
       "status": "FAIL",
       "kind": "red",
       "file": "03.mp4",
-      "reason": "oracle 'property-invariant' failed: [decrypt-eq-cleartext-decode] 23/24 frame digests differ; frame 1: sha256 0521dbf3…2fc8 vs golden dbbc7607…388d; frame 2: sha256 10273a00…f704 vs golden 4eaef4e5…4715; frame 3: sha256 03020172…ab89 vs golden 335db319…ccfc; frame 4: sha256 5ffa5c7e…87a0 vs golden 0521dbf3…2fc8; frame 5: sha256 ee8625e5…6ae2 vs golden ebb45471…36e2; frame 6: sha256 7c572e2a…1893 vs golden c3b8c3cd…6f82"
-    },
-    {
-      "s": "encryption/cenc_cens_decrypt",
-      "fam": "encryption",
-      "status": "FAIL",
-      "kind": "red",
-      "file": "02.mp4",
-      "reason": "oracle 'playback-smoke' failed: <video> playback did not advance / failed to play the output"
-    },
-    {
-      "s": "encryption/cenc_ctr_protection_zeroed_graceful",
-      "fam": "encryption",
-      "status": "FAIL",
-      "kind": "red",
-      "file": "cenc_ctr_protection_zeroed.mp4",
       "reason": "robustness oracle 'graceful-failure' failed: operation produced output from malformed/mutated input (expected a clean throw/reject)"
     },
     {
-      "s": "encryption/cenc_ctr_senc_bitflip_graceful",
-      "fam": "encryption",
+      "s": "demux/graceful_webm_header_destroyed",
+      "fam": "demux",
       "status": "FAIL",
       "kind": "red",
-      "file": "cenc_ctr_senc_bitflip.mp4",
+      "file": "01.webm",
       "reason": "robustness oracle 'graceful-failure' failed: operation produced output from malformed/mutated input (expected a clean throw/reject)"
     },
     {
@@ -63,28 +51,12 @@
       "reason": "oracle 'property-invariant' failed: [decode(mux(x))==decode(x)] platform decode of output failed: <video> has zero intrinsic size (not enough data decoded)"
     },
     {
-      "s": "mux/size_longform_audio_to_mp4",
-      "fam": "mux",
-      "status": "ERROR",
-      "kind": "red",
-      "file": "03.mp4",
-      "reason": "track 1 has no samples to stream-copy"
-    },
-    {
-      "s": "performance/op-sweep-transcode-webm",
-      "fam": "performance",
-      "status": "FAIL",
-      "kind": "timeout",
-      "file": "h264_1080p_30s.mp4",
-      "reason": "timeout: operation exceeded timeout of 120000ms"
-    },
-    {
-      "s": "probe/h264_1080p_5s",
+      "s": "probe/aac_adts",
       "fam": "probe",
       "status": "FAIL",
       "kind": "red",
-      "file": "01.mov",
-      "reason": "oracle 'golden-metadata' failed: duration: measured 9.4667s vs golden 6.4670s (Δ 2.9997s > tol 0.0417s)"
+      "file": "02.aac",
+      "reason": "oracle 'golden-metadata' failed: duration: measured 19.9924s vs golden 17.1360s (Δ 2.8564s > tol 2.5704s) [estimate-only container 'adts': loose band max(±0.5s, ±15%) applied]"
     },
     {
       "s": "probe/hls_aes128",
@@ -95,71 +67,47 @@
       "reason": "not an MPEG-TS stream (no transport sync run found — encrypted, scrambled, or not a transport stream)"
     },
     {
-      "s": "probe/huge_h264_1080p_600s",
-      "fam": "probe",
-      "status": "FAIL",
-      "kind": "red",
-      "file": "01.mov",
-      "reason": "oracle 'golden-metadata' failed: track count: measured 2 vs golden 3; track[1].type: 'audio' vs 'other'; track[1].codec: 'aac' vs ''"
-    },
-    {
-      "s": "remux/h264_ts_ts_to_mp4",
+      "s": "remux/prop_adts_to_mp4_duration_invariant",
       "fam": "remux",
       "status": "FAIL",
       "kind": "red",
-      "file": "02.ts",
-      "reason": "oracle 'reference-reimport' failed: duration: reimport 10.0100s vs golden 10.1290s (Δ 0.1190s > tol 0.1000s)"
+      "file": "02.aac",
+      "reason": "oracle 'property-invariant' failed: [invariant probe(out).dur≈probe(x).dur] out 19.9920s vs 17.1360s (Δ 2.8560s > 2.5704s)"
     },
     {
-      "s": "transcode/extreme_fps_1",
-      "fam": "transcode",
+      "s": "trim/h264_vfr_frame_accurate",
+      "fam": "trim",
       "status": "FAIL",
       "kind": "red",
-      "file": "02.mp4",
-      "reason": "oracle 'property-invariant' failed: [invariant probe(out).dur≈probe(x).dur] out 23.0000s vs 22.5070s (Δ 0.4930s > 0.1500s)"
+      "file": "h264_vfr.mp4",
+      "reason": "oracle 'trim-boundaries' failed: duration: out 3.1000s vs requested 3.0000s (Δ 0.1000s > 0.1000s)"
     },
     {
-      "s": "transcode/h264_crop_center",
-      "fam": "transcode",
-      "status": "ERROR",
-      "kind": "red",
-      "file": "03.mp4",
-      "reason": "crop rect 240,135 1440×810 is outside the 1080×1920 source"
-    },
-    {
-      "s": "transcode/h264_resize_720p",
-      "fam": "transcode",
+      "s": "trim/vp9_noop_full_range_idempotent",
+      "fam": "trim",
       "status": "FAIL",
       "kind": "red",
-      "file": "03.mp4",
-      "reason": "oracle 'ssim-psnr' failed: vs in-browser reference (source decoded + resized to 1280x720): SSIM mean 0.9684 (min 0.9617); PSNR mean 29.0 dB (advisory) over 8 frame(s); gate SSIM≥0.97"
-    },
-    {
-      "s": "transcode/selfcheck_h264_resize_720p_tie",
-      "fam": "transcode",
-      "status": "FAIL",
-      "kind": "red",
-      "file": "03.mp4",
-      "reason": "oracle 'ssim-psnr' failed: vs in-browser reference (source decoded + resized to 1280x720): SSIM mean 0.9684 (min 0.9617); PSNR mean 29.0 dB (advisory) over 8 frame(s); gate SSIM≥0.98"
+      "file": "02.webm",
+      "reason": "oracle 'property-invariant' failed: [invariant probe(out).dur≈probe(x).dur] out 10.0000s vs 46.5480s (Δ 36.5480s > 0.0500s)"
     }
   ],
   "bakeBlocked": [
     {
       "s": "audio-dsp/downmix_5_1_to_stereo",
       "fam": "audio-dsp",
-      "file": "wav_5_1.wav",
+      "file": "02.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
       "s": "audio-dsp/downmix_stereo_to_mono",
       "fam": "audio-dsp",
-      "file": "03.wav",
+      "file": "01.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
       "s": "audio-dsp/edge_longform_audio_resample_16k",
       "fam": "audio-dsp",
-      "file": "longform_1h_audio_pcm.wav",
+      "file": "02.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -171,7 +119,7 @@
     {
       "s": "audio-dsp/fade_in_out_f32",
       "fam": "audio-dsp",
-      "file": "02.wav",
+      "file": "03.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -183,7 +131,7 @@
     {
       "s": "audio-dsp/gain_minus6db_s16",
       "fam": "audio-dsp",
-      "file": "wav_s16.wav",
+      "file": "03.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -225,19 +173,19 @@
     {
       "s": "audio-dsp/resample_44k1_to_48k",
       "fam": "audio-dsp",
-      "file": "wav_s16_44k1.wav",
+      "file": "03.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
       "s": "audio-dsp/resample_48k_to_16k",
       "fam": "audio-dsp",
-      "file": "03.wav",
+      "file": "01.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
       "s": "audio-dsp/resample_48k_to_44k1",
       "fam": "audio-dsp",
-      "file": "03.wav",
+      "file": "wav_s16.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -249,7 +197,7 @@
     {
       "s": "audio-dsp/upmix_mono_to_stereo",
       "fam": "audio-dsp",
-      "file": "03.wav",
+      "file": "wav_s16_mono.wav",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'wav' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -261,20 +209,32 @@
     {
       "s": "decode-seek/decode_bframes_reorder",
       "fam": "decode-seek",
-      "file": "01.mp4",
+      "file": "02.mp4",
+      "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
+    },
+    {
+      "s": "decode-seek/decode_h264_4k",
+      "fam": "decode-seek",
+      "file": "02.mp4",
       "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
     },
     {
       "s": "decode-seek/decode_h264_first_frames",
       "fam": "decode-seek",
+      "file": "02.mp4",
+      "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
+    },
+    {
+      "s": "decode-seek/decode_size_tiny_h264_360p",
+      "fam": "decode-seek",
       "file": "01.mp4",
       "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
     },
     {
-      "s": "decode-seek/decode_size_huge_h264_600s",
+      "s": "decode-seek/meta_decode_remux_eq_decode_anchored",
       "fam": "decode-seek",
-      "file": "01.mov",
-      "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
+      "file": "02.mp4",
+      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/decode-seek/meta_decode_remux_eq_decode_anchored/02.mp4 = decode(x) to compare against (frame-bake pending)"
     },
     {
       "s": "metadata/rotation_survives_mp4_mkv",
@@ -285,55 +245,67 @@
     {
       "s": "metadata/tagedit_no_corrupt_audio_flac",
       "fam": "metadata",
-      "file": "01.flac",
+      "file": "02.flac",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe-duration] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
+    },
+    {
+      "s": "metadata/tracks_packet_attribution_multitrack",
+      "fam": "metadata",
+      "file": "03.mp4",
+      "reason": "oracle 'golden-packets' unavailable: no golden packets (fixtures/golden/<id>.packets.json absent)"
     },
     {
       "s": "metadata/write_flac_vorbiscomment",
       "fam": "metadata",
-      "file": "03.flac",
+      "file": "02.flac",
       "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
     },
     {
       "s": "metadata/write_mp3_id3",
       "fam": "metadata",
-      "file": "mp3_xing.mp3",
+      "file": "01.mp3",
+      "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
+    },
+    {
+      "s": "metadata/write_ogg_vorbiscomment",
+      "fam": "metadata",
+      "file": "02.ogg",
       "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
     },
     {
       "s": "mux/aac_to_adts",
       "fam": "mux",
-      "file": "03.aac",
+      "file": "02.aac",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
     },
     {
-      "s": "mux/edge_bframes_decode_mux_mkv",
+      "s": "mux/edge_bframes_decode_mux_mp4",
       "fam": "mux",
       "file": "01.mp4",
-      "reason": "oracle 'property-invariant' unavailable: [decode(mux(x))==decode(x)] no golden frames for scenarios/mux/edge_bframes_decode_mux_mkv/01.mp4 = decode(x) to compare against (frame-bake pending)"
+      "reason": "oracle 'property-invariant' unavailable: [decode(mux(x))==decode(x)] no golden frames for scenarios/mux/edge_bframes_decode_mux_mp4/01.mp4 = decode(x) to compare against (frame-bake pending)"
     },
     {
-      "s": "mux/edge_rotation_decode_mux_mov",
+      "s": "mux/edge_rotation_decode_mux_mkv",
       "fam": "mux",
-      "file": "01.mp4",
-      "reason": "oracle 'property-invariant' unavailable: [decode(mux(x))==decode(x)] no golden frames for scenarios/mux/edge_rotation_decode_mux_mov/01.mp4 = decode(x) to compare against (frame-bake pending)"
+      "file": "03.mp4",
+      "reason": "oracle 'property-invariant' unavailable: [decode(mux(x))==decode(x)] no golden frames for scenarios/mux/edge_rotation_decode_mux_mkv/03.mp4 = decode(x) to compare against (frame-bake pending)"
     },
     {
       "s": "mux/h264_aac_to_ts",
       "fam": "mux",
-      "file": "03.mp4",
+      "file": "h264_1080p_30s.mp4",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
     },
     {
       "s": "mux/mp3_to_mp3",
       "fam": "mux",
-      "file": "02.mp3",
+      "file": "mp3_xing.mp3",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
     },
     {
       "s": "mux/opus_to_ogg",
       "fam": "mux",
-      "file": "02.ogg",
+      "file": "03.ogg",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
     },
     {
@@ -345,7 +317,7 @@
     {
       "s": "mux/prop_h264_mux_duration_mp4_to_ts",
       "fam": "mux",
-      "file": "01.mp4",
+      "file": "02.mp4",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
     },
     {
@@ -357,19 +329,25 @@
     {
       "s": "mux/vorbis_to_ogg",
       "fam": "mux",
-      "file": "03.webm",
+      "file": "02.webm",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [probe(mux(x)).dur≈probe(x).dur] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
+    },
+    {
+      "s": "performance/decode-fps",
+      "fam": "performance",
+      "file": "02.mp4",
+      "reason": "decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)"
     },
     {
       "s": "remux/aac_adts_adts_to_ts",
       "fam": "remux",
-      "file": "03.aac",
+      "file": "01.aac",
       "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
     },
     {
       "s": "remux/h264_1080p_30s_mp4_to_ts",
       "fam": "remux",
-      "file": "h264_1080p_30s.mp4",
+      "file": "02.mp4",
       "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
     },
     {
@@ -393,20 +371,44 @@
     {
       "s": "remux/prop_bframes_decode_remux_mp4_mkv",
       "fam": "remux",
-      "file": "02.mp4",
-      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_bframes_decode_remux_mp4_mkv/02.mp4 = decode(x) to compare against (frame-bake pending)"
+      "file": "01.mp4",
+      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_bframes_decode_remux_mp4_mkv/01.mp4 = decode(x) to compare against (frame-bake pending)"
     },
     {
       "s": "remux/prop_bframes_decode_remux_mp4_mov",
       "fam": "remux",
-      "file": "02.mp4",
-      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_bframes_decode_remux_mp4_mov/02.mp4 = decode(x) to compare against (frame-bake pending)"
+      "file": "03.mp4",
+      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_bframes_decode_remux_mp4_mov/03.mp4 = decode(x) to compare against (frame-bake pending)"
     },
     {
-      "s": "remux/prop_roundtrip_mp4_mkv_mp4",
+      "s": "remux/prop_rotation_survives_mp4_mov",
       "fam": "remux",
-      "file": "03.mp4",
-      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_roundtrip_mp4_mkv_mp4/03.mp4 = decode(x) to compare against (frame-bake pending)"
+      "file": "01.mp4",
+      "reason": "oracle 'property-invariant' unavailable: [decode(remux(x))==decode(x)] no golden frames for scenarios/remux/prop_rotation_survives_mp4_mov/01.mp4 = decode(x) to compare against (frame-bake pending)"
+    },
+    {
+      "s": "streaming-output/prop_probe_dur_stream_shape",
+      "fam": "streaming-output",
+      "file": "h264_1080p_30s.mp4",
+      "reason": "oracle 'property-invariant' unavailable: golden absent: [probe-duration] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
+    },
+    {
+      "s": "streaming-output/prop_ts_stream_duration_materialized",
+      "fam": "streaming-output",
+      "file": "h264_1080p_30s.mp4",
+      "reason": "oracle 'property-invariant' unavailable: golden absent: [probe-duration] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)"
+    },
+    {
+      "s": "streaming-output/ts_continuity_many_writes",
+      "fam": "streaming-output",
+      "file": "h264_1080p_30s.mp4",
+      "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
+    },
+    {
+      "s": "streaming-output/ts_tiny_writes",
+      "fam": "streaming-output",
+      "file": "h264_1080p_30s.mp4",
+      "reason": "oracle 'reference-reimport' unavailable: golden absent: reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy"
     },
     {
       "s": "transcode/aac_to_pcm_wav_extract",
@@ -417,7 +419,7 @@
     {
       "s": "transcode/h264_to_ts",
       "fam": "transcode",
-      "file": "03.mp4",
+      "file": "02.mp4",
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'ts' outside mp4/webm/aiff reader coverage)"
     },
     {
@@ -439,198 +441,148 @@
       "reason": "oracle 'property-invariant' unavailable: golden absent: [transcode-output-metadata] transcode output metadata not byte-readable (container 'ogg' outside mp4/webm/aiff reader coverage)"
     },
     {
+      "s": "trim/audio_aac_adts_copy",
+      "fam": "trim",
+      "file": "02.aac",
+      "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
+    },
+    {
+      "s": "trim/audio_flac_noseektable_copy",
+      "fam": "trim",
+      "file": "flac_noseektable.flac",
+      "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
+    },
+    {
       "s": "trim/audio_flac_seektable_copy",
       "fam": "trim",
       "file": "flac_seektable.flac",
       "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
+    },
+    {
+      "s": "trim/audio_mp3_copy",
+      "fam": "trim",
+      "file": "03.mp3",
+      "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
+    },
+    {
+      "s": "trim/audio_opus_ogg_copy",
+      "fam": "trim",
+      "file": "opus.ogg",
+      "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
+    },
+    {
+      "s": "trim/ts_keyframe_aligned",
+      "fam": "trim",
+      "file": "h264_ts.ts",
+      "reason": "oracle 'trim-boundaries' unavailable: golden absent: trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)"
     }
   ],
-  "contested": 190,
-  "rawLossCount": 22,
-  "activeLossCount": 22,
+  "contested": 251,
+  "rawLossCount": 12,
+  "activeLossCount": 12,
   "exemptLossCount": 0,
   "tiers": {
-    "catastrophic": 0,
-    "severe": 2,
-    "moderate": 1,
-    "minor": 19
+    "catastrophic": 1,
+    "severe": 0,
+    "moderate": 0,
+    "minor": 11
   },
   "losses": [
     {
       "s": "performance/size-ladder-iterate-packets-huge",
       "fam": "performance",
-      "our": 154.83000001311302,
+      "our": 828.0600000023842,
       "comp": "remotion-webcodecs",
       "cw": 7.9200000166893005,
-      "ratio": 19.549242384703263
+      "ratio": 104.55303008301354
     },
     {
-      "s": "streaming-output/prop_webm_headerless_duration_materialized",
-      "fam": "streaming-output",
-      "our": 72.53999999165535,
+      "s": "decode-seek/decode_vp9_alpha",
+      "fam": "decode-seek",
+      "our": 252.2249999642372,
       "comp": "mediabunny",
-      "cw": 7.140000015497208,
-      "ratio": 10.15966384232618
-    },
-    {
-      "s": "demux/flac_noseektable",
-      "fam": "demux",
-      "our": 39.479999989271164,
-      "comp": "remotion-webcodecs",
-      "cw": 10.995000004768372,
-      "ratio": 3.590723053401479
-    },
-    {
-      "s": "metadata/meta_consistent_mp4_to_mkv",
-      "fam": "metadata",
-      "our": 332.30500000715256,
-      "comp": "mediabunny",
-      "cw": 120.42500001192093,
-      "ratio": 2.759435332981171
-    },
-    {
-      "s": "streaming-output/mp4_fragmented_cmaf",
-      "fam": "streaming-output",
-      "our": 1132.0600000023842,
-      "comp": "mp4box",
-      "cw": 534.7450000047684,
-      "ratio": 2.1170090416783505
+      "cw": 123.53500002622604,
+      "ratio": 2.0417290639146053
     },
     {
       "s": "decode-seek/decode_size_large_vp9_120s",
       "fam": "decode-seek",
-      "our": 1282.3899999856949,
+      "our": 1359.714999973774,
       "comp": "ffmpeg.wasm",
       "cw": 666.6550000011921,
-      "ratio": 1.9236186633017105
+      "ratio": 2.039608193100393
+    },
+    {
+      "s": "decode-seek/decode_mov_h264",
+      "fam": "decode-seek",
+      "our": 538.6000000238419,
+      "comp": "ffmpeg.wasm",
+      "cw": 272.169999986887,
+      "ratio": 1.9789102401065193
+    },
+    {
+      "s": "transcode/h264_resize_720p",
+      "fam": "transcode",
+      "our": 756.2750000357628,
+      "comp": "remotion-webcodecs",
+      "cw": 433.0149999856949,
+      "ratio": 1.7465330301738904
     },
     {
       "s": "decode-seek/decode_size_tiny_vp9_360p",
       "fam": "decode-seek",
-      "our": 108.74000000953674,
+      "our": 103.26499998569489,
       "comp": "mediabunny",
       "cw": 61.775000005960464,
-      "ratio": 1.7602590044361761
-    },
-    {
-      "s": "demux/flac_seektable",
-      "fam": "demux",
-      "our": 60.3299999833107,
-      "comp": "remotion-webcodecs",
-      "cw": 36.474999994039536,
-      "ratio": 1.6540095954261649
-    },
-    {
-      "s": "probe/longform_1h_audio",
-      "fam": "probe",
-      "our": 81.51499998569489,
-      "comp": "mediabunny",
-      "cw": 50.229999989271164,
-      "ratio": 1.6228349592495723
-    },
-    {
-      "s": "demux/h264_bframes_1080p",
-      "fam": "demux",
-      "our": 109.3250000178814,
-      "comp": "mp4box",
-      "cw": 78.30500000715256,
-      "ratio": 1.3961432859701859
+      "ratio": 1.6716309182635563
     },
     {
       "s": "probe/recorder_headerless",
       "fam": "probe",
-      "our": 3.939999997615814,
+      "our": 4.659999966621399,
       "comp": "mediabunny",
       "cw": 2.8900000154972076,
-      "ratio": 1.3633217911723645
-    },
-    {
-      "s": "transcode/h264_rotate_normalize",
-      "fam": "transcode",
-      "our": 560.9800000190735,
-      "comp": "remotion-webcodecs",
-      "cw": 421.91499999165535,
-      "ratio": 1.329604304255996
+      "ratio": 1.612456727208589
     },
     {
       "s": "transcode/hevc_to_vp9_webm",
       "fam": "transcode",
-      "our": 1696.1949999928474,
+      "our": 1859.7900000214577,
       "comp": "mediabunny",
       "cw": 1356.8299999833107,
-      "ratio": 1.2501160794010384
+      "ratio": 1.3706875585330023
+    },
+    {
+      "s": "decode-seek/seek_vp9_keyframe",
+      "fam": "decode-seek",
+      "our": 49.700000047683716,
+      "comp": "mediabunny",
+      "cw": 37.25499999523163,
+      "ratio": 1.3340491223740427
+    },
+    {
+      "s": "probe/longform_1h_audio",
+      "fam": "probe",
+      "our": 66.03999996185303,
+      "comp": "mediabunny",
+      "cw": 50.229999989271164,
+      "ratio": 1.314752139676663
     },
     {
       "s": "demux/vp9_1080p_10s",
       "fam": "demux",
-      "our": 123.40999999642372,
+      "our": 118.66500002145767,
       "comp": "mediabunny",
       "cw": 100.80000001192093,
-      "ratio": 1.2243055553752864
+      "ratio": 1.1772321429307933
     },
     {
-      "s": "trim/h264_multitrack_keyframe_aligned",
-      "fam": "trim",
-      "our": 89.18999999761581,
-      "comp": "ffmpeg.wasm",
-      "cw": 73.21500000357628,
-      "ratio": 1.2181929931470221
-    },
-    {
-      "s": "decode-seek/decode_h264_4k",
-      "fam": "decode-seek",
-      "our": 2411.8949999809265,
-      "comp": "remotion-webcodecs",
-      "cw": 2033.1099999845028,
-      "ratio": 1.1863081682738814
-    },
-    {
-      "s": "demux/size_tiny_tiny_vp9_360p_2s",
-      "fam": "demux",
-      "our": 26.009999990463257,
-      "comp": "remotion-webcodecs",
-      "cw": 22.34000000357628,
-      "ratio": 1.1642793189928142
-    },
-    {
-      "s": "remux/h264_1080p_5s_mov_to_mp4",
-      "fam": "remux",
-      "our": 20.6700000166893,
-      "comp": "mp4box",
-      "cw": 18.03999999165535,
-      "ratio": 1.1457871411447058
-    },
-    {
-      "s": "demux/opus",
-      "fam": "demux",
-      "our": 41.395000010728836,
+      "s": "streaming-output/prop_webm_headerless_duration_materialized",
+      "fam": "streaming-output",
+      "our": 8.100000023841858,
       "comp": "mediabunny",
-      "cw": 37.31999999284744,
-      "ratio": 1.1091907829223577
-    },
-    {
-      "s": "demux/size_micro_micro_h264_1frame",
-      "fam": "demux",
-      "our": 36.354999989271164,
-      "comp": "mp4box",
-      "cw": 34.55000001192093,
-      "ratio": 1.0522431252308957
-    },
-    {
-      "s": "transcode/extreme_fps_240",
-      "fam": "transcode",
-      "our": 8963.680000007153,
-      "comp": "mediabunny",
-      "cw": 8680.889999985695,
-      "ratio": 1.0325761529085062
-    },
-    {
-      "s": "decode-seek/decode_size_large_h264_120s",
-      "fam": "decode-seek",
-      "our": 4522.215000033379,
-      "comp": "web-demuxer",
-      "cw": 4463.530000001192,
-      "ratio": 1.0131476656440466
+      "cw": 7.140000015497208,
+      "ratio": 1.1344537823894947
     }
   ],
   "parityExemptions": []

@@ -68,6 +68,12 @@ export interface EsdsInfo {
   codec: string;
   objectTypeIndication: number;
   audioObjectType?: number;
+  /** Effective decoded/output sample rate from AudioSpecificConfig (includes SBR upsampling). */
+  sampleRate?: number;
+  /** Channel count represented by AudioSpecificConfig's channelConfiguration, when not PCE-defined. */
+  channels?: number;
+  /** SBR is present; presentation channel geometry remains the outer sample entry's responsibility. */
+  sbrPresent?: true;
   /** AudioSpecificConfig — the `description` for an AAC `AudioDecoderConfig`. */
   asc?: Uint8Array;
 }
@@ -75,6 +81,158 @@ export interface EsdsInfo {
 const TAG_ES = 0x03;
 const TAG_DECODER_CONFIG = 0x04;
 const TAG_DECODER_SPECIFIC = 0x05;
+
+const AAC_SAMPLE_RATES = [
+  96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+  7_350,
+] as const;
+const AAC_CHANNELS_BY_CONFIGURATION: Readonly<Record<number, number>> = {
+  1: 1,
+  2: 2,
+  3: 3,
+  4: 4,
+  5: 5,
+  6: 6,
+  7: 8,
+  11: 7,
+  12: 8,
+  13: 24,
+  14: 8,
+};
+
+class AacBitReader {
+  #offset = 0;
+
+  constructor(private readonly bytes: Uint8Array) {}
+
+  get remaining(): number {
+    return this.bytes.byteLength * 8 - this.#offset;
+  }
+
+  read(width: number): number | undefined {
+    if (!Number.isInteger(width) || width < 0 || width > 32 || this.remaining < width)
+      return undefined;
+    let value = 0;
+    for (let index = 0; index < width; index++) {
+      const bit = this.#offset + index;
+      value = value * 2 + (((this.bytes[bit >> 3] ?? 0) >> (7 - (bit & 7))) & 1);
+    }
+    this.#offset += width;
+    return value;
+  }
+}
+
+function readAacAudioObjectType(bits: AacBitReader): number | undefined {
+  const base = bits.read(5);
+  if (base === undefined) return undefined;
+  if (base !== 31) return base;
+  const extension = bits.read(6);
+  return extension === undefined ? undefined : 32 + extension;
+}
+
+function readAacSampleRate(bits: AacBitReader): number | undefined {
+  const index = bits.read(4);
+  if (index === undefined) return undefined;
+  if (index === 15) return bits.read(24);
+  return AAC_SAMPLE_RATES[index];
+}
+
+function skipGaSpecificConfig(
+  bits: AacBitReader,
+  audioObjectType: number,
+  channelConfiguration: number,
+): void {
+  if (bits.read(1) === undefined) return; // frameLengthFlag
+  const dependsOnCoreCoder = bits.read(1);
+  if (dependsOnCoreCoder === undefined) return;
+  if (dependsOnCoreCoder === 1 && bits.read(14) === undefined) return;
+  const extensionFlag = bits.read(1);
+  if (extensionFlag !== 1) return;
+  if (audioObjectType === 22) {
+    if (bits.read(16) === undefined) return;
+  }
+  if (
+    (audioObjectType === 17 ||
+      audioObjectType === 19 ||
+      audioObjectType === 20 ||
+      audioObjectType === 23) &&
+    bits.read(3) === undefined
+  ) {
+    return;
+  }
+  // extensionFlag3 is present for ER object types; reading it is safe only when the syntax reaches it.
+  if (
+    audioObjectType === 17 ||
+    audioObjectType === 19 ||
+    audioObjectType === 20 ||
+    audioObjectType === 23
+  ) {
+    bits.read(1);
+  }
+  // channelConfiguration=0 carries a ProgramConfigElement between the fixed GA fields and sync
+  // extension. We intentionally do not guess its variable length; the outer sample entry remains the
+  // fallback for that uncommon form.
+  void channelConfiguration;
+}
+
+interface AacAscGeometry {
+  readonly audioObjectType?: number;
+  readonly sampleRate?: number;
+  readonly channels?: number;
+  readonly sbrPresent?: true;
+}
+
+/** Parse the AudioSpecificConfig fields that override an MP4 AudioSampleEntry's stale geometry. */
+function parseAacAscGeometry(asc: Uint8Array): AacAscGeometry {
+  const bits = new AacBitReader(asc);
+  const signaledAudioObjectType = readAacAudioObjectType(bits);
+  const baseSampleRate = readAacSampleRate(bits);
+  const channelConfiguration = bits.read(4);
+  if (
+    signaledAudioObjectType === undefined ||
+    baseSampleRate === undefined ||
+    channelConfiguration === undefined
+  ) {
+    return {};
+  }
+
+  let coreAudioObjectType = signaledAudioObjectType;
+  let sampleRate = baseSampleRate;
+  let channels = AAC_CHANNELS_BY_CONFIGURATION[channelConfiguration];
+  let sbrPresent = signaledAudioObjectType === 5 || signaledAudioObjectType === 29;
+  if (signaledAudioObjectType === 5 || signaledAudioObjectType === 29) {
+    const extensionRate = readAacSampleRate(bits);
+    const extensionCoreType = readAacAudioObjectType(bits);
+    if (extensionRate !== undefined) sampleRate = extensionRate;
+    if (extensionCoreType !== undefined) coreAudioObjectType = extensionCoreType;
+    if (extensionCoreType === 22) {
+      const extensionChannels = bits.read(4);
+      if (extensionChannels !== undefined) {
+        channels = AAC_CHANNELS_BY_CONFIGURATION[extensionChannels];
+      }
+    }
+  } else if (channelConfiguration !== 0) {
+    skipGaSpecificConfig(bits, coreAudioObjectType, channelConfiguration);
+    if (bits.remaining >= 16 && bits.read(11) === 0x2b7 && readAacAudioObjectType(bits) === 5) {
+      const sbrFlag = bits.read(1);
+      if (sbrFlag === 1) {
+        // The sync extension describes a doubled-rate SBR presentation around the AAC-LC core.
+        // Channel configuration still describes the core; the MP4 sample entry carries presentation
+        // geometry (notably implicit Parametric Stereo material that retains a mono core config).
+        sbrPresent = true;
+        const extensionRate = readAacSampleRate(bits);
+        if (extensionRate !== undefined) sampleRate = extensionRate;
+      }
+    }
+  }
+
+  return {
+    audioObjectType: signaledAudioObjectType,
+    sampleRate,
+    ...(channels !== undefined ? { channels } : {}),
+    ...(sbrPresent ? { sbrPresent: true } : {}),
+  };
+}
 
 /** Variable-length descriptor size (each byte: 7 bits + continuation flag). */
 function readDescriptorLen(r: Reader): number {
@@ -107,10 +265,12 @@ export function parseEsds(esds: Uint8Array): EsdsInfo {
 
   let asc: Uint8Array | undefined;
   let audioObjectType: number | undefined;
+  let ascGeometry: AacAscGeometry = {};
   if (r.remaining > 1 && r.u8() === TAG_DECODER_SPECIFIC) {
     const len = readDescriptorLen(r);
     asc = r.bytes(len).slice();
-    audioObjectType = (asc[0] ?? 0) >> 3;
+    ascGeometry = parseAacAscGeometry(asc);
+    audioObjectType = ascGeometry.audioObjectType;
   }
 
   const codec =
@@ -121,6 +281,9 @@ export function parseEsds(esds: Uint8Array): EsdsInfo {
     codec,
     objectTypeIndication: oti,
     ...(audioObjectType !== undefined ? { audioObjectType } : {}),
+    ...(ascGeometry.sampleRate !== undefined ? { sampleRate: ascGeometry.sampleRate } : {}),
+    ...(ascGeometry.channels !== undefined ? { channels: ascGeometry.channels } : {}),
+    ...(ascGeometry.sbrPresent ? { sbrPresent: true } : {}),
     ...(asc ? { asc } : {}),
   };
 }

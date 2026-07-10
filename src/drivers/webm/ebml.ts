@@ -8,6 +8,8 @@ export interface EbmlElement {
   id: number;
   dataStart: number;
   dataEnd: number;
+  /** Whether the declared finite payload is wholly present in this DataView. */
+  complete: boolean;
 }
 
 /** A variable-length integer. `keepMarker` true for element IDs, false for sizes. */
@@ -49,9 +51,15 @@ export function* elements(dv: DataView, start: number, end: number): Generator<E
     const size = readVint(dv, at + id.length, false);
     if (!size) return;
     const dataStart = at + id.length + size.length;
-    const dataEnd = size.value < 0 ? limit : Math.min(dataStart + size.value, limit);
+    const declaredDataEnd = size.value < 0 ? limit : dataStart + size.value;
+    const dataEnd = Math.min(declaredDataEnd, limit);
     if (dataEnd < dataStart) return;
-    yield { id: id.value, dataStart, dataEnd };
+    yield {
+      id: id.value,
+      dataStart,
+      dataEnd,
+      complete: size.value >= 0 && declaredDataEnd <= limit,
+    };
     at = dataEnd;
   }
 }

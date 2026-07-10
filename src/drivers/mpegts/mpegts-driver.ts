@@ -310,7 +310,14 @@ function packetStream(
       // The PES carries a real DTS (B-frame H.264 streams keep PTS ≠ DTS); ts-parse already resolved it
       // (== ptsUs when the PES had no separate DTS), so carry it through for lossless decode-order remux.
       const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
-      controller.enqueue({ chunk, dtsUs: unit.dtsUs });
+      // `sizeBytes` is the on-disk container packet size for packet oracles (== `ffprobe` size): the whole
+      // ADTS frame for AAC (the header the de-framer stripped from `data` is counted), else the Annex-B AU
+      // whose `data` already IS the packet. Mirrors the ADTS/MP4 driver demux packets.
+      controller.enqueue({
+        chunk,
+        dtsUs: unit.dtsUs,
+        sizeBytes: unit.sizeBytes ?? unit.data.byteLength,
+      });
     },
   });
   /* v8 ignore stop */

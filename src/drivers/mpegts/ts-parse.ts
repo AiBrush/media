@@ -88,7 +88,18 @@ export interface TsAccessUnit {
   ptsUs: number;
   /** Decode timestamp in microseconds; equals `ptsUs` when the PES carried no separate DTS. */
   dtsUs: number;
+  /** Internal provenance used by the H.264 PES→access-unit de-framer; omitted from public packets. */
+  pesHadExplicitDts?: boolean;
   keyframe: boolean;
+  /**
+   * The container packet's on-disk byte size — what a packet-size oracle (`ffprobe -show_packets` size,
+   * surfaced on {@link import('../../contracts/driver.ts').Packet.sizeBytes}) compares against. For ADTS
+   * AAC this is the WHOLE ADTS frame length: the 7/9-byte header the de-framer strips from {@link data} is
+   * still counted here, so the reported size equals the transport-stream packet even though `data` is the
+   * bare raw access unit. Absent when `data` already IS the on-disk packet (H.264/HEVC Annex-B, whose
+   * `data.byteLength` is the size), so the driver falls back to `data.byteLength`.
+   */
+  sizeBytes?: number;
 }
 
 /** Per-track parse result: the stream descriptor, its access units (decode order), and its PTS span. */
@@ -395,6 +406,116 @@ function h264HasIdr(au: Uint8Array): boolean {
   return false;
 }
 
+interface AnnexBNalStart {
+  readonly offset: number;
+  readonly type: number;
+}
+
+/** Find exact 3/4-byte Annex-B start-code offsets and H.264 NAL types in source order. */
+function h264AnnexBNalStarts(bytes: Uint8Array): AnnexBNalStart[] {
+  const starts: AnnexBNalStart[] = [];
+  for (let offset = 0; offset + 3 < bytes.byteLength; offset++) {
+    let prefixLength = 0;
+    if (
+      bytes[offset] === 0 &&
+      bytes[offset + 1] === 0 &&
+      bytes[offset + 2] === 0 &&
+      bytes[offset + 3] === 1
+    ) {
+      prefixLength = 4;
+    } else if (bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) {
+      prefixLength = 3;
+    }
+    if (prefixLength === 0) continue;
+    const header = bytes[offset + prefixLength];
+    if (header !== undefined) starts.push({ offset, type: header & 0x1f });
+    offset += prefixLength - 1;
+  }
+  return starts;
+}
+
+/**
+ * Reassemble H.264 access units across PES boundaries. ISO/IEC 13818-1 permits a PES to begin in the
+ * middle of an access unit; a PTS/DTS then names the first AU that *commences* in that PES. FFmpeg TS
+ * muxers emit AUD NALs, so a new AUD after VCL data is an exact boundary. Consecutive AUDs before VCL
+ * remain in one AU (field-coded streams may carry them); a stream with no usable AUD delimiter retains
+ * the original PES units rather than guessing slice boundaries.
+ */
+export function deframeH264PesUnits(units: readonly TsAccessUnit[]): TsAccessUnit[] {
+  if (units.length === 0) return [];
+  const totalBytes = units.reduce((sum, unit) => sum + unit.data.byteLength, 0);
+  const joined = new Uint8Array(totalBytes);
+  const anchors: { readonly offset: number; readonly unit: TsAccessUnit }[] = [];
+  let writeOffset = 0;
+  for (const unit of units) {
+    anchors.push({ offset: writeOffset, unit });
+    joined.set(unit.data, writeOffset);
+    writeOffset += unit.data.byteLength;
+  }
+
+  const nalStarts = h264AnnexBNalStarts(joined);
+  const firstNal = nalStarts[0];
+  if (firstNal === undefined) return [...units];
+  const ranges: { readonly start: number; readonly end: number }[] = [];
+  let accessUnitStart = firstNal.offset;
+  let sawAud = false;
+  let sawVcl = false;
+  for (const nal of nalStarts) {
+    if (nal.type === 9) {
+      sawAud = true;
+      if (sawVcl) {
+        ranges.push({ start: accessUnitStart, end: nal.offset });
+        accessUnitStart = nal.offset;
+        sawVcl = false;
+      }
+    }
+    if (nal.type === 1 || nal.type === 5) sawVcl = true;
+  }
+  if (sawVcl) ranges.push({ start: accessUnitStart, end: joined.byteLength });
+  if (!sawAud || ranges.length === 0) return [...units];
+
+  const hasIndependentDts = units.some(
+    (unit) => unit.pesHadExplicitDts === true && unit.dtsUs !== unit.ptsUs,
+  );
+  const out: TsAccessUnit[] = [];
+  let anchorIndex = 0;
+  let dtsCursor: number | undefined;
+  for (const range of ranges) {
+    while (
+      anchorIndex + 1 < anchors.length &&
+      (anchors[anchorIndex + 1]?.offset ?? 0) <= range.start
+    ) {
+      anchorIndex++;
+    }
+    const anchor = anchors[anchorIndex]?.unit;
+    if (anchor === undefined) continue;
+    let dtsUs: number;
+    // A DTS equal to PTS carries no independent decode-order information. Treat it like an omitted DTS
+    // and continue the nominal decode cadence; this is how ffmpeg bridges the two PTS-only AUs around
+    // an IDR while preserving the B-frame DTS sequence on either side.
+    if (anchor.pesHadExplicitDts === true && anchor.dtsUs !== anchor.ptsUs) {
+      dtsUs = anchor.dtsUs;
+      dtsCursor = dtsUs;
+    } else if (!hasIndependentDts) {
+      dtsUs = anchor.ptsUs;
+    } else {
+      dtsUs = dtsCursor ?? anchor.dtsUs;
+      // In a reordered stream, ffmpeg bridges a PTS-only PES by assigning the prior decode cursor to
+      // this AU, then using this AU's exact PTS as the cursor for the next one. Referencing the exact PTS
+      // avoids 1 µs drift on 30000/1001 cadences that alternate rounded 33333/33334 µs intervals.
+      dtsCursor = anchor.ptsUs;
+    }
+    const data = joined.subarray(range.start, range.end);
+    out.push({
+      data,
+      ptsUs: anchor.ptsUs,
+      dtsUs,
+      keyframe: h264HasIdr(data),
+    });
+  }
+  return out;
+}
+
 /** True when an HEVC Annex-B access unit contains an IRAP NAL (types 16–23: BLA/IDR/CRA). */
 function hevcHasIrap(au: Uint8Array): boolean {
   for (let i = 0; i + 4 < au.byteLength; i++) {
@@ -522,6 +643,7 @@ export function parseTs(bytes: Uint8Array): TsParse {
       data: split.payload,
       ptsUs: ticksToUs(split.pts),
       dtsUs: ticksToUs(split.dts ?? split.pts),
+      ...(split.dts !== undefined ? { pesHadExplicitDts: true } : {}),
       keyframe: isKeyframe(stream.codec, stream.mediaType, split.payload),
     });
     unitsByPid.set(pid, list);
@@ -582,6 +704,11 @@ export function parseTs(bytes: Uint8Array): TsParse {
   }
   for (const pid of [...builders.keys()]) flush(pid); // EOF flush of the last (unbounded video) PES
   for (const deframer of deframers.values()) deframer.finish(); // a trailing partial frame is dropped
+  for (const stream of streamsByPid.values()) {
+    if (stream.codec !== 'h264') continue;
+    const pesUnits = unitsByPid.get(stream.pid);
+    if (pesUnits !== undefined) unitsByPid.set(stream.pid, deframeH264PesUnits(pesUnits));
+  }
 
   if (!sawSync) {
     throw new InputError('unsupported-input', 'no readable transport packets (corrupt MPEG-TS)');
@@ -645,7 +772,7 @@ function mediaRank(t: MediaType): number {
 /** Parse H.264 SPS coded dimensions from the first SPS NAL in an access unit (Annex-B). */
 function h264Dimensions(au: Uint8Array): { width: number; height: number } | undefined {
   const sps = findNal(au, (nal) => (nal[0] as number) & 0x1f, 7);
-  return sps ? parseH264Sps(sps) : undefined;
+  return sps ? parseH264SpsDimensions(sps) : undefined;
 }
 
 /** Find the first Annex-B NAL whose `typeOf(nalBody)` equals `want`; returns the NAL body (sans header byte offset 0). */
@@ -665,7 +792,9 @@ function findNal(
 }
 
 /** A minimal Exp-Golomb + SPS reader: enough for coded width/height (profile-agnostic baseline path). */
-function parseH264Sps(nal: Uint8Array): { width: number; height: number } | undefined {
+export function parseH264SpsDimensions(
+  nal: Uint8Array,
+): { width: number; height: number } | undefined {
   // Strip emulation-prevention 0x03 bytes, then read past the 1-byte NAL header.
   const rbsp = stripEmulation(nal).subarray(1);
   const r = new BitReader(rbsp);
@@ -991,6 +1120,9 @@ export class AdtsDeframer {
           ptsUs: ticksToUs(ticks),
           dtsUs: ticksToUs(ticks), // audio has no reorder
           keyframe: true,
+          // The on-disk packet is the WHOLE ADTS frame (header + optional CRC + payload); `data` above is
+          // the bare AU, so carry the framed length for packet-size oracles (== ffprobe -show_packets size).
+          sizeBytes: header.frameLength,
         });
         this.ptsTicksList.push(ticks);
         this.#chainSamples += header.samples;
@@ -1018,9 +1150,16 @@ function configForStream(
   units: readonly TsAccessUnit[],
   adtsParams: AdtsTrackParams | undefined,
 ): VideoDecoderConfig | AudioDecoderConfig {
-  const first = units[0]?.data;
   if (stream.mediaType === 'video') {
-    const dims = first && stream.codec === 'h264' ? h264Dimensions(first) : undefined;
+    let dims: { width: number; height: number } | undefined;
+    if (stream.codec === 'h264') {
+      // A TS range can begin mid-GOP. The first complete AU then legitimately has no SPS; keep scanning
+      // decode order until the next parameter-set repetition instead of publishing a false 0×0 config.
+      for (const unit of units) {
+        dims = h264Dimensions(unit.data);
+        if (dims !== undefined) break;
+      }
+    }
     return { codec: stream.codec, codedWidth: dims?.width ?? 0, codedHeight: dims?.height ?? 0 };
   }
   if (adtsParams !== undefined) {

@@ -35,6 +35,7 @@ import { encryptCenc } from '../../test-support/cenc-encrypt.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { parseSenc, parseTenc } from './cenc.ts';
 import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
+import { buildSampleData } from './samples.ts';
 
 /** The sibling acceptance harness's verified CENC corpus (its prebaked, git-ignored fixtures). */
 const HARNESS_MEDIA_DIR = new URL(
@@ -74,6 +75,14 @@ async function audioSamples(mp4: Uint8Array): Promise<Uint8Array[]> {
   const movie = await readMovie(ra(mp4));
   const tracks = await muxTracksFromMovie(ra(mp4), movie);
   const idx = movie.tracks.findIndex((t) => t.mediaType === 'audio');
+  return (tracks[idx]?.samples ?? []).map((s) => s.data);
+}
+
+/** The video track's coded sample bytes — used as a strict decoder-double oracle. */
+async function videoSamples(mp4: Uint8Array): Promise<Uint8Array[]> {
+  const movie = await readMovie(ra(mp4));
+  const tracks = await muxTracksFromMovie(ra(mp4), movie);
+  const idx = movie.tracks.findIndex((t) => t.mediaType === 'video');
   return (tracks[idx]?.samples ?? []).map((s) => s.data);
 }
 
@@ -176,39 +185,33 @@ describeHarness(
       await expect(readMovie(ra(out))).resolves.toBeDefined();
     });
 
-    // Graceful-failure contract. Structural corruption is detectable and MUST reject with a typed
-    // MediaError. Payload tampering of a valid-structure `cenc` (AES-CTR) file is cryptographically
-    // undetectable at the decrypt seam — CTR is unauthenticated (ISO/IEC 23001-7 delegates integrity to
-    // the container, not the cipher), so a spec-conformant decryptor decrypts tampered ciphertext to
-    // (garbage) plaintext without a crash; the caller's subsequent probe/decode is where the garbage is
-    // rejected. So the sound contract at THIS seam is "typed MediaError, or a clean (non-crashing,
-    // non-CapabilityError) decrypt" — never an unhandled throw. (The fair harness additionally expects the
-    // decrypt op itself to reject via post-decrypt heuristic validation of the recovered stream; that
-    // stricter robustness enhancement is tracked in docs/perf/performance-deficits.md.)
-    const HARNESS_REJECT: ReadonlyArray<{ name: string; structural: boolean }> = [
-      { name: 'cenc_ctr_protection_zeroed.mp4', structural: false },
-      { name: 'cenc_ctr_senc_bitflip.mp4', structural: false },
-      { name: 'cenc_ctr_truncated_mdat.mp4', structural: true },
+    // Every baked mutation must reject at the decrypt seam with a typed MediaError. The bit-flip fixture
+    // changes one `senc` IV inside an otherwise consecutive producer run; the clean neighbours expose that
+    // metadata corruption without assuming that all valid CENC IVs are sequential.
+    const HARNESS_REJECT: ReadonlyArray<{ name: string; path: string }> = [
+      {
+        name: 'cenc_ctr_protection_zeroed.mp4',
+        path: 'scenarios/encryption/cenc_ctr_protection_zeroed_graceful/cenc_ctr_protection_zeroed.mp4',
+      },
+      {
+        name: 'cenc_ctr_senc_bitflip.mp4',
+        path: 'scenarios/encryption/cenc_ctr_senc_bitflip_graceful/cenc_ctr_senc_bitflip.mp4',
+      },
+      {
+        name: 'cenc_ctr_truncated_mdat.mp4',
+        path: 'scenarios/encryption/cenc_ctr_truncated_mdat_graceful/cenc_ctr_truncated_mdat.mp4',
+      },
     ];
-    for (const { name, structural } of HARNESS_REJECT) {
-      it(`handles ${name} gracefully (typed MediaError or clean decrypt, never a crash/CapabilityError)`, async () => {
-        const bytes = harnessFixture(name);
+    for (const { name, path } of HARNESS_REJECT) {
+      it(`rejects ${name} with a typed MediaError`, async () => {
+        const bytes = harnessFixture(path);
         if (!bytes) return;
         const err = await decryptHarness(bytes).then(
           () => undefined,
           (e: unknown) => e,
         );
-        if (structural) {
-          // A truncated mdat is caught by sample-range validation — it must reject.
-          expect(err).toBeInstanceOf(MediaError);
-          expect(err).not.toBeInstanceOf(CapabilityError);
-        } else if (err !== undefined) {
-          // Undetectable CTR payload tampering may still be rejected, but only with a typed MediaError —
-          // never an unhandled crash, and never a CapabilityError (which would wrongly signal "unsupported"
-          // for a fully-supported scheme). A clean decrypt is equally acceptable at this seam.
-          expect(err).toBeInstanceOf(MediaError);
-          expect(err).not.toBeInstanceOf(CapabilityError);
-        }
+        expect(err).toBeInstanceOf(MediaError);
+        expect(err).not.toBeInstanceOf(CapabilityError);
       });
     }
   },
@@ -258,6 +261,135 @@ describe('media.decrypt — CENC robustness: malformed protection rejects cleanl
     );
     expect(err).toBeInstanceOf(MediaError);
     expect(err).not.toBeInstanceOf(CapabilityError);
+  });
+
+  it('browser-validates recovered AVC samples: clean CENC stays bit-exact, payload corruption rejects', async () => {
+    const clear = await loadFixture('bear-1280x720.mp4');
+    const clearVideo = await videoSamples(clear);
+    expect(clearVideo.length).toBeGreaterThan(10);
+
+    const encrypted = await encryptCenc(clear, {
+      keyHex: KEY,
+      kidHex: KID,
+      mediaType: 'video',
+    });
+    expect(await videoSamples(encrypted)).not.toEqual(clearVideo);
+
+    // Flip one protected payload bit while leaving ftyp/moov/tenc/senc/sample sizes and byte ranges intact.
+    // AES-CTR has no MAC, so only post-decrypt codec validation can distinguish this from valid ciphertext.
+    const encryptedMovie = await readMovie(ra(encrypted));
+    const encryptedVideo = encryptedMovie.tracks.find((track) => track.mediaType === 'video');
+    if (encryptedVideo === undefined) throw new Error('encrypted fixture has no video track');
+    const sample = buildSampleData(encryptedVideo).find((entry) => entry.size > 64);
+    if (sample === undefined)
+      throw new Error('encrypted fixture has no sufficiently large video sample');
+    const corrupted = encrypted.slice();
+    const mutationOffset = sample.offset + 64;
+    const originalByte = corrupted[mutationOffset];
+    if (originalByte === undefined)
+      throw new Error('mutation offset is outside the encrypted fixture');
+    corrupted[mutationOffset] = originalByte ^ 0x01;
+
+    let decodedSamples = 0;
+    class FakeCencEncodedVideoChunk {
+      readonly data: Uint8Array;
+
+      constructor(init: EncodedVideoChunkInit) {
+        const data = init.data;
+        this.data = ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+          : new Uint8Array(data);
+      }
+    }
+    class StrictCencVideoDecoder {
+      static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        return Promise.resolve({ config, supported: true });
+      }
+
+      readonly decodeQueueSize = 0;
+      state: CodecState = 'unconfigured';
+      readonly #output: (frame: VideoFrame) => void;
+
+      constructor(init: VideoDecoderInit) {
+        this.#output = init.output;
+      }
+
+      configure(_config: VideoDecoderConfig): void {
+        this.state = 'configured';
+      }
+
+      decode(chunk: EncodedVideoChunk): void {
+        const actual = (chunk as unknown as FakeCencEncodedVideoChunk).data;
+        const expected = clearVideo[decodedSamples];
+        decodedSamples++;
+        if (
+          expected === undefined ||
+          actual.byteLength !== expected.byteLength ||
+          actual.some((byte, index) => byte !== expected[index])
+        ) {
+          // Model a real decoder's error-concealment path: it may accept the chunk but drop the damaged
+          // access unit without firing the error callback. Full-track validation must still reject because
+          // one MP4 AVC sample is one access unit and therefore owes exactly one output frame.
+          return;
+        }
+        this.#output({ close: (): void => undefined } as VideoFrame);
+      }
+
+      flush(): Promise<void> {
+        return Promise.resolve();
+      }
+
+      reset(): void {
+        this.state = 'unconfigured';
+      }
+
+      close(): void {
+        this.state = 'closed';
+      }
+
+      addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+
+      removeEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+    }
+
+    const originalVideoDecoder = globalThis.VideoDecoder;
+    const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
+    Object.defineProperty(globalThis, 'VideoDecoder', {
+      configurable: true,
+      value: StrictCencVideoDecoder as unknown as typeof VideoDecoder,
+    });
+    Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+      configurable: true,
+      value: FakeCencEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
+    });
+
+    try {
+      const recovered = await decryptBytes(encrypted);
+      expect(decodedSamples).toBe(clearVideo.length);
+      expect(await videoSamples(recovered)).toEqual(clearVideo);
+
+      decodedSamples = 0;
+      const error = await decryptBytes(corrupted).then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(error).toBeInstanceOf(MediaError);
+      expect(error).not.toBeInstanceOf(CapabilityError);
+    } finally {
+      if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
+      else
+        Object.defineProperty(globalThis, 'VideoDecoder', {
+          configurable: true,
+          value: originalVideoDecoder,
+        });
+      if (originalEncodedVideoChunk === undefined)
+        Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+      else
+        Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+          configurable: true,
+          value: originalEncodedVideoChunk,
+        });
+    }
   });
 });
 
@@ -320,6 +452,22 @@ describe('parseSenc — structural validation (both arms of every guard)', () =>
     const samples = parseSenc(sencPayload(3, 8), 8);
     expect(samples).toHaveLength(3);
     expect(samples[0]?.iv.length).toBe(8);
+  });
+
+  it('rejects one corrupted IV sandwiched between consecutive counter neighbours', () => {
+    const count = 5;
+    const ivSize = 8;
+    const p = new Uint8Array(8 + count * ivSize);
+    const dv = new DataView(p.buffer);
+    dv.setUint32(4, count);
+    for (let sample = 0; sample < count; sample++) {
+      p.set([0xbd, 0xf1, 0x91, 0x8f, 0x4d, 0xbc, 0x40, 0x20 + sample], 8 + sample * ivSize);
+    }
+    expect(parseSenc(p, ivSize)).toHaveLength(count);
+
+    // Keep the previous/next counters at N/N+2 and flip one high bit only in their midpoint.
+    p[8 + 2 * ivSize + 3] = (p[8 + 2 * ivSize + 3] ?? 0) ^ 0x01;
+    expect(() => parseSenc(p, ivSize)).toThrow(MediaError);
   });
 
   it('rejects an unsupported per-sample IV size (0)', () => {
