@@ -10,7 +10,7 @@ import { aiffPacketInfoFromBytes } from '../src/drivers/aiff/aiff-driver.ts';
 const WARMUP = 2;
 const SAMPLES = 9;
 const CORPUS = new URL(
-  '../../media-test/media-browser-test/fixtures/media/scenarios/demux/pcm_s16be/',
+  '../../media-test/fixtures/media/scenarios/demux/pcm_s16be/',
   import.meta.url,
 ).pathname;
 const SUBJECTS = ['pcm_s16be.aiff', '01.aiff', '02.aiff', '03.aiff'] as const;

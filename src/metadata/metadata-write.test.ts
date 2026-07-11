@@ -29,6 +29,7 @@ import {
 import { readFlacVorbisComment, writeFlacVorbisComment } from './vorbis-comment.ts';
 
 const DERIVED = new URL('../../fixtures/media-derived/', import.meta.url).pathname;
+const MEDIA_TEST = new URL('../../../media-test/fixtures/media/', import.meta.url).pathname;
 const LONG_COMMENT = 'metadata:write roundtrip - '.repeat(12);
 const TAGS = {
   title: 'Conformance Clip',
@@ -417,6 +418,38 @@ describe('metadata:write tag writers — strict structural readback', () => {
     expectTags(readMp3Id3Tags(mp3));
     expectTags(readFlacVorbisComment(flac));
     expectTags(readOggVorbisComment(ogg));
+  });
+
+  it('public MKV tag rewrite preserves every real attachment payload and declared stream', async () => {
+    const input = new Uint8Array(
+      await readFile(`${MEDIA_TEST}scenarios/metadata/write_mkv_tags/03.mkv`),
+    );
+    const before = demuxWebm(input).info.tracks;
+    const output = await blobBytes(
+      await createMedia().remux(fromBytes(input, { mime: 'video/x-matroska' }), {
+        to: 'mkv',
+        tags: TAGS,
+      }),
+    );
+    const after = demuxWebm(output).info.tracks;
+
+    expectTags(readMkvTags(output));
+    expect(
+      after.map((track) => ({
+        mediaType: track.mediaType,
+        codec: track.codec,
+        nonMedia: track.nonMedia,
+        attachment: track.attachedFilePayload,
+      })),
+    ).toEqual(
+      before.map((track) => ({
+        mediaType: track.mediaType,
+        codec: track.codec,
+        nonMedia: track.nonMedia,
+        attachment: track.attachedFilePayload,
+      })),
+    );
+    expect(output).not.toEqual(input);
   });
 
   it('rejects public metadata rewrites for unsupported targets and track-selection mixes', async () => {

@@ -1,0 +1,35 @@
+{
+  "oracle": "ffprobe packet Skip Samples side data + ffmpeg decoded s16le sample count",
+  "sampleRate": 48000,
+  "channels": 2,
+  "files": [
+    {
+      "name": "01.webm",
+      "sha256": "5f083475a1105c7af33c47996e3a01de137700bef72c25134df5bab806cc556d",
+      "leadingSamples": 312,
+      "trailingSamples": 80,
+      "totalSamples": 1248568
+    },
+    {
+      "name": "02.webm",
+      "sha256": "999d4e779a626d74c9df6d3bc4911836f103d9719c3bf91248f98e56c5554e48",
+      "leadingSamples": 312,
+      "trailingSamples": 648,
+      "totalSamples": 2233920
+    },
+    {
+      "name": "03.webm",
+      "sha256": "1e549042f6402c232cbdf2a5b4236d332054f26e163e121a748da93ecb85b421",
+      "leadingSamples": 312,
+      "trailingSamples": 108,
+      "totalSamples": 10728540
+    },
+    {
+      "name": "vp9_1080p_10s.webm",
+      "sha256": "2fc7d368edd6fa2ac1ce7c538c5b643ec7d46867fb1026cf1f6daa76de9fa8dc",
+      "leadingSamples": 312,
+      "trailingSamples": 648,
+      "totalSamples": 480000
+    }
+  ]
+}

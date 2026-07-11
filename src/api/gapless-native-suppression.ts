@@ -1,0 +1,130 @@
+import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
+
+/** AAC edit priming is normally one or two access units; keep runtime detection strictly bounded. */
+export const MP4_GAPLESS_PREFLIGHT_MAX_PACKETS = 8 as const;
+
+export interface GaplessNativeSuppressionProbe {
+  readonly packets: ReadableStream<Packet>;
+  readonly createDecoder: () => TransformStream<EncodedChunk, RawFrame>;
+}
+
+interface GaplessPrefix {
+  readonly chunks: readonly EncodedChunk[];
+  readonly expectedSamples: number;
+}
+
+function durationSamples(chunk: EncodedChunk, sampleRate: number): number {
+  const durationUs = chunk.duration;
+  if (durationUs === null || !Number.isFinite(durationUs) || durationUs <= 0) return 0;
+  return Math.max(0, Math.round((durationUs * sampleRate) / 1_000_000));
+}
+
+async function collectNegativeTimestampPrefix(
+  packets: ReadableStream<Packet>,
+  leadingSamples: number,
+  sampleRate: number,
+): Promise<GaplessPrefix> {
+  const reader = packets.getReader();
+  const chunks: EncodedChunk[] = [];
+  let expectedSamples = 0;
+  let exhausted = false;
+  try {
+    while (
+      chunks.length < MP4_GAPLESS_PREFLIGHT_MAX_PACKETS &&
+      expectedSamples < leadingSamples
+    ) {
+      const next = await reader.read();
+      if (next.done) {
+        exhausted = true;
+        break;
+      }
+      if (next.value.chunk.timestamp >= 0) break;
+      chunks.push(next.value.chunk);
+      expectedSamples += durationSamples(next.value.chunk, sampleRate);
+    }
+  } finally {
+    if (!exhausted) await reader.cancel();
+    reader.releaseLock();
+  }
+  return { chunks, expectedSamples };
+}
+
+function prefixChunkStream(chunks: readonly EncodedChunk[]): ReadableStream<EncodedChunk> {
+  let index = 0;
+  return new ReadableStream<EncodedChunk>(
+    {
+      pull(controller): void {
+        const chunk = chunks[index];
+        index++;
+        if (chunk === undefined) controller.close();
+        else controller.enqueue(chunk);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+async function decodedPrefixSamples(
+  chunks: readonly EncodedChunk[],
+  createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+): Promise<number> {
+  const decoded = prefixChunkStream(chunks).pipeThrough(createDecoder());
+  const reader = decoded.getReader();
+  let samples = 0;
+  let exhausted = false;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) {
+        exhausted = true;
+        return samples;
+      }
+      const frame = next.value;
+      try {
+        if (!('numberOfFrames' in frame)) throw new TypeError('audio preflight emitted video');
+        samples += frame.numberOfFrames;
+      } finally {
+        frame.close();
+      }
+    }
+  } finally {
+    if (!exhausted) await reader.cancel();
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Measure how many edit-list priming samples the selected native decoder already consumed. MP4 packet
+ * timestamps alone cannot answer this: Chromium emits the negative packet for ordinary AAC, but silently
+ * consumes the same packet for some standards-valid encoder-delay streams. Decode only the negative
+ * prefix through an independent decoder instance, close every probe frame, and compare its exact decoded
+ * sample count with the packet-duration expectation. If a prefix-only decode is unsupported, preserve the
+ * conservative historical behavior (zero native suppression) and let the full decoder remain authoritative.
+ */
+export async function nativeSuppressedMp4EditSamples(
+  probe: GaplessNativeSuppressionProbe,
+  leadingSamples: number,
+  sampleRate: number,
+): Promise<number> {
+  if (
+    !Number.isSafeInteger(leadingSamples) ||
+    leadingSamples <= 0 ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0
+  ) {
+    return 0;
+  }
+  const prefix = await collectNegativeTimestampPrefix(probe.packets, leadingSamples, sampleRate);
+  if (prefix.chunks.length === 0 || prefix.expectedSamples === 0) return 0;
+  let observedSamples: number;
+  try {
+    observedSamples = await decodedPrefixSamples(prefix.chunks, probe.createDecoder);
+  } catch {
+    return 0;
+  }
+  const missingSamples = Math.max(0, prefix.expectedSamples - observedSamples);
+  // One independently-rounded packet duration can differ by at most one sample. Never interpret that
+  // representational drift as native priming suppression.
+  if (missingSamples <= prefix.chunks.length) return 0;
+  return Math.min(leadingSamples, missingSamples);
+}

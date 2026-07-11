@@ -9,7 +9,7 @@ For each stage the Planner produces, the Router selects exactly one driver:
 1. Gather the registered drivers of the stage's kind (codec / container / filter).
 2. Order them by the **ladder** (best-first, ADR-002).
 3. Walk top-down, calling each driver's **capability probe**; pick the first that reports support.
-4. **Cache** the verdict keyed by the query (so the hot path never re-probes).
+4. **Cache** only a provable highest-ranked positive verdict keyed by the exact query. Unprovable configs and lower-tier fallbacks deliberately re-probe so dynamic capability recovery remains visible (ADR-207).
 5. **Lazy-import** the chosen driver's module if not already loaded, then build the stage.
 6. If none support it → throw `CapabilityError` (ADR-017).
 
@@ -33,7 +33,7 @@ Top = tried first. These defaults encode the benchmark's per-family winners; the
 
 `Tier` ordering used for normal ranking: `hardware` > `gpu` > `native` > `wasm`. For telemetry-classified tiny work (ADR-020), `hardware` remains first for codecs and `native` moves ahead of GPU/WASM setup.
 
-> **As built (Phase 1–2, ADR-026/027/032/033/049/069/076).** The WebCodecs codec drivers (`webcodecs-video`, `webcodecs-audio`) are a *single* `tier:'hardware'` driver each, codec-agnostic by config; the hardware-vs-software split is not two drivers but the `hardwareAcceleration` hint the determinism modifier sets — `auto → 'prefer-hardware'` (video) / `'no-preference'` (audio), `force-software → 'prefer-software'` (both). `isConfigSupported` then reports whether the UA will actually accelerate, and `force-software` additionally drops the whole `hardware`/`gpu` tier (§6). The image path is deliberately outside the codec/container ladders: `ImageOps` sniffs GIF/PNG/JPEG/WebP/AVIF magic before container probing, uses a pure header parser for `probe`, and uses browser `ImageDecoder` for `decode` when present. The video-filter ladder ships **WebGPU + Canvas2D + native CPU** — the **WebGL rung is intentionally omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for every geometric op, so it is the single, simpler fallback before the pure-TS CPU floor. The WASM filter rung remains reserved for a future compiled filter tail. **Colorspace + tonemap are now implemented (ADR-032/038)** via a WebGPU color pipeline and the native CPU fallback: WebGPU handles `colorspace` (BT.2020↔709↔601↔sRGB gamut+transfer) and `tonemap` (HDR PQ/HLG → SDR) for all targets, Canvas2D handles `colorspace` only when the target resolves to the display space (srgb/bt709, a UA-color-managed passthrough), and `cpu-video-filter` handles all six video filter specs through `VideoFrame.copyTo` when GPU/canvas decline. The **audio** `FilterSpec`s (`resample`/`remix`/`gain`) are served by a separate auto-registered `audio-dsp-filter` (`AudioData` seam over the pure-TS dsp kernels, ADR-033); it declares `substrate:'native'`, ranked below GPU/canvas and above WASM. `mpegts` and `hls` are auto-registered container drivers. The real Symphonia audio WASM codec tails are also auto-registered and miss-only, but their probes require the browser `EncodedAudioChunk` → `AudioData` seam and co-vendored assets; scaffold tails stay explicit/not in defaults until their cores exist (see the doc 09 status table).
+> **As built (Phase 1–2, ADR-026/027/032/033/049/069/076/203/207).** The WebCodecs codec drivers (`webcodecs-video`, `webcodecs-audio`) are a *single* `tier:'hardware'` driver each, codec-agnostic by config; the hardware-vs-software split is not two drivers but the accepted `hardwareAcceleration` config — auto video probes `prefer-hardware` first, proves that candidate through the asynchronous configure control queue, and falls back to exact `no-preference` before packet submission; auto audio uses `'no-preference'`; `force-software` uses `'prefer-software'` and additionally drops the whole `hardware`/`gpu` tier (§6). Both the video acceleration verdict and Router positive-driver caches use exact config facts, including ordinary description bytes, geometry, colour, and effective alpha. Unprovable Router configs re-probe, and only a top-rung positive is cached so a temporary lower-tier fallback cannot lock out later recovery. The image path is deliberately outside the codec/container ladders: `ImageOps` sniffs GIF/PNG/JPEG/WebP/AVIF magic before container probing, uses a pure header parser for `probe`, and uses browser `ImageDecoder` for `decode` when present. The video-filter ladder ships **WebGPU + Canvas2D + native CPU** — the **WebGL rung is intentionally omitted** (ADR-027): Canvas2D `drawImage` is itself GPU-accelerated and pixel-exact for every geometric op, so it is the single, simpler fallback before the pure-TS CPU floor. The WASM filter rung remains reserved for a future compiled filter tail. **Colorspace + tonemap are now implemented (ADR-032/038)** via a WebGPU color pipeline and the native CPU fallback: WebGPU handles `colorspace` (BT.2020↔709↔601↔sRGB gamut+transfer) and `tonemap` (HDR PQ/HLG → SDR) for all targets, Canvas2D handles `colorspace` only when the target resolves to the display space (srgb/bt709, a UA-color-managed passthrough), and `cpu-video-filter` handles all six video filter specs through `VideoFrame.copyTo` when GPU/canvas decline. The **audio** `FilterSpec`s (`resample`/`remix`/`gain`) are served by a separate auto-registered `audio-dsp-filter` (`AudioData` seam over the pure-TS dsp kernels, ADR-033); it declares `substrate:'native'`, ranked below GPU/canvas and above WASM. `mpegts` and `hls` are auto-registered container drivers. The real Symphonia audio WASM codec tails are also auto-registered and miss-only, but their probes require the browser `EncodedAudioChunk` → `AudioData` seam and co-vendored assets; scaffold tails stay explicit/not in defaults until their cores exist (see the doc 09 status table).
 
 ## 3. Capability probes (per kind)
 
@@ -47,15 +47,21 @@ Top = tried first. These defaults encode the benchmark's per-family winners; the
 
 ```ts
 async function pickCodec(q: CodecQuery, opts: StageOptions): Promise<CodecDriver> {
-  const key = codecKey(q, opts.determinism, costBucket(q, opts.cost))
-  if (cache.has(key)) return cache.get(key)!
+  const key = exactCodecKey(q, opts.determinism, costBucket(q, opts.cost)) // undefined if unprovable
+  if (key !== undefined) {
+    const cached = cache.get(key)
+    if (cached !== undefined) return cached
+  }
   const candidates = registry.codecs()
     .filter(d => opts.determinism === 'force-software' ? d.tier !== 'hardware' && d.tier !== 'gpu' : true)
     .sort(byTierAndCost)                           // normal: hardware -> gpu -> native -> wasm; tiny: hardware -> native -> gpu -> wasm
-  for (const d of candidates) {
+  for (const [rank, d] of candidates.entries()) {
     await ensureLoaded(d)                           // lazy import the driver module if needed
     const s = await d.supports(q)                   // isConfigSupported / wasm caps
-    if (s.supported) { cache.set(key, d); return d }
+    if (s.supported) {
+      if (rank === 0 && key !== undefined && exactCodecKey(q, opts.determinism, costBucket(q, opts.cost)) === key) cache.setLRU(key, d)
+      return d                                      // lower-tier wins are deliberately re-probed next call
+    }
   }
   throw new CapabilityError('capability-miss', `no codec driver for ${describe(q)}`, { op: q, tried: candidates.map(d => d.id) })
 }
@@ -67,17 +73,18 @@ Container and filter selection are the synchronous analogues (no `await` on `sup
 
 ## 5. Caching
 
-- Verdicts are cached by `(stage-kind, codec/mime, direction, determinism, cost-bucket)`. Capabilities are environment-stable within a session, but tiny-work re-ranking is intentionally a separate bucket so small and normal jobs do not poison each other's hot paths.
-- Capability of the *environment* (does the browser have WebGPU? does WebCodecs support `hev1`?) is also cached once per session.
+- Codec positives use a bounded 64-entry LRU keyed by the complete provable config snapshot plus media type, direction, determinism, and cost bucket. A descriptor-driven serializer never invokes `toJSON` or accessors. Ordinary BufferSource view bytes participate; shared/cross-realm, cyclic, hostile, or oversized shapes skip the optimization and re-probe. The snapshot is checked again after asynchronous `supports()` before insertion.
+- Only the highest-ranked positive codec driver is cached. A lower-tier fallback is re-probed on its next use so dynamic recovery of a hardware/native rung is not hidden for the rest of the session. Container keys retain their documented stable subsets.
+- Filter cache hits retain the bounded media/type/determinism/cost key, but re-run the cached driver's synchronous `supports(exactSpec)` before reuse and retain only a top-rung positive. Thus target-dependent support (for example Canvas2D display-space colour versus CPU wide-gamut colour) cannot depend on which target ran first, and a lower fallback cannot hide a faster later match.
 - `media.preload(...)` (ADR / [`07`](07-public-api.md)) warms these caches ahead of the first real call.
 
 ## 6. Determinism modifier (ADR-007)
 
 `determinism: 'force-software'` removes the `hardware` and `gpu` tiers from candidate lists before ranking, forcing software WebCodecs / WASM / Canvas paths so output is identical across machines. Default `'auto'` keeps the full ladder.
 
-## 7. Cost-awareness (ADR-020)
+## 7. Cost-awareness (ADR-020/199)
 
-The router now accepts an internal `RouteCost` and derives cost automatically for video `resize`/`crop` output area; codec stages keep the static ladder unless an internal caller supplies explicit cost. Thresholds are seeded from committed fresh telemetry, not guessed: `inputBytes <= 64 KiB`, `outputPixels <= 4096`, `mediaSeconds <= 1`, or `audioFrames <= 48_000` marks the stage as tiny. Tiny work re-ranks cheaper native/in-process tiers ahead of GPU/WASM setup while keeping hardware WebCodecs first where present. Unknown cost data keeps the static ladder. This is deliberately not exposed as a public backend knob.
+The router accepts an internal `RouteCost`; codec stages keep the static ladder unless an internal caller supplies explicit cost. Generic codec/audio thresholds remain seeded from committed telemetry: `inputBytes <= 64 KiB`, `outputPixels <= 4096`, `mediaSeconds <= 1`, or `audioFrames <= 48_000` marks that stage as tiny. Video filters are modality-specific (ADR-199): when the engine has source and output geometry, it supplies total pixel work `(inputPixels + outputPixels) * estimatedFrames`, using the higher input/output fps (or the 30 fps planning default) and at least one frame when duration is unknown. Only `videoPixelWork <= 245,760` — an identity 64×64 source-read plus destination-write over 30 frames — is tiny; duration alone can never classify a high-resolution video filter as cheap, and incomplete geometry keeps the normal GPU-first ladder. Tiny work re-ranks cheaper native/in-process tiers ahead of GPU/WASM setup while keeping hardware WebCodecs first where present. This is deliberately not exposed as a public backend knob.
 
 ## 8. Failure semantics (ADR-017)
 

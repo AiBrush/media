@@ -347,11 +347,11 @@ describe('parseTs H.264 access units spanning PES boundaries', () => {
 
   it('matches every ffprobe packet on the rotated cross-PES Annex-B fixture', async () => {
     const mediaPath = new URL(
-      '../../../../media-test/media-browser-test/fixtures/media/scenarios/demux/h264_ts/02.ts',
+      '../../../../media-test/fixtures/media/scenarios/demux/h264_ts/02.ts',
       import.meta.url,
     ).pathname;
     const goldenPath = new URL(
-      '../../../../media-test/media-browser-test/fixtures/golden/scenarios/demux/h264_ts/02.ts.packets.json',
+      '../../../../media-test/fixtures/golden/scenarios/demux/h264_ts/02.ts.packets.json',
       import.meta.url,
     ).pathname;
     const parsed = parseTs(new Uint8Array(await readFile(mediaPath)));
@@ -372,7 +372,7 @@ describe('parseTs H.264 access units spanning PES boundaries', () => {
 
   it('discovers coded dimensions when a transport-stream slice begins before the next SPS', async () => {
     const mediaPath = new URL(
-      '../../../../media-test/media-browser-test/fixtures/media/scenarios/probe/h264_ts/03.ts',
+      '../../../../media-test/fixtures/media/scenarios/probe/h264_ts/03.ts',
       import.meta.url,
     ).pathname;
     const parsed = parseTs(new Uint8Array(await readFile(mediaPath)));

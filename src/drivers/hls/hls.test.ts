@@ -22,10 +22,7 @@ import {
   parseM3u8,
 } from './hls-driver.ts';
 
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 async function textFromMediaTest(name: string): Promise<string> {
   return readFile(`${MEDIA_TEST}${name}`, 'utf8');

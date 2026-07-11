@@ -19,7 +19,13 @@
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK } from '../../crypto/aes.ts';
 import { decryptHlsAes128, decryptHlsSampleAesTs } from '../../crypto/hls-aes.ts';
-import { type MediaInput, type Source, fromBytes } from '../../sources/source.ts';
+import {
+  type MediaInput,
+  SOURCE_CACHE_KEY,
+  SOURCE_URL_KEY,
+  type Source,
+  fromBytes,
+} from '../../sources/source.ts';
 import {
   type HlsKey,
   type HlsMap,
@@ -180,11 +186,29 @@ export async function resolveHlsInputIfManifest(
 ): Promise<Source> {
   const peeked = await peekSourceHead(src, HLS_HEAD_SNIFF_BYTES, signal);
   if (!isHlsPlaylist(peeked.head)) return peeked.source;
-  const baseUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : undefined;
+  const baseUrl = hlsManifestBaseUrl(input, src);
   return resolveHlsSourceFromSource(peeked.source, {
     signal,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
   });
+}
+
+/** Preserve the real playlist URL across input normalization; never invent one for detached bytes. */
+function hlsManifestBaseUrl(input: MediaInput, src: Source): string | undefined {
+  // `MediaInput` accepts an already-normalized URL-backed `Source` as well as its original string/URL.
+  // `fromURL()` retains the exact href as the source identity, so normalization cannot detach relative
+  // key/segment URIs from their manifest. In-memory bytes/Blob sources carry no identity and stay
+  // originless. A browser-relative input is made absolute against the document/worker location before
+  // RFC 3986 resolution; this is using the caller's actual URL, not guessing a fixture directory.
+  const href =
+    src[SOURCE_URL_KEY] ??
+    (typeof input === 'string' ? input : input instanceof URL ? input.href : src[SOURCE_CACHE_KEY]);
+  if (href === undefined || typeof location === 'undefined') return href;
+  try {
+    return new URL(href, location.href).href;
+  } catch {
+    return href;
+  }
 }
 
 interface PeekedSource {
@@ -212,13 +236,27 @@ async function peekSourceHead(src: Source, n: number, signal: AbortSignal): Prom
       retained.push(value);
       retainedBytes += value.byteLength;
     }
+    throwIfAborted(signal);
   } catch (error) {
     await reader.cancel(error).catch(() => {});
     reader.releaseLock();
     throw error;
   }
+  const head = retainedHead(retained, n);
+  // Every Source kind except `stream` promises a fresh readable on each call. Do not downgrade such a
+  // caller-provided source to the one-shot replay wrapper merely because it has no random-access method:
+  // later image/container routing is entitled to open another reader. Close only this bounded sniff and
+  // return the original identity. A true `stream` remains single-use and must replay the retained chunks.
+  if (src.kind !== 'stream') {
+    try {
+      await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
+    return { head, source: src };
+  }
   return {
-    head: retainedHead(retained, n),
+    head,
     source: replayStreamSource(src, retained, reader),
   };
 }

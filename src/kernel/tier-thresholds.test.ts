@@ -5,7 +5,9 @@ import {
   TINY_AUDIO_FRAMES,
   TINY_INPUT_BYTES,
   TINY_MEDIA_SECONDS,
+  TINY_VIDEO_FRAMES,
   TINY_VIDEO_PIXELS,
+  TINY_VIDEO_PIXEL_WORK,
 } from './tier-thresholds.ts';
 
 describe('telemetry-seeded tier thresholds', () => {
@@ -21,11 +23,15 @@ describe('telemetry-seeded tier thresholds', () => {
     expect(TINY_VIDEO_PIXELS).toBe(64 * 64);
     expect(TINY_MEDIA_SECONDS).toBe(1);
     expect(TINY_AUDIO_FRAMES).toBe(48_000);
+    expect(TINY_VIDEO_FRAMES).toBe(30);
+    expect(TINY_VIDEO_PIXEL_WORK).toBe((64 * 64 + 64 * 64) * 30);
+    expect(TELEMETRY_SEEDED_TIER_THRESHOLDS.tinyVideoPixelWork).toBe(TINY_VIDEO_PIXEL_WORK);
     expect(ROUTER_THRESHOLDS).toEqual({
       tinyInputBytes: TINY_INPUT_BYTES,
       tinyVideoPixels: TINY_VIDEO_PIXELS,
       tinyMediaSeconds: TINY_MEDIA_SECONDS,
       tinyAudioFrames: TINY_AUDIO_FRAMES,
+      tinyVideoPixelWork: TINY_VIDEO_PIXEL_WORK,
     });
   });
 });

@@ -33,6 +33,10 @@ export type {
  * the same declarations the driver-author surface exposes (ADR-009/016).
  */
 export type {
+  /** Exact non-packet container metadata preserved by demux-to-mux packet copies. */
+  ContainerSideData,
+  /** Marker for a probe track that projects container metadata instead of timed packets. */
+  ContainerProjection,
   /** The tier-ladder reproducibility mode passed to {@link CreateMediaOptions.determinism}. */
   Determinism,
   /** A sealed encoded unit (PTS only) — the unit of {@link PacketStreams} and {@link Packet.chunk}. */
@@ -49,6 +53,12 @@ export type {
   Progress,
   /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
   TrackInfo,
+  /** Exact ordered Matroska `AttachedFile` payloads carried as container side data. */
+  MatroskaAttachmentsSideData,
+  /** Marker linking an attached-picture/attachment projection to its exact Matroska side-data item. */
+  MatroskaAttachmentProjection,
+  /** Raw H.273/Matroska video-colour facts preserved across container remux. */
+  VideoColorMetadata,
 } from '../contracts/driver.ts';
 
 /** Diagnostic event delivered to the `onLog` hook. */

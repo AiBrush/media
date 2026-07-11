@@ -8,9 +8,9 @@ container bytes are genuine; the content is real licensed media). Never syntheti
 
 | File | Derived from | What | Provenance |
 |---|---|---|---|
-| `big_buck_bunny_1080p_h264.header.mov` | `big_buck_bunny_1080p_h264.mov` (725 MB) | verbatim `ftyp` + `moov` only (a valid probe input; probe reads no `mdat`) | Big Buck Bunny © Blender Foundation, [CC BY 3.0](https://peach.blender.org/about/); the harness asset under `../../../media-test/media-browser-test/fixtures/media/` |
-| `h264_1080p_5s.header.mov` | `h264_1080p_5s.mov` (4.4 MB) | verbatim `ftyp` + `moov` only | harness asset under `../../../media-test/media-browser-test/fixtures/media/` |
-| `h264_720p.head.ts` | `h264_ts.ts` (4.4 MB) | the first 860 verbatim 188-byte transport packets (PAT + PMT + the first few video/audio PES) — a valid standalone TS probe input | Big Buck Bunny © Blender Foundation, [CC BY 3.0](https://peach.blender.org/about/); the harness asset under `../../../media-test/media-browser-test/fixtures/media/` |
+| `big_buck_bunny_1080p_h264.header.mov` | `big_buck_bunny_1080p_h264.mov` (725 MB) | verbatim `ftyp` + `moov` only (a valid probe input; probe reads no `mdat`) | Big Buck Bunny © Blender Foundation, [CC BY 3.0](https://peach.blender.org/about/); the harness asset under `../../../media-test/fixtures/media/` |
+| `h264_1080p_5s.header.mov` | `h264_1080p_5s.mov` (4.4 MB) | verbatim `ftyp` + `moov` only | harness asset under `../../../media-test/fixtures/media/` |
+| `h264_720p.head.ts` | `h264_ts.ts` (4.4 MB) | the first 860 verbatim 188-byte transport packets (PAT + PMT + the first few video/audio PES) — a valid standalone TS probe input | Big Buck Bunny © Blender Foundation, [CC BY 3.0](https://peach.blender.org/about/); the harness asset under `../../../media-test/fixtures/media/` |
 | `mjpeg_pcm_160p.avi` | `fixtures/media/movie_5.mp4` (WPT) | a real RIFF/`AVI ` container: MJPEG 160×120 @24fps (1 s) + PCM s16 16 kHz, transcoded by ffmpeg | web-platform-tests `media/movie_5.mp4` ([W3C 3-Clause BSD test license](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md), public test media) |
 | `mpeg4_mp3_160p.avi` | `fixtures/media/movie_5.mp4` (WPT) | a real RIFF/`AVI ` container: MPEG-4/XVID 160×120 @24fps + MP3 16 kHz, transcoded by ffmpeg | web-platform-tests `media/movie_5.mp4` (W3C 3-Clause BSD test license, public test media) |
 

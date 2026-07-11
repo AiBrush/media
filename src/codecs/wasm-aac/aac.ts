@@ -287,8 +287,7 @@ export function normalizeAacDecoderConfig(config: AudioDecoderConfig): AacDecode
   if (heAacObjectType !== undefined) {
     throw new MediaError(
       'decode-error',
-      `aac: wasm-aac (AAC-LC core) cannot decode HE-AAC/SBR (audioObjectType ${heAacObjectType}); ` +
-        'a native AAC decoder is required',
+      `aac: wasm-aac (AAC-LC core) cannot decode HE-AAC/SBR (audioObjectType ${heAacObjectType}); a native AAC decoder is required`,
     );
   }
   const channels = config.numberOfChannels;

@@ -826,6 +826,7 @@ export interface TrackState {
   readonly description: Uint8Array | undefined;
   readonly width: number | undefined;
   readonly height: number | undefined;
+  readonly rotation: number | undefined;
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
   readonly gapless: TrackInfo['gapless'];
@@ -850,6 +851,7 @@ export function trackStateFrom(info: TrackInfo): TrackState {
       description,
       width: vc?.codedWidth,
       height: vc?.codedHeight,
+      rotation: info.rotation,
       sampleRate: undefined,
       channels: undefined,
       gapless: undefined,
@@ -868,6 +870,7 @@ export function trackStateFrom(info: TrackInfo): TrackState {
     description,
     width: undefined,
     height: undefined,
+    rotation: undefined,
     sampleRate,
     channels: ac?.numberOfChannels,
     gapless: info.gapless,
@@ -959,6 +962,7 @@ export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
     samples,
     ...(t.width !== undefined ? { width: t.width } : {}),
     ...(t.height !== undefined ? { height: t.height } : {}),
+    ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
     ...(muxEdit !== undefined ? { edit: muxEdit } : {}),

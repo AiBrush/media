@@ -536,6 +536,17 @@ export function restampAudioDataRange(
   const { init } = pcmRangeToPlanarInit(audioDataToPcm(frame), startFrame, frameCount, timestamp);
   return new AudioData(init);
 }
+
+/** Rebase one decoded video frame while preserving its pixels and close-once ownership contract. */
+export function restampVideoFrame(
+  frame: VideoFrame,
+  timestamp: number,
+  duration: number | null,
+): VideoFrame {
+  if (frame.timestamp === timestamp && frame.duration === duration) return frame;
+  const init: VideoFrameInit = duration === null ? { timestamp } : { timestamp, duration };
+  return new VideoFrame(frame, init);
+}
 /* v8 ignore stop */
 
 function restampAudioPacket(packet: Packet, timestampUs: number, baseUs: number): Packet {

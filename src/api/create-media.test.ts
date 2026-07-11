@@ -21,6 +21,7 @@ import { toStreamTarget } from '../sinks/stream-target.ts';
 import {
   type MediaInput,
   SOURCE_CACHE_KEY,
+  SOURCE_URL_KEY,
   type Source,
   fromBytes,
   fromStream,
@@ -240,6 +241,10 @@ function delayedDecodeFrameModule(
   frame: CancelRaceFrame,
   waitForDemux: Promise<void>,
   onDemuxStarted: () => void,
+  onDemuxSource: (src: {
+    readonly size?: number;
+    readonly [SOURCE_URL_KEY]?: string;
+  }) => void = () => {},
 ): DriverModule {
   const track: TrackInfo = {
     id: 1,
@@ -253,8 +258,9 @@ function delayedDecodeFrameModule(
     kind: 'container',
     formats: ['mp4'],
     supports: (q) => q.mime === 'video/x-delayed',
-    async demux() {
+    async demux(src) {
       onDemuxStarted();
+      onDemuxSource(src);
       await waitForDemux;
       return {
         tracks: [track],
@@ -883,30 +889,45 @@ describe('createMedia', () => {
     expect(frame.closeCount).toBe(1);
   });
 
-  it('decode consumes the prefix cached by an immediately preceding URL probe', async () => {
+  it('decode consumes a probe prefix with its learned URL size and needs no second range read', async () => {
     const bytes = new Uint8Array(8192);
     const firstCalls: Array<readonly [number, number]> = [];
+    let probeSize: number | undefined;
+    let probeEffectiveUrl = 'https://fixtures.test/delayed.mp4';
     const srcForProbe: Source = {
       __media: 'source',
       kind: 'url',
       mimeHint: 'video/x-delayed',
-      size: bytes.byteLength,
       [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
+      get [SOURCE_URL_KEY](): string {
+        return probeEffectiveUrl;
+      },
       range: (start, end) => {
         firstCalls.push([start, end]);
+        probeSize = bytes.byteLength;
+        probeEffectiveUrl = 'https://cdn.fixtures.test/final/delayed.mp4';
         return Promise.resolve(bytes.subarray(start, end));
       },
       stream(): ReadableStream<Uint8Array> {
         throw new Error('seekable probe must not open the full stream');
       },
     };
+    Object.defineProperty(srcForProbe, 'size', {
+      configurable: true,
+      enumerable: true,
+      get: () => probeSize,
+    });
+    let decodeEffectiveUrl = 'https://fixtures.test/delayed.mp4';
     const srcForDecode: Source = {
       __media: 'source',
       kind: 'url',
       mimeHint: 'video/x-delayed',
-      size: bytes.byteLength,
       [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
+      get [SOURCE_URL_KEY](): string {
+        return decodeEffectiveUrl;
+      },
       range: () => {
+        decodeEffectiveUrl = 'https://should-not-be-read.test/delayed.mp4';
         throw new Error('decode should use the probe prefix handoff');
       },
       stream(): ReadableStream<Uint8Array> {
@@ -914,7 +935,20 @@ describe('createMedia', () => {
       },
     };
     const frame = new CancelRaceFrame();
-    const media = createMedia().use(delayedDecodeFrameModule(frame, Promise.resolve(), () => {}));
+    const demuxFacts: Array<{
+      readonly size: number | undefined;
+      readonly url: string | undefined;
+    }> = [];
+    const media = createMedia().use(
+      delayedDecodeFrameModule(
+        frame,
+        Promise.resolve(),
+        () => {},
+        (src) => {
+          demuxFacts.push({ size: src.size, url: src[SOURCE_URL_KEY] });
+        },
+      ),
+    );
 
     await expect(media.probe(srcForProbe)).resolves.toMatchObject({
       tracks: [{ id: 1, type: 'video', codec: 'fake-video' }],
@@ -923,6 +957,11 @@ describe('createMedia', () => {
     expect(got).toBe(frame);
     frame.close();
     expect(firstCalls).toEqual([[0, 4 * 1024]]);
+    expect(demuxFacts).toEqual([
+      { size: bytes.byteLength, url: 'https://cdn.fixtures.test/final/delayed.mp4' },
+      { size: bytes.byteLength, url: 'https://fixtures.test/delayed.mp4' },
+    ]);
+    expect(decodeEffectiveUrl).toBe('https://fixtures.test/delayed.mp4');
     expect(frame.closeCount).toBe(1);
   });
 
@@ -1087,20 +1126,24 @@ describe('createMedia', () => {
   });
 
   it('reads the head of a non-seekable custom source, then routes', async () => {
+    let opens = 0;
     const noRange: Source = {
       __media: 'source',
       kind: 'bytes',
-      stream: () =>
-        new ReadableStream({
+      stream: () => {
+        opens++;
+        return new ReadableStream({
           start: (c) => {
             c.enqueue(new Uint8Array([0x66]));
             c.close();
           },
-        }),
+        });
+      },
     };
     const media = createMedia().use(tracksModule());
     const info = await media.probe(noRange);
     expect(info.container).toBe('mp4');
+    expect(opens).toBeGreaterThanOrEqual(2);
   });
 
   it('honors a pre-aborted signal path without crashing', async () => {

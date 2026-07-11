@@ -17,10 +17,7 @@ import {
 
 // A real H.264-in-Matroska asset (ffprobe: h264 High 1280×720 + aac 48k/2ch) lives in the sibling
 // acceptance corpus, not this project's manifest, so it is read by direct path — like the mpegts tests.
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
 }
@@ -218,7 +215,22 @@ describe('probe WebM across the real corpus', () => {
     const probeTracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
     const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
     try {
-      expect(probeTracks).toEqual(demuxed.tracks);
+      const withoutTailGapless = (tracks: readonly TrackInfo[]): TrackInfo[] =>
+        tracks.map(({ gapless, ...track }) => ({
+          ...track,
+          ...(gapless?.leadingSamples !== undefined
+            ? { gapless: { leadingSamples: gapless.leadingSamples } }
+            : {}),
+        }));
+      // A bounded metadata probe can read CodecDelay/OpusHead at the front, while exact trailing
+      // DiscardPadding and decoded sample totals live on the terminal BlockGroup. Keep probe bounded
+      // and require every front-metadata field plus the leading delay to match full demux.
+      expect(withoutTailGapless(probeTracks)).toEqual(withoutTailGapless(demuxed.tracks));
+      expect(demuxed.tracks.find((track) => track.codec === 'opus')?.gapless).toMatchObject({
+        leadingSamples: 312,
+        trailingSamples: 648,
+        totalSamples: 240_000,
+      });
       expect(probeTracks.find((track) => track.mediaType === 'video')?.codec).toBe('av1');
     } finally {
       await demuxed.close();
@@ -386,14 +398,25 @@ describe('CodecPrivate → decoder description + canonical codec ids (real fixtu
     await demuxed.close();
   });
 
-  it('movie_5.webm — self-describing VP9/Opus carry no decoder description', async () => {
+  it('movie_5.webm — VP9 stays self-describing while Opus carries its mandatory OpusHead', async () => {
     const demuxed = await WebmDriver.demux(await fixtureSource('movie_5.webm'));
-    for (const t of demuxed.tracks) {
-      const hasDescription = t.config !== undefined && 'description' in t.config;
-      expect(hasDescription).toBe(false); // VP9/Opus are self-describing — no avcC/hvcC to surface
-    }
-    expect(demuxed.tracks.find((t) => t.mediaType === 'video')?.codec).toBe('vp9');
-    expect(demuxed.tracks.find((t) => t.mediaType === 'audio')?.codec).toBe('opus');
+    const video = demuxed.tracks.find((track) => track.mediaType === 'video');
+    expect(video?.codec).toBe('vp9');
+    expect(video?.config !== undefined && 'description' in video.config).toBe(false);
+
+    const audio = demuxed.tracks.find((track) => track.mediaType === 'audio');
+    expect(audio?.codec).toBe('opus');
+    const audioConfig = audio?.config;
+    const description =
+      audioConfig !== undefined && 'description' in audioConfig
+        ? audioConfig.description
+        : undefined;
+    expect(description).toBeInstanceOf(Uint8Array);
+    const opusHead = description as Uint8Array;
+    expect(new TextDecoder().decode(opusHead.subarray(0, 8))).toBe('OpusHead');
+    expect(
+      new DataView(opusHead.buffer, opusHead.byteOffset, opusHead.byteLength).getUint16(10, true),
+    ).toBe(312);
     await demuxed.close();
   });
 });
@@ -648,10 +671,7 @@ describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm +
     dtsUs: number;
     keyframe: boolean;
   }
-  const GOLDEN_DIR = new URL(
-    '../../../../media-test/media-browser-test/fixtures/golden/',
-    import.meta.url,
-  ).pathname;
+  const GOLDEN_DIR = new URL('../../../../media-test/fixtures/golden/', import.meta.url).pathname;
   async function golden(name: string): Promise<GoldenPacket[]> {
     return JSON.parse(
       await readFile(`${GOLDEN_DIR}${name}.packets.json`, 'utf8'),

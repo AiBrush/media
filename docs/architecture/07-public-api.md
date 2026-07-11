@@ -109,6 +109,12 @@ muxer needs codec-private data (`description` boxes/headers), dimensions or samp
 media type before it can write a legal container. Bare `ReadableStream<EncodedChunk>` inputs are rejected
 with `InputError` and cancelled rather than guessed. Streams may be live `ReadableStream`s, while bounded
 prepared callers may provide `packetsArray` to avoid wrapping an already-materialized packet list.
+`TrackInfo` may also carry optional `containerSideData` (ADR-210): exact metadata that is not a timed
+packet but must survive demux-to-mux selection. Matroska repeats one ordered opaque `AttachedFile` bundle
+on every source track, so forwarding either the selected video or audio descriptor retains attachments.
+An attached-picture/attachment enumeration projection carries `containerProjection`; MKV muxers consume
+that descriptor as Segment metadata and never emit its packet as a Block. WebM output rejects Matroska
+attachment side data with a typed capability miss rather than silently dropping it.
 
 ### `MediaInfo` (probe result)
 
@@ -153,6 +159,12 @@ fromStream(readable)
 ```
 
 Bare-string rule: `from('…')` = URL by precedence (`http(s)|blob|data|file`), else relative `fetch`; **OPFS needs `fromOPFS()`**; otherwise `InputError`.
+
+The `Source` contract distinguishes re-readable sources from a true single-use `kind:'stream'`: every
+other kind must return a fresh readable on each `stream()` call even when it has no `range()` method. An
+ambiguous HLS signature peek consumes and replay-wraps only the single-use kind. For a re-readable custom
+source it closes the bounded sniff reader and returns the original source identity, so subsequent image and
+container routing may legally open fresh readers (ADR-212).
 
 ## 4. Data out — sinks (ADR-013)
 

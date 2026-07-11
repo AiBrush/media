@@ -37,10 +37,7 @@ import {
 
 const DERIVED = new URL('../../../fixtures/media-derived/aiff-caf/', import.meta.url).pathname;
 // The sibling acceptance corpus holds the larger real AIFFs (not in this project's fetch manifest).
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 const loadDerived = async (n: string): Promise<Uint8Array> =>
   new Uint8Array(await readFile(`${DERIVED}${n}`));

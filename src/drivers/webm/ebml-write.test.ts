@@ -174,10 +174,7 @@ function chunk(timestampUs: number, durationUs: number, key: boolean, n: number)
   return { timestampUs, durationUs, key, data: new Uint8Array(n).fill(key ? 0x6b : 0x42) };
 }
 
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 async function mediaTestFixture(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));

@@ -405,10 +405,28 @@ describe('resolveHlsSource — IV attribute edge semantics (RFC 8216 §4.3.2.4)'
 /** The probe-scenario playlist's declared key (16 raw bytes) + explicit IV — mirrored for the hermetic case. */
 const HARNESS_IV_HEX = '953e5e232e1585e615d9164ece153cf2';
 const HARNESS_KEY = Buffer.from('366a63833fcc99941516c6239b0d3f11', 'hex');
-const HARNESS_PROBE_DIR = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/scenarios/probe/hls_aes128/',
-  import.meta.url,
-).pathname;
+const HARNESS_PROBE_DIRS = [
+  new URL('../../../../media-test/fixtures/media/scenarios/probe/hls_aes128/', import.meta.url)
+    .pathname,
+  new URL(
+    '../../../../media-test/media-browser-test/fixtures/media/scenarios/probe/hls_aes128/',
+    import.meta.url,
+  ).pathname,
+] as const;
+
+async function readHarnessProbeFile(name: string): Promise<Buffer> {
+  let lastError: unknown;
+  for (const directory of HARNESS_PROBE_DIRS) {
+    try {
+      return await readFile(join(directory, name));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`unable to read fair-harness HLS fixture '${name}'`);
+}
 
 /** The byte-exact fair-harness `hls_aes128.m3u8` shape: v3 VOD, explicit `IV=0x…`, 5× `2.000000` TS, LF. */
 function harnessShapedPlaylist(): string {
@@ -479,18 +497,16 @@ describe('resolveHlsSource — the fair-harness hls_aes128 shape (ADR-183)', () 
   });
 
   it('the ACTUAL corpus probe/hls_aes128 file decrypts 0x47-sync-valid, node:crypto byte-equal, probes as TS', async () => {
-    const playlistText = await readFile(join(HARNESS_PROBE_DIR, 'hls_aes128.m3u8'), 'utf8');
+    const playlistText = (await readHarnessProbeFile('hls_aes128.m3u8')).toString('utf8');
     const fetchLocal: HlsResourceFetcher = async (uri) =>
-      new Uint8Array(await readFile(join(HARNESS_PROBE_DIR, uri.split('/').pop() ?? uri)));
+      new Uint8Array(await readHarnessProbeFile(uri.split('/').pop() ?? uri));
 
     const src = await resolveHlsSource(playlistText, { fetchResource: fetchLocal });
     expect(src.mimeHint).toBe('video/mp2t');
     const stitched = await drain(src.stream());
     assertTsSync(stitched);
 
-    const keyHex = Buffer.from(await readFile(join(HARNESS_PROBE_DIR, 'hls_aes128.key'))).toString(
-      'hex',
-    );
+    const keyHex = (await readHarnessProbeFile('hls_aes128.key')).toString('hex');
     const ivMatch = /IV=0x([0-9a-fA-F]{32})/.exec(playlistText);
     if (ivMatch === null || ivMatch[1] === undefined) {
       throw new Error('corpus probe/hls_aes128 playlist unexpectedly lacks an explicit 128-bit IV');
@@ -504,7 +520,7 @@ describe('resolveHlsSource — the fair-harness hls_aes128 shape (ADR-183)', () 
       'hls_aes128_003.ts',
       'hls_aes128_004.ts',
     ]) {
-      const cipher = new Uint8Array(await readFile(join(HARNESS_PROBE_DIR, name)));
+      const cipher = new Uint8Array(await readHarnessProbeFile(name));
       const twin = opensslTwinDecrypt(keyHex, ivHex, cipher);
       expect(stitched.subarray(off, off + twin.byteLength)).toEqual(twin);
       off += twin.byteLength;

@@ -14,7 +14,8 @@
  */
 
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { MediaError } from '../../contracts/errors.ts';
+import { adtsMuxTrackConfig, assertAudioMuxOptions } from '../audio-container-mux-validation.ts';
 import type { ChunkStruct } from '../ogg/ogg-write.ts';
 
 interface AdtsMuxTrack {
@@ -26,39 +27,6 @@ interface AdtsMuxTrack {
   /** Channel configuration (1–7), from the ASC. */
   readonly channelConfig: number;
   readonly chunks: ChunkStruct[];
-}
-
-/** A read-only byte view over an ASC `description` `BufferSource` (no copy). */
-function descriptionBytes(
-  description: AllowSharedBufferSource | undefined,
-): Uint8Array | undefined {
-  if (description === undefined) return undefined;
-  if (description instanceof ArrayBuffer) return new Uint8Array(description);
-  const view = description as ArrayBufferView;
-  return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-}
-
-/**
- * Decode the 2-byte AudioSpecificConfig into the ADTS header fields. Layout (ISO 14496-3): 5 bits AOT,
- * 4 bits samplingFrequencyIndex, 4 bits channelConfiguration. A too-short or out-of-range ASC is rejected
- * (the muxer never emits an ADTS header it can't fill faithfully).
- */
-function parseAsc(asc: Uint8Array): { aot: number; freqIndex: number; channelConfig: number } {
-  if (asc.byteLength < 2) {
-    throw new MediaError('mux-error', 'ADTS mux: AAC track description (ASC) must be ≥ 2 bytes');
-  }
-  const b0 = asc[0] ?? 0;
-  const b1 = asc[1] ?? 0;
-  const aot = (b0 >> 3) & 0x1f;
-  const freqIndex = ((b0 & 0x7) << 1) | (b1 >> 7);
-  const channelConfig = (b1 >> 3) & 0xf;
-  if (aot < 1 || aot > 31 || freqIndex > 12 || channelConfig < 1 || channelConfig > 7) {
-    throw new MediaError(
-      'mux-error',
-      `ADTS mux: unsupported ASC (aot=${aot} freqIndex=${freqIndex} channels=${channelConfig})`,
-    );
-  }
-  return { aot, freqIndex, channelConfig };
 }
 
 /**
@@ -102,12 +70,7 @@ export class AdtsMuxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions) {
-    if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'ADTS has no fragmented/segmented mux form', {
-        op: { op: 'mux', fragmented: true },
-        tried: ['adts'],
-      });
-    }
+    assertAudioMuxOptions('adts', options);
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -121,27 +84,10 @@ export class AdtsMuxer implements Muxer {
 
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
-    if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'the ADTS muxer writes a single audio stream', {
-        op: { op: 'mux' },
-        tried: ['adts'],
-      });
-    }
-    if (info.mediaType !== 'audio' || !info.codec.toLowerCase().startsWith('mp4a.40.')) {
-      throw new CapabilityError(
-        'capability-miss',
-        `ADTS container carries a single AAC audio track, not ${info.mediaType}/${info.codec}`,
-        { op: { op: 'mux' }, tried: ['adts'] },
-      );
-    }
-    const asc = descriptionBytes(info.config?.description);
-    if (asc === undefined) {
-      throw new MediaError(
-        'mux-error',
-        'ADTS mux needs the AAC track description (the 2-byte ASC)',
-      );
-    }
-    const { aot, freqIndex, channelConfig } = parseAsc(asc);
+    const { aot, freqIndex, channelConfig } = adtsMuxTrackConfig(
+      info,
+      this.#track === undefined ? 0 : 1,
+    );
     const id = 0;
     this.#track = { id, aot, freqIndex, channelConfig, chunks: [] };
     return id;

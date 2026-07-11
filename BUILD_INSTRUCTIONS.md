@@ -1,7 +1,7 @@
 # BUILD INSTRUCTIONS — aibrush-media (0 → 100%)
 
 > **Audience:** Claude Code, building this framework end to end.
-> **Mission:** implement `aibrush-media` — a unified, capability-routed, in-browser media engine — from an empty repo to a **production-grade, fully tested, fully benchmarked, state-of-the-art** library that conforms exactly to [`docs/architecture/`](docs/architecture/README.md) and **wins the 558-feature benchmark in aggregate** against all 7 reference engines.
+> **Mission:** implement `aibrush-media` — a unified, capability-routed, in-browser media engine — from an empty repo to a **production-grade, fully tested, fully benchmarked, state-of-the-art** library that conforms exactly to [`docs/architecture/`](docs/architecture/README.md) and **wins the current full versioned benchmark suite in aggregate** against all 7 reference engines.
 > **How to use:** run at **maximum reasoning effort**. Read this file fully, then [`docs/architecture/`](docs/architecture/README.md), then execute §8 phase by phase without stopping until §2 (Definition of Done) is 100% met.
 
 ---
@@ -40,7 +40,7 @@ Read these before coding; consult them per concern. **Do not re-derive what they
 | Roadmap / phases | [`12-roadmap.md`](docs/architecture/12-roadmap.md) |
 | Glossary | [`13-glossary.md`](docs/architecture/13-glossary.md) |
 
-**Acceptance battery:** the 558-feature benchmark harness in `../media-test/media-browser-test` (sibling project). Register `aibrush-media` as an engine and run it. It is the external judge of "did we build the best-of-the-best."
+**Acceptance battery:** the versioned benchmark harness in `../media-test/media-browser-test` (sibling project). Its original architecture baseline had 558 features; the live suite may add cells (the Session 11 full export has 563). Register `aibrush-media` as an engine and always run the current full suite. It is the external judge of "did we build the best-of-the-best."
 
 ---
 
@@ -51,7 +51,7 @@ The build is **100% done** only when **every** box is checkable and green. This 
 - [ ] Every public op in [`07`](docs/architecture/07-public-api.md) is implemented per [`09`](docs/architecture/09-operations.md): `probe, convert(=transcode), remux, trim, mux, demux, decode, encode, decrypt` — plus `from()`/`fromX`, `to*` sinks, `preload`.
 - [ ] The full container set (MP4/MOV, WebM/MKV, Ogg, WAV, ADTS, MP3, MPEG-TS+HLS) and codec set (H.264, HEVC, VP8, VP9, AV1; AAC, Opus, MP3, FLAC, Vorbis, PCM) work, with WebCodecs→GPU→WASM routing and graceful `CapabilityError` on real gaps.
 - [ ] **Validation:** every op passes its strict oracle ([`11`](docs/architecture/11-testing-and-validation.md)) across the **diverse, internet-sourced real-media corpus** (§6.1; ≥ 5 files/op, never mock, never a single file) with baked goldens, bit-exact in `force-software`. **Zero** WEAK-GATE-only passes; **zero** SUSPECT shortcuts (anti-cheat self-checks green).
-- [ ] **Benchmark:** `aibrush-media` registered in the 558-feature harness, run fresh (multi-sample), and **wins in aggregate vs each of the 7 reference engines**; per-family results recorded; no regressions vs the recorded baseline.
+- [ ] **Benchmark:** `aibrush-media` registered in the current full versioned harness, run fresh (multi-sample), and **wins in aggregate vs each of the 7 reference engines**; per-family results recorded; no regressions vs the recorded baseline.
 - [ ] **Quality gates:** `typecheck` (strict, 0 errors, 0 `any`), `lint` (0 errors/warnings), `format` clean, **test coverage ≥ 90%** lines/branches on core + drivers, all unit/contract/integration/property/robustness tests green.
 - [ ] **Cross-browser:** correctness + smoke pass in real Chromium, WebKit, Firefox (Playwright).
 - [ ] **Budgets:** eager kernel ≤ ~50 kB; typical app eager JS ~150–250 kB; WASM is lazy + miss-only + same-origin (verified by a bundle-analysis test). No COOP/COEP required on the common path.
@@ -144,9 +144,9 @@ Then implement. For every non-trivial line, ask: *is this correct under reorder/
 - **Re-measure fresh** — never reuse the original benchmark's cached, single-sample numbers (they are not ours; [`background/benchmark-summary.md`](docs/architecture/background/benchmark-summary.md) Finding 7).
 - Verify the architecture's perf claims hold (hardware WebCodecs ≫ single-thread wasm; worker keeps `longtasks` near zero on the main thread).
 
-### 6.4 Acceptance against the 558-feature harness
+### 6.4 Acceptance against the current versioned harness
 
-- Register `aibrush-media` in `../media-test/media-browser-test`, run all 13 families, and **win in aggregate** vs each of the 7 engines. Record per-family wins. This is the headline acceptance gate at each phase and at DoD.
+- Register `aibrush-media` in `../media-test/media-browser-test`, run every cell in the current 13-family suite, and **win in aggregate** vs each of the 7 engines. Record the suite version/cell count and per-family wins. This is the headline acceptance gate at each phase and at DoD.
 
 ### 6.5 Anti-cheat self-checks (CI gates on *our* code)
 
@@ -255,6 +255,6 @@ The build is large and may span sessions — make it **resumable and never half-
 - **Do not ask for permission** to proceed between steps or phases. Proceed.
 - **If blocked** by a missing decision: choose the SOTA option, record an ADR, continue. Do not wait.
 - **If a test fails:** fix the code (or the oracle if it's genuinely wrong, with justification), never delete/loosen it to go green.
-- **The finish line is §2.** Keep building, testing, and benchmarking until every box is checked. Then run the full 558-feature harness one final time, confirm the aggregate win, and report the results.
+- **The finish line is §2.** Keep building, testing, and benchmarking until every box is checked. Then run the current full versioned harness one final time, record its suite version/cell count, confirm the aggregate win, and report the results.
 
 **Now: set max effort, read [`docs/architecture/`](docs/architecture/README.md), create the Phase-0 tasks, and begin. Do not stop until aibrush-media is 100% done.**

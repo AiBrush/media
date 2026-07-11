@@ -185,6 +185,37 @@ export interface ContainerQuery {
   head?: Uint8Array;
 }
 
+/**
+ * Exact container metadata that must travel with an encoded track even though it is not a timed packet.
+ * A Matroska bundle owns the complete payload of every ordered `AttachedFile` element (the bytes inside
+ * `AttachedFile`, including filename/MIME/UID plus duplicate, unknown, and future children). The whole
+ * bundle is repeated by reference on each track from one demux result so ordinary track selection retains
+ * it; target muxers exact-deduplicate repeated bundles before authoring Segment-level metadata.
+ */
+export interface MatroskaAttachmentsSideData {
+  readonly kind: 'matroska-attachments';
+  readonly attachedFilePayloads: readonly Uint8Array[];
+}
+
+/** Additive container metadata carried by {@link TrackInfo}; never decoded or emitted as a packet. */
+export type ContainerSideData = MatroskaAttachmentsSideData;
+
+/**
+ * Marks a probe-compatible track descriptor as a projection of container metadata rather than a timed
+ * media track. For example, Matroska cover JPEGs are enumerated as attached-picture MJPEG streams, while
+ * their bytes remain an `AttachedFile` and must never become a Block during packet-copy muxing.
+ */
+export interface MatroskaAttachmentProjection {
+  readonly kind: 'matroska-attachment';
+  /** Index into this track's {@link TrackInfo.containerSideData}. */
+  readonly sideDataIndex: number;
+  /** Index into the referenced bundle's ordered `attachedFilePayloads`. */
+  readonly attachmentIndex: number;
+}
+
+/** A container-metadata projection carried by a public track descriptor. */
+export type ContainerProjection = MatroskaAttachmentProjection;
+
 export interface TrackInfo {
   id: number;
   mediaType: MediaType;
@@ -204,10 +235,31 @@ export interface TrackInfo {
   encrypted?: boolean;
   /** True when the coded video packets carry a separate alpha plane side channel. */
   alpha?: boolean;
+  /** Exact non-packet container metadata that follows this descriptor through track selection/muxing. */
+  containerSideData?: readonly ContainerSideData[];
+  /** Marks this descriptor as an enumeration projection of one {@link containerSideData} item. */
+  containerProjection?: ContainerProjection;
+  /** Container codec delay subtracted from stored packet timestamps (Matroska nanoseconds). */
+  codecDelayNs?: number;
+  /** Decoder convergence preroll carried by the container (Matroska nanoseconds). */
+  seekPreRollNs?: number;
   /** WebCodecs config: video coded dims/rotation/fps; audio sampleRate/channels. */
   config?: DecoderConfig;
+  /**
+   * Raw container video-colour facts. Numeric primaries/transfer/matrix values use the H.273 code
+   * points; the remaining fields preserve Matroska `Colour` unsigned values losslessly so a remux can
+   * retain information (including future/unknown-safe code points) that WebCodecs cannot name.
+   */
+  color?: VideoColorMetadata;
   /** Optional exact compressed-audio gapless facts, in decoded samples at the track sample rate. */
   gapless?: {
+    /**
+     * Provenance for gapless facts whose native decoder treatment is substrate-dependent. MP4 edit
+     * lists rebase encoded packet timestamps before decode; some browsers also consume that priming
+     * natively, while others expose it for the engine to trim. An absent basis keeps the historical
+     * count-only contract used by codec-delay metadata such as Matroska Opus.
+     */
+    basis?: 'mp4-edit-list';
     /** Leading decoder/encoder-delay samples to discard before exposing program audio. */
     leadingSamples?: number;
     /** Trailing encoder-padding samples to discard after program audio. */
@@ -215,6 +267,23 @@ export interface TrackInfo {
     /** Exact program-audio sample count after leading/trailing removal. */
     totalSamples?: number;
   };
+}
+
+export interface VideoColorMetadata {
+  matrixCoefficients?: number;
+  bitsPerChannel?: number;
+  chromaSubsamplingHorz?: number;
+  chromaSubsamplingVert?: number;
+  cbSubsamplingHorz?: number;
+  cbSubsamplingVert?: number;
+  chromaSitingHorz?: number;
+  chromaSitingVert?: number;
+  /** Matroska Range: 0 unspecified, 1 broadcast/limited, 2 full, 3 defined by matrix/transfer. */
+  range?: number;
+  transferCharacteristics?: number;
+  primaries?: number;
+  maxCll?: number;
+  maxFall?: number;
 }
 
 /** A live demux session: per-track lazy packet streams ({@link Packet} carries PTS + optional DTS). */

@@ -9,7 +9,6 @@
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -26,10 +25,8 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { matchesOgg } from '../audio-container-sniff.ts';
 import { type ChunkStruct, OggMuxer, trackStateFrom, writeOgg } from './ogg-write.ts';
-
-const OGG_MIMES = new Set(['audio/ogg', 'video/ogg', 'application/ogg', 'audio/opus']);
-const OGG_EXTENSIONS = new Set(['ogg', 'oga', 'ogv', 'opus', 'spx']);
 
 function asciiAt(dv: DataView, offset: number, length: number): string {
   if (offset + length > dv.byteLength) return '';
@@ -759,20 +756,12 @@ function packetStreamFromInfo(
   /* v8 ignore stop */
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && OGG_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && OGG_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head === undefined || head.byteLength < 4) return false;
-  return asciiAt(new DataView(head.buffer, head.byteOffset, head.byteLength), 0, 4) === 'OggS';
-}
-
 export const OggDriver: ContainerDriver = {
   id: 'ogg',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['ogg'],
-  supports: matches,
+  supports: matchesOgg,
   validatesStreamCopyTrim: true,
   async probe(src: ByteSource): Promise<readonly TrackInfo[]> {
     // Exact Ogg duration lives in the terminal page granule. Head+tail range probing is valid only when

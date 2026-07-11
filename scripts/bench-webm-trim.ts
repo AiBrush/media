@@ -12,7 +12,7 @@ import { WebmDriver, demuxWebm, parseWebm } from '../src/drivers/webm/webm-drive
 import { fromBytes } from '../src/sources/source.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
-const MEDIA_TEST = `${ROOT}../media-test/media-browser-test/fixtures/media/`;
+const MEDIA_TEST = `${ROOT}../media-test/fixtures/media/`;
 const WARMUP = 2;
 const ITERS = 9;
 

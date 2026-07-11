@@ -12,10 +12,7 @@ const AVC_CONFIGURATION_VERSION = 1;
 const HIGH_PROFILES = new Set([44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244]);
 
 /** Add `cropPixels` to the visible right crop of every SPS in an `avcC` record. */
-export function addH264AvcCVisibleRightCrop(
-  avcC: Uint8Array,
-  cropPixels: number,
-): Uint8Array {
+export function addH264AvcCVisibleRightCrop(avcC: Uint8Array, cropPixels: number): Uint8Array {
   if (!Number.isSafeInteger(cropPixels) || cropPixels <= 0) {
     throw new RangeError(`H.264 right crop must be a positive integer, got ${cropPixels}`);
   }
@@ -35,7 +32,8 @@ export function addH264AvcCVisibleRightCrop(
       throw new Error('truncated avcC SPS payload');
     }
     const rewritten = addSpsVisibleRightCrop(avcC.subarray(offset, offset + length), cropPixels);
-    if (rewritten.byteLength > 0xffff) throw new Error('rewritten H.264 SPS exceeds avcC u16 length');
+    if (rewritten.byteLength > 0xffff)
+      throw new Error('rewritten H.264 SPS exceeds avcC u16 length');
     output.push((rewritten.byteLength >>> 8) & 0xff, rewritten.byteLength & 0xff, ...rewritten);
     offset += length;
   }
@@ -192,14 +190,14 @@ function bytesFromBits(bits: readonly number[]): Uint8Array {
   const output = new Uint8Array(bits.length / 8);
   for (let offset = 0; offset < bits.length; offset++) {
     const byteIndex = offset >> 3;
-    output[byteIndex] =
-      (output[byteIndex] ?? 0) | ((bits[offset] as number) << (7 - (offset & 7)));
+    output[byteIndex] = (output[byteIndex] ?? 0) | ((bits[offset] as number) << (7 - (offset & 7)));
   }
   return output;
 }
 
 function unsignedExpGolombBits(value: number): number[] {
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`invalid Exp-Golomb value ${value}`);
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new Error(`invalid Exp-Golomb value ${value}`);
   const binary = (value + 1).toString(2);
   const output = new Array<number>(binary.length - 1).fill(0);
   for (const bit of binary) output.push(bit === '1' ? 1 : 0);

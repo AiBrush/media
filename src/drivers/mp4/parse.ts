@@ -15,6 +15,11 @@ import {
   qtPcmCodec,
   videoColorSpaceFromColr,
 } from './codec-strings.ts';
+import {
+  type Mp4DisplayMatrix,
+  type Mp4DisplayTransform,
+  clockwiseRotationFromMp4Matrix,
+} from './display-transform.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 export type { ColrInfo } from './codec-strings.ts';
@@ -110,6 +115,8 @@ export interface TrackEdit {
   mediaTimeTicks: number;
   /** `elst.segment_duration`, converted from the movie timescale. */
   durationSec: number;
+  /** Total duration of consecutive leading empty edits, converted from the movie timescale. */
+  leadingEmptyDurationSec?: number;
 }
 
 export interface ParsedTrack {
@@ -127,6 +134,8 @@ export interface ParsedTrack {
   codecPrivate?: CodecPrivate;
   width?: number;
   height?: number;
+  /** Raw `tkhd` matrix + display dimensions, distinct from coded sample-entry geometry. */
+  displayTransform?: Mp4DisplayTransform;
   rotation?: number;
   fps?: number;
   sampleRate?: number;
@@ -141,12 +150,16 @@ export interface ParsedTrack {
   clap?: ClapInfo;
   /** 0-based position of this trak in `moov` (file order, == ffprobe stream order). */
   trakIndex?: number;
+  /** Samples indexed by the initial `moov/stbl` (metadata parses retain the count without the sizes). */
+  moovSampleCount?: number;
   /**
    * For fragmented/CMAF tracks (empty `moov` sample table), the sample count accumulated from the
    * movie fragments ({@link applyFragmentTiming}). Lets probe report timing the `stts`/`stsz` path
    * cannot, without faking a sample table the demuxer would mis-read.
    */
   fragmentSampleCount?: number;
+  /** Sum of the later `moof/trun` sample durations, in this track's native timescale. */
+  fragmentMediaTicks?: number;
   /** Present when the track is CENC-protected (sample entry was `enca`/`encv`). */
   encryption?: TrackProtection;
   samples: SampleTable;
@@ -157,6 +170,8 @@ export interface Movie {
   timescale: number;
   durationSec: number;
   tracks: ParsedTrack[];
+  /** `moov/mvex` declares that later `moof` runs may extend even a non-empty initial sample table. */
+  hasFragments?: true;
   /** Declared non-media traks (tmcd/text/…), in addition to the decodable `tracks` (ADR-185). */
   otherTracks?: OtherTrack[];
 }
@@ -202,6 +217,7 @@ export function parseMovie(brand: string, moov: Uint8Array): Movie {
     timescale: parsed.timescale,
     durationSec: parsed.durationSec,
     tracks: parsed.tracks,
+    ...(parsed.hasFragments === true ? { hasFragments: true as const } : {}),
     ...(parsed.otherTracks !== undefined ? { otherTracks: parsed.otherTracks } : {}),
   };
 }
@@ -219,6 +235,7 @@ export function parseMoviePacketInfo(brand: string, moov: Uint8Array): Movie {
     timescale: parsed.timescale,
     durationSec: parsed.durationSec,
     tracks: parsed.tracks,
+    ...(parsed.hasFragments === true ? { hasFragments: true as const } : {}),
     ...(parsed.otherTracks !== undefined ? { otherTracks: parsed.otherTracks } : {}),
   };
 }
@@ -242,6 +259,7 @@ function parseMovieInternal(brand: string, moov: Uint8Array, mode: ParseMode): M
 
   const mvhd = child(r, root, 'mvhd') ?? fail('moov has no mvhd');
   const movie = parseMvhd(r, mvhd);
+  const hasFragments = child(r, root, 'mvex') !== undefined;
 
   const tracks: ParsedTrack[] = [];
   const otherTracks: OtherTrack[] = [];
@@ -265,7 +283,8 @@ function parseMovieInternal(brand: string, moov: Uint8Array, mode: ParseMode): M
     durationSec: movie.durationSec,
     tracks,
     ...(otherTracks.length > 0 ? { otherTracks } : {}),
-    needsFragmentTiming,
+    ...(hasFragments ? { hasFragments: true as const } : {}),
+    needsFragmentTiming: needsFragmentTiming || hasFragments,
   };
 }
 
@@ -490,20 +509,44 @@ function trackTimescalesOf(r: Reader, moov: BoxHeader): Array<{ id: number; time
  * left untouched, so non-fragmented inputs are unaffected.
  */
 export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
-  if (!movie.tracks.some((t) => t.samples.sampleSizes.length === 0)) return movie;
+  if (
+    movie.hasFragments !== true &&
+    !movie.tracks.some((t) => t.samples.sampleSizes.length === 0)
+  ) {
+    return movie;
+  }
   const timing = parseFragments(file);
   let movieDurationSec = movie.durationSec;
   for (const track of movie.tracks) {
-    if (track.samples.sampleSizes.length > 0) continue;
     const frag = timing.get(track.id);
     if (!frag || frag.durationTicks <= 0 || track.timescale <= 0) continue;
     const durationSec = frag.durationTicks / track.timescale;
-    track.durationSec = durationSec;
+    track.durationSec = Math.max(track.durationSec, durationSec);
     track.fragmentSampleCount = frag.sampleCount;
+    track.fragmentMediaTicks = frag.mediaTicks;
+    // Seekable FFmpeg hybrid-fragmented output can leave a provisional zero-duration `elst` in the
+    // initial moov. The media-time is still the exact AAC priming offset; the final fragment end closes
+    // that otherwise-empty window. A positive edit remains authoritative (it may be an intentional trim).
+    if (
+      track.edit !== undefined &&
+      track.edit.durationSec <= 0 &&
+      frag.durationTicks > track.edit.mediaTimeTicks
+    ) {
+      track.edit = {
+        ...track.edit,
+        durationSec: (frag.durationTicks - track.edit.mediaTimeTicks) / track.timescale,
+      };
+    }
     // fps is frames over the *content* span (Σ sample durations), not the presentation end, so a
     // start offset in `durationSec` doesn't deflate it — this equals ffprobe's avg_frame_rate.
-    const mediaSec = frag.mediaTicks / track.timescale;
-    if (track.mediaType === 'video' && mediaSec > 0) track.fps = frag.sampleCount / mediaSec;
+    const moovMediaTicks = track.samples.timeToSample.reduce(
+      (total, entry) => total + entry.count * entry.delta,
+      0,
+    );
+    const mediaSec = (moovMediaTicks + frag.mediaTicks) / track.timescale;
+    const sampleCount =
+      (track.moovSampleCount ?? track.samples.sampleSizes.length) + frag.sampleCount;
+    if (track.mediaType === 'video' && mediaSec > 0) track.fps = sampleCount / mediaSec;
     movieDurationSec = Math.max(movieDurationSec, durationSec);
   }
   movie.durationSec = movieDurationSec;
@@ -624,7 +667,7 @@ function parseTrak(
   }
 
   const tkhd = child(r, trak, 'tkhd') ?? fail('trak has no tkhd');
-  const { trackId, rotation } = parseTkhd(r, tkhd);
+  const { trackId, rotation, displayTransform } = parseTkhd(r, tkhd);
 
   const mdia = child(r, trak, 'mdia') ?? fail('trak has no mdia');
   const mdhd = child(r, mdia, 'mdhd') ?? fail('mdia has no mdhd');
@@ -653,6 +696,7 @@ function parseTrak(
     mediaType,
     timescale,
     durationSec,
+    moovSampleCount: sampleCount,
     trakIndex,
     ...(edit !== undefined ? { edit } : {}),
     codec: entry.codec,
@@ -670,6 +714,7 @@ function parseTrak(
         ...base,
         ...(entry.width !== undefined ? { width: entry.width } : {}),
         ...(entry.height !== undefined ? { height: entry.height } : {}),
+        displayTransform,
         ...(entry.colr !== undefined ? { colr: entry.colr } : {}),
         ...(entry.colorSpace !== undefined ? { colorSpace: entry.colorSpace } : {}),
         ...(entry.pasp !== undefined ? { pasp: entry.pasp } : {}),
@@ -700,6 +745,7 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
   const { version } = readFullBoxHeader(r);
   const entryCount = r.u32();
   let active: TrackEdit | undefined;
+  let leadingEmptyDurationSec = 0;
 
   for (let i = 0; i < entryCount; i++) {
     const segmentDuration = version === 1 ? r.u64() : r.u32();
@@ -707,19 +753,28 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
     const mediaRateInteger = r.i16();
     const mediaRateFraction = r.i16();
 
-    if (mediaTime < 0) continue; // leading empty edit: no media samples to timestamp
+    if (mediaTime < 0) {
+      if (active === undefined && movieTimescale > 0) {
+        leadingEmptyDurationSec += segmentDuration / movieTimescale;
+      }
+      continue;
+    }
     if (mediaRateInteger !== 1 || mediaRateFraction !== 0) return undefined;
     if (active !== undefined) return undefined; // multiple active edits need sample filtering/concatenation
     active = {
       mediaTimeTicks: mediaTime,
       durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
+      ...(leadingEmptyDurationSec > 0 ? { leadingEmptyDurationSec } : {}),
     };
   }
 
   return active;
 }
 
-function parseTkhd(r: Reader, box: BoxHeader): { trackId: number; rotation?: number } {
+function parseTkhd(
+  r: Reader,
+  box: BoxHeader,
+): { trackId: number; rotation?: number; displayTransform: Mp4DisplayTransform } {
   r.seek(box.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8); // creation + modification
@@ -727,21 +782,26 @@ function parseTkhd(r: Reader, box: BoxHeader): { trackId: number; rotation?: num
   r.skip(4); // reserved
   r.skip(version === 1 ? 8 : 4); // duration
   r.skip(8 + 2 + 2 + 2 + 2); // reserved + layer + altgroup + volume + reserved
-  const a = r.fixed16();
-  const b = r.fixed16();
-  r.skip(4); // u
-  const c = r.fixed16();
-  const d = r.fixed16();
-  // remaining matrix (v, x, y, w) + width + height are unused for rotation
-  const rotation = matrixRotation(a, b, c, d);
-  return rotation === undefined ? { trackId } : { trackId, rotation };
-}
-
-function matrixRotation(a: number, b: number, _c: number, _d: number): number | undefined {
-  if (a === 1 && b === 0) return 0;
-  const deg = Math.round((Math.atan2(b, a) * 180) / Math.PI);
-  const norm = ((deg % 360) + 360) % 360;
-  return norm === 0 ? undefined : norm;
+  const matrix: Mp4DisplayMatrix = [
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+    r.u32(),
+  ];
+  const displayTransform: Mp4DisplayTransform = {
+    matrix,
+    width16_16: r.u32(),
+    height16_16: r.u32(),
+  };
+  const rotation = clockwiseRotationFromMp4Matrix(matrix);
+  return rotation === undefined
+    ? { trackId, displayTransform }
+    : { trackId, rotation, displayTransform };
 }
 
 function parseMdhd(r: Reader, box: BoxHeader): { timescale: number; durationSec: number } {

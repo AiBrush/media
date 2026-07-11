@@ -26,10 +26,7 @@ const ra = (b: Uint8Array) => ({
   size: b.byteLength,
 });
 
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));

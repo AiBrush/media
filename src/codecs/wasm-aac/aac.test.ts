@@ -308,7 +308,12 @@ describe('HE-AAC/SBR honest decline (the AAC-LC-only wasm core)', () => {
     const support = await WasmAacDriver.supports({
       mediaType: 'audio',
       direction: 'decode',
-      config: { codec: 'mp4a.40.5', sampleRate: 44100, numberOfChannels: 2, description: HE_AAC_ASC },
+      config: {
+        codec: 'mp4a.40.5',
+        sampleRate: 44100,
+        numberOfChannels: 2,
+        description: HE_AAC_ASC,
+      },
     });
     expect(support.supported).toBe(false);
     expect(support.reason ?? '').toMatch(/HE-AAC/);

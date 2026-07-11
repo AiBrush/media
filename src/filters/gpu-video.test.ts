@@ -478,15 +478,19 @@ describe('WebGPU geometric colour-management routing', () => {
   it('routes non-BT.709 YUV matrices through Canvas2D for UA colour-managed sampling', () => {
     expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'smpte170m' })).toBe(true);
     expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt470bg' })).toBe(true);
-    expect(
-      webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: false }),
-    ).toBe(true);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: false })).toBe(
+      true,
+    );
   });
 
   it('keeps full-range/untagged BT.709, RGB, unknown, and absent matrices on the WebGPU fast path', () => {
-    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: true })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709', fullRange: true })).toBe(
+      false,
+    );
     expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'bt709' })).toBe(false);
-    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'rgb', fullRange: true })).toBe(false);
+    expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: 'rgb', fullRange: true })).toBe(
+      false,
+    );
     expect(webgpuGeometryNeedsCanvasColorManagement({ matrix: null })).toBe(false);
     expect(webgpuGeometryNeedsCanvasColorManagement(undefined)).toBe(false);
   });

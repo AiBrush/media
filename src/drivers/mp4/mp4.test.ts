@@ -221,10 +221,12 @@ function delayMoovPastSmallFaststartRead(bytes: Uint8Array): Uint8Array {
   const [moovStart, moovEnd] = topLevelBoxRange(bytes, 'moov');
   return joinBytes([
     bytes.subarray(0, ftypEnd),
+    // Keep the original mdat at the exact same byte offset by replacing the faststart moov with an
+    // equal-size free box. Moving mdat without rewriting stco/co64 made this test fixture invalid.
+    box('free', zeros(moovEnd - moovStart - 8)),
+    bytes.subarray(moovEnd),
     box('free', zeros(4088)),
     bytes.subarray(moovStart, moovEnd),
-    bytes.subarray(ftypEnd, moovStart),
-    bytes.subarray(moovEnd),
   ]);
 }
 
@@ -474,6 +476,7 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     expect(reads).toEqual([[0, bytes.byteLength]]);
     expect(tracks).toEqual(expected);
     expect(tracks?.[0]?.gapless).toEqual({
+      basis: 'mp4-edit-list',
       leadingSamples: 1024,
       trailingSamples: 0,
       totalSamples: 4410,
@@ -663,7 +666,7 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     }
   });
 
-  it('metadata-only probe falls back when the small video faststart parser cannot prove the track shape', async () => {
+  it('metadata-only probe falls back from retained complete bytes when the small parser cannot prove the track shape', async () => {
     const bytes = writeMp4([smallH264Track({ sampleEntryType: 'xxxx' })], { faststart: true });
     const reads: Array<readonly [number, number]> = [];
     const src: MimeHintedByteSource = {
@@ -677,10 +680,7 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
 
     const tracks = await Mp4Driver.probe?.(src);
 
-    expect(reads).toEqual([
-      [0, bytes.byteLength],
-      [0, bytes.byteLength],
-    ]);
+    expect(reads).toEqual([[0, bytes.byteLength]]);
     expect(tracks).toHaveLength(1);
     expect(tracks?.[0]?.codec).toBe('xxxx');
   });
@@ -715,6 +715,17 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       expect(tracks?.[0]?.mediaType, label).toBe(mediaType);
       expect(reads.length, label).toBeGreaterThan(0);
       expect(reads[0]?.[0], label).toBe(0);
+    }
+  });
+
+  it('demux accepts a structurally valid MP4 track with an empty sample table', async () => {
+    const bytes = writeMp4([smallH264Track({ samples: [] })], { faststart: true });
+    const demuxer = await Mp4Driver.demux(byteSource(bytes));
+    try {
+      expect(demuxer.tracks).toHaveLength(1);
+      expect(demuxer.tracks[0]?.mediaType).toBe('video');
+    } finally {
+      await demuxer.close();
     }
   });
 

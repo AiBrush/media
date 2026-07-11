@@ -15,8 +15,15 @@
  * separate DTS/ctts as in MP4), so reordered (B-frame) input simply yields blocks timestamped by PTS.
  */
 
-import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
+import type {
+  MuxOptions,
+  Muxer,
+  Packet,
+  TrackInfo,
+  VideoColorMetadata,
+} from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { matroskaRollFromClockwise, normalizeClockwiseRotation } from '../../util/rotation.ts';
 
 // ============ Matroska/EBML element IDs (verbatim, marker bits included) ============
 
@@ -44,12 +51,32 @@ const EBML_ID = {
   DefaultDuration: 0x23e383,
   CodecID: 0x86,
   CodecPrivate: 0x63a2,
+  CodecDelay: 0x56aa,
+  SeekPreRoll: 0x56bb,
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
+  Projection: 0x7670,
+  ProjectionPoseRoll: 0x7675,
+  Colour: 0x55b0,
+  MatrixCoefficients: 0x55b1,
+  BitsPerChannel: 0x55b2,
+  ChromaSubsamplingHorz: 0x55b3,
+  ChromaSubsamplingVert: 0x55b4,
+  CbSubsamplingHorz: 0x55b5,
+  CbSubsamplingVert: 0x55b6,
+  ChromaSitingHorz: 0x55b7,
+  ChromaSitingVert: 0x55b8,
+  Range: 0x55b9,
+  TransferCharacteristics: 0x55ba,
+  Primaries: 0x55bb,
+  MaxCLL: 0x55bc,
+  MaxFALL: 0x55bd,
   Audio: 0xe1,
   SamplingFrequency: 0xb5,
   Channels: 0x9f,
+  Attachments: 0x1941a469,
+  AttachedFile: 0x61a7,
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
   SimpleBlock: 0xa3,
@@ -60,12 +87,16 @@ const EBML_ID = {
   BlockAdditional: 0xa5,
   BlockAddID: 0xee,
   ReferenceBlock: 0xfb,
+  DiscardPadding: 0x75a2,
 } as const;
 
 /** WebM default TimecodeScale: 1 ms per tick (ns). Matches {@link parseWebm}'s default. */
 const TIMECODE_SCALE_NS = 1_000_000;
 const NS_PER_MS = 1_000_000;
 const MICROS_PER_MS = 1_000;
+const NANOS_PER_SECOND = 1_000_000_000;
+const OPUS_SAMPLE_RATE = 48_000;
+const OPUS_SEEK_PREROLL_NS = 80_000_000;
 /**
  * A new Cluster is started before a block's timecode relative to the cluster would overflow the signed
  * int16 `SimpleBlock` field. The hard limit is 32767 ms; 30000 leaves margin (and bounds cluster size).
@@ -165,6 +196,31 @@ function uintBytes(n: number): number[] {
 /** An EBML unsigned-integer element. */
 function uintEl(id: number, n: number): Uint8Array {
   return element(id, uintBytes(n));
+}
+
+/** Big-endian minimal-width two's-complement bytes for a safe signed EBML integer. */
+function intBytes(n: number): number[] {
+  if (!Number.isSafeInteger(n)) {
+    throw new MediaError('mux-error', `cannot encode an unsafe/invalid signed integer ${n}`);
+  }
+  let width = 1;
+  while (width < 8) {
+    const bound = 2 ** (width * 8 - 1);
+    if (n >= -bound && n < bound) break;
+    width++;
+  }
+  const bytes = new Array<number>(width).fill(0);
+  let value = n;
+  for (let index = width - 1; index >= 0; index--) {
+    bytes[index] = ((value % 256) + 256) % 256;
+    value = Math.floor(value / 256);
+  }
+  return bytes;
+}
+
+/** An EBML signed-integer element (used by BlockGroup DiscardPadding). */
+function intEl(id: number, n: number): Uint8Array {
+  return element(id, intBytes(n));
 }
 
 /** An EBML 64-bit float element (Matroska `Duration`/`SamplingFrequency` are floats). */
@@ -298,6 +354,8 @@ export interface ChunkStruct {
   data: Uint8Array;
   /** VPx alpha side-data bytes from Matroska BlockAdditions (BlockAddID=1), when present. */
   alpha?: Uint8Array;
+  /** Signed Matroska BlockGroup DiscardPadding, in nanoseconds. */
+  discardPaddingNs?: number;
   /**
    * Decode timestamp (µs), from the demuxer's {@link Packet.dtsUs} on a verbatim remux. Matroska stores
    * blocks in **decode** order (a Cluster is read front-to-back and fed straight to the decoder), so a
@@ -318,6 +376,8 @@ export interface TimelineBlock {
   data: Uint8Array;
   /** VPx alpha side-data bytes to write as BlockAdditions (BlockAddID=1), when present. */
   alpha?: Uint8Array;
+  /** Signed Matroska BlockGroup DiscardPadding, in nanoseconds. */
+  discardPaddingNs?: number;
 }
 
 /** Round µs to whole-ms ticks (the chosen TimecodeScale). */
@@ -331,6 +391,8 @@ interface TrackChunks {
   durationSec?: number;
   sampleRate?: number;
   gapless?: TrackInfo['gapless'];
+  timestampAdjustmentNs?: number;
+  trailingDiscardPaddingNs?: number;
   chunks: readonly ChunkStruct[];
 }
 
@@ -345,10 +407,10 @@ interface DeclaredTrackDuration {
  * negative, the positive timeline remains anchored at zero and the priming packet is written as a signed
  * negative `SimpleBlock` relative time. Blocks are sorted by `(dtsMs, trackNumber)` — Matroska reads a
  * Cluster front-to-back and submits blocks to the decoder, so storage order must be DECODE order even
- * though each `SimpleBlock` carries a PTS timecode. The end time uses source-declared durations when the
- * demuxer provided them; for video+audio, a small audio overhang is treated as codec padding and the video
- * declaration wins. AAC gapless edits contribute their exact presentation sample count rather than the
- * longer coded `mdhd` span; an AAC edit whose presentation genuinely outlasts video remains authoritative.
+ * though each `SimpleBlock` carries a PTS timecode. The end time is the maximum source-declared
+ * presentation duration when the demuxer provided one. AAC gapless edits contribute their exact
+ * presentation sample count rather than the longer coded `mdhd` span; without such explicit trim facts,
+ * an audio tail remains genuine declared media and must not be truncated to a shorter video track.
  * Unknown-duration tracks fall back to their packet tail.
  */
 export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
@@ -372,14 +434,22 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   const declaredDurations: DeclaredTrackDuration[] = [];
   let fallbackEndMs = 0;
   for (const t of tracks) {
-    for (const c of t.chunks) {
+    const codecDelayUs = (t.timestampAdjustmentNs ?? 0) / 1000;
+    for (let chunkIndex = 0; chunkIndex < t.chunks.length; chunkIndex++) {
+      const c = t.chunks[chunkIndex] as ChunkStruct;
+      const isTerminal = chunkIndex === t.chunks.length - 1;
+      const discardPaddingNs =
+        c.discardPaddingNs ?? (isTerminal ? t.trailingDiscardPaddingNs : undefined);
       blocks.push({
         trackNumber: t.trackNumber,
-        timeMs: usToMs(c.timestampUs - baseUs),
+        // CodecDelay is subtracted by readers, so add it back to the raw Block timestamp here. Sorting
+        // remains on the actual decode clock below, keeping cross-track/B-frame ordering independent.
+        timeMs: usToMs(c.timestampUs - baseUs + codecDelayUs),
         dtsMs: usToMs((c.dtsUs ?? c.timestampUs) - baseUs),
         key: c.key,
         data: c.data,
         ...(c.alpha !== undefined ? { alpha: c.alpha } : {}),
+        ...(discardPaddingNs !== undefined && discardPaddingNs !== 0 ? { discardPaddingNs } : {}),
       });
     }
     const declaredEndMs = durationSecToMs(t.durationSec);
@@ -440,8 +510,14 @@ interface TrackState {
   readonly mediaType: 'video' | 'audio';
   readonly codecId: string;
   readonly codecPrivate: Uint8Array | undefined;
+  readonly codecDelayNs?: number;
+  readonly seekPreRollNs?: number;
+  /** Delay already subtracted from incoming packet timestamps; add it back when storing Blocks. */
+  readonly timestampAdjustmentNs?: number;
   readonly width: number | undefined;
   readonly height: number | undefined;
+  readonly rotation?: number;
+  readonly color?: VideoColorMetadata;
   readonly fps: number | undefined;
   readonly durationSec: number | undefined;
   readonly gapless?: TrackInfo['gapless'];
@@ -458,6 +534,98 @@ function toBytes(src: AllowSharedBufferSource): Uint8Array {
   return new Uint8Array(src).slice();
 }
 
+function isOpusHead(bytes: Uint8Array | undefined): bytes is Uint8Array {
+  return (
+    bytes !== undefined &&
+    bytes.byteLength >= 19 &&
+    String.fromCharCode(...bytes.subarray(0, 8)) === 'OpusHead'
+  );
+}
+
+function opusHeadPreSkip(bytes: Uint8Array | undefined): number {
+  if (!isOpusHead(bytes)) return 0;
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(10, true);
+}
+
+function buildOpusHead(channels: number, preSkip: number, inputSampleRate: number): Uint8Array {
+  if (!Number.isInteger(channels) || channels < 1 || channels > 2) {
+    throw new CapabilityError(
+      'capability-miss',
+      `WebM Opus without CodecPrivate needs a mono/stereo mapping-family-0 track, got ${channels}`,
+      { op: 'mux', tried: ['webm', 'opus'] },
+    );
+  }
+  if (!Number.isInteger(preSkip) || preSkip < 0 || preSkip > 0xffff) {
+    throw new MediaError('mux-error', `WebM Opus pre-skip ${preSkip} is outside uint16`);
+  }
+  if (!Number.isInteger(inputSampleRate) || inputSampleRate <= 0) {
+    throw new MediaError('mux-error', `WebM Opus input sample rate ${inputSampleRate} is invalid`);
+  }
+  const out = new Uint8Array(19);
+  out.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0);
+  out[8] = 1;
+  out[9] = channels;
+  const view = new DataView(out.buffer);
+  view.setUint16(10, preSkip, true);
+  view.setUint32(12, inputSampleRate, true);
+  view.setInt16(16, 0, true);
+  out[18] = 0;
+  return out;
+}
+
+function opusDelayNanoseconds(preSkip: number): number {
+  return Math.round((preSkip * NANOS_PER_SECOND) / OPUS_SAMPLE_RATE);
+}
+
+function opusPrivateAndDelay(
+  codecId: string,
+  sourcePrivate: Uint8Array | undefined,
+  gapless: TrackInfo['gapless'],
+  channels: number,
+  sampleRate: number,
+): {
+  codecPrivate: Uint8Array | undefined;
+  codecDelayNs: number | undefined;
+  seekPreRollNs: number | undefined;
+} {
+  if (codecId !== 'A_OPUS') {
+    return {
+      codecPrivate: sourcePrivate,
+      codecDelayNs: undefined,
+      seekPreRollNs: undefined,
+    };
+  }
+  // A legacy caller with neither OpusHead nor explicit gapless facts gives us no honest pre-skip to
+  // publish. Preserve the prior omission instead of fabricating an algorithmic delay.
+  if (!isOpusHead(sourcePrivate) && gapless?.leadingSamples === undefined) {
+    return {
+      codecPrivate: sourcePrivate,
+      codecDelayNs: undefined,
+      seekPreRollNs: undefined,
+    };
+  }
+  const sourcePreSkip = opusHeadPreSkip(sourcePrivate);
+  const preSkip = gapless?.leadingSamples ?? sourcePreSkip;
+  let codecPrivate: Uint8Array;
+  if (isOpusHead(sourcePrivate) && sourcePreSkip === preSkip) {
+    codecPrivate = sourcePrivate;
+  } else if (isOpusHead(sourcePrivate)) {
+    codecPrivate = sourcePrivate.slice();
+    new DataView(codecPrivate.buffer, codecPrivate.byteOffset, codecPrivate.byteLength).setUint16(
+      10,
+      preSkip,
+      true,
+    );
+  } else {
+    codecPrivate = buildOpusHead(channels, preSkip, sampleRate);
+  }
+  return {
+    codecPrivate,
+    codecDelayNs: opusDelayNanoseconds(preSkip),
+    seekPreRollNs: OPUS_SEEK_PREROLL_NS,
+  };
+}
+
 /** Copy an immutable WebCodecs chunk into owned bytes for muxer buffering. */
 function encodedChunkBytes(chunk: EncodedAudioChunk | EncodedVideoChunk): Uint8Array {
   const data = new Uint8Array(chunk.byteLength);
@@ -465,21 +633,81 @@ function encodedChunkBytes(chunk: EncodedAudioChunk | EncodedVideoChunk): Uint8A
   return data;
 }
 
+function colorCode(
+  value: string | null | undefined,
+  values: Readonly<Record<string, number>>,
+): number | undefined {
+  return value === undefined || value === null ? undefined : values[value];
+}
+
+function colorFromTrack(
+  info: TrackInfo,
+  config: VideoDecoderConfig | undefined,
+): VideoColorMetadata | undefined {
+  if (info.color !== undefined) return info.color;
+  const colorSpace = config?.colorSpace;
+  if (colorSpace === undefined) return undefined;
+  const primaries = colorCode(colorSpace.primaries, {
+    bt709: 1,
+    bt470bg: 5,
+    smpte170m: 6,
+    bt2020: 9,
+    smpte432: 12,
+  });
+  const transferCharacteristics = colorCode(colorSpace.transfer, {
+    bt709: 1,
+    smpte170m: 6,
+    linear: 8,
+    'iec61966-2-1': 13,
+    pq: 16,
+    hlg: 18,
+  });
+  const matrixCoefficients = colorCode(colorSpace.matrix, {
+    rgb: 0,
+    bt709: 1,
+    bt470bg: 5,
+    smpte170m: 6,
+    'bt2020-ncl': 9,
+  });
+  const range = colorSpace.fullRange === true ? 2 : colorSpace.fullRange === false ? 1 : undefined;
+  if (
+    primaries === undefined &&
+    transferCharacteristics === undefined &&
+    matrixCoefficients === undefined &&
+    range === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...(matrixCoefficients !== undefined ? { matrixCoefficients } : {}),
+    ...(range !== undefined ? { range } : {}),
+    ...(transferCharacteristics !== undefined ? { transferCharacteristics } : {}),
+    ...(primaries !== undefined ? { primaries } : {}),
+  };
+}
+
 /** Build the immutable {@link TrackState} from a track's {@link TrackInfo} (codec + WebCodecs config). */
 function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
   const codecId = toCodecId(info.mediaType, info.codec);
   const decoderConfig = info.config;
-  const codecPrivate =
+  const sourcePrivate =
     decoderConfig?.description !== undefined ? toBytes(decoderConfig.description) : undefined;
   if (info.mediaType === 'video') {
     const vc = decoderConfig as VideoDecoderConfig | undefined;
+    const rotation = normalizeClockwiseRotation(info.rotation);
+    const color = colorFromTrack(info, vc);
     return {
       trackNumber,
       mediaType: 'video',
       codecId,
-      codecPrivate,
+      codecPrivate: sourcePrivate,
+      ...(info.codecDelayNs !== undefined ? { codecDelayNs: info.codecDelayNs } : {}),
+      ...(info.seekPreRollNs !== undefined ? { seekPreRollNs: info.seekPreRollNs } : {}),
+      ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),
       width: vc?.codedWidth,
       height: vc?.codedHeight,
+      ...(rotation !== undefined ? { rotation } : {}),
+      ...(color !== undefined ? { color } : {}),
       fps: info.fps,
       durationSec: info.durationSec,
       sampleRate: undefined,
@@ -488,11 +716,23 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     };
   }
   const ac = decoderConfig as AudioDecoderConfig | undefined;
+  const opus = opusPrivateAndDelay(
+    codecId,
+    sourcePrivate,
+    info.gapless,
+    ac?.numberOfChannels ?? 0,
+    ac?.sampleRate ?? OPUS_SAMPLE_RATE,
+  );
+  const codecDelayNs = info.codecDelayNs ?? opus.codecDelayNs;
+  const seekPreRollNs = info.seekPreRollNs ?? opus.seekPreRollNs;
   return {
     trackNumber,
     mediaType: 'audio',
     codecId,
-    codecPrivate,
+    codecPrivate: opus.codecPrivate,
+    ...(codecDelayNs !== undefined ? { codecDelayNs } : {}),
+    ...(seekPreRollNs !== undefined ? { seekPreRollNs } : {}),
+    ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),
     width: undefined,
     height: undefined,
     fps: undefined,
@@ -506,18 +746,36 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
 
 function timelineTrack(t: TrackState): TrackChunks {
   const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
+  const trailingDiscardPaddingNs = trackTrailingDiscardPaddingNs(t);
   const base = {
     trackNumber: t.trackNumber,
     mediaType: t.mediaType,
     chunks: t.chunks,
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.gapless !== undefined ? { gapless: t.gapless } : {}),
+    ...(t.timestampAdjustmentNs !== undefined
+      ? { timestampAdjustmentNs: t.timestampAdjustmentNs }
+      : {}),
+    ...(trailingDiscardPaddingNs !== undefined ? { trailingDiscardPaddingNs } : {}),
   };
   return durationSec !== undefined ? { ...base, durationSec } : base;
 }
 
+function trackTrailingDiscardPaddingNs(track: TrackState): number | undefined {
+  const trailingSamples = track.gapless?.trailingSamples;
+  if (
+    track.codecId !== 'A_OPUS' ||
+    trailingSamples === undefined ||
+    !Number.isInteger(trailingSamples) ||
+    trailingSamples <= 0
+  ) {
+    return undefined;
+  }
+  return Math.round((trailingSamples * NANOS_PER_SECOND) / OPUS_SAMPLE_RATE);
+}
+
 /** The EBML Header (`EBML`), declaring DocType (`webm`/`matroska`) + version limits. */
-function ebmlHeader(docType: string): Uint8Array {
+function ebmlHeader(docType: string, docTypeVersion: 2 | 4): Uint8Array {
   return element(
     EBML_ID.EBML,
     concatBytes([
@@ -526,7 +784,7 @@ function ebmlHeader(docType: string): Uint8Array {
       uintEl(EBML_ID.EBMLMaxIDLength, 4),
       uintEl(EBML_ID.EBMLMaxSizeLength, 8),
       stringEl(EBML_ID.DocType, docType),
-      uintEl(EBML_ID.DocTypeVersion, 2),
+      uintEl(EBML_ID.DocTypeVersion, docTypeVersion),
       uintEl(EBML_ID.DocTypeReadVersion, 2),
     ]),
   );
@@ -546,6 +804,34 @@ function infoElement(endMs: number, opts: { includeDuration?: boolean } = {}): U
   );
 }
 
+function colorElement(color: VideoColorMetadata): Uint8Array | undefined {
+  const parts: Uint8Array[] = [];
+  const add = (id: number, value: number | undefined): void => {
+    if (value === undefined) return;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new MediaError(
+        'mux-error',
+        `Matroska Colour value ${value} is not a non-negative integer`,
+      );
+    }
+    parts.push(uintEl(id, value));
+  };
+  add(EBML_ID.MatrixCoefficients, color.matrixCoefficients);
+  add(EBML_ID.BitsPerChannel, color.bitsPerChannel);
+  add(EBML_ID.ChromaSubsamplingHorz, color.chromaSubsamplingHorz);
+  add(EBML_ID.ChromaSubsamplingVert, color.chromaSubsamplingVert);
+  add(EBML_ID.CbSubsamplingHorz, color.cbSubsamplingHorz);
+  add(EBML_ID.CbSubsamplingVert, color.cbSubsamplingVert);
+  add(EBML_ID.ChromaSitingHorz, color.chromaSitingHorz);
+  add(EBML_ID.ChromaSitingVert, color.chromaSitingVert);
+  add(EBML_ID.Range, color.range);
+  add(EBML_ID.TransferCharacteristics, color.transferCharacteristics);
+  add(EBML_ID.Primaries, color.primaries);
+  add(EBML_ID.MaxCLL, color.maxCll);
+  add(EBML_ID.MaxFALL, color.maxFall);
+  return parts.length === 0 ? undefined : element(EBML_ID.Colour, concatBytes(parts));
+}
+
 /** One `TrackEntry`: number/UID/type + CodecID(+private) + Video/Audio geometry. */
 function trackEntryElement(t: TrackState): Uint8Array {
   const parts: Uint8Array[] = [
@@ -558,16 +844,24 @@ function trackEntryElement(t: TrackState): Uint8Array {
   if (t.codecPrivate !== undefined && t.codecPrivate.byteLength > 0) {
     parts.push(element(EBML_ID.CodecPrivate, t.codecPrivate));
   }
+  if (t.codecDelayNs !== undefined) parts.push(uintEl(EBML_ID.CodecDelay, t.codecDelayNs));
+  if (t.seekPreRollNs !== undefined) parts.push(uintEl(EBML_ID.SeekPreRoll, t.seekPreRollNs));
   if (t.mediaType === 'video') {
     if (t.fps !== undefined && t.fps > 0) {
       parts.push(uintEl(EBML_ID.DefaultDuration, Math.round((NS_PER_MS * 1000) / t.fps)));
     }
+    const roll = matroskaRollFromClockwise(t.rotation);
+    const color = t.color === undefined ? undefined : colorElement(t.color);
     parts.push(
       element(
         EBML_ID.Video,
         concatBytes([
           uintEl(EBML_ID.PixelWidth, t.width ?? 0),
           uintEl(EBML_ID.PixelHeight, t.height ?? 0),
+          ...(roll !== undefined && roll !== 0
+            ? [element(EBML_ID.Projection, floatEl(EBML_ID.ProjectionPoseRoll, roll))]
+            : []),
+          ...(color !== undefined ? [color] : []),
         ]),
       ),
     );
@@ -588,6 +882,140 @@ function trackEntryElement(t: TrackState): Uint8Array {
 /** The `Tracks` element wrapping one `TrackEntry` per track (in track-number order). */
 function tracksElement(tracks: readonly TrackState[]): Uint8Array {
   return element(EBML_ID.Tracks, concatBytes(tracks.map(trackEntryElement)));
+}
+
+/** Ordered Segment-level attachments; each complete AttachedFile payload remains byte-identical. */
+function attachmentsElement(attachedFilePayloads: readonly Uint8Array[]): Uint8Array | undefined {
+  if (attachedFilePayloads.length === 0) return undefined;
+  return element(
+    EBML_ID.Attachments,
+    concatBytes(attachedFilePayloads.map((payload) => element(EBML_ID.AttachedFile, payload))),
+  );
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function attachmentBundlesEqual(
+  left: readonly Uint8Array[],
+  right: readonly Uint8Array[],
+): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    const leftPayload = left[index];
+    const rightPayload = right[index];
+    if (leftPayload === undefined || rightPayload === undefined) return false;
+    if (!bytesEqual(leftPayload, rightPayload)) return false;
+  }
+  return true;
+}
+
+/**
+ * Incremental exact collector for {@link TrackInfo.containerSideData}. A demux repeats one ordered
+ * attachment bundle on every track so normal selection retains it; muxing sees those repeats one track at
+ * a time, snapshots the first bundle, and byte-compares later copies before emitting it exactly once.
+ */
+export class WebmContainerSideData {
+  readonly #docType: string;
+  readonly #attachmentBundles: Uint8Array[][] = [];
+  readonly #seenAttachmentBundles = new WeakSet<object>();
+
+  constructor(docType: string) {
+    this.#docType = docType;
+  }
+
+  /** Ingest one track's side data; returns true when the track is only an attachment projection. */
+  addTrack(info: TrackInfo): boolean {
+    const sideData = info.containerSideData ?? [];
+    for (let index = 0; index < sideData.length; index++) {
+      const item = sideData[index];
+      if (item === undefined || item.kind !== 'matroska-attachments') {
+        throw new MediaError('mux-error', `unknown container side data at index ${index}`);
+      }
+      const payloads = item.attachedFilePayloads;
+      if (
+        !Array.isArray(payloads) ||
+        payloads.some((payload) => !(payload instanceof Uint8Array))
+      ) {
+        throw new MediaError('mux-error', `invalid Matroska attachment bundle at index ${index}`);
+      }
+      if (payloads.length === 0) continue;
+      if (this.#docType !== 'matroska') {
+        throw new CapabilityError(
+          'capability-miss',
+          'WebM output cannot contain Matroska Attachments',
+          { op: 'mux', tried: ['webm', 'matroska-attachments'] },
+        );
+      }
+      if (this.#seenAttachmentBundles.has(item)) continue;
+      this.#seenAttachmentBundles.add(item);
+      if (!this.#attachmentBundles.some((existing) => attachmentBundlesEqual(existing, payloads))) {
+        this.#attachmentBundles.push(payloads.map((payload) => payload.slice()));
+      }
+    }
+
+    const projection = info.containerProjection;
+    if (projection === undefined) return false;
+    if (
+      projection.kind !== 'matroska-attachment' ||
+      !Number.isSafeInteger(projection.sideDataIndex) ||
+      projection.sideDataIndex < 0 ||
+      !Number.isSafeInteger(projection.attachmentIndex) ||
+      projection.attachmentIndex < 0
+    ) {
+      throw new MediaError('mux-error', 'invalid Matroska attachment projection');
+    }
+    const bundle = sideData[projection.sideDataIndex];
+    if (
+      bundle?.kind !== 'matroska-attachments' ||
+      bundle.attachedFilePayloads[projection.attachmentIndex] === undefined
+    ) {
+      throw new MediaError('mux-error', 'Matroska attachment projection has no matching side data');
+    }
+    return true;
+  }
+
+  /** Ordered exact AttachedFile payloads, with repeated per-track bundles collapsed once. */
+  get attachedFilePayloads(): readonly Uint8Array[] {
+    return this.#attachmentBundles.flat();
+  }
+
+  /**
+   * Merge the legacy/manual attachment bundle with TrackInfo side data. An exact whole-bundle match is
+   * one source declaration reaching the muxer through both APIs and is emitted once; partial matches stay
+   * distinct because they may be intentional additional files. Duplicate files inside either bundle are
+   * therefore never collapsed individually.
+   */
+  mergeAttachedFilePayloads(manualBundle: readonly Uint8Array[]): readonly Uint8Array[] {
+    if (manualBundle.length === 0) return this.attachedFilePayloads;
+    const matchingIndex = this.#attachmentBundles.findIndex((bundle) =>
+      attachmentBundlesEqual(bundle, manualBundle),
+    );
+    if (matchingIndex < 0) return [...manualBundle, ...this.attachedFilePayloads];
+    return this.#attachmentBundles.flatMap((bundle, index) =>
+      index === matchingIndex ? manualBundle : bundle,
+    );
+  }
+}
+
+function docTypeVersionFor(tracks: readonly TrackState[]): 2 | 4 {
+  return tracks.some((track) => {
+    const rotation = normalizeClockwiseRotation(track.rotation);
+    return (
+      (rotation !== undefined && rotation !== 0) ||
+      track.codecDelayNs !== undefined ||
+      track.seekPreRollNs !== undefined ||
+      track.color !== undefined ||
+      (track.gapless?.trailingSamples ?? 0) > 0
+    );
+  })
+    ? 4
+    : 2;
 }
 
 function blockPayloadLength(block: TimelineBlock): number {
@@ -626,7 +1054,7 @@ function blockAdditionsElement(alpha: Uint8Array): Uint8Array {
 
 function blockElementLength(block: TimelineBlock): number {
   const rawBlockPayloadLength = blockPayloadLength(block);
-  if (block.alpha === undefined) {
+  if (block.alpha === undefined && block.discardPaddingNs === undefined) {
     return (
       idByteLength(EBML_ID.SimpleBlock) +
       vintByteLength(rawBlockPayloadLength) +
@@ -638,20 +1066,14 @@ function blockElementLength(block: TimelineBlock): number {
   const referenceElementLength = block.key
     ? 0
     : idByteLength(EBML_ID.ReferenceBlock) + vintByteLength(1) + 1;
-  const blockAddId = uintEl(EBML_ID.BlockAddID, 1);
-  const blockAdditionalLength =
-    idByteLength(EBML_ID.BlockAdditional) +
-    vintByteLength(block.alpha.byteLength) +
-    block.alpha.byteLength;
-  const blockMorePayloadLength = blockAddId.byteLength + blockAdditionalLength;
-  const blockMoreLength =
-    idByteLength(EBML_ID.BlockMore) +
-    vintByteLength(blockMorePayloadLength) +
-    blockMorePayloadLength;
   const blockAdditionsLength =
-    idByteLength(EBML_ID.BlockAdditions) + vintByteLength(blockMoreLength) + blockMoreLength;
+    block.alpha === undefined ? 0 : blockAdditionsElement(block.alpha).byteLength;
+  const discardPaddingLength =
+    block.discardPaddingNs === undefined
+      ? 0
+      : intEl(EBML_ID.DiscardPadding, block.discardPaddingNs).byteLength;
   const blockGroupPayloadLength =
-    blockElementLength + referenceElementLength + blockAdditionsLength;
+    blockElementLength + referenceElementLength + blockAdditionsLength + discardPaddingLength;
   return (
     idByteLength(EBML_ID.BlockGroup) +
     vintByteLength(blockGroupPayloadLength) +
@@ -660,7 +1082,7 @@ function blockElementLength(block: TimelineBlock): number {
 }
 
 function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
-  if (block.alpha === undefined) {
+  if (block.alpha === undefined && block.discardPaddingNs === undefined) {
     const rel = block.timeMs - clusterTimeMs;
     const flags = block.key ? 0x80 : 0x00;
     const payloadLength = vintByteLength(block.trackNumber) + 2 + 1 + block.data.byteLength;
@@ -677,7 +1099,10 @@ function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTime
     element(EBML_ID.Block, blockPayloadBytes(block, clusterTimeMs, false)),
   ];
   if (!block.key) parts.push(element(EBML_ID.ReferenceBlock, [0x01]));
-  parts.push(blockAdditionsElement(block.alpha));
+  if (block.alpha !== undefined) parts.push(blockAdditionsElement(block.alpha));
+  if (block.discardPaddingNs !== undefined) {
+    parts.push(intEl(EBML_ID.DiscardPadding, block.discardPaddingNs));
+  }
   writer.write(element(EBML_ID.BlockGroup, concatBytes(parts)));
 }
 
@@ -751,14 +1176,20 @@ function writeCluster(
 }
 
 /** Assemble the full WebM byte stream from finalized tracks (definite sizes throughout). */
-export function writeWebm(tracks: readonly TrackState[], docType: string): Uint8Array {
+export function writeWebm(
+  tracks: readonly TrackState[],
+  docType: string,
+  attachedFilePayloads: readonly Uint8Array[] = [],
+): Uint8Array {
   const { blocks, endMs } = buildBlockTimeline(tracks.map(timelineTrack));
-  const header = ebmlHeader(docType);
+  const header = ebmlHeader(docType, docTypeVersionFor(tracks));
   const info = infoElement(endMs);
   const trackBytes = tracksElement(tracks);
+  const attachmentBytes = attachmentsElement(attachedFilePayloads);
   const clusters = planClusters(blocks);
   const clustersLength = clusters.reduce((sum, cluster) => sum + cluster.totalLength, 0);
-  const segmentPayloadLength = info.byteLength + trackBytes.byteLength + clustersLength;
+  const segmentPayloadLength =
+    info.byteLength + trackBytes.byteLength + (attachmentBytes?.byteLength ?? 0) + clustersLength;
   const segmentHeader = elementHeader(EBML_ID.Segment, segmentPayloadLength);
   const writer = new ByteWriter(
     header.byteLength + segmentHeader.byteLength + segmentPayloadLength,
@@ -767,6 +1198,7 @@ export function writeWebm(tracks: readonly TrackState[], docType: string): Uint8
   writer.write(segmentHeader);
   writer.write(info);
   writer.write(trackBytes);
+  if (attachmentBytes !== undefined) writer.write(attachmentBytes);
   for (const cluster of clusters) writeCluster(writer, blocks, cluster);
   return writer.finish();
 }
@@ -894,16 +1326,19 @@ function webmInitSegment(
   tracks: readonly TrackState[],
   docType: string,
   endMs: number,
+  attachedFilePayloads: readonly Uint8Array[] = [],
 ): Uint8Array {
-  const header = ebmlHeader(docType);
+  const header = ebmlHeader(docType, docTypeVersionFor(tracks));
   const info = infoElement(endMs, { includeDuration: false });
   const trackBytes = tracksElement(tracks);
+  const attachmentBytes = attachmentsElement(attachedFilePayloads);
   const out = new Uint8Array(
     header.byteLength +
       idBytes(EBML_ID.Segment).length +
       SEGMENT_UNKNOWN_SIZE.byteLength +
       info.byteLength +
-      trackBytes.byteLength,
+      trackBytes.byteLength +
+      (attachmentBytes?.byteLength ?? 0),
   );
   let off = 0;
   out.set(header, off);
@@ -916,6 +1351,8 @@ function webmInitSegment(
   out.set(info, off);
   off += info.byteLength;
   out.set(trackBytes, off);
+  off += trackBytes.byteLength;
+  if (attachmentBytes !== undefined) out.set(attachmentBytes, off);
   return out;
 }
 
@@ -933,13 +1370,14 @@ export function* fragmentWebm(
   tracks: readonly TrackState[],
   docType: string,
   opts: WebmFragmentOptions = {},
+  attachedFilePayloads: readonly Uint8Array[] = [],
 ): Generator<Uint8Array, void, undefined> {
   const { blocks, endMs } = buildBlockTimeline(tracks.map(timelineTrack));
   const videoKeyTrackNumbers = new Set<number>(
     tracks.filter((t) => t.mediaType === 'video').map((t) => t.trackNumber),
   );
 
-  yield webmInitSegment(tracks, docType, endMs);
+  yield webmInitSegment(tracks, docType, endMs, attachedFilePayloads);
 
   for (const range of planWebmFragments(blocks, videoKeyTrackNumbers, opts)) {
     if (range.end > range.start) yield serializeFragmentCluster(blocks, range);
@@ -966,6 +1404,7 @@ export class WebmStreamingMuxer {
 
   readonly #tracks = new Map<number, TrackState>();
   readonly #docType: string;
+  readonly #containerSideData: WebmContainerSideData;
   readonly #maxBlocksPerFragment: number;
   #nextTrackNumber = 1;
   #finalized = false;
@@ -975,6 +1414,7 @@ export class WebmStreamingMuxer {
   #currentMinPtsMs = 0;
   #currentMaxPtsMs = 0;
   readonly #writtenTrackNumbers = new Set<number>();
+  readonly #attachmentProjectionTrackNumbers = new Set<number>();
   readonly #pullWaiters: Array<() => void> = [];
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   readonly #ready: Promise<void>;
@@ -982,6 +1422,7 @@ export class WebmStreamingMuxer {
 
   constructor(options?: MuxOptions & WebmStreamingMuxerOptions, docType = 'webm') {
     this.#docType = docType;
+    this.#containerSideData = new WebmContainerSideData(docType);
     this.#maxBlocksPerFragment = Math.max(
       1,
       options?.maxBlocksPerFragment ?? DEFAULT_MAX_BLOCKS_PER_FRAGMENT,
@@ -1008,6 +1449,10 @@ export class WebmStreamingMuxer {
       );
     }
     const trackNumber = this.#nextTrackNumber++;
+    if (this.#containerSideData.addTrack(info)) {
+      this.#attachmentProjectionTrackNumbers.add(trackNumber);
+      return trackNumber;
+    }
     this.#tracks.set(trackNumber, trackStateFrom(info, trackNumber));
     return trackNumber;
   }
@@ -1017,30 +1462,41 @@ export class WebmStreamingMuxer {
     await this.#ensureStarted();
   }
 
-  async write(trackId: number, packet: Packet): Promise<void> {
+  async write(trackId: number, packet: Packet, lastInTrack = false): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; browser-harness validated. */
+    if (this.#attachmentProjectionTrackNumbers.has(trackId)) return;
     const chunk = packet.chunk;
     const data = packet.data ?? encodedChunkBytes(chunk);
-    await this.addChunkStruct(trackId, {
-      timestampUs: chunk.timestamp,
-      durationUs: chunk.duration ?? undefined,
-      key: chunk.type === 'key',
-      data,
-      ...(packet.alpha !== undefined ? { alpha: encodedChunkBytes(packet.alpha) } : {}),
-      ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
-    });
+    await this.addChunkStruct(
+      trackId,
+      {
+        timestampUs: chunk.timestamp,
+        durationUs: chunk.duration ?? undefined,
+        key: chunk.type === 'key',
+        data,
+        ...(packet.alpha !== undefined ? { alpha: encodedChunkBytes(packet.alpha) } : {}),
+        ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
+      },
+      lastInTrack,
+    );
     /* v8 ignore stop */
   }
 
-  async addChunkStruct(trackId: number, chunk: ChunkStruct): Promise<void> {
+  async addChunkStruct(trackId: number, chunk: ChunkStruct, lastInTrack = false): Promise<void> {
     this.#assertOpen();
+    if (this.#attachmentProjectionTrackNumbers.has(trackId)) return;
     await this.#ensureStarted();
-    const pendingFlush = this.addChunkStructStarted(trackId, chunk);
+    const pendingFlush = this.addChunkStructStarted(trackId, chunk, lastInTrack);
     if (pendingFlush !== undefined) await pendingFlush;
   }
 
-  addChunkStructStarted(trackId: number, chunk: ChunkStruct): Promise<void> | undefined {
+  addChunkStructStarted(
+    trackId: number,
+    chunk: ChunkStruct,
+    lastInTrack = false,
+  ): Promise<void> | undefined {
     this.#assertOpen();
+    if (this.#attachmentProjectionTrackNumbers.has(trackId)) return undefined;
     if (!this.#started) {
       throw new MediaError('mux-error', 'streaming muxer has not started');
     }
@@ -1048,7 +1504,7 @@ export class WebmStreamingMuxer {
     if (track === undefined) {
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
     }
-    const block = this.#blockFromChunk(track, chunk);
+    const block = this.#blockFromChunk(track, chunk, lastInTrack);
     if (this.#shouldFlushBefore(block)) {
       return this.#flushCurrentCluster().then(() => {
         this.#appendBlock(block);
@@ -1094,19 +1550,24 @@ export class WebmStreamingMuxer {
       throw new MediaError('mux-error', 'muxer output stream was not initialized');
     }
     const tracks = [...this.#tracks.values()].sort((a, b) => a.trackNumber - b.trackNumber);
-    await this.#enqueue(webmInitSegment(tracks, this.#docType, 0));
+    await this.#enqueue(
+      webmInitSegment(tracks, this.#docType, 0, this.#containerSideData.attachedFilePayloads),
+    );
   }
 
-  #blockFromChunk(track: TrackState, chunk: ChunkStruct): TimelineBlock {
+  #blockFromChunk(track: TrackState, chunk: ChunkStruct, lastInTrack: boolean): TimelineBlock {
     const baseUs = this.#timelineBaseUs ?? chunk.timestampUs;
     this.#timelineBaseUs = baseUs;
+    const discardPaddingNs =
+      chunk.discardPaddingNs ?? (lastInTrack ? trackTrailingDiscardPaddingNs(track) : undefined);
     return {
       trackNumber: track.trackNumber,
-      timeMs: usToMs(chunk.timestampUs - baseUs),
+      timeMs: usToMs(chunk.timestampUs - baseUs + (track.timestampAdjustmentNs ?? 0) / 1000),
       dtsMs: usToMs((chunk.dtsUs ?? chunk.timestampUs) - baseUs),
       key: chunk.key,
       data: chunk.data,
       ...(chunk.alpha !== undefined ? { alpha: chunk.alpha } : {}),
+      ...(discardPaddingNs !== undefined && discardPaddingNs !== 0 ? { discardPaddingNs } : {}),
     };
   }
 
@@ -1198,8 +1659,11 @@ export class WebmMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
 
   readonly #tracks = new Map<number, TrackState>();
+  readonly #attachedFilePayloads: Uint8Array[] = [];
   readonly #docType: string;
+  readonly #containerSideData: WebmContainerSideData;
   readonly #fragmented: boolean;
+  readonly #attachmentProjectionTrackNumbers = new Set<number>();
   #nextTrackNumber = 1;
   #finalized = false;
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -1211,6 +1675,7 @@ export class WebmMuxer implements Muxer {
     // {@link fragmentWebm}, instead of the single length-prefixed Segment from {@link writeWebm}.
     this.#fragmented = options?.fragmented === true;
     this.#docType = docType;
+    this.#containerSideData = new WebmContainerSideData(docType);
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -1225,8 +1690,28 @@ export class WebmMuxer implements Muxer {
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
     const trackNumber = this.#nextTrackNumber++;
+    if (this.#containerSideData.addTrack(info)) {
+      this.#attachmentProjectionTrackNumbers.add(trackNumber);
+      return trackNumber;
+    }
     this.#tracks.set(trackNumber, trackStateFrom(info, trackNumber));
     return trackNumber;
+  }
+
+  /**
+   * Preserve one Matroska `AttachedFile` as Segment metadata. Attachments are outside the WebM subset and
+   * are never accepted as media tracks or Blocks.
+   */
+  addAttachment(attachedFilePayload: Uint8Array): void {
+    this.#assertOpen();
+    if (this.#docType !== 'matroska') {
+      throw new CapabilityError(
+        'capability-miss',
+        'WebM output cannot contain Matroska Attachments',
+        { op: 'mux', tried: ['webm', 'matroska-attachments'] },
+      );
+    }
+    this.#attachedFilePayloads.push(attachedFilePayload.slice());
   }
 
   /**
@@ -1236,6 +1721,7 @@ export class WebmMuxer implements Muxer {
    */
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
+    if (this.#attachmentProjectionTrackNumbers.has(trackId)) return Promise.resolve();
     const chunk = packet.chunk;
     const data = packet.data ?? encodedChunkBytes(chunk);
     this.addChunkStruct(trackId, {
@@ -1257,6 +1743,7 @@ export class WebmMuxer implements Muxer {
    */
   addChunkStruct(trackId: number, chunk: ChunkStruct): void {
     this.#assertOpen();
+    if (this.#attachmentProjectionTrackNumbers.has(trackId)) return;
     const track = this.#tracks.get(trackId);
     if (track === undefined) {
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
@@ -1275,11 +1762,15 @@ export class WebmMuxer implements Muxer {
     }
     try {
       const tracks = this.#buildTracks();
+      const attachedFilePayloads = this.#containerSideData.mergeAttachedFilePayloads(
+        this.#attachedFilePayloads,
+      );
       if (this.#fragmented) {
         // Stream the init segment then one top-level Cluster per fragment (bounded output memory, ADR-091).
-        for (const segment of fragmentWebm(tracks, this.#docType)) controller.enqueue(segment);
+        for (const segment of fragmentWebm(tracks, this.#docType, {}, attachedFilePayloads))
+          controller.enqueue(segment);
       } else {
-        controller.enqueue(writeWebm(tracks, this.#docType));
+        controller.enqueue(writeWebm(tracks, this.#docType, attachedFilePayloads));
       }
       controller.close();
     } catch (err) {

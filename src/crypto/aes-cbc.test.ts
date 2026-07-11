@@ -73,6 +73,17 @@ describe('aesCbcNoPadding — NIST SP 800-38A CBC-AES128 (F.2.1 / F.2.2)', () =>
   it('treats empty input as empty output', async () => {
     expect((await aesCbcNoPadding(KEY, IV, new Uint8Array(0), 'decrypt')).byteLength).toBe(0);
   });
+
+  it('keeps empty-input semantics without requiring WebCrypto key setup', async () => {
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+    try {
+      expect((await aesCbcNoPadding(KEY, IV, new Uint8Array(0), 'decrypt')).byteLength).toBe(0);
+    } finally {
+      if (saved) Object.defineProperty(globalThis, 'crypto', saved);
+      else Reflect.deleteProperty(globalThis, 'crypto');
+    }
+  });
 });
 
 describe('aesCbcPkcs7 — native PKCS#7 CBC', () => {

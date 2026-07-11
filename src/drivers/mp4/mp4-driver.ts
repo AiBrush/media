@@ -27,7 +27,12 @@ import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
-import { fragmentSamplesToDemuxSamples, parseFragmentSamples } from './fragment-samples.ts';
+import {
+  fragmentSamplesToDemuxSamples,
+  mergeMoovAndFragmentSamples,
+  parseFragmentSamples,
+} from './fragment-samples.ts';
+import { gaplessFromMp4Edit } from './gapless.ts';
 import {
   type FragmentInitTrackInput,
   buildMediaSegment,
@@ -47,7 +52,13 @@ import {
   parseMoviePacketInfo,
 } from './parse.ts';
 import { Reader } from './reader.ts';
-import { type Sample, type SampleData, buildSampleData, buildSamples } from './samples.ts';
+import {
+  type Sample,
+  type SampleData,
+  buildSampleData,
+  buildSamples,
+  walkSampleRanges,
+} from './samples.ts';
 import {
   type ContainerBrand,
   type Mp4ByteStreamLayout,
@@ -99,9 +110,11 @@ function brandFor(container: string | undefined): ContainerBrand {
 /** A random-access view over a source: range reads when available, else a one-time buffer. */
 interface RandomAccess {
   read(offset: number, length: number): Promise<Uint8Array>;
-  size?: number;
+  size?: number | undefined;
   /** `read()` returns a zero-copy in-memory view, so sample-granular reads carry no I/O round trip. */
   readonly inMemory?: boolean;
+  /** A complete prior read retained as a view, used to validate a probe→demux handoff without new I/O. */
+  readonly cachedWhole?: () => Uint8Array | undefined;
 }
 
 type SizedRandomAccess = RandomAccess & { readonly size: number };
@@ -110,12 +123,34 @@ interface RandomAccessOptions {
   readonly eagerReadMaxBytes?: number;
 }
 
+/** Return a zero-copy view only when retained bytes cover the complete safe half-open interval. */
+function coveredByteView(
+  bytes: Uint8Array | undefined,
+  offset: number,
+  length: number,
+): Uint8Array | undefined {
+  const end = offset + length;
+  if (
+    bytes === undefined ||
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    !Number.isSafeInteger(end) ||
+    offset < 0 ||
+    length < 0 ||
+    end > bytes.byteLength
+  ) {
+    return undefined;
+  }
+  return bytes.subarray(offset, end);
+}
+
 interface MovieParseHandoff {
   readonly movie?: Movie;
   readonly faststart?: {
     readonly brand: string;
     readonly moov: Uint8Array;
   };
+  readonly mediaDataRanges: readonly MediaDataRange[];
   readonly token: object;
 }
 
@@ -170,12 +205,34 @@ async function randomAccess(
         read: (offset, length) => Promise.resolve(buffered.subarray(offset, offset + length)),
         size: buffered.byteLength,
         inMemory: true,
+        cachedWhole: () => buffered,
       };
     }
+    let cachedWhole: Uint8Array | undefined;
     return {
-      read: (offset, length) => range.call(src, offset, offset + length),
-      ...(src.size !== undefined ? { size: src.size } : {}),
+      async read(offset, length): Promise<Uint8Array> {
+        const retained = coveredByteView(cachedWhole, offset, length);
+        if (retained !== undefined) return retained;
+        const bytes = await range.call(src, offset, offset + length);
+        const learnedSize = src.size;
+        if (
+          offset === 0 &&
+          learnedSize !== undefined &&
+          length >= learnedSize &&
+          bytes.byteLength >= learnedSize
+        ) {
+          cachedWhole = bytes.subarray(0, learnedSize);
+        }
+        return bytes;
+      },
+      // URL/element sources learn their length from the first range response. Keep the random-access
+      // view live so a later full-container validation sees that learned size instead of the undefined
+      // snapshot that existed before the request completed.
+      get size(): number | undefined {
+        return src.size;
+      },
       inMemory: sourceKind(src) === 'bytes',
+      cachedWhole: () => cachedWhole,
     };
   }
   const buffered = await readAll(src.stream());
@@ -183,6 +240,7 @@ async function randomAccess(
     read: (o, l) => Promise.resolve(buffered.subarray(o, o + l)),
     size: buffered.byteLength,
     inMemory: true,
+    cachedWhole: () => buffered,
   };
 }
 
@@ -349,12 +407,21 @@ function canHandoffFullMovie(src: ByteSource, ra: RandomAccess): boolean {
   );
 }
 
-function storeMovieParseHandoff(key: string, movie: Movie): void {
-  storeMovieParseHandoffValue(key, { movie });
+function storeMovieParseHandoff(
+  key: string,
+  movie: Movie,
+  mediaDataRanges: readonly MediaDataRange[],
+): void {
+  storeMovieParseHandoffValue(key, { movie, mediaDataRanges });
 }
 
-function storeFaststartMoovParseHandoff(key: string, brand: string, moov: Uint8Array): void {
-  storeMovieParseHandoffValue(key, { faststart: { brand, moov } });
+function storeFaststartMoovParseHandoff(
+  key: string,
+  brand: string,
+  moov: Uint8Array,
+  mediaDataRanges: readonly MediaDataRange[],
+): void {
+  storeMovieParseHandoffValue(key, { faststart: { brand, moov }, mediaDataRanges });
 }
 
 function storeMovieParseHandoffValue(key: string, value: Omit<MovieParseHandoff, 'token'>): void {
@@ -371,25 +438,36 @@ async function readMovieForProbe(src: ByteSource, ra: RandomAccess): Promise<Mov
   const key = sourceCacheKey(src);
   if (key !== undefined && canHandoffFullMovie(src, ra)) {
     const movie = await readMovie(ra);
-    storeMovieParseHandoff(key, movie);
+    storeMovieParseHandoff(key, movie, await readMediaDataRanges(ra));
     return movie;
   }
   return readMovieMetadata(ra);
 }
 
-async function readMovieForDemux(src: ByteSource, ra: RandomAccess): Promise<Movie> {
+interface MovieForDemux {
+  readonly movie: Movie;
+  /** Validated `mdat` ownership cached by an immediate probe of the same stable source, when present. */
+  readonly mediaDataRanges?: readonly MediaDataRange[];
+}
+
+async function readMovieForDemux(src: ByteSource, ra: RandomAccess): Promise<MovieForDemux> {
   const key = sourceCacheKey(src);
   if (key !== undefined) {
     const cached = movieParseHandoff.get(key);
     if (cached !== undefined) {
       movieParseHandoff.delete(key);
-      if (cached.movie !== undefined) return cached.movie;
+      if (cached.movie !== undefined) {
+        return { movie: cached.movie, mediaDataRanges: cached.mediaDataRanges };
+      }
       if (cached.faststart !== undefined) {
-        return parseMovie(cached.faststart.brand, cached.faststart.moov);
+        return {
+          movie: parseMovie(cached.faststart.brand, cached.faststart.moov),
+          mediaDataRanges: cached.mediaDataRanges,
+        };
       }
     }
   }
-  return readMovie(ra);
+  return { movie: await readMovie(ra) };
 }
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -523,7 +601,7 @@ async function readSmallFaststartMetadataProbeTracks(
         }
         const key = sourceCacheKey(src);
         if (key !== undefined && canHandoffFullMovie(src, ra)) {
-          storeFaststartMoovParseHandoff(key, brand, moov.slice());
+          storeFaststartMoovParseHandoff(key, brand, moov.slice(), await readMediaDataRanges(ra));
         }
         return toProbeTracks(movie);
       } catch {
@@ -544,7 +622,12 @@ async function readSimpleVideoFaststartProbeTracks(
   if (result === undefined) return undefined;
   const key = sourceCacheKey(src);
   if (key !== undefined && canHandoffFullMovie(src, ra)) {
-    storeFaststartMoovParseHandoff(key, result.brand, result.moov.slice());
+    storeFaststartMoovParseHandoff(
+      key,
+      result.brand,
+      result.moov.slice(),
+      await readMediaDataRanges(ra),
+    );
   }
   return result.tracks;
 }
@@ -554,6 +637,62 @@ async function readTinyAudioFaststartProbeTracks(
 ): Promise<readonly TrackInfo[] | undefined> {
   const { readTinyAudioFaststartProbe } = await loadFaststartProbeModule();
   return readTinyAudioFaststartProbe(ra);
+}
+
+/** A fragmented track whose initialization `stbl` declares no progressive samples at all. */
+function hasEmptyInitializationSampleTable(track: ParsedTrack): boolean {
+  const table = track.samples;
+  return (
+    track.moovSampleCount === 0 &&
+    table.timeToSample.length === 0 &&
+    table.compositionOffsets.length === 0 &&
+    table.sampleSizes.length === 0 &&
+    table.sampleToChunk.length === 0 &&
+    table.chunkOffsets.length === 0 &&
+    table.syncSamples.length === 0
+  );
+}
+
+/**
+ * Whether a fragmented audio initialization movie already contains authoritative presentation timing.
+ *
+ * ISO-BMFF permits a fragmented movie to retain positive final `mvhd`/`mdhd` durations even though its
+ * initial sample tables are empty. For that exact completed-audio shape, scanning every later `moof` only
+ * re-derives metadata already present in the initialization segment. Any video/non-media track, zero or
+ * contradictory duration, initial sample, or edit list keeps the existing fragment scan: video fps,
+ * hybrid timelines, and AAC gapless facts depend on fragment sample ticks.
+ */
+function hasAuthoritativeFragmentedAudioInitDuration(movie: MovieMetadata): boolean {
+  if (
+    movie.hasFragments !== true ||
+    movie.needsFragmentTiming !== true ||
+    movie.timescale <= 0 ||
+    !Number.isFinite(movie.durationSec) ||
+    movie.durationSec <= 0 ||
+    movie.tracks.length === 0 ||
+    (movie.otherTracks?.length ?? 0) > 0
+  ) {
+    return false;
+  }
+
+  let maximumTrackDurationSec = 0;
+  let durationToleranceSec = 1 / movie.timescale;
+  for (const track of movie.tracks) {
+    if (
+      track.mediaType !== 'audio' ||
+      !hasEmptyInitializationSampleTable(track) ||
+      track.edit !== undefined ||
+      track.timescale <= 0 ||
+      !Number.isFinite(track.durationSec) ||
+      track.durationSec <= 0
+    ) {
+      return false;
+    }
+    maximumTrackDurationSec = Math.max(maximumTrackDurationSec, track.durationSec);
+    durationToleranceSec = Math.max(durationToleranceSec, 1 / track.timescale);
+  }
+
+  return Math.abs(movie.durationSec - maximumTrackDurationSec) <= durationToleranceSec;
 }
 
 /** Walk the top-level boxes to find the `ftyp` brand and the `moov`, then parse it. */
@@ -583,10 +722,11 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
     if (type === 'moov') {
       const box = await ra.read(offset, size);
       const movie = parseMovie(brand, box.subarray(headerSize));
-      // Fragmented/CMAF: the `moov` sample tables are empty and the real timing lives in `moof`/`sidx`
-      // (top-level siblings of `moov`). Recover per-track duration + sample count from the fragments so
-      // probe reports a correct `durationSec`/`fps` instead of 0.
-      if (movie.tracks.some((t) => t.samples.sampleSizes.length === 0)) {
+      // Empty-table CMAF and hybrid-fragmented MP4 both carry later timing in top-level `moof`/`sidx`.
+      if (
+        movie.hasFragments === true ||
+        movie.tracks.some((t) => t.samples.sampleSizes.length === 0)
+      ) {
         return applyFragmentTiming(movie, await readWholeFile(ra, limit));
       }
       return movie;
@@ -601,6 +741,7 @@ export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
   const faststart = await readFaststartMetadata(ra);
   if (faststart !== undefined) {
     if (faststart.needsFragmentTiming) {
+      if (hasAuthoritativeFragmentedAudioInitDuration(faststart)) return faststart;
       return applyFragmentTiming(
         faststart,
         await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER),
@@ -635,6 +776,7 @@ export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
       const box = await ra.read(offset, size);
       const movie = parseMovieMetadata(brand, box.subarray(headerSize));
       if (movie.needsFragmentTiming) {
+        if (hasAuthoritativeFragmentedAudioInitDuration(movie)) return movie;
         return applyFragmentTiming(movie, await readWholeFile(ra, limit));
       }
       return movie;
@@ -669,7 +811,10 @@ export async function readMoviePacketInfo(ra: RandomAccess): Promise<Movie> {
       brand = r.fourcc();
     }
     if (type === 'moov') {
-      return parseMoviePacketInfo(brand, (await ra.read(offset, size)).subarray(headerSize));
+      const movie = parseMoviePacketInfo(brand, (await ra.read(offset, size)).subarray(headerSize));
+      return movie.hasFragments === true
+        ? applyFragmentTiming(movie, await readWholeFile(ra, limit))
+        : movie;
     }
     offset += size;
   }
@@ -681,6 +826,8 @@ async function readWholeFile(ra: RandomAccess, limit: number): Promise<Uint8Arra
   const size = ra.size ?? limit;
   if (!Number.isFinite(size))
     throw new MediaError('demux-error', 'fragmented MP4 needs a known size');
+  const retained = coveredByteView(ra.cachedWhole?.(), 0, size);
+  if (retained !== undefined) return retained;
   return ra.read(0, size);
 }
 
@@ -692,8 +839,25 @@ function muxTrackMeta(track: ParsedTrack): Omit<MuxTrackInput, 'samples'> {
     ...(track.codecPrivate ? { codecPrivate: track.codecPrivate } : {}),
     ...(track.width !== undefined ? { width: track.width } : {}),
     ...(track.height !== undefined ? { height: track.height } : {}),
+    ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
+    ...(track.displayTransform !== undefined ? { displayTransform: track.displayTransform } : {}),
     ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
     ...(track.channels !== undefined ? { channels: track.channels } : {}),
+    ...(track.edit !== undefined
+      ? {
+          edit: {
+            mediaTimeTicks: track.edit.mediaTimeTicks,
+            durationTicks: Math.round(track.edit.durationSec * track.timescale),
+            ...(track.edit.leadingEmptyDurationSec !== undefined
+              ? {
+                  leadingEmptyDurationTicks: Math.round(
+                    track.edit.leadingEmptyDurationSec * track.timescale,
+                  ),
+                }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -747,6 +911,138 @@ interface SampleRange {
   readonly size: number;
 }
 
+interface MediaDataRange {
+  /** First media byte, immediately after the top-level `mdat` header. */
+  readonly start: number;
+  /** Exclusive end of the declared top-level `mdat` box. */
+  readonly end: number;
+}
+
+/**
+ * Walk the complete ISO-BMFF top level and return every `mdat` payload range. Unknown boxes are legal;
+ * malformed/truncated headers are not. Demux needs this stronger pass because `readMovie()` can return as
+ * soon as it finds `moov`, while sample offsets may point into a later box whose header was destroyed.
+ */
+async function readMediaDataRanges(ra: RandomAccess): Promise<MediaDataRange[]> {
+  const sourceSize = ra.size;
+  if (sourceSize === undefined) {
+    throw new MediaError('demux-error', 'MP4 demux needs a known source size');
+  }
+  const cachedWhole = ra.cachedWhole?.();
+  const fullBytes =
+    cachedWhole ?? (ra.inMemory === true ? await ra.read(0, sourceSize) : undefined);
+  if (fullBytes !== undefined && fullBytes.byteLength !== sourceSize) {
+    throw new MediaError(
+      'demux-error',
+      `short in-memory MP4 read: got ${fullBytes.byteLength} of ${sourceSize} bytes`,
+    );
+  }
+  const ranges: MediaDataRange[] = [];
+  let offset = 0;
+  while (offset < sourceSize) {
+    const headerLength = Math.min(16, sourceSize - offset);
+    const header =
+      fullBytes?.subarray(offset, offset + headerLength) ?? (await ra.read(offset, headerLength));
+    if (header.byteLength < 8) {
+      throw new MediaError('demux-error', `truncated top-level MP4 box header at offset ${offset}`);
+    }
+    const reader = new Reader(header);
+    let size = reader.u32();
+    const type = reader.fourcc();
+    // ISO-BMFF boxes have a four-character-code type. 0x00000000 is a legacy QuickTime terminator only
+    // inside a sound-description `wave` atom; at file top level it is a destroyed header, not an unknown
+    // extension box. Keep every nonzero unknown type forward-compatible and skip it by its declared size.
+    if (header[4] === 0 && header[5] === 0 && header[6] === 0 && header[7] === 0) {
+      throw new MediaError('demux-error', `zero top-level MP4 box type at offset ${offset}`);
+    }
+    let headerSize = 8;
+    if (size === 1) {
+      if (header.byteLength < 16) {
+        throw new MediaError(
+          'demux-error',
+          `truncated 64-bit top-level MP4 box header at offset ${offset}`,
+        );
+      }
+      size = reader.u64();
+      headerSize = 16;
+    } else if (size === 0) {
+      size = sourceSize - offset;
+    }
+    const end = offset + size;
+    if (size < headerSize || !Number.isSafeInteger(end) || end <= offset || end > sourceSize) {
+      throw new MediaError(
+        'demux-error',
+        `invalid top-level MP4 box '${type}' range [${offset}, ${end}) for source size ${sourceSize}`,
+      );
+    }
+    if (type === 'mdat') ranges.push({ start: offset + headerSize, end });
+    offset = end;
+  }
+  return ranges;
+}
+
+function mediaDataRangeContains(
+  ranges: readonly MediaDataRange[],
+  offset: number,
+  size: number,
+): boolean {
+  const sampleEnd = offset + size;
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(size) ||
+    !Number.isSafeInteger(sampleEnd) ||
+    offset < 0 ||
+    size < 0
+  ) {
+    return false;
+  }
+  let low = 0;
+  let high = ranges.length - 1;
+  while (low <= high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const range = ranges[middle];
+    if (range === undefined) return false;
+    if (offset < range.start) {
+      high = middle - 1;
+    } else if (offset > range.end || (offset === range.end && size !== 0)) {
+      low = middle + 1;
+    } else {
+      return sampleEnd <= range.end;
+    }
+  }
+  return false;
+}
+
+/** Require every exposed sample to be physically owned by an `mdat`; valid empty tracks remain valid. */
+function validateDemuxSampleStorage(
+  movie: Movie,
+  fragmentSamples: ReadonlyMap<number, readonly Sample[]> | undefined,
+  mediaDataRanges: readonly MediaDataRange[],
+): void {
+  const validate = (index: number, offset: number, size: number): void => {
+    if (mediaDataRangeContains(mediaDataRanges, offset, size)) return;
+    throw new MediaError(
+      'demux-error',
+      `sample ${index} range [${offset}, ${offset + size}) is not inside a declared MP4 mdat`,
+    );
+  };
+  for (const track of movie.tracks) {
+    const samples = fragmentSamples?.get(track.id);
+    if (samples === undefined) {
+      const placedSamples = walkSampleRanges(track, validate);
+      const declaredSamples = track.samples.sampleSizes.length;
+      if (placedSamples !== declaredSamples) {
+        throw new MediaError(
+          'demux-error',
+          `track ${track.id} sample table declares ${declaredSamples} samples but its chunk layout places ${placedSamples}`,
+        );
+      }
+      continue;
+    }
+    for (const sample of samples) validate(sample.index, sample.offset, sample.size);
+  }
+}
+
 function validateSampleRanges(
   samples: readonly SampleRange[],
   sourceSize: number | undefined,
@@ -765,7 +1061,17 @@ function validateSampleRange(
   size: number,
   sourceSize: number | undefined,
 ): void {
-  if (offset >= 0 && size >= 0 && (sourceSize === undefined || offset + size <= sourceSize)) return;
+  const end = offset + size;
+  if (
+    Number.isSafeInteger(offset) &&
+    Number.isSafeInteger(size) &&
+    Number.isSafeInteger(end) &&
+    offset >= 0 &&
+    size >= 0 &&
+    (sourceSize === undefined || end <= sourceSize)
+  ) {
+    return;
+  }
   const sizeNote = sourceSize !== undefined ? ` size ${sourceSize}` : '';
   throw new MediaError(
     'demux-error',
@@ -811,6 +1117,61 @@ function planSampleReadWindows<T extends SampleRange>(
     windows.push(current);
   }
   return windows;
+}
+
+interface PacketReadWindow {
+  start: number;
+  end: number;
+}
+
+interface MonotonicPacketReadWindow extends PacketReadWindow {
+  lastOrdinal: number;
+}
+
+type PacketReadPlan =
+  | { readonly kind: 'monotonic'; readonly windows: readonly MonotonicPacketReadWindow[] }
+  | { readonly kind: 'ordinal'; readonly byOrdinal: readonly (PacketReadWindow | undefined)[] };
+
+/**
+ * Map decode-order packet ordinals to bounded read windows without per-sample planner objects on the
+ * ordinary monotonic MP4 layout. A legal decreasing-offset layout retains the stable general planner.
+ */
+function planPacketReadWindows(samples: readonly Sample[]): PacketReadPlan {
+  let previousOffset = Number.NEGATIVE_INFINITY;
+  for (const sample of samples) {
+    if (sample.offset < previousOffset) {
+      const byOrdinal = new Array<PacketReadWindow | undefined>(samples.length);
+      for (const window of planSampleReadWindows(samples)) {
+        for (const item of window.items) byOrdinal[item.ordinal] = window;
+      }
+      return { kind: 'ordinal', byOrdinal };
+    }
+    previousOffset = sample.offset;
+  }
+
+  const windows: MonotonicPacketReadWindow[] = [];
+  let current: MonotonicPacketReadWindow | undefined;
+  for (let ordinal = 0; ordinal < samples.length; ordinal++) {
+    const sample = samples[ordinal];
+    if (sample === undefined) break;
+    const start = sample.offset;
+    const end = start + sample.size;
+    if (current === undefined) {
+      current = { start, end, lastOrdinal: ordinal };
+      windows.push(current);
+    } else {
+      const gap = start - current.end;
+      const combinedSpan = end - current.start;
+      if (gap <= SAMPLE_READ_GAP_BYTES && combinedSpan <= SAMPLE_READ_WINDOW_BYTES) {
+        current.end = Math.max(current.end, end);
+        current.lastOrdinal = ordinal;
+      } else {
+        current = { start, end, lastOrdinal: ordinal };
+        windows.push(current);
+      }
+    }
+  }
+  return { kind: 'monotonic', windows };
 }
 
 function avcNalLengthSize(track: ParsedTrack): 1 | 2 | 4 | undefined {
@@ -937,11 +1298,15 @@ async function buildFragmentSampleDataMap(
 ): Promise<Map<number, SampleData[]> | undefined> {
   if (!movieIsFragmented(movie)) return undefined;
   const file = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+  const fragmentsByTrack = parseFragmentSamples(file);
   const out = new Map<number, SampleData[]>();
-  for (const [trackId, data] of parseFragmentSamples(file)) {
+  for (const track of movie.tracks) {
+    const fragments = fragmentsByTrack.get(track.id);
+    if (fragments === undefined || fragments.length === 0) continue;
+    const merged = mergeMoovAndFragmentSamples(buildSampleData(track), fragments);
     out.set(
-      trackId,
-      data.filter((s) => s.offset >= 0 && s.offset + s.size <= file.byteLength),
+      track.id,
+      merged.filter((s) => s.offset >= 0 && s.offset + s.size <= file.byteLength),
     );
   }
   return out;
@@ -993,6 +1358,8 @@ export function normalizeDecryptedFragmentTracks(
 }
 
 function hasCompleteSampleTables(movie: Movie): boolean {
+  // The moov-only packet-table helpers do not include later trun rows. Demux packets use the merged map.
+  if (movie.hasFragments === true) return false;
   return movie.tracks.every((track) => {
     if (track.samples.sampleSizes.length > 0) return true;
     return track.fragmentSampleCount === undefined && track.durationSec === 0;
@@ -1022,6 +1389,33 @@ interface PacketTimelineTrack {
   readonly timescale: number;
   readonly edit?: ParsedTrack['edit'];
   readonly samples: ParsedTrack['samples'];
+}
+
+/**
+ * ISO edit lists bound the presented tail. Keep leading decode pre-roll (including negative rebased
+ * timestamps) and the final sample that overlaps the edit end, but do not expose coded samples whose
+ * decode interval starts wholly after the active edit. This mirrors ffprobe packet enumeration while
+ * retaining every packet needed to decode the visible B-frame/AAC boundary.
+ */
+function sampleStartsBeforeActiveEditEnd(track: PacketTimelineTrack, dtsTicks: number): boolean {
+  const edit = track.edit;
+  if (edit === undefined || edit.durationSec <= 0 || track.timescale <= 0) return true;
+  const durationTicks = Math.max(0, Math.round(edit.durationSec * track.timescale));
+  return dtsTicks < edit.mediaTimeTicks + durationTicks;
+}
+
+function samplesWithinActiveEdit(
+  track: PacketTimelineTrack,
+  samples: readonly Sample[],
+): readonly Sample[] {
+  const edit = track.edit;
+  if (edit === undefined || edit.durationSec <= 0) return samples;
+  const editEndUs = Math.round(edit.durationSec * 1_000_000);
+  let end = samples.length;
+  while (end > 0 && (samples[end - 1]?.dtsUs ?? Number.NEGATIVE_INFINITY) >= editEndUs) {
+    end--;
+  }
+  return end === samples.length ? samples : samples.slice(0, end);
 }
 
 type DeclaredTrackEntry =
@@ -1159,18 +1553,19 @@ function appendTrackPacketMetadata(
         syncSample = syncSamples[syncIndex];
       }
       const dtsUs = ticksToUs(dtsTicks - editOffsetTicks, timescale);
-      packets[writeIndex] = {
-        trackId: track.id,
-        trackIndex,
-        size,
-        sizeBytes: size,
-        ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
-        dtsUs,
-        durationUs: ticksToUs(durationTicks, timescale),
-        keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
-      };
-
-      writeIndex++;
+      if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+        packets[writeIndex] = {
+          trackId: track.id,
+          trackIndex,
+          size,
+          sizeBytes: size,
+          ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+          dtsUs,
+          durationUs: ticksToUs(durationTicks, timescale),
+          keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+        };
+        writeIndex++;
+      }
       offset += size;
       dtsTicks += durationTicks;
       sampleIndex++;
@@ -1234,16 +1629,17 @@ function appendTrackPacketInfoBySampleOrder(
       syncIndex++;
       syncSample = syncSamples[syncIndex];
     }
-    packets[writeIndex] = {
-      trackIndex,
-      size,
-      ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
-      dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
-      durationUs: ticksToUs(durationTicks, timescale),
-      keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
-    };
-
-    writeIndex++;
+    if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+      packets[writeIndex] = {
+        trackIndex,
+        size,
+        ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+        dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+        durationUs: ticksToUs(durationTicks, timescale),
+        keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+      };
+      writeIndex++;
+    }
     dtsTicks += durationTicks;
   }
   return writeIndex;
@@ -1307,17 +1703,18 @@ function appendTrackPacketInfoMetadata(
         syncIndex++;
         syncSample = syncSamples[syncIndex];
       }
-      packets[writeIndex] = {
-        trackIndex,
-        ...(includeOffsets ? { offset } : {}),
-        size,
-        ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
-        dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
-        durationUs: ticksToUs(durationTicks, timescale),
-        keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
-      };
-
-      writeIndex++;
+      if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+        packets[writeIndex] = {
+          trackIndex,
+          ...(includeOffsets ? { offset } : {}),
+          size,
+          ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
+          dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
+          durationUs: ticksToUs(durationTicks, timescale),
+          keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
+        };
+        writeIndex++;
+      }
       offset += size;
       dtsTicks += durationTicks;
       sampleIndex++;
@@ -1709,35 +2106,50 @@ async function trimMuxTracks(
 
 function toTrackInfo(t: ParsedTrack): TrackInfo {
   const gapless = audioGaplessInfo(t);
+  const color: TrackInfo['color'] | undefined =
+    t.mediaType === 'video' && t.colr !== undefined
+      ? {
+          matrixCoefficients: t.colr.matrix,
+          transferCharacteristics: t.colr.transfer,
+          primaries: t.colr.primaries,
+          ...(t.colr.fullRange !== undefined ? { range: t.colr.fullRange ? 2 : 1 } : {}),
+        }
+      : undefined;
   return {
     id: t.id,
     mediaType: t.mediaType,
     codec: t.codec,
-    durationSec: t.durationSec,
+    durationSec: presentationDurationSec(t),
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
     ...(t.encryption !== undefined ? { encrypted: true } : {}),
+    ...(color !== undefined ? { color } : {}),
     ...(gapless !== undefined ? { gapless } : {}),
     config: t.config,
   };
 }
 
 /**
- * A fully-contained non-AAC edit is a presentation trim: report its segment duration while the media
- * duration remains longer because it includes decode pre-roll. AAC edits retain media duration because
- * their common contained edit is the separate gapless priming/padding contract exposed by `gapless`.
+ * A fully-contained non-AAC edit is a presentation trim: expose its segment duration to every demux
+ * consumer, including cross-container muxers. The media duration can be longer because it contains
+ * decode pre-roll; forwarding that raw span makes a target container declare the pre-roll as playable
+ * timeline. AAC edits retain media duration because their contained edit is the separate gapless
+ * priming/padding contract exposed by `gapless`.
  */
-function toProbeTrackInfo(track: ParsedTrack): TrackInfo {
-  const info = toTrackInfo(track);
+function presentationDurationSec(track: ParsedTrack): number {
   const edit = track.edit;
   if (edit === undefined || edit.durationSec <= 0 || isAacTrack(track) || track.timescale <= 0) {
-    return info;
+    return track.durationSec;
   }
   const editEndSec = edit.mediaTimeTicks / track.timescale + edit.durationSec;
   const containedToleranceSec = 1 / track.timescale;
   const isContainedPresentationTrim =
     edit.durationSec < track.durationSec && editEndSec <= track.durationSec + containedToleranceSec;
-  return isContainedPresentationTrim ? { ...info, durationSec: edit.durationSec } : info;
+  return isContainedPresentationTrim ? edit.durationSec : track.durationSec;
+}
+
+function toProbeTrackInfo(track: ParsedTrack): TrackInfo {
+  return toTrackInfo(track);
 }
 
 export function mp4PacketInfoTable(movie: Movie, sourceSize?: number): PacketInfoTable {
@@ -1801,10 +2213,9 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
   }
   const sampleRate = track.sampleRate;
   const scale = sampleRate / track.timescale;
-  const durationTicks = track.samples.timeToSample.reduce(
-    (total, entry) => total + entry.count * entry.delta,
-    0,
-  );
+  const durationTicks =
+    track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0) +
+    (track.fragmentMediaTicks ?? 0);
   const codedSamples =
     durationTicks > 0
       ? Math.max(0, Math.round(durationTicks * scale))
@@ -1812,10 +2223,13 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
           (total, sample) => total + Math.round(sample.durationTicks * scale),
           0,
         );
-  const leadingSamples = Math.max(0, Math.round(track.edit.mediaTimeTicks * scale));
-  const totalSamples = Math.max(0, Math.round(track.edit.durationSec * sampleRate));
-  const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
-  return { leadingSamples, trailingSamples, totalSamples };
+  return gaplessFromMp4Edit(
+    track.edit.mediaTimeTicks,
+    track.edit.durationSec,
+    sampleRate,
+    track.timescale,
+    codedSamples,
+  );
 }
 
 /**
@@ -1840,80 +2254,112 @@ function packetStream(
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
   // Fragmented tracks carry no `moov` sample table; the demuxer pre-builds their samples from the
   // `moof`/`traf`/`trun` runs (fragment-samples.ts) and passes them here.
-  const samples = precomputedSamples ?? buildSamples(track);
-  validateSampleRanges(samples, ra.size);
-  const windows = planSampleReadWindows(samples);
-  const windowByOrdinal = new Array<SampleReadWindow<Sample> | undefined>(samples.length);
-  for (const window of windows) {
-    for (const item of window.items) windowByOrdinal[item.ordinal] = window;
-  }
+  const samples = samplesWithinActiveEdit(track, precomputedSamples ?? buildSamples(track));
+  // `demux()` proved these same immutable progressive tables or merged fragment samples safe before
+  // exposing the Demuxer. Re-scanning every range when a consumer opens its packet stream is redundant.
+  const readPlan = planPacketReadWindows(samples);
   const isVideo = track.mediaType === 'video';
   let i = 0;
-  let currentWindow: SampleReadWindow<Sample> | undefined;
+  let plannedWindowIndex = 0;
+  let cancelled = false;
+  let currentWindow: PacketReadWindow | undefined;
   let currentBytes: Uint8Array | undefined;
+  const enqueueSample = (
+    controller: ReadableStreamDefaultController<Packet>,
+    sample: Sample,
+    window: PacketReadWindow,
+    bytes: Uint8Array,
+  ): void => {
+    const rel = sample.offset - window.start;
+    const data = bytes.subarray(rel, rel + sample.size);
+    const init = {
+      type: (sample.keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+      timestamp: sample.ptsUs,
+      duration: sample.durationUs,
+      data,
+    };
+    const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+    controller.enqueue({
+      chunk,
+      data,
+      dtsUs: sample.dtsUs,
+      sizeBytes: sample.size,
+    });
+  };
   return new ReadableStream<Packet>({
-    async pull(controller): Promise<void> {
+    pull(controller): void | Promise<void> {
       if (signal?.aborted) {
         controller.error(abortedError());
         return;
       }
-      const sample = samples[i];
+      const ordinal = i;
+      const sample = samples[ordinal];
       if (sample === undefined) {
         controller.close();
         return;
       }
-      i++;
-      const window = windowByOrdinal[sample.index];
+      i = ordinal + 1;
+      let window: PacketReadWindow | undefined;
+      if (readPlan.kind === 'ordinal') {
+        window = readPlan.byOrdinal[ordinal];
+      } else {
+        let monotonicWindow = readPlan.windows[plannedWindowIndex];
+        if (monotonicWindow !== undefined && ordinal > monotonicWindow.lastOrdinal) {
+          plannedWindowIndex++;
+          monotonicWindow = readPlan.windows[plannedWindowIndex];
+        }
+        window = monotonicWindow;
+      }
       if (window === undefined) {
         throw new MediaError(
           'demux-error',
           `sample ${sample.index} has no read window (internal read plan error)`,
         );
       }
-      if (window !== currentWindow) {
-        currentBytes = await ra.read(window.start, window.end - window.start);
+      if (window === currentWindow && currentBytes !== undefined) {
+        enqueueSample(controller, sample, window, currentBytes);
+        return;
+      }
+
+      const windowLength = window.end - window.start;
+      const retained = coveredByteView(ra.cachedWhole?.(), window.start, windowLength);
+      if (retained !== undefined) {
+        currentWindow = window;
+        currentBytes = retained;
+        enqueueSample(controller, sample, window, retained);
+        return;
+      }
+
+      return ra.read(window.start, windowLength).then((bytes): void => {
+        if (cancelled) return;
         throwIfAborted(signal);
-        if (currentBytes.byteLength !== window.end - window.start) {
+        if (bytes.byteLength !== windowLength) {
           throw new MediaError(
             'demux-error',
             `sample window [${window.start}, ${window.end}) short read: got ${
-              currentBytes.byteLength
-            } of ${window.end - window.start} bytes (truncated MP4)`,
+              bytes.byteLength
+            } of ${windowLength} bytes (truncated MP4)`,
           );
         }
         currentWindow = window;
-      }
-      const bytes = currentBytes;
-      if (bytes === undefined) {
-        throw new MediaError(
-          'demux-error',
-          'sample window bytes are missing (internal read error)',
-        );
-      }
-      const rel = sample.offset - window.start;
-      const data = bytes.subarray(rel, rel + sample.size);
-      const init = {
-        type: (sample.keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
-        timestamp: sample.ptsUs,
-        duration: sample.durationUs,
-        data,
-      };
-      const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
-      controller.enqueue({
-        chunk,
-        data,
-        dtsUs: sample.dtsUs,
-        sizeBytes: sample.size,
+        currentBytes = bytes;
+        enqueueSample(controller, sample, window, bytes);
       });
+    },
+    cancel(): void {
+      cancelled = true;
+      currentWindow = undefined;
+      currentBytes = undefined;
     },
   });
   /* v8 ignore stop */
 }
 
-/** True when the movie is fragmented: at least one track has an empty `moov` sample table. */
+/** True when `mvex`/parsed fragment timing says later `moof` runs extend the movie. */
 function movieIsFragmented(movie: Movie): boolean {
-  return movie.tracks.some(
-    (t) => t.samples.sampleSizes.length === 0 && (t.fragmentSampleCount ?? 0) > 0,
+  return (
+    movie.hasFragments === true ||
+    movie.tracks.some((t) => t.samples.sampleSizes.length === 0 && (t.fragmentSampleCount ?? 0) > 0)
   );
 }
 
@@ -1932,8 +2378,9 @@ async function buildFragmentSampleMap(
   const byTrack = parseFragmentSamples(file);
   const out = new Map<number, Sample[]>();
   for (const track of movie.tracks) {
-    const data = byTrack.get(track.id);
-    if (data === undefined || data.length === 0) continue;
+    const fragments = byTrack.get(track.id);
+    if (fragments === undefined || fragments.length === 0) continue;
+    const data = mergeMoovAndFragmentSamples(buildSampleData(track), fragments);
     out.set(
       track.id,
       fragmentSamplesToDemuxSamples(
@@ -2182,8 +2629,11 @@ function oneShot(bytes: Uint8Array): ReadableStream<Uint8Array> {
  * (init segment, then one `moof`+`mdat` media segment per pull) so a `StreamTarget` writes each segment as
  * it is produced and peak memory stays bounded to a single fragment — never buffering the whole movie.
  */
-function fragmentedStream(tracks: readonly MuxTrackInput[]): ReadableStream<Uint8Array> {
-  const segments = fragmentMp4(tracks);
+function fragmentedStream(
+  tracks: readonly MuxTrackInput[],
+  movieTimescale: number,
+): ReadableStream<Uint8Array> {
+  const segments = fragmentMp4(tracks, { movieTimescale });
   return new ReadableStream<Uint8Array>({
     pull(controller): void {
       const { done, value } = segments.next();
@@ -2225,9 +2675,13 @@ export function planLazySampleDataFragmentRuns(
   return runs;
 }
 
-function lazyFragmentTracksFromMovie(ra: RandomAccess, movie: Movie): LazyFragmentTrack[] {
+function lazyFragmentTracksFromMovie(
+  ra: RandomAccess,
+  movie: Movie,
+  fragmentSamples?: Map<number, SampleData[]>,
+): LazyFragmentTrack[] {
   const tracks = movie.tracks.map((track): LazyFragmentTrack => {
-    const samples = buildSampleData(track);
+    const samples = fragmentSamples?.get(track.id) ?? buildSampleData(track);
     validateSampleRanges(samples, ra.size);
     return { metadata: muxTrackMeta(track), samples };
   });
@@ -2422,10 +2876,11 @@ async function lazyProgressiveTrimTracksFromMovie(
 function progressiveLayoutFromTracks(
   tracks: readonly LazyProgressiveTrack[],
   o: StreamCopyOptions | undefined,
+  movieTimescale: number,
 ): Mp4ByteStreamLayout {
   return planMp4ByteStreamLayout(
     tracks.map((track) => track.metadata),
-    { faststart: o?.faststart ?? true, brand: brandFor(o?.container) },
+    { faststart: o?.faststart ?? true, brand: brandFor(o?.container), movieTimescale },
   );
 }
 
@@ -2461,10 +2916,11 @@ async function* progressiveSegmentsFromTracks(
   ra: RandomAccess,
   tracks: readonly LazyProgressiveTrack[],
   o: StreamCopyOptions | undefined,
+  movieTimescale: number,
   payloadSamples?: readonly InterleavedPayloadSample[],
 ): AsyncGenerator<Uint8Array, void, undefined> {
   const signal = o?.signal;
-  const layout = progressiveLayoutFromTracks(tracks, o);
+  const layout = progressiveLayoutFromTracks(tracks, o, movieTimescale);
 
   throwIfAborted(signal);
   yield layout.ftyp;
@@ -2491,9 +2947,10 @@ async function materializeProgressiveTracksBytes(
   ra: RandomAccess,
   tracks: readonly LazyProgressiveTrack[],
   o: StreamCopyOptions | undefined,
+  movieTimescale: number,
 ): Promise<Uint8Array> {
   const signal = o?.signal;
-  const layout = progressiveLayoutFromTracks(tracks, o);
+  const layout = progressiveLayoutFromTracks(tracks, o, movieTimescale);
 
   throwIfAborted(signal);
   const out = new Uint8Array(layout.totalLen);
@@ -2696,10 +3153,16 @@ async function* progressiveSourceSegments(
   const tracks = lazyProgressiveTracksFromMovie(ra, movie, fragmentSamples);
   const interleaved = sourceOrderInterleavedPlan(tracks);
   if (interleaved !== undefined) {
-    yield* progressiveSegmentsFromTracks(ra, interleaved.tracks, o, interleaved.samples);
+    yield* progressiveSegmentsFromTracks(
+      ra,
+      interleaved.tracks,
+      o,
+      movie.timescale,
+      interleaved.samples,
+    );
     return;
   }
-  yield* progressiveSegmentsFromTracks(ra, tracks, o);
+  yield* progressiveSegmentsFromTracks(ra, tracks, o, movie.timescale);
 }
 
 async function* trimmedProgressiveSourceSegments(
@@ -2720,6 +3183,7 @@ async function* trimmedProgressiveSourceSegments(
       validationCacheBase,
     ),
     o,
+    movie.timescale,
   );
 }
 
@@ -2785,6 +3249,7 @@ async function materializeProgressiveSourceBytes(
     ra,
     lazyProgressiveTracksFromMovie(ra, movie, fragmentSamples),
     o,
+    movie.timescale,
   );
 }
 
@@ -2806,6 +3271,7 @@ async function materializeTrimmedProgressiveSourceBytes(
       validationCacheBase,
     ),
     o,
+    movie.timescale,
   );
 }
 
@@ -2918,9 +3384,10 @@ function fragmentedSourceStream(
   ra: RandomAccess,
   movie: Movie,
   o: StreamCopyOptions | undefined,
+  fragmentSamples?: Map<number, SampleData[]>,
 ): ReadableStream<Uint8Array> {
   const signal = o?.signal;
-  const tracks = lazyFragmentTracksFromMovie(ra, movie);
+  const tracks = lazyFragmentTracksFromMovie(ra, movie, fragmentSamples);
   const targetSamples =
     o?.buffered === true ? LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES : LAZY_FRAGMENT_TARGET_SAMPLES;
   const hardVideoSamples =
@@ -2950,7 +3417,14 @@ function fragmentedSourceStream(
           return;
         }
         if (!emittedInit) {
-          controller.enqueue(fragmentMp4InitSegment(tracks.map((track) => track.metadata)));
+          controller.enqueue(
+            fragmentMp4InitSegment(
+              tracks.map((track) => track.metadata),
+              {
+                movieTimescale: movie.timescale,
+              },
+            ),
+          );
           emittedInit = true;
           return;
         }
@@ -3047,7 +3521,7 @@ export const Mp4Driver: ContainerDriver = {
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);
-    const movie = await readMovieForDemux(src, ra);
+    const { movie, mediaDataRanges } = await readMovieForDemux(src, ra);
     const byId = new Map(movie.tracks.map((t) => [t.id, t]));
     const signal = o?.signal;
     const supportsPacketTable = hasCompleteSampleTables(movie);
@@ -3055,6 +3529,13 @@ export const Mp4Driver: ContainerDriver = {
     // Recover each track's flat sample list once so `packets()` streams real samples (without it the
     // demuxer emits nothing and decode/convert produce empty output). Progressive files skip this.
     const fragmentSamples = await buildFragmentSampleMap(movie, ra);
+    // A keyed probe handoff carries the already-validated mdat map, preserving the zero-I/O handoff while
+    // applying the same sample-ownership invariant as a cold demux.
+    validateDemuxSampleStorage(
+      movie,
+      fragmentSamples,
+      mediaDataRanges ?? (await readMediaDataRanges(ra)),
+    );
     return {
       tracks: movie.tracks.map(toTrackInfo),
       ...(supportsPacketTable
@@ -3092,7 +3573,7 @@ export const Mp4Driver: ContainerDriver = {
       if (compatibleBrandRewrite !== undefined) return oneShot(compatibleBrandRewrite);
     }
     if (o?.fragmented === true && trim === undefined) {
-      return fragmentedSourceStream(ra, movie, o);
+      return fragmentedSourceStream(ra, movie, o, await buildFragmentSampleDataMap(movie, ra));
     }
     if (o?.streaming === true && trim === undefined) {
       return progressiveSourceStream(ra, movie, o);
@@ -3112,10 +3593,11 @@ export const Mp4Driver: ContainerDriver = {
     // Fragmented/CMAF output (ADR-034): a sequence of self-describing `moof`+`mdat` segments after the
     // init segment, streamed one at a time so a StreamTarget never buffers the whole movie. The lossless
     // sample copy (DTS/ctts/codec-private preserved) is identical; only the on-disk box layout differs.
-    if (o?.fragmented === true) return fragmentedStream(tracks);
+    if (o?.fragmented === true) return fragmentedStream(tracks, movie.timescale);
     const bytes = writeMp4(tracks, {
       faststart: o?.faststart ?? true,
       brand: brandFor(o?.container),
+      movieTimescale: movie.timescale,
     });
     return oneShot(bytes);
   },
@@ -3157,6 +3639,43 @@ export const Mp4Driver: ContainerDriver = {
       };
       const clearMovie = await readMovie(clearRa);
       const clearTracks = await muxTracksFromMovie(clearRa, clearMovie);
+      // AES-CTR authenticates neither its IV nor its ciphertext. A structurally valid `senc` IV mutation
+      // therefore decrypts to garbage without tripping the box parser. Progressive CENC already validates
+      // every recovered AVC access unit below; fragmented CENC must cross the same browser codec boundary
+      // before any output is exposed. `MuxTrackInput` retains exact duration/CTO/keyframe data but not
+      // absolute DTS, so rebuild its decode-order clock by accumulating durations (the same `stts` model).
+      const protectedTrackIds = new Set(
+        movie.tracks.filter((track) => track.encryption !== undefined).map((track) => track.id),
+      );
+      for (let index = 0; index < clearMovie.tracks.length; index++) {
+        const parsed = clearMovie.tracks[index];
+        const track = clearTracks[index];
+        if (parsed === undefined || track === undefined || !protectedTrackIds.has(parsed.id))
+          continue;
+        let dtsTicks = 0;
+        const validationSamples: SampleData[] = track.samples.map((sample, sampleIndex) => {
+          const selected: SampleData = {
+            index: sampleIndex,
+            offset: 0,
+            size: sample.data.byteLength,
+            dtsTicks,
+            durationTicks: sample.durationTicks,
+            cttsTicks: sample.cttsTicks,
+            keyframe: sample.keyframe,
+          };
+          dtsTicks += sample.durationTicks;
+          return selected;
+        });
+        await verifyTrimmedAvcDecodeIfAvailable(
+          parsed,
+          validationSamples,
+          track.samples,
+          o.signal,
+          undefined,
+          'fragmented CENC decrypt',
+          validationSamples.length,
+        );
+      }
       const normalizedTracks = normalizeDecryptedFragmentTracks(clearTracks);
       if (normalizedTracks.every((track, index) => track === clearTracks[index])) {
         return oneShot(decrypted);

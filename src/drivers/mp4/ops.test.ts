@@ -352,7 +352,9 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     for (const track of sourceMovie.tracks) {
       expect(buildSampleData(track).length).toBe(0);
     }
-    const expected = (await muxTracksFromMovie(ra(source), sourceMovie)).map((t) => t.samples.length);
+    const expected = (await muxTracksFromMovie(ra(source), sourceMovie)).map(
+      (t) => t.samples.length,
+    );
     expect(expected.length).toBeGreaterThan(0);
     expect(expected.every((count) => count > 0)).toBe(true);
 

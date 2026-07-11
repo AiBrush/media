@@ -6,6 +6,11 @@
  */
 
 import { MediaError } from '../../contracts/errors.ts';
+import {
+  type Mp4DisplayTransform,
+  mp4DisplayDimensionWord,
+  mp4MatrixFromClockwiseRotation,
+} from './display-transform.ts';
 
 const u8 = (n: number): number[] => [n & 0xff];
 const u16 = (n: number): number[] => [(n >>> 8) & 0xff, n & 0xff];
@@ -85,6 +90,10 @@ export interface MuxTrackInput {
   description?: Uint8Array;
   width?: number;
   height?: number;
+  /** Container-neutral clockwise display rotation, used only when no raw source transform is present. */
+  rotation?: number;
+  /** Opaque source `tkhd` metadata; takes precedence over synthesized scalar rotation and dimensions. */
+  displayTransform?: Mp4DisplayTransform;
   sampleRate?: number;
   channels?: number;
   /** When set, the track is written as CENC-protected (the samples must already be ciphertext). */
@@ -185,6 +194,17 @@ function sampleByteLength(sample: MuxSampleInput | MuxSampleLayoutInput): number
 
 function trackDurationTicks(track: MuxTrackLayoutInput): number {
   return track.samples.reduce((a, s) => a + s.durationTicks, 0);
+}
+
+function tkhdDisplayFields(track: MuxTrackLayoutInput): number[] {
+  const raw = track.displayTransform;
+  const matrix =
+    raw?.matrix ?? mp4MatrixFromClockwiseRotation(track.rotation, track.width, track.height);
+  return cat(
+    ...matrix.map((word) => u32(word)),
+    u32(raw?.width16_16 ?? mp4DisplayDimensionWord(track.width)),
+    u32(raw?.height16_16 ?? mp4DisplayDimensionWord(track.height)),
+  );
 }
 
 function trackMovieDurationTicks(track: MuxTrackLayoutInput, movieTimescale: number): number {
@@ -411,9 +431,7 @@ function trak(
       u16(0),
       u16(isVideo ? 0 : 0x0100),
       u16(0), // layer + altgroup + volume + reserved
-      IDENTITY_MATRIX,
-      u32((track.width ?? 0) * 65536),
-      u32((track.height ?? 0) * 65536),
+      tkhdDisplayFields(track),
     ),
   );
 

@@ -12,8 +12,10 @@
  */
 
 import type {
+  CodecQuery,
   DecoderConfig,
   EncodedChunk,
+  EncoderConfig,
   Packet,
   RawFrame,
   StageOptions,
@@ -22,6 +24,7 @@ import type {
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
+import type { GaplessNativeSuppressionProbe } from './gapless-native-suppression.ts';
 import {
   RGBA_BYTES_PER_PIXEL,
   type VpxAlphaPackedSourceFormat,
@@ -335,6 +338,36 @@ export function normalizeDecoderCodec(config: {
     return hevcCodecStringFromDescription(config.description) ?? codec;
   }
   return codec;
+}
+
+/** Codec-router query for one demuxed track, with its codec string normalized for WebCodecs. */
+export async function decodeQueryFor(
+  track: TrackInfo,
+): Promise<CodecQuery & { readonly direction: 'decode'; readonly config: DecoderConfig }> {
+  const config = track.config;
+  if (config === undefined) {
+    throw new MediaError('decode-error', `track ${track.id} has no decoder config`);
+  }
+  const codec = normalizeDecoderCodec(config);
+  return {
+    mediaType: track.mediaType,
+    direction: 'decode',
+    config: codec === config.codec ? config : { ...config, codec },
+  };
+}
+
+/** Codec-router query for an encoder config, inferring media type from its structural geometry. */
+export function encodeQueryFor(config: EncoderConfig): CodecQuery {
+  const mediaType: 'video' | 'audio' = 'width' in config && 'height' in config ? 'video' : 'audio';
+  return { mediaType, direction: 'encode', config };
+}
+
+/** Assert that a live encoder published the decoder config required to author its container track. */
+export function requireEncoderConfig<T>(config: T | undefined, media: 'video' | 'audio'): T {
+  if (config === undefined) {
+    throw new MediaError('encode-error', `${media} encoder emitted a chunk before config`);
+  }
+  return config;
 }
 
 /** The public video token a WebCodecs/MP4 codec string denotes (`avc1.*`→`h264`), for preserve-source. */
@@ -959,6 +992,7 @@ export function videoTrackInfoFromDecoderConfig(
   config: VideoDecoderConfig,
   fps: number | undefined,
   durationSec?: number,
+  rotation?: number,
 ): TrackInfo {
   return {
     id: 0, // overwritten by the muxer's own id allocation; addTrack returns the real id
@@ -967,6 +1001,7 @@ export function videoTrackInfoFromDecoderConfig(
     config,
     ...(fps !== undefined ? { fps } : {}),
     ...(durationSec !== undefined ? { durationSec } : {}),
+    ...(rotation !== undefined ? { rotation } : {}),
   };
 }
 
@@ -1003,6 +1038,37 @@ export function frameSatisfiesSeek(timestampUs: number, targetUs: number): boole
 // These compose real streams but touch only `.timestamp`/`.type` and `close()` on the items, so they run
 // and are unit-tested in Node with fake frame/chunk objects (no WebCodecs construction); the live
 // round-trips with real `VideoFrame`s are validated in the browser harness (BUILD §6.1).
+
+/** Apply parsed encoder-delay/padding facts to a decoded audio stream, or preserve identity when absent. */
+export async function decodedAudioStreamWithGapless(
+  frames: ReadableStream<AudioData>,
+  track: TrackInfo,
+  suppressionProbe?: GaplessNativeSuppressionProbe,
+): Promise<ReadableStream<AudioData>> {
+  if (track.gapless === undefined) return frames;
+  let gapless = track.gapless;
+  const leadingSamples = gapless.leadingSamples;
+  const config = track.config;
+  if (
+    suppressionProbe !== undefined &&
+    gapless.basis === 'mp4-edit-list' &&
+    leadingSamples !== undefined &&
+    config !== undefined &&
+    'sampleRate' in config
+  ) {
+    const { nativeSuppressedMp4EditSamples } = await import('./gapless-native-suppression.ts');
+    const nativeSuppressed = await nativeSuppressedMp4EditSamples(
+      suppressionProbe,
+      leadingSamples,
+      config.sampleRate,
+    );
+    if (nativeSuppressed > 0) {
+      gapless = { ...gapless, leadingSamples: Math.max(0, leadingSamples - nativeSuppressed) };
+    }
+  }
+  const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
+  return trimAudioGaplessFrameStream(frames, gapless, restampAudioDataRange);
+}
 
 /** The minimal `Muxer` surface {@link drainEncoderToMuxer} needs (addTrack + write a {@link Packet}). */
 export interface MuxerSink {
@@ -1668,6 +1734,74 @@ export async function drainEncoderToMuxer(
   } finally {
     reader.releaseLock();
   }
+}
+
+/**
+ * Scan to the last keyframe at/before `targetUs`, then continue through the same reader. The bounded
+ * buffer holds only the current GOP and cancellation propagates to the packet producer.
+ */
+export async function startAtSeekKeyframe(
+  packets: ReadableStream<EncodedChunk>,
+  targetUs: number,
+): Promise<ReadableStream<EncodedChunk>> {
+  const reader = packets.getReader();
+  const head: EncodedChunk[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value.type === 'key' && value.timestamp <= targetUs) {
+      head.length = 0;
+      head.push(value);
+    } else {
+      head.push(value);
+    }
+    if (value.timestamp > targetUs) break;
+  }
+  return continueSeekStream(reader, head);
+}
+
+/** Packet-preserving variant of {@link startAtSeekKeyframe} for VPx alpha side data. */
+export async function startAtSeekKeyframePackets(
+  packets: ReadableStream<Packet>,
+  targetUs: number,
+): Promise<ReadableStream<Packet>> {
+  const reader = packets.getReader();
+  const head: Packet[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value.chunk.type === 'key' && value.chunk.timestamp <= targetUs) {
+      head.length = 0;
+      head.push(value);
+    } else {
+      head.push(value);
+    }
+    if (value.chunk.timestamp > targetUs) break;
+  }
+  return continueSeekStream(reader, head);
+}
+
+function continueSeekStream<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  head: readonly T[],
+): ReadableStream<T> {
+  return new ReadableStream<T>({
+    start(controller): void {
+      for (const value of head) controller.enqueue(value);
+    },
+    async pull(controller): Promise<void> {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        reader.releaseLock();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
 }
 
 /**

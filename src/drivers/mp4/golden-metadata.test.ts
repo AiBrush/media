@@ -21,7 +21,7 @@ const MP4S = [
 ];
 
 const HARNESS_MEDIA = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/scenarios/performance/',
+  '../../../../media-test/fixtures/media/scenarios/performance/',
   import.meta.url,
 ).pathname;
 

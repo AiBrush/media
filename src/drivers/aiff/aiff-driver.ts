@@ -9,7 +9,6 @@
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -25,13 +24,13 @@ import {
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { type PcmAudio, bytesPerSample } from '../../dsp/pcm.ts';
 import { fromURL } from '../../sources/source.ts';
+import { rejectRawPcmChunkMux } from '../audio-container-mux-validation.ts';
+import { matchesAiff } from '../audio-container-sniff.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { trySliceAiffPcm } from './aiff-slice.ts';
 import { locate, parseAiff, readAiffPcm } from './aiff.ts';
 
-const AIFF_MIMES = new Set(['audio/aiff', 'audio/x-aiff', 'audio/aifc', 'audio/x-aifc']);
-const AIFF_EXTENSIONS = new Set(['aiff', 'aif', 'aifc']);
 const AIFF_PACKET_INFO_HEAD_BYTES = 65536;
 const AIFF_PACKET_TARGET_BYTES = 4096;
 const AIFF_PACKET_INFO_PREFIX_TTL_MS = 60_000;
@@ -51,21 +50,6 @@ interface AiffPacketInfoPrefixCacheEntry {
 }
 
 const aiffPacketInfoPrefixCache = new Map<string, AiffPacketInfoPrefixCacheEntry>();
-
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
-  return out;
-}
-
-/** True iff the head is a `FORM…AIFF`/`AIFC` group. */
-function isAiffHead(head: Uint8Array): boolean {
-  return (
-    head.byteLength >= 12 &&
-    ascii(head, 0, 4) === 'FORM' &&
-    (ascii(head, 8, 4) === 'AIFF' || ascii(head, 8, 4) === 'AIFC')
-  );
-}
 
 async function readHead(src: ByteSource, n: number): Promise<Uint8Array> {
   if (src.range) return src.range(0, Math.min(n, src.size ?? n));
@@ -246,18 +230,12 @@ export async function aiffPacketInfoFromUrl(
   );
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && AIFF_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && AIFF_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  return q.head !== undefined && isAiffHead(q.head);
-}
-
 export const AiffDriver: ContainerDriver = {
   id: 'aiff',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['aiff'],
-  supports: matches,
+  supports: matchesAiff,
   async demux(src: ByteSource): Promise<Demuxer> {
     const info = parseAiff(await readHead(src, 65536));
     const track = aiffTrackInfo(info);
@@ -324,10 +302,7 @@ export const AiffDriver: ContainerDriver = {
   createMuxer(): Muxer {
     // AIFF carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is
     // produced by `transformPcm` (writeAiff) — the audio-dsp path (ADR-022), exactly like WAV.
-    throw new MediaError(
-      'mux-error',
-      'aiff output flows through transformPcm (PCM), not the chunk seam',
-    );
+    return rejectRawPcmChunkMux('aiff');
   },
 };
 

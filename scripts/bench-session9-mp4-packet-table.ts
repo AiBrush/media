@@ -19,7 +19,7 @@ import type { Movie } from '../src/drivers/mp4/parse.ts';
 const WARMUP = 2;
 const ITERS = 7;
 const DEFAULT_FIXTURE = new URL(
-  '../../media-test/media-browser-test/fixtures/media/massive_h264_1080p_2h.mp4',
+  '../../media-test/fixtures/media/massive_h264_1080p_2h.mp4',
   import.meta.url,
 ).pathname;
 

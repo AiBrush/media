@@ -326,7 +326,7 @@ describe('simple MP4 faststart probes', () => {
     await expect(readSimpleVideoFaststartProbe(ra(bytes))).resolves.toBeUndefined();
   });
 
-  it('parses tiny audio version-2 geometry, nested wave/esds config, and version-1 edit timing', async () => {
+  it('uses nested ASC over stale version-2 geometry and converts version-1 edit timing', async () => {
     const tracks = await readTinyAudioFaststartProbe(ra(tinyAudioMovieWithV2WaveEsds()));
 
     expect(tracks).toHaveLength(1);
@@ -336,15 +336,17 @@ describe('simple MP4 faststart probes', () => {
       codec: 'mp4a.40.2',
       durationSec: 4096 / 48000,
       gapless: {
-        leadingSamples: 1024,
+        basis: 'mp4-edit-list',
+        // The outer entry/edit clock is 48 kHz, while ASC 12 10 authoritatively declares 44.1 kHz.
+        leadingSamples: 941,
         trailingSamples: 0,
-        totalSamples: 3072,
+        totalSamples: 2822,
       },
     });
     expect(tracks?.[0]?.config).toMatchObject({
       codec: 'mp4a.40.2',
-      sampleRate: 48000,
-      numberOfChannels: 6,
+      sampleRate: 44100,
+      numberOfChannels: 2,
     });
   });
 

@@ -526,10 +526,7 @@ class WebGPURenderer implements Renderer {
   render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
     const gpu = this.gpu;
     if (gpu === undefined) throw new MediaError('encode-error', 'WebGPU renderer already disposed');
-    if (
-      recipe.kind !== 'color' &&
-      webgpuGeometryNeedsCanvasColorManagement(source.colorSpace)
-    ) {
+    if (recipe.kind !== 'color' && webgpuGeometryNeedsCanvasColorManagement(source.colorSpace)) {
       return this.colorManagedGeometry.render(source, recipe);
     }
     const dims = recipeDims(recipe);

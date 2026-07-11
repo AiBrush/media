@@ -9,8 +9,7 @@ import { parseWebm, webmPacketPayloadInfoFromBytes } from '../src/drivers/webm/w
 
 const WARMUP = 2;
 const SAMPLES = 9;
-const CORPUS = new URL('../../media-test/media-browser-test/fixtures/media/', import.meta.url)
-  .pathname;
+const CORPUS = new URL('../../media-test/fixtures/media/', import.meta.url).pathname;
 const SUBJECTS = [
   'h264_in_mkv.mkv',
   'scenarios/demux/h264_in_mkv/01.mkv',

@@ -13,7 +13,7 @@ import { WebmDriver } from '../src/drivers/webm/webm-driver.ts';
 const WARMUP = 2;
 const ITERS = 9;
 const DEFAULT_FIXTURE = new URL(
-  '../../media-test/media-browser-test/fixtures/media/massive_vp9_1080p_2h.webm',
+  '../../media-test/fixtures/media/massive_vp9_1080p_2h.webm',
   import.meta.url,
 ).pathname;
 

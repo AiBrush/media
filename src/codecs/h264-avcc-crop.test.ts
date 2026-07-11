@@ -13,7 +13,9 @@ const AVCC_864 = fromHex(
 function fromHex(hex: string): Uint8Array {
   if (hex.length % 2 !== 0) throw new Error('odd test hex');
   return Uint8Array.from(
-    Array.from({ length: hex.length / 2 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16)),
+    Array.from({ length: hex.length / 2 }, (_, index) =>
+      Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+    ),
   );
 }
 

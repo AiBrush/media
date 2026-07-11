@@ -16,7 +16,12 @@ import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
-import { type SourceGeometry, buildVideoEncoderConfig, videoCodecToken } from './codec-pipeline.ts';
+import {
+  type SourceGeometry,
+  buildVideoEncoderConfig,
+  outputDimensions,
+  videoCodecToken,
+} from './codec-pipeline.ts';
 import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
 
 /**
@@ -87,27 +92,63 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
 
 /**
  * Cost evidence for router selection of browser video filters. Some filter specs, notably full-frame
- * colour ops (`colorspace`/`tonemap`) do not carry dimensions themselves, so the engine passes the source
- * track geometry and duration here rather than letting the router assume a normal-sized workload.
+ * colour ops (`colorspace`/`tonemap`) do not carry dimensions themselves. Duration also cannot represent
+ * the work of even one large frame, so the estimate combines source reads and destination writes over the
+ * greater of the source and requested output cadence. Unknown cadence uses the encoder's 30 fps planning
+ * default; unknown duration conservatively represents at least one frame.
  */
-export function videoFilterRouteCost(src: SourceGeometry): RouteCost {
-  const outputPixels =
-    src.width !== undefined &&
-    src.height !== undefined &&
-    Number.isFinite(src.width) &&
-    Number.isFinite(src.height) &&
-    src.width > 0 &&
-    src.height > 0
-      ? src.width * src.height
+export function videoFilterRouteCost(target: VideoTarget, src: SourceGeometry): RouteCost {
+  const inputPixels = positivePixelArea(src.width, src.height);
+  const output = outputDimensions(target, src);
+  const outputPixels = positivePixelArea(output.width, output.height);
+  const mediaSeconds = positiveFinite(src.durationSec);
+  const sourceFps = positiveFinite(src.fps) ?? 0;
+  const targetFps = positiveFinite(target.fps) ?? 0;
+  const estimatedFps = Math.max(sourceFps, targetFps) || 30;
+  const estimatedFrameCount =
+    mediaSeconds === undefined ? 1 : Math.ceil(mediaSeconds * estimatedFps);
+  const videoFrames = Number.isSafeInteger(estimatedFrameCount)
+    ? Math.max(1, estimatedFrameCount)
+    : Number.MAX_SAFE_INTEGER;
+  const pixelsPerFrame =
+    inputPixels !== undefined && outputPixels !== undefined
+      ? inputPixels + outputPixels
       : undefined;
-  const mediaSeconds =
-    src.durationSec !== undefined && Number.isFinite(src.durationSec) && src.durationSec > 0
-      ? src.durationSec
-      : undefined;
+  const rawPixelWork = pixelsPerFrame !== undefined ? pixelsPerFrame * videoFrames : undefined;
+  const videoPixelWork =
+    rawPixelWork === undefined
+      ? undefined
+      : Number.isFinite(rawPixelWork) && rawPixelWork > 0
+        ? rawPixelWork
+        : Number.MAX_VALUE;
   return {
+    ...(inputPixels !== undefined ? { inputPixels } : {}),
     ...(outputPixels !== undefined ? { outputPixels } : {}),
+    ...(videoPixelWork !== undefined ? { videoFrames, videoPixelWork } : {}),
     ...(mediaSeconds !== undefined ? { mediaSeconds } : {}),
   };
+}
+
+function positivePixelArea(
+  width: number | undefined,
+  height: number | undefined,
+): number | undefined {
+  if (
+    width === undefined ||
+    height === undefined ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return undefined;
+  }
+  const area = width * height;
+  return Number.isFinite(area) && area > 0 ? area : undefined;
+}
+
+function positiveFinite(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 // ============ video fps retiming (decoded presentation frames → CFR) ============

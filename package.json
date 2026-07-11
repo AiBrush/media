@@ -64,6 +64,7 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:dist": "vitest run src/dist-smoke.test.ts",
+    "test:deficit-generator": "node --test docs/perf/gen-deficits.test.mjs",
     "build": "tsup",
     "vendor-wasm": "bun run scripts/vendor-wasm.ts",
     "vendor-wasm:check": "bun run scripts/vendor-wasm.ts --check",
@@ -87,12 +88,19 @@
     "bench-session9-webm-probe": "bun run scripts/bench-session9-webm-probe.ts",
     "bench-session11-mp4-packet-truth": "bun run scripts/bench-session11-mp4-packet-truth.ts",
     "bench-session11-aiff-packets": "bun run scripts/bench-session11-aiff-packets.ts",
+    "bench-session11-cenc-decrypt": "bun run scripts/bench-session11-cenc-decrypt.ts",
     "bench-session11-mp4-aac-metadata": "bun run scripts/bench-session11-mp4-aac-metadata.ts",
+    "bench-session11-mp4-demux": "bun run scripts/bench-session11-mp4-demux.ts",
+    "bench-session11-mp4-fragmented-audio-probe": "bun run scripts/bench-session11-mp4-fragmented-audio-probe.ts",
     "bench-session11-mp4-vfr-mux": "bun run scripts/bench-session11-mp4-vfr-mux.ts",
+    "bench-session11-video-decode-acceleration": "bun run scripts/bench-session11-video-decode-acceleration.ts",
     "bench-session11-video-quality-plan": "bun run scripts/bench-session11-video-quality-plan.ts",
+    "bench-session11-webm-attachments": "bun run scripts/bench-session11-webm-attachments.ts",
+    "bench-session11-webm-attachment-packet-seam": "bun run scripts/bench-session11-webm-attachment-packet-seam.ts",
+    "verify:session11-webm-attachments-browser": "node scripts/verify-session11-mkv-attachments-browser.mjs",
     "bench-session11-webm-packets": "bun run scripts/bench-session11-webm-packets.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
-    "gate": "bun run typecheck && biome check . && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
+    "gate": "bun run typecheck && biome check . && bun run test:deficit-generator && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
@@ -100,7 +108,7 @@
     "@webgpu/types": "^0.1.70",
     "bun-types": "^1.3.0",
     "tsup": "^8.3.5",
-    "typescript": "^5.7.2",
+    "typescript": "^7.0.2",
     "vitest": "^2.1.8"
   },
   "trustedDependencies": ["@biomejs/biome"]

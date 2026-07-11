@@ -114,9 +114,29 @@ export interface ByteSource {
   range?(start: number, end: number): Promise<Uint8Array>   // enables header-only probe
 }
 export interface ContainerQuery { direction: 'demux' | 'mux'; mime?: string; extension?: string; head?: Uint8Array /* magic */ }
+// Exact non-packet metadata follows TrackInfo through ordinary track selection (ADR-210). The first
+// additive kind retains complete ordered Matroska AttachedFile payloads; a projection marker identifies
+// probe-compatible JSON/attached-picture descriptors that muxers must consume as metadata, never Blocks.
+export interface MatroskaAttachmentsSideData {
+  readonly kind: 'matroska-attachments'
+  readonly attachedFilePayloads: readonly Uint8Array[]
+}
+export type ContainerSideData = MatroskaAttachmentsSideData
+export interface MatroskaAttachmentProjection {
+  readonly kind: 'matroska-attachment'
+  readonly sideDataIndex: number
+  readonly attachmentIndex: number
+}
+export type ContainerProjection = MatroskaAttachmentProjection
 export interface TrackInfo {
   id: number; mediaType: MediaType; codec: string; durationSec?: number
   encrypted?: boolean               // protected samples require decrypt() before generic decode/seek
+  containerSideData?: readonly ContainerSideData[] // exact metadata repeated on each selectable track
+  containerProjection?: ContainerProjection        // enumeration-only view; not a timed output track
+  codecDelayNs?: number             // source container subtracted this delay from stored timestamps (ADR-196)
+  seekPreRollNs?: number            // source decoder-convergence preroll (ADR-196)
+  gapless?: { leadingSamples?: number; trailingSamples?: number; totalSamples?: number }
+  color?: VideoColorMetadata        // raw H.273 + Matroska Colour integers, unknown-safe (ADR-197)
   config?: DecoderConfig            // video: coded dims/rotation/fps; audio: sampleRate/channels
                                      // config.description carries codec-private data for muxers, e.g. AVC/AAC config or FLAC metadata (ADR-064/065/066/067)
 }
@@ -129,7 +149,7 @@ export interface Demuxer {
 export interface MuxOptions { container?: string; faststart?: boolean; fragmented?: boolean }
 export interface Muxer {
   readonly output: ReadableStream<Uint8Array>
-  addTrack(info: TrackInfo): number
+  addTrack(info: TrackInfo): number                           // ingests optional container side data
   write(trackId: number, packet: Packet): Promise<void>    // honors packet.dtsUs for B-frame layout (ADR-045)
   finalize(): Promise<void>
 }

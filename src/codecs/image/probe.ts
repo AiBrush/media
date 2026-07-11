@@ -60,6 +60,49 @@ export interface ImageInfo {
   durationSec?: number;
 }
 
+/** Public-probe-shaped metadata derived from one parsed image header. */
+export interface ImageMediaMetadata {
+  container: string;
+  durationSec: number;
+  sizeBytes?: number;
+  tracks: Array<{
+    id: number;
+    type: 'video';
+    codec: string;
+    width: number;
+    height: number;
+    fps: number;
+    durationSec?: number;
+  }>;
+}
+
+const IMAGE_DEFAULT_FPS = 25;
+
+/** Map bit-exact image header facts to the engine's ordinary one-video-track probe shape. */
+export function imageInfoToMediaMetadata(
+  info: ImageInfo,
+  sizeBytes: number | undefined,
+): ImageMediaMetadata {
+  const durationSec =
+    info.durationSec ??
+    (info.animated || info.format === 'jpeg' ? info.frameCount / IMAGE_DEFAULT_FPS : 0);
+  const track: ImageMediaMetadata['tracks'][number] = {
+    id: 0,
+    type: 'video',
+    codec: info.format === 'jpeg' ? 'mjpeg' : info.format,
+    width: info.width,
+    height: info.height,
+    fps: durationSec > 0 ? info.frameCount / durationSec : IMAGE_DEFAULT_FPS,
+  };
+  if (durationSec > 0) track.durationSec = durationSec;
+  return {
+    container: info.format === 'jpeg' ? 'jpeg' : info.format,
+    durationSec,
+    ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+    tracks: [track],
+  };
+}
+
 // ── tiny byte helpers (bounds-checked; an overrun is a typed InputError, never a wrong number) ─────
 
 /** A read past the end of the buffer means the header is truncated — reject, never fabricate. */

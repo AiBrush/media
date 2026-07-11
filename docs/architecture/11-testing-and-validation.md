@@ -69,4 +69,4 @@ These are CI gates on *our* code, derived from what we caught in the benchmark:
 
 ## 7. Relationship to the existing benchmark harness
 
-The sibling `aibrush.lib/media-test/media-browser-test` suite (558 features, 13 families, the oracle implementations) is our **external regression battery**: we register `aibrush-media` as an engine and must (a) win in aggregate and (b) pass on the **strict** oracles, with our own additional anti-cheat gates from §5. It is the acceptance test for "did we actually build the best-of-the-best."
+The sibling `aibrush.lib/media-test/media-browser-test` suite is a **versioned external regression battery** (13 families; the original architecture evidence had 558 features and the Session 11 full export has 563). We register `aibrush-media` as an engine and must run every cell in the current suite, record its version/count, (a) win in aggregate, and (b) pass on the **strict** oracles, with our own additional anti-cheat gates from §5. It is the acceptance test for "did we actually build the best-of-the-best."

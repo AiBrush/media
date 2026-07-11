@@ -43,9 +43,23 @@ import type {
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import type { PcmAudio } from '../dsp/index.ts';
-import { AdtsModule } from './adts/adts-driver.ts';
-import { AiffModule } from './aiff/aiff-driver.ts';
-import { CafModule } from './caf/caf-driver.ts';
+import {
+  type LazyAudioMuxKind,
+  adtsMuxTrackConfig,
+  assertAudioMuxOptions,
+  rejectRawPcmChunkMux,
+  validateMp3MuxTrack,
+  validateOggMuxTrack,
+  wavMuxTrackConfig,
+} from './audio-container-mux-validation.ts';
+import {
+  matchesAdts,
+  matchesAiff,
+  matchesCaf,
+  matchesMp3,
+  matchesOgg,
+  matchesWav,
+} from './audio-container-sniff.ts';
 import {
   type FastFlacFrameSpan,
   fastFlacFrames,
@@ -56,10 +70,7 @@ import {
   matchesFlac,
   parseFlacStreamInfo,
 } from './flac/flac-sniff.ts';
-import { Mp3Module } from './mp3/mp3-driver.ts';
 import { Mp4Module } from './mp4/mp4-driver.ts';
-import { OggModule } from './ogg/ogg-driver.ts';
-import { WavModule } from './wav/wav-driver.ts';
 import { WebmModule } from './webm/webm-driver.ts';
 
 /**
@@ -71,13 +82,7 @@ import { WebmModule } from './webm/webm-driver.ts';
 export function registerDefaultDrivers(reg: Registry): void {
   const modules: DriverModule[] = [
     Mp4Module,
-    WavModule,
-    Mp3Module,
-    OggModule,
     WebmModule,
-    AdtsModule,
-    AiffModule,
-    CafModule,
     WebcodecsVideoModule,
     WebCodecsAudioModule,
     // All software codec tails now co-vendor their wasm via scripts/vendor-wasm.ts (rust both-files pairs:
@@ -85,6 +90,7 @@ export function registerDefaultDrivers(reg: Registry): void {
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
   for (const mod of modules) mod.register(reg);
+  for (const driver of lazyAudioContainerDrivers()) reg.addContainer(driver);
   for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
   (reg as Registry & { addImageOps?: (ops: ImageOps) => void }).addImageOps?.(lazyImageOps());
   reg.addContainer(lazyMpegTsContainerDriver());
@@ -234,6 +240,195 @@ function videoDecode(q: CodecQuery): boolean {
 
 type LazyContainerLoader = () => Promise<ContainerDriver>;
 type LazyFilterLoader = () => Promise<FilterDriver>;
+
+interface LazyContainerSpec {
+  readonly id: string;
+  readonly formats: readonly string[];
+  readonly supports: (q: ContainerQuery) => boolean;
+  readonly load: LazyContainerLoader;
+  readonly probe?: true;
+  readonly packetInfo?: true;
+  readonly streamCopy?: true;
+  readonly transformPcm?: true;
+  readonly decodePcm?: true;
+  readonly decodePcmAudio?: true;
+  readonly validatesStreamCopyTrim?: true;
+  readonly validatesPcmTrim?: true;
+  readonly muxKind?: LazyAudioMuxKind;
+  readonly rejectChunkMux?: 'aiff' | 'caf';
+  readonly validateTrack?: (track: TrackInfo, trackCount: number) => void;
+}
+
+function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
+  return [
+    lazyContainer({
+      id: 'wav',
+      formats: ['wav'],
+      supports: matchesWav,
+      load: () => import('./wav/wav-driver.ts').then((module) => module.WavDriver),
+      probe: true,
+      packetInfo: true,
+      transformPcm: true,
+      decodePcmAudio: true,
+      validatesPcmTrim: true,
+      muxKind: 'wav',
+      validateTrack: (track, trackCount) => {
+        wavMuxTrackConfig(track, trackCount);
+      },
+    }),
+    lazyContainer({
+      id: 'mp3',
+      formats: ['mp3'],
+      supports: matchesMp3,
+      load: () => import('./mp3/mp3-driver.ts').then((module) => module.Mp3Driver),
+      probe: true,
+      packetInfo: true,
+      muxKind: 'mp3',
+      validateTrack: validateMp3MuxTrack,
+    }),
+    lazyContainer({
+      id: 'ogg',
+      formats: ['ogg'],
+      supports: matchesOgg,
+      load: () => import('./ogg/ogg-driver.ts').then((module) => module.OggDriver),
+      probe: true,
+      packetInfo: true,
+      streamCopy: true,
+      validatesStreamCopyTrim: true,
+      muxKind: 'ogg',
+      validateTrack: validateOggMuxTrack,
+    }),
+    lazyContainer({
+      id: 'adts',
+      formats: ['adts'],
+      supports: matchesAdts,
+      load: () => import('./adts/adts-driver.ts').then((module) => module.AdtsDriver),
+      probe: true,
+      packetInfo: true,
+      streamCopy: true,
+      decodePcm: true,
+      validatesStreamCopyTrim: true,
+      muxKind: 'adts',
+      validateTrack: (track, trackCount) => {
+        adtsMuxTrackConfig(track, trackCount);
+      },
+    }),
+    lazyContainer({
+      id: 'aiff',
+      formats: ['aiff'],
+      supports: matchesAiff,
+      load: () => import('./aiff/aiff-driver.ts').then((module) => module.AiffDriver),
+      packetInfo: true,
+      transformPcm: true,
+      decodePcmAudio: true,
+      rejectChunkMux: 'aiff',
+    }),
+    lazyContainer({
+      id: 'caf',
+      formats: ['caf'],
+      supports: matchesCaf,
+      load: () => import('./caf/caf-driver.ts').then((module) => module.CafDriver),
+      transformPcm: true,
+      decodePcmAudio: true,
+      rejectChunkMux: 'caf',
+    }),
+  ];
+}
+
+function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
+  let driver: ContainerDriver | undefined;
+  let loadPromise: Promise<ContainerDriver> | undefined;
+  const load = async (): Promise<ContainerDriver> => {
+    if (driver !== undefined) return driver;
+    loadPromise ??= spec.load();
+    driver = await loadPromise;
+    return driver;
+  };
+  return {
+    id: spec.id,
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: spec.formats,
+    supports: spec.supports,
+    ...(spec.probe === true
+      ? {
+          async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+            const loaded = await load();
+            const probe = loaded.probe;
+            if (probe === undefined) throw missingLazyMethod(spec.id, 'probe');
+            return probe.call(loaded, src, o);
+          },
+        }
+      : {}),
+    ...(spec.packetInfo === true
+      ? {
+          async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+            const loaded = await load();
+            const packetInfo = loaded.packetInfo;
+            if (packetInfo === undefined) throw missingLazyMethod(spec.id, 'packetInfo');
+            return packetInfo.call(loaded, src, o);
+          },
+        }
+      : {}),
+    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+      const loaded = await load();
+      return loaded.demux(src, o);
+    },
+    createMuxer(o?: MuxOptions): Muxer {
+      if (spec.rejectChunkMux !== undefined) return rejectRawPcmChunkMux(spec.rejectChunkMux);
+      if (spec.muxKind !== undefined) assertAudioMuxOptions(spec.muxKind, o);
+      return new LazyContainerMuxer(load, o, spec.validateTrack);
+    },
+    ...(spec.streamCopy === true
+      ? {
+          async streamCopy(
+            src: ByteSource,
+            o?: StreamCopyOptions,
+          ): Promise<ReadableStream<Uint8Array>> {
+            const loaded = await load();
+            const streamCopy = loaded.streamCopy;
+            if (streamCopy === undefined) throw missingLazyMethod(spec.id, 'streamCopy');
+            return streamCopy.call(loaded, src, o);
+          },
+        }
+      : {}),
+    ...(spec.transformPcm === true
+      ? {
+          async transformPcm(
+            src: ByteSource,
+            o?: PcmTransform,
+          ): Promise<ReadableStream<Uint8Array>> {
+            const loaded = await load();
+            const transformPcm = loaded.transformPcm;
+            if (transformPcm === undefined) throw missingLazyMethod(spec.id, 'transformPcm');
+            return transformPcm.call(loaded, src, o);
+          },
+        }
+      : {}),
+    ...(spec.decodePcm === true
+      ? {
+          async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
+            const loaded = await load();
+            const decodePcm = loaded.decodePcm;
+            if (decodePcm === undefined) throw missingLazyMethod(spec.id, 'decodePcm');
+            return decodePcm.call(loaded, src, o);
+          },
+        }
+      : {}),
+    ...(spec.decodePcmAudio === true
+      ? {
+          async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
+            const loaded = await load();
+            const decodePcmAudio = loaded.decodePcmAudio;
+            if (decodePcmAudio === undefined) throw missingLazyMethod(spec.id, 'decodePcmAudio');
+            return decodePcmAudio.call(loaded, src, o);
+          },
+        }
+      : {}),
+    ...(spec.validatesStreamCopyTrim === true ? { validatesStreamCopyTrim: true } : {}),
+    ...(spec.validatesPcmTrim === true ? { validatesPcmTrim: true } : {}),
+  };
+}
 
 const TS_MIMES = new Set([
   'video/mp2t',
@@ -802,6 +997,7 @@ class LazyContainerMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
   readonly #load: LazyContainerLoader;
   readonly #options: MuxOptions | undefined;
+  readonly #validateTrack: ((track: TrackInfo, trackCount: number) => void) | undefined;
   readonly #ready: Promise<void>;
   readonly #tracks: TrackInfo[] = [];
   readonly #targetTrackIds: number[] = [];
@@ -809,9 +1005,14 @@ class LazyContainerMuxer implements Muxer {
   #resolveReady: (() => void) | undefined;
   #muxer: Muxer | undefined;
 
-  constructor(load: LazyContainerLoader, options?: MuxOptions) {
+  constructor(
+    load: LazyContainerLoader,
+    options?: MuxOptions,
+    validateTrack?: (track: TrackInfo, trackCount: number) => void,
+  ) {
     this.#load = load;
     this.#options = options;
+    this.#validateTrack = validateTrack;
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -824,6 +1025,7 @@ class LazyContainerMuxer implements Muxer {
   }
 
   addTrack(info: TrackInfo): number {
+    this.#validateTrack?.(info, this.#tracks.length);
     const id = this.#tracks.length;
     this.#tracks.push(info);
     if (this.#muxer !== undefined) {

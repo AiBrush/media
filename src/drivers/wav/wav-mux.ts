@@ -1,71 +1,24 @@
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { type Endianness, type SampleFormat, bytesPerSample, decodePcm } from '../../dsp/pcm.ts';
+import { MediaError } from '../../contracts/errors.ts';
+import { bytesPerSample, decodePcm } from '../../dsp/pcm.ts';
+import {
+  type WavMuxTrackConfig,
+  assertAudioMuxOptions,
+  wavMuxTrackConfig,
+} from '../audio-container-mux-validation.ts';
 import { writeWav, writeWavHeader } from './pcm.ts';
-
-interface PcmWireFormat {
-  readonly sourceFormat: SampleFormat;
-  readonly sourceEndian: Endianness;
-  readonly outputFormat: SampleFormat;
-}
 
 interface WavMuxTrack {
   readonly id: number;
   readonly sampleRate: number;
   readonly channels: number;
-  readonly wire: PcmWireFormat;
+  readonly wire: WavMuxTrackConfig['wire'];
   readonly chunks: Uint8Array[];
   audioBytes: number;
 }
 
 export interface WavChunkStruct {
   readonly data: Uint8Array;
-}
-
-function pcmWireFormat(codec: string): PcmWireFormat | undefined {
-  switch (codec) {
-    case 'pcm-u8':
-    case 'pcm-u8be':
-      return { sourceFormat: 'u8', sourceEndian: 'le', outputFormat: 'u8' };
-    case 'pcm-s8':
-      return { sourceFormat: 's8', sourceEndian: 'le', outputFormat: 'u8' };
-    case 'pcm-s16':
-      return { sourceFormat: 's16', sourceEndian: 'le', outputFormat: 's16' };
-    case 'pcm-s16be':
-      return { sourceFormat: 's16', sourceEndian: 'be', outputFormat: 's16' };
-    case 'pcm-s24':
-      return { sourceFormat: 's24', sourceEndian: 'le', outputFormat: 's24' };
-    case 'pcm-s24be':
-      return { sourceFormat: 's24', sourceEndian: 'be', outputFormat: 's24' };
-    case 'pcm-s32':
-      return { sourceFormat: 's32', sourceEndian: 'le', outputFormat: 's32' };
-    case 'pcm-s32be':
-      return { sourceFormat: 's32', sourceEndian: 'be', outputFormat: 's32' };
-    case 'pcm-f32':
-      return { sourceFormat: 'f32', sourceEndian: 'le', outputFormat: 'f32' };
-    case 'pcm-f32be':
-      return { sourceFormat: 'f32', sourceEndian: 'be', outputFormat: 'f32' };
-    case 'pcm-f64':
-      return { sourceFormat: 'f64', sourceEndian: 'le', outputFormat: 'f64' };
-    case 'pcm-f64be':
-      return { sourceFormat: 'f64', sourceEndian: 'be', outputFormat: 'f64' };
-    default:
-      return undefined;
-  }
-}
-
-function audioConfig(info: TrackInfo): AudioDecoderConfig | undefined {
-  const config = info.config;
-  if (
-    config !== undefined &&
-    'sampleRate' in config &&
-    'numberOfChannels' in config &&
-    typeof config.sampleRate === 'number' &&
-    typeof config.numberOfChannels === 'number'
-  ) {
-    return config;
-  }
-  return undefined;
 }
 
 function copyChunkBytes(packet: Packet): Uint8Array {
@@ -106,12 +59,7 @@ export class WavMuxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions) {
-    if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'WAV has no fragmented mux form', {
-        op: { op: 'mux', fragmented: true },
-        tried: ['wav'],
-      });
-    }
+    assertAudioMuxOptions('wav', options);
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -125,43 +73,10 @@ export class WavMuxer implements Muxer {
 
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
-    if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'the WAV muxer writes one audio stream', {
-        op: { op: 'mux' },
-        tried: ['wav'],
-      });
-    }
-    if (info.mediaType !== 'audio') {
-      throw new CapabilityError('capability-miss', 'WAV muxing accepts audio tracks only', {
-        op: { op: 'mux', mediaType: info.mediaType },
-        tried: ['wav'],
-      });
-    }
-    const wire = pcmWireFormat(info.codec);
-    if (wire === undefined) {
-      throw new CapabilityError(
-        'capability-miss',
-        `WAV muxing accepts raw PCM packets, not '${info.codec}'`,
-        { op: { op: 'mux', codec: info.codec }, tried: ['wav'] },
-      );
-    }
-    const config = audioConfig(info);
-    if (config === undefined) {
-      throw new MediaError(
-        'mux-error',
-        'WAV muxing requires sampleRate and numberOfChannels metadata',
-      );
-    }
-    const sampleRate = config.sampleRate;
-    const channels = config.numberOfChannels;
-    if (
-      !Number.isFinite(sampleRate) ||
-      sampleRate <= 0 ||
-      !Number.isInteger(channels) ||
-      channels <= 0
-    ) {
-      throw new MediaError('mux-error', 'WAV muxing received invalid PCM track metadata');
-    }
+    const { wire, sampleRate, channels } = wavMuxTrackConfig(
+      info,
+      this.#track === undefined ? 0 : 1,
+    );
     const id = 0;
     this.#track = { id, sampleRate, channels, wire, chunks: [], audioBytes: 0 };
     return id;

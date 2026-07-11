@@ -28,6 +28,7 @@ import {
   TINY_INPUT_BYTES,
   TINY_MEDIA_SECONDS,
   TINY_VIDEO_PIXELS,
+  TINY_VIDEO_PIXEL_WORK,
 } from './tier-thresholds.ts';
 
 /** Per-selection options. Cost is an internal ADR-020 re-ranking input, never a public backend knob. */
@@ -43,6 +44,9 @@ export interface RouterDeps {
   registry: RegistryView;
   ensureLoaded?: EnsureLoaded;
 }
+
+const MAX_CODEC_CACHE_ENTRIES = 64;
+const MAX_CODEC_CONFIG_KEY_UNITS = 4096;
 
 export class Router {
   readonly #registry: RegistryView;
@@ -60,9 +64,14 @@ export class Router {
   async pickCodec(q: CodecQuery, opts: StageSelectOptions = {}): Promise<CodecDriver> {
     const determinism: Determinism = opts.determinism ?? 'auto';
     const tiny = opts.cost !== undefined && isTinyCost(opts.cost);
-    const key = `codec|${q.mediaType}|${q.direction}|${q.config.codec}|${determinism}|${tiny ? 1 : 0}`;
-    const cached = this.#codecCache.get(key);
-    if (cached) return cached;
+    const key = codecCacheKey(q, determinism, tiny);
+    const cached = key === undefined ? undefined : this.#codecCache.get(key);
+    if (cached !== undefined && key !== undefined) {
+      // Map insertion order is the LRU order; refreshing a hit keeps hot exact configs resident.
+      this.#codecCache.delete(key);
+      this.#codecCache.set(key, cached);
+      return cached;
+    }
 
     const candidates = this.#registry
       .codecs()
@@ -74,7 +83,16 @@ export class Router {
       await this.#ensureLoaded(d);
       const s = await d.supports(q);
       if (s.supported) {
-        this.#codecCache.set(key, d);
+        // `supports()` is asynchronous. Cache only if the caller-owned dictionary stayed byte-for-byte
+        // stable across the probe, and only for the top rung: a cached fallback would prevent recovery
+        // when a temporarily unavailable higher tier becomes available later in the session.
+        if (
+          d === candidates[0] &&
+          key !== undefined &&
+          codecCacheKey(q, determinism, tiny) === key
+        ) {
+          this.#rememberCodec(key, d);
+        }
         return d;
       }
     }
@@ -110,10 +128,12 @@ export class Router {
   /** Select a filter driver (sync). `force-software` drops the GPU substrates. */
   pickFilter(spec: FilterSpec, opts: StageSelectOptions = {}): FilterDriver {
     const determinism: Determinism = opts.determinism ?? 'auto';
-    const tiny = opts.cost === undefined ? isTinyFilterSpec(spec) : isTinyCost(opts.cost);
+    const tiny =
+      opts.cost === undefined ? isTinyFilterSpec(spec) : isTinyFilterCost(spec, opts.cost);
     const key = `filter|${spec.mediaType}|${spec.type}|${determinism}|${tiny ? 1 : 0}`;
     const cached = this.#filterCache.get(key);
-    if (cached) return cached;
+    if (cached?.supports(spec)) return cached;
+    if (cached) this.#filterCache.delete(key);
 
     const candidates = this.#registry
       .filters()
@@ -122,8 +142,11 @@ export class Router {
       .sort((a, b) => filterRank(a.substrate, tiny) - filterRank(b.substrate, tiny));
 
     for (const d of candidates) {
+      if (d === cached) continue; // this exact spec already rejected the cached driver above
       if (d.supports(spec)) {
-        this.#filterCache.set(key, d);
+        // Revalidate a coarse hit and cache only the top rung. A target-dependent lower fallback must not
+        // hide a faster driver that supports a later spec sharing the same media/type/cost bucket.
+        if (d === candidates[0]) this.#filterCache.set(key, d);
         return d;
       }
     }
@@ -142,6 +165,14 @@ export class Router {
     this.#codecCache.clear();
     this.#containerCache.clear();
     this.#filterCache.clear();
+  }
+
+  #rememberCodec(key: string, driver: CodecDriver): void {
+    this.#codecCache.delete(key);
+    this.#codecCache.set(key, driver);
+    if (this.#codecCache.size <= MAX_CODEC_CACHE_ENTRIES) return;
+    const oldest = this.#codecCache.keys().next().value;
+    if (oldest !== undefined) this.#codecCache.delete(oldest);
   }
 }
 
@@ -185,6 +216,18 @@ function isTinyCost(cost: RouteCost): boolean {
   );
 }
 
+/**
+ * Video filters are proportional to pixels touched across frames, not to any single cost dimension.
+ * In particular, a short duration must never move a high-resolution frame loop onto the CPU. Audio
+ * filters retain the established multi-metric policy because their work is not pixel-shaped.
+ */
+function isTinyFilterCost(spec: FilterSpec, cost: RouteCost): boolean {
+  if (spec.mediaType === 'video') {
+    return within(cost.videoPixelWork, TINY_VIDEO_PIXEL_WORK);
+  }
+  return isTinyCost(cost);
+}
+
 function codecTierRank(tier: Tier, tiny: boolean): number {
   if (tier === 'hardware') return 0;
   if (tier === 'wasm') return 3;
@@ -205,6 +248,66 @@ function filterRank(substrate: FilterSubstrate, tiny: boolean): number {
 
 function within(value: number | undefined, threshold: number): boolean {
   return value !== undefined && Number.isFinite(value) && value > 0 && value <= threshold;
+}
+
+function codecCacheKey(q: CodecQuery, determinism: Determinism, tiny: boolean): string | undefined {
+  const config = exactRecordIdentity(q.config);
+  if (config === undefined) return undefined;
+  return `codec|${q.mediaType}|${q.direction}|${determinism}|${tiny ? 1 : 0}|${config}`;
+}
+
+/**
+ * Snapshot every submitted record fact without invoking `toJSON` or an accessor. Ordinary BufferSource
+ * windows participate byte-exactly; cyclic/shared/cross-realm/hostile shapes return no key and re-probe.
+ */
+function exactRecordIdentity(record: object): string | undefined {
+  try {
+    const key = exactValueIdentity(record, new Set<object>());
+    return key.length <= MAX_CODEC_CONFIG_KEY_UNITS ? key : undefined;
+  } catch {
+    // Detached buffers and hostile proxy traps are valid reasons to skip an optimization, not routing.
+    return undefined;
+  }
+}
+
+function exactValueIdentity(value: unknown, ancestors: Set<object>): string {
+  if (value === null || typeof value !== 'object') {
+    const type = typeof value;
+    if (type === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) {
+      if (!Number.isFinite(value)) throw new TypeError();
+      return 'number:-0';
+    }
+    if (type === 'bigint' || type === 'function' || type === 'symbol') throw new TypeError();
+    return `${type}:${JSON.stringify(value)}`;
+  }
+  if (ArrayBuffer.isView(value)) {
+    if (!(value.buffer instanceof ArrayBuffer)) throw new TypeError();
+    return exactBytesKey(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  }
+  if (value instanceof ArrayBuffer) return exactBytesKey(new Uint8Array(value));
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
+  if (ancestors.has(value)) throw new TypeError();
+  ancestors.add(value);
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    let key = 'o{';
+    for (const name of Object.keys(descriptors)) {
+      const descriptor = descriptors[name];
+      if (descriptor === undefined || !('value' in descriptor)) throw new TypeError();
+      key += `${JSON.stringify(name)}:${exactValueIdentity(descriptor.value, ancestors)};`;
+    }
+    return `${key}}`;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function exactBytesKey(bytes: Uint8Array): string {
+  if (bytes.byteLength * 2 > MAX_CODEC_CONFIG_KEY_UNITS) throw new TypeError();
+  let hex = 'b';
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+  return hex;
 }
 
 /**

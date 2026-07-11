@@ -11,15 +11,17 @@ export interface TelemetrySeededTierThresholds extends TierThresholds {
 }
 
 /**
- * ADR-020 seed thresholds, distilled from committed fresh telemetry baselines. The router imports only
- * the compact numeric thresholds from `tier-thresholds.ts`; this file keeps provenance out of the eager
- * default-entry closure.
+ * ADR-020 scalar seed thresholds, distilled from committed fresh telemetry baselines. ADR-199's compound
+ * video-work ceiling preserves the scalar 64×64 / one-second boundary at the 30 fps planning cadence. The
+ * router imports only the compact numeric thresholds from `tier-thresholds.ts`; this file keeps provenance
+ * out of the eager default-entry closure.
  */
 export const TELEMETRY_SEEDED_TIER_THRESHOLDS: TelemetrySeededTierThresholds = {
   tinyInputBytes: 64 * 1024,
   tinyVideoPixels: 64 * 64,
   tinyMediaSeconds: 1,
   tinyAudioFrames: 48_000,
+  tinyVideoPixelWork: (64 * 64 + 64 * 64) * 30,
   provenance: [
     {
       path: 'fixtures/golden/bench/containers.json',

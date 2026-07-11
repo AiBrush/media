@@ -9,7 +9,6 @@
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -21,12 +20,11 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { matchesMp3 } from '../audio-container-sniff.ts';
 import { Mp3Muxer, muxPreparedMp3PacketTrack } from './mp3-mux.ts';
 export { muxPreparedMp3PacketTrack };
 export type { PreparedMp3Packet, PreparedMp3PacketMuxInput } from './mp3-mux.ts';
 
-const MP3_MIMES = new Set(['audio/mpeg', 'audio/mp3', 'audio/mpeg3', 'audio/x-mpeg-3']);
-const MP3_EXTENSIONS = new Set(['mp3']);
 const MP3_PROBE_HEAD_BYTES = 16 * 1024;
 
 // version: 3=MPEG1, 2=MPEG2, 0=MPEG2.5 (1=reserved). Layer III only (the only one MP3 uses in practice).
@@ -366,25 +364,12 @@ function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): Reada
   /* v8 ignore stop */
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && MP3_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && MP3_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head === undefined || head.byteLength < 3) return false;
-  const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
-  if (asciiAt(dv, 0, 3) === 'ID3') return true; // ID3v2-tagged MP3
-  // Raw frame sync: 0xFFE top 11 bits AND a non-zero layer field. Layer 00 is reserved for MPEG audio
-  // but means ADTS/AAC — requiring layer != 00 keeps the MP3 and ADTS drivers mutually exclusive.
-  const b1 = dv.getUint8(1);
-  return dv.getUint8(0) === 0xff && (b1 & 0xe0) === 0xe0 && (b1 & 0x06) !== 0;
-}
-
 export const Mp3Driver = {
   id: 'mp3',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['mp3'],
-  supports: matches,
+  supports: matchesMp3,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const info = await readMp3ProbeInfo(src, o?.signal);
     throwIfAborted(o?.signal);

@@ -73,7 +73,7 @@ Coverage is "what real apps need." The long tail of obscure containers/codecs is
 
 ## 8. Success criteria
 
-1. Beats any *single* one of the 7 benchmarked engines **in aggregate** across the 558-feature set (by routing to each substrate's strength).
+1. Beats any *single* one of the 7 benchmarked engines **in aggregate** across the current full versioned suite (the architecture evidence began at 558 features; acceptance follows every later cell added to the suite).
 2. Covers the §3 practical matrix with **bit-exact/structural** correctness, not loose gates.
 3. Common path ships ~mediabunny-class eager JS, no COOP/COEP, no main-thread jank.
 4. A new codec/container is added by writing **one driver**, no core change.

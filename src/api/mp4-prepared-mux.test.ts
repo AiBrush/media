@@ -14,10 +14,7 @@ import {
   muxPreparedMp4PacketTracksStream,
 } from './mp4-prepared-mux.ts';
 
-const MEDIA_TEST = new URL(
-  '../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 async function mediaTestBytes(name: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
@@ -514,7 +511,7 @@ describe('prepared MP4 packet mux', () => {
     );
   });
 
-  it('reads MP4 packet info from URLs through byte ranges without fetching the whole file', async () => {
+  it('reads exact MP4 packet info from URLs through bounded byte ranges', async () => {
     const input = await mediaTestBytes('h264_vfr.mp4');
     const expected = await mp4PacketInfoFromBytes(input);
     const { fetch, calls } = rangeServer(input);
@@ -527,9 +524,15 @@ describe('prepared MP4 packet mux', () => {
 
     expect(table.tracks).toEqual(expected.tracks);
     expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
-    expect(calls).toHaveLength(1);
+    // AVC key-picture truth requires payload inspection when dependency metadata is absent. Keep the
+    // latency-friendly prefix prime, then allow one payload range; never fall back to a rangeless GET.
+    expect(calls).toHaveLength(2);
     expect(calls.every((call) => call.range !== null)).toBe(true);
-    expect(calls.reduce((sum, call) => sum + call.bytes, 0)).toBeLessThan(input.byteLength);
+    expect(calls[0]?.range).toBe('bytes=0-32767');
+    expect(calls[1]?.range?.endsWith(`-${input.byteLength - 1}`)).toBe(true);
+    expect(calls.reduce((sum, call) => sum + call.bytes, 0)).toBeLessThanOrEqual(
+      input.byteLength + 32 * 1024,
+    );
   });
 
   it('reads URL packet info with default MIME, discovered size, and an explicit signal', async () => {

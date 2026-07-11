@@ -25,7 +25,15 @@
  */
 
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { AES_BLOCK, aesCbcNoPadding, aesCtr, hexToBytes } from '../../crypto/aes.ts';
+import {
+  AES_BLOCK,
+  type PreparedAesKey,
+  aesCbcNoPaddingWithPreparedKey,
+  aesCtrWithPreparedKey,
+  hexToBytes,
+  prepareAesCbcKey,
+  prepareAesCtrKey,
+} from '../../crypto/aes.ts';
 import { toHex } from '../../util/digest.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
@@ -319,6 +327,44 @@ function asArrayBufferBytes(data: Uint8Array): Uint8Array<ArrayBuffer> {
   return data.slice();
 }
 
+/** Maximum independent sample transforms submitted to WebCrypto at once (ADR-201). */
+export const CENC_DECRYPT_MAX_IN_FLIGHT = 16;
+
+/**
+ * Run address-independent sample work through a bounded window. On failure, stop admitting new work,
+ * await every already-started operation, then rethrow the lowest-index observed failure. Callers cannot
+ * receive a partially written file and no native crypto promise survives the rejected operation.
+ */
+async function forEachSampleBounded<T>(
+  values: readonly T[],
+  operation: (value: T, index: number) => Promise<void>,
+): Promise<void> {
+  for (const [index, value] of values.entries()) {
+    if (value === undefined) {
+      throw new MediaError('demux-error', `sample batch is sparse: index ${index} has no value`);
+    }
+  }
+  let stopped = false;
+  let firstFailure: { index: number; error: unknown } | undefined;
+  const entries = values.entries();
+  const workerCount = Math.min(values.length, CENC_DECRYPT_MAX_IN_FLIGHT);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (!stopped) {
+      const entry = entries.next();
+      if (entry.done) return;
+      const [index, value] = entry.value;
+      try {
+        await operation(value, index);
+      } catch (error: unknown) {
+        stopped = true;
+        if (!firstFailure || index < firstFailure.index) firstFailure = { index, error };
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (firstFailure) throw firstFailure.error;
+}
+
 /**
  * Reject *erased* CENC protection. Genuine AES-CTR/CBC ciphertext of coded media is uniform random, so a
  * run of a whole AES block (16 bytes) of consecutive `0x00` is impossible (probability 2⁻¹²⁸) — it signals
@@ -342,16 +388,15 @@ function assertNotErasedProtection(protectedBytes: Uint8Array): void {
   }
 }
 
-/** AES-CTR-decrypt one sample (whole-sample, or only the protected subsample ranges). */
-export async function decryptSample(
-  key: Uint8Array<ArrayBuffer>,
+/** AES-CTR-decrypt one sample with an operation-scoped key (whole sample or protected subsamples). */
+async function decryptSamplePrepared(
+  key: PreparedAesKey,
   sample: SencSample,
   data: Uint8Array,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const counter = counterBlock(sample.iv);
   if (!sample.subsamples || sample.subsamples.length === 0) {
     assertNotErasedProtection(data);
-    return aesCtr(key, counter, asArrayBufferBytes(data), 64);
+    return aesCtrWithPreparedKey(key, counterBlock(sample.iv), data, 64);
   }
   const out = asArrayBufferBytes(data);
   let pos = 0;
@@ -360,10 +405,10 @@ export async function decryptSample(
     pos += ss.clear;
     if (ss.protected > 0) {
       assertNotErasedProtection(data.subarray(pos, pos + ss.protected));
-      const decrypted = await aesCtr(
+      const decrypted = await aesCtrWithPreparedKey(
         key,
         counterBlockAt(sample.iv, blockOffset),
-        asArrayBufferBytes(data.subarray(pos, pos + ss.protected)),
+        data.subarray(pos, pos + ss.protected),
         64,
       );
       out.set(decrypted, pos);
@@ -372,6 +417,15 @@ export async function decryptSample(
     pos += ss.protected;
   }
   return out;
+}
+
+/** AES-CTR-decrypt one sample (whole-sample, or only the protected subsample ranges). */
+export async function decryptSample(
+  key: Uint8Array<ArrayBuffer>,
+  sample: SencSample,
+  data: Uint8Array,
+): Promise<Uint8Array<ArrayBuffer>> {
+  return decryptSamplePrepared(await prepareAesCtrKey(key), sample, data);
 }
 
 /**
@@ -385,8 +439,8 @@ export async function decryptSample(
  * Whole-sample protected data (no subsample map) is treated as one protected range. Output length === input
  * length.
  */
-export async function decryptSampleCens(
-  key: Uint8Array<ArrayBuffer>,
+async function decryptSampleCensPrepared(
+  key: PreparedAesKey,
   pattern: CencPattern,
   sample: SencSample,
   data: Uint8Array,
@@ -404,10 +458,10 @@ export async function decryptSampleCens(
     const base = pos;
     if (fullSample) {
       if (ss.protected > 0) {
-        const decrypted = await aesCtr(
+        const decrypted = await aesCtrWithPreparedKey(
           key,
           counterBlockAt(sample.iv, encryptedBlockOffset),
-          asArrayBufferBytes(data.subarray(base, base + ss.protected)),
+          data.subarray(base, base + ss.protected),
           64,
         );
         out.set(decrypted, base);
@@ -422,7 +476,7 @@ export async function decryptSampleCens(
       offsets.forEach((off, i) =>
         gathered.set(data.subarray(base + off, base + off + AES_BLOCK), i * AES_BLOCK),
       );
-      const decrypted = await aesCtr(
+      const decrypted = await aesCtrWithPreparedKey(
         key,
         counterBlockAt(sample.iv, encryptedBlockOffset),
         gathered,
@@ -436,6 +490,16 @@ export async function decryptSampleCens(
     pos += ss.protected;
   }
   return out;
+}
+
+/** AES-CTR-pattern-decrypt one `cens` sample with a raw key (API-compatible convenience wrapper). */
+export async function decryptSampleCens(
+  key: Uint8Array<ArrayBuffer>,
+  pattern: CencPattern,
+  sample: SencSample,
+  data: Uint8Array,
+): Promise<Uint8Array<ArrayBuffer>> {
+  return decryptSampleCensPrepared(await prepareAesCtrKey(key), pattern, sample, data);
 }
 
 /**
@@ -462,8 +526,8 @@ function cryptBlockOffsets(protectedLen: number, pattern: CencPattern): number[]
  * back; skip blocks and trailing partial bytes pass through clear. Whole-sample protected data (no
  * subsample map) is treated as a single protected range. Output length === input length.
  */
-export async function decryptSampleCbcs(
-  key: Uint8Array<ArrayBuffer>,
+async function decryptSampleCbcsPrepared(
+  key: PreparedAesKey,
   pattern: CencPattern,
   iv: Uint8Array,
   data: Uint8Array,
@@ -483,7 +547,7 @@ export async function decryptSampleCbcs(
       offsets.forEach((off, i) =>
         gathered.set(data.subarray(base + off, base + off + AES_BLOCK), i * AES_BLOCK),
       );
-      const decrypted = await aesCbcNoPadding(key, blockIv, gathered, 'decrypt');
+      const decrypted = await aesCbcNoPaddingWithPreparedKey(key, blockIv, gathered, 'decrypt');
       offsets.forEach((off, i) =>
         out.set(decrypted.subarray(i * AES_BLOCK, i * AES_BLOCK + AES_BLOCK), base + off),
       );
@@ -493,17 +557,38 @@ export async function decryptSampleCbcs(
   return out;
 }
 
+/** AES-CBC-pattern-decrypt one `cbcs` sample with a raw key (API-compatible convenience wrapper). */
+export async function decryptSampleCbcs(
+  key: Uint8Array<ArrayBuffer>,
+  pattern: CencPattern,
+  iv: Uint8Array,
+  data: Uint8Array,
+  subsamples?: readonly Subsample[],
+): Promise<Uint8Array<ArrayBuffer>> {
+  return decryptSampleCbcsPrepared(
+    await prepareAesCbcKey(key, 'no-padding-decrypt'),
+    pattern,
+    iv,
+    data,
+    subsamples,
+  );
+}
+
 /** Decrypt a `cenc` track's samples in order (sample `i` uses `senc[i]`). */
 export async function decryptSamples(
   key: Uint8Array<ArrayBuffer>,
   data: readonly Uint8Array[],
   senc: readonly SencSample[],
 ): Promise<Uint8Array[]> {
-  const out: Uint8Array[] = [];
-  for (const [i, bytes] of data.entries()) {
+  if (data.length === 0) return [];
+  const prepared = await prepareAesCtrKey(key);
+  const out = new Array<Uint8Array>(data.length);
+  await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
-    out.push(sample ? await decryptSample(key, sample, bytes) : asArrayBufferBytes(bytes));
-  }
+    out[i] = sample
+      ? await decryptSamplePrepared(prepared, sample, bytes)
+      : asArrayBufferBytes(bytes);
+  });
   return out;
 }
 
@@ -514,13 +599,15 @@ export async function decryptSamplesCens(
   senc: readonly SencSample[],
   pattern: CencPattern,
 ): Promise<Uint8Array[]> {
-  const out: Uint8Array[] = [];
-  for (const [i, bytes] of data.entries()) {
+  if (data.length === 0) return [];
+  const prepared = await prepareAesCtrKey(key);
+  const out = new Array<Uint8Array>(data.length);
+  await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
-    out.push(
-      sample ? await decryptSampleCens(key, pattern, sample, bytes) : asArrayBufferBytes(bytes),
-    );
-  }
+    out[i] = sample
+      ? await decryptSampleCensPrepared(prepared, pattern, sample, bytes)
+      : asArrayBufferBytes(bytes);
+  });
   return out;
 }
 
@@ -535,12 +622,14 @@ export async function decryptSamplesCbcs(
   pattern: CencPattern,
   constantIv?: Uint8Array,
 ): Promise<Uint8Array[]> {
-  const out: Uint8Array[] = [];
-  for (const [i, bytes] of data.entries()) {
+  if (data.length === 0) return [];
+  const prepared = await prepareAesCbcKey(key, 'no-padding-decrypt');
+  const out = new Array<Uint8Array>(data.length);
+  await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
     if (!sample) {
-      out.push(asArrayBufferBytes(bytes));
-      continue;
+      out[i] = asArrayBufferBytes(bytes);
+      return;
     }
     const iv = sample.iv.byteLength > 0 ? sample.iv : constantIv;
     if (!iv || iv.byteLength === 0) {
@@ -549,8 +638,8 @@ export async function decryptSamplesCbcs(
         `cbcs sample ${i} has neither a per-sample IV nor a default_constant_IV (malformed protection)`,
       );
     }
-    out.push(await decryptSampleCbcs(key, pattern, iv, bytes, sample.subsamples));
-  }
+    out[i] = await decryptSampleCbcsPrepared(prepared, pattern, iv, bytes, sample.subsamples);
+  });
   return out;
 }
 
@@ -654,7 +743,7 @@ interface RunContext {
   out: Uint8Array<ArrayBuffer>;
   scheme: CencScheme;
   protectedByDesc: Map<number, TencInfo>;
-  resolveKey: (kid: Uint8Array) => Uint8Array<ArrayBuffer>;
+  resolveKey: (kid: Uint8Array) => Promise<PreparedAesKey>;
   senc: SencSample[] | undefined;
   aux: SencSample[] | undefined;
   sbgp: { count: number; index: number }[] | undefined;
@@ -1075,17 +1164,64 @@ function neutralizeSeigBox(
 }
 
 /**
+ * Prove the absolute sample writes in one run are in-bounds and disjoint before admitting parallel
+ * crypto. Canonical MP4 tables are already offset-ordered, so the common path is allocation-free; only a
+ * legal but physically non-monotonic table needs an index sort. Overlap is corrupt because completion
+ * order would otherwise decide which recovered ciphertext wins the shared bytes.
+ */
+function assertIndependentSampleRanges(samples: readonly SampleLoc[], fileSize: number): void {
+  let ascending = true;
+  let previousStart = Number.NEGATIVE_INFINITY;
+  let previousEnd = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < samples.length; i++) {
+    const loc = samples[i];
+    if (!loc) continue;
+    if (loc.start < 0 || loc.size < 0 || loc.start + loc.size > fileSize) {
+      throw new MediaError(
+        'demux-error',
+        `protected sample ${i} range [${loc.start}, ${loc.start + loc.size}) exceeds file size ${fileSize} (truncated/corrupt mdat)`,
+      );
+    }
+    if (loc.size === 0) continue;
+    if (loc.start < previousStart) ascending = false;
+    if (ascending && loc.start < previousEnd) {
+      throw new MediaError(
+        'demux-error',
+        `protected sample ${i} overlaps the previous sample range (corrupt sample table)`,
+      );
+    }
+    previousStart = loc.start;
+    previousEnd = loc.start + loc.size;
+  }
+  if (ascending) return;
+
+  const ordered = samples
+    .map((loc, index) => ({ loc, index }))
+    .filter(({ loc }) => loc.size > 0)
+    .sort((a, b) => a.loc.start - b.loc.start);
+  previousEnd = Number.NEGATIVE_INFINITY;
+  for (const { loc, index } of ordered) {
+    if (loc.start < previousEnd) {
+      throw new MediaError(
+        'demux-error',
+        `protected sample ${index} overlaps another sample range (corrupt sample table)`,
+      );
+    }
+    previousEnd = loc.start + loc.size;
+  }
+}
+
+/**
  * Decrypt one run of samples (a flat `stbl` chunk sequence or one `traf`) into `ctx.out`. Each sample's
  * protection is the `tenc` default of its sample description, optionally overridden by an `sbgp`/`sgpd`
  * 'seig' group (which may mark it clear or rotate the key/IV/pattern). The per-sample IV + subsample map
  * come from `senc`, then `saiz`/`saio` aux, then the `default_constant_IV`. Clear samples pass through.
  */
 async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<void> {
-  for (let si = 0; si < samples.length; si++) {
-    const loc = samples[si];
-    if (!loc) continue;
+  assertIndependentSampleRanges(samples, ctx.bytes.byteLength);
+  await forEachSampleBounded(samples, async (loc, si) => {
     const tenc = ctx.protectedByDesc.get(loc.descIndex);
-    if (!tenc) continue; // this sample uses a clear sample description → leave untouched
+    if (!tenc) return; // this sample uses a clear sample description → leave untouched
 
     let kid = tenc.kid;
     let pattern = tenc.pattern;
@@ -1094,7 +1230,7 @@ async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<
       const groupIndex = groupIndexAt(ctx.sbgp, si);
       if (groupIndex !== 0) {
         const group = resolveSeigGroup(groupIndex, ctx.trafSeig, ctx.stblSeig);
-        if (group.isProtected === 0) continue; // group is unprotected → sample stays clear
+        if (group.isProtected === 0) return; // group is unprotected → sample stays clear
         if (group.isProtected !== 1) {
           throw new MediaError(
             'demux-error',
@@ -1107,13 +1243,7 @@ async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<
       }
     }
 
-    if (loc.start < 0 || loc.size < 0 || loc.start + loc.size > ctx.bytes.byteLength) {
-      throw new MediaError(
-        'demux-error',
-        `protected sample ${si} range [${loc.start}, ${loc.start + loc.size}) exceeds file size ${ctx.bytes.byteLength} (truncated/corrupt mdat)`,
-      );
-    }
-    const key = ctx.resolveKey(kid);
+    const key = await ctx.resolveKey(kid);
 
     let iv: Uint8Array | undefined;
     let subsamples: Subsample[] | undefined;
@@ -1140,17 +1270,23 @@ async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<
     const data = ctx.bytes.subarray(loc.start, loc.start + loc.size);
     const clear =
       ctx.scheme === CBCS_SCHEME
-        ? await decryptSampleCbcs(key, pattern ?? DEFAULT_FULL_PATTERN, iv, data, subsamples)
+        ? await decryptSampleCbcsPrepared(
+            key,
+            pattern ?? DEFAULT_FULL_PATTERN,
+            iv,
+            data,
+            subsamples,
+          )
         : ctx.scheme === CENS_SCHEME
-          ? await decryptSampleCens(
+          ? await decryptSampleCensPrepared(
               key,
               pattern ?? DEFAULT_FULL_PATTERN,
               sencSample(iv, subsamples),
               data,
             )
-          : await decryptSample(key, sencSample(iv, subsamples), data);
+          : await decryptSamplePrepared(key, sencSample(iv, subsamples), data);
     ctx.out.set(clear, loc.start);
-  }
+  });
 }
 
 /**
@@ -1216,8 +1352,8 @@ export async function decryptCencFile(
   }
   if (!anyProtected) return out; // genuinely clear file → an identical copy is the correct result
 
-  const keyCache = new Map<string, Uint8Array<ArrayBuffer>>();
-  const resolveKey = (kid: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const keyCache = new Map<string, Promise<PreparedAesKey>>();
+  const resolveKey = (kid: Uint8Array): Promise<PreparedAesKey> => {
     const id = kidHex(kid);
     const cached = keyCache.get(id);
     if (cached) return cached;
@@ -1228,9 +1364,14 @@ export async function decryptCencFile(
         tried: ['mp4'],
       });
     }
-    const key = hexToBytes(hex);
-    keyCache.set(id, key);
-    return key;
+    const raw = hexToBytes(hex);
+    const prepared =
+      opts.scheme === CBCS_SCHEME
+        ? prepareAesCbcKey(raw, 'no-padding-decrypt')
+        : prepareAesCtrKey(raw);
+    // Store the in-flight import promise before returning so concurrent samples with one KID share it.
+    keyCache.set(id, prepared);
+    return prepared;
   };
 
   const seen = new Map<number, number>();

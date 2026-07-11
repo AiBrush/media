@@ -1,6 +1,6 @@
 # 14 — Benchmarks & Performance Measurement
 
-> The **performance** side of the Definition of Done (BUILD_INSTRUCTIONS §6: "every op ships with a multi-sample benchmark — wall, throughput, peakMemory — measured fresh across several real corpus files, not one"). This doc records the **methodology** and the **committed baseline numbers** for the pure-TS tier. It operationalizes [`11`](11-testing-and-validation.md) §6 (the perf principle: multi-sample, re-measured fresh, no degenerate metrics) with concrete harnesses + a regression gate. The WebCodecs/GPU tier and the 558-feature harness aggregate are measured on the browser/target runtime (ADR-025) — they are not in these Node baselines.
+> The **performance** side of the Definition of Done (BUILD_INSTRUCTIONS §6: "every op ships with a multi-sample benchmark — wall, throughput, peakMemory — measured fresh across several real corpus files, not one"). This doc records the **methodology** and the **committed baseline numbers** for the pure-TS tier. It operationalizes [`11`](11-testing-and-validation.md) §6 (the perf principle: multi-sample, re-measured fresh, no degenerate metrics) with concrete harnesses + a regression gate. The WebCodecs/GPU tier and the current full versioned browser-harness aggregate are measured on the browser/target runtime (ADR-025) — they are not in these Node baselines.
 
 ## 1. The §6 methodology (how every number here is produced)
 
@@ -12,6 +12,16 @@ The pure-TS benchmark harnesses (`scripts/bench-dsp.ts`, `scripts/bench-containe
 4. **A checksum sink defeats dead-code elimination.** Every iteration folds a real output value (a decoded sample, an output byte, a frame count, an image dimension/duration fact) into a `sink` accumulator that is printed at the end, so the optimizer cannot elide the work and produce a fake "infinitely fast" / `0`-cost metric (the `N/A→0` anti-pattern, [`11`](11-testing-and-validation.md) §5).
 5. **Honest units.** Throughput is reported in the unit that is *physically meaningful* for the op: `×realtime` (audio-seconds processed per wall-second) for DSP; `MB/s` of the genuinely-processed bytes for the container byte ops; **`probes/sec`** for `probe` (a bounded header read, **not** a whole-file scan — reporting it as file-MB/s would be dishonest). Aggregates use the **geomean** across files (and report the **worst/min** alongside, so a single slow file is visible).
 6. **A machine-readable baseline + a `--check` regression gate.** A no-arg run writes the baseline JSON under `fixtures/golden/bench/`; `--check` re-runs and **fails (exit 1)** if any op's aggregate throughput drops more than the tolerance below the committed baseline. Tolerance is **0.5** (a > 50% slowdown is a regression) — loose enough to absorb machine-to-machine variance, tight enough to catch an algorithmic regression. The baseline records `runtime` (e.g. `bun 1.3.x`), warmup/iteration or batch/sample settings, the per-file results, and the per-op aggregates.
+7. **Browser comparisons preserve rotation and cohort identity.** `docs/perf/gen-deficits.mjs`
+   keys correctness by browser, scenario, baked/rotated slot, and engine; a newer digest for a justified
+   replacement supersedes only that filename slot. Wall and peak-memory comparisons are stricter: our
+   result and a rival must PASS the same selected slot in the **same exported run**. A partial overlay can
+   therefore add evidence but cannot erase another rotation, splice in a stale rival, or inherit old
+   correctness coverage. Exports outside the bounded freshness window are excluded from current evidence;
+   every known rotation, warmup, and `n≥5` participant is an explicit gate. Missing or zero-sample
+   `peakMemory` is unmeasured, never a zero-byte win (ADR-209).
+   Likewise, our engine being NA while a rival PASSes is an active coverage gap unless the exact physical
+   capability is listed in the ADR-backed honest-NA register.
 
 ## 2. Scripts & baselines
 
@@ -25,6 +35,7 @@ The pure-TS benchmark harnesses (`scripts/bench-dsp.ts`, `scripts/bench-containe
 | colorspace kernel | `scripts/bench-colorspace.ts` | `fixtures/golden/bench/colorspace.json` | `bun run bench-colorspace` |
 | metadata tag writers | `scripts/bench-metadata-tags.ts` | *(prints; no committed JSON baseline)* | `bun run scripts/bench-metadata-tags.ts` |
 | FLAC decode | `scripts/bench-flac.ts` | *(prints; no committed JSON baseline)* | `bun run bench-flac` |
+| Matroska attachment packet seam | `scripts/bench-session11-webm-attachment-packet-seam.ts` | *(prints; focused Session 11 regression)* | `bun run bench-session11-webm-attachment-packet-seam` |
 
 Run `--check` (e.g. `bun run bench-dsp --check` or `bun run bench-image --check`) to gate against the committed baseline.
 
@@ -35,6 +46,14 @@ the existing MP4/MP3/FLAC/Ogg/MKV writers plus the new raw-PCM rows: `metadata/w
 across **8 WAV files** at **0.254 ms median / 1952.84 MB/s**, `metadata/write_aiff_tags` across
 **5 AIFF/AIFF-C files** at **0.252 ms / 1232.63 MB/s**, and `metadata/write_caf_info` across
 **5 CAF files** at **0.053 ms / 5512.02 MB/s**; checksum `142218504`.
+
+ADR-210's focused Matroska packet-seam benchmark is also print-only, but preserves the full method: seven
+discarded warmups, nine wall samples, a separate peak-RSS pass, and an output-byte checksum. It runs eight
+distinct real WebM/MKV inputs (four rotated H.264/AAC MKVs plus AV1, VP9, tiny, and real-world WebM),
+including the exact JSON/JPEG attachment-bearing regression file. Two fresh runs over 9,970,920 input bytes
+measured **108.406-108.996 ms** corpus medians, **0.59-0.69 MiB** peak-RSS deltas, and 9,965,075 bytes of
+genuine aggregate MKV re-layout. Exact attachment and independent ffprobe correctness remain test gates,
+not inferred from benchmark timing.
 
 ## 3. Recorded baseline — audio-dsp (`audio-dsp.json`)
 
@@ -159,6 +178,6 @@ Aggregate: **~1,835,000 probes/sec geomean**, **~265,000 probes/sec worst**, **~
 
 ## 9. What is *not* in these baselines (and why)
 
-- **The WebCodecs/GPU tier** (lossy `decode`/`encode`, GPU filters, and browser-produced host chunks from live encode/decode) — these require a browser, so their perf is measured on the target runtime against the 558-feature harness, re-measured fresh (ADR-025, [`11`](11-testing-and-validation.md) §7). The public `mux()` packet-descriptor control flow is benchmarked above with real packet bytes; fabricating browser decode/encode numbers in Node remains forbidden (directive 6).
+- **The WebCodecs/GPU tier** (lossy `decode`/`encode`, GPU filters, and browser-produced host chunks from live encode/decode) — these require a browser, so their perf is measured on the target runtime against every cell in the current versioned harness, re-measured fresh with the suite version/count recorded (ADR-025, [`11`](11-testing-and-validation.md) §7). The public `mux()` packet-descriptor control flow is benchmarked above with real packet bytes; fabricating browser decode/encode numbers in Node remains forbidden (directive 6).
 - **The WASM tail** (vendored Symphonia, Opus, AV1/dav1d, VPx/libvpx, and Vorbis-encode cores) — benchmarked where/when their cores run, not folded into the pure-TS baseline table here.
 - **The aggregate "win vs 7 engines"** — that is the external harness's job ([`11`](11-testing-and-validation.md) §7); this doc covers the in-repo per-op baselines that gate `main`.

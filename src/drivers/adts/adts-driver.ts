@@ -13,7 +13,6 @@ import { loadAacCore } from '../../codecs/wasm-aac/wasm-aac-driver.ts';
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -30,19 +29,12 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
 import { fromURL } from '../../sources/source.ts';
+import { matchesAdts } from '../audio-container-sniff.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
-import {
-  type AdtsWalkStats,
-  adtsHeadOffset,
-  isAdtsSync,
-  probeAdtsStream,
-  walkAdtsBuffer,
-} from './adts-frames.ts';
+import { type AdtsWalkStats, probeAdtsStream, walkAdtsBuffer } from './adts-frames.ts';
 import { AdtsMuxer } from './adts-mux.ts';
 
-const ADTS_MIMES = new Set(['audio/aac', 'audio/aacp', 'audio/x-aac']);
-const ADTS_EXTENSIONS = new Set(['aac', 'adts']);
 const NATIVE_AAC_TRIED = ['webcodecs-audio'] as const;
 const WASM_AAC_TRIED = ['wasm-aac'] as const;
 const PCM_OUTPUT_FORMAT = 's16' as const;
@@ -707,23 +699,12 @@ function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): Reada
   /* v8 ignore stop */
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && ADTS_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && ADTS_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head === undefined || head.byteLength < 7) return false;
-  const off = adtsHeadOffset(head);
-  if (off === undefined || off + 2 > head.byteLength) return false;
-  const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
-  return isAdtsSync(dv.getUint8(off), dv.getUint8(off + 1));
-}
-
 export const AdtsDriver = {
   id: 'adts',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['adts'],
-  supports: matches,
+  supports: matchesAdts,
   validatesStreamCopyTrim: true,
   /**
    * Metadata-only probe: EXACT duration from a bounded-read header walk — every ADTS frame header is

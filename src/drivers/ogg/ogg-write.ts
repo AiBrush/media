@@ -16,6 +16,11 @@
 
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import {
+  assertAudioMuxOptions,
+  oggMuxCodec,
+  validateOggMuxTrack,
+} from '../audio-container-mux-validation.ts';
 
 const MAX_SEGMENT = 255; // a lacing value is one byte; 255 means "continues in the next segment"
 const MAX_PAGE_SEGMENTS = 255; // a page's segment table holds at most 255 lacing values
@@ -393,27 +398,7 @@ function finitePositiveDurationSec(durationSec: number | undefined): number | un
 
 /** Resolve the codec + audio geometry from a track's {@link TrackInfo}; reject non-Ogg codecs. */
 export function trackStateFrom(info: TrackInfo): TrackState {
-  if (info.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'the ogg muxer writes audio only', {
-      op: { op: 'mux', mediaType: info.mediaType },
-      tried: ['ogg'],
-    });
-  }
-  const c = info.codec.toLowerCase();
-  const codec: 'opus' | 'vorbis' | 'flac' | undefined = c.startsWith('opus')
-    ? 'opus'
-    : c.startsWith('vorbis')
-      ? 'vorbis'
-      : c.startsWith('flac')
-        ? 'flac'
-        : undefined;
-  if (codec === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      `the ogg muxer cannot write audio codec '${info.codec}' (Opus/Vorbis/FLAC only)`,
-      { op: { op: 'mux', codec: info.codec }, tried: ['ogg'] },
-    );
-  }
+  const codec = oggMuxCodec(info);
   const ac = info.config as AudioDecoderConfig | undefined;
   const sampleRate = ac?.sampleRate && ac.sampleRate > 0 ? ac.sampleRate : 48_000;
   return {
@@ -577,12 +562,7 @@ export class OggMuxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions) {
-    if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'fragmented ogg unsupported', {
-        op: { op: 'mux', fragmented: true },
-        tried: ['ogg'],
-      });
-    }
+    assertAudioMuxOptions('ogg', options);
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -596,12 +576,7 @@ export class OggMuxer implements Muxer {
 
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
-    if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'ogg muxer writes one stream', {
-        op: { op: 'mux' },
-        tried: ['ogg'],
-      });
-    }
+    validateOggMuxTrack(info, this.#track === undefined ? 0 : 1);
     this.#track = { id: 0, state: trackStateFrom(info) };
     return 0;
   }

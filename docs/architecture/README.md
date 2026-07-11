@@ -3,7 +3,7 @@
 The architecture base for **aibrush-media**, a unified, capability-routed, in-browser media engine. These documents are the authoritative source for *what* we are building and *why*, and they precede implementation. Code in this repo must conform to them; when reality forces a change, change the doc in the same PR.
 
 > **Status:** **implementation in progress** (architecture base first ratified 2026-06-23; this README tracks reality). The docs remain the authoritative source for *what* and *why*; when reality forces a change, the doc + an ADR change in the same commit. Validation is **tier-split (ADR-025)** and labeled honestly throughout — *Node-validated* (pure-TS, runs in CI) vs *browser-validated* (WebCodecs/GPU, runs on the target runtime).
-> **Provenance:** the design is grounded in a 558-feature browser-media benchmark (7 frameworks) — distilled in [`background/benchmark-summary.md`](background/benchmark-summary.md); full report lives in the sibling project `aibrush.lib/media-test/media-browser-test/docs/report/`.
+> **Provenance:** the design is grounded in the original 558-feature v0.1.0 browser-media benchmark (7 frameworks) — distilled in [`background/benchmark-summary.md`](background/benchmark-summary.md); full report lives in the sibling project `aibrush.lib/media-test/media-browser-test/docs/report/`. The live acceptance harness is versioned and may add cells (the Session 11 full export has 563), so completion always uses its current full suite rather than this historical count.
 >
 > **Implemented so far** (full per-driver/op status + validation tier in [`09-operations.md`](09-operations.md) §"Shipped drivers & operations"):
 >
@@ -44,7 +44,7 @@ No single in-browser media engine spans all the substrates that win — hardware
 | 12 | [`12-roadmap.md`](12-roadmap.md) | Phases and milestones (MVP → lazy WASM tail → isolation profile). |
 | 13 | [`13-glossary.md`](13-glossary.md) | Terms (substrate, tier, driver, seam, packet, faststart, CENC, …). |
 | 14 | [`14-benchmarks.md`](14-benchmarks.md) | Benchmark methodology (warmup + median + separate RSS pass + checksum sink + `--check` gate) and the committed pure-TS baseline numbers (audio-dsp ×realtime, image probes/sec, container ops MB/s). |
-| — | [`background/benchmark-summary.md`](background/benchmark-summary.md) | The 558-feature evidence that justifies every `[data]` claim. |
+| — | [`background/benchmark-summary.md`](background/benchmark-summary.md) | The original 558-feature v0.1.0 evidence that justifies every `[data]` claim. |
 
 ## Status legend (used in the decision records)
 

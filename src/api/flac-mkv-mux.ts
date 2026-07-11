@@ -8,7 +8,11 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { muxPreparedOggAudioPacketTrack } from '../drivers/ogg/ogg-prepared-mux.ts';
 import type { ChunkStruct as WebmChunkStruct } from '../drivers/webm/ebml-write.ts';
-import { webmCodecIdForTrack, writeWebm } from '../drivers/webm/ebml-write.ts';
+import {
+  WebmContainerSideData,
+  webmCodecIdForTrack,
+  writeWebm,
+} from '../drivers/webm/ebml-write.ts';
 import { muxPreparedMp4PacketTrack } from './mp4-prepared-mux.ts';
 import type { Container, PacketStream, PacketStreams } from './types.ts';
 
@@ -105,11 +109,17 @@ export async function muxFlacMkv(
 ): Promise<ReadableStream<Uint8Array> | undefined> {
   const input = singleFlacAudioStream(streams);
   if (input === undefined) return undefined;
+  const sideData = new WebmContainerSideData('matroska');
+  if (sideData.addTrack(input.track)) {
+    throw new MediaError('mux-error', 'MKV mux received no media tracks');
+  }
   const chunks = await packetChunks(input, options.signal);
   if (chunks.length === 0) {
     throw new MediaError('mux-error', 'MKV mux received no packets');
   }
-  return streamFromBytes(writeWebm([flacTrackState(input, chunks)], 'matroska'));
+  return streamFromBytes(
+    writeWebm([flacTrackState(input, chunks)], 'matroska', sideData.attachedFilePayloads),
+  );
 }
 
 /** Fast single-track Ogg audio packet mux for prepared packet callers. */
@@ -173,19 +183,22 @@ export function muxPreparedWebmPacketTracks(input: PreparedWebmPacketMuxInput): 
     throw new MediaError('mux-error', 'WebM mux received no tracks');
   }
   const states: WebmTrackState[] = [];
+  const docType = input.container === 'mkv' ? 'matroska' : 'webm';
+  const sideData = new WebmContainerSideData(docType);
   for (let i = 0; i < input.tracks.length; i++) {
     const entry = input.tracks[i];
     if (entry === undefined) continue;
+    if (sideData.addTrack(entry.track)) continue;
     const chunks = packetStructs(entry.packets);
     if (chunks.length === 0) {
       throw new MediaError('mux-error', `WebM mux track ${i + 1} received no packets`);
     }
-    states.push(webmTrackStateFromPreparedTrack(entry.track, i + 1, chunks));
+    states.push(webmTrackStateFromPreparedTrack(entry.track, states.length + 1, chunks));
   }
   if (states.length === 0) {
     throw new MediaError('mux-error', 'WebM mux received no tracks');
   }
-  return writeWebm(states, input.container === 'mkv' ? 'matroska' : 'webm');
+  return writeWebm(states, docType, sideData.attachedFilePayloads);
 }
 
 /** Fast WebM/Matroska mux for callers that already hold timestamped packet byte views. */
@@ -200,19 +213,22 @@ export function muxPreparedWebmChunkTracks(input: PreparedWebmChunkMuxInput): Ui
     throw new MediaError('mux-error', 'WebM mux received no tracks');
   }
   const states: WebmTrackState[] = [];
+  const docType = input.container === 'mkv' ? 'matroska' : 'webm';
+  const sideData = new WebmContainerSideData(docType);
   for (let i = 0; i < input.tracks.length; i++) {
     const entry = input.tracks[i];
     if (entry === undefined) continue;
-    const chunks = preparedChunkStructs(entry.chunks, i + 1);
+    if (sideData.addTrack(entry.track)) continue;
+    const chunks = preparedChunkStructs(entry.chunks, states.length + 1);
     if (chunks.length === 0) {
       throw new MediaError('mux-error', `WebM mux track ${i + 1} received no packets`);
     }
-    states.push(webmTrackStateFromPreparedTrack(entry.track, i + 1, chunks));
+    states.push(webmTrackStateFromPreparedTrack(entry.track, states.length + 1, chunks));
   }
   if (states.length === 0) {
     throw new MediaError('mux-error', 'WebM mux received no tracks');
   }
-  return writeWebm(states, input.container === 'mkv' ? 'matroska' : 'webm');
+  return writeWebm(states, docType, sideData.attachedFilePayloads);
 }
 
 /** Fast WebM/Matroska mux for packet-array callers. Stream callers fall back to the general muxer. */
@@ -425,6 +441,7 @@ function isWebmPreparedPacketStream(
   if (!isPacketStream(value)) return false;
   if (slot !== undefined && value.track.mediaType !== slot) return false;
   if (!Array.isArray(value.packetsArray)) return false;
+  if (value.track.containerProjection?.kind === 'matroska-attachment') return true;
   return webmCodecId(value.track.mediaType, value.track.codec, container) !== undefined;
 }
 
@@ -477,9 +494,15 @@ function writePreparedWebmAudioTrack(
   chunks: WebmChunkStruct[],
   container: Container | string | undefined,
 ): Uint8Array {
+  const docType = container === 'mkv' ? 'matroska' : 'webm';
+  const sideData = new WebmContainerSideData(docType);
+  if (sideData.addTrack(track)) {
+    throw new MediaError('mux-error', 'WebM mux received no media tracks');
+  }
   return writeWebm(
     [webmAudioTrackStateFromTrack(track, codecId, chunks)],
-    container === 'mkv' ? 'matroska' : 'webm',
+    docType,
+    sideData.attachedFilePayloads,
   );
 }
 

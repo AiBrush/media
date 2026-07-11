@@ -35,7 +35,9 @@ const audio: MuxTrackInput = {
   mediaType: 'audio',
   sampleEntryType: 'mp4a',
   timescale: 48000,
-  description: new Uint8Array([0x12, 0x10]),
+  // AAC-LC, 48 kHz, stereo. Keep the authoritative ASC coherent with the outer sample-entry geometry;
+  // stale-entry override behavior is covered separately by the parser/probe matrix.
+  description: new Uint8Array([0x11, 0x90]),
   sampleRate: 48000,
   channels: 2,
   samples: [{ data: new Uint8Array([9]), durationTicks: 1024, cttsTicks: 0, keyframe: true }],

@@ -2,7 +2,7 @@
  * CENC (`cenc` / AES-CTR) decrypt robustness — malformed/mutated protected input must REJECT cleanly with
  * a typed {@link MediaError} rather than emit (wrong) output (BUILD_INSTRUCTIONS §6.2 robustness; ADR-023).
  *
- * The acceptance harness (`../media-test/media-browser-test`) gates three malformed CENC-CTR fixtures with
+ * The acceptance harness (`../media-test`) gates three malformed CENC-CTR fixtures with
  * the `graceful-failure` oracle, which FAILs an engine that returns an output blob for the mangled input
  * (a thrown/rejected typed error → PASS; an output → FAIL). These are the exact failing scenarios:
  *   - encryption/cenc_ctr_protection_zeroed_graceful  (cenc_ctr_protection_zeroed.mp4)
@@ -38,10 +38,8 @@ import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 import { buildSampleData } from './samples.ts';
 
 /** The sibling acceptance harness's verified CENC corpus (its prebaked, git-ignored fixtures). */
-const HARNESS_MEDIA_DIR = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const HARNESS_MEDIA_DIR = new URL('../../../../media-test/fixtures/media/', import.meta.url)
+  .pathname;
 /** The golden key/KID for `cenc_ctr.mp4` (mirrors fixtures/golden/cenc_ctr.mp4.keys.json in the harness). */
 const HARNESS_KEY = '00112233445566778899aabbccddeeff';
 const HARNESS_KID = '11223344556677889900aabbccddeeff';

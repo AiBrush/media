@@ -9,7 +9,7 @@
  * silent or fake result.
  */
 
-import type { ImageInfo, ImageOps } from '../codecs/image/index.ts';
+import type { ImageOps } from '../codecs/image/index.ts';
 import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
 import type {
   VideoDecoderStageOptions,
@@ -24,7 +24,6 @@ import type {
   Determinism,
   DriverModule,
   EncodedChunk,
-  EncoderConfig,
   FilterDriver,
   FilterSpec,
   Muxer,
@@ -36,7 +35,7 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
+import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { composeChain, lazyPipeThrough } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router, type StageSelectOptions } from '../kernel/router.ts';
@@ -60,6 +59,7 @@ import {
   type FromOptions,
   type MediaInput,
   SOURCE_CACHE_KEY,
+  SOURCE_URL_KEY,
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
@@ -115,7 +115,6 @@ const CONTAINER_MIME: Record<string, string> = {
   avi: 'video/x-msvideo',
   ts: 'video/mp2t',
 };
-const PCM_AUDIO_DATA_CHUNK_FRAMES = 4096;
 const SOURCE_PREFIX_HANDOFF_TTL_MS = 250;
 
 interface StreamCopySinkMode {
@@ -125,6 +124,8 @@ interface StreamCopySinkMode {
 
 interface SourcePrefixHandoff {
   readonly bytes: Uint8Array;
+  /** Total learned by the range response that produced `bytes`, when the source exposed it. */
+  readonly size?: number;
   readonly token: object;
 }
 
@@ -166,7 +167,6 @@ const REPEATED_PROBE_PREFIX_CACHE_TTL_MS = 60_000;
 const REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES = 1024 * 1024;
 type PacketInfoCallOptions = CallOptions & { readonly container?: Container };
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
-type PcmRangeToPlanarInit = typeof import('../dsp/audio-data.ts')['pcmRangeToPlanarInit'];
 type AbrFanoutRendition = {
   readonly opts: { readonly sink?: unknown; readonly [key: string]: unknown };
 };
@@ -520,7 +520,9 @@ export class MediaEngineImpl implements MediaEngine {
             },
           );
         }
-        const bytes = await this.#writeMetadataTags(src, opts.to, opts.tags, signal);
+        const inputBytes = await readAllSource(src, signal);
+        const { rewriteMetadataTags } = await import('../metadata/metadata-rewrite.ts');
+        const bytes = await rewriteMetadataTags(inputBytes, opts.to, opts.tags);
         return materializeOutput(
           opts.sink ?? toBlob(),
           bytesToStream(bytes),
@@ -740,10 +742,18 @@ export class MediaEngineImpl implements MediaEngine {
         // only the packets from the keyframe at/before the target onward (a stream must decode from a
         // keyframe); seekFrame drops frames before the target, closes them, and returns the first at/after
         // it (owned by the caller). The demuxer is closed on every exit by the finally.
-        const codec = await this.#routeCodec(await decodeQueryFor(track), o);
-        const { decodeVideoPacketsWithAlpha, seekFrame, unwrapPackets } = await loadCodecPipeline();
+        const {
+          decodeQueryFor,
+          decodeVideoPacketsWithAlpha,
+          seekFrame,
+          startAtSeekKeyframe,
+          startAtSeekKeyframePackets,
+          unwrapPackets,
+        } = await loadCodecPipeline();
+        const decodeQuery = await decodeQueryFor(track);
+        const codec = await this.#routeCodec(decodeQuery, o);
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
-        const config = await decodeConfigOf(track);
+        const config = decodeQuery.config;
         const packetInfoRows = (demuxer as DemuxerWithPacketInfoTable).packetInfoTable?.();
         const trackIndex = demuxer.tracks.findIndex((candidate) => candidate.id === track.id);
         let packetInfoSeekStream: ReadableStream<EncodedVideoChunk> | undefined;
@@ -1077,7 +1087,8 @@ export class MediaEngineImpl implements MediaEngine {
     const ops = await this.#imageOpsForSource(src);
     if (ops === undefined) return undefined;
     const bytes = await readAllSource(src, signal);
-    return imageToMediaInfo(await ops.probe(bytes), src);
+    const { imageInfoToMediaMetadata } = await import('../codecs/image/probe.ts');
+    return imageInfoToMediaMetadata(await ops.probe(bytes), src.size);
   }
 
   /** Sniff an image source once and, if matched, keep the bytes shared by the video/audio decode streams. */
@@ -1133,15 +1144,22 @@ export class MediaEngineImpl implements MediaEngine {
     ) {
       await demuxer.close();
       const audio = await container.decodePcmAudio(src, stage);
+      const { pcmAudioToAudioDataStream } = await import('../dsp/audio-data.ts');
       return pcmAudioToAudioDataStream(audio, stage, track.codec) as ReadableStream<RawFrameOf<M>>;
     }
-    const codec = await this.#routeCodec(await decodeQueryFor(track), {
+    const {
+      decodeQueryFor,
+      decodeVideoPacketsWithAlpha,
+      decodedAudioStreamWithGapless,
+      unwrapPackets,
+    } = await loadCodecPipeline();
+    const decodeQuery = await decodeQueryFor(track);
+    const codec = await this.#routeCodec(decodeQuery, {
       strategy: stageStrategy(stage),
     });
-    const { decodeVideoPacketsWithAlpha, unwrapPackets } = await loadCodecPipeline();
     // The route above throws a typed miss in Node (no WebCodecs); past here is the live decode path.
     /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
-    const config = await decodeConfigOf(track);
+    const config = decodeQuery.config;
     if (mediaType === 'video' && track.alpha === true) {
       return decodeVideoPacketsWithAlpha(demuxer.packets(track.id), () =>
         codec.createDecoder(config, stage),
@@ -1158,6 +1176,10 @@ export class MediaEngineImpl implements MediaEngine {
       return (await decodedAudioStreamWithGapless(
         decoded as ReadableStream<AudioData>,
         track,
+        {
+          packets: demuxer.packets(track.id),
+          createDecoder: () => codec.createDecoder(config, stage),
+        },
       )) as ReadableStream<RawFrameOf<M>>;
     }
     return decoded;
@@ -1170,13 +1192,18 @@ export class MediaEngineImpl implements MediaEngine {
     stage: StageOptions,
     o: CallOptions,
   ): Promise<ReadableStream<AudioData>> {
-    const codec = await this.#routeCodec(await decodeQueryFor(track), o);
-    const { unwrapPackets } = await loadCodecPipeline();
-    const config = await decodeConfigOf(track);
+    const { decodeQueryFor, decodedAudioStreamWithGapless, unwrapPackets } =
+      await loadCodecPipeline();
+    const decodeQuery = await decodeQueryFor(track);
+    const codec = await this.#routeCodec(decodeQuery, o);
+    const config = decodeQuery.config;
     const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(
       codec.createDecoder(config, stage),
     ) as ReadableStream<AudioData>;
-    return decodedAudioStreamWithGapless(decoded, track);
+    return decodedAudioStreamWithGapless(decoded, track, {
+      packets: demuxer.packets(track.id),
+      createDecoder: () => codec.createDecoder(config, stage),
+    });
   }
 
   /**
@@ -1357,6 +1384,7 @@ export class MediaEngineImpl implements MediaEngine {
     const {
       estimateTrackBitrateFromPacketInfo,
       restampAudioData,
+      restampVideoFrame,
       planTrimAudioPacketInfoRows,
       planTrimVideoPacketInfoRows,
       trimAudioPacketInfoStream,
@@ -1385,8 +1413,9 @@ export class MediaEngineImpl implements MediaEngine {
 
       if (videoTrack) {
         assertTrimTrackDecodable(videoTrack);
-        const codec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
-        const { unwrapPackets } = await loadCodecPipeline();
+        const { decodeQueryFor, startAtSeekKeyframe, unwrapPackets } = await loadCodecPipeline();
+        const decodeQuery = await decodeQueryFor(videoTrack);
+        const codec = await this.#routeCodec(decodeQuery, o);
         const videoTrackIndex = demuxer.tracks.findIndex((track) => track.id === videoTrack.id);
         const sourceBitrate =
           demuxerPacketInfoRows === undefined || videoTrackIndex < 0
@@ -1407,7 +1436,7 @@ export class MediaEngineImpl implements MediaEngine {
                 bounds.startUs,
               )
             : trimVideoPacketInfoChunkStream(src, packetInfoVideoRows, signal);
-        const config = await decodeConfigOf(videoTrack);
+        const config = decodeQuery.config;
         const decoded = packets.pipeThrough(
           codec.createDecoder(config, this.#stageOptions(signal, o)),
         ) as ReadableStream<VideoFrame>;
@@ -1441,14 +1470,13 @@ export class MediaEngineImpl implements MediaEngine {
             drainEncoderToMuxer(packets, muxer, () => trimAudioPacketInfoTrack(audioTrack, bounds)),
           );
         } else {
-          const codec = await this.#routeCodec(await decodeQueryFor(audioTrack), o);
-          const { unwrapPackets } = await loadCodecPipeline();
           /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
-          const config = await decodeConfigOf(audioTrack);
-          const decoded = unwrapPackets(demuxer.packets(audioTrack.id)).pipeThrough(
-            codec.createDecoder(config, this.#stageOptions(signal, o)),
-          ) as ReadableStream<AudioData>;
-          const programAudio = await decodedAudioStreamWithGapless(decoded, audioTrack);
+          const programAudio = await this.#decodeAudioTrackPackets(
+            demuxer,
+            audioTrack,
+            this.#stageOptions(signal, o),
+            o,
+          );
           const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
           openStreams.push(trimmed);
           tasks.push(
@@ -1478,56 +1506,6 @@ export class MediaEngineImpl implements MediaEngine {
       throw e;
     } finally {
       await demuxer.close();
-    }
-  }
-
-  async #writeMetadataTags(
-    src: Source,
-    target: Container,
-    tags: Record<string, string>,
-    signal: AbortSignal,
-  ): Promise<Uint8Array> {
-    const bytes = await readAllSource(src, signal);
-    switch (target) {
-      case 'mp4':
-      case 'mov': {
-        const { writeMp4Tags } = await import('../metadata/mp4-tags.ts');
-        return writeMp4Tags(bytes, tags);
-      }
-      case 'webm':
-      case 'mkv': {
-        const { writeMkvTags } = await import('../metadata/matroska-tags.ts');
-        return writeMkvTags(bytes, tags);
-      }
-      case 'mp3': {
-        const { writeMp3Id3Tags } = await import('../metadata/id3.ts');
-        return writeMp3Id3Tags(bytes, tags);
-      }
-      case 'flac': {
-        const { writeFlacVorbisComment } = await import('../metadata/vorbis-comment.ts');
-        return writeFlacVorbisComment(bytes, tags);
-      }
-      case 'ogg': {
-        const { writeOggVorbisComment } = await import('../metadata/ogg-vorbis-comment.ts');
-        return writeOggVorbisComment(bytes, tags);
-      }
-      case 'wav': {
-        const { writeWavTags } = await import('../metadata/pcm-tags.ts');
-        return writeWavTags(bytes, tags);
-      }
-      case 'aiff': {
-        const { writeAiffTags } = await import('../metadata/pcm-tags.ts');
-        return writeAiffTags(bytes, tags);
-      }
-      case 'caf': {
-        const { writeCafTags } = await import('../metadata/pcm-tags.ts');
-        return writeCafTags(bytes, tags);
-      }
-      default:
-        throw new CapabilityError('capability-miss', 'metadata tag rewrite is not available', {
-          op: 'remux',
-          tried: [target],
-        });
     }
   }
 
@@ -1616,6 +1594,7 @@ export class MediaEngineImpl implements MediaEngine {
         const {
           buildVideoEncoderConfigForRuntime,
           canUseVpxAlphaPacketTranscode,
+          decodeQueryFor,
           decodeVideoPacketsWithAlpha,
           unwrapPackets,
         } = await loadCodecPipeline();
@@ -1631,8 +1610,9 @@ export class MediaEngineImpl implements MediaEngine {
         } else {
           // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
           // the composition below is the live path, browser-validated.
-          const videoCodec = await this.#routeCodec(await decodeQueryFor(videoTrack), o);
-          const config = await decodeConfigOf(videoTrack);
+          const decodeQuery = await decodeQueryFor(videoTrack);
+          const videoCodec = await this.#routeCodec(decodeQuery, o);
+          const config = decodeQuery.config;
           /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
           const decoded =
             videoTrack.alpha === true
@@ -1679,7 +1659,7 @@ export class MediaEngineImpl implements MediaEngine {
         const stage = this.#stageOptions(signal, o);
         const decoded =
           container.decodePcmAudio && (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
-            ? pcmAudioToAudioDataStream(
+            ? (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
                 await container.decodePcmAudio(src, stage),
                 stage,
                 audioTrack.codec,
@@ -1733,7 +1713,7 @@ export class MediaEngineImpl implements MediaEngine {
     );
     const sourceGeometry = sourceGeometryOf(track);
     const specs = videoFilterSpecs(target, sourceGeometry);
-    const routeCost = videoFilterRouteCost(sourceGeometry);
+    const routeCost = videoFilterRouteCost(target, sourceGeometry);
     let out = frames;
     const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
     for (const spec of specs) {
@@ -1810,11 +1790,22 @@ export class MediaEngineImpl implements MediaEngine {
   ): Promise<void> {
     const {
       buildVideoEncoderConfig,
+      decodeQueryFor,
       drainEncoderToMuxer,
+      encodeQueryFor,
+      requireEncoderConfig,
       transcodeVpxAlphaPackets,
       videoTrackInfoFromDecoderConfig,
     } = await loadCodecPipeline();
-    const decodeCodec = await this.#routeCodec(await decodeQueryFor(sourceTrack), o);
+    const decodeQuery = await decodeQueryFor(sourceTrack);
+    // Packet-plane VPx alpha decodes colour and alpha elementary streams independently. Route the exact
+    // `alpha:'discard'` config those decoders receive; probing implicit `keep` here made a discard-capable
+    // browser miss before construction (and a coarse Router cache made the result operation-order dependent).
+    const decodeConfig: VideoDecoderConfig & { readonly alpha: AlphaOption } = {
+      ...(decodeQuery.config as VideoDecoderConfig),
+      alpha: 'discard',
+    };
+    const decodeCodec = await this.#routeCodec({ ...decodeQuery, config: decodeConfig }, o);
     const encodeConfig = buildVideoEncoderConfig(
       target,
       sourceGeometryOf(sourceTrack),
@@ -1822,7 +1813,6 @@ export class MediaEngineImpl implements MediaEngine {
     );
     const encoderConfig: VideoEncoderConfig = { ...encodeConfig, alpha: 'discard' };
     const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
-    const decodeConfig = await decodeConfigOf(sourceTrack);
     /* v8 ignore start -- requires live WebCodecs decoders/encoders; browser-harness validated. */
     let decoderConfig: VideoDecoderConfig | undefined;
     const colorStage: VideoEncoderStageOptions = {
@@ -1851,9 +1841,10 @@ export class MediaEngineImpl implements MediaEngine {
     });
     await drainEncoderToMuxer(chunks, muxer, () =>
       videoTrackInfoFromDecoderConfig(
-        requireConfig(decoderConfig, 'video'),
+        requireEncoderConfig(decoderConfig, 'video'),
         target.fps,
         sourceTrack.durationSec,
+        sourceTrack.rotation,
       ),
     );
     /* v8 ignore stop */
@@ -1872,8 +1863,10 @@ export class MediaEngineImpl implements MediaEngine {
     const {
       buildVideoEncoderConfig,
       drainEncoderToMuxer,
+      encodeQueryFor,
       encodeVideoFramesWithAlpha,
       periodicVideoKeyFrameInterval,
+      requireEncoderConfig,
       videoTrackInfoFromDecoderConfig,
     } = await loadCodecPipeline();
     const config = buildVideoEncoderConfig(
@@ -1925,9 +1918,10 @@ export class MediaEngineImpl implements MediaEngine {
         : encodeInput.pipeThrough(codec.createEncoder(encoderConfig, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
       videoTrackInfoFromDecoderConfig(
-        requireConfig(decoderConfig, 'video'),
+        requireEncoderConfig(decoderConfig, 'video'),
         target.fps,
         sourceTrack?.durationSec,
+        sourceTrack?.rotation,
       ),
     );
     /* v8 ignore stop */
@@ -1947,6 +1941,8 @@ export class MediaEngineImpl implements MediaEngine {
       audioTrackInfoFromDecoderConfig,
       buildAudioEncoderConfig,
       drainEncoderToMuxer,
+      encodeQueryFor,
+      requireEncoderConfig,
     } = await loadCodecPipeline();
     const config = buildAudioEncoderConfig(
       target,
@@ -1967,7 +1963,7 @@ export class MediaEngineImpl implements MediaEngine {
     const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
     await drainEncoderToMuxer(chunks, muxer, () =>
       audioTrackInfoFromDecoderConfig(
-        requireConfig(decoderConfig, 'audio'),
+        requireEncoderConfig(decoderConfig, 'audio'),
         sourceTrack?.durationSec,
         sourceTrack?.gapless,
       ),
@@ -2103,28 +2099,6 @@ function assertTrimTrackDecodable(track: TrackInfo): void {
   throw new MediaError('decode-error', `protected ${track.mediaType} trim needs decrypt()`);
 }
 
-async function decodedAudioStreamWithGapless(
-  frames: ReadableStream<AudioData>,
-  track: TrackInfo,
-): Promise<ReadableStream<AudioData>> {
-  if (track.gapless === undefined) return frames;
-  const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
-  return trimAudioGaplessFrameStream(frames, track.gapless, restampAudioDataRange);
-}
-
-/* v8 ignore start -- browser-only restamp constructors; trimTimedFrameStream is Node-tested below. */
-function restampVideoFrame(
-  frame: VideoFrame,
-  timestamp: number,
-  duration: number | null,
-): VideoFrame {
-  if (frame.timestamp === timestamp && frame.duration === duration) return frame;
-  const init: VideoFrameInit = duration === null ? { timestamp } : { timestamp, duration };
-  return new VideoFrame(frame, init);
-}
-
-/* v8 ignore stop */
-
 function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
   let promise: Promise<T> | undefined;
   return () => {
@@ -2216,74 +2190,6 @@ function isRawPcmTrack(track: TrackInfo): boolean {
   return track.codec === 'pcm' || track.codec.startsWith('pcm-');
 }
 
-/**
- * Browser raw-PCM decode bridge: a raw PCM container has already parsed canonical samples; this wraps
- * them as `AudioData` chunks for the public `decode()` stream. Emitted frames are owned by the readable
- * consumer and must be closed by that consumer. If an enqueue loses a cancel race, this function closes
- * the frame it just constructed so no native handle leaks.
- */
-function pcmAudioToAudioDataStream(
-  audio: PcmAudio,
-  stage: StageOptions,
-  label: string,
-): ReadableStream<AudioData> {
-  assertPcmAudioDataAvailable(label);
-  /* v8 ignore start -- requires the browser `AudioData` constructor; validated in the browser harness. */
-  let cursor = 0;
-  let initRange: PcmRangeToPlanarInit | undefined;
-  const loadInitRange = async (): Promise<PcmRangeToPlanarInit> => {
-    initRange ??= (await import('../dsp/audio-data.ts')).pcmRangeToPlanarInit;
-    return initRange;
-  };
-  return new ReadableStream<AudioData>(
-    {
-      async pull(controller): Promise<void> {
-        try {
-          throwIfAborted(stage.signal);
-          if (cursor >= audio.frames) {
-            controller.close();
-            return;
-          }
-          const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
-          const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
-          const { init } = (await loadInitRange())(audio, cursor, frames, timestamp);
-          const frame = new AudioData(init);
-          try {
-            controller.enqueue(frame);
-          } catch (e) {
-            frame.close();
-            throw e;
-          }
-          cursor += frames;
-        } catch (e) {
-          if (e instanceof MediaError) {
-            throw e;
-          }
-          throw new MediaError(
-            'decode-error',
-            `PCM audio decode failed to construct AudioData: ${unknownMessage(e)}`,
-            e,
-          );
-        }
-      },
-      cancel(): void {
-        cursor = audio.frames;
-      },
-    },
-    { highWaterMark: 0 },
-  );
-  /* v8 ignore stop */
-}
-
-function assertPcmAudioDataAvailable(label: string): void {
-  if (typeof AudioData !== 'undefined') return;
-  throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
-    op: 'decode',
-    tried: [label],
-    suggestion: 'run in a browser or worker with AudioData',
-  });
-}
-
 /** Cancel a frame stream so its producer (a decoder/demuxer) releases any buffered frames. */
 async function cancelStream(stream: ReadableStream<unknown>): Promise<void> {
   await stream.cancel(new MediaError('aborted', 'stream not consumed')).catch(() => {});
@@ -2346,35 +2252,6 @@ function openRenditionOptions(opts: ConvertOptions): AbrFanoutRendition['opts'] 
   return sink === undefined ? { ...rest } : { ...rest, sink };
 }
 
-/**
- * The WebCodecs decode `config` carried on a demux {@link TrackInfo} (guaranteed present by the callers),
- * with its codec string NORMALIZED to one `VideoDecoder`/`AudioDecoder` accepts. A container demux
- * (notably WebM/Matroska) emits a bare canonical token (`vp9`/`av1`/…) that `isConfigSupported` rejects;
- * {@link normalizeDecoderCodec} expands it to a valid WebCodecs string (a no-op for already-qualified
- * strings, so MP4/MOV configs are untouched). Returns a fresh object only when the codec actually
- * changes, so the common case allocates nothing.
- */
-async function decodeConfigOf(track: TrackInfo): Promise<TrackInfo['config'] & object> {
-  const config = track.config;
-  if (config === undefined) {
-    throw new MediaError('decode-error', `track ${track.id} has no decoder config`);
-  }
-  const { normalizeDecoderCodec } = await loadCodecPipeline();
-  const codec = normalizeDecoderCodec(config);
-  return codec === config.codec ? config : { ...config, codec };
-}
-
-/** Build the decode {@link CodecQuery} for a demux track (its media type + WebCodecs decoder config). */
-async function decodeQueryFor(track: TrackInfo): Promise<CodecQuery> {
-  return { mediaType: track.mediaType, direction: 'decode', config: await decodeConfigOf(track) };
-}
-
-/** Build the encode {@link CodecQuery} for a target encoder config (media type inferred from the shape). */
-function encodeQueryFor(config: EncoderConfig): CodecQuery {
-  const mediaType: 'video' | 'audio' = 'width' in config && 'height' in config ? 'video' : 'audio';
-  return { mediaType, direction: 'encode', config };
-}
-
 /** Source geometry (coded dims) for a video track, read from its WebCodecs decoder config. */
 function sourceGeometryOf(track: TrackInfo): {
   width: number | undefined;
@@ -2422,108 +2299,28 @@ function audioGeometryOf(track: TrackInfo | undefined): {
 }
 
 /**
- * Assert the encoder published its decoder config before the muxer needed it (else a typed error). Only
- * called from the browser-only encoder-drain path (a real WebCodecs encoder always emits the config with
- * its first chunk), so the undefined-guard is unreachable in Node — validated in the browser harness.
+ * Object spread snapshots an optional Source property. URL-backed `size` and redirect provenance are
+ * learned later, so install forwarding accessors without widening the public optional-property types.
  */
-/* v8 ignore start -- invoked only on the live WebCodecs encode path; browser-harness validated. */
-function requireConfig<T>(config: T | undefined, media: 'video' | 'audio'): T {
-  if (config === undefined) {
-    throw new MediaError('encode-error', `${media} encoder emitted a chunk before config`);
-  }
-  return config;
-}
-/* v8 ignore stop */
-
-/**
- * Build the seek input packet stream: scan the track's packets for the last keyframe at/before `targetUs`
- * (a stream must decode from a keyframe), then re-emit from that keyframe onward. Packets before it are
- * pulled (to read their timing) but not forwarded. The bytes are read lazily by the demuxer; this only
- * gates which packets reach the decoder. Returns a fresh `ReadableStream<EncodedChunk>` for the decoder.
- *
- * Single-pass with a bounded GOP buffer: buffer chunks since the last seen keyframe; once a packet's
- * timestamp exceeds the target, the most-recent buffered keyframe is the start — flush from it. If the
- * stream ends first (target past EOF), flush from the last keyframe so the final frame is still decodable.
- */
-/* v8 ignore start -- requires WebCodecs Encoded*Chunk (absent in Node); validated in the browser harness. */
-async function startAtSeekKeyframe(
-  packets: ReadableStream<EncodedChunk>,
-  targetUs: number,
-): Promise<ReadableStream<EncodedChunk>> {
-  // One reader drives both the scan and the continuation. Buffer chunks since the most-recent keyframe at
-  // or before the target; once a packet's timestamp exceeds the target the target lies within this GOP, so
-  // the buffered head (from that keyframe) is the decode start, and the same reader continues after it. The
-  // reader is NOT released — the returned stream keeps reading from it and releases it on close/cancel.
-  const reader = packets.getReader();
-  const head: EncodedChunk[] = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break; // target at/after EOF: decode from the last buffered keyframe (head holds it)
-    if (value.type === 'key' && value.timestamp <= targetUs) {
-      head.length = 0; // a keyframe at/before the target supersedes everything buffered before it
-      head.push(value);
-    } else {
-      head.push(value);
-    }
-    if (value.timestamp > targetUs) break; // the target frame is within the buffered GOP; stop scanning
-  }
-  return new ReadableStream<EncodedChunk>({
-    start(controller): void {
-      for (const chunk of head) controller.enqueue(chunk);
+function preserveLiveSourceFacts(
+  wrapped: Source,
+  src: Source,
+  handedOffSize: () => number | undefined,
+): Source {
+  Object.defineProperties(wrapped, {
+    size: {
+      configurable: true,
+      enumerable: true,
+      get: () => src.size ?? handedOffSize(),
     },
-    async pull(controller): Promise<void> {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        reader.releaseLock();
-      } else {
-        controller.enqueue(value);
-      }
-    },
-    async cancel(reason): Promise<void> {
-      await reader.cancel(reason).catch(() => {});
+    [SOURCE_URL_KEY]: {
+      configurable: true,
+      enumerable: true,
+      get: () => src[SOURCE_URL_KEY],
     },
   });
+  return wrapped;
 }
-/* v8 ignore stop */
-
-/* v8 ignore start -- requires WebCodecs Encoded*Chunk (absent in Node); validated in the browser harness. */
-async function startAtSeekKeyframePackets(
-  packets: ReadableStream<Packet>,
-  targetUs: number,
-): Promise<ReadableStream<Packet>> {
-  const reader = packets.getReader();
-  const head: Packet[] = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value.chunk.type === 'key' && value.chunk.timestamp <= targetUs) {
-      head.length = 0;
-      head.push(value);
-    } else {
-      head.push(value);
-    }
-    if (value.chunk.timestamp > targetUs) break;
-  }
-  return new ReadableStream<Packet>({
-    start(controller): void {
-      for (const packet of head) controller.enqueue(packet);
-    },
-    async pull(controller): Promise<void> {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        reader.releaseLock();
-      } else {
-        controller.enqueue(value);
-      }
-    },
-    async cancel(reason): Promise<void> {
-      await reader.cancel(reason).catch(() => {});
-    },
-  });
-}
-/* v8 ignore stop */
 
 function cacheProbeRanges(
   src: Source,
@@ -2534,24 +2331,37 @@ function cacheProbeRanges(
   const range = src.range;
   if (range === undefined) return src;
   const cacheKey = src[SOURCE_CACHE_KEY];
-  let cached =
+  const consumed =
     mode === 'consume' && cacheKey !== undefined && handoff !== undefined
-      ? handoff.get(cacheKey)?.bytes
+      ? handoff.get(cacheKey)
       : undefined;
+  let cached = consumed?.bytes;
+  let cachedSize = consumed?.size;
   if (mode === 'consume' && cacheKey !== undefined) {
     handoff?.delete(cacheKey);
   }
-  return {
+  const wrapped: Source = {
     ...src,
+    // `fromURL()` learns size and its final redirect URL during a range response. Object spread would
+    // snapshot/omit those late facts, so every Source wrapper must keep them live. A fresh Source that
+    // consumes a probe prefix also needs the total learned by the probe: otherwise parsing wholly from
+    // the cached prefix leaves the new URL unread and MP4 cannot validate its terminal boxes/mdat.
     range: async (start, end) => {
+      const sourceSize = src.size ?? cachedSize;
       const cachedCoversEnd =
         cached !== undefined &&
         (end <= cached.byteLength ||
-          (src.size !== undefined && cached.byteLength >= src.size && end >= src.size));
+          (sourceSize !== undefined && cached.byteLength >= sourceSize && end >= sourceSize));
       if (cached !== undefined && start >= 0 && cachedCoversEnd) {
         return cached.subarray(start, end);
       }
       const bytes = await range.call(src, start, end);
+      cachedSize =
+        src.size ??
+        cachedSize ??
+        (start === 0 && bytes.byteLength < Math.max(0, Math.trunc(end))
+          ? bytes.byteLength
+          : undefined);
       const cacheable = options.maxBytes === undefined || bytes.byteLength <= options.maxBytes;
       if (
         start === 0 &&
@@ -2560,12 +2370,13 @@ function cacheProbeRanges(
       ) {
         cached = bytes;
         if (mode === 'store' && cacheKey !== undefined && handoff !== undefined) {
-          storeSourcePrefixHandoff(handoff, cacheKey, bytes, options.ttlMs);
+          storeSourcePrefixHandoff(handoff, cacheKey, bytes, cachedSize, options.ttlMs);
         }
       }
       return bytes;
     },
   };
+  return preserveLiveSourceFacts(wrapped, src, () => cachedSize);
 }
 
 /**
@@ -2580,18 +2391,27 @@ function cacheRepeatedProbeRanges(
 ): Source {
   const range = src.range;
   if (range === undefined) return src;
-  let cached = handoff.get(src)?.bytes;
-  return {
+  const prior = handoff.get(src);
+  let cached = prior?.bytes;
+  let cachedSize = prior?.size;
+  const wrapped: Source = {
     ...src,
     range: async (start, end) => {
+      const sourceSize = src.size ?? cachedSize;
       const cachedCoversEnd =
         cached !== undefined &&
         (end <= cached.byteLength ||
-          (src.size !== undefined && cached.byteLength >= src.size && end >= src.size));
+          (sourceSize !== undefined && cached.byteLength >= sourceSize && end >= sourceSize));
       if (cached !== undefined && start >= 0 && cachedCoversEnd) {
         return cached.subarray(start, end);
       }
       const bytes = await range.call(src, start, end);
+      cachedSize =
+        src.size ??
+        cachedSize ??
+        (start === 0 && bytes.byteLength < Math.max(0, Math.trunc(end))
+          ? bytes.byteLength
+          : undefined);
       if (
         start === 0 &&
         bytes.byteLength <= options.maxBytes &&
@@ -2599,7 +2419,11 @@ function cacheRepeatedProbeRanges(
       ) {
         cached = bytes;
         const token = {};
-        handoff.set(src, { bytes, token });
+        handoff.set(src, {
+          bytes,
+          ...(cachedSize !== undefined ? { size: cachedSize } : {}),
+          token,
+        });
         setTimeout(() => {
           if (handoff.get(src)?.token === token) handoff.delete(src);
         }, options.ttlMs);
@@ -2607,16 +2431,18 @@ function cacheRepeatedProbeRanges(
       return bytes;
     },
   };
+  return preserveLiveSourceFacts(wrapped, src, () => cachedSize);
 }
 
 function storeSourcePrefixHandoff(
   handoff: Map<string, SourcePrefixHandoff>,
   cacheKey: string,
   bytes: Uint8Array,
+  size: number | undefined,
   ttlMs: number = SOURCE_PREFIX_HANDOFF_TTL_MS,
 ): void {
   const token = {};
-  handoff.set(cacheKey, { bytes, token });
+  handoff.set(cacheKey, { bytes, ...(size !== undefined ? { size } : {}), token });
   setTimeout(() => {
     if (handoff.get(cacheKey)?.token === token) {
       handoff.delete(cacheKey);
@@ -2703,10 +2529,6 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new MediaError('aborted', 'aborted');
   }
-}
-
-function unknownMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -2811,23 +2633,18 @@ function extensionOf(filename: string | undefined): string | undefined {
 function sourceMayBeHlsManifest(src: Source): boolean {
   const ext = extensionOf(src.filename);
   if (ext === 'm3u8' || ext === 'm3u') return true;
-  const mime = src.mimeHint?.toLowerCase();
+  const mime = src.mimeHint?.toLowerCase().split(';', 1)[0]?.trim();
+  if (mime !== undefined && /(?:mpegurl|m3u8)|^(?:video|audio)\/mp2t$/.test(mime)) return true;
+  // Known media extensions and concrete audio/video/image MIME families cannot be a text playlist, so
+  // they skip the extra read. Generic or text MIME, unknown extensions, and no hints remain ambiguous:
+  // confirm their actual `#EXTM3U` bytes, preserving replay for every non-match.
   if (
-    mime !== undefined &&
-    (mime.includes('mpegurl') ||
-      mime.includes('m3u8') ||
-      mime === 'video/mp2t' ||
-      mime === 'audio/mp2t')
+    (ext !== undefined && CONTAINER_MIME[ext] !== undefined) ||
+    /^(?:audio|video|image)\//.test(mime ?? '')
   ) {
-    return true;
+    return false;
   }
-  // A caller may have fetched the manifest and passed only its bytes. Sniffing a seekable in-memory
-  // source is a bounded subarray/Blob slice, not a network request. A single-use stream is also eligible:
-  // the HLS resolver retains its peeked chunks and returns a byte-exact one-shot replay on a non-match.
-  return (
-    ((src.kind === 'bytes' || src.kind === 'blob') && src.range !== undefined) ||
-    src.kind === 'stream'
-  );
+  return true;
 }
 
 /** Materialize options carrying the container's MIME type when known. */
@@ -2849,38 +2666,6 @@ function toMediaInfo(
     ...(src.size !== undefined ? { sizeBytes: src.size } : {}),
     tracks: infoTracks,
   };
-}
-
-const IMAGE_DEFAULT_FPS = 25;
-
-function imageToMediaInfo(info: ImageInfo, src: Source): MediaInfo {
-  const durationSec = imageDurationSec(info);
-  const track: MediaInfoTrack = {
-    id: 0,
-    type: 'video',
-    codec: info.format === 'jpeg' ? 'mjpeg' : info.format,
-    width: info.width,
-    height: info.height,
-    fps: imageFrameRate(info, durationSec),
-  };
-  if (durationSec > 0) track.durationSec = durationSec;
-  return {
-    container: info.format === 'jpeg' ? 'jpeg' : info.format,
-    durationSec,
-    ...(src.size !== undefined ? { sizeBytes: src.size } : {}),
-    tracks: [track],
-  };
-}
-
-function imageDurationSec(info: ImageInfo): number {
-  if (info.durationSec !== undefined) return info.durationSec;
-  // The harness image goldens model JPEG as one 25 fps frame (0.04s) and PNG/WebP stills as unknown
-  // duration. Animated formats without parsed header timing keep the conservative corpus fallback.
-  return info.animated || info.format === 'jpeg' ? info.frameCount / IMAGE_DEFAULT_FPS : 0;
-}
-
-function imageFrameRate(info: ImageInfo, durationSec: number): number {
-  return durationSec > 0 ? info.frameCount / durationSec : IMAGE_DEFAULT_FPS;
 }
 
 function toInfoTrack(t: TrackInfo): MediaInfoTrack {

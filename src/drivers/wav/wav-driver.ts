@@ -8,7 +8,6 @@
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -25,6 +24,7 @@ import {
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/pcm.ts';
 import { fromURL } from '../../sources/source.ts';
+import { matchesWav } from '../audio-container-sniff.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
@@ -32,9 +32,6 @@ import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
 import { tryConvertWavPcmFormatToWav } from './format-convert.ts';
 import { readWavPcm, rewriteWavPcmCopy } from './pcm.ts';
 import { WavMuxer } from './wav-mux.ts';
-
-const WAV_MIMES = new Set(['audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave']);
-const WAV_EXTENSIONS = new Set(['wav', 'wave']);
 
 function ascii(bytes: Uint8Array, offset: number, length: number): string {
   let out = '';
@@ -302,18 +299,6 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
   return out;
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && WAV_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && WAV_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  return (
-    head !== undefined &&
-    head.byteLength >= 12 &&
-    ascii(head, 0, 4) === 'RIFF' &&
-    ascii(head, 8, 4) === 'WAVE'
-  );
-}
-
 function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(c): void {
@@ -328,7 +313,7 @@ export const WavDriver: ContainerDriver = {
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['wav'],
-  supports: matches,
+  supports: matchesWav,
   validatesPcmTrim: true,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     let head = await readHead(src, WAV_PROBE_HEAD_BYTES);

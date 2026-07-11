@@ -23,10 +23,7 @@ import { MpegTsMuxer } from './ts-write.ts';
 
 // The sibling acceptance corpus holds full-length real transport streams; we read them by direct path
 // (they are not in this project's fetch-fixtures manifest). The committed slice is self-contained.
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 const DERIVED = new URL('../../../fixtures/media-derived/', import.meta.url).pathname;
 
 async function bytesFromMediaTest(name: string): Promise<Uint8Array> {
@@ -412,10 +409,7 @@ describe('golden-packets — access-unit count + per-frame size/PTS/DTS vs the h
     dtsUs: number;
     keyframe: boolean;
   }
-  const GOLDEN_DIR = new URL(
-    '../../../../media-test/media-browser-test/fixtures/golden/',
-    import.meta.url,
-  ).pathname;
+  const GOLDEN_DIR = new URL('../../../../media-test/fixtures/golden/', import.meta.url).pathname;
 
   it('h264_ts.ts — 770 packets {video:300, audio:470}, every size/PTS/DTS/keyframe matches', async () => {
     const golden = JSON.parse(

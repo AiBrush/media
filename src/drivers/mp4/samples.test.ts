@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ParsedTrack, SampleTable } from './parse.ts';
-import { buildSampleData, buildSamples } from './samples.ts';
+import { buildSampleData, buildSamples, walkSampleRanges } from './samples.ts';
 
 function track(
   partial: Partial<SampleTable>,
@@ -36,6 +36,61 @@ const oneChunk = {
 };
 
 describe('buildSamples', () => {
+  it('walks the exact normalized sample ranges without materializing timing or sync state', () => {
+    const parsed = track({
+      chunkOffsets: [100, 200, 400],
+      sampleToChunk: [
+        { firstChunk: 1, samplesPerChunk: 2, descIndex: 1 },
+        { firstChunk: 3, samplesPerChunk: 1, descIndex: 1 },
+      ],
+      sampleSizes: [10, 20, 30, 40, 0],
+      timeToSample: [{ count: 5, delta: 100 }],
+      compositionOffsets: [{ count: 5, offset: -25 }],
+      syncSamples: [4, 1],
+    });
+    const ranges: Array<readonly [number, number, number]> = [];
+
+    const visited = walkSampleRanges(parsed, (index, offset, size) =>
+      ranges.push([index, offset, size]),
+    );
+
+    expect(visited).toBe(5);
+    expect(ranges).toEqual(
+      buildSampleData(parsed).map((sample): readonly [number, number, number] => [
+        sample.index,
+        sample.offset,
+        sample.size,
+      ]),
+    );
+    expect(ranges).toEqual([
+      [0, 100, 10],
+      [1, 110, 20],
+      [2, 200, 30],
+      [3, 230, 40],
+      [4, 400, 0],
+    ]);
+  });
+
+  it('preserves large normalized co64 offsets and early chunk exhaustion', () => {
+    const parsed = track({
+      chunkOffsets: [2 ** 32 + 64],
+      sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 2, descIndex: 1 }],
+      sampleSizes: [7, 11, 13],
+      timeToSample: [{ count: 3, delta: 1 }],
+    });
+    const ranges: Array<readonly [number, number, number]> = [];
+
+    const visited = walkSampleRanges(parsed, (index, offset, size) =>
+      ranges.push([index, offset, size]),
+    );
+
+    expect(visited).toBe(2);
+    expect(ranges).toEqual([
+      [0, 2 ** 32 + 64, 7],
+      [1, 2 ** 32 + 71, 11],
+    ]);
+  });
+
   it('computes offsets, sizes, timestamps, and all-sync keyframes', () => {
     expect(buildSamples(track(oneChunk))).toEqual([
       { index: 0, offset: 100, size: 10, dtsUs: 0, ptsUs: 0, durationUs: 500_000, keyframe: true },

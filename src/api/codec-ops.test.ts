@@ -745,13 +745,18 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     const out = muxPreparedWebmPacketTracks({ tracks: prepared.tracks, container: 'mkv' });
     const info = parseWebm(out);
     const codecs = new Set(info.tracks.map((track) => track.codec));
-    const videoDurationSec = prepared.tracks.find((entry) => entry.track.mediaType === 'video')
-      ?.track.durationSec;
+    const declaredDurationSec = prepared.tracks.reduce(
+      (duration, entry) => Math.max(duration, entry.track.durationSec ?? 0),
+      0,
+    );
 
     expect(info.container).toBe('mkv');
     expect(codecs.has('h264')).toBe(true);
     expect(codecs.has('aac')).toBe(true);
-    expect(info.durationSec).toBeCloseTo(videoDurationSec ?? 0, 2);
+    // Matroska Duration covers the full declared presentation. This real source's AAC track is
+    // 5.15483 s while video is 5.00000 s (independently confirmed by ffprobe), so truncating to video
+    // would lose genuine declared audio rather than remove explicitly signalled gapless padding.
+    expect(info.durationSec).toBeCloseTo(declaredDurationSec, 2);
   });
 
   it('prepared WebM chunk mux authors real MP4 H.264/AAC packet tables without packet facades', async () => {
@@ -760,13 +765,15 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     const out = muxPreparedWebmChunkTracks({ tracks: prepared.tracks, container: 'mkv' });
     const info = parseWebm(out);
     const codecs = new Set(info.tracks.map((track) => track.codec));
-    const videoDurationSec = prepared.tracks.find((entry) => entry.track.mediaType === 'video')
-      ?.track.durationSec;
+    const declaredDurationSec = prepared.tracks.reduce(
+      (duration, entry) => Math.max(duration, entry.track.durationSec ?? 0),
+      0,
+    );
 
     expect(info.container).toBe('mkv');
     expect(codecs.has('h264')).toBe(true);
     expect(codecs.has('aac')).toBe(true);
-    expect(info.durationSec).toBeCloseTo(videoDurationSec ?? 0, 2);
+    expect(info.durationSec).toBeCloseTo(declaredDurationSec, 2);
   });
 
   it('prepared WebM chunk mux rejects unsupported containers and empty inputs', () => {

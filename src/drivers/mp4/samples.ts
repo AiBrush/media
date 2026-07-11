@@ -42,6 +42,9 @@ export type SampleVisitor = (
   keyframe: boolean,
 ) => void;
 
+/** A zero-allocation visitor over normalized sample byte ranges. */
+export type SampleRangeVisitor = (index: number, offset: number, size: number) => void;
+
 function toUs(ticks: number, timescale: number): number {
   return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
 }
@@ -85,6 +88,42 @@ function isAscending(values: readonly number[]): boolean {
     previous = value;
   }
   return true;
+}
+
+/**
+ * Walk only the byte-placement tables (`stsz` + `stsc` + `stco`/`co64`). This deliberately avoids
+ * timing, composition, and sync-table work when a caller only needs physical sample ownership.
+ */
+export function walkSampleRanges(track: ParsedTrack, visitor: SampleRangeVisitor): number {
+  const table = track.samples;
+  const sizes = table.sampleSizes;
+  const count = sizes.length;
+  let stscIndex = 0;
+  let samplesPerChunk = 0;
+  let sampleIndex = 0;
+  for (
+    let chunkIndex = 0;
+    chunkIndex < table.chunkOffsets.length && sampleIndex < count;
+    chunkIndex++
+  ) {
+    const chunkOffset = table.chunkOffsets[chunkIndex];
+    if (chunkOffset === undefined) break;
+    const chunkNumber = chunkIndex + 1;
+    while (true) {
+      const entry = table.sampleToChunk[stscIndex];
+      if (entry === undefined || entry.firstChunk > chunkNumber) break;
+      samplesPerChunk = entry.samplesPerChunk;
+      stscIndex++;
+    }
+    let offset = chunkOffset;
+    for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < count; inChunk++) {
+      const size = sizes[sampleIndex] ?? 0;
+      visitor(sampleIndex, offset, size);
+      offset += size;
+      sampleIndex++;
+    }
+  }
+  return sampleIndex;
 }
 
 /** Build the flat sample list (container-native ticks) for a track. */

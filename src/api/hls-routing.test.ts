@@ -7,24 +7,26 @@
  * byte-exact in `src/drivers/hls/hls-aes128.test.ts`; this covers the engine wiring the driver can't.)
  */
 
+import { createCipheriv } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
-import type { MediaInput } from '../sources/source.ts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { type MediaInput, fromURL } from '../sources/source.ts';
 import { createMedia } from './create-media.ts';
 import type { Container, MediaInfo } from './types.ts';
 
 const realFetch = globalThis.fetch;
-const MEDIA_TEST = new URL(
-  '../../../media-test/media-browser-test/fixtures/media/',
+const HLS_VOD = new URL(
+  '../../fixtures/media-derived/hls-aes128/ffmpeg-explicit-seq47/',
   import.meta.url,
 ).pathname;
 afterEach(() => {
+  vi.unstubAllGlobals();
   globalThis.fetch = realFetch;
 });
 
 async function corpusBytes(name: string): Promise<Uint8Array> {
-  return new Uint8Array(await readFile(`${MEDIA_TEST}${name}`));
+  return new Uint8Array(await readFile(`${HLS_VOD}${name}`));
 }
 
 interface TargetedProbeEngine {
@@ -96,8 +98,89 @@ describe('engine HLS input auto-resolution', () => {
     );
   });
 
+  it('retains the manifest URL when a URL-backed Source is passed and decrypts relative AES-128 resources', async () => {
+    const clear = await tsSegment();
+    const key = Uint8Array.from({ length: 16 }, (_, index) => index);
+    const iv = Uint8Array.from({ length: 16 }, (_, index) => 0xf0 - index);
+    const cipher = createCipheriv('aes-128-cbc', key, iv);
+    const encrypted = new Uint8Array(Buffer.concat([cipher.update(clear), cipher.final()]));
+    const manifestUrl = 'https://media.example.test/vod/index.m3u8';
+    const keyUrl = 'https://media.example.test/vod/key.bin';
+    const segmentUrl = 'https://media.example.test/vod/segment.ts';
+    const ivHex = [...iv].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const manifest = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:10',
+      `#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x${ivHex}`,
+      '#EXTINF:10.0,',
+      'segment.ts',
+      '#EXT-X-ENDLIST',
+      '',
+    ].join('\n');
+    const seen: string[] = [];
+    globalThis.fetch = (async (url: unknown): Promise<Response> => {
+      const href = String(url);
+      seen.push(href);
+      if (href === manifestUrl) return new Response(manifest, { status: 200 });
+      if (href === keyUrl) {
+        return new Response(key as unknown as BodyInit, { status: 200 });
+      }
+      if (href === segmentUrl) {
+        return new Response(encrypted as unknown as BodyInit, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const info = await createMedia().probe(fromURL(manifestUrl));
+    expect(info.container).toBe('ts');
+    expect(info.tracks.map((track) => track.type)).toEqual(
+      expect.arrayContaining(['video', 'audio']),
+    );
+    expect(seen).toContain(keyUrl);
+    expect(seen).toContain(segmentUrl);
+    expect(seen).not.toContain('key.bin');
+    expect(seen).not.toContain('segment.ts');
+  });
+
+  it('resolves a root-relative URL-backed manifest against the browser location', async () => {
+    const segment = await tsSegment();
+    const pageUrl = 'https://app.example.test/player/index.html';
+    const manifestPath = '/media/vod/index.m3u8';
+    const manifestUrl = 'https://app.example.test/media/vod/index.m3u8';
+    const segmentUrl = 'https://app.example.test/media/vod/segment.ts';
+    const manifest = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:10',
+      '#EXTINF:10.0,',
+      'segment.ts',
+      '#EXT-X-ENDLIST',
+      '',
+    ].join('\n');
+    vi.stubGlobal('location', new URL(pageUrl));
+    const seen: string[] = [];
+    globalThis.fetch = (async (url: unknown): Promise<Response> => {
+      const href = new URL(String(url), pageUrl).href;
+      seen.push(href);
+      if (href === manifestUrl) return new Response(manifest, { status: 200 });
+      if (href === segmentUrl) {
+        return new Response(segment as unknown as BodyInit, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const info = await createMedia().probe(fromURL(manifestPath));
+    expect(info.container).toBe('ts');
+    expect(info.tracks.map((track) => track.type)).toEqual(
+      expect.arrayContaining(['video', 'audio']),
+    );
+    expect(seen).toContain(segmentUrl);
+    expect(seen).not.toContain('https://app.example.test/player/segment.ts');
+  });
+
   it('recognizes an unhinted Uint8Array manifest and decrypts the real AES-128 VOD', async () => {
-    const manifest = await corpusBytes('hls_aes128.m3u8');
+    const manifest = await corpusBytes('media.m3u8');
     globalThis.fetch = (async (url: unknown): Promise<Response> => {
       const name = String(url).split('/').pop() ?? '';
       const bytes = await corpusBytes(name);
@@ -106,14 +189,33 @@ describe('engine HLS input auto-resolution', () => {
 
     const info = await createMedia().probe(manifest);
     expect(info.container).toBe('ts');
-    expect(info.durationSec).toBeGreaterThan(8);
+    expect(info.durationSec).toBeGreaterThan(5);
     expect(info.tracks.map((track) => track.type)).toEqual(
       expect.arrayContaining(['video', 'audio']),
     );
   });
 
+  it('structurally recognizes manifests behind ambiguous MIME and extension hints', async () => {
+    const segment = await tsSegment();
+    serve(segment);
+    const inputs: readonly MediaInput[] = [
+      new Blob([playlist()], { type: 'application/octet-stream' }),
+      new Blob([playlist()], { type: 'text/plain' }),
+      new Blob([playlist()], { type: 'video/mp2t; charset=utf-8' }),
+      new File([playlist()], 'detached.bin', { type: 'application/octet-stream' }),
+    ];
+
+    for (const input of inputs) {
+      const info = await createMedia().probe(input);
+      expect(info.container).toBe('ts');
+      expect(info.tracks.map((track) => track.type)).toEqual(
+        expect.arrayContaining(['video', 'audio']),
+      );
+    }
+  });
+
   it('replays an unhinted manifest stream through targeted MPEG-TS probe before decrypting', async () => {
-    const manifest = await corpusBytes('hls_aes128.m3u8');
+    const manifest = await corpusBytes('media.m3u8');
     globalThis.fetch = (async (url: unknown): Promise<Response> => {
       const name = String(url).split('/').pop() ?? '';
       const bytes = await corpusBytes(name);

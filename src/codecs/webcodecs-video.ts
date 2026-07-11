@@ -44,12 +44,11 @@ import { addH264AvcCVisibleRightCrop } from './h264-avcc-crop.ts';
 // ── pure helpers (Node-unit-tested; real logic on the live path) ─────────────────────────────────
 
 /**
- * Map the determinism modifier to the `hardwareAcceleration` hint used to **configure** a coder.
- * `force-software` pins `prefer-software` for cross-machine reproducibility (ADR-007); otherwise
- * `no-preference` — the UA accelerates when it can **and** falls back to a software coder when no hardware
- * exists. (We deliberately do **not** pin `prefer-hardware` here: a software-only codec — VP8/VP9/AV1, or
- * H.264/HEVC/AAC on some browsers — would then *fail to configure* even though it encodes/decodes fine in
- * software. `supports()` still reports `hardwareAccelerated` honestly from its `isConfigSupported` probe.)
+ * Map the determinism modifier to the conservative coder fallback hint. `force-software` pins
+ * `prefer-software` for cross-machine reproducibility (ADR-007); otherwise `no-preference` preserves
+ * software-only encode coverage. Auto **decode** does not stop at this fallback: it configures the exact
+ * hardware-first verdict accepted by `supports()`, with an exact no-preference capability fallback
+ * ({@link resolveVideoDecoderAcceleration}, ADR-203).
  */
 export function normalizeHardwareAcceleration(
   determinism: Determinism | undefined,
@@ -71,7 +70,9 @@ export function needsAppleH264HorizontalPhaseCompensation(
 ): boolean {
   const codec = config.codec.toLowerCase();
   const apple = platform !== undefined && /^(?:Mac|iP)/.test(platform);
-  return apple && (codec.startsWith('avc1.') || codec.startsWith('avc3.')) && config.width % 4 === 2;
+  return (
+    apple && (codec.startsWith('avc1.') || codec.startsWith('avc3.')) && config.width % 4 === 2
+  );
 }
 
 /**
@@ -339,6 +340,245 @@ export function combineSupport(probes: readonly SupportProbe[], reason?: string)
   return reason !== undefined ? { supported: false, reason } : { supported: false };
 }
 
+/** Result of one exact `VideoDecoder.isConfigSupported` acceleration probe. */
+export interface VideoDecoderAccelerationProbeResult {
+  readonly supported: boolean;
+  /** The hint on the UA-returned accepted config; omitted means the requested hint was retained. */
+  readonly acceptedAcceleration?: HardwareAcceleration;
+}
+
+/** Injectable seam for testing hardware-first resolution without mocking the browser's VideoDecoder. */
+export type VideoDecoderAccelerationProbe = (
+  acceleration: HardwareAcceleration,
+) => Promise<VideoDecoderAccelerationProbeResult>;
+
+/**
+ * Resolve the no-I/O acceleration decision. `force-software` always wins over a cached auto verdict;
+ * otherwise an exact cached verdict can configure synchronously. `undefined` means capability probing is
+ * still required.
+ */
+export function immediateVideoDecoderAcceleration(
+  determinism: Determinism | undefined,
+  cached: HardwareAcceleration | undefined,
+): HardwareAcceleration | undefined {
+  return determinism === 'force-software' ? 'prefer-software' : cached;
+}
+
+/**
+ * Resolve an exact decoder acceleration config hardware-first, then through the software-permitting
+ * fallback. A rejected probe does not suppress the next rung. Returning `undefined` means neither exact
+ * configuration was accepted and lets the caller raise a typed capability miss.
+ */
+export async function resolveVideoDecoderAcceleration(
+  determinism: Determinism | undefined,
+  cached: HardwareAcceleration | undefined,
+  probe: VideoDecoderAccelerationProbe,
+  shouldContinue: () => boolean = () => true,
+  cancellation?: Promise<never>,
+): Promise<HardwareAcceleration | undefined> {
+  const immediate = immediateVideoDecoderAcceleration(determinism, cached);
+  if (immediate !== undefined) return immediate;
+  for (const requested of ACCELERATION_PROBE_ORDER) {
+    if (!shouldContinue()) return undefined;
+    try {
+      const pending = probe(requested);
+      const result = await (cancellation === undefined
+        ? pending
+        : Promise.race([pending, cancellation]));
+      if (result.supported) return result.acceptedAcceleration ?? requested;
+    } catch {
+      // A capability rejection for one hint is an honest miss for that rung, not for the fallback rung.
+      if (!shouldContinue()) return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** Encode raw bytes exactly for a structural capability key (codec descriptions are normally tiny). */
+function capabilityBytesKey(bytes: Uint8Array): string {
+  let out = `${bytes.byteLength}:`;
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+  return out;
+}
+
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  'byteLength',
+)?.get;
+const SHARED_ARRAY_BUFFER_BYTE_LENGTH_GETTER =
+  typeof SharedArrayBuffer === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get;
+
+/** Brand-check and view a direct ArrayBufferLike across realms; ordinary objects return undefined. */
+function directArrayBufferBytes(value: object): Uint8Array | undefined {
+  for (const getter of [ARRAY_BUFFER_BYTE_LENGTH_GETTER, SHARED_ARRAY_BUFFER_BYTE_LENGTH_GETTER]) {
+    if (getter === undefined) continue;
+    try {
+      const byteLength: unknown = Reflect.apply(getter, value, []);
+      if (typeof byteLength !== 'number' || !Number.isSafeInteger(byteLength) || byteLength < 0) {
+        throw new TypeError('invalid ArrayBufferLike byte length');
+      }
+      return new Uint8Array(value as ArrayBufferLike, 0, byteLength);
+    } catch {
+      // Try the other branded buffer getter. Both getters reject ordinary and spoofed objects.
+    }
+  }
+  return undefined;
+}
+
+/** Canonicalize the enumerable config shape WebCodecs receives; strict and cycle-safe. */
+function capabilityValueKey(value: unknown, ancestors: Set<object>): string {
+  if (value === undefined) return 'u';
+  if (value === null) return 'n';
+  switch (typeof value) {
+    case 'boolean':
+      return value ? 'b1' : 'b0';
+    case 'number':
+      if (Number.isNaN(value)) return 'dNaN';
+      if (Object.is(value, -0)) return 'd-0';
+      return `d${String(value)}`;
+    case 'string':
+      return `s${JSON.stringify(value)}`;
+    case 'bigint':
+    case 'symbol':
+    case 'function':
+      throw new TypeError(`unsupported VideoDecoderConfig value type '${typeof value}'`);
+    case 'object':
+      break;
+  }
+  if (ArrayBuffer.isView(value)) {
+    return `v${capabilityBytesKey(
+      new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+    )}`;
+  }
+  const directBuffer = directArrayBufferBytes(value);
+  if (directBuffer !== undefined) return `a${capabilityBytesKey(directBuffer)}`;
+  if (ancestors.has(value)) {
+    throw new TypeError('VideoDecoderConfig must not contain a cycle');
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => capabilityValueKey(item, ancestors)).join(',')}]`;
+    }
+    if (Object.prototype.toString.call(value) !== '[object Object]') {
+      throw new TypeError('unsupported object in VideoDecoderConfig');
+    }
+    const entries = Object.keys(value)
+      .sort()
+      .map(
+        (key) => `${JSON.stringify(key)}:${capabilityValueKey(Reflect.get(value, key), ancestors)}`,
+      );
+    return `{${entries.join(',')}}`;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+/**
+ * Exact structural identity for the decoder config submitted to WebCodecs, excluding only the acceleration
+ * rung being selected. Description bytes, geometry, colour, latency, and the effective VPx alpha option all
+ * participate. The caller object and its description are never mutated or retained.
+ */
+export function videoDecoderCapabilityKey(
+  config: VideoDecoderConfig,
+  alpha: AlphaOption | undefined = undefined,
+): string {
+  const normalized = normalizeVideoDecoderConfig(config, 'no-preference', alpha);
+  const { hardwareAcceleration: _hardwareAcceleration, ...capabilityConfig } = normalized;
+  return capabilityValueKey(capabilityConfig, new Set<object>());
+}
+
+/** Bounded exact-config acceleration verdict cache (shared with the router's positive driver cache). */
+export interface VideoDecoderAccelerationCache {
+  get(config: VideoDecoderConfig, alpha: AlphaOption | undefined): HardwareAcceleration | undefined;
+  set(
+    config: VideoDecoderConfig,
+    alpha: AlphaOption | undefined,
+    acceleration: HardwareAcceleration,
+  ): void;
+  delete(config: VideoDecoderConfig, alpha: AlphaOption | undefined): void;
+}
+
+/** Create a bounded LRU whose keys compare decoder configs structurally, including description bytes. */
+export function createVideoDecoderAccelerationCache(
+  maxEntries = 64,
+): VideoDecoderAccelerationCache {
+  if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+    throw new RangeError(`maxEntries must be a positive integer, got ${maxEntries}`);
+  }
+  const entries = new Map<string, HardwareAcceleration>();
+  return {
+    get(config, alpha): HardwareAcceleration | undefined {
+      const key = videoDecoderCapabilityKey(config, alpha);
+      const acceleration = entries.get(key);
+      if (acceleration !== undefined) {
+        entries.delete(key);
+        entries.set(key, acceleration);
+      }
+      return acceleration;
+    },
+    set(config, alpha, acceleration): void {
+      const key = videoDecoderCapabilityKey(config, alpha);
+      entries.delete(key);
+      entries.set(key, acceleration);
+      while (entries.size > maxEntries) {
+        const oldest = entries.keys().next().value;
+        if (oldest === undefined) break;
+        entries.delete(oldest);
+      }
+    },
+    delete(config, alpha): void {
+      entries.delete(videoDecoderCapabilityKey(config, alpha));
+    },
+  };
+}
+
+const videoDecoderAccelerationCache = createVideoDecoderAccelerationCache();
+
+/** Cache a support verdict without ever turning an accepted browser capability into a thrown support probe. */
+export function rememberVideoDecoderAcceleration(
+  cache: VideoDecoderAccelerationCache,
+  config: VideoDecoderConfig,
+  alpha: AlphaOption | undefined,
+  acceleration: HardwareAcceleration,
+): boolean {
+  try {
+    cache.set(config, alpha, acceleration);
+    return true;
+  } catch {
+    // An invalid/cyclic vendor extension is not cacheable. supports() still reports the UA's exact verdict.
+    return false;
+  }
+}
+
+/** Treat an uncacheable exact config as a cache miss; decoder start can still run the real UA probes. */
+export function recallVideoDecoderAcceleration(
+  cache: VideoDecoderAccelerationCache,
+  config: VideoDecoderConfig,
+  alpha: AlphaOption | undefined,
+): HardwareAcceleration | undefined {
+  try {
+    return cache.get(config, alpha);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best-effort invalidation for the same uncacheable extension case. */
+export function forgetVideoDecoderAcceleration(
+  cache: VideoDecoderAccelerationCache,
+  config: VideoDecoderConfig,
+  alpha: AlphaOption | undefined,
+): void {
+  try {
+    cache.delete(config, alpha);
+  } catch {
+    // There was no usable cache key, so there is no retained verdict to invalidate.
+  }
+}
+
 /** Minimal shape the ordering utilities need: a presentation timestamp (µs). */
 interface Timestamped {
   readonly timestamp: number;
@@ -461,6 +701,34 @@ function unsupportedVideoCodecError(op: 'decode' | 'encode', codec: string): Cap
 
 // ── supports() — cheap, honest, never throws (wraps isConfigSupported) ────────────────────────────
 
+function acceptedVideoDecoderAcceleration(
+  accepted: VideoDecoderConfig | undefined,
+  requested: HardwareAcceleration,
+): HardwareAcceleration {
+  const acceleration = accepted?.hardwareAcceleration;
+  return acceleration === 'prefer-hardware' ||
+    acceleration === 'prefer-software' ||
+    acceleration === 'no-preference'
+    ? acceleration
+    : requested;
+}
+
+async function probeVideoDecoderAcceleration(
+  config: VideoDecoderConfig,
+  alpha: AlphaOption | undefined,
+  acceleration: HardwareAcceleration,
+): Promise<VideoDecoderAccelerationProbeResult> {
+  const { supported, config: accepted } = await VideoDecoder.isConfigSupported(
+    normalizeVideoDecoderConfig(config, acceleration, alpha),
+  );
+  return {
+    supported: supported === true,
+    ...(supported === true
+      ? { acceptedAcceleration: acceptedVideoDecoderAcceleration(accepted, acceleration) }
+      : {}),
+  };
+}
+
 async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
   const videoConfig = asVideoDecoderConfig(config);
   if (!videoConfig) return { supported: false, reason: 'not a video decoder config' };
@@ -484,16 +752,21 @@ async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
   let lastReason: string | undefined;
   for (const acceleration of ACCELERATION_PROBE_ORDER) {
     try {
-      const { supported, config: accepted } = await VideoDecoder.isConfigSupported(
-        normalizeVideoDecoderConfig(videoConfig, acceleration),
-      );
-      const accel = accepted?.hardwareAcceleration;
+      const result = await probeVideoDecoderAcceleration(videoConfig, undefined, acceleration);
       probes.push(
-        accel !== undefined
-          ? { supported: supported === true, acceleration: accel }
-          : { supported: supported === true },
+        result.acceptedAcceleration !== undefined
+          ? { supported: result.supported, acceleration: result.acceptedAcceleration }
+          : { supported: result.supported },
       );
-      if (supported === true) break; // first win short-circuits (hardware preferred)
+      if (result.supported) {
+        rememberVideoDecoderAcceleration(
+          videoDecoderAccelerationCache,
+          videoConfig,
+          undefined,
+          result.acceptedAcceleration ?? acceleration,
+        );
+        break; // first win short-circuits (hardware preferred)
+      }
     } catch (e) {
       lastReason = describeError(e); // isConfigSupported rejects only on a malformed config
     }
@@ -591,10 +864,11 @@ async function drainBelowHighWater(
 // ── decoder: EncodedChunk → VideoFrame ───────────────────────────────────────────────────────────
 
 function createVideoDecoder(
-  config: DecoderConfig,
+  config: VideoDecoderConfig,
   o: StageOptions | undefined,
 ): TransformStream<EncodedChunk, RawFrame> {
   const signal = o?.signal;
+  const alpha = readDecoderAlpha(o);
 
   let decoder: VideoDecoder | undefined;
   let readableController: ReadableStreamDefaultController<RawFrame> | undefined;
@@ -608,9 +882,26 @@ function createVideoDecoder(
   let decoderDone = false;
   let pullWaiting = false;
   let terminalError: Error | undefined;
+  let rejectStartupCancellation: ((error: Error) => void) | undefined;
+  const startupCancellation = new Promise<never>((_resolve, reject) => {
+    rejectStartupCancellation = reject;
+  });
+  // Cancellation may win just before an awaited probe/barrier installs its race handler. Keep the deferred
+  // rejection handled in that narrow window; every live startup await also races this same promise.
+  startupCancellation.catch(() => undefined);
 
   const streamClosedError = (): Error =>
     terminalError ?? new MediaError('aborted', 'video decoder stream closed');
+  const cancelStartup = (error: Error): void => {
+    const reject = rejectStartupCancellation;
+    rejectStartupCancellation = undefined;
+    reject?.(error);
+  };
+  const finishStartup = (): void => {
+    rejectStartupCancellation = undefined;
+  };
+  const awaitDuringStartup = <T>(pending: Promise<T>): Promise<T> =>
+    Promise.race([pending, startupCancellation]);
   const closeDecoder = (): void => {
     if (decoder && decoder.state !== 'closed') decoder.close(); // stop WebCodecs emitting + drop buffers
   };
@@ -641,6 +932,7 @@ function createVideoDecoder(
     if (closed) return;
     terminalError = error;
     closed = true;
+    cancelStartup(error);
     pullWaiting = false;
     closeQueuedFrames();
     rejectQueueWaiters(error);
@@ -656,6 +948,7 @@ function createVideoDecoder(
         : new MediaError('aborted', 'video decoder stream cancelled');
     terminalError = error;
     closed = true;
+    cancelStartup(error);
     pullWaiting = false;
     closeQueuedFrames();
     rejectQueueWaiters(error);
@@ -688,6 +981,135 @@ function createVideoDecoder(
     }
     if (closed) throw streamClosedError();
   };
+  const configureDecoder = async (acceleration: HardwareAcceleration): Promise<void> => {
+    if (closed || signal?.aborted) throw streamClosedError();
+    let candidate: VideoDecoder;
+    let candidateReady = false;
+    let rejectCandidateStartup: ((error: Error) => void) | undefined;
+    const candidateStartupFailure = new Promise<never>((_resolve, reject) => {
+      rejectCandidateStartup = reject;
+    });
+    candidateStartupFailure.catch(() => undefined);
+    candidate = new VideoDecoder({
+      output: (frame: VideoFrame): void => {
+        // Never throw out of this async callback: queue if the readable is alive, else close. Frames
+        // stay driver-owned until a pull hands them to the consumer, so cancellation can close them.
+        if (closed || decoder !== candidate || !candidateReady) {
+          frame.close();
+          return;
+        }
+        frameQueue.push(frame);
+        deliverQueuedFrame();
+      },
+      error: (e: DOMException): void => {
+        if (closed || decoder !== candidate) return;
+        if (!candidateReady) {
+          rejectCandidateStartup?.(e);
+          return;
+        }
+        // A native-decoder runtime failure (even on an isConfigSupported-approved config) = the browser
+        // cannot decode this → a capability miss the engine degrades to NA, not a page crash.
+        if (e.name === 'NotSupportedError') {
+          forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+        }
+        fail(decoderErrorToCapabilityMiss(e, 'webcodecs-video', config.codec));
+      },
+    });
+    // Publish the candidate before configure so cancellation can close the exact native object while its
+    // control-queue configuration is still pending.
+    decoder = candidate;
+    try {
+      // Rebuild from THIS caller's config so description bytes and every VFR/B-frame-relevant field can
+      // never come from an earlier equivalent cache entry; the cache carries only the accepted hint.
+      candidate.configure(normalizeVideoDecoderConfig(config, acceleration, alpha));
+      // `configure()` only queues the support check. An empty `flush()` is the spec-grounded control-queue
+      // barrier: it cannot resolve until configuration succeeded, and it rejects before any packet is
+      // submitted when a cached acceleration hint became stale.
+      await awaitDuringStartup(Promise.race([candidate.flush(), candidateStartupFailure]));
+      if (closed || signal?.aborted || decoder !== candidate) throw streamClosedError();
+      candidateReady = true;
+      rejectCandidateStartup = undefined;
+    } catch (error) {
+      if (decoder === candidate) decoder = undefined;
+      rejectCandidateStartup = undefined;
+      if (candidate.state !== 'closed') candidate.close();
+      throw error;
+    }
+  };
+  const unsupportedExactConfig = (): CapabilityError =>
+    new CapabilityError(
+      'capability-miss',
+      `webcodecs-video cannot configure ${config.codec} with hardware or software fallback`,
+      { op: 'decode', tried: ['webcodecs-video'] },
+    );
+  const configureSoftwareFallback = async (): Promise<void> => {
+    if (closed || signal?.aborted) throw streamClosedError();
+    forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+    let result: VideoDecoderAccelerationProbeResult;
+    try {
+      result = await awaitDuringStartup(
+        probeVideoDecoderAcceleration(config, alpha, 'no-preference'),
+      );
+    } catch {
+      if (closed || signal?.aborted) throw streamClosedError();
+      throw unsupportedExactConfig();
+    }
+    if (closed || signal?.aborted) throw streamClosedError();
+    if (!result.supported) throw unsupportedExactConfig();
+    const acceleration = result.acceptedAcceleration ?? 'no-preference';
+    try {
+      await configureDecoder(acceleration);
+    } catch {
+      if (closed || signal?.aborted) throw streamClosedError();
+      forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+      throw unsupportedExactConfig();
+    }
+    rememberVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha, acceleration);
+  };
+  const configureAccepted = async (acceleration: HardwareAcceleration): Promise<void> => {
+    try {
+      await configureDecoder(acceleration);
+    } catch (error) {
+      forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+      // A stale hardware verdict or asynchronous control-queue rejection must not erase a real software-
+      // only capability. The empty-flush barrier proves failure before writes can submit a packet.
+      if (
+        !closed &&
+        !signal?.aborted &&
+        o?.determinism !== 'force-software' &&
+        acceleration !== 'no-preference'
+      ) {
+        await configureSoftwareFallback();
+        return;
+      }
+      if (closed || signal?.aborted) throw streamClosedError();
+      if (error instanceof CapabilityError || error instanceof MediaError) throw error;
+      throw unsupportedExactConfig();
+    }
+    if (o?.determinism !== 'force-software') {
+      rememberVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha, acceleration);
+    }
+  };
+  const probeAndConfigure = async (): Promise<void> => {
+    const acceleration = await resolveVideoDecoderAcceleration(
+      o?.determinism,
+      undefined,
+      (requested) => probeVideoDecoderAcceleration(config, alpha, requested),
+      () => !closed && signal?.aborted !== true,
+      startupCancellation,
+    );
+    if (closed || signal?.aborted) throw streamClosedError();
+    if (acceleration === undefined) throw unsupportedExactConfig();
+    await configureAccepted(acceleration);
+  };
+  const failStart = (cause: unknown): never => {
+    const error =
+      cause instanceof CapabilityError || cause instanceof MediaError
+        ? cause
+        : new MediaError('decode-error', describeError(cause), cause);
+    fail(error);
+    throw error;
+  };
 
   const readable = new ReadableStream<RawFrame>(
     {
@@ -707,44 +1129,24 @@ function createVideoDecoder(
 
   const writable = new WritableStream<EncodedChunk>(
     {
-      start(): void {
+      start(): void | Promise<void> {
         onAbort = () => {
           fail(new MediaError('aborted', 'operation aborted'));
         };
         signal?.addEventListener('abort', onAbort, { once: true });
         if (signal?.aborted) {
-          fail(new MediaError('aborted', 'operation aborted'));
-          return;
-        }
-        try {
-          decoder = new VideoDecoder({
-            output: (frame: VideoFrame): void => {
-              // Never throw out of this async callback: queue if the readable is alive, else close. Frames
-              // stay driver-owned until a pull hands them to the consumer, so cancellation can close them.
-              if (closed) {
-                frame.close();
-                return;
-              }
-              frameQueue.push(frame);
-              deliverQueuedFrame();
-            },
-            error: (e: DOMException): void => {
-              // A native-decoder runtime failure (even on an isConfigSupported-approved config) = the
-              // browser cannot decode this → a capability miss the engine degrades to NA, not a crash.
-              fail(decoderErrorToCapabilityMiss(e, 'webcodecs-video', config.codec));
-            },
-          });
-          decoder.configure({
-            ...normalizeVideoDecoderConfig(
-              config,
-              normalizeHardwareAcceleration(o?.determinism),
-              readDecoderAlpha(o),
-            ),
-          });
-        } catch (e) {
-          const error = new MediaError('decode-error', describeError(e), e);
+          const error = new MediaError('aborted', 'operation aborted');
           fail(error);
-          throw error;
+          return Promise.reject(error);
+        }
+        const cached = recallVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+        const immediate = immediateVideoDecoderAcceleration(o?.determinism, cached);
+        try {
+          const pending =
+            immediate === undefined ? probeAndConfigure() : configureAccepted(immediate);
+          return pending.then(finishStartup).catch(failStart);
+        } catch (error) {
+          failStart(error);
         }
       },
       async write(chunk): Promise<void> {

@@ -17,6 +17,7 @@
  * against `ffprobe -show_packets` on the real fragmented corpus.
  */
 
+import { MediaError } from '../../contracts/errors.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 import type { Sample, SampleData } from './samples.ts';
 
@@ -233,6 +234,66 @@ export function parseFragmentSamples(file: Uint8Array): Map<number, SampleData[]
     r.seek(top.end);
   }
 
+  return out;
+}
+
+function sameIndexedSample(a: SampleData, b: SampleData): boolean {
+  return (
+    a.offset === b.offset &&
+    a.size === b.size &&
+    a.dtsTicks === b.dtsTicks &&
+    a.durationTicks === b.durationTicks &&
+    a.cttsTicks === b.cttsTicks &&
+    a.keyframe === b.keyframe
+  );
+}
+
+/**
+ * Merge samples indexed by the initial `moov/stbl` with samples appended by later `moof/trun` runs.
+ *
+ * ISO-BMFF permits a movie to carry a real progressive prefix and then continue in movie fragments
+ * (FFmpeg's default `+frag_keyframe`, without `+empty_moov`, writes exactly this shape). Neither index is
+ * complete by itself. The native DTS is the canonical decode-order key; an exact duplicate physical
+ * range is collapsed, while contradictory timing for the same bytes is rejected instead of exposing the
+ * sample twice. Returned indexes are dense because the downstream read-window planner keys by index.
+ */
+export function mergeMoovAndFragmentSamples(
+  moovSamples: readonly SampleData[],
+  fragmentSamples: readonly SampleData[],
+): SampleData[] {
+  if (moovSamples.length === 0) {
+    return fragmentSamples.map((sample, index) =>
+      sample.index === index ? sample : { ...sample, index },
+    );
+  }
+  if (fragmentSamples.length === 0) {
+    return moovSamples.map((sample, index) =>
+      sample.index === index ? sample : { ...sample, index },
+    );
+  }
+
+  const ordered = [...moovSamples, ...fragmentSamples].sort(
+    (a, b) => a.dtsTicks - b.dtsTicks || a.offset - b.offset,
+  );
+  const byOffset = new Map<number, Map<number, SampleData>>();
+  const out: SampleData[] = [];
+  for (const sample of ordered) {
+    let bySize = byOffset.get(sample.offset);
+    if (bySize === undefined) {
+      bySize = new Map<number, SampleData>();
+      byOffset.set(sample.offset, bySize);
+    }
+    const previous = bySize.get(sample.size);
+    if (previous !== undefined) {
+      if (sameIndexedSample(previous, sample)) continue;
+      throw new MediaError(
+        'demux-error',
+        `MP4 sample range [${sample.offset}, ${sample.offset + sample.size}) has contradictory moov/moof timing`,
+      );
+    }
+    bySize.set(sample.size, sample);
+    out.push(sample.index === out.length ? sample : { ...sample, index: out.length });
+  }
   return out;
 }
 

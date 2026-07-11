@@ -26,7 +26,7 @@ interface StreamingWebmReaderState {
 
 interface StreamingWebmMuxerSink {
   readonly output: ReadableStream<Uint8Array>;
-  write(trackId: number, packet: Packet): Promise<void>;
+  write(trackId: number, packet: Packet, lastInTrack?: boolean): Promise<void>;
   finalize(): Promise<void>;
   fail(error: unknown): void;
 }
@@ -355,13 +355,17 @@ async function pumpPacketInfoWebmRemux(
       state.index++;
       const dataResult = reader.bytesFor(row, signal);
       const data = dataResult instanceof Uint8Array ? dataResult : await dataResult;
-      const pendingFlush = muxer.addChunkStructStarted(row.muxTrackId, {
-        timestampUs: row.packet.ptsUs,
-        durationUs: row.packet.durationUs,
-        key: row.packet.keyframe,
-        data,
-        dtsUs: row.packet.dtsUs,
-      });
+      const pendingFlush = muxer.addChunkStructStarted(
+        row.muxTrackId,
+        {
+          timestampUs: row.packet.ptsUs,
+          durationUs: row.packet.durationUs,
+          key: row.packet.keyframe,
+          data,
+          dtsUs: row.packet.dtsUs,
+        },
+        state.index >= state.rows.length,
+      );
       if (pendingFlush !== undefined) await pendingFlush;
     }
     await muxer.finalize();
@@ -456,8 +460,8 @@ async function pumpStreamingWebmRemux(
       if (next === undefined) break;
       const packet = next.current;
       if (packet === undefined) break;
-      await muxer.write(next.muxTrackId, packet);
       await readNextStreamingWebmPacket(next);
+      await muxer.write(next.muxTrackId, packet, next.current === undefined);
     }
     await muxer.finalize();
   } catch (error) {

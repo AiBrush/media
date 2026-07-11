@@ -21,10 +21,7 @@ import { fromBytes } from '../../sources/source.ts';
 import { encryptHlsSampleAesTs } from '../../test-support/hls-sample-aes.ts';
 import { type HlsResourceFetcher, resolveHlsSource } from './hls-source.ts';
 
-const MEDIA_TEST = new URL(
-  '../../../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
 async function corpusText(name: string): Promise<string> {
   return readFile(`${MEDIA_TEST}${name}`, 'utf8');

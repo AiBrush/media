@@ -17,6 +17,7 @@
 
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { assertAudioMuxOptions, validateMp3MuxTrack } from '../audio-container-mux-validation.ts';
 import type { ChunkStruct } from '../ogg/ogg-write.ts';
 
 const SAMPLE_RATES: Record<number, readonly number[]> = {
@@ -77,12 +78,7 @@ export class Mp3Muxer implements Muxer {
   #resolveReady: (() => void) | undefined;
 
   constructor(options?: MuxOptions) {
-    if (options?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'MP3 has no fragmented/segmented mux form', {
-        op: { op: 'mux', fragmented: true },
-        tried: ['mp3'],
-      });
-    }
+    assertAudioMuxOptions('mp3', options);
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -96,19 +92,7 @@ export class Mp3Muxer implements Muxer {
 
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
-    if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'the MP3 muxer writes a single audio stream', {
-        op: { op: 'mux' },
-        tried: ['mp3'],
-      });
-    }
-    if (info.mediaType !== 'audio' || info.codec !== 'mp3') {
-      throw new CapabilityError(
-        'capability-miss',
-        `MP3 container carries a single MP3 audio track, not ${info.mediaType}/${info.codec}`,
-        { op: { op: 'mux' }, tried: ['mp3'] },
-      );
-    }
+    validateMp3MuxTrack(info, this.#track === undefined ? 0 : 1);
     const id = 0;
     this.#track = { id, chunks: [], frameCount: 0, audioBytes: 0, firstHeader: undefined };
     return id;

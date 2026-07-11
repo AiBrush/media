@@ -79,10 +79,7 @@ import { encryptHlsSampleAesTs } from '../src/test-support/hls-sample-aes.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const MEDIA_DIR = `${ROOT}fixtures/media`;
-const HARNESS_MEDIA_DIR = new URL(
-  '../../media-test/media-browser-test/fixtures/media/',
-  import.meta.url,
-).pathname;
+const HARNESS_MEDIA_DIR = new URL('../../media-test/fixtures/media/', import.meta.url).pathname;
 const DERIVED_DIR = `${ROOT}fixtures/media-derived`;
 const BASELINE_PATH = `${ROOT}fixtures/golden/bench/containers.json`;
 

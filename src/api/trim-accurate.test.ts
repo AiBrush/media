@@ -789,11 +789,7 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     const source = fakeFrameStream(input);
 
     const out = await collect(
-      trimTimedFrameStream(
-        source.stream,
-        { startUs: 1_000_000, endUs: 4_000_000 },
-        restampFake,
-      ),
+      trimTimedFrameStream(source.stream, { startUs: 1_000_000, endUs: 4_000_000 }, restampFake),
     );
 
     expect(out.map((frame) => [frame.timestamp, frame.duration])).toEqual([

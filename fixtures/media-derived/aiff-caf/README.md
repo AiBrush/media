@@ -72,5 +72,5 @@ cover the CAF `caff`/`desc`(ASBD)/`data` walk with the format-flag endianness bi
 metadata against `afinfo` and round-trip the SSND/`data` samples **byte-exact**; an AIFF(BE)↔CAF(LE)
 cross-check confirms both byte orders decode to identical samples. The larger real harness AIFF/CAF
 assets (`pcm_s16be.aiff`, `pcm_s24be.aiff`, `pcm_s16.caf` under
-`../../../../media-test/media-browser-test/fixtures/media/`, with committed `*.meta.json` goldens) are
+`../../../../media-test/fixtures/media/`, with committed `*.meta.json` goldens) are
 also read by direct path for an independent oracle.

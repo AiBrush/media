@@ -10,6 +10,7 @@ describe('MP4 AAC gapless metadata', () => {
       expect(audio?.codec).toBe('mp4a.40.2');
       expect(audio?.durationSec).toBeCloseTo(6.03718820861678, 12);
       expect(audio?.gapless).toEqual({
+        basis: 'mp4-edit-list',
         leadingSamples: 0,
         trailingSamples: 440,
         totalSamples: 265800,
@@ -25,6 +26,7 @@ describe('MP4 AAC gapless metadata', () => {
       const audio = demuxer.tracks.find((track) => track.mediaType === 'audio');
       expect(audio?.codec).toBe('mp4a.40.2');
       expect(audio?.gapless).toEqual({
+        basis: 'mp4-edit-list',
         leadingSamples: 0,
         trailingSamples: 0,
         totalSamples: 301008,

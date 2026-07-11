@@ -1,4 +1,5 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
+import { gaplessFromMp4Edit } from './gapless.ts';
 import { avcCodecString, parseEsds } from './codec-strings.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
@@ -6,7 +7,7 @@ const SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES = 8 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 
 interface SimpleRandomAccess {
-  readonly size?: number;
+  readonly size?: number | undefined;
   read(offset: number, length: number): Promise<Uint8Array>;
 }
 
@@ -347,10 +348,13 @@ function probeGapless(
   }
   const scale = sampleRate / timescale;
   const codedSamples = Math.max(0, Math.round(durationTicks * scale));
-  const leadingSamples = Math.max(0, Math.round(edit.mediaTimeTicks * scale));
-  const totalSamples = Math.max(0, Math.round(edit.durationSec * sampleRate));
-  const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);
-  return { leadingSamples, trailingSamples, totalSamples };
+  return gaplessFromMp4Edit(
+    edit.mediaTimeTicks,
+    edit.durationSec,
+    sampleRate,
+    timescale,
+    codedSamples,
+  );
 }
 
 function probeSttsDurationTicks(r: Reader, stbl: BoxHeader): number | undefined {

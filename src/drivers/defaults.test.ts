@@ -202,6 +202,141 @@ describe('registerDefaultDrivers', () => {
     expect(ids).toContain('wasm-vpx');
   });
 
+  it('registers exact lightweight proxies for every long-tail audio container', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const wav = findContainer(reg, 'wav');
+    const mp3 = findContainer(reg, 'mp3');
+    const ogg = findContainer(reg, 'ogg');
+    const adts = findContainer(reg, 'adts');
+    const aiff = findContainer(reg, 'aiff');
+    const caf = findContainer(reg, 'caf');
+
+    expect(wav.supports({ direction: 'demux', extension: 'WAVE' })).toBe(true);
+    expect(
+      wav.supports({
+        direction: 'demux',
+        head: new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]),
+      }),
+    ).toBe(true);
+    expect(mp3.supports({ direction: 'demux', head: new Uint8Array([0xff, 0xfb, 0x90]) })).toBe(
+      true,
+    );
+    expect(
+      adts.supports({ direction: 'demux', head: new Uint8Array([0xff, 0xf1, 0, 0, 0, 0, 0]) }),
+    ).toBe(true);
+    expect(mp3.supports({ direction: 'demux', head: new Uint8Array([0xff, 0xf1, 0]) })).toBe(false);
+    expect(
+      adts.supports({ direction: 'demux', head: new Uint8Array([0xff, 0xfb, 0, 0, 0, 0, 0]) }),
+    ).toBe(false);
+    expect(ogg.supports({ direction: 'demux', head: new TextEncoder().encode('OggS') })).toBe(true);
+    expect(
+      aiff.supports({ direction: 'demux', head: new TextEncoder().encode('FORM0000AIFF') }),
+    ).toBe(true);
+    expect(caf.supports({ direction: 'demux', head: new TextEncoder().encode('caff') })).toBe(true);
+    expect(caf.supports({ direction: 'demux', extension: 'mp4' })).toBe(false);
+
+    expect(wav).toMatchObject({ validatesPcmTrim: true });
+    expect(ogg).toMatchObject({ validatesStreamCopyTrim: true });
+    expect(adts).toMatchObject({ validatesStreamCopyTrim: true });
+    expect(typeof wav.probe).toBe('function');
+    expect(typeof wav.packetInfo).toBe('function');
+    expect(typeof wav.transformPcm).toBe('function');
+    expect(typeof wav.decodePcmAudio).toBe('function');
+    expect(typeof adts.decodePcm).toBe('function');
+    expect(aiff.probe).toBeUndefined();
+    expect(caf.packetInfo).toBeUndefined();
+  });
+
+  it('loads each long-tail audio implementation only after its proxy is selected', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const probeCases = [
+      ['wav', 'speech.wav', 'pcm-s16'],
+      ['mp3', 'sound_5.mp3', 'mp3'],
+      ['ogg', 'sound_5.oga', 'vorbis'],
+      ['adts', 'sfx.adts', 'mp4a.40.2'],
+    ] as const;
+    for (const [id, fixture, codec] of probeCases) {
+      const probe = findContainer(reg, id).probe;
+      if (probe === undefined) throw new Error(`${id} proxy must preserve probe`);
+      await expect(probe(await fixtureSource(fixture))).resolves.toMatchObject([{ codec }]);
+    }
+
+    for (const [id, fixture, codec] of [
+      ['aiff', 'aiff-caf/sfx.aiff', 'pcm-s16be'],
+      ['caf', 'aiff-caf/sfx.caf', 'pcm-s16'],
+    ] as const) {
+      const demuxer = await findContainer(reg, id).demux(fromBytes(await derivedBytes(fixture)));
+      expect(demuxer.tracks[0]?.codec).toBe(codec);
+      await demuxer.close();
+    }
+  });
+
+  it('preserves synchronous mux option, track, and single-track validation before lazy load', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    for (const id of ['wav', 'mp3', 'ogg', 'adts'] as const) {
+      expect(() => findContainer(reg, id).createMuxer({ fragmented: true })).toThrowError(
+        CapabilityError,
+      );
+    }
+
+    const cases: ReadonlyArray<readonly [string, TrackInfo, TrackInfo]> = [
+      [
+        'wav',
+        {
+          id: 0,
+          mediaType: 'audio',
+          codec: 'pcm-s16',
+          config: { codec: 'pcm-s16', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+        { id: 1, mediaType: 'video', codec: 'h264' },
+      ],
+      [
+        'mp3',
+        { id: 0, mediaType: 'audio', codec: 'mp3' },
+        { id: 1, mediaType: 'audio', codec: 'aac' },
+      ],
+      [
+        'ogg',
+        {
+          id: 0,
+          mediaType: 'audio',
+          codec: 'opus',
+          config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+        { id: 1, mediaType: 'video', codec: 'vp9' },
+      ],
+      [
+        'adts',
+        {
+          id: 0,
+          mediaType: 'audio',
+          codec: 'mp4a.40.2',
+          config: {
+            codec: 'mp4a.40.2',
+            sampleRate: 48_000,
+            numberOfChannels: 2,
+            description: new Uint8Array([0x11, 0x90]),
+          },
+        },
+        { id: 1, mediaType: 'audio', codec: 'mp3' },
+      ],
+    ];
+    for (const [id, valid, invalid] of cases) {
+      expect(() => findContainer(reg, id).createMuxer().addTrack(invalid)).toThrowError(
+        CapabilityError,
+      );
+      const muxer = findContainer(reg, id).createMuxer();
+      expect(muxer.addTrack(valid)).toBe(0);
+      expect(() => muxer.addTrack(valid)).toThrowError(CapabilityError);
+    }
+
+    expect(() => findContainer(reg, 'aiff').createMuxer()).toThrowError(MediaError);
+    expect(() => findContainer(reg, 'caf').createMuxer()).toThrowError(MediaError);
+  });
+
   it('registers FLAC as a lazy container proxy with cheap support checks', () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);

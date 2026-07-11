@@ -16,6 +16,7 @@
  */
 
 import { MediaError } from '../../contracts/errors.ts';
+import { mp4DisplayDimensionWord, mp4MatrixFromClockwiseRotation } from './display-transform.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
 
 export type FragmentInitTrackInput = Omit<MuxTrackInput, 'samples'>;
@@ -131,6 +132,17 @@ function sampleEntry(track: FragmentInitTrackInput): number[] {
   return track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
 }
 
+function tkhdDisplayFields(track: FragmentInitTrackInput): number[] {
+  const raw = track.displayTransform;
+  const matrix =
+    raw?.matrix ?? mp4MatrixFromClockwiseRotation(track.rotation, track.width, track.height);
+  return cat(
+    ...matrix.map((word) => u32(word)),
+    u32(raw?.width16_16 ?? mp4DisplayDimensionWord(track.width)),
+    u32(raw?.height16_16 ?? mp4DisplayDimensionWord(track.height)),
+  );
+}
+
 // ── init segment (ftyp + moov with empty trak + mvex/trex) ──────────────────────────────────────
 
 function ftypBox(): number[] {
@@ -210,9 +222,7 @@ function emptyTrak(
       u16(0),
       u16(isVideo ? 0 : 0x0100),
       u16(0), // layer + altgroup + volume + reserved
-      IDENTITY_MATRIX,
-      u32((track.width ?? 0) * 65536),
-      u32((track.height ?? 0) * 65536),
+      tkhdDisplayFields(track),
     ),
   );
   const mdhd = full('mdhd', 0, 0, cat(zeros(8), u32(track.timescale), u32(0), u16(0x55c4), u16(0)));

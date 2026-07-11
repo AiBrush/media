@@ -26,7 +26,7 @@ import { createCipheriv } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK, hexToBytes } from '../../crypto/aes.ts';
@@ -756,10 +756,16 @@ describe('decryptCencFile — cbcs layout (iii): sbgp/sgpd seig overrides (clear
         },
       ],
     ]);
+    const importKey = vi.spyOn(globalThis.crypto.subtle, 'importKey');
     const out = await decryptCencFile(file.bytes, {
       scheme: 'cbcs',
       keys: { [KID]: KEY, [KID2]: KEY2 },
-    });
+    })
+      .then((value) => {
+        expect(importKey).toHaveBeenCalledTimes(2); // one operation-scoped import per used KID
+        return value;
+      })
+      .finally(() => importKey.mockRestore());
     expectSampleBytes(out, file.ranges, plain);
     // The seig sample-group boxes are neutralized in the output (structural prefix scan only).
     const structuralEnd = file.ranges[0]?.start ?? 0;

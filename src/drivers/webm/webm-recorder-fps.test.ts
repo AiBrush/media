@@ -20,7 +20,7 @@ import { WebmModule, parseWebm } from './webm-driver.ts';
 // The real MediaRecorder asset (Chrome-captured VP8+Opus, no DefaultDuration). It is not a manifest
 // fixture (manifest-edits are owned elsewhere), so it is loaded by direct path from the git-ignored
 // media cache. sha256 4423ec5c7a9f50c6615190e642cdd8c0f501284b304a5a7824e226cd4e39c82d — copied from
-// the acceptance harness corpus (`media-test/media-browser-test/fixtures/media/recorder_headerless.webm`).
+// the acceptance harness corpus (`media-test/fixtures/media/recorder_headerless.webm`).
 const RECORDER_WEBM_URL = new URL(
   '../../../fixtures/media/recorder_headerless.webm',
   import.meta.url,

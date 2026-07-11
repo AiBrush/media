@@ -36,3 +36,15 @@ decode stream to emit a fixture-specific 48 kHz duration, inventing absent primi
 one-second prefix to 60 seconds would be fake and is rejected. The rotated fixtures need either a real
 gapless edit/skip declaration plus a public decode invocation, or the cell boundary must consume the
 complete stream that the product already returns.
+
+## Fresh-port bundle confirmation (`01.mp4`)
+
+The later fresh-port selection `01.mp4` has SHA-256
+`7c301053c21373a27029feeb73cd8b982339449463509f8db931dc8e729540fd`. It is not a hybrid
+`stbl`+`trun` movie: `stbl` is empty and the complete track is 1,295 `trun` samples. Current source parses
+`hasFragments=true`, `fragmentSampleCount=1295`, `fragmentMediaTicks=2652160`; its public decode returns
+1,295 frames / 2,652,160 samples at 44.1 kHz. The built MP4 chunk and vendored harness chunk are byte-for-
+byte identical. Source and built public full-range accurate trim were exercised with `Uint8Array`, Blob,
+File, and a range-capable URL; every path returned the original 367,594 bytes with the same SHA-256 and
+re-decoded the complete timeline. Thus the fresh-port 52,384-at-48-kHz report is also outside the product
+source/build/vendor boundary.

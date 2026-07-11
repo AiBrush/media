@@ -59,7 +59,8 @@ const HEAVY_LAZY_GUARDS: readonly HeavyLazyGuard[] = [
   },
   {
     label: 'metadata writer helper',
-    pattern: /^(?:id3|matroska-tags|mp4-tags|ogg-vorbis-comment|vorbis-comment)-[A-Z0-9]+\.js$/,
+    pattern:
+      /^(?:id3|matroska-tags|metadata-rewrite|mp4-tags|ogg-vorbis-comment|vorbis-comment)-[A-Z0-9]+\.js$/,
   },
 ];
 
@@ -67,7 +68,7 @@ const REQUIRED_EAGER_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
   { label: 'default driver bundle', pattern: /^(?:defaults|defaults-[A-Z0-9]+)\.js$/ },
   { label: 'worker host', pattern: /^worker-host-[A-Z0-9]+\.js$/ },
   { label: 'live codec pipeline', pattern: /^codec-pipeline-[A-Z0-9]+\.js$/ },
-  { label: 'metadata writer helpers', pattern: /^mp4-tags-[A-Z0-9]+\.js$/ },
+  { label: 'metadata rewrite dispatch', pattern: /^metadata-rewrite-[A-Z0-9]+\.js$/ },
 ];
 
 const REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS: readonly LazyImportRequirement[] = [

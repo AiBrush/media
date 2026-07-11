@@ -118,16 +118,30 @@ describe('engine worker-mode selection', () => {
   });
 
   it('in Node (no Worker) an engine created with worker:true runs inline (never throws for lack of a worker)', async () => {
-    // No `Worker` global in Node ⇒ #workerMode is 'inline' ⇒ convert runs the inline pure-TS path and still
-    // succeeds (the honest fallback, not a capability error).
-    expect(typeof Worker).toBe('undefined');
-    const eng = new MediaEngineImpl({ worker: true });
-    const out = await eng.convert(await wavBytes(), {
-      to: 'wav',
-      audio: { gainDb: -6, codec: 'pcm-s16' },
+    // Host runtimes may now expose a Worker-compatible global. Pin the capability this test owns instead
+    // of inheriting ambient runtime state: no Worker ⇒ inline pure-TS fallback, never a capability error.
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: undefined,
+      writable: true,
     });
-    expect(out).toBeInstanceOf(Blob);
-    expect((out as Blob).size).toBeGreaterThan(0);
+    try {
+      expect(typeof Worker).toBe('undefined');
+      const eng = new MediaEngineImpl({ worker: true });
+      const out = await eng.convert(await wavBytes(), {
+        to: 'wav',
+        audio: { gainDb: -6, codec: 'pcm-s16' },
+      });
+      expect(out).toBeInstanceOf(Blob);
+      expect((out as Blob).size).toBeGreaterThan(0);
+    } finally {
+      if (descriptor === undefined) {
+        Reflect.deleteProperty(globalThis, 'Worker');
+      } else {
+        Object.defineProperty(globalThis, 'Worker', descriptor);
+      }
+    }
   });
 });
 

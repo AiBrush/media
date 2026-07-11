@@ -10,7 +10,6 @@
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   DRIVER_API_VERSION,
   type Demuxer,
   type DriverModule,
@@ -23,23 +22,11 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/pcm.ts';
+import { rejectRawPcmChunkMux } from '../audio-container-mux-validation.ts';
+import { matchesCaf } from '../audio-container-sniff.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { parseCaf, readCafPcm } from './caf.ts';
-
-const CAF_MIMES = new Set(['audio/x-caf', 'audio/caf']);
-const CAF_EXTENSIONS = new Set(['caf', 'caff']);
-
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
-  return out;
-}
-
-/** True iff the head opens with the `caff` magic. */
-function isCafHead(head: Uint8Array): boolean {
-  return head.byteLength >= 4 && ascii(head, 0, 4) === 'caff';
-}
 
 /**
  * Read the whole source. CAF's `data` chunk may declare size `-1` ("to EOF"), so both probe and PCM
@@ -65,18 +52,12 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
   return out;
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && CAF_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && CAF_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  return q.head !== undefined && isCafHead(q.head);
-}
-
 export const CafDriver: ContainerDriver = {
   id: 'caf',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['caf'],
-  supports: matches,
+  supports: matchesCaf,
   async demux(src: ByteSource): Promise<Demuxer> {
     // A CAF `data` chunk may declare size -1 ("to EOF"); duration then needs the whole file. Reading it
     // all keeps probe correct for both forms (the file is bounded and PCM has no separate index).
@@ -126,10 +107,7 @@ export const CafDriver: ContainerDriver = {
   createMuxer(): Muxer {
     // CAF carries raw PCM, not WebCodecs EncodedChunks, so the seam Muxer doesn't map; PCM output is
     // produced by `transformPcm` (writeCaf) — the audio-dsp path (ADR-022), exactly like WAV.
-    throw new MediaError(
-      'mux-error',
-      'caf output flows through transformPcm (PCM), not the chunk seam',
-    );
+    return rejectRawPcmChunkMux('caf');
   },
 };
 

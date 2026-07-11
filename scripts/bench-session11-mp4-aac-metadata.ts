@@ -11,10 +11,8 @@ import type { Source } from '../src/sources/source.ts';
 
 const WARMUP = 2;
 const SAMPLES = 9;
-const CORPUS = new URL(
-  '../../media-test/media-browser-test/fixtures/media/scenarios/performance/',
-  import.meta.url,
-).pathname;
+const CORPUS = new URL('../../media-test/fixtures/media/scenarios/performance/', import.meta.url)
+  .pathname;
 const SUBJECTS = [
   'size-ladder-extract-metadata-massive/massive_h264_1080p_2h.mp4',
   'size-ladder-extract-metadata-massive/01.mp4',

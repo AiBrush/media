@@ -10,6 +10,8 @@ export interface EbmlElement {
   dataEnd: number;
   /** Whether the declared finite payload is wholly present in this DataView. */
   complete: boolean;
+  /** An all-ones size vint: the element deliberately extends to its enclosing boundary. */
+  unknownSize: boolean;
 }
 
 /** A variable-length integer. `keepMarker` true for element IDs, false for sizes. */
@@ -59,6 +61,7 @@ export function* elements(dv: DataView, start: number, end: number): Generator<E
       dataStart,
       dataEnd,
       complete: size.value >= 0 && declaredDataEnd <= limit,
+      unknownSize: size.value < 0,
     };
     at = dataEnd;
   }
@@ -68,6 +71,18 @@ export function* elements(dv: DataView, start: number, end: number): Generator<E
 export function readUint(dv: DataView, el: EbmlElement): number {
   let value = 0;
   for (let i = el.dataStart; i < el.dataEnd; i++) value = value * 256 + dv.getUint8(i);
+  return value;
+}
+
+/** Big-endian two's-complement integer over an element's data. */
+export function readInt(dv: DataView, el: EbmlElement): number {
+  if (el.dataStart >= el.dataEnd) return 0;
+  const first = dv.getUint8(el.dataStart);
+  // Sign-extend the first octet before folding the remainder. This also keeps small negative values
+  // exact when a writer used an unnecessarily-wide (up to 8-byte) EBML integer: a leading 0xff remains
+  // -1 at each fold instead of first becoming an unsafe ~2^64 unsigned Number.
+  let value = (first & 0x80) === 0 ? first : first - 0x100;
+  for (let i = el.dataStart + 1; i < el.dataEnd; i++) value = value * 256 + dv.getUint8(i);
   return value;
 }
 

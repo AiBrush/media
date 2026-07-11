@@ -14,6 +14,8 @@ const TINY_KNOWN_FULL_RANGE_GET_BYTES = 16 * 1024;
 
 /** Internal identity hook used for short-lived cross-operation source caches. Not exported from the public barrel. */
 export const SOURCE_CACHE_KEY: unique symbol = Symbol('a');
+/** Final effective URL learned from Fetch (after redirects), kept separate from cache identity. */
+export const SOURCE_URL_KEY: unique symbol = Symbol('u');
 
 /** Anything the public ops accept directly (ADR-013). */
 export type MediaInput =
@@ -46,6 +48,8 @@ export interface Source {
   readonly filename?: string;
   /** Opaque source identity for same-origin, short-lived cache handoffs between operations. */
   readonly [SOURCE_CACHE_KEY]?: string;
+  /** Effective resource URL, updated from `Response.url` after a URL/element fetch follows redirects. */
+  readonly [SOURCE_URL_KEY]?: string;
 }
 
 export interface FromUrlOptions {
@@ -147,6 +151,10 @@ function filenameFromHref(href: string): string | undefined {
 export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
   const href = typeof url === 'string' ? url : url.href;
   const filename = filenameFromHref(href);
+  let effectiveUrl = href;
+  const learnEffectiveUrl = (url: string): void => {
+    effectiveUrl = url;
+  };
   // `size` is a real own property, present only once known: seeded if the caller passed it, otherwise set
   // (assigned a `number`, never an explicit `undefined`) the first time a fetch learns it from a
   // `Content-Range`/`Content-Length`. The fetch closures share this object so a later read can clamp.
@@ -157,9 +165,12 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
     ...(opts.mime !== undefined ? { mimeHint: opts.mime } : {}),
     ...(filename !== undefined ? { filename } : {}),
     [SOURCE_CACHE_KEY]: href,
-    stream: () => fetchStream(href, source),
+    get [SOURCE_URL_KEY](): string {
+      return effectiveUrl;
+    },
+    stream: () => fetchStream(href, source, learnEffectiveUrl),
     ...(opts.rangeRequests !== false
-      ? { range: (start, end) => fetchRange(href, start, end, source) }
+      ? { range: (start, end) => fetchRange(href, start, end, source, learnEffectiveUrl) }
       : {}),
   };
   return source;
@@ -176,14 +187,21 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
     throw new InputError('unsupported-input', 'src');
   }
   const filename = filenameFromHref(href);
+  let effectiveUrl = href;
+  const learnEffectiveUrl = (url: string): void => {
+    effectiveUrl = url;
+  };
   // A URL-backed source relabelled `element` (reads `currentSrc`, never `loadedmetadata`). Built directly
   // over the fetch helpers (rather than spreading a `fromURL`) so `size` is learned onto *this* object on
   // the first range/stream read, exactly like a plain URL source.
   const element: Source = {
     __media: 'source',
     kind: 'element',
-    stream: () => fetchStream(href, element),
-    range: (start, end) => fetchRange(href, start, end, element),
+    get [SOURCE_URL_KEY](): string {
+      return effectiveUrl;
+    },
+    stream: () => fetchStream(href, element, learnEffectiveUrl),
+    range: (start, end) => fetchRange(href, start, end, element, learnEffectiveUrl),
     ...(filename !== undefined ? { filename } : {}),
   };
   return element;
@@ -224,12 +242,21 @@ function learnSize(target: LearnSize, total: number | undefined): void {
   if (total !== undefined && target.size === undefined) target.size = total;
 }
 
-function fetchStream(href: string, learn?: LearnSize): ReadableStream<Uint8Array> {
+function learnResponseUrl(response: Response, learn?: (url: string) => void): void {
+  if (response.url.length > 0) learn?.(response.url);
+}
+
+function fetchStream(
+  href: string,
+  learn?: LearnSize,
+  learnUrl?: (url: string) => void,
+): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   return new ReadableStream<Uint8Array>({
     async pull(controller): Promise<void> {
       if (!reader) {
         const res = await fetch(href);
+        learnResponseUrl(res, learnUrl);
         if (!res.ok || !res.body) {
           throw new InputError('unsupported-input', `f ${res.status}`);
         }
@@ -255,6 +282,7 @@ async function fetchRange(
   start: number,
   end: number,
   learn?: LearnSize,
+  learnUrl?: (url: string) => void,
 ): Promise<Uint8Array> {
   // Clamp a never-negative, ordered window first; if we already know the size, never ask past EOF.
   const known = learn?.size;
@@ -265,6 +293,7 @@ async function fetchRange(
 
   if (known !== undefined && lo === 0 && hi === known && known <= TINY_KNOWN_FULL_RANGE_GET_BYTES) {
     const res = await fetch(href);
+    learnResponseUrl(res, learnUrl);
     if (!res.ok) {
       throw new InputError('unsupported-input', `f ${res.status}`);
     }
@@ -275,6 +304,7 @@ async function fetchRange(
 
   // HTTP Range is inclusive; our contract is half-open [lo, hi).
   const res = await fetch(href, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
+  learnResponseUrl(res, learnUrl);
   if (!res.ok) {
     throw new InputError('unsupported-input', `r ${res.status}`);
   }

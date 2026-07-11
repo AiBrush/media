@@ -292,12 +292,18 @@ describe('resample — longform performance guard', () => {
       16_000,
     );
 
-    const start = performance.now();
-    const out = resample(audio, 16_000);
-    const wallSeconds = (performance.now() - start) / 1000;
-    const throughputRealtime = seconds / wallSeconds;
+    const samples: number[] = [];
+    let outFrames = 0;
+    for (let sample = 0; sample < 5; sample++) {
+      const start = performance.now();
+      const out = resample(audio, 16_000);
+      samples.push(seconds / ((performance.now() - start) / 1000));
+      outFrames = out.frames;
+    }
+    samples.sort((a, b) => a - b);
+    const throughputRealtime = samples[Math.floor(samples.length / 2)] ?? 0;
 
-    expect(out.frames).toBe(16_000 * seconds);
+    expect(outFrames).toBe(16_000 * seconds);
     // V8 coverage profiling instruments every executed line and is not a fair performance benchmark.
     // Keep the production-speed guard in normal runs, and only require non-catastrophic throughput there.
     expect(throughputRealtime).toBeGreaterThan(isCoverageRun() ? 60 : 360);

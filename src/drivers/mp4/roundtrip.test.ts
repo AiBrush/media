@@ -698,6 +698,24 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
   });
 
   it.each([
+    ['fractional offset', 1.5, 1],
+    ['fractional size', 1, 1.5],
+    ['unsafe offset', Number.MAX_SAFE_INTEGER + 1, 0],
+    ['overflowing end', Number.MAX_SAFE_INTEGER, 1],
+    ['non-finite offset', Number.POSITIVE_INFINITY, 0],
+  ])('packet metadata rejects a %s even when source size is unknown', (_label, offset, size) => {
+    expect(() => mp4PacketMetadata(syntheticAudioMovie([size], [offset]))).toThrow(
+      /outside the source/,
+    );
+  });
+
+  it('packet metadata keeps a zero-size sample at the known source boundary', () => {
+    const table = mp4PacketMetadata(syntheticAudioMovie([0], [8]), 8);
+    expect(table).toHaveLength(1);
+    expect(table[0]?.sizeBytes).toBe(0);
+  });
+
+  it.each([
     ['negative sample offset', syntheticAudioMovie([2], [-1])],
     ['negative sample size', syntheticAudioMovie([-1], [0])],
   ])('packet metadata rejects %s', (_label, movie) => {

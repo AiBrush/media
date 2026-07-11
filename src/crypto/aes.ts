@@ -54,6 +54,56 @@ function ownedCopy(data: Uint8Array): Uint8Array<ArrayBuffer> {
 }
 
 /**
+ * An operation-scoped, non-extractable AES key plus the exact WebCrypto realm that imported it. Keeping
+ * the realm avoids a global lookup per sample and makes a prepared key safe when a host replaces its
+ * `globalThis.crypto` object between asynchronous stages.
+ */
+export interface PreparedAesKey {
+  readonly algorithm: 'AES-CTR' | 'AES-CBC';
+  readonly subtle: SubtleCrypto;
+  readonly key: CryptoKey;
+}
+
+/** Return an ArrayBuffer-backed view without copying unless the source is shared-memory backed. */
+function webCryptoView(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  return data.buffer instanceof ArrayBuffer
+    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+    : data.slice();
+}
+
+/** Import one non-extractable AES-CTR key for reuse across an operation's independent samples. */
+export async function prepareAesCtrKey(key: Uint8Array<ArrayBuffer>): Promise<PreparedAesKey> {
+  const s = subtle();
+  return {
+    algorithm: 'AES-CTR',
+    subtle: s,
+    key: await s.importKey('raw', ownedCopy(key), 'AES-CTR', false, ['encrypt']),
+  };
+}
+
+/**
+ * AES-CTR with an already imported key. WebCrypto snapshots BufferSource inputs when the operation is
+ * invoked, so ordinary ArrayBuffer-backed views need no second payload copy; SharedArrayBuffer views are
+ * copied because WebCrypto rejects them.
+ */
+export async function aesCtrWithPreparedKey(
+  prepared: PreparedAesKey,
+  counter: Uint8Array,
+  data: Uint8Array,
+  counterBits = 64,
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (prepared.algorithm !== 'AES-CTR') {
+    throw new InputError('unsupported-input', 'prepared AES key is not an AES-CTR key');
+  }
+  const result = await prepared.subtle.encrypt(
+    { name: 'AES-CTR', counter: webCryptoView(counter), length: counterBits },
+    prepared.key,
+    webCryptoView(data),
+  );
+  return new Uint8Array(result);
+}
+
+/**
  * AES-CTR keystream transform (decrypt === encrypt). `counter` is the 16-byte initial counter block;
  * `counterBits` is the width of the incrementing counter portion — CENC uses 64, full-block NIST CTR
  * uses 128. Returns a fresh buffer the same length as `data`.
@@ -64,14 +114,7 @@ export async function aesCtr(
   data: Uint8Array<ArrayBuffer>,
   counterBits = 64,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const s = subtle();
-  const cryptoKey = await s.importKey('raw', ownedCopy(key), 'AES-CTR', false, ['encrypt']);
-  const result = await s.encrypt(
-    { name: 'AES-CTR', counter: ownedCopy(counter), length: counterBits },
-    cryptoKey,
-    ownedCopy(data),
-  );
-  return new Uint8Array(result);
+  return aesCtrWithPreparedKey(await prepareAesCtrKey(key), counter, data, counterBits);
 }
 
 /** XOR `a` and `b` into a fresh block (both must be {@link AES_BLOCK} bytes). */
@@ -90,6 +133,24 @@ async function importCbcKey(
   return s.importKey('raw', ownedCopy(key), 'AES-CBC', false, [usage]);
 }
 
+/**
+ * Import one non-extractable AES-CBC key for an operation. No-padding decryption needs both usages:
+ * `decrypt` for the ciphertext and `encrypt` for the synthetic terminal padding block. Encryption-only
+ * callers retain the narrower usage set.
+ */
+export async function prepareAesCbcKey(
+  key: Uint8Array<ArrayBuffer>,
+  usage: 'encrypt' | 'no-padding-decrypt',
+): Promise<PreparedAesKey> {
+  const s = subtle();
+  const usages: KeyUsage[] = usage === 'encrypt' ? ['encrypt'] : ['encrypt', 'decrypt'];
+  return {
+    algorithm: 'AES-CBC',
+    subtle: s,
+    key: await s.importKey('raw', ownedCopy(key), 'AES-CBC', false, usages),
+  };
+}
+
 /** Encrypt exactly one 16-byte block with raw AES (ECB), realized via single-block CBC with a zero IV. */
 async function aesEncryptBlock(
   s: SubtleCrypto,
@@ -100,9 +161,53 @@ async function aesEncryptBlock(
   // exactly the raw AES encryption of `block` (the second block is the appended full-pad block).
   const zeroIv = new Uint8Array(AES_BLOCK);
   const out = new Uint8Array(
-    await s.encrypt({ name: 'AES-CBC', iv: zeroIv }, cbcKey, ownedCopy(block)),
+    await s.encrypt({ name: 'AES-CBC', iv: zeroIv }, cbcKey, webCryptoView(block)),
   );
   return out.slice(0, AES_BLOCK);
+}
+
+/** AES-CBC no-padding with a prepared operation-scoped key; see {@link aesCbcNoPadding}. */
+export async function aesCbcNoPaddingWithPreparedKey(
+  prepared: PreparedAesKey,
+  iv: Uint8Array,
+  data: Uint8Array,
+  direction: 'encrypt' | 'decrypt',
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (data.byteLength === 0) return new Uint8Array(0);
+  if (data.byteLength % AES_BLOCK !== 0) {
+    throw new InputError(
+      'unsupported-input',
+      `AES-CBC no-padding needs a multiple of ${AES_BLOCK} bytes, got ${data.byteLength}`,
+    );
+  }
+  if (iv.byteLength !== AES_BLOCK) {
+    throw new InputError(
+      'unsupported-input',
+      `AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
+    );
+  }
+  if (prepared.algorithm !== 'AES-CBC') {
+    throw new InputError('unsupported-input', 'prepared AES key is not an AES-CBC key');
+  }
+  const { subtle: s, key: cbcKey } = prepared;
+
+  if (direction === 'encrypt') {
+    const padded = new Uint8Array(
+      await s.encrypt({ name: 'AES-CBC', iv: webCryptoView(iv) }, cbcKey, webCryptoView(data)),
+    );
+    return padded.slice(0, data.byteLength);
+  }
+
+  const lastCipher = data.subarray(data.byteLength - AES_BLOCK);
+  const fullPad = new Uint8Array(AES_BLOCK).fill(AES_BLOCK);
+  const synthetic = await aesEncryptBlock(s, cbcKey, xorBlock(fullPad, lastCipher));
+  const framed = new Uint8Array(data.byteLength + AES_BLOCK);
+  framed.set(data, 0);
+  framed.set(synthetic, data.byteLength);
+  const plain = new Uint8Array(
+    await s.decrypt({ name: 'AES-CBC', iv: webCryptoView(iv) }, cbcKey, framed),
+  );
+  return plain.byteLength === data.byteLength ? plain : plain.slice(0, data.byteLength);
 }
 
 /**
@@ -127,43 +232,8 @@ export async function aesCbcNoPadding(
   direction: 'encrypt' | 'decrypt',
 ): Promise<Uint8Array<ArrayBuffer>> {
   if (data.byteLength === 0) return new Uint8Array(0);
-  if (data.byteLength % AES_BLOCK !== 0) {
-    throw new InputError(
-      'unsupported-input',
-      `AES-CBC no-padding needs a multiple of ${AES_BLOCK} bytes, got ${data.byteLength}`,
-    );
-  }
-  if (iv.byteLength !== AES_BLOCK) {
-    throw new InputError(
-      'unsupported-input',
-      `AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
-    );
-  }
-  const s = subtle();
-
-  if (direction === 'encrypt') {
-    const cbcKey = await importCbcKey(s, key, 'encrypt');
-    const padded = new Uint8Array(
-      await s.encrypt({ name: 'AES-CBC', iv: ownedCopy(iv) }, cbcKey, ownedCopy(data)),
-    );
-    // SubtleCrypto appended exactly one PKCS#7 pad block (input was block-aligned); drop it.
-    return padded.slice(0, data.byteLength);
-  }
-
-  const cbcKey = await importCbcKey(s, key, 'decrypt');
-  const lastCipher = data.subarray(data.byteLength - AES_BLOCK);
-  const fullPad = new Uint8Array(AES_BLOCK).fill(AES_BLOCK); // (0x10)^16
-  // The synthetic block whose CBC-decryption (chained off the real last block) yields a full pad block.
-  const encKey = await importCbcKey(s, key, 'encrypt');
-  const synthetic = await aesEncryptBlock(s, encKey, xorBlock(fullPad, lastCipher));
-  const framed = new Uint8Array(data.byteLength + AES_BLOCK);
-  framed.set(data, 0);
-  framed.set(synthetic, data.byteLength);
-  const plain = new Uint8Array(
-    await s.decrypt({ name: 'AES-CBC', iv: ownedCopy(iv) }, cbcKey, framed),
-  );
-  // SubtleCrypto stripped the synthetic full-pad block, leaving exactly the real plaintext.
-  return plain.byteLength === data.byteLength ? plain : plain.slice(0, data.byteLength);
+  const usage = direction === 'encrypt' ? 'encrypt' : 'no-padding-decrypt';
+  return aesCbcNoPaddingWithPreparedKey(await prepareAesCbcKey(key, usage), iv, data, direction);
 }
 
 /**

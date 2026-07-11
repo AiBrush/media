@@ -1,0 +1,22 @@
+[
+  {
+    "scenario": "transcode/aac_to_mp3_mp4",
+    "adr": "ADR-109",
+    "reason": "No permissively licensed MP3 encoder is shipped; silently adding LAME or Shine would violate the approved default-package license boundary."
+  },
+  {
+    "scenario": "transcode/wav_to_mp3_mp4",
+    "adr": "ADR-109",
+    "reason": "No permissively licensed MP3 encoder is shipped; silently adding LAME or Shine would violate the approved default-package license boundary."
+  },
+  {
+    "scenario": "transcode/h264_8bit_to_hevc_10bit",
+    "adr": "ADR-109",
+    "reason": "Portable 10-bit HEVC output is not exposed by WebCodecs and no permissive software HEVC Main10 encoder is bundled; 8-bit output would be false conformance."
+  },
+  {
+    "scenario": "transcode/h264_two_pass_bitrate",
+    "adr": "ADR-109",
+    "reason": "WebCodecs exposes no first-pass statistics or second-pass control surface, so relabeling a single-pass encode would fake the requested operation."
+  }
+]

@@ -3,7 +3,7 @@ import { MediaError } from '../../contracts/errors.ts';
 import type { Movie, ParsedTrack } from './parse.ts';
 
 interface RandomAccessView {
-  readonly size?: number;
+  readonly size?: number | undefined;
   read(offset: number, length: number): Promise<Uint8Array>;
 }
 

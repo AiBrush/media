@@ -115,7 +115,9 @@ function expectedInterleaved(pcm: FlacPcm, outBytes: number, shift: number): Uin
   for (let i = 0; i < pcm.totalSamples; i++) {
     for (let ch = 0; ch < pcm.channels; ch++) {
       const v = (pcm.samples[ch]?.[i] ?? 0) * 2 ** shift;
-      if (outBytes === 2) {
+      if (outBytes === 1) {
+        dv.setInt8(o, v);
+      } else if (outBytes === 2) {
         dv.setInt16(o, v, true);
       } else {
         // 3-byte little-endian signed.
@@ -135,7 +137,9 @@ function expectedInterleaved(pcm: FlacPcm, outBytes: number, shift: number): Uin
  * and we compare against {@link interleavedPcmBytes} directly (the strongest oracle). The `flac` CLI
  * refuses raw for 12-bit, so a non-byte-aligned depth is decoded by `ffmpeg` to `s16le`, which
  * **left-justifies** sub-16-bit samples (`sample << (16-bits)`) — we build the expected bytes to match.
- * A wrong predictor/residual/decorrelation makes the bytes differ and FAILS.
+ * For 8-bit FLAC, ffmpeg must be asked for native signed `s8`: requesting `s16le` scales each sample by
+ * 256 and is not the depth-true STREAMINFO-MD5 representation. A wrong predictor/residual/decorrelation
+ * makes the bytes differ and FAILS.
  */
 function assertIndependentDecodeEquals(
   preferred: 'flac' | 'ffmpeg',
@@ -173,12 +177,14 @@ function assertIndependentDecodeEquals(
       );
       expected = interleavedPcmBytes(decodeFlac(encodeFlacVerbatim(pcm)));
     } else {
-      const outBytes = geom.bitsPerSample <= 16 ? 2 : 3;
-      const fmt = outBytes === 2 ? 's16le' : 's24le';
-      execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', inPath, '-f', fmt, outPath], {
-        stdio: 'ignore',
-      });
-      // ffmpeg left-justifies a sub-byte-aligned depth into the target width; byte-aligned passes through.
+      const outBytes = geom.bitsPerSample === 8 ? 1 : geom.bitsPerSample <= 16 ? 2 : 3;
+      const fmt = outBytes === 1 ? 's8' : outBytes === 2 ? 's16le' : 's24le';
+      execFileSync(
+        'ffmpeg',
+        ['-v', 'error', '-y', '-i', inPath, '-f', fmt, '-acodec', `pcm_${fmt}`, outPath],
+        { stdio: 'ignore' },
+      );
+      // ffmpeg left-justifies only a non-byte-aligned depth into the next supported target width.
       const shift = byteAligned ? 0 : outBytes * 8 - geom.bitsPerSample;
       expected = expectedInterleaved(pcm, outBytes, shift);
     }
@@ -189,7 +195,7 @@ function assertIndependentDecodeEquals(
     if (md5(got) !== md5(expected)) {
       let i = 0;
       while (i < got.byteLength && got[i] === expected[i]) i++;
-      expect.fail(
+      throw new Error(
         `${label}: ${tool} decode differs from source at byte ${i} (${got[i]} != ${expected[i]})`,
       );
     }

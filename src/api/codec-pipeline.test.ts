@@ -622,22 +622,99 @@ describe('videoFilterSpecs', () => {
 });
 
 describe('videoFilterRouteCost', () => {
-  it('derives positive finite pixel area and duration for router tiny-workload selection', () => {
-    expect(videoFilterRouteCost({ width: 64, height: 32, durationSec: 0.5 })).toEqual({
-      outputPixels: 2048,
-      mediaSeconds: 0.5,
+  it('derives source-plus-output pixel work across the estimated frame count', () => {
+    expect(videoFilterRouteCost({}, { width: 64, height: 64, fps: 30, durationSec: 1 })).toEqual({
+      inputPixels: 4096,
+      outputPixels: 4096,
+      videoFrames: 30,
+      videoPixelWork: 245_760,
+      mediaSeconds: 1,
     });
+    expect(videoFilterRouteCost({}, { width: 64, height: 64, durationSec: 1 })).toMatchObject({
+      videoFrames: 30,
+      videoPixelWork: 245_760,
+    });
+    expect(videoFilterRouteCost({}, { width: 64, height: 64 })).toMatchObject({
+      videoFrames: 1,
+      videoPixelWork: 8192,
+    });
+  });
+
+  it('does not classify short 4K or one-frame 360p transforms by duration alone', () => {
+    expect(
+      videoFilterRouteCost(
+        { width: 1920, height: 1080 },
+        { width: 3840, height: 2160, fps: 30, durationSec: 0.1 },
+      ),
+    ).toEqual({
+      inputPixels: 8_294_400,
+      outputPixels: 2_073_600,
+      videoFrames: 3,
+      videoPixelWork: 31_104_000,
+      mediaSeconds: 0.1,
+    });
+    expect(
+      videoFilterRouteCost(
+        { width: 320, height: 180 },
+        { width: 640, height: 360, fps: 30, durationSec: 1 / 30 },
+      ),
+    ).toEqual({
+      inputPixels: 230_400,
+      outputPixels: 57_600,
+      videoFrames: 1,
+      videoPixelWork: 288_000,
+      mediaSeconds: 1 / 30,
+    });
+  });
+
+  it('accounts for 1080p/720p geometry and the higher side of an fps conversion', () => {
+    expect(
+      videoFilterRouteCost(
+        { width: 1280, height: 720 },
+        { width: 1920, height: 1080, fps: 30, durationSec: 1 },
+      ),
+    ).toEqual({
+      inputPixels: 2_073_600,
+      outputPixels: 921_600,
+      videoFrames: 30,
+      videoPixelWork: 89_856_000,
+      mediaSeconds: 1,
+    });
+    expect(
+      videoFilterRouteCost(
+        { width: 640, height: 360, fps: 30 },
+        { width: 640, height: 360, fps: 15, durationSec: 1 },
+      ).videoFrames,
+    ).toBe(30);
+    expect(
+      videoFilterRouteCost(
+        { width: 640, height: 360, fps: 15 },
+        { width: 640, height: 360, fps: 30, durationSec: 1 },
+      ).videoFrames,
+    ).toBe(30);
+    expect(
+      videoFilterRouteCost({}, { width: 640, height: 360, fps: 15, durationSec: 1 }),
+    ).toMatchObject({ videoFrames: 15, videoPixelWork: 6_912_000 });
   });
 
   it('omits unknown or invalid geometry and duration rather than forcing a tiny route', () => {
     expect(
-      videoFilterRouteCost({
-        width: undefined,
-        height: 1080,
-        durationSec: Number.NaN,
-      }),
+      videoFilterRouteCost(
+        {},
+        {
+          width: undefined,
+          height: 1080,
+          durationSec: Number.NaN,
+        },
+      ),
     ).toEqual({});
-    expect(videoFilterRouteCost({ width: 0, height: 1080, durationSec: -1 })).toEqual({});
+    expect(videoFilterRouteCost({}, { width: 0, height: 1080, durationSec: -1 })).toEqual({});
+    expect(
+      videoFilterRouteCost(
+        { width: 320, height: 180 },
+        { width: undefined, height: undefined, fps: 30, durationSec: 1 / 30 },
+      ),
+    ).toEqual({ outputPixels: 57_600, mediaSeconds: 1 / 30 });
   });
 });
 
@@ -875,6 +952,30 @@ describe('retimeTimedFrameStream', () => {
     first.value?.close();
     await reader.cancel();
     reader.releaseLock();
+  });
+
+  it('closes pending fps duplicates and the lookahead frame when downstream cancels', async () => {
+    let nextId = 300;
+    const inputs = [new RetimeFakeFrame(0, 0, 33_333), new RetimeFakeFrame(1, 33_333, 33_334)];
+    const outputs: RetimeFakeFrame[] = [];
+    const reader = retimeTimedFrameStream(streamOf(inputs), {
+      fps: 60,
+      restamp(frame, timing): RetimeFakeFrame {
+        const output = new RetimeFakeFrame(nextId++, timing.timestamp, timing.duration, frame.id);
+        outputs.push(output);
+        return output;
+      },
+    }).getReader();
+
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    first.value?.close();
+    await reader.cancel('downstream stopped');
+    reader.releaseLock();
+
+    expect(inputs.map((frame) => frame.closed)).toEqual([true, true]);
+    expect(outputs).toHaveLength(2);
+    expect(outputs.map((frame) => frame.closed)).toEqual([true, true]);
   });
 
   it('rejects same-object restamps while closing the source frame once', async () => {
@@ -1606,7 +1707,6 @@ describe('planH264AbrLadder', () => {
       video: { codec: 'h264', width: 640, height: 360, bitrate: 800_000 },
     });
   });
-
 });
 
 // ── H.264 level selection (gap #1) ───────────────────────────────────────────────────────────────
