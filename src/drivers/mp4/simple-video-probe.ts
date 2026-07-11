@@ -1,6 +1,6 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
-import { gaplessFromMp4Edit } from './gapless.ts';
 import { avcCodecString, parseEsds } from './codec-strings.ts';
+import { gaplessFromMp4Edit } from './gapless.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 const SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES = 8 * 1024;

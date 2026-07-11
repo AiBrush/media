@@ -37,7 +37,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   FrameAccumulator,
   OPUS_RATE,
@@ -111,7 +112,7 @@ export function decodedSamplesAtRate(packet: Uint8Array, outRate: number): numbe
  */
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
-let corePromise: Promise<OpusWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<OpusWasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasOpusCoreGlue(): Promise<boolean> {
@@ -128,27 +129,38 @@ async function hasOpusCoreGlue(): Promise<boolean> {
  * driver *honest* about wasm absence rather than fabricating support. The wasm bytes are addressed via
  * `new URL('./opus_wasm_bg.wasm', import.meta.url)` so they ship same-origin alongside this chunk.
  */
-export async function loadOpusCore(runtime?: WasmRuntimeProfile): Promise<OpusWasmCore | null> {
-  corePromise ??= (async (): Promise<OpusWasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
-      const mod = await import('./opus-core.js');
-      await mod.default(
-        wasmInitForProfile(new URL('./opus_wasm_bg.wasm', import.meta.url), profile),
-      );
-      return mod.createOpusCore();
-    } catch {
-      // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.
-      return null;
-    }
-  })();
+export async function loadOpusCore(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<OpusWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './opus_wasm_bg.wasm',
+    new URL('./opus_wasm_bg.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<OpusWasmCore | null> => {
+      try {
+        // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
+        const mod = await import('./opus-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return mod.createOpusCore();
+      } catch {
+        // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.
+        return null;
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetOpusCoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -297,7 +309,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadOpusCore(o?.wasmRuntime);
+      const core = await loadOpusCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing('decode'));
         return;
@@ -383,7 +395,7 @@ function createEncoder(
 
   return new TransformStream<RawFrame, EncodedChunk>({
     async start(controller): Promise<void> {
-      const core = await loadOpusCore(o?.wasmRuntime);
+      const core = await loadOpusCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing('encode'));
         return;

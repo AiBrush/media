@@ -25,6 +25,7 @@ import {
   SOURCE_URL_KEY,
   type Source,
   fromBytes,
+  peekSourceHead,
 } from '../../sources/source.ts';
 import {
   type HlsKey,
@@ -184,10 +185,10 @@ export async function resolveHlsInputIfManifest(
   src: Source,
   signal: AbortSignal,
 ): Promise<Source> {
-  const peeked = await peekSourceHead(src, HLS_HEAD_SNIFF_BYTES, signal);
-  if (!isHlsPlaylist(peeked.head)) return peeked.source;
+  const head = await peekSourceHead(src, HLS_HEAD_SNIFF_BYTES, signal);
+  if (!isHlsPlaylist(head)) return src;
   const baseUrl = hlsManifestBaseUrl(input, src);
-  return resolveHlsSourceFromSource(peeked.source, {
+  return resolveHlsSourceFromSource(src, {
     signal,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
   });
@@ -209,122 +210,6 @@ function hlsManifestBaseUrl(input: MediaInput, src: Source): string | undefined 
   } catch {
     return href;
   }
-}
-
-interface PeekedSource {
-  readonly head: Uint8Array;
-  readonly source: Source;
-}
-
-/**
- * Read a bounded routing head. A seekable source is untouched; a single-use stream is replaced by a
- * one-shot source that replays every retained chunk before continuing the same locked reader.
- */
-async function peekSourceHead(src: Source, n: number, signal: AbortSignal): Promise<PeekedSource> {
-  if (src.range) {
-    return { head: await src.range(0, Math.min(n, src.size ?? n)), source: src };
-  }
-  throwIfAborted(signal);
-  const reader = src.stream().getReader();
-  const retained: Uint8Array[] = [];
-  let retainedBytes = 0;
-  try {
-    while (retainedBytes < n) {
-      throwIfAborted(signal);
-      const { done, value } = await reader.read();
-      if (done) break;
-      retained.push(value);
-      retainedBytes += value.byteLength;
-    }
-    throwIfAborted(signal);
-  } catch (error) {
-    await reader.cancel(error).catch(() => {});
-    reader.releaseLock();
-    throw error;
-  }
-  const head = retainedHead(retained, n);
-  // Every Source kind except `stream` promises a fresh readable on each call. Do not downgrade such a
-  // caller-provided source to the one-shot replay wrapper merely because it has no random-access method:
-  // later image/container routing is entitled to open another reader. Close only this bounded sniff and
-  // return the original identity. A true `stream` remains single-use and must replay the retained chunks.
-  if (src.kind !== 'stream') {
-    try {
-      await reader.cancel();
-    } finally {
-      reader.releaseLock();
-    }
-    return { head, source: src };
-  }
-  return {
-    head,
-    source: replayStreamSource(src, retained, reader),
-  };
-}
-
-function retainedHead(chunks: readonly Uint8Array[], limit: number): Uint8Array {
-  const length = Math.min(
-    limit,
-    chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
-  );
-  const head = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    const copyLength = Math.min(chunk.byteLength, length - offset);
-    if (copyLength <= 0) break;
-    head.set(chunk.subarray(0, copyLength), offset);
-    offset += copyLength;
-  }
-  return head;
-}
-
-/** Build the sole legal replay of a peeked single-use source, preserving all source hints. */
-function replayStreamSource(
-  original: Source,
-  retained: readonly Uint8Array[],
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-): Source {
-  let opened = false;
-  return {
-    __media: 'source',
-    kind: 'stream',
-    ...(original.size !== undefined ? { size: original.size } : {}),
-    ...(original.mimeHint !== undefined ? { mimeHint: original.mimeHint } : {}),
-    ...(original.filename !== undefined ? { filename: original.filename } : {}),
-    stream(): ReadableStream<Uint8Array> {
-      if (opened) throw new InputError('unsupported-input', 'used');
-      opened = true;
-      let retainedIndex = 0;
-      let released = false;
-      const release = (): void => {
-        if (released) return;
-        released = true;
-        reader.releaseLock();
-      };
-      return new ReadableStream<Uint8Array>({
-        async pull(controller): Promise<void> {
-          const chunk = retained[retainedIndex++];
-          if (chunk !== undefined) {
-            controller.enqueue(chunk);
-            return;
-          }
-          const { done, value } = await reader.read();
-          if (done) {
-            release();
-            controller.close();
-            return;
-          }
-          controller.enqueue(value);
-        },
-        async cancel(reason): Promise<void> {
-          try {
-            await reader.cancel(reason);
-          } finally {
-            release();
-          }
-        },
-      });
-    },
-  };
 }
 
 /** Drain a source's bytes fully (an HLS `.m3u8` manifest is small, so a whole-source read is correct). */

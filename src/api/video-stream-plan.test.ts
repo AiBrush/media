@@ -11,16 +11,20 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
   type FrameTiming,
   type TimedClosableFrame,
   planCfrFrameRetiming,
+  planVideoBitDepthConversion,
   retimeTimedFrameStream,
+  videoFilterRouteCost,
+  videoTargetPixelBoundaryBitDepth,
 } from './video-stream-plan.ts';
 
 interface StubFrame extends TimedClosableFrame {
   readonly timestamp: number;
-  duration: number;
+  duration?: number;
   closed: number;
   close(): void;
 }
@@ -72,6 +76,7 @@ async function retimedDurations(
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (value.duration === undefined) throw new Error('retimed frame omitted its duration');
     durations.push(value.duration);
   }
   return durations;
@@ -152,5 +157,280 @@ describe('planCfrFrameRetiming — final-frame duration clamp', () => {
     expect(plan.outputs).toHaveLength(4);
     for (const o of plan.outputs) expect(o.duration).toBe(500_000);
     expect(plan.outputs.reduce((sum, o) => sum + o.duration, 0)).toBe(2_000_000);
+  });
+});
+
+describe('video route-cost saturation', () => {
+  it('saturates finite work products and rejects overflowing pixel areas as unknown', () => {
+    expect(
+      videoFilterRouteCost({}, { width: 1e154, height: 1e154, fps: 240, durationSec: 1e308 }),
+    ).toEqual({
+      inputPixels: 1e308,
+      outputPixels: 1e308,
+      videoFrames: Number.MAX_SAFE_INTEGER,
+      videoPixelWork: Number.MAX_VALUE,
+      mediaSeconds: 1e308,
+    });
+    expect(videoFilterRouteCost({}, { width: Number.MAX_VALUE, height: 2 })).toEqual({});
+  });
+});
+
+function trackedFrame(timestamp: number, duration?: number): StubFrame {
+  return {
+    timestamp,
+    ...(duration === undefined ? {} : { duration }),
+    closed: 0,
+    close(): void {
+      this.closed++;
+    },
+  };
+}
+
+function trackedSource(frames: readonly StubFrame[]): ReadableStream<StubFrame> {
+  let cursor = 0;
+  return new ReadableStream<StubFrame>({
+    pull(controller): void {
+      const frame = frames[cursor++];
+      if (frame === undefined) controller.close();
+      else controller.enqueue(frame);
+    },
+  });
+}
+
+async function drainTrackedRetiming(
+  inputs: readonly StubFrame[],
+  fps: number,
+  durationUs?: number,
+): Promise<readonly StubFrame[]> {
+  const output = retimeTimedFrameStream(trackedSource(inputs), {
+    fps,
+    ...(durationUs === undefined ? {} : { durationUs }),
+    restamp: (_frame, timing): StubFrame => trackedFrame(timing.timestamp, timing.duration),
+  });
+  const reader = output.getReader();
+  const result: StubFrame[] = [];
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) return result;
+    result.push(next.value);
+  }
+}
+
+describe('retimeTimedFrameStream — inferred tails and failure ownership', () => {
+  it('infers a missing final duration from frame metadata, a VFR delta, then the CFR period', async () => {
+    const explicit = [trackedFrame(0, 250_000)];
+    const explicitOut = await drainTrackedRetiming(explicit, 4);
+    expect(explicitOut.map(({ timestamp, duration }) => ({ timestamp, duration }))).toEqual([
+      { timestamp: 0, duration: 250_000 },
+    ]);
+
+    const vfr = [trackedFrame(0), trackedFrame(250_000)];
+    const vfrOut = await drainTrackedRetiming(vfr, 4);
+    expect(vfrOut.map(({ timestamp, duration }) => ({ timestamp, duration }))).toEqual([
+      { timestamp: 0, duration: 250_000 },
+      { timestamp: 250_000, duration: 250_000 },
+    ]);
+
+    const cfrFallback = [trackedFrame(0)];
+    const cfrOut = await drainTrackedRetiming(cfrFallback, 4);
+    expect(cfrOut.map(({ timestamp, duration }) => ({ timestamp, duration }))).toEqual([
+      { timestamp: 0, duration: 250_000 },
+    ]);
+
+    for (const frame of [...explicit, ...vfr, ...cfrFallback]) expect(frame.closed).toBe(1);
+    for (const frame of [...explicitOut, ...vfrOut, ...cfrOut]) frame.close();
+  });
+
+  it('clamps an explicit end inside a long VFR interval and closes held frames on cancellation', async () => {
+    const inputs = [trackedFrame(0), trackedFrame(10_000_000)];
+    const output = retimeTimedFrameStream(trackedSource(inputs), {
+      fps: 1,
+      durationUs: 1_500_000,
+      restamp: (_frame, timing): StubFrame => trackedFrame(timing.timestamp, timing.duration),
+    });
+    const reader = output.getReader();
+    const first = await reader.read();
+    const second = await reader.read();
+    expect(first.done).toBe(false);
+    expect(second.done).toBe(false);
+    expect([first.value?.duration, second.value?.duration]).toEqual([1_000_000, 500_000]);
+    first.value?.close();
+    second.value?.close();
+    await reader.cancel('declared end reached');
+    expect(inputs.map((frame) => frame.closed)).toEqual([1, 1]);
+  });
+
+  it('closes both frames exactly once when presentation timestamps regress', async () => {
+    const inputs = [trackedFrame(1), trackedFrame(0)];
+    const reader = retimeTimedFrameStream(trackedSource(inputs), {
+      fps: 30,
+      restamp: (_frame, timing): StubFrame => trackedFrame(timing.timestamp, timing.duration),
+    }).getReader();
+    await expect(reader.read()).rejects.toBeInstanceOf(InputError);
+    expect(inputs.map((frame) => frame.closed)).toEqual([1, 1]);
+  });
+
+  it('closes the current and look-ahead frames exactly once when restamping fails', async () => {
+    const inputs = [trackedFrame(0), trackedFrame(1_000)];
+    const reader = retimeTimedFrameStream(trackedSource(inputs), {
+      fps: 1_000,
+      restamp: () => {
+        throw new Error('restamp failed');
+      },
+    }).getReader();
+    await expect(reader.read()).rejects.toThrow('restamp failed');
+    expect(inputs.map((frame) => frame.closed)).toEqual([1, 1]);
+  });
+
+  it('closes a final frame when finite timestamp arithmetic cannot represent a positive tail', async () => {
+    const input = trackedFrame(Number.MAX_VALUE, 1);
+    const reader = retimeTimedFrameStream(trackedSource([input]), {
+      fps: 30,
+      restamp: (_frame, timing): StubFrame => trackedFrame(timing.timestamp, timing.duration),
+    }).getReader();
+    await expect(reader.read()).rejects.toBeInstanceOf(InputError);
+    expect(input.closed).toBe(1);
+  });
+});
+
+describe('planVideoBitDepthConversion — partial codec metadata', () => {
+  it('recognizes HEVC Main/Main10 and does not invent depth for truncated VP9 fields', () => {
+    expect(
+      planVideoBitDepthConversion({
+        sourceCodec: 'hvc1.1.6.L93.B0',
+        targetCodec: 'hvc1.2.4.L120.B0',
+      }),
+    ).toEqual({
+      kind: 'encoder-widen',
+      sourceBitDepth: 8,
+      targetBitDepth: 10,
+      requiresPixelPath: false,
+    });
+    expect(
+      planVideoBitDepthConversion({ sourceCodec: 'vp09.00.10', targetCodec: 'hvc1.3.4.L120.B0' }),
+    ).toEqual({
+      kind: 'none',
+      sourceBitDepth: undefined,
+      targetBitDepth: undefined,
+      requiresPixelPath: false,
+    });
+  });
+
+  it('classifies 8/10-bit exact widening to 12-bit without a pixel copy', () => {
+    expect(planVideoBitDepthConversion({ sourceBitDepth: 8, targetBitDepth: 12 })).toEqual({
+      kind: 'encoder-widen',
+      sourceBitDepth: 8,
+      targetBitDepth: 12,
+      requiresPixelPath: false,
+    });
+    expect(planVideoBitDepthConversion({ sourceBitDepth: 10, targetBitDepth: 12 })).toEqual({
+      kind: 'encoder-widen',
+      sourceBitDepth: 10,
+      targetBitDepth: 12,
+      requiresPixelPath: false,
+    });
+  });
+
+  it('uses a bounded 8-bit pixel path for 10/12-bit downconversion', () => {
+    expect(planVideoBitDepthConversion({ sourceBitDepth: 10, targetBitDepth: 8 })).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 10,
+      targetBitDepth: 8,
+      requiresPixelPath: true,
+    });
+    expect(planVideoBitDepthConversion({ sourceBitDepth: 12, targetBitDepth: 8 })).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 12,
+      targetBitDepth: 8,
+      requiresPixelPath: true,
+    });
+    expect(
+      planVideoBitDepthConversion({
+        sourceBitDepth: 12,
+        targetBitDepth: 8,
+        pixelPathBitDepth: 8,
+      }),
+    ).toEqual({
+      kind: 'downconvert',
+      sourceBitDepth: 12,
+      targetBitDepth: 8,
+      requiresPixelPath: false,
+    });
+  });
+
+  it('rejects 12→10 and high-depth preservation across an existing RGBA8 filter boundary', () => {
+    expect(() => planVideoBitDepthConversion({ sourceBitDepth: 12, targetBitDepth: 10 })).toThrow(
+      CapabilityError,
+    );
+    expect(() =>
+      planVideoBitDepthConversion({
+        sourceBitDepth: 10,
+        targetBitDepth: 10,
+        pixelPathBitDepth: 8,
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      planVideoBitDepthConversion({
+        sourceBitDepth: 10,
+        targetBitDepth: 12,
+        pixelPathBitDepth: 8,
+      }),
+    ).toThrow(CapabilityError);
+    expect(() => planVideoBitDepthConversion({ targetBitDepth: 12, pixelPathBitDepth: 8 })).toThrow(
+      CapabilityError,
+    );
+  });
+
+  it('allows an 8-bit source to filter then widen and validates pixel-boundary depth', () => {
+    expect(
+      planVideoBitDepthConversion({
+        sourceBitDepth: 8,
+        targetBitDepth: 12,
+        pixelPathBitDepth: 8,
+      }),
+    ).toEqual({
+      kind: 'encoder-widen',
+      sourceBitDepth: 8,
+      targetBitDepth: 12,
+      requiresPixelPath: false,
+    });
+    expect(() =>
+      planVideoBitDepthConversion({
+        sourceBitDepth: 8,
+        targetBitDepth: 10,
+        pixelPathBitDepth: 9,
+      }),
+    ).toThrow(InputError);
+  });
+});
+
+describe('videoTargetPixelBoundaryBitDepth', () => {
+  const source = { width: 1920, height: 1080, fps: 60 };
+
+  it('classifies every current pixel filter as an RGBA8 boundary', () => {
+    const targets = [
+      { crop: { x: 0, y: 0, width: 1280, height: 720 } },
+      { width: 1280, height: 720 },
+      { pad: { width: 2560, height: 1440 } },
+      { rotate: 90 as const },
+      { flip: 'h' as const },
+      { colorspace: { to: 'bt2020' } },
+      { tonemap: { to: 'sdr' as const } },
+    ];
+    for (const target of targets) {
+      expect(videoTargetPixelBoundaryBitDepth(target, source)).toBe(8);
+    }
+  });
+
+  it('does not mistake fps-only retiming or an identity resize for a pixel conversion', () => {
+    expect(videoTargetPixelBoundaryBitDepth({ fps: 24 }, source)).toBeUndefined();
+    expect(
+      videoTargetPixelBoundaryBitDepth({ width: 1920, height: 1080, fps: 24 }, source),
+    ).toBeUndefined();
+  });
+
+  it('classifies VPx alpha merge and split as RGBA8 boundaries', () => {
+    expect(videoTargetPixelBoundaryBitDepth({ alpha: 'keep' }, source)).toBe(8);
+    expect(videoTargetPixelBoundaryBitDepth({}, source, true)).toBe(8);
   });
 });

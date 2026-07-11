@@ -32,13 +32,13 @@ import {
   mergeMoovAndFragmentSamples,
   parseFragmentSamples,
 } from './fragment-samples.ts';
-import { gaplessFromMp4Edit } from './gapless.ts';
 import {
   type FragmentInitTrackInput,
   buildMediaSegment,
   fragmentMp4,
   fragmentMp4InitSegment,
 } from './fragment.ts';
+import { gaplessFromMp4Edit } from './gapless.ts';
 import { h264AccessUnitIsKeyPicture } from './h264-access-unit.ts';
 import { Mp4Muxer } from './mux.ts';
 import {

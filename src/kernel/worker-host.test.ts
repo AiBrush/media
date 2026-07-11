@@ -175,17 +175,34 @@ describe('runOffloadStream', () => {
     expect(bytes).toEqual([1, 2, 3, 0xee]); // echoed back through the byte seam
   });
 
-  it('threads determinism onto the job (force-software is identical inline vs worker)', async () => {
-    const seenDet: { determinism?: string | undefined } = {};
-    const runJob: JobRunner = makeJobRunner(() => ({
+  it('threads routing and resolved runtime controls onto the job', async () => {
+    const seen: {
+      determinism: string | undefined;
+      pinDriver: string | undefined;
+      runtime: Parameters<Parameters<typeof makeJobRunner>[0]>[1] | undefined;
+    } = { determinism: undefined, pinDriver: undefined, runtime: undefined };
+    const runJob: JobRunner = makeJobRunner((_determinism, runtime) => ({
       convert: (input, _opts, o) => {
-        seenDet.determinism = o?.strategy?.determinism;
+        seen.determinism = o?.strategy?.determinism;
+        seen.pinDriver = o?.strategy?.pinDriver;
+        seen.runtime = runtime;
         return readAll(input).then((b) => Promise.resolve(byteStream([...b]) as never));
       },
       trim: () => Promise.reject(new Error('unused')) as never,
     }));
     const bridge = channelBridge(runJob);
-    const opts: OffloadStreamOptions = { determinism: 'force-software' };
+    const opts: OffloadStreamOptions = {
+      determinism: 'force-software',
+      pinDriver: 'wasm-aac',
+      wasmRuntime: {
+        kind: 'baseline',
+        simd: false,
+        threads: false,
+        sharedArrayBuffer: false,
+        reason: 'threads disabled by request',
+      },
+      wasmAssetBaseUrl: 'https://app.example/media/cores/',
+    };
     await drainBytes(
       await runOffloadStream(
         bridge,
@@ -194,7 +211,14 @@ describe('runOffloadStream', () => {
         opts,
       ),
     );
-    expect(seenDet.determinism).toBe('force-software');
+    expect(seen).toEqual({
+      determinism: 'force-software',
+      pinDriver: 'wasm-aac',
+      runtime: {
+        wasmRuntime: opts.wasmRuntime,
+        wasmAssetBaseUrl: 'https://app.example/media/cores/',
+      },
+    });
   });
 
   it('propagates a worker-side typed error through the byte stream', async () => {

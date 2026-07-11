@@ -77,6 +77,45 @@ function routerWith(register: (reg: Registry) => void, ensureLoaded = vi.fn()) {
 }
 
 describe('Router.pickCodec', () => {
+  it('pins the exact codec id without probing or falling through to another codec', async () => {
+    const hardware = makeCodec('hardware', 'hardware', true);
+    const pinned = makeCodec('pinned-wasm', 'wasm', false);
+    const fallback = makeCodec('fallback-wasm', 'wasm', true);
+    const { router, ensureLoaded } = routerWith((reg) => {
+      reg.addCodec(hardware.driver);
+      reg.addCodec(pinned.driver);
+      reg.addCodec(fallback.driver);
+    });
+
+    await expect(router.pickCodec(decodeQuery, { pinDriver: 'pinned-wasm' })).rejects.toMatchObject(
+      {
+        name: 'CapabilityError',
+        code: 'capability-miss',
+        message: expect.stringContaining('pinned-wasm'),
+        detail: { tried: ['pinned-wasm'] },
+      },
+    );
+    expect(ensureLoaded).toHaveBeenCalledTimes(1);
+    expect(ensureLoaded).toHaveBeenCalledWith(pinned.driver);
+    expect(pinned.supports).toHaveBeenCalledTimes(1);
+    expect(hardware.supports).not.toHaveBeenCalled();
+    expect(fallback.supports).not.toHaveBeenCalled();
+  });
+
+  it('does not let an unpinned positive cache bypass a later exact codec pin', async () => {
+    const hardware = makeCodec('hardware', 'hardware', true);
+    const pinned = makeCodec('pinned-wasm', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addCodec(hardware.driver);
+      reg.addCodec(pinned.driver);
+    });
+
+    expect((await router.pickCodec(decodeQuery)).id).toBe('hardware');
+    expect((await router.pickCodec(decodeQuery, { pinDriver: 'pinned-wasm' })).id).toBe(
+      'pinned-wasm',
+    );
+  });
+
   it('walks the tier ladder best-first (hardware over wasm)', async () => {
     const { router, ensureLoaded } = routerWith((reg) => {
       reg.addCodec(makeCodec('wasm', 'wasm', true).driver);
@@ -96,6 +135,46 @@ describe('Router.pickCodec', () => {
     expect((await router.pickCodec(decodeQuery, { determinism: 'force-software' })).id).toBe(
       'wasm',
     );
+  });
+
+  it('admits a hardware-tier WebCodecs driver only after an explicit software verdict', async () => {
+    const softwareSupports = vi.fn(async (...args: readonly unknown[]): Promise<CodecSupport> => {
+      const options = args[1] as { readonly determinism?: string } | undefined;
+      return options?.determinism === 'force-software'
+        ? { supported: true, hardwareAccelerated: false }
+        : { supported: true, hardwareAccelerated: true };
+    });
+    const hardware = makeCodec('webcodecs', 'hardware', true).driver;
+    const fallback = makeCodec('wasm', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addCodec({ ...hardware, supports: softwareSupports as CodecDriver['supports'] });
+      reg.addCodec(fallback.driver);
+    });
+
+    expect((await router.pickCodec(decodeQuery, { determinism: 'force-software' })).id).toBe(
+      'webcodecs',
+    );
+    expect(softwareSupports).toHaveBeenCalledWith(decodeQuery, {
+      determinism: 'force-software',
+    });
+    expect(fallback.supports).not.toHaveBeenCalled();
+  });
+
+  it('rejects a hardware-tier force-software verdict unless it proves non-hardware execution', async () => {
+    for (const verdict of [
+      { supported: true },
+      { supported: true, hardwareAccelerated: true },
+    ] satisfies readonly CodecSupport[]) {
+      const hardware = makeCodec('hardware-only', 'hardware', true).driver;
+      const fallback = makeCodec('wasm', 'wasm', true);
+      const { router } = routerWith((reg) => {
+        reg.addCodec({ ...hardware, supports: () => Promise.resolve(verdict) });
+        reg.addCodec(fallback.driver);
+      });
+      expect((await router.pickCodec(decodeQuery, { determinism: 'force-software' })).id).toBe(
+        'wasm',
+      );
+    }
   });
 
   it('skips a driver that reports unsupported', async () => {
@@ -472,6 +551,23 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
 }
 
 describe('Router.pickContainer', () => {
+  it('pins the exact container id and scopes a codec-only pin away from container routing', () => {
+    const first = makeContainer('first', true);
+    const pinned = makeContainer('pinned-container', true);
+    const codec = makeCodec('codec-only', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addContainer(first.driver);
+      reg.addContainer(pinned.driver);
+      reg.addCodec(codec.driver);
+    });
+
+    expect(router.pickContainer(demuxQuery, { pinDriver: 'pinned-container' }).id).toBe(
+      'pinned-container',
+    );
+    expect(first.supports).not.toHaveBeenCalled();
+    expect(router.pickContainer(demuxQuery, { pinDriver: 'codec-only' }).id).toBe('first');
+  });
+
   it('selects the first registered driver that supports the query', () => {
     const { router } = routerWith((reg) => {
       reg.addContainer(makeContainer('no', false).driver);
@@ -504,6 +600,32 @@ describe('Router.pickContainer', () => {
 });
 
 describe('Router.pickFilter', () => {
+  it('pins the exact filter id and reports only that id when its probe declines', () => {
+    const gpu = makeFilter('gpu', 'webgpu', true);
+    const pinned = makeFilter('pinned-filter', 'native', false);
+    const fallback = makeFilter('fallback', 'native', true);
+    const { router } = routerWith((reg) => {
+      reg.addFilter(gpu.driver);
+      reg.addFilter(pinned.driver);
+      reg.addFilter(fallback.driver);
+    });
+
+    let caught: unknown;
+    try {
+      router.pickFilter(resizeSpec, { pinDriver: 'pinned-filter' });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      name: 'CapabilityError',
+      message: expect.stringContaining('pinned-filter'),
+      detail: { tried: ['pinned-filter'] },
+    });
+    expect(pinned.supports).toHaveBeenCalledTimes(1);
+    expect(gpu.supports).not.toHaveBeenCalled();
+    expect(fallback.supports).not.toHaveBeenCalled();
+  });
+
   it('ranks substrates WebGPU → WebGL → Canvas2D → native → WASM', () => {
     const { router } = routerWith((reg) => {
       reg.addFilter(makeFilter('wasm', 'wasm', true).driver);
@@ -634,7 +756,6 @@ describe('Router.pickFilter', () => {
           router.pickFilter(
             { mediaType: 'video', type: 'colorspace', to },
             {
-              determinism: 'force-software',
               cost: { videoPixelWork: TINY_VIDEO_PIXEL_WORK + 1 },
             },
           ).id,
@@ -651,6 +772,7 @@ describe('Router.pickFilter', () => {
     const { router } = routerWith((reg) => {
       reg.addFilter(makeFilter('gpu', 'webgpu', true).driver);
       reg.addFilter(makeFilter('canvas', 'canvas2d', true).driver);
+      reg.addFilter(makeFilter('native', 'native', true).driver);
     });
     expect(
       router.pickFilter(resizeSpec, {
@@ -659,7 +781,16 @@ describe('Router.pickFilter', () => {
           videoPixelWork: (1920 * 1080 + 1280 * 720) * 30,
         },
       }).id,
-    ).toBe('canvas');
+    ).toBe('native');
+  });
+
+  it('does not treat Canvas2D as deterministic software when it is the only filter substrate', () => {
+    const { router } = routerWith((reg) =>
+      reg.addFilter(makeFilter('canvas', 'canvas2d', true).driver),
+    );
+    expect(() => router.pickFilter(resizeSpec, { determinism: 'force-software' })).toThrowError(
+      CapabilityError,
+    );
   });
 
   it('keeps native and wasm filter substrates under force-software', () => {

@@ -177,6 +177,25 @@ describe('resample — quality (band-limited windowed-sinc)', () => {
     expect(powerAt(channelAt(r.planar, 1), 440, 48000)).toBeLessThan(0.01);
   });
 
+  it('keeps the fused stereo polyphase path bit-identical to two independent mono paths', () => {
+    const left = channelAt(sine(431, 48000, 0.03, 0.7).planar, 0);
+    const right = channelAt(sine(719, 48000, 0.03, 0.4).planar, 0);
+    const stereo = resample(
+      { sampleRate: 48000, channels: 2, frames: left.length, planar: [left, right] },
+      44100,
+    );
+    const leftOnly = resample(
+      { sampleRate: 48000, channels: 1, frames: left.length, planar: [left] },
+      44100,
+    );
+    const rightOnly = resample(
+      { sampleRate: 48000, channels: 1, frames: right.length, planar: [right] },
+      44100,
+    );
+    expect(channelAt(stereo.planar, 0)).toEqual(channelAt(leftOnly.planar, 0));
+    expect(channelAt(stereo.planar, 1)).toEqual(channelAt(rightOnly.planar, 0));
+  });
+
   it('leaves the input audio untouched', () => {
     const a = sine(1000, 44100, 0.05);
     const before = channelAt(a.planar, 0).slice();

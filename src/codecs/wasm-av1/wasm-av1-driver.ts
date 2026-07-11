@@ -25,7 +25,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type Av1DecodedFrame,
   type Av1DecoderInit,
@@ -65,7 +66,7 @@ export function hasVideoFrameSeam(): boolean {
 }
 
 let probePromise: Promise<boolean> | undefined;
-let corePromise: Promise<Dav1dWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<Dav1dWasmCore | null>>();
 
 /**
  * Probe whether the build-emitted dav1d glue chunk is vendored. This imports only `dav1d-core.js`; it does
@@ -87,26 +88,37 @@ export async function probeAv1Core(): Promise<boolean> {
  * Load the dav1d WASM core lazily and at most once. This is the first point that instantiates/fetches the
  * heavy `.wasm`, and it is called only from `createDecoder()` after the router has selected this tail.
  */
-export async function loadAv1Core(runtime?: WasmRuntimeProfile): Promise<Dav1dWasmCore | null> {
-  corePromise ??= (async (): Promise<Dav1dWasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      const mod = await import('./dav1d-core.js');
-      await mod.default(
-        wasmInitForProfile(new URL('./dav1d_wasm_bg.wasm', import.meta.url), profile),
-      );
-      return mod.createDav1dCore();
-    } catch {
-      return null;
-    }
-  })();
+export async function loadAv1Core(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<Dav1dWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './dav1d_wasm_bg.wasm',
+    new URL('./dav1d_wasm_bg.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<Dav1dWasmCore | null> => {
+      try {
+        const mod = await import('./dav1d-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return mod.createDav1dCore();
+      } catch {
+        return null;
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset memoized core/probe state (tests only). */
 export function resetAv1CoreForTest(): void {
   probePromise = undefined;
-  corePromise = undefined;
+  corePromises.clear();
 }
 
 function coreMissing(op: 'decode' | 'encode'): CapabilityError {
@@ -167,13 +179,6 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
     return unsupported('wasm-av1 dav1d core is not vendored (see BUILD.md)');
   }
 
-  const loadedCore = corePromise === undefined ? undefined : await corePromise;
-  if (loadedCore === null) return unsupported('wasm-av1 dav1d core failed to instantiate');
-  if (loadedCore?.supports?.(init) === false) {
-    return unsupported(
-      `wasm-av1 dav1d core does not support profile ${init.profile}, ${init.bitDepth}-bit ${init.chromaSubsampling}`,
-    );
-  }
   return { supported: true, hardwareAccelerated: false };
 }
 
@@ -287,7 +292,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadAv1Core(o?.wasmRuntime);
+      const core = await loadAv1Core(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (signal?.aborted) {
         controller.error(new MediaError('aborted', 'operation aborted'));
         return;

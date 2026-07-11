@@ -8,7 +8,7 @@
  * the spec→plan dispatch, the `VideoColorSpace` mapping, and the driver's Node-observable contract.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
@@ -18,10 +18,12 @@ import {
   applyColorPlanToRgba,
   colorSpecTargetGamut,
   cpuVideoFilterDriver,
+  cpuVideoFilterSupports,
   geometryToRgba,
   mapVideoColorSpace,
   planCpuColor,
   planCpuGeometry,
+  rgbaCopyBufferSize,
 } from './cpu-video.ts';
 import {
   type ColorPlan,
@@ -139,6 +141,19 @@ describe('applyColorPlanToRgba — parity with the GPU colour math', () => {
     expect(or).toBe(Math.round(c[0] * 255));
     expect(og).toBe(Math.round(c[1] * 255));
     expect(ob).toBe(Math.round(c[2] * 255));
+  });
+});
+
+describe('rgbaCopyBufferSize — explicit copyTo layout sizing', () => {
+  it('returns the exact tight RGBA byte count without querying a source frame format', () => {
+    expect(rgbaCopyBufferSize(128, 72)).toBe(128 * 72 * 4);
+    expect(rgbaCopyBufferSize(1, 1)).toBe(4);
+  });
+
+  it('rejects invalid or unsafe dimensions', () => {
+    expect(() => rgbaCopyBufferSize(0, 1)).toThrow(InputError);
+    expect(() => rgbaCopyBufferSize(1, -1)).toThrow(InputError);
+    expect(() => rgbaCopyBufferSize(Number.MAX_SAFE_INTEGER, 2)).toThrow(InputError);
   });
 });
 
@@ -298,6 +313,31 @@ describe('geometryToRgba — flip (lossless mirror)', () => {
     const out = geometryToRgba(recipe, col);
     expect(at(out, 0, 0)).toEqual([0, 0, 255, 255]); // bottom now on top
     expect(at(out, 0, 1)).toEqual([255, 0, 0, 255]);
+  });
+});
+
+describe('geometryToRgba — pad (lossless copy with transparent border)', () => {
+  it('copies source pixels 1:1 and leaves every border pixel transparent', () => {
+    const source = img(2, 1, [255, 0, 0, 255, 0, 0, 255, 255]);
+    const recipe = planCpuGeometry(
+      { mediaType: 'video', type: 'pad', width: 4, height: 3, x: 1, y: 1 },
+      2,
+      1,
+    );
+    const out = geometryToRgba(recipe, source);
+    expect({ width: out.width, height: out.height }).toEqual({ width: 4, height: 3 });
+    expect(at(out, 1, 1)).toEqual([255, 0, 0, 255]);
+    expect(at(out, 2, 1)).toEqual([0, 0, 255, 255]);
+    for (const [x, y] of [
+      [0, 0],
+      [3, 0],
+      [0, 1],
+      [3, 1],
+      [0, 2],
+      [3, 2],
+    ] as const) {
+      expect(at(out, x, y)).toEqual([0, 0, 0, 0]);
+    }
   });
 });
 
@@ -534,6 +574,33 @@ describe('cpuVideoFilterDriver — identity & honest supports()', () => {
     expect(typeof VideoFrame).toBe('undefined');
     for (const spec of ALL_VIDEO) expect(cpuVideoFilterDriver.supports(spec)).toBe(false);
     for (const spec of AUDIO) expect(cpuVideoFilterDriver.supports(spec)).toBe(false);
+  });
+
+  it('declines Chromium tonemap when Canvas2D can consume opaque HDR frames', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Chrome/149' });
+    vi.stubGlobal('OffscreenCanvas', class FakeOffscreenCanvas {});
+    vi.stubGlobal('VideoFrame', class FakeVideoFrame {});
+    try {
+      expect(cpuVideoFilterSupports({ mediaType: 'video', type: 'tonemap', to: 'sdr' })).toBe(
+        false,
+      );
+      expect(
+        cpuVideoFilterSupports({ mediaType: 'video', type: 'resize', width: 8, height: 8 }),
+      ).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('retains CPU tonemap support on Firefox where Canvas2D does not claim HDR tonemap', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Firefox/149' });
+    vi.stubGlobal('OffscreenCanvas', class FakeOffscreenCanvas {});
+    vi.stubGlobal('VideoFrame', class FakeVideoFrame {});
+    try {
+      expect(cpuVideoFilterSupports({ mediaType: 'video', type: 'tonemap', to: 'sdr' })).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

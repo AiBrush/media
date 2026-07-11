@@ -14,12 +14,13 @@
 
 import type { MediaType } from '../../contracts/driver.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
+import { detectFraming } from './ts-framing.ts';
+
+export { detectFraming } from './ts-framing.ts';
+export type { PacketSize } from './ts-framing.ts';
 
 // `VideoDecoderConfig`/`AudioDecoderConfig` are the global WebCodecs DOM types (as in `contracts/driver.ts`).
 
-/** A transport packet is 188 bytes; m2ts/mts prepend a 4-byte timestamp (192), 204 adds RS parity. */
-export type PacketSize = 188 | 192 | 204;
-const PACKET_SIZES: readonly PacketSize[] = [188, 192, 204];
 const SYNC_BYTE = 0x47;
 /** The TS clock is 90 kHz; PTS/DTS are 33-bit values on it. */
 export const TS_CLOCK_HZ = 90_000;
@@ -117,45 +118,6 @@ export interface TsTrack {
 /** The full parse: the ordered track list (one per elementary PID with timed PES). */
 export interface TsParse {
   tracks: TsTrack[];
-}
-
-// ── packet framing ──────────────────────────────────────────────────────────────────────────────
-
-/**
- * Detect the packet size and the offset of the first whole packet. A TS has no header, so we look for a
- * column of sync bytes `0x47` spaced by one of 188/192/204: try each stride from each of the first few
- * candidate offsets and accept the first that holds for a run of packets. Returns `undefined` when no
- * stride yields a sync run — i.e. the bytes are not a transport stream (scrambled, encrypted, or garbage).
- */
-export function detectFraming(
-  bytes: Uint8Array,
-): { packetSize: PacketSize; start: number; tsOffset: number } | undefined {
-  // m2ts/mts put the 4-byte timestamp *before* the sync byte, so the sync sits at offset 4 within a
-  // 192-byte packet; 188/204 sync at offset 0. `tsOffset` is where 0x47 lands inside one packet.
-  const RUN = 8; // require this many consecutive in-stride sync bytes to lock on (rejects coincidences)
-  for (const size of PACKET_SIZES) {
-    const tsOffset = size === 192 ? 4 : 0;
-    const scanLimit = Math.min(bytes.byteLength, size * 4);
-    for (let base = 0; base + tsOffset < scanLimit; base++) {
-      const first = base + tsOffset;
-      if (bytes[first] !== SYNC_BYTE) continue;
-      let ok = true;
-      for (let k = 0; k < RUN; k++) {
-        const at = first + k * size;
-        if (at >= bytes.byteLength) {
-          // Not enough bytes for a full run; accept only if we matched at least 2 packets (tiny inputs).
-          ok = k >= 2;
-          break;
-        }
-        if (bytes[at] !== SYNC_BYTE) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) return { packetSize: size, start: base, tsOffset };
-    }
-  }
-  return undefined;
 }
 
 /** A parsed transport packet header + the slice of its payload (after any adaptation field). */

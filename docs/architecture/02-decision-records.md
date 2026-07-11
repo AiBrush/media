@@ -5988,7 +5988,1005 @@ hints, replay order, chunk identity, and range-backed fast paths remain unchange
 `kind:'bytes'` source and now routes successfully. The focused create-media/HLS matrix passes 79/79,
 including unhinted and ambiguous manifests, a split single-use manifest, exact non-HLS replay, AES-128 and
 SAMPLE-AES truth, abort, and the new re-readable path. No range-backed source pays another read. Full design
-and validation are in `docs/notes/session11-hls-rereadable-source.md`. **Rejected:** treating every
+and validation are in `docs/notes/session11-hls-rereadable-source.md`. A fresh focused benchmark on the
+exact encrypted five-segment scenario (`warmup=2`, `n=5`) resolves, decrypts, stitches, and hashes the
+4,598,668-byte TS in a 3.861 ms median; all samples share SHA-256
+`27d7492ec2c83746c673f284b151b4dfdbd05c1ddc2b6a6e5c0ce8711615db48`. **Rejected:** treating every
 range-less source as one-shot; skipping HLS sniffing for custom sources; materializing the whole ambiguous
 source; reopening a true stream; retaining a canceled reader; or swallowing the downstream seekability
 error.
+
+### ADR-213 - AAC gapless native-suppression preflight is bounded and abort-aware
+
+**Context (Session 12 lifecycle closure).** Chromium may consume MP4 edit-list priming before emitting
+`AudioData`, while the product's explicit gapless trim still needs to remain authoritative when the native
+decoder exposes the negative prefix. The bounded preflight therefore opens an independent packet stream and
+decoder. Before this decision, cancellation could be requested while that bounded stream read was pending,
+but the preflight had no stage signal and could wait for the read to settle before the normal decode
+cancellation path observed it.
+
+**Decision.** Thread the existing `StageOptions.signal` into the optional native-suppression probe. Check it
+before opening work and between each packet/frame read; race pending reads against a typed `MediaError` with
+code `aborted`, cancel the owned reader on every non-exhausted exit, and release its lock. Keep the prefix
+bounded to `MP4_GAPLESS_PREFLIGHT_MAX_PACKETS`, retain zero readable queueing, and close every probe frame in
+a `finally` block. A non-abort decoder capability/error remains conservative (zero native suppression), so
+the normal explicit trim stays authoritative; typed cancellation propagates and is never converted to a
+false success. No public driver contract or `DRIVER_API_VERSION` changes.
+
+**Consequences.** Focused tests cover an already-aborted signal with zero packet pulls, an in-flight packet
+read that is canceled by abort, negative-prefix detection, explicit-trim preservation, one-sample duration
+rounding, malformed-prefix bounds, HWM-0 behavior, and exactly-once probe-frame closure. Strict typecheck,
+the focused API/MP4/gapless suite, production build, vendored WASM, and package budgets remain green. The
+complete media matrix and headed cross-engine acceptance remain separate evidence obligations; this ADR
+does not claim browser or leaderboard closure. Full design notes are in
+`docs/notes/session12-gapless-corpus-and-native-suppression.md`. **Rejected:** polling cancellation after
+the read completes; unbounded prefix buffering; sharing the production decoder; swallowing abort; retaining
+probe frames; weakening the gapless oracle; or adding a fixture-specific branch.
+
+### ADR-214 - Chromium opaque HDR frames route tonemap through Canvas2D
+
+**Context (Session 12 public HDR closure).** The real Chromium HDR10 control
+`hdr10_pq_micro_hevc.mp4` decodes to a `VideoFrame` whose source format is null. Chromium rejects both
+`allocationSize({ format: 'RGBA' })` and `copyTo(..., { format: 'RGBA' })` for that opaque frame, while its
+Canvas2D `drawImage(VideoFrame)` path performs the browser's display-managed HDR→SDR conversion. The
+router's tiny-work ranking selected the CPU `copyTo` path first and surfaced a functional error.
+
+**Decision.** When `OffscreenCanvas`, `VideoFrame`, and a Chromium-family user agent are present, the CPU
+video filter's support predicate declines `tonemap`; the existing Canvas2D driver then owns that operation.
+Non-Chromium environments keep the CPU tonemap path, which applies the validated pure-TS color plan to
+readable frames. The CPU RGBA path sizes its destination from the explicit tight layout rather than
+querying the source frame's optional allocation size. No media-identity or fixture-specific branch is
+introduced.
+
+**Consequences.** Focused routing tests cover Chromium and Firefox capability decisions. A fresh public
+headed Chromium run with warmup 1, five iterations, no reuse, and the real baked HDR10 control passes 1/1
+with no reason. The known HLS encrypted-input boundary remains separate. **Rejected:** assuming every
+decoded HDR frame is CPU-readable; retrying the same unsupported `copyTo`; keying behavior to the HDR
+fixture filename; or fabricating pixels from source metadata.
+
+### ADR-215 - Public gapless selection and operation windows remain invocation boundaries
+
+**Context (Session 12 evidence closure).** The generated gapless trial corpus, stale manifest hash,
+fixed fallback control, and its stale baked artifacts were removed. The public scenario now contains
+five exact byte-preserved CC0 recordings: four BigSoundBank controls plus one LaSonotheque stereo
+control. Independent `ffprobe`/hash checks show ordinary 48 kHz mono/stereo AAC with no native gapless
+edit declaration. The five exact Internet Archive AAC/MP4 files with native edit-list and sample-group
+priming/padding declarations remain separately preserved for product validation.
+
+The fresh public export `chromium-2026-07-11T13-01-24-785Z.json` points the public plan at the exact
+`05.mp4` slot. The four shorter controls are dropped with the emitted reason
+`input-shape/duration mismatch: duration ... too short for op time target 1.013s`. The exact real slot is
+selected, but the operation emits only 48,128 samples (1.002667 seconds) against the disputed committed
+expectation of 50,784 samples (1.058 seconds), a 2,656-sample deficit; independent full-source truth is
+50,176 samples. A separate
+1.014458-second exact CC0 candidate was also dropped. A prior long native real recording similarly
+consumed only about 1.021667 seconds against its complete 384-second golden. These results establish
+the public operation/selection boundary independently of corpus provenance or product demux correctness.
+
+The focused standalone browser proof `bun run proof-session12-gapless` adds a second public boundary fact:
+the exact `05.mp4` bytes produce 50,176 samples (49 decoded AAC frames) through the full public
+`createMedia().decode()` stream, while public demux exposes all 50 packets and the final packet has a
+12,188 µs duration. Independent `ffprobe`/FFmpeg decoding also reports 50,176 samples; neither source
+truth reproduces the 50,784-sample expectation. This evidence does not authorize changing the strict
+oracle or padding the output; it narrows the remaining work to corpus/golden provenance and the public
+operation contract.
+
+**Decision.** Do not alter AAC bytes, pad or truncate output, invent edit metadata, weaken the golden, or
+add a fixture/scenario exception. Keep the five-slot corpus and public plan pointed at exact real media.
+The responsible fix must be made at the public operation contract: consume the complete selected
+stream, or expose a public duration/trim invocation whose expected output is independently defined for
+the selected source. Until then, the gapless browser row is not close-out evidence and all-engine
+comparison/leaderboard claims remain unqualified.
+
+**Consequences.** The repository records a reproducible, non-product blocker rather than converting
+`NA_ASSET` or a one-second partial decode into a pass. No product-byte workaround is permitted. Once the
+public contract changes, the existing hash-pinned corpus, independent native matrix, lifecycle tests,
+fresh benchmark, and rotated all-engine gates can be rerun without changing their oracle. **Rejected:**
+restoring Mozilla generated tones, selecting a short file by bypassing the public selector, copying a
+long file's prefix as a full output, manufacturing edit-list boxes, accepting partial duration, or
+silently exempting the exact slot from coverage.
+
+### ADR-216 - HLS detached-input context is a public invocation responsibility
+
+**Context (Session 12 boundary recheck).** The public HLS row is labeled
+`hls_aes128.m3u8`, but the fresh aibrush invocation still reports `not an MPEG-TS stream`.
+As a reversible audit, the shared and probe-local manifests were temporarily rewritten to carry
+root-relative key and segment URIs and then restored to their original hashes. The public server
+returned the manifest, 16-byte key, and all five encrypted segments. A direct
+`fromURL()` call against that same served manifest independently probes as MPEG-TS with H.264/AAC
+tracks and a 10.026667-second duration. The detached public row remains an error, proving that the
+remaining loss is the invocation's missing manifest/source context rather than AES, TS framing, or
+the HLS resolver implementation.
+
+**Decision.** Keep HLS source resolution strict: only a supplied manifest/source URL or an injected
+resolver may resolve relative key and segment URIs. Do not guess an adjacent fixture path, infer a
+key/IV from ciphertext, or reinterpret encrypted TS bytes as clear transport. The responsible
+close-out change is in the public invocation seam: pass the complete manifest-backed source (including
+its resolver base) to aibrush, or honestly classify the detached ciphertext row as unsupported. The
+existing public run remains a documented boundary until that seam changes.
+
+**Consequences.** The HLS product path retains standards-valid behavior and the direct URL proof is
+reproducible; no product output is weakened or fabricated. The current public row cannot contribute
+close-out PASS or leaderboard evidence, and the full Chromium zero-red gate remains pending the public
+invocation repair. **Rejected:** fixture-name branches, guessed sibling paths, key/IV guessing,
+clear-segment substitution, or a weaker metadata-only oracle.
+
+### ADR-217 - Raw VBR ADTS duration follows the complete frame clock, not ffprobe bitrate estimation
+
+**Context (Session 12 exact-slot closure).** The real rotated `02.aac` file contains 861 valid AAC-LC ADTS
+frames at 44.1 kHz. Its strict packet vector ends at PTS 19.969161 seconds, so the coded end is exactly
+`861 * 1024 / 44100 = 19.992381` seconds. The retained 17.135660-second metadata came from ffprobe's raw
+ADTS bitrate estimate; an independent ffmpeg decode produces 880,640 sample frames (about 19.97 seconds
+after decoder priming/tail treatment), disproving the estimate. Aibrush's remux preserves all 861 access
+units and therefore authors the packet-clock duration.
+
+**Decision.** Repair every public rotated catalog entry that references those exact bytes, plus its scenario
+metadata golden, to the complete ADTS frame-clock duration. The current catalog has eleven such scenarios.
+`scripts/session12-public-truth-repairs.mjs` is hash-, packet-count-, rate-, first/last-PTS-, and
+old-value-guarded, validates the complete repair set before mutation, and writes atomically. No media bytes,
+packet timing, product code, tolerance, or unrelated golden changes.
+
+**Consequences.** The strict duration oracle now measures the actual coded stream rather than a VBR bitrate
+guess, while the exact packet vector remains unchanged and independently can fail. Every exact rotation
+`02.aac` public row can now share one can-fail truth repair and must be rerun after repair. **Rejected:**
+truncating/padding AAC to 17.136 seconds;
+dropping frames; weakening tolerance; replacing the eligible real recording; or teaching product code to
+imitate a bitrate estimate that contradicts the packet clock.
+
+### ADR-218 - The completed anti-cheat CLI exits explicitly after Bun WebCrypto quiescence
+
+**Context (Session 12 gate closure).** The integrity program completed and printed all 45 green assertions,
+and Bun's Node-compatible active-handle and active-request inventories were both empty, but the Bun process
+remained alive after the HLS/CENC WebCrypto work. Consequently the aggregate shell could not return zero even
+though every gate stage had completed. Waiting indefinitely is not evidence, while force-exiting before
+settlement could hide leaked work.
+
+**Decision.** Keep the existing explicit status-one failure branch and add an explicit status-zero exit only
+after `main()` has awaited every oracle, decrypt, demux close, digest, and report write. Thrown exceptions and
+failed checks remain nonzero. No timer, background cancellation, product path, or assertion is changed.
+
+**Consequences.** `bun run verify:integrity` and therefore `bun run gate` now terminate deterministically with
+their computed status after printing the full report. At this ADR's gate run, a fresh full `bun run gate` exited zero after 182 test
+files/3,273 tests, coverage, production build, vendored WASM, dist smoke, bundle budgets, clean package
+installation, and all 45 integrity checks complete. The real CLI and full aggregate gate are the lifecycle
+validation. **Rejected:** `process.exit(0)` before awaited checks; a timeout wrapper that reports success;
+removing WebCrypto truth checks; or accepting a permanently hanging gate as green.
+
+### ADR-219 - Documented concrete driver subpaths are real package entries
+
+**Context (Session 12 package closure).** The package export map and architecture document advertise
+`@aibrush/media/drivers/*` for optional explicit first-party driver registration, but the build emitted no
+`dist/drivers/` directory. Clean-install verification therefore could not resolve or typecheck any concrete
+driver subpath and reported a warning. Removing the export would contradict the documented public hook.
+
+**Decision.** Emit each first-party container driver as its own ESM/declaration entry under `dist/drivers/`
+while retaining the existing shared code-splitting graph. The normal default entry still reaches drivers
+only through its lazy defaults import; explicit driver users opt into the selected entry. Clean-package
+verification now discovers a concrete entry, typechecks its default export as `DriverModule`, imports it from
+the packed installation at runtime, and checks `register` plus numeric `apiVersion`.
+
+**Consequences.** The wildcard export resolves to twelve real ESM/declaration pairs and the clean-install
+warning becomes a hard, exercised contract. The budget graph now recursively inventories all 146 emitted JS
+files and resolves nested relative imports from their importer, so nested public entries cannot evade closure
+accounting. A clean packed installation runtime-imports the concrete `adts` entry and passes without warnings.
+At this ADR's package-closure run, the eager closure was 49.69 kB and the typical first-operation closure was 220.63 kB. **Rejected:** removing
+the documented wildcard; copying source files without declarations; one monolithic all-drivers entry; or
+declaring files that the packed runtime cannot import.
+
+### ADR-220 - HEVC Main10 output widens exactly at the encoder
+
+**Context (Session 12 feature closure).** The public `VideoTarget.bitDepth` type already admits ten bits,
+WebCodecs codec routing already performs an exact `VideoEncoder.isConfigSupported` query, and MP4/WebM mux
+paths already consume the encoder's returned decoder configuration. The config builder nevertheless rejected
+every HEVC `profile_idc=2` string before routing, leaving `h264_8bit_to_hevc_10bit` as an engine-declared gap.
+
+**Decision.** An explicit `{ codec:'hevc', bitDepth:10 }` builds the qualified Main10 target
+`hev1.2.4.L120.B0`; preserved HEVC Main10 strings remain exact. Profiles outside Main/Main10 still reject.
+The bit-depth planner classifies 8→10 as `encoder-widen` with `requiresPixelPath:false`: all 8-bit sample
+values are exactly representable in ten bits, so the selected Main10 encoder performs the representation
+widening without Canvas/GPU conversion or invented source detail. The codec router remains the physical
+capability authority and raises a typed miss when the browser rejects that exact config.
+
+**Consequences.** Main10-capable browsers can now execute the real video decode→encode→mux path while
+unsupported browsers remain honest. No extra frame copy is added to the hot path. The focused codec pipeline
+passes 145/145; the latest fresh warm benchmark reports 1,705,830 Main10 config builds/second and includes
+the new widening plan in its bit-depth matrix. The standalone Chromium proof (2026-07-11) records
+`NA_BROWSER` for the exact `hev1.2.4.L120.B0` encoder because that browser has no codec driver; the public
+fair-harness feature declaration still needs to be updated through its allowed invocation surface before the
+formerly `NA_ENGINE` row can execute. **Rejected:**
+claiming ten-bit output with an HEVC Main8 codec string; canvas upconversion; dithering/inventing low bits;
+unconditionally declaring support without `isConfigSupported`; or silently downconverting requested Main10.
+
+### ADR-221 - Conversion requirements describe exact inputs, not requested outputs
+
+**Context (Session 12 capability inventory).** The latest completed Chromium export reported 57
+`NA_ASSET` rows, which superficially resembled missing product features. Public catalog output showed that
+many conversion rows required the codec they intended to produce even though every exact licensed input
+declared a different source codec. The selector therefore rejected valid inputs before aibrush could run.
+This affected 51 transcode, audio-DSP, and conversion-performance rows; it did not prove 51 engine gaps.
+
+**Decision.** Repair only conversion-family catalog rows with nonempty exact input codec facts. For each
+such row, retain required codecs present in at least one exact input and remove only codec requirements absent
+from every input. Before mutation, verify every involved source against its catalog SHA-256; the current
+repair validates 54 unique exact-source hashes. The maintenance command is dry-runnable, atomic, and
+idempotent. It never edits media bytes, scenario operations, selectors, product code, or goldens, and it
+deliberately skips baked/corrupt rows without trustworthy codec facts.
+
+**Consequences.** The 51 rows can reach capability routing with their real source assets, while output codec
+intent remains the conversion operation's responsibility. The latest completed export's only genuine
+`NA_ENGINE` declarations were HEVC Main10 and two-pass bitrate, so implementation work can target those two
+truthfully instead of manufacturing dozens of fake features. A future focused public run must still prove
+each repaired row; catalog reachability is not a PASS. **Rejected:** blanket rewriting all 169 apparent
+mismatches; adding output codecs to source metadata; replacing licensed inputs; changing negative fixtures;
+or treating `NA_ASSET` as evidence that product code is unimplemented.
+
+### ADR-222 - H.264 two-pass uses a real analysis encode and replay
+
+**Context (Session 12 feature closure).** WebCodecs does not expose a native first-pass stats file, so the
+previous config builder correctly rejected `twoPass:true`. Relabeling a single bitrate-mode encode would be
+fake. The engine does, however, own a replayable compressed source during `convert()`, and WebCodecs H.264
+supports per-picture quantizers. That is sufficient to build two distinct passes without retaining pixels or
+shipping a large GPL encoder tail.
+
+**Decision.** For H.264 `{twoPass:true, bitrate}`, pass one opens the normal demux/decode/filter graph and
+encodes the complete filtered picture sequence at QP 28. It immediately reduces each encoded picture to
+PTS, duration, byte length, and key-frame status, then closes that graph and demuxer. A pure allocator sorts
+evidence by PTS, uses VFR durations plus the declared tail, applies a 0.6 complexity curve and H.264's
+six-QP-per-size-doubling model, and produces a bounded per-picture QP schedule for the requested video-byte
+budget. Pass two reopens the source, repeats the identical graph, and feeds each exact PTS its scheduled QP
+through an additive driver-local `quantizerAt` callback. Duplicate, missing, or changed timestamps fail
+typed. Single-use byte streams and public `encode()` frame streams reject because they cannot replay.
+
+**Consequences.** This is two physical H.264 encodes with first-pass evidence affecting second-pass rate
+allocation, not a renamed ABR encode. Memory is O(frame count), not O(pixel count): neither decoded frames
+nor first-pass payloads survive, and the retained schedule packs each PTS/QP pair into nine bytes with an
+O(1) sequential replay cursor. Existing bounded WebCodecs backpressure and exactly-once frame ownership
+apply in both passes; B-frame callback order is harmless because evidence is PTS-keyed. Pure allocator and
+quantizer-lifecycle tests cover complexity budgeting, VFR, callback reordering, bounds, duplicates, missing
+replay timestamps, and incomplete replay accounting; all TypeScript configurations pass. The fresh multi-sample
+planner benchmark completes a reversed-order 120-frame pass at 66,467 plans/second, while the Main10 config
+cell measures 1,705,830 config builds/second. The same run reports a 1,530,174 ops/second geomean across its
+eight planning/configuration cells. The lazy browser runner keeps this live path out of the 49.36 kB
+eager kernel. The focused Chromium proof (`scripts/session12-video-browser-proof.mjs`, 2026-07-11) performs
+five fresh samples at a 2,802 ms median, emits an `avc1.64001F` 1280×720 track with 321 packets and 810,678
+payload bytes, produces the same SHA-256 on all five outputs, and returns typed `aborted` cancellation. The
+public feature declaration remains pending before the old `NA_ENGINE` slot can count as PASS. A bounded public
+harness run limited to the two exact video rows (`chromium-2026-07-11T17-39-27-944Z.json`) confirmed that
+neither row reached asset selection: the external adapter reports missing `depth:10bit-output` and `two-pass`
+declarations. This is a declaration seam, not evidence against the implementation. **Rejected:** one bitrate
+encode labeled two-pass; retaining every `VideoFrame`; buffering/re-encoding first-pass payloads;
+guessing a constant QP without first-pass evidence; or adding an unapproved GPL x264 bundle.
+
+### ADR-223 - Fuse BS.775 5.1-to-mono without temporary stereo planes
+
+**Context (Session 12 performance work).** The canonical 5.1-to-mono remix called the 5.1-to-stereo helper,
+allocated two full-length `Float64Array` planes, then made a second pass to average them into mono. Those
+temporary planes are observable neither in the public result nor in the BS.775 arithmetic, but cost sixteen
+bytes per input frame and doubled memory traffic on a hot audio-DSP path.
+
+**Decision.** Compute the existing left and right BS.775 expressions inside the mono output loop and average
+those two local double values immediately. Keep the same channel order (`L,R,C,LFE,Ls,Rs`), drop LFE exactly
+as before, retain the exact `1/sqrt(2)` center/surround coefficient, and preserve the previous operation
+grouping so output samples stay identical. The general 5.1-to-stereo helper remains unchanged for callers
+that request stereo.
+
+**Consequences.** The mono path allocates one output plane instead of three and walks the signal once. A
+fresh 51-sample, five-warmup benchmark over deterministic ten-second 48 kHz six-channel PCM improves median
+wall time from 1.084 ms to 0.477 ms (2.27×) and throughput from 2.66 to 6.04 billion input samples/second.
+The exact benchmark checksum is unchanged and all nine focused remix tests pass. **Rejected:** changing the
+BS.775 coefficients; normalizing/clipping floats during remix; retaining temporary stereo arrays for code
+reuse; or adding SIMD/WASM setup overhead to this sub-millisecond pure-TS kernel.
+
+### ADR-224 - Share the stereo polyphase traversal without interleaving
+
+**Context (Session 12 performance work).** Rational-rate resampling gives every planar channel the same
+output frame count, phase sequence, kernel, boundary window, and abort cadence. The general implementation
+nevertheless repeated all that control and coefficient traversal once per channel. Stereo is the dominant
+layout, so the duplicate work was measurable even though the coefficient bank was already cached.
+
+**Decision.** Add a stereo-only polyphase kernel that advances base/phase once per output frame and evaluates
+each coefficient once while accumulating independent left and right doubles. Preserve the existing four-tap
+grouping for each accumulator so floating-point results are bit-identical to two scalar mono calls. Keep
+planar input/output, zero-extension for malformed/short planes, the 4,096-frame abort cadence, mono and
+multichannel kernels, and the arbitrary high-phase dense-table fallback unchanged.
+
+**Consequences.** A fresh 21-sample benchmark after three warmups over one second of deterministic 48 kHz
+stereo converted to 44.1 kHz improves median wall time from 1.570 ms to 1.105 ms (1.42×), or 637× to 905×
+realtime, with the exact checksum unchanged. A dedicated parity oracle compares both fused outputs against
+two independent mono resamples byte-for-byte; all nineteen focused resampler tests pass. No interleaved
+copy, WASM setup, or new retained buffer is introduced. **Rejected:** changing tap count/window quality;
+reordering each channel's floating-point sum; fusing arbitrary channel counts before measurement; or routing
+sub-millisecond PCM work through a heavyweight software codec/filter runtime.
+
+### ADR-225 - Optional software codec tails are not part of the current public envelope
+
+**Context (Session 12 capability audit).** The capability matrix historically described possible software
+fallbacks for H.264, HEVC, VP8/VP9, AV1, AAC, and MP3, while the shipped drivers intentionally implement a
+narrower set: WebCodecs remains the native encode authority; Symphonia MP3/AAC tails decode only; the VPx and
+AV1 tails decode only; and permissive Opus/Vorbis tails cover their documented encode paths. Chromium's exact
+MP3 encoder probe is false, and no approved redistributable MP3 encoder core is present. Treating an
+aspirational tail as a capability would turn a physical miss into a false PASS; adding LAME, Shine, x264, or
+another unapproved core would violate the license directive.
+
+**Decision.** The current public envelope promises only host-supported WebCodecs encode for codecs whose
+native driver accepts the exact configuration, plus the explicitly shipped permissive WASM encode tails
+(Opus and Vorbis) and pure-TS FLAC encode. The shipped MP3/AAC/VPx/AV1 tails remain decode-only within their
+validated envelopes; HEVC and H.264 have no software fallback. A rejected exact encode configuration raises
+the existing typed `CapabilityError('capability-miss')`. Future software tails are optional additions gated
+by an independent license/provenance ADR, real packet/frame/lifecycle validation, and a fresh benchmark; they
+are not current product work or public promises.
+
+**Consequences.** The browser capability matrix and Session 12 inventory now distinguish a missing public
+feature from an intentionally unavailable optional fallback. The two fresh MP3 rows remain honest
+`NA_BROWSER` when Chromium rejects `AudioEncoder.isConfigSupported`, while native MP3 encode remains reachable
+on a browser that accepts the exact config. No adapter declaration, oracle, tolerance, or metric is changed;
+unsupported configurations remain visible and typed. **Rejected:** silently adding an LGPL/GPL tail;
+declaring a decode-only WASM driver as an encoder; downconverting to another codec; or treating `NA_BROWSER`
+as a PASS.
+
+### ADR-226 - Bounded range-backed raw-PCM decode chunks
+
+**Context (Session 12 performance work).** The retained real s24 WAV rotation exposed a genuine startup
+loss in the browser decode path: the raw-PCM driver read the entire 7.90 MB source and materialized all
+1,315,328 stereo frames before the first browser `AudioData` could be emitted. Focused same-export
+Chromium evidence measured aibrush at 60.635 ms versus Mediabunny at 27.710 ms (2.188× wall time),
+with no peak-memory loss. The existing canonical `PcmAudio` representation is correct, but whole-file
+materialization makes first-frame latency and cancellation/backpressure needlessly expensive.
+
+**Decision.** Add the optional `ContainerDriver.decodePcmAudioStream` seam. WAV uses one bounded 64 KiB
+prefix when random access is available (clamped to known source size), keeping the header and first PCM
+chunk in one range round trip, then decodes at most 4,096 PCM frames per bounded range read
+into canonical planar `Float64` chunks. The engine wraps one chunk at a time as `AudioData` with a
+monotonic timestamp cursor, high-water-mark zero, upstream cancellation propagation, and exactly-once
+consumer-frame closure. Range-less sources retain a correct full-buffer one-chunk fallback; the existing
+`decodePcmAudio` method remains unchanged for callers that require a single canonical value. The
+legacy path is not replaced for non-WAV drivers, and no asset-specific branch is introduced.
+
+**Consequences.** Focused unit tests cover exact s24 values, bounded range reads, contiguous timestamps,
+consumer cancellation, upstream cancellation, and frame ownership. The fresh multi-sample benchmark
+(`bun run bench-session12-wav-pcm-stream`) over the exact `03.wav` fixture reports 2 warmups plus 7
+samples: first chunk median 0.135 ms after 65,536 returned bytes; complete drain median 12.497 ms over
+all 1,315,328 frames with stream checksum `3860784884`; the legacy full-buffer median is 9.286 ms with
+whole-buffer checksum `2936041591`. A focused post-direct-path Chromium export selected the same `03.wav`
+and remained exact, but measured aibrush at 58.590 ms versus Mediabunny at 19.200 ms; the later export
+taken during the rejected 4 KiB experiment selected the retained stale-golden `01.wav` and therefore had no timing metrics. The
+complete-drain cost is accepted as the price of bounded backpressure and early cancellation, but the
+browser wall-loss gate remains open.
+
+**Rejected:** retaining a full decoded `Float64` buffer before framing; padding/truncating the final
+chunk; changing the strict PCM oracle; enqueueing multiple browser frames ahead of demand; hiding
+range reads behind a per-asset path; or dropping the full-buffer fallback for non-seekable streams.
+
+### ADR-227 - Skip redundant image sniffing for known media extensions
+
+**Context (Session 12 performance work).** After ADR-226, an isolated product-only Chromium probe over
+the exact real `03.wav` showed first-frame decode itself at 0.8–1.8 ms for a URL source and 0–0.3 ms for
+byte-backed input. The URL path nevertheless issued two independent reads per sample: `[0,4096)` from
+the generic image-magic sniff and `[0,65536)` from the WAV stream. The second read is the useful one for
+the raw-PCM path; the first adds a network round trip despite the source filename already identifying a
+known container.
+
+**Decision.** `decode()` keeps the image sniff for unknown/text sources and image extensions, keeps the
+existing MIME-family shortcut, and now also skips it when `Source.filename` has an entry in the engine's
+known `CONTAINER_MIME` table. HLS manifest extensions remain unknown to that table and continue through
+their own manifest/content route. This is source classification, not a fixture branch; the container
+router still validates the extension and the selected driver's parser remains authoritative.
+
+**Consequences.** A focused engine test proves an extension-only media source reaches the declared driver
+without an image sniff or extra range read. The isolated Chromium probe recorded only the WAV stream read
+for the URL path after this decision; byte-backed first-frame timing remained sub-millisecond. The
+focused harness s24 run must be refreshed after the change to determine whether the contested wall loss
+closes on the same export/rotation; correctness and range-less fallback behavior are unchanged.
+
+**Rejected:** disabling image sniff globally; trusting arbitrary filenames over MIME/content for unknown
+inputs; adding a WAV-specific condition; or making the harness adapter declare the container for the
+product.
+
+### ADR-228 - Interleaved f32 egress for raw-PCM sample consumers
+
+**Context (Session 12 performance work).** The canonical PCM decoder correctly produces planar `Float64`
+samples, but the public s24 sample-digest consumer requests interleaved `f32`. Emitting `f32-planar`
+from the raw decode bridge makes the browser convert every sample during egress. The product-only probe
+could not expose that cost because it stopped after receiving the frame; the public scenario's documented
+consumer copies interleaved f32 sample frames.
+
+**Decision.** Add interleaved `f32` framing as an internal option on the existing PCM-to-`AudioData`
+wrappers. Raw-PCM decode and convert paths select it; the default wrapper behavior remains `f32-planar`
+for audio-DSP/filter callers, and the canonical driver output remains planar `Float64`. The new layout
+uses one owned `Float32Array` per emitted chunk, retains the same 4,096-frame bound, timestamps,
+cancellation, backpressure, and exactly-once close behavior.
+
+**Consequences.** Focused tests cover interleaved ordering, frame ownership, and the unchanged planar
+default; the real s24 browser oracle remains bit-exact on every passing `03.wav` rotation. An isolated
+Chromium product probe confirms `format: 'f32'`, one bounded WAV range read, and sub-2 ms first-frame
+timing for both URL and byte-backed sources. The post-change public run selected retained `01.wav` and
+therefore supplied no timing metrics; the qualified `03.wav` wall loss remains open at 58.270 ms versus
+Mediabunny 27.655 ms in the current deficit artifact.
+
+**Rejected:** changing canonical PCM precision; making all audio-DSP filter frames interleaved; padding
+or slicing samples to match a golden; or weakening the decoded-audio oracle.
+
+### ADR-229 - Shared lazy-video bindings restore the eager guard band
+
+**Context (Session 12 package closure).** A fresh build after ADR-219–228 measured the default-entry static
+closure at 49.99 kB against the 50.00 kB ceiling. The package gate intentionally requires at least 0.25 kB
+of guard band, so the build was red despite being nominally one hundredth of a kilobyte below the cap. The
+new media work itself was already code-split, but the eager engine repeated the same router/filter/stage
+callback object at both lazy video-runner entry points and carried a second known-container classification
+for image sniffing.
+
+**Decision.** Bind the engine-owned video-runner callbacks once and reuse that context for the first-pass
+analysis and final encode entry points. Inline the single-use two-pass analysis trampoline so only the
+literal dynamic import remains in the eager graph. For decode source classification, reuse the existing
+no-MIME source/HLS plausibility classifier and retain the MIME-family decision inline; known audio/video
+extensions still skip image sniffing, while image, unknown, text, and manifest-shaped inputs retain their
+existing routes. Codec/filter work, replay evidence, packet timing, public types, and every lazy chunk stay
+unchanged.
+
+**Consequences.** The fresh production closure falls from 49.99 kB with 0.01 kB margin to 49.74 kB with
+0.26 kB margin, satisfying the unchanged guard. The typical first-operation closure remains healthy at
+221.00 kB with 35.00 kB margin, all 149 JavaScript chunks remain split, and the eager/default closures still
+contain no WASM URL. Strict typecheck and the focused source-routing/two-pass/codec tests remain green; full
+package and aggregate gates remain required after final evidence work. Full design and rejected alternatives
+are recorded in `docs/notes/session12-eager-budget-recovery.md`. **Rejected:** raising the cap or lowering the
+guard; undoing the bounded WAV/image-read improvement; copying callbacks into both call sites; moving codec
+or first-pass work eagerly; or changing HLS/image behavior to save bytes.
+
+### ADR-230 - Element sinks stream through one backpressured MediaSource pump
+
+**Context (Session 12 product closure).** ADR-013 and the public API promise three `toElement` modes, but
+the materializer implemented only whole-file Blob attachment; both `via:'mse'` and `via:'stream'` raised a
+placeholder `InputError`. The Blob path also created object URLs without revoking them. Treating `stream`
+as permission to assign `ReadableStream<Uint8Array>` to `HTMLMediaElement.srcObject` would not close the
+gap: a byte stream is not an HTML `MediaProvider`. The current HTML/MSE standards instead expose
+`MediaSource` as a media provider and retain the MediaSource object-URL attachment for the broad MSE path.
+
+**Decision.** Use one byte-preserving MediaSource append pump for both streaming modes. It waits for
+`sourceopen`, creates exactly one `SourceBuffer` from the output MIME, reads one producer chunk, calls
+`appendBuffer`, and waits for `updateend` before reading again; EOF calls `endOfStream()` only after the
+last completed append. `via:'mse'` attaches the MediaSource through a library-owned object URL.
+`via:'stream'` assigns the MediaSource directly to `el.srcObject`; a platform that cannot retain that
+assignment receives a typed `CapabilityError`, never a Blob fallback. Missing MIME is a typed input error,
+unsupported MIME/provider APIs are capability misses, and parser/append/state failures are `mux-error`s.
+The producer must still author a registered MSE byte-stream format (normally fragmented output); the sink
+does not pretend that it can segment or relabel an arbitrary progressive file.
+Each element has one active writer session: a newer attachment aborts and cancels the older producer, while
+attachment identity prevents the older cleanup race from clearing its replacement. Caller abort, element
+error, source close/end, and SourceBuffer error/abort cancel the reader; an updating SourceBuffer is aborted
+best-effort after asynchronous producer cancellation settles, without hiding the primary typed failure.
+Malformed element descriptors are cancelled before the first producer pull. Blob URLs are revoked on
+`loadedmetadata`, element error, or replacement. MSE URLs are revoked as soon as `sourceopen` proves
+attachment, and on every earlier failure.
+
+**Consequences.** The documented element output surface no longer has throwing feature placeholders.
+Streaming attachment preserves byte order and applies native SourceBuffer backpressure without buffering
+the whole output in JavaScript; B-frames, VFR, open-GOP ordering, interleave, and timestamps remain exactly
+the muxer's responsibility. Strict sink tests prove ordered/bit-exact appends (including a downloaded real
+H.264 MP4), one-append-at-a-time pull behavior, both attachment mechanisms, EOF, abort while waiting for
+`sourceopen` or `updateend`, supersession, typed capability/platform failures, and URL revocation. The
+existing multi-file streaming benchmark remains the throughput/memory gate because the element pump adds
+no transform. A live browser playback check remains required at the cross-browser gate; this agent's
+in-app browser runtime was unavailable, so the ADR makes no unsupported playback claim. The change is an
+implementation of the existing `Sink` union and does not change `DRIVER_API_VERSION`.
+
+**Rejected:** assigning a byte `ReadableStream` to `srcObject`; collecting before MSE; concurrent
+`appendBuffer` calls; silently degrading requested streaming attachment to a Blob; immediate Blob-URL
+revocation before the element has opened it; keeping multiple writers alive on one element; or weakening
+container/playback validation because the sink itself is byte-exact.
+
+### ADR-231 - Direct stream inputs use one bounded replay cursor
+
+**Context (Session 12 product closure).** `ReadableStream<Uint8Array>` has always appeared in the public
+`MediaInput` union, but the engine's generic image/container route explicitly rejected `kind:'stream'`
+with `InputError('need seekable')`. `from(stream, opts)` also discarded its MIME/size hints. The HLS seam
+had a private one-shot replay wrapper, but a negative manifest decision handed that wrapper to the next
+image sniff, which rejected it again. Simply allowing the reads would not be safe: signature routing,
+image routing, and a driver must not each consume the sole reader, and public `decode()` exposes audio and
+video streams that currently demux from their source independently.
+
+**Decision.** `fromStream` now retains `mime` and known `size` in a tiny source-owned state cell. On the
+first unseekable routing peek it lazily loads one replay cursor, acquires exactly one upstream reader, and
+retains only the whole chunks needed to cover the largest requested prefix. Repeated HLS/image/container
+peeks reuse or extend those bytes. The source's sole downstream `stream()` replays them one chunk per pull,
+then continues that same reader one read per pull with `highWaterMark:0`. EOF or cancel releases the lock
+once; abort races a pending prefix/materialization read and forwards cancellation upstream; a locked input,
+second open, or ownership transfer during a pending peek is a typed error. Re-readable range-less custom
+sources keep their temporary sniff-reader cancel/reopen contract. HLS uses the shared primitive instead of
+maintaining a second replay implementation, and terminal probe/packet-info plus failed route/demux paths
+cancel any still-owned one-shot reader.
+
+Public `decode()` takes the narrow safe exception to prefix-only buffering. Because its audio and video
+outputs are independently pulled while current container demuxers open the source per track, a true
+single-use input is materialized once behind the same memoized, abort-aware resolution promise and becomes
+one immutable byte source shared by image routing and both tracks. Pull order therefore cannot steal bytes
+or change results. This does not fabricate seekability for other operations, duplicate `VideoFrame` or
+`AudioData`, or change B-frame/VFR packet timing. The replay implementation is a lazy chunk so direct-stream
+support does not join the default eager closure; the public `Source` and driver contracts remain additive
+and `DRIVER_API_VERSION` stays 1.
+
+**Consequences.** Fail-first tests reproduced the old `need seekable` rejection, dropped hints, locked/raw
+host error, and missing abort/replay behavior. The focused source matrix now proves increasing peeks,
+byte-exact replay, one-reader backpressure, pre/pending abort, upstream cancel, locked/second-open rejection,
+and preserved hints. A real downloaded VP9/WebM direct stream passes exact public probe metadata after HLS,
+image, and container routing and independently demuxes after replaying its route prefix; the HLS
+single-use/re-readable/abort matrix remains green. A dual-track fake
+codec test makes both demuxes verify the same exact bytes after pulling audio before video and closes each
+emitted frame exactly once. The fresh 2-warmup/7-sample real-corpus benchmark spans MP4/H.264, WebM/VP9,
+WAV/s24, native FLAC, and MP3 (190,813 bytes; five independently pinned SHA-256 inputs). All fourteen byte
+and stream samples produce metadata digest
+`19b614d3a47c35ad512a7dda53d51566f5a1f617c44b7eb09463e9999c2e539a`; direct input performs exactly 194
+pulls per corpus sample. Median wall time is 0.569 ms for direct streams versus 0.186 ms for replayable
+bytes, with seven positive measured RSS deltas of 999,424–1,867,776 bytes for the stream path. The command
+is `bun run bench-session12-stream-input`; full package budgets and cross-browser gates remain required.
+Full design and edge analysis are in `docs/notes/session12-readable-stream-input.md`.
+
+**Rejected:** full-buffering every stream before routing; `ReadableStream.tee()` and its independent hidden
+queues/cancellation ambiguity; consuming and discarding a sniff prefix; reopening the caller's stream;
+letting audio/video race; claiming random access; weakening metadata/packet/frame oracles; or moving the
+cursor into the eager kernel.
+
+### ADR-232 - Public container aliases share exact routing, and direct HLS AES-128 validates clear structure
+
+**Context (Session 12 product closure).** The public `Container` union already promised `aac`, `m2ts`,
+`mts`, and `mpegts`, but the concrete/lazy drivers declared only `adts` and `ts`/`m2ts`/`mts`, while the
+eager chunk-mux truth table named only `adts` and `ts`. Consequently some aliases matched as input hints
+yet fell off same-family remux/convert into a browser-only packet seam or a typed “no muxer” miss. The
+MPEG-TS parser already handled physical 188-, 192-, and 204-byte packet grids, but both cheap driver
+predicates recognized only two 188-byte sync bytes. Finally, manifest resolution could decrypt AES-128
+packed audio/TS, while direct public `decrypt` supported full-segment AES-128 only for MP4: MPEG-TS
+dispatched only SAMPLE-AES and ADTS exposed no decrypt method.
+
+**Decision.** Keep `adts` and `ts` as canonical `formats[0]` probe identities, declare `aac` as the ADTS
+alias and `m2ts`/`mts`/`mpegts` as MPEG-TS aliases everywhere routing and chunk-mux truth is decided, and
+share one tiny packet-grid detector between the lazy proxy, concrete TS driver, and parser. The detector
+requires a repeated `0x47` column and covers ordinary 188-byte packets, 192-byte M2TS/MTS packets with a
+four-byte prefix, and 204-byte RS-protected packets; the legacy `.m2t` input spelling remains accepted
+without becoming a new public output token. Add one shared abort-aware full-segment AES-128 helper over
+the existing WebCrypto CBC+PKCS#7 primitive. Direct TS and ADTS callers must supply a container hint because
+ciphertext has no sniffable magic. Before output is exposed, TS plaintext must begin on a complete
+188/192/204 packet grid and parse to real PAT/PMT/PES tracks; ADTS plaintext must start after only a
+structurally complete optional ID3 prefix, contain real frames, and not end in a truncated frame. The
+single cleartext chunk is enqueued only on downstream pull. Missing/malformed key material and aborts are
+typed, active stream reads are cancelled and unlocked, temporary raw key/IV bytes are wiped after
+WebCrypto completes, and recovered plaintext is wiped on every validation/cancellation path before output
+ownership transfers. `hls-sample-aes` remains a separate TS-only dispatcher calling the existing
+sample-payload algorithm; neither scheme retries as the other.
+
+**Consequences.** Fail-first tests produced 21 targeted failures, then the completed focused matrix passed
+120/120 after the plaintext-lifetime review. Six ffmpeg/OpenSSL-encrypted real TS segments and six
+independently encrypted packed-ADTS segments
+recover their committed clear twins byte-for-byte through public `media.decrypt`; padding-valid wrong-IV
+first-block corruption is rejected before output; cross-scheme inputs remain typed failures; abort while
+draining cancels the source. Three real TS programs remux through the public TS aliases, `aac` preserves a
+real ADTS segment exactly, and real TS packets wrapped in 192/204-byte physical framing route through both
+lazy and concrete predicates. Fresh 2-warmup/7-sample benchmarks record 1.086 ms median / 46.90 MB/s for
+the 12-segment AES batch, 2.197 ms / 195.66 MB/s for the four-alias public remux batch, and 3.438 ms per
+6,000 mixed 188/192/204 predicates. Full design, checksums, and sample vectors are recorded in
+`docs/notes/session12-container-routing-and-direct-aes.md`. No `DRIVER_API_VERSION` bump is needed: this
+implements formats and an optional decrypt method already present in v1. Central review additionally pins
+case-insensitive parameterized MIME routing before ciphertext sniff, correct alias Blob MIME types, and
+zeroization of an already-parsed SAMPLE-AES key when IV parsing fails before source ownership; the broader
+relevant matrix passes 337/337.
+
+**Rejected:** treating promised aliases as type-only spellings; reporting aliases as new canonical
+containers; duplicating a weaker magic test in the lazy proxy; emitting padding-valid bytes without a
+container oracle; silently recovering after wrong-IV leading corruption; guessing key/IV from an asset;
+or falling between full-segment AES-128 and SAMPLE-AES based on ciphertext shape.
+
+### ADR-233 - Force-software routes only through proved non-hardware execution
+
+**Context (Session 12 product closure).** The router implemented `force-software` by removing every
+`tier:'hardware'` codec before asking for support. That also removed the WebCodecs drivers whose runtime
+configuration already knew how to request `prefer-software`, making valid native software configurations
+unreachable. Conversely, Canvas2D survived filter routing even though `drawImage` is normally
+GPU-accelerated. Still/animated image decode bypassed both ladders and always reached browser
+`ImageDecoder`, whose API provides no software-selection proof. The public mode therefore both rejected
+some honest software paths and admitted unproved native/GPU work.
+
+**Decision.** Extend `CodecDriver.supports` additively with an optional determinism context. Under
+`force-software`, GPU codec tiers are excluded; a hardware-ranked driver may be probed but is accepted only
+when it explicitly returns `supported:true, hardwareAccelerated:false`. A legacy/third-party driver that
+omits that verdict remains ineligible. WebCodecs video and audio probe only the exact
+`hardwareAcceleration:'prefer-software'` configuration in this mode, reject a rewritten accepted
+configuration, and keep those verdicts isolated from auto-mode cache entries. WebGPU, WebGL, and Canvas2D
+filter substrates are all excluded; native CPU and WASM remain ordered software rungs.
+
+Image probe remains pure header parsing and is allowed in either mode, but image pixel decode raises a
+typed capability miss until a licensed software decoder exists. Decode now makes the image decision before
+one-shot dual-track materialization: a forced matched image reads only the bounded 4 KiB prefix, cancels the
+sole producer reader, and never constructs `ImageDecoder`; a negative image decision replays the preserved
+prefix into the existing one-time non-image materialization. B-frame/VFR ordering, seek behavior,
+backpressure, and frame ownership remain downstream and unchanged.
+
+**Consequences.** Fail-first tests pin explicit software verdicts, legacy-driver exclusion, exact probe
+arguments, acceleration-rewrite rejection, determinism cache separation, GPU/canvas exclusion, auto-mode
+recovery, bounded image sniffing, and upstream cancellation. Focused router/WebCodecs/engine tests pass.
+The fresh three-warmup/21-sample benchmark (`bun run bench-session12-deterministic-routing`) reports
+1.640 us per uncached selection, 0.744 us per exact cached selection, and 14.607 us per public
+force-software image decline (100 operations per sample; exactly one pull and one cancel each). The
+optional support argument is structurally backward-compatible and does not change `DRIVER_API_VERSION`.
+
+**Rejected:** banning the whole WebCodecs driver by its ranking tier; trusting `prefer-software` without
+checking the accepted configuration/verdict; treating Canvas2D as deterministic CPU work; silently using
+`ImageDecoder`; reusing an auto acceleration verdict; buffering an entire one-shot image before a known
+forced-mode miss; or weakening deterministic output expectations.
+
+### ADR-234 - Video pad is an exact transparent-canvas geometry stage
+
+**Context (Session 12 product closure).** The filter drivers already implemented crop, resize, rotate,
+flip, colorspace, and tonemap, but the public `VideoTarget` had no way to place an image unchanged on a
+larger canvas. Treating pad as resize would alter pixels; treating it as crop with negative coordinates
+would make out-of-bounds reads substrate-dependent. The operation also needed one unambiguous location in
+the existing geometry/color chain so dimensions, alpha preservation, encoder configuration, and packet
+copy decisions could not disagree.
+
+**Decision.** Add `VideoTarget.pad = {width,height,x?,y?}` and a `FilterSpec` pad variant with resolved
+integer offsets. Pad runs after crop and resize and before rotate, flip, colorspace, and tonemap. Omitted
+offsets floor-center independently on each axis. The source is copied one-for-one into a transparent RGBA
+canvas; there is no scaling or cropping. Dimensions and offsets must be safe integers, the target must not
+shrink either source axis, and the placed source rectangle must fit completely. An exact same-size,
+zero-offset request is removed as a no-op. Output-dimension planning applies the pad canvas before the
+90/270-degree swap, and any real pad request disables pure packet copy and VPx-alpha packet bypass.
+
+GPU/Canvas pad reuses the existing clear-target blit geometry; the native CPU floor allocates an exact
+zeroed RGBA target and copies each source row into its validated offset. The filter stream keeps the normal
+close-once rule: after the source pixels have been consumed, the input `VideoFrame` closes once in `finally`,
+and the new output frame owns its transparent border and original timing. Cancellation, backpressure,
+B-frame reorder, and VFR retiming are unchanged because pad is a same-frame pixel stage before encoding.
+
+**Consequences.** Fail-first planner and driver tests prove operation order, default/explicit offsets,
+dimension propagation, exact border pixels, no-op removal, shrink/overflow/non-integer rejection, packet
+copy exclusion, alpha-path exclusion, and GPU/CPU blit parity. The focused filter/planning matrices pass.
+The fresh three-warmup/21-sample benchmark (`bun run bench-session12-video-pad`) reports a 1.373 ms median
+for a 640x360 source centered exactly into a 720x480 canvas, or 251.6 MPix/s; a border-alpha sink guard
+prevents dead-code elimination. This is an additive filter variant and public option; existing drivers that
+do not advertise it simply miss, so `DRIVER_API_VERSION` remains 1. Cross-browser live-frame validation
+remains part of the final Chromium/WebKit/Firefox gate.
+
+**Rejected:** implementing pad as resize; permitting implicit clipping; filling with an opaque/default
+colour; rounding caller offsets differently per substrate; applying pad after rotation without declaring
+that order; keeping packet-copy/VPx-alpha bypass enabled; or weakening the exact pixel oracle to SSIM.
+
+### ADR-235 - Declarative jobs preflight plain data and compose one public operation graph
+
+**Context (Session 12 product closure).** The public architecture showed `media.run({input,ops,output})` as
+the worker/serialization boundary, but the engine exposed no implementation. Reinterpreting that shape as a
+second transcoder would duplicate routing, timing, and frame-lifetime logic. Executing operations while they
+were still being validated could consume a one-shot input before discovering a malformed later stage, and
+blindly merging transforms could change pixel order. A serialized job must also exclude host handles and
+accessors whose behavior cannot cross a structured-clone boundary predictably.
+
+**Decision.** Define a strict plain-data `MediaJob` whose input is an `ArrayBuffer`/view, `Blob`/`File`,
+unlocked transferable byte `ReadableStream`, or URL string; function-backed sources, DOM elements,
+`MediaStream`, signals, sinks, callbacks, and `URL` objects remain flat-API concerns. Validate and snapshot
+the complete job before normalizing or reading input. Objects and arrays may contain only canonical
+enumerable data properties: accessors, symbols, custom prototypes, sparse/named array fields, non-finite
+geometry/timing, unknown discriminants, and contradictory stream/transform requests reject typed.
+
+Compile the validated job into the existing `trim`/`convert`/`remux`/`decrypt` operations. Adjacent video
+transforms fuse only in the canonical crop→resize→pad→rotate→flip→colorspace→tonemap order and only once per
+kind; a repeat, order reversal, or byte-boundary operation creates an owned Blob boundary. This preserves
+declared semantics while still making the documented trim→resize→output job the minimum two real stages.
+The runner enters through one lazy engine import and returns `Cancellable<Blob>`. One internal abort domain
+links caller abort and handle cancellation to the active flat task; stage-local progress is projected onto a
+monotonic whole-job clock. B-frame DTS/PTS, VFR cadence, open-GOP preroll, mux backpressure, and frame
+close-once ownership stay entirely inside the proven flat operations.
+
+**Consequences.** The public engine method, configured `createMedia().run`, and bare barrel export now share
+the same runner. The focused unit matrix passes 67/67, including full preflight before source consumption,
+mutation snapshots, canonical and noncanonical transform ordering, exact Blob handoff, typed host-field
+rejection, already/in-flight abort, active-task cancel-once behavior, and monotonic progress. A public-engine
+integration trims the licensed `sfx-pcm-s16.wav` fixture to exactly 4,800 mono s16 frames / 9,600 payload
+bytes and independently reprobes 48 kHz, 0.1 s WAV output. The fresh five-warmup/21-sample benchmark covers
+1,000 mixed jobs per sample; its committed baseline is 219,883 jobs/s and confirmation is 199,077 jobs/s
+with positive 1.18–1.42 MB process-heap samples. The runner is additive and does not change
+`DRIVER_API_VERSION`.
+
+**Rejected:** inventing a second codec/container graph; evaluating getters during execution; accepting
+arbitrary host objects because a local clone happens to work; consuming a one-shot input before full
+preflight; sorting caller transforms into canonical order; fusing through an explicit byte boundary;
+silently dropping unsupported fields; returning an uncancellable promise; or retiming/closing frames in the
+composition layer.
+
+### ADR-236 - Live MediaStream input is a raw-frame source, never a byte-container fiction
+
+**Context (Session 12 product closure).** `MediaInput` already declared `MediaStream`, and element options
+already named `{mode:'capture'}`, but the universal normalizer rejected the former and the latter was a
+placeholder throw. A live track has no finite encoded byte source, random access, container packet table,
+replay contract, or trustworthy upstream codec token. Treating it as a `Source`, recording it through
+`MediaRecorder`, polling canvas pixels, or inventing probe facts would falsely claim semantics and would
+break the engine's bounded-stream, cancellation, A/V-clock, and close-once contracts. The current W3C
+Media Capture Transform draft specifies `MediaStreamTrackProcessor` video frames and bounded buffering,
+while explicitly recording no working-group consensus for audio processors.
+
+**Decision.** Add a separately branded `LiveMediaSource`; byte `Source` and `SourceKind` remain unchanged.
+`from(MediaStream)` and explicit `fromElement(element,{mode:'capture'})` preserve the caller-owned stream,
+and capture raises a typed capability miss when the real platform method is absent. Cross-realm structural
+streams are accepted. The eager normalizer imports only tiny `live-source.ts`; processor/probe logic stays
+in lazy `live-media.ts`, conversion coordination stays in lazy `live-convert.ts`, and neither heavy helper
+is statically re-exported by the default barrel. Bundle guards fail if either enters the eager/default-probe
+closure.
+
+Probe is non-consuming current truth: `container:'media-stream'`, explicit `raw-video`/`raw-audio` domains,
+current track settings, no byte size, and no guessed encoded codec or per-track duration. Aggregate
+`durationSec:Infinity` is the in-memory platform convention for an unbounded live source, paired with
+`tags:{live:'true',duration:'unbounded'}`; because JSON has no Infinity token and serializes it as `null`,
+those tags pin the exported meaning instead of allowing `null` or zero to be misread as a finite duration.
+Demux, packet tables, remux, trim, seek, decrypt, and ABR replay typed-decline before track consumption.
+
+Decode creates at most one processor per live video/audio kind, lazily on first pull, with
+`maxBufferSize:1` and an output `highWaterMark:0`. More than one active same-kind track is a typed input
+error; ended tracks are ignored. Original timestamps and durations pass through without rebasing, sorting,
+or clamping, preserving the shared A/V clock, VFR, gaps, and B-frame presentation order. The adapter owns a
+processor frame until enqueue succeeds; then the caller owns it. Wrong-kind/regressing frames, enqueue
+failure, abort/end races, and late cancellation results close exactly once. Cancellation drains the pending
+read, releases its lock, and never stops caller-owned tracks. Audio succeeds only when the runtime processor
+actually yields `AudioData`; otherwise it is an exact typed capability miss, not a fabricated fallback.
+
+Live convert uses the same raw streams through the ordinary filter/encoder/mux stages, but requires an
+explicit output container, video codec/width/height, and audio codec/sample-rate/channel layout for each
+selected track. Two-pass is rejected because the source is not replayable. One coordinator abort domain
+wraps zero-buffer relays that remain cancellable while encoders hold their public readers; any stage failure
+cancels the sibling and preserves the primary typed error. Success is returned only after every selected
+track ends, both encoder drains finish, the muxer finalizes, and the sink materializes. Current track
+settings must independently provide source video geometry or audio layout before any processor pull;
+missing input settings are a typed error and explicit output facts are never substituted for them.
+
+**Consequences.** Fail-first engine/source/processor/coordinator coverage now passes 79/79 focused tests.
+It pins normalization, probe non-consumption and JSON semantics, lazy processor construction, backpressure,
+A/V timing/duration identity, multiple-track rejection, track-end/abort/cancel races, exact late-frame
+close counts, primary-error preservation, sibling cancellation, target validation, partial-output discard,
+and final-mux waiting. The fresh two-warmup/seven-sample Node adapter benchmark processes 10,000 fresh
+frames plus 200 pending-read cancellations per sample: median 4.991 ms (2,003,490 frames/s), exactly 10,001
+pulls, 3.374 us per cancellation, all 1,400 measured late frames closed once, and 3,817,472 bytes post-GC
+RSS retention under a 32 MiB bound. The strict five-file licensed real-browser RGBA oracle is implemented,
+but its local Chromium execution remains explicitly blocked by the desktop escalation reviewer's exhausted
+session usage allowance; this is an external evidence gap, not a claimed PASS.
+
+**Rejected:** normalizing live tracks into byte `Source`; `MediaRecorder` and its UA-selected encoded
+container; canvas polling with a new clock/drop policy; hidden ScriptProcessor/AudioWorklet recording;
+unbounded frame queues; silently selecting one of multiple same-kind tracks; rebasing or clamping timestamps;
+stopping caller tracks; guessing codecs/duration/size; serializing unknown duration as zero; allowing
+two-pass/seek/remux semantics on a one-shot live source; resolving after a partial mux; or statically pulling
+the processor pipeline into the eager kernel.
+
+### ADR-237 - Public runtime controls are exact, instance-scoped, and worker-stable
+
+**Context (Session 12 product closure).** Three declared public controls were inert. Per-call
+`strategy.pinDriver` never reached the router; `createMedia({enableThreads})` did not reach the existing
+WASM profile resolver; and `assetBaseUrl` never changed a core URL. A naive pin on every stage would make
+compound graphs impossible because a codec id is not a container/filter id. Global runtime/asset state
+would let concurrent engine instances poison each other, and resolving a relative asset root again inside
+a worker could silently select a different URL. Cross-origin roots would also contradict the binding
+same-origin software-tail requirement. None of these controls may alter B-frame/VFR timing, streaming
+backpressure, cancellation, or `VideoFrame`/`AudioData` ownership.
+
+**Decision.** An exact pin is scoped to the registered driver kind(s) carrying its id. Within a matching
+container, codec, or filter route, only that id is eligible, is the only id loaded/probed, participates in
+the cache key, and is the sole `tried` id on failure; there is no fallback. Other kinds keep their ordinary
+ladder. An unknown id joins one shared in-flight lazy default registration, then fails before source
+or frame consumption if still absent. Nested routes inherit the pin through `StageOptions`, and worker jobs
+serialize it.
+
+Each engine resolves `enableThreads` exactly once. Explicit false always produces the baseline profile;
+true without `crossOriginIsolated`/`SharedArrayBuffer` also produces an honest baseline profile with a
+reason, never a false threaded claim or an error for an unavailable optimization. The resolved profile is
+carried through every stage, ready-level preload, direct ADTS/WASM path, worker job, and worker inner-engine
+construction. `assetBaseUrl`, when supplied, is resolved once against the browser document/location,
+normalized to an absolute query/hash-free directory, and rejects credentials, non-HTTP(S), or cross-origin
+URLs in HTTP(S) pages; `file:` is limited to Node/file contexts. The normalized string is serialized into
+workers unchanged. All six external/miss-tail URL loaders use one resolver and memoize by absolute URL plus
+runtime-profile kind. With no override, each loader passes its original literal
+`new URL('./core.wasm', import.meta.url)` unchanged, preserving bundler hashing and default behavior.
+Support probes import at most glue and never resolve/fetch/instantiate the asset.
+
+**Consequences.** Fail-first router/public-engine tests prove exact selection, cache isolation, a declining
+pin with no fallback load/probe, codec-pin/container scoping, one defaults retry, and an unknown-pin miss
+before source open. URL tests prove relative-directory normalization, unchanged default URL identity, and
+synchronous rejection of cross-origin, credentialed, and non-network browser roots without `fetch`.
+Stage, preload, direct ADTS, host/worker serialization, and inner-engine tests prove the same resolved
+profile/root/pin reaches each path; the six codec-core suites pass 277/277. Focused controls/worker tests
+pass 98/98 and the preload-focused matrix passes 41/41. The fresh three-warmup/11-sample benchmark
+(`bun run bench-session12-runtime-controls`) reports 0.787 µs per exact pinned codec selection, 2.265 µs
+per profile+root+asset resolution set, and 1.881 µs per configured engine construction. Additive
+`StageOptions` fields do not change `DRIVER_API_VERSION`.
+
+**Rejected:** a process-global asset root/profile; silently accepting a cross-origin CDN; re-resolving a
+relative root in each worker; treating `enableThreads:true` as proof of isolation; throwing when only the
+optimization is unavailable; applying one codec id to unrelated container/filter kinds; falling through
+after a pinned probe declines; fetching WASM during `supports()`; or weakening route/cancellation/lifetime
+oracles.
+
+### ADR-238 - Remux selection completes before target-native metadata rewrite
+
+**Context (Session 12 product closure).** `RemuxOptions` independently implemented `trackSelect` and `tags`
+but rejected their combination. Applying metadata to an input before selection is semantically wrong for a
+cross-container target, while dropping either option would violate the public request. The existing target
+writers already knew how to update the supported MP4/MOV, WebM/MKV, Ogg, WAV, MP3, FLAC, AIFF, and CAF
+metadata structures, but most require random access to a completed container. Composition therefore needed
+one explicit order, truthful buffering, a single cancellation domain, and nonregressing progress.
+
+**Decision.** Validate the requested target and snapshot `tags` as a plain record containing enumerable
+string data properties only before opening the source. Select tracks and complete the normal target remux
+first, preserving the existing packet seam's track order, codec-private data, DTS/PTS, B-frame composition
+offsets, VFR cadence, selected payloads, and container side data. Then collect the completed target only
+when required and invoke its existing native metadata writer. The request signal covers demux/selection,
+mux drain, collection, rewrite, and final sink; remux and metadata progress are mapped into one monotonic
+two-phase `{done,total:2,stage}` domain.
+
+For tags-only same-family targets, an already-owned target buffer can enter the same writer without a
+second stream collection. When `trackSelect` names the complete ordered track set of an independently
+probed single-track raw-PCM wrapper, the engine may equivalently write a fresh tagged target wrapper around
+the exact original PCM data bytes. A true subset or any unproved layout falls through to ordinary demux and
+mux. No branch decodes/re-encodes packets, guesses track facts, treats the input as the target, or reports
+incremental metadata writing where the format requires random access.
+
+**Consequences.** Focused composition tests pass 38/38, public codec-operation tests pass 52/52, and lazy
+remux-runner helpers pass 4/4. A real multitrack WebM selects Vorbis audio, remuxes to Ogg, writes the target
+comment, and independently reparses codec, duration, and exact comment; the WAV oracle proves `audio:0`, a
+fresh metadata wrapper, and byte-exact `data` payload preservation. Cancellation, unsupported targets,
+hostile tag objects, aliases, and monotonic two-stage progress are pinned. The fresh real-media benchmark
+reports 0.135 ms confirmation / 675.59 MB/s for WAV full-track selection plus tags and 0.827 ms /
+516.84 MB/s for WebM Vorbis selection→tagged Ogg, with positive 1.97 MB and 6.23 MB process-heap samples.
+No driver contract changes, so `DRIVER_API_VERSION` remains 1.
+
+**Rejected:** metadata-first rewriting; rejecting the documented combination; coercing tag values;
+executing accessors; copying input bytes as cross-container output; claiming streaming metadata updates;
+resetting public progress between phases; decoding selected packets; dropping attachments or timing side
+data; or special-casing the benchmark assets without structural track proof.
+
+### ADR-239 - High-bit-depth output uses exact VP9/AV1 profiles and level envelopes
+
+**Context (Session 12 product closure).** Video encode configuration used static VP9/AV1 codec strings even
+when `bitDepth`, post-filter geometry, cadence, or explicit bitrate required another profile or level. A
+host support probe against an underqualified string is not evidence for the requested output, and writing
+that string into container metadata can contradict the coded sequence. Pixel filters currently expose an
+RGBA8 boundary, so silently routing a high-depth source through them would also destroy precision while
+claiming preservation.
+
+**Decision.** Derive VP9 and AV1 strings from the requested/output depth and the minimum official level
+whose dimension, luma-picture-size, luma-display-rate, and effective-bitrate envelope contains the target.
+VP9 8-bit 4:2:0 uses profile 0 and 10/12-bit 4:2:0 uses profile 2. AV1 8/10-bit 4:2:0 uses Main profile 0;
+12-bit uses Professional profile 2 and its defined bitrate factor. The effective bitrate includes the
+implicit quality-budget value and is capped at the largest legal envelope only when the caller did not
+specify it. Unknown cadence selects the highest defined level instead of inventing a low rate; outputs
+outside the tables decline typed, and the exact generated configuration still must pass
+`VideoEncoder.isConfigSupported()`. A fully qualified compatible source codec string is preserved only
+while depth, geometry, cadence, and explicit bitrate facts remain unchanged, with its implicit bitrate
+bounded to that level. Changed facts preserve family/depth intent and author a new qualified string.
+
+An 8-bit source can widen exactly at a 10/12-bit encoder, and 10-bit can widen at a 12-bit encoder, without
+a pixel copy. A 10/12→8 request enters one backpressured, one-frame-at-a-time RGBA8 conversion; it preserves
+timestamps/durations and closes every consumed or failed-to-enqueue frame exactly once. The unproved
+12→10 conversion declines. Crop, resize, pad, rotate, flip, colorspace, tonemap, and general VPx alpha
+merge/split are treated as current RGBA8 pixel boundaries, so high-depth-to-high-depth graphs crossing them decline instead of silently
+narrowing; FPS-only retiming is not a pixel boundary. H.264 10/12 and HEVC 12 stay honest misses, HEVC
+Main10 remains exact, and VP8 remains 8-bit. Two-pass H.264 analysis/final planning shares the same precision
+classification. These decisions do not reorder B-frames, restamp VFR, or change mux/cancellation ownership.
+
+**Consequences.** The focused configuration/lifecycle suite passes 191/191 before the additional alpha
+error-lifecycle matrix, and supporting mux/parser suites
+pass 160/160. It covers level boundaries from 720p through 8K60, post-rotation dimensions, explicit bitrate
+promotion, VP9/AV1 8/10/12-bit strings, source-string preservation, widening/downconversion, high-depth
+filter rejection, FPS-only retiming, alpha policy, copy-route exclusion, and close-once failure/cancel paths.
+The five-warmup, 21-sample benchmark measures 3,274,777 profile/config plans/s, 52,575,959
+precision-lifecycle plans/s, and 132,085,856 public encode-route guards/s, with 0.89 MB, 1.05 MB, and
+1.00 MB positive process-heap samples and no committed-baseline regression. Exact browser
+encode/mux/reimport proof remains capability-qualified: a host that rejects the generated configuration is
+a typed miss, never a fabricated PASS. This is an additive planner change and keeps `DRIVER_API_VERSION` 1.
+
+**Rejected:** one static low VP9/AV1 level; trusting an encoder to repair an incorrect public config;
+declaring 12-bit AV1 Main profile; guessing support from a codec family; rewriting an already-qualified
+source string without a depth change; silently quantizing 12→10; allowing RGBA8 filters to claim high-depth
+preservation; buffering a full frame sequence; or treating host rejection as software support.
+
+### ADR-240 - Lazy FLAC routing preserves the native Ogg stream-copy declaration
+
+**Context (Session 12 public-surface truth audit).** The native FLAC container driver declared Ogg as a
+cross-container `streamCopyTarget` and implemented the copy entirely over parsed FLAC frame spans, but its
+zero-config lazy proxy omitted that optional capability metadata. Public remux routing consults the proxy
+before loading the full driver, so `remux(FLAC, {to:'ogg'})` fell into the generic packet seam and attempted
+to construct host `EncodedAudioChunk` objects. Pure `convert(FLAC, {to:'ogg'})` also accepted only same-family
+stream-copy and omitted the requested container from `StreamCopyOptions`, so it fell into PCM decode instead.
+A shimmed public test made the remux fallback appear supported even though clean Node and browsers without
+that constructor could not reach the already-implemented native path.
+
+**Decision.** The lazy FLAC proxy synchronously advertises the same immutable `['ogg']` target declaration
+as the full driver while keeping the driver import behind the existing `streamCopy()` call. Pure convert
+accepts either a same-family format or a declared cross-target and passes the resolved target as
+`StreamCopyOptions.container`; `isPureStreamCopy` and explicit-target validation remain mandatory. Public
+fail-first remux and convert tests install throwing video and audio chunk constructors, process a licensed
+real FLAC fixture through `createMedia()`, reparse the embedded Ogg-FLAC STREAMINFO and granule sample total,
+and compare every de-laced output packet with its native FLAC frame. A proxy conformance assertion pins the
+optional metadata to the full driver's declaration.
+
+**Consequences.** Public zero-config FLAC-to-Ogg remux reaches the pure-TS writer without WebCodecs, keeps
+every compressed frame byte-exact, and preserves sample rate, channels, bit depth, and exact total samples.
+The focused default/public routing suites pass 71/71. The fresh two-warmup/seven-sample benchmark processes
+five varied licensed FLAC files through both public routes under throwing host chunk constructors and an
+independent cross-page Ogg lacing oracle: remux median 20.274 ms / 203.267 MB/s and convert median 19.503 ms /
+211.306 MB/s for 4,120,999 input bytes, both with stable SHA-256
+`9866ee5f05f043a82d0b9f0a68c21ee566d9900ceda3673fe26fa96fc88199b4`. This restores existing optional
+metadata rather than extending the contract, so `DRIVER_API_VERSION` remains 1. Audio packet copy has no
+B-frame/VFR clock or raw-frame ownership change; existing abort and full-source FLAC read semantics remain.
+The same benchmark's positive process-heap/RSS and retention gate is recorded with the downstream demux
+repair in ADR-241.
+
+**Rejected:** eagerly importing the FLAC driver to discover routing metadata; retaining the WebCodecs packet
+fallback; accepting a constructor shim as native-path proof; special-casing fixture names; relabelling input
+bytes as Ogg; or advertising cross-container trim, which the native driver still declines explicitly.
+
+### ADR-241 - Ogg continued packets retain ordered page-body payload spans
+
+**Context (Session 12 public-surface truth audit).** Ogg lacing can continue one coded packet across page
+boundaries. The demux parser accumulated the payload byte count but represented the packet as one source
+`offset + size` range. That range crossed the next page's `OggS` header and lacing table, so live demux
+inserted container bytes and omitted the same number of trailing payload bytes. A public native copy of the
+real `flac-08bit.flac` fixture reproduced the defect at packet 24: byte 255 was `79` (`'O'` from `OggS`)
+instead of the source FLAC frame's `150`. Packet counts and sizes remained plausible, which allowed the
+existing metadata-only oracle to miss the corruption.
+
+**Decision.** Each de-laced packet retains ordered `{offset,size}` spans containing page-body payload only.
+Adjacent laces in one page are coalesced, but a page boundary remains a distinct span. Packet rows expose a
+plain source `offset` only for one provably contiguous span; discontiguous rows omit it and therefore cannot
+be mistaken for direct-range evidence. One shared bounds-checking payload helper returns the source view for
+a contiguous packet or assembles a continued packet exactly once when the consumer pulls it. Codec-private
+headers, Opus TOC timing, live `EncodedAudioChunk` construction, same-container trim, and prepared benchmark
+callers use that same representation. The stream checks abort before payload assembly or chunk construction.
+The page writer, lacing, granules, sequence numbers, and CRC bytes are unchanged.
+
+**Consequences.** A fail-first public oracle authors Ogg through native FLAC copy, demuxes it through
+`createMedia()` under a capture chunk constructor, and compares every emitted packet with every source FLAC
+frame across five varied licensed fixtures. It requires real discontiguous rows; the current corpus exercises
+61 per batch. The focused public/Ogg driver/writer matrix passes 109/109, including abort-before-construction,
+and typecheck plus Biome remain required at the full gate. The fresh two-warmup/seven-sample demux benchmark
+reports 1.723 ms median for 4,114,780 input bytes (2,387.802 MB/s), stable payload SHA-256
+`2000b318dfdd81082016c0ba2d37425e5ebb5dfbc8851c49370cae381f15c90c`. A separate three-run GC-bracketed
+memory sample records positive 39,856,840-byte peak process heap and 281,214,976-byte peak RSS, with
+-12,030,010 retained heap bytes and +311,296 retained RSS bytes, both below the explicit 67,108,864-byte
+retention bound. Ogg audio has no B-frame/VFR reorder or raw-frame ownership; packet timestamps/granules and
+close semantics are unchanged.
+
+**Rejected:** treating page headers as packet payload; exposing a false contiguous offset; eagerly flattening
+every packet during table construction; buffering decoded frames; special-casing FLAC or fixture ids;
+weakening the byte oracle to packet counts/sizes; or changing the writer/CRC layout to hide a demux defect.
+
+### ADR-244 - Matroska tag rewrites replace every prior tag tree without moving media
+
+**Context (Session 12 public-surface truth audit).** The target-native Matroska metadata writer appended one
+new Segment-level `Tags` element on every invocation. Existing global and targeted `Tag` trees therefore
+remained present, conflicting values depended on reader traversal order, an empty request could not clear
+metadata, and repeating the same rewrite grew the file forever. Simply removing old elements and closing
+the gap would introduce a second correctness defect: Matroska `SeekPosition` and `CueClusterPosition` are
+Segment-relative, so shifting Clusters/Cues would stale otherwise-valid random-access metadata.
+
+**Decision.** Strictly preflight the complete top-level Segment child walk before allocating output. Every
+old `Tags` span is replaced with a valid same-length EBML `Void`, including arbitrary multiple `Tag`,
+`Targets`, nested `SimpleTag`, language, and default trees. The one canonical flat public tag set reuses the
+first referenced Tags span (or reserved top-level Void) that can contain it plus exact Void padding. If none
+fits, it is appended once at Segment end; the next identical rewrite reuses that span exactly. An empty
+normalized request authors no Tags. All Tags `SeekHead` entries are repointed to the canonical span, or
+voided when tags are cleared; changed nested and Segment CRC-32 elements are recomputed with IEEE CRC-32 and
+little-endian storage. Finite Segment size VINTs keep their width and widen only when required; an
+unknown-size Segment retains its exact all-ones size field. Unknown-size children, truncated/unsafe child
+sizes, malformed Seek entries, and misplaced, malformed, or invalid CRC elements reject with typed
+`InputError` before output allocation rather than guessing through Block payload bytes.
+
+**Consequences.** Non-tag top-level elements keep their exact bytes, order, and Segment-relative offsets.
+B-frame/VFR packet payloads, synthesized DTS and source PTS, codec-private bytes, alpha/discard-padding,
+Clusters, Cues, and ordered attachment payloads remain unchanged. The synchronous writer performs one
+output allocation plus bounded tag/span metadata; it creates no frame, stream reader, or sink resource, so
+the enclosing ADR-238 remux cancellation/backpressure domain is unchanged. All nine fail-first replacement
+cases now pass across five checksum-pinned licensed W3C/Chromium WebMs plus the exact attachment-bearing MKV;
+the combined metadata matrix passes 54/54. Twelve repeated writes per fixture are byte-identical and fixed
+size. The three-warmup/15-sample confirmation benchmark rewrites 590,465 bytes per sample in 0.210 ms median
+(2,806.74 MB/s), output SHA-256
+`f6130829b5d88aba0d68cd30006ae7d47cefd5d0b435f65595be499126e8298b`. Its separate memory pass records
+positive 12,650,222-byte process-heap and 12,959,744-byte RSS deltas, then 77,352 retained heap bytes and
+13,041,664 retained RSS bytes under the 32 MiB bound. No public or driver contract changes; API version
+remains 1. Full design and proof are in `docs/notes/session12-matroska-tag-replacement.md`.
+
+**Rejected:** appending another Tags tree; preserving unaddressable stale target trees behind a flat public
+map; shifting Clusters and repairing only the parser-visible timeline; rebuilding timed packets; returning
+input bytes unchanged; leaving stale Seek/CRC metadata; scanning through an unknown-size Cluster for a
+fixture-shaped byte pattern; weakening the oracle to last-value-wins readback; or special-casing assets.

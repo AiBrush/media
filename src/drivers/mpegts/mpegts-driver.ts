@@ -12,7 +12,6 @@
 import type {
   ByteSource,
   ContainerDriver,
-  ContainerQuery,
   Demuxer,
   DriverModule,
   MuxOptions,
@@ -25,17 +24,10 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { MPEG_TS_FORMATS, isMpegTsExtension, matchesMpegTs } from './mpegts-sniff.ts';
 import { type TsAccessUnit, type TsParse, type TsTrack, parseTs } from './ts-parse.ts';
 import { MpegTsMuxer } from './ts-write.ts';
 
-const TS_MIMES = new Set([
-  'video/mp2t',
-  'video/MP2T',
-  'video/mpeg',
-  'application/x-mpegts',
-  'audio/mp2t',
-]);
-const TS_EXTENSIONS = new Set(['ts', 'm2ts', 'mts', 'm2t']);
 const MICROSECONDS_PER_SECOND = 1_000_000;
 
 interface NormalizedTrimRange {
@@ -98,7 +90,7 @@ function capabilityDetail(extra: Record<string, unknown>): Record<string, unknow
 
 function assertStreamCopyOptions(options: StreamCopyOptions | undefined): void {
   const target = options?.container?.toLowerCase();
-  if (target !== undefined && !TS_EXTENSIONS.has(target)) {
+  if (target !== undefined && !isMpegTsExtension(target)) {
     throw new CapabilityError(
       'capability-miss',
       `MPEG-TS stream-copy cannot write '${options?.container}' output.`,
@@ -323,17 +315,6 @@ function packetStream(
   /* v8 ignore stop */
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && TS_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && TS_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head && head.byteLength >= 189) {
-    // Two sync bytes one 188-packet apart is a strong, cheap TS signal (the magic byte alone is common).
-    if (head[0] === 0x47 && head[188] === 0x47) return true;
-  }
-  return false;
-}
-
 /** Parse the source into the track table + per-PID access units (shared by `probe` and `demux`). */
 async function parse(src: ByteSource, signal: AbortSignal | undefined): Promise<TsParse> {
   return parseTs(await readAll(src, signal));
@@ -343,8 +324,8 @@ export const MpegTsDriver: ContainerDriver = {
   id: 'mpegts',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
-  formats: ['ts', 'm2ts', 'mts'],
-  supports: matches,
+  formats: MPEG_TS_FORMATS,
+  supports: matchesMpegTs,
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const signal = o?.signal;
     const parsed = await parse(src, signal);
@@ -367,8 +348,8 @@ export const MpegTsDriver: ContainerDriver = {
     return streamCopyParsed(parsed, o);
   },
   async decrypt(src: ByteSource, o): Promise<ReadableStream<Uint8Array>> {
-    const { decryptMpegTsSampleAes } = await import('./mpegts-decrypt.ts');
-    return decryptMpegTsSampleAes(src, o);
+    const { decryptMpegTs } = await import('./mpegts-decrypt.ts');
+    return decryptMpegTs(src, o);
   },
   createMuxer(o?: MuxOptions): Muxer {
     return new MpegTsMuxer(o);

@@ -24,8 +24,8 @@ import dav1d from './dav1d-wasm.js';
 /** The dav1d "no display frame for this OBU yet" sentinel (a reordered/hidden frame). */
 const NO_FRAME = 'error in djs_decode';
 
-/** Memoized sibling-wasm bytes (one fetch per session); the URL the driver passes is the source. */
-let wasmBytesPromise;
+/** Memoized sibling-wasm bytes per absolute URL; distinct engine overrides never poison each other. */
+const wasmBytesPromises = new Map();
 
 /**
  * Load the sibling `dav1d_wasm_bg.wasm` bytes from the URL the driver resolves with
@@ -35,20 +35,22 @@ let wasmBytesPromise;
  * @returns {Promise<Uint8Array>}
  */
 function loadWasmBytes(moduleOrPath) {
-  wasmBytesPromise ??= (async () => {
-    const url = moduleOrPath instanceof URL ? moduleOrPath : moduleOrPath?.module_or_path;
-    if (!(url instanceof URL)) throw new Error('dav1d-core: init needs a module_or_path URL');
-    const isNode =
-      typeof globalThis.process !== 'undefined' && globalThis.process.versions?.node !== undefined;
-    if (url.protocol === 'file:' || isNode) {
-      const { readFile } = await import('node:fs/promises');
-      const { fileURLToPath } = await import('node:url');
-      return new Uint8Array(await readFile(fileURLToPath(url)));
-    }
-    const res = await fetch(url);
-    return new Uint8Array(await res.arrayBuffer());
-  })();
-  return wasmBytesPromise;
+  const url = moduleOrPath instanceof URL ? moduleOrPath : moduleOrPath?.module_or_path;
+  if (!(url instanceof URL)) throw new Error('dav1d-core: init needs a module_or_path URL');
+  let promise = wasmBytesPromises.get(url.href);
+  if (promise === undefined) {
+    promise = (async () => {
+      if (url.protocol === 'file:') {
+        const { readFile } = await import('node:fs/promises');
+        const { fileURLToPath } = await import('node:url');
+        return new Uint8Array(await readFile(fileURLToPath(url)));
+      }
+      const res = await fetch(url);
+      return new Uint8Array(await res.arrayBuffer());
+    })();
+    wasmBytesPromises.set(url.href, promise);
+  }
+  return promise;
 }
 
 /**

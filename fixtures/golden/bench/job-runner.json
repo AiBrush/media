@@ -1,0 +1,38 @@
+{
+  "generatedAt": "2026-07-11T19:46:34.304Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 5,
+  "samples": 21,
+  "iterations": 1000,
+  "scenarios": [
+    {
+      "name": "documented trim+resize+output",
+      "medianMs": 4.371375,
+      "p95Ms": 16.01675,
+      "jobsPerSec": 228760.97337794176,
+      "peakProcessHeapMb": 1.1771631240844727
+    },
+    {
+      "name": "canonical seven-transform fusion",
+      "medianMs": 5.162125,
+      "p95Ms": 6.775666,
+      "jobsPerSec": 193718.67205850303,
+      "peakProcessHeapMb": 1.3688592910766602
+    },
+    {
+      "name": "unsafe order plus Blob boundaries",
+      "medianMs": 5.539125,
+      "p95Ms": 6.030084,
+      "jobsPerSec": 180533.92909529933,
+      "peakProcessHeapMb": 1.4206066131591797
+    },
+    {
+      "name": "whole-job typed preflight reject",
+      "medianMs": 3.4225,
+      "p95Ms": 3.779208,
+      "jobsPerSec": 292184.07596785977,
+      "peakProcessHeapMb": 1.2539434432983398
+    }
+  ],
+  "geomeanJobsPerSec": 219883.27614746089
+}

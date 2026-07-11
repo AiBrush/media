@@ -22,7 +22,7 @@
  */
 
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import { type PcmAudio, sampleAt } from './pcm.ts';
+import { type PcmAudio, channelAt, sampleAt } from './pcm.ts';
 
 /**
  * Quality knobs of the prototype windowed-sinc filter. Fixed (not exposed) so every `convert` resample
@@ -238,6 +238,70 @@ function resampleChannelPolyphase(
 }
 
 /**
+ * Stereo specialization of {@link resampleChannelPolyphase}. Both planar channels share the exact phase,
+ * boundary, and coefficient traversal while retaining independent accumulators in the scalar tap order.
+ */
+function resampleStereoPolyphase(
+  left: Float64Array,
+  right: Float64Array,
+  outFrames: number,
+  bank: PolyphaseBank,
+  signal: AbortSignal | undefined,
+): [Float64Array, Float64Array] {
+  const leftOut = new Float64Array(outFrames);
+  const rightOut = new Float64Array(outFrames);
+  const kernels = bank.kernels;
+  const baseIncrements = bank.baseIncrements;
+  const nextPhases = bank.nextPhases;
+  let base = 0;
+  let phase = 0;
+  throwIfAborted(signal);
+  for (let frame = 0; frame < outFrames; frame++) {
+    if ((frame & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+    const kernel = kernels[phase] as PolyphaseKernel;
+    const { coeffs } = kernel;
+    const tapCount = coeffs.length;
+    const start = base + kernel.firstOffset;
+    let leftAcc = 0;
+    let rightAcc = 0;
+    if (start >= 0 && start + tapCount <= left.length && start + tapCount <= right.length) {
+      let tap = 0;
+      let input = start;
+      const unrolled = tapCount - (tapCount & 3);
+      for (; tap < unrolled; tap += 4, input += 4) {
+        leftAcc +=
+          (left[input] as number) * (coeffs[tap] as number) +
+          (left[input + 1] as number) * (coeffs[tap + 1] as number) +
+          (left[input + 2] as number) * (coeffs[tap + 2] as number) +
+          (left[input + 3] as number) * (coeffs[tap + 3] as number);
+        rightAcc +=
+          (right[input] as number) * (coeffs[tap] as number) +
+          (right[input + 1] as number) * (coeffs[tap + 1] as number) +
+          (right[input + 2] as number) * (coeffs[tap + 2] as number) +
+          (right[input + 3] as number) * (coeffs[tap + 3] as number);
+      }
+      for (; tap < tapCount; tap++, input++) {
+        leftAcc += (left[input] as number) * (coeffs[tap] as number);
+        rightAcc += (right[input] as number) * (coeffs[tap] as number);
+      }
+    } else {
+      for (let tap = 0, input = start; tap < tapCount; tap++, input++) {
+        const coefficient = coeffs[tap] as number;
+        if (input >= 0 && input < left.length) leftAcc += (left[input] as number) * coefficient;
+        if (input >= 0 && input < right.length) {
+          rightAcc += (right[input] as number) * coefficient;
+        }
+      }
+    }
+    leftOut[frame] = leftAcc;
+    rightOut[frame] = rightAcc;
+    base += baseIncrements[phase] as number;
+    phase = nextPhases[phase] as number;
+  }
+  return [leftOut, rightOut];
+}
+
+/**
  * Resample one channel to `outFrames` samples. `ratio = outRate/inRate`; `cutoff = min(1, ratio)` shrinks
  * the kernel in input-space when downsampling so its cutoff drops to the **output** Nyquist (anti-alias).
  */
@@ -303,6 +367,14 @@ export function resample(
   const planar =
     bank === undefined
       ? audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table, options.signal))
-      : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank, options.signal));
+      : audio.channels === 2
+        ? resampleStereoPolyphase(
+            channelAt(audio.planar, 0),
+            channelAt(audio.planar, 1),
+            outFrames,
+            bank,
+            options.signal,
+          )
+        : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank, options.signal));
   return { sampleRate: outRate, channels: audio.channels, frames: outFrames, planar };
 }

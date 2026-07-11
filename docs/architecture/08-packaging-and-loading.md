@@ -48,6 +48,9 @@ Author in **TypeScript (strict)**; emit:
 - Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004).
 - Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103).
 - `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
+- Live input normalization similarly keeps only the tiny `LiveMediaSource` brand/capture/shape module eager;
+  `MediaStreamTrackProcessor` decode/probe and live-convert coordination are separate lazy chunks and are
+  not statically re-exported from the default barrel (ADR-236).
 - `./drivers/*` exists only for the optional "inject a custom/third-party driver" hook; normal usage never imports a driver directly (the router does, lazily).
 - The `browser` map stubs Node builtins that can appear in package-manager or transitive analysis, so a browser-targeted consumer bundle does not silently polyfill `fs`, `path`, `crypto`, `worker_threads`, or CommonJS module loaders (ADR-111).
 
@@ -76,7 +79,7 @@ const { instance } = await WebAssembly.instantiateStreaming(fetch(url), imports)
 
 - The consumer's bundler (Vite, webpack 5, Rollup, esbuild, Parcel) recognizes `new URL('…', import.meta.url)`, **copies the `.wasm` into the app's `dist/` as a hashed asset, and rewrites the URL** — same-origin, no CDN, no manual copy step.
 - Loaded with `instantiateStreaming` (fastest compile), and **only on a hardware miss** (never in `supports()`).
-- **Escape hatches** (not defaults): `inline: true` build flag base64s a *small* module into its lazy chunk (single-file/strict-CSP only; +~33%, no streaming compile); `assetBaseUrl` overrides the asset root for custom paths/CDN.
+- **Escape hatches** (not defaults): `inline: true` build flag base64s a *small* module into its lazy chunk (single-file/strict-CSP only; +~33%, no streaming compile); `assetBaseUrl` overrides the root for custom **same-origin** paths. Session 12 closes the earlier CDN ambiguity: in an HTTP(S) page, cross-origin, credentialed, and non-HTTP(S) roots are rejected before media/fetch; `file:` is limited to Node/file contexts (ADR-237).
 
 ## 5. Worker bundling
 
@@ -131,6 +134,7 @@ eager WASM inclusion, and drift between the source tree and the npm-published sh
 - WASM **threads** (`SharedArrayBuffer`) require **COOP/COEP** cross-origin isolation — opt-in only (ADR-006); the common path needs neither beyond `wasm-unsafe-eval`.
 - WASM `supports()` probes may import tiny JS glue to prove a core is vendored, but must not fetch or instantiate the `.wasm` asset. The `.wasm` URL is passed only from `createDecoder`/`createEncoder`/`createFilter`, after the router has selected that miss-only tier and the runtime profile has been resolved.
 - Same-origin assets avoid the CORS/CRP allowlisting a cross-origin CDN would require.
+- A supplied `assetBaseUrl` is resolved against `document.baseURI`/`location`, normalized as an absolute query/hash-free directory, then serialized unchanged into workers. Every external first-party WASM loader resolves its static filename through the shared resolver and memoizes by `profile.kind + absolute asset URL`. With no override, the literal `new URL('./core.wasm', import.meta.url)` object is passed through unchanged, retaining bundler hashing and zero default behavior drift. Support probes still never call the resolver or fetch a core (ADR-237).
 
 ## 10. Versioning & release
 

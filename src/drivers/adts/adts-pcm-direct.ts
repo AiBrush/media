@@ -113,7 +113,7 @@ export async function tryDecodeWasmAacToS16Wav(
   layout: AdtsLayout,
   o: PcmTransform | undefined,
 ): Promise<Uint8Array<ArrayBuffer> | undefined> {
-  const core = await loadAacCore();
+  const core = await loadAacCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
   if (core === null) return undefined;
   let decoder: ReturnType<typeof core.createDecoder> | undefined;
   try {

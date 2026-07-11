@@ -87,6 +87,11 @@ export class WavMuxer implements Muxer {
     return Promise.resolve();
   }
 
+  writePcm(trackId: number, data: Uint8Array): Promise<void> {
+    this.addChunkStruct(trackId, { data });
+    return Promise.resolve();
+  }
+
   addChunkStruct(trackId: number, chunk: WavChunkStruct): void {
     this.#assertOpen();
     const track = this.#track;

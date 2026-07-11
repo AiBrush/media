@@ -21,9 +21,13 @@ function matchesHint(
   extensions: ReadonlySet<string>,
 ): boolean {
   return (
-    (q.mime !== undefined && mimes.has(q.mime)) ||
+    (q.mime !== undefined && mimes.has(normalizeMime(q.mime))) ||
     (q.extension !== undefined && extensions.has(q.extension.toLowerCase()))
   );
+}
+
+function normalizeMime(value: string): string {
+  return value.split(';', 1)[0]?.trim().toLowerCase() ?? '';
 }
 
 function tag(bytes: Uint8Array, offset: number, value: string): boolean {

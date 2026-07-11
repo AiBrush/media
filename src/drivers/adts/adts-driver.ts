@@ -14,6 +14,7 @@ import {
   type ByteSource,
   type ContainerDriver,
   DRIVER_API_VERSION,
+  type DecryptParams,
   type Demuxer,
   type DriverModule,
   type MuxOptions,
@@ -32,7 +33,12 @@ import { fromURL } from '../../sources/source.ts';
 import { matchesAdts } from '../audio-container-sniff.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
-import { type AdtsWalkStats, probeAdtsStream, walkAdtsBuffer } from './adts-frames.ts';
+import {
+  type AdtsWalkStats,
+  adtsHeadOffset,
+  probeAdtsStream,
+  walkAdtsBuffer,
+} from './adts-frames.ts';
 import { AdtsMuxer } from './adts-mux.ts';
 
 const NATIVE_AAC_TRIED = ['webcodecs-audio'] as const;
@@ -236,6 +242,25 @@ function readLayout(bytes: Uint8Array): AdtsLayout {
   };
 }
 
+/** A decrypt oracle is intentionally stricter than resilient demux: no arbitrary pre-frame resync. */
+function assertDecryptedAdtsSegment(bytes: Uint8Array): void {
+  const expectedFirstOffset = adtsHeadOffset(bytes);
+  let actualFirstOffset: number | undefined;
+  const stats = walkAdtsBuffer(bytes, (frame) => {
+    actualFirstOffset ??= frame.offset;
+  });
+  if (
+    expectedFirstOffset === undefined ||
+    actualFirstOffset !== expectedFirstOffset ||
+    stats.truncated
+  ) {
+    throw new InputError(
+      'unsupported-input',
+      'HLS AES-128 plaintext is not a complete ADTS segment with a valid leading frame or ID3 prefix',
+    );
+  }
+}
+
 export function adtsPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
   const layout = readLayout(bytes);
   return {
@@ -349,7 +374,7 @@ function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
 }
 
 function assertAdtsStreamCopyTarget(container: string | undefined): void {
-  if (container === undefined || container === 'adts') return;
+  if (container === undefined || container === 'adts' || container === 'aac') return;
   throw new CapabilityError('capability-miss', `ADTS stream-copy cannot write '${container}'`, {
     op: { op: 'streamCopy', container },
     tried: ['adts'],
@@ -564,9 +589,9 @@ function wasmUnavailable(reason: string): CapabilityError {
 async function decodeWasmAacToPcm(
   bytes: Uint8Array,
   layout: AdtsLayout,
-  signal: AbortSignal | undefined,
+  o: PcmTransform | undefined,
 ): Promise<PcmAudio> {
-  const core = await loadAacCore();
+  const core = await loadAacCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
   if (core === null) throw wasmUnavailable('core is unavailable');
   const chunks: PcmAudio[] = [];
   let decoder: ReturnType<typeof core.createDecoder> | undefined;
@@ -575,7 +600,7 @@ async function decodeWasmAacToPcm(
     const channels = decoder.channels;
     const sampleRate = decoder.sampleRate;
     for (const frame of layout.frames) {
-      throwIfAborted(signal);
+      throwIfAborted(o?.signal);
       chunks.push(
         pcmFromInterleavedF32(decoder.decode(payload(bytes, frame)), channels, sampleRate),
       );
@@ -639,7 +664,7 @@ async function decodeAacToPcmWithLayout(
     }
     if (rung === 'wasm-aac') {
       try {
-        return await decodeWasmAacToPcm(bytes, layout, o?.signal);
+        return await decodeWasmAacToPcm(bytes, layout, o);
       } catch (e) {
         if (!(e instanceof CapabilityError)) throw e;
         wasmMiss = e;
@@ -703,7 +728,7 @@ export const AdtsDriver = {
   id: 'adts',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
-  formats: ['adts'],
+  formats: ['adts', 'aac'],
   supports: matchesAdts,
   validatesStreamCopyTrim: true,
   /**
@@ -762,6 +787,22 @@ export const AdtsDriver = {
       start(c): void {
         c.enqueue(out);
         c.close();
+      },
+    });
+  },
+  async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
+    if (o.scheme !== 'hls-aes128') {
+      throw new CapabilityError('capability-miss', `ADTS decrypt does not support '${o.scheme}'`, {
+        op: 'decrypt',
+        tried: ['adts'],
+      });
+    }
+    const { decryptHlsAes128ContainerSegment } = await import('../hls-full-segment-decrypt.ts');
+    return decryptHlsAes128ContainerSegment(src, o, {
+      driverId: 'adts',
+      containerLabel: 'ADTS',
+      validate(clear): void {
+        assertDecryptedAdtsSegment(clear);
       },
     });
   },

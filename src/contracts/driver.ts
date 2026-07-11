@@ -45,10 +45,14 @@ export interface WasmRuntimeProfile {
 export interface StageOptions {
   signal?: AbortSignal;
   onProgress?: (p: Progress) => void;
-  /** `force-software` drops the hardware/gpu tiers for cross-machine reproducibility. */
+  /** `force-software` requires a proved non-hardware codec/filter path for reproducibility. */
   determinism?: Determinism;
   /** WASM execution profile. Omitted means drivers resolve ADR-006 from the current runtime. */
   wasmRuntime?: WasmRuntimeProfile;
+  /** Normalized absolute same-origin directory used only when resolving a selected WASM asset. */
+  wasmAssetBaseUrl?: string;
+  /** Exact ADR-014 route pin, retained so nested stage routes inherit the caller's strategy. */
+  pinDriver?: string;
 }
 
 /** Monotonic progress signal derived from timestamps against a known duration. */
@@ -154,6 +158,12 @@ export interface CodecSupport {
   reason?: string;
 }
 
+/** Selection facts a codec capability probe must honor before a coder is constructed. */
+export interface CodecSupportOptions {
+  /** Require an explicitly non-hardware capability verdict when set to `force-software`. */
+  readonly determinism?: Determinism;
+}
+
 /**
  * Decode or encode exactly one codec on one substrate. A coder is a `TransformStream`: it configures
  * its WebCodecs/WASM object on start, processes each chunk, and flushes on writable close. Cancellation
@@ -163,7 +173,7 @@ export interface CodecDriver extends DriverBase {
   readonly kind: 'codec';
   readonly tier: Tier;
   /** Cheap, honest capability check (wraps `isConfigSupported`); returns `false`, never throws later. */
-  supports(q: CodecQuery): Promise<CodecSupport>;
+  supports(q: CodecQuery, o?: CodecSupportOptions): Promise<CodecSupport>;
   createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame>;
   createEncoder(c: EncoderConfig, o?: StageOptions): TransformStream<RawFrame, EncodedChunk>;
 }
@@ -311,6 +321,8 @@ export interface Muxer {
   readonly output: ReadableStream<Uint8Array>;
   addTrack(info: TrackInfo): number;
   write(trackId: number, packet: Packet): Promise<void>;
+  /** Optional raw-PCM frame seam; bytes must match the added track's declared PCM wire layout. */
+  writePcm?(trackId: number, data: Uint8Array): Promise<void>;
   finalize(): Promise<void>;
 }
 
@@ -459,6 +471,12 @@ export interface ContainerDriver extends DriverBase {
    * a typed capability miss before constructing frames. Absent ⇒ the WebCodecs/WASM codec seam.
    */
   decodePcmAudio?(src: ByteSource, o?: StageOptions): Promise<PcmAudio>;
+  /**
+   * Optional bounded raw-PCM decode stream. Each emitted {@link PcmAudio} is a canonical planar chunk;
+   * the engine owns the browser `AudioData` framing and closes consumer-owned frames exactly once.
+   * Drivers should use source ranges when available and may fall back to one full canonical chunk.
+   */
+  decodePcmAudioStream?(src: ByteSource, o?: StageOptions): Promise<ReadableStream<PcmAudio>>;
 }
 
 // ============ 3) FilterDriver ============
@@ -473,6 +491,7 @@ export type FilterSpec =
       fit?: 'contain' | 'cover' | 'fill';
     }
   | { mediaType: 'video'; type: 'crop'; x: number; y: number; width: number; height: number }
+  | { mediaType: 'video'; type: 'pad'; x: number; y: number; width: number; height: number }
   | { mediaType: 'video'; type: 'rotate'; degrees: 0 | 90 | 180 | 270 }
   | { mediaType: 'video'; type: 'flip'; axis: 'h' | 'v' }
   | { mediaType: 'video'; type: 'colorspace'; to: string }

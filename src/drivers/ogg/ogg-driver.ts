@@ -168,14 +168,21 @@ function maxGranule(dv: DataView, serial: number): number {
 
 const MICROS_PER_SECOND = 1_000_000;
 
+/** One contiguous payload span inside an Ogg page body (never includes page headers or lacing bytes). */
+export interface OggPacketSpan {
+  readonly offset: number;
+  readonly size: number;
+}
+
 /**
- * One de-laced Ogg **packet** of a logical stream: its byte span in the source plus how many segments
- * completed it. `complete` is false only for the final packet when the file is truncated mid-packet
- * (last page's last segment was 255 with no continuation) — those are dropped, not emitted.
+ * One de-laced Ogg **packet** of a logical stream. A packet that continues onto another page owns multiple
+ * ordered payload spans because intervening page headers/lacing bytes are not part of its coded payload.
+ * `complete` is false only for the final packet when the file is truncated mid-packet (last page's last
+ * segment was 255 with no continuation) — those are dropped, not emitted.
  */
 interface RawPacket {
-  offset: number;
-  size: number;
+  readonly spans: readonly OggPacketSpan[];
+  readonly size: number;
   /** The page granule_position carried on the page where this packet *completed* (-1 ⇒ none). */
   pageGranule: number;
   complete: boolean;
@@ -189,8 +196,8 @@ interface RawPacket {
  */
 function delacePackets(dv: DataView, serial: number): RawPacket[] {
   const packets: RawPacket[] = [];
-  // A packet may span pages; we accumulate its [start,end) byte span across continuation pages.
-  let pendingStart = -1;
+  // A packet may span pages; retain only the actual page-body spans, never intervening page structures.
+  let pendingSpans: OggPacketSpan[] = [];
   let pendingSize = 0;
   let at = 0;
   while (at + 27 <= dv.byteLength) {
@@ -213,35 +220,45 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
       continue;
     }
     // De-lace this page's segment table. A run of segments forms one packet that ends on the first <255.
-    // A run carried in from the previous page (HT_CONTINUED) resumes from `pending*`.
+    // A run carried in from the previous page (HT_CONTINUED) resumes from `pendingSpans`.
     let segOffset = body;
-    let runStart = pendingStart >= 0 ? pendingStart : body;
+    let runSpans = pendingSpans;
     let runSize = pendingSize;
-    pendingStart = -1;
+    pendingSpans = [];
     pendingSize = 0;
     for (let i = 0; i < segCount; i++) {
       const lace = dv.getUint8(at + 27 + i);
-      if (runStart < 0) runStart = segOffset;
+      if (lace > 0) appendPacketSpan(runSpans, segOffset, lace);
       runSize += lace;
       segOffset += lace;
       if (lace < 255) {
-        packets.push({ offset: runStart, size: runSize, pageGranule: granule, complete: true });
-        runStart = -1;
+        packets.push({ spans: runSpans, size: runSize, pageGranule: granule, complete: true });
+        runSpans = [];
         runSize = 0;
       }
     }
     // A run still open at page end (last lace was 255) continues into the next page (HT_CONTINUED).
-    if (runStart >= 0) {
-      pendingStart = runStart;
+    if (runSpans.length > 0) {
+      pendingSpans = runSpans;
       pendingSize = runSize;
     }
     at = pageEnd > at ? pageEnd : at + 1;
   }
   // A still-open run at EOF is a truncated trailing packet — record it as incomplete so it is dropped.
-  if (pendingStart >= 0) {
-    packets.push({ offset: pendingStart, size: pendingSize, pageGranule: -1, complete: false });
+  if (pendingSpans.length > 0) {
+    packets.push({ spans: pendingSpans, size: pendingSize, pageGranule: -1, complete: false });
   }
   return packets;
+}
+
+/** Coalesce adjacent laces in one page body while preserving page-boundary discontinuities. */
+function appendPacketSpan(spans: OggPacketSpan[], offset: number, size: number): void {
+  const prior = spans[spans.length - 1];
+  if (prior !== undefined && prior.offset + prior.size === offset) {
+    spans[spans.length - 1] = { offset: prior.offset, size: prior.size + size };
+    return;
+  }
+  spans.push({ offset, size });
 }
 
 /** Opus TOC frame-size table (config 0..31 → frame duration in 48 kHz samples), RFC 6716 §3.1. */
@@ -251,24 +268,56 @@ const OPUS_FRAME_SAMPLES: readonly number[] = [
   480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
 ];
 
+/** Read one payload byte by packet-relative index without assembling a continued packet. */
+function packetByte(dv: DataView, packet: RawPacket, index: number): number | undefined {
+  if (index < 0 || index >= packet.size) return undefined;
+  let remaining = index;
+  for (const span of packet.spans) {
+    if (remaining < span.size) return dv.getUint8(span.offset + remaining);
+    remaining -= span.size;
+  }
+  return undefined;
+}
+
+function packetAscii(dv: DataView, packet: RawPacket, offset: number, length: number): string {
+  let out = '';
+  for (let index = 0; index < length; index += 1) {
+    const byte = packetByte(dv, packet, offset + index);
+    if (byte === undefined) return '';
+    out += String.fromCharCode(byte);
+  }
+  return out;
+}
+
 /** Decode an Opus packet's output sample count (at 48 kHz) from its TOC byte (RFC 6716 §3.1). */
-function opusPacketSamples(dv: DataView, offset: number, size: number): number {
-  if (size < 1) return 0;
-  const toc = dv.getUint8(offset);
+function opusPacketSamples(dv: DataView, packet: RawPacket): number {
+  if (packet.size < 1) return 0;
+  const toc = packetByte(dv, packet, 0) ?? 0;
   const frameSamples = OPUS_FRAME_SAMPLES[toc >> 3] ?? 960;
   const code = toc & 0x03; // frame-packing code: 0=1 frame, 1/2=2 frames, 3=arbitrary count (byte 1 &0x3f)
   let frames = 1;
   if (code === 1 || code === 2) frames = 2;
-  else if (code === 3) frames = size >= 2 ? dv.getUint8(offset + 1) & 0x3f : 1;
+  else if (code === 3) frames = packet.size >= 2 ? (packetByte(dv, packet, 1) ?? 1) & 0x3f : 1;
   return frameSamples * (frames > 0 ? frames : 1);
 }
 
-/** A framed audio packet ready for the browser block: byte span + presentation/duration in µs. */
+/** A framed audio packet ready for the browser block: payload spans + presentation/duration in µs. */
 export interface OggPacket {
-  offset: number;
-  size: number;
-  ptsUs: number;
-  durationUs: number;
+  /** Present only when the complete payload is one contiguous source range. */
+  readonly offset?: number;
+  readonly spans: readonly OggPacketSpan[];
+  readonly size: number;
+  readonly ptsUs: number;
+  readonly durationUs: number;
+}
+
+/** Ogg's packet-info row retains payload spans privately needed by its live demux stream. */
+export interface OggPacketInfoMetadata extends PacketInfoMetadata {
+  readonly spans: readonly OggPacketSpan[];
+}
+
+export interface OggPacketInfoTable extends Omit<PacketInfoTable, 'packets'> {
+  readonly packets: readonly OggPacketInfoMetadata[];
 }
 
 /**
@@ -282,10 +331,10 @@ function headerPacketCount(codec: string, dv: DataView, raw: readonly RawPacket[
     if (
       first &&
       first.size >= 9 &&
-      dv.getUint8(first.offset) === 0x7f &&
-      asciiAt(dv, first.offset + 1, 4) === 'FLAC'
+      packetByte(dv, first, 0) === 0x7f &&
+      packetAscii(dv, first, 1, 4) === 'FLAC'
     ) {
-      return 1 + ((dv.getUint8(first.offset + 7) << 8) | dv.getUint8(first.offset + 8));
+      return 1 + (((packetByte(dv, first, 7) ?? 0) << 8) | (packetByte(dv, first, 8) ?? 0));
     }
   }
   return 2; // opus, or a malformed FLAC stream that identifyStream should already have rejected.
@@ -309,8 +358,50 @@ function firstRecognizedStream(dv: DataView): OggStream | undefined {
   return undefined;
 }
 
-function packetBytes(data: Uint8Array, packet: RawPacket): Uint8Array {
-  return data.slice(packet.offset, packet.offset + packet.size);
+function contiguousPacketOffset(packet: {
+  readonly spans: readonly OggPacketSpan[];
+  readonly size: number;
+}): number | undefined {
+  const span = packet.spans[0];
+  return packet.spans.length === 1 && span?.size === packet.size ? span.offset : undefined;
+}
+
+/** Return one exact coded payload; continued packets are assembled without page headers/lacing bytes. */
+export function oggPacketBytes(
+  data: Uint8Array,
+  packet: { readonly spans: readonly OggPacketSpan[]; readonly size: number },
+): Uint8Array {
+  const offset = contiguousPacketOffset(packet);
+  if (offset !== undefined) {
+    const end = offset + packet.size;
+    if (offset < 0 || packet.size < 0 || end > data.byteLength) {
+      throw new MediaError('demux-error', 'Ogg packet payload span is out of bounds');
+    }
+    return data.subarray(offset, end);
+  }
+  const out = new Uint8Array(packet.size);
+  let written = 0;
+  for (const span of packet.spans) {
+    const end = span.offset + span.size;
+    if (
+      span.offset < 0 ||
+      span.size < 0 ||
+      end > data.byteLength ||
+      written + span.size > out.byteLength
+    ) {
+      throw new MediaError('demux-error', 'Ogg packet payload span is out of bounds');
+    }
+    out.set(data.subarray(span.offset, end), written);
+    written += span.size;
+  }
+  if (written !== packet.size) {
+    throw new MediaError('demux-error', 'Ogg packet payload spans do not match its declared size');
+  }
+  return out;
+}
+
+function ownedPacketBytes(data: Uint8Array, packet: RawPacket): Uint8Array {
+  return oggPacketBytes(data, packet).slice();
 }
 
 function xiphLacedHeaders(headers: readonly Uint8Array[]): Uint8Array | undefined {
@@ -347,16 +438,16 @@ function codecPrivateDescription(data: Uint8Array): Uint8Array | undefined {
   const raw = delacePackets(dv, stream.serial).filter((p) => p.complete);
   if (stream.codec === 'opus') {
     const opusHead = raw[0];
-    return opusHead ? packetBytes(data, opusHead) : undefined;
+    return opusHead ? ownedPacketBytes(data, opusHead) : undefined;
   }
   if (stream.codec === 'vorbis') {
-    const headers = raw.slice(0, 3).map((p) => packetBytes(data, p));
+    const headers = raw.slice(0, 3).map((p) => ownedPacketBytes(data, p));
     return xiphLacedHeaders(headers);
   }
   if (stream.codec === 'flac') {
     const first = raw[0];
     if (!first) return undefined;
-    const firstBytes = packetBytes(data, first);
+    const firstBytes = ownedPacketBytes(data, first);
     if (
       firstBytes.byteLength < 13 ||
       firstBytes[0] !== 0x7f ||
@@ -367,15 +458,16 @@ function codecPrivateDescription(data: Uint8Array): Uint8Array | undefined {
     }
     const headerPackets = ((firstBytes[7] ?? 0) << 8) | (firstBytes[8] ?? 0);
     const metadata: Uint8Array<ArrayBufferLike>[] = [firstBytes.slice(9)];
-    for (const packet of raw.slice(1, 1 + headerPackets)) metadata.push(packetBytes(data, packet));
+    for (const packet of raw.slice(1, 1 + headerPackets))
+      metadata.push(ownedPacketBytes(data, packet));
     return concatBytes(metadata);
   }
   return undefined;
 }
 
 /**
- * Enumerate the **audio** packets of the first recognized Ogg stream as {@link OggPacket}s (offset/size +
- * PTS/duration in µs). Pure — no WebCodecs — so it is the unit under test. Timing is anchored to the
+ * Enumerate the **audio** packets of the first recognized Ogg stream as {@link OggPacket}s (ordered
+ * payload spans/size + PTS/duration in µs). Pure — no WebCodecs — so it is the unit under test. Timing is anchored to the
  * container's page granules:
  *
  * - **Opus** (deterministic): per-packet sample counts come from the TOC byte; the running decode granule
@@ -408,10 +500,9 @@ export function oggAudioPackets(data: Uint8Array): OggPacket[] {
     // Opus: exact per-packet samples from the TOC; PTS = running start granule − pre_skip.
     let startGranule = -preSkip;
     for (const p of audio) {
-      const samples = opusPacketSamples(dv, p.offset, p.size);
+      const samples = opusPacketSamples(dv, p);
       out.push({
-        offset: p.offset,
-        size: p.size,
+        ...oggPacketLocation(p),
         ptsUs: Math.round((startGranule / rate) * MICROS_PER_SECOND),
         durationUs: Math.round((samples / rate) * MICROS_PER_SECOND),
       });
@@ -439,8 +530,7 @@ export function oggAudioPackets(data: Uint8Array): OggPacket[] {
       const p = audio[i + k];
       if (!p) continue;
       out.push({
-        offset: p.offset,
-        size: p.size,
+        ...oggPacketLocation(p),
         ptsUs: Math.round((startSamples / rate) * MICROS_PER_SECOND),
         durationUs: Math.round(((endSamples - startSamples) / rate) * MICROS_PER_SECOND),
       });
@@ -449,6 +539,15 @@ export function oggAudioPackets(data: Uint8Array): OggPacket[] {
     i = j;
   }
   return out;
+}
+
+function oggPacketLocation(packet: RawPacket): Pick<OggPacket, 'offset' | 'spans' | 'size'> {
+  const offset = contiguousPacketOffset(packet);
+  return {
+    spans: packet.spans,
+    size: packet.size,
+    ...(offset === undefined ? {} : { offset }),
+  };
 }
 
 /** Read the Opus `pre_skip` (16-bit LE at OpusHead+10) from the BOS page of `serial`; 0 if absent. */
@@ -525,24 +624,28 @@ export function parseOgg(head: Uint8Array, tail?: Uint8Array): OggInfo {
   };
 }
 
-export function oggPacketInfoTable(data: Uint8Array): PacketInfoTable {
+export function oggPacketInfoTable(data: Uint8Array): OggPacketInfoTable {
   const info = parseOgg(data);
-  const packets = oggAudioPackets(data).map((packet) => ({
-    trackIndex: 0,
-    offset: packet.offset,
-    size: packet.size,
-    ptsUs: packet.ptsUs,
-    dtsUs: packet.ptsUs,
-    durationUs: packet.durationUs,
-    keyframe: true,
-  }));
+  const packets: OggPacketInfoMetadata[] = oggAudioPackets(data).map((packet) => {
+    const { offset } = packet;
+    return {
+      trackIndex: 0,
+      spans: packet.spans,
+      ...(offset === undefined ? {} : { offset }),
+      size: packet.size,
+      ptsUs: packet.ptsUs,
+      dtsUs: packet.ptsUs,
+      durationUs: packet.durationUs,
+      keyframe: true,
+    };
+  });
   return {
     tracks: [trackFromInfo(info, codecPrivateDescription(data))],
     packets,
   };
 }
 
-export function oggPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
+export function oggPacketInfoFromBytes(bytes: Uint8Array): OggPacketInfoTable {
   return oggPacketInfoTable(bytes);
 }
 
@@ -621,13 +724,9 @@ function writeOggPacketCopyTrim(
   const chunks: ChunkStruct[] = [];
   let baseUs: number | undefined;
   for (const packet of table.packets) {
-    const offset = packet.offset;
     const durationUs = packet.durationUs;
-    if (offset === undefined || durationUs === undefined) {
-      throw new MediaError(
-        'demux-error',
-        'Ogg trim packet table is missing byte or duration facts',
-      );
+    if (durationUs === undefined) {
+      throw new MediaError('demux-error', 'Ogg trim packet table is missing duration facts');
     }
     const packetStartUs = Math.round(packet.ptsUs);
     const packetDurationUs = Math.round(durationUs);
@@ -638,7 +737,7 @@ function writeOggPacketCopyTrim(
       timestampUs: Math.max(0, packetStartUs - baseUs),
       durationUs: packetDurationUs,
       key: packet.keyframe,
-      data: bytes.subarray(offset, offset + packet.size),
+      data: oggPacketBytes(bytes, packet),
     });
   }
   if (chunks.length === 0) throw new MediaError('mux-error', 'Ogg trim selected no audio packets');
@@ -715,7 +814,7 @@ async function readAll(src: ByteSource): Promise<Uint8Array> {
  */
 function packetStreamFromInfo(
   data: Uint8Array,
-  packets: readonly PacketInfoMetadata[],
+  packets: readonly OggPacketInfoMetadata[],
   signal: AbortSignal | undefined,
 ): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
@@ -738,15 +837,11 @@ function packetStreamFromInfo(
         controller.close();
         return;
       }
-      if (packet.offset === undefined) {
-        controller.error(new MediaError('demux-error', 'Ogg packet is missing source byte offset'));
-        return;
-      }
       i++;
       const init: EncodedAudioChunkInit = {
         type: 'key', // every Ogg audio packet is independently a sync sample
         timestamp: packet.ptsUs,
-        data: data.subarray(packet.offset, packet.offset + packet.size),
+        data: oggPacketBytes(data, packet),
       };
       if (packet.durationUs !== undefined) init.duration = packet.durationUs;
       const chunk = new EncodedAudioChunk(init);

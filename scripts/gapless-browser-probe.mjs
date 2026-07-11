@@ -1,5 +1,5 @@
-import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
 import { chromium } from '../../media-test/node_modules/playwright/index.mjs';
 
@@ -50,105 +50,111 @@ try {
     '/private/tmp/gapless-candidates/chromium-bear-1280x720.mp4',
     '/private/tmp/gapless-candidates/chromium-bear.mp4',
   ];
-  const results = await page.evaluate(async ({ port, files: paths }) => {
-    const { createMedia } = await import('/media/dist/index.js');
-    const rows = [];
-    for (const path of paths) {
-      try {
-      const url = path.startsWith('/private/tmp/')
-        ? `http://127.0.0.1:${port}/gapless-candidates/${path.split('/').at(-1)}`
-        : `http://127.0.0.1:${port}${path}`;
-      const bytes = await (await fetch(url)).arrayBuffer();
-      const demuxed = await createMedia().demux(bytes);
-      const track = demuxed.tracks.find((candidate) => candidate.mediaType === 'audio');
-      if (track?.config === undefined) throw new Error(`no audio config for ${path}`);
-      const nativeRows = [];
-      let nativeError;
-      const decoder = new AudioDecoder({
-        output(frame) {
-          nativeRows.push({
-            timestamp: frame.timestamp,
-            frames: frame.numberOfFrames,
-            rate: frame.sampleRate,
+  const results = await page.evaluate(
+    async ({ port, files: paths }) => {
+      const { createMedia } = await import('/media/dist/index.js');
+      const rows = [];
+      for (const path of paths) {
+        try {
+          const url = path.startsWith('/private/tmp/')
+            ? `http://127.0.0.1:${port}/gapless-candidates/${path.split('/').at(-1)}`
+            : `http://127.0.0.1:${port}${path}`;
+          const bytes = await (await fetch(url)).arrayBuffer();
+          const demuxed = await createMedia().demux(bytes);
+          const track = demuxed.tracks.find((candidate) => candidate.mediaType === 'audio');
+          if (track?.config === undefined) throw new Error(`no audio config for ${path}`);
+          const nativeRows = [];
+          let nativeError;
+          const decoder = new AudioDecoder({
+            output(frame) {
+              nativeRows.push({
+                timestamp: frame.timestamp,
+                frames: frame.numberOfFrames,
+                rate: frame.sampleRate,
+              });
+              frame.close();
+            },
+            error(error) {
+              nativeError = String(error);
+            },
           });
-          frame.close();
-        },
-        error(error) {
-          nativeError = String(error);
-        },
-      });
-      decoder.configure(track.config);
-      const packets = demuxed.packets(track.id).getReader();
-      const packetRows = [];
-      let firstNegativePacket;
-      for (;;) {
-        const next = await packets.read();
-        if (next.done) break;
-        packetRows.push({
-          timestamp: next.value.chunk.timestamp,
-          duration: next.value.chunk.duration,
-          type: next.value.chunk.type,
-        });
-        if (firstNegativePacket === undefined && next.value.chunk.timestamp < 0) {
-          firstNegativePacket = next.value.chunk;
+          decoder.configure(track.config);
+          const packets = demuxed.packets(track.id).getReader();
+          const packetRows = [];
+          let firstNegativePacket;
+          for (;;) {
+            const next = await packets.read();
+            if (next.done) break;
+            packetRows.push({
+              timestamp: next.value.chunk.timestamp,
+              duration: next.value.chunk.duration,
+              type: next.value.chunk.type,
+            });
+            if (firstNegativePacket === undefined && next.value.chunk.timestamp < 0) {
+              firstNegativePacket = next.value.chunk;
+            }
+            decoder.decode(next.value.chunk);
+          }
+          await decoder.flush();
+          decoder.close();
+          const prefixRows = [];
+          if (firstNegativePacket !== undefined) {
+            const prefixDecoder = new AudioDecoder({
+              output(frame) {
+                prefixRows.push(frame.numberOfFrames);
+                frame.close();
+              },
+              error() {},
+            });
+            prefixDecoder.configure(track.config);
+            prefixDecoder.decode(firstNegativePacket);
+            await prefixDecoder.flush();
+            prefixDecoder.close();
+          }
+          await demuxed.close();
+          const reader = createMedia().decode(bytes).audio.getReader();
+          let frames = 0;
+          let samples = 0;
+          let sampleRate;
+          let channels;
+          for (;;) {
+            const next = await reader.read();
+            if (next.done) break;
+            frames += 1;
+            samples += next.value.numberOfFrames;
+            sampleRate = next.value.sampleRate;
+            channels = next.value.numberOfChannels;
+            next.value.close();
+          }
+          rows.push({
+            path,
+            track: { codec: track.codec, gapless: track.gapless },
+            native: {
+              error: nativeError,
+              frames: nativeRows.length,
+              samples: nativeRows.reduce((sum, row) => sum + row.frames, 0),
+              first: nativeRows.slice(0, 3),
+              last: nativeRows.slice(-3),
+            },
+            packets: {
+              count: packetRows.length,
+              first: packetRows.slice(0, 3),
+              last: packetRows.slice(-3),
+            },
+            prefix: {
+              frames: prefixRows.length,
+              samples: prefixRows.reduce((sum, n) => sum + n, 0),
+            },
+            public: { frames, samples, sampleRate, channels },
+          });
+        } catch (error) {
+          rows.push({ path, error: String(error) });
         }
-        decoder.decode(next.value.chunk);
       }
-      await decoder.flush();
-      decoder.close();
-      const prefixRows = [];
-      if (firstNegativePacket !== undefined) {
-        const prefixDecoder = new AudioDecoder({
-          output(frame) {
-            prefixRows.push(frame.numberOfFrames);
-            frame.close();
-          },
-          error() {},
-        });
-        prefixDecoder.configure(track.config);
-        prefixDecoder.decode(firstNegativePacket);
-        await prefixDecoder.flush();
-        prefixDecoder.close();
-      }
-      await demuxed.close();
-      const reader = createMedia().decode(bytes).audio.getReader();
-      let frames = 0;
-      let samples = 0;
-      let sampleRate;
-      let channels;
-      for (;;) {
-        const next = await reader.read();
-        if (next.done) break;
-        frames += 1;
-        samples += next.value.numberOfFrames;
-        sampleRate = next.value.sampleRate;
-        channels = next.value.numberOfChannels;
-        next.value.close();
-      }
-      rows.push({
-        path,
-        track: { codec: track.codec, gapless: track.gapless },
-        native: {
-          error: nativeError,
-          frames: nativeRows.length,
-          samples: nativeRows.reduce((sum, row) => sum + row.frames, 0),
-          first: nativeRows.slice(0, 3),
-          last: nativeRows.slice(-3),
-        },
-        packets: {
-          count: packetRows.length,
-          first: packetRows.slice(0, 3),
-          last: packetRows.slice(-3),
-        },
-        prefix: { frames: prefixRows.length, samples: prefixRows.reduce((sum, n) => sum + n, 0) },
-        public: { frames, samples, sampleRate, channels },
-      });
-      } catch (error) {
-        rows.push({ path, error: String(error) });
-      }
-    }
-    return rows;
-  }, { port: address.port, files });
+      return rows;
+    },
+    { port: address.port, files },
+  );
   console.log(JSON.stringify(results, null, 2));
 } finally {
   await browser.close();

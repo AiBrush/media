@@ -484,3 +484,7 @@ async function main(): Promise<void> {
 }
 
 await main();
+// Bun retains internal WebCrypto worker state after the completed CENC/HLS checks even when its Node-compatible
+// active-handle and active-request inventories are empty. The CLI has fully awaited every check here; mirror
+// the explicit failure exit above so the integrity gate deterministically returns its computed success.
+process.exit(0);

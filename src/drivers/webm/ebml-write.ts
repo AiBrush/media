@@ -24,6 +24,7 @@ import type {
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { matroskaRollFromClockwise, normalizeClockwiseRotation } from '../../util/rotation.ts';
+import { webmVideoCodecPrivate } from './video-codec-qualification.ts';
 
 // ============ Matroska/EBML element IDs (verbatim, marker bits included) ============
 
@@ -694,13 +695,17 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     decoderConfig?.description !== undefined ? toBytes(decoderConfig.description) : undefined;
   if (info.mediaType === 'video') {
     const vc = decoderConfig as VideoDecoderConfig | undefined;
+    const codecPrivate =
+      codecId === 'V_VP9' || codecId === 'V_AV1'
+        ? webmVideoCodecPrivate(codecId, vc?.codec ?? info.codec, sourcePrivate)
+        : sourcePrivate;
     const rotation = normalizeClockwiseRotation(info.rotation);
     const color = colorFromTrack(info, vc);
     return {
       trackNumber,
       mediaType: 'video',
       codecId,
-      codecPrivate: sourcePrivate,
+      codecPrivate,
       ...(info.codecDelayNs !== undefined ? { codecDelayNs: info.codecDelayNs } : {}),
       ...(info.seekPreRollNs !== undefined ? { seekPreRollNs: info.seekPreRollNs } : {}),
       ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),

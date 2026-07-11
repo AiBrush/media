@@ -31,8 +31,8 @@ import type {
   PacketInfoMetadata,
   PacketInfoTable,
   StageOptions,
-  StreamCopyOptions,
   TrackInfo,
+  WasmRuntimeProfile,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
@@ -40,6 +40,7 @@ import { composeChain, lazyPipeThrough } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router, type StageSelectOptions } from '../kernel/router.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
+import { normalizeWasmAssetBaseUrl, resolveWasmRuntimeProfile } from '../kernel/wasm-runtime.ts';
 // Only the tiny, DEPENDENCY-FREE worker-mode selectors are statically imported here, from the dedicated
 // `worker-mode.ts` (NOT `worker-bridge.ts`) so the eager kernel never pulls the heavy worker pump/pool or
 // the offload protocol into its closure (doc 08 §7 budget). The actual worker spawn + ensure-pool + offload
@@ -55,13 +56,18 @@ import {
 } from '../kernel/worker-mode.ts';
 import { toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Sink } from '../sinks/sink.ts';
+import { type LiveMediaSource, isLiveMediaSource } from '../sources/live-source.ts';
 import {
+  type ByteMediaInput,
   type FromOptions,
   type MediaInput,
+  type NormalizedSource,
   SOURCE_CACHE_KEY,
   SOURCE_URL_KEY,
   type Source,
+  cancelSource,
   from as normalizeInput,
+  peekSourceHead,
 } from '../sources/source.ts';
 import type { ChainStep } from './chain.ts';
 import {
@@ -71,11 +77,16 @@ import {
   isPcmContainer,
   isPureStreamCopy,
 } from './codec-routing.ts';
+import type { DecryptRunnerContext } from './decrypt-runner.ts';
+import type { MediaJob } from './job.ts';
+import type { MuxRunnerContext } from './mux-runner.ts';
 // Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
 // routines are reached only through lazy `import()`s on an eligible `to:'flac'`/raw-PCM convert. The
 // engine's `#authoringDeps()` returns the `PcmConvertDeps` superset, which also satisfies the FLAC route's
 // (narrower) deps at its call site, so only this one type is referenced here.
 import type { PcmConvertDeps } from './pcm-convert-plan.ts';
+import type { RemuxRunnerContext } from './remux-runner.ts';
+import type { TrimRunnerContext } from './trim-runner.ts';
 import type {
   AudioTarget,
   CallOptions,
@@ -99,6 +110,8 @@ import type {
   TrimOptions,
   VideoTarget,
 } from './types.ts';
+import type { H264TwoPassRunnerContext } from './video-two-pass-runner.ts';
+import type { H264TwoPassPlan } from './video-two-pass.ts';
 
 const CONTAINER_MIME: Record<string, string> = {
   mp4: 'video/mp4',
@@ -110,10 +123,14 @@ const CONTAINER_MIME: Record<string, string> = {
   mp3: 'audio/mpeg',
   flac: 'audio/flac',
   adts: 'audio/aac',
+  aac: 'audio/aac',
   aiff: 'audio/aiff',
   caf: 'audio/x-caf',
   avi: 'video/x-msvideo',
   ts: 'video/mp2t',
+  m2ts: 'video/mp2t',
+  mts: 'video/mp2t',
+  mpegts: 'video/mp2t',
 };
 const SOURCE_PREFIX_HANDOFF_TTL_MS = 250;
 
@@ -151,12 +168,22 @@ export interface MediaEngine {
   /** Decode and return the single frame at/just-after `timeUs` (frame-accurate seek, doc 09). */
   seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame>;
   decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Cancellable<Output>;
+  /** Execute one fully validated declarative job through the canonical flat operations (ADR-010). */
+  run(job: MediaJob, o?: CallOptions): Cancellable<Blob>;
   preload(...specs: PreloadSpec[]): Promise<void>;
   /** Start an immutable fluent chain over the flat operation API (ADR-010). */
   load(input: MediaInput): MediaChain;
   /** The universal normalizer, exported for optioned sources (ADR-013). */
-  from(input: MediaInput, opts?: FromOptions): Source;
-  source(input: MediaInput): Source;
+  from(input: MediaStream | LiveMediaSource, opts?: FromOptions): LiveMediaSource;
+  from(input: HTMLMediaElement, opts: FromOptions & { readonly mode: 'capture' }): LiveMediaSource;
+  from(input: HTMLMediaElement): Source;
+  from(input: HTMLMediaElement, opts: FromOptions & { readonly mode?: 'bytes' }): Source;
+  from(input: ByteMediaInput, opts?: FromOptions): Source;
+  from(input: HTMLMediaElement, opts: FromOptions): NormalizedSource;
+  from(input: MediaInput, opts?: FromOptions): NormalizedSource;
+  source(input: MediaStream | LiveMediaSource): LiveMediaSource;
+  source(input: ByteMediaInput | HTMLMediaElement): Source;
+  source(input: MediaInput): NormalizedSource;
   /** Inject a custom/third-party driver module (ADR-009 hook). Chainable. */
   use(module: DriverModule): MediaEngine;
 }
@@ -175,29 +202,25 @@ function loadCodecPipeline(): Promise<CodecPipelineModule> {
   return import('./codec-pipeline.ts');
 }
 
-function assertSupportedDecryptScheme(scheme: unknown): asserts scheme is DecryptOptions['scheme'] {
-  switch (scheme) {
-    case 'cenc':
-    case 'cens':
-    case 'cbcs':
-    case 'hls-aes128':
-    case 'hls-sample-aes':
-      return;
-  }
-  throw new CapabilityError('capability-miss', 'bad decrypt', {
-    op: 'decrypt',
-    tried: [],
-  });
+function normalizeByteInput(input: MediaInput, op: string): Source {
+  const normalized = normalizeInput(input);
+  if (!isLiveMediaSource(normalized)) return normalized;
+  throw new CapabilityError(
+    'capability-miss',
+    `${op} requires finite encoded/container bytes and is unavailable for a raw live MediaStream`,
+    { op, tried: ['media-stream/raw-frames'] },
+  );
 }
-
-const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
 
 export class MediaEngineImpl implements MediaEngine {
   readonly #opts: CreateMediaOptions;
+  readonly #wasmRuntime: WasmRuntimeProfile;
+  readonly #wasmAssetBaseUrl: string | undefined;
   readonly #registry = new Registry();
   readonly #router = new Router({ registry: this.#registry });
   readonly #preloadTasks = new Map<string, Promise<void>>();
   #defaultsLoaded = false;
+  #defaultDriversPromise: Promise<void> | undefined;
   /**
    * Worker offload mode for the heavy decode→encode graph (doc 06 §4, ADR-019), resolved once from
    * `worker` + `Worker` availability. `'inline'` everywhere a `Worker` is absent (e.g. Node) — the honest
@@ -216,8 +239,22 @@ export class MediaEngineImpl implements MediaEngine {
   readonly #sourcePrefixHandoff = new Map<string, SourcePrefixHandoff>();
   readonly #repeatedProbePrefixCache = new WeakMap<Source, SourcePrefixHandoff>();
 
-  constructor(opts: CreateMediaOptions = {}) {
+  constructor(
+    opts: CreateMediaOptions = {},
+    resolvedRuntime: {
+      readonly wasmRuntime?: WasmRuntimeProfile;
+      readonly wasmAssetBaseUrl?: string;
+    } = {},
+  ) {
     this.#opts = opts;
+    this.#wasmRuntime =
+      resolvedRuntime.wasmRuntime ??
+      resolveWasmRuntimeProfile(
+        opts.enableThreads === undefined ? {} : { enableThreads: opts.enableThreads },
+      );
+    this.#wasmAssetBaseUrl =
+      resolvedRuntime.wasmAssetBaseUrl ??
+      (opts.assetBaseUrl === undefined ? undefined : normalizeWasmAssetBaseUrl(opts.assetBaseUrl));
     this.#workerMode = selectWorkerMode(opts.worker, workerOffloadAvailable());
   }
 
@@ -232,11 +269,21 @@ export class MediaEngineImpl implements MediaEngine {
     return this;
   }
 
-  from(input: MediaInput, opts?: FromOptions): Source {
+  from(input: MediaStream | LiveMediaSource, opts?: FromOptions): LiveMediaSource;
+  from(input: HTMLMediaElement, opts: FromOptions & { readonly mode: 'capture' }): LiveMediaSource;
+  from(input: HTMLMediaElement): Source;
+  from(input: HTMLMediaElement, opts: FromOptions & { readonly mode?: 'bytes' }): Source;
+  from(input: ByteMediaInput, opts?: FromOptions): Source;
+  from(input: HTMLMediaElement, opts: FromOptions): NormalizedSource;
+  from(input: MediaInput, opts?: FromOptions): NormalizedSource;
+  from(input: MediaInput, opts?: FromOptions): NormalizedSource {
     return normalizeInput(input, opts);
   }
 
-  source(input: MediaInput): Source {
+  source(input: MediaStream | LiveMediaSource): LiveMediaSource;
+  source(input: ByteMediaInput | HTMLMediaElement): Source;
+  source(input: MediaInput): NormalizedSource;
+  source(input: MediaInput): NormalizedSource {
     return normalizeInput(input);
   }
 
@@ -279,31 +326,49 @@ export class MediaEngineImpl implements MediaEngine {
     return build([]);
   }
 
+  run(job: MediaJob, o: CallOptions = {}): Cancellable<Blob> {
+    return this.#withCancel(o, async (signal) => {
+      const { runMediaJob } = await import('./job-runner.ts');
+      return runMediaJob(this, job, { ...o, signal });
+    });
+  }
+
   probe(input: MediaInput, o: CallOptions = {}): Cancellable<MediaInfo> {
     return this.#withCancel(o, async (signal) => {
+      const normalized = normalizeInput(input);
+      if (isLiveMediaSource(normalized)) {
+        throwIfAborted(signal);
+        const { probeLiveMediaStream } = await import('../sources/live-media.ts');
+        throwIfAborted(signal);
+        return probeLiveMediaStream(normalized);
+      }
       // Resolve an HLS `.m3u8` to its (decrypted, concatenated) media source BEFORE the probe-prefix cache
       // wrappers — exactly as demux/decode do (they pass a fresh `normalizeInput(input)` to the resolver).
       // Wrapping first put the eager range-cache in front of an *unresolved* manifest, so the HLS content
       // sniff saw cached/segment bytes, declined to resolve, and probe then mis-read the raw encrypted TS
       // segment as "not an MPEG-TS stream". For non-HLS inputs the resolver is a cheap no-op (same source).
-      const resolved = await this.#resolveHlsInput(input, normalizeInput(input), signal);
+      const resolved = await this.#resolveHlsInput(input, normalized, signal);
       const repeated = cacheRepeatedProbeRanges(resolved, this.#repeatedProbePrefixCache, {
         maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
         ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
       });
       const src = cacheProbeRanges(repeated, this.#sourcePrefixHandoff, 'store');
-      const imageInfo = await this.#probeImageInfo(src, signal);
-      if (imageInfo !== undefined) return imageInfo;
-      const container = await this.#routeContainer(src, 'demux');
-      const stage = this.#stageOptions(signal, o);
-      if (container.probe) {
-        return toMediaInfo(container, await container.probe(src, stage), src);
-      }
-      const demuxer = await container.demux(src, stage);
       try {
-        return toMediaInfo(container, demuxer.tracks, src);
+        const imageInfo = await this.#probeImageInfo(src, signal);
+        if (imageInfo !== undefined) return imageInfo;
+        const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
+        const stage = this.#stageOptions(signal, o);
+        if (container.probe) {
+          return toMediaInfo(container, await container.probe(src, stage), src);
+        }
+        const demuxer = await container.demux(src, stage);
+        try {
+          return toMediaInfo(container, demuxer.tracks, src);
+        } finally {
+          await demuxer.close();
+        }
       } finally {
-        await demuxer.close();
+        await cancelSource(src, signal.reason);
       }
     });
   }
@@ -317,48 +382,69 @@ export class MediaEngineImpl implements MediaEngine {
       // Resolve an HLS `.m3u8` to its decrypted media source first (as `demux`/`probe` do) — a container-
       // targeted probe of an HLS manifest (e.g. an AES-128 `mpeg-ts` playlist) must sniff the resolved TS,
       // not the raw encrypted segment (which reads as "not an MPEG-TS stream"). No-op for non-HLS inputs.
-      const resolved = await this.#resolveHlsInput(input, normalizeInput(input), signal);
+      const resolved = await this.#resolveHlsInput(
+        input,
+        normalizeByteInput(input, 'probeContainer'),
+        signal,
+      );
       const src = cacheRepeatedProbeRanges(resolved, this.#repeatedProbePrefixCache, {
         maxBytes: REPEATED_PROBE_PREFIX_CACHE_MAX_BYTES,
         ttlMs: REPEATED_PROBE_PREFIX_CACHE_TTL_MS,
       });
-      const driver = await this.#routeContainerToken(container, 'demux');
-      const stage = this.#stageOptions(signal, o);
-      if (driver.probe) {
-        return toMediaInfo(driver, await driver.probe(src, stage), src);
-      }
-      const demuxer = await driver.demux(src, stage);
       try {
-        return toMediaInfo(driver, demuxer.tracks, src);
+        const driver = await this.#routeContainerToken(container, 'demux', o.strategy?.pinDriver);
+        const stage = this.#stageOptions(signal, o);
+        if (driver.probe) {
+          return toMediaInfo(driver, await driver.probe(src, stage), src);
+        }
+        const demuxer = await driver.demux(src, stage);
+        try {
+          return toMediaInfo(driver, demuxer.tracks, src);
+        } finally {
+          await demuxer.close();
+        }
       } finally {
-        await demuxer.close();
+        await cancelSource(src, signal.reason);
       }
     });
   }
 
   demux(input: MediaInput, o: CallOptions = {}): Cancellable<Demuxed> {
     return this.#withCancel(o, async (signal) => {
-      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
-      const container = await this.#routeContainer(src, 'demux');
-      return container.demux(src, this.#stageOptions(signal, o));
+      const src = await this.#resolveHlsInput(input, normalizeByteInput(input, 'demux'), signal);
+      const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
+      try {
+        return await container.demux(src, this.#stageOptions(signal, o));
+      } catch (error) {
+        await cancelSource(src, error);
+        throw error;
+      }
     });
   }
 
   packetInfo(input: MediaInput, o: PacketInfoCallOptions = {}): Cancellable<PacketInfoTable> {
     return this.#withCancel(o, async (signal) => {
-      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
-      const container =
-        o.container === undefined
-          ? await this.#routeContainer(src, 'demux')
-          : await this.#routeContainerToken(o.container, 'demux');
-      const packetInfo = container.packetInfo;
-      if (packetInfo === undefined) {
-        throw new CapabilityError('capability-miss', 'no packet-info', {
-          op: 'demux',
-          tried: [container.id],
-        });
+      const src = await this.#resolveHlsInput(
+        input,
+        normalizeByteInput(input, 'packetInfo'),
+        signal,
+      );
+      try {
+        const container =
+          o.container === undefined
+            ? await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver)
+            : await this.#routeContainerToken(o.container, 'demux', o.strategy?.pinDriver);
+        const packetInfo = container.packetInfo;
+        if (packetInfo === undefined) {
+          throw new CapabilityError('capability-miss', 'no packet-info', {
+            op: 'demux',
+            tried: [container.id],
+          });
+        }
+        return await packetInfo.call(container, src, this.#stageOptions(signal, o));
+      } finally {
+        await cancelSource(src, signal.reason);
       }
-      return packetInfo.call(container, src, this.#stageOptions(signal, o));
     });
   }
 
@@ -371,8 +457,9 @@ export class MediaEngineImpl implements MediaEngine {
     const run = async (signal?: AbortSignal): Promise<Output | Uint8Array> => {
       const { pcm } = await import('./pcm-convert-plan.ts');
       return pcm(
-        this.#authoringDeps(),
-        (container, direction) => this.#routeContainerToken(container, direction),
+        this.#authoringDeps(o),
+        (container, direction) =>
+          this.#routeContainerToken(container, direction, o.strategy?.pinDriver),
         src,
         sourceContainer,
         opts,
@@ -381,7 +468,14 @@ export class MediaEngineImpl implements MediaEngine {
       );
     };
     if (src instanceof Uint8Array && o.signal === undefined) {
-      const p = run() as Cancellable<Output | Uint8Array>;
+      const p = (
+        o.strategy?.pinDriver === undefined
+          ? run()
+          : (async (): Promise<Output | Uint8Array> => {
+              await this.#ensurePinRegistered(o);
+              return run();
+            })()
+      ) as Cancellable<Output | Uint8Array>;
       p.cancel = (): void => {};
       return p;
     }
@@ -406,7 +500,53 @@ export class MediaEngineImpl implements MediaEngine {
 
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
+      const normalized = normalizeInput(input);
+      if (isLiveMediaSource(normalized)) {
+        const live = await import('./live-convert.ts');
+        return live.convertLiveMediaStream(
+          normalized,
+          opts,
+          {
+            run: (frames, liveOptions, liveSignal) =>
+              live.runLiveFramePipeline(normalized.mediaStream, frames, liveOptions, liveSignal, {
+                supportsContainer: containerHasChunkMuxer,
+                createMuxer: async (target, options) =>
+                  (await this.#routeMuxer(target, o.strategy?.pinDriver)).createMuxer(
+                    muxOptionsFrom(options, target),
+                  ),
+                applyVideoFilters: (stream, target, source, activeSignal) =>
+                  this.#applyVideoFilters(stream, target, source, activeSignal, o),
+                applyAudioFilters: (stream, target, source, activeSignal) =>
+                  this.#applyAudioFilters(stream, target, source, activeSignal, o),
+                resolveAudioTarget: async (target, sourceCodec) =>
+                  (await loadCodecPipeline()).resolveAudioEncodeTargetForRuntime(
+                    target,
+                    sourceCodec,
+                  ),
+                encodeVideo: (stream, target, source, muxer, activeSignal, fragmented) =>
+                  this.#encodeVideoStream(
+                    stream,
+                    target,
+                    source,
+                    muxer,
+                    activeSignal,
+                    o,
+                    fragmented,
+                  ),
+                encodeAudio: (stream, target, source, muxer, activeSignal) =>
+                  this.#encodeAudioStream(stream, target, source, muxer, activeSignal, o),
+                materialize: (muxer, target, options, activeSignal) =>
+                  materializeOutput(
+                    options.sink ?? toBlob(),
+                    muxer.output,
+                    mimeOpts(activeSignal, target),
+                  ),
+              }),
+          },
+          signal,
+        );
+      }
+      const src = await this.#resolveHlsInput(input, normalized, signal);
       const audio = opts.audio;
       // FLAC authoring (ADR-024): a native-FLAC target authored losslessly in pure TS from canonical PCM —
       // a FLAC source re-encodes through its own `transformPcm`; a raw-PCM source (WAV/AIFF/CAF) is decoded
@@ -418,7 +558,7 @@ export class MediaEngineImpl implements MediaEngine {
         // for an eligible `to:'flac'` convert, so the eager kernel never carries it (doc 08 §7). The thin
         // gate above stays inline-eager so a non-FLAC convert never loads the chunk.
         const { convertToFlac } = await import('./flac-convert-plan.ts');
-        const flac = await convertToFlac(this.#authoringDeps(), src, opts, audio, signal, o);
+        const flac = await convertToFlac(this.#authoringDeps(o), src, opts, audio, signal, o);
         if (flac !== undefined) return flac;
       }
       // PCM-native audio path (ADR-022): a raw-PCM target (WAV/AIFF/CAF) whose source container transforms
@@ -434,7 +574,7 @@ export class MediaEngineImpl implements MediaEngine {
       ) {
         const { convertPcmNative } = await import('./pcm-convert-plan.ts');
         const pcm = await convertPcmNative(
-          this.#authoringDeps(),
+          this.#authoringDeps(o),
           src,
           opts,
           audio,
@@ -468,6 +608,9 @@ export class MediaEngineImpl implements MediaEngine {
     return offloadAbrLadder(pool, src, renditions, {
       signal,
       determinism: this.#determinism(o),
+      ...(o.strategy?.pinDriver !== undefined ? { pinDriver: o.strategy.pinDriver } : {}),
+      wasmRuntime: this.#wasmRuntime,
+      ...(this.#wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl } : {}),
       ...(o.onProgress ? { onProgress: o.onProgress } : {}),
     });
     /* v8 ignore stop */
@@ -479,7 +622,7 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions = {},
   ): Cancellable<readonly Output[]> {
     return this.#withCancel(o, async (signal) => {
-      const src = normalizeInput(input);
+      const src = normalizeByteInput(input, 'h264AbrLadder');
       const { planH264AbrLadder } = await import('./video-stream-plan.ts');
       const planned = planH264AbrLadder(ladder, { width: undefined, height: undefined });
       const offloaded = await this.#offloadAbrLadder(
@@ -506,170 +649,77 @@ export class MediaEngineImpl implements MediaEngine {
 
   remux(input: MediaInput, opts: RemuxOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = await this.#resolveHlsInput(input, normalizeInput(input), signal);
-      const container = await this.#routeContainer(src, 'demux');
-      const wantsTrackSelection = opts.trackSelect !== undefined && opts.trackSelect.length > 0;
-      if (opts.tags !== undefined) {
-        if (wantsTrackSelection) {
-          throw new CapabilityError(
-            'capability-miss',
-            'metadata tag rewrite does not combine with track selection',
-            {
-              op: 'remux',
-              tried: [container.id, opts.to],
-            },
-          );
-        }
-        const inputBytes = await readAllSource(src, signal);
-        const { rewriteMetadataTags } = await import('../metadata/metadata-rewrite.ts');
-        const bytes = await rewriteMetadataTags(inputBytes, opts.to, opts.tags);
-        return materializeOutput(
-          opts.sink ?? toBlob(),
-          bytesToStream(bytes),
-          mimeOpts(signal, opts.to),
-        );
-      }
-      // (1) Same-container stream-copy — a lossless byte re-serialization that preserves DTS/B-frames/
-      // codec-private (ADR-021), and works in pure TS (Node) for the drivers that implement it (MP4↔MOV).
-      if (
-        !wantsTrackSelection &&
-        container.streamCopy &&
-        (container.formats.includes(opts.to) ||
-          container.streamCopyTargets?.includes(opts.to) === true)
-      ) {
-        const stream = await container.streamCopy(src, {
-          ...this.#stageOptions(signal, o),
-          container: opts.to,
-          ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
-          ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
-          ...streamCopySinkMode(opts.sink),
-        });
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
-      }
-      // (2) Cross-container stream-copy via the packet seam: demux the source, copy each track's encoded
-      // packets verbatim into the target container's muxer (no re-encode). The muxer's addTrack enforces
-      // codec-in-container legality (e.g. vorbis→mp4 rejects), so an unsupported pair stays an honest
-      // CapabilityError. The live packet copy needs WebCodecs `EncodedChunk` (browser); the routing +
-      // track-copy control flow is unit-tested with fakes, and the path is browser-harness validated.
-      const stream = await this.#remuxViaSeam(container, src, opts, signal, o);
-      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, opts.to));
+      const { runRemux } = await import('./remux-runner.ts');
+      return runRemux(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
   trim(input: MediaInput, opts: TrimOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const src = cacheProbeRanges(normalizeInput(input));
-      const container = await this.#routeContainer(src, 'demux');
-      const target = (container.formats[0] ?? 'mp4') as Container;
-      if (opts.mode !== 'accurate' && container.streamCopy) {
-        // Native FLAC keyframe trim validates against STREAMINFO while packet-copying, so it does not need
-        // the generic duration demux that would parse every frame once before parsing it again to write.
-        if (target === 'flac') {
-          const stream = await container.streamCopy(src, {
-            ...this.#stageOptions(signal, o),
-            trim: { startSec: opts.start, endSec: opts.end },
-          });
-          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-        }
-        // Drivers that validate native stream-copy trim ranges can avoid the generic duration demux here:
-        // MP4 already has to parse `moov` before copy, so it validates `start/end` against that movie and
-        // then reuses the same metadata for no-op/full-range detection and payload planning.
-        if (container.validatesStreamCopyTrim) {
-          const stream = await container.streamCopy(src, {
-            ...this.#stageOptions(signal, o),
-            trim: { startSec: opts.start, endSec: opts.end },
-            ...streamCopySinkMode(opts.sink),
-          });
-          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-        }
-      }
-      if (
-        opts.mode !== 'accurate' &&
-        isPcmContainer(target) &&
-        container.transformPcm &&
-        container.validatesPcmTrim
-      ) {
-        const stream = await container.transformPcm(src, {
-          ...this.#stageOptions(signal, o),
-          container: target,
-          timeBounds: { startSec: opts.start, endSec: opts.end },
-        });
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-      }
-      // Validate the requested range against the media's real duration BEFORE any cut, so a malformed
-      // range (negative / inverted / zero-length / past-EOF) rejects with a typed `InputError` instead
-      // of flowing to the driver and fabricating output (ADR-021, robustness §7). Duration is read the
-      // same way `probe` does — demux once, take the longest track — then the demuxer is released.
-      const durationSec = await this.#probeDurationSec(container, src, signal, o);
-      assertTrimRange(opts.start, opts.end, durationSec);
-      if (opts.mode === 'accurate' && isWholeSourceTrim(src, opts, durationSec)) {
-        return materializeOutput(opts.sink ?? toBlob(), src.stream(), mimeOpts(signal, target));
-      }
-      if (opts.mode === 'accurate') {
-        if (target === 'flac' && container.transformPcm) {
-          const stream = await container.transformPcm(src, {
-            ...this.#stageOptions(signal, o),
-            timeBounds: { startSec: opts.start, endSec: opts.end },
-          });
-          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-        }
-        const stream = await this.#trimViaCodec(
-          container,
-          src,
-          target,
-          opts,
-          durationSec,
-          signal,
-          o,
-        );
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-      }
-      // Keyframe trim of raw PCM-domain audio (WAV/AIFF/CAF) is a sample-accurate cut through the
-      // container's own `transformPcm` path: raw audio has no inter-frame dependency, so slicing samples is
-      // still the fast lossless route. Compressed FLAC keyframe trim is handled below by native packet-copy;
-      // explicit accurate FLAC trim used the transformPcm branch above.
-      if (isPcmContainer(target) && container.transformPcm) {
-        const stream = await container.transformPcm(src, {
-          ...this.#stageOptions(signal, o),
-          container: target,
-          timeBounds: { startSec: opts.start, endSec: opts.end },
-        });
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-      }
-      if (canTrimAudioPackets(target)) {
-        const stream = await this.#trimAudioPacketsViaSeam(container, src, target, opts, signal, o);
-        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-      }
-      const stream = await this.#streamCopyOrThrow(container, src, target, 'trim', {
-        ...this.#stageOptions(signal, o),
-        trim: { startSec: opts.start, endSec: opts.end },
-        ...streamCopySinkMode(opts.sink),
-      });
-      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
+      const { runTrim } = await import('./trim-runner.ts');
+      return runTrim(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
   decode(input: MediaInput, o: CallOptions = {}): MediaStreams {
-    const src = cacheProbeRanges(normalizeInput(input), this.#sourcePrefixHandoff, 'consume'); // validate the input shape eagerly (throws InputError on bad input)
+    const normalized = normalizeInput(input); // validate the input shape eagerly (throws InputError on bad input)
     // The `decode` contract returns frame streams synchronously; the async demux + codec routing happens
     // lazily when each stream is first pulled. A track without a decode `config` (codec unknown) is
     // simply absent. Cancellation rides `o.signal` threaded into each decoder's StageOptions; a frame
     // emitted by a decoder is owned by the readable consumer and closed by it (the contract).
     const ctrl = new AbortController();
     bridgeSignal(o.signal, ctrl);
+    if (isLiveMediaSource(normalized)) {
+      // Keep the processor implementation out of the eager kernel: each public result stream resolves
+      // the same live decode exactly once on its first pull, then forwards only its selected track.
+      const liveStreams = memoizeAsync(async () => {
+        if (o.strategy?.pinDriver !== undefined) await this.#ensurePinRegistered(o);
+        const { decodeLiveMediaStream } = await import('../sources/live-media.ts');
+        return decodeLiveMediaStream(normalized, { signal: ctrl.signal });
+      });
+      return {
+        video: deferredStream(async () => (await liveStreams()).video),
+        audio: deferredStream(async () => (await liveStreams()).audio),
+      };
+    }
+    const src = cacheProbeRanges(normalized, this.#sourcePrefixHandoff, 'consume');
     const stage = this.#stageOptions(ctrl.signal, o);
     // An HLS `.m3u8` manifest is resolved+stitched to its segment source lazily on first pull (decode's
     // contract is synchronous), memoized so both frame streams share one resolution. Non-HLS is a no-op.
-    const resolvedSrc = memoizeAsync(() => this.#resolveHlsInput(input, src, ctrl.signal));
-    const imageRoute = shouldSniffImageForDecode(src)
-      ? memoizeAsync(() => this.#imageDecodeRoute(src, ctrl.signal))
+    const resolvedInputSrc = memoizeAsync(async () => {
+      if (o.strategy?.pinDriver !== undefined) await this.#ensurePinRegistered(o);
+      return this.#resolveHlsInput(input, src, ctrl.signal);
+    });
+    const replayableSrc = memoizeAsync(async (): Promise<Source> => {
+      const resolved = await resolvedInputSrc();
+      if (resolved.kind !== 'stream') return resolved;
+      const bytes = await readAllSource(resolved, ctrl.signal);
+      return normalizeInput(
+        bytes,
+        resolved.mimeHint === undefined ? {} : { mime: resolved.mimeHint },
+      );
+    });
+    const mime = src.mimeHint?.toLowerCase();
+    const imageRoute = (
+      mime === undefined
+        ? sourceMayBeHlsManifest(src)
+        : !/^(?:audio|video)\//.test(mime)
+    )
+      ? memoizeAsync(async () =>
+          this.#imageDecodeRoute(
+            await resolvedInputSrc(),
+            ctrl.signal,
+            stage.determinism ?? 'auto',
+          ),
+        )
       : noImageDecodeRoute;
     const video = deferredStream<VideoFrame>(async () =>
-      this.#decodeVideoOrImage(await resolvedSrc(), stage, imageRoute),
+      this.#decodeVideoOrImage(replayableSrc, stage, imageRoute),
     );
-    const audio = deferredStream<AudioData>(async () =>
-      this.#decodeTrack(await resolvedSrc(), 'audio', stage, imageRoute),
-    );
+    const audio = deferredStream<AudioData>(async () => {
+      if ((await imageRoute()) !== undefined) return undefined;
+      return this.#decodeTrack(await replayableSrc(), 'audio', stage);
+    });
     return { video, audio };
   }
 
@@ -677,10 +727,20 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const target = chooseOutputContainer(opts.to, undefined);
       if (target === 'wav') {
-        throw new CapabilityError('capability-miss', 'bad wav encode', {
-          op: 'encode',
-          tried: [target],
-        });
+        const { encodeWavFrames } = await import('./wav-frame-encode.ts');
+        const stream = await encodeWavFrames(
+          {
+            createMuxer: async () =>
+              (await this.#routeMuxer(target, o.strategy?.pinDriver)).createMuxer(
+                muxOptionsFrom(opts, target),
+              ),
+          },
+          frames,
+          opts,
+          signal,
+          o,
+        );
+        return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
       }
       if (!containerHasChunkMuxer(target)) {
         // A target without a frame-encode packet muxer cannot accept encoded chunks; surface the honest
@@ -704,7 +764,9 @@ export class MediaEngineImpl implements MediaEngine {
         await cancelStream(frames.audio);
         throw new InputError('unsupported-input', 'audio target missing');
       }
-      const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+      const muxer = (await this.#routeMuxer(target, o.strategy?.pinDriver)).createMuxer(
+        muxOptionsFrom(opts, target),
+      );
       const tasks: Promise<void>[] = [];
       if (frames.video && opts.video) {
         tasks.push(this.#encodeVideoStream(frames.video, opts.video, undefined, muxer, signal, o));
@@ -723,8 +785,8 @@ export class MediaEngineImpl implements MediaEngine {
       if (!Number.isFinite(timeUs) || timeUs < 0) {
         throw new InputError('unsupported-input', `bad seek ${timeUs}`);
       }
-      const src = normalizeInput(input);
-      const container = await this.#routeContainer(src, 'demux');
+      const src = normalizeByteInput(input, 'seek');
+      const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
       const stage = this.#stageOptions(signal, o);
       const demuxer = await container.demux(src, stage);
       try {
@@ -798,106 +860,15 @@ export class MediaEngineImpl implements MediaEngine {
 
   mux(streams: PacketStreams, opts: MuxSpec, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const target = opts.container;
-      if (!containerHasChunkMuxer(target)) {
-        throw new CapabilityError('capability-miss', `no muxer '${target}'`, {
-          op: 'mux',
-          tried: [target],
-        });
-      }
-      if (
-        opts.fragmented !== true &&
-        (target === 'mp4'
-          ? opts.faststart !== false
-          : target === 'webm' || target === 'mkv' || target === 'ogg')
-      ) {
-        const fastMux = await import('./flac-mkv-mux.ts');
-        const muxPrepared =
-          target === 'mp4'
-            ? fastMux.muxSingleTrackMp4
-            : target === 'ogg'
-              ? fastMux.muxSingleTrackOggAudio
-              : fastMux.muxPreparedWebmPacketStreams;
-        const stream = await muxPrepared(streams, {
-          ...this.#stageOptions(signal, o),
-          container: target,
-        });
-        if (stream) {
-          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-        }
-      }
-      if (opts.fragmented !== true && target === 'ts') {
-        const { muxPreparedMpegTsPacketStreams } = await import('./mpegts-prepared-mux.ts');
-        const stream = await muxPreparedMpegTsPacketStreams(streams, {
-          ...this.#stageOptions(signal, o),
-          container: target,
-        });
-        if (stream) {
-          return materializeOutput(opts.sink ?? toBlob(), stream, mimeOpts(signal, target));
-        }
-      }
-
-      const { muxPacketStreams, readablePacketStreams } = await import('./mux-packet-streams.ts');
-      let inputs: ReturnType<typeof muxPacketStreams>;
-      try {
-        inputs = muxPacketStreams(streams);
-      } catch (e) {
-        await Promise.all(readablePacketStreams(streams).map((stream) => cancelStream(stream)));
-        throw e;
-      }
-
-      const openStreams = inputs.map((input) => input.packets as ReadableStream<unknown>);
-      let drainsStarted = false;
-      try {
-        const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
-        const { drainEncoderToMuxer } = await loadCodecPipeline();
-        const tasks = inputs.map((input) =>
-          drainEncoderToMuxer(input.packets, muxer, () => input.track),
-        );
-        drainsStarted = true;
-        await allOrCancelStreams(tasks, openStreams);
-        await muxer.finalize();
-        return materializeOutput(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
-      } catch (e) {
-        if (!drainsStarted) {
-          await Promise.all(openStreams.map((stream) => cancelStream(stream)));
-        }
-        throw e;
-      }
+      const { runMux } = await import('./mux-runner.ts');
+      return runMux(this.#operationRunnerContext(), streams, opts, o, signal);
     });
   }
 
   decrypt(input: MediaInput, opts: DecryptOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      assertSupportedDecryptScheme(opts.scheme);
-      // No static key ⇒ EME/ClearKey live key acquisition, which is OUT OF SCOPE: this engine decrypts
-      // CENC (`cenc`/`cens`/`cbcs`) and HLS AES-128/SAMPLE-AES with caller-PROVIDED keys, never an EME license exchange.
-      // Fail fast with a typed miss — **before any source read, container route, or network** — so a
-      // ClearKey/EME request maps to a clean capability-miss (NA) instead of a license-fetch retry loop.
-      if (Object.keys(opts.keys).length === 0) {
-        throw new CapabilityError('capability-miss', 'keys', {
-          op: 'decrypt',
-          tried: [],
-        });
-      }
-      const src = normalizeInput(input);
-      const container = await this.#routeContainer(src, 'demux');
-      if (!container.decrypt) {
-        throw new CapabilityError('capability-miss', 'no decrypt', {
-          op: 'decrypt',
-          tried: [container.id],
-        });
-      }
-      const stream = await container.decrypt(src, {
-        ...this.#stageOptions(signal, o),
-        scheme: opts.scheme,
-        keys: opts.keys,
-      });
-      return materializeOutput(
-        opts.sink ?? toBlob(),
-        stream,
-        mimeOpts(signal, container.formats[0] ?? 'mp4'),
-      );
+      const { runDecrypt } = await import('./decrypt-runner.ts');
+      return runDecrypt(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
@@ -906,6 +877,10 @@ export class MediaEngineImpl implements MediaEngine {
     await runPreload(
       {
         tasks: this.#preloadTasks,
+        wasmRuntime: this.#wasmRuntime,
+        ...(this.#wasmAssetBaseUrl !== undefined
+          ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl }
+          : {}),
         ensureDefaultDrivers: () => this.#ensureDefaultDrivers(),
         pickContainer: (q) => {
           this.#router.pickContainer(q);
@@ -932,19 +907,23 @@ export class MediaEngineImpl implements MediaEngine {
     return {
       signal,
       determinism: this.#determinism(o),
+      wasmRuntime: this.#wasmRuntime,
+      ...(this.#wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl } : {}),
+      ...(o.strategy?.pinDriver !== undefined ? { pinDriver: o.strategy.pinDriver } : {}),
       ...(o.onProgress ? { onProgress: o.onProgress } : {}),
     };
   }
 
-  async #pickContainer(q: ContainerQuery): Promise<ContainerDriver> {
+  async #pickContainer(q: ContainerQuery, pinDriver?: string): Promise<ContainerDriver> {
+    const select = pinDriver === undefined ? {} : { pinDriver };
     try {
-      return this.#router.pickContainer(q);
+      return this.#router.pickContainer(q, select);
     } catch (e) {
       // On a miss, lazily load the first-party drivers and retry once (zero-config, ADR-004). An
       // explicitly `use()`d driver that matches never misses, so it always wins over the defaults.
       if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
       await this.#ensureDefaultDrivers();
-      return this.#router.pickContainer(q);
+      return this.#router.pickContainer(q, select);
     }
   }
 
@@ -966,34 +945,59 @@ export class MediaEngineImpl implements MediaEngine {
     return hls.resolveHlsInputIfManifest(input, src, signal);
   }
 
-  async #routeContainer(src: Source, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
-    const ext = extensionOf(src.filename);
-    if (src.mimeHint !== undefined || ext !== undefined) {
-      try {
-        return await this.#pickContainer({
+  async #routeContainer(
+    src: Source,
+    direction: 'demux' | 'mux',
+    signal?: AbortSignal,
+    pinDriver?: string,
+  ): Promise<ContainerDriver> {
+    try {
+      const ext = extensionOf(src.filename);
+      if (src.mimeHint !== undefined || ext !== undefined) {
+        try {
+          return await this.#pickContainer(
+            {
+              direction,
+              ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
+              ...(ext !== undefined ? { extension: ext } : {}),
+            },
+            pinDriver,
+          );
+        } catch (error) {
+          if (!(error instanceof CapabilityError)) throw error;
+          // A pin miss is final for this route. Do not consume a one-shot source merely to repeat the same
+          // exact-id failure with magic bytes after the one allowed default-driver retry.
+          if (isPinnedDriverMiss(error, pinDriver)) throw error;
+        }
+      }
+      const head = await readHead(src, routeHeadBytes(src), signal);
+      return await this.#pickContainer(
+        {
           direction,
+          head,
           ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
           ...(ext !== undefined ? { extension: ext } : {}),
-        });
-      } catch (e) {
-        if (!(e instanceof CapabilityError)) throw e;
-      }
+        },
+        pinDriver,
+      );
+    } catch (error) {
+      await cancelSource(src, error);
+      throw error;
     }
-    const head = await readHead(src, routeHeadBytes(src));
-    const q: ContainerQuery = {
-      direction,
-      head,
-      ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
-      ...(ext !== undefined ? { extension: ext } : {}),
-    };
-    return this.#pickContainer(q);
   }
 
-  async #routeContainerToken(target: string, direction: 'demux' | 'mux'): Promise<ContainerDriver> {
-    return this.#pickContainer({
-      direction,
-      extension: target,
-    });
+  async #routeContainerToken(
+    target: string,
+    direction: 'demux' | 'mux',
+    pinDriver?: string,
+  ): Promise<ContainerDriver> {
+    return this.#pickContainer(
+      {
+        direction,
+        extension: target,
+      },
+      pinDriver,
+    );
   }
 
   /**
@@ -1001,17 +1005,28 @@ export class MediaEngineImpl implements MediaEngine {
    * input bytes to magic-probe. Loads the first-party defaults on a miss then retries once, mirroring
    * {@link routeContainer}'s zero-config behavior.
    */
-  async #routeMuxer(target: string): Promise<ContainerDriver> {
-    return this.#routeContainerToken(target, 'mux');
+  async #routeMuxer(target: string, pinDriver?: string): Promise<ContainerDriver> {
+    return this.#routeContainerToken(target, 'mux', pinDriver);
   }
 
   /** Lazily import + register the first-party driver bundle (a code-split chunk). One-time. */
   async #ensureDefaultDrivers(): Promise<void> {
     if (this.#defaultsLoaded) return;
-    this.#defaultsLoaded = true;
-    const { registerDefaultDrivers } = await import('../drivers/defaults.ts');
-    registerDefaultDrivers(this.#registry);
-    this.#router.clearCache();
+    const pending =
+      this.#defaultDriversPromise ??
+      (async (): Promise<void> => {
+        const { registerDefaultDrivers } = await import('../drivers/defaults.ts');
+        registerDefaultDrivers(this.#registry);
+        this.#router.clearCache();
+        this.#defaultsLoaded = true;
+      })();
+    this.#defaultDriversPromise = pending;
+    try {
+      await pending;
+    } catch (error) {
+      if (this.#defaultDriversPromise === pending) this.#defaultDriversPromise = undefined;
+      throw error;
+    }
   }
 
   /**
@@ -1040,6 +1055,9 @@ export class MediaEngineImpl implements MediaEngine {
     return tryOffload(this.#poolCache, resolvePoolSize(this.#opts.worker), src, kind, publicOpts, {
       signal,
       determinism: this.#determinism(o),
+      ...(o.strategy?.pinDriver !== undefined ? { pinDriver: o.strategy.pinDriver } : {}),
+      wasmRuntime: this.#wasmRuntime,
+      ...(this.#wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl } : {}),
       ...(o.onProgress ? { onProgress: o.onProgress } : {}),
     });
     /* v8 ignore stop */
@@ -1047,7 +1065,10 @@ export class MediaEngineImpl implements MediaEngine {
 
   /** Resolve a codec driver for a query, loading the first-party defaults on a miss then retrying once. */
   async #routeCodec(q: CodecQuery, o: CallOptions): Promise<CodecDriver> {
-    const opts = { determinism: this.#determinism(o) };
+    const opts: StageSelectOptions = {
+      determinism: this.#determinism(o),
+      ...(o.strategy?.pinDriver !== undefined ? { pinDriver: o.strategy.pinDriver } : {}),
+    };
     try {
       return await this.#router.pickCodec(q, opts);
     } catch (e) {
@@ -1061,6 +1082,7 @@ export class MediaEngineImpl implements MediaEngine {
   async #routeFilter(spec: FilterSpec, o: CallOptions, cost?: RouteCost): Promise<FilterDriver> {
     const opts: StageSelectOptions = {
       determinism: this.#determinism(o),
+      ...(o.strategy?.pinDriver !== undefined ? { pinDriver: o.strategy.pinDriver } : {}),
       ...(cost !== undefined ? { cost } : {}),
     };
     try {
@@ -1073,8 +1095,8 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /** Resolve the default image capability if the source's magic bytes are a supported image format. */
-  async #imageOpsForSource(src: Source): Promise<ImageOps | undefined> {
-    const head = await readHead(src, HINTED_HEAD_BYTES);
+  async #imageOpsForSource(src: Source, signal?: AbortSignal): Promise<ImageOps | undefined> {
+    const head = await readHead(src, HINTED_HEAD_BYTES, signal);
     if (this.#registry.imageOps() === undefined) {
       await this.#ensureDefaultDrivers();
     }
@@ -1084,7 +1106,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   /** Probe image bytes through the standalone image parser when the source magic matches an image. */
   async #probeImageInfo(src: Source, signal: AbortSignal): Promise<MediaInfo | undefined> {
-    const ops = await this.#imageOpsForSource(src);
+    const ops = await this.#imageOpsForSource(src, signal);
     if (ops === undefined) return undefined;
     const bytes = await readAllSource(src, signal);
     const { imageInfoToMediaMetadata } = await import('../codecs/image/probe.ts');
@@ -1092,16 +1114,29 @@ export class MediaEngineImpl implements MediaEngine {
   }
 
   /** Sniff an image source once and, if matched, keep the bytes shared by the video/audio decode streams. */
-  async #imageDecodeRoute(src: Source, signal: AbortSignal): Promise<ImageDecodeRoute | undefined> {
-    const ops = await this.#imageOpsForSource(src);
+  async #imageDecodeRoute(
+    src: Source,
+    signal: AbortSignal,
+    determinism: Determinism,
+  ): Promise<ImageDecodeRoute | undefined> {
+    const ops = await this.#imageOpsForSource(src, signal);
     if (ops === undefined) return undefined;
+    if (determinism === 'force-software') {
+      const error = new CapabilityError(
+        'capability-miss',
+        'force-software image decode has no proved software substrate',
+        { op: { op: 'decode', mediaType: 'video', source: 'image' }, tried: ['image-decoder'] },
+      );
+      await cancelSource(src, error);
+      throw error;
+    }
     const bytes = await readAllSource(src, signal);
     return { ops, bytes };
   }
 
   /** Browser-only image decode route: still/animated images become a video frame stream, no packet seam. */
   async #decodeVideoOrImage(
-    src: Source,
+    source: () => Promise<Source>,
     stage: StageOptions,
     imageRoute: ImageDecodeRouteLoader,
   ): Promise<ReadableStream<VideoFrame> | undefined> {
@@ -1109,7 +1144,7 @@ export class MediaEngineImpl implements MediaEngine {
     if (image !== undefined) {
       return image.ops.decode(image.bytes, stage.signal ? { signal: stage.signal } : {});
     }
-    return this.#decodeTrack(src, 'video', stage);
+    return this.#decodeTrack(await source(), 'video', stage);
   }
 
   /**
@@ -1121,12 +1156,18 @@ export class MediaEngineImpl implements MediaEngine {
     src: Source,
     mediaType: M,
     stage: StageOptions,
-    imageRoute?: ImageDecodeRouteLoader,
   ): Promise<ReadableStream<RawFrameOf<M>> | undefined> {
-    if (mediaType === 'audio' && imageRoute !== undefined && (await imageRoute()) !== undefined) {
-      return undefined;
+    const container = await this.#routeContainer(src, 'demux', stage.signal, stage.pinDriver);
+    // A raw-PCM stream driver owns the complete audio-container parse and exposes canonical chunks
+    // directly. Avoid a duplicate demux/track-discovery pass before the first frame; the contract is
+    // intentionally limited to raw-PCM containers, so a declared stream is itself the audio track.
+    if (mediaType === 'audio' && container.decodePcmAudioStream !== undefined) {
+      const { pcmAudioChunksToAudioDataStream } = await import('../dsp/audio-data.ts');
+      const chunks = await container.decodePcmAudioStream(src, stage);
+      return pcmAudioChunksToAudioDataStream(chunks, stage, container.id, 'f32') as ReadableStream<
+        RawFrameOf<M>
+      >;
     }
-    const container = await this.#routeContainer(src, 'demux');
     const demuxer = await container.demux(src, stage);
     const track = demuxer.tracks.find((t) => t.mediaType === mediaType && t.config !== undefined);
     if (!track) {
@@ -1143,9 +1184,19 @@ export class MediaEngineImpl implements MediaEngine {
       (isRawPcmTrack(track) || track.codec === 'flac')
     ) {
       await demuxer.close();
+      const { pcmAudioChunksToAudioDataStream, pcmAudioToAudioDataStream } = await import(
+        '../dsp/audio-data.ts'
+      );
+      if (container.decodePcmAudioStream !== undefined) {
+        const chunks = await container.decodePcmAudioStream(src, stage);
+        return pcmAudioChunksToAudioDataStream(chunks, stage, track.codec, 'f32') as ReadableStream<
+          RawFrameOf<M>
+        >;
+      }
       const audio = await container.decodePcmAudio(src, stage);
-      const { pcmAudioToAudioDataStream } = await import('../dsp/audio-data.ts');
-      return pcmAudioToAudioDataStream(audio, stage, track.codec) as ReadableStream<RawFrameOf<M>>;
+      return pcmAudioToAudioDataStream(audio, stage, track.codec, 'f32') as ReadableStream<
+        RawFrameOf<M>
+      >;
     }
     const {
       decodeQueryFor,
@@ -1173,14 +1224,11 @@ export class MediaEngineImpl implements MediaEngine {
       RawFrameOf<M>
     >;
     if (mediaType === 'audio') {
-      return (await decodedAudioStreamWithGapless(
-        decoded as ReadableStream<AudioData>,
-        track,
-        {
-          packets: demuxer.packets(track.id),
-          createDecoder: () => codec.createDecoder(config, stage),
-        },
-      )) as ReadableStream<RawFrameOf<M>>;
+      return (await decodedAudioStreamWithGapless(decoded as ReadableStream<AudioData>, track, {
+        packets: demuxer.packets(track.id),
+        createDecoder: () => codec.createDecoder(config, stage),
+        signal: stage.signal,
+      })) as ReadableStream<RawFrameOf<M>>;
     }
     return decoded;
     /* v8 ignore stop */
@@ -1203,321 +1251,37 @@ export class MediaEngineImpl implements MediaEngine {
     return decodedAudioStreamWithGapless(decoded, track, {
       packets: demuxer.packets(track.id),
       createDecoder: () => codec.createDecoder(config, stage),
+      signal: stage.signal,
     });
   }
 
-  /**
-   * Cross-container stream-copy (ADR-021/012): demux the source and write each track's encoded packets
-   * **verbatim** into the target container's `Muxer` — no decode/re-encode, so codec-private/PTS/DTS/
-   * B-frame composition survive. The target muxer's `addTrack`/`mapCodec` is the single arbiter of
-   * codec-in-container legality, so an illegal pair (e.g. Vorbis→MP4, H.264→Ogg) stays an honest
-   * `CapabilityError` from the muxer; a target with no working muxer is rejected up front. The packet copy
-   * itself needs WebCodecs `EncodedChunk` (browser) — unreachable in Node, where `packets()` throws the
-   * typed miss first — so it is browser-harness validated; the routing decision is unit-tested.
-   */
-  async #remuxViaSeam(
-    container: ContainerDriver,
-    src: Source,
-    opts: RemuxOptions,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<ReadableStream<Uint8Array>> {
-    if (!containerHasChunkMuxer(opts.to)) {
-      throw new CapabilityError('capability-miss', `no remux muxer '${opts.to}'`, {
-        op: 'remux',
-        tried: [container.id, opts.to],
-      });
-    }
-    if (
-      (opts.to === 'webm' || opts.to === 'mkv') &&
-      (opts.fragmented === true ||
-        (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES))
-    ) {
-      const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
-      return remuxViaStreamingWebm(container, src, opts, this.#stageOptions(signal, o));
-    }
-    if (opts.to === 'ts') {
-      const { tryRemuxPacketInfoToMpegTs } = await import('./mpegts-packet-info-remux.ts');
-      const stream = await tryRemuxPacketInfoToMpegTs(
-        container,
-        src,
-        opts,
-        this.#stageOptions(signal, o),
-      );
-      if (stream !== undefined) return stream;
-    }
-    // Decline an oversize buffer-all remux UP FRONT (ADR-094): the cross-container seam copies every packet
-    // into a muxer that serializes the whole file at finalize (no incremental Cluster emit), so a
-    // multi-GB output would OOM/hang. The output of a verbatim stream-copy is ~the source media size, so a
-    // known source size over the ceiling is a real resource limit — a typed miss, not an attempt-then-timeout.
-    // Unknown size ⇒ proceed (best-effort guard, never a guess); the streaming-mux follow-up lifts this.
-    if (src.size !== undefined && src.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
-      throw new CapabilityError('capability-miss', `remux '${opts.to}' over buffer limit`, {
-        op: 'remux',
-        tried: [container.id, opts.to],
-      });
-    }
-    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
-    const muxer = (await this.#routeMuxer(opts.to)).createMuxer(muxOptionsFrom(opts, opts.to));
-    // Copy only tracks the demuxer fully describes (a `config`-less track cannot be re-muxed faithfully).
-    const { selectTrackInfos } = await import('./track-select.ts');
-    const tracks = selectTrackInfos(
-      demuxer.tracks.filter((t) => t.config !== undefined),
-      opts.trackSelect,
-    );
-    if (tracks.length === 0) {
-      await demuxer.close();
-      throw new CapabilityError('capability-miss', 'no remux track', {
-        op: 'remux',
-        tried: [container.id],
-      });
-    }
-    /* v8 ignore start -- the verbatim packet copy needs WebCodecs EncodedChunk (browser); in Node
-       `packets()` throws the typed miss above. The track fan-out + drain is browser-harness validated. */
-    const openStreams: ReadableStream<unknown>[] = [];
-    try {
-      const { drainEncoderToMuxer } = await loadCodecPipeline();
-      const tasks = tracks.map((track) => {
-        const packets = demuxer.packets(track.id);
-        openStreams.push(packets);
-        return drainEncoderToMuxer(packets, muxer, () => track);
-      });
-      await allOrCancelStreams(tasks, openStreams);
-      await muxer.finalize();
-      return muxer.output;
-    } finally {
-      await demuxer.close();
-    }
-    /* v8 ignore stop */
-  }
-
-  /**
-   * Audio-only packet trim for elementary / audio-page containers whose muxers already write the copied
-   * compressed frames. This is deliberately narrower than generic keyframe trim: no video tracks, no
-   * multi-audio assembly, and no intra-frame cuts. We keep whole packets overlapping `[start,end)`, rebase
-   * the first kept packet to t=0, and let the container muxer repair duration/header metadata.
-   */
-  async #trimAudioPacketsViaSeam(
-    container: ContainerDriver,
-    src: Source,
-    target: Container,
-    opts: TrimOptions,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<ReadableStream<Uint8Array>> {
-    if (typeof EncodedAudioChunk === 'undefined') {
-      throw new CapabilityError('capability-miss', 'audio trim needs EncodedAudioChunk', {
-        op: 'trim',
-        tried: [container.id, target],
-      });
-    }
-    const { trimAudioPacketStream, trimBoundsUs, trimPacketCopyTrack } = await import(
-      './trim-streams.ts'
-    );
-    const bounds = trimBoundsUs(opts.start, opts.end);
-    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
-    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
-    try {
-      if (demuxer.tracks.some((track) => track.mediaType === 'video')) {
-        throw new CapabilityError('capability-miss', 'audio trim rejects video', {
-          op: 'trim',
-          tried: [container.id, target],
-        });
-      }
-      const tracks = demuxer.tracks.filter(
-        (track) => track.mediaType === 'audio' && track.config !== undefined,
-      );
-      if (tracks.length !== 1) {
-        throw new CapabilityError(
-          'capability-miss',
-          `audio trim needs one track, found ${tracks.length}`,
-          { op: 'trim', tried: [container.id, target] },
-        );
-      }
-      const track = tracks[0];
-      if (track === undefined) {
-        throw new CapabilityError('capability-miss', 'no audio trim track', {
-          op: 'trim',
-          tried: [container.id, target],
-        });
-      }
-      const packets = trimAudioPacketStream(demuxer.packets(track.id), bounds);
-      const { drainEncoderToMuxer } = await loadCodecPipeline();
-      await drainEncoderToMuxer(packets, muxer, () => trimPacketCopyTrack(track, bounds));
-      await muxer.finalize();
-      return muxer.output;
-    } finally {
-      await demuxer.close();
-    }
-  }
-
-  /**
-   * Accurate trim: decode from a safe video keyframe preroll (audio from the head), keep decoded frames
-   * whose presentation timestamp lands in the requested window, rebase the first kept frame to t=0, then
-   * re-encode and mux. This is the browser codec seam; Node reaches the typed codec miss before packets
-   * are consumed. Frame lifetime is owned by `trimTimedFrameStream` (skipped/input frames) and the encoder
-   * stages (emitted frames).
-   */
-  async #trimViaCodec(
-    container: ContainerDriver,
-    src: Source,
-    target: Container,
-    opts: TrimOptions,
-    durationSec: number,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<ReadableStream<Uint8Array>> {
-    if (!containerHasChunkMuxer(target)) {
-      throw new CapabilityError('capability-miss', `accurate trim to '${target}' has no muxer`, {
-        op: 'trim',
-        tried: [target],
-      });
-    }
-
-    // Accurate trim is decode→(restamp)→encode→mux — the same heavy graph as convert, so it offloads to
-    // the worker too (doc 06 §4, ADR-019), returning the encoded byte stream the caller materializes.
-    // `undefined` ⇒ no worker; run the inline path below (the honest fallback).
-    const offloaded = await this.#offloadStream(src, 'trim', opts, signal, o);
-    /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
-    if (offloaded !== undefined) return offloaded;
-
-    const {
-      estimateTrackBitrateFromPacketInfo,
-      restampAudioData,
-      restampVideoFrame,
-      planTrimAudioPacketInfoRows,
-      planTrimVideoPacketInfoRows,
-      trimAudioPacketInfoStream,
-      trimAudioPacketInfoTrack,
-      trimBoundsUs,
-      trimEncodeTrack,
-      trimTimedFrameStream,
-      trimVideoEncodeTarget,
-      trimVideoPacketInfoChunkStream,
-    } = await import('./trim-streams.ts');
-    const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
-    const bounds = trimBoundsUs(opts.start, endSec);
-    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
-    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
-    const tasks: Promise<void>[] = [];
-    const openStreams: ReadableStream<unknown>[] = [];
-    let drainsStarted = false;
-    try {
-      const demuxerPacketInfoRows = (demuxer as DemuxerWithPacketInfoTable).packetInfoTable?.();
-      const videoTrack = demuxer.tracks.find(
-        (t) => t.mediaType === 'video' && t.config !== undefined,
-      );
-      const audioTrack = demuxer.tracks.find(
-        (t) => t.mediaType === 'audio' && t.config !== undefined,
-      );
-
-      if (videoTrack) {
-        assertTrimTrackDecodable(videoTrack);
-        const { decodeQueryFor, startAtSeekKeyframe, unwrapPackets } = await loadCodecPipeline();
-        const decodeQuery = await decodeQueryFor(videoTrack);
-        const codec = await this.#routeCodec(decodeQuery, o);
-        const videoTrackIndex = demuxer.tracks.findIndex((track) => track.id === videoTrack.id);
-        const sourceBitrate =
-          demuxerPacketInfoRows === undefined || videoTrackIndex < 0
-            ? undefined
-            : estimateTrackBitrateFromPacketInfo(demuxerPacketInfoRows, videoTrackIndex);
-        const packetInfoVideoRows =
-          typeof EncodedVideoChunk === 'undefined' ||
-          src.range === undefined ||
-          demuxerPacketInfoRows === undefined ||
-          videoTrackIndex < 0
-            ? undefined
-            : planTrimVideoPacketInfoRows(demuxerPacketInfoRows, videoTrackIndex, bounds);
-        /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
-        const packets =
-          packetInfoVideoRows === undefined
-            ? await startAtSeekKeyframe(
-                unwrapPackets(demuxer.packets(videoTrack.id)),
-                bounds.startUs,
-              )
-            : trimVideoPacketInfoChunkStream(src, packetInfoVideoRows, signal);
-        const config = decodeQuery.config;
-        const decoded = packets.pipeThrough(
-          codec.createDecoder(config, this.#stageOptions(signal, o)),
-        ) as ReadableStream<VideoFrame>;
-        const trimmed = trimTimedFrameStream(decoded, bounds, restampVideoFrame);
-        openStreams.push(trimmed);
-        tasks.push(
-          this.#encodeVideoStream(
-            trimmed,
-            trimVideoEncodeTarget(videoTrack, sourceBitrate),
-            trimEncodeTrack(videoTrack),
-            muxer,
-            signal,
-            o,
-          ),
-        );
-        /* v8 ignore stop */
-      }
-
-      if (audioTrack) {
-        assertTrimTrackDecodable(audioTrack);
-        const audioTrackIndex = demuxer.tracks.findIndex((track) => track.id === audioTrack.id);
-        const packetInfoRows =
-          typeof EncodedAudioChunk === 'undefined' || src.range === undefined || audioTrackIndex < 0
-            ? undefined
-            : planTrimAudioPacketInfoRows(demuxerPacketInfoRows ?? [], audioTrackIndex, bounds);
-        if (packetInfoRows !== undefined) {
-          const packets = trimAudioPacketInfoStream(src, packetInfoRows, signal);
-          openStreams.push(packets);
-          const { drainEncoderToMuxer } = await loadCodecPipeline();
-          tasks.push(
-            drainEncoderToMuxer(packets, muxer, () => trimAudioPacketInfoTrack(audioTrack, bounds)),
-          );
-        } else {
-          /* v8 ignore start -- live decode→trim→encode requires WebCodecs; browser-harness validated. */
-          const programAudio = await this.#decodeAudioTrackPackets(
-            demuxer,
-            audioTrack,
-            this.#stageOptions(signal, o),
-            o,
-          );
-          const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
-          openStreams.push(trimmed);
-          tasks.push(
-            this.#encodeAudioStream(trimmed, {}, trimEncodeTrack(audioTrack), muxer, signal, o),
-          );
-          /* v8 ignore stop */
-        }
-      }
-
-      if (tasks.length === 0) {
-        throw new CapabilityError('capability-miss', 'accurate trim found no track', {
-          op: 'trim',
-          tried: [container.id],
-        });
-      }
-
-      /* v8 ignore start -- reached only after live codec routes resolve; browser-harness validated. */
-      drainsStarted = true;
-      await allOrCancelStreams(tasks, openStreams);
-      await muxer.finalize();
-      return muxer.output;
-      /* v8 ignore stop */
-    } catch (e) {
-      if (!drainsStarted) {
-        await Promise.all(openStreams.map((stream) => cancelStream(stream)));
-      }
-      throw e;
-    } finally {
-      await demuxer.close();
-    }
+  /** Bind only engine-private routing/codec seams; complete remux/trim orchestration stays lazy. */
+  #operationRunnerContext(): DecryptRunnerContext &
+    MuxRunnerContext &
+    RemuxRunnerContext &
+    TrimRunnerContext {
+    return {
+      resolveHls: this.#resolveHlsInput.bind(this),
+      container: this.#routeContainer.bind(this),
+      muxer: this.#routeMuxer.bind(this),
+      stage: this.#stageOptions.bind(this),
+      offload: this.#offloadStream.bind(this),
+      codec: this.#routeCodec.bind(this),
+      decodeAudio: this.#decodeAudioTrackPackets.bind(this),
+      encodeVideo: this.#encodeVideoStream.bind(this),
+      encodeAudio: this.#encodeAudioStream.bind(this),
+      assertRange: assertTrimRange,
+    };
   }
 
   /**
    * The capabilities the lazily-imported PCM-family authoring routines need, bound to this engine instance —
-   * a superset satisfying BOTH {@link FlacConvertDeps} (FLAC route) and {@link PcmConvertDeps} (raw-PCM
-   * route). Built only on an eligible `to:'flac'`/raw-PCM convert (the inline gate gates the lazy import), so
-   * the eager kernel never carries those routes — just this tiny binder + the shared `pcm*` mappers.
+   * a superset satisfying both the FLAC and raw-PCM authoring routes. The implementation stays lazy.
    */
-  #authoringDeps(): PcmConvertDeps {
+  #authoringDeps(o: CallOptions = {}): PcmConvertDeps {
     return {
-      routeContainer: (src, direction) => this.#routeContainer(src, direction),
+      routeContainer: (src, direction) =>
+        this.#routeContainer(src, direction, undefined, o.strategy?.pinDriver),
       stageOptions: (signal, o) => this.#stageOptions(signal, o),
       mimeOpts: (signal, container) => mimeOpts(signal, container),
       pcmSampleFormat: (codec) => pcmSampleFormat(codec),
@@ -1536,7 +1300,7 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<Output> {
-    const container = await this.#routeContainer(src, 'demux');
+    const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
     const target = chooseOutputContainer(opts.to, container.formats[0]);
 
     // Preferred fast path: a pure container change (no codec/filter/param change, no dropped track) is a
@@ -1544,11 +1308,13 @@ export class MediaEngineImpl implements MediaEngine {
     if (
       isPureStreamCopy(opts) &&
       container.streamCopy &&
-      container.formats.includes(target) &&
+      (container.formats.includes(target) ||
+        container.streamCopyTargets?.includes(target) === true) &&
       target === opts.to
     ) {
       const stream = await container.streamCopy(src, {
         ...this.#stageOptions(signal, o),
+        container: target,
         ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
         ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
         ...streamCopySinkMode(opts.sink),
@@ -1573,8 +1339,22 @@ export class MediaEngineImpl implements MediaEngine {
       return materializeOutput(opts.sink ?? toBlob(), offloaded, mimeOpts(signal, target));
     }
 
+    const twoPassPlan =
+      opts.video !== false && opts.video?.twoPass === true
+        ? await (await import('./video-two-pass-runner.ts')).analyzeH264TwoPass(
+            src,
+            container,
+            opts.video,
+            signal,
+            o,
+            opts.fragmented === true,
+            this.#videoRunnerContext(),
+          )
+        : undefined;
     const demuxer = await container.demux(src, this.#stageOptions(signal, o));
-    const muxer = (await this.#routeMuxer(target)).createMuxer(muxOptionsFrom(opts, target));
+    const muxer = (await this.#routeMuxer(target, o.strategy?.pinDriver)).createMuxer(
+      muxOptionsFrom(opts, target),
+    );
     const tasks: Promise<void>[] = [];
     const openStreams: ReadableStream<unknown>[] = [];
     try {
@@ -1600,8 +1380,19 @@ export class MediaEngineImpl implements MediaEngine {
         } = await loadCodecPipeline();
         const videoTarget = opts.video || {};
         const sourceGeometry = sourceGeometryOf(videoTrack);
-        await buildVideoEncoderConfigForRuntime(videoTarget, sourceGeometry, videoTrack.codec);
-        if (canUseVpxAlphaPacketTranscode(videoTarget, videoTrack.alpha === true)) {
+        const videoEncoderConfig = await buildVideoEncoderConfigForRuntime(
+          videoTarget,
+          sourceGeometry,
+          videoTrack.codec,
+        );
+        if (
+          canUseVpxAlphaPacketTranscode(
+            videoTarget,
+            videoTrack.alpha === true,
+            videoTrack.codec,
+            videoEncoderConfig.codec,
+          )
+        ) {
           const packets = demuxer.packets(videoTrack.id);
           openStreams.push(packets);
           tasks.push(
@@ -1645,6 +1436,7 @@ export class MediaEngineImpl implements MediaEngine {
               signal,
               o,
               opts.fragmented === true,
+              twoPassPlan,
             ),
           );
           /* v8 ignore stop */
@@ -1657,14 +1449,31 @@ export class MediaEngineImpl implements MediaEngine {
           audioTrack.codec,
         );
         const stage = this.#stageOptions(signal, o);
-        const decoded =
-          container.decodePcmAudio && (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
-            ? (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
-                await container.decodePcmAudio(src, stage),
-                stage,
-                audioTrack.codec,
-              )
-            : await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
+        let decoded: ReadableStream<AudioData>;
+        if (
+          (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
+          container.decodePcmAudioStream !== undefined
+        ) {
+          const chunks = await container.decodePcmAudioStream(src, stage);
+          decoded = (await import('../dsp/audio-data.ts')).pcmAudioChunksToAudioDataStream(
+            chunks,
+            stage,
+            audioTrack.codec,
+            'f32',
+          );
+        } else if (
+          container.decodePcmAudio !== undefined &&
+          (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
+        ) {
+          decoded = (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
+            await container.decodePcmAudio(src, stage),
+            stage,
+            audioTrack.codec,
+            'f32',
+          );
+        } else {
+          decoded = await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
+        }
         /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
         // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
         // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
@@ -1688,6 +1497,15 @@ export class MediaEngineImpl implements MediaEngine {
     } finally {
       await demuxer.close();
     }
+  }
+
+  /** Bind the engine-owned router/filter capabilities shared by both lazy video-runner entry points. */
+  #videoRunnerContext(): H264TwoPassRunnerContext {
+    return {
+      routeCodec: this.#routeCodec.bind(this),
+      applyVideoFilters: this.#applyVideoFilters.bind(this),
+      stageOptions: this.#stageOptions.bind(this),
+    };
   }
 
   /**
@@ -1839,13 +1657,17 @@ export class MediaEngineImpl implements MediaEngine {
       colorStage,
       alphaStage,
     });
-    await drainEncoderToMuxer(chunks, muxer, () =>
-      videoTrackInfoFromDecoderConfig(
-        requireEncoderConfig(decoderConfig, 'video'),
-        target.fps,
-        sourceTrack.durationSec,
-        sourceTrack.rotation,
-      ),
+    await drainEncoderToMuxer(
+      chunks,
+      muxer,
+      () =>
+        videoTrackInfoFromDecoderConfig(
+          requireEncoderConfig(decoderConfig, 'video'),
+          target.fps,
+          sourceTrack.durationSec,
+          sourceTrack.rotation,
+        ),
+      signal,
     );
     /* v8 ignore stop */
   }
@@ -1859,72 +1681,20 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
     fragmented = false,
+    twoPassPlan?: H264TwoPassPlan,
   ): Promise<void> {
-    const {
-      buildVideoEncoderConfig,
-      drainEncoderToMuxer,
-      encodeQueryFor,
-      encodeVideoFramesWithAlpha,
-      periodicVideoKeyFrameInterval,
-      requireEncoderConfig,
-      videoTrackInfoFromDecoderConfig,
-    } = await loadCodecPipeline();
-    const config = buildVideoEncoderConfig(
+    const { encodeVideoStream } = await import('./video-two-pass-runner.ts');
+    await encodeVideoStream(
+      frames,
       target,
-      sourceTrack ? sourceGeometryOf(sourceTrack) : { width: target.width, height: target.height },
-      sourceTrack?.codec,
+      sourceTrack,
+      muxer,
+      signal,
+      o,
+      fragmented,
+      twoPassPlan,
+      this.#videoRunnerContext(),
     );
-    const { planVideoBitDepthConversion } = await import('./video-stream-plan.ts');
-    const bitDepthPlan = planVideoBitDepthConversion({
-      ...(sourceTrack?.codec !== undefined ? { sourceCodec: sourceTrack.codec } : {}),
-      targetCodec: config.codec,
-      ...(target.bitDepth !== undefined ? { targetBitDepth: target.bitDepth } : {}),
-    });
-    const encoderConfig: VideoEncoderConfig =
-      target.alpha === 'keep' ? { ...config, alpha: 'discard' } : config;
-    const codec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
-    const keyFrameInterval = periodicVideoKeyFrameInterval(target.fps, fragmented);
-    // The encoder publishes its VideoDecoderConfig (codec box) out-of-band via onDecoderConfig; the muxer
-    // needs it before addTrack, so we capture it and build the TrackInfo lazily on the first chunk. Past
-    // here is the live WebCodecs path — unreachable in Node (the route above throws first), browser-validated.
-    /* v8 ignore start -- requires a real VideoEncoder; validated in the browser harness (BUILD §6.1). */
-    let decoderConfig: VideoDecoderConfig | undefined;
-    const stage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      onDecoderConfig: (c) => {
-        decoderConfig = c;
-      },
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-      ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
-    };
-    const alphaStage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-      ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
-    };
-    const encodeInput = bitDepthPlan.requiresPixelPath
-      ? frames.pipeThrough(
-          (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
-        )
-      : frames;
-    const chunks =
-      target.alpha === 'keep'
-        ? encodeVideoFramesWithAlpha(encodeInput, {
-            config: encoderConfig,
-            createEncoder: (c, stageOptions) => codec.createEncoder(c, stageOptions),
-            colorStage: stage,
-            alphaStage,
-          })
-        : encodeInput.pipeThrough(codec.createEncoder(encoderConfig, stage));
-    await drainEncoderToMuxer(chunks, muxer, () =>
-      videoTrackInfoFromDecoderConfig(
-        requireEncoderConfig(decoderConfig, 'video'),
-        target.fps,
-        sourceTrack?.durationSec,
-        sourceTrack?.rotation,
-      ),
-    );
-    /* v8 ignore stop */
   }
 
   /** Encode one audio stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
@@ -1961,64 +1731,76 @@ export class MediaEngineImpl implements MediaEngine {
       },
     };
     const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
-    await drainEncoderToMuxer(chunks, muxer, () =>
-      audioTrackInfoFromDecoderConfig(
-        requireEncoderConfig(decoderConfig, 'audio'),
-        sourceTrack?.durationSec,
-        sourceTrack?.gapless,
-      ),
+    await drainEncoderToMuxer(
+      chunks,
+      muxer,
+      () =>
+        audioTrackInfoFromDecoderConfig(
+          requireEncoderConfig(decoderConfig, 'audio'),
+          sourceTrack?.durationSec,
+          sourceTrack?.gapless,
+        ),
+      signal,
     );
     /* v8 ignore stop */
-  }
-
-  /** The media's duration (longest track), read via a one-shot demux — mirrors {@link probe}. */
-  async #probeDurationSec(
-    container: ContainerDriver,
-    src: Source,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<number> {
-    const stage = this.#stageOptions(signal, o);
-    if (container.probe !== undefined) {
-      return trimDurationSecFromTracks(await container.probe(src, stage));
-    }
-    const demuxer = await container.demux(src, stage);
-    try {
-      return trimDurationSecFromTracks(demuxer.tracks);
-    } finally {
-      await demuxer.close();
-    }
-  }
-
-  /** Use the container's native stream-copy for same-container remux/trim; else a typed miss (ADR-021). */
-  async #streamCopyOrThrow(
-    container: ContainerDriver,
-    src: Source,
-    target: string,
-    op: string,
-    opts: StreamCopyOptions,
-  ): Promise<ReadableStream<Uint8Array>> {
-    if (!container.streamCopy || !container.formats.includes(target)) {
-      throw new CapabilityError('capability-miss', `${op} to '${target}' needs codec seam`, {
-        op,
-        tried: [container.id],
-      });
-    }
-    // Pass the requested target token so a multi-format driver writes the right flavor (e.g. the MP4
-    // driver emits a QuickTime `ftyp` for a 'mov' target vs an ISO one for 'mp4').
-    return container.streamCopy(src, { ...opts, container: target });
   }
 
   #withCancel<T>(o: CallOptions, exec: (signal: AbortSignal) => Promise<T>): Cancellable<T> {
     const ctrl = new AbortController();
     const caller = o.signal;
+    const onCallerAbort = (): void => ctrl.abort(caller?.reason);
+    let callerListenerAttached = false;
     if (caller) {
       if (caller.aborted) ctrl.abort(caller.reason);
-      else caller.addEventListener('abort', () => ctrl.abort(caller.reason), { once: true });
+      else {
+        caller.addEventListener('abort', onCallerAbort, { once: true });
+        callerListenerAttached = true;
+      }
     }
-    const p = exec(ctrl.signal) as Cancellable<T>;
+    const releaseCallerListener = (): void => {
+      if (!callerListenerAttached || caller === undefined) return;
+      callerListenerAttached = false;
+      caller.removeEventListener('abort', onCallerAbort);
+    };
+    // Preserve the original zero-pin execution ordering: no pre-execution promise wrapper or registry
+    // scan. A caller-signal task adds only one settlement observer to release its owned listener.
+    let p: Cancellable<T>;
+    try {
+      p = (
+        o.strategy?.pinDriver === undefined || ctrl.signal.aborted
+          ? exec(ctrl.signal)
+          : (async (): Promise<T> => {
+              await this.#ensurePinRegistered(o);
+              return exec(ctrl.signal);
+            })()
+      ) as Cancellable<T>;
+    } catch (error) {
+      releaseCallerListener();
+      throw error;
+    }
+    if (callerListenerAttached) void p.then(releaseCallerListener, releaseCallerListener);
     p.cancel = (): void => ctrl.abort(new MediaError('aborted', 'operation cancelled'));
     return p;
+  }
+
+  /** Resolve an exact pin before any source/frame ownership begins; defaults may define the id lazily. */
+  async #ensurePinRegistered(o: CallOptions): Promise<void> {
+    const pin = o.strategy?.pinDriver;
+    if (pin === undefined || this.#hasDriverId(pin)) return;
+    await this.#ensureDefaultDrivers();
+    if (this.#hasDriverId(pin)) return;
+    throw new CapabilityError('capability-miss', `pinned driver '${pin}' is not registered`, {
+      op: 'route',
+      tried: [pin],
+    });
+  }
+
+  #hasDriverId(id: string): boolean {
+    return (
+      this.#registry.codecs().some((driver) => driver.id === id) ||
+      this.#registry.containers().some((driver) => driver.id === id) ||
+      this.#registry.filters().some((driver) => driver.id === id)
+    );
   }
 }
 
@@ -2049,55 +1831,7 @@ interface ImageDecodeRoute {
 type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
 const noImageDecodeRoute: ImageDecodeRouteLoader = () => Promise.resolve(undefined);
 
-function shouldSniffImageForDecode(src: Source): boolean {
-  const mime = src.mimeHint?.toLowerCase();
-  return mime === undefined || (!mime.startsWith('video/') && !mime.startsWith('audio/'));
-}
-
 const MICROS_PER_SECOND = 1_000_000;
-const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
-const TRIM_IDENTITY_START_EPSILON_SEC = 1e-9;
-const TRIM_IDENTITY_END_EPSILON_SEC = 0.001;
-
-function canTrimAudioPackets(container: Container): boolean {
-  return AUDIO_PACKET_TRIM_CONTAINERS.has(container);
-}
-
-function isWholeSourceTrim(src: Source, opts: TrimOptions, durationSec: number): boolean {
-  if (src.kind === 'stream') return false;
-  if (durationSec <= 0) return false;
-  return (
-    Math.abs(opts.start) <= TRIM_IDENTITY_START_EPSILON_SEC &&
-    Math.abs(opts.end - durationSec) <= TRIM_IDENTITY_END_EPSILON_SEC
-  );
-}
-
-function trimDurationSecFromTracks(tracks: readonly TrackInfo[]): number {
-  return tracks.reduce((max, track) => Math.max(max, trimDurationSecOfTrack(track)), 0);
-}
-
-function trimDurationSecOfTrack(track: TrackInfo): number {
-  const totalSamples = track.gapless?.totalSamples;
-  const sampleRate = audioGeometryOf(track).sampleRate;
-  if (
-    track.mediaType === 'audio' &&
-    totalSamples !== undefined &&
-    sampleRate !== undefined &&
-    sampleRate > 0
-  ) {
-    return totalSamples / sampleRate;
-  }
-  return track.durationSec !== undefined &&
-    Number.isFinite(track.durationSec) &&
-    track.durationSec > 0
-    ? track.durationSec
-    : 0;
-}
-
-function assertTrimTrackDecodable(track: TrackInfo): void {
-  if (track.encrypted !== true) return;
-  throw new MediaError('decode-error', `protected ${track.mediaType} trim needs decrypt()`);
-}
 
 function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
   let promise: Promise<T> | undefined;
@@ -2125,8 +1859,19 @@ function forceSoftware(o: CallOptions): CallOptions {
 }
 
 /** Re-expose a {@link StageOptions} as a {@link CallOptions.strategy} so a sub-route inherits determinism. */
-function stageStrategy(stage: StageOptions): { determinism: Determinism } {
-  return { determinism: stage.determinism ?? 'auto' };
+function stageStrategy(stage: StageOptions): { determinism: Determinism; pinDriver?: string } {
+  return {
+    determinism: stage.determinism ?? 'auto',
+    ...(stage.pinDriver !== undefined ? { pinDriver: stage.pinDriver } : {}),
+  };
+}
+
+function isPinnedDriverMiss(error: CapabilityError, pinDriver: string | undefined): boolean {
+  if (pinDriver === undefined || !error.message.startsWith('pinned ')) return false;
+  const detail = error.detail;
+  if (typeof detail !== 'object' || detail === null || !('tried' in detail)) return false;
+  const tried = (detail as { readonly tried?: unknown }).tried;
+  return Array.isArray(tried) && tried.length === 1 && tried[0] === pinDriver;
 }
 
 /**
@@ -2454,32 +2199,12 @@ function routeHeadBytes(src: Source): number {
   return src.mimeHint !== undefined || src.filename !== undefined ? HINTED_HEAD_BYTES : HEAD_BYTES;
 }
 
-async function readHead(src: Source, n: number = HEAD_BYTES): Promise<Uint8Array> {
-  if (src.range) return src.range(0, n);
-  if (src.kind === 'stream') {
-    throw new InputError('unsupported-input', 'need seekable');
-  }
-  const reader = src.stream().getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (total < n) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-  const head = new Uint8Array(Math.min(total, n));
-  let off = 0;
-  for (const c of chunks) {
-    if (off >= head.length) break;
-    head.set(c.subarray(0, head.length - off), off);
-    off += c.byteLength;
-  }
-  return head;
+async function readHead(
+  src: Source,
+  n: number = HEAD_BYTES,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  return peekSourceHead(src, n, signal);
 }
 
 async function readAllSource(src: Source, signal: AbortSignal | undefined): Promise<Uint8Array> {
@@ -2495,7 +2220,7 @@ async function readAllSource(src: Source, signal: AbortSignal | undefined): Prom
   try {
     for (;;) {
       throwIfAborted(signal);
-      const { done, value } = await reader.read();
+      const { done, value } = await readSourceChunk(reader, signal);
       if (done) break;
       chunks.push(value);
       total += value.byteLength;
@@ -2516,13 +2241,23 @@ async function readAllSource(src: Source, signal: AbortSignal | undefined): Prom
   return out;
 }
 
-function bytesToStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(controller): void {
-      controller.enqueue(bytes);
-      controller.close();
-    },
+async function readSourceChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>> {
+  throwIfAborted(signal);
+  if (signal === undefined) return reader.read();
+  let rejectAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = () => reject(new MediaError('aborted', 'aborted'));
   });
+  const onAbort = (): void => rejectAbort?.();
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([reader.read(), aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

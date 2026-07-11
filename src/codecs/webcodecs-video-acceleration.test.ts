@@ -272,6 +272,42 @@ function restoreGlobalProperty(
   Object.defineProperty(globalThis, key, prior);
 }
 
+describe('WebcodecsVideoDriver.supports — deterministic software declaration', () => {
+  it('probes only prefer-software and rejects a UA rewrite to a hardware hint', async () => {
+    const priorDecoder = Object.getOwnPropertyDescriptor(globalThis, 'VideoDecoder');
+    const seen: HardwareAcceleration[] = [];
+    let acceptedAcceleration: HardwareAcceleration = 'prefer-software';
+    const capabilityVideoDecoder = {
+      isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+        seen.push(config.hardwareAcceleration ?? 'no-preference');
+        return Promise.resolve({
+          supported: true,
+          config: { ...config, hardwareAcceleration: acceptedAcceleration },
+        });
+      },
+    };
+    Object.defineProperty(globalThis, 'VideoDecoder', {
+      configurable: true,
+      value: capabilityVideoDecoder as unknown as typeof VideoDecoder,
+    });
+    const query = { mediaType: 'video', direction: 'decode', config: vp9Config() } as const;
+    try {
+      await expect(
+        WebcodecsVideoDriver.supports(query, { determinism: 'force-software' }),
+      ).resolves.toEqual({ supported: true, hardwareAccelerated: false });
+      expect(seen).toEqual(['prefer-software']);
+
+      acceptedAcceleration = 'prefer-hardware';
+      await expect(
+        WebcodecsVideoDriver.supports(query, { determinism: 'force-software' }),
+      ).resolves.toMatchObject({ supported: false });
+      expect(seen).toEqual(['prefer-software', 'prefer-software']);
+    } finally {
+      restoreGlobalProperty('VideoDecoder', priorDecoder);
+    }
+  });
+});
+
 describe('WebCodecs decoder startup — configuration is proven before packet submission', () => {
   it('falls back from a stale cached hardware decoder through an empty-flush barrier before decode()', async () => {
     const priorDecoder = Object.getOwnPropertyDescriptor(globalThis, 'VideoDecoder');

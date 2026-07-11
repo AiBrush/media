@@ -14,6 +14,7 @@ import {
   applyAffine,
   cropBlit,
   flipGeometry,
+  padBlit,
   resizeBlit,
   rotateGeometry,
 } from './geometry.ts';
@@ -206,6 +207,64 @@ describe('resizeBlit — fit modes', () => {
     expect(() =>
       resizeBlit(0, 100, { mediaType: 'video', type: 'resize', width: 10, height: 10 }),
     ).toThrow(InputError);
+  });
+});
+
+// ============ pad geometry ============
+
+describe('padBlit — exact placement on a larger transparent canvas', () => {
+  it('centers by default with deterministic floor placement for odd remainders', () => {
+    const blit = padBlit(2, 1, {
+      mediaType: 'video',
+      type: 'pad',
+      width: 5,
+      height: 4,
+      x: 1,
+      y: 1,
+    });
+    expect(blit).toEqual({
+      dims: { width: 5, height: 4 },
+      src: { x: 0, y: 0, width: 2, height: 1 },
+      dst: { x: 1, y: 1, width: 2, height: 1 },
+    });
+  });
+
+  it('honors an explicit in-bounds placement without scaling', () => {
+    expect(
+      padBlit(2, 1, { mediaType: 'video', type: 'pad', width: 5, height: 4, x: 3, y: 0 }),
+    ).toMatchObject({ dst: { x: 3, y: 0, width: 2, height: 1 } });
+  });
+
+  it('rejects shrinking, fractional dimensions, and out-of-bounds offsets', () => {
+    expect(() =>
+      padBlit(2, 2, { mediaType: 'video', type: 'pad', width: 1, height: 2, x: 0, y: 0 }),
+    ).toThrow(InputError);
+    expect(() =>
+      padBlit(2, 2, {
+        mediaType: 'video',
+        type: 'pad',
+        width: 3.5,
+        height: 3,
+        x: 0,
+        y: 0,
+      }),
+    ).toThrow(InputError);
+    expect(() =>
+      padBlit(2, 2, { mediaType: 'video', type: 'pad', width: 3, height: 3, x: 2, y: 0 }),
+    ).toThrow(InputError);
+  });
+
+  it('dispatches through the shared GPU/Canvas draw recipe', () => {
+    expect(
+      planDraw({ mediaType: 'video', type: 'pad', width: 4, height: 3, x: 1, y: 1 }, 2, 1),
+    ).toEqual({
+      kind: 'blit',
+      blit: {
+        dims: { width: 4, height: 3 },
+        src: { x: 0, y: 0, width: 2, height: 1 },
+        dst: { x: 1, y: 1, width: 2, height: 1 },
+      },
+    });
   });
 });
 

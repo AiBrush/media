@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { InputError } from '../contracts/errors.ts';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { loadFixture } from '../test-support/corpus.ts';
+import type { LiveMediaSource } from './live-source.ts';
 import {
   type MediaInput,
   type Source,
@@ -12,6 +13,7 @@ import {
   fromStream,
   fromURL,
   isSource,
+  peekSourceHead,
   probeUrlSize,
 } from './source.ts';
 
@@ -140,6 +142,82 @@ describe('fromStream', () => {
     expect((await readAll(src.stream())).byteLength).toBe(5);
     expect(() => src.stream()).toThrowError(InputError);
   });
+
+  it('preserves universal-normalizer MIME and size hints', () => {
+    const src = from(fromBytes(FIVE).stream(), {
+      mime: 'audio/wav; codecs=1',
+      size: FIVE.byteLength,
+    });
+    expect(src.kind).toBe('stream');
+    expect(src.mimeHint).toBe('audio/wav; codecs=1');
+    expect(src.size).toBe(FIVE.byteLength);
+  });
+
+  it('replays increasing routing peeks byte-exactly through one backpressured consumer', async () => {
+    const chunks = [Uint8Array.of(0, 1), Uint8Array.of(2), Uint8Array.of(3, 4)];
+    let pulls = 0;
+    const src = fromStream(
+      new ReadableStream<Uint8Array>(
+        {
+          pull(controller): void {
+            const chunk = chunks[pulls++];
+            if (chunk === undefined) controller.close();
+            else controller.enqueue(chunk);
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+    );
+
+    expect([...(await peekSourceHead(src, 3))]).toEqual([0, 1, 2]);
+    expect(pulls).toBe(2);
+    expect([...(await peekSourceHead(src, 5))]).toEqual([0, 1, 2, 3, 4]);
+    expect(pulls).toBe(3);
+
+    const reader = src.stream().getReader();
+    expect(await reader.read()).toEqual({ done: false, value: chunks[0] });
+    expect(pulls).toBe(3);
+    expect(await reader.read()).toEqual({ done: false, value: chunks[1] });
+    expect(pulls).toBe(3);
+    expect(await reader.read()).toEqual({ done: false, value: chunks[2] });
+    expect(pulls).toBe(3);
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    expect(pulls).toBe(4);
+    expect(() => src.stream()).toThrowError(InputError);
+  });
+
+  it('cancels one pending prefix reader on abort and rejects later ownership transfer', async () => {
+    let cancels = 0;
+    let markPullStarted: (() => void) | undefined;
+    const pullStarted = new Promise<void>((resolve) => {
+      markPullStarted = resolve;
+    });
+    const src = fromStream(
+      new ReadableStream<Uint8Array>({
+        pull(): void {
+          markPullStarted?.();
+        },
+        cancel(): void {
+          cancels++;
+        },
+      }),
+    );
+    const ctrl = new AbortController();
+    const peek = peekSourceHead(src, 4, ctrl.signal);
+    await pullStarted;
+    ctrl.abort('stop');
+
+    await expect(peek).rejects.toMatchObject({ code: 'aborted' });
+    expect(cancels).toBe(1);
+    expect(() => src.stream()).toThrowError(InputError);
+  });
+
+  it('rejects an already-locked caller stream with a typed input error', () => {
+    const input = fromBytes(FIVE).stream();
+    const reader = input.getReader();
+    expect(() => fromStream(input)).toThrowError(InputError);
+    reader.releaseLock();
+  });
 });
 
 describe('fromURL', () => {
@@ -185,9 +263,23 @@ describe('fromElement', () => {
     expect([...(await readAll(src.stream()))]).toEqual([0, 1, 2, 3, 4]);
   });
 
-  it('throws on capture mode (Phase 1) and on a missing src', () => {
-    const el = { currentSrc: DATA_URL, src: '' } as unknown as HTMLMediaElement;
-    expect(() => fromElement(el, { mode: 'capture' })).toThrowError(InputError);
+  it('uses captureStream only in explicit capture mode and rejects a missing byte src', () => {
+    const mediaStream = {
+      getTracks: () => [],
+      getVideoTracks: () => [],
+      getAudioTracks: () => [],
+    } as unknown as MediaStream;
+    const el = {
+      currentSrc: DATA_URL,
+      src: '',
+      captureStream: () => mediaStream,
+    } as unknown as HTMLMediaElement;
+    const captured = fromElement(el, { mode: 'capture' });
+    expect(captured.kind).toBe('media-stream');
+    expect(captured.mediaStream).toBe(mediaStream);
+    expect(() => fromElement({} as HTMLMediaElement, { mode: 'capture' })).toThrowError(
+      CapabilityError,
+    );
     const empty = { currentSrc: '', src: '' } as unknown as HTMLMediaElement;
     expect(() => fromElement(empty)).toThrowError(InputError);
   });
@@ -200,6 +292,23 @@ describe('fromOPFS', () => {
 });
 
 describe('from (universal dispatch)', () => {
+  it('keeps byte, default-element, capture-element, and live overloads distinct', () => {
+    const element = {} as HTMLMediaElement;
+    const stream = {
+      getTracks: () => [],
+      getVideoTracks: () => [],
+      getAudioTracks: () => [],
+    } as unknown as MediaStream;
+    const assertTypes = (): void => {
+      expectTypeOf(from(FIVE)).toEqualTypeOf<Source>();
+      expectTypeOf(from(element)).toEqualTypeOf<Source>();
+      expectTypeOf(from(element, { mode: 'bytes' })).toEqualTypeOf<Source>();
+      expectTypeOf(from(element, { mode: 'capture' })).toEqualTypeOf<LiveMediaSource>();
+      expectTypeOf(from(stream)).toEqualTypeOf<LiveMediaSource>();
+    };
+    expectTypeOf(assertTypes).toBeFunction();
+  });
+
   it('routes each input kind to the right source', async () => {
     expect(from(FIVE).kind).toBe('bytes');
     expect(from(FIVE.buffer).kind).toBe('bytes');
@@ -264,7 +373,7 @@ describe('stubbed-environment paths', () => {
     await expect(rangeOf(fromURL('https://x/y.mp4'), 0, 2)).rejects.toBeInstanceOf(InputError);
   });
 
-  it('routes a stubbed HTMLMediaElement and rejects a stubbed MediaStream', () => {
+  it('routes a stubbed HTMLMediaElement and brands a structural MediaStream', () => {
     class FakeEl {
       currentSrc = DATA_URL;
       src = '';
@@ -272,9 +381,21 @@ describe('stubbed-environment paths', () => {
     vi.stubGlobal('HTMLMediaElement', FakeEl);
     expect(from(new FakeEl() as unknown as MediaInput).kind).toBe('element');
 
-    class FakeStream {}
+    class FakeStream {
+      getTracks(): MediaStreamTrack[] {
+        return [];
+      }
+
+      getVideoTracks(): MediaStreamTrack[] {
+        return [];
+      }
+
+      getAudioTracks(): MediaStreamTrack[] {
+        return [];
+      }
+    }
     vi.stubGlobal('MediaStream', FakeStream);
-    expect(() => from(new FakeStream() as unknown as MediaInput)).toThrowError(InputError);
+    expect(from(new FakeStream() as unknown as MediaStream).kind).toBe('media-stream');
   });
 });
 

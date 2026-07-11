@@ -20,7 +20,12 @@
 
 import type { Determinism } from '../contracts/driver.ts';
 import { runOffloadWorker } from './worker-entry.ts';
-import { type InnerEngine, type InnerEngineFactory, makeJobRunner } from './worker-main.ts';
+import {
+  type InnerEngine,
+  type InnerEngineFactory,
+  type InnerEngineRuntimeOptions,
+  makeJobRunner,
+} from './worker-main.ts';
 import type { HostMessage, MessageLike, WorkerMessage } from './worker-protocol.ts';
 
 /**
@@ -34,8 +39,8 @@ export function startWorkerMain(
   scope: MessageLike<HostMessage, WorkerMessage> & { webcodecs?: boolean },
 ): () => void {
   let enginePromise: Promise<typeof import('../api/engine.ts')> | undefined;
-  const makeInner: InnerEngineFactory = (determinism) =>
-    deferredInnerEngine(determinism, () => {
+  const makeInner: InnerEngineFactory = (determinism, runtime) =>
+    deferredInnerEngine(determinism, runtime, () => {
       enginePromise ??= import('../api/engine.ts');
       return enginePromise;
     });
@@ -50,11 +55,12 @@ export function startWorkerMain(
  */
 function deferredInnerEngine(
   determinism: Determinism,
+  runtime: InnerEngineRuntimeOptions,
   loadEngine: () => Promise<typeof import('../api/engine.ts')>,
 ): InnerEngine {
   const real = async (): Promise<InnerEngine> => {
     const { MediaEngineImpl } = await loadEngine();
-    return new MediaEngineImpl({ worker: false, determinism }) as unknown as InnerEngine;
+    return new MediaEngineImpl({ worker: false, determinism }, runtime) as unknown as InnerEngine;
   };
   return {
     convert: async (input, opts, o) => (await real()).convert(input, opts, o),

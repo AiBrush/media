@@ -1,62 +1,42 @@
 import type { ByteSource, DecryptParams } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError } from '../../contracts/errors.ts';
 import { hexToBytes } from '../../crypto/aes.ts';
 import { decryptHlsSampleAesTs } from '../../crypto/hls-aes.ts';
+import {
+  assertHlsSegmentClearNotAborted,
+  decryptHlsAes128ContainerSegment,
+  demandDrivenSegmentStream,
+  readHlsSegment,
+} from '../hls-full-segment-decrypt.ts';
+import { detectFraming, parseTs } from './ts-parse.ts';
 
-function abortedError(): MediaError {
-  return new MediaError('aborted', 'operation aborted');
+function validateMpegTsSegment(clear: Uint8Array): void {
+  const framing = detectFraming(clear);
+  if (framing === undefined || framing.start !== 0 || clear.byteLength % framing.packetSize !== 0) {
+    throw new InputError(
+      'unsupported-input',
+      'HLS AES-128 plaintext is not a complete packet-aligned MPEG-TS segment',
+    );
+  }
+  parseTs(clear);
 }
 
-function assertNotAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw abortedError();
-}
-
-async function readAll(src: ByteSource, signal: AbortSignal | undefined): Promise<Uint8Array> {
-  assertNotAborted(signal);
-  if (src.range && src.size !== undefined) {
-    const bytes = await src.range(0, src.size);
-    assertNotAborted(signal);
-    return bytes;
+/** Dispatch direct TS decrypt without ever conflating full-segment AES-128 and SAMPLE-AES. */
+export async function decryptMpegTs(
+  src: ByteSource,
+  o: DecryptParams,
+): Promise<ReadableStream<Uint8Array>> {
+  if (o.scheme === 'hls-aes128') {
+    return decryptHlsAes128ContainerSegment(src, o, {
+      driverId: 'mpegts',
+      containerLabel: 'MPEG-TS',
+      validate: validateMpegTsSegment,
+    });
   }
-  const reader = src.stream().getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const onAbort = (): void => {
-    void reader.cancel(abortedError()).catch(() => {});
-  };
-  signal?.addEventListener('abort', onAbort, { once: true });
-  try {
-    for (;;) {
-      assertNotAborted(signal);
-      const { done, value } = await reader.read();
-      assertNotAborted(signal);
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } catch (error) {
-    await reader.cancel(error).catch(() => {});
-    throw error;
-  } finally {
-    signal?.removeEventListener('abort', onAbort);
-    reader.releaseLock();
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  assertNotAborted(signal);
-  return out;
-}
-
-function oneShot(bytes: Uint8Array): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(controller): void {
-      controller.enqueue(bytes);
-      controller.close();
-    },
+  if (o.scheme === 'hls-sample-aes') return decryptMpegTsSampleAes(src, o);
+  throw new CapabilityError('capability-miss', `bad TS decrypt '${o.scheme}'`, {
+    op: 'decrypt',
+    tried: ['mpegts'],
   });
 }
 
@@ -77,11 +57,16 @@ export async function decryptMpegTsSampleAes(
       tried: ['mpegts'],
     });
   }
-  const clear = await decryptHlsSampleAesTs(
-    await readAll(src, o.signal),
-    hexToBytes(key),
-    hexToBytes(iv),
-  );
-  assertNotAborted(o.signal);
-  return oneShot(clear);
+  const keyBytes = hexToBytes(key);
+  let ivBytes: Uint8Array<ArrayBuffer> | undefined;
+  let clear: Uint8Array<ArrayBuffer>;
+  try {
+    ivBytes = hexToBytes(iv);
+    clear = await decryptHlsSampleAesTs(await readHlsSegment(src, o.signal), keyBytes, ivBytes);
+  } finally {
+    keyBytes.fill(0);
+    ivBytes?.fill(0);
+  }
+  assertHlsSegmentClearNotAborted(clear, o.signal);
+  return demandDrivenSegmentStream(clear, o.signal);
 }

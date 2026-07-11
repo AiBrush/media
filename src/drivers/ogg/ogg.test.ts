@@ -12,6 +12,24 @@ import {
 } from './ogg-driver.ts';
 import { OggMuxer } from './ogg-write.ts';
 
+function installThrowingAudioChunkConstructor(): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'EncodedAudioChunk');
+  class ThrowingAudioChunk {
+    constructor() {
+      throw new Error('aborted Ogg packet stream must not construct a chunk');
+    }
+  }
+  Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+    configurable: true,
+    writable: true,
+    value: ThrowingAudioChunk as unknown as typeof EncodedAudioChunk,
+  });
+  return (): void => {
+    if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+    else Object.defineProperty(globalThis, 'EncodedAudioChunk', descriptor);
+  };
+}
+
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -211,6 +229,23 @@ describe('OggDriver — demux seam + muxer', () => {
     expect((description as Uint8Array)[0]).toBe(2); // Xiph-laced Vorbis id/comment/setup headers
     expect(() => demuxed.packets(0)).toThrowError(/browser codec layer/);
     await demuxed.close();
+  });
+
+  it('aborts before assembling or constructing the next packet', async () => {
+    const controller = new AbortController();
+    const demuxed = await OggDriver.demux(await fixtureSource('sfx-opus.ogg'), {
+      signal: controller.signal,
+    });
+    const restore = installThrowingAudioChunkConstructor();
+    try {
+      const reader = demuxed.packets(0).getReader();
+      controller.abort();
+      await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+      reader.releaseLock();
+    } finally {
+      restore();
+      await demuxed.close();
+    }
   });
 
   it('carries the source OpusHead through the demux TrackInfo description', async () => {

@@ -37,6 +37,7 @@ interface RecordedCall {
   opts: unknown;
   sinkKind: string;
   determinism: string | undefined;
+  pinDriver: string | undefined;
   signalProvided: boolean;
 }
 
@@ -54,7 +55,12 @@ function fakeInnerEngine(calls: RecordedCall[]): InnerEngine {
     op: 'convert' | 'trim',
     input: { bytes(): Promise<Uint8Array>; filename?: string; mimeHint?: string },
     opts: { sink?: { kind: string } } & Record<string, unknown>,
-    o: { signal?: AbortSignal; strategy?: { determinism?: string } } | undefined,
+    o:
+      | {
+          signal?: AbortSignal;
+          strategy?: { determinism?: string; pinDriver?: string };
+        }
+      | undefined,
   ): Promise<Output> =>
     input.bytes().then((b) => {
       calls.push({
@@ -65,6 +71,7 @@ function fakeInnerEngine(calls: RecordedCall[]): InnerEngine {
         opts,
         sinkKind: opts.sink?.kind ?? '<none>',
         determinism: o?.strategy?.determinism,
+        pinDriver: o?.strategy?.pinDriver,
         signalProvided: o?.signal !== undefined,
       });
       // Echo the input bytes back as the "encoded" output so the test can assert the stream surfaced.
@@ -184,6 +191,40 @@ describe('makeJobRunner: pipeline reconstruction', () => {
     };
     await drain(runner(jobOf(payload, 'force-software'), noopCtx));
     expect(calls[0]?.determinism).toBe('force-software');
+  });
+
+  it('threads the exact pin and host-resolved WASM profile/asset root into the worker engine', async () => {
+    const calls: RecordedCall[] = [];
+    let runtimeSeen: Parameters<Parameters<typeof makeJobRunner>[0]>[1] | undefined;
+    const runner = makeJobRunner((_determinism, runtime) => {
+      runtimeSeen = runtime;
+      return innerWithBytes(calls);
+    });
+    const payload: OffloadJobPayload = {
+      kind: 'convert',
+      input: Uint8Array.from([7]).buffer,
+      opts: { to: 'mp4' },
+    };
+    const job: OffloadJob = {
+      ...jobOf(payload, 'force-software'),
+      pinDriver: 'wasm-aac',
+      wasmRuntime: {
+        kind: 'baseline',
+        simd: false,
+        threads: false,
+        sharedArrayBuffer: false,
+        reason: 'threads disabled by request',
+      },
+      wasmAssetBaseUrl: 'https://app.example/media/cores/',
+    };
+
+    await drain(runner(job, noopCtx));
+
+    expect(calls[0]?.pinDriver).toBe('wasm-aac');
+    expect(runtimeSeen).toEqual({
+      wasmRuntime: job.wasmRuntime,
+      wasmAssetBaseUrl: 'https://app.example/media/cores/',
+    });
   });
 
   it('rebuilds an accurate trim with its serializable options', async () => {

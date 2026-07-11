@@ -39,6 +39,7 @@ import type {
   CodecDriver,
   CodecQuery,
   CodecSupport,
+  CodecSupportOptions,
   DecoderConfig,
   DriverModule,
   EncodedChunk,
@@ -345,15 +346,18 @@ export async function awaitAudioCodecQueueDrain(
 
 // ============ supports() ============
 
-async function supports(q: CodecQuery): Promise<CodecSupport> {
+async function supports(q: CodecQuery, o?: CodecSupportOptions): Promise<CodecSupport> {
   if (q.mediaType !== 'audio') return unsupported('webcodecs-audio handles audio codecs only');
 
   if (q.direction === 'decode') {
     if (typeof AudioDecoder === 'undefined') return unsupported('AudioDecoder is unavailable');
     /* v8 ignore start -- requires WebCodecs AudioDecoder; validated in-browser. */
     try {
-      const support = await AudioDecoder.isConfigSupported(q.config as AudioDecoderConfig);
-      return codecSupport(support.supported === true, support.config);
+      const requested = hardwareAccelerationFor(o?.determinism);
+      const support = await AudioDecoder.isConfigSupported(
+        normalizeAudioDecoderConfig(q.config as AudioDecoderConfig, o?.determinism),
+      );
+      return codecSupport(support.supported === true, support.config, requested);
     } catch (e) {
       return unsupported(e instanceof Error ? e.message : 'isConfigSupported rejected');
     }
@@ -363,8 +367,11 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
   if (typeof AudioEncoder === 'undefined') return unsupported('AudioEncoder is unavailable');
   /* v8 ignore start -- requires WebCodecs AudioEncoder; validated in-browser. */
   try {
-    const support = await AudioEncoder.isConfigSupported(q.config as AudioEncoderConfig);
-    return codecSupport(support.supported === true, support.config);
+    const requested = hardwareAccelerationFor(o?.determinism);
+    const support = await AudioEncoder.isConfigSupported(
+      normalizeAudioEncoderConfig(q.config as AudioEncoderConfig, o?.determinism),
+    );
+    return codecSupport(support.supported === true, support.config, requested);
   } catch (e) {
     return unsupported(e instanceof Error ? e.message : 'isConfigSupported rejected');
   }
@@ -380,8 +387,12 @@ async function supports(q: CodecQuery): Promise<CodecSupport> {
 function codecSupport(
   supported: boolean,
   config: AudioDecoderConfig | AudioEncoderConfig | undefined,
+  requested: HardwareAcceleration,
 ): CodecSupport {
-  const accel = (config as AudioDecoderConfigEx | undefined)?.hardwareAcceleration;
+  const accel = (config as AudioDecoderConfigEx | undefined)?.hardwareAcceleration ?? requested;
+  if (requested === 'prefer-software' && accel !== 'prefer-software') {
+    return unsupported(`browser accepted '${accel}', not deterministic software`);
+  }
   return {
     supported,
     ...(accel !== undefined ? { hardwareAccelerated: accel === 'prefer-hardware' } : {}),

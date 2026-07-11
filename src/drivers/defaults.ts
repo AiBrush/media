@@ -71,6 +71,7 @@ import {
   parseFlacStreamInfo,
 } from './flac/flac-sniff.ts';
 import { Mp4Module } from './mp4/mp4-driver.ts';
+import { MPEG_TS_FORMATS, matchesMpegTs } from './mpegts/mpegts-sniff.ts';
 import { WebmModule } from './webm/webm-driver.ts';
 
 /**
@@ -249,9 +250,11 @@ interface LazyContainerSpec {
   readonly probe?: true;
   readonly packetInfo?: true;
   readonly streamCopy?: true;
+  readonly decrypt?: true;
   readonly transformPcm?: true;
   readonly decodePcm?: true;
   readonly decodePcmAudio?: true;
+  readonly decodePcmAudioStream?: true;
   readonly validatesStreamCopyTrim?: true;
   readonly validatesPcmTrim?: true;
   readonly muxKind?: LazyAudioMuxKind;
@@ -270,6 +273,7 @@ function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
       packetInfo: true,
       transformPcm: true,
       decodePcmAudio: true,
+      decodePcmAudioStream: true,
       validatesPcmTrim: true,
       muxKind: 'wav',
       validateTrack: (track, trackCount) => {
@@ -300,12 +304,13 @@ function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
     }),
     lazyContainer({
       id: 'adts',
-      formats: ['adts'],
+      formats: ['adts', 'aac'],
       supports: matchesAdts,
       load: () => import('./adts/adts-driver.ts').then((module) => module.AdtsDriver),
       probe: true,
       packetInfo: true,
       streamCopy: true,
+      decrypt: true,
       decodePcm: true,
       validatesStreamCopyTrim: true,
       muxKind: 'adts',
@@ -392,6 +397,16 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
           },
         }
       : {}),
+    ...(spec.decrypt === true
+      ? {
+          async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
+            const loaded = await load();
+            const decrypt = loaded.decrypt;
+            if (decrypt === undefined) throw missingLazyMethod(spec.id, 'decrypt');
+            return decrypt.call(loaded, src, o);
+          },
+        }
+      : {}),
     ...(spec.transformPcm === true
       ? {
           async transformPcm(
@@ -425,19 +440,26 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
           },
         }
       : {}),
+    ...(spec.decodePcmAudioStream === true
+      ? {
+          async decodePcmAudioStream(
+            src: ByteSource,
+            o?: StageOptions,
+          ): Promise<ReadableStream<PcmAudio>> {
+            const loaded = await load();
+            const decodePcmAudioStream = loaded.decodePcmAudioStream;
+            if (decodePcmAudioStream === undefined) {
+              throw missingLazyMethod(spec.id, 'decodePcmAudioStream');
+            }
+            return decodePcmAudioStream.call(loaded, src, o);
+          },
+        }
+      : {}),
     ...(spec.validatesStreamCopyTrim === true ? { validatesStreamCopyTrim: true } : {}),
     ...(spec.validatesPcmTrim === true ? { validatesPcmTrim: true } : {}),
   };
 }
 
-const TS_MIMES = new Set([
-  'video/mp2t',
-  'video/MP2T',
-  'video/mpeg',
-  'application/x-mpegts',
-  'audio/mp2t',
-]);
-const TS_EXTENSIONS = new Set(['ts', 'm2ts', 'mts', 'm2t']);
 const FLAC_PROBE_HEAD_BYTES = 4096;
 
 function lazyMpegTsContainerDriver(): ContainerDriver {
@@ -453,7 +475,7 @@ function lazyMpegTsContainerDriver(): ContainerDriver {
     id: 'mpegts',
     apiVersion: DRIVER_API_VERSION,
     kind: 'container',
-    formats: ['ts', 'm2ts', 'mts'],
+    formats: MPEG_TS_FORMATS,
     supports: matchesMpegTs,
     async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
       return (driver ?? (await load())).demux(src, o);
@@ -474,16 +496,6 @@ function lazyMpegTsContainerDriver(): ContainerDriver {
   };
 }
 
-function matchesMpegTs(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && TS_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && TS_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head !== undefined && head.byteLength >= 189) {
-    return head[0] === 0x47 && head[188] === 0x47;
-  }
-  return false;
-}
-
 function lazyFlacContainerDriver(): ContainerDriver {
   let driver: ContainerDriver | undefined;
   let loadPromise: Promise<ContainerDriver> | undefined;
@@ -498,6 +510,7 @@ function lazyFlacContainerDriver(): ContainerDriver {
     apiVersion: DRIVER_API_VERSION,
     kind: 'container',
     formats: ['flac'],
+    streamCopyTargets: ['ogg'],
     supports(q: ContainerQuery): boolean {
       return matchesFlac(q);
     },
@@ -703,7 +716,7 @@ function lazyFilterDrivers(): readonly FilterDriver[] {
     lazyFilter({
       id: 'cpu-video-filter',
       substrate: 'native',
-      supports: (spec) => spec.mediaType === 'video' && typeof VideoFrame !== 'undefined',
+      supports: cpuVideoFilterSupports,
       load: () => import('../filters/cpu-video.ts').then((m) => m.cpuVideoFilterDriver),
     }),
   ];
@@ -874,6 +887,16 @@ function canvas2dAvailable(): boolean {
   return typeof OffscreenCanvas !== 'undefined' && typeof VideoFrame !== 'undefined';
 }
 
+function cpuVideoFilterSupports(spec: FilterSpec): boolean {
+  if (spec.mediaType !== 'video' || typeof VideoFrame === 'undefined') return false;
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const chromiumCanvasTonemap =
+    typeof OffscreenCanvas !== 'undefined' &&
+    /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) &&
+    !/\bFirefox\//.test(ua);
+  return !(spec.type === 'tonemap' && chromiumCanvasTonemap);
+}
+
 function chromiumCanvasTonemapAvailable(): boolean {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   return /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
@@ -1040,6 +1063,20 @@ class LazyContainerMuxer implements Muxer {
     if (targetTrackId === undefined)
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
     await muxer.write(targetTrackId, packet);
+  }
+
+  async writePcm(trackId: number, data: Uint8Array): Promise<void> {
+    const muxer = await this.#ensureMuxer();
+    const targetTrackId = this.#targetTrackIds[trackId];
+    if (targetTrackId === undefined)
+      throw new MediaError('mux-error', `write PCM to unknown track ${trackId}`);
+    if (muxer.writePcm === undefined) {
+      throw new CapabilityError('capability-miss', 'the selected muxer has no raw PCM frame seam', {
+        op: { op: 'mux', mediaType: 'audio', codec: 'pcm' },
+        tried: [],
+      });
+    }
+    await muxer.writePcm(targetTrackId, data);
   }
 
   async finalize(): Promise<void> {

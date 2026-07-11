@@ -24,7 +24,6 @@ import {
   SOURCE_URL_KEY,
   type Source,
   fromBytes,
-  fromStream,
 } from '../sources/source.ts';
 import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
@@ -257,7 +256,7 @@ function delayedDecodeFrameModule(
     apiVersion: DRIVER_API_VERSION,
     kind: 'container',
     formats: ['mp4'],
-    supports: (q) => q.mime === 'video/x-delayed',
+    supports: (q) => q.mime === 'video/x-delayed' || q.extension === 'mp4',
     async demux(src) {
       onDemuxStarted();
       onDemuxSource(src);
@@ -301,6 +300,98 @@ function delayedDecodeFrameModule(
     register(reg): void {
       reg.addContainer(container);
       reg.addCodec(codec);
+    },
+  };
+}
+
+function dualTrackStreamDecodeModule(
+  expectedBytes: Uint8Array,
+  videoFrame: CancelRaceFrame,
+  audioFrame: CancelRaceFrame,
+  onDemux: () => void,
+): DriverModule {
+  const tracks: readonly TrackInfo[] = [
+    {
+      id: 1,
+      mediaType: 'video',
+      codec: 'fake-video',
+      config: { codec: 'fake-video', codedWidth: 16, codedHeight: 16 },
+    },
+    {
+      id: 2,
+      mediaType: 'audio',
+      codec: 'fake-audio',
+      config: { codec: 'fake-audio', sampleRate: 48_000, numberOfChannels: 2 },
+    },
+  ];
+  const container: ContainerDriver = {
+    id: 'dual-track-stream',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (query) => query.mime === 'video/x-dual-track',
+    async demux(src) {
+      onDemux();
+      const reader = src.stream().getReader();
+      const chunks: Uint8Array[] = [];
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      expect(bytes).toEqual(expectedBytes);
+      return {
+        tracks,
+        packets: () =>
+          new ReadableStream<Packet>({
+            start(controller): void {
+              controller.enqueue(fakeVideoPacket());
+              controller.close();
+            },
+          }),
+        close: () => Promise.resolve(),
+      };
+    },
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'dual-track-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: (query) =>
+      Promise.resolve({
+        supported:
+          query.direction === 'decode' &&
+          (query.config.codec === 'fake-video' || query.config.codec === 'fake-audio'),
+      }),
+    createDecoder: (config) =>
+      new TransformStream<EncodedChunk, RawFrame>({
+        transform(_chunk, controller): void {
+          controller.enqueue(
+            (config.codec === 'fake-video' ? videoFrame : audioFrame) as unknown as RawFrame,
+          );
+        },
+      }),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(registry): void {
+      registry.addContainer(container);
+      registry.addCodec(codec);
     },
   };
 }
@@ -859,6 +950,40 @@ describe('createMedia', () => {
     await expect(readFirst(streams.audio)).resolves.toBeUndefined();
   });
 
+  it('force-software image decode rejects after a bounded sniff and cancels one-shot input', async () => {
+    const head = new Uint8Array(4096);
+    head.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const tail = new Uint8Array(4096).fill(0x5a);
+    const chunks = [head, tail] as const;
+    let pulls = 0;
+    let cancels = 0;
+    const input = new ReadableStream<Uint8Array>(
+      {
+        pull(controller): void {
+          const chunk = chunks[pulls++];
+          if (chunk === undefined) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const media = createMedia();
+    const streams = media.decode(media.from(input, { mime: 'image/png' }), {
+      strategy: { determinism: 'force-software' },
+    });
+
+    await expect(readFirst(streams.video)).rejects.toMatchObject({
+      code: 'capability-miss',
+      message: expect.stringMatching(/software.*image|image.*software/i),
+    });
+    await expect(readFirst(streams.audio)).rejects.toMatchObject({ code: 'capability-miss' });
+    expect(pulls).toBe(1);
+    expect(cancels).toBe(1);
+  });
+
   it('decode skips image sniffing for definite video MIME sources', async () => {
     const bytes = new Uint8Array(8192);
     const calls: Array<readonly [number, number]> = [];
@@ -866,6 +991,36 @@ describe('createMedia', () => {
       __media: 'source',
       kind: 'url',
       mimeHint: 'video/x-delayed',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable decode must not open the full stream');
+      },
+    };
+    const frame = new CancelRaceFrame();
+    const counts = { sniff: 0 };
+    const media = createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use(delayedDecodeFrameModule(frame, Promise.resolve(), () => {}));
+
+    const got = await readFirst(media.decode(src).video);
+    expect(got).toBe(frame);
+    frame.close();
+    expect(calls).toEqual([]);
+    expect(counts.sniff).toBe(0);
+    expect(frame.closeCount).toBe(1);
+  });
+
+  it('decode skips image sniffing for definite container extension sources', async () => {
+    const bytes = new Uint8Array(8192);
+    const calls: Array<readonly [number, number]> = [];
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      filename: 'delayed.mp4',
       size: bytes.byteLength,
       range: (start, end) => {
         calls.push([start, end]);
@@ -993,6 +1148,44 @@ describe('createMedia', () => {
     expect(frame.closeCount).toBe(1);
   });
 
+  it('materializes a one-shot input once so dual-track decode is pull-order safe', async () => {
+    const bytes = Uint8Array.of(1, 2, 3, 4, 5, 6);
+    let inputPulls = 0;
+    let demuxes = 0;
+    const input = new ReadableStream<Uint8Array>(
+      {
+        pull(controller): void {
+          const start = inputPulls++ * 2;
+          if (start >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes.subarray(start, start + 2));
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const videoFrame = new CancelRaceFrame();
+    const audioFrame = new CancelRaceFrame();
+    const media = createMedia().use(
+      dualTrackStreamDecodeModule(bytes, videoFrame, audioFrame, () => {
+        demuxes++;
+      }),
+    );
+    const decoded = media.decode(media.from(input, { mime: 'video/x-dual-track' }));
+
+    const audio = await readFirst(decoded.audio);
+    const video = await readFirst(decoded.video);
+    expect(audio).toBe(audioFrame);
+    expect(video).toBe(videoFrame);
+    expect(inputPulls).toBe(4);
+    expect(demuxes).toBe(2);
+    audioFrame.close();
+    videoFrame.close();
+    expect(audioFrame.closeCount).toBe(1);
+    expect(videoFrame.closeCount).toBe(1);
+  });
+
   it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {
     // With no driver matching the NOOP container (and WebCodecs absent in Node), each op must surface a
     // typed CapabilityError. `convert`/`remux`/`trim`/`decrypt` reject at the container route;
@@ -1105,7 +1298,10 @@ describe('createMedia', () => {
       media.encode({ audio: frameStream<AudioData>() }, { to: 'wav', audio: { codec: 'opus' } }),
     ).rejects.toBeInstanceOf(CapabilityError);
     await expect(
-      media.encode({ audio: frameStream<AudioData>() }, { to: 'aac', audio: { codec: 'opus' } }),
+      media.encode(
+        { audio: frameStream<AudioData>() },
+        { to: 'aac', audio: { codec: 'opus', sampleRate: 48_000, channels: 2 } },
+      ),
     ).rejects.toBeInstanceOf(CapabilityError);
     await expect(
       media.encode({ video: frameStream<VideoFrame>() }, { to: 'mp4' }),
@@ -1163,17 +1359,60 @@ describe('createMedia', () => {
     expect(info.container).toBe('noop');
   });
 
-  it('rejects probing a non-seekable stream source', async () => {
-    const media = createMedia().use(NoopDriverModule);
-    const input = fromStream(
-      new ReadableStream<Uint8Array>({
-        start(c): void {
-          c.enqueue(new Uint8Array([1]));
-          c.close();
+  it('probes a direct one-shot real-media stream after bounded routing peeks', async () => {
+    const bytes = loadMedia('bear-vp9-alpha.webm');
+    let offset = 0;
+    let cancels = 0;
+    const input = new ReadableStream<Uint8Array>(
+      {
+        pull(controller): void {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(offset + 1021, bytes.byteLength);
+          controller.enqueue(bytes.subarray(offset, end));
+          offset = end;
         },
-      }),
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
     );
-    await expect(media.probe(input)).rejects.toBeInstanceOf(InputError);
+
+    const info = await createMedia().use(WebmModule).probe(input);
+    expect(info.container).toBe('webm');
+    expect(info.tracks.find((track) => track.type === 'video')?.codec).toBe('vp9');
+    expect(offset).toBe(bytes.byteLength);
+    expect(cancels).toBe(0);
+  });
+
+  it('demuxes a direct one-shot real-media stream after replaying its route prefix', async () => {
+    const bytes = loadMedia('bear-vp9-alpha.webm');
+    let offset = 0;
+    const input = new ReadableStream<Uint8Array>(
+      {
+        pull(controller): void {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(offset + 4093, bytes.byteLength);
+          controller.enqueue(bytes.subarray(offset, end));
+          offset = end;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    const demuxed = await createMedia().use(WebmModule).demux(input);
+    try {
+      expect(demuxed.tracks.find((track) => track.mediaType === 'video')?.codec).toBe('vp9');
+      expect(offset).toBe(bytes.byteLength);
+    } finally {
+      await demuxed.close();
+    }
   });
 
   it('routes a container by file extension', async () => {
@@ -1238,6 +1477,45 @@ describe('createMedia', () => {
     expect(typeof handle.cancel).toBe('function');
     handle.cancel();
     return expect(handle).rejects.toBeInstanceOf(MediaError);
+  });
+
+  it('releases the caller AbortSignal listener after a cancellable task settles', async () => {
+    let adds = 0;
+    let removes = 0;
+    const listeners = new Set<EventListenerOrEventListenerObject>();
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      onabort: null,
+      throwIfAborted(): void {},
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        if (type !== 'abort') return;
+        adds++;
+        listeners.add(listener);
+      },
+      removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        if (type !== 'abort') return;
+        removes++;
+        listeners.delete(listener);
+      },
+      dispatchEvent(): boolean {
+        return true;
+      },
+    } as AbortSignal;
+
+    await expect(
+      createMedia().use(NoopDriverModule).probe(NOOP_BYTES, { signal }),
+    ).resolves.toMatchObject({ container: 'noop' });
+    expect(adds).toBe(1);
+    expect(removes).toBe(1);
+    expect(listeners.size).toBe(0);
+
+    await expect(createMedia().probe(NOOP_BYTES, { signal })).rejects.toBeInstanceOf(
+      CapabilityError,
+    );
+    expect(adds).toBe(2);
+    expect(removes).toBe(2);
+    expect(listeners.size).toBe(0);
   });
 
   it('use() validates the driver module apiVersion', () => {

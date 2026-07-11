@@ -1,6 +1,6 @@
 /**
  * Video filter drivers (doc 09 §filters, ladder doc 04: WebGPU → Canvas2D → native CPU → WASM). Implements the
- * four geometric `FilterSpec` ops — `resize`, `crop`, `rotate`, `flip` — on the best available pixel
+ * five geometric `FilterSpec` ops — `resize`, `crop`, `pad`, `rotate`, `flip` — on the best available pixel
  * substrate, each as a `TransformStream<VideoFrame, VideoFrame>` per the {@link FilterDriver} contract.
  *
  * Two drivers register (the router ranks them WebGPU-first by substrate, falling back on a miss):
@@ -39,6 +39,7 @@ import {
   type OrientedDraw,
   cropBlit,
   flipGeometry,
+  padBlit,
   resizeBlit,
   rotateGeometry,
 } from './geometry.ts';
@@ -59,20 +60,24 @@ import { mapVideoColorSpace } from './video-color-space.ts';
 
 export { type VideoColorSpaceLike, mapVideoColorSpace } from './video-color-space.ts';
 
-/** The geometric video specs handled by the single quad pipeline (resize/crop/rotate/flip). */
+/** The geometric video specs handled by the single quad pipeline (resize/crop/pad/rotate/flip). */
 type GeometricVideoSpec = Extract<
   FilterSpec,
-  { mediaType: 'video'; type: 'resize' | 'crop' | 'rotate' | 'flip' }
+  { mediaType: 'video'; type: 'resize' | 'crop' | 'pad' | 'rotate' | 'flip' }
 >;
 
 /** The colour video specs handled by the second (colour) pipeline. */
 type ColorVideoSpec = Extract<FilterSpec, { mediaType: 'video'; type: 'colorspace' | 'tonemap' }>;
 
-/** True for the four geometric video filter specs (single quad pipeline). */
+/** True for the five geometric video filter specs (single quad pipeline). */
 function isGeometricVideoSpec(f: FilterSpec): f is GeometricVideoSpec {
   return (
     f.mediaType === 'video' &&
-    (f.type === 'resize' || f.type === 'crop' || f.type === 'rotate' || f.type === 'flip')
+    (f.type === 'resize' ||
+      f.type === 'crop' ||
+      f.type === 'pad' ||
+      f.type === 'rotate' ||
+      f.type === 'flip')
   );
 }
 
@@ -155,6 +160,8 @@ export function planDraw(spec: GeometricVideoSpec, srcW: number, srcH: number): 
       return { kind: 'blit', blit: resizeBlit(srcW, srcH, spec) };
     case 'crop':
       return { kind: 'blit', blit: cropBlit(srcW, srcH, spec) };
+    case 'pad':
+      return { kind: 'blit', blit: padBlit(srcW, srcH, spec) };
     case 'rotate':
       return { kind: 'oriented', draw: rotateGeometry(srcW, srcH, spec.degrees) };
     case 'flip':

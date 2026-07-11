@@ -1,5 +1,5 @@
-import type { WasmRuntimeProfile, WasmRuntimeProfileKind } from '../contracts/driver.ts';
-import { CapabilityError } from '../contracts/errors.ts';
+import type { WasmRuntimeProfile } from '../contracts/driver.ts';
+import { InputError } from '../contracts/errors.ts';
 
 export interface WasmRuntimeRequest {
   /** `undefined` follows ADR-006: threads are enabled by default only in an isolated page. */
@@ -10,8 +10,55 @@ export interface WasmRuntimeRequest {
   sharedArrayBuffer?: boolean;
 }
 
-export interface WasmBindgenInit {
-  module_or_path: URL;
+/**
+ * Normalize the public asset override once, before a pipeline or worker can consume media. Browser roots
+ * are same-origin HTTP(S) directories with no embedded credentials; `file:` is accepted only in Node or
+ * an actual file-page context for deterministic local tests. Query/hash components cannot safely apply to
+ * multiple sibling assets and are removed. The returned string is structured-clone safe for workers.
+ */
+export function normalizeWasmAssetBaseUrl(value: string): string {
+  if (typeof value !== 'string') throw invalidAssetBase('assetBaseUrl must be a string');
+  const raw = value.trim();
+  if (raw === '') throw invalidAssetBase('assetBaseUrl must not be empty');
+  const locationUrl = currentLocationUrl();
+  const base = currentDocumentBaseUrl() ?? locationUrl ?? new URL(import.meta.url);
+  let resolved: URL;
+  try {
+    resolved = new URL(raw, base);
+  } catch {
+    throw invalidAssetBase(`assetBaseUrl '${value}' is not a valid URL`);
+  }
+  if (resolved.username !== '' || resolved.password !== '') {
+    throw invalidAssetBase('assetBaseUrl must not contain URL credentials');
+  }
+
+  if (locationUrl !== undefined) {
+    if (locationUrl.protocol === 'http:' || locationUrl.protocol === 'https:') {
+      if (
+        (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') ||
+        resolved.origin !== locationUrl.origin
+      ) {
+        throw invalidAssetBase('assetBaseUrl must be same-origin HTTP(S)');
+      }
+    } else if (locationUrl.protocol === 'file:') {
+      if (resolved.protocol !== 'file:') {
+        throw invalidAssetBase('a file-page assetBaseUrl must use file:');
+      }
+    } else {
+      throw invalidAssetBase(`assetBaseUrl is unavailable from a ${locationUrl.protocol} page`);
+    }
+  } else if (
+    resolved.protocol !== 'file:' &&
+    resolved.protocol !== 'http:' &&
+    resolved.protocol !== 'https:'
+  ) {
+    throw invalidAssetBase('assetBaseUrl must use file:, http:, or https: in this runtime');
+  }
+
+  if (!resolved.pathname.endsWith('/')) resolved.pathname += '/';
+  resolved.search = '';
+  resolved.hash = '';
+  return resolved.href;
 }
 
 /**
@@ -40,43 +87,6 @@ export function resolveWasmRuntimeProfile(req: WasmRuntimeRequest = {}): WasmRun
   };
 }
 
-/**
- * Helper for drivers that ship a threaded-only core. Current first-party cores have baseline fallbacks, so
- * they call {@link resolveWasmRuntimeProfile}; a future threaded-only asset can call this and surface the
- * required isolation as a typed capability miss instead of accidentally touching `SharedArrayBuffer`.
- */
-export function requireIsolatedWasmProfile(req: WasmRuntimeRequest = {}): WasmRuntimeProfile {
-  const profile = resolveWasmRuntimeProfile(req);
-  if (profile.kind === 'isolated-simd-threads') return profile;
-  throw new CapabilityError(
-    'capability-miss',
-    'WASM SIMD+threads requires crossOriginIsolated and SharedArrayBuffer',
-    {
-      op: 'wasm-runtime',
-      tried: [profile.kind],
-      suggestion: 'serve the page with COOP/COEP or disable threaded WASM',
-    },
-  );
-}
-
-/**
- * Keep the wasm-bindgen init payload narrow and asset-only. The profile is intentionally resolved before
- * this call, but the current vendored cores use the same baseline artifact unless a driver explicitly
- * ships a second threaded asset; no `SharedArrayBuffer` is allocated here.
- */
-export function wasmInitForProfile(
-  moduleUrl: URL,
-  profile: WasmRuntimeProfile = resolveWasmRuntimeProfile(),
-): WasmBindgenInit {
-  switch (profile.kind) {
-    case 'baseline':
-    case 'isolated-simd-threads':
-      return { module_or_path: moduleUrl };
-    default:
-      return exhaustiveProfile(profile.kind);
-  }
-}
-
 function baselineProfile(reason: string): WasmRuntimeProfile {
   return {
     kind: 'baseline',
@@ -96,9 +106,25 @@ function currentSharedArrayBuffer(): boolean {
   return typeof SharedArrayBuffer === 'function';
 }
 
-function exhaustiveProfile(kind: never): never {
-  throw new CapabilityError('capability-miss', `unknown WASM runtime profile '${kind}'`, {
-    op: 'wasm-runtime',
-    tried: [kind as WasmRuntimeProfileKind],
-  });
+function currentLocationUrl(): URL | undefined {
+  const candidate = globalThis as typeof globalThis & { location?: { href?: unknown } };
+  return parseRuntimeUrl(candidate.location?.href);
+}
+
+function currentDocumentBaseUrl(): URL | undefined {
+  const candidate = globalThis as typeof globalThis & { document?: { baseURI?: unknown } };
+  return parseRuntimeUrl(candidate.document?.baseURI);
+}
+
+function parseRuntimeUrl(value: unknown): URL | undefined {
+  if (typeof value !== 'string') return undefined;
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function invalidAssetBase(message: string): InputError {
+  return new InputError('unsupported-input', message, { field: 'assetBaseUrl' });
 }

@@ -21,7 +21,7 @@
  */
 
 import type { ConvertOptions, TrimOptions } from '../api/types.ts';
-import type { Determinism } from '../contracts/driver.ts';
+import type { Determinism, WasmRuntimeProfile } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { type Output, toStream } from '../sinks/sink.ts';
 import { type Source, fromBytes } from '../sources/source.ts';
@@ -68,17 +68,31 @@ export interface InnerEngine {
   convert(
     input: Source,
     opts: ConvertOptions,
-    o?: { signal?: AbortSignal; strategy?: { determinism?: Determinism } },
+    o?: {
+      signal?: AbortSignal;
+      strategy?: { determinism?: Determinism; pinDriver?: string };
+    },
   ): Promise<Output> & { cancel?(): void };
   trim(
     input: Source,
     opts: TrimOptions,
-    o?: { signal?: AbortSignal; strategy?: { determinism?: Determinism } },
+    o?: {
+      signal?: AbortSignal;
+      strategy?: { determinism?: Determinism; pinDriver?: string };
+    },
   ): Promise<Output> & { cancel?(): void };
 }
 
 /** Build the inner engine for a job (lazily, once per job). Overridable in tests. */
-export type InnerEngineFactory = (determinism: Determinism) => InnerEngine;
+export interface InnerEngineRuntimeOptions {
+  readonly wasmRuntime?: WasmRuntimeProfile;
+  readonly wasmAssetBaseUrl?: string;
+}
+
+export type InnerEngineFactory = (
+  determinism: Determinism,
+  runtime: InnerEngineRuntimeOptions,
+) => InnerEngine;
 
 // ── payload decode (the serializable contract is checked, never trusted blindly) ──────────────────────
 
@@ -137,11 +151,18 @@ function streamForJob(
   const start = async (): Promise<ReadableStreamDefaultReader<Uint8Array>> => {
     const payload = decodeOffloadPayload(job.payload);
     const determinism: Determinism = job.determinism ?? 'auto';
-    const engine = makeInner(determinism);
+    const runtime: InnerEngineRuntimeOptions = {
+      ...(job.wasmRuntime !== undefined ? { wasmRuntime: job.wasmRuntime } : {}),
+      ...(job.wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: job.wasmAssetBaseUrl } : {}),
+    };
+    const engine = makeInner(determinism, runtime);
     const source = sourceFromPayload(payload);
     const callOptions = {
       signal: ctx.signal,
-      strategy: { determinism },
+      strategy: {
+        determinism,
+        ...(job.pinDriver !== undefined ? { pinDriver: job.pinDriver } : {}),
+      },
       onProgress: ctx.progress,
     };
     const output = await runInnerOp(engine, source, payload, callOptions);
@@ -183,7 +204,11 @@ function runInnerOp(
   engine: InnerEngine,
   source: Source,
   payload: OffloadJobPayload,
-  o: { signal: AbortSignal; strategy: { determinism: Determinism }; onProgress: ProgressSink },
+  o: {
+    signal: AbortSignal;
+    strategy: { determinism: Determinism; pinDriver?: string };
+    onProgress: ProgressSink;
+  },
 ): Promise<Output> {
   switch (payload.kind) {
     case 'convert':

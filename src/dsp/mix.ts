@@ -69,9 +69,21 @@ function surroundToStereo(a: PcmAudio): PcmAudio {
 }
 
 function surroundToMono(a: PcmAudio): PcmAudio {
-  const [lo, ro] = surroundDownmix(a);
+  const L = channelAt(a.planar, 0);
+  const R = channelAt(a.planar, 1);
+  const Cn = channelAt(a.planar, 2);
+  const Ls = channelAt(a.planar, 4);
+  const Rs = channelAt(a.planar, 5);
   const m = new Float64Array(a.frames);
-  for (let f = 0; f < a.frames; f++) m[f] = 0.5 * (sampleAt(lo, f) + sampleAt(ro, f));
+  // Fuse BS.775 stereo construction and the final stereo average. The older composition allocated two
+  // full-size temporary channels and walked the signal twice; this preserves the exact arithmetic order
+  // while writing only the requested mono output.
+  for (let f = 0; f < a.frames; f++) {
+    const center = C * sampleAt(Cn, f);
+    const lo = sampleAt(L, f) + center + C * sampleAt(Ls, f);
+    const ro = sampleAt(R, f) + center + C * sampleAt(Rs, f);
+    m[f] = 0.5 * (lo + ro);
+  }
   return build(a, 1, [m]);
 }
 

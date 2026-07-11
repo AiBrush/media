@@ -14,9 +14,11 @@ import type {
   RawFrame,
   Registry,
   StageOptions,
+  WasmRuntimeProfile,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   VORBIS_CODEC,
   type VorbisEncWasmCore,
@@ -53,7 +55,7 @@ function hasWebCodecsAudioSeam(): boolean {
   return typeof EncodedAudioChunk !== 'undefined' && typeof AudioData !== 'undefined';
 }
 
-let corePromise: Promise<VorbisEncWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<VorbisEncWasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasVorbisEncCoreGlue(): Promise<boolean> {
@@ -64,21 +66,28 @@ async function hasVorbisEncCoreGlue(): Promise<boolean> {
   return coreGluePromise;
 }
 
-export async function loadVorbisEncCore(): Promise<VorbisEncWasmCore | null> {
-  corePromise ??= (async (): Promise<VorbisEncWasmCore | null> => {
-    try {
-      const mod = await import('./vorbis-enc-core.js');
-      await mod.default();
-      return mod.createVorbisEncCore();
-    } catch {
-      return null;
-    }
-  })();
+export async function loadVorbisEncCore(
+  runtime?: WasmRuntimeProfile,
+): Promise<VorbisEncWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  let corePromise = corePromises.get(profile.kind);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<VorbisEncWasmCore | null> => {
+      try {
+        const mod = await import('./vorbis-enc-core.js');
+        await mod.default();
+        return mod.createVorbisEncCore();
+      } catch {
+        return null;
+      }
+    })();
+    corePromises.set(profile.kind, corePromise);
+  }
   return corePromise;
 }
 
 export function resetVorbisEncCoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -213,7 +222,7 @@ function createEncoder(
 
   return new TransformStream<RawFrame, EncodedChunk>({
     async start(controller): Promise<void> {
-      const core = await loadVorbisEncCore();
+      const core = await loadVorbisEncCore(o?.wasmRuntime);
       if (core === null) {
         controller.error(coreMissing());
         return;

@@ -44,6 +44,19 @@ media.decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Promise
 
 Still/animated images are accepted by `probe` and `decode` for GIF, PNG/APNG, JPEG, WebP, and AVIF (ADR-049/077). `probe` returns a video-like `MediaInfo` track from the pure header parser, including exact animation duration when GIF/APNG/WebP headers carry per-frame delays; animated images without parsed timing keep the conservative frame-count fallback, and still images report duration `0`. `decode` returns a lazy video `ReadableStream<VideoFrame>` via browser `ImageDecoder`; the paired audio stream is empty, and Node raises a typed `CapabilityError` for image pixel decode because `ImageDecoder` is absent there.
 
+Container targets accept family aliases without changing canonical probe identity (ADR-232): `aac` is the
+ADTS elementary-stream alias and reports `container:'adts'`; `m2ts`, `mts`, and `mpegts` route to the
+MPEG-TS driver and report `container:'ts'`. The TS parser accepts raw 188-byte transport packets,
+192-byte M2TS/MTS packets with their four-byte prefix, and 204-byte RS-protected packets.
+
+`encode({audio}, {to:'wav', audio:{codec:'pcm-*'}})` is a native raw-frame route (ADR-243), not a
+fabricated `EncodedAudioChunk` codec. It pulls one `AudioData` at a time, closes each consumed frame once,
+and authors its copied samples through the WAV muxer's exact PCM seam. Omitted/generic `pcm` selects
+`pcm-f32`; omitted sample rate/channels are inferred from the first non-empty frame. Later frames must keep
+that layout and a contiguous cumulative sample clock (the first timestamp is rebased to zero). An explicit
+rate/channel mismatch, video, compressed audio, empty input, or WAV-frame DSP request rejects typed before
+silently reshaping or dropping data; callers apply frame-domain DSP before this low-level `encode()` route.
+
 ### Option shapes (flat, typed — ADR-011)
 
 ```ts
@@ -67,6 +80,7 @@ interface ConvertOptions {
     alpha?: 'keep' | 'discard'
     rotate?: 0 | 90 | 180 | 270; flip?: 'h' | 'v'
     crop?: { x: number; y: number; width: number; height: number }
+    pad?: { width: number; height: number; x?: number; y?: number } // centered transparent border by default
     colorspace?: { to: string }; tonemap?: { to: 'sdr' }
   }
   audio?: false | {
@@ -84,7 +98,7 @@ interface ConvertOptions {
 }
 interface RemuxOptions {
   to: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean
-  tags?: Record<string, string>                      // same-container tag rewrite
+  tags?: Record<string, string>                      // target-native rewrite after selection/remux
   trackSelect?: readonly string[]; sink?: Sink
 }
 interface TrimOptions  { start: number; end: number; mode?: 'keyframe' | 'accurate'; sink?: Sink }   // seconds
@@ -98,6 +112,20 @@ interface PacketStreams { video?: PacketStream; audio?: PacketStream; tracks?: r
 interface MuxSpec { container: ConvertOptions['to']; faststart?: boolean; fragmented?: boolean; sink?: Sink }
 interface H264AbrRung { name?: string; width: number; height: number; bitrate: number; fps?: number }
 ```
+
+`strategy.pinDriver` is an exact hidden/test override (ADR-237). It constrains only the registered driver
+kind carrying that id: pinning a codec does not block the operation's container/filter routes, but the
+matching codec route probes no other id and a miss reports `tried:[pin]`. Unknown ids are checked after one
+lazy default-driver registration and fail before media ownership begins. `enableThreads` and
+`assetBaseUrl` are instance controls: the former resolves once to an honest baseline/threaded profile; the
+latter normalizes once to an absolute same-origin directory and is rejected synchronously when unsafe.
+
+When `trackSelect` and `tags` are combined, `remux()` first validates and selects the requested tracks,
+authors the requested target container, and only then invokes that target's native metadata writer
+(ADR-238). The metadata step is explicitly buffered when its random-access format requires it. Encoded
+payloads and DTS/PTS remain packet-copy data; progress is projected onto one monotonic remux→metadata
+timeline. Complete ordered selection of a single raw-PCM track may use the equivalent exact wrapper rewrite
+after independently proving the source track table and payload bytes.
 
 `trim({ mode:'keyframe' })` is the fast lossless packet-copy path. `trim({ mode:'accurate' })`
 routes through the browser codec seam: decode from a safe preroll, keep decoded frames whose timestamps
@@ -141,7 +169,9 @@ Operations accept media **directly** (`MediaInput`), so most callers never const
 type MediaInput =
   | ArrayBuffer | Uint8Array | Blob | File
   | ReadableStream<Uint8Array> | URL | string /* url */
-  | HTMLMediaElement | MediaStream | Source
+  | HTMLMediaElement | MediaStream | Source | LiveMediaSource
+
+type NormalizedSource = Source | LiveMediaSource
 
 await media.probe(file)
 await media.probe('https://cdn/x.mp4')      // URL string -> range/header read
@@ -155,7 +185,7 @@ await media.probe(videoEl)                  // <video> -> BYTES mode (reads curr
 from(input, opts?)                          // universal
 fromBytes(u8) · fromBlob(file) · fromURL(url, { rangeRequests }) · fromOPFS(path)
 fromElement(el, { mode: 'bytes' | 'capture' })   // 'bytes' (default) | 'capture' = captureStream() live
-fromStream(readable)
+fromStream(readable, { mime?, size? })
 ```
 
 Bare-string rule: `from('…')` = URL by precedence (`http(s)|blob|data|file`), else relative `fetch`; **OPFS needs `fromOPFS()`**; otherwise `InputError`.
@@ -166,15 +196,38 @@ ambiguous HLS signature peek consumes and replay-wraps only the single-use kind.
 source it closes the bounded sniff reader and returns the original source identity, so subsequent image and
 container routing may legally open fresh readers (ADR-212).
 
+A direct `ReadableStream<Uint8Array>` remains one-shot but is fully routable (ADR-231). Increasing HLS,
+image, and container-magic peeks retain only their bounded prefix and replay those exact chunks into the
+sole downstream reader before continuing it under pull backpressure; cancellation owns and releases that
+reader once. `from(stream, { mime, size })` preserves both hints. Because public `decode()` exposes audio
+and video as independently pulled streams while current demuxers open their source per track, that one API
+materializes a single-use byte input once behind a memoized, abort-aware read and shares the resulting
+immutable source; it never races two readers against the caller stream.
+
+A `MediaStream` is never coerced into the byte `Source` contract (ADR-236). `from(MediaStream)` and explicit
+element capture return a separately branded `LiveMediaSource`; ordinary element mode remains URL-backed
+bytes. Live probe reports current raw track settings without consuming frames. Live decode exposes
+demand-driven `VideoFrame`/`AudioData` streams through a one-frame processor queue, while container packet,
+seek, replay, decrypt, and remux operations typed-decline. Live convert requires explicit output
+container/codec/geometry/layout facts and independently available current input track settings; one shared
+abort domain runs filters, encoders, final mux, and sink completion without stopping caller-owned tracks.
+
 ## 4. Data out — sinks (ADR-013)
 
 ```ts
 type Sink = ReturnType<typeof toBlob> | /* … */ Sink
 toBlob() · toFile(name) · toStream() · toOPFS(path)
-toElement(el, { via?: 'blob' | 'mse' | 'stream' })   // default: blob (whole-file) / mse (streaming target)
+toElement(el, { via?: 'blob' | 'mse' | 'stream' })   // blob=whole-file URL; mse=MediaSource URL; stream=MediaSource srcObject
 ```
 
 `type Output = Blob | File | ReadableStream<Uint8Array> | void` depending on the sink. Default sink is `toBlob()`. Stream sinks are **lazy** (pull-based).
+The two element-streaming modes feed one `SourceBuffer` incrementally and await each `updateend` before
+pulling the next output chunk. `mse` uses the broadly supported MediaSource object-URL attachment; `stream`
+uses direct `HTMLMediaElement.srcObject = MediaSource` and raises a typed capability miss where that provider
+assignment is unavailable. Neither mode silently collects a Blob. Library-created Blob URLs are revoked
+after the element opens them (or on error/replacement), and MSE URLs are revoked after `sourceopen`.
+The producer must author an MSE byte-stream format (normally an operation with `fragmented:true`); the sink
+does not relabel or segment an arbitrary progressive file, and a platform parse rejection is a typed error.
 
 ## 5. Warmup — `preload` (hide first-call latency)
 
@@ -225,6 +278,11 @@ await media.run({
   output: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
 }, { signal, onProgress })
 ```
+
+`run()` accepts only structured-clone-safe job data, validates and snapshots the complete job before reading
+its input, preserves declared operation order, and fuses adjacent video transforms only when that order is
+the canonical pixel pipeline (ADR-235). It returns a cancellable `Blob` task and shares one monotonic
+progress/abort domain across the flat-operation boundaries it composes.
 
 ## 9. Worked examples
 

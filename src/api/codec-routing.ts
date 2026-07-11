@@ -18,7 +18,7 @@ import type { AudioTarget, Container, VideoTarget } from './types.ts';
  * (ADR-022). This mirrors the registered muxers' own truth; an illegal codec-in-container is still rejected
  * by the muxer's `addTrack`/`mapCodec` (the single source of codec-legality), so this set never over-claims.
  */
-const CODEC_MUX_CONTAINERS = '|mp4|mov|webm|mkv|ogg|ts|flac|mp3|adts|wav|avi|';
+const CODEC_MUX_CONTAINERS = '|mp4|mov|webm|mkv|ogg|ts|m2ts|mts|mpegts|flac|mp3|adts|aac|wav|avi|';
 
 /** True when {@link container} has a working EncodedChunk-seam muxer. */
 export function containerHasChunkMuxer(container: string): container is Container {
@@ -101,12 +101,18 @@ function videoTargetRequestsReencode(t: VideoTarget): boolean {
     t.codec !== undefined ||
     t.width !== undefined ||
     t.height !== undefined ||
+    t.fit !== undefined ||
     t.fps !== undefined ||
     t.bitrate !== undefined ||
+    t.bitrateMode !== undefined ||
     t.crf !== undefined ||
+    t.twoPass === true ||
+    t.bitDepth !== undefined ||
+    t.alpha !== undefined ||
     t.rotate !== undefined ||
     t.flip !== undefined ||
     t.crop !== undefined ||
+    t.pad !== undefined ||
     t.colorspace !== undefined ||
     t.tonemap !== undefined
   );

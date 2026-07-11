@@ -3,7 +3,7 @@
 The architecture base for **aibrush-media**, a unified, capability-routed, in-browser media engine. These documents are the authoritative source for *what* we are building and *why*, and they precede implementation. Code in this repo must conform to them; when reality forces a change, change the doc in the same PR.
 
 > **Status:** **implementation in progress** (architecture base first ratified 2026-06-23; this README tracks reality). The docs remain the authoritative source for *what* and *why*; when reality forces a change, the doc + an ADR change in the same commit. Validation is **tier-split (ADR-025)** and labeled honestly throughout — *Node-validated* (pure-TS, runs in CI) vs *browser-validated* (WebCodecs/GPU, runs on the target runtime).
-> **Provenance:** the design is grounded in the original 558-feature v0.1.0 browser-media benchmark (7 frameworks) — distilled in [`background/benchmark-summary.md`](background/benchmark-summary.md); full report lives in the sibling project `aibrush.lib/media-test/media-browser-test/docs/report/`. The live acceptance harness is versioned and may add cells (the Session 11 full export has 563), so completion always uses its current full suite rather than this historical count.
+> **Provenance:** the design is grounded in the original 558-feature v0.1.0 browser-media benchmark (7 frameworks) — distilled in [`background/benchmark-summary.md`](background/benchmark-summary.md); full report lives in the sibling project `aibrush.lib/media-test/docs/report/`. The live acceptance harness is versioned and may add cells (the Session 12 suite has 563), so completion always uses its current full suite rather than this historical count.
 >
 > **Implemented so far** (full per-driver/op status + validation tier in [`09-operations.md`](09-operations.md) §"Shipped drivers & operations"):
 >
@@ -13,7 +13,10 @@ The architecture base for **aibrush-media**, a unified, capability-routed, in-br
 > - **Streaming output building blocks:** fragmented/CMAF MP4, WebM/MKV live Cluster output, true WebM/MKV Cluster-on-write remux, and the `StreamTarget` sink are wired into the public sink/remux/mux surface; MP4/MOV remux and keyframe trim both have source-range lazy materialization paths for large inputs, and GB-scale buffered fragmented MP4 uses a buffer-only segment budget.
 > - **WASM tail:** real vendored decode tails for **Vorbis / AAC-LC / MP3** (Symphonia), **AV1** (dav1d), and **VP8/VP9** (ogv.js/libvpx), plus real **Opus decode+encode** and **Vorbis encode** tails, are auto-registered behind lazy default proxies. External `.wasm` assets are co-vendored by `scripts/vendor-wasm.ts`; self-contained cores stay inside lazy chunks. Exact codec envelopes are Node-validated and probed honestly before routing.
 >
-> **Not yet:** software video encoders for AV1/VP8/VP9, MP3 encode approval, HEVC Main10 output, and true two-pass H.264; fresh Firefox full-matrix closure, the 8-engine aggregate "win vs 7 engines" refresh, and external package verification for Session 8. These are tracked as honest gaps, never claimed done.
+> **Optional future work:** software encoders for AV1/VP8/VP9/MP3 and broader codec tails are deliberately
+> outside the current public envelope until license/provenance and packet/frame validation are approved
+> (ADR-225). Remaining Session 12 work is fresh Main10/two-pass public declaration, Firefox/full-engine
+> evidence, corpus/invocation closure, and the aggregate "win vs 7 engines" refresh. None is claimed done.
 
 ## The thesis (one sentence)
 
@@ -52,5 +55,5 @@ No single in-browser media engine spans all the substrates that win — hardware
 
 ## Companion documents (sibling project, the "options" phase that produced these decisions)
 
-- `aibrush.lib/media-test/media-browser-test/docs/unified-media-framework-feasibility-2026-06-23.md` — feasibility analysis (why one framework can win).
-- `aibrush.lib/media-test/media-browser-test/docs/unified-media-framework-architecture-options-2026-06-23.md` — the options + decision register these docs are derived from.
+- `aibrush.lib/media-test/docs/unified-media-framework-feasibility-2026-06-23.md` — feasibility analysis (why one framework can win).
+- `aibrush.lib/media-test/docs/unified-media-framework-architecture-options-2026-06-23.md` — the options + decision register these docs are derived from.

@@ -2,7 +2,7 @@
 /**
  * Session 6 R4 focused benchmark:
  * - CRF/quantizer and bitrate/two-pass rate-control planning.
- * - 10-bit→8-bit bit-depth planning.
+ * - 10-bit→8-bit pixel planning and exact 8-bit→Main10 encoder widening.
  * - H.264 ABR ladder normalization.
  * - Tiny 1x1 H.264 encoder config.
  * - Codec-specific WebCodecs quantizer encode-option generation.
@@ -17,6 +17,7 @@ import {
   planVideoBitDepthConversion,
   planVideoRateControl,
 } from '../src/api/video-stream-plan.ts';
+import { planH264TwoPass } from '../src/api/video-two-pass.ts';
 import { videoEncodeOptions } from '../src/codecs/webcodecs-video.ts';
 
 const WARMUP = 5;
@@ -28,6 +29,7 @@ interface BenchResult {
   readonly medianMs: number;
   readonly opsPerSec: number;
   readonly checksum: number;
+  readonly operationsPerSample: number;
   readonly samples: readonly number[];
 }
 
@@ -45,14 +47,18 @@ function elapsedMs(startNs: number): number {
   return (Number(Bun.nanoseconds()) - startNs) / 1_000_000;
 }
 
-async function runBench(name: string, fn: () => number): Promise<BenchResult> {
+async function runBench(
+  name: string,
+  fn: () => number,
+  operationsPerSample = OPS_PER_SAMPLE,
+): Promise<BenchResult> {
   for (let i = 0; i < WARMUP; i++) sink = (sink + fn()) | 0;
   const samples: number[] = [];
   let checksum = 0;
   for (let sample = 0; sample < ITERS; sample++) {
     const start = Number(Bun.nanoseconds());
     let local = 0;
-    for (let op = 0; op < OPS_PER_SAMPLE; op++) local = (local + fn()) | 0;
+    for (let op = 0; op < operationsPerSample; op++) local = (local + fn()) | 0;
     checksum = (checksum + local) | 0;
     samples.push(elapsedMs(start));
   }
@@ -60,8 +66,9 @@ async function runBench(name: string, fn: () => number): Promise<BenchResult> {
   return {
     name,
     medianMs,
-    opsPerSec: OPS_PER_SAMPLE / (medianMs / 1_000),
+    opsPerSec: operationsPerSample / (medianMs / 1_000),
     checksum,
+    operationsPerSample,
     samples,
   };
 }
@@ -115,6 +122,10 @@ function benchBitDepthPlans(): number {
       sourceCodec: 'avc1.42E01E',
       targetCodec: 'avc1.42E028',
     }),
+    planVideoBitDepthConversion({
+      sourceCodec: 'avc1.640028',
+      targetCodec: 'hev1.2.4.L120.B0',
+    }),
   ];
   return plans.reduce(
     (sum, plan) =>
@@ -126,6 +137,24 @@ function benchBitDepthPlans(): number {
   );
 }
 
+function benchHevcMain10Config(): number {
+  const sizes = [
+    { width: 640, height: 360, fps: 30 },
+    { width: 1920, height: 1080, fps: 30 },
+    { width: 3840, height: 2160, fps: 60 },
+  ] as const;
+  let checksum = 0;
+  for (const size of sizes) {
+    const config = buildVideoEncoderConfig(
+      { codec: 'hevc', bitDepth: 10, fps: size.fps },
+      size,
+      'avc1.640028',
+    );
+    checksum += config.codec.length + config.width + config.height + (config.framerate ?? 0);
+  }
+  return checksum;
+}
+
 function benchH264AbrPlan(): number {
   const ladder = planH264AbrLadder(
     [
@@ -133,7 +162,7 @@ function benchH264AbrPlan(): number {
       { name: '720p', width: 1280, height: 720, bitrate: 3_000_000, fps: 30 },
       { name: '540p', width: 960, height: 540, bitrate: 1_600_000, fps: 30 },
       { name: '360p', width: 640, height: 360, bitrate: 800_000, fps: 30 },
-      { name: 'tiny', width: 1, height: 1, bitrate: 50_000, fps: 30 },
+      { name: 'tiny', width: 2, height: 2, bitrate: 50_000, fps: 30 },
     ],
     { width: 1920, height: 1080 },
   );
@@ -151,7 +180,7 @@ function benchH264AbrPlan(): number {
 
 function benchTinyH264Config(): number {
   const config = buildVideoEncoderConfig(
-    { codec: 'h264', width: 1, height: 1, fps: 30, bitDepth: 8 },
+    { codec: 'h264', width: 2, height: 2, fps: 30, bitDepth: 8 },
     { width: 1920, height: 1080 },
     undefined,
   );
@@ -176,18 +205,39 @@ function benchQuantizerEncodeOptions(): number {
   return checksum;
 }
 
+function benchTwoPassAllocation(): number {
+  const samples = Array.from({ length: 120 }, (_, index) => ({
+    timestampUs: index * 33_333,
+    durationUs: 33_333,
+    byteLength: 1_500 + ((index * 7_919) % 24_000),
+    keyFrame: index % 60 === 0,
+  }));
+  // Feed reverse callback order to retain the B-frame/PTS-sort cost in the measurement.
+  const plan = planH264TwoPass(samples.reverse(), 2_000_000, 3.99996);
+  return (
+    plan.sampleCount +
+    plan.targetBytes +
+    plan.predictedBytes +
+    plan.evidenceBytes +
+    plan.quantizerForTimestamp(0) +
+    plan.quantizerForTimestamp(3_966_627)
+  );
+}
+
 async function main(): Promise<void> {
   const results = await Promise.all([
     runBench('r4.crf-config-h264', benchCrfConfig),
     runBench('r4.rate-plan-matrix', benchRatePlans),
     runBench('r4.bit-depth-plan', benchBitDepthPlans),
+    runBench('r4.hevc-main10-config', benchHevcMain10Config),
     runBench('r4.h264-abr-plan', benchH264AbrPlan),
     runBench('r4.tiny-h264-config', benchTinyH264Config),
     runBench('r4.quantizer-encode-options', benchQuantizerEncodeOptions),
+    runBench('r4.h264-two-pass-allocation-120f', benchTwoPassAllocation, 100),
   ]);
   for (const result of results) {
     console.log(
-      `${result.name}: median=${result.medianMs.toFixed(4)}ms/${OPS_PER_SAMPLE} ops ` +
+      `${result.name}: median=${result.medianMs.toFixed(4)}ms/${result.operationsPerSample} ops ` +
         `opsPerSec=${result.opsPerSec.toFixed(0)} checksum=${result.checksum}`,
     );
   }

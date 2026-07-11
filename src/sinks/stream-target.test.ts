@@ -72,13 +72,28 @@ describe('writeToStreamTarget — WritableStream destination', () => {
 
 describe('writeToStreamTarget — callback destination', () => {
   it('rejects unsupported destination shapes as a typed capability miss', async () => {
+    let pulls = 0;
+    let cancels = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(): void {
+          pulls++;
+        },
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
     const target = {
       kind: 'stream-target',
       destination: { write: () => undefined },
     } as unknown as StreamTarget;
-    const err = await writeToStreamTarget(target, bytesStream([1])).catch((e: unknown) => e);
+    const err = await writeToStreamTarget(target, stream).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CapabilityError);
     expect((err as CapabilityError).code).toBe('capability-miss');
+    expect(pulls).toBe(0);
+    expect(cancels).toBe(1);
   });
 
   it('hands each chunk to the callback with its running byte position', async () => {
@@ -128,6 +143,44 @@ describe('writeToStreamTarget — callback destination', () => {
     expect(err).toBeInstanceOf(MediaError);
     expect((err as MediaError).code).toBe('mux-error');
     expect(cancelled).toBe(true);
+  });
+
+  it('awaits asynchronous upstream cancellation before rejecting a callback failure', async () => {
+    let releaseCancel: (() => void) | undefined;
+    let markCancelStarted: (() => void) | undefined;
+    const cancelStarted = new Promise<void>((resolve) => {
+      markCancelStarted = resolve;
+    });
+    const cancelGate = new Promise<void>((resolve) => {
+      releaseCancel = resolve;
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(Uint8Array.of(1));
+      },
+      async cancel(): Promise<void> {
+        markCancelStarted?.();
+        await cancelGate;
+      },
+    });
+    const pending = writeToStreamTarget(
+      toStreamTarget(() => Promise.reject(new Error('stop'))),
+      stream,
+    );
+    const observed = pending.then(
+      () => 'settled' as const,
+      () => 'settled' as const,
+    );
+    await cancelStarted;
+    const beforeRelease = await Promise.race([
+      observed,
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 0)),
+    ]);
+    expect(beforeRelease).toBe('pending');
+
+    releaseCancel?.();
+    await expect(pending).rejects.toMatchObject({ code: 'mux-error' });
+    await expect(observed).resolves.toBe('settled');
   });
 
   it('preserves typed callback failures without remapping their code', async () => {
@@ -185,15 +238,30 @@ describe('writeToStreamTarget — cancellation', () => {
     const ac = new AbortController();
     ac.abort();
     const calls: number[] = [];
+    let pulls = 0;
+    let cancels = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(): void {
+          pulls++;
+        },
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
     const writer: StreamTargetWriter = (chunk) => {
       calls.push(chunk[0] ?? -1);
     };
-    const err = await writeToStreamTarget(toStreamTarget(writer), bytesStream([1]), {
+    const err = await writeToStreamTarget(toStreamTarget(writer), stream, {
       signal: ac.signal,
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MediaError);
     expect((err as MediaError).code).toBe('aborted');
     expect(calls).toEqual([]); // never pulled a chunk
+    expect(pulls).toBe(0);
+    expect(cancels).toBe(1);
   });
 
   it('aborts mid-stream: stops pulling and rejects (callback arm)', async () => {

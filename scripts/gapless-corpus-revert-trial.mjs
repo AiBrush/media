@@ -12,12 +12,9 @@ function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-const expectedCatalogBackupSha =
-  'f1b7c9fcecaaa3646aca01fcc8f57ff6bff00b6559edbc9e8ed77527a3802ab2';
-const expectedFixtureBackupSha =
-  '1ceee73f659a3c83205b1c2c31dc6804d46d79e0de89231635b6b66a876be8a3';
-const expectedTrialFixtureSha =
-  '7a5b8dd34abbec73fda181a9106f28c792cc89b8740c534fd6563d7f756b1a58';
+const expectedCatalogBackupSha = 'f1b7c9fcecaaa3646aca01fcc8f57ff6bff00b6559edbc9e8ed77527a3802ab2';
+const expectedFixtureBackupSha = '1ceee73f659a3c83205b1c2c31dc6804d46d79e0de89231635b6b66a876be8a3';
+const expectedTrialFixtureSha = '7a5b8dd34abbec73fda181a9106f28c792cc89b8740c534fd6563d7f756b1a58';
 
 if (sha256(destinationPath) !== expectedTrialFixtureSha) {
   throw new Error('trial rotation changed since the audited mutation');

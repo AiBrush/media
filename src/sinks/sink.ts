@@ -4,6 +4,7 @@
  * target. Stream sinks are lazy (pull-based); large outputs never fully buffer when streamed.
  */
 
+import type { MaterializeOptions } from './materialize.ts';
 import type { StreamTarget } from './stream-target.ts';
 
 export type Sink =
@@ -50,5 +51,14 @@ export function toElement(
   return { kind: 'element', el, via: opts.via ?? 'blob' };
 }
 
-export { materialize } from './materialize.ts';
-export type { MaterializeOptions } from './materialize.ts';
+/** Lazily load the byte writer on first materialization so sink descriptors stay in the eager kernel. */
+export async function materialize(
+  sink: Sink,
+  stream: ReadableStream<Uint8Array>,
+  opts: MaterializeOptions = {},
+): Promise<Output> {
+  const writer = await import('./materialize.ts');
+  return writer.materialize(sink, stream, opts);
+}
+
+export type { MaterializeOptions };

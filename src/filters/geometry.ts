@@ -70,7 +70,7 @@ export function applyAffine(t: Affine, x: number, y: number): readonly [number, 
 
 /** Validate a dimension is a finite integer ≥ 1 (output frames must have real, non-degenerate size). */
 function requirePositiveInt(value: number, label: string): number {
-  if (!Number.isInteger(value) || value < 1) {
+  if (!Number.isSafeInteger(value) || value < 1) {
     throw new InputError('unsupported-input', `${label} must be a positive integer, got ${value}`);
   }
   return value;
@@ -78,7 +78,7 @@ function requirePositiveInt(value: number, label: string): number {
 
 /** Validate source dimensions decoded from a `VideoFrame` (display size). */
 function requireSourceDims(srcW: number, srcH: number): void {
-  if (!Number.isInteger(srcW) || !Number.isInteger(srcH) || srcW < 1 || srcH < 1) {
+  if (!Number.isSafeInteger(srcW) || !Number.isSafeInteger(srcH) || srcW < 1 || srcH < 1) {
     throw new InputError('unsupported-input', `invalid source dimensions ${srcW}×${srcH}`);
   }
 }
@@ -141,7 +141,7 @@ type CropSpec = Extract<FilterSpec, { type: 'crop' }>;
 export function cropBlit(srcW: number, srcH: number, spec: CropSpec): Blit {
   requireSourceDims(srcW, srcH);
   const { x, y, width, height } = spec;
-  if (![x, y, width, height].every((n) => Number.isInteger(n))) {
+  if (![x, y, width, height].every((n) => Number.isSafeInteger(n))) {
     throw new InputError(
       'unsupported-input',
       `crop rect must be integers, got ${x},${y} ${width}×${height}`,
@@ -160,6 +160,39 @@ export function cropBlit(srcW: number, srcH: number, spec: CropSpec): Blit {
     dims: { width, height },
     src: { x, y, width, height },
     dst: { x: 0, y: 0, width, height },
+  };
+}
+
+// ============ pad ============
+
+type PadSpec = Extract<FilterSpec, { type: 'pad' }>;
+
+/**
+ * Pad recipe — copy the complete source 1:1 onto a larger transparent canvas. The public planner resolves
+ * default centering into explicit integer offsets, so this low-level recipe is self-contained and every
+ * substrate receives identical placement facts.
+ */
+export function padBlit(srcW: number, srcH: number, spec: PadSpec): Blit {
+  requireSourceDims(srcW, srcH);
+  const { x, y } = spec;
+  const width = requirePositiveInt(spec.width, 'pad width');
+  const height = requirePositiveInt(spec.height, 'pad height');
+  if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0) {
+    throw new InputError(
+      'unsupported-input',
+      `pad offsets must be non-negative integers, got ${x},${y}`,
+    );
+  }
+  if (width < srcW || height < srcH || x + srcW > width || y + srcH > height) {
+    throw new InputError(
+      'unsupported-input',
+      `pad placement ${x},${y} + ${srcW}×${srcH} is outside the ${width}×${height} canvas`,
+    );
+  }
+  return {
+    dims: { width, height },
+    src: { x: 0, y: 0, width: srcW, height: srcH },
+    dst: { x, y, width: srcW, height: srcH },
   };
 }
 

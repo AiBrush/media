@@ -99,10 +99,25 @@ describe('lazyPipeThrough', () => {
 
 describe('cancellation', () => {
   it('rejects immediately when the signal is already aborted', async () => {
-    await expect(collect(bytesStream([1]), { signal: AbortSignal.abort() })).rejects.toMatchObject({
+    let pulls = 0;
+    let cancels = 0;
+    const source = new ReadableStream<Uint8Array>(
+      {
+        pull(): void {
+          pulls++;
+        },
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    await expect(collect(source, { signal: AbortSignal.abort() })).rejects.toMatchObject({
       name: 'MediaError',
       code: 'aborted',
     });
+    expect(pulls).toBe(0);
+    expect(cancels).toBe(1);
   });
 
   it('aborts an in-flight collect and cancels the source', async () => {
@@ -127,10 +142,31 @@ describe('cancellation', () => {
   });
 
   it('rejects runToSink when pre-aborted', async () => {
-    const sink = new WritableStream<Uint8Array>();
-    await expect(
-      runToSink(bytesStream([1]), sink, { signal: AbortSignal.abort() }),
-    ).rejects.toMatchObject({ code: 'aborted' });
+    let pulls = 0;
+    let cancels = 0;
+    let aborts = 0;
+    const source = new ReadableStream<Uint8Array>(
+      {
+        pull(): void {
+          pulls++;
+        },
+        cancel(): void {
+          cancels++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const sink = new WritableStream<Uint8Array>({
+      abort(): void {
+        aborts++;
+      },
+    });
+    await expect(runToSink(source, sink, { signal: AbortSignal.abort() })).rejects.toMatchObject({
+      code: 'aborted',
+    });
+    expect(pulls).toBe(0);
+    expect(cancels).toBe(1);
+    expect(aborts).toBe(1);
   });
 });
 

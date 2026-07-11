@@ -23,8 +23,8 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
-import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
 import type { GaplessNativeSuppressionProbe } from './gapless-native-suppression.ts';
+import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
 import {
   RGBA_BYTES_PER_PIXEL,
   type VpxAlphaPackedSourceFormat,
@@ -64,6 +64,160 @@ const VIDEO_CODEC_STRING: Record<VideoCodec, string> = {
   vp9: 'vp09.00.10.08',
   av1: 'av01.0.04M.08',
 };
+
+/** HEVC Main10, Main tier, Level 4.0 — the explicit WebCodecs target for requested 10-bit output. */
+const HEVC_MAIN10_CODEC_STRING = 'hev1.2.4.L120.B0';
+
+type Vp9Level = readonly [
+  level: number,
+  maxPictureSamples: number,
+  maxDimension: number,
+  maxDisplaySampleRate: number,
+  maxBitrate: number,
+];
+
+/** WebM VP9 4:2:0 levels, ordered by increasing capability. Bitrate values are bits/second. */
+const VP9_LEVELS = [
+  [10, 36_864, 512, 829_440, 200_000],
+  [11, 73_728, 768, 2_764_800, 800_000],
+  [20, 122_880, 960, 4_608_000, 1_800_000],
+  [21, 245_760, 1_344, 9_216_000, 3_600_000],
+  [30, 552_960, 2_048, 20_736_000, 7_200_000],
+  [31, 983_040, 2_752, 36_864_000, 12_000_000],
+  [40, 2_228_224, 4_160, 83_558_400, 18_000_000],
+  [41, 2_228_224, 4_160, 160_432_128, 30_000_000],
+  [50, 8_912_896, 8_384, 311_951_360, 60_000_000],
+  [51, 8_912_896, 8_384, 588_251_136, 120_000_000],
+  [52, 8_912_896, 8_384, 1_176_502_272, 180_000_000],
+  [60, 35_651_584, 16_832, 1_176_502_272, 180_000_000],
+  [61, 35_651_584, 16_832, 2_353_004_544, 240_000_000],
+  [62, 35_651_584, 16_832, 4_706_009_088, 480_000_000],
+] as const satisfies readonly Vp9Level[];
+
+type Av1Level = readonly [
+  sequenceLevelIndex: number,
+  maxPictureSamples: number,
+  maxWidth: number,
+  maxHeight: number,
+  maxDisplaySampleRate: number,
+  mainTierBitrate: number,
+];
+
+/** AV1 Annex-A defined levels, ordered by increasing capability. Undefined 2.2/2.3 etc. are omitted. */
+const AV1_LEVELS = [
+  [0, 147_456, 2_048, 1_152, 4_423_680, 1_500_000],
+  [1, 278_784, 2_816, 1_584, 8_363_520, 3_000_000],
+  [4, 665_856, 4_352, 2_448, 19_975_680, 6_000_000],
+  [5, 1_065_024, 5_504, 3_096, 31_950_720, 10_000_000],
+  [8, 2_359_296, 6_144, 3_456, 70_778_880, 12_000_000],
+  [9, 2_359_296, 6_144, 3_456, 141_557_760, 20_000_000],
+  [12, 8_912_896, 8_192, 4_352, 267_386_880, 30_000_000],
+  [13, 8_912_896, 8_192, 4_352, 534_773_760, 40_000_000],
+  [14, 8_912_896, 8_192, 4_352, 1_069_547_520, 60_000_000],
+  [15, 8_912_896, 8_192, 4_352, 1_069_547_520, 60_000_000],
+  [16, 35_651_584, 16_384, 8_704, 1_069_547_520, 60_000_000],
+  [17, 35_651_584, 16_384, 8_704, 2_139_095_040, 100_000_000],
+  [18, 35_651_584, 16_384, 8_704, 4_278_190_080, 160_000_000],
+  [19, 35_651_584, 16_384, 8_704, 4_278_190_080, 160_000_000],
+] as const satisfies readonly Av1Level[];
+
+function videoDisplaySampleRate(width: number, height: number, fps: number): number {
+  return width * height * fps;
+}
+
+function noVideoLevel(
+  codec: 'VP9' | 'AV1',
+  width: number,
+  height: number,
+  fps: number | 'unknown',
+): never {
+  throw new CapabilityError(
+    'capability-miss',
+    `${codec} output ${width}x${height}@${fps} exceeds the defined level envelope`,
+    {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion: 'reduce output dimensions, frame rate, or explicit bitrate',
+    },
+  );
+}
+
+/** Author an exact VP9 profile/level/depth codec string for a 4:2:0 encoder request. */
+export function vp9CodecStringForConfig(
+  width: number,
+  height: number,
+  fps: number | undefined,
+  bitDepth: VideoBitDepth,
+  explicitBitrate: number | undefined,
+): string {
+  const pictureSamples = width * height;
+  const profile = bitDepth === 8 ? '00' : '02';
+  if (fps === undefined) {
+    const top = VP9_LEVELS.at(-1);
+    if (
+      top !== undefined &&
+      pictureSamples <= top[1] &&
+      width <= top[2] &&
+      height <= top[2] &&
+      (explicitBitrate === undefined || explicitBitrate <= top[4])
+    ) {
+      return `vp09.${profile}.${top[0]}.${bitDepth.toString().padStart(2, '0')}`;
+    }
+    return noVideoLevel('VP9', width, height, 'unknown');
+  }
+  const displaySampleRate = videoDisplaySampleRate(width, height, fps);
+  for (const [level, maxPicture, maxDimension, maxRate, maxBitrate] of VP9_LEVELS) {
+    if (
+      pictureSamples <= maxPicture &&
+      width <= maxDimension &&
+      height <= maxDimension &&
+      displaySampleRate <= maxRate &&
+      (explicitBitrate === undefined || explicitBitrate <= maxBitrate)
+    ) {
+      return `vp09.${profile}.${level}.${bitDepth.toString().padStart(2, '0')}`;
+    }
+  }
+  return noVideoLevel('VP9', width, height, fps);
+}
+
+/** Author an exact AV1 Main-tier profile/level/depth codec string for a 4:2:0 encoder request. */
+export function av1CodecStringForConfig(
+  width: number,
+  height: number,
+  fps: number | undefined,
+  bitDepth: VideoBitDepth,
+  explicitBitrate: number | undefined,
+): string {
+  const pictureSamples = width * height;
+  const profile = bitDepth === 12 ? 2 : 0;
+  const bitrateFactor = profile === 2 ? 3 : 1;
+  if (fps === undefined) {
+    const top = AV1_LEVELS.at(-1);
+    if (
+      top !== undefined &&
+      pictureSamples <= top[1] &&
+      width <= top[2] &&
+      height <= top[3] &&
+      (explicitBitrate === undefined || explicitBitrate <= top[5] * bitrateFactor)
+    ) {
+      return `av01.${profile}.${top[0].toString().padStart(2, '0')}M.${bitDepth.toString().padStart(2, '0')}`;
+    }
+    return noVideoLevel('AV1', width, height, 'unknown');
+  }
+  const displaySampleRate = videoDisplaySampleRate(width, height, fps);
+  for (const [level, maxPicture, maxWidth, maxHeight, maxRate, mainBitrate] of AV1_LEVELS) {
+    if (
+      pictureSamples <= maxPicture &&
+      width <= maxWidth &&
+      height <= maxHeight &&
+      displaySampleRate <= maxRate &&
+      (explicitBitrate === undefined || explicitBitrate <= mainBitrate * bitrateFactor)
+    ) {
+      return `av01.${profile}.${level.toString().padStart(2, '0')}M.${bitDepth.toString().padStart(2, '0')}`;
+    }
+  }
+  return noVideoLevel('AV1', width, height, fps);
+}
 
 // ── H.264 level selection (Annex A, Table A-1) ───────────────────────────────────────────────────
 
@@ -442,10 +596,10 @@ function hevcProfileIdc(codecString: string): number | undefined {
   return Number.isInteger(idc) ? idc : undefined;
 }
 
-/** True for HEVC profiles this build cannot honestly encode without a software HEVC encoder tail. */
+/** True for HEVC profiles outside the WebCodecs Main/Main10 output surface used by this build. */
 export function isUnsupportedHevcEncodeProfile(codecString: string): boolean {
   const profileIdc = hevcProfileIdc(codecString);
-  return profileIdc !== undefined && profileIdc !== 1;
+  return profileIdc !== undefined && profileIdc !== 1 && profileIdc !== 2;
 }
 
 function assertSupportedVideoEncodeProfile(codecString: string): void {
@@ -453,7 +607,7 @@ function assertSupportedVideoEncodeProfile(codecString: string): void {
   throw new CapabilityError('capability-miss', 'bad HEVC profile', {
     op: 'encode',
     tried: ['webcodecs-video'],
-    suggestion: 'use HEVC Main8 or add Main10 encode',
+    suggestion: 'use HEVC Main or Main10, or add a proven encoder tail for the requested profile',
   });
 }
 
@@ -522,6 +676,10 @@ export function outputDimensions(
     width = target.width ?? width;
     height = target.height ?? height;
   }
+  if (target.pad !== undefined) {
+    width = target.pad.width;
+    height = target.pad.height;
+  }
   if (target.rotate === 90 || target.rotate === 270) {
     const w = width;
     width = height;
@@ -532,18 +690,27 @@ export function outputDimensions(
 
 /**
  * True when a VPx-alpha transcode can preserve the alpha side stream without decoding to merged RGBA
- * frames. Any pixel/timing transform must use the general decoded-frame path instead.
+ * frames. Any pixel/timing transform or unproved precision transition must use the general decoded-frame
+ * path instead. The caller supplies the already-resolved encoder codec so the comparison cannot be bypassed
+ * by a bare target token or an implicit profile default.
  */
 export function canUseVpxAlphaPacketTranscode(
   target: VideoTarget,
   sourceHasAlpha: boolean,
+  sourceCodec: string,
+  targetCodec: string,
 ): boolean {
+  const sourceBitDepth = bitDepthFromCodec(sourceCodec);
+  const targetBitDepth = bitDepthFromCodec(targetCodec);
   return (
     sourceHasAlpha &&
+    sourceBitDepth !== undefined &&
+    targetBitDepth === sourceBitDepth &&
     target.alpha === 'keep' &&
     target.width === undefined &&
     target.height === undefined &&
     target.crop === undefined &&
+    target.pad === undefined &&
     target.rotate === undefined &&
     target.flip === undefined &&
     target.colorspace === undefined &&
@@ -766,7 +933,12 @@ function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
   return codec === 'h264' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 }
 
-function defaultVideoBitrate(codec: VideoCodec | 'unknown', width: number, height: number): number {
+function defaultVideoBitrate(
+  codec: VideoCodec | 'unknown',
+  width: number,
+  height: number,
+  maximum: number | undefined,
+): number {
   const minBitrate = 300_000;
   // Offline transcodes default to a visually transparent quality budget. Ten aggregate bits per output
   // pixel per second left high-detail H.264 resizes near SSIM 0.96–0.98 even with Chromium's quality
@@ -782,22 +954,51 @@ function defaultVideoBitrate(codec: VideoCodec | 'unknown', width: number, heigh
     av1: 0.6,
     unknown: 1,
   };
-  return Math.max(
+  const planned = Math.max(
     minBitrate,
     Math.round(width * height * bitsPerPixelPerSecond * efficiency[codec]),
   );
+  return maximum === undefined ? planned : Math.min(planned, maximum);
+}
+
+function maximumLevelBitrate(
+  codec: VideoCodec | 'unknown',
+  bitDepth: VideoBitDepth,
+): number | undefined {
+  if (codec === 'vp9') return VP9_LEVELS.at(-1)?.[4];
+  if (codec === 'av1') {
+    const main = AV1_LEVELS.at(-1)?.[5];
+    return main === undefined ? undefined : main * (bitDepth === 12 ? 3 : 1);
+  }
+  return undefined;
+}
+
+function declaredLevelBitrate(codecString: string): number | undefined {
+  const vp9 = /^vp09\.\d{2}\.(\d{2})\./i.exec(codecString);
+  if (vp9?.[1] !== undefined) {
+    const level = Number(vp9[1]);
+    return VP9_LEVELS.find(([candidate]) => candidate === level)?.[4];
+  }
+  const av1 = /^av01\.(\d)\.(\d{2})([MH])\./i.exec(codecString);
+  if (av1?.[1] !== undefined && av1[2] !== undefined && av1[3]?.toUpperCase() === 'M') {
+    const profile = Number(av1[1]);
+    const level = Number(av1[2]);
+    const main = AV1_LEVELS.find(([candidate]) => candidate === level)?.[5];
+    return main === undefined ? undefined : main * (profile === 2 ? 3 : 1);
+  }
+  return undefined;
 }
 
 function eagerVideoRateConfig(
   target: EagerVideoRateTarget,
-  codecString: string,
+  codec: VideoCodec | 'unknown',
   width: number,
   height: number,
+  implicitBitrateMaximum: number | undefined,
 ): {
   readonly bitrate?: number;
   readonly bitrateMode?: VideoEncoderBitrateMode;
 } {
-  const codec = videoCodecToken(codecString) ?? 'unknown';
   if (target.bitrate !== undefined) assertValidVideoBitrate(target.bitrate);
   if (target.crf !== undefined) assertValidVideoCrf(target.crf, codec);
   if (target.bitrate !== undefined && target.crf !== undefined) {
@@ -807,11 +1008,21 @@ function eagerVideoRateConfig(
     throw new InputError('unsupported-input', 'two-pass needs bitrate');
   }
   if (target.twoPass === true) {
-    throw new CapabilityError('capability-miss', 'WebCodecs has no two-pass video encode API', {
-      op: 'encode',
-      tried: ['webcodecs-video'],
-      suggestion: 'route to an encoder tail that exposes first-pass stats and second-pass control',
-    });
+    if (codec !== 'h264') {
+      throw new CapabilityError(
+        'capability-miss',
+        `two-pass video encode is currently available only for H.264, not ${codec}`,
+        {
+          op: 'encode',
+          tried: ['webcodecs-video'],
+          suggestion: 'target H.264 or add a validated two-pass allocator for the requested codec',
+        },
+      );
+    }
+    // The engine performs a real fixed-QP analysis encode, then replays the filtered source with a
+    // timestamp-exact per-picture H.264 QP schedule. Pass two therefore uses WebCodecs quantizer mode;
+    // forwarding `bitrate` here would silently turn it back into the forbidden one-pass ABR path.
+    return { bitrateMode: 'quantizer' };
   }
   if (target.crf !== undefined) {
     if (!webCodecsQuantizerSupported(codec)) {
@@ -828,7 +1039,7 @@ function eagerVideoRateConfig(
     return { bitrateMode: 'quantizer' };
   }
   return {
-    bitrate: target.bitrate ?? defaultVideoBitrate(codec, width, height),
+    bitrate: target.bitrate ?? defaultVideoBitrate(codec, width, height, implicitBitrateMaximum),
     bitrateMode: target.bitrateMode ?? 'variable',
   };
 }
@@ -893,6 +1104,94 @@ function assertTargetBitDepth(target: Pick<VideoTarget, 'bitDepth'>, codecString
   );
 }
 
+function unsupportedVideoBitDepth(codec: VideoCodec, bitDepth: VideoBitDepth): never {
+  throw new CapabilityError(
+    'capability-miss',
+    `video ${bitDepth}-bit output is not available for ${codec}`,
+    {
+      op: 'encode',
+      tried: ['webcodecs-video'],
+      suggestion:
+        codec === 'h264'
+          ? 'use 8-bit H.264 until a High10 encode+mux path is browser-proven'
+          : codec === 'hevc'
+            ? 'use HEVC Main or Main10'
+            : 'target VP9 or AV1 for a probed high-bit-depth encode',
+    },
+  );
+}
+
+function resolvedVideoEncoderCodecString(
+  target: Pick<VideoTarget, 'codec' | 'bitDepth'>,
+  width: number,
+  height: number,
+  fps: number | undefined,
+  sourceCodecString: string | undefined,
+  effectiveBitrate: number | undefined,
+  preserveSourceQualification: boolean,
+): string {
+  const requestedDepth = normalizeVideoBitDepth(target.bitDepth);
+  const sourceToken =
+    sourceCodecString === undefined ? undefined : videoCodecToken(sourceCodecString);
+  const sourceDepth =
+    sourceCodecString === undefined ? undefined : bitDepthFromCodec(sourceCodecString);
+
+  if (preserveSourceQualification) {
+    return videoEncoderCodecString(undefined, sourceCodecString);
+  }
+
+  const codec = target.codec ?? sourceToken;
+  if (codec === undefined) return videoEncoderCodecString(undefined, sourceCodecString);
+  if (target.codec === undefined && codec === 'hevc' && sourceDepth === undefined) {
+    return videoEncoderCodecString(undefined, sourceCodecString);
+  }
+  const bitDepth = requestedDepth ?? (target.codec === undefined ? sourceDepth : undefined) ?? 8;
+  switch (codec) {
+    case 'h264':
+      if (bitDepth !== 8) return unsupportedVideoBitDepth(codec, bitDepth);
+      return h264CodecStringForSourceProfile(width, height, fps, sourceCodecString);
+    case 'hevc':
+      if (bitDepth === 8) return VIDEO_CODEC_STRING.hevc;
+      if (bitDepth === 10) return HEVC_MAIN10_CODEC_STRING;
+      return unsupportedVideoBitDepth(codec, bitDepth);
+    case 'vp8':
+      if (bitDepth !== 8) return unsupportedVideoBitDepth(codec, bitDepth);
+      return VIDEO_CODEC_STRING.vp8;
+    case 'vp9':
+      return vp9CodecStringForConfig(width, height, fps, bitDepth, effectiveBitrate);
+    case 'av1':
+      return av1CodecStringForConfig(width, height, fps, bitDepth, effectiveBitrate);
+  }
+}
+
+function sourceQualificationFactsAreUnchanged(
+  target: VideoTarget,
+  src: SourceGeometry,
+  width: number,
+  height: number,
+  frameRate: number | undefined,
+  sourceCodecString: string | undefined,
+): boolean {
+  if (
+    target.codec !== undefined ||
+    target.bitrate !== undefined ||
+    sourceCodecString === undefined
+  ) {
+    return false;
+  }
+  const sourceDepth = bitDepthFromCodec(sourceCodecString);
+  const requestedDepth = normalizeVideoBitDepth(target.bitDepth);
+  const sourceFps =
+    src.fps !== undefined && Number.isFinite(src.fps) && src.fps > 0 ? src.fps : undefined;
+  return (
+    sourceDepth !== undefined &&
+    (requestedDepth === undefined || requestedDepth === sourceDepth) &&
+    src.width === width &&
+    src.height === height &&
+    sourceFps === frameRate
+  );
+}
+
 /**
  * Build the {@link VideoEncoderConfig} for a target stream: the resolved codec string, the post-filter
  * output `width`/`height` (which must be known to configure an encoder), and the optional bitrate +
@@ -908,21 +1207,49 @@ export function buildVideoEncoderConfig(
   if (width === undefined || height === undefined) {
     throw new InputError('unsupported-input', 'video dims required');
   }
+  assertEncodableVideoDimensions('video', width, height);
+  if (target.fps !== undefined) assertPositiveFinite('fps', target.fps);
+  if (target.bitrate !== undefined) assertValidVideoBitrate(target.bitrate);
   const sourceFps =
     src.fps !== undefined && Number.isFinite(src.fps) && src.fps > 0 ? src.fps : undefined;
   const frameRate = target.fps ?? sourceFps;
-  // Resolve the codec string. For the `h264` token, size the level to the actual output geometry/rate
-  // and preserve a known source Main/High profile for compression efficiency. A caller-pinned qualified
-  // target remains exact through `videoEncoderCodecString`; other tokens keep their standard mapping.
-  const codec =
-    target.codec === 'h264'
-      ? h264CodecStringForSourceProfile(width, height, frameRate, sourceCodecString)
-      : videoEncoderCodecString(target.codec, sourceCodecString);
-  assertEncodableVideoDimensions(codec, width, height);
+  const sourceToken =
+    sourceCodecString === undefined ? undefined : videoCodecToken(sourceCodecString);
+  const sourceDepth =
+    sourceCodecString === undefined ? undefined : bitDepthFromCodec(sourceCodecString);
+  const requestedDepth = normalizeVideoBitDepth(target.bitDepth);
+  const rateCodec = target.codec ?? sourceToken ?? 'unknown';
+  const rateDepth = requestedDepth ?? (target.codec === undefined ? sourceDepth : undefined) ?? 8;
+  const preserveSourceQualification = sourceQualificationFactsAreUnchanged(
+    target,
+    src,
+    width,
+    height,
+    frameRate,
+    sourceCodecString,
+  );
+  const implicitBitrateMaximum =
+    preserveSourceQualification && sourceCodecString !== undefined
+      ? declaredLevelBitrate(sourceCodecString)
+      : maximumLevelBitrate(rateCodec, rateDepth);
+  const rateControl = eagerVideoRateConfig(
+    target,
+    rateCodec,
+    width,
+    height,
+    implicitBitrateMaximum,
+  );
+  const codec = resolvedVideoEncoderCodecString(
+    target,
+    width,
+    height,
+    frameRate,
+    sourceCodecString,
+    rateControl.bitrate,
+    preserveSourceQualification,
+  );
   assertSupportedVideoEncodeProfile(codec);
   assertTargetBitDepth(target, codec);
-  if (target.fps !== undefined) assertPositiveFinite('fps', target.fps);
-  const rateControl = eagerVideoRateConfig(target, codec, width, height);
   const alpha = videoAlphaOption(target, codec);
   return {
     codec,
@@ -949,7 +1276,9 @@ export function periodicVideoKeyFrameInterval(
 }
 
 function assertEncodableVideoDimensions(codec: string, width: number, height: number): void {
-  if (width >= 2 && height >= 2) return;
+  if (Number.isSafeInteger(width) && width >= 2 && Number.isSafeInteger(height) && height >= 2) {
+    return;
+  }
   throw new InputError(
     'unsupported-input',
     `video encode ${codec} needs at least 2x2 output dimensions; got ${width}x${height}`,
@@ -1074,6 +1403,40 @@ export async function decodedAudioStreamWithGapless(
 export interface MuxerSink {
   addTrack(info: TrackInfo): number;
   write(trackId: number, packet: Packet): Promise<void>;
+}
+
+/** One operation-scoped abort domain for concurrent encoder/packet drains. */
+export interface DrainTaskGroup {
+  readonly signal: AbortSignal;
+  run(tasks: readonly Promise<void>[]): Promise<void>;
+  dispose(): void;
+}
+
+/**
+ * Link sibling drains without aborting the caller-owned parent controller. The first task failure is the
+ * public error; it aborts every sibling reader, waits for all teardown to settle, then rethrows that same
+ * error. Parent cancellation enters the same domain and the explicit dispose removes its listener.
+ */
+export function createDrainTaskGroup(parent: AbortSignal): DrainTaskGroup {
+  const controller = new AbortController();
+  const onParentAbort = (): void => controller.abort(parent.reason);
+  if (parent.aborted) onParentAbort();
+  else parent.addEventListener('abort', onParentAbort, { once: true });
+  return {
+    signal: controller.signal,
+    async run(tasks): Promise<void> {
+      try {
+        await Promise.all(tasks);
+      } catch (error) {
+        controller.abort(error);
+        await Promise.allSettled(tasks);
+        throw error;
+      }
+    },
+    dispose(): void {
+      parent.removeEventListener('abort', onParentAbort);
+    },
+  };
 }
 
 /**
@@ -1331,10 +1694,17 @@ async function splitFrameForVpxAlpha(
     }
   }
   const split = splitRgbaForVpxAlpha(await rgbaPixelsFromFrame(frame));
-  return {
-    color: rgbaPixelsToFrame(split.color, frame),
-    alpha: rgbaPixelsToFrame(split.alpha, frame),
-  };
+  let colorFrame: VideoFrame | undefined;
+  let alphaFrame: VideoFrame | undefined;
+  try {
+    colorFrame = rgbaPixelsToFrame(split.color, frame);
+    alphaFrame = rgbaPixelsToFrame(split.alpha, frame);
+    return { color: colorFrame, alpha: alphaFrame };
+  } catch (error) {
+    if (colorFrame !== undefined) closeFrame(colorFrame);
+    if (alphaFrame !== undefined) closeFrame(alphaFrame);
+    throw error;
+  }
 }
 
 async function mergeAlphaFrames(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
@@ -1409,11 +1779,13 @@ export function encodeVideoFramesWithAlpha(
   ): Promise<void> => {
     try {
       await writer.ready;
-      await writer.write(frame);
     } catch (error) {
       closeFrame(frame);
       throw error;
     }
+    // Before write, this function owns the derived frame. Once write is invoked, the encoder driver
+    // owns it on both success and failure and closes it from its transform's finally block.
+    await writer.write(frame);
   };
 
   const pumpInput = (): Promise<void> => {
@@ -1472,7 +1844,7 @@ export function encodeVideoFramesWithAlpha(
 
   return new ReadableStream<Packet>({
     start(): void {
-      void pumpInput();
+      void pumpInput().catch(() => undefined);
     },
     async pull(controller): Promise<void> {
       try {
@@ -1628,10 +2000,21 @@ export function decodeVideoPacketsWithAlpha(
   const alphaReader = alphaFrames.getReader();
   const alphaByTimestamp = new Map<number, VideoFrame>();
   let alphaDone = false;
+  let teardownPromise: Promise<void> | undefined;
 
   const closeBufferedAlpha = (): void => {
     for (const frame of alphaByTimestamp.values()) closeFrame(frame);
     alphaByTimestamp.clear();
+  };
+
+  const teardown = (reason: unknown): Promise<void> => {
+    if (teardownPromise !== undefined) return teardownPromise;
+    closeBufferedAlpha();
+    teardownPromise = Promise.allSettled([
+      colorReader.cancel(reason),
+      alphaReader.cancel(reason),
+    ]).then(() => undefined);
+    return teardownPromise;
   };
 
   const alphaForTimestamp = async (timestamp: number): Promise<VideoFrame | undefined> => {
@@ -1667,37 +2050,44 @@ export function decodeVideoPacketsWithAlpha(
   return new ReadableStream<VideoFrame>(
     {
       async pull(controller): Promise<void> {
-        const { done, value: color } = await colorReader.read();
-        if (done) {
-          closeBufferedAlpha();
-          controller.close();
-          return;
-        }
-
+        let color: VideoFrame | undefined;
         let alpha: VideoFrame | undefined;
         let output: VideoFrame | undefined;
         try {
+          const result = await colorReader.read();
+          if (result.done) {
+            await teardown('color stream ended');
+            controller.close();
+            return;
+          }
+          color = result.value;
           alpha = await alphaForTimestamp(color.timestamp);
           if (alpha === undefined) {
-            enqueueFrame(controller, color);
+            const directOutput = color;
+            color = undefined;
+            enqueueFrame(controller, directOutput);
             return;
           }
           output = await mergeAlphaFrames(color, alpha);
-          closeFrame(color);
-          closeFrame(alpha);
+          const consumedColor = color;
+          color = undefined;
+          closeFrame(consumedColor);
+          const consumedAlpha = alpha;
           alpha = undefined;
-          enqueueFrame(controller, output);
+          closeFrame(consumedAlpha);
+          const mergedOutput = output;
           output = undefined;
-        } catch (e) {
-          closeFrame(color);
+          enqueueFrame(controller, mergedOutput);
+        } catch (error) {
+          if (color !== undefined) closeFrame(color);
           if (alpha !== undefined) closeFrame(alpha);
           if (output !== undefined) closeFrame(output);
-          controller.error(e);
+          await teardown(error);
+          controller.error(error);
         }
       },
       async cancel(reason): Promise<void> {
-        await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
-        closeBufferedAlpha();
+        await teardown(reason);
       },
     },
     { highWaterMark: 0 },
@@ -1705,33 +2095,80 @@ export function decodeVideoPacketsWithAlpha(
 }
 
 /**
- * Drain a seam stream into a `Muxer`, allocating the track lazily on the first item — *after* the
- * encoder has published its `decoderConfig` (codec box), which the caller captures through the encoder
- * driver's `onDecoderConfig`/`onConfig` bridge. Serves BOTH seam producers: an *encoder*'s bare
- * {@link EncodedChunk}s (PTS only — the muxer recovers DTS from arrival order/durations) and a
- * *demuxer*'s {@link Packet}s (verbatim remux — carrying the source `dtsUs` so B-frame composition
- * survives losslessly); each item is normalized via {@link toPacket} before `write`. Returns when the
- * stream ends (all packets written). An empty stream allocates no track (an encoder that produced
- * nothing does not create a sample-less track).
+ * Drain a seam stream into a `Muxer`. A callable config is the encoder bridge: the track is allocated
+ * lazily on the first item, after the encoder has published its `decoderConfig`/`onConfig` metadata. A
+ * concrete {@link TrackInfo} is the packet-copy bridge: `addTrack()` validates it before the producer is
+ * pulled, so an illegal codec/container pair cannot consume the caller's first packet. Serves BOTH seam
+ * producers: an encoder's bare {@link EncodedChunk}s (PTS only — the muxer recovers DTS from arrival
+ * order/durations) and a demuxer's {@link Packet}s (verbatim remux — carrying the source `dtsUs` so
+ * B-frame composition survives losslessly); each item is normalized via {@link toPacket} before `write`.
+ * Returns when the stream ends. An empty encoder stream allocates no track; a known packet track is
+ * deliberately validated/allocated before its stream is inspected.
  *
  * Frame lifetime: packets are not closable; the encoder already closed every input `VideoFrame`/
- * `AudioData` (its contract). On error the stream rejects and the caller cancels the siblings.
+ * `AudioData` (its contract). This drain owns its reader: write/config failure and operation abort cancel
+ * the locked producer before releasing it, while a higher-level task group remains responsible for
+ * aborting sibling drains.
  */
 export async function drainEncoderToMuxer(
   chunks: ReadableStream<EncodedChunk | Packet>,
   muxer: MuxerSink,
-  getConfig: () => TrackInfo,
+  config: TrackInfo | (() => TrackInfo),
+  signal?: AbortSignal,
 ): Promise<void> {
-  const reader = chunks.getReader();
+  const abortFailure = (): MediaError =>
+    new MediaError('aborted', 'operation aborted', signal?.reason);
+  const isAborted = (): boolean => signal?.aborted === true;
+  if (isAborted()) {
+    const error = abortFailure();
+    await chunks.cancel(error).catch(() => {});
+    throw error;
+  }
+
+  let lazyConfig: (() => TrackInfo) | undefined;
   let trackId: number | undefined;
+  if (typeof config === 'function') {
+    lazyConfig = config;
+  } else {
+    try {
+      trackId = muxer.addTrack(config);
+    } catch (error) {
+      await chunks.cancel(error).catch(() => {});
+      throw error;
+    }
+  }
+
+  const reader = chunks.getReader();
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (reason: unknown): Promise<void> => {
+    cancelPromise ??= reader.cancel(reason).catch(() => {});
+    return cancelPromise;
+  };
+  const onAbort = (): void => {
+    void cancelReader(abortFailure());
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
     for (;;) {
+      if (isAborted()) throw abortFailure();
       const { done, value } = await reader.read();
+      if (isAborted()) throw abortFailure();
       if (done) break;
-      if (trackId === undefined) trackId = muxer.addTrack(getConfig());
+      if (trackId === undefined) {
+        if (lazyConfig === undefined) {
+          throw new MediaError('mux-error', 'known packet track was not allocated');
+        }
+        trackId = muxer.addTrack(lazyConfig());
+      }
       await muxer.write(trackId, toPacket(value));
+      if (isAborted()) throw abortFailure();
     }
+  } catch (error) {
+    await cancelReader(error);
+    throw error;
   } finally {
+    signal?.removeEventListener('abort', onAbort);
+    await cancelPromise;
     reader.releaseLock();
   }
 }

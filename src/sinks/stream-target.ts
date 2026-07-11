@@ -1,167 +1,35 @@
-/**
- * `StreamTarget` — a streaming output sink (doc 07 §4 sinks, doc 09 streaming-output, ADR-013).
- *
- * The default `blob`/`file` sinks (`sink.ts`) collect the whole output into one buffer; that is fine for a
- * faststart MP4 but defeats a *streaming* producer (a fragmented/CMAF muxer, a long live recording) whose
- * point is bounded memory. A `StreamTarget` instead writes each produced chunk straight to a caller-owned
- * destination — a `WritableStream<Uint8Array>` (OPFS/`FileSystemWritableFileStream`, a `fetch` upload body,
- * a `TransformStream` tee) or a plain callback — as the chunk is produced, so peak memory stays at one
- * chunk regardless of the output's total size.
- *
- * This module is self-contained (it owns no shared sink state): it exports the descriptor, its
- * constructor, and the {@link writeToStreamTarget} materializer. The engine's `materialize` (`sink.ts`)
- * delegates a `stream-target` sink here; `to*` exposes {@link toStreamTarget}. Writing is built on the
- * executor's {@link runToSink} for the `WritableStream` case (cancellation + typed error mapping) and on a
- * cancellable pull loop for the callback case — both honour `signal` and surface a typed {@link MediaError}.
- */
-
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { MediaError } from '../contracts/errors.ts';
 import type { ExecuteOptions } from '../kernel/executor.ts';
-import { runToSink } from '../kernel/executor.ts';
 
-/**
- * A position-aware chunk sink: each call receives the produced bytes and their byte offset from the start
- * of the output (chunks arrive in order, contiguous, starting at 0). The offset lets a random-access
- * destination (e.g. an OPFS `write({ type:'write', position, data })`) place bytes precisely even though a
- * pure streaming writer can ignore it. Returning a promise applies backpressure (the producer waits).
- */
+/** A position-aware chunk sink. Returning a promise applies producer backpressure. */
 export type StreamTargetWriter = (chunk: Uint8Array, position: number) => void | Promise<void>;
 
-/**
- * The destination a {@link StreamTarget} writes to: either a standard `WritableStream<Uint8Array>` (piped
- * with native backpressure) or a {@link StreamTargetWriter} callback. A union, not an overloaded class, so
- * the descriptor stays a plain serializable value like every other {@link import('./sink.ts').Sink}.
- */
+/** A standard writable byte stream or a position-aware callback destination. */
 export type StreamDestination = WritableStream<Uint8Array> | StreamTargetWriter;
 
-/** The streaming sink descriptor (the `stream-target` member of the engine's sink union). */
+/** The streaming sink descriptor carried by the public {@link import('./sink.ts').Sink} union. */
 export interface StreamTarget {
   readonly kind: 'stream-target';
   readonly destination: StreamDestination;
 }
 
-/** Build a {@link StreamTarget} that writes each output chunk incrementally to `destination`. */
+/** Build a sink that writes each produced output chunk incrementally to `destination`. */
 export function toStreamTarget(destination: StreamDestination): StreamTarget {
   return { kind: 'stream-target', destination };
 }
 
-/** Narrow a {@link StreamDestination} to the `WritableStream` arm (vs the callback arm). */
-function isWritableStream(d: unknown): d is WritableStream<Uint8Array> {
-  // A callback is a function; a WritableStream is an object with a `getWriter` method. Feature-detect
-  // rather than `instanceof` so a structurally-compatible writable (or a polyfill) is also accepted.
-  return (
-    typeof d === 'object' &&
-    d !== null &&
-    typeof (d as { getWriter?: unknown }).getWriter === 'function'
-  );
-}
-
-function isStreamTargetWriter(d: unknown): d is StreamTargetWriter {
-  return typeof d === 'function';
-}
-
-/** Runtime-validate the descriptor before pulling from the produced byte stream. */
-function streamDestinationOf(target: StreamTarget): StreamDestination {
-  const destination = (target as { readonly destination?: unknown }).destination;
-  if (isStreamTargetWriter(destination) || isWritableStream(destination)) return destination;
-  throw new CapabilityError(
-    'capability-miss',
-    'stream-target destination must be a WritableStream<Uint8Array> or a callback writer',
-    { op: { op: 'stream-target' }, tried: [] },
-  );
-}
-
-function abortedError(): MediaError {
-  return new MediaError('aborted', 'operation aborted');
-}
-
-/** Race one async step against cancellation so a stalled producer/writer cannot pin the op forever. */
-function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (signal === undefined) return work;
-  if (signal.aborted) return Promise.reject(abortedError());
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(abortedError());
-    signal.addEventListener('abort', onAbort, { once: true });
-    work.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      (err: unknown) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(err);
-      },
-    );
-  });
-}
-
-/**
- * Drive a callback destination from the source readable: pull chunks in order and hand each to `write`
- * with its running byte position, awaiting the callback (backpressure). Cancels the reader on abort/throw
- * so the upstream pipeline tears down and releases resources; maps any failure to a typed error.
- */
-async function writeToCallback(
-  readable: ReadableStream<Uint8Array>,
-  write: StreamTargetWriter,
-  opts: ExecuteOptions,
-): Promise<void> {
-  const { signal } = opts;
-  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-
-  const reader = readable.getReader();
-  let position = 0;
-  try {
-    for (;;) {
-      if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const { done, value } = await raceAbort(reader.read(), signal);
-      if (done) break;
-      await raceAbort(Promise.resolve(write(value, position)), signal);
-      position += value.byteLength;
-    }
-  } catch (err) {
-    // Best-effort: release upstream, but never let a stuck cancel hide the primary typed error.
-    void reader.cancel(err).catch(() => undefined);
-    throw mapToMediaError(err, signal);
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // A pending read can still be unwinding after an abort-race; cancellation above owns cleanup.
-    }
-  }
-}
-
-/**
- * Write a produced byte stream to a {@link StreamTarget}'s destination incrementally (never buffering the
- * whole output). Returns `undefined` — like the OPFS/element sinks — because the bytes went to the
- * caller-owned target rather than being handed back as a value.
- */
+/** Lazily load the incremental writer so descriptor-only apps keep it out of the eager kernel. */
 export async function writeToStreamTarget(
   target: StreamTarget,
   stream: ReadableStream<Uint8Array>,
   opts: ExecuteOptions = {},
 ): Promise<undefined> {
-  const dest = streamDestinationOf(target);
-  if (isWritableStream(dest)) {
-    // Native pipe: backpressure + abort are handled by the streams runtime. Tag the stage with
-    // `mux-error` so a destination-side write failure surfaces as a typed MediaError (runToSink passes
-    // an abort through as `aborted` and an already-typed MediaError unchanged), matching the callback arm.
-    await runToSink(stream, dest, { ...opts, errorCode: 'mux-error' });
-    return undefined;
+  try {
+    const writer = await import('./stream-target-materialize.ts');
+    return await writer.writeToStreamTarget(target, stream, opts);
+  } catch (error) {
+    if (!stream.locked) await stream.cancel(error).catch(() => undefined);
+    if (error instanceof MediaError) throw error;
+    throw new MediaError('mux-error', 'stream-target materializer failed', error);
   }
-  await writeToCallback(stream, dest, opts);
-  return undefined;
-}
-
-/** Map a thrown value from the callback loop to the typed model (abort → `aborted`, else `mux-error`). */
-function mapToMediaError(err: unknown, signal: AbortSignal | undefined): MediaError {
-  if (signal?.aborted) return new MediaError('aborted', 'operation aborted');
-  if (err instanceof MediaError) return err;
-  const isAbort =
-    (typeof DOMException !== 'undefined' &&
-      err instanceof DOMException &&
-      err.name === 'AbortError') ||
-    (err instanceof Error && err.name === 'AbortError');
-  if (isAbort) return new MediaError('aborted', 'operation aborted');
-  return new MediaError('mux-error', err instanceof Error ? err.message : String(err), err);
 }

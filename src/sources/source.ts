@@ -1,14 +1,22 @@
 /**
  * Source normalization (ADR-013, docs/architecture/07 §3) — turn anything a caller has (bytes, Blob,
- * URL, stream, DOM element) into a uniform {@link Source}: a {@link ByteSource} with a fresh
+ * URL, byte stream, DOM element) into a uniform {@link Source}: a {@link ByteSource} with a fresh
  * `stream()`, an optional `size`, and optional random-access `range()` (which is what keeps `probe`
- * fast — header-only reads). Web streams are used so a huge file never fully buffers.
+ * fast — header-only reads). A raw `MediaStream` remains the distinct {@link LiveMediaSource} brand;
+ * it is never represented as container bytes. Web streams are used so a huge file never fully buffers.
  *
  * `range(start, end)` is **half-open** `[start, end)` (JS `subarray`/`slice` semantics); the URL source
  * translates it to the inclusive HTTP `Range` header.
  */
 
-import { InputError } from '../contracts/errors.ts';
+import { InputError, MediaError } from '../contracts/errors.ts';
+import {
+  type LiveMediaSource,
+  captureElementMediaStream,
+  fromMediaStream,
+  isLiveMediaSource,
+  mediaStreamOf,
+} from './live-source.ts';
 
 const TINY_KNOWN_FULL_RANGE_GET_BYTES = 16 * 1024;
 
@@ -27,7 +35,21 @@ export type MediaInput =
   | string
   | HTMLMediaElement
   | MediaStream
+  | LiveMediaSource
   | Source;
+
+/** Inputs normalized into the finite/one-shot byte {@link Source} contract (never raw live tracks). */
+export type ByteMediaInput =
+  | ArrayBuffer
+  | ArrayBufferView
+  | Blob
+  | ReadableStream<Uint8Array>
+  | URL
+  | string
+  | Source;
+
+/** A normalized byte source or a separately-branded raw live source. */
+export type NormalizedSource = Source | LiveMediaSource;
 
 /** How a {@link Source} was constructed (used for diagnostics and sink defaults). */
 export type SourceKind = 'bytes' | 'blob' | 'stream' | 'url' | 'opfs' | 'element';
@@ -64,10 +86,27 @@ export interface FromUrlOptions {
   size?: number;
 }
 export interface FromElementOptions {
-  /** `bytes` reads `currentSrc` (default); `capture` taps `captureStream()` (Phase 1). */
+  /** `bytes` reads `currentSrc` (default); `capture` explicitly taps the live `captureStream()`. */
   mode?: 'bytes' | 'capture';
 }
-export type FromOptions = FromUrlOptions & { mime?: string };
+export interface FromStreamOptions {
+  /** A caller-provided MIME hint used to route a one-shot stream without an unnecessary large sniff. */
+  mime?: string;
+  /** A known total byte length, if the producer exposes it out of band. */
+  size?: number;
+}
+
+/** Universal source options: one all-optional shape spanning URL, stream, and element inputs. */
+export interface FromOptions {
+  /** Use HTTP Range requests for URL-backed sources (default true). */
+  rangeRequests?: boolean;
+  /** Caller-provided content type for URLs, streams, or bytes. */
+  mime?: string;
+  /** Known byte length for URL/stream sources. */
+  size?: number;
+  /** Element input mode; live capture is always explicit. */
+  mode?: 'bytes' | 'capture';
+}
 
 /** Type guard: is this already a normalized {@link Source}? */
 export function isSource(x: unknown): x is Source {
@@ -82,7 +121,7 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
     bytes instanceof ArrayBuffer
       ? new Uint8Array(bytes)
       : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return {
+  const source: Source = {
     __media: 'source',
     kind: 'bytes',
     size: u8.byteLength,
@@ -97,6 +136,7 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
     range: (start, end) =>
       Promise.resolve(u8.subarray(clamp(start, u8.byteLength), clamp(end, u8.byteLength))),
   };
+  return source;
 }
 
 /** Wrap a `Blob`/`File`. */
@@ -113,20 +153,86 @@ export function fromBlob(blob: Blob): Source {
   };
 }
 
-/** Wrap a single-use byte stream (no random access; consuming twice throws). */
-export function fromStream(readable: ReadableStream<Uint8Array>): Source {
-  let consumed = false;
-  return {
+/** Internal one-shot stream state shared with the lazy prefix-replay implementation. */
+export const SOURCE_STREAM_STATE: unique symbol = Symbol('s');
+
+/** Internal operations installed lazily after the first routing peek. */
+export interface StreamCursor {
+  peek(limit: number, signal?: AbortSignal): Promise<Uint8Array>;
+  open(): ReadableStream<Uint8Array>;
+  cancel(reason?: unknown): Promise<void>;
+}
+
+/** Internal mutable ownership cell for a public single-use stream source. */
+export interface StreamSourceState {
+  readonly readable: ReadableStream<Uint8Array>;
+  consumed: boolean;
+  cursor?: StreamCursor;
+}
+
+interface StreamStateSource extends Source {
+  readonly [SOURCE_STREAM_STATE]: StreamSourceState;
+}
+
+/**
+ * Wrap a single-use byte stream. Routing peeks retain only a bounded prefix and the sole later
+ * {@link Source.stream} call replays it before continuing the same reader, so sniffing never steals bytes.
+ */
+export function fromStream(
+  readable: ReadableStream<Uint8Array>,
+  opts: FromStreamOptions = {},
+): Source {
+  if (readable.locked) {
+    throw new InputError('unsupported-input', 'stream is already locked');
+  }
+  const state: StreamSourceState = { readable, consumed: false };
+  const source: StreamStateSource = {
     __media: 'source',
     kind: 'stream',
+    ...(opts.size !== undefined ? { size: opts.size } : {}),
+    ...(opts.mime !== undefined ? { mimeHint: opts.mime } : {}),
     stream: () => {
-      if (consumed) {
-        throw new InputError('unsupported-input', 'used');
-      }
-      consumed = true;
+      if (state.cursor !== undefined) return state.cursor.open();
+      if (state.consumed) throw new InputError('unsupported-input', 'used');
+      state.consumed = true;
       return readable;
     },
+    [SOURCE_STREAM_STATE]: state,
   };
+  return source;
+}
+
+/**
+ * Read a bounded source prefix without consuming it from the later container reader. A true stream input
+ * uses its single-reader replay cursor; re-readable sources open and cancel a temporary reader.
+ */
+export async function peekSourceHead(
+  src: Source,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const bounded = Math.max(0, Math.trunc(limit));
+  assertSourceNotAborted(signal);
+  if (src.range !== undefined) {
+    const head = await src.range(0, bounded);
+    assertSourceNotAborted(signal);
+    return head;
+  }
+  const { peekUnseekableSourceHead } = await import('./stream-input.ts');
+  return peekUnseekableSourceHead(src, bounded, signal);
+}
+
+/** Cancel a normalized one-shot source if it currently owns a routing reader. */
+export async function cancelSource(src: Source, reason?: unknown): Promise<void> {
+  if (!(SOURCE_STREAM_STATE in src)) return;
+  const { cancelOneShotSource } = await import('./stream-input.ts');
+  await cancelOneShotSource(src, reason);
+}
+
+function assertSourceNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new MediaError('aborted', 'source read aborted', signal.reason);
+  }
 }
 
 /** Derive a query/hash-free last pathname component without mistaking opaque data/blob URLs for files. */
@@ -177,11 +283,19 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
 }
 
 /** Read a media element's current source as bytes (default), per ADR-013 (never `loadedmetadata`). */
-export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {}): Source {
+export function fromElement(el: HTMLMediaElement): Source;
+export function fromElement(
+  el: HTMLMediaElement,
+  opts: FromElementOptions & { readonly mode: 'capture' },
+): LiveMediaSource;
+export function fromElement(
+  el: HTMLMediaElement,
+  opts: FromElementOptions & { readonly mode?: 'bytes' },
+): Source;
+export function fromElement(el: HTMLMediaElement, opts: FromElementOptions): NormalizedSource;
+export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {}): NormalizedSource {
   const mode = opts.mode ?? 'bytes';
-  if (mode === 'capture') {
-    throw new InputError('unsupported-input', 'capture');
-  }
+  if (mode === 'capture') return captureElementMediaStream(el);
   const href = el.currentSrc || el.src;
   if (!href) {
     throw new InputError('unsupported-input', 'src');
@@ -214,19 +328,36 @@ export async function fromOPFS(path: string): Promise<Source> {
 }
 
 /**
- * The universal normalizer (ADR-013). Accepts anything in {@link MediaInput} and returns a
- * {@link Source}; a bare string resolves to a URL by protocol precedence, else a relative fetch.
+ * The universal normalizer (ADR-013/236). Byte inputs become {@link Source}; a `MediaStream` or explicit
+ * element capture remains a separately-branded {@link LiveMediaSource}. A bare string resolves to a URL
+ * by protocol precedence, else a relative fetch.
  */
-export function from(input: MediaInput, opts: FromOptions = {}): Source {
+export function from(input: MediaStream | LiveMediaSource, opts?: FromOptions): LiveMediaSource;
+export function from(
+  input: HTMLMediaElement,
+  opts: FromOptions & { readonly mode: 'capture' },
+): LiveMediaSource;
+export function from(input: HTMLMediaElement): Source;
+export function from(
+  input: HTMLMediaElement,
+  opts: FromOptions & { readonly mode?: 'bytes' },
+): Source;
+export function from(input: ByteMediaInput, opts?: FromOptions): Source;
+export function from(input: HTMLMediaElement, opts: FromOptions): NormalizedSource;
+export function from(input: MediaInput, opts?: FromOptions): NormalizedSource;
+export function from(input: MediaInput, opts: FromOptions = {}): NormalizedSource {
   if (isSource(input)) return input;
+  if (isLiveMediaSource(input)) return input;
+  const mediaStream = mediaStreamOf(input);
+  if (mediaStream !== undefined) return fromMediaStream(mediaStream);
   if (input instanceof Uint8Array) return fromBytes(input, opts);
   if (input instanceof ArrayBuffer) return fromBytes(input, opts);
   if (ArrayBuffer.isView(input)) return fromBytes(input, opts);
   if (input instanceof Blob) return fromBlob(input);
-  if (input instanceof ReadableStream) return fromStream(input);
+  if (input instanceof ReadableStream) return fromStream(input, opts);
   if (input instanceof URL) return fromURL(input, opts);
   if (typeof input === 'string') return fromURL(input, opts);
-  if (isMediaElement(input)) return fromElement(input);
+  if (isMediaElement(input)) return fromElement(input, opts);
   throw new InputError('unsupported-input', 'bad');
 }
 

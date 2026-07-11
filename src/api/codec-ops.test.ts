@@ -14,14 +14,15 @@ import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { parseAdts } from '../drivers/adts/adts-driver.ts';
-import { FlacDriver, parseFlac } from '../drivers/flac/flac-driver.ts';
+import { FlacDriver, enumerateFlacFrames, parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
-import { OggDriver, parseOgg } from '../drivers/ogg/ogg-driver.ts';
+import { OggDriver, oggAudioPackets, oggPacketBytes, parseOgg } from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { demuxWebm, parseWebm } from '../drivers/webm/webm-driver.ts';
 import { channelAt } from '../dsp/pcm.ts';
+import { readOggVorbisComment } from '../metadata/ogg-vorbis-comment.ts';
 import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
@@ -40,6 +41,13 @@ import type { PacketStreams } from './types.ts';
 
 /** Real, stream-copyable MP4s (h264 + aac), ≥3 distinct files of varied duration/tracks. */
 const MP4_FIXTURES = ['movie_5.mp4', 'test.mp4', 'h264.mp4'] as const;
+const FLAC_OGG_FIXTURES = [
+  'sfx.flac',
+  'flac-08bit.flac',
+  'flac-12bit.flac',
+  'flac-24bit-hires.flac',
+  'flac-5_1ch.flac',
+] as const;
 const CENC_KEY = '000102030405060708090a0b0c0d0e0f';
 const CENC_KID = '00112233445566778899aabbccddeeff';
 const DERIVED_DIR = new URL('../../fixtures/media-derived/aiff-caf/', import.meta.url);
@@ -196,6 +204,33 @@ async function streamBytes(stream: ReadableStream<Uint8Array> | undefined): Prom
   return out;
 }
 
+async function packetPayloads(stream: ReadableStream<Packet>): Promise<readonly Uint8Array[]> {
+  const reader = stream.getReader();
+  const payloads: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return payloads;
+      const payload = new Uint8Array(value.chunk.byteLength);
+      value.chunk.copyTo(payload);
+      payloads.push(payload);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function assertBytesEqual(actual: Uint8Array, expected: Uint8Array, label: string): void {
+  expect(actual.byteLength, `${label}: byte length`).toBe(expected.byteLength);
+  for (let index = 0; index < expected.byteLength; index += 1) {
+    if (actual[index] !== expected[index]) {
+      throw new Error(
+        `${label}: byte ${index} differs (${actual[index] ?? 'missing'} !== ${expected[index] ?? 'missing'})`,
+      );
+    }
+  }
+}
+
 function encodedChunkFromPacketInfo(row: PacketInfoMetadata, data: Uint8Array): EncodedChunk {
   return testChunk(data, {
     type: row.keyframe ? 'key' : 'delta',
@@ -328,6 +363,41 @@ function installThrowingEncodedChunkConstructors(message: string): () => void {
 async function outputBytes(output: Blob | File | ReadableStream<Uint8Array> | undefined) {
   if (!(output instanceof Blob)) throw new Error('expected Blob output');
   return new Uint8Array(await output.arrayBuffer());
+}
+
+async function expectNativeFlacOggCopy(input: Uint8Array, out: Uint8Array): Promise<void> {
+  const sourceInfo = parseFlac(input);
+  const sourceFrames = enumerateFlacFrames(input);
+  expect(out.byteLength).toBeGreaterThan(0);
+  expect(
+    out.byteLength === input.byteLength && out.every((byte, index) => byte === input[index]),
+  ).toBe(false);
+
+  const info = parseOgg(out);
+  expect(info.codec).toBe('flac');
+  expect(info.sampleRate).toBe(sourceInfo.sampleRate);
+  expect(info.channels).toBe(sourceInfo.channels);
+  expect(info.durationSec * info.sampleRate).toBe(sourceInfo.totalSamples);
+
+  const demuxed = await OggDriver.demux(fromBytes(out, { mime: 'audio/ogg' }));
+  try {
+    const description = demuxed.tracks[0]?.config?.description;
+    if (description === undefined) throw new Error('Ogg-FLAC track must expose STREAMINFO');
+    const reparsedStreamInfo = parseFlac(copyBufferSource(description));
+    expect(reparsedStreamInfo.totalSamples).toBe(sourceInfo.totalSamples);
+    expect(reparsedStreamInfo.bitsPerSample).toBe(sourceInfo.bitsPerSample);
+  } finally {
+    await demuxed.close();
+  }
+
+  const packets = oggAudioPackets(out);
+  expect(packets).toHaveLength(sourceFrames.length);
+  expect(packets.map((packet) => [...oggPacketBytes(out, packet)])).toEqual(
+    sourceFrames.map((frame) => [...frame.data]),
+  );
+  expect(sourceFrames.reduce((total, frame) => total + frame.samples, 0)).toBe(
+    sourceInfo.totalSamples,
+  );
 }
 
 describe('convert — stream-copy auto-route (no re-encode needed)', () => {
@@ -530,24 +600,73 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     }
   });
 
-  it('cross-container remux (flac → ogg) accepts foreign native FLAC packets through the muxer seam', async () => {
-    const restore = installEncodedChunkShims();
+  it('cross-container remux (flac → ogg) uses native frame copy without host chunk constructors', async () => {
+    const restore = installThrowingEncodedChunkConstructors(
+      'native FLAC-to-Ogg remux must not construct EncodedChunk objects',
+    );
     try {
       const input = await loadFixture('sfx.flac');
-      const sourceInfo = parseFlac(input);
       const out = await outputBytes(
         await media().remux(await fixtureSource('sfx.flac'), { to: 'ogg' }),
       );
-      expect(out.byteLength).toBeGreaterThan(0);
-      expect(
-        out.byteLength === input.byteLength && out.every((b, index) => b === input[index]),
-      ).toBe(false);
+      await expectNativeFlacOggCopy(input, out);
+    } finally {
+      restore();
+    }
+  });
 
-      const info = parseOgg(out);
-      expect(info.codec).toBe('flac');
-      expect(info.sampleRate).toBe(sourceInfo.sampleRate);
-      expect(info.channels).toBe(sourceInfo.channels);
-      expect(info.durationSec).toBeCloseTo(sourceInfo.durationSec, 5);
+  it('pure convert (flac → ogg) uses native frame copy without host chunk constructors', async () => {
+    const restore = installThrowingEncodedChunkConstructors(
+      'native FLAC-to-Ogg convert must not construct EncodedChunk objects',
+    );
+    try {
+      const input = await loadFixture('sfx.flac');
+      const out = await outputBytes(
+        await media().convert(await fixtureSource('sfx.flac'), { to: 'ogg' }),
+      );
+      await expectNativeFlacOggCopy(input, out);
+    } finally {
+      restore();
+    }
+  });
+
+  it('public Ogg demux reassembles cross-page native FLAC packets byte-exactly', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      let sawDiscontiguousPacket = false;
+      for (const id of FLAC_OGG_FIXTURES) {
+        const input = await loadFixture(id);
+        const sourceFrames = enumerateFlacFrames(input);
+        const ogg = await outputBytes(await media().remux(await fixtureSource(id), { to: 'ogg' }));
+        const demuxed = await media().demux(fromBytes(ogg, { mime: 'audio/ogg' }));
+        try {
+          const track = demuxed.tracks.find((candidate) => candidate.codec === 'flac');
+          if (track === undefined) throw new Error(`${id}: public Ogg demux found no FLAC track`);
+          const rows = (
+            demuxed as typeof demuxed & {
+              packetInfoTable?: () => readonly PacketInfoMetadata[];
+            }
+          ).packetInfoTable?.();
+          sawDiscontiguousPacket ||= rows?.some((row) => row.offset === undefined) === true;
+
+          const payloads = await packetPayloads(demuxed.packets(track.id));
+          expect(payloads, `${id}: packet count`).toHaveLength(sourceFrames.length);
+          for (let index = 0; index < sourceFrames.length; index += 1) {
+            const frame = sourceFrames[index];
+            const payload = payloads[index];
+            if (frame === undefined || payload === undefined) {
+              throw new Error(`${id}: missing FLAC packet ${index}`);
+            }
+            assertBytesEqual(payload, frame.data, `${id}: FLAC packet ${index}`);
+          }
+        } finally {
+          await demuxed.close();
+        }
+      }
+      expect(
+        sawDiscontiguousPacket,
+        'real corpus must exercise at least one cross-page packet',
+      ).toBe(true);
     } finally {
       restore();
     }
@@ -1074,6 +1193,42 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     }
   });
 
+  it('combines real multitrack selection with target-native metadata rewrite', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      const sourceInfo = await media().probe(await fixtureSource('bear-multitrack.webm'));
+      const progress: Array<{
+        readonly done: number;
+        readonly total?: number;
+        readonly stage: string;
+      }> = [];
+      const output = await outputBytes(
+        await media().remux(
+          await fixtureSource('bear-multitrack.webm'),
+          {
+            to: 'ogg',
+            trackSelect: ['audio:0'],
+            tags: { title: 'Selected Vorbis track' },
+          },
+          { onProgress: (event) => progress.push(event) },
+        ),
+      );
+      const info = parseOgg(output);
+      const { title } = readOggVorbisComment(output);
+      expect(info.codec).toBe('vorbis');
+      expect(Math.abs(info.durationSec - sourceInfo.durationSec)).toBeLessThanOrEqual(1 / 44_100);
+      expect(title).toBe('Selected Vorbis track');
+      expect(progress.at(-1)).toMatchObject({ done: 2, total: 2, stage: 'metadata:metadata' });
+      expect(
+        progress.every(
+          (event, index) => index === 0 || event.done >= (progress[index - 1]?.done ?? 0),
+        ),
+      ).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
   it('cross-container remux keeps illegal codec/container pairs as typed capability misses', async () => {
     const restore = installEncodedChunkShims();
     try {
@@ -1206,14 +1361,76 @@ describe('mux — caller packet streams (public packet seam)', () => {
   });
 
   it('rejects non-chunk-muxable targets before consuming packet streams', async () => {
-    // `aac`/`adts` are still a typed mux miss (no EncodedChunk-seam muxer); `mp3` now HAS one (Mp3Muxer),
-    // so it is no longer a valid example of a non-muxable target here.
+    // ADTS/AAC and MP3 now have real EncodedChunk-seam muxers. AIFF remains a raw-PCM DSP target, so it
+    // is the honest example here: explicit packet assembly must decline before pulling the input stream.
     await expect(
       media().mux(
         { video: { track: videoTrack, packets: cancellablePacketStream(() => {}) } },
-        { container: 'aac' },
+        { container: 'aiff' },
       ),
     ).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('preflights known tracks and cancels a locked sibling when one target pairing is illegal', async () => {
+    let validPulls = 0;
+    let validCancels = 0;
+    let invalidPulls = 0;
+    let invalidCancels = 0;
+    const pendingPackets = (
+      onPull: () => void,
+      onCancel: () => void,
+    ): ReadableStream<EncodedChunk> =>
+      new ReadableStream<EncodedChunk>(
+        {
+          pull(): void {
+            onPull();
+          },
+          cancel(): void {
+            onCancel();
+          },
+        },
+        { highWaterMark: 0 },
+      );
+    const opus: TrackInfo = {
+      id: 11,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    };
+    const h264: TrackInfo = {
+      id: 12,
+      mediaType: 'video',
+      codec: 'h264',
+      config: { codec: 'avc1.42E01E', codedWidth: 16, codedHeight: 16 },
+    };
+
+    await expect(
+      media().mux(
+        {
+          tracks: [
+            {
+              track: opus,
+              packets: pendingPackets(
+                () => validPulls++,
+                () => validCancels++,
+              ),
+            },
+            {
+              track: h264,
+              packets: pendingPackets(
+                () => invalidPulls++,
+                () => invalidCancels++,
+              ),
+            },
+          ],
+        },
+        { container: 'ogg' },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityError);
+    expect(validPulls).toBe(1);
+    expect(validCancels).toBe(1);
+    expect(invalidPulls).toBe(0);
+    expect(invalidCancels).toBe(1);
   });
 
   // Multi-source / multi-track assembly (PacketStreams.tracks): tracks demuxed from DIFFERENT sources, or
@@ -1393,11 +1610,12 @@ describe('encode — input validation', () => {
     await expect(media().encode({}, { to: 'mp4' })).rejects.toBeInstanceOf(InputError);
   });
 
-  it('rejects a frame-encode target with no encode path as a typed CapabilityError', async () => {
+  it('validates WAV frame targets before choosing its PCM-only encode path', async () => {
     const streams = media().decode(await fixtureSource('movie_5.mp4'));
-    // WAV has a raw-PCM packet muxer, but encode() is the raw-frame→codec path and must not invent a
-    // PCM encoder or consume the decoded streams for this unsupported target.
-    await expect(media().encode(streams, { to: 'wav' })).rejects.toBeInstanceOf(CapabilityError);
+    // The decoded result contains video and audio but the request declares neither target. Shape
+    // validation wins before WAV's PCM-only audio route and cancels both deferred streams. Positive
+    // PCM WAV frame encode plus video/compressed no-pull declines are covered by wav-frame-encode.test.
+    await expect(media().encode(streams, { to: 'wav' })).rejects.toBeInstanceOf(InputError);
   });
 
   it('rejects a video stream with no video target (InputError) and a video target with no encoder (CapabilityError)', async () => {

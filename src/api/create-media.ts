@@ -6,6 +6,7 @@
 
 import type { MediaInput } from '../sources/source.ts';
 import { type MediaEngine, MediaEngineImpl } from './engine.ts';
+import type { MediaJob } from './job.ts';
 import type {
   CallOptions,
   Cancellable,
@@ -96,4 +97,7 @@ export function preload(...specs: PreloadSpec[]): Promise<void> {
 }
 export function load(input: MediaInput): MediaChain {
   return shared().load(input);
+}
+export function run(job: MediaJob, o?: CallOptions): Cancellable<Blob> {
+  return shared().run(job, o);
 }

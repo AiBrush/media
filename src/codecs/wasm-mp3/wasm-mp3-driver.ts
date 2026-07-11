@@ -37,7 +37,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type Mp3DecodeConfig,
   type Mp3WasmCore,
@@ -72,7 +73,7 @@ function hasWebCodecsAudioSeam(): boolean {
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
-let corePromise: Promise<Mp3WasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<Mp3WasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasMp3CoreGlue(): Promise<boolean> {
@@ -91,30 +92,41 @@ async function hasMp3CoreGlue(): Promise<boolean> {
  * specifier is a string literal so bundlers code-split it into its own lazy chunk (loaded only on a real
  * MP3 miss).
  */
-export async function loadMp3Core(runtime?: WasmRuntimeProfile): Promise<Mp3WasmCore | null> {
-  corePromise ??= (async (): Promise<Mp3WasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
-      const mod = await import('./mp3-core.js');
-      await mod.default(
-        wasmInitForProfile(new URL('./mp3_wasm_bg.wasm', import.meta.url), profile),
-      );
-      return {
-        createDecoder(channels: number, sampleRate: number): Mp3WasmDecoder {
-          return new mod.Mp3Wasm(channels, sampleRate);
-        },
-      };
-    } catch {
-      return null; // not loadable here → honest miss; router yields a CapabilityError
-    }
-  })();
+export async function loadMp3Core(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<Mp3WasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './mp3_wasm_bg.wasm',
+    new URL('./mp3_wasm_bg.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<Mp3WasmCore | null> => {
+      try {
+        // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
+        const mod = await import('./mp3-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return {
+          createDecoder(channels: number, sampleRate: number): Mp3WasmDecoder {
+            return new mod.Mp3Wasm(channels, sampleRate);
+          },
+        };
+      } catch {
+        return null; // not loadable here → honest miss; router yields a CapabilityError
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetMp3CoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -240,7 +252,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadMp3Core(o?.wasmRuntime);
+      const core = await loadMp3Core(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing());
         return;

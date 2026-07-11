@@ -87,6 +87,12 @@ describe('materialize', () => {
     expect((out as File).name).toBe('clip.mp4');
   });
 
+  it('collects into a named File with an explicit MIME type', async () => {
+    const out = await materialize(toFile('clip.mp4'), bytesStream([9]), { mime: 'video/mp4' });
+    expect(out).toBeInstanceOf(File);
+    expect((out as File).type).toBe('video/mp4');
+  });
+
   it('returns a stream sink lazily (the same stream)', async () => {
     const stream = bytesStream([1]);
     expect(await materialize(toStream(), stream)).toBe(stream);
@@ -146,15 +152,18 @@ describe('materialize — stubbed environment sinks', () => {
     await expect(materialize(toOPFS('///'), bytesStream([1]))).rejects.toThrow(/invalid OPFS path/);
   });
 
-  it('attaches a Blob URL to an element (via:blob) and rejects other vias', async () => {
+  it('attaches a Blob URL to an event-capable media element (via:blob)', async () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:fake');
-    const el = { src: '' } as HTMLMediaElement;
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const el = Object.assign(new EventTarget(), {
+      src: '',
+      load(): void {},
+      removeAttribute(name: string): void {
+        if (name === 'src') this.src = '';
+      },
+    }) as unknown as HTMLMediaElement;
     await materialize(toElement(el), bytesStream([1, 2]));
     expect(el.src).toBe('blob:fake');
-
-    await expect(
-      materialize(toElement(el, { via: 'mse' }), bytesStream([1])),
-    ).rejects.toBeInstanceOf(InputError);
   });
 });
 

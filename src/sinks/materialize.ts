@@ -1,4 +1,4 @@
-import { InputError } from '../contracts/errors.ts';
+import { InputError, MediaError } from '../contracts/errors.ts';
 import { type ExecuteOptions, collect, runToSink } from '../kernel/executor.ts';
 import type { Output, Sink } from './sink.ts';
 import { writeToStreamTarget } from './stream-target.ts';
@@ -29,9 +29,17 @@ export async function materialize(
     case 'opfs':
       await writeOpfs(sink.path, stream, opts);
       return undefined;
-    case 'element':
-      await writeElement(sink, stream, opts);
-      return undefined;
+    case 'element': {
+      try {
+        const { writeElement } = await import('./element-materialize.ts');
+        await writeElement(sink, stream, opts);
+        return undefined;
+      } catch (error) {
+        if (!stream.locked) await stream.cancel(error).catch(() => undefined);
+        if (error instanceof MediaError) throw error;
+        throw new MediaError('mux-error', 'element materializer failed', error);
+      }
+    }
     case 'stream-target':
       // Incremental write to the caller's destination (never buffers the whole output); returns undefined.
       return writeToStreamTarget(sink, stream, opts);
@@ -49,7 +57,7 @@ async function writeOpfs(
   if (!storage || typeof storage.getDirectory !== 'function') {
     throw new InputError('unsupported-input', 'OPFS is unavailable in this environment');
   }
-  const parts = path.split('/').filter((p) => p.length > 0);
+  const parts = path.split('/').filter((part) => part.length > 0);
   const name = parts.pop();
   if (name === undefined) throw new InputError('unsupported-input', `invalid OPFS path '${path}'`);
   let dir = await storage.getDirectory();
@@ -61,22 +69,6 @@ async function writeOpfs(
   await runToSink(stream, writable, opts);
 }
 
-async function writeElement(
-  sink: { el: HTMLMediaElement; via: 'blob' | 'mse' | 'stream' },
-  stream: ReadableStream<Uint8Array>,
-  opts: MaterializeOptions,
-): Promise<void> {
-  if (sink.via !== 'blob') {
-    throw new InputError(
-      'unsupported-input',
-      `element sink via '${sink.via}' is not available yet (Phase 1)`,
-    );
-  }
-  const bytes = await collect(stream, opts);
-  const blob = new Blob([bytes], opts.mime ? { type: opts.mime } : {});
-  sink.el.src = URL.createObjectURL(blob);
-}
-
-function assertNever(x: never): never {
-  throw new InputError('unsupported-input', `unknown sink ${JSON.stringify(x)}`);
+function assertNever(value: never): never {
+  throw new InputError('unsupported-input', `unknown sink ${JSON.stringify(value)}`);
 }

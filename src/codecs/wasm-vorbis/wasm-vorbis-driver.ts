@@ -36,7 +36,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   VORBIS_CODEC,
   type VorbisDecodeConfig,
@@ -71,7 +72,7 @@ function hasWebCodecsAudioSeam(): boolean {
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
-let corePromise: Promise<VorbisWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<VorbisWasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasVorbisCoreGlue(): Promise<boolean> {
@@ -88,34 +89,45 @@ async function hasVorbisCoreGlue(): Promise<boolean> {
  * load — keeping the driver honest about absence rather than fabricating support. The wasm bytes are
  * addressed via `new URL('./vorbis_wasm_bg.wasm', import.meta.url)` so they ship same-origin.
  */
-export async function loadVorbisCore(runtime?: WasmRuntimeProfile): Promise<VorbisWasmCore | null> {
-  corePromise ??= (async (): Promise<VorbisWasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
-      const mod = await import('./vorbis-core.js');
-      await mod.default(
-        wasmInitForProfile(new URL('./vorbis_wasm_bg.wasm', import.meta.url), profile),
-      );
-      return {
-        createDecoder(
-          extraData: Uint8Array,
-          channels: number,
-          sampleRate: number,
-        ): VorbisWasmDecoder {
-          return new mod.VorbisWasm(extraData, channels, sampleRate);
-        },
-      };
-    } catch {
-      return null; // not loadable here → honest miss; router yields a CapabilityError
-    }
-  })();
+export async function loadVorbisCore(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<VorbisWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './vorbis_wasm_bg.wasm',
+    new URL('./vorbis_wasm_bg.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<VorbisWasmCore | null> => {
+      try {
+        // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
+        const mod = await import('./vorbis-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return {
+          createDecoder(
+            extraData: Uint8Array,
+            channels: number,
+            sampleRate: number,
+          ): VorbisWasmDecoder {
+            return new mod.VorbisWasm(extraData, channels, sampleRate);
+          },
+        };
+      } catch {
+        return null; // not loadable here → honest miss; router yields a CapabilityError
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetVorbisCoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -240,7 +252,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadVorbisCore(o?.wasmRuntime);
+      const core = await loadVorbisCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing());
         return;

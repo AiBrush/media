@@ -19,11 +19,13 @@ export {
   preload,
   probe,
   remux,
+  run,
   seek,
   transcode,
   trim,
 } from './api/create-media.ts';
 export type { MediaEngine } from './api/engine.ts';
+export type { MediaJob, MediaJobInput, MediaJobOperation, MediaJobOutput } from './api/job.ts';
 
 // Public option/result types
 export type * from './api/types.ts';
@@ -39,12 +41,22 @@ export {
   fromStream,
   fromURL,
   isSource,
+  type ByteMediaInput,
+  type FromStreamOptions,
   type MediaInput,
+  type NormalizedSource,
   probeUrlSize,
   type Source,
 } from './sources/source.ts';
 export { cacheSource } from './sources/cache.ts';
 export type { ByteRange, CacheOptions, CachingSource } from './sources/cache.ts';
+export {
+  captureElementMediaStream,
+  fromMediaStream,
+  isLiveMediaSource,
+  mediaStreamOf,
+  type LiveMediaSource,
+} from './sources/live-source.ts';
 
 // Sinks (ADR-013). `toBlob`/`toFile` buffer the whole output; `toStreamTarget` writes each chunk straight
 // to a caller-owned `WritableStream`/callback for bounded-memory streaming output (doc 09 streaming-output).

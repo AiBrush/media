@@ -44,7 +44,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type VpxCodec,
   type VpxDecodedFrame,
@@ -86,7 +87,7 @@ export function unsupported(reason: string): CodecSupport {
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
-let corePromise: Promise<VpxWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<VpxWasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasVpxCoreGlue(): Promise<boolean> {
@@ -104,25 +105,38 @@ async function hasVpxCoreGlue(): Promise<boolean> {
  * `new URL('./vpx.wasm', import.meta.url)` so they ship same-origin alongside this chunk; the specifier is
  * a string literal so bundlers code-split it into its own lazy chunk (loaded only on a real VPX miss).
  */
-export async function loadVpxCore(runtime?: WasmRuntimeProfile): Promise<VpxWasmCore | null> {
-  corePromise ??= (async (): Promise<VpxWasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
-      const mod = await import('./vpx-core.js');
-      await mod.default(wasmInitForProfile(new URL('./vpx.wasm', import.meta.url), profile));
-      return mod.createVpxCore();
-    } catch {
-      // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.
-      return null;
-    }
-  })();
+export async function loadVpxCore(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<VpxWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './vpx.wasm',
+    new URL('./vpx.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<VpxWasmCore | null> => {
+      try {
+        // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
+        const mod = await import('./vpx-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return mod.createVpxCore();
+      } catch {
+        // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.
+        return null;
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetVpxCoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -284,7 +298,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadVpxCore(o?.wasmRuntime);
+      const core = await loadVpxCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing('decode'));
         return;

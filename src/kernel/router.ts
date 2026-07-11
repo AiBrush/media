@@ -4,13 +4,14 @@
  * the chosen driver's module. A miss is a typed {@link CapabilityError} naming what was tried
  * (ADR-017), never a silent wrong result.
  *
- * `determinism: 'force-software'` drops the hardware/gpu tiers before ranking so output is reproducible
- * across machines (ADR-007).
+ * `determinism: 'force-software'` admits a WebCodecs-ranked driver only after an explicit non-hardware
+ * capability verdict and drops GPU/canvas substrates, so output is reproducible across machines (ADR-007).
  */
 
 import type {
   CodecDriver,
   CodecQuery,
+  CodecSupport,
   ContainerDriver,
   ContainerQuery,
   Determinism,
@@ -35,6 +36,8 @@ import {
 export interface StageSelectOptions {
   determinism?: Determinism;
   cost?: RouteCost;
+  /** Exact hidden ADR-014 driver pin, scoped to the registered kind carrying this id. */
+  pinDriver?: string;
 }
 
 /** Hook the router calls before probing a driver, to lazily import its module (no-op by default). */
@@ -64,7 +67,9 @@ export class Router {
   async pickCodec(q: CodecQuery, opts: StageSelectOptions = {}): Promise<CodecDriver> {
     const determinism: Determinism = opts.determinism ?? 'auto';
     const tiny = opts.cost !== undefined && isTinyCost(opts.cost);
-    const key = codecCacheKey(q, determinism, tiny);
+    const registered = this.#registry.codecs();
+    const pinned = this.#pinApplies('codec', opts.pinDriver);
+    const key = codecCacheKey(q, determinism, tiny, pinned ? opts.pinDriver : undefined);
     const cached = key === undefined ? undefined : this.#codecCache.get(key);
     if (cached !== undefined && key !== undefined) {
       // Map insertion order is the LRU order; refreshing a hit keeps hot exact configs resident.
@@ -73,23 +78,23 @@ export class Router {
       return cached;
     }
 
-    const candidates = this.#registry
-      .codecs()
-      .filter((d) => (determinism === 'force-software' ? isSoftwareTier(d.tier) : true))
+    const candidates = registered
+      .filter((d) => (!pinned ? true : d.id === opts.pinDriver))
+      .filter((d) => (determinism === 'force-software' ? d.tier !== 'gpu' : true))
       .slice()
       .sort((a, b) => codecTierRank(a.tier, tiny) - codecTierRank(b.tier, tiny));
 
     for (const d of candidates) {
       await this.#ensureLoaded(d);
-      const s = await d.supports(q);
-      if (s.supported) {
+      const s = await d.supports(q, { determinism });
+      if (supportsDeterminism(d, s, determinism)) {
         // `supports()` is asynchronous. Cache only if the caller-owned dictionary stayed byte-for-byte
         // stable across the probe, and only for the top rung: a cached fallback would prevent recovery
         // when a temporarily unavailable higher tier becomes available later in the session.
         if (
           d === candidates[0] &&
           key !== undefined &&
-          codecCacheKey(q, determinism, tiny) === key
+          codecCacheKey(q, determinism, tiny, pinned ? opts.pinDriver : undefined) === key
         ) {
           this.#rememberCodec(key, d);
         }
@@ -98,20 +103,25 @@ export class Router {
     }
     throw new CapabilityError(
       'capability-miss',
-      `no codec driver for ${q.direction} ${q.mediaType}/${q.config.codec}`,
-      { op: q, tried: candidates.map((d) => d.id) },
+      pinned
+        ? `pinned codec driver '${opts.pinDriver}' cannot ${q.direction} ${q.mediaType}/${q.config.codec}`
+        : `no codec driver for ${q.direction} ${q.mediaType}/${q.config.codec}`,
+      { op: q, tried: pinned ? [opts.pinDriver as string] : candidates.map((d) => d.id) },
     );
   }
 
   /** Select a container driver (sync: magic/mime/extension). Registration order is the ladder. */
-  pickContainer(q: ContainerQuery): ContainerDriver {
-    const key = containerKey(q);
+  pickContainer(q: ContainerQuery, opts: StageSelectOptions = {}): ContainerDriver {
+    const pinned = this.#pinApplies('container', opts.pinDriver);
+    const key = containerKey(q, pinned ? opts.pinDriver : undefined);
     if (key !== undefined) {
       const cached = this.#containerCache.get(key);
       if (cached) return cached;
     }
 
-    const candidates = this.#registry.containers();
+    const candidates = this.#registry
+      .containers()
+      .filter((d) => (!pinned ? true : d.id === opts.pinDriver));
     for (const d of candidates) {
       if (d.supports(q)) {
         if (key !== undefined) this.#containerCache.set(key, d);
@@ -120,8 +130,10 @@ export class Router {
     }
     throw new CapabilityError(
       'capability-miss',
-      `no container driver for ${q.direction} ${q.mime ?? q.extension ?? 'unknown'}`,
-      { op: q, tried: candidates.map((d) => d.id) },
+      pinned
+        ? `pinned container driver '${opts.pinDriver}' cannot ${q.direction} ${q.mime ?? q.extension ?? 'unknown'}`
+        : `no container driver for ${q.direction} ${q.mime ?? q.extension ?? 'unknown'}`,
+      { op: q, tried: pinned ? [opts.pinDriver as string] : candidates.map((d) => d.id) },
     );
   }
 
@@ -130,13 +142,15 @@ export class Router {
     const determinism: Determinism = opts.determinism ?? 'auto';
     const tiny =
       opts.cost === undefined ? isTinyFilterSpec(spec) : isTinyFilterCost(spec, opts.cost);
-    const key = `filter|${spec.mediaType}|${spec.type}|${determinism}|${tiny ? 1 : 0}`;
+    const pinned = this.#pinApplies('filter', opts.pinDriver);
+    const key = `filter|${spec.mediaType}|${spec.type}|${determinism}|${tiny ? 1 : 0}|${pinned ? opts.pinDriver : ''}`;
     const cached = this.#filterCache.get(key);
     if (cached?.supports(spec)) return cached;
     if (cached) this.#filterCache.delete(key);
 
     const candidates = this.#registry
       .filters()
+      .filter((d) => (!pinned ? true : d.id === opts.pinDriver))
       .filter((d) => (determinism === 'force-software' ? isSoftwareSubstrate(d.substrate) : true))
       .slice()
       .sort((a, b) => filterRank(a.substrate, tiny) - filterRank(b.substrate, tiny));
@@ -152,10 +166,12 @@ export class Router {
     }
     throw new CapabilityError(
       'capability-miss',
-      `no filter driver for ${spec.mediaType} ${spec.type}`,
+      pinned
+        ? `pinned filter driver '${opts.pinDriver}' cannot run ${spec.mediaType} ${spec.type}`
+        : `no filter driver for ${spec.mediaType} ${spec.type}`,
       {
         op: spec,
-        tried: candidates.map((d) => d.id),
+        tried: pinned ? [opts.pinDriver as string] : candidates.map((d) => d.id),
       },
     );
   }
@@ -174,20 +190,53 @@ export class Router {
     const oldest = this.#codecCache.keys().next().value;
     if (oldest !== undefined) this.#codecCache.delete(oldest);
   }
+
+  /**
+   * A pin constrains only the registered driver kind carrying that id. This keeps compound graphs usable:
+   * pinning a codec does not make their container/filter stages look for an impossible same-id driver.
+   * An id absent from every kind is treated as a pin for the stage currently being routed, producing the
+   * exact typed miss that lets the engine load defaults once and retry without consuming media.
+   */
+  #pinApplies(kind: 'codec' | 'container' | 'filter', pin: string | undefined): boolean {
+    if (pin === undefined) return false;
+    const codecs = this.#registry.codecs();
+    const containers = this.#registry.containers();
+    const filters = this.#registry.filters();
+    const currentHasPin =
+      kind === 'codec'
+        ? codecs.some((driver) => driver.id === pin)
+        : kind === 'container'
+          ? containers.some((driver) => driver.id === pin)
+          : filters.some((driver) => driver.id === pin);
+    if (currentHasPin) return true;
+    return (
+      !codecs.some((driver) => driver.id === pin) &&
+      !containers.some((driver) => driver.id === pin) &&
+      !filters.some((driver) => driver.id === pin)
+    );
+  }
 }
 
-function isSoftwareTier(tier: Tier): boolean {
-  return tier !== 'hardware' && tier !== 'gpu';
+function supportsDeterminism(
+  driver: CodecDriver,
+  support: CodecSupport,
+  determinism: Determinism,
+): boolean {
+  if (!support.supported) return false;
+  if (determinism !== 'force-software') return true;
+  if (support.hardwareAccelerated === true) return false;
+  return driver.tier !== 'hardware' || support.hardwareAccelerated === false;
 }
 
 function isSoftwareSubstrate(substrate: FilterSubstrate): boolean {
-  return substrate !== 'webgpu' && substrate !== 'webgl';
+  return substrate !== 'webgpu' && substrate !== 'webgl' && substrate !== 'canvas2d';
 }
 
 function isTinyFilterSpec(spec: FilterSpec): boolean {
   switch (spec.type) {
     case 'resize':
     case 'crop':
+    case 'pad':
       return within(spec.width * spec.height, TINY_VIDEO_PIXELS);
     case 'rotate':
     case 'flip':
@@ -250,10 +299,15 @@ function within(value: number | undefined, threshold: number): boolean {
   return value !== undefined && Number.isFinite(value) && value > 0 && value <= threshold;
 }
 
-function codecCacheKey(q: CodecQuery, determinism: Determinism, tiny: boolean): string | undefined {
+function codecCacheKey(
+  q: CodecQuery,
+  determinism: Determinism,
+  tiny: boolean,
+  pinDriver?: string,
+): string | undefined {
   const config = exactRecordIdentity(q.config);
   if (config === undefined) return undefined;
-  return `codec|${q.mediaType}|${q.direction}|${determinism}|${tiny ? 1 : 0}|${config}`;
+  return `codec|${q.mediaType}|${q.direction}|${determinism}|${tiny ? 1 : 0}|${pinDriver ?? ''}|${config}`;
 }
 
 /**
@@ -314,9 +368,9 @@ function exactBytesKey(bytes: Uint8Array): string {
  * Cache key for a container query — only when a stable mime/extension is present. Head-only (magic)
  * probes are cheap and re-run each time rather than risk caching one driver for every headless probe.
  */
-function containerKey(q: ContainerQuery): string | undefined {
+function containerKey(q: ContainerQuery, pinDriver?: string): string | undefined {
   if (q.mime === undefined && q.extension === undefined) return undefined;
-  return `container|${q.direction}|${q.mime ?? ''}|${q.extension ?? ''}`;
+  return `container|${q.direction}|${q.mime ?? ''}|${q.extension ?? ''}|${pinDriver ?? ''}`;
 }
 
 function noop(): void {

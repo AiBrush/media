@@ -1,11 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WasmRuntimeProfile } from '../contracts/driver.ts';
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
   requireIsolatedWasmProfile,
-  resolveWasmRuntimeProfile,
+  resolveWasmAssetUrl,
   wasmInitForProfile,
-} from './wasm-runtime.ts';
+} from './wasm-loader-runtime.ts';
+import { normalizeWasmAssetBaseUrl, resolveWasmRuntimeProfile } from './wasm-runtime.ts';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('resolveWasmRuntimeProfile', () => {
   it('keeps the common path baseline when the page is not cross-origin isolated', () => {
@@ -121,5 +126,53 @@ describe('wasmInitForProfile', () => {
     } as unknown as WasmRuntimeProfile;
 
     expect(() => wasmInitForProfile(url, unknown)).toThrow(CapabilityError);
+  });
+});
+
+describe('WASM asset URL controls', () => {
+  it('preserves import.meta-relative resolution byte-for-byte when no override exists', () => {
+    const moduleUrl = new URL('https://app.example/assets/driver-abc.js');
+    const defaultUrl = new URL('./core_bg.wasm', moduleUrl);
+    const resolved = resolveWasmAssetUrl('./core_bg.wasm', defaultUrl);
+    expect(resolved).toBe(defaultUrl);
+    expect(resolved.href).toBe('https://app.example/assets/core_bg.wasm');
+  });
+
+  it('normalizes a same-origin browser override to an absolute directory and resolves assets beneath it', () => {
+    vi.stubGlobal('location', new URL('https://app.example/player/index.html'));
+    const root = normalizeWasmAssetBaseUrl('../media/cores?stale=1#fragment');
+
+    expect(root).toBe('https://app.example/media/cores/');
+    expect(
+      resolveWasmAssetUrl(
+        './aac_wasm_bg.wasm',
+        new URL('https://app.example/chunks/aac_wasm_bg.wasm'),
+        root,
+      ).href,
+    ).toBe('https://app.example/media/cores/aac_wasm_bg.wasm');
+  });
+
+  it.each([
+    'https://cdn.example/cores/',
+    'https://user:secret@app.example/cores/',
+    'data:text/plain,not-an-asset-root',
+  ])('rejects an unsafe browser asset override before any fetch: %s', (value) => {
+    vi.stubGlobal('location', new URL('https://app.example/player/index.html'));
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+
+    expect(() => normalizeWasmAssetBaseUrl(value)).toThrow(InputError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('maps a non-string JavaScript override to a typed input error', () => {
+    expect(() => normalizeWasmAssetBaseUrl(null as unknown as string)).toThrow(InputError);
+  });
+
+  it('allows an absolute file directory only in a Node/file context', () => {
+    vi.stubGlobal('location', undefined);
+    expect(normalizeWasmAssetBaseUrl('file:///tmp/aibrush-cores')).toBe(
+      'file:///tmp/aibrush-cores/',
+    );
   });
 });

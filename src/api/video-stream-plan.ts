@@ -1,7 +1,7 @@
 /**
  * Video filter-chain PLANNING (docs/architecture/09) — the pure builder that turns a public
  * {@link VideoTarget} into the ordered GPU {@link FilterSpec} chain the engine composes on a decoded video
- * stream before the encoder (**crop → resize → rotate → flip → colorspace → tonemap**).
+ * stream before the encoder (**crop → resize → pad → rotate → flip → colorspace → tonemap**).
  *
  * Why a SEPARATE module (split out of `codec-pipeline.ts`): `videoFilterSpecs` is reached ONLY on the
  * convert-with-video-filter path (a live, browser-only decode→filter→encode). Keeping it here, behind the
@@ -25,9 +25,9 @@ import {
 import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
 
 /**
- * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → rotate →
- * flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
- * selects a source sub-rect first, then resize scales it to the requested output, then orientation, then
+ * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → pad → rotate
+ * → flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
+ * selects a source sub-rect first, resize scales it, pad places it without resampling, then orientation and
  * full-frame colour conversion. A `resize` is emitted when width/height are given and differ from the
  * post-crop geometry; a geometry-identical resize is omitted so a no-op request does not introduce an
  * avoidable YUV→RGB→YUV canvas round trip. `rotate`/`flip` pass straight through. Pure: every spec is a
@@ -67,6 +67,47 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
       });
     }
   }
+  if (target.pad !== undefined) {
+    const currentWidth = target.width ?? target.crop?.width ?? src.width;
+    const currentHeight = target.height ?? target.crop?.height ?? src.height;
+    if (currentWidth === undefined || currentHeight === undefined) {
+      throw new InputError(
+        'unsupported-input',
+        'pad needs known source dimensions (or an explicit resize width and height)',
+      );
+    }
+    const { width, height } = target.pad;
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
+      throw new InputError(
+        'unsupported-input',
+        `pad ${width}x${height} must use positive integers`,
+      );
+    }
+    if (width < currentWidth || height < currentHeight) {
+      throw new InputError(
+        'unsupported-input',
+        `pad ${width}x${height} cannot contain ${currentWidth}x${currentHeight}`,
+      );
+    }
+    const x = target.pad.x ?? Math.floor((width - currentWidth) / 2);
+    const y = target.pad.y ?? Math.floor((height - currentHeight) / 2);
+    if (
+      !Number.isSafeInteger(x) ||
+      !Number.isSafeInteger(y) ||
+      x < 0 ||
+      y < 0 ||
+      x + currentWidth > width ||
+      y + currentHeight > height
+    ) {
+      throw new InputError(
+        'unsupported-input',
+        `pad placement ${x},${y} + ${currentWidth}x${currentHeight} is outside ${width}x${height}`,
+      );
+    }
+    if (width !== currentWidth || height !== currentHeight || x !== 0 || y !== 0) {
+      specs.push({ mediaType: 'video', type: 'pad', width, height, x, y });
+    }
+  }
   if (target.rotate !== undefined && target.rotate !== 0) {
     specs.push({ mediaType: 'video', type: 'rotate', degrees: target.rotate });
   }
@@ -88,6 +129,20 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
   }
   return specs;
+}
+
+/**
+ * Effective precision after the current video-filter graph. Every shipped pixel filter materializes an
+ * RGBA8 `VideoFrame`; timing-only CFR retiming emits no `FilterSpec` and therefore has no pixel boundary.
+ */
+export function videoTargetPixelBoundaryBitDepth(
+  target: VideoTarget,
+  src: SourceGeometry,
+  sourceHasAlpha = false,
+): 8 | undefined {
+  return sourceHasAlpha || target.alpha === 'keep' || videoFilterSpecs(target, src).length > 0
+    ? 8
+    : undefined;
 }
 
 /**
@@ -372,22 +427,22 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
   };
 
   const processFrameInterval = (frame: F, endUs: number, isFinal = false): void => {
-    if (!Number.isFinite(endUs) || endUs <= frame.timestamp) {
-      throw new InputError('unsupported-input', 'cannot infer a positive frame duration');
-    }
-    const start = startUs ?? frame.timestamp;
-    startUs = start;
-    // Authoritative end of the materialized output, which bounds EVERY grid frame — not just those sampled
-    // from the final source frame. A declared source duration is known up front (`start + durationUs`), so
-    // a fine-grained downsample clamps correctly even when its last grid point lands mid-stream: at 30 fps →
-    // 1 fps the true final source frame spans ~1/30 s (far below the 1 s CFR period), so the last grid point
-    // (t = 22 s for a 22.5 s source) is emitted inside an *interior* source interval, never the tiny final
-    // one — a clamp tied only to the final source frame misses it and the output over-runs by ~a full
-    // period (23 s). Absent a declared duration the source end is known only at the final interval (best
-    // effort: the trailing frame still can't over-run its own interval).
-    const hardEndUs =
-      options.durationUs !== undefined ? start + options.durationUs : isFinal ? endUs : undefined;
     try {
+      if (!Number.isFinite(endUs) || endUs <= frame.timestamp) {
+        throw new InputError('unsupported-input', 'cannot infer a positive frame duration');
+      }
+      const start = startUs ?? frame.timestamp;
+      startUs = start;
+      // Authoritative end of the materialized output, which bounds EVERY grid frame — not just those sampled
+      // from the final source frame. A declared source duration is known up front (`start + durationUs`), so
+      // a fine-grained downsample clamps correctly even when its last grid point lands mid-stream: at 30 fps →
+      // 1 fps the true final source frame spans ~1/30 s (far below the 1 s CFR period), so the last grid point
+      // (t = 22 s for a 22.5 s source) is emitted inside an *interior* source interval, never the tiny final
+      // one — a clamp tied only to the final source frame misses it and the output over-runs by ~a full
+      // period (23 s). Absent a declared duration the source end is known only at the final interval (best
+      // effort: the trailing frame still can't over-run its own interval).
+      const hardEndUs =
+        options.durationUs !== undefined ? start + options.durationUs : isFinal ? endUs : undefined;
       for (;;) {
         const timestamp = cfrTimestampAt(start, options.fps, outputIndex);
         if (timestamp >= endUs) break;
@@ -553,7 +608,9 @@ export type VideoRateControlPlan =
       readonly mode: 'two-pass-bitrate';
       readonly bitrate: number;
       readonly passes: 2;
-      readonly webCodecsConfigurable: false;
+      readonly webCodecsConfigurable: true;
+      readonly requiresReplay: true;
+      readonly firstPassQuantizer: 28;
     };
 
 function crfBounds(codec: VideoCodec | 'unknown'): { min: number; max: number } {
@@ -610,7 +667,9 @@ export function planVideoRateControl(
       mode: 'two-pass-bitrate',
       bitrate,
       passes: 2,
-      webCodecsConfigurable: false,
+      webCodecsConfigurable: true,
+      requiresReplay: true,
+      firstPassQuantizer: 28,
     };
   }
   if (hasCrf) {
@@ -652,6 +711,8 @@ export interface VideoBitDepthConversionRequest {
   readonly targetCodec?: string;
   readonly sourceBitDepth?: number;
   readonly targetBitDepth?: number;
+  /** Effective depth of an already-planned pixel-filter boundary; omitted means frames stay native. */
+  readonly pixelPathBitDepth?: number;
 }
 
 export type VideoBitDepthConversionPlan =
@@ -665,7 +726,15 @@ export type VideoBitDepthConversionPlan =
       readonly kind: 'downconvert';
       readonly sourceBitDepth: VideoBitDepth;
       readonly targetBitDepth: VideoBitDepth;
-      readonly requiresPixelPath: true;
+      /** False when an earlier filter has already materialized the requested 8-bit precision. */
+      readonly requiresPixelPath: boolean;
+    }
+  | {
+      /** Lower-depth integer samples are exactly representable at the target; no precision is invented. */
+      readonly kind: 'encoder-widen';
+      readonly sourceBitDepth: 8 | 10;
+      readonly targetBitDepth: 10 | 12;
+      readonly requiresPixelPath: false;
     };
 
 function normalizeBitDepth(depth: number | undefined): VideoBitDepth | undefined {
@@ -729,6 +798,24 @@ export function planVideoBitDepthConversion(
     normalizeBitDepth(request.sourceBitDepth) ?? bitDepthFromCodec(request.sourceCodec);
   const targetBitDepth =
     normalizeBitDepth(request.targetBitDepth) ?? bitDepthFromCodec(request.targetCodec);
+  const pixelPathBitDepth = normalizeBitDepth(request.pixelPathBitDepth);
+  if (
+    pixelPathBitDepth !== undefined &&
+    targetBitDepth !== undefined &&
+    targetBitDepth > pixelPathBitDepth &&
+    (sourceBitDepth === undefined || sourceBitDepth > pixelPathBitDepth)
+  ) {
+    throw new CapabilityError(
+      'capability-miss',
+      `${targetBitDepth}-bit output would cross a ${pixelPathBitDepth}-bit video filter boundary`,
+      {
+        op: 'convert',
+        tried: ['webcodecs-video', 'gpu-video-filter'],
+        suggestion:
+          'remove pixel filters, target 8-bit output, or add a proven high-bit-depth filter path',
+      },
+    );
+  }
   if (
     sourceBitDepth === undefined ||
     targetBitDepth === undefined ||
@@ -736,8 +823,19 @@ export function planVideoBitDepthConversion(
   ) {
     return { kind: 'none', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
   }
-  if (sourceBitDepth > targetBitDepth && sourceBitDepth === 10 && targetBitDepth === 8) {
-    return { kind: 'downconvert', sourceBitDepth, targetBitDepth, requiresPixelPath: true };
+  if (sourceBitDepth > targetBitDepth && targetBitDepth === 8) {
+    return {
+      kind: 'downconvert',
+      sourceBitDepth,
+      targetBitDepth,
+      requiresPixelPath: pixelPathBitDepth !== 8,
+    };
+  }
+  if (sourceBitDepth === 8 && (targetBitDepth === 10 || targetBitDepth === 12)) {
+    return { kind: 'encoder-widen', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
+  }
+  if (sourceBitDepth === 10 && targetBitDepth === 12) {
+    return { kind: 'encoder-widen', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
   }
   throw new CapabilityError(
     'capability-miss',

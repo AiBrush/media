@@ -1,4 +1,9 @@
-import type { CodecQuery, ContainerQuery, FilterSpec } from '../contracts/driver.ts';
+import type {
+  CodecQuery,
+  ContainerQuery,
+  FilterSpec,
+  WasmRuntimeProfile,
+} from '../contracts/driver.ts';
 import type { LogEvent, PreloadSpec } from './types.ts';
 
 const CONTAINER_MIME: Record<string, string> = {
@@ -42,6 +47,8 @@ interface PreloadSpecRecord {
 
 export interface PreloadHost {
   readonly tasks: Map<string, Promise<void>>;
+  readonly wasmRuntime?: WasmRuntimeProfile;
+  readonly wasmAssetBaseUrl?: string;
   ensureDefaultDrivers(): Promise<void>;
   pickContainer(q: ContainerQuery): void;
   pickCodec(q: CodecQuery): Promise<void>;
@@ -94,7 +101,7 @@ async function runPreloadTask(host: PreloadHost, spec: NormalizedPreloadSpec): P
     warmContainerPreload(host, spec),
     warmCodecPreload(host, spec),
     warmFilterPreload(host, spec),
-    warmWasmPreload(spec),
+    warmWasmPreload(host, spec),
   ]);
 }
 
@@ -114,9 +121,11 @@ async function warmFilterPreload(host: PreloadHost, spec: NormalizedPreloadSpec)
   );
 }
 
-async function warmWasmPreload(spec: NormalizedPreloadSpec): Promise<void> {
+async function warmWasmPreload(host: PreloadHost, spec: NormalizedPreloadSpec): Promise<void> {
   await Promise.allSettled(
-    preloadWasmCodecs(spec).map((codec) => warmWasmCodec(codec, spec.level !== 'chunks')),
+    preloadWasmCodecs(spec).map((codec) =>
+      warmWasmCodec(codec, spec.level !== 'chunks', host.wasmRuntime, host.wasmAssetBaseUrl),
+    ),
   );
 }
 
@@ -306,37 +315,42 @@ function preloadWasmCodecs(spec: NormalizedPreloadSpec): readonly string[] {
   return [...codecs];
 }
 
-async function warmWasmCodec(codec: string, compile: boolean): Promise<void> {
+async function warmWasmCodec(
+  codec: string,
+  compile: boolean,
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<void> {
   switch (codec) {
     case 'aac': {
       const mod = await import('../codecs/wasm-aac/wasm-aac-driver.ts');
-      if (compile) await mod.loadAacCore();
+      if (compile) await mod.loadAacCore(runtime, assetBaseUrl);
       return;
     }
     case 'mp3': {
       const mod = await import('../codecs/wasm-mp3/wasm-mp3-driver.ts');
-      if (compile) await mod.loadMp3Core();
+      if (compile) await mod.loadMp3Core(runtime, assetBaseUrl);
       return;
     }
     case 'vorbis': {
       const mod = await import('../codecs/wasm-vorbis/wasm-vorbis-driver.ts');
-      if (compile) await mod.loadVorbisCore();
+      if (compile) await mod.loadVorbisCore(runtime, assetBaseUrl);
       return;
     }
     case 'opus': {
       const mod = await import('../codecs/wasm-opus/wasm-opus-driver.ts');
-      if (compile) await mod.loadOpusCore();
+      if (compile) await mod.loadOpusCore(runtime, assetBaseUrl);
       return;
     }
     case 'av1': {
       const mod = await import('../codecs/wasm-av1/wasm-av1-driver.ts');
-      if (compile) await mod.loadAv1Core();
+      if (compile) await mod.loadAv1Core(runtime, assetBaseUrl);
       return;
     }
     case 'vp8':
     case 'vp9': {
       const mod = await import('../codecs/wasm-vpx/wasm-vpx-driver.ts');
-      if (compile) await mod.loadVpxCore();
+      if (compile) await mod.loadVpxCore(runtime, assetBaseUrl);
       return;
     }
     default:

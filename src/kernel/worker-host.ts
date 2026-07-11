@@ -18,6 +18,7 @@
  */
 
 import { MediaError } from '../contracts/errors.ts';
+import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import type { Source } from '../sources/source.ts';
 import { type RunStreamOptions, WorkerStreamBridge } from './worker-bridge.ts';
 import type { OffloadJobPayload } from './worker-main.ts';
@@ -185,6 +186,9 @@ function awaitReady(worker: SpawnedWorker, timeoutMs: number): Promise<boolean> 
 export interface OffloadStreamOptions extends RunStreamOptions {
   /** Threaded into the worker job so `force-software` is bit-identical inline vs worker (ADR-007). */
   readonly determinism?: 'auto' | 'force-software';
+  readonly pinDriver?: string;
+  readonly wasmRuntime?: WasmRuntimeProfile;
+  readonly wasmAssetBaseUrl?: string;
 }
 
 /** A source's serializable routing hints (filename/mime) carried so the worker routes identically. */
@@ -372,7 +376,7 @@ export async function offloadAbrLadder(
   opts: OffloadStreamOptions = {},
 ): Promise<ReadableStream<Uint8Array>[]> {
   const bytes = await readAllSource(src, opts.signal);
-  const { determinism } = opts;
+  const { determinism, pinDriver, wasmRuntime, wasmAssetBaseUrl } = opts;
   const jobs: OffloadJob[] = ladder.map((rung) => {
     // Per-rendition copy: each job transfers (detaches) its own input buffer, so they cannot share one.
     const input = bytes.slice().buffer as ArrayBuffer;
@@ -380,9 +384,18 @@ export async function offloadAbrLadder(
       op: 'convert' as const,
       payload: { ...buildOffloadPayload('convert', src, rung.opts), input },
       ...(determinism !== undefined ? { determinism } : {}),
+      ...(pinDriver !== undefined ? { pinDriver } : {}),
+      ...(wasmRuntime !== undefined ? { wasmRuntime } : {}),
+      ...(wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl } : {}),
     };
   });
-  const { determinism: _determinism, ...runOpts } = opts;
+  const {
+    determinism: _determinism,
+    pinDriver: _pinDriver,
+    wasmRuntime: _wasmRuntime,
+    wasmAssetBaseUrl: _wasmAssetBaseUrl,
+    ...runOpts
+  } = opts;
   return pool.runMany(jobs, runOpts).map((stream) => asBytes(stream));
 }
 
@@ -409,8 +422,17 @@ export async function runOffloadStream(
     op: payload.kind,
     payload: { ...payload, input },
     ...(opts.determinism !== undefined ? { determinism: opts.determinism } : {}),
+    ...(opts.pinDriver !== undefined ? { pinDriver: opts.pinDriver } : {}),
+    ...(opts.wasmRuntime !== undefined ? { wasmRuntime: opts.wasmRuntime } : {}),
+    ...(opts.wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: opts.wasmAssetBaseUrl } : {}),
   };
-  const { determinism: _determinism, ...runOpts } = opts;
+  const {
+    determinism: _determinism,
+    pinDriver: _pinDriver,
+    wasmRuntime: _wasmRuntime,
+    wasmAssetBaseUrl: _wasmAssetBaseUrl,
+    ...runOpts
+  } = opts;
   const transferable = runner.runStream(job, runOpts);
   return asBytes(transferable);
 }

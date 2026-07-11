@@ -1,9 +1,10 @@
 import { defineConfig } from 'tsup';
 
 /**
- * Library build (docs/architecture/08). Two ESM entries — the default `index` (tiny eager kernel +
- * bare-function sugar) and `core` (driver-author surface) — with code-splitting so every op/driver chunk
- * and every WASM core loads lazily on first use (ADR-004). The eager `index` chunk must therefore pull in
+ * Library build (docs/architecture/08). Public ESM entries include the default `index` (tiny eager kernel +
+ * bare-function sugar), `core` (driver-author surface), `image`, and optional explicit first-party driver
+ * imports. Code-splitting keeps every op/driver chunk and every WASM core lazy for normal default-entry use
+ * (ADR-004). The eager `index` chunk must therefore pull in
  * NO driver and NO `.wasm`: the engine reaches the first-party drivers only through a dynamic
  * `import('../drivers/defaults.ts')` (a literal specifier esbuild splits into its own chunk), and each
  * codec core sits behind a further lazy import inside that bundle. `splitting` is what realizes those
@@ -35,6 +36,18 @@ export default defineConfig({
     core: 'src/core.ts',
     image: 'src/image.ts',
     worker: 'src/kernel/worker.ts',
+    'drivers/adts': 'src/drivers/adts/adts-driver.ts',
+    'drivers/aiff': 'src/drivers/aiff/aiff-driver.ts',
+    'drivers/avi': 'src/drivers/avi/avi-driver.ts',
+    'drivers/caf': 'src/drivers/caf/caf-driver.ts',
+    'drivers/flac': 'src/drivers/flac/flac-driver.ts',
+    'drivers/hls': 'src/drivers/hls/hls-driver.ts',
+    'drivers/mp3': 'src/drivers/mp3/mp3-driver.ts',
+    'drivers/mp4': 'src/drivers/mp4/mp4-driver.ts',
+    'drivers/mpegts': 'src/drivers/mpegts/mpegts-driver.ts',
+    'drivers/ogg': 'src/drivers/ogg/ogg-driver.ts',
+    'drivers/wav': 'src/drivers/wav/wav-driver.ts',
+    'drivers/webm': 'src/drivers/webm/webm-driver.ts',
   },
   format: ['esm'],
   target: 'es2022',

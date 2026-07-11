@@ -1,0 +1,24 @@
+{
+  "generatedAt": "2026-07-11T20:07:16.463Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 3,
+  "samples": 15,
+  "scenarios": [
+    {
+      "name": "wav full-track selection + tags",
+      "medianMs": 0.1525,
+      "p95Ms": 0.206667,
+      "inputMbPerSec": 596.0308137487193,
+      "outputBytes": 95932,
+      "peakProcessHeapMb": 3.024148941040039
+    },
+    {
+      "name": "webm vorbis selection -> tagged ogg",
+      "medianMs": 0.883958,
+      "p95Ms": 2.936125,
+      "inputMbPerSec": 483.3168415640267,
+      "outputBytes": 22810,
+      "peakProcessHeapMb": 6.152271270751953
+    }
+  ]
+}

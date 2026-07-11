@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
+import { MediaError } from '../contracts/errors.ts';
 import {
   MP4_GAPLESS_PREFLIGHT_MAX_PACKETS,
   nativeSuppressedMp4EditSamples,
@@ -107,6 +108,96 @@ describe('MP4 native gapless suppression preflight', () => {
     expect(frames.map((frame) => frame.closeCount)).toEqual([1, 1, 1]);
   });
 
+  it('handles an early packet-stream EOF while collecting the prefix', async () => {
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    const suppressed = await nativeSuppressedMp4EditSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () => fakeDecoder([0], []),
+      },
+      100_000,
+      44100,
+    );
+
+    expect(suppressed).toBe(1024);
+    expect(packets.pulls()).toBe(2);
+  });
+
+  it('ignores a negative-prefix packet with an invalid duration', async () => {
+    const packets = fakePackets([fakeChunk(-1, Number.NaN)]);
+
+    const suppressed = await nativeSuppressedMp4EditSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () => fakeDecoder([0], []),
+      },
+      1024,
+      44100,
+    );
+
+    expect(suppressed).toBe(0);
+    expect(packets.pulls()).toBe(2);
+  });
+
+  it('stops before a non-negative first packet', async () => {
+    const packets = fakePackets([fakeChunk(0, 23220)]);
+
+    const suppressed = await nativeSuppressedMp4EditSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () => fakeDecoder([0], []),
+      },
+      1024,
+      44100,
+    );
+
+    expect(suppressed).toBe(0);
+    expect(packets.pulls()).toBe(1);
+  });
+
+  it('rejects a decoder that emits a video-shaped frame', async () => {
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    const suppressed = await nativeSuppressedMp4EditSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () =>
+          new TransformStream<EncodedChunk, RawFrame>({
+            transform(_chunk, controller): void {
+              controller.enqueue({ close(): void {} } as unknown as RawFrame);
+            },
+          }),
+      },
+      1024,
+      44100,
+    );
+
+    expect(suppressed).toBe(0);
+    expect(packets.canceled()).toBe(true);
+  });
+
+  it('propagates an underlying packet-read rejection', async () => {
+    const packets = new ReadableStream<Packet>({
+      pull(controller): void {
+        controller.error(new Error('packet source failed'));
+      },
+    });
+    const controller = new AbortController();
+
+    await expect(
+      nativeSuppressedMp4EditSamples(
+        {
+          packets,
+          createDecoder: () => fakeDecoder([0], []),
+          signal: controller.signal,
+        },
+        1024,
+        44100,
+      ),
+    ).rejects.toThrow('packet source failed');
+  });
+
   it('does not mistake one-sample timestamp rounding for decoder suppression', async () => {
     const packets = fakePackets([fakeChunk(-23220, 23220)]);
     const frames: FakeAudioFrame[] = [];
@@ -122,6 +213,64 @@ describe('MP4 native gapless suppression preflight', () => {
 
     expect(suppressed).toBe(0);
     expect(frames[0]?.closeCount).toBe(1);
+  });
+
+  it('returns zero for invalid preflight bounds', async () => {
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    await expect(
+      nativeSuppressedMp4EditSamples(
+        {
+          packets: packets.stream,
+          createDecoder: () => fakeDecoder([0], []),
+        },
+        0,
+        44100,
+      ),
+    ).resolves.toBe(0);
+    expect(packets.pulls()).toBe(0);
+  });
+
+  it('keeps a decoder capability error conservative', async () => {
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    const suppressed = await nativeSuppressedMp4EditSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () =>
+          new TransformStream<EncodedChunk, RawFrame>({
+            transform(_chunk, controller): void {
+              controller.error(new Error('prefix decode unsupported'));
+            },
+          }),
+      },
+      1024,
+      44100,
+    );
+
+    expect(suppressed).toBe(0);
+    expect(packets.canceled()).toBe(true);
+  });
+
+  it('propagates a typed decoder abort instead of converting it to zero', async () => {
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    await expect(
+      nativeSuppressedMp4EditSamples(
+        {
+          packets: packets.stream,
+          createDecoder: () =>
+            new TransformStream<EncodedChunk, RawFrame>({
+              transform(_chunk, controller): void {
+                controller.error(new MediaError('aborted', 'decoder aborted'));
+              },
+            }),
+        },
+        1024,
+        44100,
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(packets.canceled()).toBe(true);
   });
 
   it('caps malformed long negative prefixes without scanning the complete track', async () => {
@@ -141,5 +290,55 @@ describe('MP4 native gapless suppression preflight', () => {
 
     expect(packets.pulls()).toBe(MP4_GAPLESS_PREFLIGHT_MAX_PACKETS);
     expect(packets.canceled()).toBe(true);
+  });
+
+  it('propagates an already-aborted signal without pulling a packet', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const packets = fakePackets([fakeChunk(-23220, 23220)]);
+
+    await expect(
+      nativeSuppressedMp4EditSamples(
+        {
+          packets: packets.stream,
+          createDecoder: () => fakeDecoder([0], []),
+          signal: controller.signal,
+        },
+        1024,
+        44100,
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(packets.pulls()).toBe(0);
+    expect(packets.canceled()).toBe(false);
+  });
+
+  it('cancels an in-flight bounded packet read when the signal aborts', async () => {
+    let canceled = false;
+    const packets = new ReadableStream<Packet>(
+      {
+        pull(): Promise<void> {
+          return new Promise<void>(() => undefined);
+        },
+        cancel(): void {
+          canceled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const controller = new AbortController();
+    const pending = nativeSuppressedMp4EditSamples(
+      {
+        packets,
+        createDecoder: () => fakeDecoder([0], []),
+        signal: controller.signal,
+      },
+      1024,
+      44100,
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
+    expect(canceled).toBe(true);
   });
 });

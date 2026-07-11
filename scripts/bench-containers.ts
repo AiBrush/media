@@ -60,7 +60,12 @@ import type { ParsedTrack } from '../src/drivers/mp4/parse.ts';
 import { buildSamples } from '../src/drivers/mp4/samples.ts';
 import { parseTs } from '../src/drivers/mpegts/ts-parse.ts';
 import { MpegTsMuxer } from '../src/drivers/mpegts/ts-write.ts';
-import { OggDriver, oggAudioPackets, parseOgg } from '../src/drivers/ogg/ogg-driver.ts';
+import {
+  OggDriver,
+  oggAudioPackets,
+  oggPacketBytes,
+  parseOgg,
+} from '../src/drivers/ogg/ogg-driver.ts';
 import { OggMuxer } from '../src/drivers/ogg/ogg-write.ts';
 import { parseWav } from '../src/drivers/wav/wav-driver.ts';
 import { WavMuxer } from '../src/drivers/wav/wav-mux.ts';
@@ -1139,7 +1144,7 @@ async function muxOggSource(id: string, bytes: Uint8Array): Promise<Uint8Array> 
         timestampUs: packet.ptsUs,
         durationUs: packet.durationUs,
         key: true,
-        data: bytes.slice(packet.offset, packet.offset + packet.size),
+        data: oggPacketBytes(bytes, packet),
       });
     }
     await muxer.finalize();

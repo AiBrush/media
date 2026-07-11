@@ -8,7 +8,7 @@ export {};
 
 declare module './dav1d-core.js' {
   import type { Dav1dWasmCore } from './av1.ts';
-  import type { WasmBindgenInit } from '../../kernel/wasm-runtime.ts';
+  import type { WasmBindgenInit } from '../../kernel/wasm-loader-runtime.ts';
 
   /**
    * Instantiate the sibling dav1d WASM module. The driver passes

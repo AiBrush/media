@@ -28,6 +28,7 @@ import type {
   CodecDriver,
   CodecQuery,
   CodecSupport,
+  CodecSupportOptions,
   DecoderConfig,
   Determinism,
   DriverModule,
@@ -317,6 +318,13 @@ export function normalizeVideoDecoderConfig(
  * when the hardware probe actually succeeds).
  */
 export const ACCELERATION_PROBE_ORDER = ['prefer-hardware', 'no-preference'] as const;
+
+/** Exact acceleration probes for a routing mode; deterministic selection never probes a hardware hint. */
+export function videoAccelerationProbeOrder(
+  determinism: Determinism | undefined,
+): readonly HardwareAcceleration[] {
+  return determinism === 'force-software' ? ['prefer-software'] : ACCELERATION_PROBE_ORDER;
+}
 
 /** One `isConfigSupported` probe outcome: did it report support, and (if so) was it the hardware path. */
 export interface SupportProbe {
@@ -645,8 +653,20 @@ export interface VideoEncoderStageOptions extends StageOptions {
   keyFrameInterval?: number;
   /** Constant quality/CRF-style quantizer forwarded through the codec-specific WebCodecs encode option. */
   quantizer?: number;
+  /**
+   * Per-picture quantizer selected from prior-pass evidence. The callback runs synchronously before
+   * `encode()` and must return the quantizer for this exact presentation timestamp.
+   */
+  quantizerAt?: (frame: VideoEncoderRateControlFrame) => number;
   /** Receives the decoder config (with `description`) emitted with the encoder's first chunk. */
   onDecoderConfig?: (config: VideoDecoderConfig) => void;
+}
+
+export interface VideoEncoderRateControlFrame {
+  readonly index: number;
+  readonly timestampUs: number;
+  readonly durationUs: number | null;
+  readonly keyFrame: boolean;
 }
 
 function readEncoderInterval(o: StageOptions | undefined): number | undefined {
@@ -657,6 +677,13 @@ function readEncoderInterval(o: StageOptions | undefined): number | undefined {
 function readEncoderQuantizer(o: StageOptions | undefined): number | undefined {
   const v = (o as VideoEncoderStageOptions | undefined)?.quantizer;
   return typeof v === 'number' ? v : undefined;
+}
+
+function readEncoderQuantizerSelector(
+  o: StageOptions | undefined,
+): ((frame: VideoEncoderRateControlFrame) => number) | undefined {
+  const v = (o as VideoEncoderStageOptions | undefined)?.quantizerAt;
+  return typeof v === 'function' ? v : undefined;
 }
 
 function readDecoderConfigSink(
@@ -729,7 +756,10 @@ async function probeVideoDecoderAcceleration(
   };
 }
 
-async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
+async function supportsDecode(
+  config: DecoderConfig,
+  determinism: Determinism | undefined,
+): Promise<CodecSupport> {
   const videoConfig = asVideoDecoderConfig(config);
   if (!videoConfig) return { supported: false, reason: 'not a video decoder config' };
   if (!isVideoCodecString(videoConfig.codec)) {
@@ -747,24 +777,26 @@ async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
   /* v8 ignore start -- requires WebCodecs VideoDecoder; validated under browser-mode (Phase 1) */
   // Probe hardware first, then a software-permitting probe (ACCELERATION_PROBE_ORDER): a software-only
   // decoder reports `prefer-hardware` unsupported but `no-preference` supported, so probing hardware-only
-  // would wrongly NA it. The router drops this whole tier under `force-software` (doc 04 §6).
+  // would wrongly NA it. `force-software` instead supplies the one-item `prefer-software` order.
   const probes: SupportProbe[] = [];
   let lastReason: string | undefined;
-  for (const acceleration of ACCELERATION_PROBE_ORDER) {
+  for (const acceleration of videoAccelerationProbeOrder(determinism)) {
     try {
       const result = await probeVideoDecoderAcceleration(videoConfig, undefined, acceleration);
-      probes.push(
-        result.acceptedAcceleration !== undefined
-          ? { supported: result.supported, acceleration: result.acceptedAcceleration }
-          : { supported: result.supported },
-      );
-      if (result.supported) {
-        rememberVideoDecoderAcceleration(
-          videoDecoderAccelerationCache,
-          videoConfig,
-          undefined,
-          result.acceptedAcceleration ?? acceleration,
-        );
+      const acceptedAcceleration = result.acceptedAcceleration ?? acceleration;
+      const supported =
+        result.supported &&
+        (determinism !== 'force-software' || acceptedAcceleration === 'prefer-software');
+      probes.push({ supported, acceleration: acceptedAcceleration });
+      if (supported) {
+        if (determinism !== 'force-software') {
+          rememberVideoDecoderAcceleration(
+            videoDecoderAccelerationCache,
+            videoConfig,
+            undefined,
+            acceptedAcceleration,
+          );
+        }
         break; // first win short-circuits (hardware preferred)
       }
     } catch (e) {
@@ -775,7 +807,10 @@ async function supportsDecode(config: DecoderConfig): Promise<CodecSupport> {
   /* v8 ignore stop */
 }
 
-async function supportsEncode(config: EncoderConfig): Promise<CodecSupport> {
+async function supportsEncode(
+  config: EncoderConfig,
+  determinism: Determinism | undefined,
+): Promise<CodecSupport> {
   const videoConfig = asVideoEncoderConfig(config);
   if (!videoConfig) return { supported: false, reason: 'not a video encoder config' };
   if (!isVideoCodecString(videoConfig.codec)) {
@@ -796,19 +831,18 @@ async function supportsEncode(config: EncoderConfig): Promise<CodecSupport> {
   // target. The software-permitting `no-preference` probe recovers them (ACCELERATION_PROBE_ORDER).
   const probes: SupportProbe[] = [];
   let lastReason: string | undefined;
-  for (const acceleration of ACCELERATION_PROBE_ORDER) {
+  for (const acceleration of videoAccelerationProbeOrder(determinism)) {
     try {
       const { supported, config: accepted } = await VideoEncoder.isConfigSupported({
         ...videoConfig,
         hardwareAcceleration: acceleration,
       });
-      const accel = accepted?.hardwareAcceleration;
-      probes.push(
-        accel !== undefined
-          ? { supported: supported === true, acceleration: accel }
-          : { supported: supported === true },
-      );
-      if (supported === true) break;
+      const acceptedAcceleration = accepted?.hardwareAcceleration ?? acceleration;
+      const acceptedSoftwareMode =
+        supported === true &&
+        (determinism !== 'force-software' || acceptedAcceleration === 'prefer-software');
+      probes.push({ supported: acceptedSoftwareMode, acceleration: acceptedAcceleration });
+      if (acceptedSoftwareMode) break;
     } catch (e) {
       lastReason = describeError(e);
     }
@@ -1241,6 +1275,7 @@ function createVideoEncoder(
   const signal = o?.signal;
   const keyFrameInterval = readEncoderInterval(o);
   const quantizer = readEncoderQuantizer(o);
+  const quantizerAt = readEncoderQuantizerSelector(o);
   const onDecoderConfig = readDecoderConfigSink(o);
 
   let encoder: VideoEncoder | undefined;
@@ -1310,7 +1345,7 @@ function createVideoEncoder(
         },
       });
       // Default to the hardware hint (this is the hardware-tier driver) unless the caller pinned one;
-      // `force-software` would have routed away from this tier (doc 04 §6), but honor it defensively.
+      // `force-software` reaches this tier only after a matching non-hardware capability verdict.
       encoder.configure({
         ...wireConfig,
         hardwareAcceleration:
@@ -1373,9 +1408,17 @@ function createVideoEncoder(
           });
           encodeFrame = compensatedFrame;
         }
+        const keyFrame = shouldKeyframe(frameIndex, keyFrameInterval);
+        const frameQuantizer =
+          quantizerAt?.({
+            index: frameIndex,
+            timestampUs: frame.timestamp,
+            durationUs: frame.duration,
+            keyFrame,
+          }) ?? quantizer;
         encoder.encode(
           encodeFrame,
-          videoEncodeOptions(frameIndex, keyFrameInterval, config.codec, quantizer),
+          videoEncodeOptions(frameIndex, keyFrameInterval, config.codec, frameQuantizer),
         );
         frameIndex++;
       } finally {
@@ -1422,13 +1465,13 @@ export const WebcodecsVideoDriver: CodecDriver = {
   apiVersion: DRIVER_API_VERSION,
   kind: 'codec',
   tier: 'hardware',
-  supports(q: CodecQuery): Promise<CodecSupport> {
+  supports(q: CodecQuery, o?: CodecSupportOptions): Promise<CodecSupport> {
     if (q.mediaType !== 'video') {
       return Promise.resolve({ supported: false, reason: 'webcodecs-video handles video only' });
     }
     return q.direction === 'decode'
-      ? supportsDecode(q.config)
-      : supportsEncode(q.config as EncoderConfig);
+      ? supportsDecode(q.config, o?.determinism)
+      : supportsEncode(q.config as EncoderConfig, o?.determinism);
   },
   createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame> {
     const videoConfig = asVideoDecoderConfig(c);

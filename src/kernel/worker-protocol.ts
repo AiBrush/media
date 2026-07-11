@@ -19,6 +19,7 @@ import {
   MediaError,
   type MediaErrorCode,
 } from '../contracts/errors.ts';
+import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 
 // ============ transport ============
 
@@ -51,6 +52,12 @@ export interface OffloadJob {
   readonly op: 'decode' | 'encode' | 'convert' | 'transcode' | 'trim' | 'filter' | 'mux' | 'remux';
   readonly payload: unknown;
   readonly determinism?: 'auto' | 'force-software';
+  /** Exact per-call ADR-014 pin; the worker must route the same driver kind/id as the host. */
+  readonly pinDriver?: string;
+  /** Host-resolved ADR-006 profile; never re-guessed from a different worker global environment. */
+  readonly wasmRuntime?: WasmRuntimeProfile;
+  /** Host-normalized absolute same-origin asset directory (structured-clone-safe). */
+  readonly wasmAssetBaseUrl?: string;
 }
 
 // ============ host → worker ============

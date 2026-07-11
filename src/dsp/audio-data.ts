@@ -61,6 +61,36 @@ export function pcmRangeToPlanarInit(
   return { init, data };
 }
 
+/** Lay a canonical planar frame range into interleaved `f32` AudioData storage. */
+export function pcmRangeToInterleavedInit(
+  audio: PcmAudio,
+  startFrame: number,
+  frameCount: number,
+  timestamp: number,
+): { init: AudioDataInit; data: Float32Array<ArrayBuffer> } {
+  const start = clampFrame(startFrame, audio.frames);
+  const frames = Math.max(0, Math.min(Math.trunc(frameCount), audio.frames - start));
+  const { channels, sampleRate } = audio;
+  const data = new Float32Array(new ArrayBuffer(channels * frames * 4));
+  for (let channel = 0; channel < channels; channel++) {
+    const samples = channelAt(audio.planar, channel);
+    for (let frame = 0; frame < frames; frame++) {
+      data[frame * channels + channel] = samples[start + frame] as number;
+    }
+  }
+  return {
+    init: {
+      format: 'f32',
+      sampleRate,
+      numberOfChannels: channels,
+      numberOfFrames: frames,
+      timestamp,
+      data: data.buffer,
+    },
+    data,
+  };
+}
+
 /**
  * Lay a complete canonical PCM buffer into channel-major `f32-planar` data and `AudioDataInit`.
  */
@@ -69,6 +99,14 @@ export function pcmToPlanarInit(
   timestamp: number,
 ): { init: AudioDataInit; data: Float32Array<ArrayBuffer> } {
   return pcmRangeToPlanarInit(audio, 0, audio.frames, timestamp);
+}
+
+/** Lay a complete canonical planar PCM buffer into interleaved `f32` AudioData storage. */
+export function pcmToInterleavedInit(
+  audio: PcmAudio,
+  timestamp: number,
+): { init: AudioDataInit; data: Float32Array<ArrayBuffer> } {
+  return pcmRangeToInterleavedInit(audio, 0, audio.frames, timestamp);
 }
 
 /**
@@ -80,6 +118,7 @@ export function pcmAudioToAudioDataStream(
   audio: PcmAudio,
   stage: StageOptions,
   label: string,
+  format: 'f32' | 'f32-planar' = 'f32-planar',
 ): ReadableStream<AudioData> {
   if (typeof AudioData === 'undefined') {
     throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
@@ -101,7 +140,11 @@ export function pcmAudioToAudioDataStream(
           }
           const frames = Math.min(PCM_AUDIO_DATA_CHUNK_FRAMES, audio.frames - cursor);
           const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
-          const frame = new AudioData(pcmRangeToPlanarInit(audio, cursor, frames, timestamp).init);
+          const init =
+            format === 'f32'
+              ? pcmRangeToInterleavedInit(audio, cursor, frames, timestamp).init
+              : pcmRangeToPlanarInit(audio, cursor, frames, timestamp).init;
+          const frame = new AudioData(init);
           try {
             controller.enqueue(frame);
           } catch (error) {
@@ -121,6 +164,87 @@ export function pcmAudioToAudioDataStream(
       },
       cancel(): void {
         cursor = audio.frames;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  /* v8 ignore stop */
+}
+
+/**
+ * Wrap a bounded stream of canonical PCM chunks as browser `AudioData` frames. The upstream reader stays
+ * locked for the stream lifetime, so at most one canonical chunk and one browser frame are in flight. The
+ * downstream consumer owns every successfully-enqueued frame; cancellation propagates to the chunk stream.
+ */
+export function pcmAudioChunksToAudioDataStream(
+  chunks: ReadableStream<PcmAudio>,
+  stage: StageOptions,
+  label: string,
+  format: 'f32' | 'f32-planar' = 'f32-planar',
+): ReadableStream<AudioData> {
+  if (typeof AudioData === 'undefined') {
+    throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
+      op: 'decode',
+      tried: [label],
+      suggestion: 'run in a browser or worker with AudioData',
+    });
+  }
+  /* v8 ignore start -- requires the browser `AudioData` constructor; browser-harness validated. */
+  const reader = chunks.getReader();
+  let cursor = 0;
+  let upstreamCancelled = false;
+  const cancelUpstream = async (reason?: unknown): Promise<void> => {
+    if (upstreamCancelled) return;
+    upstreamCancelled = true;
+    await reader.cancel(reason);
+  };
+  return new ReadableStream<AudioData>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          if (stage.signal?.aborted) {
+            await cancelUpstream(stage.signal.reason);
+            throw new MediaError('aborted', 'aborted');
+          }
+          for (;;) {
+            const next = await reader.read();
+            if (next.done) {
+              controller.close();
+              return;
+            }
+            const audio = next.value;
+            if (audio.frames <= 0) continue;
+            if (stage.signal?.aborted) {
+              await cancelUpstream(stage.signal.reason);
+              throw new MediaError('aborted', 'aborted');
+            }
+            const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
+            const init =
+              format === 'f32'
+                ? pcmToInterleavedInit(audio, timestamp).init
+                : pcmToPlanarInit(audio, timestamp).init;
+            const frame = new AudioData(init);
+            try {
+              controller.enqueue(frame);
+            } catch (error) {
+              frame.close();
+              throw error;
+            }
+            cursor += audio.frames;
+            return;
+          }
+        } catch (error) {
+          if (error instanceof MediaError) throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          throw new MediaError(
+            'decode-error',
+            `PCM audio chunk decode failed to construct AudioData: ${message}`,
+            error,
+          );
+        }
+      },
+      async cancel(reason): Promise<void> {
+        await cancelUpstream(reason);
       },
     },
     { highWaterMark: 0 },

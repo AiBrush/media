@@ -22,7 +22,7 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
-import type { PcmAudio } from '../../dsp/pcm.ts';
+import { type PcmAudio, type SampleFormat, decodePcm } from '../../dsp/pcm.ts';
 import { fromURL } from '../../sources/source.ts';
 import { matchesWav } from '../audio-container-sniff.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
@@ -63,6 +63,7 @@ export interface WavPacketInfoFromUrlOptions {
 
 interface ParsedWavHeader {
   info: WavInfo;
+  format: WavFormat;
   dataOffset: number;
   dataBytes: number;
   bytesPerFrame: number;
@@ -88,6 +89,22 @@ function pcmCodec(fmt: WavFormat): string {
   if (fmt.formatTag === 3) return fmt.bitsPerSample === 64 ? 'pcm-f64' : 'pcm-f32';
   if (fmt.bitsPerSample === 8) return 'pcm-u8'; // 8-bit WAV PCM is unsigned (offset binary)
   return `pcm-s${fmt.bitsPerSample}`;
+}
+
+function pcmSampleFormat(fmt: WavFormat): SampleFormat {
+  if (fmt.formatTag === 1) {
+    if (fmt.bitsPerSample === 8) return 'u8';
+    if (fmt.bitsPerSample === 16) return 's16';
+    if (fmt.bitsPerSample === 24) return 's24';
+    if (fmt.bitsPerSample === 32) return 's32';
+  } else if (fmt.formatTag === 3) {
+    if (fmt.bitsPerSample === 32) return 'f32';
+    if (fmt.bitsPerSample === 64) return 'f64';
+  }
+  throw new InputError(
+    'unsupported-input',
+    `unsupported WAV PCM layout (tag ${fmt.formatTag}, ${fmt.bitsPerSample}-bit)`,
+  );
 }
 
 function parseFormat(dv: DataView, body: number, size: number): WavFormat {
@@ -144,6 +161,7 @@ function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWavHeader 
       channels: format.channels,
       durationSec: byteRate > 0 ? dataSize / byteRate : 0,
     },
+    format,
     dataOffset: dataFound ? pos + 8 : 0,
     dataBytes: dataSize,
     bytesPerFrame,
@@ -308,6 +326,48 @@ function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+type PcmChunkReader = (start: number, end: number) => Promise<Uint8Array>;
+
+function wavPcmChunkStream(
+  parsed: ParsedWavHeader,
+  format: SampleFormat,
+  readChunk: PcmChunkReader,
+  signal?: AbortSignal,
+): ReadableStream<PcmAudio> {
+  const totalFrames =
+    parsed.bytesPerFrame > 0 ? Math.floor(parsed.dataBytes / parsed.bytesPerFrame) : 0;
+  let frame = 0;
+  return new ReadableStream<PcmAudio>(
+    {
+      async pull(controller): Promise<void> {
+        if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+        if (frame >= totalFrames) {
+          controller.close();
+          return;
+        }
+        const frameCount = Math.min(WAV_PACKET_FRAMES, totalFrames - frame);
+        const start = parsed.dataOffset + frame * parsed.bytesPerFrame;
+        const end = start + frameCount * parsed.bytesPerFrame;
+        const bytes = await readChunk(start, end);
+        if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+        const audio = decodePcm(bytes, format, parsed.format.channels, parsed.format.sampleRate);
+        if (audio.frames !== frameCount) {
+          throw new MediaError(
+            'demux-error',
+            'WAV PCM range ended before the declared data payload',
+          );
+        }
+        controller.enqueue(audio);
+        frame += frameCount;
+      },
+      cancel(): void {
+        frame = totalFrames;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
 export const WavDriver: ContainerDriver = {
   id: 'wav',
   apiVersion: DRIVER_API_VERSION,
@@ -421,6 +481,37 @@ export const WavDriver: ContainerDriver = {
     const wav = readWavPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
     return wav;
+  },
+  async decodePcmAudioStream(src: ByteSource, o?: StageOptions): Promise<ReadableStream<PcmAudio>> {
+    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+    if (src.range !== undefined) {
+      const maxHead = Math.min(src.size ?? WAV_DEMUX_HEAD_BYTES, WAV_DEMUX_HEAD_BYTES);
+      const prefix = await src.range(0, maxHead);
+      if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+      const parsed = parseWavHeader(prefix, src.size);
+      if (parsed.dataFound) {
+        const format = pcmSampleFormat(parsed.format);
+        return wavPcmChunkStream(
+          parsed,
+          format,
+          async (start, end) => {
+            if (start >= 0 && end <= prefix.byteLength) return prefix.subarray(start, end);
+            return src.range?.(start, end) ?? new Uint8Array(0);
+          },
+          o?.signal,
+        );
+      }
+    }
+    const bytes = await readAll(src);
+    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+    const parsed = parseWavHeader(bytes, bytes.byteLength);
+    const format = pcmSampleFormat(parsed.format);
+    return wavPcmChunkStream(
+      parsed,
+      format,
+      (start, end) => Promise.resolve(bytes.subarray(start, end)),
+      o?.signal,
+    );
   },
   createMuxer(o?: MuxOptions): Muxer {
     return new WavMuxer(o);

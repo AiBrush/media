@@ -41,6 +41,10 @@ import {
   readVint,
 } from './ebml.ts';
 import { h264MaxNumReorderFramesFromAvcC } from './h264-sps.ts';
+import {
+  type WebmVideoCodecQualification,
+  qualifyWebmVideoCodec,
+} from './video-codec-qualification.ts';
 
 const ID = {
   EBML: 0x1a45dfa3,
@@ -195,6 +199,10 @@ export interface WebmTrack {
   rotation?: number;
   /** Raw Matroska Colour values, preserved even when WebCodecs cannot name a code point. */
   color?: VideoColorMetadata;
+  /** Exact WebCodecs string established from CodecPrivate or an in-band sequence header. */
+  decoderCodec?: string;
+  /** Whether `decoderCodec` is proved or is an explicit non-defaulting miss token. */
+  decoderCodecSource?: 'codec-private' | 'bitstream' | 'unknown';
   fps?: number;
   sampleRate?: number;
   channels?: number;
@@ -324,8 +332,13 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   // H.264's `avcC`, HEVC's `hvcC`, AAC's AudioSpecificConfig, Vorbis' Xiph-laced id/comment/setup
   // headers, native FLAC metadata prelude, and Opus' mandatory RFC 7845 OpusHead. VP8/VP9/AV1 are
   // self-describing for the paths this driver exposes, so their CodecPrivate is omitted.
+  const videoQualification =
+    (codec === 'vp9' || codec === 'av1') && codecPrivate !== undefined
+      ? qualifyWebmVideoCodec({ codec, codecPrivate })
+      : undefined;
   const description =
-    (codec === 'h264' ||
+    videoQualification?.description ??
+    ((codec === 'h264' ||
       codec === 'hevc' ||
       codec === 'aac' ||
       codec === 'vorbis' ||
@@ -334,7 +347,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     codecPrivate &&
     codecPrivate.byteLength > 0
       ? codecPrivate
-      : undefined;
+      : undefined);
   const reorderDepth =
     codec === 'h264' && description !== undefined
       ? h264MaxNumReorderFramesFromAvcC(description)
@@ -350,6 +363,12 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     ...(height !== undefined ? { height } : {}),
     ...(rotation !== undefined ? { rotation } : {}),
     ...(color !== undefined ? { color } : {}),
+    ...(videoQualification !== undefined
+      ? {
+          decoderCodec: videoQualification.codec,
+          decoderCodecSource: videoQualification.source,
+        }
+      : {}),
     ...(fps !== undefined ? { fps } : {}),
     ...(sampleRate !== undefined ? { sampleRate } : {}),
     ...(channels !== undefined ? { channels } : {}),
@@ -482,6 +501,47 @@ function collectClusterBlockTimes(
       if (block) {
         const tn = blockTrackNumber(dv, block);
         if (tn !== undefined) recordBlockTime(acc, tn, timecode + blockRelTimecode(dv, block));
+      }
+    }
+  }
+}
+
+/** Retain at most one complete key access-unit view per track for codec qualification. */
+function collectFirstKeyframes(
+  bytes: Uint8Array,
+  dv: DataView,
+  cluster: EbmlElement,
+  firstKeyframes: Map<number, Uint8Array>,
+): void {
+  const retain = (block: EbmlElement, keyframe: boolean | undefined): void => {
+    if (!block.complete) return;
+    const parsed = blockFrames(
+      bytes,
+      dv,
+      block,
+      0,
+      1_000_000,
+      0,
+      false,
+      keyframe,
+      undefined,
+      undefined,
+    );
+    if (parsed === undefined || firstKeyframes.has(parsed.trackNumber)) return;
+    const frame = parsed.frames.find((candidate) => candidate.keyframe);
+    if (frame !== undefined) firstKeyframes.set(parsed.trackNumber, frame.data);
+  };
+
+  for (const child of elements(dv, cluster.dataStart, cluster.dataEnd)) {
+    if (child.id === ID.SimpleBlock) {
+      retain(child, undefined);
+    } else if (child.id === ID.BlockGroup && child.complete) {
+      const block = findChild(dv, child.dataStart, child.dataEnd, ID.Block);
+      if (block !== undefined) {
+        retain(
+          block,
+          findChild(dv, child.dataStart, child.dataEnd, ID.ReferenceBlock) === undefined,
+        );
       }
     }
   }
@@ -800,6 +860,8 @@ function fpsFromBlockTiming(timing: BlockTiming, timecodeScale: number): number 
 /** Parse WebM/MKV metadata from (enough of) the file head. Pure. */
 interface ParseWebmOptions {
   readonly scanClusters?: boolean;
+  /** Whole-container size, used only as a conservative VP9 bitrate upper bound during prefix probe. */
+  readonly sourceSizeBytes?: number;
 }
 
 interface EbmlHeaderFacts {
@@ -960,6 +1022,7 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
   let lastEndTicks = 0; // max (clusterTimecode + blockRel), used when Duration is absent (streamed)
   const tracks: WebmTrack[] = [];
   const blockTimes = new Map<number, BlockTiming>(); // TrackNumber → block-timing, for fps fallback
+  const firstKeyframes = new Map<number, Uint8Array>();
   for (const el of elements(dv, segment.dataStart, segment.dataEnd)) {
     if (el.id === ID.Info) {
       for (const c of elements(dv, el.dataStart, el.dataEnd)) {
@@ -975,9 +1038,14 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
       }
     } else if (el.id === ID.Attachments) {
       tracks.push(...parseAttachments(bytes, dv, el));
-    } else if (scanClusters && el.id === ID.Cluster) {
-      lastEndTicks = Math.max(lastEndTicks, clusterEnd(dv, el));
-      collectClusterBlockTimes(dv, el, blockTimes);
+    } else if (el.id === ID.Cluster) {
+      // Even metadata-only prefix probes inspect one complete key access unit when VP9/AV1 private
+      // data is absent. This is bounded by the prefix ladder and does not retain packet tables.
+      collectFirstKeyframes(bytes, dv, el, firstKeyframes);
+      if (scanClusters) {
+        lastEndTicks = Math.max(lastEndTicks, clusterEnd(dv, el));
+        collectClusterBlockTimes(dv, el, blockTimes);
+      }
     }
   }
   if (tracks.length === 0)
@@ -999,6 +1067,38 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
   // commonly omits Duration). Never a degenerate 0 when the file clearly has content (doc 11 §5).
   const durationSec =
     duration > 0 ? (duration * timecodeScale) / 1e9 : (lastEndTicks * timecodeScale) / 1e9;
+  for (const track of tracks) {
+    if (
+      track.mediaType !== 'video' ||
+      (track.codec !== 'vp9' && track.codec !== 'av1') ||
+      track.decoderCodecSource === 'codec-private'
+    ) {
+      continue;
+    }
+    const firstKeyframe =
+      track.trackNumber === undefined ? undefined : firstKeyframes.get(track.trackNumber);
+    let qualification: WebmVideoCodecQualification;
+    try {
+      qualification = qualifyWebmVideoCodec({
+        codec: track.codec,
+        ...(firstKeyframe !== undefined ? { firstKeyframe } : {}),
+        ...(track.width !== undefined ? { width: track.width } : {}),
+        ...(track.height !== undefined ? { height: track.height } : {}),
+        ...(track.fps !== undefined ? { fps: track.fps } : {}),
+        sourceSizeBytes: options.sourceSizeBytes ?? bytes.byteLength,
+        ...(durationSec > 0 ? { durationSec } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof CapabilityError)) throw error;
+      qualification = {
+        codec: track.codec === 'vp9' ? 'vp09' : 'av01',
+        source: 'unknown' as const,
+      };
+    }
+    track.decoderCodec = qualification.codec;
+    track.decoderCodecSource = qualification.source;
+    if (qualification.description !== undefined) track.description = qualification.description;
+  }
   return { container: docType === 'matroska' ? 'mkv' : 'webm', durationSec, tracks };
 }
 
@@ -1325,7 +1425,12 @@ function toTrackInfo(
   const config: VideoDecoderConfig | AudioDecoderConfig =
     track.mediaType === 'video'
       ? {
-          codec: track.codec,
+          // `vp09`/`av01` are deliberate fourcc-only miss tokens when neither CodecPrivate nor an
+          // in-band sequence header proved profile/depth. The generic normalizer does not turn them
+          // into a false profile-0 8-bit declaration.
+          codec:
+            track.decoderCodec ??
+            (track.codec === 'vp9' ? 'vp09' : track.codec === 'av1' ? 'av01' : track.codec),
           codedWidth: track.width ?? 0,
           codedHeight: track.height ?? 0,
           ...(track.description !== undefined ? { description: track.description } : {}),
@@ -1473,6 +1578,12 @@ function metadataComplete(bytes: Uint8Array, info: WebmInfo): boolean {
     if (track.width === undefined || track.height === undefined || track.fps === undefined) {
       return false;
     }
+    if (
+      (track.codec === 'vp9' || track.codec === 'av1') &&
+      track.decoderCodecSource === 'unknown'
+    ) {
+      return false;
+    }
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findSegment(dv);
@@ -1503,18 +1614,27 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
     const bytes = await range.call(src, 0, end);
     assertNotAborted(signal);
     try {
-      const info = parseWebm(bytes, { scanClusters: false });
+      const info = parseWebm(bytes, {
+        scanClusters: false,
+        ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
+      });
       if (metadataComplete(bytes, info)) {
         return info;
       }
-      if (bytes.byteLength >= (src.size ?? Number.POSITIVE_INFINITY)) return parseWebm(bytes);
+      if (bytes.byteLength >= (src.size ?? Number.POSITIVE_INFINITY)) {
+        return parseWebm(bytes, {
+          ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
+        });
+      }
     } catch (error) {
       lastError = error;
     }
   }
 
   try {
-    return parseWebm(await readAll(src, signal));
+    return parseWebm(await readAll(src, signal), {
+      ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
+    });
   } catch (error) {
     throw lastError ?? error;
   }

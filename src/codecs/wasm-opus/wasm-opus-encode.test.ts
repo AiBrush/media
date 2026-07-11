@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import { oggAudioPackets } from '../../drivers/ogg/ogg-driver.ts';
+import { oggAudioPackets, oggPacketBytes } from '../../drivers/ogg/ogg-driver.ts';
 import { OggMuxer } from '../../drivers/ogg/ogg-write.ts';
 import { readWavPcm } from '../../drivers/wav/pcm.ts';
 import { demuxWebm } from '../../drivers/webm/webm-driver.ts';
@@ -393,7 +393,7 @@ describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.1
     const frames: Float32Array[] = [];
     try {
       for (const p of packets) {
-        const packet = data.subarray(p.offset, p.offset + p.size);
+        const packet = oggPacketBytes(data, p);
         frames.push(decoder.decode(packet, packetDurationSamples(packet)));
       }
     } finally {
@@ -472,7 +472,7 @@ describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.1
     const frames: Float32Array[] = [];
     try {
       for (const p of packets) {
-        const packet = ogg.subarray(p.offset, p.offset + p.size);
+        const packet = oggPacketBytes(ogg, p);
         frames.push(decoder.decode(packet, packetDurationSamples(packet)));
       }
     } finally {

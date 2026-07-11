@@ -85,7 +85,11 @@ export async function collect(
   opts: ExecuteOptions = {},
 ): Promise<Uint8Array<ArrayBuffer>> {
   const { signal } = opts;
-  if (signal?.aborted) throw abortedError();
+  if (signal?.aborted) {
+    const error = abortedError();
+    await readable.cancel(error).catch(() => undefined);
+    throw error;
+  }
 
   const reader = readable.getReader();
   const chunks: Uint8Array[] = [];
@@ -113,7 +117,14 @@ export async function runToSink(
   opts: ExecuteOptions = {},
 ): Promise<void> {
   const { signal } = opts;
-  if (signal?.aborted) throw abortedError();
+  if (signal?.aborted) {
+    const error = abortedError();
+    await Promise.all([
+      readable.cancel(error).catch(() => undefined),
+      sink.abort(error).catch(() => undefined),
+    ]);
+    throw error;
+  }
   try {
     await readable.pipeTo(sink, signal ? { signal } : {});
   } catch (e) {

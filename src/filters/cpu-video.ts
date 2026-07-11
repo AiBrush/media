@@ -1,6 +1,6 @@
 /**
  * CPU video filter driver (doc 09 §filters; ladder doc 04: WebGPU → Canvas2D → native CPU → WASM).
- * The cross-browser fallback that runs **every** video `FilterSpec` — resize, crop, rotate, flip, colorspace,
+ * The cross-browser fallback that runs **every** video `FilterSpec` — resize, crop, pad, rotate, flip, colorspace,
  * tonemap — without WebGPU or Canvas2D colour management, for engines (Firefox/Safari often lack WebGPU)
  * where the GPU drivers' `supports()` is false. It reads a frame's pixels with `VideoFrame.copyTo` into a
  * tightly-packed RGBA buffer, applies the **same pure math** the GPU path uses — the geometry from
@@ -48,6 +48,7 @@ import {
   type OrientedDraw,
   cropBlit,
   flipGeometry,
+  padBlit,
   resizeBlit,
   rotateGeometry,
 } from './geometry.ts';
@@ -82,6 +83,31 @@ export interface RgbaImage {
 
 /** Bytes per RGBA pixel. */
 const RGBA = 4;
+
+/**
+ * Return the exact destination size for a tightly packed RGBA `VideoFrame.copyTo` layout.
+ *
+ * `allocationSize({ format: 'RGBA' })` is not usable for every valid decoded frame in Chromium: an
+ * HDR frame can expose a null source format even though `copyTo` can perform the requested conversion.
+ * Supplying the layout ourselves makes the destination size deterministic and avoids that optional
+ * source-format query.
+ */
+export function rgbaCopyBufferSize(width: number, height: number): number {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
+    throw new InputError(
+      'unsupported-input',
+      `RGBA copy dimensions must be positive integers (${width}×${height})`,
+    );
+  }
+  const size = width * height * RGBA;
+  if (!Number.isSafeInteger(size)) {
+    throw new InputError(
+      'unsupported-input',
+      `RGBA copy buffer size is not safely representable (${width}×${height})`,
+    );
+  }
+  return size;
+}
 
 /** Allocate a transparent-black RGBA image of the given dimensions. */
 function blankRgba(dims: Dims): RgbaImage {
@@ -317,10 +343,10 @@ export function geometryToRgba(recipe: CpuGeometry, src: RgbaImage): RgbaImage {
 
 // ============ spec → plan resolution (pure; mirrors gpu-video, kept local) ============
 
-/** The geometric video specs this driver handles (resize/crop/rotate/flip). */
+/** The geometric video specs this driver handles (resize/crop/pad/rotate/flip). */
 type GeometricVideoSpec = Extract<
   FilterSpec,
-  { mediaType: 'video'; type: 'resize' | 'crop' | 'rotate' | 'flip' }
+  { mediaType: 'video'; type: 'resize' | 'crop' | 'pad' | 'rotate' | 'flip' }
 >;
 
 /** The colour video specs this driver handles (colorspace/tonemap). */
@@ -329,11 +355,15 @@ type ColorVideoSpec = Extract<FilterSpec, { mediaType: 'video'; type: 'colorspac
 /** Any video spec the CPU driver handles (all six). */
 type CpuVideoSpec = GeometricVideoSpec | ColorVideoSpec;
 
-/** True for the four geometric video specs. */
+/** True for the five geometric video specs. */
 function isGeometricVideoSpec(f: FilterSpec): f is GeometricVideoSpec {
   return (
     f.mediaType === 'video' &&
-    (f.type === 'resize' || f.type === 'crop' || f.type === 'rotate' || f.type === 'flip')
+    (f.type === 'resize' ||
+      f.type === 'crop' ||
+      f.type === 'pad' ||
+      f.type === 'rotate' ||
+      f.type === 'flip')
   );
 }
 
@@ -354,6 +384,8 @@ export function planCpuGeometry(spec: GeometricVideoSpec, srcW: number, srcH: nu
       return { kind: 'blit', blit: resizeBlit(srcW, srcH, spec) };
     case 'crop':
       return { kind: 'blit', blit: cropBlit(srcW, srcH, spec) };
+    case 'pad':
+      return { kind: 'blit', blit: padBlit(srcW, srcH, spec) };
     case 'rotate':
       return { kind: 'oriented', draw: rotateGeometry(srcW, srcH, spec.degrees) };
     case 'flip':
@@ -393,6 +425,27 @@ function videoFrameRgbaAvailable(): boolean {
   return typeof VideoFrame !== 'undefined';
 }
 
+/**
+ * Chromium's HDR decoder can expose an opaque/null-format `VideoFrame` that cannot be read with `copyTo`.
+ * When the browser's Canvas2D path is available, it is the honest HDR→SDR substrate for those frames;
+ * other browsers retain the pure CPU path.
+ */
+function chromiumCanvasTonemapAvailable(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  return (
+    typeof OffscreenCanvas !== 'undefined' &&
+    videoFrameRgbaAvailable() &&
+    /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) &&
+    !/\bFirefox\//.test(ua)
+  );
+}
+
+/** True when the CPU filter can read the source frames for a spec in this environment. */
+export function cpuVideoFilterSupports(f: FilterSpec): boolean {
+  if (!isCpuVideoSpec(f) || !videoFrameRgbaAvailable()) return false;
+  return !(f.type === 'tonemap' && chromiumCanvasTonemapAvailable());
+}
+
 /** Cast through the lib.dom lag for BT.2020/PQ/HLG tokens; the runtime accepts the spec-defined values. */
 function domColorSpace(init: RgbVideoColorSpaceInit): VideoColorSpaceInit {
   return init as VideoColorSpaceInit;
@@ -403,8 +456,7 @@ async function frameToRgba(frame: VideoFrame): Promise<RgbaImage> {
   const width = frame.displayWidth;
   const height = frame.displayHeight;
   const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA }];
-  const size = frame.allocationSize({ format: 'RGBA', rect: { x: 0, y: 0, width, height } });
-  const data = new Uint8ClampedArray(Math.max(size, width * height * RGBA));
+  const data = new Uint8ClampedArray(rgbaCopyBufferSize(width, height));
   await frame.copyTo(data, { format: 'RGBA', rect: { x: 0, y: 0, width, height }, layout });
   return { data, width, height };
 }
@@ -524,7 +576,7 @@ export const cpuVideoFilterDriver: FilterDriver = {
   kind: 'filter',
   substrate: CPU_SUBSTRATE,
   supports(f: FilterSpec): boolean {
-    return isCpuVideoSpec(f) && videoFrameRgbaAvailable();
+    return cpuVideoFilterSupports(f);
   },
   createFilter(f: FilterSpec, o?: StageOptions): TransformStream<VideoFrame, VideoFrame> {
     if (!isCpuVideoSpec(f)) {

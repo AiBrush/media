@@ -1,4 +1,5 @@
 import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
+import { MediaError } from '../contracts/errors.ts';
 
 /** AAC edit priming is normally one or two access units; keep runtime detection strictly bounded. */
 export const MP4_GAPLESS_PREFLIGHT_MAX_PACKETS = 8 as const;
@@ -6,6 +7,7 @@ export const MP4_GAPLESS_PREFLIGHT_MAX_PACKETS = 8 as const;
 export interface GaplessNativeSuppressionProbe {
   readonly packets: ReadableStream<Packet>;
   readonly createDecoder: () => TransformStream<EncodedChunk, RawFrame>;
+  readonly signal?: AbortSignal | undefined;
 }
 
 interface GaplessPrefix {
@@ -19,21 +21,48 @@ function durationSamples(chunk: EncodedChunk, sampleRate: number): number {
   return Math.max(0, Math.round((durationUs * sampleRate) / 1_000_000));
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+}
+
+async function readWithAbort<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  signal: AbortSignal | undefined,
+): Promise<ReadableStreamReadResult<T>> {
+  throwIfAborted(signal);
+  if (signal === undefined) return reader.read() as Promise<ReadableStreamReadResult<T>>;
+  return new Promise<ReadableStreamReadResult<T>>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new MediaError('aborted', 'operation aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void reader.read().then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result as ReadableStreamReadResult<T>);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function collectNegativeTimestampPrefix(
   packets: ReadableStream<Packet>,
   leadingSamples: number,
   sampleRate: number,
+  signal: AbortSignal | undefined,
 ): Promise<GaplessPrefix> {
   const reader = packets.getReader();
   const chunks: EncodedChunk[] = [];
   let expectedSamples = 0;
   let exhausted = false;
   try {
-    while (
-      chunks.length < MP4_GAPLESS_PREFLIGHT_MAX_PACKETS &&
-      expectedSamples < leadingSamples
-    ) {
-      const next = await reader.read();
+    while (chunks.length < MP4_GAPLESS_PREFLIGHT_MAX_PACKETS && expectedSamples < leadingSamples) {
+      const next = await readWithAbort(reader, signal);
       if (next.done) {
         exhausted = true;
         break;
@@ -67,6 +96,7 @@ function prefixChunkStream(chunks: readonly EncodedChunk[]): ReadableStream<Enco
 async function decodedPrefixSamples(
   chunks: readonly EncodedChunk[],
   createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+  signal: AbortSignal | undefined,
 ): Promise<number> {
   const decoded = prefixChunkStream(chunks).pipeThrough(createDecoder());
   const reader = decoded.getReader();
@@ -74,7 +104,7 @@ async function decodedPrefixSamples(
   let exhausted = false;
   try {
     for (;;) {
-      const next = await reader.read();
+      const next = await readWithAbort(reader, signal);
       if (next.done) {
         exhausted = true;
         return samples;
@@ -114,14 +144,22 @@ export async function nativeSuppressedMp4EditSamples(
   ) {
     return 0;
   }
-  const prefix = await collectNegativeTimestampPrefix(probe.packets, leadingSamples, sampleRate);
+  throwIfAborted(probe.signal);
+  const prefix = await collectNegativeTimestampPrefix(
+    probe.packets,
+    leadingSamples,
+    sampleRate,
+    probe.signal,
+  );
   if (prefix.chunks.length === 0 || prefix.expectedSamples === 0) return 0;
   let observedSamples: number;
   try {
-    observedSamples = await decodedPrefixSamples(prefix.chunks, probe.createDecoder);
-  } catch {
+    observedSamples = await decodedPrefixSamples(prefix.chunks, probe.createDecoder, probe.signal);
+  } catch (error: unknown) {
+    if (error instanceof MediaError && error.code === 'aborted') throw error;
     return 0;
   }
+  throwIfAborted(probe.signal);
   const missingSamples = Math.max(0, prefix.expectedSamples - observedSamples);
   // One independently-rounded packet duration can differ by at most one sample. Never interpret that
   // representational drift as native priming suppression.

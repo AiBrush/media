@@ -41,7 +41,8 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmRuntimeProfile, wasmInitForProfile } from '../../kernel/wasm-runtime.ts';
+import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
+import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type AacDecodeConfig,
   type AacWasmCore,
@@ -76,7 +77,7 @@ function hasWebCodecsAudioSeam(): boolean {
 // ============ lazy, self-hosted wasm core ============
 
 /** Memoized core load (one wasm instantiation per session); `null` once we've learned it is unavailable. */
-let corePromise: Promise<AacWasmCore | null> | undefined;
+const corePromises = new Map<string, Promise<AacWasmCore | null>>();
 let coreGluePromise: Promise<boolean> | undefined;
 
 async function hasAacCoreGlue(): Promise<boolean> {
@@ -93,30 +94,45 @@ async function hasAacCoreGlue(): Promise<boolean> {
  * honest about absence rather than fabricating support. The wasm bytes are addressed via
  * `new URL('./aac_wasm_bg.wasm', import.meta.url)` so they ship same-origin.
  */
-export async function loadAacCore(runtime?: WasmRuntimeProfile): Promise<AacWasmCore | null> {
-  corePromise ??= (async (): Promise<AacWasmCore | null> => {
-    try {
-      const profile = runtime ?? resolveWasmRuntimeProfile();
-      // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
-      const mod = await import('./aac-core.js');
-      await mod.default(
-        wasmInitForProfile(new URL('./aac_wasm_bg.wasm', import.meta.url), profile),
-      );
-      return {
-        createDecoder(extraData: Uint8Array, channels: number, sampleRate: number): AacWasmDecoder {
-          return new mod.AacWasm(extraData, channels, sampleRate);
-        },
-      };
-    } catch {
-      return null; // not loadable here → honest miss; router yields a CapabilityError
-    }
-  })();
+export async function loadAacCore(
+  runtime?: WasmRuntimeProfile,
+  assetBaseUrl?: string,
+): Promise<AacWasmCore | null> {
+  const profile = runtime ?? resolveWasmRuntimeProfile();
+  const moduleUrl = resolveWasmAssetUrl(
+    './aac_wasm_bg.wasm',
+    new URL('./aac_wasm_bg.wasm', import.meta.url),
+    assetBaseUrl,
+  );
+  const key = `${profile.kind}|${moduleUrl.href}`;
+  let corePromise = corePromises.get(key);
+  if (corePromise === undefined) {
+    corePromise = (async (): Promise<AacWasmCore | null> => {
+      try {
+        // String-literal specifier → its own code-split chunk; the artifact is vendored in this dir.
+        const mod = await import('./aac-core.js');
+        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        return {
+          createDecoder(
+            extraData: Uint8Array,
+            channels: number,
+            sampleRate: number,
+          ): AacWasmDecoder {
+            return new mod.AacWasm(extraData, channels, sampleRate);
+          },
+        };
+      } catch {
+        return null; // not loadable here → honest miss; router yields a CapabilityError
+      }
+    })();
+    corePromises.set(key, corePromise);
+  }
   return corePromise;
 }
 
 /** Reset the memoized core (tests only — lets a suite re-evaluate availability). */
 export function resetAacCoreForTest(): void {
-  corePromise = undefined;
+  corePromises.clear();
   coreGluePromise = undefined;
 }
 
@@ -243,7 +259,7 @@ function createDecoder(
 
   return new TransformStream<EncodedChunk, RawFrame>({
     async start(controller): Promise<void> {
-      const core = await loadAacCore(o?.wasmRuntime);
+      const core = await loadAacCore(o?.wasmRuntime, o?.wasmAssetBaseUrl);
       if (core === null) {
         controller.error(coreMissing());
         return;

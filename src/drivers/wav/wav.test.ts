@@ -344,6 +344,17 @@ describe('probe WAV across the real corpus', () => {
       [0, 65536],
     ]);
     expect(tracks[0]?.durationSec).toBeGreaterThan(0);
+
+    reads.length = 0;
+    const decode = WavDriver.decodePcmAudioStream;
+    if (decode === undefined) throw new Error('WavDriver must expose lazy PCM audio decode');
+    const chunks = await decode(source);
+    const reader = chunks.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(first.value?.frames).toBe(4);
+    expect(reads).toEqual([[0, bytes.byteLength]]);
+    await reader.cancel('large-header fallback coverage');
   });
 
   it('the demux packet seam is a typed capability gap in node (PCM → audio-dsp)', async () => {
@@ -394,6 +405,43 @@ describe('probe WAV across the real corpus', () => {
       dtsUs: 0,
       keyframe: true,
     });
+  });
+
+  it('decodes range-capable WAV PCM lazily in bounded canonical chunks', async () => {
+    const sourcePcm = {
+      sampleRate: 48_000,
+      channels: 2,
+      frames: 40_000,
+      planar: [new Float64Array(40_000).fill(0.25), new Float64Array(40_000).fill(-0.25)],
+    } as const;
+    const bytes = writeWav(sourcePcm, 's24');
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('range-capable lazy decode must not fall back to stream()');
+      },
+    };
+    const decode = WavDriver.decodePcmAudioStream;
+    if (decode === undefined) throw new Error('WavDriver must expose lazy PCM audio decode');
+
+    const chunks = await decode(source);
+    const reader = chunks.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(first.value?.sampleRate).toBe(48_000);
+    expect(first.value?.channels).toBe(2);
+    expect(first.value?.frames).toBe(4096);
+    expect(first.value?.planar[0]?.slice(0, 3)).toEqual(sourcePcm.planar[0].slice(0, 3));
+    expect(first.value?.planar[1]?.slice(0, 3)).toEqual(sourcePcm.planar[1].slice(0, 3));
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads[0]).toEqual([0, 65536]);
+    expect(reads.some(([start, end]) => start === 0 && end < bytes.byteLength)).toBe(true);
+    await reader.cancel('first chunk is sufficient for the lazy contract');
   });
 
   it('wavPacketInfoFromUrl uses one small range for header-visible data chunks', async () => {

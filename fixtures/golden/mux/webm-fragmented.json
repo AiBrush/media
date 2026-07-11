@@ -1,5 +1,5 @@
 {
-  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment with no Info/Duration + one Cluster per fragment. A byte change in the EBML header, Tracks, Segment unknown-size encoding, live Info layout, cluster boundary rule, or SimpleBlock layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (and record an ADR).",
+  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment with no Info/Duration, an exact VP9 profile/level/depth/chroma CodecPrivate feature list, and one Cluster per fragment. A byte change in the EBML header, Tracks, Segment unknown-size encoding, live Info layout, cluster boundary rule, or SimpleBlock layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (ADR-242).",
   "input": {
     "codec": "vp09.00.10.08",
     "codedWidth": 64,
@@ -12,11 +12,11 @@
   "docType": "webm",
   "fragmented": true,
   "chunkCount": 3,
-  "chunkSizes": [135, 118, 135],
-  "totalBytes": 388,
-  "sha256": "a1a297226ab3d78574fefcfb0b0ba6041f8b48806a7b9199e5e0b3cd68397f0c",
+  "chunkSizes": [150, 118, 135],
+  "totalBytes": 403,
+  "sha256": "f4db1b2e28376d5e87ecc14eabdacd9b148e242836b9461e102496f6cb6a7227",
   "chunkSha256": [
-    "e4a4ed21fcd62539e34fca0e8661d18bfdb3df5704ce80df26eb4fa604b349b8",
+    "692674d7f4a1bf2ccb8afa5b7be13d6d7c192b5b8a89b27abef193d0e30d031d",
     "073752a9ecdc79e2f0f8b18cb4015659d0fed5880fa082d667344ff13a6dc345",
     "717d2286d5f307825af3b1a2ec52d3319750351d22d59fbd50e3d4a377432f8f"
   ]

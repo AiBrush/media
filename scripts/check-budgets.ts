@@ -14,6 +14,7 @@
  */
 
 import { readdirSync } from 'node:fs';
+import { dirname, join, normalize } from 'node:path/posix';
 
 const DIST = new URL('../dist/', import.meta.url).pathname;
 // Eager-kernel ceiling — the DoD §2 target. The Session-4 accretion (worker-offload dispatch + the
@@ -55,12 +56,38 @@ const HEAVY_LAZY_GUARDS: readonly HeavyLazyGuard[] = [
   {
     label: 'live codec pipeline helper',
     pattern:
-      /^(?:audio-stream-plan|codec-pipeline|flac-convert-plan|materialize|mux-packet-streams|pcm-convert-plan|preload|trim-streams|video-frame-convert|video-stream-plan)-[A-Z0-9]+\.js$/,
+      /^(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|flac-convert-plan|job-runner|live-convert|live-media|materialize|mux-packet-streams|mux-runner|pcm-convert-plan|preload|remux-runner|stream-target-materialize|trim-runner|trim-streams|video-frame-convert|video-stream-plan)-[A-Z0-9]+\.js$/,
   },
   {
     label: 'metadata writer helper',
     pattern:
-      /^(?:id3|matroska-tags|metadata-rewrite|mp4-tags|ogg-vorbis-comment|vorbis-comment)-[A-Z0-9]+\.js$/,
+      /^(?:id3|matroska-tags|metadata-rewrite|mp4-tags|ogg-vorbis-comment|remux-metadata|vorbis-comment)-[A-Z0-9]+\.js$/,
+  },
+];
+
+// Chunk names are an intentionally independent first oracle above. Source maps make the leak check robust
+// when esbuild folds a heavy module into a generic `chunk-*` artifact whose filename carries no identity.
+const HEAVY_LAZY_SOURCE_GUARDS: readonly HeavyLazySourceGuard[] = [
+  {
+    label: 'worker boot/host',
+    pattern: /\/src\/kernel\/(?:worker|worker-host)\.ts$/,
+  },
+  {
+    label: 'WASM loader-only runtime',
+    pattern: /\/src\/kernel\/wasm-loader-runtime\.ts$/,
+  },
+  {
+    label: 'live/declarative operation implementation',
+    pattern: /\/src\/(?:api\/(?:job-runner|live-convert)|sources\/live-media)\.ts$/,
+  },
+  {
+    label: 'heavy operation helper',
+    pattern:
+      /\/src\/api\/(?:audio-stream-plan|codec-pipeline|decrypt-runner|flac-convert-plan|mux-runner|pcm-convert-plan|preload|remux-metadata|remux-runner|trim-runner|trim-streams|video-frame-convert|video-stream-plan)\.ts$/,
+  },
+  {
+    label: 'sink implementation',
+    pattern: /\/src\/sinks\/(?:element-materialize|stream-target-materialize)\.ts$/,
   },
 ];
 
@@ -68,11 +95,31 @@ const REQUIRED_EAGER_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
   { label: 'default driver bundle', pattern: /^(?:defaults|defaults-[A-Z0-9]+)\.js$/ },
   { label: 'worker host', pattern: /^worker-host-[A-Z0-9]+\.js$/ },
   { label: 'live codec pipeline', pattern: /^codec-pipeline-[A-Z0-9]+\.js$/ },
-  { label: 'metadata rewrite dispatch', pattern: /^metadata-rewrite-[A-Z0-9]+\.js$/ },
+  { label: 'live MediaStream processor', pattern: /^live-media-[A-Z0-9]+\.js$/ },
+  { label: 'live MediaStream convert coordinator', pattern: /^live-convert-[A-Z0-9]+\.js$/ },
+  { label: 'live media processor', pattern: /^live-media-[A-Z0-9]+\.js$/ },
+  { label: 'live conversion coordinator', pattern: /^live-convert-[A-Z0-9]+\.js$/ },
+  { label: 'declarative job runner', pattern: /^job-runner-[A-Z0-9]+\.js$/ },
+  { label: 'decrypt operation runner', pattern: /^decrypt-runner-[A-Z0-9]+\.js$/ },
+  { label: 'explicit mux runner', pattern: /^mux-runner-[A-Z0-9]+\.js$/ },
+  { label: 'remux operation runner', pattern: /^remux-runner-[A-Z0-9]+\.js$/ },
+  { label: 'trim operation runner', pattern: /^trim-runner-[A-Z0-9]+\.js$/ },
+  { label: 'sink materializer', pattern: /^materialize-[A-Z0-9]+\.js$/ },
+  {
+    label: 'stream-target materializer',
+    pattern: /^stream-target-materialize-[A-Z0-9]+\.js$/,
+  },
+];
+
+const REQUIRED_REMUX_RUNNER_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
+  { label: 'remux metadata rewriter', pattern: /^remux-metadata-[A-Z0-9]+\.js$/ },
 ];
 
 const REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
-  { label: 'lazy FLAC driver', pattern: /^flac-driver-[A-Z0-9]+\.js$/ },
+  {
+    label: 'lazy FLAC driver',
+    pattern: /^(?:flac-driver-[A-Z0-9]+\.js|drivers\/flac\.js)$/,
+  },
   {
     label: 'WASM fallback driver',
     pattern: /^wasm-(?:aac|av1|mp3|opus|vorbis|vpx)-driver-[A-Z0-9]+\.js$/,
@@ -90,6 +137,7 @@ interface DistGraph {
   readonly jsFiles: readonly string[];
   readonly wasmFiles: readonly string[];
   readonly text: ReadonlyMap<string, string>;
+  readonly sourceMapSources: ReadonlyMap<string, readonly string[]>;
 }
 
 interface WasmReference {
@@ -98,6 +146,11 @@ interface WasmReference {
 }
 
 interface HeavyLazyGuard {
+  readonly label: string;
+  readonly pattern: RegExp;
+}
+
+interface HeavyLazySourceGuard {
   readonly label: string;
   readonly pattern: RegExp;
 }
@@ -132,7 +185,7 @@ function distPath(file: string): string {
 async function readDistGraph(): Promise<DistGraph> {
   let files: string[];
   try {
-    files = readdirSync(DIST).sort();
+    files = collectDistFiles(DIST).sort();
   } catch {
     fail('dist/ is missing; run `bun run build` before `bun run check-budgets`');
   }
@@ -146,28 +199,83 @@ async function readDistGraph(): Promise<DistGraph> {
       ],
     ),
   );
-  return { files, jsFiles, wasmFiles, text: new Map(entries) };
+  const sourceEntries = await Promise.all(
+    jsFiles
+      .filter((file) => files.includes(`${file}.map`))
+      .map(async (file): Promise<readonly [string, readonly string[]]> => {
+        const mapFile = `${file}.map`;
+        const mapText = await Bun.file(distPath(mapFile)).text();
+        return [file, parseSourceMapSources(mapText, mapFile)];
+      }),
+  );
+  return {
+    files,
+    jsFiles,
+    wasmFiles,
+    text: new Map(entries),
+    sourceMapSources: new Map(sourceEntries),
+  };
+}
+
+function parseSourceMapSources(text: string, file: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    fail(`dist/${file} is not valid JSON`);
+  }
+  assert(
+    typeof parsed === 'object' && parsed !== null && 'sources' in parsed,
+    `dist/${file} has no sources array`,
+  );
+  const sources = parsed.sources;
+  assert(Array.isArray(sources), `dist/${file} has no sources array`);
+  const result: string[] = [];
+  for (const source of sources) {
+    assert(typeof source === 'string', `dist/${file} contains a non-string source`);
+    result.push(source);
+  }
+  return result;
+}
+
+function collectDistFiles(directory: string, prefix = ''): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const relative = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      files.push(...collectDistFiles(`${directory}${entry.name}/`, relative));
+    } else if (entry.isFile()) {
+      files.push(relative);
+    }
+  }
+  return files;
 }
 
 /** Static `import ... from` / `export ... from` local JS specifiers. Dynamic `import()` is excluded. */
 function staticLocalJsImports(code: string): string[] {
   const specs: string[] = [];
-  const re = /(?:^|[\s;])(?:import|export)\b[^'"]*?\bfrom\s*['"](\.\/[^'"]+\.js)['"]/g;
+  const re = /(?:^|[\s;])(?:import|export)\b[^'"]*?\bfrom\s*['"]((?:\.\.?\/)+[^'"]+\.js)['"]/g;
   for (const match of code.matchAll(re)) {
     const spec = match[1];
-    if (spec !== undefined) specs.push(spec.replace(/^\.\//, ''));
+    if (spec !== undefined) specs.push(spec);
   }
   return unique(specs);
 }
 
 function dynamicLocalJsImports(code: string): string[] {
   const specs: string[] = [];
-  const re = /import\(\s*['"](\.\/[^'"]+\.js)['"]\s*\)/g;
+  const re = /import\(\s*['"]((?:\.\.?\/)+[^'"]+\.js)['"]\s*\)/g;
   for (const match of code.matchAll(re)) {
     const spec = match[1];
-    if (spec !== undefined) specs.push(spec.replace(/^\.\//, ''));
+    if (spec !== undefined) specs.push(spec);
   }
   return unique(specs);
+}
+
+function resolveLocalJsImport(importer: string, specifier: string): string {
+  const resolved = normalize(join(dirname(importer), specifier));
+  assert(!resolved.startsWith('../'), `dist/${importer} imports outside dist/: ${specifier}`);
+  return resolved;
 }
 
 function staticLocalWasmImports(code: string): string[] {
@@ -219,7 +327,7 @@ function closure(graph: DistGraph, entryFile: string): Map<string, number> {
     const code = graph.text.get(file);
     assert(code !== undefined, `dist/${file} is imported but was not emitted`);
     sizes.set(file, Bun.file(distPath(file)).size);
-    for (const spec of staticLocalJsImports(code)) queue.push(spec);
+    for (const spec of staticLocalJsImports(code)) queue.push(resolveLocalJsImport(file, spec));
   }
   return sizes;
 }
@@ -282,7 +390,9 @@ function assertCodeSplit(
   for (const file of eagerKernel.keys()) {
     const code = graph.text.get(file);
     assert(code !== undefined, `dist/${file} is missing`);
-    for (const spec of staticLocalJsImports(code)) staticImports.add(spec);
+    for (const spec of staticLocalJsImports(code)) {
+      staticImports.add(resolveLocalJsImport(file, spec));
+    }
   }
   assert(
     dynamicImports.has(defaultDriverChunk),
@@ -302,8 +412,9 @@ function dynamicImportEdges(
     const code = graph.text.get(file);
     assert(code !== undefined, `dist/${file} is missing`);
     for (const spec of dynamicLocalJsImports(code)) {
-      assert(graph.text.has(spec), `dist/${file} lazy-imports missing chunk ${spec}`);
-      edges.push({ from: file, to: spec });
+      const target = resolveLocalJsImport(file, spec);
+      assert(graph.text.has(target), `dist/${file} lazy-imports missing chunk ${target}`);
+      edges.push({ from: file, to: target });
     }
   }
   return edges.sort((a, b) => a.to.localeCompare(b.to) || a.from.localeCompare(b.from));
@@ -321,6 +432,35 @@ function assertRequiredLazyImports(
       `${label} does not expose a lazy ${requirement.label} import`,
     );
   }
+}
+
+function requireLazyTarget(
+  label: string,
+  edges: readonly LazyImportEdge[],
+  pattern: RegExp,
+): string {
+  const matches = unique(edges.map((edge) => edge.to)).filter((file) => pattern.test(file));
+  assert(
+    matches.length === 1,
+    `${label} expected exactly one lazy target, found ${matches.length}`,
+  );
+  const match = matches[0];
+  assert(match !== undefined, `${label} lazy target disappeared`);
+  return match;
+}
+
+function assertClosureContainsSource(
+  label: string,
+  files: ReadonlyMap<string, number>,
+  graph: DistGraph,
+  pattern: RegExp,
+): void {
+  const sources = [...files.keys()].flatMap((file) => graph.sourceMapSources.get(file) ?? []);
+  assert(
+    sources.some((source) => pattern.test(source)),
+    `${label} source implementation is missing`,
+  );
+  console.info(`✓ ${label} is present only in its lazy operation closure`);
 }
 
 function logLazyFrontier(label: string, edges: readonly LazyImportEdge[]): void {
@@ -351,6 +491,27 @@ function assertNoHeavyLazyLeaks(label: string, files: ReadonlyMap<string, number
     `${label} statically includes heavy lazy artifacts: ${leaks.join(', ')}`,
   );
   console.info(`✓ ${label} excludes heavy lazy codec/worker/op chunks`);
+}
+
+function assertNoHeavyLazySourceLeaks(
+  label: string,
+  files: ReadonlyMap<string, number>,
+  graph: DistGraph,
+): void {
+  const leaks: string[] = [];
+  for (const file of files.keys()) {
+    const sources = graph.sourceMapSources.get(file);
+    assert(sources !== undefined, `dist/${file}.map sources are missing`);
+    for (const source of sources) {
+      const guard = HEAVY_LAZY_SOURCE_GUARDS.find((candidate) => candidate.pattern.test(source));
+      if (guard !== undefined) leaks.push(`${source} via ${file} (${guard.label})`);
+    }
+  }
+  assert(
+    leaks.length === 0,
+    `${label} source maps contain heavy lazy implementations: ${leaks.sort().join(', ')}`,
+  );
+  console.info(`✓ ${label} source maps exclude heavy lazy implementations`);
 }
 
 function assertWasmPackaging(
@@ -445,6 +606,7 @@ const eagerTotal = closureReport(
   eagerKernel,
   KERNEL_BUDGET,
 );
+assertNoHeavyLazySourceLeaks('eager kernel', eagerKernel, graph);
 assertBudget('eager kernel', eagerTotal, KERNEL_BUDGET);
 assertNoHeavyLazyLeaks('eager kernel', eagerKernel);
 
@@ -454,6 +616,7 @@ const typicalTotal = closureReport(
   typicalApp,
   TYPICAL_APP_BUDGET,
 );
+assertNoHeavyLazySourceLeaks('default/probe first-operation closure', typicalApp, graph);
 assertBudget('typical app first-operation JS', typicalTotal, TYPICAL_APP_BUDGET);
 assertNoHeavyLazyLeaks('default/probe first-operation closure', typicalApp);
 
@@ -466,7 +629,31 @@ assertRequiredLazyImports(
   defaultProbeLazyEdges,
   REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS,
 );
+const remuxRunnerChunk = requireLazyTarget(
+  'eager remux runner',
+  eagerLazyEdges,
+  /^remux-runner-[A-Z0-9]+\.js$/,
+);
+const remuxRunnerClosure = closure(graph, remuxRunnerChunk);
+const remuxRunnerLazyEdges = dynamicImportEdges(graph, remuxRunnerClosure);
+assertRequiredLazyImports(
+  'remux operation closure',
+  remuxRunnerLazyEdges,
+  REQUIRED_REMUX_RUNNER_LAZY_IMPORTS,
+);
+const remuxMetadataChunk = requireLazyTarget(
+  'remux metadata rewriter',
+  remuxRunnerLazyEdges,
+  /^remux-metadata-[A-Z0-9]+\.js$/,
+);
+assertClosureContainsSource(
+  'metadata rewrite dispatch',
+  closure(graph, remuxMetadataChunk),
+  graph,
+  /\/src\/metadata\/metadata-rewrite\.ts$/,
+);
 logLazyFrontier('\nEager kernel', eagerLazyEdges);
+logLazyFrontier('\nRemux operation', remuxRunnerLazyEdges);
 logLazyFrontier('\nDefault/probe first-operation', defaultProbeLazyEdges);
 assertWasmPackaging(graph, eagerKernel, unionClosure(graph, ['index.js', defaultDriverChunk]));
 

@@ -13,6 +13,7 @@ import { Registry } from '../kernel/registry.ts';
 import { fromBytes } from '../sources/source.ts';
 import { fixtureSource } from '../test-support/corpus.ts';
 import { registerDefaultDrivers } from './defaults.ts';
+import { FlacDriver } from './flac/flac-driver.ts';
 
 const DERIVED = new URL('../../fixtures/media-derived/', import.meta.url).pathname;
 
@@ -243,6 +244,7 @@ describe('registerDefaultDrivers', () => {
     expect(typeof wav.packetInfo).toBe('function');
     expect(typeof wav.transformPcm).toBe('function');
     expect(typeof wav.decodePcmAudio).toBe('function');
+    expect(typeof wav.decodePcmAudioStream).toBe('function');
     expect(typeof adts.decodePcm).toBe('function');
     expect(aiff.probe).toBeUndefined();
     expect(caf.packetInfo).toBeUndefined();
@@ -343,6 +345,7 @@ describe('registerDefaultDrivers', () => {
 
     const flac = findContainer(reg, 'flac');
     expect(flac.formats).toEqual(['flac']);
+    expect(flac.streamCopyTargets).toEqual(FlacDriver.streamCopyTargets);
     expect(
       flac.supports({ direction: 'demux', head: new Uint8Array([0x66, 0x4c, 0x61, 0x43]) }),
     ).toBe(true);
@@ -356,7 +359,7 @@ describe('registerDefaultDrivers', () => {
     registerDefaultDrivers(reg);
 
     const ts = findContainer(reg, 'mpegts');
-    expect(ts.formats).toEqual(['ts', 'm2ts', 'mts']);
+    expect(ts.formats).toEqual(['ts', 'm2ts', 'mts', 'mpegts']);
     expect(ts.supports({ direction: 'demux', mime: 'video/mp2t' })).toBe(true);
     expect(ts.supports({ direction: 'demux', mime: 'audio/mp2t' })).toBe(true);
     expect(ts.supports({ direction: 'demux', extension: 'M2TS' })).toBe(true);
@@ -588,7 +591,7 @@ describe('registerDefaultDrivers', () => {
       expect(audio.supports(gain)).toBe(true);
       expect(audio.supports(resize)).toBe(false);
       expect(cpu.supports(resize)).toBe(true);
-      expect(cpu.supports(tonemap)).toBe(true);
+      expect(cpu.supports(tonemap)).toBe(false);
       expect(cpu.supports(gain)).toBe(false);
 
       await closeEmptyFilterStream(webgpu.createFilter(resize));

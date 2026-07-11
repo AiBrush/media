@@ -20,9 +20,11 @@ export type { Output, Sink } from '../sinks/sink.ts';
 // here we add only the source *option* types (for typed `from`/`fromURL`/`fromElement` calls) and the
 // `SourceKind` union on {@link Source.kind}, so the default entry's source surface is fully nameable.
 export type {
+  ByteMediaInput,
   FromElementOptions,
   FromOptions,
   FromUrlOptions,
+  NormalizedSource,
   SourceKind,
 } from '../sources/source.ts';
 
@@ -73,14 +75,15 @@ export interface CreateMediaOptions {
   determinism?: Determinism; // default 'auto'                 (ADR-007)
   enableThreads?: boolean; // default = crossOriginIsolated    (ADR-006)
   worker?: boolean | { pool?: number }; // default true (heavy) (ADR-019)
-  assetBaseUrl?: string; // default = import.meta.url-resolved  (ADR-005)
+  /** Optional same-origin asset directory; normalized once, default keeps literal import.meta URLs. */
+  assetBaseUrl?: string; // default = import.meta.url-resolved  (ADR-005/237)
   onLog?: (e: LogEvent) => void;
 }
 
 /** Hidden power-user/test override (ADR-014); not part of the primary signatures. */
 export interface StrategyOverride {
   determinism?: Determinism;
-  /** Pin a specific driver id for the operation. */
+  /** Pin one exact driver id within the registered kind carrying that id (ADR-237). */
   pinDriver?: string;
 }
 
@@ -152,6 +155,8 @@ export interface VideoTarget {
   rotate?: 0 | 90 | 180 | 270;
   flip?: 'h' | 'v';
   crop?: { x: number; y: number; width: number; height: number };
+  /** Place the current image 1:1 on a larger transparent canvas; omitted offsets center it. */
+  pad?: { width: number; height: number; x?: number; y?: number };
   colorspace?: { to: string };
   tonemap?: { to: 'sdr' };
 }

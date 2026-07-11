@@ -452,18 +452,21 @@ describe('metadata:write tag writers — strict structural readback', () => {
     expect(output).not.toEqual(input);
   });
 
-  it('rejects public metadata rewrites for unsupported targets and track-selection mixes', async () => {
+  it('rejects unsupported targets but combines a full single-track selection with tag rewrite', async () => {
     const media = createMedia();
     await expect(
       media.remux(await loadFixture('speech.wav'), { to: 'ts', tags: TAGS }),
     ).rejects.toThrow(/metadata tag rewrite is not available/);
-    await expect(
-      media.remux(await loadFixture('speech.wav'), {
+    const input = await loadFixture('speech.wav');
+    const selected = await blobBytes(
+      await media.remux(input, {
         to: 'wav',
         tags: TAGS,
         trackSelect: ['audio:0'],
       }),
-    ).rejects.toThrow(/does not combine with track selection/);
+    );
+    expectTags(readWavTags(selected));
+    expect(chunkPayload(selected, 'data', 'le')).toEqual(chunkPayload(input, 'data', 'le'));
   });
 
   it('rejects malformed raw-PCM metadata wrappers and truncated chunks', () => {

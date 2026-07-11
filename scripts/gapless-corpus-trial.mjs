@@ -13,12 +13,9 @@ function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-const expectedCatalogSha =
-  'f1b7c9fcecaaa3646aca01fcc8f57ff6bff00b6559edbc9e8ed77527a3802ab2';
-const expectedOldFixtureSha =
-  '1ceee73f659a3c83205b1c2c31dc6804d46d79e0de89231635b6b66a876be8a3';
-const expectedNewFixtureSha =
-  '7a5b8dd34abbec73fda181a9106f28c792cc89b8740c534fd6563d7f756b1a58';
+const expectedCatalogSha = 'f1b7c9fcecaaa3646aca01fcc8f57ff6bff00b6559edbc9e8ed77527a3802ab2';
+const expectedOldFixtureSha = '1ceee73f659a3c83205b1c2c31dc6804d46d79e0de89231635b6b66a876be8a3';
+const expectedNewFixtureSha = '7a5b8dd34abbec73fda181a9106f28c792cc89b8740c534fd6563d7f756b1a58';
 
 if (sha256(catalogPath) !== expectedCatalogSha) {
   throw new Error('catalog changed since the audited snapshot');
@@ -45,8 +42,7 @@ const updatedLines = lines.map((line) => {
     file: '01.mp4',
     provider: 'internet-archive',
     sourcePageUrl: 'https://archive.org/details/untitled-feb-32026810-am',
-    downloadUrl:
-      'https://archive.org/download/untitled-feb-32026810-am/UntitledFeb32026810AM.m4a',
+    downloadUrl: 'https://archive.org/download/untitled-feb-32026810-am/UntitledFeb32026810AM.m4a',
     license: 'CC0-1.0',
     container: 'mp4',
     videoCodecs: [],

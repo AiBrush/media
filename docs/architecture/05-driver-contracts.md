@@ -23,8 +23,10 @@ export type MediaType = 'video' | 'audio'
 export interface StageOptions {
   signal?: AbortSignal
   onProgress?: (p: Progress) => void
-  determinism?: 'auto' | 'force-software'      // force-software drops the hardware/gpu tiers
+  determinism?: 'auto' | 'force-software'      // require a proved non-hardware stage
   wasmRuntime?: WasmRuntimeProfile             // optional ADR-006 profile; omitted = resolve from runtime
+  wasmAssetBaseUrl?: string                     // normalized absolute same-origin directory (ADR-237)
+  pinDriver?: string                            // inherited exact nested-route pin (ADR-014/237)
 }
 export interface Progress { done: number; total?: number; stage: string }
 
@@ -98,11 +100,12 @@ export type DecoderConfig = VideoDecoderConfig | AudioDecoderConfig   // WebCode
 export type EncoderConfig = VideoEncoderConfig | AudioEncoderConfig
 export interface CodecQuery { mediaType: MediaType; direction: 'decode' | 'encode'; config: DecoderConfig | EncoderConfig }
 export interface CodecSupport { supported: boolean; hardwareAccelerated?: boolean; reason?: string }
+export interface CodecSupportOptions { determinism?: 'auto' | 'force-software' }
 
 export interface CodecDriver extends DriverBase {
   readonly kind: 'codec'
   readonly tier: Tier
-  supports(q: CodecQuery): Promise<CodecSupport>                                  // wraps isConfigSupported
+  supports(q: CodecQuery, o?: CodecSupportOptions): Promise<CodecSupport>          // exact-mode probe
   createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame>
   createEncoder(c: EncoderConfig, o?: StageOptions): TransformStream<RawFrame, EncodedChunk>
 }
@@ -151,6 +154,7 @@ export interface Muxer {
   readonly output: ReadableStream<Uint8Array>
   addTrack(info: TrackInfo): number                           // ingests optional container side data
   write(trackId: number, packet: Packet): Promise<void>    // honors packet.dtsUs for B-frame layout (ADR-045)
+  writePcm?(trackId: number, data: Uint8Array): Promise<void> // optional exact raw-PCM bytes (ADR-243)
   finalize(): Promise<void>
 }
 export interface StreamCopyOptions extends StageOptions {  // ADR-021
@@ -212,12 +216,17 @@ export interface ContainerDriver extends DriverBase {
   // Optional decode of a raw-PCM container to canonical planar PCM for public decode() (ADR-063).
   // The engine wraps the returned samples as browser AudioData chunks. Absent ⇒ codec seam.
   decodePcmAudio?(src: ByteSource, o?: StageOptions): Promise<PcmAudio>
+  // Optional bounded raw-PCM decode stream. Each emitted PcmAudio is one canonical planar chunk;
+  // the engine owns AudioData framing and closes consumer-owned frames exactly once. Drivers should
+  // use source ranges when available and may fall back to one full canonical chunk (ADR-226).
+  decodePcmAudioStream?(src: ByteSource, o?: StageOptions): Promise<ReadableStream<PcmAudio>>
 }
 
 // ============ 3) FilterDriver ============
 export type FilterSpec =
   | { mediaType: 'video'; type: 'resize'; width: number; height: number; fit?: 'contain' | 'cover' | 'fill' }
   | { mediaType: 'video'; type: 'crop'; x: number; y: number; width: number; height: number }
+  | { mediaType: 'video'; type: 'pad'; x: number; y: number; width: number; height: number }
   | { mediaType: 'video'; type: 'rotate'; degrees: 0 | 90 | 180 | 270 }
   | { mediaType: 'video'; type: 'flip'; axis: 'h' | 'v' }
   | { mediaType: 'video'; type: 'colorspace'; to: string }
@@ -248,6 +257,8 @@ export interface DriverModule {
 ```
 
 > **`FilterDriver` covers audio too (ADR-033/076).** The three audio `FilterSpec` variants (`resample`/`remix`/`gain`) are served by `audioDspFilterDriver` (`src/filters/audio-dsp.ts`) — a `TransformStream<AudioData, AudioData>` over the pure-TS dsp kernels (`src/dsp`). It declares `substrate:'native'`, the same truthful CPU value used by the pure-TS `cpu-video-filter`; the router ranks native below WebGPU/WebGL/Canvas2D and above the WASM tail. Adding `native` to `FilterSubstrate` was additive (older drivers that declare `webgpu`/`webgl`/`canvas2d`/`wasm` still conform) and did not change `DRIVER_API_VERSION`. This driver is implemented, tested, and auto-registered in `defaults.ts` (doc 09 status table).
+
+> **`pad` is an additive geometric spec (ADR-234).** Public optional offsets are resolved to explicit integer `x/y` before routing, so every driver sees a self-contained placement on a larger transparent canvas. Existing v1 drivers remain structurally valid and simply return `false` for the new discriminant; `DRIVER_API_VERSION` remains 1.
 
 > **`ImageOps` is intentionally outside the driver contract (ADR-049).** GIF/PNG/JPEG/WebP/AVIF probe is pure header parsing, and browser image decode is `ImageDecoder` over a whole encoded image payload. There is no demuxed packet stream and no codec-config handoff, so forcing images into `ContainerDriver`/`CodecDriver` would invent a fake seam. `ImageModule` is `DriverModule`-shaped only so `defaults.ts` can register it alongside first-party modules; it attaches to an `ImageRegistry` host and does not change `DRIVER_API_VERSION`.
 

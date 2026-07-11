@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { CapabilityError } from '../contracts/errors.ts';
-import { pcmAudioToAudioDataStream } from './audio-data.ts';
+import {
+  pcmAudioChunksToAudioDataStream,
+  pcmAudioToAudioDataStream,
+  pcmRangeToInterleavedInit,
+  pcmRangeToPlanarInit,
+  pcmToInterleavedInit,
+} from './audio-data.ts';
 import type { PcmAudio } from './pcm.ts';
 
 class TestAudioData {
@@ -44,6 +50,21 @@ async function withAudioData<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 describe('pcmAudioToAudioDataStream', () => {
+  it('can emit interleaved f32 for sample consumers without changing canonical PCM', async () => {
+    await withAudioData(async () => {
+      const reader = pcmAudioToAudioDataStream(pcm(2), {}, 'pcm-s24', 'f32').getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      const frame = first.value as unknown as TestAudioData;
+      expect(frame.init).toMatchObject({ format: 'f32', numberOfFrames: 2 });
+      expect(Array.from(new Float32Array(frame.init.data as ArrayBuffer))).toEqual([
+        0.25, -0.25, 0.25, -0.25,
+      ]);
+      frame.close();
+      await reader.cancel('format coverage');
+    });
+  });
+
   it('emits bounded, timestamped planar frames and leaves successful outputs consumer-owned', async () => {
     await withAudioData(async () => {
       const reader = pcmAudioToAudioDataStream(pcm(4100), {}, 'pcm-s16').getReader();
@@ -123,5 +144,81 @@ describe('pcmAudioToAudioDataStream', () => {
       if (original === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
       else Object.defineProperty(globalThis, 'AudioData', original);
     }
+  });
+
+  it('wraps lazy PCM chunks with continuous timestamps and cancels the upstream reader', async () => {
+    await withAudioData(async () => {
+      let cancelled = false;
+      const chunks = new ReadableStream<PcmAudio>({
+        start(controller): void {
+          controller.enqueue(pcm(2));
+          controller.enqueue(pcm(1));
+          controller.close();
+        },
+        cancel(): void {
+          cancelled = true;
+        },
+      });
+      const reader = pcmAudioChunksToAudioDataStream(chunks, {}, 'pcm-s24').getReader();
+      const first = await reader.read();
+      const second = await reader.read();
+      const end = await reader.read();
+
+      expect(first.done).toBe(false);
+      expect(second.done).toBe(false);
+      expect(end.done).toBe(true);
+      const firstFrame = first.value as unknown as TestAudioData;
+      const secondFrame = second.value as unknown as TestAudioData;
+      expect(firstFrame.init).toMatchObject({ numberOfFrames: 2, timestamp: 0 });
+      expect(secondFrame.init).toMatchObject({ numberOfFrames: 1, timestamp: 42 });
+      firstFrame.close();
+      secondFrame.close();
+      expect(TestAudioData.instances.map((frame) => frame.closeCount)).toEqual([1, 1]);
+      await reader.cancel('done');
+      expect(cancelled).toBe(false);
+    });
+  });
+
+  it('propagates consumer cancellation to an open PCM chunk stream', async () => {
+    await withAudioData(async () => {
+      let cancelled = false;
+      const chunks = new ReadableStream<PcmAudio>({
+        pull(controller): void {
+          controller.enqueue(pcm(2));
+        },
+        cancel(): void {
+          cancelled = true;
+        },
+      });
+      const reader = pcmAudioChunksToAudioDataStream(chunks, {}, 'pcm-s24').getReader();
+      const first = await reader.read();
+      const frame = first.value as unknown as TestAudioData;
+      await reader.cancel('consumer stopped');
+      frame.close();
+      expect(cancelled).toBe(true);
+      expect(frame.closeCount).toBe(1);
+    });
+  });
+});
+
+describe('pcmToInterleavedInit', () => {
+  it('preserves channel-major samples in interleaved f32 order', () => {
+    const out = pcmToInterleavedInit(pcm(2), 123);
+    expect(out.init).toMatchObject({ format: 'f32', timestamp: 123 });
+    expect(Array.from(out.data)).toEqual([0.25, -0.25, 0.25, -0.25]);
+  });
+
+  it('clamps non-finite and past-end range starts without reading outside channel storage', () => {
+    const audio = pcm(3);
+    const fromStart = pcmRangeToPlanarInit(audio, Number.NaN, 2, 10);
+    expect(fromStart.init).toMatchObject({ numberOfFrames: 2, timestamp: 10 });
+    expect(Array.from(fromStart.data)).toEqual([0.25, 0.25, -0.25, -0.25]);
+
+    const atEnd = pcmRangeToInterleavedInit(audio, audio.frames, 4, 20);
+    const pastEnd = pcmRangeToPlanarInit(audio, audio.frames + 100, 4, 30);
+    expect(atEnd.init).toMatchObject({ numberOfFrames: 0, timestamp: 20 });
+    expect(pastEnd.init).toMatchObject({ numberOfFrames: 0, timestamp: 30 });
+    expect(atEnd.data).toHaveLength(0);
+    expect(pastEnd.data).toHaveLength(0);
   });
 });

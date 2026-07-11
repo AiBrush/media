@@ -1,0 +1,31 @@
+{
+  "generatedAt": "2026-07-11T20:25:25.331Z",
+  "runtime": "bun 1.3.14",
+  "warmup": 5,
+  "samples": 21,
+  "iterations": 10000,
+  "scenarios": [
+    {
+      "name": "profile-level config matrix",
+      "medianMs": 48.858291,
+      "p95Ms": 53.868542,
+      "plansPerSec": 3274776.8439137586,
+      "peakProcessHeapMb": 0.8937530517578125
+    },
+    {
+      "name": "depth and filter lifecycle matrix",
+      "medianMs": 3.233417,
+      "p95Ms": 3.732459,
+      "plansPerSec": 52575959.11693419,
+      "peakProcessHeapMb": 1.0518426895141602
+    },
+    {
+      "name": "public encode-route guard matrix",
+      "medianMs": 0.45425,
+      "p95Ms": 0.584625,
+      "plansPerSec": 132085855.80627407,
+      "peakProcessHeapMb": 1.0048694610595703
+    }
+  ],
+  "geomeanPlansPerSec": 28331859.303747263
+}

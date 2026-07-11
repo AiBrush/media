@@ -233,6 +233,42 @@ function mp4aV2Payload(channels: number, sampleRate: number): Uint8Array {
   return joinBytes([prefix, box('wave', esdsBox(AAC_ASC))]);
 }
 
+function mp4aV0Payload(channels = 2, sampleRate = 44100, asc: Uint8Array = AAC_ASC): Uint8Array {
+  const prefix = joinBytes([
+    zeros(6),
+    u16(1),
+    u16(0),
+    u16(0),
+    u32(0),
+    u16(channels),
+    u16(16),
+    u16(0),
+    u16(0),
+    u32(sampleRate * 65536),
+  ]);
+  expect(prefix.byteLength).toBe(28);
+  return joinBytes([prefix, esdsBox(asc)]);
+}
+
+function esdsWithoutAscBox(): Uint8Array {
+  const dcdPayload = joinBytes([new Uint8Array([0x40, 0x15, 0, 0, 0]), u32(0), u32(0)]);
+  const dcd = joinBytes([new Uint8Array([0x04, dcdPayload.byteLength]), dcdPayload]);
+  const esPayload = joinBytes([u16(0), new Uint8Array([0]), dcd]);
+  const es = joinBytes([new Uint8Array([0x03, esPayload.byteLength]), esPayload]);
+  return fullBox('esds', 0, 0, es);
+}
+
+function mp4aV0PayloadWithoutAsc(): Uint8Array {
+  return joinBytes([mp4aV0Payload().subarray(0, 28), esdsWithoutAscBox()]);
+}
+
+function mp4aV1Payload(): Uint8Array {
+  const prefix = mp4aV0Payload().subarray(0, 28).slice();
+  prefix[8] = 0;
+  prefix[9] = 1;
+  return joinBytes([prefix, zeros(16), esdsBox(AAC_ASC)]);
+}
+
 function videoTrackWithStsd(entry: Uint8Array, tkhd = tkhdV0(1)): Uint8Array {
   return box(
     'trak',
@@ -275,6 +311,43 @@ function tinyAudioMovieWithV2WaveEsds(): Uint8Array {
     ),
   );
   return joinBytes([ftyp('M4A '), box('moov', mvhdV1(1000, 64), audioTrack)]);
+}
+
+function simpleAudioTrack(
+  stbl: Uint8Array,
+  mdhd: Uint8Array = mdhdV0(44100, 2048),
+  tkhd: Uint8Array = tkhdV0(1),
+): Uint8Array {
+  return box('trak', tkhd, box('mdia', mdhd, hdlr('soun'), box('minf', box('stbl', stbl))));
+}
+
+function simpleAudioTrackWithEdit(edit: Uint8Array, stbl: Uint8Array): Uint8Array {
+  return box(
+    'trak',
+    tkhdV0(1),
+    box('edts', edit),
+    box('mdia', mdhdV0(44100, 2048), hdlr('soun'), box('minf', box('stbl', stbl))),
+  );
+}
+
+function simpleVideoTrack(
+  stbl: Uint8Array = joinBytes([stsd(box('avc1', avc1Payload())), stts(2, 600), stsz([1, 1])]),
+  mdhd: Uint8Array = mdhdV0(600, 1200),
+  tkhd: Uint8Array = tkhdV0(1),
+): Uint8Array {
+  return box('trak', tkhd, box('mdia', mdhd, hdlr('vide'), box('minf', box('stbl', stbl))));
+}
+
+function simpleMovie(...tracks: readonly Uint8Array[]): Uint8Array {
+  return joinBytes([ftyp(), box('moov', mvhdV1(), ...tracks)]);
+}
+
+function simpleMovieWithMvhd(mvhd: Uint8Array, ...tracks: readonly Uint8Array[]): Uint8Array {
+  return joinBytes([ftyp(), box('moov', mvhd, ...tracks)]);
+}
+
+function validSimpleAudioTrack(): Uint8Array {
+  return simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(44100, 2048));
 }
 
 describe('simple MP4 faststart probes', () => {
@@ -348,6 +421,221 @@ describe('simple MP4 faststart probes', () => {
       sampleRate: 44100,
       numberOfChannels: 2,
     });
+  });
+
+  it('covers direct version-0 AAC, HE-AAC SBR, zero timing, and absent timing tables', async () => {
+    const heAac = await readTinyAudioFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            stsd(
+              box('mp4a', mp4aV0Payload(2, 24000, new Uint8Array([0x13, 0x08, 0x56, 0xe5, 0x98]))),
+            ),
+            mdhdV0(24000, 1024),
+          ),
+        ),
+      ),
+    );
+    expect(heAac?.[0]).toMatchObject({ codec: 'mp4a.40.2', config: { sampleRate: 48000 } });
+
+    const direct = await readTinyAudioFaststartProbe(ra(simpleMovie(validSimpleAudioTrack())));
+    expect(direct?.[0]).toMatchObject({ codec: 'mp4a.40.2', durationSec: 2048 / 44100 });
+
+    const zeroTiming = await readTinyAudioFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(0, 0)))),
+    );
+    expect(zeroTiming?.[0]?.durationSec).toBe(0);
+
+    const noTiming = await readTinyAudioFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(44100, 0)))),
+    );
+    expect(noTiming?.[0]?.durationSec).toBe(0);
+
+    const noSamples = await readTinyAudioFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            joinBytes([stsd(box('mp4a', mp4aV0Payload())), stsz([])]),
+            mdhdV0(44100, 0),
+          ),
+        ),
+      ),
+    );
+    expect(noSamples).toHaveLength(1);
+
+    const simpleNoSamples = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            joinBytes([stsd(box('mp4a', mp4aV0Payload())), stsz([])]),
+            mdhdV0(44100, 0),
+          ),
+          videoTrackWithStsd(box('avc1', avc1Payload())),
+        ),
+      ),
+    );
+    expect(simpleNoSamples).toBeUndefined();
+  });
+
+  it('covers simple-track timing, edit, fallback, and structural rejection paths', async () => {
+    const audioStbl = joinBytes([
+      stsd(box('mp4a', mp4aV0PayloadWithoutAsc())),
+      stts(2, 1024),
+      stsz([1, 1]),
+    ]);
+    const noAsc = await readSimpleVideoFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(audioStbl), simpleVideoTrack())),
+    );
+    expect(noAsc?.tracks).toHaveLength(2);
+    expect(noAsc?.tracks[0]).toMatchObject({ codec: 'mp4a.40', config: { sampleRate: 44100 } });
+
+    const versionOneAudio = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(stsd(box('mp4a', mp4aV1Payload())), mdhdV0(44100, 2048)),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(versionOneAudio).toBeUndefined();
+
+    const noStsz = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(joinBytes([stsd(box('mp4a', mp4aV0Payload())), stts(2, 1024)])),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(noStsz?.tracks).toHaveLength(2);
+
+    const noStts = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            joinBytes([stsd(box('mp4a', mp4aV0Payload())), stsz([1, 1])]),
+            mdhdV0(44100, 0),
+          ),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(noStts?.tracks).toHaveLength(2);
+    expect(noStts?.tracks[0]?.gapless).toBeUndefined();
+
+    const zeroDurationVideo = await readSimpleVideoFaststartProbe(
+      ra(simpleMovie(simpleVideoTrack(undefined, mdhdV0(0, 0), tkhdV1(1, 0.999, 0)))),
+    );
+    expect(zeroDurationVideo?.tracks[0]).toMatchObject({ durationSec: 0 });
+    expect(zeroDurationVideo?.tracks[0]?.fps).toBeUndefined();
+
+    const negativeEdit = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrackWithEdit(
+            fullBox('elst', 0, 0, u32(1), u32(64), u32(0xffffffff), u16(1), u16(0)),
+            audioStbl,
+          ),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(negativeEdit?.tracks[0]?.gapless).toBeUndefined();
+
+    const invalidRate = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrackWithEdit(
+            fullBox('elst', 0, 0, u32(1), u32(64), u32(0), u16(0), u16(0)),
+            audioStbl,
+          ),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(invalidRate?.tracks[0]?.gapless).toBeUndefined();
+
+    const zeroMovieClock = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovieWithMvhd(
+          mvhdV1(0, 64),
+          simpleAudioTrackWithEdit(
+            fullBox('elst', 1, 0, u32(1), u64(64), u64(1024), u16(1), u16(0)),
+            audioStbl,
+          ),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(zeroMovieClock?.tracks[0]?.gapless).toMatchObject({ basis: 'mp4-edit-list' });
+
+    const noMovieHeader = await readSimpleVideoFaststartProbe(
+      ra(joinBytes([ftyp(), box('moov', simpleVideoTrack())])),
+    );
+    expect(noMovieHeader).toBeUndefined();
+
+    const audioOnly = await readSimpleVideoFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(audioStbl))),
+    );
+    expect(audioOnly).toBeUndefined();
+
+    const malformedTracks = [
+      box('trak', tkhdV0(1)),
+      box('trak', box('mdia', mdhdV0(600, 1200), hdlr('vide'))),
+      box('trak', tkhdV0(1), box('mdia', hdlr('vide'))),
+      box('trak', tkhdV0(1), box('mdia', mdhdV0(600, 1200), hdlr('vide'), box('minf'))),
+      box(
+        'trak',
+        tkhdV0(1),
+        box('mdia', mdhdV0(600, 1200), hdlr('vide'), box('minf', box('stbl'))),
+      ),
+    ];
+    for (const track of malformedTracks) {
+      await expect(readSimpleVideoFaststartProbe(ra(simpleMovie(track)))).resolves.toBeUndefined();
+    }
+
+    const badVideoCount = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleVideoTrack(
+            joinBytes([
+              fullBox('stsd', 0, 0, u32(2), box('avc1', avc1Payload())),
+              stts(2, 600),
+              stsz([1, 1]),
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect(badVideoCount).toBeUndefined();
+
+    const badAudioCount = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            joinBytes([
+              fullBox('stsd', 0, 0, u32(2), box('mp4a', mp4aV0Payload())),
+              stts(2, 1024),
+              stsz([1, 1]),
+            ]),
+          ),
+          simpleVideoTrack(),
+        ),
+      ),
+    );
+    expect(badAudioCount).toBeUndefined();
+  });
+
+  it('rejects truncated audio sample-entry headers without reading past moov', async () => {
+    const noEntry = await readTinyAudioFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(fullBox('stsd', 0, 0, u32(1))))),
+    );
+    expect(noEntry).toBeUndefined();
+
+    const truncatedExtended = await readTinyAudioFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(fullBox('stsd', 0, 0, u32(1), u32(1), ascii('mp4a'))))),
+    );
+    expect(truncatedExtended).toBeUndefined();
   });
 
   it.each([

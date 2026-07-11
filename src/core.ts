@@ -25,10 +25,14 @@ export {
 } from './kernel/router.ts';
 export {
   type WasmBindgenInit,
-  type WasmRuntimeRequest,
   requireIsolatedWasmProfile,
-  resolveWasmRuntimeProfile,
+  resolveWasmAssetUrl,
   wasmInitForProfile,
+} from './kernel/wasm-loader-runtime.ts';
+export {
+  type WasmRuntimeRequest,
+  normalizeWasmAssetBaseUrl,
+  resolveWasmRuntimeProfile,
 } from './kernel/wasm-runtime.ts';
 export { closeFrame, closeFrames, type Closable, isClosable } from './kernel/frames.ts';
 export { collect, composeChain, type ExecuteOptions, runToSink } from './kernel/executor.ts';
@@ -71,6 +75,7 @@ export {
   type ConvertOffloadPayload,
   type InnerEngine,
   type InnerEngineFactory,
+  type InnerEngineRuntimeOptions,
   type OffloadJobPayload,
   type TrimOffloadPayload,
   decodeOffloadPayload,

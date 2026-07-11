@@ -516,6 +516,18 @@ async function writeConsumerSources(
     [
       "import { MediaError, VERSION, probe } from '@aibrush/media';",
       '',
+      ...(concreteDriverSubpath === undefined
+        ? []
+        : [
+            `const concreteDriver = await import('@aibrush/media/drivers/${concreteDriverSubpath}');`,
+            'if (typeof concreteDriver.default?.register !== "function") {',
+            '  throw new Error("concrete driver default export is not a DriverModule");',
+            '}',
+            'if (typeof concreteDriver.default.apiVersion !== "number") {',
+            '  throw new Error("concrete driver apiVersion is missing");',
+            '}',
+            '',
+          ]),
       'if (typeof VERSION !== "string" || VERSION.length === 0) {',
       '  throw new Error("VERSION is not exported");',
       '}',
