@@ -115,8 +115,14 @@ export interface TrackEdit {
   mediaTimeTicks: number;
   /** `elst.segment_duration`, converted from the movie timescale. */
   durationSec: number;
+  /** Exact source `elst.segment_duration` in the movie timescale, for lossless same-family rewrite. */
+  durationMovieTicks: number;
+  /** Timescale governing the exact movie-tick edit durations. */
+  movieTimescale: number;
   /** Total duration of consecutive leading empty edits, converted from the movie timescale. */
   leadingEmptyDurationSec?: number;
+  /** Exact sum of leading empty `elst.segment_duration` values in the movie timescale. */
+  leadingEmptyDurationMovieTicks?: number;
 }
 
 export interface ParsedTrack {
@@ -125,6 +131,8 @@ export interface ParsedTrack {
   /** mdhd timescale (ticks per second). */
   timescale: number;
   durationSec: number;
+  /** Exact source `mdhd.duration` in this track timescale, distinct from summed sample durations. */
+  mediaDurationTicks?: number;
   /** Present for a normal single-rate edit list; applied by the packet/WebCodecs seam. */
   edit?: TrackEdit;
   codec: string;
@@ -152,6 +160,8 @@ export interface ParsedTrack {
   trakIndex?: number;
   /** Samples indexed by the initial `moov/stbl` (metadata parses retain the count without the sizes). */
   moovSampleCount?: number;
+  /** Sum of initial `moov/stts` durations; metadata mode retains this scalar without run objects. */
+  moovMediaTicks?: number;
   /**
    * For fragmented/CMAF tracks (empty `moov` sample table), the sample count accumulated from the
    * movie fragments ({@link applyFragmentTiming}). Lets probe report timing the `stts`/`stsz` path
@@ -520,8 +530,10 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
   for (const track of movie.tracks) {
     const frag = timing.get(track.id);
     if (!frag || frag.durationTicks <= 0 || track.timescale <= 0) continue;
+    const declaredMediaDurationTicks = track.mediaDurationTicks ?? 0;
     const durationSec = frag.durationTicks / track.timescale;
     track.durationSec = Math.max(track.durationSec, durationSec);
+    track.mediaDurationTicks = Math.max(track.mediaDurationTicks ?? 0, frag.durationTicks);
     track.fragmentSampleCount = frag.sampleCount;
     track.fragmentMediaTicks = frag.mediaTicks;
     // Seekable FFmpeg hybrid-fragmented output can leave a provisional zero-duration `elst` in the
@@ -539,11 +551,11 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
     }
     // fps is frames over the *content* span (Σ sample durations), not the presentation end, so a
     // start offset in `durationSec` doesn't deflate it — this equals ffprobe's avg_frame_rate.
-    const moovMediaTicks = track.samples.timeToSample.reduce(
-      (total, entry) => total + entry.count * entry.delta,
-      0,
-    );
-    const mediaSec = (moovMediaTicks + frag.mediaTicks) / track.timescale;
+    const moovMediaTicks =
+      track.moovMediaTicks ??
+      track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0);
+    const mediaSec =
+      Math.max(declaredMediaDurationTicks, moovMediaTicks + frag.mediaTicks) / track.timescale;
     const sampleCount =
       (track.moovSampleCount ?? track.samples.sampleSizes.length) + frag.sampleCount;
     if (track.mediaType === 'video' && mediaSec > 0) track.fps = sampleCount / mediaSec;
@@ -628,7 +640,7 @@ function parseOtherTrak(
     ? attempt(
         () =>
           parseStszSampleCount(r, child(r, stbl, 'stsz')) ??
-          sampleCountFromStts(parseStts(r, child(r, stbl, 'stts'))),
+          parseSttsSummary(r, child(r, stbl, 'stts')).sampleCount,
       )
     : undefined;
   const edit = attempt(() => parseTrackEdit(r, trak, movieTimescale));
@@ -671,18 +683,19 @@ function parseTrak(
 
   const mdia = child(r, trak, 'mdia') ?? fail('trak has no mdia');
   const mdhd = child(r, mdia, 'mdhd') ?? fail('mdia has no mdhd');
-  const { timescale, durationSec } = parseMdhd(r, mdhd);
+  const { timescale, durationSec, durationTicks: mediaDurationTicks } = parseMdhd(r, mdhd);
 
   const minf = child(r, mdia, 'minf') ?? fail('mdia has no minf');
   const stbl = child(r, minf, 'stbl') ?? fail('minf has no stbl');
   const stsd = child(r, stbl, 'stsd') ?? fail('stbl has no stsd');
 
-  const { samples, sampleCount } =
+  const parsedSamples =
     mode === 'full'
       ? parseSampleTableWithCount(r, stbl)
       : mode === 'packet-info'
         ? parsePacketInfoSampleTable(r, stbl)
         : parseMetadataSampleTable(r, stbl);
+  const { samples, sampleCount } = parsedSamples;
   const fps = mediaType === 'video' && durationSec > 0 ? sampleCount / durationSec : undefined;
   const needsFragmentTiming = sampleCount === 0;
 
@@ -696,6 +709,7 @@ function parseTrak(
     mediaType,
     timescale,
     durationSec,
+    mediaDurationTicks,
     moovSampleCount: sampleCount,
     trakIndex,
     ...(edit !== undefined ? { edit } : {}),
@@ -703,6 +717,7 @@ function parseTrak(
     sampleEntryType: entry.type,
     config: entry.config,
     samples,
+    ...(parsedSamples.mediaTicks !== undefined ? { moovMediaTicks: parsedSamples.mediaTicks } : {}),
     ...(entry.codecPrivate ? { codecPrivate: entry.codecPrivate } : {}),
     ...(encryption ? { encryption } : {}),
   };
@@ -746,6 +761,7 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
   const entryCount = r.u32();
   let active: TrackEdit | undefined;
   let leadingEmptyDurationSec = 0;
+  let leadingEmptyDurationMovieTicks = 0;
 
   for (let i = 0; i < entryCount; i++) {
     const segmentDuration = version === 1 ? r.u64() : r.u32();
@@ -756,6 +772,7 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
     if (mediaTime < 0) {
       if (active === undefined && movieTimescale > 0) {
         leadingEmptyDurationSec += segmentDuration / movieTimescale;
+        leadingEmptyDurationMovieTicks += segmentDuration;
       }
       continue;
     }
@@ -764,7 +781,10 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
     active = {
       mediaTimeTicks: mediaTime,
       durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
+      durationMovieTicks: segmentDuration,
+      movieTimescale,
       ...(leadingEmptyDurationSec > 0 ? { leadingEmptyDurationSec } : {}),
+      ...(leadingEmptyDurationMovieTicks > 0 ? { leadingEmptyDurationMovieTicks } : {}),
     };
   }
 
@@ -804,13 +824,20 @@ function parseTkhd(
     : { trackId, rotation, displayTransform };
 }
 
-function parseMdhd(r: Reader, box: BoxHeader): { timescale: number; durationSec: number } {
+function parseMdhd(
+  r: Reader,
+  box: BoxHeader,
+): { timescale: number; durationSec: number; durationTicks: number } {
   r.seek(box.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
-  return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
+  return {
+    timescale,
+    durationSec: timescale > 0 ? duration / timescale : 0,
+    durationTicks: duration,
+  };
 }
 
 function parseHandler(r: Reader, box: BoxHeader): string {
@@ -1195,7 +1222,9 @@ function parseAudioEntry(r: Reader, entry: BoxHeader): SampleEntry {
 
   const esds = findAudioConfigBox(r, childStart, entry.end, 'esds');
   if (esds && entry.type === 'mp4a') {
-    const esdsPayload = r.bytesAt(esds.payloadStart, esds.end);
+    // Codec-private metadata escapes the parser through Movie/TrackInfo and can outlive the input window.
+    // Own these few bytes so a tiny `esds` view never pins an entire in-memory MP4 backing store.
+    const esdsPayload = r.bytesAt(esds.payloadStart, esds.end).slice();
     const info = parseEsds(esdsPayload);
     const aacSampleRate = info.sampleRate ?? sampleRate;
     const aacChannels = info.sbrPresent === true ? channels : (info.channels ?? channels);
@@ -1270,10 +1299,13 @@ function emptySampleTable(): SampleTable {
   };
 }
 
-function parseSampleTableWithCount(
-  r: Reader,
-  stbl: BoxHeader,
-): { samples: SampleTable; sampleCount: number } {
+interface ParsedSampleTable {
+  readonly samples: SampleTable;
+  readonly sampleCount: number;
+  readonly mediaTicks?: number;
+}
+
+function parseSampleTableWithCount(r: Reader, stbl: BoxHeader): ParsedSampleTable {
   const samples = {
     timeToSample: parseStts(r, child(r, stbl, 'stts')),
     compositionOffsets: parseCtts(r, child(r, stbl, 'ctts')),
@@ -1285,10 +1317,7 @@ function parseSampleTableWithCount(
   return { samples, sampleCount: samples.sampleSizes.length };
 }
 
-function parsePacketInfoSampleTable(
-  r: Reader,
-  stbl: BoxHeader,
-): { samples: SampleTable; sampleCount: number } {
+function parsePacketInfoSampleTable(r: Reader, stbl: BoxHeader): ParsedSampleTable {
   const samples = {
     timeToSample: parseStts(r, child(r, stbl, 'stts')),
     compositionOffsets: parseCtts(r, child(r, stbl, 'ctts')),
@@ -1300,18 +1329,10 @@ function parsePacketInfoSampleTable(
   return { samples, sampleCount: samples.sampleSizes.length };
 }
 
-function parseMetadataSampleTable(
-  r: Reader,
-  stbl: BoxHeader,
-): { samples: SampleTable; sampleCount: number } {
-  const timeToSample = parseStts(r, child(r, stbl, 'stts'));
-  const sampleCount =
-    parseStszSampleCount(r, child(r, stbl, 'stsz')) ?? sampleCountFromStts(timeToSample);
-  return { samples: { ...emptySampleTable(), timeToSample }, sampleCount };
-}
-
-function sampleCountFromStts(entries: readonly TimeToSample[]): number {
-  return entries.reduce((total, entry) => total + entry.count, 0);
+function parseMetadataSampleTable(r: Reader, stbl: BoxHeader): ParsedSampleTable {
+  const timing = parseSttsSummary(r, child(r, stbl, 'stts'));
+  const sampleCount = parseStszSampleCount(r, child(r, stbl, 'stsz')) ?? timing.sampleCount;
+  return { samples: emptySampleTable(), sampleCount, mediaTicks: timing.mediaTicks };
 }
 
 function parseStszSampleCount(r: Reader, box: BoxHeader | undefined): number | undefined {
@@ -1330,6 +1351,25 @@ function parseStts(r: Reader, box: BoxHeader | undefined): TimeToSample[] {
   const out: TimeToSample[] = [];
   for (let i = 0; i < n; i++) out.push({ count: r.u32(), delta: r.u32() });
   return out;
+}
+
+function parseSttsSummary(
+  r: Reader,
+  box: BoxHeader | undefined,
+): { sampleCount: number; mediaTicks: number } {
+  if (!box) return { sampleCount: 0, mediaTicks: 0 };
+  r.seek(box.payloadStart);
+  readFullBoxHeader(r);
+  const n = r.u32();
+  let sampleCount = 0;
+  let mediaTicks = 0;
+  for (let i = 0; i < n; i++) {
+    const count = r.u32();
+    const delta = r.u32();
+    sampleCount += count;
+    mediaTicks += count * delta;
+  }
+  return { sampleCount, mediaTicks };
 }
 
 function parseCtts(r: Reader, box: BoxHeader | undefined): CompositionOffset[] {

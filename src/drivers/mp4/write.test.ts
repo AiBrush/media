@@ -62,6 +62,43 @@ describe('writeMp4 — encode path (synthesizes avcC/esds from description)', ()
     expect(movie.tracks[0]?.codec).toBe('avc1.42C01E');
   });
 
+  it.each([
+    {
+      colourType: 'nclc' as const,
+      colr: { colourType: 'nclc' as const, primaries: 1, transfer: 1, matrix: 1 },
+    },
+    {
+      colourType: 'nclx' as const,
+      colr: {
+        colourType: 'nclx' as const,
+        primaries: 9,
+        transfer: 16,
+        matrix: 9,
+        fullRange: true,
+      },
+    },
+  ])('round-trips $colourType color, pixel aspect, and signed clean aperture', async ({ colr }) => {
+    const sideDataVideo: MuxTrackInput = {
+      ...video,
+      colr,
+      pasp: { hSpacing: 4, vSpacing: 3 },
+      clap: {
+        cleanApertureWidthN: 15,
+        cleanApertureWidthD: 2,
+        cleanApertureHeightN: 7,
+        cleanApertureHeightD: 1,
+        horizOffN: -1,
+        horizOffD: 2,
+        vertOffN: 3,
+        vertOffD: 4,
+      },
+    };
+    const reparsed = (await readMovie(ra(writeMp4([sideDataVideo])))).tracks[0];
+    expect(reparsed?.colr).toEqual(colr);
+    expect(reparsed?.pasp).toEqual(sideDataVideo.pasp);
+    expect(reparsed?.clap).toEqual(sideDataVideo.clap);
+  });
+
   it('advertises compatible codec brands from the actual video sample entries', () => {
     const { description: _description, ...videoBase } = video;
     const hevc: MuxTrackInput = {

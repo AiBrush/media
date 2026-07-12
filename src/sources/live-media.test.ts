@@ -177,6 +177,22 @@ afterEach(() => {
 });
 
 describe('live MediaStream source identity', () => {
+  it('rejects malformed source identities and capture failures at the public boundary', () => {
+    expect(() => fromMediaStream({} as MediaStream)).toThrowError(InputError);
+    expect(isLiveMediaSource(null)).toBe(false);
+    expect(isLiveMediaSource({ __media: 'live-source' })).toBe(false);
+    expect(() =>
+      captureElementMediaStream({
+        captureStream(): never {
+          throw new Error('capture denied');
+        },
+      } as unknown as HTMLMediaElement),
+    ).toThrowError(CapabilityError);
+    expect(() =>
+      captureElementMediaStream({ captureStream: () => ({}) } as unknown as HTMLMediaElement),
+    ).toThrowError(CapabilityError);
+  });
+
   it('brands a MediaStream distinctly from byte Source and unwraps it exactly', () => {
     const stream = new FakeMediaStream([]) as unknown as MediaStream;
     const source = fromMediaStream(stream);
@@ -200,6 +216,69 @@ describe('live MediaStream source identity', () => {
     expect(mediaStreamOf(source)).toBe(stream);
 
     expect(() => captureElementMediaStream({} as HTMLMediaElement)).toThrowError(CapabilityError);
+  });
+
+  it('validates raw structural streams and truthful optional/other-track facts', () => {
+    expect(() => probeLiveMediaStream({} as MediaStream)).toThrowError(InputError);
+    expect(() => liveTrackInfo({} as MediaStream, 'video')).toThrowError(InputError);
+    expect(() => decodeLiveMediaStream({} as MediaStream)).toThrowError(InputError);
+
+    const other = {
+      kind: 'text',
+      readyState: 'live',
+      getSettings: () => ({ width: -1, height: Number.NaN }),
+    } as unknown as MediaStreamTrack;
+    const structural = {
+      getTracks: () => [other],
+      getVideoTracks: () => [],
+      getAudioTracks: () => [],
+    } as unknown as MediaStream;
+    expect(probeLiveMediaStream(structural).tracks).toEqual([
+      { id: 0, type: 'other', codec: 'raw-track' },
+    ]);
+    expect(liveTrackInfo(structural, 'video')).toBeUndefined();
+    expect(liveTrackInfo(structural, 'audio')).toBeUndefined();
+    expect(decodeLiveMediaStream(structural)).toEqual({});
+  });
+
+  it('survives missing/throwing track settings and rejects fractional source layouts', () => {
+    const missingSettings = new FakeTrack('video') as FakeTrack & {
+      getSettings: undefined;
+    };
+    Object.defineProperty(missingSettings, 'getSettings', { value: undefined });
+    expect(probeLiveMediaStream(liveSource([missingSettings])).tracks[0]).toEqual({
+      id: 0,
+      type: 'video',
+      codec: 'raw-video',
+    });
+
+    const throwingSettings = new FakeTrack('audio');
+    throwingSettings.getSettings = (): never => {
+      throw new Error('detached track');
+    };
+    expect(probeLiveMediaStream(liveSource([throwingSettings])).tracks[0]).toEqual({
+      id: 0,
+      type: 'audio',
+      codec: 'raw-audio',
+    });
+
+    const video = new FakeTrack('video');
+    video.settings = { width: 640.5, height: 480, frameRate: 0 };
+    expect(() => liveTrackInfo(liveSource([video]), 'video')).toThrowError(InputError);
+    const audio = new FakeTrack('audio');
+    audio.settings = { sampleRate: 48_000, channelCount: 1.5 };
+    expect(() => liveTrackInfo(liveSource([audio]), 'audio')).toThrowError(InputError);
+  });
+
+  it('includes the dedicated suggestion only for live convert', () => {
+    try {
+      rejectLiveByteOperation('convert');
+    } catch (error) {
+      expect(error).toBeInstanceOf(CapabilityError);
+      expect(error).toMatchObject({
+        detail: { suggestion: 'use the dedicated live decode→encode path' },
+      });
+    }
   });
 
   it('typed-declines byte/container operations on a raw live source', () => {
@@ -271,6 +350,137 @@ describe('live MediaStream source identity', () => {
 });
 
 describe('decodeLiveMediaStream', () => {
+  it('maps default processor constructor and readable-shape failures', async () => {
+    vi.stubGlobal(
+      'MediaStreamTrackProcessor',
+      class {
+        constructor() {
+          throw new Error('host rejected track');
+        }
+      },
+    );
+    const rejected = decodeLiveMediaStream(liveSource([new FakeTrack('video')])).video?.getReader();
+    if (rejected === undefined) throw new Error('expected live video stream');
+    await expect(rejected.read()).rejects.toBeInstanceOf(CapabilityError);
+
+    vi.stubGlobal(
+      'MediaStreamTrackProcessor',
+      class {
+        readonly readable = {};
+      },
+    );
+    const malformed = decodeLiveMediaStream(
+      liveSource([new FakeTrack('video')]),
+    ).video?.getReader();
+    if (malformed === undefined) throw new Error('expected live video stream');
+    await expect(malformed.read()).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('maps custom invalid, locked, and capability-preserving processor factories', async () => {
+    const invalid = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      processorFactory: factoryFor(() => ({}) as ReadableStream<unknown>),
+    }).video?.getReader();
+    if (invalid === undefined) throw new Error('expected live video stream');
+    await expect(invalid.read()).rejects.toBeInstanceOf(CapabilityError);
+
+    const stream = streamOf([]);
+    const held = stream.getReader();
+    const locked = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      processorFactory: factoryFor(() => stream),
+    }).video?.getReader();
+    if (locked === undefined) throw new Error('expected live video stream');
+    await expect(locked.read()).rejects.toBeInstanceOf(CapabilityError);
+    held.releaseLock();
+
+    const primary = new CapabilityError('capability-miss', 'known host miss');
+    const preserved = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      processorFactory: factoryFor(() => {
+        throw primary;
+      }),
+    }).video?.getReader();
+    if (preserved === undefined) throw new Error('expected live video stream');
+    await expect(preserved.read()).rejects.toBe(primary);
+  });
+
+  it('closes before processor creation for pre-abort and pre-pull track end', async () => {
+    const primary = new MediaError('aborted', 'caller stop');
+    const ctrl = new AbortController();
+    ctrl.abort(primary);
+    const factory = factoryFor(() => streamOf([]));
+    const aborted = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      signal: ctrl.signal,
+      processorFactory: factory,
+    }).video?.getReader();
+    if (aborted === undefined) throw new Error('expected live video stream');
+    await expect(aborted.read()).rejects.toBe(primary);
+    expect(factory.calls).toHaveLength(0);
+
+    const endedTrack = new FakeTrack('video');
+    const ended = decodeLiveMediaStream(liveSource([endedTrack]), {
+      processorFactory: factory,
+    }).video?.getReader();
+    endedTrack.end();
+    if (ended === undefined) throw new Error('expected live video stream');
+    await expect(ended.read()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it('handles end during processor creation and ordinary processor EOF', async () => {
+    const endingTrack = new FakeTrack('video');
+    const ending = decodeLiveMediaStream(liveSource([endingTrack]), {
+      processorFactory: factoryFor(() => {
+        endingTrack.end();
+        return streamOf([]);
+      }),
+    }).video?.getReader();
+    if (ending === undefined) throw new Error('expected live video stream');
+    await expect(ending.read()).resolves.toEqual({ done: true, value: undefined });
+
+    const eof = decodeLiveMediaStream(liveSource([new FakeTrack('audio')]), {
+      processorFactory: factoryFor(() => streamOf([])),
+    }).audio?.getReader();
+    if (eof === undefined) throw new Error('expected live audio stream');
+    await expect(eof.read()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it('classifies null, primitive, and close-failing wrong frames without masking the primary error', async () => {
+    for (const value of [
+      null,
+      7,
+      {
+        close: () => {
+          throw new Error('close failed');
+        },
+      },
+      {},
+    ]) {
+      const reader = decodeLiveMediaStream(liveSource([new FakeTrack('audio')]), {
+        processorFactory: factoryFor(() => streamOf([value])),
+      }).audio?.getReader();
+      if (reader === undefined) throw new Error('expected live audio stream');
+      await expect(reader.read()).rejects.toBeInstanceOf(CapabilityError);
+    }
+  });
+
+  it('maps an untyped processor read rejection and non-finite first timestamp', async () => {
+    const failing = new ReadableStream<unknown>({
+      pull(): never {
+        throw new Error('host read failed');
+      },
+    });
+    const reader = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      processorFactory: factoryFor(() => failing),
+    }).video?.getReader();
+    if (reader === undefined) throw new Error('expected live video stream');
+    await expect(reader.read()).rejects.toMatchObject({ code: 'decode-error' });
+
+    const invalidTime = new FakeVideoFrame(Number.NaN);
+    const timeReader = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
+      processorFactory: factoryFor(() => streamOf([invalidTime])),
+    }).video?.getReader();
+    if (timeReader === undefined) throw new Error('expected live video stream');
+    await expect(timeReader.read()).rejects.toMatchObject({ code: 'decode-error' });
+    expect(invalidTime.closeCount).toBe(1);
+  });
   it('rejects multiple live tracks of one kind instead of silently selecting one', () => {
     const factory = factoryFor(() => streamOf([]));
     expect(() =>

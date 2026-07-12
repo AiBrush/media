@@ -8,14 +8,13 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { fragmentMp4 } from '../drivers/mp4/fragment.ts';
 import { Mp4Driver, mp4PacketInfoTable, readMovie } from '../drivers/mp4/mp4-driver.ts';
+import type { ChunkStruct, Mp4PacketTrackInput } from '../drivers/mp4/mux.ts';
 import {
-  type ChunkStruct,
-  type Mp4PacketTrackInput,
-  toMuxTrack,
-  trackStateFrom,
-} from '../drivers/mp4/mux.ts';
-import { streamMp4PacketTracks, writeMp4PacketTracks } from '../drivers/mp4/prepared-stream.ts';
-import type { MuxTrackInput } from '../drivers/mp4/write.ts';
+  mp4PacketMuxTracks,
+  streamMp4PacketTracks,
+  writeMp4PacketTracks,
+} from '../drivers/mp4/prepared-stream.ts';
+import type { NativePacketChunk } from '../internal/packet-provenance.ts';
 import { cacheSource } from '../sources/cache.ts';
 import { fromBytes, fromURL } from '../sources/source.ts';
 import type { Container } from './types.ts';
@@ -40,6 +39,17 @@ export interface PreparedMp4PacketTracksMuxInput {
   readonly container: Container | string;
   readonly faststart?: boolean;
   readonly fragmented?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface PreparedMp4NativeTracksMuxInput {
+  readonly tracks: readonly {
+    readonly track: TrackInfo;
+    readonly chunks: readonly NativePacketChunk[];
+  }[];
+  readonly container: Container | string;
+  readonly faststart?: boolean;
+  readonly signal?: AbortSignal;
 }
 
 export interface Mp4PacketInfoFromUrlOptions {
@@ -62,9 +72,9 @@ export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uin
 
 export function muxPreparedMp4PacketTracks(input: PreparedMp4PacketTracksMuxInput): Uint8Array {
   assertPreparedMp4MuxInput(input, 'mux');
-  const tracks = packetTrackInputsFrom(input.tracks);
+  const tracks = packetTrackInputsFrom(input.tracks, input.signal);
   if (input.fragmented === true)
-    return concatenateSegments(fragmentMp4(muxTracksFromPacketTracks(tracks)));
+    return concatenateSegments(fragmentMp4(mp4PacketMuxTracks(tracks)));
   const options: MuxOptions = {
     container: input.container,
     fragmented: false,
@@ -73,13 +83,42 @@ export function muxPreparedMp4PacketTracks(input: PreparedMp4PacketTracksMuxInpu
   return writeMp4PacketTracks(tracks, options);
 }
 
+/** Author already-validated first-party packet structs without WebCodecs host-chunk projection. */
+export function muxPreparedMp4NativeTracks(input: PreparedMp4NativeTracksMuxInput): Uint8Array {
+  if (input.container !== 'mp4' && input.container !== 'mov') {
+    throw new CapabilityError(
+      'capability-miss',
+      `prepared MP4 native mux cannot write '${input.container}'`,
+      {
+        op: { op: 'mux', container: input.container },
+        tried: ['mp4'],
+      },
+    );
+  }
+  assertNotAborted(input.signal);
+  const tracks: Mp4PacketTrackInput[] = input.tracks.map(({ track, chunks }) => ({
+    track,
+    chunks: chunks.map((chunk) => ({
+      timestampUs: chunk.timestampUs,
+      durationUs: chunk.durationUs,
+      key: chunk.key,
+      data: chunk.data,
+      ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
+    })),
+  }));
+  return writeMp4PacketTracks(tracks, {
+    container: input.container,
+    fragmented: false,
+    ...(input.faststart !== undefined ? { faststart: input.faststart } : {}),
+  });
+}
+
 export function muxPreparedMp4PacketTracksStream(
   input: PreparedMp4PacketTracksMuxInput,
 ): ReadableStream<Uint8Array> {
   assertPreparedMp4MuxInput(input, 'stream mux');
-  const tracks = packetTrackInputsFrom(input.tracks);
-  if (input.fragmented === true)
-    return streamSegments(fragmentMp4(muxTracksFromPacketTracks(tracks)));
+  const tracks = packetTrackInputsFrom(input.tracks, input.signal);
+  if (input.fragmented === true) return streamSegments(fragmentMp4(mp4PacketMuxTracks(tracks)));
   const options: MuxOptions = {
     container: input.container,
     fragmented: false,
@@ -223,26 +262,18 @@ function chunkStructFrom(value: Packet | EncodedChunk): ChunkStruct {
 
 function packetTrackInputsFrom(
   tracks: readonly PreparedMp4PacketTrackMuxInput[],
+  signal?: AbortSignal,
 ): Mp4PacketTrackInput[] {
   const out: Mp4PacketTrackInput[] = [];
   for (const track of tracks) {
     const chunks: ChunkStruct[] = [];
-    for (const packet of track.packets) chunks.push(chunkStructFrom(packet));
+    for (const packet of track.packets) {
+      assertNotAborted(signal);
+      chunks.push(chunkStructFrom(packet));
+    }
     out.push({ track: track.track, chunks });
   }
-  return out;
-}
-
-function muxTracksFromPacketTracks(inputs: readonly Mp4PacketTrackInput[]): MuxTrackInput[] {
-  const out: MuxTrackInput[] = [];
-  for (const [index, input] of inputs.entries()) {
-    const state = trackStateFrom(input.track);
-    for (const chunk of input.chunks) state.chunks.push(chunk);
-    if (state.chunks.length === 0) {
-      throw new MediaError('mux-error', `MP4 mux track ${index + 1} received no packets`);
-    }
-    out.push(toMuxTrack(state));
-  }
+  assertNotAborted(signal);
   return out;
 }
 

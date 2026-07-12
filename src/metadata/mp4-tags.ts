@@ -9,13 +9,46 @@ import {
   vorbisKeyFor,
 } from './tag-map.ts';
 
-interface Mp4Box {
+export interface Mp4MetadataBox {
   readonly type: string;
   readonly start: number;
   readonly headerSize: number;
   readonly payloadStart: number;
   readonly end: number;
 }
+
+type Mp4Box = Mp4MetadataBox;
+
+export type Mp4MetadataTarget = 'mp4' | 'mov';
+
+export interface Mp4MetadataDirectRewritePlan {
+  readonly moovStart: number;
+  readonly moovEnd: number;
+  readonly patchedMoov: Uint8Array<ArrayBuffer>;
+}
+
+const OFFSET_CONTAINER_BOXES = new Set([
+  'moov',
+  'trak',
+  'mdia',
+  'minf',
+  'stbl',
+  'edts',
+  'dinf',
+  'udta',
+  'meta',
+]);
+
+const DIRECT_REWRITE_UNSAFE_TOP_LEVEL_BOXES = new Set([
+  'meta',
+  'moof',
+  'sidx',
+  'ssix',
+  'mfra',
+  'uuid',
+]);
+
+const DIRECT_REWRITE_UNSAFE_MOOV_BOXES = new Set(['mvex', 'cmov', 'saio', 'iloc', 'uuid']);
 
 const TEXT_ATOMS = new Map<string, string>([
   ['album', '\u00a9alb'],
@@ -124,7 +157,14 @@ function boxes(bytes: Uint8Array, start: number, end: number): Mp4Box[] {
       size = end - offset;
     }
     const next = offset + size;
-    if (size < headerSize || next <= offset || next > end) break;
+    if (
+      !Number.isSafeInteger(size) ||
+      !Number.isSafeInteger(next) ||
+      size < headerSize ||
+      next <= offset ||
+      next > end
+    )
+      break;
     out.push({
       type: fourcc(bytes, offset + 4),
       start: offset,
@@ -137,14 +177,171 @@ function boxes(bytes: Uint8Array, start: number, end: number): Mp4Box[] {
   return out;
 }
 
-function replaceBoxSize(bytes: Uint8Array): Uint8Array {
+function completeBoxes(bytes: Uint8Array, start: number, end: number): Mp4Box[] | undefined {
+  const parsed = boxes(bytes, start, end);
+  if (start === end) return parsed;
+  return parsed.at(-1)?.end === end ? parsed : undefined;
+}
+
+function offsetPointsIntoMdat(offset: number, mdats: readonly Mp4Box[]): boolean {
+  return mdats.some((mdat) => offset >= mdat.payloadStart && offset < mdat.end);
+}
+
+function validateChunkOffsetBox(
+  bytes: Uint8Array,
+  chunkOffsets: Mp4Box,
+  mdats: readonly Mp4Box[],
+): boolean {
+  const count = readU32(bytes, chunkOffsets.payloadStart + 4);
+  if (count === undefined) return false;
+  const valueBytes = chunkOffsets.type === 'co64' ? 8 : 4;
+  const valuesStart = chunkOffsets.payloadStart + 8;
+  if (count > Math.floor((chunkOffsets.end - valuesStart) / valueBytes)) return false;
+  if (valuesStart + count * valueBytes !== chunkOffsets.end) return false;
+  for (let index = 0, offset = valuesStart; index < count; index++, offset += valueBytes) {
+    const value = valueBytes === 8 ? readU64(bytes, offset) : readU32(bytes, offset);
+    if (
+      value === undefined ||
+      !Number.isSafeInteger(value) ||
+      !offsetPointsIntoMdat(value, mdats)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateDirectMoovOffsets(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  mdats: readonly Mp4Box[],
+): boolean {
+  const children = completeBoxes(bytes, start, end);
+  if (children === undefined) return false;
+  for (const child of children) {
+    if (DIRECT_REWRITE_UNSAFE_MOOV_BOXES.has(child.type)) return false;
+    if (
+      (child.type === 'stco' || child.type === 'co64') &&
+      !validateChunkOffsetBox(bytes, child, mdats)
+    ) {
+      return false;
+    }
+    if (!OFFSET_CONTAINER_BOXES.has(child.type)) continue;
+    const childStart = child.type === 'meta' ? child.payloadStart + 4 : child.payloadStart;
+    if (childStart > child.end || !validateDirectMoovOffsets(bytes, childStart, child.end, mdats)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+interface QualifiedDirectLayout {
+  readonly moov: Mp4MetadataBox;
+  readonly mediaAfterMoov: boolean;
+}
+
+function qualifyDirectLayout(
+  top: readonly Mp4MetadataBox[],
+  sourceSize: number,
+  ftypPrefix: Uint8Array,
+  moovBytes: Uint8Array,
+  target: Mp4MetadataTarget,
+): QualifiedDirectLayout | undefined {
+  if (!Number.isSafeInteger(sourceSize) || sourceSize < 0) return undefined;
+  let expectedStart = 0;
+  for (const child of top) {
+    if (
+      child.start !== expectedStart ||
+      child.headerSize < 8 ||
+      child.payloadStart !== child.start + child.headerSize ||
+      child.end <= child.start ||
+      child.end > sourceSize
+    ) {
+      return undefined;
+    }
+    expectedStart = child.end;
+  }
+  if (expectedStart !== sourceSize) return undefined;
+  if (top.some((child) => DIRECT_REWRITE_UNSAFE_TOP_LEVEL_BOXES.has(child.type))) {
+    return undefined;
+  }
+  const ftyps = top.filter((child) => child.type === 'ftyp');
+  const moovs = top.filter((child) => child.type === 'moov');
+  const mdats = top.filter((child) => child.type === 'mdat');
+  const ftyp = ftyps[0];
+  const moov = moovs[0];
+  if (
+    ftyps.length !== 1 ||
+    moovs.length !== 1 ||
+    mdats.length === 0 ||
+    ftyp === undefined ||
+    moov === undefined ||
+    moov.headerSize !== 8 ||
+    ftyp.headerSize + 8 > ftypPrefix.byteLength ||
+    moovBytes.byteLength !== moov.end - moov.start ||
+    fourcc(ftypPrefix, 4) !== 'ftyp' ||
+    fourcc(moovBytes, 4) !== 'moov'
+  ) {
+    return undefined;
+  }
+  const quickTimeBrand = fourcc(ftypPrefix, ftyp.headerSize) === 'qt  ';
+  if (target === 'mp4' ? quickTimeBrand : !quickTimeBrand) return undefined;
+  const allBefore = mdats.every((mdat) => mdat.end <= moov.start);
+  const allAfter = mdats.every((mdat) => mdat.start >= moov.end);
+  if (!allBefore && !allAfter) return undefined;
+  if (!validateDirectMoovOffsets(moovBytes, moov.headerSize, moovBytes.byteLength, mdats)) {
+    return undefined;
+  }
+  return { moov, mediaAfterMoov: allAfter };
+}
+
+/**
+ * Whether a complete MP4-family file can receive tags by relocating only `moov`.
+ *
+ * Fragment indexes, auxiliary/item offsets, mixed pre/post-`moov` media, external chunk references, and
+ * malformed box tails conservatively decline so the caller can replay the bytes through normal remux.
+ */
+export function canWriteMp4TagsDirectly(bytes: Uint8Array, target: Mp4MetadataTarget): boolean {
+  const top = completeBoxes(bytes, 0, bytes.byteLength);
+  if (top === undefined) return false;
+  const ftyp = top.find((child) => child.type === 'ftyp');
+  const moov = top.find((child) => child.type === 'moov');
+  if (ftyp === undefined || moov === undefined) return false;
+  return (
+    qualifyDirectLayout(
+      top,
+      bytes.byteLength,
+      bytes.subarray(ftyp.start, Math.min(ftyp.end, ftyp.payloadStart + 8)),
+      bytes.subarray(moov.start, moov.end),
+      target,
+    ) !== undefined
+  );
+}
+
+/**
+ * Whether immutable source bytes may be reused for an exact same-brand MP4-family semantic no-op.
+ * The caller still performs the driver's complete sample-extent validation before exposing output.
+ */
+export function canReuseMp4BlobDirectly(
+  top: readonly Mp4MetadataBox[],
+  sourceSize: number,
+  ftypPrefix: Uint8Array,
+  moovBytes: Uint8Array,
+  target: Mp4MetadataTarget,
+): boolean {
+  return qualifyDirectLayout(top, sourceSize, ftypPrefix, moovBytes, target) !== undefined;
+}
+
+function replaceBoxSize(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   if (bytes.byteLength > 0xffffffff) {
     throw new MediaError(
       'mux-error',
       'metadata rewrite produced an MP4 box over the 32-bit size limit',
     );
   }
-  const out = bytes.slice();
+  const out = new Uint8Array(bytes.byteLength);
+  out.set(bytes);
   writeU32(out, 0, out.byteLength);
   return out;
 }
@@ -253,6 +450,33 @@ function patchChunkOffsets(bytes: Uint8Array, start: number, end: number, delta:
         patchChunkOffsets(bytes, childPayloadStart, child.end, delta);
     }
   }
+}
+
+/**
+ * Plan the same ADR-274 `moov` rewrite from a range-scanned top-level layout. The caller may compose the
+ * returned owned `patchedMoov` between immutable source slices without materializing media payload bytes.
+ */
+export function planMp4TagsDirectRewrite(
+  top: readonly Mp4MetadataBox[],
+  sourceSize: number,
+  ftypPrefix: Uint8Array,
+  moovBytes: Uint8Array,
+  target: Mp4MetadataTarget,
+  tags: MetadataTags,
+): Mp4MetadataDirectRewritePlan | undefined {
+  const qualified = qualifyDirectLayout(top, sourceSize, ftypPrefix, moovBytes, target);
+  if (qualified === undefined) return undefined;
+  const newMoov = updateMoov(moovBytes, tags);
+  const delta = newMoov.byteLength - moovBytes.byteLength;
+  const patchedMoov = replaceBoxSize(newMoov);
+  if (delta !== 0 && qualified.mediaAfterMoov) {
+    patchChunkOffsets(patchedMoov, 8, patchedMoov.byteLength, delta);
+  }
+  return {
+    moovStart: qualified.moov.start,
+    moovEnd: qualified.moov.end,
+    patchedMoov,
+  };
 }
 
 function textDataValue(payload: Uint8Array): string {

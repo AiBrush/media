@@ -26,6 +26,10 @@ import type {
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
+import {
+  type NativePacketChunk,
+  registerNativePacketSource,
+} from '../../internal/packet-provenance.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import {
   fragmentSamplesToDemuxSamples,
@@ -39,7 +43,7 @@ import {
   fragmentMp4InitSegment,
 } from './fragment.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
-import { h264AccessUnitIsKeyPicture } from './h264-access-unit.ts';
+import { h264AccessUnitRangeIsKeyPicture } from './h264-access-unit.ts';
 import { Mp4Muxer } from './mux.ts';
 import {
   type Movie,
@@ -57,6 +61,7 @@ import {
   type SampleData,
   buildSampleData,
   buildSamples,
+  walkSampleClassificationRanges,
   walkSampleRanges,
 } from './samples.ts';
 import {
@@ -75,6 +80,8 @@ const MP4_EXTENSIONS = new Set(['mp4', 'mov', 'm4a', 'm4v', 'qt']);
 const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
+const PACKET_STREAM_BATCH_BYTES = 256 * 1024;
+const PACKET_STREAM_BATCH_PACKETS = 256;
 const AVC_IN_MEMORY_READ_BATCH_SAMPLES = 2048;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
 const LAZY_FRAGMENT_BUFFERED_SEGMENT_MULTIPLIER = 32;
@@ -84,10 +91,11 @@ const PACKET_INFO_OFFSET_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const LAZY_FRAGMENT_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_TARGET_SAMPLES * 4;
 const LAZY_FRAGMENT_BUFFERED_HARD_VIDEO_SAMPLES = LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES * 4;
 const FASTSTART_METADATA_PREFETCH_BYTES = 32 * 1024;
-const SMALL_FASTSTART_METADATA_PREFETCH_BYTES = 4 * 1024;
+const REMOTE_FASTSTART_METADATA_PREFETCH_BYTES = 128 * 1024;
+const REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES = 256 * 1024;
+const VIDEO_METADATA_LAYOUT_WINDOW_BYTES = 16 * 1024;
 const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
-const SIMPLE_VIDEO_FASTSTART_PROBE_MAX_SOURCE_BYTES = 256 * 1024;
 const FULL_RANGE_EOF_SLACK_SEC = 0.05;
 const SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES = 1024 * 1024;
 const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
@@ -111,6 +119,8 @@ function brandFor(container: string | undefined): ContainerBrand {
 interface RandomAccess {
   read(offset: number, length: number): Promise<Uint8Array>;
   size?: number | undefined;
+  /** Source-aware first-window policy for metadata-only reads. */
+  readonly metadataPrefetchBytes?: number;
   /** `read()` returns a zero-copy in-memory view, so sample-granular reads carry no I/O round trip. */
   readonly inMemory?: boolean;
   /** A complete prior read retained as a view, used to validate a probe→demux handoff without new I/O. */
@@ -145,12 +155,10 @@ function coveredByteView(
 }
 
 interface MovieParseHandoff {
-  readonly movie?: Movie;
-  readonly faststart?: {
+  readonly faststart: {
     readonly brand: string;
     readonly moov: Uint8Array;
   };
-  readonly mediaDataRanges: readonly MediaDataRange[];
   readonly token: object;
 }
 
@@ -180,6 +188,16 @@ function sourceKind(src: ByteSource): string | undefined {
   return (src as ByteSource & { readonly kind?: string }).kind;
 }
 
+function metadataProbePrefetchBytes(src: ByteSource): number {
+  const kind = sourceKind(src);
+  // One 128 KiB HTTP window is the latency/overfetch crossover for remote metadata: it captures the
+  // common medium faststart `moov` in one request, while keeping tail-moov overfetch strictly bounded.
+  // Local byte/blob sources retain the smaller window because their range reads have no round-trip.
+  return kind === 'url' || kind === 'element'
+    ? REMOTE_FASTSTART_METADATA_PREFETCH_BYTES
+    : FASTSTART_METADATA_PREFETCH_BYTES;
+}
+
 function shouldEagerReadRandomAccess(
   src: ByteSource,
   maxBytes: number | undefined,
@@ -199,11 +217,13 @@ async function randomAccess(
 ): Promise<RandomAccess> {
   const range = src.range;
   if (range) {
+    const metadataPrefetchBytes = metadataProbePrefetchBytes(src);
     if (shouldEagerReadRandomAccess(src, opts.eagerReadMaxBytes)) {
       const buffered = await range.call(src, 0, src.size);
       return {
         read: (offset, length) => Promise.resolve(buffered.subarray(offset, offset + length)),
         size: buffered.byteLength,
+        metadataPrefetchBytes,
         inMemory: true,
         cachedWhole: () => buffered,
       };
@@ -231,6 +251,7 @@ async function randomAccess(
       get size(): number | undefined {
         return src.size;
       },
+      metadataPrefetchBytes,
       inMemory: sourceKind(src) === 'bytes',
       cachedWhole: () => cachedWhole,
     };
@@ -384,13 +405,7 @@ function shouldTrySimpleVideoFaststartProbe(
   src: ByteSource,
   ra: RandomAccess,
 ): ra is SizedRandomAccess {
-  if (
-    ra.size === undefined ||
-    ra.size > SIMPLE_VIDEO_FASTSTART_PROBE_MAX_SOURCE_BYTES ||
-    ra.size <= 0
-  ) {
-    return false;
-  }
+  if (ra.size === undefined || ra.size <= 0) return false;
   const mime = sourceMimeHint(src)?.toLowerCase();
   if (mime !== undefined) {
     return mime.startsWith('video/') || mime === 'application/mp4';
@@ -407,21 +422,8 @@ function canHandoffFullMovie(src: ByteSource, ra: RandomAccess): boolean {
   );
 }
 
-function storeMovieParseHandoff(
-  key: string,
-  movie: Movie,
-  mediaDataRanges: readonly MediaDataRange[],
-): void {
-  storeMovieParseHandoffValue(key, { movie, mediaDataRanges });
-}
-
-function storeFaststartMoovParseHandoff(
-  key: string,
-  brand: string,
-  moov: Uint8Array,
-  mediaDataRanges: readonly MediaDataRange[],
-): void {
-  storeMovieParseHandoffValue(key, { faststart: { brand, moov }, mediaDataRanges });
+function storeFaststartMoovParseHandoff(key: string, brand: string, moov: Uint8Array): void {
+  storeMovieParseHandoffValue(key, { faststart: { brand, moov } });
 }
 
 function storeMovieParseHandoffValue(key: string, value: Omit<MovieParseHandoff, 'token'>): void {
@@ -437,8 +439,13 @@ function storeMovieParseHandoffValue(key: string, value: Omit<MovieParseHandoff,
 async function readMovieForProbe(src: ByteSource, ra: RandomAccess): Promise<Movie> {
   const key = sourceCacheKey(src);
   if (key !== undefined && canHandoffFullMovie(src, ra)) {
-    const movie = await readMovie(ra);
-    storeMovieParseHandoff(key, movie, await readMediaDataRanges(ra));
+    let handoff: { readonly brand: string; readonly moov: Uint8Array } | undefined;
+    const movie = await readMovieMetadata(ra, (brand, moov) => {
+      handoff = { brand, moov: moov.slice() };
+    });
+    if (handoff !== undefined) {
+      storeFaststartMoovParseHandoff(key, handoff.brand, handoff.moov);
+    }
     return movie;
   }
   return readMovieMetadata(ra);
@@ -446,7 +453,7 @@ async function readMovieForProbe(src: ByteSource, ra: RandomAccess): Promise<Mov
 
 interface MovieForDemux {
   readonly movie: Movie;
-  /** Validated `mdat` ownership cached by an immediate probe of the same stable source, when present. */
+  /** Cold demux discovers `moov` and validates top-level `mdat` ownership in one forward scan. */
   readonly mediaDataRanges?: readonly MediaDataRange[];
 }
 
@@ -456,18 +463,10 @@ async function readMovieForDemux(src: ByteSource, ra: RandomAccess): Promise<Mov
     const cached = movieParseHandoff.get(key);
     if (cached !== undefined) {
       movieParseHandoff.delete(key);
-      if (cached.movie !== undefined) {
-        return { movie: cached.movie, mediaDataRanges: cached.mediaDataRanges };
-      }
-      if (cached.faststart !== undefined) {
-        return {
-          movie: parseMovie(cached.faststart.brand, cached.faststart.moov),
-          mediaDataRanges: cached.mediaDataRanges,
-        };
-      }
+      return { movie: parseMovie(cached.faststart.brand, cached.faststart.moov) };
     }
   }
-  return { movie: await readMovie(ra) };
+  return readMovieAndMediaDataRanges(src, ra);
 }
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -512,50 +511,92 @@ function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefin
   return { size, type, headerSize };
 }
 
-async function readFaststartMetadata(ra: RandomAccess): Promise<MovieMetadata | undefined> {
-  const prefetchBytes = Math.min(
-    FASTSTART_METADATA_PREFETCH_BYTES,
-    ra.size ?? FASTSTART_METADATA_PREFETCH_BYTES,
-  );
-  const head = await ra.read(0, prefetchBytes);
+interface FaststartMetadataContinuation {
+  readonly kind: 'continue';
+  readonly offset: number;
+  readonly brand: string;
+}
+
+interface FaststartMetadataMovie {
+  readonly kind: 'movie';
+  readonly movie: MovieMetadata;
+}
+
+type FaststartMetadataResult = FaststartMetadataContinuation | FaststartMetadataMovie | undefined;
+type MoovObserver = (brand: string, moov: Uint8Array) => void;
+
+async function readFaststartMetadata(
+  ra: RandomAccess,
+  onMoov?: MoovObserver,
+): Promise<FaststartMetadataResult> {
+  const requestedPrefetchBytes = ra.metadataPrefetchBytes ?? FASTSTART_METADATA_PREFETCH_BYTES;
+  const prefetchBytes = Math.min(requestedPrefetchBytes, ra.size ?? requestedPrefetchBytes);
+  let window = await ra.read(0, prefetchBytes);
+  let windowStart = 0;
   let offset = 0;
   let brand = 'mp42';
 
   for (;;) {
-    const header = topBoxHeader(head, offset);
-    if (header === undefined) return undefined;
-    if (header.type === 'ftyp' && offset + 12 <= head.byteLength) {
-      brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
+    const header = topBoxHeader(window, offset);
+    if (header === undefined) {
+      return windowStart === 0
+        ? undefined
+        : { kind: 'continue', offset: windowStart + offset, brand };
+    }
+    const absoluteOffset = windowStart + offset;
+    if (header.type === 'ftyp' && offset + 12 <= window.byteLength) {
+      brand = new Reader(window.subarray(offset + 8, offset + 12)).fourcc();
     }
     if (header.type === 'moov') {
-      if (offset + header.size <= head.byteLength) {
-        return parseMovieMetadata(
-          brand,
-          head.subarray(offset + header.headerSize, offset + header.size),
-        );
+      if (offset + header.size <= window.byteLength) {
+        const moov = window.subarray(offset + header.headerSize, offset + header.size);
+        onMoov?.(brand, moov);
+        return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
       }
-      const moovEnd = offset + header.size;
-      if (moovEnd <= FASTSTART_PREFIX_CACHE_READ_MAX_BYTES) {
+      const moovEnd = absoluteOffset + header.size;
+      if (windowStart === 0 && moovEnd <= FASTSTART_PREFIX_CACHE_READ_MAX_BYTES) {
         const prefix = await ra.read(0, moovEnd);
         if (prefix.byteLength >= moovEnd) {
-          return parseMovieMetadata(brand, prefix.subarray(offset + header.headerSize, moovEnd));
+          const moov = prefix.subarray(absoluteOffset + header.headerSize, moovEnd);
+          onMoov?.(brand, moov);
+          return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
         }
       }
-      const box = await ra.read(offset, header.size);
+      const box = await ra.read(absoluteOffset, header.size);
       if (box.byteLength < header.headerSize) return undefined;
-      return parseMovieMetadata(brand, box.subarray(header.headerSize));
+      const moov = box.subarray(header.headerSize);
+      onMoov?.(brand, moov);
+      return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
+    }
+    const nextOffset = absoluteOffset + header.size;
+    if (!Number.isSafeInteger(nextOffset)) {
+      throw new MediaError('demux-error', 'MP4 top-level box exceeds the safe byte-offset range');
     }
     offset += header.size;
-    if (offset + 8 > head.byteLength) return undefined;
+    if (offset + 8 <= window.byteLength) continue;
+
+    const continuationBytes = Math.min(
+      FASTSTART_METADATA_PREFETCH_BYTES,
+      ra.size === undefined ? FASTSTART_METADATA_PREFETCH_BYTES : Math.max(0, ra.size - nextOffset),
+    );
+    if (continuationBytes < 8) {
+      return { kind: 'continue', offset: nextOffset, brand };
+    }
+    window = await ra.read(nextOffset, continuationBytes);
+    windowStart = nextOffset;
+    offset = 0;
   }
 }
 
 type SmallFaststartMetadataProbeTracks = readonly TrackInfo[] | false | undefined;
 
-function isSmallFaststartMetadataTrack(track: ParsedTrack): boolean {
+function isBoundedVideoMetadataTrack(track: ParsedTrack): boolean {
   if (track.mediaType === 'video') {
     return (
-      (track.sampleEntryType === 'avc1' || track.sampleEntryType === 'avc3') &&
+      (track.sampleEntryType === 'avc1' ||
+        track.sampleEntryType === 'avc3' ||
+        track.sampleEntryType === 'hvc1' ||
+        track.sampleEntryType === 'hev1') &&
       track.width !== undefined &&
       track.height !== undefined &&
       track.fps !== undefined &&
@@ -570,47 +611,75 @@ function isSmallFaststartMetadataTrack(track: ParsedTrack): boolean {
   );
 }
 
-async function readSmallFaststartMetadataProbeTracks(
+async function readBoundedVideoMetadataProbeTracks(
   src: ByteSource,
   ra: SizedRandomAccess,
+  signal: AbortSignal | undefined,
 ): Promise<SmallFaststartMetadataProbeTracks> {
-  const head = await ra.read(0, Math.min(ra.size, SMALL_FASTSTART_METADATA_PREFETCH_BYTES));
-  let offset = 0;
+  const kind = sourceKind(src);
+  // A remote request's round trip dominates copying a few extra metadata bytes, while local Blob/byte
+  // ranges favor the smallest parsing window. Both policies still jump over top-level payload boxes.
+  const layoutWindowBytes =
+    kind === 'url' || kind === 'element'
+      ? (ra.metadataPrefetchBytes ?? REMOTE_FASTSTART_METADATA_PREFETCH_BYTES)
+      : VIDEO_METADATA_LAYOUT_WINDOW_BYTES;
+  let windowStart = 0;
+  let window = await ra.read(0, Math.min(ra.size, layoutWindowBytes));
+  throwIfAborted(signal);
+  let absoluteOffset = 0;
   let brand = 'mp42';
-  for (;;) {
-    const header = topBoxHeader(head, offset);
-    if (header === undefined) return undefined;
-    if (header.type === 'ftyp' && offset + 12 <= head.byteLength) {
-      brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
+  while (absoluteOffset < ra.size) {
+    let relativeOffset = absoluteOffset - windowStart;
+    if (relativeOffset < 0 || relativeOffset + 8 > window.byteLength) {
+      const remaining = ra.size - absoluteOffset;
+      if (remaining < 8) return false;
+      windowStart = absoluteOffset;
+      window = await ra.read(windowStart, Math.min(remaining, layoutWindowBytes));
+      throwIfAborted(signal);
+      relativeOffset = 0;
+    }
+
+    const header = topBoxHeader(window, relativeOffset);
+    if (header === undefined) return false;
+    const boxEnd = absoluteOffset + header.size;
+    if (!Number.isSafeInteger(boxEnd) || boxEnd <= absoluteOffset || boxEnd > ra.size) {
+      return false;
+    }
+    if (header.type === 'ftyp' && relativeOffset + 12 <= window.byteLength) {
+      brand = new Reader(window.subarray(relativeOffset + 8, relativeOffset + 12)).fourcc();
     }
     if (header.type === 'moov') {
-      const moovEnd = offset + header.size;
-      const moov =
-        moovEnd <= head.byteLength
-          ? head.subarray(offset + header.headerSize, moovEnd)
-          : (await ra.read(offset, header.size)).subarray(header.headerSize);
-      if (moov.byteLength < header.size - header.headerSize) return undefined;
+      const relativeEnd = relativeOffset + header.size;
+      let moov: Uint8Array;
+      if (relativeEnd <= window.byteLength) {
+        moov = window.subarray(relativeOffset + header.headerSize, relativeEnd);
+      } else {
+        const box = await ra.read(absoluteOffset, header.size);
+        throwIfAborted(signal);
+        if (box.byteLength < header.size) return false;
+        moov = box.subarray(header.headerSize, header.size);
+      }
       try {
         const movie = parseMovieMetadata(brand, moov);
         if (
           movie.needsFragmentTiming ||
           !movie.tracks.some((track) => track.mediaType === 'video') ||
-          !movie.tracks.every(isSmallFaststartMetadataTrack)
+          !movie.tracks.every(isBoundedVideoMetadataTrack)
         ) {
           return false;
         }
         const key = sourceCacheKey(src);
         if (key !== undefined && canHandoffFullMovie(src, ra)) {
-          storeFaststartMoovParseHandoff(key, brand, moov.slice(), await readMediaDataRanges(ra));
+          storeFaststartMoovParseHandoff(key, brand, moov.slice());
         }
         return toProbeTracks(movie);
       } catch {
         return false;
       }
     }
-    offset += header.size;
-    if (offset + 8 > head.byteLength) return undefined;
+    absoluteOffset = boxEnd;
   }
+  return false;
 }
 
 async function readSimpleVideoFaststartProbeTracks(
@@ -622,12 +691,7 @@ async function readSimpleVideoFaststartProbeTracks(
   if (result === undefined) return undefined;
   const key = sourceCacheKey(src);
   if (key !== undefined && canHandoffFullMovie(src, ra)) {
-    storeFaststartMoovParseHandoff(
-      key,
-      result.brand,
-      result.moov.slice(),
-      await readMediaDataRanges(ra),
-    );
+    storeFaststartMoovParseHandoff(key, result.brand, result.moov.slice());
   }
   return result.tracks;
 }
@@ -737,21 +801,22 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
 }
 
 /** Read only metadata needed for probe; full packet tables remain a demux-only cost. */
-export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
-  const faststart = await readFaststartMetadata(ra);
-  if (faststart !== undefined) {
-    if (faststart.needsFragmentTiming) {
-      if (hasAuthoritativeFragmentedAudioInitDuration(faststart)) return faststart;
+export async function readMovieMetadata(ra: RandomAccess, onMoov?: MoovObserver): Promise<Movie> {
+  const faststart = await readFaststartMetadata(ra, onMoov);
+  if (faststart?.kind === 'movie') {
+    const movie = faststart.movie;
+    if (movie.needsFragmentTiming) {
+      if (hasAuthoritativeFragmentedAudioInitDuration(movie)) return movie;
       return applyFragmentTiming(
-        faststart,
+        movie,
         await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER),
       );
     }
-    return faststart;
+    return movie;
   }
 
-  let offset = 0;
-  let brand = 'mp42';
+  let offset = faststart?.offset ?? 0;
+  let brand = faststart?.brand ?? 'mp42';
   const limit = ra.size ?? Number.MAX_SAFE_INTEGER;
 
   while (offset + 8 <= limit) {
@@ -774,7 +839,9 @@ export async function readMovieMetadata(ra: RandomAccess): Promise<Movie> {
     }
     if (type === 'moov') {
       const box = await ra.read(offset, size);
-      const movie = parseMovieMetadata(brand, box.subarray(headerSize));
+      const moov = box.subarray(headerSize);
+      onMoov?.(brand, moov);
+      const movie = parseMovieMetadata(brand, moov);
       if (movie.needsFragmentTiming) {
         if (hasAuthoritativeFragmentedAudioInitDuration(movie)) return movie;
         return applyFragmentTiming(movie, await readWholeFile(ra, limit));
@@ -836,11 +903,17 @@ function muxTrackMeta(track: ParsedTrack): Omit<MuxTrackInput, 'samples'> {
     mediaType: track.mediaType,
     sampleEntryType: track.sampleEntryType,
     timescale: track.timescale,
+    ...(track.mediaDurationTicks !== undefined && track.mediaDurationTicks > 0
+      ? { mediaDurationTicks: track.mediaDurationTicks }
+      : {}),
     ...(track.codecPrivate ? { codecPrivate: track.codecPrivate } : {}),
     ...(track.width !== undefined ? { width: track.width } : {}),
     ...(track.height !== undefined ? { height: track.height } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(track.displayTransform !== undefined ? { displayTransform: track.displayTransform } : {}),
+    ...(track.colr !== undefined ? { colr: track.colr } : {}),
+    ...(track.pasp !== undefined ? { pasp: track.pasp } : {}),
+    ...(track.clap !== undefined ? { clap: track.clap } : {}),
     ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
     ...(track.channels !== undefined ? { channels: track.channels } : {}),
     ...(track.edit !== undefined
@@ -848,12 +921,17 @@ function muxTrackMeta(track: ParsedTrack): Omit<MuxTrackInput, 'samples'> {
           edit: {
             mediaTimeTicks: track.edit.mediaTimeTicks,
             durationTicks: Math.round(track.edit.durationSec * track.timescale),
+            movieTimescale: track.edit.movieTimescale,
+            durationMovieTicks: track.edit.durationMovieTicks,
             ...(track.edit.leadingEmptyDurationSec !== undefined
               ? {
                   leadingEmptyDurationTicks: Math.round(
                     track.edit.leadingEmptyDurationSec * track.timescale,
                   ),
                 }
+              : {}),
+            ...(track.edit.leadingEmptyDurationMovieTicks !== undefined
+              ? { leadingEmptyDurationMovieTicks: track.edit.leadingEmptyDurationMovieTicks }
               : {}),
           },
         }
@@ -918,6 +996,163 @@ interface MediaDataRange {
   readonly end: number;
 }
 
+interface TopLevelBoxRange {
+  readonly type: string;
+  readonly headerSize: number;
+  readonly end: number;
+}
+
+function validatedTopLevelBoxRange(
+  header: Uint8Array,
+  offset: number,
+  sourceSize: number,
+): TopLevelBoxRange {
+  if (header.byteLength < 8) {
+    throw new MediaError('demux-error', `truncated top-level MP4 box header at offset ${offset}`);
+  }
+  const reader = new Reader(header);
+  let size = reader.u32();
+  const type = reader.fourcc();
+  // ISO-BMFF boxes have a four-character-code type. 0x00000000 is a legacy QuickTime terminator only
+  // inside a sound-description `wave` atom; at file top level it is a destroyed header, not an unknown
+  // extension box. Keep every nonzero unknown type forward-compatible and skip it by its declared size.
+  if (header[4] === 0 && header[5] === 0 && header[6] === 0 && header[7] === 0) {
+    throw new MediaError('demux-error', `zero top-level MP4 box type at offset ${offset}`);
+  }
+  let headerSize = 8;
+  if (size === 1) {
+    if (header.byteLength < 16) {
+      throw new MediaError(
+        'demux-error',
+        `truncated 64-bit top-level MP4 box header at offset ${offset}`,
+      );
+    }
+    size = reader.u64();
+    headerSize = 16;
+  } else if (size === 0) {
+    size = sourceSize - offset;
+  }
+  const end = offset + size;
+  if (size < headerSize || !Number.isSafeInteger(end) || end <= offset || end > sourceSize) {
+    throw new MediaError(
+      'demux-error',
+      `invalid top-level MP4 box '${type}' range [${offset}, ${end}) for source size ${sourceSize}`,
+    );
+  }
+  return { type, headerSize, end };
+}
+
+interface ReadWindow {
+  readonly start: number;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * Cold demux needs both full sample tables and strict top-level `mdat` ownership. Discover them in one
+ * monotonic layout scan so a range source does not pay one request sequence for `moov` and then repeat it
+ * for storage validation. Remote reads use one bounded look-ahead window; local sources keep exact reads.
+ */
+async function readMovieAndMediaDataRanges(
+  src: ByteSource,
+  ra: RandomAccess,
+): Promise<MovieForDemux> {
+  const kind = sourceKind(src);
+  const remote = kind === 'url' || kind === 'element';
+  let window: ReadWindow | undefined;
+
+  // An unknown-size URL needs one exact header read to learn its Content-Range before deciding whether
+  // metadata read-ahead is appropriate. Never turn a small source into an eager payload read.
+  if (remote && ra.size === undefined) {
+    window = { start: 0, bytes: await ra.read(0, 16) };
+  }
+
+  const sourceSize = ra.size;
+  if (sourceSize === undefined) {
+    throw new MediaError('demux-error', 'MP4 demux needs a known source size');
+  }
+  const remoteReadAhead = remote && sourceSize > REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES * 2;
+  if (remoteReadAhead && (window?.bytes.byteLength ?? 0) < REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES) {
+    window = {
+      start: 0,
+      bytes: await ra.read(0, REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES),
+    };
+  }
+  const cachedWhole = ra.cachedWhole?.();
+  if (cachedWhole !== undefined) {
+    if (cachedWhole.byteLength !== sourceSize) {
+      throw new MediaError(
+        'demux-error',
+        `short in-memory MP4 read: got ${cachedWhole.byteLength} of ${sourceSize} bytes`,
+      );
+    }
+    window = { start: 0, bytes: cachedWhole };
+  } else if (ra.inMemory === true) {
+    const fullBytes = await ra.read(0, sourceSize);
+    if (fullBytes.byteLength !== sourceSize) {
+      throw new MediaError(
+        'demux-error',
+        `short in-memory MP4 read: got ${fullBytes.byteLength} of ${sourceSize} bytes`,
+      );
+    }
+    window = { start: 0, bytes: fullBytes };
+  }
+
+  const readWindow = async (offset: number, minimumLength: number): Promise<Uint8Array> => {
+    const relativeOffset = offset - (window?.start ?? 0);
+    if (
+      window !== undefined &&
+      relativeOffset >= 0 &&
+      relativeOffset + minimumLength <= window.bytes.byteLength
+    ) {
+      return window.bytes.subarray(relativeOffset, relativeOffset + minimumLength);
+    }
+    const available = sourceSize - offset;
+    const requestLength = Math.min(
+      available,
+      minimumLength + (remoteReadAhead ? REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES : 0),
+    );
+    const bytes = await ra.read(offset, requestLength);
+    if (bytes.byteLength < minimumLength) {
+      throw new MediaError(
+        'demux-error',
+        `short MP4 layout read at offset ${offset}: got ${bytes.byteLength} of ${minimumLength} bytes`,
+      );
+    }
+    window = { start: offset, bytes };
+    return bytes.subarray(0, minimumLength);
+  };
+
+  const ranges: MediaDataRange[] = [];
+  let movie: Movie | undefined;
+  let brand = 'mp42';
+  let offset = 0;
+  while (offset < sourceSize) {
+    const headerLength = Math.min(16, sourceSize - offset);
+    const header = await readWindow(offset, headerLength);
+    const box = validatedTopLevelBoxRange(header, offset, sourceSize);
+    if (box.type === 'ftyp' && header.byteLength >= 12) {
+      brand = new Reader(header.subarray(8, 12)).fourcc();
+    }
+    if (box.type === 'mdat') ranges.push({ start: offset + box.headerSize, end: box.end });
+    if (box.type === 'moov' && movie === undefined) {
+      const boxLength = box.end - offset;
+      const boxBytes = await readWindow(offset, boxLength);
+      movie = parseMovie(brand, boxBytes.subarray(box.headerSize));
+    }
+    offset = box.end;
+  }
+  if (movie === undefined) {
+    throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
+  }
+  if (
+    movie.hasFragments === true ||
+    movie.tracks.some((track) => track.samples.sampleSizes.length === 0)
+  ) {
+    movie = applyFragmentTiming(movie, await readWholeFile(ra, sourceSize));
+  }
+  return { movie, mediaDataRanges: ranges };
+}
+
 /**
  * Walk the complete ISO-BMFF top level and return every `mdat` payload range. Unknown boxes are legal;
  * malformed/truncated headers are not. Demux needs this stronger pass because `readMovie()` can return as
@@ -943,40 +1178,9 @@ async function readMediaDataRanges(ra: RandomAccess): Promise<MediaDataRange[]> 
     const headerLength = Math.min(16, sourceSize - offset);
     const header =
       fullBytes?.subarray(offset, offset + headerLength) ?? (await ra.read(offset, headerLength));
-    if (header.byteLength < 8) {
-      throw new MediaError('demux-error', `truncated top-level MP4 box header at offset ${offset}`);
-    }
-    const reader = new Reader(header);
-    let size = reader.u32();
-    const type = reader.fourcc();
-    // ISO-BMFF boxes have a four-character-code type. 0x00000000 is a legacy QuickTime terminator only
-    // inside a sound-description `wave` atom; at file top level it is a destroyed header, not an unknown
-    // extension box. Keep every nonzero unknown type forward-compatible and skip it by its declared size.
-    if (header[4] === 0 && header[5] === 0 && header[6] === 0 && header[7] === 0) {
-      throw new MediaError('demux-error', `zero top-level MP4 box type at offset ${offset}`);
-    }
-    let headerSize = 8;
-    if (size === 1) {
-      if (header.byteLength < 16) {
-        throw new MediaError(
-          'demux-error',
-          `truncated 64-bit top-level MP4 box header at offset ${offset}`,
-        );
-      }
-      size = reader.u64();
-      headerSize = 16;
-    } else if (size === 0) {
-      size = sourceSize - offset;
-    }
-    const end = offset + size;
-    if (size < headerSize || !Number.isSafeInteger(end) || end <= offset || end > sourceSize) {
-      throw new MediaError(
-        'demux-error',
-        `invalid top-level MP4 box '${type}' range [${offset}, ${end}) for source size ${sourceSize}`,
-      );
-    }
-    if (type === 'mdat') ranges.push({ start: offset + headerSize, end });
-    offset = end;
+    const box = validatedTopLevelBoxRange(header, offset, sourceSize);
+    if (box.type === 'mdat') ranges.push({ start: offset + box.headerSize, end: box.end });
+    offset = box.end;
   }
   return ranges;
 }
@@ -1202,20 +1406,21 @@ function mergeSampleNumbers(
   declaredSyncSamples: readonly number[],
   inferredIntraSamples: readonly number[],
 ): number[] {
-  if (inferredIntraSamples.length === 0) return [...declaredSyncSamples];
   const merged = new Set<number>(declaredSyncSamples);
   for (const sampleNumber of inferredIntraSamples) merged.add(sampleNumber);
   return [...merged].sort((left, right) => left - right);
 }
 
 function classifyAvcSample(
-  sample: SampleData,
-  bytes: Uint8Array,
+  sampleIndex: number,
+  storage: Uint8Array,
+  offset: number,
+  size: number,
   lengthSize: 1 | 2 | 4,
   inferredIntraSamples: number[],
 ): void {
-  if (h264AccessUnitIsKeyPicture(bytes, lengthSize) === true) {
-    inferredIntraSamples.push(sample.index + 1);
+  if (h264AccessUnitRangeIsKeyPicture(storage, offset, size, lengthSize) === true) {
+    inferredIntraSamples.push(sampleIndex + 1);
   }
 }
 
@@ -1233,54 +1438,105 @@ async function enrichAvcPictureClassification(
     const lengthSize = avcNalLengthSize(track);
     if (lengthSize === undefined || !trackNeedsAvcPictureClassification(track)) continue;
 
-    const samples = buildSampleData(track).filter((sample) => !sample.keyframe);
-    if (samples.length === 0) continue;
-    validateSampleRanges(samples, ra.size);
     const inferredIntraSamples: number[] = [];
 
-    if (ra.inMemory === true) {
-      for (let start = 0; start < samples.length; start += AVC_IN_MEMORY_READ_BATCH_SAMPLES) {
-        throwIfAborted(signal);
-        const batch = samples.slice(start, start + AVC_IN_MEMORY_READ_BATCH_SAMPLES);
-        const bytes = await Promise.all(batch.map((sample) => ra.read(sample.offset, sample.size)));
-        for (let index = 0; index < batch.length; index++) {
-          const sample = batch[index];
-          const accessUnit = bytes[index];
-          if (sample === undefined || accessUnit === undefined) continue;
-          if (accessUnit.byteLength !== sample.size) {
-            throw new MediaError(
-              'demux-error',
-              `sample ${sample.index} short read: got ${accessUnit.byteLength} of ${sample.size} bytes (truncated MP4)`,
-            );
-          }
-          classifyAvcSample(sample, accessUnit, lengthSize, inferredIntraSamples);
+    let inMemoryWhole = ra.cachedWhole?.();
+    if (ra.inMemory === true && inMemoryWhole === undefined && ra.size !== undefined) {
+      throwIfAborted(signal);
+      inMemoryWhole = await ra.read(0, ra.size);
+    }
+
+    if (ra.inMemory === true && inMemoryWhole !== undefined) {
+      walkSampleClassificationRanges(track, (sampleIndex, offset, size, declaredSync) => {
+        if ((sampleIndex & (AVC_IN_MEMORY_READ_BATCH_SAMPLES - 1)) === 0) {
+          throwIfAborted(signal);
         }
-      }
-    } else {
-      for (const window of planSampleReadWindows(samples)) {
-        throwIfAborted(signal);
-        const span = await ra.read(window.start, window.end - window.start);
-        if (span.byteLength !== window.end - window.start) {
+        if (declaredSync) return;
+        validateSampleRange(sampleIndex, offset, size, ra.size);
+        const end = offset + size;
+        if (end > inMemoryWhole.byteLength) {
+          const available =
+            offset < 0 || offset >= inMemoryWhole.byteLength
+              ? 0
+              : Math.min(size, inMemoryWhole.byteLength - offset);
           throw new MediaError(
             'demux-error',
-            `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
-              window.end - window.start
-            } bytes (truncated MP4)`,
+            `sample ${sampleIndex} short read: got ${available} of ${size} bytes (truncated MP4)`,
           );
         }
-        for (const item of window.items) {
-          const relativeOffset = item.sample.offset - window.start;
-          classifyAvcSample(
-            item.sample,
-            span.subarray(relativeOffset, relativeOffset + item.sample.size),
-            lengthSize,
-            inferredIntraSamples,
+        classifyAvcSample(
+          sampleIndex,
+          inMemoryWhole,
+          offset,
+          size,
+          lengthSize,
+          inferredIntraSamples,
+        );
+      });
+    } else {
+      const samples = buildSampleData(track).filter((sample) => !sample.keyframe);
+      if (samples.length === 0) continue;
+      validateSampleRanges(samples, ra.size);
+      if (ra.inMemory === true) {
+        for (let start = 0; start < samples.length; start += AVC_IN_MEMORY_READ_BATCH_SAMPLES) {
+          throwIfAborted(signal);
+          const batch = samples.slice(start, start + AVC_IN_MEMORY_READ_BATCH_SAMPLES);
+          const bytes = await Promise.all(
+            batch.map((sample) => ra.read(sample.offset, sample.size)),
           );
+          for (let index = 0; index < batch.length; index++) {
+            const sample = batch[index];
+            const accessUnit = bytes[index];
+            if (sample === undefined || accessUnit === undefined) continue;
+            if (accessUnit.byteLength !== sample.size) {
+              throw new MediaError(
+                'demux-error',
+                `sample ${sample.index} short read: got ${accessUnit.byteLength} of ${sample.size} bytes (truncated MP4)`,
+              );
+            }
+            classifyAvcSample(
+              sample.index,
+              accessUnit,
+              0,
+              accessUnit.byteLength,
+              lengthSize,
+              inferredIntraSamples,
+            );
+          }
+        }
+      } else {
+        for (const window of planSampleReadWindows(samples)) {
+          throwIfAborted(signal);
+          const span = await ra.read(window.start, window.end - window.start);
+          if (span.byteLength !== window.end - window.start) {
+            throw new MediaError(
+              'demux-error',
+              `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
+                window.end - window.start
+              } bytes (truncated MP4)`,
+            );
+          }
+          for (const item of window.items) {
+            const relativeOffset = item.sample.offset - window.start;
+            classifyAvcSample(
+              item.sample.index,
+              span,
+              relativeOffset,
+              item.sample.size,
+              lengthSize,
+              inferredIntraSamples,
+            );
+          }
         }
       }
     }
 
-    track.samples.syncSamples = mergeSampleNumbers(track.samples.syncSamples, inferredIntraSamples);
+    if (inferredIntraSamples.length > 0) {
+      track.samples.syncSamples = mergeSampleNumbers(
+        track.samples.syncSamples,
+        inferredIntraSamples,
+      );
+    }
   }
 }
 
@@ -1704,15 +1960,14 @@ function appendTrackPacketInfoMetadata(
         syncSample = syncSamples[syncIndex];
       }
       if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
-        packets[writeIndex] = {
-          trackIndex,
-          ...(includeOffsets ? { offset } : {}),
-          size,
-          ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale),
-          dtsUs: ticksToUs(dtsTicks - editOffsetTicks, timescale),
-          durationUs: ticksToUs(durationTicks, timescale),
-          keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
-        };
+        const ptsUs = ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, timescale);
+        const dtsUs = ticksToUs(dtsTicks - editOffsetTicks, timescale);
+        const durationUs = ticksToUs(durationTicks, timescale);
+        const keyframe =
+          allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber;
+        packets[writeIndex] = includeOffsets
+          ? { trackIndex, offset, size, ptsUs, dtsUs, durationUs, keyframe }
+          : { trackIndex, size, ptsUs, dtsUs, durationUs, keyframe };
         writeIndex++;
       }
       offset += size;
@@ -2214,7 +2469,8 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
   const sampleRate = track.sampleRate;
   const scale = sampleRate / track.timescale;
   const durationTicks =
-    track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0) +
+    (track.moovMediaTicks ??
+      track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0)) +
     (track.fragmentMediaTicks ?? 0);
   const codedSamples =
     durationTicks > 0
@@ -2241,6 +2497,7 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
 function packetStream(
   ra: RandomAccess,
   track: ParsedTrack,
+  trackInfo: TrackInfo,
   signal: AbortSignal | undefined,
   precomputedSamples?: readonly Sample[],
 ): ReadableStream<Packet> {
@@ -2257,18 +2514,59 @@ function packetStream(
   const samples = samplesWithinActiveEdit(track, precomputedSamples ?? buildSamples(track));
   // `demux()` proved these same immutable progressive tables or merged fragment samples safe before
   // exposing the Demuxer. Re-scanning every range when a consumer opens its packet stream is redundant.
-  const readPlan = planPacketReadWindows(samples);
-  const isVideo = track.mediaType === 'video';
-  let i = 0;
-  let plannedWindowIndex = 0;
-  let cancelled = false;
-  let currentWindow: PacketReadWindow | undefined;
-  let currentBytes: Uint8Array | undefined;
+  return packetReadableStream(
+    {
+      source: ra,
+      samples,
+      readPlan: planPacketReadWindows(samples),
+      ordinal: 0,
+      plannedWindowIndex: 0,
+      cancelled: false,
+      currentWindow: undefined,
+      currentBytes: undefined,
+    },
+    track.mediaType === 'video',
+    trackInfo,
+    ra.inMemory !== true,
+    signal,
+  );
+  /* v8 ignore stop */
+}
+
+interface PacketStreamState {
+  source: RandomAccess | undefined;
+  samples: readonly Sample[] | undefined;
+  readPlan: PacketReadPlan | undefined;
+  ordinal: number;
+  plannedWindowIndex: number;
+  cancelled: boolean;
+  currentWindow: PacketReadWindow | undefined;
+  currentBytes: Uint8Array | undefined;
+}
+
+function packetReadableStream(
+  state: PacketStreamState,
+  isVideo: boolean,
+  trackInfo: TrackInfo,
+  exposesPacketData: boolean,
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
+  let removeAbortListener: (() => void) | undefined;
+  const release = (): void => {
+    removeAbortListener?.();
+    removeAbortListener = undefined;
+    state.source = undefined;
+    state.samples = undefined;
+    state.readPlan = undefined;
+    state.currentWindow = undefined;
+    state.currentBytes = undefined;
+  };
   const enqueueSample = (
     controller: ReadableStreamDefaultController<Packet>,
     sample: Sample,
     window: PacketReadWindow,
     bytes: Uint8Array,
+    terminal: boolean,
   ): void => {
     const rel = sample.offset - window.start;
     const data = bytes.subarray(rel, rel + sample.size);
@@ -2281,78 +2579,221 @@ function packetStream(
     const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
     controller.enqueue({
       chunk,
-      data,
+      ...(exposesPacketData ? { data } : {}),
       dtsUs: sample.dtsUs,
       sizeBytes: sample.size,
     });
+    if (terminal) {
+      release();
+      controller.close();
+    }
   };
-  return new ReadableStream<Packet>({
-    pull(controller): void | Promise<void> {
-      if (signal?.aborted) {
-        controller.error(abortedError());
-        return;
-      }
-      const ordinal = i;
-      const sample = samples[ordinal];
-      if (sample === undefined) {
-        controller.close();
-        return;
-      }
-      i = ordinal + 1;
-      let window: PacketReadWindow | undefined;
-      if (readPlan.kind === 'ordinal') {
-        window = readPlan.byOrdinal[ordinal];
-      } else {
-        let monotonicWindow = readPlan.windows[plannedWindowIndex];
-        if (monotonicWindow !== undefined && ordinal > monotonicWindow.lastOrdinal) {
-          plannedWindowIndex++;
-          monotonicWindow = readPlan.windows[plannedWindowIndex];
+  let claimed = false;
+  const stream = new ReadableStream<Packet>(
+    {
+      start(controller): void {
+        if (signal === undefined) return;
+        const onAbort = (): void => {
+          state.cancelled = true;
+          release();
+          controller.error(abortedError());
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) onAbort();
+      },
+      async pull(controller): Promise<void> {
+        let emittedBytes = 0;
+        let emittedPackets = 0;
+        let batchWindow: PacketReadWindow | undefined;
+        try {
+          while (
+            emittedPackets < PACKET_STREAM_BATCH_PACKETS &&
+            (emittedPackets === 0 || emittedBytes < PACKET_STREAM_BATCH_BYTES)
+          ) {
+            const source = state.source;
+            const samples = state.samples;
+            const readPlan = state.readPlan;
+            if (source === undefined || samples === undefined || readPlan === undefined) {
+              controller.close();
+              return;
+            }
+            if (signal?.aborted) {
+              state.cancelled = true;
+              release();
+              controller.error(abortedError());
+              return;
+            }
+            const ordinal = state.ordinal;
+            const sample = samples[ordinal];
+            if (sample === undefined) {
+              release();
+              controller.close();
+              return;
+            }
+            let window: PacketReadWindow | undefined;
+            if (readPlan.kind === 'ordinal') {
+              window = readPlan.byOrdinal[ordinal];
+            } else {
+              let monotonicWindow = readPlan.windows[state.plannedWindowIndex];
+              if (monotonicWindow !== undefined && ordinal > monotonicWindow.lastOrdinal) {
+                state.plannedWindowIndex++;
+                monotonicWindow = readPlan.windows[state.plannedWindowIndex];
+              }
+              window = monotonicWindow;
+            }
+            if (window === undefined) {
+              throw new MediaError(
+                'demux-error',
+                `sample ${sample.index} has no read window (internal read plan error)`,
+              );
+            }
+            // Keep one pull inside one retained source window. Packet.data views from prior windows may
+            // still be queued, so crossing here would let a small byte queue pin many 8 MiB backings for
+            // sparse/non-monotonic layouts. A zero-HWM stream requests the next batch only after this one
+            // drains, retaining the existing bounded-memory contract.
+            if (batchWindow !== undefined && window !== batchWindow) return;
+            state.ordinal = ordinal + 1;
+            const terminal = state.ordinal === samples.length;
+            let bytes = state.currentBytes;
+            if (window !== state.currentWindow || bytes === undefined) {
+              const windowLength = window.end - window.start;
+              bytes = coveredByteView(source.cachedWhole?.(), window.start, windowLength);
+              if (bytes === undefined) {
+                bytes = await source.read(window.start, windowLength);
+                if (state.cancelled) return;
+                throwIfAborted(signal);
+                if (bytes.byteLength !== windowLength) {
+                  throw new MediaError(
+                    'demux-error',
+                    `sample window [${window.start}, ${window.end}) short read: got ${
+                      bytes.byteLength
+                    } of ${windowLength} bytes (truncated MP4)`,
+                  );
+                }
+              }
+              if (state.cancelled) return;
+              state.currentWindow = window;
+              state.currentBytes = bytes;
+            }
+            enqueueSample(controller, sample, window, bytes, terminal);
+            batchWindow = window;
+            emittedBytes += sample.size;
+            emittedPackets++;
+            if (terminal) return;
+          }
+        } catch (error) {
+          release();
+          throw error;
         }
-        window = monotonicWindow;
-      }
-      if (window === undefined) {
-        throw new MediaError(
-          'demux-error',
-          `sample ${sample.index} has no read window (internal read plan error)`,
-        );
-      }
-      if (window === currentWindow && currentBytes !== undefined) {
-        enqueueSample(controller, sample, window, currentBytes);
-        return;
-      }
-
-      const windowLength = window.end - window.start;
-      const retained = coveredByteView(ra.cachedWhole?.(), window.start, windowLength);
-      if (retained !== undefined) {
-        currentWindow = window;
-        currentBytes = retained;
-        enqueueSample(controller, sample, window, retained);
-        return;
-      }
-
-      return ra.read(window.start, windowLength).then((bytes): void => {
-        if (cancelled) return;
-        throwIfAborted(signal);
-        if (bytes.byteLength !== windowLength) {
-          throw new MediaError(
-            'demux-error',
-            `sample window [${window.start}, ${window.end}) short read: got ${
-              bytes.byteLength
-            } of ${windowLength} bytes (truncated MP4)`,
-          );
-        }
-        currentWindow = window;
-        currentBytes = bytes;
-        enqueueSample(controller, sample, window, bytes);
-      });
+      },
+      cancel(): void {
+        state.cancelled = true;
+        release();
+      },
     },
-    cancel(): void {
-      cancelled = true;
-      currentWindow = undefined;
-      currentBytes = undefined;
+    { highWaterMark: 0 },
+  );
+  registerNativePacketSource(stream, {
+    track: trackInfo,
+    isClaimable: () =>
+      !claimed &&
+      !stream.locked &&
+      state.ordinal === 0 &&
+      state.source !== undefined &&
+      !state.cancelled,
+    async claim(activeSignal) {
+      if (claimed || state.ordinal !== 0 || state.source === undefined || state.cancelled) {
+        throw new MediaError('mux-error', 'MP4 packet stream was already consumed');
+      }
+      claimed = true;
+      const source = state.source;
+      const samples = state.samples ?? [];
+      const chunks = new Array<NativePacketChunk | undefined>(samples.length);
+      try {
+        for (const window of planSampleReadWindows(samples)) {
+          throwIfAborted(activeSignal);
+          const length = window.end - window.start;
+          const bytes =
+            coveredByteView(source.cachedWhole?.(), window.start, length) ??
+            (await source.read(window.start, length));
+          throwIfAborted(activeSignal);
+          if (bytes.byteLength !== length) {
+            throw new MediaError(
+              'demux-error',
+              `sample window short read: got ${bytes.byteLength} of ${length} bytes`,
+            );
+          }
+          for (const item of window.items) {
+            const sample = item.sample;
+            const rel = sample.offset - window.start;
+            chunks[item.ordinal] = {
+              timestampUs: sample.ptsUs,
+              durationUs: sample.durationUs,
+              key: sample.keyframe,
+              data: bytes.subarray(rel, rel + sample.size),
+              dtsUs: sample.dtsUs,
+            };
+          }
+        }
+        return chunks.map((chunk, index) => {
+          if (chunk === undefined)
+            throw new MediaError('demux-error', `sample ${index} was not materialized`);
+          return chunk;
+        });
+      } finally {
+        state.cancelled = true;
+        release();
+      }
     },
   });
-  /* v8 ignore stop */
+  return stream;
+}
+
+/**
+ * Construct the public demuxer outside the async `demux()` activation. V8 may share one closure context
+ * between every method in an object literal; constructing that object in `demux()` therefore made even a
+ * retained `close` method keep unrelated async locals such as the full-source RandomAccess alive. This
+ * synchronous boundary receives RandomAccess only through the revocable cell, so clearing the cell severs
+ * the sole source lease while independently retained methods and completed packet streams remain usable.
+ */
+function createMp4Demuxer(
+  movie: Movie,
+  sourceSize: number | undefined,
+  sourceCell: { current: RandomAccess | undefined },
+  byId: Map<number, ParsedTrack>,
+  fragmentSamples: Map<number, Sample[]> | undefined,
+  signal: AbortSignal | undefined,
+): Demuxer {
+  const supportsPacketTable = hasCompleteSampleTables(movie);
+  const publicTracks = movie.tracks.map(toTrackInfo);
+  const publicById = new Map(publicTracks.map((track) => [track.id, track] as const));
+  return {
+    tracks: publicTracks,
+    ...(supportsPacketTable
+      ? {
+          packetTable: () => mp4PacketMetadata(movie, sourceSize),
+          packetInfoTable: () => mp4PacketInfoMetadata(movie, sourceSize),
+        }
+      : {}),
+    packets(trackId: number): ReadableStream<Packet> {
+      const source = sourceCell.current;
+      if (source === undefined) throw new MediaError('demux-error', 'MP4 demuxer is closed');
+      const track = byId.get(trackId);
+      if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
+      const trackInfo = publicById.get(trackId);
+      if (trackInfo === undefined)
+        throw new MediaError('demux-error', `no public track ${trackId}`);
+      return packetStream(source, track, trackInfo, signal, fragmentSamples?.get(trackId));
+    },
+    close: () => {
+      sourceCell.current = undefined;
+      byId.clear();
+      publicById.clear();
+      fragmentSamples?.clear();
+      return Promise.resolve();
+    },
+  };
 }
 
 /** True when `mvex`/parsed fragment timing says later `moof` runs extend the movie. */
@@ -3486,7 +3927,7 @@ export const Mp4Driver: ContainerDriver = {
     const ra = await randomAccess(src);
     throwIfAborted(signal);
     if (shouldTrySimpleVideoFaststartProbe(src, ra)) {
-      const metadataTracks = await readSmallFaststartMetadataProbeTracks(src, ra);
+      const metadataTracks = await readBoundedVideoMetadataProbeTracks(src, ra, signal);
       if (metadataTracks !== false) {
         throwIfAborted(signal);
         if (metadataTracks !== undefined) return metadataTracks;
@@ -3524,33 +3965,20 @@ export const Mp4Driver: ContainerDriver = {
     const { movie, mediaDataRanges } = await readMovieForDemux(src, ra);
     const byId = new Map(movie.tracks.map((t) => [t.id, t]));
     const signal = o?.signal;
-    const supportsPacketTable = hasCompleteSampleTables(movie);
+    const sourceSize = ra.size;
+    const sourceCell: { current: RandomAccess | undefined } = { current: ra };
     // Fragmented/CMAF inputs carry no `moov` sample table — the timeline lives in `moof`/`traf`/`trun`.
     // Recover each track's flat sample list once so `packets()` streams real samples (without it the
     // demuxer emits nothing and decode/convert produce empty output). Progressive files skip this.
     const fragmentSamples = await buildFragmentSampleMap(movie, ra);
-    // A keyed probe handoff carries the already-validated mdat map, preserving the zero-I/O handoff while
-    // applying the same sample-ownership invariant as a cold demux.
+    // A keyed probe handoff carries only an owned raw `moov`. Demux still validates top-level `mdat`
+    // ownership here, after it has committed to packet-capable work.
     validateDemuxSampleStorage(
       movie,
       fragmentSamples,
       mediaDataRanges ?? (await readMediaDataRanges(ra)),
     );
-    return {
-      tracks: movie.tracks.map(toTrackInfo),
-      ...(supportsPacketTable
-        ? {
-            packetTable: () => mp4PacketMetadata(movie, ra.size),
-            packetInfoTable: () => mp4PacketInfoMetadata(movie, ra.size),
-          }
-        : {}),
-      packets(trackId: number): ReadableStream<Packet> {
-        const track = byId.get(trackId);
-        if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
-        return packetStream(ra, track, signal, fragmentSamples?.get(trackId));
-      },
-      close: () => Promise.resolve(),
-    };
+    return createMp4Demuxer(movie, sourceSize, sourceCell, byId, fragmentSamples, signal);
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     const ra = await randomAccess(src, {

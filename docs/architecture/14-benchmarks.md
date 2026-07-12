@@ -34,6 +34,11 @@ The pure-TS benchmark harnesses (`scripts/bench-dsp.ts`, `scripts/bench-containe
 | fluent chain façade | `scripts/bench-chain.ts` | `fixtures/golden/bench/chain.json` | `bun run bench-chain` |
 | colorspace kernel | `scripts/bench-colorspace.ts` | `fixtures/golden/bench/colorspace.json` | `bun run bench-colorspace` |
 | metadata tag writers | `scripts/bench-metadata-tags.ts` | *(prints; no committed JSON baseline)* | `bun run scripts/bench-metadata-tags.ts` |
+| MP4 metadata direct rewrite | `scripts/bench-session13-mp4-metadata-direct.ts` | *(prints; focused ADR-274/280 evidence)* | `bun run scripts/bench-session13-mp4-metadata-direct.ts` |
+| WebM bounded keyframe-prefix probe | `scripts/bench-session13-webm-keyframe-prefix.ts` | *(prints; focused ADR-276 evidence)* | `bun run bench-session13-webm-keyframe-prefix` |
+| WebM terminal-timeline probe | `scripts/bench-session13-webm-terminal-timeline.ts` | *(prints; focused ADR-279 evidence)* | `bun run bench-session13-webm-terminal-timeline` |
+| First-party MP4/MOV packet fusion | `scripts/bench-session13-native-packet-fusion.ts` | *(prints; focused ADR-282 evidence)* | `bun run bench-session13-native-packet-fusion` |
+| Selective native-audio registration | `scripts/bench-session13-selective-native-audio.ts` | *(prints; focused ADR-290 evidence)* | `bun run scripts/bench-session13-selective-native-audio.ts` |
 | FLAC decode | `scripts/bench-flac.ts` | *(prints; no committed JSON baseline)* | `bun run bench-flac` |
 | Matroska attachment packet seam | `scripts/bench-session11-webm-attachment-packet-seam.ts` | *(prints; focused Session 11 regression)* | `bun run bench-session11-webm-attachment-packet-seam` |
 
@@ -181,3 +186,17 @@ Aggregate: **~1,835,000 probes/sec geomean**, **~265,000 probes/sec worst**, **~
 - **The WebCodecs/GPU tier** (lossy `decode`/`encode`, GPU filters, and browser-produced host chunks from live encode/decode) — these require a browser, so their perf is measured on the target runtime against every cell in the current versioned harness, re-measured fresh with the suite version/count recorded (ADR-025, [`11`](11-testing-and-validation.md) §7). The public `mux()` packet-descriptor control flow is benchmarked above with real packet bytes; fabricating browser decode/encode numbers in Node remains forbidden (directive 6).
 - **The WASM tail** (vendored Symphonia, Opus, AV1/dav1d, VPx/libvpx, and Vorbis-encode cores) — benchmarked where/when their cores run, not folded into the pure-TS baseline table here.
 - **The aggregate "win vs 7 engines"** — that is the external harness's job ([`11`](11-testing-and-validation.md) §7); this doc covers the in-repo per-op baselines that gate `main`.
+- **MP4 semantic no-op Blob composition (ADR-281):** the dedicated Session 13 benchmark compares a raw
+  Blob/File default output with the retained owned-byte writer over five real MP4s at warmup three and
+  21 samples. It requires byte-identical Blob output, exact packet metadata/payload hashes, nonzero
+  checksums, and retained-output RSS/ArrayBuffer observations; browser leadership still belongs to the
+  external all-engine harness.
+- **Selective default-container startup (ADR-285):** the dedicated fresh-process benchmark compares a
+  definite WAV/Ogg public operation against the register-all preload control. Both routes must produce the
+  same exact PCM/output checksum and report live/post-GC ArrayBuffer facts; RSS is diagnostic module/JIT
+  residency, never substituted for the browser harness's positive UA-memory measurement.
+- **Selective native-audio registration (ADR-290):** the dedicated fresh-process benchmark compares the
+  ADTS + WebM + supported WebCodecs-audio query graph against the register-all control over five real ADTS
+  inputs. Both routes must select the same drivers and produce the same exact track/duration checksum; RSS
+  remains diagnostic module/JIT residency and never substitutes for native codec output or the browser
+  harness's positive peak-memory measurement.

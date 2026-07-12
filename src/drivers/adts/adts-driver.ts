@@ -29,6 +29,7 @@ import {
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
+import { registerNativePacketSource } from '../../internal/packet-provenance.ts';
 import { fromURL } from '../../sources/source.ts';
 import { matchesAdts } from '../audio-container-sniff.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
@@ -688,7 +689,12 @@ async function decodeAacToPcmWithLayout(
  * decoder consumes a bare access unit matched by the synthesized `config.description` ASC. `sizeBytes`
  * carries the full ADTS frame length so packet-size oracles can compare the on-disk packet unit.
  */
-function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
+function packetStream(
+  bytes: Uint8Array,
+  frames: readonly AdtsPacket[],
+  track: TrackInfo,
+  signal: AbortSignal | undefined,
+): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
       'capability-miss',
@@ -697,30 +703,55 @@ function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): Reada
     );
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
-  const frames = enumerateAdtsFrames(bytes);
   let i = 0;
-  return new ReadableStream<Packet>({
-    pull(controller): void {
-      if (signal?.aborted) {
-        controller.error(new MediaError('aborted', 'operation aborted'));
-        return;
+  let claimed = false;
+  const stream = new ReadableStream<Packet>(
+    {
+      pull(controller): void {
+        if (signal?.aborted) {
+          controller.error(new MediaError('aborted', 'operation aborted'));
+          return;
+        }
+        const f = frames[i];
+        if (f === undefined) {
+          controller.close();
+          return;
+        }
+        i++;
+        const data = bytes.subarray(f.offset + f.headerBytes, f.offset + f.size);
+        const chunk = new EncodedAudioChunk({
+          type: 'key', // every AAC frame is independently decodable (a sync sample)
+          timestamp: f.ptsUs,
+          duration: f.durationUs,
+          data,
+        });
+        controller.enqueue({ chunk, sizeBytes: f.size }); // no dtsUs: audio never reorders (DTS == PTS)
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  registerNativePacketSource(stream, {
+    track,
+    isClaimable: () => !claimed && i === 0 && !stream.locked,
+    async claim(activeSignal) {
+      if (claimed || i !== 0)
+        throw new MediaError('mux-error', 'ADTS packet stream was already consumed');
+      claimed = true;
+      i = frames.length;
+      const chunks = [];
+      for (const frame of frames) {
+        throwIfAborted(activeSignal);
+        chunks.push({
+          timestampUs: frame.ptsUs,
+          durationUs: frame.durationUs,
+          key: true,
+          data: payload(bytes, frame),
+        });
       }
-      const f = frames[i];
-      if (f === undefined) {
-        controller.close();
-        return;
-      }
-      i++;
-      const data = bytes.subarray(f.offset + f.headerBytes, f.offset + f.size);
-      const chunk = new EncodedAudioChunk({
-        type: 'key', // every AAC frame is independently decodable (a sync sample)
-        timestamp: f.ptsUs,
-        duration: f.durationUs,
-        data,
-      });
-      controller.enqueue({ chunk, sizeBytes: f.size }); // no dtsUs: audio never reorders (DTS == PTS)
+      return chunks;
     },
   });
+  return stream;
   /* v8 ignore stop */
 }
 
@@ -773,7 +804,7 @@ export const AdtsDriver = {
       tracks: [track],
       packets(trackId: number): ReadableStream<Packet> {
         if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
-        return packetStream(bytes, signal);
+        return packetStream(bytes, layout.frames, track, signal);
       },
       close: () => Promise.resolve(),
     };

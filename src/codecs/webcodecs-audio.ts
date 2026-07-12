@@ -342,6 +342,60 @@ export async function awaitAudioCodecQueueDrain(
   }
 }
 
+/**
+ * Submit one unit to a WebCodecs audio coder without manufacturing an already-resolved promise when its
+ * native queue is below the bounded backpressure threshold. `TransformStream` accepts a synchronous
+ * `transform()` result, so the ordinary path can preserve exact native submission order without one
+ * promise continuation per packet/frame. A saturated queue retains the existing dequeue-driven wait and
+ * rechecks abort before submission.
+ */
+export function submitAudioCodecInput(
+  target: CodecQueueEventTarget,
+  queueSize: () => number,
+  signal: AbortSignal | undefined,
+  submit: () => void,
+  threshold: number = BACKPRESSURE_THRESHOLD,
+): void | Promise<void> {
+  const submitIfActive = (): void => {
+    if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    submit();
+  };
+  if (!shouldApplyBackpressure(queueSize(), threshold)) {
+    submitIfActive();
+    return;
+  }
+  return awaitAudioCodecQueueDrain(target, queueSize, signal, threshold).then(submitIfActive);
+}
+
+/**
+ * Encoder-input specialization of {@link submitAudioCodecInput}: the caller transfers one closable frame,
+ * and this helper releases it exactly once after synchronous submission, after a saturated wait, or on
+ * either arm's failure. Keeping the lifetime rule beside the sync/async split prevents a fast path from
+ * accidentally leaking or double-closing `AudioData`.
+ */
+export function submitClosableAudioCodecInput(
+  target: CodecQueueEventTarget,
+  queueSize: () => number,
+  signal: AbortSignal | undefined,
+  frame: Closable,
+  submit: () => void,
+  threshold: number = BACKPRESSURE_THRESHOLD,
+): void | Promise<void> {
+  try {
+    const pending = submitAudioCodecInput(target, queueSize, signal, submit, threshold);
+    if (pending === undefined) {
+      frame.close();
+      return;
+    }
+    return pending.finally(() => {
+      frame.close();
+    });
+  } catch (error) {
+    frame.close();
+    throw error;
+  }
+}
+
 /* v8 ignore stop */
 
 // ============ supports() ============
@@ -456,12 +510,17 @@ function createDecoder(
       };
       signal?.addEventListener('abort', onAbort, { once: true });
     },
-    async transform(chunk): Promise<void> {
+    transform(chunk): void | Promise<void> {
       const dec = decoder;
       if (!dec) throw new MediaError('decode-error', 'decoder not configured');
-      await awaitAudioCodecQueueDrain(dec, () => dec.decodeQueueSize, signal);
-      if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      dec.decode(asAudioChunk(chunk));
+      return submitAudioCodecInput(
+        dec,
+        () => dec.decodeQueueSize,
+        signal,
+        () => {
+          dec.decode(asAudioChunk(chunk));
+        },
+      );
     },
     async flush(): Promise<void> {
       const dec = decoder;
@@ -540,20 +599,22 @@ function createEncoder(
       };
       signal?.addEventListener('abort', onAbort, { once: true });
     },
-    async transform(frame): Promise<void> {
+    transform(frame): void | Promise<void> {
       const enc = encoder;
       const data = asAudioData(frame);
       if (!enc) {
         data.close(); // never leak the input even on a misuse path
         throw new MediaError('encode-error', 'encoder not configured');
       }
-      try {
-        await awaitAudioCodecQueueDrain(enc, () => enc.encodeQueueSize, signal);
-        if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-        enc.encode(data); // copies the planes it needs synchronously
-      } finally {
-        data.close(); // close-exactly-once: the encoder owns each input AudioData
-      }
+      return submitClosableAudioCodecInput(
+        enc,
+        () => enc.encodeQueueSize,
+        signal,
+        data,
+        () => {
+          enc.encode(data); // copies the planes it needs synchronously
+        },
+      );
     },
     async flush(): Promise<void> {
       const enc = encoder;

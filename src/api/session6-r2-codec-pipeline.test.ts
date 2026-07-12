@@ -9,7 +9,7 @@ describe('Session 6 R2 codec edge planning', () => {
     const config = buildVideoEncoderConfig({ codec: 'vp9' }, { width: 64, height: 64 }, undefined);
 
     expect(config).toMatchObject({
-      codec: 'vp09.00.10.08',
+      codec: 'vp09.00.62.08',
       width: 64,
       height: 64,
     });

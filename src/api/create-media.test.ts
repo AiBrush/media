@@ -27,6 +27,7 @@ import {
 } from '../sources/source.ts';
 import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
+import type { MediaInfo } from './types.ts';
 
 /** A container driver that reports real tracks, to exercise MediaInfo mapping. */
 function tracksModule(): DriverModule {
@@ -645,9 +646,10 @@ describe('createMedia', () => {
     });
   });
 
-  it('probe shares the seekable prefix across image sniff, container route, and metadata hook', async () => {
+  it('probe sends a concrete seekable video MIME directly to its container metadata hook', async () => {
     const bytes = loadMedia('bear-vp9-alpha.webm');
     const calls: Array<readonly [number, number]> = [];
+    const counts = { sniff: 0 };
     const src: Source = {
       __media: 'source',
       kind: 'url',
@@ -662,10 +664,184 @@ describe('createMedia', () => {
       },
     };
 
-    const info = await createMedia().use(WebmModule).probe(src);
-    expect(calls).toEqual([[0, 4 * 1024]]);
+    const info = await createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use(WebmModule)
+      .probe(src);
+    expect(calls).toEqual([[0, 8 * 1024]]);
+    expect(counts.sniff).toBe(0);
     expect(info.tracks.find((track) => track.type === 'video')?.codec).toBe('vp9');
   });
+
+  it('probe reuses the first WebM prefix when exact cadence requires a terminal scan', async () => {
+    const bytes = Uint8Array.from(
+      readFileSync(
+        resolve(MEDIA, '../../../media-test/fixtures/media/scenarios/probe/vp9_alpha/01.webm'),
+      ),
+    );
+    const calls: Array<readonly [number, number]> = [];
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/webm',
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('known-size terminal-timeline probe must remain range-backed');
+      },
+    };
+
+    const info = await createMedia().use(WebmModule).probe(source);
+    expect(info).toMatchObject({
+      container: 'webm',
+      durationSec: 2.7,
+      sizeBytes: bytes.byteLength,
+      tracks: [{ type: 'video', codec: 'vp9', fps: 30, width: 320, height: 240 }],
+    });
+    expect(calls).toEqual([
+      [0, 8 * 1024],
+      [8 * 1024, bytes.byteLength],
+    ]);
+  });
+
+  it('probe preserves a typed hinted-container error when the deferred image fallback misses', async () => {
+    const failure = new InputError('unsupported-input', 'exact container rejection');
+    const counts = { sniff: 0 };
+    const calls: Array<readonly [number, number]> = [];
+    const driver: ContainerDriver = {
+      id: 'rejecting-hinted-video',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['rejecting'],
+      supports: (query) => query.mime?.startsWith('video/x-rejecting;') === true,
+      probe: () => Promise.reject(failure),
+      demux: () => Promise.reject(new Error('probe hook must be preferred')),
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/x-rejecting; codecs=vp9',
+      size: 8,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(new Uint8Array(Math.max(0, Math.min(8, end) - start)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable hinted probe must not open a stream');
+      },
+    };
+    const media = createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use({
+        apiVersion: DRIVER_API_VERSION,
+        register: (registry) => registry.addContainer(driver),
+      });
+
+    const error = await media.probe(source).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    expect(error).toBe(failure);
+    expect(counts.sniff).toBe(1);
+    expect(calls).toEqual([[0, 4 * 1024]]);
+  });
+
+  it('probe never converts an aborted hinted-container result into an image fallback', async () => {
+    const failure = new MediaError('aborted', 'driver aborted');
+    const counts = { sniff: 0 };
+    const driver: ContainerDriver = {
+      id: 'aborted-hinted-video',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['aborted'],
+      supports: (query) => query.mime === 'video/x-aborted',
+      probe: () => Promise.reject(failure),
+      demux: () => Promise.reject(new Error('probe hook must be preferred')),
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/x-aborted',
+      size: 8,
+      range: () => Promise.reject(new Error('aborted path must not sniff image bytes')),
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable hinted probe must not open a stream');
+      },
+    };
+    const media = createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use({
+        apiVersion: DRIVER_API_VERSION,
+        register: (registry) => registry.addContainer(driver),
+      });
+
+    const error = await media.probe(source).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    expect(error).toBe(failure);
+    expect(counts.sniff).toBe(0);
+  });
+
+  it.each(['video/', 'audio/   ', 'video/foo bar'])(
+    'probe keeps malformed MIME %j on the image-first path',
+    async (mimeHint) => {
+      const counts = { sniff: 0 };
+      const calls: Array<readonly [number, number]> = [];
+      const driver: ContainerDriver = {
+        id: 'malformed-mime-container',
+        apiVersion: DRIVER_API_VERSION,
+        kind: 'container',
+        formats: ['malformed'],
+        supports: (query) => query.mime === mimeHint,
+        probe: () =>
+          Promise.resolve([
+            {
+              id: 0,
+              mediaType: 'audio',
+              codec: 'test-audio',
+              durationSec: 1,
+            },
+          ]),
+        demux: () => Promise.reject(new Error('probe hook must be preferred')),
+        createMuxer: () => {
+          throw new Error('unused');
+        },
+      };
+      const source: Source = {
+        __media: 'source',
+        kind: 'url',
+        mimeHint,
+        size: 8,
+        range: (start, end) => {
+          calls.push([start, end]);
+          return Promise.resolve(new Uint8Array(Math.max(0, Math.min(8, end) - start)));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('seekable malformed-MIME probe must not open a stream');
+        },
+      };
+      const media = createMedia()
+        .use(imageSniffCounterModule(counts))
+        .use({
+          apiVersion: DRIVER_API_VERSION,
+          register: (registry) => registry.addContainer(driver),
+        });
+
+      await expect(media.probe(source)).resolves.toMatchObject({ container: 'malformed' });
+      expect(counts.sniff).toBe(1);
+      expect(calls).toEqual([[0, 4 * 1024]]);
+    },
+  );
 
   it('probe reuses bounded source prefixes across repeated public probes', async () => {
     const calls: Array<readonly [number, number]> = [];
@@ -719,7 +895,7 @@ describe('createMedia', () => {
     await media.probe(src);
     await media.probe(src);
 
-    expect(calls).toEqual([[0, 4 * 1024]]);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
   it('probe never reuses a URL prefix across distinct source snapshots with the same href', async () => {
@@ -900,6 +1076,103 @@ describe('createMedia', () => {
     await media.probeContainer(src, 'mp4');
 
     expect(calls).toEqual([[0, bytes.byteLength]]);
+  });
+
+  it('probeContainer reuses bounded disjoint metadata intervals on the exact source', async () => {
+    const bytes = new Uint8Array(512);
+    bytes.set([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]);
+    for (let index = 128; index < 192; index++) bytes[index] = index & 0xff;
+    const calls: Array<readonly [number, number]> = [];
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'video',
+        codec: 'hevc',
+        durationSec: 1,
+        config: { codec: 'hev1.1.6.L93.B0', codedWidth: 1920, codedHeight: 1080 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'disjoint-metadata',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp4'],
+      supports: () => true,
+      probe: async (src) => {
+        expect(await src.range?.(128, 144)).toEqual(bytes.subarray(128, 144));
+        expect(await src.range?.(128, 192)).toEqual(bytes.subarray(128, 192));
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('known-container probe must not demux when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('repeated disjoint metadata probe must not stream');
+      },
+    };
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    }) as unknown as {
+      probeContainer(input: MediaInput, container: 'mp4'): Promise<MediaInfo>;
+    };
+
+    await media.probeContainer(src, 'mp4');
+    await media.probeContainer(src, 'mp4');
+
+    expect(calls).toEqual([
+      [128, 144],
+      [144, 192],
+    ]);
+  });
+
+  it('repeats real tail, VFR, fragmented, and rotated MP4 probes without new range I/O', async () => {
+    const fixtures = [
+      'bear-4k-hevc.mp4',
+      'obs-remux-variable-aac.mp4',
+      'bear-hevc-10bit-hdr10.mp4',
+      'bear-open-gop-frag.mp4',
+      'bear-rotate-90.mp4',
+    ] as const;
+    for (const fixture of fixtures) {
+      const bytes = loadMedia(fixture);
+      let rangeCalls = 0;
+      const src: Source = {
+        __media: 'source',
+        kind: 'url',
+        mimeHint: 'video/mp4',
+        filename: fixture,
+        size: bytes.byteLength,
+        [SOURCE_CACHE_KEY]: `https://example.test/${fixture}`,
+        range: (start, end) => {
+          rangeCalls++;
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('seekable repeated probe must not open the full stream');
+        },
+      };
+      const media = createMedia();
+      const first = await media.probe(src);
+      const coldRangeCalls = rangeCalls;
+      expect(coldRangeCalls).toBeGreaterThan(0);
+      const second = await media.probe(src);
+      expect(second).toEqual(first);
+      expect(rangeCalls).toBe(coldRangeCalls);
+    }
   });
 
   it('probe routes still images through the registered image capability', async () => {

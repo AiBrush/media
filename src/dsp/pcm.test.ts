@@ -5,6 +5,7 @@ import {
   bytesPerSample,
   channelAt,
   decodePcm,
+  decodePcmToInterleavedF32,
   encodePcm,
   sampleAt,
 } from './pcm.ts';
@@ -49,6 +50,48 @@ describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => 
 });
 
 describe('PCM codec — normalization & clamping', () => {
+  it('direct interleaved Float32 egress is bit-exact to canonical narrowing', () => {
+    const floatingCases: ReadonlyArray<readonly [SampleFormat, Uint8Array]> = [
+      ['f32', new Uint8Array(new Float32Array([0, 0.5, -0.5, 1, -1, 0.25]).buffer)],
+      ['f64', new Uint8Array(new Float64Array([0, 1 / 3, -2 / 7, 1, -1, 0.125]).buffer)],
+    ];
+    const cases: ReadonlyArray<readonly [SampleFormat, Uint8Array]> = [
+      ...INT_FORMATS.map((format): readonly [SampleFormat, Uint8Array] => [
+        format,
+        pattern(bytesPerSample(format) * 2 * 97 + 1),
+      ]),
+      ...floatingCases,
+    ];
+    for (const [format, bytes] of cases) {
+      const channels = 2;
+      const canonical = decodePcm(bytes, format, channels, 48_000);
+      const expected = new Float32Array(canonical.frames * channels);
+      for (let frame = 0; frame < canonical.frames; frame++) {
+        for (let channel = 0; channel < channels; channel++) {
+          expected[frame * channels + channel] = canonical.planar[channel]?.[frame] ?? 0;
+        }
+      }
+      const direct = decodePcmToInterleavedF32(bytes, format, channels, 48_000);
+      expect(direct).toMatchObject({ channels, frames: canonical.frames, sampleRate: 48_000 });
+      expect(new Uint32Array(direct.data.buffer)).toEqual(new Uint32Array(expected.buffer));
+    }
+  });
+
+  it('direct signed-24 egress preserves extrema and byte order exactly', () => {
+    const little = Uint8Array.of(0, 0, 0x80, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff);
+    const big = Uint8Array.of(0x80, 0, 0, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff);
+    expect(Array.from(decodePcmToInterleavedF32(little, 's24', 1, 8_000).data)).toEqual([
+      -1,
+      8_388_607 / 8_388_608,
+      -1 / 8_388_608,
+    ]);
+    expect(Array.from(decodePcmToInterleavedF32(big, 's24', 1, 8_000, 'be').data)).toEqual([
+      -1,
+      8_388_607 / 8_388_608,
+      -1 / 8_388_608,
+    ]);
+  });
+
   it('decodes the documented normalization (full-scale → ±1)', () => {
     // s16: -32768 → -1.0, 32767 → ~+1.0; u8: 0 → -1.0, 255 → ~+1.0 (offset);
     // s8: -128 → -1.0, 127 → ~+1.0 (two's-complement).
@@ -99,6 +142,7 @@ describe('PCM codec — edges & guards', () => {
   it('rejects an invalid channel count with a typed InputError', () => {
     expect(() => decodePcm(pattern(8), 's16', 0, 48000)).toThrow(InputError);
     expect(() => decodePcm(pattern(8), 's16', 1.5, 48000)).toThrow(InputError);
+    expect(() => decodePcmToInterleavedF32(pattern(8), 's16', 0, 48000)).toThrow(InputError);
   });
 
   it('sampleAt / channelAt guard both arms', () => {

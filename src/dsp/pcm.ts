@@ -25,6 +25,14 @@ export interface PcmAudio {
   readonly planar: readonly Float64Array[];
 }
 
+/** One exact-owned, frame-major interleaved Float32 PCM chunk for direct browser-frame egress. */
+export interface InterleavedPcmF32 {
+  readonly sampleRate: number;
+  readonly channels: number;
+  readonly frames: number;
+  readonly data: Float32Array<ArrayBuffer>;
+}
+
 const BYTES_PER_SAMPLE: Record<SampleFormat, number> = {
   u8: 1,
   s8: 1,
@@ -155,6 +163,44 @@ export function decodePcm(
     planar.push(ch);
   }
   return { sampleRate, channels, frames, planar };
+}
+
+/**
+ * Decode interleaved wire PCM directly into an exact-owned interleaved Float32 chunk. This is the
+ * browser-frame egress seam: unlike {@link decodePcm}, it intentionally does not preserve Float64
+ * working precision for later DSP or integer re-encoding.
+ */
+export function decodePcmToInterleavedF32(
+  bytes: Uint8Array,
+  format: SampleFormat,
+  channels: number,
+  sampleRate: number,
+  endian: Endianness = 'le',
+): InterleavedPcmF32 {
+  if (channels <= 0 || !Number.isInteger(channels)) {
+    throw new InputError('unsupported-input', `invalid channel count ${channels}`);
+  }
+  const bps = BYTES_PER_SAMPLE[format];
+  const frames = Math.floor(bytes.byteLength / (bps * channels));
+  const sampleCount = frames * channels;
+  const data = new Float32Array(new ArrayBuffer(sampleCount * 4));
+  const le = endian === 'le';
+
+  if (format === 's24') {
+    for (let sample = 0, offset = 0; sample < sampleCount; sample++, offset += 3) {
+      const first = bytes[offset] as number;
+      const middle = bytes[offset + 1] as number;
+      const last = bytes[offset + 2] as number;
+      const raw = le ? first | (middle << 8) | (last << 16) : last | (middle << 8) | (first << 16);
+      data[sample] = ((raw << 8) >> 8) / 8_388_608;
+    }
+  } else {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * bps);
+    for (let sample = 0; sample < sampleCount; sample++) {
+      data[sample] = readSample(view, sample * bps, format, le);
+    }
+  }
+  return { sampleRate, channels, frames, data };
 }
 
 /** Encode canonical planar audio back to interleaved PCM bytes; out-of-range floats clamp to the format's range. */

@@ -24,19 +24,43 @@ export function h264AccessUnitIsKeyPicture(
   accessUnit: Uint8Array,
   lengthSize: number,
 ): boolean | undefined {
-  if (lengthSize !== 1 && lengthSize !== 2 && lengthSize !== 4) return undefined;
+  return h264AccessUnitRangeIsKeyPicture(accessUnit, 0, accessUnit.byteLength, lengthSize);
+}
 
-  let offset = 0;
-  while (offset < accessUnit.byteLength) {
-    if (offset + lengthSize > accessUnit.byteLength) return undefined;
+/**
+ * Classify one exact access-unit range inside retained storage without allocating a typed-array view.
+ * Invalid or escaping intervals are unknown, matching a malformed/truncated standalone access unit.
+ */
+export function h264AccessUnitRangeIsKeyPicture(
+  storage: Uint8Array,
+  start: number,
+  length: number,
+  lengthSize: number,
+): boolean | undefined {
+  if (lengthSize !== 1 && lengthSize !== 2 && lengthSize !== 4) return undefined;
+  const end = start + length;
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(length) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    length < 0 ||
+    end > storage.byteLength
+  ) {
+    return undefined;
+  }
+
+  let offset = start;
+  while (offset < end) {
+    if (offset + lengthSize > end) return undefined;
     let nalLength = 0;
     for (let index = 0; index < lengthSize; index++) {
-      nalLength = nalLength * 256 + (accessUnit[offset + index] as number);
+      nalLength = nalLength * 256 + (storage[offset + index] as number);
     }
     offset += lengthSize;
-    if (nalLength <= 0 || offset + nalLength > accessUnit.byteLength) return undefined;
+    if (nalLength <= 0 || offset + nalLength > end) return undefined;
 
-    const header = accessUnit[offset] as number;
+    const header = storage[offset] as number;
     if ((header & 0x80) !== 0) return undefined; // forbidden_zero_bit
     const nalType = header & 0x1f;
     if (nalType === NAL_TYPE_CODED_SLICE_IDR) return true;
@@ -45,70 +69,77 @@ export function h264AccessUnitIsKeyPicture(
       nalType === NAL_TYPE_CODED_SLICE_DATA_PARTITION_A ||
       nalType === NAL_TYPE_CODED_SLICE_AUXILIARY
     ) {
-      try {
-        const reader = new EbspBitReader(accessUnit, offset + 1, offset + nalLength);
-        reader.unsignedExpGolomb(); // first_mb_in_slice
-        const sliceType = reader.unsignedExpGolomb() % 5;
-        return sliceType === I_SLICE_TYPE || sliceType === SI_SLICE_TYPE;
-      } catch {
-        return undefined;
-      }
+      return sliceHeaderIsKeyPicture(storage, offset + 1, offset + nalLength);
     }
     offset += nalLength;
   }
   return undefined;
 }
 
-/** Bit reader over EBSP bytes that removes `00 00 03` emulation-prevention bytes on demand. */
-class EbspBitReader {
-  readonly #bytes: Uint8Array;
-  readonly #end: number;
-  #offset: number;
-  #zeroRun = 0;
-  #currentByte = 0;
-  #remainingBits = 0;
-
-  constructor(bytes: Uint8Array, start: number, end: number) {
-    this.#bytes = bytes;
-    this.#offset = start;
-    this.#end = end;
-  }
-
-  bit(): number {
-    if (this.#remainingBits === 0) {
-      this.#currentByte = this.#nextRbspByte();
-      this.#remainingBits = 8;
-    }
-    this.#remainingBits--;
-    return (this.#currentByte >> this.#remainingBits) & 1;
-  }
-
-  unsignedExpGolomb(): number {
+/** Read only `first_mb_in_slice` and `slice_type` while removing EBSP prevention bytes on demand. */
+function sliceHeaderIsKeyPicture(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): boolean | undefined {
+  let offset = start;
+  let zeroRun = 0;
+  let currentByte = 0;
+  let remainingBits = 0;
+  let sliceType = 0;
+  for (let field = 0; field < 2; field++) {
     let leadingZeros = 0;
-    while (this.bit() === 0) {
+    while (true) {
+      if (remainingBits === 0) {
+        let found = false;
+        while (offset < end) {
+          const value = bytes[offset] as number;
+          offset++;
+          if (zeroRun >= 2 && value === 3) {
+            const escaped = bytes[offset];
+            if (escaped === undefined || offset >= end || escaped > 3) return undefined;
+            zeroRun = 0;
+            continue;
+          }
+          zeroRun = value === 0 ? zeroRun + 1 : 0;
+          currentByte = value;
+          remainingBits = 8;
+          found = true;
+          break;
+        }
+        if (!found) return undefined;
+      }
+      remainingBits--;
+      if (((currentByte >> remainingBits) & 1) !== 0) break;
       leadingZeros++;
-      if (leadingZeros > 31) throw new Error('H.264 Exp-Golomb overflow');
+      if (leadingZeros > 31) return undefined;
     }
     let suffix = 0;
-    for (let index = 0; index < leadingZeros; index++) suffix = suffix * 2 + this.bit();
-    return 2 ** leadingZeros - 1 + suffix;
-  }
-
-  #nextRbspByte(): number {
-    while (this.#offset < this.#end) {
-      const value = this.#bytes[this.#offset] as number;
-      this.#offset++;
-      if (this.#zeroRun >= 2 && value === 3) {
-        const escaped = this.#bytes[this.#offset];
-        if (escaped === undefined || this.#offset >= this.#end || escaped > 3) {
-          throw new Error('invalid H.264 emulation-prevention sequence');
+    for (let index = 0; index < leadingZeros; index++) {
+      if (remainingBits === 0) {
+        let found = false;
+        while (offset < end) {
+          const value = bytes[offset] as number;
+          offset++;
+          if (zeroRun >= 2 && value === 3) {
+            const escaped = bytes[offset];
+            if (escaped === undefined || offset >= end || escaped > 3) return undefined;
+            zeroRun = 0;
+            continue;
+          }
+          zeroRun = value === 0 ? zeroRun + 1 : 0;
+          currentByte = value;
+          remainingBits = 8;
+          found = true;
+          break;
         }
-        this.#zeroRun = 0;
-        continue;
+        if (!found) return undefined;
       }
-      this.#zeroRun = value === 0 ? this.#zeroRun + 1 : 0;
-      return value;
+      remainingBits--;
+      suffix = suffix * 2 + ((currentByte >> remainingBits) & 1);
     }
-    throw new Error('truncated H.264 slice header');
+    const value = 2 ** leadingZeros - 1 + suffix;
+    if (field === 1) sliceType = value % 5;
   }
+  return sliceType === I_SLICE_TYPE || sliceType === SI_SLICE_TYPE;
 }

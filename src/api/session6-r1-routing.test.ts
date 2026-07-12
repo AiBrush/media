@@ -402,7 +402,10 @@ describe('Session 6 R1 — Vorbis decode fallback routing', () => {
         config,
       });
 
-      expect(isConfigSupported).toHaveBeenCalledWith(config);
+      expect(isConfigSupported).toHaveBeenCalledWith({
+        ...config,
+        hardwareAcceleration: 'no-preference',
+      });
       expect(picked.id).toBe('wasm-vorbis');
     } finally {
       restoreAudio();

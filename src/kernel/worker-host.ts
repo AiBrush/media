@@ -17,8 +17,8 @@
  *    engine materializes into the caller's sink. No `VideoFrame`/`AudioData` crosses — only encoded bytes.
  */
 
-import { MediaError } from '../contracts/errors.ts';
 import type { WasmRuntimeProfile } from '../contracts/driver.ts';
+import { MediaError } from '../contracts/errors.ts';
 import type { Source } from '../sources/source.ts';
 import { type RunStreamOptions, WorkerStreamBridge } from './worker-bridge.ts';
 import type { OffloadJobPayload } from './worker-main.ts';

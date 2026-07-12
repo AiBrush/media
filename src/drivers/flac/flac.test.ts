@@ -28,6 +28,7 @@ import {
   nativeFlacMetadata,
   parseFlac,
 } from './flac-driver.ts';
+import { flacMetadataLayout, flacPacketInfoTable } from './flac-sniff.ts';
 
 const md5 = (b: Uint8Array): string => createHash('md5').update(b).digest('hex');
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
@@ -289,6 +290,173 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     expect(streamReads).toBe(0);
   });
 
+  it('stream-only packetInfo preserves exact fused rows and releases its full-drain reader', async () => {
+    const bytes = await loadFixture('flac-5_1ch.flac');
+    let readable: ReadableStream<Uint8Array> | undefined;
+    const src: Source = {
+      __media: 'source',
+      kind: 'stream',
+      size: bytes.byteLength,
+      mimeHint: 'audio/flac',
+      stream: () => {
+        readable = new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+        return readable;
+      },
+    };
+    const media = createMedia() as unknown as {
+      packetInfo(input: Source, o: { readonly container: 'flac' }): Promise<PacketInfoTable>;
+    };
+
+    const table = await media.packetInfo(src, { container: 'flac' });
+    expect(table).toEqual(flacPacketInfoTable(bytes));
+    expect(readable?.locked).toBe(false);
+  });
+
+  it('the fused FLAC packet table rejects a corrupted first frame instead of fabricating rows', async () => {
+    const bytes = (await loadFixture('sfx.flac')).slice();
+    const { audioStart } = flacMetadataLayout(bytes);
+    bytes[audioStart] = 0;
+
+    expect(() => flacPacketInfoTable(bytes)).toThrowError(/lost frame sync/);
+  });
+
+  it('stream-only packetInfo unlocks its reader when the byte producer fails', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    let pulls = 0;
+    const readable = new ReadableStream<Uint8Array>({
+      pull(controller): void {
+        if (pulls++ === 0) {
+          controller.enqueue(bytes.subarray(0, 16));
+          return;
+        }
+        throw new Error('FLAC test source failed');
+      },
+    });
+    const src: Source = {
+      __media: 'source',
+      kind: 'stream',
+      size: bytes.byteLength,
+      mimeHint: 'audio/flac',
+      stream: () => readable,
+    };
+    const media = createMedia() as unknown as {
+      packetInfo(input: Source, o: { readonly container: 'flac' }): Promise<PacketInfoTable>;
+    };
+
+    await expect(media.packetInfo(src, { container: 'flac' })).rejects.toThrow(
+      'FLAC test source failed',
+    );
+    expect(readable.locked).toBe(false);
+  });
+
+  it('the full FLAC driver releases its one-chunk packet-info reader at normal EOF', async () => {
+    const bytes = await loadFixture('flac-5_1ch.flac');
+    let readable: ReadableStream<Uint8Array> | undefined;
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => {
+        readable = new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+        return readable;
+      },
+    };
+    const packetInfo = FlacDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('FLAC packetInfo unavailable');
+
+    expect(await packetInfo.call(FlacDriver, src)).toEqual(flacPacketInfoTable(bytes));
+    expect(readable?.locked).toBe(false);
+  });
+
+  it('the full FLAC driver concatenates multiple chunks once without changing packet truth', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const firstEnd = Math.floor(bytes.byteLength / 3);
+    const secondEnd = Math.floor((bytes.byteLength * 2) / 3);
+    let readable: ReadableStream<Uint8Array> | undefined;
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => {
+        readable = new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes.subarray(0, firstEnd));
+            controller.enqueue(bytes.subarray(firstEnd, secondEnd));
+            controller.enqueue(bytes.subarray(secondEnd));
+            controller.close();
+          },
+        });
+        return readable;
+      },
+    };
+    const packetInfo = FlacDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('FLAC packetInfo unavailable');
+
+    expect(await packetInfo.call(FlacDriver, src)).toEqual(flacPacketInfoTable(bytes));
+    expect(readable?.locked).toBe(false);
+  });
+
+  it('the full FLAC driver unlocks an empty producer after the typed parse failure', async () => {
+    let readable: ReadableStream<Uint8Array> | undefined;
+    const src: ByteSource = {
+      size: 0,
+      stream: () => {
+        readable = new ReadableStream<Uint8Array>({ start: (controller) => controller.close() });
+        return readable;
+      },
+    };
+    const packetInfo = FlacDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('FLAC packetInfo unavailable');
+
+    await expect(packetInfo.call(FlacDriver, src)).rejects.toMatchObject({
+      code: 'unsupported-input',
+    });
+    expect(readable?.locked).toBe(false);
+  });
+
+  it('the full FLAC driver cancels a failing packet-info producer before unlocking it', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const failure = new Error('direct FLAC source failed');
+    let reads = 0;
+    let cancels = 0;
+    let cancelReason: unknown;
+    let releases = 0;
+    const reader = {
+      read(): Promise<ReadableStreamReadResult<Uint8Array>> {
+        if (reads++ === 0) {
+          return Promise.resolve({ done: false, value: bytes.subarray(0, 16) });
+        }
+        return Promise.reject(failure);
+      },
+      cancel(reason: unknown): Promise<void> {
+        cancels++;
+        cancelReason = reason;
+        return Promise.reject(new Error('direct FLAC teardown also failed'));
+      },
+      releaseLock(): void {
+        releases++;
+      },
+    };
+    const src: ByteSource = {
+      size: bytes.byteLength,
+      stream: () =>
+        ({ getReader: (): typeof reader => reader }) as unknown as ReadableStream<Uint8Array>,
+    };
+    const packetInfo = FlacDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('FLAC packetInfo unavailable');
+
+    await expect(packetInfo.call(FlacDriver, src)).rejects.toBe(failure);
+    expect(cancels).toBe(1);
+    expect(cancelReason).toBe(failure);
+    expect(releases).toBe(1);
+  });
+
   it('parseFlac reads STREAMINFO fields from the real file', async () => {
     const info = parseFlac(await loadFixture('sfx.flac'));
     expect(info).toEqual({
@@ -477,7 +645,7 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
   });
 
   it('enumerates byte-exact native FLAC frames across the real corpus', async () => {
-    const entries = (await fixturesByContainer('flac')).slice(0, 5);
+    const entries = await fixturesByContainer('flac');
     expect(entries.length).toBeGreaterThanOrEqual(5);
 
     for (const entry of entries) {
@@ -485,16 +653,20 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
       const info = parseFlac(bytes);
       const frames = enumerateFlacFrames(bytes);
       const decodedFrames = enumerateDecodedFlacFrameSpans(bytes);
+      const packetTable = flacPacketInfoTable(bytes);
       expect(frames).toHaveLength(decodedFrames.length);
+      expect(packetTable.packets).toHaveLength(decodedFrames.length);
       expect(frames.length, `${entry.id}: frame count`).toBeGreaterThan(0);
       expect(
         frames.reduce((sum, f) => sum + f.samples, 0),
         `${entry.id}: samples`,
       ).toBe(info.totalSamples);
+      const roundedDurationSec =
+        frames.reduce((sum, frame) => sum + frame.durationUs, 0) / 1_000_000;
       expect(
-        frames.reduce((sum, f) => sum + f.durationUs, 0) / 1_000_000,
-        `${entry.id}: duration`,
-      ).toBeCloseTo(info.durationSec, 3);
+        Math.abs(roundedDurationSec - info.durationSec),
+        `${entry.id}: accumulated per-packet duration rounding`,
+      ).toBeLessThanOrEqual(frames.length / 2_000_000 + Number.EPSILON);
 
       for (let i = 0; i < frames.length; i++) {
         const frame = frames[i];
@@ -502,6 +674,15 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
         if (frame === undefined || decodedFrame === undefined) {
           throw new Error(`${entry.id}: missing frame ${i}`);
         }
+        expect(packetTable.packets[i], `${entry.id}: packet-info row ${i}`).toEqual({
+          trackIndex: 0,
+          offset: decodedFrame.offset,
+          size: decodedFrame.size,
+          ptsUs: decodedFrame.ptsUs,
+          dtsUs: decodedFrame.ptsUs,
+          durationUs: decodedFrame.durationUs,
+          keyframe: true,
+        });
         expect(
           {
             offset: frame.offset,
@@ -529,7 +710,7 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
         expectBytesEqual(frame.data, decodedFrame.data, `${entry.id}: decoded frame ${i}`);
       }
     }
-  });
+  }, 30_000);
 });
 
 describe('FlacDriver.decodePcm — pure-TS decode to WAV (ADR-024)', () => {

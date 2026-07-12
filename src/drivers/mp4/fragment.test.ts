@@ -289,6 +289,91 @@ describe('fragmentMp4 — init segment structure', () => {
     const trexCount = [...boxes(mvexScan, mvexBox.end)].filter((b) => b.type === 'trex').length;
     expect(trexCount).toBe(1);
   });
+
+  it.each([
+    {
+      colourType: 'nclc' as const,
+      colr: { colourType: 'nclc' as const, primaries: 1, transfer: 1, matrix: 1 },
+    },
+    {
+      colourType: 'nclx' as const,
+      colr: {
+        colourType: 'nclx' as const,
+        primaries: 9,
+        transfer: 16,
+        matrix: 9,
+        fullRange: true,
+      },
+    },
+  ])('round-trips $colourType visual side data and exact declared clocks', async ({ colr }) => {
+    const track: FragmentTrackInput = {
+      ...videoTrack([sample(1_000, 0, true, 10, 1)]),
+      mediaDurationTicks: 30_123,
+      colr,
+      pasp: { hSpacing: 4, vSpacing: 3 },
+      clap: {
+        cleanApertureWidthN: 127,
+        cleanApertureWidthD: 2,
+        cleanApertureHeightN: 95,
+        cleanApertureHeightD: 2,
+        horizOffN: -1,
+        horizOffD: 2,
+        vertOffN: 3,
+        vertOffD: 4,
+      },
+      edit: {
+        mediaTimeTicks: 7,
+        durationTicks: 30_000,
+        leadingEmptyDurationTicks: 630,
+        movieTimescale: 1_000,
+        durationMovieTicks: 1_001,
+        leadingEmptyDurationMovieTicks: 21,
+      },
+    };
+    const init = [...fragmentMp4([track], { movieTimescale: 1_000 })][0];
+    expect(init).toBeDefined();
+    if (init === undefined) return;
+    const parsed = (await readMovie(ra(init))).tracks[0];
+
+    expect(parsed?.mediaDurationTicks).toBe(track.mediaDurationTicks);
+    expect(parsed?.colr).toEqual(track.colr);
+    expect(parsed?.pasp).toEqual(track.pasp);
+    expect(parsed?.clap).toEqual(track.clap);
+    expect(parsed?.edit).toEqual({
+      mediaTimeTicks: 7,
+      durationSec: 1.001,
+      durationMovieTicks: 1_001,
+      movieTimescale: 1_000,
+      leadingEmptyDurationSec: 0.021,
+      leadingEmptyDurationMovieTicks: 21,
+    });
+  });
+
+  it('derives edit clocks when the target movie timescale differs from the source clock', async () => {
+    const track: FragmentTrackInput = {
+      ...videoTrack([sample(1_000, 0, true, 10, 1)]),
+      edit: {
+        mediaTimeTicks: 5,
+        durationTicks: 30_000,
+        leadingEmptyDurationTicks: 3_000,
+        movieTimescale: 600,
+        durationMovieTicks: 999,
+        leadingEmptyDurationMovieTicks: 111,
+      },
+    };
+    const init = [...fragmentMp4([track], { movieTimescale: 1_000 })][0];
+    expect(init).toBeDefined();
+    if (init === undefined) return;
+
+    expect((await readMovie(ra(init))).tracks[0]?.edit).toEqual({
+      mediaTimeTicks: 5,
+      durationSec: 1,
+      durationMovieTicks: 1_000,
+      movieTimescale: 1_000,
+      leadingEmptyDurationSec: 0.1,
+      leadingEmptyDurationMovieTicks: 100,
+    });
+  });
 });
 
 describe('fragmentMp4 — audio segment planning', () => {
@@ -427,6 +512,28 @@ describe('fragmentMp4 — typed misuse', () => {
 
   it('a track with no samples → mux-error', () => {
     expect(() => [...fragmentMp4([videoTrack([])])]).toThrowError(/no samples/);
+  });
+
+  it.each([
+    {
+      label: 'segment duration',
+      edit: { mediaTimeTicks: 0, durationTicks: -30 },
+      message: /edit segment_duration -1 exceeds version-0 elst/,
+    },
+    {
+      label: 'media time',
+      edit: { mediaTimeTicks: -1, durationTicks: 1 },
+      message: /edit media_time -1 exceeds version-0 elst/,
+    },
+    {
+      label: 'leading empty duration',
+      edit: { mediaTimeTicks: 0, durationTicks: 1, leadingEmptyDurationTicks: -30 },
+      message: /leading empty edit duration -1 exceeds version-0 elst/,
+    },
+  ] as const)('invalid $label → typed mux-error', ({ edit, message }) => {
+    expect(() => [
+      ...fragmentMp4([{ ...videoTrack([sample(1, 0, true, 1, 1)]), edit }]),
+    ]).toThrowError(message);
   });
 });
 

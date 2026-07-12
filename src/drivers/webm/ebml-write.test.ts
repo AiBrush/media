@@ -488,6 +488,7 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
       id: 0,
       mediaType: 'video',
       codec: 'vp9',
+      alpha: true,
       durationSec: 0.08,
       fps: 25,
       config: { codec: 'vp9', codedWidth: 16, codedHeight: 16 },
@@ -521,6 +522,7 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     expect(frames[0]?.alpha).toEqual(firstAlpha);
     expect(frames[1]?.data).toEqual(secondColor);
     expect(frames[1]?.alpha).toEqual(secondAlpha);
+    expect(demuxed.info.tracks[0]?.alpha).toBe(true);
   });
 
   it('materializes the real h264_1080p_30s MP4 packet table as a 30s WebM, not AAC padding', async () => {

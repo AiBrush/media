@@ -18,7 +18,13 @@ import { FlacDriver, enumerateFlacFrames, parseFlac } from '../drivers/flac/flac
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
-import { OggDriver, oggAudioPackets, oggPacketBytes, parseOgg } from '../drivers/ogg/ogg-driver.ts';
+import {
+  OggDriver,
+  oggAudioPackets,
+  oggPacketBytes,
+  oggPacketInfoFromBytes,
+  parseOgg,
+} from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { demuxWebm, parseWebm } from '../drivers/webm/webm-driver.ts';
 import { channelAt } from '../dsp/pcm.ts';
@@ -27,6 +33,7 @@ import { fromBytes } from '../sources/source.ts';
 import { encryptCenc } from '../test-support/cenc-encrypt.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
+import { deferredStream } from './engine.ts';
 import {
   muxFlacMkv,
   muxPreparedWebmAudioPacketTrack,
@@ -615,6 +622,53 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     }
   });
 
+  it('cross-container remux (Ogg audio → MKV) uses native packet views without host chunks', async () => {
+    const restore = installThrowingEncodedChunkConstructors(
+      'native Ogg-to-MKV remux must not construct EncodedChunk objects',
+    );
+    try {
+      for (const id of ['sfx-opus.ogg', 'sound_5.oga'] as const) {
+        const input = await loadFixture(id);
+        const sourcePackets = oggAudioPackets(input);
+        const sourceTable = oggPacketInfoFromBytes(input);
+        const description = sourceTable.tracks[0]?.config?.description;
+        const codecDelayUs =
+          sourceTable.tracks[0]?.codec === 'opus' &&
+          description instanceof Uint8Array &&
+          description.byteLength >= 12
+            ? Math.round(
+                (new DataView(
+                  description.buffer,
+                  description.byteOffset,
+                  description.byteLength,
+                ).getUint16(10, true) /
+                  48_000) *
+                  1_000_000,
+              )
+            : 0;
+        const out = await outputBytes(await media().remux(await fixtureSource(id), { to: 'mkv' }));
+        const reparsed = demuxWebm(out);
+        expect(reparsed.info.container).toBe('mkv');
+        expect(reparsed.info.tracks[0]?.codec).toBe(parseOgg(input).codec);
+        const frames = reparsed.framesByIndex[0] ?? [];
+        expect(frames).toHaveLength(sourcePackets.length);
+        for (let index = 0; index < frames.length; index++) {
+          const sourcePacket = sourcePackets[index];
+          const frame = frames[index];
+          if (sourcePacket === undefined || frame === undefined) {
+            throw new Error(`${id}: missing packet ${index}`);
+          }
+          expect(frame.data).toEqual(oggPacketBytes(input, sourcePacket));
+          expect(
+            Math.abs(frame.timestampUs - (sourcePacket.ptsUs - codecDelayUs)),
+          ).toBeLessThanOrEqual(1_000);
+        }
+      }
+    } finally {
+      restore();
+    }
+  });
+
   it('pure convert (flac → ogg) uses native frame copy without host chunk constructors', async () => {
     const restore = installThrowingEncodedChunkConstructors(
       'native FLAC-to-Ogg convert must not construct EncodedChunk objects',
@@ -893,6 +947,40 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     expect(codecs.has('h264')).toBe(true);
     expect(codecs.has('aac')).toBe(true);
     expect(info.durationSec).toBeCloseTo(declaredDurationSec, 2);
+  });
+
+  it('prepared WebM chunk mux carries declared alpha into Video/AlphaMode', () => {
+    const alpha = new Uint8Array([0x11, 0x22, 0x33]);
+    const color = new Uint8Array([0x44, 0x55, 0x66]);
+    const out = muxPreparedWebmChunkTracks({
+      container: 'webm',
+      tracks: [
+        {
+          track: {
+            id: 0,
+            mediaType: 'video',
+            codec: 'vp8',
+            alpha: true,
+            durationSec: 1 / 30,
+            fps: 30,
+            config: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+          },
+          chunks: [
+            {
+              timestampUs: 0,
+              durationUs: 33_333,
+              key: true,
+              data: color,
+              alpha,
+            },
+          ],
+        },
+      ],
+    });
+    const parsed = demuxWebm(out);
+    expect(parsed.info.tracks[0]?.alpha).toBe(true);
+    expect(parsed.framesByIndex[0]?.[0]?.data).toEqual(color);
+    expect(parsed.framesByIndex[0]?.[0]?.alpha).toEqual(alpha);
   });
 
   it('prepared WebM chunk mux rejects unsupported containers and empty inputs', () => {
@@ -1551,6 +1639,73 @@ describe('mux — caller packet streams (public packet seam)', () => {
 });
 
 describe('decode — lazy frame streams (contract)', () => {
+  it('releases the produced stream lock immediately after EOF', async () => {
+    const inner = new ReadableStream<number>({
+      start(controller): void {
+        controller.enqueue(7);
+        controller.close();
+      },
+    });
+    const outer = deferredStream(() => Promise.resolve(inner));
+    const reader = outer.getReader();
+
+    await expect(reader.read()).resolves.toEqual({ done: false, value: 7 });
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+
+    expect(inner.locked).toBe(false);
+    reader.releaseLock();
+  });
+
+  it('releases the produced stream lock when its reader errors', async () => {
+    const failure = new Error('inner-read-failed');
+    const inner = new ReadableStream<number>({
+      start(controller): void {
+        controller.error(failure);
+      },
+    });
+    const outer = deferredStream(() => Promise.resolve(inner));
+    const reader = outer.getReader();
+
+    await expect(reader.read()).rejects.toBe(failure);
+    expect(inner.locked).toBe(false);
+    reader.releaseLock();
+  });
+
+  it('cancels and unlocks an inner stream that resolves after downstream cancellation', async () => {
+    let resolveInner: ((stream: ReadableStream<number>) => void) | undefined;
+    let innerCancelled = 0;
+    let markInnerCancelled: (() => void) | undefined;
+    const innerCancelledDone = new Promise<void>((resolve) => {
+      markInnerCancelled = resolve;
+    });
+    const inner = new ReadableStream<number>({
+      cancel(reason): void {
+        expect(reason).toBe('stop-before-route-resolved');
+        innerCancelled++;
+        markInnerCancelled?.();
+      },
+    });
+    const outer = deferredStream(
+      () =>
+        new Promise<ReadableStream<number>>((resolve) => {
+          resolveInner = resolve;
+        }),
+    );
+    const reader = outer.getReader();
+    const pending = reader.read();
+    while (resolveInner === undefined) await Promise.resolve();
+
+    const cancelled = reader.cancel('stop-before-route-resolved');
+    resolveInner(inner);
+    await cancelled;
+    await pending;
+    await innerCancelledDone;
+    while (inner.locked) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(innerCancelled).toBe(1);
+    expect(inner.locked).toBe(false);
+  });
+
   it('returns a MediaStreams shape synchronously', () => {
     const streams = media().decode(new Uint8Array([1, 2, 3, 4]));
     expect(streams.video).toBeInstanceOf(ReadableStream);
@@ -1591,6 +1746,61 @@ describe('decode — lazy frame streams (contract)', () => {
       await expect(readFirstFrame(streams.audio)).rejects.toThrow(
         /AudioData missing for PCM decode/,
       );
+    }
+  });
+
+  it('routes real s24 WAV decode through exact-owned interleaved transfer chunks', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'AudioData');
+    class CapturingAudioData {
+      readonly init: AudioDataInit;
+      closeCount = 0;
+
+      constructor(init: AudioDataInit) {
+        this.init = init;
+      }
+
+      close(): void {
+        this.closeCount++;
+      }
+    }
+    Object.defineProperty(globalThis, 'AudioData', {
+      configurable: true,
+      value: CapturingAudioData as unknown as typeof AudioData,
+    });
+    try {
+      const bytes = await loadFixture('sfx-pcm-s24.wav');
+      const canonical = readWavPcm(bytes);
+      const streams = media().decode(fromBytes(bytes, { mime: 'audio/wav' }));
+      const reader = streams.audio?.getReader();
+      if (reader === undefined) throw new Error('expected WAV audio frame stream');
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      const frame = next.value as unknown as CapturingAudioData;
+      const frames = Math.min(4096, canonical.frames);
+      const expected = new Float32Array(frames * canonical.channels);
+      for (let sample = 0; sample < frames; sample++) {
+        for (let channel = 0; channel < canonical.channels; channel++) {
+          expected[sample * canonical.channels + channel] =
+            canonical.planar[channel]?.[sample] ?? 0;
+        }
+      }
+      expect(frame.init).toMatchObject({
+        format: 'f32',
+        numberOfChannels: canonical.channels,
+        numberOfFrames: frames,
+        sampleRate: canonical.sampleRate,
+        timestamp: 0,
+      });
+      expect(frame.init.transfer).toEqual([frame.init.data]);
+      expect(new Uint32Array(frame.init.data as ArrayBuffer)).toEqual(
+        new Uint32Array(expected.buffer),
+      );
+      frame.close();
+      await reader.cancel('first exact chunk is sufficient');
+      expect(frame.closeCount).toBe(1);
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
+      else Object.defineProperty(globalThis, 'AudioData', original);
     }
   });
 

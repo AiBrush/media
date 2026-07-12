@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { ParsedTrack, SampleTable } from './parse.ts';
-import { buildSampleData, buildSamples, walkSampleRanges } from './samples.ts';
+import {
+  buildSampleData,
+  buildSamples,
+  walkSampleClassificationRanges,
+  walkSampleRanges,
+} from './samples.ts';
 
 function track(
   partial: Partial<SampleTable>,
@@ -91,6 +96,38 @@ describe('buildSamples', () => {
     ]);
   });
 
+  it('walks classification ranges with exact sorted and unsorted stss truth', () => {
+    const sorted = track({
+      chunkOffsets: [100, 200],
+      sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 3, descIndex: 1 }],
+      sampleSizes: [10, 20, 30, 40, 50],
+      syncSamples: [1, 4],
+    });
+    const sortedRows: Array<readonly [number, number, number, boolean]> = [];
+
+    expect(
+      walkSampleClassificationRanges(sorted, (index, offset, size, declaredSync) =>
+        sortedRows.push([index, offset, size, declaredSync]),
+      ),
+    ).toBe(5);
+    expect(sortedRows).toEqual([
+      [0, 100, 10, true],
+      [1, 110, 20, false],
+      [2, 130, 30, false],
+      [3, 200, 40, true],
+      [4, 240, 50, false],
+    ]);
+
+    const unsortedRows: boolean[] = [];
+    const unsorted = track({ ...oneChunk, syncSamples: [2, 1] });
+    expect(
+      walkSampleClassificationRanges(unsorted, (_index, _offset, _size, declaredSync) =>
+        unsortedRows.push(declaredSync),
+      ),
+    ).toBe(2);
+    expect(unsortedRows).toEqual([true, true]);
+  });
+
   it('computes offsets, sizes, timestamps, and all-sync keyframes', () => {
     expect(buildSamples(track(oneChunk))).toEqual([
       { index: 0, offset: 100, size: 10, dtsUs: 0, ptsUs: 0, durationUs: 500_000, keyframe: true },
@@ -135,6 +172,8 @@ describe('buildSamples', () => {
       track({ ...oneChunk, compositionOffsets: [{ count: 2, offset: 250 }] }, 1000, {
         mediaTimeTicks: 250,
         durationSec: 1,
+        durationMovieTicks: 1_000,
+        movieTimescale: 1_000,
       }),
     );
     expect(s[0]?.ptsUs).toBe(0);

@@ -91,6 +91,44 @@ function codecConfigBox(track: FragmentInitTrackInput): number[] {
   return [];
 }
 
+function visualSideDataBoxes(track: FragmentInitTrackInput): number[] {
+  const colr = track.colr;
+  const colrBox =
+    colr === undefined
+      ? []
+      : box(
+          'colr',
+          cat(
+            fourcc(colr.colourType),
+            u16(colr.primaries),
+            u16(colr.transfer),
+            u16(colr.matrix),
+            colr.colourType === 'nclx' ? u8(colr.fullRange === true ? 0x80 : 0) : [],
+          ),
+        );
+  const paspBox =
+    track.pasp === undefined
+      ? []
+      : box('pasp', cat(u32(track.pasp.hSpacing), u32(track.pasp.vSpacing)));
+  const clapBox =
+    track.clap === undefined
+      ? []
+      : box(
+          'clap',
+          cat(
+            u32(track.clap.cleanApertureWidthN),
+            u32(track.clap.cleanApertureWidthD),
+            u32(track.clap.cleanApertureHeightN),
+            u32(track.clap.cleanApertureHeightD),
+            u32(track.clap.horizOffN),
+            u32(track.clap.horizOffD),
+            u32(track.clap.vertOffN),
+            u32(track.clap.vertOffD),
+          ),
+        );
+  return cat(colrBox, paspBox, clapBox);
+}
+
 function videoSampleEntry(track: FragmentInitTrackInput): number[] {
   return box(
     track.sampleEntryType,
@@ -108,6 +146,7 @@ function videoSampleEntry(track: FragmentInitTrackInput): number[] {
       u16(0x0018),
       u16(0xffff), // compressorname + depth + pre_defined
       codecConfigBox(track),
+      visualSideDataBoxes(track),
     ),
   );
 }
@@ -171,10 +210,15 @@ function emptyStbl(track: FragmentInitTrackInput): number[] {
 function editList(track: FragmentInitTrackInput, movieTimescale: number): number[] {
   const edit = track.edit;
   if (edit === undefined) return [];
-  const segmentDuration = Math.round((edit.durationTicks * movieTimescale) / track.timescale);
-  const leadingEmptyDuration = Math.round(
-    ((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale,
-  );
+  const preservesSourceMovieClock = edit.movieTimescale === movieTimescale;
+  const segmentDuration =
+    preservesSourceMovieClock && edit.durationMovieTicks !== undefined
+      ? edit.durationMovieTicks
+      : Math.round((edit.durationTicks * movieTimescale) / track.timescale);
+  const leadingEmptyDuration =
+    preservesSourceMovieClock && edit.leadingEmptyDurationMovieTicks !== undefined
+      ? edit.leadingEmptyDurationMovieTicks
+      : Math.round(((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale);
   if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
     throw new MediaError(
       'mux-error',
@@ -225,7 +269,12 @@ function emptyTrak(
       tkhdDisplayFields(track),
     ),
   );
-  const mdhd = full('mdhd', 0, 0, cat(zeros(8), u32(track.timescale), u32(0), u16(0x55c4), u16(0)));
+  const mdhd = full(
+    'mdhd',
+    0,
+    0,
+    cat(zeros(8), u32(track.timescale), u32(track.mediaDurationTicks ?? 0), u16(0x55c4), u16(0)),
+  );
   const hdlr = full(
     'hdlr',
     0,

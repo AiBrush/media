@@ -42,6 +42,31 @@ export interface H264TwoPassQuantizerInstallation {
   readonly assertComplete: () => void;
 }
 
+/**
+ * Native ABR encoders under-allocate their first few pictures before their rate model has observations.
+ * Prime only implicit offline H.264/AV1 targets; explicit bitrate/mode, CRF, and two-pass contracts remain
+ * exact.
+ */
+export function implicitRateControlWarmupFrames(
+  target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
+  codec: string,
+  frameRate: number | undefined,
+): number | undefined {
+  if (
+    target.bitrate !== undefined ||
+    target.bitrateMode !== undefined ||
+    target.crf !== undefined ||
+    target.twoPass === true
+  ) {
+    return undefined;
+  }
+  const normalized = codec.toLowerCase();
+  // Container time-base division can report nominal 30 fps as 30.0000003; require a real cadence step.
+  if (normalized.startsWith('av01.') && frameRate !== undefined && frameRate > 30.5) return 8;
+  if (normalized.startsWith('avc1.') || normalized.startsWith('avc3.')) return 3;
+  return undefined;
+}
+
 export function installH264TwoPassQuantizer(
   baseStage: VideoEncoderStageOptions,
   plan: H264TwoPassPlan,
@@ -311,6 +336,11 @@ export async function encodeVideoStream(
   }
   const codec = await context.routeCodec(encodeQueryFor(encoderConfig), options);
   const keyFrameInterval = periodicVideoKeyFrameInterval(target.fps, fragmented);
+  const rateControlWarmupFrames = implicitRateControlWarmupFrames(
+    target,
+    encoderConfig.codec,
+    encoderConfig.framerate,
+  );
   /* v8 ignore start -- requires a real VideoEncoder; validated in the browser harness (BUILD §6.1). */
   let decoderConfig: VideoDecoderConfig | undefined;
   let stage: VideoEncoderStageOptions = {
@@ -320,6 +350,7 @@ export async function encodeVideoStream(
     },
     ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
     ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
+    ...(rateControlWarmupFrames !== undefined ? { rateControlWarmupFrames } : {}),
   };
   let assertTwoPassComplete: (() => void) | undefined;
   if (twoPassPlan !== undefined) {
@@ -331,6 +362,7 @@ export async function encodeVideoStream(
     ...context.stageOptions(signal, options),
     ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
     ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
+    ...(rateControlWarmupFrames !== undefined ? { rateControlWarmupFrames } : {}),
   };
   const encodeInput = bitDepthPlan.requiresPixelPath
     ? frames.pipeThrough((await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream())

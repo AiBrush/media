@@ -42,7 +42,7 @@ import type {
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import type { PcmAudio } from '../dsp/index.ts';
+import type { InterleavedPcmF32, PcmAudio } from '../dsp/index.ts';
 import {
   type LazyAudioMuxKind,
   adtsMuxTrackConfig,
@@ -65,7 +65,7 @@ import {
   fastFlacFrames,
   flacMetadataLayout,
   flacOffset,
-  flacPacketInfoRows,
+  flacPacketInfoTable,
   flacTrackInfo,
   matchesFlac,
   parseFlacStreamInfo,
@@ -245,6 +245,7 @@ type LazyFilterLoader = () => Promise<FilterDriver>;
 interface LazyContainerSpec {
   readonly id: string;
   readonly formats: readonly string[];
+  readonly streamCopyTargets?: readonly string[];
   readonly supports: (q: ContainerQuery) => boolean;
   readonly load: LazyContainerLoader;
   readonly probe?: true;
@@ -255,6 +256,7 @@ interface LazyContainerSpec {
   readonly decodePcm?: true;
   readonly decodePcmAudio?: true;
   readonly decodePcmAudioStream?: true;
+  readonly decodePcmInterleavedStream?: true;
   readonly validatesStreamCopyTrim?: true;
   readonly validatesPcmTrim?: true;
   readonly muxKind?: LazyAudioMuxKind;
@@ -274,6 +276,7 @@ function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
       transformPcm: true,
       decodePcmAudio: true,
       decodePcmAudioStream: true,
+      decodePcmInterleavedStream: true,
       validatesPcmTrim: true,
       muxKind: 'wav',
       validateTrack: (track, trackCount) => {
@@ -293,6 +296,7 @@ function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
     lazyContainer({
       id: 'ogg',
       formats: ['ogg'],
+      streamCopyTargets: ['webm', 'mkv'],
       supports: matchesOgg,
       load: () => import('./ogg/ogg-driver.ts').then((module) => module.OggDriver),
       probe: true,
@@ -354,6 +358,7 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
     apiVersion: DRIVER_API_VERSION,
     kind: 'container',
     formats: spec.formats,
+    ...(spec.streamCopyTargets === undefined ? {} : { streamCopyTargets: spec.streamCopyTargets }),
     supports: spec.supports,
     ...(spec.probe === true
       ? {
@@ -455,6 +460,21 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
           },
         }
       : {}),
+    ...(spec.decodePcmInterleavedStream === true
+      ? {
+          async decodePcmInterleavedStream(
+            src: ByteSource,
+            o?: StageOptions,
+          ): Promise<ReadableStream<InterleavedPcmF32>> {
+            const loaded = await load();
+            const decodePcmInterleavedStream = loaded.decodePcmInterleavedStream;
+            if (decodePcmInterleavedStream === undefined) {
+              throw missingLazyMethod(spec.id, 'decodePcmInterleavedStream');
+            }
+            return decodePcmInterleavedStream.call(loaded, src, o);
+          },
+        }
+      : {}),
     ...(spec.validatesStreamCopyTrim === true ? { validatesStreamCopyTrim: true } : {}),
     ...(spec.validatesPcmTrim === true ? { validatesPcmTrim: true } : {}),
   };
@@ -523,13 +543,9 @@ function lazyFlacContainerDriver(): ContainerDriver {
     async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
       const bytes = await readFlacBytes(src);
       if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const layout = flacMetadataLayout(bytes);
-      const frames = fastFlacFrames(bytes, layout);
+      const table = flacPacketInfoTable(bytes);
       if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      return {
-        tracks: [flacTrackInfo(layout.info, bytes.slice(layout.start, layout.audioStart))],
-        packets: flacPacketInfoRows(frames),
-      };
+      return table;
     },
     async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
       const bytes = await readFlacBytes(src);
@@ -625,21 +641,33 @@ function flacPacketStream(
 
 async function readByteStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+  try {
+    const first = await reader.read();
+    if (first.done) return new Uint8Array(0);
+    const second = await reader.read();
+    if (second.done) return first.value;
+
+    const chunks = [first.value, second.value];
+    let total = first.value.byteLength + second.value.byteLength;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value);
+      total += next.value.byteLength;
+    }
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return out;
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  const out = new Uint8Array(total);
-  let at = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, at);
-    at += chunk.byteLength;
-  }
-  return out;
 }
 
 const AVI_MIMES = new Set(['video/avi', 'video/x-msvideo', 'video/msvideo', 'video/vnd.avi']);

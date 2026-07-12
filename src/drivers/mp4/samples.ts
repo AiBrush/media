@@ -45,6 +45,14 @@ export type SampleVisitor = (
 /** A zero-allocation visitor over normalized sample byte ranges. */
 export type SampleRangeVisitor = (index: number, offset: number, size: number) => void;
 
+/** A physical sample row plus its exact `stss` membership, without timing-table expansion. */
+export type SampleClassificationRangeVisitor = (
+  index: number,
+  offset: number,
+  size: number,
+  declaredSync: boolean,
+) => void;
+
 function toUs(ticks: number, timescale: number): number {
   return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
 }
@@ -119,6 +127,58 @@ export function walkSampleRanges(track: ParsedTrack, visitor: SampleRangeVisitor
     for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < count; inChunk++) {
       const size = sizes[sampleIndex] ?? 0;
       visitor(sampleIndex, offset, size);
+      offset += size;
+      sampleIndex++;
+    }
+  }
+  return sampleIndex;
+}
+
+/**
+ * Walk byte-placement tables and exact sync membership without materializing sample objects or touching
+ * timing tables. Sorted `stss` uses a monotonic cursor; malformed unsorted tables retain set semantics.
+ */
+export function walkSampleClassificationRanges(
+  track: ParsedTrack,
+  visitor: SampleClassificationRangeVisitor,
+): number {
+  const table = track.samples;
+  const sizes = table.sampleSizes;
+  const count = sizes.length;
+  const syncSamples = table.syncSamples;
+  const allSync = syncSamples.length === 0;
+  const sortedSync = allSync || isAscending(syncSamples);
+  const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
+  let stscIndex = 0;
+  let samplesPerChunk = 0;
+  let syncIndex = 0;
+  let sampleIndex = 0;
+  for (
+    let chunkIndex = 0;
+    chunkIndex < table.chunkOffsets.length && sampleIndex < count;
+    chunkIndex++
+  ) {
+    const chunkOffset = table.chunkOffsets[chunkIndex];
+    if (chunkOffset === undefined) break;
+    const chunkNumber = chunkIndex + 1;
+    while (true) {
+      const entry = table.sampleToChunk[stscIndex];
+      if (entry === undefined || entry.firstChunk > chunkNumber) break;
+      samplesPerChunk = entry.samplesPerChunk;
+      stscIndex++;
+    }
+    let offset = chunkOffset;
+    for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < count; inChunk++) {
+      const size = sizes[sampleIndex] ?? 0;
+      const sampleNumber = sampleIndex + 1;
+      let syncSample = syncSamples[syncIndex];
+      while (syncSample !== undefined && syncSample < sampleNumber) {
+        syncIndex++;
+        syncSample = syncSamples[syncIndex];
+      }
+      const declaredSync =
+        allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber;
+      visitor(sampleIndex, offset, size, declaredSync);
       offset += size;
       sampleIndex++;
     }

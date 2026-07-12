@@ -139,7 +139,7 @@ describe('wasm-av1 default routing', () => {
     }
   });
 
-  it('routes force-software AV1 decode directly to dav1d and still performs probe-only zero wasm', async () => {
+  it('keeps an exact proved software WebCodecs AV1 configuration under force-software', async () => {
     const browser = installBrowserVideoSeam(true);
     const wasmTrap = installNoWasmInstantiationTrap();
     try {
@@ -147,8 +147,11 @@ describe('wasm-av1 default routing', () => {
         determinism: 'force-software',
       });
 
-      expect(picked.id).toBe('wasm-av1');
-      expect(browser.isConfigSupported).not.toHaveBeenCalled();
+      expect(picked.id).toBe('webcodecs-video');
+      expect(browser.isConfigSupported).toHaveBeenCalledOnce();
+      expect(browser.isConfigSupported).toHaveBeenCalledWith(
+        expect.objectContaining({ hardwareAcceleration: 'prefer-software' }),
+      );
       expect(wasmTrap.fetch).not.toHaveBeenCalled();
       expect(WebAssembly.instantiate).not.toHaveBeenCalled();
     } finally {

@@ -45,7 +45,7 @@ Author in **TypeScript (strict)**; emit:
 ```
 
 - The **default export** is the tiny kernel + bare-function sugar (ADR-009).
-- Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004).
+- Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004). A definite long-tail audio container query first imports only that container's native driver (ADR-285). A definite MP4/MOV or WebM/Matroska mux target and an automatic supported WebCodecs audio query likewise register only their immediately-needed native modules (ADR-290); native support misses, deterministic software, non-native pins, ambiguous/unknown queries, filters, images, preload, and failed selective retries retain the complete register-all fallback.
 - Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103).
 - `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
 - Live input normalization similarly keeps only the tiny `LiveMediaSource` brand/capture/shape module eager;

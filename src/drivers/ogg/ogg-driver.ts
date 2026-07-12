@@ -673,11 +673,149 @@ function oggPacketMetadata(table: PacketInfoTable): readonly PacketMetadata[] {
 }
 
 function validateOggStreamCopyTarget(container: string | undefined): void {
-  if (container === undefined || container === 'ogg') return;
+  if (
+    container === undefined ||
+    container === 'ogg' ||
+    container === 'webm' ||
+    container === 'mkv'
+  ) {
+    return;
+  }
   throw new CapabilityError('capability-miss', `Ogg stream-copy cannot write '${container}'`, {
     op: { op: 'streamCopy', container },
     tried: ['ogg'],
   });
+}
+
+interface OggTrimPacketSelection {
+  readonly firstIndex: number;
+  readonly lastIndex: number;
+  readonly firstPtsUs: number;
+  readonly endUs: number;
+}
+
+function selectOggTrimPackets(
+  packets: readonly OggPacketInfoMetadata[],
+  startUs: number,
+  endUs: number,
+  signal: AbortSignal | undefined,
+): OggTrimPacketSelection {
+  let firstIndex = -1;
+  let lastIndex = -1;
+  let firstPtsUs = 0;
+  let selectedEndUs = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < packets.length; index++) {
+    if (signal?.aborted) throw abortedOggRead();
+    const packet = packets[index];
+    if (packet === undefined) continue;
+    const durationUs = packet.durationUs;
+    if (durationUs === undefined) {
+      throw new MediaError('demux-error', 'Ogg packet table is missing duration facts');
+    }
+    const packetStartUs = Math.round(packet.ptsUs);
+    const packetDurationUs = Math.round(durationUs);
+    const packetEndUs = packetStartUs + packetDurationUs;
+    if (packetEndUs <= startUs || packetStartUs >= endUs) continue;
+    if (firstIndex < 0) {
+      firstIndex = index;
+      firstPtsUs = packetStartUs;
+    }
+    lastIndex = index;
+    selectedEndUs = Math.max(selectedEndUs, packetEndUs);
+  }
+  if (firstIndex < 0 || lastIndex < firstIndex || !Number.isFinite(selectedEndUs)) {
+    throw new MediaError('mux-error', 'Ogg remux selected no audio packets');
+  }
+  return { firstIndex, lastIndex, firstPtsUs, endUs: selectedEndUs };
+}
+
+function resetOpusPreSkip(track: TrackInfo): TrackInfo {
+  const config = track.config;
+  if (track.codec !== 'opus' || config === undefined || !('sampleRate' in config)) return track;
+  const source = config.description;
+  if (source === undefined) return track;
+  const description = ArrayBuffer.isView(source)
+    ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice()
+    : new Uint8Array(source).slice();
+  if (
+    description.byteLength < 12 ||
+    asciiAt(new DataView(description.buffer), 0, 8) !== 'OpusHead'
+  ) {
+    return track;
+  }
+  new DataView(description.buffer).setUint16(10, 0, true);
+  const output: TrackInfo = { ...track, config: { ...config, description } };
+  Reflect.deleteProperty(output, 'codecDelayNs');
+  Reflect.deleteProperty(output, 'gapless');
+  return output;
+}
+
+async function writeOggWebmPacketCopy(
+  bytes: Uint8Array,
+  container: 'webm' | 'mkv',
+  trim: StreamCopyOptions['trim'],
+  signal: AbortSignal | undefined,
+): Promise<ReadableStream<Uint8Array>> {
+  const table = oggPacketInfoTable(bytes);
+  const track = table.tracks[0];
+  if (track === undefined || track.mediaType !== 'audio') {
+    throw new CapabilityError('capability-miss', 'Ogg remux needs one audio track', {
+      op: 'remux',
+      tried: ['ogg', container],
+    });
+  }
+  if (container === 'webm' && track.codec.toLowerCase().startsWith('flac')) {
+    throw new CapabilityError('capability-miss', 'WebM does not support FLAC audio', {
+      op: 'remux',
+      tried: ['ogg', 'webm'],
+    });
+  }
+  if (trim !== undefined) validateOggTrimRange(track.durationSec, trim);
+  const startUs = trim === undefined ? undefined : Math.round(trim.startSec * MICROS_PER_SECOND);
+  const endUs = trim === undefined ? undefined : Math.round(trim.endSec * MICROS_PER_SECOND);
+  const selection =
+    startUs === undefined || endUs === undefined
+      ? undefined
+      : selectOggTrimPackets(table.packets, startUs, endUs, signal);
+  const { WebmMuxer } = await import('../webm/ebml-write.ts');
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+  const outputTrack =
+    selection === undefined
+      ? track
+      : {
+          ...(selection.firstIndex === 0 ? track : resetOpusPreSkip(track)),
+          durationSec: (selection.endUs - selection.firstPtsUs) / MICROS_PER_SECOND,
+        };
+  const muxer = new WebmMuxer({ container }, container === 'mkv' ? 'matroska' : 'webm');
+  const trackId = muxer.addTrack(outputTrack);
+  let selected = 0;
+  const firstIndex = selection?.firstIndex ?? 0;
+  const lastIndex = selection?.lastIndex ?? table.packets.length - 1;
+  for (let index = firstIndex; index <= lastIndex; index++) {
+    if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const packet = table.packets[index];
+    if (packet === undefined) continue;
+    const durationUs = packet.durationUs;
+    if (durationUs === undefined) {
+      throw new MediaError('demux-error', 'Ogg packet table is missing duration facts');
+    }
+    const packetStartUs = Math.round(packet.ptsUs);
+    const packetDurationUs = Math.round(durationUs);
+    const timestampUs =
+      selection === undefined ? packetStartUs : Math.max(0, packetStartUs - selection.firstPtsUs);
+    muxer.addChunkStruct(trackId, {
+      timestampUs,
+      durationUs: packetDurationUs,
+      key: packet.keyframe,
+      data: oggPacketBytes(bytes, packet),
+    });
+    selected++;
+  }
+  if (selected === 0) throw new MediaError('mux-error', 'Ogg remux selected no audio packets');
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+  await muxer.finalize();
+  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+  return muxer.output;
 }
 
 function validateOggTrimRange(
@@ -784,17 +922,52 @@ async function readTail(src: ByteSource, head: Uint8Array): Promise<Uint8Array |
   return undefined;
 }
 
+function abortedOggRead(): MediaError {
+  return new MediaError('aborted', 'operation aborted');
+}
+
+async function readOggChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+) {
+  if (signal === undefined) return reader.read();
+  if (signal.aborted) throw abortedOggRead();
+  let onAbort: (() => void) | undefined;
+  const abort = new Promise<never>((_resolve, reject) => {
+    onAbort = (): void => reject(abortedOggRead());
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([reader.read(), abort]);
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /** Read the entire source into one buffer — packets() must de-lace the whole file, not just the head. */
-async function readAll(src: ByteSource): Promise<Uint8Array> {
-  if (src.range && src.size !== undefined) return src.range(0, src.size);
+async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Array> {
+  if (signal?.aborted) throw abortedOggRead();
+  if (src.range && src.size !== undefined) {
+    const bytes = await src.range(0, src.size);
+    if (signal?.aborted) throw abortedOggRead();
+    return bytes;
+  }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+  try {
+    for (;;) {
+      const { done, value } = await readOggChunk(reader, signal);
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    if (signal?.aborted) throw abortedOggRead();
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
   const out = new Uint8Array(total);
   let off = 0;
@@ -856,24 +1029,25 @@ export const OggDriver: ContainerDriver = {
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['ogg'],
+  streamCopyTargets: ['webm', 'mkv'],
   supports: matchesOgg,
   validatesStreamCopyTrim: true,
-  async probe(src: ByteSource): Promise<readonly TrackInfo[]> {
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     // Exact Ogg duration lives in the terminal page granule. Head+tail range probing is valid only when
     // both a finite size and random access are available; an unknown-size/chunked stream must reach EOS.
     if (src.range === undefined || src.size === undefined) {
-      return [trackFromInfo(parseOgg(await readAll(src)))];
+      return [trackFromInfo(parseOgg(await readAll(src, o?.signal)))];
     }
     const head = await readHead(src);
     return [trackFromInfo(parseOgg(head, await readTail(src, head)))];
   },
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
-    const table = oggPacketInfoTable(await readAll(src));
+    const table = oggPacketInfoTable(await readAll(src, o?.signal));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return table;
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-    const all = await readAll(src);
+    const all = await readAll(src, o?.signal);
     const table = oggPacketInfoTable(all);
     const packetTable = oggPacketMetadata(table);
     const signal = o?.signal;
@@ -903,8 +1077,12 @@ export const OggDriver: ContainerDriver = {
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     validateOggStreamCopyTarget(o?.container);
-    const bytes = await readAll(src);
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const bytes = await readAll(src, o?.signal);
+    if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    if (o?.container === 'webm' || o?.container === 'mkv') {
+      return writeOggWebmPacketCopy(bytes, o.container, o.trim, o.signal);
+    }
     const trim = o?.trim;
     if (trim === undefined) return byteStream(bytes);
     const out = writeOggPacketCopyTrim(bytes, trim);

@@ -230,6 +230,13 @@ describe('wasm-av1 driver identity and honest absence', () => {
         config: { codec: 'av01.0.04M.08' } as unknown as AudioDecoderConfig,
       }),
     ).toBe(false);
+    expect(
+      isAv1DecodeQuery({
+        mediaType: 'video',
+        direction: 'decode',
+        config: { codec: 'vp09.00.10.08' },
+      }),
+    ).toBe(false);
   });
 
   it('unsupported returns a reasoned non-support result', () => {
@@ -274,6 +281,20 @@ describe('wasm-av1 driver identity and honest absence', () => {
         chromaSubsampling: '420',
       }),
     ).toBe(false);
+    expect(await loadAv1Core()).toBe(core);
+  });
+
+  it('isolates a failed asset-base override from the valid cached dav1d core', async () => {
+    const profile = {
+      kind: 'baseline',
+      simd: false,
+      threads: false,
+      sharedArrayBuffer: false,
+    } as const;
+    await expect(
+      loadAv1Core(profile, 'file:///definitely-missing-aibrush-av1/'),
+    ).resolves.toBeNull();
+    await expect(loadAv1Core(profile)).resolves.not.toBeNull();
   });
 
   it('supports() returns false in Node before any core load', async () => {
@@ -287,6 +308,14 @@ describe('wasm-av1 driver identity and honest absence', () => {
   });
 
   it('supports() returns false for encode and non-AV1 codecs', async () => {
+    await expect(
+      WasmAv1Driver.supports({
+        mediaType: 'audio',
+        direction: 'decode',
+        config: { codec: 'av01.0.04M.08' } as unknown as AudioDecoderConfig,
+      }),
+    ).resolves.toMatchObject({ supported: false, reason: expect.stringMatching(/video only/) });
+
     await expect(
       WasmAv1Driver.supports({
         mediaType: 'video',
@@ -306,6 +335,21 @@ describe('wasm-av1 driver identity and honest absence', () => {
         config: { codec: 'vp09.00.10.08' },
       }),
     ).resolves.toMatchObject({ supported: false, reason: expect.stringMatching(/AV1/) });
+
+    for (const codec of [
+      'av01.0.04M.10',
+      'av01.1.04M.08.0.000',
+      'av01.2.05M.12.0.000',
+      'av01.0.04M.08.1.110',
+    ]) {
+      await expect(
+        WasmAv1Driver.supports({
+          mediaType: 'video',
+          direction: 'decode',
+          config: { codec },
+        }),
+      ).resolves.toMatchObject({ supported: false, reason: expect.any(String) });
+    }
   });
 
   it('createDecoder fails fast with a typed capability miss when the host video seam is absent', () => {
@@ -316,6 +360,23 @@ describe('wasm-av1 driver identity and honest absence', () => {
 
   it('createDecoder validates config before the seam check', () => {
     expect(() => WasmAv1Driver.createDecoder({ codec: 'vp09.00.10.08' })).toThrow(MediaError);
+  });
+
+  it('createDecoder and createEncoder reject an already-aborted operation before opening a seam', () => {
+    const controller = new AbortController();
+    controller.abort();
+    expect(() =>
+      WasmAv1Driver.createDecoder(
+        { codec: 'av01.0.04M.08', codedWidth: 16, codedHeight: 16 },
+        { signal: controller.signal },
+      ),
+    ).toThrow(MediaError);
+    expect(() =>
+      WasmAv1Driver.createEncoder(
+        { codec: 'av01.0.04M.08', width: 16, height: 16 } as unknown as VideoEncoderConfig,
+        { signal: controller.signal },
+      ),
+    ).toThrow(MediaError);
   });
 
   it('createEncoder is an honest dav1d decode-only miss', () => {

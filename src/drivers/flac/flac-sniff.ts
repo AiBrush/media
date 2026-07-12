@@ -36,6 +36,7 @@ export interface FastFlacFrameSpan {
 }
 
 interface ParsedFlacFrameHeader {
+  readonly offset: number;
   readonly headerBytes: number;
   readonly blockSize: number;
 }
@@ -141,13 +142,14 @@ export function fastFlacFrames(bytes: Uint8Array, layout: FlacMetadataLayout): F
   const frames: FastFlacFrameSpan[] = [];
   let offset = layout.audioStart;
   let produced = 0;
+  let header: ParsedFlacFrameHeader | undefined;
   while (produced < layout.info.totalSamples) {
-    const header = parseFastFlacFrameHeader(bytes, offset);
+    header ??= parseFastFlacFrameHeader(bytes, offset);
     if (header === undefined) {
       throw new MediaError('demux-error', `FLAC: lost frame sync at byte ${offset}`);
     }
     const next = findNextFastFlacFrame(bytes, offset + header.headerBytes);
-    const end = next < 0 ? bytes.byteLength : next;
+    const end = next?.offset ?? bytes.byteLength;
     if (end <= offset) {
       throw new MediaError('demux-error', `FLAC: invalid frame span at byte ${offset}`);
     }
@@ -163,6 +165,7 @@ export function fastFlacFrames(bytes: Uint8Array, layout: FlacMetadataLayout): F
     });
     produced += samples;
     offset = end;
+    header = next;
   }
   return frames;
 }
@@ -199,9 +202,38 @@ export function flacPacketInfoRows(
 export function flacPacketInfoTable(bytes: Uint8Array): PacketInfoTable {
   const layout = flacMetadataLayout(bytes);
   const metadata = bytes.slice(layout.start, layout.audioStart);
+  const packets: PacketInfoMetadata[] = [];
+  let offset = layout.audioStart;
+  let produced = 0;
+  let header: ParsedFlacFrameHeader | undefined;
+  while (produced < layout.info.totalSamples) {
+    header ??= parseFastFlacFrameHeader(bytes, offset);
+    if (header === undefined) {
+      throw new MediaError('demux-error', `FLAC: lost frame sync at byte ${offset}`);
+    }
+    const next = findNextFastFlacFrame(bytes, offset + header.headerBytes);
+    const end = next?.offset ?? bytes.byteLength;
+    if (end <= offset) {
+      throw new MediaError('demux-error', `FLAC: invalid frame span at byte ${offset}`);
+    }
+    const samples = Math.min(header.blockSize, layout.info.totalSamples - produced);
+    const ptsUs = Math.round((produced / layout.info.sampleRate) * 1_000_000);
+    packets.push({
+      trackIndex: 0,
+      offset,
+      size: end - offset,
+      ptsUs,
+      dtsUs: ptsUs,
+      durationUs: Math.round((samples / layout.info.sampleRate) * 1_000_000),
+      keyframe: true,
+    });
+    produced += samples;
+    offset = end;
+    header = next;
+  }
   return {
     tracks: [flacTrackInfo(layout.info, metadata)],
-    packets: flacPacketInfoRows(fastFlacFrames(bytes, layout)),
+    packets,
   };
 }
 
@@ -246,7 +278,7 @@ function parseFastFlacFrameHeader(
 
   if (at >= bytes.byteLength) return undefined;
   if ((bytes[at] as number) !== flacCrc8(bytes, offset, at)) return undefined;
-  return { headerBytes: at + 1 - offset, blockSize };
+  return { offset, headerBytes: at + 1 - offset, blockSize };
 }
 
 function flacUtf8NumberBytes(bytes: Uint8Array, offset: number): number | undefined {
@@ -262,17 +294,18 @@ function flacUtf8NumberBytes(bytes: Uint8Array, offset: number): number | undefi
   return length;
 }
 
-function findNextFastFlacFrame(bytes: Uint8Array, from: number): number {
+function findNextFastFlacFrame(bytes: Uint8Array, from: number): ParsedFlacFrameHeader | undefined {
   let at = bytes.indexOf(0xff, Math.max(0, from));
   while (at >= 0 && at + 6 <= bytes.byteLength) {
     if (((bytes[at + 1] as number) & 0xfe) !== 0xf8) {
       at = bytes.indexOf(0xff, at + 1);
       continue;
     }
-    if (parseFastFlacFrameHeader(bytes, at) !== undefined) return at;
+    const header = parseFastFlacFrameHeader(bytes, at);
+    if (header !== undefined) return header;
     at = bytes.indexOf(0xff, at + 1);
   }
-  return -1;
+  return undefined;
 }
 
 function flacCrc8(bytes: Uint8Array, start: number, end: number): number {

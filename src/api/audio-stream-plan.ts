@@ -28,6 +28,22 @@ export interface SourceAudio {
   channels: number | undefined;
 }
 
+/**
+ * True when the audio target has no fields that can create, validate, or reject an `AudioData→AudioData`
+ * filter stage. Codec/bitrate-only audio transcodes bypass the remaining planner work after this lazy
+ * module is loaded; targets with even no-op filter fields retain centralized validation semantics.
+ */
+export function audioTargetCanBypassFilterPlanner(t: AudioTarget): boolean {
+  return (
+    t.gainDb === undefined &&
+    t.fade === undefined &&
+    t.channels === undefined &&
+    t.sampleRate === undefined &&
+    t.biquad === undefined &&
+    t.dynamics === undefined
+  );
+}
+
 /** Resolve a fade-duration (seconds) to a source-rate frame count, mirroring `transformPcm`'s `fadeFrames`. */
 function fadeFramesAt(
   sec: number | undefined,

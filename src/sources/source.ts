@@ -54,7 +54,10 @@ export type NormalizedSource = Source | LiveMediaSource;
 /** How a {@link Source} was constructed (used for diagnostics and sink defaults). */
 export type SourceKind = 'bytes' | 'blob' | 'stream' | 'url' | 'opfs' | 'element';
 
-/** A normalized, re-readable byte source. */
+/**
+ * A normalized, re-readable byte snapshot. Every read from one Source object must describe the same
+ * immutable media bytes; create a new Source when a mutable URL/OPFS resource changes.
+ */
 export interface Source {
   readonly __media: 'source';
   readonly kind: SourceKind;

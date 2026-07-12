@@ -5,7 +5,7 @@
  */
 
 import type { PcmContainer } from '../contracts/driver.ts';
-import type { AudioTarget, Container, VideoTarget } from './types.ts';
+import type { Container } from './types.ts';
 
 /**
  * Container tokens with a working EncodedChunk-seam `Muxer` (`createMuxer` returns a real muxer, not a
@@ -61,72 +61,3 @@ export function isPcmContainer(container: string): container is PcmContainer {
 
 // Track-selection helpers (`selectTrackInfos`/`hasTrackSelection`) moved to `track-select.ts` so they load
 // lazily only when a `trackSelect` request is present (doc 08 §7 eager-kernel budget split).
-
-/**
- * Decide whether a `convert` request is a pure **container change with no re-encode** — i.e. neither
- * stream is dropped, no video filter/codec/dims/fps/bitrate change is requested, and no audio
- * codec/rate/channel/bitrate change is requested. Such a request is a stream-copy (the remux fast path),
- * which preserves codec-private/DTS/B-frames losslessly (ADR-021) and is always preferred over the codec
- * seam. Any re-encode trigger (a codec target, a filter, a dimension/rate change) returns `false`.
- */
-export function isPureStreamCopy(opts: {
-  video?: false | VideoTarget;
-  audio?: false | AudioTarget;
-}): boolean {
-  if (opts.video === false || opts.audio === false) return false;
-  if (opts.video !== undefined && videoTargetRequestsReencode(opts.video)) return false;
-  if (opts.audio !== undefined && audioTargetRequestsReencode(opts.audio)) return false;
-  return true;
-}
-
-/**
- * True when the audio target has no fields that can create, validate, or reject an `AudioData→AudioData`
- * filter stage. Codec/bitrate-only audio transcodes do not need the lazy audio-filter planner; targets
- * with even no-op filter fields (`gainDb:0`, same `channels`, same `sampleRate`, empty `fade`) still go
- * through the planner so its validation and exact no-op semantics remain the single source of truth.
- */
-export function audioTargetCanBypassFilterPlanner(t: AudioTarget): boolean {
-  return (
-    t.gainDb === undefined &&
-    t.fade === undefined &&
-    t.channels === undefined &&
-    t.sampleRate === undefined &&
-    t.biquad === undefined &&
-    t.dynamics === undefined
-  );
-}
-
-function videoTargetRequestsReencode(t: VideoTarget): boolean {
-  return (
-    t.codec !== undefined ||
-    t.width !== undefined ||
-    t.height !== undefined ||
-    t.fit !== undefined ||
-    t.fps !== undefined ||
-    t.bitrate !== undefined ||
-    t.bitrateMode !== undefined ||
-    t.crf !== undefined ||
-    t.twoPass === true ||
-    t.bitDepth !== undefined ||
-    t.alpha !== undefined ||
-    t.rotate !== undefined ||
-    t.flip !== undefined ||
-    t.crop !== undefined ||
-    t.pad !== undefined ||
-    t.colorspace !== undefined ||
-    t.tonemap !== undefined
-  );
-}
-
-function audioTargetRequestsReencode(t: AudioTarget): boolean {
-  return (
-    t.codec !== undefined ||
-    t.sampleRate !== undefined ||
-    t.channels !== undefined ||
-    t.bitrate !== undefined ||
-    (t.gainDb !== undefined && t.gainDb !== 0) ||
-    t.fade !== undefined ||
-    t.dynamics !== undefined ||
-    t.biquad !== undefined
-  );
-}

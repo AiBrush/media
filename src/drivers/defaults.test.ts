@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type {
+  ByteSource,
   CodecDriver,
   ContainerDriver,
   FilterDriver,
@@ -11,9 +12,11 @@ import type {
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { Registry } from '../kernel/registry.ts';
 import { fromBytes } from '../sources/source.ts';
-import { fixtureSource } from '../test-support/corpus.ts';
+import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
 import { registerDefaultDrivers } from './defaults.ts';
 import { FlacDriver } from './flac/flac-driver.ts';
+import { flacPacketInfoTable } from './flac/flac-sniff.ts';
+import { OggDriver } from './ogg/ogg-driver.ts';
 
 const DERIVED = new URL('../../fixtures/media-derived/', import.meta.url).pathname;
 
@@ -245,6 +248,7 @@ describe('registerDefaultDrivers', () => {
     expect(typeof wav.transformPcm).toBe('function');
     expect(typeof wav.decodePcmAudio).toBe('function');
     expect(typeof wav.decodePcmAudioStream).toBe('function');
+    expect(typeof wav.decodePcmInterleavedStream).toBe('function');
     expect(typeof adts.decodePcm).toBe('function');
     expect(aiff.probe).toBeUndefined();
     expect(caf.packetInfo).toBeUndefined();
@@ -354,6 +358,15 @@ describe('registerDefaultDrivers', () => {
     expect(flac.supports({ direction: 'demux', extension: 'mp3' })).toBe(false);
   });
 
+  it('registers Ogg cross-container packet-copy targets on its lazy proxy', () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+
+    const ogg = findContainer(reg, 'ogg');
+    expect(ogg.streamCopyTargets).toEqual(OggDriver.streamCopyTargets);
+    expect(ogg.streamCopyTargets).toEqual(['webm', 'mkv']);
+  });
+
   it('registers MPEG-TS as a lazy container proxy with cheap support checks', () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);
@@ -402,6 +415,92 @@ describe('registerDefaultDrivers', () => {
       await flac.transformPcm(src, { container: 'wav', gainDb: -1 }),
     );
     expect(new TextDecoder().decode(transformed.slice(0, 4))).toBe('RIFF');
+  });
+
+  it('the lazy FLAC packet reader preserves multi-chunk truth and releases terminal readers', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const flac = findContainer(reg, 'flac');
+    const packetInfo = flac.packetInfo;
+    if (packetInfo === undefined) throw new Error('lazy FLAC packetInfo unavailable');
+    const firstEnd = Math.floor(bytes.byteLength / 3);
+    const secondEnd = Math.floor((bytes.byteLength * 2) / 3);
+    let readable: ReadableStream<Uint8Array> | undefined;
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => {
+        readable = new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes.subarray(0, firstEnd));
+            controller.enqueue(bytes.subarray(firstEnd, secondEnd));
+            controller.enqueue(bytes.subarray(secondEnd));
+            controller.close();
+          },
+        });
+        return readable;
+      },
+    };
+
+    expect(await packetInfo.call(flac, source)).toEqual(flacPacketInfoTable(bytes));
+    expect(readable?.locked).toBe(false);
+
+    let singleChunkStream: ReadableStream<Uint8Array> | undefined;
+    const singleChunk: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => {
+        singleChunkStream = new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+        return singleChunkStream;
+      },
+    };
+    expect(await packetInfo.call(flac, singleChunk)).toEqual(flacPacketInfoTable(bytes));
+    expect(singleChunkStream?.locked).toBe(false);
+
+    let emptyStream: ReadableStream<Uint8Array> | undefined;
+    const empty: ByteSource = {
+      size: 0,
+      stream: () => {
+        emptyStream = new ReadableStream<Uint8Array>({
+          start: (controller) => controller.close(),
+        });
+        return emptyStream;
+      },
+    };
+    await expect(packetInfo.call(flac, empty)).rejects.toMatchObject({ code: 'unsupported-input' });
+    expect(emptyStream?.locked).toBe(false);
+
+    const failure = new Error('lazy FLAC producer failed');
+    let reads = 0;
+    let cancels = 0;
+    let releases = 0;
+    const reader = {
+      read(): Promise<ReadableStreamReadResult<Uint8Array>> {
+        if (reads++ === 0) return Promise.resolve({ done: false, value: bytes.subarray(0, 16) });
+        return Promise.reject(failure);
+      },
+      cancel(reason: unknown): Promise<void> {
+        expect(reason).toBe(failure);
+        cancels++;
+        return Promise.reject(new Error('lazy FLAC teardown also failed'));
+      },
+      releaseLock(): void {
+        releases++;
+      },
+    };
+    const failing: ByteSource = {
+      size: bytes.byteLength,
+      stream: () =>
+        ({ getReader: (): typeof reader => reader }) as unknown as ReadableStream<Uint8Array>,
+    };
+
+    await expect(packetInfo.call(flac, failing)).rejects.toBe(failure);
+    expect(cancels).toBe(1);
+    expect(releases).toBe(1);
   });
 
   it('routes the lazy FLAC muxer through the real muxer and preserves typed misuse errors', async () => {

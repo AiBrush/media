@@ -33,12 +33,12 @@ import {
 } from './vpx-alpha-pixels.ts';
 
 export {
-  audioTargetCanBypassFilterPlanner,
   chooseOutputContainer,
   containerHasChunkMuxer,
   isPcmContainer,
-  isPureStreamCopy,
 } from './codec-routing.ts';
+export { audioTargetCanBypassFilterPlanner } from './audio-stream-plan.ts';
+export { isPureStreamCopy } from './semantic-stream-copy.ts';
 export { hasTrackSelection, selectTrackInfos } from './track-select.ts';
 export {
   type VpxAlphaI420Plane,
@@ -719,6 +719,41 @@ export function canUseVpxAlphaPacketTranscode(
   );
 }
 
+/** Prefer a proved decoder qualification over the container's bare family token. */
+export function qualifiedVideoSourceCodec(track: Pick<TrackInfo, 'codec' | 'config'>): string {
+  return track.config !== undefined && 'codedWidth' in track.config
+    ? track.config.codec
+    : track.codec;
+}
+
+function vpxAlphaProfile(codec: string): string | undefined {
+  const normalized = codec.toLowerCase();
+  if (normalized === 'vp8') return 'vp8';
+  const vp9 = /^vp09\.(\d{2})\./.exec(normalized);
+  return vp9?.[1] === undefined ? undefined : `vp9:${vp9[1]}`;
+}
+
+/**
+ * Whether an unfiltered same-codec VPx transcode can preserve the already-separate alpha elementary
+ * stream byte-for-byte while genuinely re-encoding colour. Explicit rate controls apply to both planes,
+ * so they keep the dual-encode path.
+ */
+export function canCopyVpxAlphaSideData(
+  target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
+  sourceCodec: string,
+  targetCodec: string,
+): boolean {
+  const sourceProfile = vpxAlphaProfile(sourceCodec);
+  return (
+    target.bitrate === undefined &&
+    target.bitrateMode === undefined &&
+    target.crf === undefined &&
+    target.twoPass !== true &&
+    sourceProfile !== undefined &&
+    sourceProfile === vpxAlphaProfile(targetCodec)
+  );
+}
+
 /**
  * Runtime evidence from the parent WebKit harness shows this package's WebCodecs path cannot complete
  * a few filtered H.264/VPx transcode sub-modes even though `isConfigSupported` accepts their encoder
@@ -933,11 +968,34 @@ function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
   return codec === 'h264' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 }
 
+/**
+ * Native realtime mode materially reduces implicit H.264 and ordinary-cadence AV1 wall time while
+ * retaining their generous implicit quality budgets. Every explicit rate/quantizer/two-pass contract,
+ * high-cadence AV1, and all other codecs retain quality mode.
+ */
+export function videoLatencyMode(
+  target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
+  codec: VideoCodec | 'unknown',
+  frameRate: number | undefined,
+): 'quality' | 'realtime' {
+  const noExplicitRateControl =
+    target.bitrate === undefined && target.bitrateMode === undefined && target.crf === undefined;
+  if (codec === 'h264' && noExplicitRateControl && target.twoPass === undefined) return 'realtime';
+  return codec === 'av1' &&
+    frameRate !== undefined &&
+    frameRate <= 30.5 &&
+    noExplicitRateControl &&
+    target.twoPass !== true
+    ? 'realtime'
+    : 'quality';
+}
+
 function defaultVideoBitrate(
   codec: VideoCodec | 'unknown',
   width: number,
   height: number,
   maximum: number | undefined,
+  frameRate: number | undefined,
 ): number {
   const minBitrate = 300_000;
   // Offline transcodes default to a visually transparent quality budget. Ten aggregate bits per output
@@ -954,9 +1012,17 @@ function defaultVideoBitrate(
     av1: 0.6,
     unknown: 1,
   };
+  // Temporal prediction makes bitrate sublinear in cadence, but a 60 fps stream still needs more rate
+  // than the old 30 fps-shaped AV1 default. Scale only upward so ordinary 24/25/30 fps speed and size
+  // stay unchanged. The 30.5 tolerance absorbs rational-clock noise around nominal 30 fps, matching the
+  // latency/warmup boundary. Cap at H.264's common budget rather than erasing AV1's efficiency advantage.
+  const cadenceScale =
+    codec === 'av1' && frameRate !== undefined && frameRate > 30.5
+      ? Math.min(1 / efficiency.av1, Math.sqrt(frameRate / 30))
+      : 1;
   const planned = Math.max(
     minBitrate,
-    Math.round(width * height * bitsPerPixelPerSecond * efficiency[codec]),
+    Math.round(width * height * bitsPerPixelPerSecond * efficiency[codec] * cadenceScale),
   );
   return maximum === undefined ? planned : Math.min(planned, maximum);
 }
@@ -995,6 +1061,7 @@ function eagerVideoRateConfig(
   width: number,
   height: number,
   implicitBitrateMaximum: number | undefined,
+  frameRate: number | undefined,
 ): {
   readonly bitrate?: number;
   readonly bitrateMode?: VideoEncoderBitrateMode;
@@ -1039,7 +1106,9 @@ function eagerVideoRateConfig(
     return { bitrateMode: 'quantizer' };
   }
   return {
-    bitrate: target.bitrate ?? defaultVideoBitrate(codec, width, height, implicitBitrateMaximum),
+    bitrate:
+      target.bitrate ??
+      defaultVideoBitrate(codec, width, height, implicitBitrateMaximum, frameRate),
     bitrateMode: target.bitrateMode ?? 'variable',
   };
 }
@@ -1195,8 +1264,9 @@ function sourceQualificationFactsAreUnchanged(
 /**
  * Build the {@link VideoEncoderConfig} for a target stream: the resolved codec string, the post-filter
  * output `width`/`height` (which must be known to configure an encoder), and the optional bitrate +
- * framerate. `latencyMode:'quality'` favours compression over realtime latency for an offline transcode.
- * Throws a typed {@link InputError} when output dims cannot be determined (no target dims, unknown source).
+ * framerate. The latency policy is codec/rate-contract aware: explicit controls retain `quality`, while
+ * qualified implicit native paths may select `realtime` under {@link videoLatencyMode}. Throws a typed
+ * {@link InputError} when output dims cannot be determined (no target dims, unknown source).
  */
 export function buildVideoEncoderConfig(
   target: VideoTarget,
@@ -1238,6 +1308,7 @@ export function buildVideoEncoderConfig(
     width,
     height,
     implicitBitrateMaximum,
+    frameRate,
   );
   const codec = resolvedVideoEncoderCodecString(
     target,
@@ -1255,7 +1326,7 @@ export function buildVideoEncoderConfig(
     codec,
     width,
     height,
-    latencyMode: 'quality',
+    latencyMode: videoLatencyMode(target, rateCodec, frameRate),
     ...rateControl,
     ...(alpha !== undefined ? { alpha } : {}),
     ...(frameRate !== undefined ? { framerate: frameRate } : {}),
@@ -1456,12 +1527,39 @@ function toPacket(v: EncodedChunk | Packet): Packet {
  * with fake packets; the live decode that follows is browser-gated.
  */
 export function unwrapPackets(packets: ReadableStream<Packet>): ReadableStream<EncodedChunk> {
-  return packets.pipeThrough(
-    new TransformStream<Packet, EncodedChunk>({
-      transform(p, controller): void {
-        controller.enqueue(p.chunk);
+  const reader = packets.getReader();
+  let released = false;
+  let cancelPromise: Promise<void> | undefined;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
+  const cancelAndRelease = (reason: unknown): Promise<void> => {
+    cancelPromise ??= reader.cancel(reason).finally(release);
+    return cancelPromise;
+  };
+  return new ReadableStream<EncodedChunk>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            release();
+            controller.close();
+            return;
+          }
+          controller.enqueue(value.chunk);
+        } catch (error) {
+          await cancelAndRelease(error).catch(() => undefined);
+          throw error;
+        }
       },
-    }),
+      async cancel(reason): Promise<void> {
+        await cancelAndRelease(reason);
+      },
+    },
+    { highWaterMark: 0 },
   );
 }
 
@@ -1749,6 +1847,8 @@ export interface VpxAlphaPacketTranscodeOptions {
   readonly decodeStage?: StageOptions;
   readonly colorStage?: StageOptions;
   readonly alphaStage?: StageOptions;
+  /** Preserve same-codec alpha access units instead of decoding and re-encoding that independent plane. */
+  readonly copyAlpha?: boolean;
 }
 
 /**
@@ -1892,9 +1992,13 @@ export function transcodeVpxAlphaPackets(
   const colorChunks = unwrapPackets(colorPackets)
     .pipeThrough(options.createDecoder(options.decodeConfig, options.decodeStage))
     .pipeThrough(options.createEncoder(options.encodeConfig, options.colorStage));
-  const alphaChunks = alphaChunkStream(alphaPackets)
-    .pipeThrough(options.createDecoder(options.decodeConfig, options.decodeStage))
-    .pipeThrough(options.createEncoder(options.encodeConfig, options.alphaStage));
+  const alphaInput = alphaChunkStream(alphaPackets);
+  const alphaChunks =
+    options.copyAlpha === true
+      ? alphaInput
+      : alphaInput
+          .pipeThrough(options.createDecoder(options.decodeConfig, options.decodeStage))
+          .pipeThrough(options.createEncoder(options.encodeConfig, options.alphaStage));
   const colorReader = colorChunks.getReader();
   const alphaReader = alphaChunks.getReader();
   const alphaByTimestamp = new Map<number, EncodedChunk>();

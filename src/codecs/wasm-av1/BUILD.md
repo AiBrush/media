@@ -94,7 +94,7 @@ The JS glue must export the wasm-bindgen-style surface the driver imports:
 | JS export | Meaning |
 |---|---|
 | `default({ module_or_path })` | instantiate the sibling `dav1d_wasm_bg.wasm` |
-| `createDav1dCore()` | return a `Dav1dWasmCore` facade |
+| `createDav1dCore({ module_or_path })` | return a `Dav1dWasmCore` facade bound to the exact sibling-WASM URL |
 | `core.supports(init)` | optional profile/bit-depth/subsampling predicate |
 | `core.createDecoder(init)` | create one stateful dav1d decoder |
 | `decoder.decode(packet)` | feed one AV1 access unit and return displayed frames |

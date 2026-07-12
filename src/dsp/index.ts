@@ -7,11 +7,13 @@
 
 export {
   type Endianness,
+  type InterleavedPcmF32,
   type PcmAudio,
   type SampleFormat,
   bytesPerSample,
   channelAt,
   decodePcm,
+  decodePcmToInterleavedF32,
   encodePcm,
   sampleAt,
 } from './pcm.ts';

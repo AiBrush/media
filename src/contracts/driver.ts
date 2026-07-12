@@ -13,7 +13,7 @@
 import type { BiquadSpec } from '../dsp/biquad.ts';
 import type { DynamicsSpec, LimitMode } from '../dsp/dynamics.ts';
 import type { FadeShape } from '../dsp/fade.ts';
-import type { Endianness, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
+import type { Endianness, InterleavedPcmF32, PcmAudio, SampleFormat } from '../dsp/pcm.ts';
 
 // ============ versioning ============
 
@@ -243,7 +243,7 @@ export interface TrackInfo {
   rotation?: number;
   /** True when encoded samples are protected and must be decrypted before generic decode/seek. */
   encrypted?: boolean;
-  /** True when the coded video packets carry a separate alpha plane side channel. */
+  /** True when a container declaration or complete demux proves a separate coded alpha side channel. */
   alpha?: boolean;
   /** Exact non-packet container metadata that follows this descriptor through track selection/muxing. */
   containerSideData?: readonly ContainerSideData[];
@@ -474,9 +474,19 @@ export interface ContainerDriver extends DriverBase {
   /**
    * Optional bounded raw-PCM decode stream. Each emitted {@link PcmAudio} is a canonical planar chunk;
    * the engine owns the browser `AudioData` framing and closes consumer-owned frames exactly once.
-   * Drivers should use source ranges when available and may fall back to one full canonical chunk.
+   * Drivers should use source ranges when available and preserve pull-driven sequential delivery for
+   * range-less sources rather than materializing the complete input.
    */
   decodePcmAudioStream?(src: ByteSource, o?: StageOptions): Promise<ReadableStream<PcmAudio>>;
+  /**
+   * Optional bounded raw-PCM stream already narrowed to exact-owned interleaved Float32. The engine may
+   * transfer each chunk directly into `AudioData`; drivers retain {@link decodePcmAudioStream} for
+   * canonical planar consumers and formats that cannot provide this representation efficiently.
+   */
+  decodePcmInterleavedStream?(
+    src: ByteSource,
+    o?: StageOptions,
+  ): Promise<ReadableStream<InterleavedPcmF32>>;
 }
 
 // ============ 3) FilterDriver ============

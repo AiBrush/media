@@ -9,7 +9,8 @@
  * Shape: `dav1d.js` exports `create({ wasmData | wasmURL }) → Promise<Dav1d>`, where a `Dav1d` instance IS
  * one stateful decoder (`decodeFrameAsYUV(obu) → { width, height, data }`, one display frame per coded OBU
  * / temporal unit). The driver's loader calls `default init({ module_or_path })` (we fetch the sibling
- * `.wasm` bytes from that URL — Node `fs` or browser `fetch` — and memoize them) then `createDav1dCore()`.
+ * `.wasm` bytes from that URL — Node `fs` or browser `fetch` — and memoize them) then
+ * `createDav1dCore({ module_or_path })` with the same exact URL.
  * Decoder *creation* is async (dav1d.js instantiates the wasm per decoder), so {@link
  * Dav1dWasmCore.createDecoder} is async (the driver `await`s it in its async `start`); the hot `decode`
  * is synchronous. The driver owns all framing (demux → access units), PTS reorder, and `VideoFrame`
@@ -81,9 +82,14 @@ function i420Size(width, height, bitDepth) {
 /**
  * Build the {@link Dav1dWasmCore} facade. One per session; `createDecoder` makes one stateful dav1d
  * instance per stream (dav1d.js has no core/decoder split — each `create` is a full decoder).
+ * @param {{ module_or_path: URL } | URL} moduleOrPath exact asset URL for this engine instance
  * @returns {import('./av1.ts').Dav1dWasmCore}
  */
-export function createDav1dCore() {
+export function createDav1dCore(moduleOrPath) {
+  // Capture this core's exact asset promise. A module can host concurrent engines with different
+  // same-origin asset bases; consulting mutable "last initialized" state at decoder creation would let
+  // one engine silently instantiate another engine's bytes.
+  const wasmBytes = loadWasmBytes(moduleOrPath);
   return {
     /**
      * Honest capability gate for THIS vendored core. `dav1d.js@0.1.1`'s YUV output is **8-bit only** —
@@ -103,7 +109,7 @@ export function createDav1dCore() {
      * @returns {Promise<import('./av1.ts').Dav1dWasmDecoder>}
      */
     async createDecoder(_initCfg) {
-      const wasmData = await loadWasmBytes();
+      const wasmData = await wasmBytes;
       const d = await dav1d.create({ wasmData });
       let freed = false;
       return {

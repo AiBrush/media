@@ -26,7 +26,8 @@ sample-domain path; the rewrite helper is split into its own lazy module so the 
 budget keeps margin.
 
 The PCM plan keeps a tiny raw-source-byte cache for repeated URL-like calls: exact `SOURCE_CACHE_KEY` plus
-known size, at most 32 entries, at most 8 MiB per source, expiring after 60 seconds. The cache stores only
+known size, at most 8 MiB per source, expiring after 60 seconds. ADR-261 later replaced the historical
+32-entry-only aggregate with an 8 MiB total-byte LRU while preserving the one-source warm hit. The cache stores only
 the raw input bytes after a real full read whose byte length matches the known size. It never stores WAV
 outputs, decoded samples, parsed metadata, packet tables, benchmark results, or oracle outcomes.
 

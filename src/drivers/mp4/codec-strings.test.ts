@@ -73,6 +73,16 @@ function esds(
   return new Uint8Array([0, 0, 0, 0, ...es]); // fullbox header + ES_Descriptor
 }
 
+function ascBits(bits: string): number[] {
+  const compact = bits.replaceAll(' ', '');
+  const padded = compact.padEnd(Math.ceil(compact.length / 8) * 8, '0');
+  const bytes: number[] = [];
+  for (let offset = 0; offset < padded.length; offset += 8) {
+    bytes.push(Number.parseInt(padded.slice(offset, offset + 8), 2));
+  }
+  return bytes;
+}
+
 describe('parseEsds', () => {
   it('parses AAC-LC into mp4a.40.2 with the AudioSpecificConfig', () => {
     const info = parseEsds(esds({ asc: [0x12, 0x10] }));
@@ -100,9 +110,85 @@ describe('parseEsds', () => {
     expect(info.sbrPresent).toBe(true);
   });
 
+  it('parses escaped object types, explicit sample rates, and signaled SBR geometry', () => {
+    const escaped = parseEsds(esds({ asc: ascBits('11111 000001 0100 0010') }));
+    expect(escaped).toMatchObject({
+      codec: 'mp4a.40.33',
+      audioObjectType: 33,
+      sampleRate: 44_100,
+      channels: 2,
+    });
+
+    const explicitRate = parseEsds(
+      esds({ asc: ascBits(`00010 1111 ${(48_000).toString(2).padStart(24, '0')} 0110`) }),
+    );
+    expect(explicitRate).toMatchObject({
+      codec: 'mp4a.40.2',
+      sampleRate: 48_000,
+      channels: 6,
+    });
+
+    const sbr = parseEsds(esds({ asc: ascBits('00101 0110 0010 0011 00010') }));
+    expect(sbr).toMatchObject({
+      audioObjectType: 5,
+      sampleRate: 48_000,
+      channels: 2,
+      sbrPresent: true,
+    });
+
+    const sbrCore22 = parseEsds(esds({ asc: ascBits('00101 0110 0010 0011 10110 0001') }));
+    expect(sbrCore22).toMatchObject({
+      audioObjectType: 5,
+      sampleRate: 48_000,
+      channels: 1,
+      sbrPresent: true,
+    });
+  });
+
+  it('keeps truncated AudioSpecificConfig geometry absent instead of guessing', () => {
+    expect(parseEsds(esds({ asc: [] }))).toMatchObject({ codec: 'mp4a.40' });
+    const truncated = parseEsds(esds({ asc: [0x12] }));
+    expect(truncated.codec).toBe('mp4a.40');
+    expect('sampleRate' in truncated).toBe(false);
+    expect('channels' in truncated).toBe(false);
+  });
+
   it('skips ES flag-driven optional fields (streamDependence)', () => {
     const info = parseEsds(esds({ asc: [0x12, 0x10], esFlags: 0x80, extra: [0x00, 0x02] }));
     expect(info.codec).toBe('mp4a.40.2');
+  });
+
+  it('skips URL and OCR optional ES descriptor fields without shifting DecoderConfig', () => {
+    const info = parseEsds(
+      esds({
+        asc: [0x12, 0x10],
+        esFlags: 0x60,
+        extra: [0x02, 0x6f, 0x6b, 0x00, 0x03],
+      }),
+    );
+    expect(info.codec).toBe('mp4a.40.2');
+    expect(info.sampleRate).toBe(44_100);
+  });
+
+  it('walks GA-specific extension syntax for ER and scalable AAC object types', () => {
+    for (const audioObjectType of [17, 19, 20, 23]) {
+      const typeBits = audioObjectType.toString(2).padStart(5, '0');
+      const info = parseEsds(esds({ asc: ascBits(`${typeBits} 0100 0010 0 0 1 000 0`) }));
+      expect(info).toMatchObject({
+        codec: `mp4a.40.${audioObjectType}`,
+        audioObjectType,
+        sampleRate: 44_100,
+        channels: 2,
+      });
+    }
+
+    const scalable = parseEsds(esds({ asc: ascBits('10110 0100 0010 0 0 1 0000000000000000') }));
+    expect(scalable).toMatchObject({
+      codec: 'mp4a.40.22',
+      audioObjectType: 22,
+      sampleRate: 44_100,
+      channels: 2,
+    });
   });
 
   it('falls back to mp4a.<oti> for a non-AAC object type', () => {
@@ -215,6 +301,7 @@ describe('qtPcmCodec', () => {
   it('maps the fixed-endianness 16-bit formats', () => {
     expect(qtPcmCodec('sowt', 16, undefined)).toBe('pcm-s16');
     expect(qtPcmCodec('twos', 16, undefined)).toBe('pcm-s16be');
+    expect(qtPcmCodec('twos', 24, undefined)).toBeUndefined();
   });
   it('maps the 8-bit formats where endianness is moot', () => {
     expect(qtPcmCodec('raw ', 8, undefined)).toBe('pcm-u8');
@@ -224,19 +311,26 @@ describe('qtPcmCodec', () => {
     expect(qtPcmCodec('fl32', 32, undefined)).toBe('pcm-f32be');
     expect(qtPcmCodec('fl32', 32, true)).toBe('pcm-f32');
     expect(qtPcmCodec('fl64', 64, false)).toBe('pcm-f64be');
+    expect(qtPcmCodec('fl64', 64, true)).toBe('pcm-f64');
     expect(qtPcmCodec('in24', 24, true)).toBe('pcm-s24');
     expect(qtPcmCodec('in24', 24, undefined)).toBe('pcm-s24be');
     expect(qtPcmCodec('in32', 32, true)).toBe('pcm-s32');
+    expect(qtPcmCodec('in32', 32, false)).toBe('pcm-s32be');
   });
   it('maps lpcm (v2) from constBitsPerChannel + formatSpecificFlags', () => {
     // CoreAudio flags: 0x1 float, 0x2 big-endian, 0x4 signed integer, 0x8 packed.
     expect(qtPcmCodec('lpcm', 16, undefined, 0xc)).toBe('pcm-s16'); // signed+packed, LE
     expect(qtPcmCodec('lpcm', 16, undefined, 0xe)).toBe('pcm-s16be'); // + big-endian
     expect(qtPcmCodec('lpcm', 32, undefined, 0x9)).toBe('pcm-f32'); // float+packed, LE
+    expect(qtPcmCodec('lpcm', 32, undefined, 0xb)).toBe('pcm-f32be');
     expect(qtPcmCodec('lpcm', 64, undefined, 0xb)).toBe('pcm-f64be'); // float+BE
+    expect(qtPcmCodec('lpcm', 64, undefined, 0x9)).toBe('pcm-f64');
     expect(qtPcmCodec('lpcm', 8, undefined, 0xc)).toBe('pcm-s8');
     expect(qtPcmCodec('lpcm', 8, undefined, 0x8)).toBe('pcm-u8'); // unsigned 8-bit
     expect(qtPcmCodec('lpcm', 24, undefined, 0x6)).toBe('pcm-s24be');
+    expect(qtPcmCodec('lpcm', 24, undefined, 0x4)).toBe('pcm-s24');
+    expect(qtPcmCodec('lpcm', 32, undefined, 0x6)).toBe('pcm-s32be');
+    expect(qtPcmCodec('lpcm', 32, undefined, 0x4)).toBe('pcm-s32');
   });
   it('returns undefined for non-PCM or unrepresentable combinations (honest fourcc fallback)', () => {
     expect(qtPcmCodec('mp4a', 16, undefined)).toBeUndefined();

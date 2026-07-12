@@ -13,7 +13,11 @@ import {
   webmCodecIdForTrack,
   writeWebm,
 } from '../drivers/webm/ebml-write.ts';
-import { muxPreparedMp4PacketTrack } from './mp4-prepared-mux.ts';
+import {
+  muxPreparedMp4PacketTrack,
+  muxPreparedMp4PacketTracks,
+  muxPreparedMp4PacketTracksStream,
+} from './mp4-prepared-mux.ts';
 import type { Container, PacketStream, PacketStreams } from './types.ts';
 
 type WebmTrackState = Parameters<typeof writeWebm>[0][number];
@@ -21,6 +25,20 @@ type WebmTrackState = Parameters<typeof writeWebm>[0][number];
 interface ReadableStreamLike {
   readonly getReader?: unknown;
 }
+
+type PreparedPacketArrayStream = Omit<PacketStream, 'packetsArray'> & {
+  readonly packetsArray: readonly (EncodedChunk | Packet)[];
+};
+
+type PreparedMp4StreamOptions = MuxOptions &
+  StageOptions & {
+    /** Whole-output sinks can adopt the writer's sole exact-owned ArrayBuffer (ADR-268). */
+    readonly buffered?: boolean;
+  };
+
+// Below this measured crossover, ordinary stream draining is within noise or faster. Above it, avoiding
+// one promise-backed pull per already-materialized packet is a durable general win (ADR-256).
+const MP4_PREPARED_MULTITRACK_MIN_PACKETS = 256;
 
 export interface PreparedWebmAudioPacketMuxInput {
   readonly track: TrackInfo;
@@ -100,6 +118,38 @@ export async function muxSingleTrackMp4(
     ...(options.faststart !== undefined ? { faststart: options.faststart } : {}),
   };
   return streamFromBytes(muxPreparedMp4PacketTrack(muxOptions));
+}
+
+/** Prepared faststart MP4 mux for large complete packet arrays; other shapes retain existing seams. */
+export async function muxPreparedMp4PacketStreams(
+  streams: PacketStreams,
+  options: PreparedMp4StreamOptions,
+): Promise<ReadableStream<Uint8Array> | undefined> {
+  if (options.fragmented === true || !isMp4Family(options.container)) return undefined;
+  const inputs = mp4PacketArrayStreams(streams);
+  if (
+    inputs === undefined ||
+    inputs.length < 2 ||
+    options.faststart === false ||
+    inputs.reduce((total, input) => total + input.packetsArray.length, 0) <
+      MP4_PREPARED_MULTITRACK_MIN_PACKETS
+  ) {
+    return muxSingleTrackMp4(streams, options);
+  }
+  assertNotAborted(options.signal);
+  const input = {
+    tracks: inputs.map((input) => ({
+      track: input.track,
+      packets: input.packetsArray,
+    })),
+    container: options.container ?? 'mp4',
+    fragmented: false,
+    ...(options.faststart !== undefined ? { faststart: options.faststart } : {}),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  };
+  return options.buffered === true
+    ? streamFromBytes(muxPreparedMp4PacketTracks(input))
+    : muxPreparedMp4PacketTracksStream(input);
 }
 
 /** Fast single-track FLAC packet mux for benchmark/prepared-packet callers that already hold chunks. */
@@ -292,6 +342,36 @@ function singlePacketStream(streams: PacketStreams): PacketStream | undefined {
   return only.value;
 }
 
+function mp4PacketArrayStreams(streams: PacketStreams): PreparedPacketArrayStream[] | undefined {
+  const out: PreparedPacketArrayStream[] = [];
+  if (streams.video !== undefined) {
+    if (!isMp4PacketArrayStream(streams.video, 'video')) return undefined;
+    out.push(streams.video);
+  }
+  if (streams.audio !== undefined) {
+    if (!isMp4PacketArrayStream(streams.audio, 'audio')) return undefined;
+    out.push(streams.audio);
+  }
+  if (streams.tracks !== undefined) {
+    if (!Array.isArray(streams.tracks)) return undefined;
+    for (const stream of streams.tracks) {
+      if (!isMp4PacketArrayStream(stream, undefined)) return undefined;
+      out.push(stream);
+    }
+  }
+  return out.length === 0 ? undefined : out;
+}
+
+function isMp4PacketArrayStream(
+  value: unknown,
+  slot: 'video' | 'audio' | undefined,
+): value is PreparedPacketArrayStream {
+  if (!isPacketStream(value)) return false;
+  if (slot !== undefined && value.track.mediaType !== slot) return false;
+  if (isReadableStream(value.packets)) return false;
+  return Array.isArray(value.packetsArray);
+}
+
 function isPacketStream(value: unknown): value is PacketStream {
   if (!isObject(value)) return false;
   const descriptor = value as Partial<PacketStream>;
@@ -480,6 +560,7 @@ function webmAudioTrackStateFromTrack(
     codecPrivate: config?.description === undefined ? undefined : ownedBytes(config.description),
     width: undefined,
     height: undefined,
+    alpha: false,
     fps: undefined,
     durationSec: track.durationSec,
     sampleRate: config?.sampleRate,
@@ -586,6 +667,7 @@ function webmTrackStateFromPreparedTrack(
       codecPrivate,
       width: videoConfig?.codedWidth,
       height: videoConfig?.codedHeight,
+      alpha: track.alpha === true,
       fps: track.fps,
       durationSec: track.durationSec,
       sampleRate: undefined,
@@ -601,6 +683,7 @@ function webmTrackStateFromPreparedTrack(
     codecPrivate,
     width: undefined,
     height: undefined,
+    alpha: false,
     fps: undefined,
     durationSec: track.durationSec,
     sampleRate: audioConfig?.sampleRate,
@@ -618,6 +701,7 @@ function flacTrackState(input: PacketStream, chunks: WebmChunkStruct[]): WebmTra
     codecPrivate: config?.description === undefined ? undefined : ownedBytes(config.description),
     width: undefined,
     height: undefined,
+    alpha: false,
     fps: undefined,
     durationSec: input.track.durationSec,
     sampleRate: config?.sampleRate,

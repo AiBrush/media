@@ -217,6 +217,72 @@ describe('probe ADTS — real corpus', () => {
     }
   });
 
+  it('demux reuses its validated real-file layout for exact raw AAC packet emission', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    const original = globalThis.EncodedAudioChunk;
+    class FakeEncodedAudioChunk {
+      readonly type: EncodedAudioChunkType;
+      readonly timestamp: number;
+      readonly duration: number | null;
+      readonly byteLength: number;
+      readonly #data: Uint8Array;
+
+      constructor(init: EncodedAudioChunkInit) {
+        this.type = init.type;
+        this.timestamp = init.timestamp;
+        this.duration = init.duration ?? null;
+        this.#data = ArrayBuffer.isView(init.data)
+          ? new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength).slice()
+          : new Uint8Array(init.data).slice();
+        this.byteLength = this.#data.byteLength;
+      }
+
+      copyTo(destination: AllowSharedBufferSource): void {
+        new Uint8Array(
+          ArrayBuffer.isView(destination) ? destination.buffer : destination,
+          ArrayBuffer.isView(destination) ? destination.byteOffset : 0,
+          ArrayBuffer.isView(destination) ? destination.byteLength : destination.byteLength,
+        ).set(this.#data);
+      }
+    }
+    Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+      configurable: true,
+      value: FakeEncodedAudioChunk as unknown as typeof EncodedAudioChunk,
+    });
+    try {
+      const demuxed = await AdtsDriver.demux(fromBytes(bytes, { mime: 'audio/aac' }));
+      const reader = demuxed.packets(0).getReader();
+      try {
+        for (const frame of frames) {
+          const result = await reader.read();
+          expect(result.done).toBe(false);
+          const packet = result.value;
+          if (packet === undefined) throw new Error('missing emitted AAC packet');
+          const data = new Uint8Array(packet.chunk.byteLength);
+          packet.chunk.copyTo(data);
+          expect(data).toEqual(
+            bytes.subarray(frame.offset + frame.headerBytes, frame.offset + frame.size),
+          );
+          expect(packet.chunk.timestamp).toBe(frame.ptsUs);
+          expect(packet.chunk.duration).toBe(frame.durationUs);
+          expect(packet.sizeBytes).toBe(frame.size);
+        }
+        expect((await reader.read()).done).toBe(true);
+      } finally {
+        reader.releaseLock();
+        await demuxed.close();
+      }
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+      else
+        Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+          configurable: true,
+          value: original,
+        });
+    }
+  });
+
   it('streamCopy trim emits the original complete ADTS frames overlapping the requested range', async () => {
     if (AdtsDriver.streamCopy === undefined) throw new Error('expected ADTS streamCopy');
     expect(AdtsDriver.validatesStreamCopyTrim).toBe(true);

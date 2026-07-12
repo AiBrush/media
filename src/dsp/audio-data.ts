@@ -6,7 +6,7 @@
 
 import type { StageOptions } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import { type PcmAudio, channelAt } from './pcm.ts';
+import { type InterleavedPcmF32, type PcmAudio, channelAt } from './pcm.ts';
 
 /** The `f32-planar` layout: one full channel plane at a time. */
 const F32_PLANAR = 'f32-planar' as const;
@@ -182,6 +182,58 @@ export function pcmAudioChunksToAudioDataStream(
   label: string,
   format: 'f32' | 'f32-planar' = 'f32-planar',
 ): ReadableStream<AudioData> {
+  return pcmChunksToAudioDataStream(chunks, stage, label, (audio, timestamp) =>
+    format === 'f32'
+      ? pcmToInterleavedInit(audio, timestamp).init
+      : pcmToPlanarInit(audio, timestamp).init,
+  );
+}
+
+/**
+ * Transfer exact-owned interleaved Float32 PCM chunks into bounded browser `AudioData` frames. A
+ * successful constructor detaches each source buffer; the resulting frame is owned by the consumer.
+ */
+export function interleavedPcmChunksToAudioDataStream(
+  chunks: ReadableStream<InterleavedPcmF32>,
+  stage: StageOptions,
+  label: string,
+): ReadableStream<AudioData> {
+  return pcmChunksToAudioDataStream(chunks, stage, label, (audio, timestamp) => {
+    const expectedBytes = audio.frames * audio.channels * 4;
+    if (
+      audio.data.byteOffset !== 0 ||
+      audio.data.byteLength !== expectedBytes ||
+      audio.data.buffer.byteLength !== expectedBytes
+    ) {
+      throw new MediaError(
+        'decode-error',
+        `PCM interleaved chunk has ${audio.data.byteLength} bytes; expected exact-owned ${expectedBytes}`,
+      );
+    }
+    return {
+      format: 'f32',
+      sampleRate: audio.sampleRate,
+      numberOfChannels: audio.channels,
+      numberOfFrames: audio.frames,
+      timestamp,
+      data: audio.data.buffer,
+      transfer: [audio.data.buffer],
+    };
+  });
+}
+
+interface TimedPcmChunk {
+  readonly sampleRate: number;
+  readonly channels: number;
+  readonly frames: number;
+}
+
+function pcmChunksToAudioDataStream<T extends TimedPcmChunk>(
+  chunks: ReadableStream<T>,
+  stage: StageOptions,
+  label: string,
+  initFor: (chunk: T, timestamp: number) => AudioDataInit,
+): ReadableStream<AudioData> {
   if (typeof AudioData === 'undefined') {
     throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
       op: 'decode',
@@ -193,36 +245,45 @@ export function pcmAudioChunksToAudioDataStream(
   const reader = chunks.getReader();
   let cursor = 0;
   let upstreamCancelled = false;
+  let readerReleased = false;
+  const releaseReader = (): void => {
+    if (readerReleased) return;
+    readerReleased = true;
+    reader.releaseLock();
+  };
   const cancelUpstream = async (reason?: unknown): Promise<void> => {
     if (upstreamCancelled) return;
     upstreamCancelled = true;
-    await reader.cancel(reason);
+    try {
+      await reader.cancel(reason);
+    } finally {
+      releaseReader();
+    }
   };
   return new ReadableStream<AudioData>(
     {
       async pull(controller): Promise<void> {
         try {
           if (stage.signal?.aborted) {
-            await cancelUpstream(stage.signal.reason);
+            await cancelUpstream(stage.signal.reason).catch(() => {});
             throw new MediaError('aborted', 'aborted');
           }
           for (;;) {
             const next = await reader.read();
             if (next.done) {
+              upstreamCancelled = true;
+              releaseReader();
               controller.close();
               return;
             }
             const audio = next.value;
             if (audio.frames <= 0) continue;
             if (stage.signal?.aborted) {
-              await cancelUpstream(stage.signal.reason);
+              await cancelUpstream(stage.signal.reason).catch(() => {});
               throw new MediaError('aborted', 'aborted');
             }
             const timestamp = Math.round((cursor / audio.sampleRate) * 1_000_000);
-            const init =
-              format === 'f32'
-                ? pcmToInterleavedInit(audio, timestamp).init
-                : pcmToPlanarInit(audio, timestamp).init;
+            const init = initFor(audio, timestamp);
             const frame = new AudioData(init);
             try {
               controller.enqueue(frame);
@@ -234,6 +295,8 @@ export function pcmAudioChunksToAudioDataStream(
             return;
           }
         } catch (error) {
+          await cancelUpstream(error).catch(() => {});
+          releaseReader();
           if (error instanceof MediaError) throw error;
           const message = error instanceof Error ? error.message : String(error);
           throw new MediaError(

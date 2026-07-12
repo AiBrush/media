@@ -17,6 +17,6 @@ declare module './dav1d-core.js' {
    */
   export default function init(moduleOrPath?: WasmBindgenInit | URL): Promise<unknown>;
 
-  /** Construct the typed dav1d facade after `init`. */
-  export function createDav1dCore(): Dav1dWasmCore;
+  /** Construct a typed dav1d facade bound to this engine's exact sibling-WASM URL. */
+  export function createDav1dCore(moduleOrPath: WasmBindgenInit | URL): Dav1dWasmCore;
 }

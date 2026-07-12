@@ -23,6 +23,8 @@ import WebCodecsAudioModule, {
   isAudioCodecString,
   normalizeAudioDecoderConfig,
   normalizeAudioEncoderConfig,
+  submitAudioCodecInput,
+  submitClosableAudioCodecInput,
   shouldApplyBackpressure,
   unsupported,
   WebCodecsAudioDriver,
@@ -307,6 +309,158 @@ describe('awaitAudioCodecQueueDrain — event-driven WebCodecs audio pacing', ()
     controller.abort();
     await pending;
     expect(resolved).toBe(true);
+  });
+});
+
+describe('submitAudioCodecInput — zero-promise unsaturated queue cadence (ADR-272)', () => {
+  class FakeCodecQueue extends EventTarget {
+    queueSize = 0;
+
+    drainTo(queueSize: number): void {
+      this.queueSize = queueSize;
+      this.dispatchEvent(new Event('dequeue'));
+    }
+  }
+
+  it('submits synchronously and returns void below the native queue bound', () => {
+    const codec = new FakeCodecQueue();
+    const calls: string[] = [];
+    const result = submitAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      undefined,
+      () => {
+        calls.push('submit');
+      },
+    );
+    expect(calls).toEqual(['submit']);
+    expect(result).toBeUndefined();
+  });
+
+  it('waits for dequeue at the bound, then submits exactly once', async () => {
+    const codec = new FakeCodecQueue();
+    codec.queueSize = BACKPRESSURE_THRESHOLD;
+    let calls = 0;
+    const result = submitAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      undefined,
+      () => {
+        calls++;
+      },
+    );
+    expect(result).toBeInstanceOf(Promise);
+    expect(calls).toBe(0);
+    codec.drainTo(BACKPRESSURE_THRESHOLD - 1);
+    await result;
+    expect(calls).toBe(1);
+  });
+
+  it('does not submit after abort wakes a saturated queue', async () => {
+    const codec = new FakeCodecQueue();
+    codec.queueSize = BACKPRESSURE_THRESHOLD;
+    const controller = new AbortController();
+    let calls = 0;
+    const result = submitAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      controller.signal,
+      () => {
+        calls++;
+      },
+    );
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
+    expect(calls).toBe(0);
+  });
+});
+
+describe('submitClosableAudioCodecInput — encoder input close-exactly-once (ADR-272)', () => {
+  class FakeCodecQueue extends EventTarget {
+    queueSize = 0;
+
+    drain(): void {
+      this.queueSize = 0;
+      this.dispatchEvent(new Event('dequeue'));
+    }
+  }
+
+  it('closes once after synchronous submission', () => {
+    const codec = new FakeCodecQueue();
+    const frame = new FakeData();
+    let calls = 0;
+    const result = submitClosableAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      undefined,
+      frame,
+      () => {
+        calls++;
+      },
+    );
+    expect(result).toBeUndefined();
+    expect(calls).toBe(1);
+    expect(frame.closeCount).toBe(1);
+  });
+
+  it('closes once when synchronous native submission throws', () => {
+    const codec = new FakeCodecQueue();
+    const frame = new FakeData();
+    const failure = new Error('native encode rejected');
+    expect(() =>
+      submitClosableAudioCodecInput(
+        codec,
+        () => codec.queueSize,
+        undefined,
+        frame,
+        () => {
+          throw failure;
+        },
+      ),
+    ).toThrow(failure);
+    expect(frame.closeCount).toBe(1);
+  });
+
+  it('closes once after a saturated wait succeeds', async () => {
+    const codec = new FakeCodecQueue();
+    codec.queueSize = BACKPRESSURE_THRESHOLD;
+    const frame = new FakeData();
+    let calls = 0;
+    const result = submitClosableAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      undefined,
+      frame,
+      () => {
+        calls++;
+      },
+    );
+    expect(frame.closeCount).toBe(0);
+    codec.drain();
+    await result;
+    expect(calls).toBe(1);
+    expect(frame.closeCount).toBe(1);
+  });
+
+  it('closes once and never submits when abort wakes a saturated wait', async () => {
+    const codec = new FakeCodecQueue();
+    codec.queueSize = BACKPRESSURE_THRESHOLD;
+    const frame = new FakeData();
+    const controller = new AbortController();
+    let calls = 0;
+    const result = submitClosableAudioCodecInput(
+      codec,
+      () => codec.queueSize,
+      controller.signal,
+      frame,
+      () => {
+        calls++;
+      },
+    );
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
+    expect(calls).toBe(0);
+    expect(frame.closeCount).toBe(1);
   });
 });
 

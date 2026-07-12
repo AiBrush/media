@@ -76,6 +76,30 @@ describe('AudioSampleEntry version parsing (probe, real MOV headers)', () => {
     }
   });
 
+  it('owns escaped esds metadata instead of retaining the source backing store', async () => {
+    const file = new Uint8Array(await readFile(`${DERIVED_DIR}h264_1080p_5s.header.mov`));
+    const r = new Reader(file);
+    let audio: ParsedTrack | undefined;
+    for (const box of boxes(r, file.byteLength)) {
+      if (box.type !== 'moov') continue;
+      audio = parseMovieMetadata('qt  ', file.subarray(box.payloadStart, box.end)).tracks.find(
+        (track) => track.mediaType === 'audio',
+      );
+      break;
+    }
+
+    expect(audio?.codecPrivate?.boxType).toBe('esds');
+    expect(audio?.codecPrivate?.data.byteLength).toBeGreaterThan(0);
+    expect(audio?.codecPrivate?.data.buffer).not.toBe(file.buffer);
+    const description = (audio?.config as AudioDecoderConfig | undefined)?.description;
+    expect(description).toBeDefined();
+    if (description === undefined) throw new Error('AAC description was asserted above');
+    const descriptionView = ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+      : new Uint8Array(description);
+    expect(descriptionView.buffer).not.toBe(file.buffer);
+  });
+
   it('the oracle can fail — v2 channels are genuinely 6, not the v0-misread 3 (anti-cheat, doc 11 §5)', async () => {
     const audio = await probeAudioTrack(await headerSource('big_buck_bunny_1080p_h264.header.mov'));
     // 3 / 1 are exactly what the old version-0-only parser produced (always3 / always65536>>16);

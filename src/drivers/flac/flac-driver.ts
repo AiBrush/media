@@ -207,21 +207,33 @@ async function writeFlacOggPacketCopy(bytes: Uint8Array): Promise<ReadableStream
 async function readAll(src: ByteSource): Promise<Uint8Array> {
   if (src.range && src.size !== undefined) return src.range(0, src.size);
   const reader = src.stream().getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+  try {
+    const first = await reader.read();
+    if (first.done) return new Uint8Array(0);
+    const second = await reader.read();
+    if (second.done) return first.value;
+
+    const chunks = [first.value, second.value];
+    let total = first.value.byteLength + second.value.byteLength;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value);
+      total += next.value.byteLength;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
 }
 
 function packetStream(

@@ -5,7 +5,7 @@ import { gain } from '../../dsp/index.ts';
 import { channelAt, encodePcm } from '../../dsp/pcm.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { slice as rewriteWavPcmSlice } from './pcm-slice.ts';
-import { readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
+import { planWavPcmCopy, readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
 import { parseWav } from './wav-driver.ts';
 
 /** Independent `data`-chunk locator — the byte-exact oracle must not depend on the code under test. */
@@ -31,6 +31,13 @@ function peak(ch: Float64Array): number {
   let m = 0;
   for (const s of ch) m = Math.max(m, Math.abs(s));
   return m;
+}
+
+function materializeCopyPlan(plan: NonNullable<ReturnType<typeof planWavPcmCopy>>): Uint8Array {
+  const out = new Uint8Array(plan.header.byteLength + plan.payload.byteLength);
+  out.set(plan.header, 0);
+  out.set(plan.payload, plan.header.byteLength);
+  return out;
 }
 
 const REAL_WAVS = [
@@ -186,6 +193,40 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(rewriteWavPcmCopy(wav, 's16', 'be')).toBeUndefined();
     expect(rewriteWavPcmCopy(wav, 's16', 'le', 2)).toBeUndefined();
     expect(rewriteWavPcmCopy(wav, 's16', 'le', 1, 44_100)).toBeUndefined();
+  });
+
+  it('plans the exact current canonical rewrite without copying its PCM payload', () => {
+    const wav = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 3,
+        planar: [Float64Array.of(0.25, -0.25, 0.5), Float64Array.of(-0.5, 0.75, -0.75)],
+      },
+      's16',
+    );
+    const plan = planWavPcmCopy(wav, 's16', 'le', 2, 48_000);
+    if (plan === undefined) throw new Error('expected same-layout WAV copy plan');
+    expect(plan.header).not.toBe(wav.subarray(0, 44));
+    expect(plan.payload.buffer).toBe(wav.buffer);
+    expect(materializeCopyPlan(plan)).toEqual(rewriteWavPcmCopy(wav, 's16', 'le', 2, 48_000));
+  });
+
+  it('keeps truncated declared data behavior byte-exact and mismatched plans ineligible', () => {
+    const wav = writeWav(
+      { sampleRate: 8_000, channels: 1, frames: 4, planar: [Float64Array.of(0, 0.5, -0.5, 1)] },
+      's16',
+    );
+    const truncated = wav.subarray(0, wav.byteLength - 1);
+    const plan = planWavPcmCopy(truncated, 's16', 'le', 1, 8_000);
+    const current = rewriteWavPcmCopy(truncated, 's16', 'le', 1, 8_000);
+    if (plan === undefined || current === undefined) {
+      throw new Error('truncated source should preserve the existing bounded-data rewrite');
+    }
+    expect(materializeCopyPlan(plan)).toEqual(current);
+    expect(planWavPcmCopy(wav, 's24', 'le', 1, 8_000)).toBeUndefined();
+    expect(planWavPcmCopy(wav, 's16', 'le', 2, 8_000)).toBeUndefined();
+    expect(planWavPcmCopy(wav, 's16', 'le', 1, 44_100)).toBeUndefined();
   });
 
   it('packet-copy trims WAV PCM by an exact interleaved byte window', () => {

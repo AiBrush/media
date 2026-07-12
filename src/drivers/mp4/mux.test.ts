@@ -589,7 +589,12 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     const movie = await readMovie(ra(await collect(muxer.output)));
     const audio = movie.tracks.find((track) => track.mediaType === 'audio');
     expect(audio?.durationSec).toBeCloseTo((1024 + 44673) / 44_100, 12);
-    expect(audio?.edit).toEqual({ mediaTimeTicks: 1024, durationSec: 1.013 });
+    expect(audio?.edit).toEqual({
+      mediaTimeTicks: 1024,
+      durationSec: 1.013,
+      durationMovieTicks: 1_013,
+      movieTimescale: 1_000,
+    });
     const durations = audio ? buildSampleData(audio).map((s) => s.durationTicks) : [];
     expect(durations).toHaveLength(45);
     expect(durations.at(-1)).toBe(641);

@@ -489,7 +489,12 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     const video = movie.tracks[0];
 
     expect(video?.samples.sampleSizes).toHaveLength(8); // keyframe at 0 is retained as decode pre-roll
-    expect(video?.edit).toEqual({ mediaTimeTicks: 2_000, durationSec: 6 });
+    expect(video?.edit).toEqual({
+      mediaTimeTicks: 2_000,
+      durationSec: 6,
+      durationMovieTicks: 6_000,
+      movieTimescale: 1_000,
+    });
     expect((await Mp4Driver.probe(rangeSource(output, [])))[0]?.durationSec).toBe(6);
   });
 
@@ -506,7 +511,12 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     const movie = await readMovie(ra(output));
 
     expect(movie.tracks[0]?.fragmentSampleCount).toBe(8);
-    expect(movie.tracks[0]?.edit).toEqual({ mediaTimeTicks: 2_000, durationSec: 6 });
+    expect(movie.tracks[0]?.edit).toEqual({
+      mediaTimeTicks: 2_000,
+      durationSec: 6,
+      durationMovieTicks: 6_000,
+      movieTimescale: 1_000,
+    });
     expect((await Mp4Driver.probe(rangeSource(output, [])))[0]?.durationSec).toBe(6);
   });
 

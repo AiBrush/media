@@ -84,6 +84,8 @@ export interface MuxTrackInput {
   mediaType: 'video' | 'audio';
   sampleEntryType: string; // 'avc1' | 'mp4a'
   timescale: number;
+  /** Exact source `mdhd.duration`; omitted on encode paths that derive duration from samples. */
+  mediaDurationTicks?: number;
   /** Raw codec-config box (avcC/esds) preserved verbatim for lossless stream-copy. */
   codecPrivate?: { boxType: string; data: Uint8Array };
   /** avcC record (video) or AudioSpecificConfig (audio) — used to synthesize the box on the encode path. */
@@ -94,6 +96,27 @@ export interface MuxTrackInput {
   rotation?: number;
   /** Opaque source `tkhd` metadata; takes precedence over synthesized scalar rotation and dimensions. */
   displayTransform?: Mp4DisplayTransform;
+  /** Raw parsed `colr` code points preserved for semantic same-family rewrite. */
+  colr?: {
+    colourType: 'nclc' | 'nclx';
+    primaries: number;
+    transfer: number;
+    matrix: number;
+    fullRange?: boolean;
+  };
+  /** Exact pixel aspect ratio from the visual sample entry. */
+  pasp?: { hSpacing: number; vSpacing: number };
+  /** Exact clean-aperture fractions from the visual sample entry. */
+  clap?: {
+    cleanApertureWidthN: number;
+    cleanApertureWidthD: number;
+    cleanApertureHeightN: number;
+    cleanApertureHeightD: number;
+    horizOffN: number;
+    horizOffD: number;
+    vertOffN: number;
+    vertOffD: number;
+  };
   sampleRate?: number;
   channels?: number;
   /** When set, the track is written as CENC-protected (the samples must already be ciphertext). */
@@ -103,6 +126,10 @@ export interface MuxTrackInput {
     mediaTimeTicks: number;
     durationTicks: number;
     leadingEmptyDurationTicks?: number;
+    /** Exact source movie-tick durations, used only when the output retains this movie timescale. */
+    movieTimescale?: number;
+    durationMovieTicks?: number;
+    leadingEmptyDurationMovieTicks?: number;
   };
   /** Optional explicit `mdat` chunk layout; omitted means one contiguous chunk per track. */
   sampleChunks?: readonly MuxSampleChunkLayoutInput[];
@@ -208,6 +235,12 @@ function tkhdDisplayFields(track: MuxTrackLayoutInput): number[] {
 }
 
 function trackMovieDurationTicks(track: MuxTrackLayoutInput, movieTimescale: number): number {
+  if (
+    track.edit?.movieTimescale === movieTimescale &&
+    track.edit.durationMovieTicks !== undefined
+  ) {
+    return track.edit.durationMovieTicks + (track.edit.leadingEmptyDurationMovieTicks ?? 0);
+  }
   const durationTicks = track.edit?.durationTicks ?? trackDurationTicks(track);
   const leadingEmptyDurationTicks = track.edit?.leadingEmptyDurationTicks ?? 0;
   return (
@@ -232,6 +265,44 @@ function codecConfigBox(track: MuxTrackLayoutInput): number[] {
   if (track.mediaType === 'video' && track.description) return box('avcC', [...track.description]);
   if (track.mediaType === 'audio' && track.description) return esdsBox(track.description);
   return [];
+}
+
+function visualSideDataBoxes(track: MuxTrackLayoutInput): number[] {
+  const colr = track.colr;
+  const colrBox =
+    colr === undefined
+      ? []
+      : box(
+          'colr',
+          cat(
+            fourcc(colr.colourType),
+            u16(colr.primaries),
+            u16(colr.transfer),
+            u16(colr.matrix),
+            colr.colourType === 'nclx' ? u8(colr.fullRange === true ? 0x80 : 0) : [],
+          ),
+        );
+  const paspBox =
+    track.pasp === undefined
+      ? []
+      : box('pasp', cat(u32(track.pasp.hSpacing), u32(track.pasp.vSpacing)));
+  const clapBox =
+    track.clap === undefined
+      ? []
+      : box(
+          'clap',
+          cat(
+            u32(track.clap.cleanApertureWidthN),
+            u32(track.clap.cleanApertureWidthD),
+            u32(track.clap.cleanApertureHeightN),
+            u32(track.clap.cleanApertureHeightD),
+            u32(track.clap.horizOffN),
+            u32(track.clap.horizOffD),
+            u32(track.clap.vertOffN),
+            u32(track.clap.vertOffD),
+          ),
+        );
+  return cat(colrBox, paspBox, clapBox);
 }
 
 /** The `sinf` protection box (`frma`/`schm`/`schi`→`tenc`) wrapping the original format, when protected. */
@@ -313,6 +384,7 @@ function videoSampleEntry(track: MuxTrackLayoutInput): number[] {
       u16(0x0018),
       u16(0xffff), // compressorname + depth + pre_defined
       codecConfigBox(track),
+      visualSideDataBoxes(track),
       sinfBox(track),
     ),
   );
@@ -377,10 +449,15 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
 function editList(track: MuxTrackLayoutInput, movieTimescale: number): number[] {
   const edit = track.edit;
   if (edit === undefined) return [];
-  const segmentDuration = Math.round((edit.durationTicks * movieTimescale) / track.timescale);
-  const leadingEmptyDuration = Math.round(
-    ((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale,
-  );
+  const preservesSourceMovieClock = edit.movieTimescale === movieTimescale;
+  const segmentDuration =
+    preservesSourceMovieClock && edit.durationMovieTicks !== undefined
+      ? edit.durationMovieTicks
+      : Math.round((edit.durationTicks * movieTimescale) / track.timescale);
+  const leadingEmptyDuration =
+    preservesSourceMovieClock && edit.leadingEmptyDurationMovieTicks !== undefined
+      ? edit.leadingEmptyDurationMovieTicks
+      : Math.round(((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale);
   if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
     throw new MediaError(
       'mux-error',
@@ -413,7 +490,7 @@ function trak(
   movieTimescale: number,
   chunkTable: TrackChunkTable,
 ): number[] {
-  const durTicks = trackDurationTicks(track);
+  const durTicks = track.mediaDurationTicks ?? trackDurationTicks(track);
   const movieDur = trackMovieDurationTicks(track, movieTimescale);
   const isVideo = track.mediaType === 'video';
 
@@ -658,6 +735,161 @@ function zeroChunkTables(layouts: readonly TrackChunkLayout[]): TrackChunkTable[
   }));
 }
 
+interface GeneratedBoxRange {
+  readonly type: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+function generatedU32(bytes: readonly number[], offset: number): number {
+  const a = bytes[offset];
+  const b = bytes[offset + 1];
+  const c = bytes[offset + 2];
+  const d = bytes[offset + 3];
+  if (a === undefined || b === undefined || c === undefined || d === undefined) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch encountered a truncated u32');
+  }
+  return a * 0x1000000 + b * 0x10000 + c * 0x100 + d;
+}
+
+function generatedFourcc(bytes: readonly number[], offset: number): string {
+  const a = bytes[offset];
+  const b = bytes[offset + 1];
+  const c = bytes[offset + 2];
+  const d = bytes[offset + 3];
+  if (a === undefined || b === undefined || c === undefined || d === undefined) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch encountered a truncated fourcc');
+  }
+  return String.fromCharCode(a, b, c, d);
+}
+
+function generatedBoxAt(
+  bytes: readonly number[],
+  start: number,
+  parentEnd: number,
+): GeneratedBoxRange {
+  if (start < 0 || start + 8 > parentEnd || parentEnd > bytes.length) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch encountered a truncated box header');
+  }
+  const size = generatedU32(bytes, start);
+  const end = start + size;
+  if (size < 8 || !Number.isSafeInteger(end) || end <= start || end > parentEnd) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch encountered an invalid box range');
+  }
+  return {
+    type: generatedFourcc(bytes, start + 4),
+    start,
+    end,
+  };
+}
+
+function generatedChildren(
+  bytes: readonly number[],
+  parent: GeneratedBoxRange,
+): GeneratedBoxRange[] {
+  const children: GeneratedBoxRange[] = [];
+  let offset = parent.start + 8;
+  while (offset < parent.end) {
+    const child = generatedBoxAt(bytes, offset, parent.end);
+    children.push(child);
+    offset = child.end;
+  }
+  if (offset !== parent.end) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch did not consume a container box');
+  }
+  return children;
+}
+
+function requiredGeneratedChild(
+  bytes: readonly number[],
+  parent: GeneratedBoxRange,
+  type: string,
+): GeneratedBoxRange {
+  const matches = generatedChildren(bytes, parent).filter((child) => child.type === type);
+  if (matches.length !== 1 || matches[0] === undefined) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 moov patch expected one '${type}' child, got ${matches.length}`,
+    );
+  }
+  return matches[0];
+}
+
+function patchGeneratedU32(bytes: number[], offset: number, value: number): void {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > 0xffffffff ||
+    offset + 4 > bytes.length
+  ) {
+    throw new MediaError('mux-error', `internal MP4 moov patch has invalid stco offset ${value}`);
+  }
+  bytes[offset] = Math.floor(value / 0x1000000) & 0xff;
+  bytes[offset + 1] = Math.floor(value / 0x10000) & 0xff;
+  bytes[offset + 2] = Math.floor(value / 0x100) & 0xff;
+  bytes[offset + 3] = value & 0xff;
+}
+
+/** Patch only fixed-width `stco` values in a writer-owned zero-offset moov; its byte length is unchanged. */
+function patchGeneratedMoovChunkOffsets(
+  moovBytes: number[],
+  chunkTables: readonly TrackChunkTable[],
+): void {
+  const root = generatedBoxAt(moovBytes, 0, moovBytes.length);
+  if (root.type !== 'moov' || root.end !== moovBytes.length) {
+    throw new MediaError('mux-error', 'internal MP4 moov patch expected one complete moov box');
+  }
+  const tracks = generatedChildren(moovBytes, root).filter((child) => child.type === 'trak');
+  if (tracks.length !== chunkTables.length) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 moov patch track count ${tracks.length} does not match ${chunkTables.length}`,
+    );
+  }
+
+  let patchedOffsets = 0;
+  let plannedOffsets = 0;
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex];
+    const chunkTable = chunkTables[trackIndex];
+    if (track === undefined || chunkTable === undefined) {
+      throw new MediaError('mux-error', 'internal MP4 moov patch lost track order');
+    }
+    const mdia = requiredGeneratedChild(moovBytes, track, 'mdia');
+    const minf = requiredGeneratedChild(moovBytes, mdia, 'minf');
+    const stbl = requiredGeneratedChild(moovBytes, minf, 'stbl');
+    const stco = requiredGeneratedChild(moovBytes, stbl, 'stco');
+    if (stco.start + 16 > stco.end) {
+      throw new MediaError('mux-error', 'internal MP4 moov patch encountered a truncated stco');
+    }
+    const entryCount = generatedU32(moovBytes, stco.start + 12);
+    if (
+      entryCount !== chunkTable.chunkOffsets.length ||
+      stco.start + 16 + entryCount * 4 !== stco.end
+    ) {
+      throw new MediaError(
+        'mux-error',
+        `internal MP4 moov patch stco count ${entryCount} does not match ${chunkTable.chunkOffsets.length}`,
+      );
+    }
+    plannedOffsets += chunkTable.chunkOffsets.length;
+    for (let index = 0; index < entryCount; index++) {
+      const chunkOffset = chunkTable.chunkOffsets[index];
+      if (chunkOffset === undefined) {
+        throw new MediaError('mux-error', 'internal MP4 moov patch lost a planned chunk offset');
+      }
+      patchGeneratedU32(moovBytes, stco.start + 16 + index * 4, chunkOffset);
+      patchedOffsets++;
+    }
+  }
+  if (patchedOffsets !== plannedOffsets) {
+    throw new MediaError(
+      'mux-error',
+      `internal MP4 moov patch wrote ${patchedOffsets} of ${plannedOffsets} offsets`,
+    );
+  }
+}
+
 /** Copy samples into their planned `mdat` chunk positions; returns the advanced position. */
 function writeSamples(
   out: Uint8Array,
@@ -712,9 +944,9 @@ function mp4LayoutParts(
   let moovBytes: number[];
   let mdatBeforeMoov: boolean;
   if (faststart) {
-    const sized = moov(tracks, movieTimescale, zeroChunkTables(trackChunks)); // fixed-width → stable length
-    const mdatStart = ftyp.length + sized.length;
-    moovBytes = moov(tracks, movieTimescale, chunkTablesFor(trackChunks, mdatStart));
+    moovBytes = moov(tracks, movieTimescale, zeroChunkTables(trackChunks));
+    const mdatStart = ftyp.length + moovBytes.length;
+    patchGeneratedMoovChunkOffsets(moovBytes, chunkTablesFor(trackChunks, mdatStart));
     mdatBeforeMoov = false;
   } else {
     moovBytes = moov(tracks, movieTimescale, chunkTablesFor(trackChunks, ftyp.length));

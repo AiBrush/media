@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
-import { InputError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError } from '../../contracts/errors.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
+import { FlacDriver } from '../flac/flac-driver.ts';
+import { demuxWebm, webmPacketPayloadInfoFromBytes } from '../webm/webm-driver.ts';
 import {
   OggDriver,
   OggModule,
   oggAudioPackets,
+  oggPacketBytes,
   oggPacketInfoFromBytes,
   parseOgg,
 } from './ogg-driver.ts';
@@ -50,6 +53,7 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
 }
 
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
+const MICROS_PER_SECOND = 1_000_000;
 const u16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
 const u32 = (n: number): number[] => [
   n & 0xff,
@@ -307,6 +311,310 @@ describe('OggDriver — demux seam + muxer', () => {
     const info = parseOgg(out, out);
     expect(info.codec).toBe('opus');
     expect(info.durationSec).toBeCloseTo(0.12, 1);
+  });
+
+  it('streamCopy rejects an unsupported target before acquiring source bytes', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    let reads = 0;
+    const source: ByteSource = {
+      size: 1,
+      range(): Promise<Uint8Array> {
+        reads++;
+        return Promise.resolve(Uint8Array.of(0));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('unsupported target must not acquire the Ogg stream');
+      },
+    };
+
+    await expect(streamCopy(source, { container: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
+    expect(reads).toBe(0);
+  });
+
+  it('streamCopy re-authors real Opus and Vorbis packets directly as WebM and Matroska', async () => {
+    expect(OggDriver.streamCopyTargets).toEqual(['webm', 'mkv']);
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+
+    for (const container of ['webm', 'mkv'] as const) {
+      for (const fixture of ['sfx-opus.ogg', 'sound_5.oga'] as const) {
+        const source = await loadFixture(fixture);
+        const sourceTable = oggPacketInfoFromBytes(source);
+        const output = await collect(await streamCopy(await fixtureSource(fixture), { container }));
+        expect(output).not.toEqual(source);
+        const reparsed = demuxWebm(output);
+        expect(reparsed.info.container).toBe(container);
+        expect(reparsed.info.tracks[0]?.codec).toBe(sourceTable.tracks[0]?.codec);
+        const description = sourceTable.tracks[0]?.config?.description;
+        const codecDelayUs =
+          sourceTable.tracks[0]?.codec === 'opus' &&
+          description instanceof Uint8Array &&
+          description.byteLength >= 12
+            ? Math.round(
+                (new DataView(
+                  description.buffer,
+                  description.byteOffset,
+                  description.byteLength,
+                ).getUint16(10, true) /
+                  48_000) *
+                  MICROS_PER_SECOND,
+              )
+            : 0;
+        const outputFrames = reparsed.framesByIndex[0] ?? [];
+        expect(outputFrames).toHaveLength(sourceTable.packets.length);
+        for (let index = 0; index < sourceTable.packets.length; index++) {
+          const sourcePacket = sourceTable.packets[index];
+          const outputFrame = outputFrames[index];
+          if (sourcePacket === undefined || outputFrame === undefined) {
+            throw new Error(`${fixture}: missing packet ${index}`);
+          }
+          expect(outputFrame.data).toEqual(
+            sourcePacket.spans.length === 1 && sourcePacket.offset !== undefined
+              ? source.subarray(sourcePacket.offset, sourcePacket.offset + sourcePacket.size)
+              : new Uint8Array(
+                  sourcePacket.spans.flatMap((span) =>
+                    Array.from(source.subarray(span.offset, span.offset + span.size)),
+                  ),
+                ),
+          );
+          expect(
+            Math.abs(outputFrame.timestampUs - (sourcePacket.ptsUs - codecDelayUs)),
+          ).toBeLessThanOrEqual(1_000);
+        }
+      }
+    }
+  });
+
+  it('cross-container Ogg trim copies exactly the overlapping packets and rebases their timing', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const source = await loadFixture('sound_5.oga');
+    const table = oggPacketInfoFromBytes(source);
+    const trim = { startSec: 0.2, endSec: 0.6 } as const;
+    const startUs = trim.startSec * MICROS_PER_SECOND;
+    const endUs = trim.endSec * MICROS_PER_SECOND;
+    const expected = table.packets.filter((packet) => {
+      const durationUs = packet.durationUs;
+      if (durationUs === undefined) throw new Error('Ogg packet duration missing');
+      return packet.ptsUs + durationUs > startUs && packet.ptsUs < endUs;
+    });
+    const firstPtsUs = expected[0]?.ptsUs;
+    if (firstPtsUs === undefined)
+      throw new Error('trim must retain at least one real Vorbis packet');
+
+    const output = await collect(
+      await streamCopy(await fixtureSource('sound_5.oga'), { container: 'mkv', trim }),
+    );
+    const reparsed = demuxWebm(output);
+    const frames = reparsed.framesByIndex[0] ?? [];
+    expect(frames).toHaveLength(expected.length);
+    for (let index = 0; index < expected.length; index++) {
+      const packet = expected[index];
+      const frame = frames[index];
+      if (packet === undefined || frame === undefined) throw new Error(`missing packet ${index}`);
+      expect(frame.data).toEqual(oggPacketBytes(source, packet));
+      expect(Math.abs(frame.timestampUs - (packet.ptsUs - firstPtsUs))).toBeLessThanOrEqual(1_000);
+    }
+    const selectedEndUs = Math.max(
+      ...expected.map((packet) => packet.ptsUs + (packet.durationUs ?? 0)),
+    );
+    expect(reparsed.info.durationSec).toBeCloseTo(
+      (selectedEndUs - firstPtsUs) / MICROS_PER_SECOND,
+      6,
+    );
+  });
+
+  it('cross-container Opus trim resets pre-skip after the original leading packet', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const source = await loadFixture('sfx-opus.ogg');
+    const sourceTable = oggPacketInfoFromBytes(source);
+    const trim = { startSec: 0.04, endSec: 0.14 } as const;
+    const expected = sourceTable.packets.filter((packet) => {
+      const durationUs = packet.durationUs;
+      if (durationUs === undefined) throw new Error('Opus packet duration missing');
+      return (
+        packet.ptsUs + durationUs > trim.startSec * MICROS_PER_SECOND &&
+        packet.ptsUs < trim.endSec * MICROS_PER_SECOND
+      );
+    });
+    const expectedFirst = expected[0];
+    if (expectedFirst === undefined) throw new Error('Opus trim selected no packets');
+    expect(sourceTable.packets.indexOf(expectedFirst)).toBeGreaterThan(0);
+    const output = await collect(
+      await streamCopy(await fixtureSource('sfx-opus.ogg'), { container: 'mkv', trim }),
+    );
+    const outputTable = webmPacketPayloadInfoFromBytes(output);
+    const outputTrack = outputTable.tracks[0];
+    const firstPtsUs = expected[0]?.ptsUs;
+    const last = expected.at(-1);
+    if (outputTrack === undefined || firstPtsUs === undefined || last?.durationUs === undefined) {
+      throw new Error('trimmed Opus output is missing track or packet facts');
+    }
+    const description = outputTrack.config?.description;
+    expect(description).toBeInstanceOf(Uint8Array);
+    const opusHead = description as Uint8Array;
+    expect(
+      new DataView(opusHead.buffer, opusHead.byteOffset, opusHead.byteLength).getUint16(10, true),
+    ).toBe(0);
+    expect(outputTrack.codecDelayNs).toBeUndefined();
+    expect(outputTrack.gapless).toBeUndefined();
+    expect(outputTrack.durationSec).toBeCloseTo(
+      (last.ptsUs + last.durationUs - firstPtsUs) / MICROS_PER_SECOND,
+      6,
+    );
+    expect(outputTable.packets.map((packet) => packet.data)).toEqual(
+      expected.map((packet) => oggPacketBytes(source, packet)),
+    );
+  });
+
+  it('cross-container Opus trim retains original pre-skip when it keeps the leading packet', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const source = await loadFixture('sfx-opus.ogg');
+    const sourceTable = oggPacketInfoFromBytes(source);
+    const output = await collect(
+      await streamCopy(await fixtureSource('sfx-opus.ogg'), {
+        container: 'mkv',
+        trim: { startSec: 0, endSec: 0.04 },
+      }),
+    );
+    const outputTable = webmPacketPayloadInfoFromBytes(output);
+    const outputTrack = outputTable.tracks[0];
+    const first = sourceTable.packets[0];
+    if (outputTrack === undefined || first === undefined) {
+      throw new Error('leading Opus trim is missing track truth');
+    }
+    expect(outputTrack.codecDelayNs).toBe(6_500_000);
+    expect(outputTrack.gapless?.leadingSamples).toBe(312);
+    expect(outputTrack.gapless?.trailingSamples).toBeUndefined();
+    expect(outputTable.packets[0]?.data).toEqual(oggPacketBytes(source, first));
+  });
+
+  it('cross-target Ogg-FLAC writes Matroska and declines WebM with a typed capability miss', async () => {
+    const flacStreamCopy = FlacDriver.streamCopy;
+    const oggStreamCopy = OggDriver.streamCopy;
+    if (flacStreamCopy === undefined || oggStreamCopy === undefined) {
+      throw new Error('FLAC/Ogg stream-copy must be implemented');
+    }
+    const oggFlac = await collect(
+      await flacStreamCopy(await fixtureSource('flac-verbatim.flac'), { container: 'ogg' }),
+    );
+    const sourceTable = oggPacketInfoFromBytes(oggFlac);
+    expect(sourceTable.tracks[0]?.codec).toBe('flac');
+
+    await expect(
+      oggStreamCopy(
+        {
+          size: oggFlac.byteLength,
+          range: () => Promise.resolve(oggFlac),
+          stream: () => {
+            throw new Error('seekable Ogg-FLAC should use its range source');
+          },
+        },
+        { container: 'webm' },
+      ),
+    ).rejects.toMatchObject({ code: 'capability-miss' });
+
+    const mkv = await collect(
+      await oggStreamCopy(
+        {
+          size: oggFlac.byteLength,
+          range: () => Promise.resolve(oggFlac),
+          stream: () => {
+            throw new Error('seekable Ogg-FLAC should use its range source');
+          },
+        },
+        { container: 'mkv' },
+      ),
+    );
+    const outputTable = webmPacketPayloadInfoFromBytes(mkv);
+    expect(outputTable.tracks[0]?.codec).toBe('flac');
+    expect(outputTable.tracks[0]?.config).toEqual(sourceTable.tracks[0]?.config);
+    expect(outputTable.packets.map((packet) => packet.data)).toEqual(
+      sourceTable.packets.map((packet) => oggPacketBytes(oggFlac, packet)),
+    );
+  });
+
+  it('cross-container Ogg packet copy aborts before reading or emitting output', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const controller = new AbortController();
+    controller.abort();
+    let reads = 0;
+    const source: ByteSource = {
+      size: 1,
+      range(): Promise<Uint8Array> {
+        reads++;
+        return Promise.resolve(new Uint8Array([0]));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('aborted Ogg stream-copy must not open a stream');
+      },
+    };
+    await expect(
+      streamCopy(source, { container: 'mkv', signal: controller.signal }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(0);
+  });
+
+  it('cross-container Ogg packet copy observes abort during packet authoring', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const controller = new AbortController();
+    let abortChecks = 0;
+    const signal = new Proxy(controller.signal, {
+      get(target, property): unknown {
+        if (property === 'aborted') {
+          abortChecks++;
+          if (abortChecks === 7) controller.abort();
+        }
+        return Reflect.get(target, property, target);
+      },
+    });
+
+    await expect(
+      streamCopy(await fixtureSource('sound_5.oga'), { container: 'mkv', signal }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(abortChecks).toBe(7);
+  });
+
+  it('cross-container Ogg packet copy cancels and unlocks a one-shot source on mid-read abort', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const bytes = await loadFixture('sound_5.oga');
+    const controller = new AbortController();
+    let pulls = 0;
+    let cancelReason: unknown;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(streamController): void {
+          pulls++;
+          if (pulls === 1) {
+            streamController.enqueue(bytes.subarray(0, 4_096));
+            controller.abort();
+            return;
+          }
+          streamController.enqueue(bytes.subarray(4_096));
+          streamController.close();
+        },
+        cancel(reason): void {
+          cancelReason = reason;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const source: ByteSource = {
+      stream: () => stream,
+    };
+
+    await expect(
+      streamCopy(source, { container: 'mkv', signal: controller.signal }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(pulls).toBe(1);
+    expect(cancelReason).toMatchObject({ code: 'aborted' });
+    expect(stream.locked).toBe(false);
   });
 
   it('demux exposes packet tables from one full-source read', async () => {

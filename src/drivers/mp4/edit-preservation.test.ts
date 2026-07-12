@@ -96,11 +96,18 @@ describe('MP4 same-family remux edit-list preservation', () => {
           : {
               mediaTimeTicks: sourceTrack.edit.mediaTimeTicks,
               durationTicks: Math.round(sourceTrack.edit.durationSec * sourceTrack.timescale),
+              movieTimescale: sourceTrack.edit.movieTimescale,
+              durationMovieTicks: sourceTrack.edit.durationMovieTicks,
               ...(sourceTrack.edit.leadingEmptyDurationSec !== undefined
                 ? {
                     leadingEmptyDurationTicks: Math.round(
                       sourceTrack.edit.leadingEmptyDurationSec * sourceTrack.timescale,
                     ),
+                  }
+                : {}),
+              ...(sourceTrack.edit.leadingEmptyDurationMovieTicks !== undefined
+                ? {
+                    leadingEmptyDurationMovieTicks: sourceTrack.edit.leadingEmptyDurationMovieTicks,
                   }
                 : {}),
             },
@@ -128,6 +135,12 @@ describe('MP4 same-family remux edit-list preservation', () => {
         );
       }
       expect(sampleFacts(outputTrack)).toEqual(sampleFacts(sourceTrack));
+      expect(outputTrack.mediaDurationTicks).toBe(sourceTrack.mediaDurationTicks);
+      expect(outputTrack.durationSec).toBe(sourceTrack.durationSec);
+      expect(outputTrack.fps).toBe(sourceTrack.fps);
+      expect(outputTrack.colr).toEqual(sourceTrack.colr);
+      expect(outputTrack.pasp).toEqual(sourceTrack.pasp);
+      expect(outputTrack.clap).toEqual(sourceTrack.clap);
     }
   });
 
@@ -140,11 +153,23 @@ describe('MP4 same-family remux edit-list preservation', () => {
         await Mp4Driver.streamCopy(fromBytes(source, { mime: 'video/mp4' }), options),
       );
       const movie = await readMovie(randomAccess(output));
-      expect(movie.tracks.find((track) => track.mediaType === 'video')?.edit).toEqual({
+      const sourceMovie = await readMovie(randomAccess(source));
+      const sourceVideo = sourceMovie.tracks.find((track) => track.mediaType === 'video');
+      const video = movie.tracks.find((track) => track.mediaType === 'video');
+      expect(video?.edit).toEqual({
         mediaTimeTicks: 2880,
         durationSec: 6.283,
+        durationMovieTicks: 6283,
+        movieTimescale: 1000,
         leadingEmptyDurationSec: 0.021,
+        leadingEmptyDurationMovieTicks: 21,
       });
+      expect(video?.mediaDurationTicks).toBe(sourceVideo?.mediaDurationTicks);
+      expect(video?.durationSec).toBe(sourceVideo?.durationSec);
+      expect(video?.fps).toBe(sourceVideo?.fps);
+      expect(video?.colr).toEqual(sourceVideo?.colr);
+      expect(video?.pasp).toEqual(sourceVideo?.pasp);
+      expect(video?.clap).toEqual(sourceVideo?.clap);
     },
   );
 

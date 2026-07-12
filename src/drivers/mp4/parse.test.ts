@@ -83,13 +83,15 @@ describe('parseMovieMetadata — metadata-only sample tables', () => {
 
     const video = movie.tracks.find((t) => t.mediaType === 'video');
     expect(video?.fps).toBe(1);
-    expect(video?.samples.timeToSample).toEqual([{ count: 2, delta: 300 }]);
+    expect(video?.samples.timeToSample).toEqual([]);
+    expect(video?.moovMediaTicks).toBe(600);
     expect(video?.samples.sampleSizes).toEqual([]);
     expect(video?.samples.sampleToChunk).toEqual([]);
     expect(video?.samples.chunkOffsets).toEqual([]);
 
     const audio = movie.tracks.find((t) => t.mediaType === 'audio');
-    expect(audio?.samples.timeToSample).toEqual([{ count: 1, delta: 48000 }]);
+    expect(audio?.samples.timeToSample).toEqual([]);
+    expect(audio?.moovMediaTicks).toBe(48_000);
     expect(audio?.samples.sampleSizes).toEqual([]);
   });
 
@@ -99,7 +101,8 @@ describe('parseMovieMetadata — metadata-only sample tables', () => {
 
     const video = movie.tracks.find((t) => t.mediaType === 'video');
     expect(video?.fps).toBe(1);
-    expect(video?.samples.timeToSample).toEqual([{ count: 2, delta: 300 }]);
+    expect(video?.samples.timeToSample).toEqual([]);
+    expect(video?.moovMediaTicks).toBe(600);
     expect(video?.samples.sampleSizes).toEqual([]);
   });
 });
@@ -459,6 +462,11 @@ describe('parseMovie — edit-list presentation duration vs media duration (ffpr
     expect(v.fps).toBe(10);
     // edit.durationSec is the presentation duration ffprobe reports as the *stream* duration (segment
     // duration ÷ movie timescale = 1200/600); mediaTimeTicks is the 1 s leading skip.
-    expect(v.edit).toEqual({ mediaTimeTicks: 600, durationSec: 2 });
+    expect(v.edit).toEqual({
+      mediaTimeTicks: 600,
+      durationSec: 2,
+      durationMovieTicks: 1_200,
+      movieTimescale: 600,
+    });
   });
 });

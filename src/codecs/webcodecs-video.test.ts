@@ -25,6 +25,7 @@ import WebcodecsVideoModule, {
   needsAppleH264HorizontalPhaseCompensation,
   normalizeHardwareAcceleration,
   queueIsBackpressured,
+  rateControlWarmupTimestamps,
   reorderByTimestamp,
   shouldKeyframe,
   videoEncodeOptions,
@@ -316,6 +317,36 @@ describe('videoEncodeOptions — keyframe plus codec-specific quantizer options'
   it('rejects invalid quantizer requests before a frame is submitted', () => {
     expect(() => videoEncodeOptions(0, 30, 'vp8', 12)).toThrow(CapabilityError);
     expect(() => videoEncodeOptions(0, 30, 'avc1.42E01E', Number.NaN)).toThrow(RangeError);
+  });
+});
+
+describe('rateControlWarmupTimestamps — disposable encoder preroll timeline', () => {
+  it('places every preroll picture strictly before a positive or negative first PTS', () => {
+    expect(rateControlWarmupTimestamps(1_000_000, 40_000, 25, 3)).toEqual([
+      880_000, 920_000, 960_000,
+    ]);
+    expect(rateControlWarmupTimestamps(-50_000, null, 50, 2)).toEqual([-90_000, -70_000]);
+  });
+
+  it('uses a stable cadence fallback and declines unsafe timestamp arithmetic', () => {
+    expect(rateControlWarmupTimestamps(100_000, null, undefined, 2)).toEqual([33_334, 66_667]);
+    expect(rateControlWarmupTimestamps(100_000, 0, 50, 2)).toEqual([60_000, 80_000]);
+    expect(rateControlWarmupTimestamps(100_000, Number.NaN, Number.POSITIVE_INFINITY, 2)).toEqual([
+      33_334, 66_667,
+    ]);
+    expect(rateControlWarmupTimestamps(100_000, null, 2_000_000, 2)).toEqual([99_998, 99_999]);
+    expect(rateControlWarmupTimestamps(Number.NaN, 40_000, 25, 3)).toEqual([]);
+    expect(rateControlWarmupTimestamps(Number.MIN_SAFE_INTEGER, 40_000, 25, 3)).toEqual([]);
+  });
+
+  it('treats an explicit zero warmup as a no-op', () => {
+    expect(rateControlWarmupTimestamps(100_000, 40_000, 25, 0)).toEqual([]);
+  });
+
+  it('rejects invalid counts instead of constructing an unbounded preroll', () => {
+    expect(() => rateControlWarmupTimestamps(0, 40_000, 25, -1)).toThrow(RangeError);
+    expect(() => rateControlWarmupTimestamps(0, 40_000, 25, 17)).toThrow(RangeError);
+    expect(() => rateControlWarmupTimestamps(0, 40_000, 25, 1.5)).toThrow(RangeError);
   });
 });
 

@@ -135,6 +135,10 @@ export async function runToSink(
 // ── Internals ───────────────────────────────────────────────────────────────────────────────────
 
 function concat(chunks: readonly Uint8Array[], total: number): Uint8Array<ArrayBuffer> {
+  const only = chunks.length === 1 ? chunks[0] : undefined;
+  if (only?.buffer instanceof ArrayBuffer && only.byteLength === only.buffer.byteLength) {
+    return only as Uint8Array<ArrayBuffer>;
+  }
   const out = new Uint8Array(total);
   let off = 0;
   for (const c of chunks) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { h264AccessUnitIsKeyPicture } from './h264-access-unit.ts';
+import { h264AccessUnitIsKeyPicture, h264AccessUnitRangeIsKeyPicture } from './h264-access-unit.ts';
 
 function unsignedExpGolomb(value: number): string {
   const codeNum = value + 1;
@@ -88,5 +88,17 @@ describe('H.264 AVC access-unit picture classification', () => {
       h264AccessUnitIsKeyPicture(accessUnit(4, new Uint8Array([0x67, 0x64, 0, 0x28])), 4),
     ).toBeUndefined();
     expect(h264AccessUnitIsKeyPicture(accessUnit(4, sliceNal(1, 2)), 3)).toBeUndefined();
+  });
+
+  it('classifies an exact byte range without treating adjacent storage as access-unit data', () => {
+    const picture = accessUnit(4, sliceNal(1, 2));
+    const storage = new Uint8Array(picture.byteLength + 7);
+    storage.fill(0xff);
+    storage.set(picture, 3);
+
+    expect(h264AccessUnitRangeIsKeyPicture(storage, 3, picture.byteLength, 4)).toBe(true);
+    expect(h264AccessUnitRangeIsKeyPicture(storage, 3, picture.byteLength - 1, 4)).toBeUndefined();
+    expect(h264AccessUnitRangeIsKeyPicture(storage, -1, picture.byteLength, 4)).toBeUndefined();
+    expect(h264AccessUnitRangeIsKeyPicture(storage, 3, Number.MAX_SAFE_INTEGER, 4)).toBeUndefined();
   });
 });

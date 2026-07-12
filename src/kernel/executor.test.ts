@@ -43,6 +43,57 @@ describe('composeChain + collect', () => {
     expect(seen.map((p) => p.done)).toEqual([2, 5]);
     expect(seen.every((p) => p.stage === 'collect')).toBe(true);
   });
+
+  it('adopts one exact-owned ArrayBuffer chunk without copying it', async () => {
+    const chunk = new Uint8Array([1, 2, 3, 4]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+
+    const out = await collect(stream);
+
+    expect(out).toEqual(chunk);
+    expect(out.buffer).toBe(chunk.buffer);
+  });
+
+  it('copies a sole subview instead of retaining unrelated backing bytes', async () => {
+    const storage = new Uint8Array([90, 91, 1, 2, 3, 4, 92, 93]);
+    const chunk = storage.subarray(2, 6);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+
+    const out = await collect(stream);
+
+    expect([...out]).toEqual([1, 2, 3, 4]);
+    expect(out.buffer).not.toBe(storage.buffer);
+    expect(out.byteOffset).toBe(0);
+    expect(out.buffer.byteLength).toBe(4);
+  });
+
+  it('copies a sole SharedArrayBuffer view into exact-owned ArrayBuffer storage', async () => {
+    const storage = new SharedArrayBuffer(4);
+    const chunk = new Uint8Array(storage);
+    chunk.set([1, 2, 3, 4]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+
+    const out = await collect(stream);
+
+    expect([...out]).toEqual([1, 2, 3, 4]);
+    expect(out.buffer).toBeInstanceOf(ArrayBuffer);
+    expect(out.buffer).not.toBe(storage);
+  });
 });
 
 describe('lazyPipeThrough', () => {

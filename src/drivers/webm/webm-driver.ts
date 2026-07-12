@@ -1,8 +1,8 @@
 /**
  * The WebM/MKV (EBML/Matroska) container driver — hand-written TS on top of {@link ebml}. Probe walks
  * EBML header → DocType, then Segment → Info (TimecodeScale, Duration) and Tracks (TrackEntry: type,
- * CodecID, geometry, audio params). Metadata lives at the segment start (before clusters), so a head
- * read suffices (docs/architecture/09).
+ * CodecID, geometry, declared AlphaMode, audio params). Metadata lives at the segment start (before
+ * clusters), so a head read suffices (docs/architecture/09).
  */
 
 import { probeJpeg } from '../../codecs/image/probe.ts';
@@ -70,6 +70,7 @@ const ID = {
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
+  AlphaMode: 0x53c0,
   Projection: 0x7670,
   ProjectionPoseRoll: 0x7675,
   Colour: 0x55b0,
@@ -122,7 +123,7 @@ const OPUS_FRAME_SAMPLES: readonly number[] = [
 ];
 const FULL_RANGE_EPSILON_US = 50_000;
 const WEBM_METADATA_PREFIX_BYTES = [
-  4 * 1024,
+  8 * 1024,
   64 * 1024,
   256 * 1024,
   1024 * 1024,
@@ -195,6 +196,8 @@ export interface WebmTrack {
   attachedFilePayload?: Uint8Array;
   width?: number;
   height?: number;
+  /** Standards-declared Matroska `Video/AlphaMode=1`; absent means metadata did not prove alpha. */
+  alpha?: true;
   /** Clockwise-positive display rotation, converted from Matroska's CCW ProjectionPoseRoll. */
   rotation?: number;
   /** Raw Matroska Colour values, preserved even when WebCodecs cannot name a code point. */
@@ -285,6 +288,8 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   let trackNumber: number | undefined;
   let width: number | undefined;
   let height: number | undefined;
+  let alphaModeDeclarations = 0;
+  let declaredAlpha = false;
   let rotation: number | undefined;
   let color: VideoColorMetadata | undefined;
   let sampleRate: number | undefined;
@@ -307,7 +312,18 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
       for (const v of elements(dv, c.dataStart, c.dataEnd)) {
         if (v.id === ID.PixelWidth) width = readUint(dv, v);
         else if (v.id === ID.PixelHeight) height = readUint(dv, v);
-        else if (v.id === ID.Projection) {
+        else if (v.id === ID.AlphaMode) {
+          alphaModeDeclarations++;
+          const byteLength = v.dataEnd - v.dataStart;
+          declaredAlpha =
+            alphaModeDeclarations === 1 &&
+            c.complete &&
+            v.complete &&
+            !v.unknownSize &&
+            byteLength >= 1 &&
+            byteLength <= 8 &&
+            readUint(dv, v) === 1;
+        } else if (v.id === ID.Projection) {
           for (const projection of elements(dv, v.dataStart, v.dataEnd)) {
             if (projection.id !== ID.ProjectionPoseRoll) continue;
             const clockwise = clockwiseFromMatroskaRoll(readFloat(dv, projection));
@@ -361,6 +377,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     ...(reorderDepth !== undefined ? { reorderDepth } : {}),
     ...(width !== undefined ? { width } : {}),
     ...(height !== undefined ? { height } : {}),
+    ...(declaredAlpha ? { alpha: true } : {}),
     ...(rotation !== undefined ? { rotation } : {}),
     ...(color !== undefined ? { color } : {}),
     ...(videoQualification !== undefined
@@ -506,15 +523,18 @@ function collectClusterBlockTimes(
   }
 }
 
-/** Retain at most one complete key access-unit view per track for codec qualification. */
+/** Retain at most one sequence-bearing access-unit view/prefix per track for codec qualification. */
 function collectFirstKeyframes(
   bytes: Uint8Array,
   dv: DataView,
   cluster: EbmlElement,
   firstKeyframes: Map<number, Uint8Array>,
 ): void {
-  const retain = (block: EbmlElement, keyframe: boolean | undefined): void => {
-    if (!block.complete) return;
+  const retain = (
+    block: EbmlElement,
+    keyframe: boolean | undefined,
+    allowUnprovenCandidate = false,
+  ): void => {
     const parsed = blockFrames(
       bytes,
       dv,
@@ -528,19 +548,29 @@ function collectFirstKeyframes(
       undefined,
     );
     if (parsed === undefined || firstKeyframes.has(parsed.trackNumber)) return;
-    const frame = parsed.frames.find((candidate) => candidate.keyframe);
+    // An incomplete BlockGroup cannot yet prove keyframe status from the absence of a later
+    // ReferenceBlock. Its available leading payload is still safe as a qualification candidate:
+    // VP9 validates frame_type+sync code and AV1 requires a sequence-header OBU. Inter/truncated data
+    // therefore stays unqualified and makes the metadata ladder grow exactly as before.
+    const frame = allowUnprovenCandidate
+      ? parsed.frames[0]
+      : parsed.frames.find((candidate) => candidate.keyframe);
     if (frame !== undefined) firstKeyframes.set(parsed.trackNumber, frame.data);
   };
 
   for (const child of elements(dv, cluster.dataStart, cluster.dataEnd)) {
     if (child.id === ID.SimpleBlock) {
       retain(child, undefined);
-    } else if (child.id === ID.BlockGroup && child.complete) {
+    } else if (child.id === ID.BlockGroup) {
       const block = findChild(dv, child.dataStart, child.dataEnd, ID.Block);
       if (block !== undefined) {
+        const complete = child.complete;
         retain(
           block,
-          findChild(dv, child.dataStart, child.dataEnd, ID.ReferenceBlock) === undefined,
+          complete
+            ? findChild(dv, child.dataStart, child.dataEnd, ID.ReferenceBlock) === undefined
+            : undefined,
+          !complete,
         );
       }
     }
@@ -1401,7 +1431,7 @@ function toTrackInfo(
   track: WebmTrack,
   id: number,
   durationSec?: number,
-  alpha?: boolean,
+  observedAlpha?: boolean,
   frames?: readonly WebmFrame[],
   includeLeadingGaplessDelay = true,
   containerSideData?: readonly ContainerSideData[],
@@ -1450,7 +1480,7 @@ function toTrackInfo(
     ...(durationSec !== undefined ? { durationSec } : {}),
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
-    ...(alpha === true ? { alpha: true } : {}),
+    ...(track.alpha === true || observedAlpha === true ? { alpha: true } : {}),
     ...(containerSideData !== undefined ? { containerSideData } : {}),
     ...(containerProjection !== undefined ? { containerProjection } : {}),
     ...(track.codecDelayNs !== undefined ? { codecDelayNs: track.codecDelayNs } : {}),
@@ -1571,35 +1601,47 @@ function videoTracksHaveDefaultDuration(dv: DataView, segment: EbmlElement): boo
   return true;
 }
 
-function metadataComplete(bytes: Uint8Array, info: WebmInfo): boolean {
-  if (info.durationSec <= 0 || info.tracks.length === 0) return false;
+type MetadataReadiness = 'complete' | 'incomplete' | 'needs-terminal-scan';
+
+function metadataReadiness(bytes: Uint8Array, info: WebmInfo): MetadataReadiness {
+  if (info.tracks.length === 0) return 'incomplete';
   for (const track of info.tracks) {
     if (track.mediaType !== 'video') continue;
-    if (track.width === undefined || track.height === undefined || track.fps === undefined) {
-      return false;
-    }
-    if (
-      (track.codec === 'vp9' || track.codec === 'av1') &&
-      track.decoderCodecSource === 'unknown'
-    ) {
-      return false;
-    }
+    if (track.width === undefined || track.height === undefined) return 'incomplete';
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findSegment(dv);
-  if (segment === undefined) return false;
+  if (segment === undefined) return 'incomplete';
   const tracks = findChild(dv, segment.dataStart, segment.dataEnd, ID.Tracks);
   // A bounded prefix may contain one complete TrackEntry while truncating its finite parent Tracks
   // element and every following entry. Never freeze that partial declaration as the public track list.
-  if (tracks === undefined || !tracks.complete) return false;
+  if (tracks === undefined || !tracks.complete) return 'incomplete';
   for (const child of elements(dv, segment.dataStart, segment.dataEnd)) {
     // A prefix can contain the first AttachedFile while truncating a later one. Do not freeze that
     // partial stream list; grow the range until the finite Attachments element is wholly available.
-    if (child.id === ID.Attachments && !child.complete) return false;
+    if (child.id === ID.Attachments && !child.complete) return 'incomplete';
   }
-  if (!segmentHasDeclaredDuration(dv, segment)) return false;
-  if (!videoTracksHaveDefaultDuration(dv, segment)) return false;
-  return true;
+  // With scanClusters:false, absent duration/fps means the container declarations cannot answer the
+  // public timeline. No larger bounded prefix can prove terminal cadence for VFR or a missing Duration;
+  // a complete Cluster scan is required, so known-size callers can skip intermediate ladder windows.
+  if (
+    info.durationSec <= 0 ||
+    info.tracks.some((track) => track.mediaType === 'video' && track.fps === undefined)
+  ) {
+    return 'needs-terminal-scan';
+  }
+  for (const track of info.tracks) {
+    if (
+      track.mediaType === 'video' &&
+      (track.codec === 'vp9' || track.codec === 'av1') &&
+      track.decoderCodecSource === 'unknown'
+    ) {
+      return 'incomplete';
+    }
+  }
+  if (!segmentHasDeclaredDuration(dv, segment)) return 'incomplete';
+  if (!videoTracksHaveDefaultDuration(dv, segment)) return 'incomplete';
+  return 'complete';
 }
 
 async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<WebmInfo> {
@@ -1613,21 +1655,37 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
     const end = src.size === undefined ? prefixBytes : Math.min(prefixBytes, src.size);
     const bytes = await range.call(src, 0, end);
     assertNotAborted(signal);
+    let info: WebmInfo;
     try {
-      const info = parseWebm(bytes, {
+      info = parseWebm(bytes, {
         scanClusters: false,
         ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
       });
-      if (metadataComplete(bytes, info)) {
-        return info;
-      }
-      if (bytes.byteLength >= (src.size ?? Number.POSITIVE_INFINITY)) {
-        return parseWebm(bytes, {
-          ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
-        });
-      }
     } catch (error) {
       lastError = error;
+      continue;
+    }
+    const readiness = metadataReadiness(bytes, info);
+    if (readiness === 'complete') return info;
+    if (
+      readiness === 'needs-terminal-scan' &&
+      src.size !== undefined &&
+      bytes.byteLength < src.size
+    ) {
+      const completeBytes = await range.call(src, 0, src.size);
+      assertNotAborted(signal);
+      if (completeBytes.byteLength < src.size) {
+        throw new InputError(
+          'unsupported-input',
+          `WebM source ended at ${completeBytes.byteLength} bytes before declared size ${src.size}`,
+        );
+      }
+      return parseWebm(completeBytes, { sourceSizeBytes: src.size });
+    }
+    if (bytes.byteLength >= (src.size ?? Number.POSITIVE_INFINITY)) {
+      return parseWebm(bytes, {
+        ...(src.size !== undefined ? { sourceSizeBytes: src.size } : {}),
+      });
     }
   }
 

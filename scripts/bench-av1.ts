@@ -73,10 +73,11 @@ async function av1Units(
 async function main(): Promise<void> {
   const mod = (await import('../src/codecs/wasm-av1/dav1d-core.js')) as {
     default: (u?: unknown) => Promise<unknown>;
-    createDav1dCore: () => CoreLike;
+    createDav1dCore: (moduleOrPath: URL) => CoreLike;
   };
-  await mod.default(new URL('../src/codecs/wasm-av1/dav1d_wasm_bg.wasm', import.meta.url));
-  const core = mod.createDav1dCore();
+  const moduleUrl = new URL('../src/codecs/wasm-av1/dav1d_wasm_bg.wasm', import.meta.url);
+  await mod.default(moduleUrl);
+  const core = mod.createDav1dCore(moduleUrl);
 
   console.info(`AV1 decode throughput (median of ${ITERS} runs, dav1d-wasm, single-thread):`);
   for (const id of FILES) {

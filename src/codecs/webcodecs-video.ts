@@ -654,6 +654,11 @@ export interface VideoEncoderStageOptions extends StageOptions {
   /** Constant quality/CRF-style quantizer forwarded through the codec-specific WebCodecs encode option. */
   quantizer?: number;
   /**
+   * Disposable pictures submitted before the first real key frame to prime a native bitrate controller.
+   * Their timestamps are earlier than the first input timestamp and their chunks are never emitted.
+   */
+  rateControlWarmupFrames?: number;
+  /**
    * Per-picture quantizer selected from prior-pass evidence. The callback runs synchronously before
    * `encode()` and must return the quantizer for this exact presentation timestamp.
    */
@@ -677,6 +682,46 @@ function readEncoderInterval(o: StageOptions | undefined): number | undefined {
 function readEncoderQuantizer(o: StageOptions | undefined): number | undefined {
   const v = (o as VideoEncoderStageOptions | undefined)?.quantizer;
   return typeof v === 'number' ? v : undefined;
+}
+
+const MAX_RATE_CONTROL_WARMUP_FRAMES = 16;
+
+function readRateControlWarmupFrames(o: StageOptions | undefined): number {
+  const value = (o as VideoEncoderStageOptions | undefined)?.rateControlWarmupFrames;
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_RATE_CONTROL_WARMUP_FRAMES) {
+    throw new RangeError(
+      `rateControlWarmupFrames must be an integer in [0, ${MAX_RATE_CONTROL_WARMUP_FRAMES}], got ${value}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Allocate collision-free preroll timestamps strictly before the first real picture. An unsafe timeline
+ * declines preroll instead of risking timestamp aliasing or integer precision loss.
+ */
+export function rateControlWarmupTimestamps(
+  firstTimestampUs: number,
+  frameDurationUs: number | null,
+  frameRate: number | undefined,
+  count: number,
+): readonly number[] {
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_RATE_CONTROL_WARMUP_FRAMES) {
+    throw new RangeError(
+      `warmup count must be an integer in [0, ${MAX_RATE_CONTROL_WARMUP_FRAMES}], got ${count}`,
+    );
+  }
+  if (count === 0 || !Number.isSafeInteger(firstTimestampUs)) return [];
+  const duration =
+    frameDurationUs !== null && Number.isSafeInteger(frameDurationUs) && frameDurationUs > 0
+      ? frameDurationUs
+      : frameRate !== undefined && Number.isFinite(frameRate) && frameRate > 0
+        ? Math.max(1, Math.round(1_000_000 / frameRate))
+        : 33_333;
+  const earliest = firstTimestampUs - duration * count;
+  if (!Number.isSafeInteger(earliest)) return [];
+  return Array.from({ length: count }, (_, index) => earliest + duration * index);
 }
 
 function readEncoderQuantizerSelector(
@@ -1277,9 +1322,11 @@ function createVideoEncoder(
   const quantizer = readEncoderQuantizer(o);
   const quantizerAt = readEncoderQuantizerSelector(o);
   const onDecoderConfig = readDecoderConfigSink(o);
+  const rateControlWarmupFrames = readRateControlWarmupFrames(o);
 
   let encoder: VideoEncoder | undefined;
   let frameIndex = 0;
+  const rateControlWarmupTimestampsPending = new Set<number>();
   let alignmentCanvas: OffscreenCanvas | undefined;
   const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(
     config,
@@ -1297,6 +1344,7 @@ function createVideoEncoder(
     closed = true;
     if (encoder && encoder.state !== 'closed') encoder.close(); // stop WebCodecs emitting
     alignmentCanvas = undefined;
+    rateControlWarmupTimestampsPending.clear();
   };
 
   const transformer: TransformerWithCancel<RawFrame, EncodedChunk> = {
@@ -1335,6 +1383,9 @@ function createVideoEncoder(
               return;
             }
           }
+          // Preroll exists only to initialize the native bitrate controller. The real first picture is
+          // forced key below, so no emitted picture can reference these disposable access units.
+          if (rateControlWarmupTimestampsPending.delete(chunk.timestamp)) return;
           // Never throw out of this async callback: enqueue if the readable is alive, else drop the chunk
           // (a plain byte buffer — nothing to close, GC frees it).
           enqueueOrDrop(controller, chunk, () => closed);
@@ -1408,6 +1459,38 @@ function createVideoEncoder(
           });
           encodeFrame = compensatedFrame;
         }
+        if (frameIndex === 0 && rateControlWarmupFrames > 0) {
+          const timestamps = rateControlWarmupTimestamps(
+            encodeFrame.timestamp,
+            encodeFrame.duration,
+            config.framerate,
+            rateControlWarmupFrames,
+          );
+          for (let index = 0; index < timestamps.length; index++) {
+            if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+            if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
+            await drainBelowHighWater(encoder, signal);
+            const timestamp = timestamps[index];
+            if (timestamp === undefined)
+              throw new MediaError('encode-error', 'invalid warmup timeline');
+            const warmupFrame = new VideoFrame(encodeFrame, {
+              timestamp,
+              ...(encodeFrame.duration === null ? {} : { duration: encodeFrame.duration }),
+            });
+            rateControlWarmupTimestampsPending.add(timestamp);
+            try {
+              encoder.encode(
+                warmupFrame,
+                videoEncodeOptions(index, undefined, config.codec, quantizer),
+              );
+            } catch (error) {
+              rateControlWarmupTimestampsPending.delete(timestamp);
+              throw error;
+            } finally {
+              warmupFrame.close();
+            }
+          }
+        }
         const keyFrame = shouldKeyframe(frameIndex, keyFrameInterval);
         const frameQuantizer =
           quantizerAt?.({
@@ -1437,6 +1520,7 @@ function createVideoEncoder(
       closed = true; // the readable is about to close; reject any late `output` (none expected post-flush)
       if (encoder && encoder.state !== 'closed') encoder.close();
       alignmentCanvas = undefined;
+      rateControlWarmupTimestampsPending.clear();
     },
     // The muxer closed/cancelled the readable while the encoder may still be draining: mark closed and
     // dispose the encoder so it stops emitting — no late enqueue. (Chunks are byte buffers; nothing leaks.)

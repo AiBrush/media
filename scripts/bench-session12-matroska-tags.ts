@@ -107,12 +107,6 @@ function packetFingerprint(bytes: Uint8Array): string {
         seekPreRollNs: track.seekPreRollNs,
         gapless: track.gapless,
         color: track.color,
-        width: track.width,
-        height: track.height,
-        rotation: track.rotation,
-        fps: track.fps,
-        sampleRate: track.sampleRate,
-        channels: track.channels,
       }),
     );
     const description = track.config?.description;

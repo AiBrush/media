@@ -13,13 +13,13 @@
  * a real Worker alike.
  */
 
+import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import {
   CapabilityError,
   InputError,
   MediaError,
   type MediaErrorCode,
 } from '../contracts/errors.ts';
-import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 
 // ============ transport ============
 

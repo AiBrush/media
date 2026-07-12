@@ -4,14 +4,16 @@ import type { ByteSource, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { gain } from '../../dsp/gain.ts';
 import { channelAt } from '../../dsp/pcm.ts';
+import { type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { readAiffPcm, writeAiff } from '../aiff/aiff.ts';
 import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
 import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
 import { tryConvertWavPcmFormatToWav } from './format-convert.ts';
-import { readWavPcm, writeWav } from './pcm.ts';
+import { readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
 import { tryResampleWavS16ToS16Wav, wavS16ResampleToWavFromBytes } from './s16-resample.ts';
 import { wavTrimFromUrl } from './url-trim.ts';
+import { streamWavPcmCopy } from './wav-copy-stream.ts';
 import {
   WavDriver,
   WavModule,
@@ -444,6 +446,426 @@ describe('probe WAV across the real corpus', () => {
     await reader.cancel('first chunk is sufficient for the lazy contract');
   });
 
+  it('fuses the real signed-24 WAV fixture to bit-exact interleaved Float32 chunks', async () => {
+    interface InterleavedChunk {
+      readonly sampleRate: number;
+      readonly channels: number;
+      readonly frames: number;
+      readonly data: Float32Array<ArrayBuffer>;
+    }
+    type InterleavedDecoder = (src: ByteSource) => Promise<ReadableStream<InterleavedChunk>>;
+    const decode = (
+      WavDriver as typeof WavDriver & {
+        readonly decodePcmInterleavedStream?: InterleavedDecoder;
+      }
+    ).decodePcmInterleavedStream;
+    expect(decode).toBeTypeOf('function');
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const canonical = readWavPcm(bytes);
+    const expected = new Float32Array(canonical.frames * canonical.channels);
+    for (let frame = 0; frame < canonical.frames; frame++) {
+      for (let channel = 0; channel < canonical.channels; channel++) {
+        expected[frame * canonical.channels + channel] = canonical.planar[channel]?.[frame] ?? 0;
+      }
+    }
+    const stream = await decode({
+      size: bytes.byteLength,
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('real range-backed WAV must not fall back to full streaming');
+      },
+    });
+    const reader = stream.getReader();
+    const actual = new Uint32Array(expected.length);
+    let sample = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      expect(next.value.data.length).toBe(next.value.frames * next.value.channels);
+      const bits = new Uint32Array(
+        next.value.data.buffer,
+        next.value.data.byteOffset,
+        next.value.data.length,
+      );
+      actual.set(bits, sample);
+      sample += bits.length;
+    }
+    expect(sample).toBe(expected.length);
+    expect(actual).toEqual(new Uint32Array(expected.buffer));
+  });
+
+  it('streams range-less signed-24 PCM sequentially with exact range-path samples and cadence', async () => {
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const expectedReader = (
+      await decode({
+        size: bytes.byteLength,
+        range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+        stream: () => {
+          throw new Error('range control must not stream');
+        },
+      })
+    ).getReader();
+    const expectedBits: number[] = [];
+    const expectedCadence: number[] = [];
+    for (;;) {
+      const next = await expectedReader.read();
+      if (next.done) break;
+      expectedCadence.push(next.value.frames);
+      expectedBits.push(...new Uint32Array(next.value.data.buffer));
+    }
+    expectedReader.releaseLock();
+
+    let streamCalls = 0;
+    const rangeCalls = 0;
+    let offset = 0;
+    let activePulls = 0;
+    let maximumActivePulls = 0;
+    const source: Source = {
+      __media: 'source',
+      kind: 'stream',
+      size: bytes.byteLength,
+      mimeHint: 'audio/wav',
+      stream: () => {
+        streamCalls++;
+        offset = 0;
+        return new ReadableStream<Uint8Array>(
+          {
+            async pull(controller): Promise<void> {
+              activePulls++;
+              maximumActivePulls = Math.max(maximumActivePulls, activePulls);
+              await Promise.resolve();
+              const length = Math.min(97 + (offset % 131), bytes.byteLength - offset);
+              if (length > 0) {
+                controller.enqueue(bytes.slice(offset, offset + length));
+                offset += length;
+              }
+              if (offset >= bytes.byteLength) controller.close();
+              activePulls--;
+            },
+          },
+          { highWaterMark: 0 },
+        );
+      },
+    };
+
+    const actualReader = (await decode(source)).getReader();
+    const actualBits: number[] = [];
+    const actualCadence: number[] = [];
+    for (;;) {
+      const next = await actualReader.read();
+      if (next.done) break;
+      actualCadence.push(next.value.frames);
+      actualBits.push(...new Uint32Array(next.value.data.buffer));
+    }
+    actualReader.releaseLock();
+
+    expect(streamCalls).toBe(1);
+    expect(rangeCalls).toBe(0);
+    expect(maximumActivePulls).toBe(1);
+    expect(actualCadence).toEqual(expectedCadence);
+    expect(actualBits).toEqual(expectedBits);
+  });
+
+  it('cancels and unlocks a sequential signed-24 source during a pending payload read', async () => {
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const firstPayloadEnd = 68 + 4096 * 2 * 3;
+    let pendingPull = false;
+    let cancelled = 0;
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(bytes.slice(0, firstPayloadEnd));
+        },
+        pull(): Promise<void> {
+          pendingPull = true;
+          return new Promise(() => {});
+        },
+        cancel(): void {
+          cancelled++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const output = await decode({ stream: () => sourceStream });
+    const reader = output.getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    const pending = reader.read();
+    while (!pendingPull) await Promise.resolve();
+
+    await reader.cancel('consumer stopped');
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    reader.releaseLock();
+    expect(cancelled).toBe(1);
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('preserves a sequential source error as a typed demux failure and unlocks the reader', async () => {
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const firstPayloadEnd = 68 + 4096 * 2 * 3;
+    const sourceFailure = new Error('producer failed after first PCM chunk');
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(bytes.slice(0, firstPayloadEnd));
+        },
+        pull(controller): void {
+          controller.error(sourceFailure);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const reader = (await decode({ stream: () => sourceStream })).getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    await expect(reader.read()).rejects.toMatchObject({
+      code: 'demux-error',
+      detail: sourceFailure,
+      message: expect.stringContaining('producer failed after first PCM chunk'),
+    });
+    reader.releaseLock();
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('rejects a sequential signed-24 payload that ends before its declared final frame', async () => {
+    const bytes = await loadFixture('sfx-pcm-s24.wav');
+    const truncated = bytes.slice(0, -3);
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(truncated.subarray(0, 83));
+          controller.enqueue(truncated.subarray(83));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const reader = (await decode({ stream: () => sourceStream })).getReader();
+    await expect(
+      (async () => {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) return;
+        }
+      })(),
+    ).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('ended before the declared data payload'),
+    });
+    reader.releaseLock();
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('amortizes a full fused drain through bounded sequential range windows', async () => {
+    const frames = 100_000;
+    const sourcePcm = {
+      sampleRate: 48_000,
+      channels: 2,
+      frames,
+      planar: [new Float64Array(frames).fill(0.25), new Float64Array(frames).fill(-0.25)],
+    } as const;
+    const bytes = writeWav(sourcePcm, 's24');
+    const reads: Array<readonly [number, number]> = [];
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const chunks = await decode({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('range-backed fused decode must remain bounded');
+      },
+    });
+    const reader = chunks.getReader();
+    let decodedFrames = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      expect(next.value.frames).toBeLessThanOrEqual(4096);
+      expect(next.value.data[0]).toBe(0.25);
+      expect(next.value.data[1]).toBe(-0.25);
+      decodedFrames += next.value.frames;
+    }
+    expect(decodedFrames).toBe(frames);
+    expect(reads[0]).toEqual([0, 65_536]);
+    expect(reads.length).toBeLessThanOrEqual(2);
+    expect(Math.max(...reads.map(([start, end]) => end - start))).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it('drops a pending fused range window when the consumer cancels', async () => {
+    const frames = 20_000;
+    const bytes = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames,
+        planar: [new Float64Array(frames).fill(0.25), new Float64Array(frames).fill(-0.25)],
+      },
+      's24',
+    );
+    let resolveRange: (() => void) | undefined;
+    let rangeCalls = 0;
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        expect(this).toBe(source);
+        rangeCalls++;
+        if (rangeCalls === 1) return Promise.resolve(bytes.subarray(start, end));
+        return new Promise((resolve) => {
+          resolveRange = () => resolve(bytes.subarray(start, end));
+        });
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('range-backed fused decode must remain bounded');
+      },
+    };
+    const chunks = await decode(source);
+    const reader = chunks.getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    expect((await reader.read()).value?.frames).toBe(4096);
+    const pending = reader.read();
+    while (resolveRange === undefined) await Promise.resolve();
+
+    const cancelled = reader.cancel('consumer stopped during range read');
+    resolveRange();
+
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    await expect(cancelled).resolves.toBeUndefined();
+    expect(rangeCalls).toBe(2);
+    reader.releaseLock();
+    expect(chunks.locked).toBe(false);
+  });
+
+  it('keeps every fused range request bounded for high-channel PCM', async () => {
+    const frames = 4096;
+    const channels = 96;
+    const bytes = writeWav(
+      {
+        sampleRate: 48_000,
+        channels,
+        frames,
+        planar: Array.from({ length: channels }, () => new Float64Array(frames).fill(0.125)),
+      },
+      's24',
+    );
+    const reads: Array<readonly [number, number]> = [];
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const chunks = await decode({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('range-backed fused decode must remain bounded');
+      },
+    });
+
+    const reader = chunks.getReader();
+    let decodedFrames = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      decodedFrames += next.value.frames;
+    }
+
+    expect(decodedFrames).toBe(frames);
+    expect(reads.every(([start, end]) => end - start <= 1024 * 1024)).toBe(true);
+  });
+
+  it('keeps a stream-backed source locked only until the fused PCM payload is consumed', async () => {
+    const bytes = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [new Float64Array([0.25, -0.25, 0.5, -0.5])],
+      },
+      's24',
+    );
+    const sourceStream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+
+    const chunks = await decode({ stream: () => sourceStream });
+
+    expect(sourceStream.locked).toBe(true);
+    const reader = chunks.getReader();
+    const first = await reader.read();
+    expect(first.value?.frames).toBe(4);
+    expect((await reader.read()).done).toBe(true);
+    reader.releaseLock();
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('cancels and unlocks a pending stream-backed fused fallback on abort', async () => {
+    const bytes = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 4,
+        planar: [new Float64Array([0.25, -0.25, 0.5, -0.5])],
+      },
+      's24',
+    );
+    let releasePull: (() => void) | undefined;
+    let cancelled = false;
+    const sourceStream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(bytes.subarray(0, 12));
+      },
+      pull(controller): Promise<void> {
+        return new Promise((resolve) => {
+          releasePull = () => {
+            controller.enqueue(bytes.subarray(12));
+            controller.close();
+            resolve();
+          };
+        });
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    const decode = WavDriver.decodePcmInterleavedStream;
+    if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
+    const abort = new AbortController();
+    const pending = decode({ stream: () => sourceStream }, { signal: abort.signal });
+    const outcome = pending.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    while (releasePull === undefined) await Promise.resolve();
+
+    abort.abort('stop');
+    await Promise.resolve();
+    await Promise.resolve();
+    const wasCancelledPromptly = cancelled;
+    if (!cancelled) releasePull?.();
+
+    expect(wasCancelledPromptly).toBe(true);
+    await expect(outcome).resolves.toMatchObject({ code: 'aborted' });
+    expect(sourceStream.locked).toBe(false);
+  });
+
   it('wavPacketInfoFromUrl uses one small range for header-visible data chunks', async () => {
     const bytes = await loadFixture('sfx-pcm-s24.wav');
     const server = rangeServer(bytes);
@@ -829,6 +1251,119 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     );
     expect(out).toEqual(canonical);
     expect(out).not.toEqual(withJunk);
+  });
+
+  it('streams a fresh canonical header before the immutable PCM payload under pull backpressure', async () => {
+    const canonical = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 4,
+        planar: [Float64Array.of(0, 0.25, -0.25, 0.5), Float64Array.of(0.5, -0.5, 0.75, -0.75)],
+      },
+      's16',
+    );
+    const withJunk = withJunkChunk(canonical);
+    const stream = await transformPcm(streamOnly(withJunk), {
+      container: 'wav',
+      sampleFormat: 's16',
+      endian: 'le',
+      channels: 2,
+      sampleRate: 48_000,
+    });
+    const reader = stream.getReader();
+    const header = await reader.read();
+    expect(header.done).toBe(false);
+    expect(header.value).toEqual(canonical.subarray(0, 44));
+    const payload = await reader.read();
+    expect(payload.done).toBe(false);
+    expect(payload.value).toEqual(chunkPayload(canonical, 'data'));
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    reader.releaseLock();
+  });
+
+  it('releases a copy payload when cancelled between its canonical header and PCM bytes', async () => {
+    const bytes = await loadFixture('stereo-48000.wav');
+    const stream = await transformPcm(streamOnly(bytes), {
+      container: 'wav',
+      sampleFormat: 's16',
+      endian: 'le',
+      channels: 2,
+      sampleRate: 48_000,
+    });
+    const reader = stream.getReader();
+    const header = await reader.read();
+    expect(header.value?.byteLength).toBe(44);
+    await reader.cancel('stop before payload');
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    reader.releaseLock();
+  });
+
+  it('rejects a WAV copy stream before its first pull when already aborted', async () => {
+    const abort = new AbortController();
+    abort.abort('stop before stream construction');
+    const reader = streamWavPcmCopy(
+      { header: new Uint8Array(44), payload: Uint8Array.of(1, 2, 3, 4) },
+      abort.signal,
+    ).getReader();
+
+    await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+    reader.releaseLock();
+  });
+
+  it('errors a WAV copy stream and releases its pending payload on live abort', async () => {
+    const abort = new AbortController();
+    const header = Uint8Array.from({ length: 44 }, (_value, index) => index);
+    const reader = streamWavPcmCopy(
+      { header, payload: Uint8Array.of(7, 8, 9, 10) },
+      abort.signal,
+    ).getReader();
+
+    await expect(reader.read()).resolves.toEqual({ done: false, value: header });
+    abort.abort('stop before payload');
+    await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+    reader.releaseLock();
+  });
+
+  it('snapshots multipart Blob output before the caller mutates its original input bytes', async () => {
+    const canonical = await loadFixture('stereo-48000.wav');
+    const input = withJunkChunk(canonical);
+    const expected = rewriteWavPcmCopy(input, 's16', 'le', 2, 48_000);
+    if (expected === undefined) throw new Error('expected same-layout canonical WAV rewrite');
+    const output = await createMedia().convert(fromBytes(input, { mime: 'audio/wav' }), {
+      to: 'wav',
+      audio: { codec: 'pcm-s16', channels: 2, sampleRate: 48_000 },
+    });
+    if (!(output instanceof Blob)) throw new Error('expected Blob output');
+    input.fill(0);
+    expect(new Uint8Array(await output.arrayBuffer())).toEqual(expected);
+  });
+
+  it('routes an unhinted WAV before its single full copy-plan read', async () => {
+    const input = await loadFixture('stereo-48000.wav');
+    const reads: Array<readonly [number, number]> = [];
+    const source: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: input.byteLength,
+      stream: () => {
+        throw new Error('unhinted range source must not open a stream');
+      },
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(input.subarray(start, end));
+      },
+    };
+    const output = await createMedia().convert(source, {
+      to: 'wav',
+      audio: { codec: 'pcm-s16', channels: 2, sampleRate: 48_000 },
+    });
+    expect(await outputBytes(output)).toEqual(input);
+    expect(reads).toHaveLength(3);
+    expect(reads.slice(0, -1).every(([start, end]) => start === 0 && end < input.byteLength)).toBe(
+      true,
+    );
+    expect(reads.at(-1)).toEqual([0, input.byteLength]);
   });
 
   it('direct-resamples s16 WAV to canonical s16 WAV for sample-rate-only transforms', () => {

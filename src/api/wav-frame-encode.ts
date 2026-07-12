@@ -23,6 +23,10 @@ interface PcmWireTarget {
   readonly endian: Endianness;
 }
 
+type DefaultReaderResult<T> =
+  | { readonly done: false; readonly value: T }
+  | { readonly done: true; readonly value?: T | undefined };
+
 export interface WavFrameEncodeDeps {
   readonly createMuxer: () => Promise<Muxer>;
 }
@@ -322,7 +326,7 @@ async function cancelFrameStreams(frames: MediaStreams, reason: unknown): Promis
 async function readAudioFrame(
   reader: ReadableStreamDefaultReader<AudioData>,
   signal: AbortSignal,
-): Promise<ReadableStreamReadResult<AudioData>> {
+): Promise<DefaultReaderResult<AudioData>> {
   throwIfAborted(signal);
   const pending = reader.read();
   let rejectAbort: (() => void) | undefined;

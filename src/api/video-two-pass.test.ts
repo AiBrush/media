@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { TrackInfo } from '../contracts/driver.ts';
 import { InputError } from '../contracts/errors.ts';
-import { installH264TwoPassQuantizer, sourceGeometryOf } from './video-two-pass-runner.ts';
+import {
+  implicitRateControlWarmupFrames,
+  installH264TwoPassQuantizer,
+  sourceGeometryOf,
+} from './video-two-pass-runner.ts';
 import {
   type H264FirstPassSample,
   H264_FIRST_PASS_QUANTIZER,
@@ -18,6 +22,25 @@ function sample(
 }
 
 describe('planH264TwoPass', () => {
+  it('warms only implicit H.264/AV1 bitrate control without changing explicit contracts', () => {
+    expect(implicitRateControlWarmupFrames({}, 'avc1.64001F', 30)).toBe(3);
+    expect(implicitRateControlWarmupFrames({}, 'av01.0.12M.08', 60)).toBe(8);
+    expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30)).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30.0000003)).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30.5)).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30.500001)).toBe(8);
+    expect(implicitRateControlWarmupFrames({}, 'AVC3.64001F', undefined)).toBe(3);
+    expect(implicitRateControlWarmupFrames({}, 'vp09.00.31.08', 60)).toBeUndefined();
+    expect(
+      implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'avc1.64001F', 30),
+    ).toBeUndefined();
+    expect(
+      implicitRateControlWarmupFrames({ bitrateMode: 'constant' }, 'avc1.64001F', 30),
+    ).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({ crf: 22 }, 'av01.0.12M.08', 60)).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({ twoPass: true }, 'avc1.64001F', 30)).toBeUndefined();
+  });
+
   it('maps known and unknown source geometry without inventing dimensions', () => {
     const known: TrackInfo = {
       id: 0,

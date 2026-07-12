@@ -48,20 +48,38 @@ export async function runMux(
   }
   if (
     opts.fragmented !== true &&
-    (target === 'mp4'
+    (target === 'mp4' || target === 'mov'
       ? opts.faststart !== false
       : target === 'webm' || target === 'mkv' || target === 'ogg')
   ) {
+    if (
+      (target === 'mp4' || target === 'mov') &&
+      (opts.sink === undefined || opts.sink.kind === 'blob')
+    ) {
+      const { muxNativeFirstPartyPacketStreams } = await import('./native-packet-mux.ts');
+      const native = await muxNativeFirstPartyPacketStreams(streams, {
+        container: target,
+        ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+        signal,
+      });
+      if (native !== undefined) {
+        return materializeOutput(opts.sink ?? toBlob(), native, mimeOptions(signal, target));
+      }
+    }
     const fastMux = await import('./flac-mkv-mux.ts');
     const muxPrepared =
-      target === 'mp4'
-        ? fastMux.muxSingleTrackMp4
+      target === 'mp4' || target === 'mov'
+        ? fastMux.muxPreparedMp4PacketStreams
         : target === 'ogg'
           ? fastMux.muxSingleTrackOggAudio
           : fastMux.muxPreparedWebmPacketStreams;
     const stream = await muxPrepared(streams, {
       ...context.stage(signal, options),
       container: target,
+      ...((target === 'mp4' || target === 'mov') &&
+      (opts.sink === undefined || opts.sink.kind === 'blob')
+        ? { buffered: true }
+        : {}),
     });
     if (stream !== undefined) {
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));

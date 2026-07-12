@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TrackInfo } from '../../contracts/driver.ts';
-import { MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { muxTracksFromMovie, readMovie } from '../mp4/mp4-driver.ts';
@@ -13,6 +13,7 @@ import {
   parseVp9UncompressedHeader,
   qualifyWebmVideoCodec,
   vp9CodecPrivateFromCodecString,
+  webmVideoCodecPrivate,
 } from './video-codec-qualification.ts';
 import { WebmDriver, demuxWebm } from './webm-driver.ts';
 
@@ -268,6 +269,255 @@ describe('WebM AV1 qualification', () => {
     expect(() => parseAv1SequenceHeader(av1ReducedSequenceHeader(2, 12).subarray(0, 4))).toThrow(
       MediaError,
     );
+  });
+});
+
+function vp9HeaderVariant(options: {
+  readonly profile?: 0 | 1 | 2 | 3;
+  readonly bitDepth?: 8 | 10 | 12;
+  readonly showExisting?: boolean;
+  readonly inter?: boolean;
+  readonly profileReserved?: number;
+  readonly sync?: readonly [number, number, number];
+  readonly colorSpace?: number;
+  readonly colorReserved?: number;
+  readonly subsamplingX?: number;
+  readonly subsamplingY?: number;
+  readonly chromaReserved?: number;
+  readonly width?: number;
+  readonly height?: number;
+}): Uint8Array {
+  const profile = options.profile ?? 0;
+  const bits = new MsbBitWriter();
+  bits.write(2, 2);
+  bits.write(profile & 1, 1);
+  bits.write(profile >> 1, 1);
+  if (profile === 3) bits.write(options.profileReserved ?? 0, 1);
+  bits.write(options.showExisting ? 1 : 0, 1);
+  if (options.showExisting) return bits.bytes();
+  bits.write(options.inter ? 1 : 0, 1);
+  if (options.inter) return bits.bytes();
+  bits.write(1, 1);
+  bits.write(0, 1);
+  for (const value of options.sync ?? [0x49, 0x83, 0x42]) bits.write(value, 8);
+  const bitDepth = options.bitDepth ?? 8;
+  if (profile >= 2) bits.write(bitDepth === 12 ? 1 : 0, 1);
+  const colorSpace = options.colorSpace ?? 2;
+  bits.write(colorSpace, 3);
+  if (colorSpace === 7) {
+    if (profile === 1 || profile === 3) bits.write(options.colorReserved ?? 0, 1);
+  } else {
+    bits.write(0, 1);
+    if (profile === 1 || profile === 3) {
+      bits.write(options.subsamplingX ?? 1, 1);
+      bits.write(options.subsamplingY ?? 1, 1);
+      bits.write(options.chromaReserved ?? 0, 1);
+    }
+  }
+  bits.write((options.width ?? 320) - 1, 16);
+  bits.write((options.height ?? 240) - 1, 16);
+  return bits.bytes();
+}
+
+describe('WebM video codec qualification boundaries', () => {
+  it('rejects every malformed VP9 feature and codec-string field with mux/demux typing', () => {
+    for (const bytes of [
+      Uint8Array.of(1, 1, 0, 1, 1, 0),
+      Uint8Array.of(1, 0, 2, 1, 10, 3, 1, 8),
+      Uint8Array.of(1, 1, 4, 2, 1, 10, 3, 1, 8),
+      Uint8Array.of(1, 1, 0, 2, 1, 19, 3, 1, 8),
+      Uint8Array.of(1, 1, 0, 2, 1, 10, 3, 1, 9),
+      Uint8Array.of(1, 1, 0, 2, 1, 10, 3, 1, 8, 4, 1, 4),
+      Uint8Array.of(1, 1, 1, 2, 1, 10, 3, 1, 8, 4, 1, 1),
+    ]) {
+      expect(() => parseVp9CodecPrivate(bytes)).toThrow(MediaError);
+    }
+    expect(
+      parseVp9CodecPrivate(Uint8Array.of(99, 2, 7, 8, 1, 1, 0, 2, 1, 10, 3, 1, 8)),
+    ).toMatchObject({ codec: 'vp09.00.10.08' });
+    for (const codec of [
+      'vp9',
+      'vp09',
+      'vp09.x.10.08',
+      'vp09.4.10.08',
+      'vp09.0.x.08',
+      'vp09.0.19.08',
+      'vp09.0.10.x',
+      'vp09.0.10.09',
+      'vp09.0.10.08.x',
+      'vp09.0.10.08.4',
+      'vp09.0.10.10',
+      'vp09.0.10.08.2',
+    ]) {
+      expect(() => vp9CodecPrivateFromCodecString(codec)).toThrow(MediaError);
+    }
+  });
+
+  it('distinguishes VP9 keyframe/profile/colorspace syntax and capability misses exactly', () => {
+    expect(() =>
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 3, profileReserved: 1 })),
+    ).toThrow(MediaError);
+    expect(() => parseVp9UncompressedHeader(vp9HeaderVariant({ showExisting: true }))).toThrow(
+      CapabilityError,
+    );
+    expect(() => parseVp9UncompressedHeader(vp9HeaderVariant({ inter: true }))).toThrow(
+      CapabilityError,
+    );
+    for (const sync of [
+      [0, 0x83, 0x42],
+      [0x49, 0, 0x42],
+      [0x49, 0x83, 0],
+    ] as const) {
+      expect(() => parseVp9UncompressedHeader(vp9HeaderVariant({ sync }))).toThrow(MediaError);
+    }
+    expect(() =>
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 0, colorSpace: 7 })),
+    ).toThrow(MediaError);
+    expect(() =>
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 2, colorSpace: 7 })),
+    ).toThrow(MediaError);
+    expect(
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 1, colorSpace: 7 })),
+    ).toMatchObject({
+      chromaSubsampling: 3,
+    });
+    expect(() =>
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 1, colorSpace: 7, colorReserved: 1 })),
+    ).toThrow(MediaError);
+    expect(
+      parseVp9UncompressedHeader(
+        vp9HeaderVariant({ profile: 1, subsamplingX: 1, subsamplingY: 0 }),
+      ),
+    ).toMatchObject({ chromaSubsampling: 2 });
+    expect(
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 1, subsamplingX: 0 })),
+    ).toMatchObject({ chromaSubsampling: 3 });
+    expect(() =>
+      parseVp9UncompressedHeader(vp9HeaderVariant({ profile: 1, chromaReserved: 1 })),
+    ).toThrow(MediaError);
+  });
+
+  it('enforces VP9 geometry, rate, and container/header identity without defaulting', () => {
+    expect(qualifyWebmVideoCodec({ codec: 'vp9' })).toEqual({ codec: 'vp09', source: 'unknown' });
+    expect(qualifyWebmVideoCodec({ codec: 'av1' })).toEqual({ codec: 'av01', source: 'unknown' });
+    expect(() =>
+      qualifyWebmVideoCodec({
+        codec: 'vp9',
+        firstKeyframe: vp9HeaderVariant({}),
+        width: 321,
+        height: 240,
+      }),
+    ).toThrow(MediaError);
+    expect(() =>
+      qualifyWebmVideoCodec({ codec: 'vp9', firstKeyframe: vp9HeaderVariant({ width: 0 }) }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      qualifyWebmVideoCodec({
+        codec: 'vp9',
+        firstKeyframe: vp9HeaderVariant({ width: 16_833, height: 1 }),
+      }),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      qualifyWebmVideoCodec({
+        codec: 'vp9',
+        firstKeyframe: vp9HeaderVariant({ width: 8000, height: 4000 }),
+        fps: 1000,
+        sourceSizeBytes: 1_000_000_000,
+        durationSec: 1,
+      }),
+    ).toThrow(CapabilityError);
+  });
+
+  it('validates AV1 record and codec-string level/tier/depth/layout constraints', () => {
+    for (const bytes of [
+      Uint8Array.of(0x81, 0x60, 0, 0),
+      Uint8Array.of(0x81, 0x18, 0x0c, 0),
+      Uint8Array.of(0x81, 0x28, 0x10, 0),
+      Uint8Array.of(0x81, 0x00, 0x80, 0),
+    ]) {
+      expect(() => parseAv1CodecPrivate(bytes)).toThrow(MediaError);
+    }
+    for (const codec of [
+      'av1',
+      'av01',
+      'av01.x.08M.08',
+      'av01.3.08M.08',
+      'av01.0.8M.08',
+      'av01.0.08M.x',
+      'av01.0.08M.09',
+      'av01.0.08M.08.2',
+      'av01.0.08M.08.0.222',
+      'av01.0.24M.08',
+      'av01.0.07H.08',
+      'av01.0.08M.12',
+      'av01.1.08M.08.1.000',
+    ]) {
+      expect(() => av1CodecPrivateFromCodecString(codec)).toThrow(MediaError);
+    }
+    expect([...av1CodecPrivateFromCodecString('AV01.1.08h.10.0.000')]).toEqual([
+      0x81, 0x28, 0xc0, 0,
+    ]);
+  });
+
+  it('rejects malformed AV1 OBU framing before parsing sequence truth', () => {
+    for (const bytes of [
+      Uint8Array.of(0x80),
+      Uint8Array.of(0x01),
+      Uint8Array.of(0x16),
+      Uint8Array.of(0x16, 0x07),
+      Uint8Array.of(0x0a, ...new Array<number>(9).fill(0x80)),
+      Uint8Array.of(0x12, 0),
+      Uint8Array.of(0x10),
+    ]) {
+      expect(() => parseAv1SequenceHeader(bytes)).toThrow(MediaError);
+    }
+    const reducedWithoutStill = av1ReducedSequenceHeader(0, 8).slice();
+    reducedWithoutStill[2] = (reducedWithoutStill[2] ?? 0) & 0xef;
+    expect(() => parseAv1SequenceHeader(reducedWithoutStill)).toThrow(MediaError);
+    const sequence = av1ReducedSequenceHeader(0, 8);
+    expect(parseAv1SequenceHeader(Uint8Array.of(0x12, 0, ...sequence))).toMatchObject({
+      codec: 'av01.0.05M.08',
+    });
+    expect(
+      parseAv1SequenceHeader(Uint8Array.of(0x0e, 0, sequence[1] ?? 0, ...sequence.subarray(2))),
+    ).toMatchObject({ codec: 'av01.0.05M.08' });
+  });
+
+  it('converts only exact VP9/AV1 private-data dialects and rejects contradictions', () => {
+    const vp9Private = vp9CodecPrivateFromCodecString('vp09.02.31.10');
+    expect(webmVideoCodecPrivate('V_VP9', 'vp9', undefined)).toBeUndefined();
+    expect(webmVideoCodecPrivate('V_VP9', 'vp9', vp9Private)).toEqual(vp9Private);
+    expect(() => webmVideoCodecPrivate('V_VP9', 'vp9', Uint8Array.of(1))).toThrow(MediaError);
+    expect(webmVideoCodecPrivate('V_VP9', 'vp09.02.31.10', undefined)).toEqual(vp9Private);
+    expect(
+      webmVideoCodecPrivate('V_VP9', 'vp09.02.31.10', Uint8Array.of(1, 0, 0, 0, 2, 31, 10 << 4, 0)),
+    ).toEqual(vp9Private);
+    expect(() =>
+      webmVideoCodecPrivate('V_VP9', 'vp09.02.31.10', Uint8Array.of(1, 0, 0, 0, 0, 31, 8 << 4, 0)),
+    ).toThrow(MediaError);
+    expect(() => webmVideoCodecPrivate('V_VP9', 'vp09.02.31.10', Uint8Array.of(1))).toThrow(
+      MediaError,
+    );
+    expect(() =>
+      webmVideoCodecPrivate(
+        'V_VP9',
+        'vp09.02.31.10',
+        vp9CodecPrivateFromCodecString('vp09.00.31.08'),
+      ),
+    ).toThrow(MediaError);
+
+    const av1Private = av1CodecPrivateFromCodecString('av01.2.08H.12');
+    expect(webmVideoCodecPrivate('V_AV1', 'av01.2.08H.12', undefined)).toEqual(av1Private);
+    expect(webmVideoCodecPrivate('V_AV1', 'av1', av1Private)).toEqual(av1Private);
+    expect(() => webmVideoCodecPrivate('V_AV1', 'av1', undefined)).toThrow(CapabilityError);
+    expect(() => webmVideoCodecPrivate('V_AV1', 'av1', Uint8Array.of(1))).toThrow(MediaError);
+    expect(() =>
+      webmVideoCodecPrivate(
+        'V_AV1',
+        'av01.0.08M.10',
+        av1CodecPrivateFromCodecString('av01.2.08H.12'),
+      ),
+    ).toThrow(MediaError);
   });
 });
 

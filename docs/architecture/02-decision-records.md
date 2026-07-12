@@ -3837,8 +3837,9 @@ The lazy PCM conversion plan and byte-backed PCM route use the same helper befor
 `ContainerDriver.transformPcm()`. For repeated URL-like sources it keeps a short-lived raw-source-byte cache
 keyed by the internal
 `SOURCE_CACHE_KEY` plus known source size. The cache stores only exact source bytes, never parsed layouts,
-sample buffers, outputs, benchmark results, or oracle outcomes; it is capped at **32** entries, **8 MiB**
-per entry, and **60 seconds**. Sources without an exact key and size, oversized sources, short reads,
+sample buffers, outputs, benchmark results, or oracle outcomes. ADR-261 retains the **8 MiB** per-entry and
+**60 second** eligibility but supersedes the former 32-entry-only bound with an **8 MiB total-byte LRU**.
+Sources without an exact key and size, oversized sources, short reads,
 aborts, failed parses, and declined target shapes are not cached as successes. The AIFF helper is
 dynamically imported from the PCM plan so non-PCM and non-AIFF converts do not grow the eager kernel.
 
@@ -6951,6 +6952,34 @@ close semantics are unchanged.
 every packet during table construction; buffering decoded frames; special-casing FLAC or fixture ids;
 weakening the byte oracle to packet counts/sizes; or changing the writer/CRC layout to hide a demux defect.
 
+### ADR-243 - Public raw `AudioData` encode reaches WAV through exact PCM bytes
+
+**Context (Session 12 public-surface truth audit).** PCM has no `EncodedAudioChunk` or WebCodecs encoder,
+but the documented public raw-frame `encode()` operation must accept one `ReadableStream<AudioData>` and
+author genuine PCM WAV output. The path must reuse the first-party WAV muxer, preserve the requested wire
+precision, and retain exact frame ownership and bounded backpressure rather than invent a coded-chunk seam.
+
+**Decision.** A lazy runner pulls exactly one audio frame at a time and validates one non-empty stream,
+stable sample rate/channel geometry, finite timestamps, and a contiguous sample clock rebased from the
+first frame to zero. Generic `pcm` becomes canonical `pcm-f32`; explicit legal `pcm-*` tokens retain their
+exact wire precision through the shared `AudioData`-to-PCM and PCM wire-format kernels. An optional
+`Muxer.writePcm` seam feeds those bounded bytes to the existing `WavMuxer`, so RIFF layout, endian
+normalization, and target validation remain centralized. No read is prefetched. Every frame handed off by
+the reader is closed exactly once in `finally`; abort or error cancels and unlocks the reader, leaving
+unpushed frame release to the source cancellation contract.
+
+**Consequences.** Video, compressed audio, empty input, discontinuous clocks, and changing geometry decline
+with typed errors before invalid output is authored. Five real WPT PCM formats (`u8`, `s16`, `s24`, `s32`,
+and `f32`) cover exact layout and the strongest representable sample oracle, while lifecycle tests pin
+close-once ownership, pending-read cancellation, errors, and no-prefetch backpressure. The warm
+two-discard/seven-sample public benchmark covers the same corpus. Audio has no B-frame or VFR reorder; its
+arbitrary frame boundaries remain legal and the cumulative sample clock is exact within integer-microsecond
+rounding.
+
+**Rejected:** a second RIFF writer; wrapping raw PCM bytes in a fake `EncodedAudioChunk`; buffering the
+complete frame stream before muxing; silently reshaping gaps, overlap, or geometry changes; or leaving
+consumed frames to garbage collection.
+
 ### ADR-244 - Matroska tag rewrites replace every prior tag tree without moving media
 
 **Context (Session 12 public-surface truth audit).** The target-native Matroska metadata writer appended one
@@ -6990,3 +7019,1791 @@ remains 1. Full design and proof are in `docs/notes/session12-matroska-tag-repla
 map; shifting Clusters and repairing only the parser-visible timeline; rebuilding timed packets; returning
 input bytes unchanged; leaving stale Seek/CRC metadata; scanning through an unknown-size Cluster for a
 fixture-shaped byte pattern; weakening the oracle to last-value-wins readback; or special-casing assets.
+
+### ADR-245 - Packet drains preflight known tracks and tear down sibling producers
+
+**Context (Session 12 lifecycle closure).** Packet-copy tracks already carry complete `TrackInfo`, yet the
+shared mux drain waited for and pulled the first packet before validating the codec/container pairing. A
+known illegal track could therefore hang before its inevitable rejection. Config or write failures also
+left locked producers live, and one failing track did not reliably cancel concurrent siblings.
+
+**Decision.** Validate packet-copy tracks against the muxer before acquiring or pulling their stream;
+encoder drains remain lazy until their first chunk publishes decoder configuration. Each drain owns its
+reader through completion and cancels it before releasing on abort/config/write failure. Concurrent drains
+share a child abort domain linked to, but never mutating, the caller signal. The first failure aborts all
+siblings, waits for their teardown, preserves that primary typed error, and removes the parent listener.
+
+**Consequences.** Invalid known tracks are pulled zero times, sibling producers cancel exactly once, and
+ordinary packet streams remain backpressured one read/write at a time. Packet bytes are not closable and
+are never retimed, so B-frame DTS/PTS, VFR cadence, and encoded-byte ownership are unchanged. Focused
+fail-first, public mux, abort, and listener lifecycle tests plus the benchmark in
+`docs/notes/session12-packet-drain-lifecycle.md` are the validation record.
+
+**Rejected:** probing a known-illegal stream for configuration; letting `Promise.all` abandon live
+siblings; aborting the caller-owned controller; swallowing the first typed failure behind teardown errors;
+or releasing a reader before its producer has been cancelled.
+
+### ADR-246 - Repeated probe reuses bounded exact-source metadata intervals
+
+**Context (Session 13 per-feature speed leadership).** Public probe already reused a bounded start-at-zero
+prefix for the exact same normalized `Source`, but MP4/MOV tail `moov` boxes and other disjoint metadata
+ranges were fetched again on every warm sample. Product instrumentation on real AVC, HEVC, and VFR inputs
+showed repeated structural I/O—not decode, frame work, or packet timing—as the common cost. Expanding the
+inline helper would also consume the remaining eager-kernel budget margin.
+
+**Decision.** Repeated public probe and known-container probe lazily import a source-layer interval cache
+only for seekable inputs and keep that import inside operation cleanup. One `Source` object is explicitly an
+immutable byte snapshot; a changed URL/OPFS resource requires a new Source. The cache is a `WeakMap` keyed by
+that exact object and retains only successfully read byte intervals: at most one MiB total and eight
+intervals for 60 seconds, with lazy expiry and deterministic least-recently-used eviction. Retention copies
+the exact requested bytes into a compact owned buffer, so a small HTTP-200 fallback view cannot pin a whole
+file. Every hit returns an isolated copy, so consumer mutation or detachment cannot poison cached truth.
+When a larger request begins inside an owned interval, only the missing suffix is fetched; the cache joins
+an exact owned response and replaces the contained entry. Short suffixes preserve their actual length and
+can prove an unknown source's end. Distinct source snapshots never share bytes, even if their URL identity string
+matches. Range-less streams bypass the cache. Parsed movies, tracks, metadata answers, payload outputs,
+scenario facts, filenames, hashes, and oracle results are never cached.
+
+**Consequences.** Warm header-, tail-, and multi-island metadata probes avoid repeated transport latency
+without changing parsers or public output. A public 4 KiB sniff followed by 8 KiB and 64 KiB metadata
+windows transfers 64 KiB total rather than 76 KiB of overlapping prefixes. Memory is deterministically bounded and weakly owned; lazy
+expiry creates no timer retaining a source. B-frame/VFR/seek clocks, malformed-input validation,
+cancellation, backpressure, and `VideoFrame`/`AudioData` ownership are unchanged because only encoded source
+bytes cross this seam. The implementation stays outside the eager closure and is loaded only by probe.
+
+**Rejected:** a fixture-shaped two-range shortcut; URL-keyed cross-snapshot reuse; parsed-result caching;
+borrowed mutable views; unbounded range retention; cancellation-unsafe in-flight sharing; prefetching
+guessed offsets; weakening metadata completeness; or growing the
+eager kernel for a probe-only optimization.
+
+### ADR-247 - MP4 probe retains scalar timing and defers demux-only structure
+
+**Context (Session 13 per-feature speed leadership).** After ADR-246 removed repeated transport I/O, warm
+AVC, HEVC, and VFR probe still paid for work that only an immediately following demux could consume. A
+cache-keyed MP4 below one MiB ran the full sample-table parser and walked every top-level box to validate
+`mdat`, then retained that parsed movie for 250 ms. Metadata mode also allocated one `{count,delta}` object
+for every `stts` run even though probe needs only sample count and total media ticks. On the real HEVC
+tail-`moov` input this speculative work caused nine range calls.
+
+**Decision.** Metadata probe always uses the metadata parser. While walking top-level boxes it may capture
+the exact already-read `moov` payload into an owned buffer for the existing short keyed handoff; demux
+reparses that raw payload in full mode and alone validates `mdat` ownership. The bounded head scan returns
+its proven next top-level offset and brand when a declared box jumps beyond the prefix, then reads one
+bounded continuation window there; an ordinary complete tail `moov` therefore needs no separate 16-byte
+header round trip, while an oversized or truncated box retains the exact-read/failure fallback. Unsafe
+64-bit offsets reject typed before random access. Metadata `stts` parsing accumulates only scalar sample
+count and media ticks. Those ticks remain on the internal track for hybrid-fragment fps and AAC
+edit/gapless calculations; packet-info and full modes retain their complete run arrays. The public engine
+also retains the resolved ADR-246 wrapper function after its first lazy load, avoiding a warm dynamic-import
+await without moving that module into the eager static closure. Remote URL/element random access uses a
+128 KiB initial metadata window so a medium faststart `moov` crosses one transport round trip; local
+byte/blob/OPFS shapes retain 32 KiB. The 128 KiB cap is a latency/resource policy: it matched 256 KiB on the
+measured faststart path while halving worst-case tail overfetch.
+
+**Consequences.** Ordinary tail-`moov` AVC VFR, HEVC, and HEVC Main10 inputs use two product reads (bounded
+head plus bounded continuation) rather than three, while an immediate demux still performs every
+sample-table, fragment, and payload-ownership validation before exposing packets. Product n=101 medians for
+those tail shapes fall from 0.0169–0.0259 ms to 0.0096–0.0117 ms; skipping the already-resolved warm module
+await removes another measured 1.569 microseconds per isolated call. Browser evidence remains authoritative.
+Probe and demux track facts remain structurally equal across real AVC, HEVC 10-bit/HDR, VFR, rotated,
+B-frame, fragmented, edited AAC, and malformed inputs. No decoded frame is created, so close-exactly-once
+ownership is unchanged; cancellation and source backpressure remain at the existing random-access seam.
+Memory is one short-lived exact `moov` copy rather than full sample tables plus range maps.
+
+For the 20.35 MiB faststart H.264 shape selected by the public large-probe rotation, the remote policy
+reduces two requests/117,681 transferred bytes to one request/131,072 bytes and a 3 ms-latency product
+median from 7.001 ms to 3.711 ms. A real tail VFR shape remains two reads and stays below 160 KiB total;
+there is no whole-file prefetch or source-size/name recognition.
+
+**Rejected:** retaining the metadata-only `Movie` as a demux result; trusting probe-time `mdat` guesses;
+approximating VFR from the first `stts` run; dropping edit/fragment media ticks; rescanning from offset zero;
+recognizing a fixture or box layout; a 256 KiB remote window with equal measured latency and twice the tail
+overfetch; applying remote overfetch to zero-latency local sources; or weakening probe/demux structural
+equality.
+
+### ADR-248 - WAV frame egress fuses packed PCM into transferred interleaved Float32
+
+**Context (Session 13 per-feature speed leadership).** Public signed-24 WAV decode converted every bounded
+wire chunk into planar Float64, interleaved and narrowed it into a second Float32 allocation, then asked
+`AudioData` to copy that buffer again. The retained 7.9 MiB stereo fixture therefore created roughly 20
+MiB of avoidable Float64 churn and one range request per 4,096-frame chunk. Product profiling showed the
+sample conversion, not container parsing, as the dominant cost.
+
+**Decision.** Containers may expose an optional typed stream of exact-owned, frame-major interleaved
+Float32 chunks for browser-frame egress. WAV implements it by decoding every supported little-endian PCM
+wire format directly; signed 24-bit uses one sign-extending packed-byte loop. The engine transfers each
+owned backing buffer into `AudioData`. The canonical planar Float64 decoder remains the sole DSP and
+integer re-encode path. Range-backed sequential WAV drains keep at most 4,096 frames per output but reduce
+high-channel chunks so no wire request exceeds the bounded one-MiB window shared by canonical and fused
+streams. Their reader holds a revocable source/range capability and clears both references plus its final
+byte window at EOF, error, or cancellation; the full-buffer fallback uses the
+same terminal release contract. Transform-only DSP, rewrite, and alternate-container dependencies sit
+behind one lazy boundary and are not instantiated by decode. Abort is checked around each range read;
+constructor, enqueue, abort, and consumer-cancel failures cancel and unlock the upstream reader. A late
+range reply after cancellation is discarded rather than retained or emitted. A successfully enqueued
+frame is consumer-owned, and enqueue rejection closes it exactly once.
+
+**Consequences.** Every Float32 bit on the real signed-24 WPT fixture equals canonical Float64-to-Float32
+narrowing, including negative extrema and both endian interpretations in the pure conversion helper. A
+warm two-warmup/seven-sample full drain of the retained 1,315,328-frame fixture measures 3.012 ms median
+for the fused path versus 9.433 ms for canonical planar-plus-interleave (3.13×), with identical checksum
+`2064061439`, nine bounded range calls, and exactly 7,904,256 source bytes on both paths. Exhaustive
+little- and big-endian signed-24 validation covers all 33,554,432 values. The emitted static WAV decode
+closure falls from about 58.2 kB to 29,788 bytes after lazy transform isolation. Empty/truncated payload,
+mono/multichannel order, timestamps, streaming backpressure, cancellation, and frame lifetime remain
+explicit. Retaining a completed low-level stream over an exact-owned real `03.wav` copy now retains `0`
+post-GC `ArrayBuffer` bytes under the benchmark's 2 MiB bound. Raw PCM has no B-frame/VFR reorder or
+seek-keyframe concern.
+
+**Rejected:** transferring a borrowed/subarray backing buffer; making Float32 canonical for DSP; pooling
+detached buffers across independent frame lifetimes; using WASM/SIMD for a memory-bound byte loop; growing
+the output chunk beyond the established backpressure bound; swallowing upstream cancellation errors on
+ordinary consumer cancellation; or specializing by fixture length/name.
+
+### ADR-249 - Deferred frame streams release routed producers at every terminal edge
+
+**Context (Session 13 memory/lifecycle pass).** Public decode returns eager outer streams whose actual
+container/codec stream is routed asynchronously on first pull. The outer wrapper retained its producer
+closure and inner reader after normal EOF, and cancellation while routing was pending could resolve before
+the eventual inner stream was cancelled. A completed WAV decode could therefore keep the source backing
+store reachable until the outer result itself was collected, inflating post-operation memory despite every
+`AudioData` being closed.
+
+**Decision.** The deferred wrapper clears its producer closure as soon as routing starts, releases the
+inner reader lock on EOF, and cancels then releases it on read/enqueue failure or downstream cancellation.
+Cancellation state and reason survive an in-flight async route; if a stream resolves afterward, a cold
+cleanup helper takes its reader, gives an already-queued closable value at most one task to settle, closes
+that value exactly once, then cancels and unlocks the stream before anything reaches the outer consumer.
+The ordinary pull/EOF path stays inline and allocation-free. Successfully enqueued outer frames remain
+consumer-owned. An outer enqueue rejection still closes that value exactly once before the inner producer
+is cancelled.
+
+**Consequences.** A real signed-24 WAV lifecycle probe drops retained external backing from 8,238,493 to
+334,237 bytes after the input and public stream references are released. Fail-first tests prove normal EOF
+unlocks the inner stream and cancellation-before-route-resolution cancels a late stream exactly once.
+B-frame/VFR order, timestamps, seek, output bytes/samples, pull backpressure, and frame ownership do not
+change because the wrapper alters only terminal reachability. Focused verification covers EOF/error lock
+release, cancellation during routing, and a queued late frame; package budgets remain green at 49.75 kB
+eager and 240.77 kB typical first-operation JS. The full s24 rival memory row remains open:
+the terminal-source-release changes have not yet been measured in a fresh same-export all-engine rotation.
+
+**Rejected:** relying on GC to break a live reader/source chain; releasing a reader before cancelling its
+producer on failure; ignoring a stream that resolves after cancellation; closing successfully enqueued
+frames in the wrapper; moving the whole deferred lifecycle into a lazy helper (changed late-cancel ordering
+and failed the close-exactly-once public lifecycle test); larger PCM frame chunks (the public 4,096-frame
+oracle rejects them); or reusable borrowed PCM scratch (slower and no peak-memory improvement).
+
+### ADR-250 - Native FLAC packet-info carries validated headers and emits rows in one pass
+
+**Context (Session 13 per-feature speed leadership).** The fresh same-export rotation selected an ordinary
+no-SEEKTABLE FLAC with eight frames. Aibrush remained correct but measured 2.810 ms median (MAD 0.290) against
+remotion-webcodecs at 1.920 ms (MAD 0.030). The ADR-124 scanner used native `indexOf` plus a strict frame-header
+validator, but it validated every candidate next header, discarded that result, reparsed the same header at
+the start of the following iteration, built a complete `FastFlacFrameSpan[]`, then mapped it into a second
+complete `PacketInfoMetadata[]`. A full-stream source also copied its only chunk into a same-sized allocation.
+SEEKTABLE is not a content oracle, and the selected file intentionally has none, so faster work still has to
+derive every exact boundary and duration from the bitstream.
+
+**Decision.** The validated header record now carries its byte offset and becomes the next iteration's current
+header, so sync/reserved-code/UTF-8-number/explicit-field/CRC-8 validation runs once per accepted frame. The
+payload-free packet-info path emits final rows directly while scanning; live demux and packet-copy retain the
+full frame-span form they need. PTS and duration preserve the prior sequential sample arithmetic exactly,
+including variable-block streams and a final nominal block clipped to STREAMINFO `totalSamples`. Metadata is
+still copied into an exact-owned track description, so returning the table never pins the whole media buffer.
+For a stream-only source, a one-chunk full drain returns the immutable source chunk directly; multi-chunk
+sources still concatenate into one exact allocation. Both paths release their reader lock, and a read failure
+cancels the producer before unlock. Public abort checks remain before and after the synchronous scan; no frame,
+decoder object, B-frame reorder queue, or backpressure contract is introduced.
+
+**Consequences.** The fused and composed scanners are structurally identical on the real FLAC corpus against
+the independent decoder-backed frame-span oracle: byte offset/size, PTS/DTS, duration, keyframe status, track
+layout, variable blocks, ID3-prefixed metadata, and packet count stay exact. On the 959,681-byte real
+`flac-blocksize-16.flac` shape (19,294 packets), fresh alternating `n=21` product samples measure 2.414 ms
+median fused versus 2.560 ms composed (1.061x, with repeated runs spanning roughly 6.1-6.4%); the public
+one-chunk source measures 2.453 ms and avoids one 959,681-byte allocation/copy. The eight-frame browser row is
+transport/operation dominated: this product result does **not** close or excuse its 0.890 ms baseline gap.
+Strict fastest status remains open until a fresh same-export, rotation-matched browser rerun shows a durable
+lead and qualified memory is no worse than the leanest passing rival.
+
+**Rejected:** treating SEEKTABLE entries as a complete frame table; recognizing the eight-frame asset, its
+name, size, digest, or rotation; caching parsed packet tables or oracle results; returning borrowed metadata
+that retains the full file; skipping CRC-8 or reserved-field validation; changing sample-time rounding;
+decoding audio to discover frame boundaries; and claiming browser victory from a pure-parser microbenchmark or
+one unusually fast timing sample.
+
+### ADR-251 - Cold MP4 demux fuses metadata discovery with top-level storage validation
+
+**Context (Session 13 per-feature speed leadership).** The fresh same-export
+`performance/size-ladder-iterate-packets-large` row passed exact truth for 9,982 packets but measured
+71.285 ms median (MAD 1.380) against `mp4box` at 45.550 ms (MAD 1.895), a durable 25.735 ms loss. The
+payload-free `packetTable()` loop was already single-pass: product profiling on an 11,050-packet MP4
+measured 0.206 ms to parse full metadata and 0.298 ms to expand every packet row. The avoidable cost was
+structural I/O. Cold demux first walked top-level boxes until `moov`, then restarted at byte zero to prove
+that every indexed sample belonged to a declared `mdat`. A representative faststart source issued seven
+range calls while transferring only 138,842 bytes. No packet payload, codec, B-frame reorder, or row-object
+work explained the browser gap.
+
+**Decision.** Cold MP4/MOV demux performs one monotonic top-level layout scan that returns both the fully
+parsed first `moov` and all strictly validated `mdat` payload ranges. URL and element sources whose size is
+larger than twice the window use a bounded 256 KiB look-ahead because full `stsz`/`stts`/`ctts`/`stsc`/offset
+tables are materially larger than scalar probe metadata. A miss reads the exact required box plus at most
+one further window, so tail-`moov` and intervening large boxes are skipped by their proven sizes without
+materializing `mdat`. Small remote sources, blobs, OPFS/range sources, and byte inputs do not pay remote
+payload read-ahead; byte inputs retain their existing zero-copy complete view. The shared top-level header
+validator preserves nonzero unknown boxes, multiple `mdat` ranges, size-zero-to-EOF boxes, 64-bit headers,
+safe-integer bounds, short-read errors, and destroyed zero-type rejection. Fragmented movies still read
+their real fragment timeline and reuse a retained complete read. An immediate probe handoff remains
+deliberately separate: it reparses only its owned raw `moov` and independently runs the full top-level
+storage scan before exposing packets.
+
+**Consequences.** The real faststart B-frame fixture now uses one range read and the real tail-`moov` VFR
+fixture uses two; both match byte-input demux track objects and every packet size, PTS, DTS, duration, and
+keyframe flag exactly. The faststart scan never reads the whole 715,963-byte source, and the tail scan reads
+277,143 of 4,777,511 bytes. With three milliseconds of transport latency injected per request, fresh
+warmup-three/median-eleven product samples measure 3.941 ms faststart and 7.872 ms tail, with stable checksums
+and read counts. The complete 694-test MP4 surface remains green, including B-frames, VFR, edit lists,
+fragmentation, CENC, corrupt top-level headers, outside-`mdat` samples, short reads, abort, cancellation, and
+one-packet stream backpressure. No `VideoFrame`, `AudioData`, or decoder is created. Browser leaderboard
+closure still requires a fresh same-export qualified rerun; product evidence proves the general mechanism,
+not a fixture-specific win claim.
+
+**Rejected:** bursting packet streams beyond `desiredSize`; constructing packet rows lazily in a way that
+changes the synchronous table contract; micro-tuning the already-sub-millisecond row objects; trusting
+probe-time `mdat` facts; scanning only until `moov`; fetching the entire source like a whole-file append;
+applying the remote window to local or small sources; recognizing a filename, digest, packet count, box
+offset, or rotation; weakening sample ownership or corruption checks; and claiming the public loss closed
+before fresh browser evidence.
+
+### ADR-253 - Same-layout WAV re-authoring streams a fresh header over validated PCM bytes
+
+**Context (Session 13 per-feature speed leadership).** The fresh same-export
+`audio-dsp/meta_idempotent_resample_same_rate` row remained correct but measured 4.380 ms median (MAD
+0.165) against mediabunny at 2.970 ms (MAD 0.430) for the baked five-second stereo s16 WAV. ADR-138 already
+prevented fake sample resampling: it parsed RIFF/WAVE, checked the explicit s16/48 kHz/stereo identity, and
+wrote a fresh canonical WAV. Two avoidable costs remained. `WavDriver.transformPcm()` instantiated the broad
+transform dependency graph in parallel with source materialization before discovering that no transform was
+needed, and both driver and direct Blob paths allocated a complete contiguous output before the Blob/File or
+stream sink copied/consumed it again.
+
+**Decision.** The existing strict RIFF/fmt/data parser now exposes a WAV-specific copy plan: one freshly
+owned canonical 44-byte header plus the validated PCM payload view. Requested sample format, little-endian
+wire order, channel count, and sample rate must still match exactly; noncanonical chunk order/padding is
+accepted only after the ordinary chunk walk, and bounded declared-data truncation preserves the existing
+canonicalization behavior. The buffer-returning helper still allocates a fresh contiguous WAV and never
+returns the input. `WavDriver.transformPcm()` tries the lightweight plan after full source read and before it
+imports transform-only DSP/AIFF/CAF dependencies. Its output stream uses high-water mark zero, emits the new
+header on one pull and payload on the next, then clears header, payload, controller, and abort-listener
+references at EOF, cancellation, abort, or enqueue/error. Source bytes are immutable by contract. Direct
+Blob/File output passes the two WAV parts to their snapshotting constructors; SharedArrayBuffer-backed payloads
+are copied before those constructors. Other sink kinds consume the same two-part pull stream. No shared sink
+or generic engine shortcut changes.
+
+**Consequences.** Canonical and JUNK-bearing WAVs materialize byte-for-byte identically to the prior
+`rewriteWavPcmCopy()` output, and decoded PCM remains exact. Unhinted inputs now route on bounded heads before
+one full copy-plan read rather than being fully materialized before and after routing. Tests cover mismatched rate/channel/format,
+bounded truncation, noncanonical RIFF chunks, two-pull header/payload order, cancellation between those pulls,
+and Blob stability after the caller mutates its original bytes. On a real-corpus-derived 960,044-byte shape
+matching the public row's 240,000 stereo sample frames, fresh alternating `n=101` product samples measure
+0.015 ms median for multipart Blob construction versus 0.041 ms for contiguous-rewrite-then-Blob (2.71x;
+independent runs span 2.08-3.14x).
+The JavaScript output allocation falls from 960,044 bytes to 44 bytes before the Blob's required snapshot;
+the warm public convert route measures 0.023 ms hinted and 0.029 ms unhinted locally. Raw PCM has no B-frame/VFR reorder or closable frame
+ownership. The browser row remains open until a final-bundle same-export rerun proves a durable strict lead
+and qualified peak memory no worse than the leanest passing rival.
+
+**Rejected:** returning the input WAV/Blob/container; treating equal target metadata as proof without parsing
+RIFF/fmt/data; weakening format/channel/rate or truncation checks; preserving source JUNK chunks in the fresh
+canonical output; eagerly loading the general transform graph; borrowing mutable shared memory; buffering the
+payload again for a stream sink; adding a generic sink fast path; caching an output or recognizing the baked
+fixture; and claiming public closure from the product allocation benchmark alone.
+
+### ADR-252 - Cadence-aware implicit AV1 rate control and qualified VPx alpha preservation
+
+**Context (Session 13 transcode quality and per-feature speed pass).** Two passing-shape transcodes failed
+strict minimum-frame SSIM only during the native rate controller's first pictures: packet counts, PTS,
+duration, cadence, keyframe placement, and full-stream mean quality were otherwise correct. Raising the
+ordinary H.264 bitrate did not improve those startup pictures. Separately, ordinary-cadence VP9-to-AV1 was
+slower than a passing rival, and VP9-with-alpha conversion took the general merged-RGBA dual-encode route
+because routing inspected a bare `vp9` track token instead of its proved `vp09.*` decoder configuration.
+The latter re-encoded both color and an independently coded alpha stream even when no alpha-affecting filter
+or explicit quality control was requested.
+
+**Decision.** Implicit AV1 keeps its established `0.6` codec-efficiency budget at ordinary cadence. Above
+30.5 fps, only its implicit bitrate budget scales by `sqrt(frameRate / 30)`, capped at the H.264-equivalent
+budget; this grows quality headroom sublinearly rather than doubling bandwidth at 60 fps. Ordinary-cadence
+implicit AV1 selects WebCodecs `latencyMode:'realtime'`, while high-cadence AV1 and every explicit bitrate,
+bitrate mode, CRF, or two-pass request retain `quality`. A 30.5 fps boundary separates the two policies so
+the rational-clock estimate of nominal 30 fps (observed as `30.0000003`) cannot accidentally enter the
+high-cadence path.
+
+The WebCodecs video stage may seed native rate control with disposable clones of the first frame: three for
+implicit H.264 and eight for implicit AV1 above 30.5 fps. It assigns exact, unique PTS immediately before the
+real first PTS, records those PTS before encode, and suppresses only chunks carrying that set. The real first
+frame is still forced key, so no retained frame references a discarded picture. If safe earlier PTS cannot
+be represented, warmup is skipped. Metadata from a suppressed callback is still forwarded. Every disposable
+clone and every consumed source frame is closed exactly once, including encode throw and cancellation; the
+pending timestamp set is cleared on teardown. Encoder queue backpressure remains bounded at eight.
+
+VPx alpha routing now prefers the proved qualified `TrackInfo.config.codec` over a bare container token. For
+unfiltered same-family, profile-compatible VP8/VP9 conversion with wholly implicit quality controls, color
+is re-encoded while the independently coded alpha access unit is copied byte-for-byte with its original
+timestamp. VP9 level changes are compatible, but a profile change is not. Cross-codec work,
+any alpha-affecting filter, explicit bitrate/bitrate mode/CRF, and two-pass work retain the general dual-encode
+path. The optimization is therefore a coded-side-data preservation rule, not video passthrough.
+
+**Consequences.** The strict H.264 startup proof improved its independent minimum-frame SSIM from `0.971876`
+to `0.978309` while retaining exactly 675 frames, 22.5 seconds, and 30 fps. The high-cadence AV1 proof retains
+exactly 626 frames, 10.433333 seconds, and 60 fps while independently measuring minimum SSIM `0.984279`.
+Two non-harness real-media proofs cover the policy boundary: `bear-1280x720.mp4` at ordinary cadence retains
+82 frames and independently measures mean/minimum SSIM `0.987050`/`0.983496`; the 377-frame high-cadence VFR
+`obs-remux-variable-aac.mp4` retains every packet and independently measures SSIM `1.0` on its static visual
+content. On the ordinary-cadence real input, realtime latency reduces fresh warm median wall from 590.2 ms
+to 385.7 ms without a material quality change. The exact public VP9-to-AV1 shape measures 1645.1 ms median
+over five fresh samples with minimum SSIM `0.996395`, versus the prior 2059.6 ms local quality-mode median
+and a 1913.135 ms passing rival result.
+
+The exact alpha proof retains 150 alpha packets and 6,069 bytes with identical timestamps and SHA-256
+`1c594ca7ce81be399b6a4bc7359dd8c62701efb6a933a93ab814c6f65483fb11`; color bytes change from 738,941 to
+1,886,028 and the color digest changes, proving real color re-encode. Independent decoded color quality is
+mean/minimum SSIM `0.998909`/`0.996343`, and five fresh samples measure 266.7 ms median instead of the public
+1197.965 ms baseline. A second non-harness alpha fixture retains 82 packets and 1,496 alpha bytes with exact
+SHA-256 `a2d47bf68cb3593440880af7ba38f373d301f31374f5cd7210d585abefd15391`, while its color digest changes; five
+fresh samples measure 157.1 ms median. B-frame/VFR decode order, source and output PTS, packet counts, seek,
+mux timing, and streaming pull order are unchanged. A fresh same-export, rotation-matched all-engine sweep is
+still required before declaring the public rows closed.
+
+**Rejected:** fixture, filename, digest, dimensions, duration, rotation, or packet-count recognition; copying
+color payloads; weakening SSIM or structural truth; a global AV1 efficiency increase to `0.8` (slowed the
+ordinary VP9-to-AV1 row); bitrate-only H.264 repair (did not change the weak startup pictures); queue
+high-water mark 16 (fresh median regressed from about 2059.6 to 2149.6 ms); realtime mode for explicit-control
+or high-cadence work; copying alpha across codecs, filters, or explicit rate-control semantics; retaining
+warmup output; or claiming browser leaderboard closure from local product evidence.
+
+### ADR-254 - MP4/MOV faststart patches one structurally validated `moov`
+
+**Context (Session 13 per-feature speed leadership).** In the qualified public partial export
+`chromium-2026-07-11T23-02-02-666Z`, `mux/h264_aac_to_mov` passed for both engines but aibrush-media measured
+21.160 ms warm median (MAD 1.260) against mediabunny at 13.920 ms (MAD 0.825), with five samples and 1,118
+packets. The shared MP4 writer generated a complete zero-offset `moov` to learn its stable faststart length,
+discarded it, then generated the complete box again with final `stco` values. Alternating warm `n=101`
+product measurements on real VFR/B-frame H.264+AAC media reproduced the shape: faststart took 1.383375 ms
+versus 0.888334 ms without faststart, a 0.495041 ms penalty and 1.557x ratio.
+
+**Decision.** Faststart serializes the writer-owned zero-offset `moov` once, derives `mdat` start from that
+exact byte length, then patches only its fixed-width 32-bit `stco` entries. The internal patcher performs a
+structural `moov/trak/mdia/minf/stbl/stco` walk, validates every generated box boundary, requires exactly one
+required child at every level, and checks track order, entry counts, table lengths, 32-bit ranges, and the
+total number of patched offsets. Any impossible writer-internal mismatch raises a typed
+`MediaError('mux-error', ...)`; the implementation does not search for sentinel byte sequences. Non-faststart
+layout is unchanged. The rule is general across supported MP4/MOV codecs, tracks, and chunk counts and has no
+input-name, digest, geometry, duration, rotation, or packet-count condition.
+
+**Consequences.** Four retained pre-change outputs remain byte-identical: VFR/B-frame H.264+AAC to MOV
+(`78444151c8fa8563cc17f3045f0a6b94977eabfa110015ec7f884ef0b1d42243`), rotated MP4
+(`fe5e8b5f9d17b6fe2bb44ccb2210e75c04c1d5a29abca92df9faa0def939bf90`), a second MP4-to-MOV corpus case
+(`957f4009ab8cd5bae5bc36fa30f1d49a968afbe98b21adaa68789a03aebe783b`), and an explicit multi-chunk video,
+empty-audio, edit-list, rotation, signed-`ctts` construction
+(`d7b012e0c8867939d447dce74122ed5e4e9768a17bc9c62e0eaf56609b979228`). Real outputs reparse with exact
+track media type, codec, rotation, packet count, size, duration, keyframe truth, and composition-offset truth
+within one clock-rounding microsecond. Decode order, VFR/B-frame PTS/DTS, edit semantics, sample bytes,
+stream cancellation, backpressure, memory ownership, and frame close-exactly-once behavior are unchanged;
+the writer creates no `VideoFrame`, `AudioData`, or decoder. After the change, the same alternating benchmark
+measures faststart at 0.894417 ms versus non-faststart at 0.903084 ms with checksum 964,116,104, eliminating
+the double-serialization penalty. Browser closure still requires a fresh same-export, rotation-on, warm
+`n>=5` all-engine sweep and qualified peak-memory comparison.
+
+**Rejected:** an array-only MOV route was implemented and fully reverted after an early roughly 0.5% result
+proved unstable and a final warmed run regressed (1.941 ms specialized versus 1.547 ms generic). This is
+separate from ADR-256's measured large multitrack faststart-MP4 array route. Also rejected were fixture/layout
+recognition, asset caching, byte-pattern offset searches, packet copying or passthrough, output padding,
+timing changes, weakened output oracles, and claiming the public row closed from a Bun writer benchmark.
+
+### ADR-255 - Ogg audio packet copy reaches WebM/Matroska without host chunks
+
+**Context (Session 13 per-feature speed leadership).** Three qualified audio fixed-cost rows were open in
+`chromium-2026-07-11T23-02-02-666Z`. `transcode/aac_to_opus_webm` passed but measured 24.840 ms warm median
+(MAD 1.500) against mediabunny at 21.185 ms (MAD 0.880). The ADTS demux performed one exact whole-stream
+header walk to build the track, discarded those frame rows, then repeated the walk when the decoder opened
+`packets()`. `demux/size_micro_micro_audio_short` passed 1,296 exact MP4 audio packet rows at 22.765 ms
+(MAD 0.695) against remotion-media-parser at 16.675 ms (MAD 0.460), but product instrumentation across five
+independent real MP4 files put complete byte-backed parse plus packet-info construction at only
+0.014-0.164 ms for 27-671 packets. Parser arithmetic therefore could not honestly explain that browser gap.
+Finally, `remux/opus_ogg_to_mkv` passed reference re-import at 3.795 ms (MAD 0.075) against mediabunny at
+2.965 ms (MAD 0.645). Ogg already de-laced the complete source into validated byte spans, but generic remux
+discarded that representation, constructed one host `EncodedAudioChunk` per packet, drained promise-backed
+packets, and copied every host chunk back into JavaScript before the WebM writer buffered it.
+
+**Decision.** `OggDriver` declares `streamCopyTargets:['webm','mkv']`, and the lazy default proxy declares
+the same capability before loading the driver. For an Ogg audio source targeting WebM/Matroska, the driver
+performs its ordinary complete page/lacing/header/timing validation once, projects immutable packet byte
+views and exact timing directly into `WebmMuxer.addChunkStruct()`, and lets that existing writer author the
+fresh target container. It does not construct a host chunk, decoder, encoder, or alternate EBML serializer.
+Optional packet-copy trim uses the same overlap selection and first-kept-PTS rebase as Ogg trim; invalid or
+empty ranges remain typed. Abort is checked before source acquisition, during packet projection, before
+authoring, and before output exposure. The lazy proxy's `streamCopyTargets` is data, not a load side effect,
+so the engine can choose the route without importing or probing a second driver first.
+
+ADTS demux retains its operation-owned immutable `AdtsLayout.frames` and passes those rows to its packet
+stream instead of performing the exact header walk again. CRC headers, multiple raw blocks, rate changes,
+ID3/junk resynchronization, truncated final frames, raw-payload slicing, PTS/duration, full-frame `sizeBytes`,
+backpressure, and abort behavior are unchanged. The MP4 packet-info implementation is deliberately unchanged:
+its measured sub-millisecond product cost rules it out as the dominant browser loss. A direct replacement for
+the shared `unwrapPackets()` TransformStream is integrated at that central seam rather than inside one audio
+route. Its high-water-mark-zero pull source performs one upstream read per downstream demand and forwards the
+exact chunk object. EOF releases the packet reader once; downstream cancellation first propagates the reason
+upstream, then releases; a read failure remains the primary error even if teardown also fails; and an upstream
+cancellation failure remains visible while its lock is still released. Encoded chunks are not closable frames,
+so the projection neither closes nor duplicates ownership.
+
+**Consequences.** Real Opus and Vorbis Ogg inputs re-author as Matroska with exact coded packet payloads,
+count, codec-private bytes, normative Opus pre-skip/CodecDelay timing, and fresh non-passthrough output. The
+direct and former host-chunk-shaped product paths produce byte-identical outputs with SHA-256
+`80753e05feda136529bc93191a52d09f1cb6cb6ce0020dce9920427bfd67c469` (Opus) and
+`1f98a3085f7de0584a46d6266795e7a02734c1fb3efb796b60db407e8d5a3f3d` (Vorbis). Alternating warm `n=51`
+samples across repeated runs measure the direct route at 0.034-0.059 ms versus 0.048-0.077 ms for the small
+Opus file (1.32-1.45x), and 0.132-0.157 ms versus 0.271-0.324 ms for the larger Vorbis file (1.89-2.12x).
+The control counted 2,068,512 bytes copied into/out of host-chunk shims across the measured real inputs; the
+direct route performs neither copy. Batched real-ADTS parser samples measure retained layout at 0.000322 ms
+per operation versus 0.000682 ms for the repeated walk (2.11x). The checked-in alternating `n=51` packet
+control measures direct pull at 0.350 ms versus the former TransformStream at 0.803 ms over 1,296 packets
+(2.30x), with equal count and timestamp/size checksum. Focused tests prove public default-engine Ogg-to-MKV
+remux never touches host chunk constructors, reparses exact packet payloads and codec timing, preserves typed
+abort before reading, and keeps all existing Ogg/ADTS truth green. Packet-projection tests pin exact identity,
+demand, EOF, cancel, error, and lock-release behavior. Browser leaderboard closure for all three motivating
+rows still requires a final-bundle, same-export, rotation-matched warm `n>=5` rerun and qualified positive
+memory; product microbenchmarks do not declare public victory.
+
+**Rejected:** recognizing any Ogg/AAC/MP4 fixture name, digest, packet count, byte length, duration, or
+rotation; caching packet rows or outputs across operations; passthrough; changing coded bytes or codec
+configuration; a second EBML writer; a runner-owned Ogg parser; widening the WebCodecs queue from 128 to 512
+(ADR-165 already measured it slower and burstier); weakening reference re-import or packet truth; tuning the
+already-sub-millisecond MP4 parser without a measured cause; and claiming either browser row closed from a
+Node/Bun control.
+
+### ADR-256 - Large complete multitrack faststart MP4 arrays bypass promise-backed packet drains
+
+**Context (Session 13 per-feature speed leadership).** The fresh public
+`mux/video_plus_audio_to_mp4` row passed exact duration truth but measured aibrush-media at 228.685 ms warm
+median (MAD 14.955) against mediabunny at 49.785 ms (MAD 0.715) on the 30-second H.264 + ADTS-AAC shape.
+Public `packetsArray` inputs were already complete and bounded, but multitrack MP4 alone fell through the
+single-track prepared shortcut. The generic route wrapped every array in a `ReadableStream`, performed one
+promise-backed pull/write per packet across sibling drains, then rebuilt the same `ChunkStruct` arrays the
+prepared ISO-BMFF writer accepts synchronously.
+
+**Decision.** Non-fragmented, default-faststart `mp4` with at least two valid packet descriptors may use the
+prepared multi-track writer only when every descriptor supplies `packetsArray`, none supplies a readable
+`packets` stream, and the combined known count is at least 256. That crossover is derived from generated
+real-payload shapes at 2, 8, 16, 32, 64, 256, 512, 1,024, and 2,048 packets, not from a benchmark fixture.
+Counts below 256 were within noise or slower; from 256 onward repeated alternating samples measured durable
+prepared wins. MOV, fragmented MP4, explicit non-faststart, ordinary streams, mixed stream/array inputs, and
+smaller multitrack arrays stay on their prior routes. Existing single-track prepared behavior is unchanged.
+The conversion checks the operation signal before every packet byte extraction and once after conversion, so
+an abort triggered during `copyTo()` stops before the next packet. Typed empty-track, codec/container, and
+mux failures still come from the shared prepared writer.
+
+**Consequences.** Alternating warm `n=15` product samples with real H.264/AAC payloads measured generic versus
+prepared medians of 0.558/0.510 ms at 256 packets (1.09x), 1.049/0.793 ms at 512 (1.32x), 1.873/1.686 ms at
+1,024 (1.11x), and 3.560/3.096 ms at 2,048 (1.15x). The nine-size sweep compares materialized Blob output
+and requires byte identity at every size; its SHA-256 values are committed in the benchmark output. A real
+2,308-packet, 30-second two-track H.264/AAC proof also compares prepared routing byte-for-byte with the shared
+direct writer, then reparses exact media types, packet count, PTS, DTS, duration, size, and keyframe truth.
+A cancellation oracle aborts from the first packet's `copyTo()` and proves the second is never copied.
+B-frame/VFR decode order and signed `ctts`, edit timing, codec-private data, payload ownership, sink
+backpressure after authoring, and close-exactly-once frame ownership are unchanged; packet arrays contain no
+closable raw frames. The public row remains open until the final bundle receives a fresh qualified browser
+rerun and peak-memory comparison.
+
+**Rejected:** applying the route to MOV despite ADR-254's negative evidence; routing tiny arrays where fixed
+cost is within noise; recognizing the 30-second asset, dimensions, codec bitrate, packet count, filename, or
+digest; weakening the duration/reparse oracle; copying color payloads; changing timestamps; buffering an
+ordinary stream into an array; or claiming browser closure from Bun crossover evidence.
+
+### ADR-257 - Exact native profiling rejects a duplicate prepared Matroska payload path
+
+**Context (Session 13 per-feature speed leadership).** The qualified baseline
+`mux/swap_audio_video_with_opus_to_mkv` passed exact truth but measured aibrush-media at 202.400 ms against
+mediabunny at 53.115 ms. The product already routes complete non-fragmented WebM/Matroska packet arrays
+through `muxPreparedWebmPacketStreams`; there was no missing prepared-array route. A remaining hypothesis was
+that extracting bare native `EncodedChunk` payloads and then copying them into the final EBML output caused
+the 149.285 ms gap.
+
+**Decision.** Do not introduce a second prepared writer or widen the shared `ChunkStruct` payload type without
+measured evidence. Profile the exact selected general H.264+Opus shape through both the pure writer and native
+Chromium product seams, require byte-identical output for every ownership variant, and retain the existing
+writer when the proposed copy elimination is not a durable end-to-end win. The current public loss remains
+open until the stabilized bundle is measured by the unchanged black-box harness; a faster product control is
+diagnostic evidence, not leaderboard closure.
+
+**Consequences.** All paths author 30,906,411 Matroska bytes with SHA-256
+`3d6916790939be115045c4d53442b22e40a2414b60a116bcf1fc5a4a1680ddb3` from 900 H.264 and 501 Opus packets.
+In Bun, bare host extraction measures 3.902 ms versus 1.825 ms for direct views, only a 2.077 ms penalty.
+In Chromium, warmup three plus nine samples measure packet-owned prepared mux at 15.100 ms versus 16.200 ms
+for bare native chunks; the proposed representation is not faster. Five fresh full product operations from
+source bytes through MP4/Ogg demux, packet materialization, Matroska mux, and Blob readback measure 19.600 ms
+median with the same digest, already below the recorded 53.115 ms rival. No product writer behavior changes,
+so Block bytes/order, codec-private data, B-frame/VFR timestamps, cancellation, backpressure, payload
+ownership, and frame close-exactly-once remain untouched. A fresh same-export, rotation-matched, warm `n>=5`
+browser rerun is required next.
+
+**Rejected:** duplicating the existing prepared-array route; a host-payload union justified by a two-millisecond
+Bun micro-result that reverses in native Chromium; recognizing the selected assets, codecs, packet counts,
+duration, dimensions, byte lengths, names, hashes, or rotation; caching packet tables or output; reading
+harness/adapter/oracle code; weakening reference re-import; and declaring the row closed from a product-only
+browser benchmark.
+
+### ADR-258 - WebM metadata probes start with one bounded 8 KiB window
+
+**Context (Session 13 per-feature speed leadership).** The fresh same-export
+`probe/realworld_mdn_flower_webm` row passed exact two-track metadata but measured 3.280 ms (MAD 0.425)
+against remotion-webcodecs at 1.895 ms (MAD 0.110). The selected real WebM's finite `Tracks` element ends
+at byte 4,749. ADR-120's 4 KiB first prefix therefore correctly refused the truncated track declaration,
+then restarted at zero with the 64 KiB ladder step. The related selected VP9-alpha input is only 6,663
+bytes. Parser work is sub-millisecond; the avoidable cost is a second transport round trip and 4 KiB plus
+64 KiB transferred for ordinary metadata that needs only 653 bytes beyond the old boundary.
+
+**Decision.** Start the existing WebM/MKV metadata ladder at 8 KiB, followed unchanged by 64 KiB, 256 KiB,
+1 MiB, and 4 MiB. Known smaller sources clamp the request to their exact size. All acceptance rules remain
+identical: duration, complete `Tracks` and `Attachments`, video geometry/fps, and qualified VP9/AV1 config
+must be present before a prefix returns. Headerless recorder inputs still scan Clusters; larger declarations,
+truncation, malformed EBML, unknown-size elements, and range-less sources retain their prior growth/full-parse
+fallback. Cancellation checks remain around every range. The policy contains no codec, filename, digest,
+duration, size, track-count, or rotation branch.
+
+**Consequences.** The 541,606-byte real VP8/Vorbis shape uses one `[0,8192)` range instead of `[0,4096)`
+plus `[0,65536)`, with exact `TrackInfo` equality. An alternating warmup-three/median-21 product benchmark
+with three milliseconds injected per range measures 3.867 ms and 8,192 transferred bytes versus 7.791 ms
+and 69,632 bytes for the former control. Through the full public route, ADR-246 reuses the separate 4 KiB
+image sniff by fetching only `[4096,8192)`; warmup-three/median-21 measures 8.051 ms, two transport calls,
+and 8,192 total transferred bytes without repeating either prefix. Sixty-nine WebM/Matroska tests with 8,089 assertions retain VP9,
+AV1, VP9 alpha, H.264, Opus gapless, attachments, recorder fps, malformed-container rejection, packet truth,
+and stream behavior. Probe creates no frame or packet ownership change. Final public wall/memory closure still
+requires the fresh current-bundle sweep.
+
+**Rejected:** accepting an incomplete `Tracks` element; jumping directly to a 64 KiB first request; reading
+Clusters when declared metadata is already complete; recognizing either selected asset; weakening codec or
+duration truth; changing packet/decoder behavior; or claiming the public loss closed from a latency-injected
+product benchmark.
+
+### ADR-259 - Exhaustive in-memory AVC classification uses one retained byte view
+
+**Context (Session 13 per-feature speed leadership).** The public
+`demux/size_massive_massive_h264_1080p_2h` row passed its 553,501-packet golden but measured 1,480.830 ms
+warm median against web-demuxer at 54.770 ms. ADR-204 requires exhaustive first-VCL parsing when an AVC
+`stss` table cannot prove all non-IDR I/SI pictures. The in-memory arm still created one `ra.read()` promise
+per candidate, plus sliced 2,048-sample batch arrays and `Promise.all()` result arrays, even when
+`cachedWhole()` already owned the complete immutable file. This promise/array churn is especially expensive
+in Chromium and does not perform I/O.
+
+**Decision.** If random access is explicitly in-memory and can supply one complete retained file view, AVC
+picture classification validates every candidate sample interval with `coveredByteView()` and passes that
+zero-copy subarray directly to the unchanged first-VCL parser. If the view is not already retained and size is
+known, one full in-memory read obtains it. Abort is checked before that read and at the same 2,048-sample
+bound during the tight loop. An uncovered interval raises the same typed per-sample short-read error. If no
+complete view is available, the former promise batches remain. Range-backed inputs retain the unchanged
+8 MiB coalesced-window plan. No `stss`, packet, slice-header, malformed-NAL, B-frame/VFR, or source-ownership
+rule changes.
+
+**Consequences.** On the selected 1,144,400,182-byte public base, warmup-one/five fresh full packet-info
+samples measure 78.245 ms median (76.658–86.584 ms), versus the prior 1,480.830 ms browser row and a 578 ms
+pre-change product profile. Header/table/row construction measures 55.114 ms, leaving 23.131 ms for the
+exhaustive classifier. A direct replay of the former 2,048-sample promise/batch implementation makes exactly
+212,400 resident-view read promises and measures 38.185 ms median; the new direct loop measures 32.581 ms
+(1.17x) with the identical classification checksum. Each product run uses seven reads and requests
+1,156,851,704 bytes; peak RSS is 2,075,131,904 bytes and retained ArrayBuffers are 1,144,400,294 bytes. The
+untouched range control uses 142 reads/1,150,414,286 requested bytes and measures 97.115 ms. Both paths
+produce exactly 553,501 packets,
+341,101 cross-track key flags, and checksum 2,336,086,988. The selected exported base has no first-VCL I/SI
+addition outside its declared sync table, independently confirmed by a second exhaustive scan. A constructed
+4,097-AU oracle instead places 2,048 non-IDR I pictures outside `stss` and proves every one is promoted while
+the optimized source uses fewer than 20 reads. ADR-204's separate real rotated two-hour proof retains its
+exact 1,680 declared plus 261 non-IDR-intra result. Packet rows are not closable; no `VideoFrame`, `AudioData`, or
+decoder is created. Fresh qualified browser wall/memory evidence is still required before closing the row.
+
+**Rejected:** trusting `stss` without payload truth; skipping non-IDR candidates; sampling only a prefix;
+recognizing a fixture, duration, dimensions, packet count, digest, or rotation; copying the 1.1 GB source;
+changing the range-backed classifier; weakening malformed-NAL or short-read handling; removing bounded abort
+checks; and claiming public closure from the Bun product benchmark.
+
+### ADR-260 - MP4 packet streams revoke source ownership at every terminal path
+
+**Context (Session 13 per-feature memory leadership).** The selected
+`demux/size_large_large_h264_1080p_120s` row passed exact packet truth and was faster than its leanest rival,
+but retained 189,426,678 bytes against 85,555,893 bytes. A live packet stream cached its current read window
+and captured random access until explicit `cancel()` only. Ordinary EOF, synchronous construction errors,
+asynchronous read/short-read/abort errors, and `Demuxer.close()` did not revoke those references. When the
+window was a `coveredByteView()` into `cachedWhole()`, a completed stream or last delivered `Packet.data`
+could pin the complete source backing store. MP4A `esds` codec-private metadata also escaped as a small view
+of that store. Finally, V8 could allocate all methods returned directly from async `demux()` in one shared
+closure context containing the otherwise-unreferenced raw random-access local, so retaining even `close` or
+`packetTable` kept the source alive.
+
+**Decision.** Each opened MP4 packet stream receives a private revocable state containing its random-access
+lease, active samples, read plan, and current window. The final packet enqueue releases state and closes the
+controller immediately, avoiding a terminal extra pull. Synchronous planning/enqueue failures and both arms
+of asynchronous reads release before rethrow; abort and cancel set the cancellation flag and release without
+enqueuing or closing a cancelled controller. `Demuxer.close()` revokes a separate central source cell and
+clears future track/fragment lookup maps. Streams opened before close retain independent leases, so sibling
+audio/video consumption remains valid. Packet-table functions capture only the scalar source size. For
+in-memory sources, packets omit optional `Packet.data`: the constructed `EncodedVideoChunk` or
+`EncodedAudioChunk` already owns the copied payload, and omitting the whole-file subarray prevents a delivered
+packet from retaining the input. Range-backed streams keep bounded-window `Packet.data` views.
+MP4A parsing owns its small escaped `esds` payload. A synchronous demuxer factory constructs the public
+methods from `movie`, scalar size, lookup maps, signal, and a revocable source cell; raw random access is never
+a factory parameter outside that cell, so V8 closure-context widening cannot retain the async frame's source.
+
+**Consequences.** On the exact selected 74,425,089-byte input, a real packet-stream lifecycle benchmark
+drains 1,808 packets with stable checksum 1,438,865,538 in 10.945–11.415 ms across three fresh processes. It
+closes the demuxer and deliberately retains both completed streams plus `close`, `packets`, `packetTable`,
+and `tracks`. A self-describing V8 heap snapshot finds zero strong inbound retainers of the exact source-sized
+`ArrayBuffer`; only weak GC-root/`WeakRef` edges remain. The gate does not require instantaneous weak-target
+clearing, which JSC may legally defer. Its fail-first control retains the source buffer and is rejected by the
+same graph oracle through a strong `Array` element edge. Tests preserve exact packet
+count/size/PTS/DTS/duration/keyframe truth, real-header `esds` backing isolation, normal EOF, cancel,
+abort-before-read, abort racing an asynchronous miss, asynchronous short read, and a pre-opened audio sibling
+completing after video EOF and central close. No `VideoFrame` or `AudioData` is created; encoded chunks remain
+consumer-owned host values, packet backpressure stays one pull per packet, and range I/O bounds are unchanged.
+A focused current-bundle browser memory rerun is still required before closing the 189 MB public row.
+
+**Rejected:** globally clearing random access when the first sibling finishes; invalidating already-open
+streams on demux close; retaining in-memory `Packet.data` whole-file subarrays; copying the entire source or
+every packet into a second JS array; weakening packet truth; forcing GC from product code; fixture/size/hash
+recognition; requiring nondeterministic instantaneous `WeakRef` clearing; and claiming public memory closure
+from the local heap-retainer proof alone.
+
+### ADR-261 - Raw PCM rewrite reuse has one total-byte LRU budget
+
+**Context (Session 13 WAV memory leadership).** ADR-248/249/253 release signed-24 decode windows and
+same-layout WAV multipart payloads at EOF, cancellation, abort, and error. Retained-stream profiling over the
+real `03.wav` signed-24 source reports zero retained input ArrayBuffer bytes, and Blob/File/stream identity
+outputs do not retain their source buffers. The remaining cross-call retention was ADR-152's URL-like raw PCM
+rewrite cache. Its entries were individually bounded to 8 MiB and expired after 60 seconds, but the 32-entry
+map could retain 256 MiB after distinct AIFF/WAV operations. That is bounded in count yet not memory-lean or
+appropriate for a browser media session.
+
+**Decision.** Keep exact-source identity (`SOURCE_CACHE_KEY` plus known size), the 8 MiB per-source
+eligibility, 32-entry defensive count ceiling, and 60-second TTL, but impose an 8 MiB **total** byte budget.
+The map is access-ordered: a cache hit refreshes recency without extending TTL. Before insertion, all expired
+entries are removed and their bytes subtracted. An exact-key replacement subtracts its prior size before the
+new bytes are counted, covering concurrent same-source reads. Oldest entries are evicted until both count and
+total-byte limits hold. Aborts are checked after a range read and before insertion; rejected reads, short
+reads, unknown sizes, oversized sources, and parser declines never populate cache. Cached values remain exact
+immutable source bytes only, never parsed facts, decoded samples, outputs, timings, or oracle results.
+
+**Consequences.** A fail-first cache test fills three distinct real-derived 3 MiB canonical WAV sources,
+refreshes A, inserts C past the total budget, and proves B alone is reread while A stays hot. A concurrent
+same-key 4 MiB replacement plus a 4 MiB sibling remains exactly within budget and does not double-account.
+Abort and range-error tests prove the next clean call performs a real read. The warm product benchmark derives
+twelve distinct 1,048,576-byte WAVs from the real `stereo-48000.wav` corpus source, verifies twelve distinct
+SHA-256 output digests byte-for-byte, and measures a same-source 0.085 ms median (MAD 0.008, `n=21`) with one
+range read. After rotating all twelve sources, retained ArrayBuffers are 7,340,816 bytes under an 8 MiB plus
+64 KiB measurement guard; the oldest source is reread and the newest remains hot. The previous 256 MiB
+maximum becomes 8 MiB without changing output bytes, PCM samples, URL identity truth, stream backpressure,
+or frame ownership.
+
+**Rejected:** deleting reuse and regressing every repeated immutable URL read; weak-value caching whose hit
+behavior depends on nondeterministic browser collection; extending TTL on hits; caching parsed layouts or
+fresh outputs; keeping 8 MiB per entry while accepting a 256 MiB aggregate; forcing GC; recognizing fixture
+names, hashes, sizes, scenarios, or rotations; and claiming the selected browser memory row closed from a Bun
+retention benchmark without positive same-export browser evidence.
+
+### ADR-262 - Full FLAC drains return one owned source chunk and release every reader
+
+**Context (Session 13 FLAC fixed-cost and lifecycle pass).** ADR-250 fused native-FLAC packet-info scanning,
+but the full `FlacDriver` retained the older whole-source reader used by decode, demux, trim, remux, and direct
+driver callers. It accumulated every stream chunk, always allocated a source-sized output, copied even a sole
+complete immutable chunk, and did not explicitly cancel or release its reader on producer failure or normal
+EOF. The lazy default FLAC proxy already had the correct one-chunk and terminal-release behavior. Product-only
+profiling also localized the remaining public `demux/flac_noseektable` browser loss: on the selected real
+30,105-byte/eight-frame source, the fused parser is about 0.004 ms, a reused public engine is about 0.012 ms,
+and a new engine after module resolution is cached is about 0.067 ms. Those costs cannot honestly explain the
+old 2.810 ms browser median against 1.920 ms; transport and first-use resolution had to be measured separately.
+
+**Decision.** The full FLAC reader now reads at most two chunks before allocating. Empty streams return an
+empty owned array; a sole complete immutable source chunk is returned directly; two or more chunks are
+concatenated once into an exact-size allocation. The reader lock is always released in `finally`. A read
+failure first attempts upstream cancellation with the same reason, preserves the original read error even if
+teardown fails, and then unlocks. Range-backed sources retain their existing one exact range request. No
+packet parser, metadata ownership, CRC/header validation, variable-block timing, final-block clipping, or
+public routing rule changes.
+
+**Consequences.** Fail-first direct-driver tests prove the former reader remained locked at ordinary EOF and
+did not attempt cancellation/unlock after a failed read; both terminal paths are now explicit and green while
+the packet table remains exactly equal to the decoder-backed oracle. Alternating warm `n=21` product samples
+on the real 6,611,359-byte/376-frame `flac-192khz.flac` measure 0.623 ms median for the one-chunk route versus
+0.901 ms for the former copy control (1.45x); repeated runs span 1.39-1.58x. On the packet-dense 959,681-byte/
+19,294-frame corpus control, parser work dominates and the two routes stay within noise, with no regression
+claim. The selected eight-frame URL-like path under an injected 3 ms transport performs exactly one range
+request, transfers exactly 30,105 bytes, opens no stream, and measures 3.773 ms median (MAD 0.006); its first
+lazy driver resolution is 9.694 ms versus 0.058 ms immediate reuse, but the qualified browser protocol's
+warmup excludes that first call. Therefore this ADR improves general source ownership and payload-dense FLAC
+work but does not declare or exempt the browser row: final-bundle same-export warm `n>=5` evidence is still
+required. FLAC has no B-frame/VFR/frame-close queue; packet timing, cancellation semantics, and bounded
+multi-chunk memory remain unchanged.
+
+**Rejected:** recognizing the selected file, size, hash, frame count, rotation, or scenario; caching parsed
+tables or source bytes across calls; treating SEEKTABLE as a complete frame oracle; moving FLAC parsing into
+the eager kernel to optimize a warmup-discarded first import; borrowing codec metadata that pins the whole
+source; swallowing the producer's primary error; returning one of several chunks without concatenation;
+claiming the old browser gap closed from a microbenchmark; or recording a parity exemption while a passing
+rival remains faster.
+
+### ADR-263 - Source-proved semantic no-op convert uses the native container writer
+
+**Context (Session 13 per-feature speed leadership).** A public H.264 normalization row requested the
+source's existing codec family, 720x1280 coded geometry, and zero rotation. The old eager predicate treated
+every explicit codec, dimension, or rotation field as a re-encode trigger, so the engine decoded, filtered,
+and encoded 329 frames in 1,735.840 ms even though every requested semantic was already true; the best
+passing rival rewrote the container in 27.690 ms and decoded to exactly the source pixels. Blindly treating
+same-family requests as copy would be wrong for changed geometry, non-zero display rotation, VFR-to-CFR,
+rate control, alpha, audio layout, extra tracks, or an unproved codec profile. Probing a one-shot stream and
+then opening its copy writer would also consume the source twice.
+
+**Decision.** After routing the source container and exact explicit destination, `convert()` may lazily
+probe metadata and select the existing driver-native `streamCopy()` writer only when a proof predicate
+establishes that all requested semantics already hold. The source must be re-readable; the driver must
+declare `streamCopy` for exactly `opts.to`; and there must be exactly one configured video and at most one
+configured audio track, with no non-media, encrypted, projection-only, or extra tracks that the ordinary
+codec graph would drop. Container side data on a selected media track remains eligible because both the
+ordinary mux graph and native writer carry it with that same track. Present video codec family, coded
+width/height, normalized zero rotation, bit depth, and alpha intent must match qualified source facts.
+Present audio family, sample rate, and channel count must match. Explicit fps, bitrate/mode, CRF, two-pass,
+fit, crop, pad, non-zero rotation, flip, colour/tonemap,
+audio bitrate, fade/dynamics/biquad, non-zero gain, or either track drop is never eligible. Unknown facts
+decline rather than guess. Single-use streams retain the pre-existing pure container-copy route when no
+probe is needed, but never enter semantic proof. `faststart`, `fragmented`, sink mode, signal, progress, and
+driver pinning flow unchanged into the writer.
+
+**Consequences.** The positive path parses and authors a fresh container; it never returns input bytes,
+recognizes an asset, or skips container work. Existing writer semantics preserve encoded packet payloads,
+DTS/PTS, B-frame/open-GOP order, VFR durations, codec-private data, colour metadata, and edit-list duration,
+while creating no `VideoFrame` or `AudioData`. Ten focused tests cover exact matches, codec/profile/geometry/
+rotation/precision/alpha/audio mismatches, rate control and every transform class, extra/encrypted tracks,
+exact destination and streaming-sink selection, abort propagation, single-use source ownership, real rotated
+negative input, and real B-frame plus VFR packet-row/payload-SHA invariance. A five-file real H.264 MP4
+benchmark (warmup two, `n=7`, separate three-sample RSS pass) measures 0.080-1.628 ms per public rewrite,
+with 0.11-1.23 MiB positive RSS deltas and exact packet truth. On the selected 4,376,205-byte public source,
+warmup three/`n=21` product samples measure 2.136 ms median (1.332-2.529 ms), versus the old 1,735.840 ms
+browser path; a current-bundle qualified browser rerun remains the closing evidence. The separately selected
+metamorphic source is 1080x1920 while its requested oracle geometry is 1920x1080, so it correctly remains a
+real resize/re-encode and receives no claim from this ADR.
+
+**Rejected:** checking a filename, hash, size, dimensions, packet count, rotation slot, or scenario; passing
+the original bytes through; accepting average fps as proof of CFR identity; guessing display dimensions from
+rotation; preserving extra tracks the codec graph would drop; probing a single-use stream twice; decoding one
+frame to decide; weakening codec/packet/frame oracles; ignoring colour/edit metadata; or claiming the public
+row closed from the local product benchmark.
+
+### ADR-264 - MP4 semantic rewrite preserves visual side-data and exact container clocks
+
+**Context (Session 13 semantic-copy correctness).** ADR-263 exposed existing MP4 `streamCopy()` as a public
+semantic no-op writer. Real VFR H.264 then showed two pre-existing rewrite losses: the parsed visual sample
+entry's `colr` was dropped, and `mdhd.duration` was regenerated from summed `stts` durations. The selected
+source declares 6.283 s in `mdhd` while its VFR sample durations sum to 6.281 s, so rewriting changed public
+duration from 6.283 to 6.281 and fps from 60.00318319274232 to 60.022289444356 despite identical packets.
+The adjacent parsed `pasp` and `clap` sample-entry extensions were also not represented by the writer. Edit
+durations were converted movie ticks → seconds → track ticks → movie ticks, which needlessly risked rounding
+an otherwise exact same-timescale rewrite.
+
+**Decision.** `ParsedTrack` retains exact positive `mdhd.duration` ticks separately from sample-duration
+sums. Parsed edits retain their exact active and leading-empty `elst.segment_duration` values plus the source
+movie timescale. `muxTrackMeta()` projects those facts and parsed `colr`, `pasp`, and `clap` structurally into
+the generic MP4 writer. `videoSampleEntry()` emits canonical `nclc`/`nclx` boxes (including the `nclx`
+full-range bit), pixel-aspect integers, and all signed/unsigned clean-aperture fractions. The fragmented init
+writer emits the same visual boxes and declared media duration; fragment timing uses the maximum of declared
+media duration and recovered sample media ticks. Exact movie-tick edit durations are used only when the
+output retains their source movie timescale; encode/trim paths and changed clocks keep the existing derived
+fallback. Unsupported ICC-profile `colr` remains omitted because the parser deliberately exposes no invented
+H.273 facts for it.
+
+**Consequences.** The real B-frame and VFR public conversion test now preserves complete TrackInfo including
+BT.709 limited-range `color`/`config.colorSpace`, rotation, exact duration/fps, every packet size/key/PTS/DTS/
+duration field, and SHA-256 of every encoded payload. Materialized, progressive-stream, progressive-buffer,
+and fragmented rewrites preserve exact VFR `mdhd` ticks, fps, `elst` active/empty movie ticks, `colr`, `pasp`,
+and `clap`. Synthetic writer tests cover both `nclc` and full-range `nclx`, non-square pixels, and signed clean
+aperture. The full MP4/API gate passes 784 tests with 22,176 assertions; all production, test, and script
+TypeScript configs are green. The existing 671-packet VFR writer benchmark remains faststart/non-faststart
+neutral at 0.976209/0.978958 ms (`n=101`, checksum 964,116,104), while the rotated full demux/remux control
+measures 0.202666 ms. No sample payload, PTS/DTS, B-frame/VFR order, cancellation, backpressure, or frame
+ownership changes.
+
+**Rejected:** deriving declared media duration solely from `stts`; rounding exact source edit clocks through
+seconds; preserving only the selected BT.709 values while dropping general H.273 code points; ignoring
+`pasp`/`clap`; copying unsupported ICC bytes into an invented typed color model; changing packet timestamps
+to match container declarations; recognizing fixture names, hashes, dimensions, durations, or rotations;
+weakening packet/payload/color oracles; or enabling semantic copy before these writer invariants were green.
+
+### ADR-265 - Each dav1d facade owns its exact resolved WASM asset
+
+**Context (Session 13 integration gate).** The AV1 glue memoized WASM bytes by absolute URL, but
+`createDav1dCore()` later requested bytes without a URL. That made actual decoder creation fail after a
+successful lazy initialization and left no sound way to choose among concurrent engines using different
+`assetBaseUrl` overrides. A mutable "last initialized URL" would make the failure intermittent and could
+cross-wire one engine to another engine's bytes.
+
+**Decision.** The lazy driver resolves one exact module URL and one wasm-bindgen-shaped init value, passes
+that same value to both glue initialization and `createDav1dCore`, and the returned facade captures the
+corresponding memoized byte promise immutably. Node oracles and the standalone benchmark do the same with a
+file URL. URL-keyed byte memoization remains shared, so repeated identical engines do not reread the asset;
+different URLs remain isolated. Support probing still imports glue only and performs zero fetches or WASM
+instantiations. Decoder creation stays lazy, stateful per stream, and preserves reorder, cancellation,
+backpressure, and close-once frame ownership.
+
+**Consequences.** The real AV1 oracle can again instantiate the vendored decoder and compares every decoded
+I420 byte against ffmpeg/dav1d across at least five coded frames; the no-display-frame reorder case remains
+an exact empty-array assertion. Routing continues to prefer a browser configuration that proves
+`hardwareAcceleration:'prefer-software'` under `force-software`, as required by ADR-233, and reaches dav1d
+only on a genuine browser capability miss. No input bytes, output pixels, timestamps, codec facts, or public
+routing thresholds change.
+
+**Rejected:** mutable last-initialized module state; falling back to an arbitrary cached URL; embedding WASM
+bytes in the JS bundle; fetching during `supports()`; weakening the bit-exact oracle; or forcing every
+`force-software` request to WASM when WebCodecs explicitly proves a software configuration.
+
+### ADR-266 - Stream-copy proof and audio-filter bypass stay behind operation-lazy boundaries
+
+**Context (Session 13 integration gate).** ADR-263 initially placed its source-independent pre-probe
+predicate in the eager codec-routing module. Together with an eager audio-filter bypass predicate, the
+rebuilt default entry reached 50.78 kB against the binding 50.00 kB eager budget. The semantic predicate is
+needed only after `convert()` has proved that the routed container can write the exact destination, and the
+audio predicate is reached only inside the already-browser-only lossy audio filter stage. Keeping either in
+the startup closure paid bytes for operations that probe, demux, or never convert.
+
+**Decision.** Co-locate pure-container-copy classification, semantic pre-probe classification, and full
+track-metadata proof in the operation-lazy `semantic-stream-copy` module. `convert()` imports it only after
+the exact driver/target stream-copy capability is known; pure container copies still skip metadata probing,
+while semantic candidates probe only after the cheap predicate succeeds. Move the audio target bypass
+predicate into the existing lazy `audio-stream-plan` module and load both predicate and planner together on
+the live audio-filter path. No predicate conditions, driver capability checks, target equality, source
+replayability rules, or packet/frame semantics change.
+
+**Consequences.** After the Session 13 probe/collector integrations, the eager kernel is 49.75 kB with the
+required 0.25 kB guard band, and the typical first-operation closure is 250.87 kB against 256 kB. Both
+optional modules appear only on the eager lazy frontier. Warm
+convert behavior is unchanged; a first stream-copy-capable convert may resolve one small local code-split
+chunk before invoking the same native writer. Pure copy still performs zero decode, zero metadata probe,
+and zero `VideoFrame`/`AudioData` allocation. Semantic copy retains exact B-frame/VFR packet truth,
+cancellation, sinks, progress, and source ownership; audio filtering retains the same validation/order and
+close-once frame lifecycle.
+
+**Rejected:** raising or weakening either budget; minifying identifiers by hand; eagerly retaining optional
+predicates; probing metadata for every convert; duplicating predicates in engine code; weakening semantic
+eligibility; or hiding reachable production code from the budget scanner.
+
+### ADR-267 - Known-size hinted containers probe before deferred image magic
+
+**Context (Session 13 per-feature speed leadership).** The provisional `probe/vp9_alpha` row passed exact
+metadata but measured aibrush-media at 2.485 ms against the best passing rival at 1.525 ms. The selected
+rotation is a 6,663-byte WebM whose complete finite Segment fits the driver's first metadata window. Public
+`probe()` nevertheless performed an unconditional 4 KiB image-magic read before selecting the explicitly
+declared `video/webm` container, then obtained the remaining 2,567 bytes in a second asynchronous range read.
+The image sniff was useful only for wrong/ambiguous hints, but every correctly declared known-size audio/video
+container paid it. With one millisecond injected per owned range response, warmup-three/`n=21` product A/B
+measured the old generic route at 2.631 ms versus 1.337 ms for the existing container-targeted control.
+
+**Decision.** A known-size seekable source whose normalized MIME is `audio/` or `video/` plus a nonempty
+RFC-token subtype tries its hinted container before image magic. MIME parameters remain accepted by the
+predicate and flow unchanged to routing. If routing or metadata parsing raises a typed non-abort `MediaError`,
+the engine runs the unchanged image sniff: a matching image wins exactly as before, otherwise the original
+container error is rethrown by identity. Untyped failures and aborts never become image fallback. Unknown-size
+URLs remain image-first so their bounded sniff can learn size and effective redirect URL; range-less/one-shot
+streams remain image-first so fallback never consumes unreplayable bytes. `image/*`, absent/generic MIME,
+empty or whitespace-only subtypes, and malformed token characters remain image-first.
+
+**Consequences.** The real 113,605-byte VP9-alpha regression fixture now begins WebM parsing directly and
+performs `[0,8192)` plus `[8192,65536)` instead of `[0,4096)`, `[4096,8192)`, and `[8192,65536)`, while exact
+VP9 codec, dimensions, fps, duration, size, and track truth stay unchanged. The selected 6,663-byte shape
+reduces to one full range response. Under the same one-millisecond-response control, the new generic path
+measures 1.368 ms versus 1.368 ms for the targeted control. Focused tests cover exact range calls, zero image
+sniff on success, parameterized MIME, wrong-MIME JPEG recovery, original typed-error identity, abort
+propagation, malformed/empty subtypes, repeated-range reuse, unknown-size URL fact handoff, and one-shot
+stream replay; 127 WebM/source/API tests pass with strict TypeScript and Biome. Probe allocates no packets,
+decoders, `VideoFrame`, or `AudioData`, so B-frame/VFR order, seek, backpressure, and close-once ownership do
+not change. Fresh Chromium product and same-export leaderboard evidence remain pending; this ADR does not
+claim the row closed from the latency-controlled result.
+
+**Rejected:** recognizing VP9, alpha, a filename, hash, exact size, duration, dimensions, scenario, or
+rotation; trusting MIME without fallback; applying container-first to one-shot or unknown-size sources;
+swallowing the original typed container error; treating `video/` or whitespace/malformed subtypes as
+concrete; increasing every image sniff from 4 KiB to 8 KiB; caching parsed metadata; weakening alpha/config/
+duration truth; or claiming browser closure from a simulated-latency benchmark.
+
+### ADR-268 - Terminal collection adopts one exact-owned full ArrayBuffer chunk
+
+**Context (Session 13 fixed-cost and memory pass).** The default Blob/File materializer collects an internal
+byte stream into one `Uint8Array`. Even when a native writer had already produced exactly one owned full
+`ArrayBuffer` chunk, the collector allocated an equally large buffer and copied every byte before the
+Blob/File constructor. Prepared whole-file mux paths therefore paid avoidable wall time and temporarily
+held two complete JS output buffers. Subviews cannot be adopted because they would retain unrelated backing
+bytes, and shared buffers cannot be adopted because another agent may mutate them after collection.
+
+**Decision.** When terminal collection receives exactly one chunk whose offset is zero, whose view length
+equals the collected total, and whose backing storage is an exact-sized current-realm `ArrayBuffer`, return
+that chunk directly. Continue allocating and copying for zero/multiple chunks, subviews, cross-realm or
+cross-storage mismatches, and `SharedArrayBuffer` views. Internal byte
+stream producers transfer chunk ownership downstream; progressive/stream-target sinks do not use this
+collector and remain unchanged.
+
+**Consequences.** Exact-output tests prove buffer identity only for the qualifying shape and prove that a
+sole subview and shared view are copied into exact-sized ordinary `ArrayBuffer` storage. The 8 MiB warm
+benchmark (`n=21`) measures 0.009958 ms median/MAD 0.002209 and zero collector-output allocation versus
+0.505875 ms/MAD 0.071334 and one 8 MiB allocation for the former copying control, with an exhaustive
+byte-for-byte oracle. The rule changes no bytes, ordering, progress, cancellation, backpressure, B-frame/VFR
+truth, codec work, or frame ownership.
+
+**Rejected:** adopting subviews and retaining unrelated source bytes; adopting mutable shared storage;
+special-casing MP4/MOV or fixture sizes; returning a source input as an operation result; weakening the Blob
+snapshot contract; skipping collection for multi-chunk streams; or changing progressive sink behavior.
+
+### ADR-269 - Resident AVC packet truth uses object-free placement walks and stable row shapes
+
+**Context (Session 13 per-feature closure).** ADR-259 removed one promise and one batch slot per candidate,
+but the massive in-memory packet-info path still constructed a native-tick `SampleData` object for every AVC
+sample, filtered a second candidate array, allocated a `Uint8Array.subarray()` view and an EBSP bit-reader
+object for each of 212,400 non-`stss` access units, and copied the 341,101-entry sync array even when the
+exhaustive scan inferred no additional I/SI pictures. The final packet projector then walked the same physical
+placement tables again and built each offset-free row through a conditional object spread, creating an empty
+spread source before every one of 553,501 object literals. A strict fresh local baseline measured 74.369 ms median for 553,501 packet rows, of
+which 28.933 ms remained above the header/table control. Exact packet truth still cannot trust `stss`: the
+independent real two-hour control retained by ADR-204 contains undeclared non-IDR I pictures.
+
+**Decision.** For a complete immutable in-memory file view, walk `stsz`, `stsc`, and `stco`/`co64` directly
+with exact sync membership instead of materializing timing-bearing sample objects. Ordinary sorted `stss`
+uses a monotonic cursor; malformed unsorted order uses a set and therefore preserves membership exactly. The
+walker validates every candidate interval, checks abort at most every 2,048 placed samples, and passes the
+whole retained storage plus exact offset/length to the H.264 classifier. That classifier keeps the standalone
+access-unit API but adds an exact-range entry, removes typed-array subviews, and reads the first two Exp-Golomb
+fields with scalar EBSP state instead of an allocated reader/exception path. A zero-addition scan leaves the
+original sync array in place; real inferred I/SI sample numbers still merge and sort exactly. Unknown-size
+in-memory sources retain the former bounded promise batches, and range-backed sources retain the 8 MiB
+window planner without altered reads, coalescing, or memory. The final projector emits one of two explicit,
+stable packet-row shapes for offset-present and offset-absent calls; it never constructs a temporary spread
+object. Both arms compute the same size, PTS, DTS, duration, and key flag scalars once.
+
+**Consequences.** Repeated warmup-one, median-eleven real massive runs after both changes measure 32.639 ms
+(MAD 1.524) and 31.097 ms (MAD 0.814). The conservative 32.639 ms result is 1.68x faster than the prior
+54.770 ms passing rival median and 2.28x faster than the fresh 74.369 ms product baseline. The latest isolated
+exact-range classifier is 14.109 ms versus 27.905 ms for the former promise/batch control (1.978x); the
+offset-free table/row baseline is 8.149 ms. Every run performs seven reads and returns exactly 553,501 rows,
+341,101 key
+flags, and checksum 2,336,086,988; the unchanged 142-read range control matches every packet field. The
+constructed 4,097-access-unit negative control still promotes all 2,048 undeclared non-IDR I pictures.
+Focused tests additionally cover one/two/four-byte NAL lengths, EBSP prevention, exact storage bounds,
+sorted/unsorted sync membership, short whole-file reads, and abort immediately after the resident view
+resolves. The path retains one complete source ArrayBuffer and adds no payload copy, packet/frame object, or
+decoder resource; B-frame/VFR timestamps, edit bounds, packet order, backpressure, and frame ownership do not
+change.
+
+**Rejected:** trusting `stss`, fixed-size NAL prefixes, or a fixture/count/hash/size branch; recognizing the
+massive asset or its zero-addition result; skipping malformed range validation; dropping unsorted-sync
+fallback; copying the whole source or caching parsed key-picture answers; fusing first-VCL parsing into the
+packet-row object-construction loop (measured 61.954 ms because it destabilized that hot projector); changing
+range-window planning; weakening abort cadence, packet fields, or the undeclared-I control.
+
+### ADR-270 - Declared Matroska alpha proves an exact same-codec rewrite
+
+**Context (Session 13 VP9-alpha feature leadership).** The passing public
+`transcode/vp9_alpha_to_vp9_keepalpha` row measured 1197.965 ms against mediabunny at 549.545 ms. ADR-252's
+packet-plane path reduced a local control to 266.7 ms by re-encoding color while copying alpha, but the
+request's explicit VP9 target and `alpha:'keep'` already matched the source exactly. ADR-263 could use the
+native lossless rewrite only when `TrackInfo.alpha` proved that fact. Full WebM demux inferred alpha from
+`BlockAdditional` payloads, while metadata-only probe omitted the normative Matroska
+`Video/AlphaMode=1` declaration carried by both real alpha fixtures, so the proof conservatively declined.
+
+**Decision.** Parse `AlphaMode` (`0x53C0`) only as a child of a complete `Video` master. Exactly one
+complete one-to-eight-byte unsigned value equal to `1` projects `WebmTrack.alpha` and `TrackInfo.alpha`.
+Omission/default zero, unknown values, empty/oversized/truncated integers, duplicates, and TrackEntry-level
+misplacement are not positive proof. Full demux retains its packet-observation fallback so a malformed
+legacy file with real alpha side data remains decodable, but semantic metadata routing never scans packets
+or infers alpha from codec, filename, size, dimensions, or content identity. Buffered, streaming, prepared,
+and ordinary WebM writers carry declared alpha into `Video/AlphaMode=1`; a buffered writer may also declare
+alpha already proved by its owned packet rows. ADR-263's unchanged predicate still requires a same-family
+VP8/VP9 codec, `alpha:'keep'`, exact single-track metadata, a replayable source, and no geometry, cadence,
+rate-control, colour, or other transform before selecting native stream-copy.
+
+**Consequences.** Warmup-three/`n=21` on the real 748,970-byte public VP9-alpha asset measures 0.991416 ms
+median (0.178916 ms MAD), versus the 1197.965 ms old product baseline and 549.545 ms passing-rival result.
+The fresh output is 748,639 bytes with SHA-256
+`b6b35f061c6bfc60d6ef8b1d56fc0336ba29d2af6699db6fd93fd0910500ce3d`; all 150 color packets and all
+150 alpha packets retain exact SHA-256, key type, PTS, duration, and DTS truth. The independent pinned
+`bear-vp9-alpha.webm` proof retains all 82 alpha packets and exact track/color/alpha/timing truth. Synthetic
+validation covers absent, zero, unknown, empty, oversized, truncated, duplicate, and misplaced declarations;
+prepared and ordinary writers re-declare alpha exactly. A one-shot source remains on the single-consumption
+codec path, and abort during range proof raises the typed abort before stream-copy opens. No decoder,
+encoder, `VideoFrame`, or `AudioData` is created, and B-frame/VFR clocks, packet backpressure, and ownership
+are unchanged. Same-export browser wall and peak-memory evidence remain required before the ledger row can
+be called a qualified lead.
+
+**Rejected:** inferring alpha by scanning packets during probe; treating VP8/VP9 as implicitly alpha-capable;
+accepting zero/unknown/malformed/duplicate `AlphaMode`; returning the input bytes; copying only alpha while
+needlessly re-encoding already-matching color; probing a one-shot stream twice; recognizing either real
+fixture or its digest/size/packet count; weakening the exact color/alpha/timing oracle; or claiming final
+leadership from a local product benchmark.
+
+### ADR-271 - Prepared MOV arrays share generic presentation origin and sink-shaped output
+
+**Context (Session 13 MP4/MOV public fixed cost).** A correct public `mux/h264_aac_to_mov` row measured
+21.160 ms against mediabunny at 13.920 ms over 1,118 caller-prepared packets. The MP4-family prepared writer
+already authored MOV, but public routing declined multitrack MOV arrays and wrapped them in promise-backed
+packet streams before feeding the same box writer. An initial bounded prepared-stream experiment was not a
+durable default-Blob win: the real 2,308-packet source alternated between a lead and a regression because 136
+payload chunks replaced one full writer chunk. The direct prepared writer was durably faster, but could not
+be accepted while terminal collection copied its full output. Profiling also found a pre-existing prepared
+timeline mismatch: unlike `Mp4Muxer`, prepared multitrack projection omitted a leading empty edit when one
+source-timed track began after the global presentation origin.
+
+**Decision.** Non-fragmented default-faststart MOV joins MP4 in the prepared mux candidate. Complete
+multitrack packet arrays use the existing ADR-256 crossover of at least 256 combined packets; smaller or
+mixed/readable multitrack shapes stay generic. Single-track MOV retains the established prepared packet
+route. The shared prepared projector now computes the same global minimum PTS, verifies every chunk has a
+source DTS before applying source timing, and passes each track's nonnegative first-DTS offset into the same
+`toMuxTrack` edit projection as `Mp4Muxer`. Default and explicit Blob sinks author one exact-owned complete
+output chunk, which ADR-268 terminal collection adopts without a second full allocation. ReadableStream,
+File, OPFS, element, and StreamTarget sinks keep the bounded prepared stream. Abort is checked before and
+during packet projection. Fragmented MOV remains a typed non-capability.
+
+**Consequences.** A fail-first real 30-second H.264+AAC control changed from a 48-byte direct/generic output
+length mismatch to byte identity. Six real MP4 inputs spanning 90-2,308 packets, single/multitrack,
+B-frames, VFR, rotation, and delayed audio now produce byte-identical direct, retained-generic,
+buffered-public, and streamed-public MOV output; reparsing preserves every packet payload, key flag, size,
+PTS, DTS, duration, and track config. Warm-five/`n=21` product runs measure the 442-packet path at
+0.352-0.405 ms versus 0.446-0.515 ms, and the 671-packet B-frame/VFR path at 1.147-1.317 ms versus
+1.358-1.399 ms. The 2,308-packet path measures 4.032-4.367 ms versus 4.377-4.624 ms; its smallest local
+margin is parity, so only a current-bundle same-export browser run may close the public row. For explicit
+streaming, that long output is 136 chunks with a 262,140-byte maximum instead of one 31,241,944-byte generic
+chunk. For Blob, both routes retain one full output and ADR-268 allocates zero second collector bytes. No
+`VideoFrame` or `AudioData` is created; encoded inputs remain caller-owned until synchronous projection,
+and no output or parsed fact is cached.
+
+**Rejected:** recognizing an asset name, digest, dimensions, packet count, output size, scenario, or
+rotation; lowering the existing packet crossover for multitrack shapes that remain within noise; eagerly
+collecting arbitrary readable/live tracks; changing cross-track backpressure; retaining the unstable
+bounded-chunk default Blob experiment; accepting the 48-byte timeline difference; copying a second full
+output after ADR-268; forking MOV timing/box logic; weakening byte or packet truth; or claiming browser
+leadership from Bun product measurements.
+
+### ADR-272 - Unsaturated WebCodecs audio input stays synchronous
+
+**Context (Session 13 AAC-to-Opus fixed cost).** A passing short AAC-to-Opus WebM row measured 24.840 ms
+against mediabunny at 21.185 ms. Its real WPT AAC-LC input has only ten packets over 213,330 microseconds,
+and retained ADTS parsing is already sub-millisecond. The decoder and encoder transformers nevertheless
+returned an already-resolved promise for every input because each unconditionally awaited the queue-drain
+helper, even while the native queue was empty. This inserted two avoidable promise continuations per audio
+unit without applying backpressure.
+
+**Decision.** When `decodeQueueSize`/`encodeQueueSize` is below the established 128-item bound, submit the
+input synchronously and let `TransformStream` receive `void`. At or above the bound, retain the existing
+event-driven `dequeue` promise and recheck abort after waking. Centralize encoder-input submission in a
+closable helper that releases its `AudioData` exactly once after synchronous submission, a saturated wait,
+abort, or native rejection. Decoder configure/output/flush/close and encoder metadata/output/flush/close
+remain unchanged.
+
+**Consequences.** The real-fixture cadence control (warmup seven, alternating `n=51`, 2,000 complete
+ten-frame graphs per sample) measures 0.000368 ms median versus 0.000521 ms for the former resolved-promise
+cadence, a 1.42x scheduling improvement, with the same packet timestamp/size checksum and exactly ten frame
+closes per graph. Focused tests prove immediate submission returns no promise, saturated submission waits,
+abort prevents late submission, and synchronous/asynchronous success and failure each close once. Native
+codec bytes, samples, timestamps, queue bounds, cancellation, and mux finalization do not change. The public
+row remains behind pending a fresh same-export browser run; JavaScript cadence evidence is not native-row
+closure.
+
+**Rejected:** a fixture/count/duration threshold; raising the 128-item memory bound; polling or sleeping for
+queue space; dropping abort rechecks; reusing stateful codec objects across jobs; a fused private
+decoder-to-encoder-to-WebM path without native evidence and complete independent lifecycle validation; or
+claiming feature leadership from the scheduling microbenchmark.
+
+### ADR-275 - Ogg cross-target packet truth includes exact trim clocks and abort ownership
+
+**Context (Session 13 Ogg-to-Matroska public closure).** ADR-255 removed host audio chunks from native
+Ogg-to-WebM/Matroska packet copy, but the complete public operation still needed product-level attribution
+and lifecycle evidence. Warm full-operation profiling over the pinned real Opus and Vorbis Ogg corpus put
+the complete public Blob route at 0.063/0.128 ms, leaving no honest local speed seam beyond the browser
+runtime floor. The lifecycle audit did find a general defect: whole-stream Ogg reads checked the operation
+signal only after reaching EOF. A one-shot producer therefore delivered a second chunk after abort before
+the operation rejected, and a stalled read could delay cancellation indefinitely. The stricter re-import
+review also found that cross-target packet trim declared the requested `end-start` duration even when its
+first/last whole packets extended beyond those boundaries, and a midstream Opus selection incorrectly kept
+the original encoder pre-skip. ADR-255 already introduced and justifies the Ogg-to-WebM/Matroska route and
+existing `WebmMuxer`; this ADR corrects its clocks/lifecycle without adding another target or writer.
+
+**Decision.** The shared Ogg whole-source reader accepts the operation signal. Every one-shot stream read
+races that signal; abort or read failure cancels the owned reader with the primary error and releases its
+lock in `finally`. Abort is checked before source acquisition and again after EOF before allocation. A
+finite random-access read cannot revoke a caller-owned range promise, so it rechecks abort immediately after
+the read and discards the result before parsing. Probe, packet-info, demux, and stream-copy pass their stage
+signal through this one shared reader. Successful streams retain the same one-pass chunk accumulation and
+exact concatenation. Cross-target trim first validates the complete packet table, selects every whole packet
+overlapping the requested interval, and declares the actual selected extent from the first kept PTS through
+the last kept packet end. When packet zero remains selected, OpusHead pre-skip and derived CodecDelay/gapless
+facts remain exact. A later-starting Opus selection owns a copied OpusHead with pre-skip zero, so the fresh
+timeline does not discard samples that belong to the selected first packet. The operation keeps full terminal
+packets and therefore invents no discard padding. Ogg-FLAC remains legal for Matroska and is explicitly
+declined for WebM with a typed `CapabilityError`; Opus and Vorbis remain legal for both. The recognized codec
+set still comes only from the ordinary Ogg parser. No output writer, target declaration, cache, workload
+threshold, source-shape selection, or untrimmed packet/output byte changes.
+
+**Consequences.** A fail-first high-water-mark-zero one-shot test changed from two pulls and no cancellation
+to one pull, one typed `aborted` cancellation, and an unlocked stream. Existing before-read and during-packet
+authoring abort tests remain green. Strict public reparse over real Opus and Vorbis preserves every coded
+payload, packet count, timestamp/duration within the Matroska clock, codec-private byte, Opus pre-skip,
+CodecDelay, SeekPreRoll, decoded gapless sample count, target DocType, and deterministic output SHA-256
+(`80753e05…` and `1f98a308…`). Warm-seven/alternating-31 public Blob medians are 0.063 ms (Opus) and
+0.128 ms (Vorbis), with a repeat at 0.065/0.133 ms, versus direct-driver 0.035-0.037/0.098-0.101 ms; separate
+256-operation passes peak at 6,485,376 ArrayBuffer bytes over baseline and retain 0-19,796 bytes after forced
+collection. Real Vorbis trim now declares its 0.418322-second selected packet extent instead of 0.4 seconds.
+Focused Opus tests prove midstream pre-skip zero, leading-packet pre-skip 312, no invented trailing padding,
+and exact selected payloads; a real FLAC-derived Ogg proves exact Matroska config/payloads plus the typed WebM
+decline. These local results do not close the ledger row: current-bundle same-export browser wall and rival
+memory remain mandatory.
+
+**Rejected:** polling the signal only between later chunks; waiting for EOF after abort; swallowing a
+producer read error behind cancellation; retaining a returned range after abort; aborting a caller-owned
+controller; fixture/name/digest/size/packet-count recognition; output caching or passthrough; a second EBML
+writer; weakening reference re-import; and claiming browser leadership from the Bun product benchmark.
+
+### ADR-274 - Same-brand MP4 metadata writes relocate one validated `moov`
+
+**Context (Session 13 metadata speed leadership).** The correct public `metadata/write_mp4_tags` row
+measured 25.570 ms against mediabunny at 16.455 ms. MP4 and MOV share one container driver, so the existing
+single-format metadata shortcut could not prove that a requested MP4 target already matched its source.
+The ordinary path parsed every sample table, projected/gathered every sample, authored a fresh faststart
+movie, collected that complete output, and then allocated another complete movie to replace
+`moov/udta/meta/ilst`. On the real 5,339,207-byte selected source, warmup-three/`n=21` product profiling
+measured 3.098 ms for that full-remux-plus-tags path versus 0.558 ms for the already-validated direct tag
+writer before public routing and storage validation.
+
+**Decision.** A tag-only request with no track selection, explicit faststart, or fragmentation may relocate
+metadata directly only when a complete owned source proves an exact brand class: non-`qt  ` ISO-BMFF for an
+MP4 target, or `qt  ` for a MOV target. MP4→MOV and MOV→MP4 remain real remuxes. The cheap classifier requires
+one complete `ftyp`, one `moov`, at least one `mdat`, a fully consumed top-level box walk, and every media box
+wholly before or wholly after `moov`; it rejects fragments/indexes, mixed placement, compressed movies,
+auxiliary/item absolute offsets, malformed offset tables, and external chunk offsets. Before authoring, the
+selected MP4 driver performs ADR-251's full demux validation over the owned bytes: `stsz`/`stsc` plus
+`stco`/`co64` must place every complete sample inside a declared `mdat`. The demuxer is closed without opening
+packet streams or projecting payloads. The direct writer replaces only tag metadata, applies the exact
+`moov` byte delta to chunk offsets when media follows it, and copies every other top-level byte unchanged.
+Any cheap-classifier decline replays the exact owned bytes through the unchanged remux path; a one-shot
+source is therefore consumed once. Abort checks remain before/after collection and synchronous authoring.
+
+**Consequences.** Five real-fixture public tests spanning faststart/tail-`moov`, H.264, AV1, B-frame/VFR-like
+timing, and different sizes preserve every non-`moov` byte plus exact movie/media/edit clocks, track/config
+side data, sample bytes, key flags, DTS, PTS, and durations while re-importing every requested tag. Exact
+brand tests prove both accepted same-brand outputs and both cross-brand remuxes. Fragmented, truncated, and
+wrong-brand inputs decline; a constructed `stco` that points at the final `mdat` byte is rejected because its
+first complete sample escapes the media box. The seven-file real-corpus benchmark (VFR H.264/AAC, HEVC 4K,
+H.264 720p, HDR10, FLAC-in-MP4, ordinary and tiny MP4; warmup five, `n=21`) measures 2.287 ms median/MAD
+0.345 for the public direct route versus 5.040/0.531 ms for the retained full-remux control (2.204x), with
+0.59 versus 17.02 MiB positive peak RSS and checksum 512,504,502. The selected 5.34 MiB public shape measures
+1.608 ms direct versus 2.910 ms full-remux locally. No decoder, encoder, `VideoFrame`, or `AudioData` is
+created; B-frame/VFR order, cancellation, existing buffered metadata backpressure, and close-once frame
+ownership do not change. Fresh same-export browser wall and memory evidence remain required before the
+ledger row becomes a qualified lead.
+
+**Rejected:** recognizing a fixture, filename, digest, size, tag set, scenario, or rotation; trusting MIME or
+the multi-format driver as source-format proof; treating ISO-branded MP4 as a direct MOV result; checking
+only whether a scalar chunk offset falls somewhere inside `mdat`; applying a uniform delta to mixed
+pre/post-`moov` media; directly rewriting fragmented/indexed/CENC auxiliary-offset shapes; returning source
+bytes unchanged; weakening tag/sample/clock oracles; and claiming browser leadership from local product
+measurements.
+
+### ADR-276 - WebM qualifies a sequence header from an incomplete bounded Block
+
+**Context (Session 13 VP9-alpha probe leadership).** The fresh same-export `probe/vp9_alpha` row passed
+exact metadata but measured 8.335 ms (MAD 1.105) against mediabunny at 7.165 ms (MAD 1.785). The selected
+748,970-byte WebM stores complete `Info`, `Tracks`, declared `Video/AlphaMode`, and color by byte 418. Its
+first Cluster begins at byte 419, but the first alpha-bearing BlockGroup spans about 14.4 KiB. ADR-258's
+8 KiB metadata window therefore contained several kilobytes of the first VP9 key access unit, including
+its complete uncompressed header, yet the parser discarded it solely because the enclosing EBML Block was
+not complete. Decoder configuration stayed unknown and forced a second 64 KiB transport read. Parser work
+was sub-millisecond; the avoidable cost was the second range latency and 57,344 additional bytes.
+
+**Decision.** Metadata-only WebM parsing may retain the available payload prefix of an incomplete Block as
+a decoder-qualification candidate. A SimpleBlock still needs its own keyframe flag. A complete BlockGroup
+still proves keyframe status only by the absence of `ReferenceBlock`. An incomplete BlockGroup cannot make
+that absence claim, so its first payload is merely unproven input to the codec parser: VP9 must independently
+validate frame marker, frame type, sync code, profile, depth, chroma, and geometry; AV1 must independently
+find and completely parse a sequence-header OBU. Inter frames, show-existing frames, truncated headers,
+incomplete OBUs, and malformed payloads remain unqualified and drive the unchanged 8 KiB → 64 KiB →
+256 KiB → 1 MiB → 4 MiB/full fallback. Duration, tracks, attachments, alpha, color, and geometry continue
+to require complete declared container metadata. No first-window size, source routing, or cache policy changes.
+
+**Consequences.** The selected public VP9-alpha source now returns exact full-file `TrackInfo` from one
+`[0,8192)` driver read instead of `[0,8192)` plus `[0,65536)`, preserving `vp09.00.30.08`, 640×480,
+30.0000003 fps, declared alpha, limited range, duration, and every public field. A structural mutation that
+turns the unproven candidate into a VP9 inter frame remains `vp09`/unknown. The diverse five-source real
+benchmark (public VP9-alpha, AV1, VP8/Vorbis, corpus VP9-alpha, and VP9/Opus; warmup three, alternating
+`n=21`, one-millisecond range latency) measures 1.292-1.330 ms medians with one 8 KiB read versus
+2.597-2.662 ms when a sequence-bearing first window is unavailable and the same exact truth needs a second
+range; the selected row is 1.330 versus 2.654 ms. One hundred forty focused WebM/codec/writer tests pass.
+Probe creates no decoder, packet stream, `VideoFrame`, or `AudioData`; B-frame/VFR order, cancellation,
+backpressure, and close-exactly-once ownership do not change. Same-export browser wall and memory remain the
+required leadership gate.
+
+**Rejected:** increasing every first window to 16 or 64 KiB; trusting an incomplete BlockGroup as a
+container-proven keyframe; substituting a default VP9/AV1 profile; recognizing the selected filename, size,
+offsets, codec, duration, dimensions, digest, or rotation; caching parsed metadata; weakening config/alpha
+truth; and claiming row closure from the latency-injected product benchmark.
+
+### ADR-279 - Complete WebM declarations jump directly to terminal timeline truth
+
+**Context (Session 13 VP9-alpha rotation stability).** A fresh warm-five/`n=21` same-export rotation selected
+a 95,093-byte VP9-alpha WebM and measured 10.420 ms (MAD 1.385) against remotion-media-parser at 11.035 ms
+(MAD 5.170). The raw 0.615 ms lead was inside noise. Product profiling found complete `Info`, `Tracks`,
+declared `AlphaMode`, and geometry by byte 258, but no `DefaultDuration`. Exact 30 fps therefore requires all
+81 Blocks through the terminal 2.7-second Cluster. The existing ladder correctly reached a full scan, but
+first fetched an unnecessary 64 KiB intermediate window: public reads were `[0,8192)`, `[8192,65536)`, then
+`[65536,95093)`.
+
+**Decision.** Metadata readiness separates complete container declarations from complete public timeline.
+Once finite `Tracks` and `Attachments` are wholly present and every video track has geometry, a missing
+declared duration or video fps proves that `scanClusters:false` cannot finish the result. A known-size source
+then jumps directly to one full range and the unchanged full Cluster parser; ADR-246 fetches only the missing
+suffix. Incomplete declarations retain the bounded ladder, as do complete declared timelines whose VP9/AV1
+sequence qualification remains unknown. A full range shorter than the declared size rejects typed rather
+than deriving plausible fps from a partial Cluster. Abort is rechecked after the full await.
+
+**Consequences.** The selected source now reads `[0,8192)` and `[8192,95093)`, transferring every source byte
+once, and preserves duration 2.7, fps 30, VP9, 320×240, declared alpha, and `vp09.00.20.08`. A real headerless
+recorder uses the same general two-read schedule; three declared-timeline VP9/AV1 controls remain one bounded
+8 KiB read. A five-source public benchmark (warmup three, alternating `n=21`, one-millisecond range latency)
+measures the selected path at 2.710 ms versus 4.042 ms with redundant intermediate transport, and the recorder
+at 2.755 versus 4.052 ms, with exact `MediaInfo` equality. No frame, packet stream, B-frame/VFR clock, cache,
+or ownership contract changes. Fresh browser wall and memory evidence remain mandatory.
+
+**Rejected:** estimating fps from an early constant-looking cadence; dividing declared duration by a prefix
+packet count; accepting the wrong 30.37037 partial cadence; recognizing a name, size, digest, block count,
+dimensions, duration, or rotation; increasing every prefix; weakening alpha/config/duration truth; or calling
+the inside-noise browser lead closed.
+
+### ADR-277 - Range-less WAV decode owns one incremental RIFF cursor
+
+**Context (Session 13 WAV memory and lifecycle).** ADR-248 made seekable packed-PCM decode emit exact-owned
+interleaved Float32 chunks, but `decodePcmAudioStream` and `decodePcmInterleavedStream` still collected every
+range-less WAV byte before parsing `fmt ` and `data`. A long one-shot source therefore retained one complete
+input allocation in addition to its bounded output frames. That work is unnecessary because RIFF chunk
+headers, the effective extensible PCM tag, and the next frame-aligned payload span are all decidable in
+stream order.
+
+**Decision.** A range-less WAV source is parsed by one driver-local sequential byte cursor. It reads the
+12-byte RIFF envelope, inspects at most 40 bytes of `fmt `, skips unrelated chunk bodies without collecting
+them, and stops at the first `data` body. Each downstream pull then assembles at most the existing 4,096
+frames into the unchanged canonical-planar or exact-owned interleaved-Float32 decoder. At most one producer
+read is pending, and storage is bounded by one producer chunk, one exact wire chunk, and one output chunk.
+EOF after the declared payload cancels any trailing source bytes; consumer cancel, live abort, source read
+failure, truncated payload, and decode/enqueue failure cancel the owned reader, release its lock once, and
+clear byte views. Source failures become typed `demux-error`; abort remains typed `aborted`. Seekable byte,
+Blob, URL, and OPFS sources retain ADR-248's one-MiB range window and zero-copy/range policy.
+
+**Consequences.** Adversarial 97-228-byte producer seams over the real signed-24 fixture return every
+Float32 bit and every 4,096-frame cadence entry identically to the range path while never overlapping two
+producer pulls. Focused tests cover pending-read downstream cancellation, pending-read abort, source error
+identity in typed detail, premature EOF, normal EOF, lock release, and the pre-existing `AudioData`
+close-exactly-once seam. On the real 7,904,256-byte public `03.wav`, warmup-three/`n=11` measures 3.438 ms
+median versus 3.428 ms for the former whole-buffer control, with exact 1,315,328 frames, 322 chunks, and
+checksum 658,366,885. Median positive ArrayBuffer peak falls from 18,463,056 to 10,558,688 bytes and a
+retained completed stream keeps zero bytes. Raw PCM has no B-frame, VFR, seek-reorder, or GOP state; sample
+timestamps and consumer frame ownership do not change. The historical seekable public memory row remains
+open for the central same-export sweep.
+
+**Rejected:** selecting every Blob stream (Bun emits up to 2 MiB chunks and measured a 500,288-byte peak
+regression); reducing the general range window to 64/128/256 KiB (fresh five-shape Chrome profiling made the
+large path slower, and its memory sampler returned inadmissible zero deltas); changing the public 4,096-frame
+cadence; buffering skipped RIFF chunks; recognizing a fixture, name, size, duration, sample rate, or channel
+count; pooling transferred `AudioData` storage; weakening exact sample truth; or claiming the seekable public
+row closed from this range-less result.
+
+### ADR-278 - MP4 native packet streams fill bounded source-window batches
+
+**Context (Session 13 massive-demux contract floor).** The qualified
+`demux/size_massive_massive_h264_1080p_2h` row passed exact 553,501-packet truth but measured 1,384.170 ms
+against a 43.750 ms passing rival. A product-only Chromium boundary profile on the selected
+1,144,400,182-byte source measured `demux()+packetTable()` at 32.0 ms and a native `packets()` drain at
+1,278.6 ms with the identical packet checksum. ADR-269 had therefore already removed the metadata/parser
+floor; the remaining path constructed immutable WebCodecs chunks for 1.14 GiB of payload and scheduled one
+underlying stream pull for nearly every consumer read. The 74,425,089-byte 4K control exposed the same
+boundary over 1,808 exact rows.
+
+**Decision.** MP4 packet streams retain a zero high-water mark, so an idle consumer triggers no payload read
+or chunk construction. One pending pull may fill at most 256 KiB or 256 packets, whichever comes first, and
+never crosses the current validated source read window. This manual budget is necessary because packet
+payload bytes alone do not bound retention: range-backed `Packet.data` views from sparse/non-monotonic
+layouts can otherwise pin a different 8 MiB window per tiny packet. B-frame/VFR iteration remains decode
+order with exact PTS, DTS, duration, size, and key truth; every packet remains a real immutable
+`EncodedVideoChunk`/`EncodedAudioChunk`. The operation signal owns a stream abort listener that errors the
+controller and releases queued/source state immediately. Range misses retain post-await abort and exact
+short-read validation; cancellation, EOF, central demux close, and pre-opened sibling-stream leases retain
+ADR-260 semantics.
+
+**Consequences.** Fail-first tests reduce product pull count by more than half while preserving every real
+B-frame/VFR packet field, and prove cancellation starts no later read, a racing abort emits no packet, a
+prefetched batch is purged by typed abort, short reads construct no chunk, and completed streams release the
+source without breaking siblings. Headed Chromium (`warmup=1`, `n=5`) returns exact packet-table/drain
+hashes of 1,238,307,765 for the 4K control and 2,889,335,330 for the massive source. The 4K drain measures
+21.155 ms median/MAD 0.855 with 270 producer pulls (6.70 packets/pull); massive measures 1,052.745/3.170 ms
+with 5,522 pulls (100.24 packets/pull), a 17.7% reduction from the 1,278.6 ms isolated baseline. Sampled
+positive JS heap peaks are 103,857,792 and 157,151,825 bytes, respectively; they are diagnostic rather than
+the harness process-memory oracle. The massive row remains explicitly **blocked**, not closed: immutable
+native chunk construction still copies the coded payload and the public stream consumer still performs
+553,501 `read()`/`await` steps, while the exact metadata-only public seam already finishes in 33.945 ms.
+The first qualified same-export rotation after integration selects real `01.mp4` and improves the 4K row
+from 126.400 to 70.320 ms (MAD 0.680), but mp4box still leads at 38.865 ms (MAD 4.700); that row therefore
+also remains **BEHIND**, not closed. Fresh same-export massive wall/memory remains authoritative.
+
+**Rejected:** replacing sealed native chunks with lazy/plain metadata objects; zero-byte or truncated chunks;
+using `packetTable()` rows as coded packets; trusting `stss` instead of exhaustive AVC truth; grouping several
+samples into one packet; fixture/name/hash/size/count recognition; unbounded eager packet arrays; allowing a
+batch to cross source windows; and a 1 MiB candidate. The 1 MiB candidate failed the real abort oracle by
+prefilling an entire remaining track before terminal close, and raised worst-case live queued payload by
+786,432 bytes while the qualified row already trailed the leanest passing rival by 818,622 bytes.
+
+### ADR-280 - Default Blob MP4 metadata rewrites compose immutable source slices
+
+**Context (Session 13 MP4 metadata leadership).** The qualified `metadata/write_mp4_tags` row selected a
+3.5 MiB MP4, passed exact metadata truth, and measured 25.260 ms against mediabunny at 10.745 ms. ADR-274's
+general same-brand route already reduced seven-file owned-byte product work below a millisecond per corpus
+on warm runs, but a Blob/File caller still read the complete source into a new Uint8Array and the tag writer
+then allocated another complete output around one changed `moov`. The default API returns a Blob, whose
+immutable source-slice composition can preserve `mdat` without either payload copy.
+
+**Decision.** A direct Blob/File input may use the composed rewrite only for a tag-only, same-brand MP4 or
+MOV request with the default Blob sink and no track selection, explicit faststart, or fragmentation. A
+range scanner consumes every complete top-level header with exact 32/64-bit/to-EOF size bounds, plus the
+`ftyp` brand and complete `moov`; it rejects duplicate/missing `ftyp` or `moov`, absent `mdat`, unsafe
+fragment/index/UUID boxes, mixed pre/post-`moov` media, malformed tails, external chunk offsets, and
+`mvex`/`cmov`/`saio`/`iloc`/`uuid` anywhere in the recognized `moov` hierarchy. The existing MP4 driver's
+ADR-251 demux still validates `stsz`, `stsc`, and `stco`/`co64`, proving every complete sample extent inside
+a declared `mdat`. Only then does the route return a fresh target-MIME Blob composed from the immutable
+source prefix slice, one owned patched `moov`, and the immutable suffix slice. The patched metadata bytes
+are exactly the ADR-274 byte writer's output, including chunk-offset delta repair when media follows `moov`.
+Abort is checked before/after every finite range read, validation, and composition; the established two-phase
+progress clock reports source proof then metadata completion. Explicit sinks, URLs, normalized sources,
+one-shot streams, cross-brand, selected-track, and every declined topology retain their former paths.
+
+**Consequences.** A fail-first tracked-Blob oracle changes from one `[0,size)` read to bounded header/metadata
+reads and proves that no full-source interval is materialized. Six diverse real MP4s cover AVC, AV1,
+B-frame/VFR, faststart and tail-`moov`, audio, and size variation; every composed Blob is byte-for-byte equal
+to the owned-byte ADR-274 output, reimports every tag, preserves every non-`moov` byte, and reparses with
+identical brand, movie/media/edit clocks, track/config facts, sample payloads, keys, DTS, PTS, and durations.
+Focused controls decline fragmented, indexed, UUID, mixed-placement, `saio`, `iloc`, wrong-brand, malformed,
+explicit-sink, one-shot, and unsafe complete-sample shapes; File input shares the route when available;
+pre-abort performs no read and progress stays monotonic. The ten-file real-corpus benchmark (`warmup=3`,
+`n=21`), including all three current public rotations, measures Blob-direct at 1.860 ms median/MAD 0.348
+versus byte-direct 3.917/0.374 and full-remux 8.108/0.375, with positive peak RSS deltas of 0.41, 4.53,
+and 0.55 MiB and exact checksum 2,249,792,799 (unsigned). Peak deltas are measured in sequential process
+passes and therefore prove positive bounded allocation, not cross-route simultaneous residency. An isolated
+exact rotated-`02.mp4` public-product profile (`n=21`) confirms that the route accepts: topology plus patched
+`moov` is 0.232 ms, full public Blob remux including ADR-251 validation is 0.311 ms, output readback is
+0.141 ms, and the retained byte route is 1.077 ms for 5,339,207 input bytes.
+The exact-vendored qualified Chromium rotation (`warmup=3`, `n=7`) selects baked
+`h264_1080p_30s.mp4` and measures 59.165 ms (MAD 1.465) versus mediabunny 227.305 (MAD 2.110), a durable
+168.140 ms lead. A second Brave rotation selects real `03.mp4` SHA `58dc001d18…` and measures 42.010 ms
+(MAD 5.770) versus 86.990 (MAD 3.190). Both pass strict output truth; neither browser produced a positive
+memory sample. The original 3.5 MiB `01.mp4` losing rotation and same-export positive memory therefore remain
+mandatory before closing the row across rotations.
+
+**Rejected:** materializing the complete Blob before composition; returning the input Blob unchanged;
+copying or omitting `mdat`; trusting scalar chunk offsets without complete sample extents; weakening tag,
+packet, clock, or MIME truth; applying the route to explicit sinks or cross-brand/fragmented/indexed/
+auxiliary-offset/mixed layouts; recognizing a filename, size, digest, tag set, scenario, or rotation; caching
+an output; and claiming browser leadership from the product benchmark.
+
+### ADR-281 - Proven MP4 semantic no-ops compose a target-typed source Blob
+
+**Context (Session 13 rotation wall/memory leadership).** The qualified
+`transcode/h264_rotate_normalize` row passed exact decoded-frame truth and led wall time at 18.170 ms
+(MAD 2.650) versus remotion-webcodecs at 86.730 ms (MAD 2.805), but retained 39,125,869 peak bytes versus
+39,023,550: a 102,319-byte memory loss. The selected 4,369,242-byte source has an inherited
+`h264_rotated90.mp4` filename, but authoritative MP4 and ffprobe truth both show an identity `tkhd`,
+rotation zero, and matching 1280x720 display dimensions. ADR-263 therefore proves the requested H.264,
+coded geometry, and `rotate: 0` semantics, after which the MP4 stream-copy path needlessly allocates and
+authors a new 4,363,515-byte file from unchanged compressed samples.
+
+**Decision.** After ADR-263 proves a semantic no-op, direct raw Blob/File input may use immutable source
+composition only for the default Blob sink, an exact same-brand MP4/MOV target, and no explicit faststart
+or fragmentation choice. The ADR-280 top-level scanner and MP4 layout qualifier read complete bounded box
+headers, `ftyp`, and `moov`; they reject duplicate/missing structural boxes, fragments/indexes/UUIDs,
+auxiliary/item offsets, compressed movie metadata, mixed media placement, external chunk references, and
+malformed tails. The MP4 driver's ADR-251 demux validation then proves every complete sample extent lies
+inside a declared `mdat`. Only after both proofs does the engine return a fresh target-MIME Blob composed
+over the immutable source Blob. Serialized bytes do not change. Actual non-zero rotation, resizing, fps,
+rate, filter, track, codec, or alpha changes never satisfy ADR-263; cross-brand targets, explicit sinks,
+explicit layout controls, URL/one-shot/normalized sources, unsafe topology, and aborts retain the established
+path. No filename, size, digest, scenario, corpus rotation, or benchmark threshold affects eligibility.
+The complete convert stream-copy proof/execution planner lives in an operation-lazy module; the eager engine
+retains only routing and output materialization, so optional semantic strategies do not tax probe/startup.
+
+**Consequences.** Three real tracked-Blob regressions cover ordinary H.264, B-frame/VFR, edit/timing, and
+large multitrack shapes: output is byte-for-byte source-identical with target MIME, no `[0,size)` payload
+read occurs above the existing tiny-source eager threshold, and total range reads remain below source size.
+File uses the same route; controls prove fallback for explicit sink/layout, normalized source, cross-brand,
+UUID, malformed tail, pre-abort, and a real non-zero display rotation. Because no byte changes, movie/media/
+edit clocks, DTS/PTS/CTTS, VFR durations, B-frame order, color/config, other tracks, and compressed payloads
+are invariant by construction. The final five-real-file product benchmark (`warmup=3`, `n=21`) measures
+Blob medians from 0.048-0.148 ms versus 0.075-1.194 ms for the owned-byte writer; the 4.78 MiB case retains
+449,085 peak ArrayBuffer bytes versus 14,530,176. Its checksums and exact packet/hash oracles are nonzero.
+An isolated profile of the exact selected public file (`n=21`) measures 0.221 ms Blob-direct versus
+1.380 ms owned-byte, returns all 4,369,242 source bytes byte-identically with SHA-256 `04d75954b237…`, and
+an operation-only five-output run measures 3,031,040 bytes peak RSS versus 17,547,264. Fresh same-export
+browser wall/memory remains authoritative; this product evidence alone does not close the row.
+The rebuilt eager closure is 49.25 kB with a 0.75 kB guard and the typical first-operation closure is
+252.87 kB with 3.13 kB margin.
+
+**Rejected:** returning a differently typed input object by identity; changing or copying `mdat`; trusting
+only scalar rotation or chunk offsets; applying the route to any requested transform or unsafe layout;
+weakening decoded-frame, packet, timing, MIME, cancellation, or close-once truth; fixture recognition,
+output caching, and claiming browser leadership without a fresh qualified export.
+
+### ADR-282 - First-party packet provenance fuses demux into buffered MP4/MOV mux
+
+**Context.** Correct public video+audio MP4 measured 203.115 ms against mediabunny at 62.445 ms; H.264+AAC
+MOV measured 24.445 ms against 15.360 ms. Exact reconstruction attributed only 9-13 ms to writing. The
+dominant boundary constructed one native `Encoded*Chunk` per first-party MP4/ADTS packet and promise-drained
+it; in-memory MP4 also copied payload back out of the host object.
+
+**Decision.** A module-private `WeakMap` associates untouched first-party packet streams with one-shot native
+providers; streams expose no property or symbol. Default/Blob non-fragmented faststart MP4/MOV transactionally
+preflights every provider, exact `TrackInfo` identity, and untouched/unlocked/live state before claiming any.
+MP4 reuses validated sample tables/random access; ADTS reuses frame tables/owned bytes. Exact payload/PTS/DTS/
+duration/key structs feed the unchanged prepared writer without host chunks. Claim failure aborts and settles
+siblings. External, mixed, cloned-track, locked, pulled, progressive, fragmented, and array inputs stay generic.
+
+**Consequences.** The real 31.26 MiB H.264+ADTS shape produces a 30.92 MiB MP4 in 13.5 ms locally with zero
+host-chunk constructions and byte identity to forced generic output. B-frame/VFR/edit/config/rotation and
+presentation-origin truth remain prepared-writer inputs. Views remain owned through writing and release on
+success/error/abort. Tests prove transactional preflight, locked/wrong-track decline, sibling teardown, and
+exact real output. Fresh browser wall/memory remains mandatory.
+
+**Rejected:** forgeable symbols; caller metadata trust; asset/size/count thresholds; mixed/partially consumed
+fusion; consuming before full preflight; writer changes; dropped DTS/edit/config truth; progressive buffering;
+or claiming leadership from local attribution.
+
+### ADR-283 - False media selectors are no-ops only after exact absence proof
+
+**Context (Session 13 VP9-alpha rotation leadership).** The qualified
+`transcode/vp9_alpha_to_vp9_keepalpha` rotation passed alpha-plane and playback truth but measured 300.495
+ms (MAD 4.110) against mediabunny at 74.120 ms (MAD 1.985). The selected 5,487-byte source contains one
+2.4-second 200x200 VP9 profile-0/8-bit track at 25 fps, declares Matroska `AlphaMode=1`, and carries actual
+`BlockAdditional` alpha bytes on all 60 packets. Its explicit VP9 and `alpha:'keep'` target already matches
+every track fact. The operation's `audio:false` is also semantically exact because the source has no audio,
+but ADR-263's cheap pre-gate treated every false selector as a mutation before it obtained source metadata.
+The fallback therefore decoded and re-encoded all 60 color frames at an implicit bitrate while ADR-252
+copied their already-exact alpha packets.
+
+**Decision.** One `video:false` or `audio:false` selector may enter ADR-263's metadata proof as a
+source-dependent candidate. After the routed driver returns exact `TrackInfo[]`, the semantic predicate
+requires the corresponding video or audio track count to equal zero. A present track is a real exclusion
+and keeps the ordinary codec path. Both selectors false, no source-dependent target fact, empty metadata,
+non-media/projection/encrypted tracks, duplicate media tracks, unknown configuration, and every existing
+codec, geometry, rotation, cadence, precision, alpha, rate-control, or DSP mismatch remain ineligible. This
+changes only the proof module: one-shot sources still skip pre-probe, abort still prevents copy output, and
+the established driver writer, backpressure, cancellation, packet, mux, and frame-ownership behavior is
+unchanged. No negative alpha fact is inferred; `alpha:'keep'` still needs ADR-270's positive declared-alpha
+proof.
+
+**Consequences.** Focused validation passes 24 tests / 173 assertions. Symmetric video-only and audio-only
+cases accept only with zero opposite-media tracks; actual drops probe then use the generic demux path;
+both-false, empty, and non-media controls decline. Custom-driver tests prove eligible input calls
+`probe()` then `streamCopy()` without demux, while an actual drop calls demux and never copy. Abort and
+one-shot behavior are unchanged. The selected real source is pinned by SHA-256
+`518640653e936308e2c85aae4d6f02b35bbac468b82c36486732e284d599e513`; a fresh native rewrite emits
+3,862 bytes with SHA-256 `25dd20c3ed93ef38f371036c8b41b7f53523ca472658af59493d613f1dda9152`.
+All 60 color payloads, all 60 alpha payloads, track facts, keys, PTS, DTS, and 40 ms durations are exact.
+Warmup-three/`n=21` measures 0.388 ms median (MAD 0.038) locally versus the 300.495 ms qualified pre-fix
+browser wall. Fresh same-export browser wall and memory remain authoritative; local evidence alone does not
+close the row.
+
+**Rejected:** treating any false selector as automatically safe; copying when a corresponding source track
+exists; admitting both-false or empty requests; inferring track or alpha absence from a codec, filename,
+size, digest, scenario, or packet prefix; scanning one-shot input twice; weakening color/alpha/timing or
+playback truth; returning input bytes; fixture-specific routing; or claiming leadership before the central
+browser rerun.
+
+### ADR-284 - A bounded exact packet prefix recovers pre-output native VPx runtime misses
+
+**Context (Session 13 VP9→AV1 capability rotation).** A real rotated `03.webm` with VP9
+(`SHA-256 1e549042f6402c232cbdf2a5b4236d332054f26e163e121a748da93ecb85b421`) with
+`vp09.00.31.08` passes the browser's support probe and empty configure barrier, then its native decoder
+reports an asynchronous `EncodingError`; the public transcode is therefore `NA_ENGINE` while mediabunny
+passes. Ordinary routing cannot pick another driver after a stream has consumed packets. Reopening a one-shot
+source is impossible, teeing an unread sibling can grow without a byte-accounted bound, and switching after
+any frame was emitted would duplicate output or require retracting frames already owned downstream.
+
+**Decision.** Unpinned, non-alpha VP8/VP9 transcode decode keeps the routed native driver first. A one-reader
+recording input retains exactly one reference to each immutable `EncodedChunk` submitted before native output,
+without copying payload bytes or reopening the demuxer. Only a typed `CapabilityError` before the first emitted
+frame may fall through: the coordinator waits for primary-input teardown (the WebCodecs driver has already
+closed the native decoder and every queued frame), selects the exact internal `wasm-vpx` pin, replays the
+recorded references in order, and continues from the same locked source reader. The exact config, description,
+profile, alpha declaration, chunk type/key status, timestamps, durations, and packet bytes therefore reach the
+fallback unchanged. The first native frame commits the primary and releases the prefix. Retaining 256 packets
+or 16 MiB also releases the prefix and commits native without inventing a miss, bounding live replay memory by
+that ceiling plus the inherent largest packet. Late failures remain typed. Explicit non-WASM pins, alpha
+packet-plane transcode, non-VPx codecs, generic decode errors, unsupported WASM profiles, and absent fallback
+cores do not silently reroute. Abort cancels the active decoder and sole source reader, drops retained
+references, and closes any frame that loses the enqueue handoff. Because operation code splitting or a
+cross-realm registered driver can give the same typed class a different constructor identity, the guard accepts
+either local `instanceof CapabilityError` or the platform Error brand plus exact `name:'CapabilityError'` and
+`code:'capability-miss'`; plain objects and generic errors remain ineligible.
+
+**Consequences.** Eleven fail-first controls prove exact VFR timestamp/order replay and chunk-reference identity, successful-native
+invariance, no fallback construction on a late or non-capability error, typed missing-tail propagation,
+packet/byte over-budget behavior, abort propagation, frame close-once ownership, cross-realm/split-chunk typed
+error recognition, and rejection of plain-object error spoofs. The coordinator microbenchmark
+(`warmup=5`, `n=31`, 180 packets) produces the same checksum `536994630`: direct native is 0.175 ms median
+(MAD 0.012), bounded native 0.233/0.018, and fail-first replay 0.229/0.015. This is an isolated seam cost,
+not browser leadership evidence. Headed Chrome 149 on the selected 14,077,804-byte real file now succeeds
+natively (`warmup=1`, `n=5`, 6,636.0 ms median / 118.7 MAD), so the historical asynchronous miss did not
+reproduce in that fresh process; exact 4,482-frame/timeline/close truth, minimum sampled SSIM 0.999745, playback,
+and output SHA-256 `dc6c3d0a800a2e485cd33723bb3ca930f09b8b15bd62862edcc247e5caf7f97d` pass.
+A separate test-only top-rung driver then raises one genuine typed pre-output `CapabilityError` per conversion
+on the same real packets. Six conversions activate the actual lazy `wasm-vpx-driver` and `vpx-core`; each emits
+exactly 4,482 frames into the AV1 encoder with normalized input/output timestamp fold `96046486`, input/output
+close counts 4,482/4,482, one output key, minimum sampled SSIM 0.999736, playback to 0.243 seconds of a
+224.107-second output, and SHA-256 `41e677c3fb0bc6cc86299e749dc91c2520360b6c7bdfa2a53656d8ac1cd92894`.
+Its 6,966.4/131.6 ms median/MAD is diagnostic injected-failure evidence, not a leadership claim. Browser peak
+memory was unavailable and remains open; a same-export qualified rival rotation remains mandatory.
+
+**Rejected:** fixture/name/hash/size/profile recognition; weakening `isConfigSupported`; preselecting WASM;
+copying or transferring packet bytes; full-input or decoded-frame buffering; reopening/re-demuxing one-shot
+input; uncontrolled `tee()` retention; retrying corrupt-input errors; falling through an explicit native pin;
+switching after a frame was emitted; losing B-frame/VFR timestamps; changing alpha handling; or claiming a
+PASS before the real selected browser rotation is rerun.
+
+### ADR-285 - Definite audio containers register one default family before the full bundle
+
+**Context (Session 13 cross-feature memory attribution).** Qualified Brave rotations reported nearly the
+same absolute aibrush peak for unrelated work: 33,729,168 bytes for s24 WAV decode and 33,478,114 for a
+3,998-byte Ogg-to-MKV remux, exceeding mediabunny by 9,679,573 and 9,934,520.5 bytes. Public lifecycle
+profiles reject an operation-retention explanation. The WAV source is 141,168 bytes, performs two bounded
+reads totaling 141,002 bytes, emits six close-once frames totaling 187,944 bytes, and peaks at 329,842 live
+ArrayBuffer bytes. Ogg reads its 3,998-byte source once and produces a 2,939-byte MKV; output readback plus
+re-probe peaks at 13,765 bytes. Source/output Blobs, readers, streams, and engine instances collect, and
+post-GC ArrayBuffers return to zero in the ownership-focused profiles. Chromium's larger baked Ogg rotation
+reports aibrush and mediabunny equal within 2,984 bytes around 32.66 MiB; Brave lowers mediabunny by roughly
+9.1 MiB while aibrush stays near that baseline. The absolute cross-engine figure is therefore dominated by
+module/runtime residency. Fresh-process controls identify the product contribution: the first container miss
+imports `defaults.ts`, whose static MP4/WebM and all-family proxy closure is compiled even when the query is
+definitely WAV or Ogg. Explicit one-driver registration avoids roughly 13 MiB post-GC Node RSS with identical
+live operation buffers.
+
+**Decision.** Before importing the register-all defaults bundle, `#pickContainer` dynamically imports a
+small query-selective registrar. For a query exactly matched by the existing WAV, MP3, Ogg, ADTS, AIFF, or
+CAF support predicate—or a pin naming one of those first-party drivers—the registrar imports and registers
+only that actual native driver, clears the router cache, and retries the unchanged query. Existing
+caller-registered drivers retain precedence because a successful initial selection never enters this path.
+If the query is ambiguous/unsupported, the pin is unknown, or the selective retry still misses, routing
+imports the complete defaults bundle and retries exactly as before. Codec/filter/image registration,
+`preload`, wrong-MIME image recovery, later unrelated operations, and the full fallback remain unchanged.
+Registration is idempotent under repeated/concurrent calls. Matching delegates to the existing normalized
+MIME/extension/magic predicates; no filename, size, hash, asset, scenario, rotation, or performance threshold
+participates.
+
+**Consequences.** Seventeen focused tests cover all six MIME/extension families, MIME parameters/case,
+ambiguous and unknown queries, known/unknown pins, registry non-mutation on decline, exact single-family
+contents, and concurrent idempotence. The existing default-driver, public create-media, codec-operation, and
+runtime-control matrices preserve full fallback, source precedence, and pinned behavior. The committed
+fresh-process benchmark (`n=7` independent processes per cell) compares the public selective path with a
+register-all preload control on both real selected files. WAV measures 18,202,624 versus 31,850,496 median
+post-GC RSS bytes and 7.719 versus 15.829 ms, with identical 23,493-frame checksum `1331326d` and identical
+329,842-byte peak ArrayBuffers. Ogg measures 8,257,536 versus 19,480,576 RSS bytes and 9.656 versus
+15.115 ms, with identical 2,939-byte SHA-256 `3a7a2e33dcbb…` and identical 10,714-byte peak ArrayBuffers.
+The general startup deltas fall by 13,647,872 bytes for WAV and 11,223,040 for Ogg without changing media
+work. Browser UA-memory remains authoritative; the authorized focused browser A/B could not run because
+this session exposed no browser backend, so no browser closure is claimed.
+
+**Rejected:** changing packet/frame/output bytes; retaining an asset-specific cache; using fixture names,
+sizes, hashes, scenarios, or thresholds; weakening close-once/cancellation/backpressure; treating RSS as live
+payload memory; replacing the full fallback; changing caller-driver precedence; skipping wrong-MIME/image
+recovery; eagerly registering a chosen family in the kernel; and claiming the Brave rows closed from Node.
+
+### ADR-286 - Large progressive MP4 probe walks bounded metadata windows independent of payload size
+
+**Context (Session 13 contested MP4 probe wall).** Fresh same-export Chromium evidence left three passing
+MP4 probe rows behind mediabunny: H.264 4K measured 3.790 ms versus 2.970 inside combined noise, HEVC 1080p
+measured 4.305 versus 2.215 with a durable loss, and H.264 VFR measured 4.285 versus 2.070 with a durable
+loss. A later selected large-H.264 rotation already led durably at 2.915 versus 7.420 ms, so that fourth
+shape is a no-regression control rather than evidence of an unresolved loss. Product range traces found one shared admission
+error: the existing exact metadata proof rejected every known-size video source above 256 KiB solely because
+the file carried a large `mdat`. Those sources then paid the generic 32 KiB local metadata path even though
+their complete progressive `moov` was either at the head or reachable by one declared-size jump over payload.
+Payload byte count does not affect whether `ftyp`/`moov` proves track metadata.
+
+**Decision.** Remove total source size from known-size, video-hinted MP4/MOV metadata-proof eligibility.
+Walk top-level boxes from a bounded source-aware window: 16 KiB for local Blob/byte ranges and the existing
+128 KiB latency-amortized window for URL/media-element ranges. Validate each safe integer box end against the
+known source size, reuse headers already inside the current window, and jump by declared size across `mdat`
+and forward-compatible unknown boxes without reading their payload. Read an out-of-window `moov` exactly,
+parse it with the authoritative metadata parser, and return only when it proves at least one progressive AVC
+(`avc1`/`avc3`) or HEVC (`hvc1`/`hev1`) video track with positive geometry/cadence and only already-supported
+AAC companions. Preserve complete codec/config, bit-depth/color, rotation/edit, duration/fps, and track-order
+projection through the unchanged `toProbeTracks` mapping. Fragment timing, unsupported sample entries,
+malformed/overflowing/truncated layout, unknown-size input, and inconclusive reads decline to the existing
+generic typed parser before exposing metadata. Abort is checked after every bounded range read. The 16 KiB
+local crossover is four ordinary VM pages: multi-file measurements show one promise/range read is more
+expensive than copying the additional 12 KiB over the former 4 KiB tier, while still halving generic local
+overfetch; it is not derived from a fixture size, name, duration, dimension, or harness threshold.
+
+**Consequences.** Fail-first real-corpus validation spans faststart AVC B-frames, tail-`moov` AVC VFR,
+4K HEVC 8-bit, and HEVC Main10 HDR. Every optimized `TrackInfo[]` equals `Mp4Driver.demux()` truth; local
+reads are limited to bounded windows plus an exact `moov`, and read bytes remain independent of media payload.
+A real fragmented open-GOP control retains its whole-file fragment-timing scan; an overflowing top-level
+`mdat` rejects with typed `demux-error`; an abort triggered by the first range read performs exactly one read
+and raises typed `aborted`. The focused MP4 suites pass 98 tests, including golden metadata and B-frame/VFR
+timing. The alternating real-file product benchmark (`warmup=5`, `n=31`) covers six committed corpus files
+plus all four public contested assets when present, checks exact track equality on every iteration, and records
+read count/bytes. In the repeat used for this ADR, exact public shapes improve H.264 4K from 0.034333 to
+0.030541 ms, HEVC from 0.035708 to 0.035000, VFR from 0.033917 to 0.032208, and large H.264 from 0.046750
+to 0.045125; each local read window falls from 32 KiB to 16 KiB, while the large-`moov` case retains two
+reads and drops total range bytes from 137,869 to 121,453. These sub-millisecond product timings are root-
+cause evidence, not browser leadership: the exact rebuilt public rows, strict golden oracle, positive memory,
+and same-export rotations remain mandatory before their ledger statuses can close.
+
+**Rejected:** recognizing fixture names, hashes, sizes, dimensions, durations, rotations, or scenarios;
+caching metadata/output per input; increasing a payload-size exemption; guessing a footer offset; scanning or
+copying `mdat`; accepting incomplete timing/config; adding AV1/VP9 without focused proof; trusting fragmented
+init timing for video; weakening malformed/cancellation behavior; using a 4 KiB window after measured extra-
+read regressions; replacing the remote 128 KiB latency policy with local micro-I/O policy; or claiming public
+leadership from the product benchmark.
+
+### ADR-287 - Unforgeable packet provenance accepts only exhaustive TrackInfo value copies
+
+**Context (Session 13 two-source MP4 mux wall).** The selected public pair is the real 30-second H.264 MP4
+plus ADTS AAC. ADR-282 writes that exact first-party pair in about 5 ms with zero native host chunks when the
+demuxer-owned descriptor objects reach mux unchanged, yet the qualified public row remains 202.305 ms versus
+mediabunny at 61.575 ms. A public-API-only shape profile proves the boundary: shallow and structured copies
+of the exact descriptors fall back and construct 1,370 `Encoded*Chunk` objects even though they produce the
+same 30,918,082 bytes and SHA-256 `6517ad7b53b1…`. Complete arrays already route through prepared authoring;
+the missing general seam is a value-preserving descriptor copy paired with the untouched first-party stream.
+
+**Decision.** Keep ADR-282's exact module-private `WeakMap` stream identity as the unforgeable authority.
+Allow its provider to match either its own `TrackInfo` object or a plain-record clone only after exhaustive
+semantic equality: exactly the known top-level keys; every scalar; alpha, rotation, cadence, encryption,
+delay/preroll; nested video/audio config dimensions and rates; color space and raw color metadata; gapless
+facts; projections and attachment payloads; and codec-description bytes. Buffer/view content and type must
+match, and any extra, unknown, absent-versus-explicit, field, or byte difference declines. The prepared writer
+uses the provider-owned descriptor, never caller values. Every stream remains exact, unlocked, unpulled, and
+claimable, and all tracks still preflight before the first claim. Wrapped/teed/external/array streams remain
+generic; claim failure still aborts and settles siblings.
+
+**Consequences.** Fail-first clone validation now accepts shallow and structured exact copies while mutations
+to rotation, alpha, fps, coded dimensions, color, gapless totals, attachment/projection facts, one description
+byte, or an unknown key decline. Real H.264 B-frame and VFR plus ADTS integrations produce byte-identical
+clone-fused and generic outputs while fusion constructs zero additional host chunks. Existing locked, mixed,
+abort, short-read, and sibling-failure controls remain green. The product shape benchmark (`warmup=2`, `n=7`)
+measures identity/shallow/structured at 5.798/5.986/5.274 ms with zero host chunks and identical bytes; the
+wrapped-stream negative remains generic at 13.694 ms with 1,370 host chunks. Fresh same-export browser wall
+and positive memory remain mandatory before the public row closes.
+
+**Rejected:** public or forgeable provenance markers; trusting scalar-only equality; ignoring unknown fields;
+using caller-owned track truth; admitting a changed description/config/timeline; propagating authority through
+arbitrary wrappers; claiming partially consumed streams; array or external-stream fusion; fixture/name/hash/
+size/scenario logic; output caching; weakening transactional abort/backpressure; or claiming browser
+leadership from local evidence.
+
+### ADR-288 - Wholly implicit H.264 uses the native realtime latency policy
+
+**Context (Session 13 native encode leadership).** Two correct rows share a durable native H.264 wall:
+`transcode/h264_to_mkv` measures 1,913.845 ms against mediabunny at 1,660.265 ms, and
+`performance/encode-fps` measures 4,916.685 ms against 4,139.805 ms. A headed public-product profile on the
+real selected 321-frame H.264/AAC source attributes only 3.0-4.5 ms to encoded-chunk extraction and 5.4-12.9
+ms to Matroska finalization plus output materialization; the native encoder spans 1.59-2.26 seconds. Reusing
+the support probe's accepted `prefer-hardware` hint does not help: forced hardware measures 2,298.9 ms versus
+2,278.5 for the existing no-preference configuration. With codec/profile, 18,432,000 bit/s configuration,
+25 fps cadence, mux path, and every pipeline stage fixed, only changing WebCodecs `latencyMode` from
+`quality` to `realtime` improves alternating warm-one/`n=7` median wall from 2,259.5 to 1,606.2 ms.
+
+**Decision.** A target resolving to H.264 selects `latencyMode:'realtime'` only when `bitrate`,
+`bitrateMode`, `crf`, and `twoPass` are all absent. The presence of any one—including explicit
+`twoPass:false`—retains `quality`, so caller-selected rate/quality semantics do not change. Ordinary implicit
+AV1 keeps ADR-252's cadence-qualified realtime policy; HEVC, VP8, VP9, unknown codecs, high-cadence AV1, and
+unknown-cadence AV1 remain quality. The resolved codec/profile, configured bitrate and mode, dimensions,
+framerate, three disposable H.264 rate-control pictures, queue high-water mark eight, decoder, filters,
+muxer, and sink are unchanged. No input fact beyond the general target policy participates.
+
+**Consequences.** The pre-change A/B emits exactly 321 packets at 25 fps for 12.841667 seconds, starts with
+a key packet, preserves normalized packet/frame timestamps, and decodes all frames through the public
+playback path in both modes. All 324 submitted frames (321 source plus three preroll) close exactly once,
+with zero pending frames, duplicate submissions, or duplicate closes; decoder and encoder queues peak at
+seven. Twelve decoded-frame samples measure minimum SSIM 0.999708 in quality mode and 0.999346 in realtime;
+the 0.000362 reduction is explicit, remains well above the public quality floor, and retains the stronger
+near-lossless quality class. Realtime output is smaller (6,688,844 versus 27,468,322 bytes), so the wall win
+does not come from retaining more coded output. Fail-first policy validation covers implicit and explicit
+H.264, the complete existing AV1 boundary, HEVC, and VP9.
+
+On the integrated artifact, the independent 900-frame control measures realtime at 6,331.7 ms versus forced
+quality at 11,856.1 ms (`warmup=1`, alternating `n=7`), with 900 packets, exact 30-second duration, HTML
+playback, 903/903 close-once submitted frames, and minimum sampled SSIM 0.999978/0.999976. The 82-frame 720p
+B-frame control retains every frame/cadence, playback, 85/85 close truth, and minimum SSIM 0.999869. The
+377-frame VFR/B-frame diagnostic retains every packet and frame, exact normalized frame PTS, and a leading key;
+its stricter packet-row comparison records the source's first declared duration as 16 ms and the re-encoded
+timestamp-derived duration as 17 ms. A final alternating `n=7` control proves realtime and quality produce
+identical sorted packet PTS/duration rows, including that 17 ms projection: realtime measures 2,685.3 ms versus
+quality at 4,353.7 ms, both modes play through HTML, close 380/380 submissions once, and measure minimum sampled
+SSIM 0.99999947. The 900-frame product transcode is not the public `encode-fps` operation despite using the
+same real input, so its absolute wall is not ledger evidence. Fresh same-export public wall and positive memory
+remain mandatory before either row closes.
+
+**Rejected:** caching or forcing the hardware hint; increasing the queue bound; deleting the three quality
+preroll pictures; lowering bitrate; dropping, duplicating, or restamping frames; changing profile/framerate;
+parallelizing a single-digit-millisecond mux tail; applying realtime to any explicit rate/quantizer/two-pass
+contract; using fixture names, hashes, sizes, durations, geometries, frame counts, scenarios, or thresholds;
+weakening SSIM/playback/timeline gates; or claiming public leadership from the product A/B alone.
+
+### ADR-290 - Definite native audio transcodes avoid the register-all module closure
+
+**Context (Session 13 AAC-to-Opus memory leadership).** The qualified
+`transcode/aac_to_opus_webm` row leads wall durably at 56.190 ms but reports 32,421,157 peak bytes,
+7,029,024 above the leanest passing rival. The selected 163,811-byte ADTS input has 470 stereo 48 kHz
+AAC frames over 10.026667 seconds. Its complete f32 signal is 3,850,240 bytes, the existing 128-frame
+native encoder window covers at most 1,048,576 sample bytes, and a 502-packet Opus WebM at this duration is
+about 150 kB. Product WebM parsing, retained packet views, final serialization, and output readback add only
+about 151 kB of live ArrayBuffers at that scale. Fresh public-engine processes identify the persistent cost:
+selective ADTS probe retains 9,994,240 bytes median RSS versus 22,183,936 after register-all, but a public
+ADTS-to-WebM conversion that reaches target/codec routing retains 25,722,880 versus 25,296,896 for an
+explicitly preloaded control. ADR-285 cannot help the complete transcode because definite WebM target
+selection imports `defaults.ts` before the first decoder query.
+
+**Decision.** Extend query-selective default registration in two narrow, composable steps. First, an exact
+MP4/MOV or WebM/Matroska **mux** extension query imports and registers only that real native container module;
+demux, magic-only, ambiguous, and unknown queries retain the existing behavior. Second, after the ordinary
+caller/custom codec selection misses, an audio query for the canonical WebCodecs families
+(`mp4a`/Opus/MP3/FLAC/Vorbis) in automatic determinism imports and registers only
+`WebCodecsAudioModule`, clears router caches, and retries the unchanged `isConfigSupported` query. A native
+support false/throw, selective retry miss, deterministic-software request, explicit non-native pin, unknown
+codec, video query, later filter/image/video operation, or preload imports the complete defaults bundle and
+retries the established ladder, including matching WASM tails. Existing custom drivers retain precedence
+because initial routing always runs before either registrar. An explicit `webcodecs-audio` pin may register
+that exact driver before source ownership; any other absent pin keeps the complete registration/validation
+path. Registration remains idempotent by driver id and concurrent dynamic imports converge through the
+module loader. No source fact, filename, size, hash, packet count, duration, scenario, rotation, cache, or
+threshold participates.
+
+**Consequences.** Thirty-nine focused registrar tests cover all retained audio families, mux-only
+MP4/MOV/WebM/MKV/MKA tokens, demux/ambiguous/unknown decline, registry isolation, support success,
+support false/throw, force-software, native/non-native pins, concurrent idempotence, and a later unrelated
+full fallback. A public real-WPT-ADTS routing/lifecycle control compares selective and preloaded execution:
+both produce byte-identical WebM, the same exact target-clock packet PTS/durations and Opus track truth, close
+every decoded `AudioData` exactly once, and keep an already-aborted operation frame-free and typed. This
+control uses deterministic test coders only to falsify routing/lifetime changes; native codec truth remains
+browser-owned. The committed fresh-process benchmark uses five real ADTS inputs and seven independent
+processes per arm. Both routes select ADTS/WebM/WebCodecs audio and produce identical five-track checksum
+`bfdcf98e310b…`, 468,260 source bytes, and 35,062,132 duration microseconds. Selective registration measures
+9.556 ms / 16,367,616 median post-GC RSS bytes versus register-all at 12.794 ms / 24,887,296 bytes, saving
+3.238 ms and 8,519,680 RSS bytes; both retain exactly 468,934 ArrayBuffer bytes. An independent repeat
+measures 10.155 ms / 16,695,296 bytes versus 12.992 ms / 24,543,232, a 7,847,936-byte reduction with the
+same checksum and ArrayBuffer truth. RSS is diagnostic module residency, not browser peak-memory closure. A
+fresh same-export, same-rotation warm `n>=5` browser row with positive memory remains mandatory before the
+ledger can move from `BEHIND`.
+
+Asynchronous native decoder failure remains the existing typed `CapabilityError`; even the register-all path
+does not currently replay audio packets into a second decoder. This registration-only decision deliberately
+does not invent a replay buffer, change source consumption, or alter native configure/decode/encode/flush/
+close behavior. AAC priming, Opus pre-skip, packet clocks, the 128-item native queue bound, backpressure,
+cancellation, delayed encoder metadata, and close-exactly-once ownership remain in the unchanged media path.
+
+**Rejected:** registering MP4/WebM selectively for inconclusive source demux; keeping target selection on
+register-all; loading every codec/filter/image/WASM proxy and relying on GC to reclaim module namespaces;
+skipping the full ladder on native support/config failure; applying native selection in force-software or
+under a non-native pin; output staging; changing native queue bounds without browser evidence; stateful
+decoder/encoder reuse; adding audio runtime replay inside a registration change; fixture/name/hash/size/
+duration/count/scenario/rotation logic; treating RSS as browser memory; weakening byte/timeline/playback or
+frame-lifetime truth; or claiming the public row closed from the local attribution benchmark.

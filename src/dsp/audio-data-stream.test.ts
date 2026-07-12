@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { CapabilityError } from '../contracts/errors.ts';
 import {
+  interleavedPcmChunksToAudioDataStream,
   pcmAudioChunksToAudioDataStream,
   pcmAudioToAudioDataStream,
   pcmRangeToInterleavedInit,
   pcmRangeToPlanarInit,
   pcmToInterleavedInit,
 } from './audio-data.ts';
-import type { PcmAudio } from './pcm.ts';
+import type { InterleavedPcmF32, PcmAudio } from './pcm.ts';
 
 class TestAudioData {
   static readonly instances: TestAudioData[] = [];
@@ -197,6 +198,186 @@ describe('pcmAudioToAudioDataStream', () => {
       frame.close();
       expect(cancelled).toBe(true);
       expect(frame.closeCount).toBe(1);
+    });
+  });
+});
+
+describe('interleavedPcmChunksToAudioDataStream', () => {
+  function interleaved(frames = 2): InterleavedPcmF32 {
+    return {
+      sampleRate: 48_000,
+      channels: 2,
+      frames,
+      data: new Float32Array(new ArrayBuffer(frames * 2 * 4)).fill(0.125),
+    };
+  }
+
+  it('declares exact buffer transfer and leaves successful frames consumer-owned', async () => {
+    await withAudioData(async () => {
+      const chunk = interleaved();
+      const chunks = new ReadableStream<InterleavedPcmF32>({
+        start(controller): void {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+      const reader = interleavedPcmChunksToAudioDataStream(chunks, {}, 'pcm-s24').getReader();
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      const frame = next.value as unknown as TestAudioData;
+      expect(frame.init).toMatchObject({
+        format: 'f32',
+        numberOfChannels: 2,
+        numberOfFrames: 2,
+        sampleRate: 48_000,
+        timestamp: 0,
+        data: chunk.data.buffer,
+        transfer: [chunk.data.buffer],
+      });
+      expect(frame.closeCount).toBe(0);
+      frame.close();
+      expect(frame.closeCount).toBe(1);
+      expect((await reader.read()).done).toBe(true);
+      expect(chunks.locked).toBe(false);
+    });
+  });
+
+  it('cancels and unlocks upstream when native construction fails', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'AudioData');
+    let cancelled = false;
+    const chunks = new ReadableStream<InterleavedPcmF32>({
+      pull(controller): void {
+        controller.enqueue(interleaved());
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    Object.defineProperty(globalThis, 'AudioData', {
+      configurable: true,
+      value: class ThrowingAudioData {
+        constructor() {
+          throw new TypeError('native transfer rejected data');
+        }
+      } as unknown as typeof AudioData,
+    });
+    try {
+      const reader = interleavedPcmChunksToAudioDataStream(chunks, {}, 'pcm-s24').getReader();
+      await expect(reader.read()).rejects.toMatchObject({
+        code: 'decode-error',
+        message: expect.stringContaining('native transfer rejected data'),
+      });
+      expect(cancelled).toBe(true);
+      expect(chunks.locked).toBe(false);
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
+      else Object.defineProperty(globalThis, 'AudioData', original);
+    }
+  });
+
+  it('closes a constructed frame exactly once when downstream closes during construction', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'AudioData');
+    let outputReader: ReadableStreamDefaultReader<AudioData> | undefined;
+    let upstreamCancelled = 0;
+    const instances: Array<{ closeCount: number }> = [];
+    class ReentrantCancelAudioData {
+      closeCount = 0;
+
+      constructor(_init: AudioDataInit) {
+        instances.push(this);
+        void outputReader?.cancel('closed during native construction');
+      }
+
+      close(): void {
+        this.closeCount++;
+      }
+    }
+    const chunks = new ReadableStream<InterleavedPcmF32>({
+      start(controller): void {
+        controller.enqueue(interleaved());
+      },
+      cancel(): void {
+        upstreamCancelled++;
+      },
+    });
+    Object.defineProperty(globalThis, 'AudioData', {
+      configurable: true,
+      value: ReentrantCancelAudioData as unknown as typeof AudioData,
+    });
+    try {
+      outputReader = interleavedPcmChunksToAudioDataStream(chunks, {}, 'pcm-s24').getReader();
+      await expect(outputReader.read()).resolves.toMatchObject({ done: true });
+      expect(instances).toHaveLength(1);
+      expect(instances[0]?.closeCount).toBe(1);
+      expect(upstreamCancelled).toBe(1);
+      expect(chunks.locked).toBe(false);
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
+      else Object.defineProperty(globalThis, 'AudioData', original);
+    }
+  });
+
+  it('propagates consumer cancellation and rejects non-owned chunk views', async () => {
+    await withAudioData(async () => {
+      let cancelled = 0;
+      const openChunks = new ReadableStream<InterleavedPcmF32>({
+        pull(controller): void {
+          controller.enqueue(interleaved());
+        },
+        cancel(): void {
+          cancelled++;
+        },
+      });
+      const reader = interleavedPcmChunksToAudioDataStream(openChunks, {}, 'pcm-s24').getReader();
+      const first = await reader.read();
+      const frame = first.value as unknown as TestAudioData;
+      await reader.cancel('consumer stopped');
+      frame.close();
+      expect(cancelled).toBe(1);
+      expect(openChunks.locked).toBe(false);
+
+      const backing = new Float32Array(8);
+      const invalid: InterleavedPcmF32 = {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 2,
+        data: backing.subarray(2, 6) as Float32Array<ArrayBuffer>,
+      };
+      const malformedChunks = new ReadableStream<InterleavedPcmF32>({
+        start(controller): void {
+          controller.enqueue(invalid);
+        },
+      });
+      const malformed = interleavedPcmChunksToAudioDataStream(
+        malformedChunks,
+        {},
+        'pcm-s24',
+      ).getReader();
+      await expect(malformed.read()).rejects.toMatchObject({ code: 'decode-error' });
+      expect(malformedChunks.locked).toBe(false);
+    });
+  });
+
+  it('keeps abort typed when an upstream cancellation hook also fails', async () => {
+    await withAudioData(async () => {
+      const chunks = new ReadableStream<InterleavedPcmF32>({
+        pull(controller): void {
+          controller.enqueue(interleaved());
+        },
+        cancel(): void {
+          throw new Error('upstream cancellation failed');
+        },
+      });
+      const abort = new AbortController();
+      abort.abort('stop');
+      const reader = interleavedPcmChunksToAudioDataStream(
+        chunks,
+        { signal: abort.signal },
+        'pcm-s24',
+      ).getReader();
+      await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+      expect(chunks.locked).toBe(false);
+      expect(TestAudioData.instances).toHaveLength(0);
     });
   });
 });

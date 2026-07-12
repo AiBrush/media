@@ -57,6 +57,7 @@ const EBML_ID = {
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
+  AlphaMode: 0x53c0,
   Projection: 0x7670,
   ProjectionPoseRoll: 0x7675,
   Colour: 0x55b0,
@@ -517,6 +518,7 @@ interface TrackState {
   readonly timestampAdjustmentNs?: number;
   readonly width: number | undefined;
   readonly height: number | undefined;
+  readonly alpha: boolean;
   readonly rotation?: number;
   readonly color?: VideoColorMetadata;
   readonly fps: number | undefined;
@@ -711,6 +713,7 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
       ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),
       width: vc?.codedWidth,
       height: vc?.codedHeight,
+      alpha: info.alpha === true,
       ...(rotation !== undefined ? { rotation } : {}),
       ...(color !== undefined ? { color } : {}),
       fps: info.fps,
@@ -740,6 +743,7 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),
     width: undefined,
     height: undefined,
+    alpha: false,
     fps: undefined,
     durationSec: info.durationSec,
     ...(info.gapless !== undefined ? { gapless: info.gapless } : {}),
@@ -857,12 +861,14 @@ function trackEntryElement(t: TrackState): Uint8Array {
     }
     const roll = matroskaRollFromClockwise(t.rotation);
     const color = t.color === undefined ? undefined : colorElement(t.color);
+    const alpha = t.alpha || t.chunks.some((chunk) => chunk.alpha !== undefined);
     parts.push(
       element(
         EBML_ID.Video,
         concatBytes([
           uintEl(EBML_ID.PixelWidth, t.width ?? 0),
           uintEl(EBML_ID.PixelHeight, t.height ?? 0),
+          ...(alpha ? [uintEl(EBML_ID.AlphaMode, 1)] : []),
           ...(roll !== undefined && roll !== 0
             ? [element(EBML_ID.Projection, floatEl(EBML_ID.ProjectionPoseRoll, roll))]
             : []),

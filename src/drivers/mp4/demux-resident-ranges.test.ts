@@ -99,6 +99,38 @@ function withFirstTwoStcoEntriesSwapped(bytes: Uint8Array): Uint8Array {
   return mutated;
 }
 
+function appendBytes(bytes: Uint8Array, suffix: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.byteLength + suffix.byteLength);
+  out.set(bytes);
+  out.set(suffix, bytes.byteLength);
+  return out;
+}
+
+function emptyTopLevelBox(type: 'free' | 'mdat'): Uint8Array {
+  return Uint8Array.of(
+    0,
+    0,
+    0,
+    8,
+    type.charCodeAt(0),
+    type.charCodeAt(1),
+    type.charCodeAt(2),
+    type.charCodeAt(3),
+  );
+}
+
+function extendedEmptyFreeBox(highSize = 0, lowSize = 16): Uint8Array {
+  const bytes = Uint8Array.of(0, 0, 0, 1, 0x66, 0x72, 0x65, 0x65, 0, 0, 0, 0, 0, 0, 0, 0);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, highSize);
+  view.setUint32(12, lowSize);
+  return bytes;
+}
+
+function emptyToEofMdat(): Uint8Array {
+  return Uint8Array.of(0, 0, 0, 0, 0x6d, 0x64, 0x61, 0x74);
+}
+
 function observeArraySorts<T>(run: () => T): { readonly value: T; readonly calls: number } {
   const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'sort');
   const originalSort = Array.prototype.sort;
@@ -284,6 +316,25 @@ describe('MP4 demux retained-range and pull allocation bounds', () => {
     }
   });
 
+  it('revokes the demuxer source on close while already-open sibling streams retain independent leases', async () => {
+    const bytes = await loadFixture('obs-remux-variable-aac.mp4');
+    const demuxer = await Mp4Driver.demux(countingSource(bytes, [], 'bytes'));
+    const video = demuxer.tracks.find((track) => track.mediaType === 'video');
+    const audio = demuxer.tracks.find((track) => track.mediaType === 'audio');
+    if (video === undefined || audio === undefined)
+      throw new Error('expected video and audio tracks');
+    const videoPackets = demuxer.packets(video.id);
+    const audioPackets = demuxer.packets(audio.id);
+
+    const videoTruth = await drainPackets(videoPackets);
+    expect(videoTruth.length).toBeGreaterThan(0);
+    await demuxer.close();
+    expect(() => demuxer.packets(video.id)).toThrow(/demuxer is closed/);
+
+    const audioTruth = await drainPackets(audioPackets);
+    expect(audioTruth.length).toBeGreaterThan(0);
+  });
+
   it('reuses one complete fragmented-file read for fragment mapping, validation, and packet bytes', async () => {
     const path = fileURLToPath(
       new URL(
@@ -314,7 +365,141 @@ describe('MP4 demux retained-range and pull allocation bounds', () => {
     }
   });
 
-  it('returns a Promise only for genuine packet-window misses and preserves B-frame packet truth', async () => {
+  it('fuses remote cold-demux layout reads without changing B-frame or VFR packet truth', async () => {
+    const fixtures = [
+      { name: 'bear-1280x720.mp4', maximumReads: 1 },
+      { name: 'obs-remux-variable-aac.mp4', maximumReads: 2 },
+    ] as const;
+    for (const fixture of fixtures) {
+      const bytes = await loadFixture(fixture.name);
+      const expectedDemuxer = await Mp4Driver.demux(countingSource(bytes, [], 'bytes'));
+      const reads: RangeRead[] = [];
+      const actualDemuxer = await Mp4Driver.demux(countingSource(bytes, reads, 'url'));
+      try {
+        const expectedTable = expectedDemuxer.packetTable?.();
+        const actualTable = actualDemuxer.packetTable?.();
+        expect(actualDemuxer.tracks).toEqual(expectedDemuxer.tracks);
+        expect(actualTable).toEqual(expectedTable);
+        expect(reads.length).toBeLessThanOrEqual(fixture.maximumReads);
+        expect(reads.reduce((total, read) => total + read.end - read.start, 0)).toBeLessThan(
+          bytes.byteLength,
+        );
+
+        const video = actualDemuxer.tracks.find((track) => track.mediaType === 'video');
+        expect(video).toBeDefined();
+        if (video === undefined || actualTable === undefined) continue;
+        const videoRows = actualTable.filter((packet) => packet.trackId === video.id);
+        expect(videoRows.some((packet) => packet.ptsUs !== packet.dtsUs)).toBe(true);
+        const packets = await drainPackets(actualDemuxer.packets(video.id));
+        expect(packets).toEqual(
+          videoRows.map(
+            (packet): PacketSnapshot => ({
+              size: packet.sizeBytes,
+              ptsUs: packet.ptsUs,
+              dtsUs: packet.dtsUs,
+              durationUs: packet.durationUs,
+              keyframe: packet.keyframe,
+            }),
+          ),
+        );
+        if (fixture.name === 'obs-remux-variable-aac.mp4') {
+          expect(new Set(videoRows.map((packet) => packet.durationUs)).size).toBeGreaterThan(1);
+        }
+      } finally {
+        await actualDemuxer.close();
+        await expectedDemuxer.close();
+      }
+    }
+  });
+
+  it('keeps strict ownership across multiple, size-zero, and extended top-level boxes', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const expected = await Mp4Driver.demux(countingSource(bytes, [], 'bytes'));
+    const expectedTable = expected.packetTable?.();
+    await expected.close();
+    const variants = [
+      appendBytes(bytes, emptyTopLevelBox('mdat')),
+      appendBytes(bytes, extendedEmptyFreeBox()),
+      appendBytes(bytes, emptyToEofMdat()),
+    ];
+    for (const variant of variants) {
+      const demuxer = await Mp4Driver.demux(countingSource(variant, [], 'url'));
+      try {
+        expect(demuxer.packetTable?.()).toEqual(expectedTable);
+      } finally {
+        await demuxer.close();
+      }
+    }
+  });
+
+  it('rejects unsafe extended sizes, truncated trailing headers, and unknown demux sizes', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    await expect(
+      Mp4Driver.demux(
+        countingSource(appendBytes(bytes, extendedEmptyFreeBox(0x20_0000)), [], 'url'),
+      ),
+    ).rejects.toMatchObject({ code: 'demux-error' });
+    await expect(
+      Mp4Driver.demux(countingSource(appendBytes(bytes, Uint8Array.of(0, 0, 0, 8)), [], 'url')),
+    ).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('truncated top-level MP4 box header'),
+    });
+    const unknownSizeSource: ByteSource & { readonly kind: 'url' } = {
+      kind: 'url',
+      stream: () => {
+        throw new Error('unknown-size range source must not fall back to streaming');
+      },
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    await expect(Mp4Driver.demux(unknownSizeSource)).rejects.toMatchObject({
+      code: 'demux-error',
+      message: 'MP4 demux needs a known source size',
+    });
+  });
+
+  it('rejects destroyed cold-layout headers, absent moov, and short range responses', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const zeroType = appendBytes(bytes, Uint8Array.of(0, 0, 0, 8, 0, 0, 0, 0));
+    await expect(Mp4Driver.demux(countingSource(zeroType, [], 'url'))).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('zero top-level MP4 box type'),
+    });
+
+    const onlyFree = emptyTopLevelBox('free');
+    await expect(Mp4Driver.demux(countingSource(onlyFree, [], 'url'))).rejects.toMatchObject({
+      code: 'demux-error',
+      message: 'no moov box found (not a valid MP4/MOV)',
+    });
+
+    const shortLayoutSource: CountingSource = {
+      kind: 'url',
+      size: bytes.byteLength,
+      stream: () => {
+        throw new Error('range-backed malformed source must not stream');
+      },
+      range: (start, end) => Promise.resolve(bytes.subarray(start, Math.max(start, end - 1))),
+    };
+    await expect(Mp4Driver.demux(shortLayoutSource)).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('short MP4 layout read'),
+    });
+
+    const shortInMemorySource: CountingSource = {
+      kind: 'bytes',
+      size: bytes.byteLength + 1,
+      stream: () => {
+        throw new Error('range-backed malformed source must not stream');
+      },
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+    };
+    await expect(Mp4Driver.demux(shortInMemorySource)).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('short in-memory MP4 read'),
+    });
+  });
+
+  it('fills bounded packet batches per pull while preserving B-frame packet truth', async () => {
     const bytes = await loadFixture('test.mp4');
     const reads: RangeRead[] = [];
     const demuxer = await Mp4Driver.demux(countingSource(bytes, reads, 'url'));
@@ -346,9 +531,9 @@ describe('MP4 demux retained-range and pull allocation bounds', () => {
 
       expect(observed.value).toEqual(expected);
       expect(packetWindowReads).toBeGreaterThan(0);
-      expect(observed.pulls.promise).toBe(packetWindowReads);
-      expect(observed.pulls.synchronous).toBeGreaterThan(observed.pulls.promise);
-      expect(observed.pulls.promise + observed.pulls.synchronous).toBe((expected?.length ?? 0) + 1);
+      expect(observed.pulls.promise).toBeGreaterThanOrEqual(packetWindowReads);
+      expect(observed.pulls.synchronous).toBe(0);
+      expect(observed.pulls.promise).toBeLessThan((expected?.length ?? 0) / 2);
       expect(constructedChunks).toBe(expected?.length);
     } finally {
       await demuxer.close();
@@ -429,6 +614,30 @@ describe('MP4 demux retained-range and pull allocation bounds', () => {
       await Promise.resolve();
       expect(reads).toHaveLength(readsAfterCancel);
       expect(constructedChunks).toBe(chunksAfterCancel);
+    } finally {
+      await demuxer.close();
+    }
+  });
+
+  it('drops a prefetched packet batch immediately when the operation aborts', async () => {
+    const bytes = await loadFixture('bear-1280x720.mp4');
+    const abort = new AbortController();
+    const demuxer = await Mp4Driver.demux(countingSource(bytes, [], 'bytes'), {
+      signal: abort.signal,
+    });
+    try {
+      const track = demuxer.tracks.find((candidate) => candidate.mediaType === 'video');
+      expect(track).toBeDefined();
+      if (track === undefined) return;
+      const reader = demuxer.packets(track.id).getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(constructedChunks).toBeGreaterThan(1);
+
+      abort.abort('stop prefetched packets');
+
+      await expect(reader.read()).rejects.toMatchObject({ code: 'aborted' });
+      reader.releaseLock();
     } finally {
       await demuxer.close();
     }

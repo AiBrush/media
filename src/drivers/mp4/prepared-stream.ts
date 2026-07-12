@@ -77,20 +77,41 @@ function writeOptionsFromMuxOptions(options?: MuxOptions): {
   };
 }
 
-function mp4PacketMuxTracks(inputs: readonly Mp4PacketTrackInput[]): MuxTrackInput[] {
+export function mp4PacketMuxTracks(inputs: readonly Mp4PacketTrackInput[]): MuxTrackInput[] {
   if (inputs.length === 0) {
     throw new MediaError('mux-error', 'MP4 mux received no tracks');
   }
-  const tracks: MuxTrackInput[] = [];
+  const states: Array<ReturnType<typeof trackStateFrom>> = [];
   for (const [index, input] of inputs.entries()) {
     const state = trackStateFrom(input.track);
     for (const chunk of input.chunks) state.chunks.push(chunk);
     if (state.chunks.length === 0) {
       throw new MediaError('mux-error', `MP4 mux track ${index + 1} received no packets`);
     }
-    tracks.push(toMuxTrack(state));
+    states.push(state);
   }
-  return tracks;
+  // Match Mp4Muxer's presentation-origin projection exactly. Complete source-timed arrays can have one
+  // track start after another (typically encoder-delay AAC beside video); the later track needs a leading
+  // empty edit or the prepared route would author a different timeline than the ordinary packet seam.
+  const sourceTimed = states.every((state) =>
+    state.chunks.every((chunk) => chunk.dtsUs !== undefined),
+  );
+  let globalPresentationOriginUs = Number.POSITIVE_INFINITY;
+  if (sourceTimed) {
+    for (const state of states) {
+      for (const chunk of state.chunks) {
+        globalPresentationOriginUs = Math.min(globalPresentationOriginUs, chunk.timestampUs);
+      }
+    }
+  }
+  return states.map((state) => {
+    const firstDtsUs = state.chunks[0]?.dtsUs;
+    const leadingEmptyUs =
+      sourceTimed && firstDtsUs !== undefined && Number.isFinite(globalPresentationOriginUs)
+        ? Math.max(0, firstDtsUs - globalPresentationOriginUs)
+        : 0;
+    return toMuxTrack(state, leadingEmptyUs);
+  });
 }
 
 function nextPayloadChunk(

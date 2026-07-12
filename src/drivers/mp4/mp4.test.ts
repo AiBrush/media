@@ -10,6 +10,7 @@ import { type MuxTrackInput, writeMp4 } from './write.ts';
 
 type CacheKeyedByteSource = ByteSource & { readonly [SOURCE_CACHE_KEY]: string };
 type MimeHintedByteSource = ByteSource & { readonly mimeHint: string };
+type UrlByteSource = ByteSource & { readonly kind: 'url' };
 
 function makeRA(bytes: Uint8Array) {
   return {
@@ -275,6 +276,103 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     }
   });
 
+  it('large AVC/HEVC probe walks bounded top-level windows and returns exact demux truth', async () => {
+    for (const fixture of [
+      'bear-1280x720.mp4',
+      'obs-remux-variable-aac.mp4',
+      'bear-4k-hevc.mp4',
+      'bear-hevc-10bit-hdr10.mp4',
+    ] as const) {
+      const bytes = await loadFixture(fixture);
+      expect(bytes.byteLength).toBeGreaterThan(256 * 1024);
+      const [moovStart, moovEnd] = topLevelBoxRange(bytes, 'moov');
+      const reads: Array<readonly [number, number]> = [];
+      const src: MimeHintedByteSource = {
+        ...byteSource(bytes),
+        mimeHint: 'video/mp4',
+        range: (start, end) => {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+      };
+
+      const probed = await Mp4Driver.probe?.(src);
+      const demuxer = await Mp4Driver.demux(byteSource(bytes));
+      try {
+        expect(probed).toEqual(demuxer.tracks);
+      } finally {
+        await demuxer.close();
+      }
+
+      expect(reads.length, `${fixture}: bounded read count`).toBeLessThanOrEqual(3);
+      expect(reads[0], `${fixture}: initial metadata window`).toEqual([0, 16 * 1024]);
+      expect(
+        reads.every(
+          ([start, end]) => end - start <= 16 * 1024 || (start === moovStart && end === moovEnd),
+        ),
+        `${fixture}: only bounded windows plus exact moov`,
+      ).toBe(true);
+      expect(
+        reads.reduce((total, [start, end]) => total + end - start, 0),
+        `${fixture}: metadata bytes are independent of media payload size`,
+      ).toBeLessThanOrEqual(moovEnd - moovStart + 32 * 1024);
+    }
+  });
+
+  it('large-probe metadata proof conservatively falls back for fragments and malformed layout', async () => {
+    const fragmented = await loadFixture('bear-open-gop-frag.mp4');
+    const fragmentReads: Array<readonly [number, number]> = [];
+    const fragmentSource: MimeHintedByteSource = {
+      ...byteSource(fragmented),
+      mimeHint: 'video/mp4',
+      range: (start, end) => {
+        fragmentReads.push([start, end]);
+        return Promise.resolve(fragmented.subarray(start, end));
+      },
+    };
+    const fragmentedProbe = await Mp4Driver.probe?.(fragmentSource);
+    const fragmentDemuxer = await Mp4Driver.demux(byteSource(fragmented));
+    try {
+      expect(fragmentedProbe).toEqual(fragmentDemuxer.tracks);
+    } finally {
+      await fragmentDemuxer.close();
+    }
+    expect(fragmentReads.some(([start, end]) => start === 0 && end === fragmented.byteLength)).toBe(
+      true,
+    );
+
+    const malformed = (await loadFixture('bear-4k-hevc.mp4')).slice();
+    const [mdatStart] = topLevelBoxRange(malformed, 'mdat');
+    new DataView(malformed.buffer, malformed.byteOffset + mdatStart, 4).setUint32(
+      0,
+      malformed.byteLength,
+    );
+    await expect(
+      Mp4Driver.probe?.({
+        ...byteSource(malformed),
+        mimeHint: 'video/mp4',
+      } as MimeHintedByteSource),
+    ).rejects.toMatchObject({ code: 'demux-error' });
+
+    const controller = new AbortController();
+    let reads = 0;
+    await expect(
+      Mp4Driver.probe?.(
+        {
+          ...byteSource(malformed),
+          mimeHint: 'video/mp4',
+          range: (start, end) => {
+            reads++;
+            controller.abort();
+            return Promise.resolve(malformed.subarray(start, end));
+          },
+        } as MimeHintedByteSource,
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(1);
+  });
+
   it('metadata-only parser preserves track facts without materializing sample-size tables', async () => {
     const bytes = await loadFixture('test.mp4');
     const metadata = await readMovieMetadata(makeRA(bytes));
@@ -289,9 +387,13 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       const fullTrack = full.tracks.find((candidate) => candidate.id === track.id);
       expect(fullTrack).toBeDefined();
       if (!fullTrack) continue;
-      if (fullTrack.samples.sampleSizes.length > 0) {
-        expect(track.samples.timeToSample.length).toBeGreaterThan(0);
-      }
+      expect(track.samples.timeToSample).toHaveLength(0);
+      expect(track.moovMediaTicks).toBe(
+        fullTrack.samples.timeToSample.reduce(
+          (total, entry) => total + entry.count * entry.delta,
+          0,
+        ),
+      );
       expect({
         id: track.id,
         mediaType: track.mediaType,
@@ -322,7 +424,47 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     }
   });
 
+  it('prefetches tail moov metadata once across AVC VFR and HEVC while preserving demux truth', async () => {
+    for (const fixture of [
+      'obs-remux-variable-aac.mp4',
+      'bear-4k-hevc.mp4',
+      'bear-hevc-10bit-hdr10.mp4',
+    ] as const) {
+      const bytes = await loadFixture(fixture);
+      const calls: Array<readonly [number, number]> = [];
+      const src: CacheKeyedByteSource & UrlByteSource = {
+        size: bytes.byteLength,
+        kind: 'url',
+        [SOURCE_CACHE_KEY]: `url:https://fixtures.test/${fixture}`,
+        stream: () => streamBytes(bytes),
+        range: (start, end) => {
+          calls.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+      };
+
+      const probed = await Mp4Driver.probe?.(src);
+      // Once the initial prefix proves the next top-level offset, one bounded continuation window must
+      // contain an ordinary tail `moov`; a separate 16-byte header round-trip is redundant.
+      expect(calls.length).toBe(2);
+      expect(calls[0]).toEqual([0, 128 * 1024]);
+      expect(calls.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThanOrEqual(
+        160 * 1024,
+      );
+      const demuxer = await Mp4Driver.demux(src);
+      try {
+        expect(demuxer.tracks).toEqual(probed);
+      } finally {
+        await demuxer.close();
+      }
+    }
+  });
+
   it('metadata readers report typed errors on short unknown-size random-access inputs', async () => {
+    const unsafeExtendedBox = joinBytes([u32(1), ascii('mdat'), u64(Number.MAX_SAFE_INTEGER + 1)]);
+    await expect(readMovieMetadata(makeRA(unsafeExtendedBox))).rejects.toMatchObject({
+      code: 'demux-error',
+    });
     await expect(
       readMovie({
         read: () => Promise.resolve(new Uint8Array()),
@@ -347,6 +489,31 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
           Promise.resolve(offset === 0 ? declaredMoovAfterFtyp : new Uint8Array(4)),
       }),
     ).rejects.toBeInstanceOf(MediaError);
+
+    const ftyp = box('ftyp', ascii('isom'));
+    const tailOffset = 40_000;
+    const truncatedTailHead = joinBytes([
+      ftyp,
+      u32(tailOffset - ftyp.byteLength),
+      ascii('mdat'),
+      zeros(32 * 1024 - ftyp.byteLength - 8),
+    ]);
+    const tailReads: Array<readonly [number, number]> = [];
+    await expect(
+      readMovieMetadata({
+        size: tailOffset + 100,
+        read: (offset, length) => {
+          tailReads.push([offset, length]);
+          if (offset === 0) return Promise.resolve(truncatedTailHead);
+          return Promise.resolve(joinBytes([u32(100), ascii('moov')]));
+        },
+      }),
+    ).rejects.toBeInstanceOf(MediaError);
+    expect(tailReads).toEqual([
+      [0, 32 * 1024],
+      [tailOffset, 100],
+      [tailOffset, 100],
+    ]);
     await expect(
       readMovieMetadata({
         read: () => Promise.resolve(joinBytes([u32(0), ascii('free')])),
@@ -428,6 +595,35 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       [0, 32 * 1024],
       [0, moovEnd],
     ]);
+  });
+
+  it('metadata-only remote probe amortizes a medium faststart moov into one bounded range', async () => {
+    const samples = Array.from({ length: 20_000 }, (_, i) => ({
+      data: new Uint8Array(15 + (i & 1)),
+      durationTicks: 1,
+      cttsTicks: 0,
+      keyframe: i % 60 === 0,
+    }));
+    const bytes = writeMp4([smallH264Track({ timescale: 30, samples })], { faststart: true });
+    const [, moovEnd] = topLevelBoxRange(bytes, 'moov');
+    expect(moovEnd).toBeGreaterThan(32 * 1024);
+    expect(moovEnd).toBeLessThan(128 * 1024);
+    expect(bytes.byteLength).toBeGreaterThan(256 * 1024);
+    const expected = await Mp4Driver.probe?.(byteSource(bytes));
+    const reads: Array<readonly [number, number]> = [];
+    const src: UrlByteSource = {
+      kind: 'url',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(reads).toEqual([[0, 128 * 1024]]);
+    expect(tracks).toEqual(expected);
   });
 
   it('metadata-only probe uses the tiny M4A audio fast path only when the source is known audio', async () => {
@@ -564,16 +760,20 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     expect(reads).toEqual([[0, bytes.byteLength]]);
     expect(tracks).toEqual(expected);
 
+    const demuxReads: Array<readonly [number, number]> = [];
     const demuxSource: CacheKeyedByteSource = {
       ...byteSource(bytes),
       [SOURCE_CACHE_KEY]: cacheKey,
-      range: () => {
-        throw new Error('demux should consume the cached faststart moov before reading ranges');
+      range: (start, end) => {
+        demuxReads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
       },
     };
     const demuxer = await Mp4Driver.demux(demuxSource);
     try {
       expect(demuxer.tracks).toEqual(tracks);
+      expect(demuxReads.length).toBeGreaterThan(0);
+      expect(demuxReads.every(([start, end]) => end - start <= 16)).toBe(true);
     } finally {
       await demuxer.close();
     }
@@ -645,22 +845,23 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
 
     const tracks = await Mp4Driver.probe?.(probeSource);
 
-    expect(reads).toEqual([
-      [0, 4 * 1024],
-      [0, bytes.byteLength],
-    ]);
+    expect(reads).toEqual([[0, bytes.byteLength]]);
     expect(tracks).toEqual(expected);
 
+    const demuxReads: Array<readonly [number, number]> = [];
     const demuxSource: CacheKeyedByteSource = {
       ...byteSource(bytes),
       [SOURCE_CACHE_KEY]: cacheKey,
-      range: () => {
-        throw new Error('demux should consume the lazy faststart moov before reading ranges');
+      range: (start, end) => {
+        demuxReads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
       },
     };
     const demuxer = await Mp4Driver.demux(demuxSource);
     try {
       expect(demuxer.tracks).toEqual(tracks);
+      expect(demuxReads.length).toBeGreaterThan(0);
+      expect(demuxReads.every(([start, end]) => end - start <= 16)).toBe(true);
     } finally {
       await demuxer.close();
     }
@@ -883,6 +1084,7 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
         return Promise.resolve(bytes.subarray(start, end));
       },
     };
+    const demuxReads: Array<readonly [number, number]> = [];
     const demuxSource: CacheKeyedByteSource = {
       stream: () =>
         new ReadableStream<Uint8Array>({
@@ -893,8 +1095,9 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
         }),
       size: bytes.byteLength,
       [SOURCE_CACHE_KEY]: cacheKey,
-      range: () => {
-        throw new Error('demux should consume the parsed movie handoff before reading ranges');
+      range: (start, end) => {
+        demuxReads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
       },
     };
 
@@ -903,6 +1106,8 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     try {
       expect(demuxer.tracks).toEqual(tracks);
       expect(firstReads.length).toBeGreaterThan(0);
+      expect(demuxReads.length).toBeGreaterThan(0);
+      expect(demuxReads.every(([start, end]) => end - start <= 16)).toBe(true);
     } finally {
       await demuxer.close();
     }

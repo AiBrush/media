@@ -59,6 +59,12 @@ export interface WavPcmData {
   readonly dataSize: number;
 }
 
+/** A fresh canonical WAV header plus the validated immutable PCM payload view it describes. */
+export interface WavPcmCopyPlan {
+  readonly header: Uint8Array<ArrayBuffer>;
+  readonly payload: Uint8Array;
+}
+
 function parseFmt(dv: DataView, body: number, size: number): WavFmt {
   let formatTag = dv.getUint16(body, true);
   const bits = dv.getUint16(body + 14, true);
@@ -162,6 +168,53 @@ function isCanonicalWavPcmEnvelope(bytes: Uint8Array, parsed: WavPcmData): boole
   );
 }
 
+function validatedWavPcmCopy(
+  bytes: Uint8Array,
+  requestedFormat: SampleFormat | undefined,
+  endian: Endianness,
+  requestedChannels: number | undefined,
+  requestedSampleRate: number | undefined,
+): WavPcmData | undefined {
+  if (endian !== 'le') return undefined;
+  const parsed = parseWavPcmData(bytes);
+  const { fmt, format } = parsed;
+  if (requestedFormat !== undefined && requestedFormat !== format) return undefined;
+  if (requestedChannels !== undefined && requestedChannels !== fmt.channels) return undefined;
+  if (requestedSampleRate !== undefined && requestedSampleRate !== fmt.sampleRate) return undefined;
+  return parsed;
+}
+
+/**
+ * Plan a fresh canonical WAV envelope without copying its already-validated immutable PCM payload. The
+ * caller must either snapshot the payload (Blob/File), stream it under backpressure, or materialize a new
+ * contiguous output; the input container itself is never returned.
+ */
+export function planWavPcmCopy(
+  bytes: Uint8Array,
+  requestedFormat?: SampleFormat,
+  endian: Endianness = 'le',
+  requestedChannels?: number,
+  requestedSampleRate?: number,
+): WavPcmCopyPlan | undefined {
+  const parsed = validatedWavPcmCopy(
+    bytes,
+    requestedFormat,
+    endian,
+    requestedChannels,
+    requestedSampleRate,
+  );
+  if (parsed === undefined) return undefined;
+  const header = new Uint8Array(44);
+  writeWavHeader(
+    header,
+    parsed.data.byteLength,
+    parsed.fmt.channels,
+    parsed.fmt.sampleRate,
+    parsed.format,
+  );
+  return { header, payload: parsed.data };
+}
+
 /**
  * Re-author a WAV file by copying its raw PCM payload into a fresh canonical RIFF/WAVE envelope. This is
  * the no-DSP/no-format-change fast path: it still parses the source and writes a new header, but avoids
@@ -174,12 +227,15 @@ export function rewriteWavPcmCopy(
   requestedChannels?: number,
   requestedSampleRate?: number,
 ): Uint8Array<ArrayBuffer> | undefined {
-  if (endian !== 'le') return undefined;
-  const parsed = parseWavPcmData(bytes);
+  const parsed = validatedWavPcmCopy(
+    bytes,
+    requestedFormat,
+    endian,
+    requestedChannels,
+    requestedSampleRate,
+  );
+  if (parsed === undefined) return undefined;
   const { fmt, format, data } = parsed;
-  if (requestedFormat !== undefined && requestedFormat !== format) return undefined;
-  if (requestedChannels !== undefined && requestedChannels !== fmt.channels) return undefined;
-  if (requestedSampleRate !== undefined && requestedSampleRate !== fmt.sampleRate) return undefined;
   if (isCanonicalWavPcmEnvelope(bytes, parsed)) {
     const out = bytes.slice() as Uint8Array<ArrayBuffer>;
     writeWavHeader(out, data.byteLength, fmt.channels, fmt.sampleRate, format);

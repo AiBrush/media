@@ -128,6 +128,7 @@ const E = {
   Video: [0xe0],
   PixelWidth: [0xb0],
   PixelHeight: [0xba],
+  AlphaMode: [0x53, 0xc0],
   Audio: [0xe1],
   SamplingFrequency: [0xb5],
   Channels: [0x9f],
@@ -157,6 +158,19 @@ describe('WebmDriver.supports', () => {
 });
 
 describe('probe WebM across the real corpus', () => {
+  it('projects the real declared VP9 alpha mode without scanning BlockAdditions', async () => {
+    for (const bytes of [
+      await loadFixture('bear-vp9-alpha.webm'),
+      await bytesFromMediaTest('vp9_alpha.webm'),
+    ]) {
+      const tracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+      expect(tracks.find((track) => track.mediaType === 'video')).toMatchObject({
+        codec: 'vp9',
+        alpha: true,
+      });
+    }
+  });
+
   it('movie_5.webm — vp9 video + opus audio, ~5 s', async () => {
     const info = await createMedia()
       .use(WebmModule)
@@ -205,7 +219,7 @@ describe('probe WebM across the real corpus', () => {
     };
 
     const tracks = await probeWithWebmDriver(src);
-    expect(calls).toEqual([[0, 4096]]);
+    expect(calls).toEqual([[0, 8 * 1024]]);
     expect(tracks.find((track) => track.mediaType === 'video')?.codec).toBe('vp9');
     expect(tracks.find((track) => track.mediaType === 'audio')?.codec).toBe('opus');
   });
@@ -237,13 +251,151 @@ describe('probe WebM across the real corpus', () => {
     }
   });
 
-  it('range-probes every TrackEntry when the first bounded prefix truncates Tracks', async () => {
+  it('captures a modestly extended finite Tracks element in one bounded metadata range', async () => {
     const bytes = await bytesFromMediaTest('scenarios/demux/realworld_mdn_flower_webm/02.webm');
-    const tracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('bounded WebM metadata probe must not open a stream');
+      },
+    };
+    const tracks = await probeWithWebmDriver(source);
     expect(tracks.map((track) => [track.mediaType, track.codec])).toEqual([
       ['audio', 'vorbis'],
       ['video', 'vp8'],
     ]);
+    expect(reads).toEqual([[0, 8 * 1024]]);
+  });
+
+  it('qualifies a large first VP9-alpha keyframe from one bounded metadata range', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/probe/vp9_alpha/vp9_alpha.webm');
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('bounded VP9-alpha metadata probe must not open a stream');
+      },
+    };
+
+    const tracks = await probeWithWebmDriver(source);
+    const fullTracks = await probeWithWebmDriver({
+      size: bytes.byteLength,
+      stream: () => new Blob([Uint8Array.from(bytes).buffer]).stream(),
+    });
+    expect(tracks).toEqual(fullTracks);
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0]).toMatchObject({
+      codec: 'vp9',
+      alpha: true,
+      config: { codec: 'vp09.00.30.08', codedWidth: 640, codedHeight: 480 },
+    });
+    expect(reads).toEqual([[0, 8 * 1024]]);
+  });
+
+  it('does not qualify an unproven incomplete BlockGroup when its VP9 payload is an inter frame', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/probe/vp9_alpha/vp9_alpha.webm');
+    const prefix = bytes.slice(0, 8 * 1024);
+    // The first Block payload starts with a VP9 key-frame header. Flip only frame_type; the container
+    // BlockGroup remains incomplete, so no absent-ReferenceBlock claim may override bitstream truth.
+    const firstVp9Byte = prefix.indexOf(0x82, 430);
+    expect(firstVp9Byte).toBeGreaterThan(430);
+    prefix[firstVp9Byte] = (prefix[firstVp9Byte] ?? 0) | 0x04;
+
+    const info = parseWebm(prefix, {
+      scanClusters: false,
+      sourceSizeBytes: bytes.byteLength,
+    });
+    expect(info.tracks[0]).toMatchObject({
+      codec: 'vp9',
+      decoderCodec: 'vp09',
+      decoderCodecSource: 'unknown',
+    });
+  });
+
+  it('jumps from complete declarations to one full parse when exact fps needs the terminal cluster', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/probe/vp9_alpha/01.webm');
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await probeWithWebmDriver({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('known-size terminal-timeline probe must remain range-backed');
+      },
+    });
+    const fullTracks = await probeWithWebmDriver({
+      size: bytes.byteLength,
+      stream: () => new Blob([Uint8Array.from(bytes).buffer]).stream(),
+    });
+
+    expect(tracks).toEqual(fullTracks);
+    expect(tracks[0]).toMatchObject({
+      codec: 'vp9',
+      durationSec: 2.7,
+      fps: 30,
+      alpha: true,
+      config: { codec: 'vp09.00.20.08', codedWidth: 320, codedHeight: 240 },
+    });
+    expect(reads).toEqual([
+      [0, 8 * 1024],
+      [0, bytes.byteLength],
+    ]);
+  });
+
+  it('rejects a short terminal-timeline range instead of deriving fps from a partial Cluster', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/probe/vp9_alpha/01.webm');
+    let reads = 0;
+    await expect(
+      probeWithWebmDriver({
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          reads++;
+          const shortEnd = reads === 1 ? end : Math.min(end, 64 * 1024);
+          return Promise.resolve(bytes.subarray(start, shortEnd));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('short known-size timeline probe must remain range-backed');
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'unsupported-input',
+      message: expect.stringContaining('before declared size'),
+    });
+    expect(reads).toBe(2);
+  });
+
+  it('rechecks cancellation after the terminal-timeline range resolves', async () => {
+    const bytes = await bytesFromMediaTest('scenarios/probe/vp9_alpha/01.webm');
+    const controller = new AbortController();
+    let reads = 0;
+    await expect(
+      probeWithWebmDriver(
+        {
+          size: bytes.byteLength,
+          range(start, end): Promise<Uint8Array> {
+            reads++;
+            if (reads === 2) controller.abort('cancel terminal scan');
+            return Promise.resolve(bytes.subarray(start, end));
+          },
+          stream(): ReadableStream<Uint8Array> {
+            throw new Error('cancelled known-size timeline probe must remain range-backed');
+          },
+        },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(2);
   });
 
   it('WebmDriver.probe rejects a pre-aborted signal with the typed abort error', async () => {
@@ -422,6 +574,50 @@ describe('CodecPrivate → decoder description + canonical codec ids (real fixtu
 });
 
 describe('parseWebm — EBML parsing', () => {
+  it('proves alpha only from one complete standards-defined Video/AlphaMode=1 declaration', () => {
+    const makeVideo = (
+      videoChildren: readonly number[][],
+      trackChildren: readonly number[][] = [],
+    ): Uint8Array => {
+      const track = el(E.TrackEntry, [
+        ...el(E.TrackType, [1]),
+        ...el(E.TrackNumber, [1]),
+        ...el(E.CodecID, str('V_VP9')),
+        ...trackChildren.flat(),
+        ...el(E.Video, [
+          ...el(E.PixelWidth, [2]),
+          ...el(E.PixelHeight, [2]),
+          ...videoChildren.flat(),
+        ]),
+      ]);
+      return new Uint8Array([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [
+          ...el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4))),
+          ...el(E.Tracks, track),
+        ]),
+      ]);
+    };
+    const alpha = (payload: readonly number[]): number[] => el(E.AlphaMode, [...payload]);
+
+    expect(parseWebm(makeVideo([alpha([1])])).tracks[0]?.alpha).toBe(true);
+    for (const candidate of [
+      makeVideo([]),
+      makeVideo([alpha([0])]),
+      makeVideo([alpha([2])]),
+      makeVideo([alpha([])]),
+      makeVideo([alpha([0, 0, 0, 0, 0, 0, 0, 0, 1])]),
+      // A finite uint that declares two payload bytes but contains only one is not positive proof.
+      makeVideo([[...E.AlphaMode, 0x82, 0x01]]),
+      makeVideo([alpha([1]), alpha([1])]),
+      makeVideo([alpha([1]), alpha([0])]),
+      // AlphaMode is a Video child; TrackEntry-level placement is malformed and ignored.
+      makeVideo([], [alpha([1])]),
+    ]) {
+      expect(parseWebm(candidate).tracks[0]?.alpha).toBeUndefined();
+    }
+  });
+
   it('parses Duration when declared (video track)', () => {
     const info = el(E.Info, [
       ...el(E.TimecodeScale, uintN(1_000_000, 4)),

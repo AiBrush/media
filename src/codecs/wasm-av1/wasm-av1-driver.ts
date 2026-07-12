@@ -104,8 +104,9 @@ export async function loadAv1Core(
     corePromise = (async (): Promise<Dav1dWasmCore | null> => {
       try {
         const mod = await import('./dav1d-core.js');
-        await mod.default(wasmInitForProfile(moduleUrl, profile));
-        return mod.createDav1dCore();
+        const wasmInit = wasmInitForProfile(moduleUrl, profile);
+        await mod.default(wasmInit);
+        return mod.createDav1dCore(wasmInit);
       } catch {
         return null;
       }

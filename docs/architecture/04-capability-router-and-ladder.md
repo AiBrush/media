@@ -15,6 +15,13 @@ For each stage the Planner produces, the Router selects exactly one driver:
 
 The developer sees none of this; they called `convert`/`probe` and got a result or a typed error.
 
+For unpinned VP8/VP9 transcode decode, the successful capability probe is not the final proof: some browser
+decoders accept and configure an exact profile, then report an asynchronous runtime `CapabilityError` on its
+first coded packets. ADR-284 retains a bounded exact packet prefix until the first native frame. A pre-output
+runtime miss selects the exact `wasm-vpx` tail and replays that prefix plus the same one-shot reader remainder.
+The first native frame, 256 retained packets, or 16 MiB retained payload commits the native route; a later
+failure stays typed because emitted frames cannot be retracted. Explicit non-WASM pins never fall through.
+
 ## 2. The ladders (seeded from the benchmark)
 
 Top = tried first. These defaults encode the benchmark's per-family winners; they are refined later by telemetry, never exposed.

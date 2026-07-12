@@ -27,11 +27,12 @@ import type { Av1DecoderInit, Dav1dWasmCore } from './av1.ts';
 async function loadCore(): Promise<Dav1dWasmCore> {
   const mod = (await import('./dav1d-core.js')) as {
     default: (u?: unknown) => Promise<unknown>;
-    createDav1dCore: () => Dav1dWasmCore;
+    createDav1dCore: (moduleOrPath: URL) => Dav1dWasmCore;
   };
   // The driver passes this exact URL; the glue fetches the sibling wasm bytes from it (Node `fs`).
-  await mod.default(new URL('./dav1d_wasm_bg.wasm', import.meta.url));
-  return mod.createDav1dCore();
+  const moduleUrl = new URL('./dav1d_wasm_bg.wasm', import.meta.url);
+  await mod.default(moduleUrl);
+  return mod.createDav1dCore(moduleUrl);
 }
 
 /** Whether ffmpeg (the independent dav1d reference) is installed. */

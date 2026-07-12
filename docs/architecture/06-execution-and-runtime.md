@@ -73,6 +73,12 @@ The main thread sends the worker a **serializable job spec** (`{ input, ops[], o
 3. each driver releases its WebCodecs/WASM resources and `close()`s in-flight frames,
 4. the op promise rejects with `MediaError{ code: 'aborted' }`.
 
+ADR-284's VP8/VP9 runtime-fallback coordinator owns one encoded source reader across both attempts. Before
+native output it retains at most 256 immutable chunk references / 16 MiB; a typed native miss first closes the
+native decoder and its queued frames, then replays the exact references and continues the same reader through
+the WASM decoder. Abort cancels the active decoder and sole source reader, drops the prefix, and closes a frame
+that loses the final enqueue race. No full input, decoded frame, or second demux is buffered.
+
 A `media.convert(...)` returns a handle exposing `.cancel()` in addition to accepting `{ signal }`.
 
 ## 8. Progress

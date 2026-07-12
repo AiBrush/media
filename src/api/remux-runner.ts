@@ -96,6 +96,83 @@ export async function runRemux(
     container.formats.length === 1 &&
     container.formats[0] === opts.to;
 
+  // MP4/MOV share one driver, so the single-format shortcut above cannot identify an ordinary same-family
+  // rewrite. Materialize once, prove that relocating only `moov` preserves every media reference, and
+  // replay the exact owned bytes through normal remux on any structural decline (ADR-274).
+  const directMp4MetadataCandidate =
+    metadata !== undefined &&
+    !wantsTrackSelection &&
+    opts.faststart === undefined &&
+    opts.fragmented === undefined &&
+    (opts.to === 'mp4' || opts.to === 'mov') &&
+    container.formats.includes(opts.to);
+  if (directMp4MetadataCandidate && metadata !== undefined) {
+    if (opts.sink === undefined && typeof Blob !== 'undefined' && input instanceof Blob) {
+      const blobOutput = await metadata.module.tryRewriteMp4MetadataBlobDirectly(
+        input,
+        metadata.plan,
+        signal,
+      );
+      if (blobOutput !== undefined) {
+        // The range-only topology planner proves ADR-274's relocation envelope. The existing ADR-251
+        // demux validation still proves every complete stsz/stsc sample lies inside a declared mdat.
+        const validationDemuxer = await container.demux(
+          source,
+          context.stage(signal, remuxCallOptions),
+        );
+        await validationDemuxer.close();
+        throwIfAborted(signal);
+        progress?.remux?.({
+          done: input.size,
+          total: input.size,
+          stage: 'metadata-direct-source',
+        });
+        progress?.metadata?.({
+          done: blobOutput.size,
+          total: blobOutput.size,
+          stage: 'metadata',
+        });
+        return blobOutput;
+      }
+    }
+    const inputBytes = await readAllSource(source, signal);
+    if (await metadata.module.canRewriteMp4MetadataBytesDirectly(inputBytes, metadata.plan)) {
+      const replayOptions = source.mimeHint === undefined ? {} : { mime: source.mimeHint };
+      // The cheap relocation classifier proves box topology. The container's ADR-251 demux validation
+      // additionally walks stsz/stsc/stco/co64 and proves every complete sample lies in a declared mdat.
+      const validationDemuxer = await container.demux(
+        normalizeInput(inputBytes, replayOptions),
+        context.stage(signal, remuxCallOptions),
+      );
+      await validationDemuxer.close();
+      progress?.remux?.({
+        done: inputBytes.byteLength,
+        total: inputBytes.byteLength,
+        stage: 'metadata-direct-source',
+      });
+      const output = await metadata.module.tryRewriteMp4MetadataBytesDirectly(
+        inputBytes,
+        metadata.plan,
+        {
+          signal,
+          ...(progress?.metadata === undefined ? {} : { onProgress: progress.metadata }),
+        },
+      );
+      if (output === undefined) {
+        throw new MediaError('mux-error', 'validated MP4 metadata rewrite became ineligible');
+      }
+      return materializeOutput(
+        opts.sink ?? toBlob(),
+        bytesToStream(output),
+        mimeOptions(signal, opts.to),
+      );
+    }
+    source = normalizeInput(
+      inputBytes,
+      source.mimeHint === undefined ? {} : { mime: source.mimeHint },
+    );
+  }
+
   // Metadata rewriting is the complete same-container operation for formats that deliberately expose no
   // EncodedChunk mux seam. Multi-format drivers still reserialize so family changes remain genuine remuxes.
   if (directMetadataTarget && !wantsTrackSelection && metadata !== undefined) {
