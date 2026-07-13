@@ -1,6 +1,9 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { TrackInfo } from '../contracts/driver.ts';
 import { InputError } from '../contracts/errors.ts';
+import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
+import { fromBytes } from '../sources/source.ts';
 import {
   implicitRateControlWarmupFrames,
   installH264TwoPassQuantizer,
@@ -21,8 +24,13 @@ function sample(
   return { timestampUs, durationUs, byteLength, keyFrame };
 }
 
+const REAL_H264_ABR_FIXTURE = new URL(
+  '../../../media-test/fixtures/media/scenarios/demux/h264_1080p_30s/03.mp4',
+  import.meta.url,
+);
+
 describe('planH264TwoPass', () => {
-  it('warms only implicit H.264/AV1 bitrate control without changing explicit contracts', () => {
+  it('warms H.264/AV1 bitrate control while preserving CRF and two-pass contracts', () => {
     expect(implicitRateControlWarmupFrames({}, 'avc1.64001F', 30)).toBe(3);
     expect(implicitRateControlWarmupFrames({}, 'av01.0.12M.08', 60)).toBe(8);
     expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30)).toBeUndefined();
@@ -31,14 +39,30 @@ describe('planH264TwoPass', () => {
     expect(implicitRateControlWarmupFrames({}, 'av01.0.08M.08', 30.500001)).toBe(8);
     expect(implicitRateControlWarmupFrames({}, 'AVC3.64001F', undefined)).toBe(3);
     expect(implicitRateControlWarmupFrames({}, 'vp09.00.31.08', 60)).toBeUndefined();
-    expect(
-      implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'avc1.64001F', 30),
-    ).toBeUndefined();
+    expect(implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'avc1.64001F', 30)).toBe(3);
     expect(
       implicitRateControlWarmupFrames({ bitrateMode: 'constant' }, 'avc1.64001F', 30),
     ).toBeUndefined();
     expect(implicitRateControlWarmupFrames({ crf: 22 }, 'av01.0.12M.08', 60)).toBeUndefined();
     expect(implicitRateControlWarmupFrames({ twoPass: true }, 'avc1.64001F', 30)).toBeUndefined();
+  });
+
+  it('primes the real portrait 60-fps ABR corpus geometry used by the strict golden gate', async () => {
+    const bytes = new Uint8Array(await readFile(REAL_H264_ABR_FIXTURE));
+    const tracks = await Mp4Driver.probe?.(fromBytes(bytes, { mime: 'video/mp4' }));
+    const video = tracks?.find((track) => track.mediaType === 'video');
+    if (video === undefined || video.config === undefined || !('codedWidth' in video.config)) {
+      throw new Error('real H.264 ABR fixture did not expose a video geometry');
+    }
+    expect({
+      width: video.config.codedWidth,
+      height: video.config.codedHeight,
+      fps: video.fps,
+      codec: video.config.codec,
+    }).toEqual({ width: 1080, height: 1920, fps: 60, codec: 'avc1.64002A' });
+    expect(
+      implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, video.config.codec, video.fps),
+    ).toBe(8);
   });
 
   it('maps known and unknown source geometry without inventing dimensions', () => {

@@ -9049,3 +9049,29 @@ surfaces as the driver’s typed error instead of an incomplete table.
 
 **Rejected:** reparsing frame boundaries in the harness; weakening packet goldens; returning guessed final
 durations; or removing the payload stream in favor of metadata-only demux.
+
+### ADR-300 — Prime explicit H.264 average-bitrate control with disposable pictures
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The Chromium native H.264 variable-bitrate controller produced an overly small first GOP on
+the real portrait 60-fps `h264_1080p_30s.mp4` corpus input when `video.bitrate` was explicitly set to
+2,000,000. The strict reference oracle measured SSIM 0.9085 (floor 0.95). The encoder's controller needs
+picture observations before it allocates its first real access unit.
+
+**Decision.** For explicit H.264 average-bitrate targets, submit disposable copies of the first decoded
+picture at backward-derived timestamps before the real first keyframe: three at ordinary cadence and eight
+above 30.5 fps, where the native controller needs more observations per second. The warmup encodes use the
+same configured bitrate and are dropped before the muxer; they do not change output timestamps, frame count,
+GOP structure, target bitrate, or packet bytes. VFR uses the first picture duration when present; a missing
+duration uses the existing finite cadence fallback. B-frame DTS/PTS reconstruction and seek behavior remain
+owned by the container/decoder pipeline.
+
+**Invariants and consequences.** Cancellation is checked before each warmup and encoder queue backpressure
+is unchanged. Each disposable `VideoFrame` is closed exactly once in a `finally`, and the source frame's
+existing close ownership is unchanged. At most one warmup frame is in the encoder call at a time; no
+payload or decoded-frame retention is added. A browser that rejects the configured encoder still raises
+the existing typed capability/encode error.
+
+**Rejected:** increasing the requested bitrate, silently ignoring the bitrate target, switching to CRF,
+retaining warmup chunks in the output, or weakening the SSIM oracle.

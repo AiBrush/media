@@ -44,23 +44,23 @@ export interface H264TwoPassQuantizerInstallation {
 
 /**
  * Native ABR encoders under-allocate their first few pictures before their rate model has observations.
- * Prime only implicit offline H.264/AV1 targets; explicit bitrate/mode, CRF, and two-pass contracts remain
- * exact.
+ * Prime H.264 targets with disposable pictures. Explicit H.264 average bitrate still keeps its
+ * exact output budget; only explicit constant/quantizer modes and two-pass schedules opt out. AV1's
+ * high-cadence implicit path retains its eight-picture prime and all other codecs remain unprimed.
  */
 export function implicitRateControlWarmupFrames(
   target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
   codec: string,
   frameRate: number | undefined,
 ): number | undefined {
-  if (
-    target.bitrate !== undefined ||
-    target.bitrateMode !== undefined ||
-    target.crf !== undefined ||
-    target.twoPass === true
-  ) {
+  if (target.bitrateMode !== undefined || target.crf !== undefined || target.twoPass === true) {
     return undefined;
   }
   const normalized = codec.toLowerCase();
+  if (target.bitrate !== undefined) {
+    if (!normalized.startsWith('avc1.') && !normalized.startsWith('avc3.')) return undefined;
+    return frameRate !== undefined && frameRate > 30.5 ? 8 : 3;
+  }
   // Container time-base division can report nominal 30 fps as 30.0000003; require a real cadence step.
   if (normalized.startsWith('av01.') && frameRate !== undefined && frameRate > 30.5) return 8;
   if (normalized.startsWith('avc1.') || normalized.startsWith('avc3.')) return 3;

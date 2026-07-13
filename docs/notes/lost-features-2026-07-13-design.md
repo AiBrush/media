@@ -154,6 +154,33 @@ reported FLAC fused packet-info at 2.444 ms median versus 2.626 ms for the compo
 retained-layout at 0.000327 ms versus 0.000668 ms for a repeated frame walk; browser acceptance used the
 strict six-engine export at `media-test/results/raw/chromium-2026-07-13T13-03-56-825Z.json` with `n=5`.
 
+## Batch J — Prime explicit H.264 ABR control without changing the target budget
+
+The fresh `transcode/h264_bitrate_2mbps` matrix exposed a correctness loss on the real portrait 60-fps
+source: Chromium's native H.264 variable-bitrate controller under-allocates the first pictures when the
+caller supplies an explicit average bitrate, producing SSIM 0.9085 against the strict in-browser reference
+at the requested 2 Mbps. The fix primes that controller with three disposable encodes of the first
+decoded picture at ordinary cadence and eight at high cadence (>30.5 fps) before submitting the real first
+keyframe. The warmups are never muxed, so the requested average bitrate remains the output contract rather
+than a hidden quality override.
+
+Warmup timestamps are derived backward from the first frame's own duration and cadence; no constant-FPS
+assumption is made for VFR input. They are outside the output presentation timeline, so B-frame DTS/PTS
+ordering and seek/keyframe behavior are unchanged. Cancellation is checked before each warmup and the
+existing encoder queue drain remains the backpressure boundary. Each disposable `VideoFrame` is closed in
+its own `finally`, the source frame is still closed exactly once by the ordinary encoder path, and only
+one disposable frame is live at a time; no decoded frame or encoded payload is retained after priming.
+
+The strict validation uses the real `h264_1080p_30s.mp4` corpus family and its baked packet/frame/metadata
+goldens in the browser harness; the local structural gate asserts the real MP4's 1080×1920, 60-fps,
+B-frame geometry drives the explicit-ABR warmup decision. The multi-sample benchmark is the same fresh
+Chromium six-engine export (`n=5`) plus the existing video rate-control benchmark axis.
+
+Fresh post-fix corpus coverage is recorded in `chromium-2026-07-13T14-02-05-308Z.json` (`01.mp4`, SSIM
+0.9890/0.9884), `chromium-2026-07-13T14-08-47-421Z.json` (`02.mp4`, SSIM 0.9709/0.9556), and
+`chromium-2026-07-13T14-11-46-525Z.json` (`03.mp4`, SSIM 0.9509/0.9435); all aibrush rows are strict
+PASS and all six competitor cells are present in each export.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |
