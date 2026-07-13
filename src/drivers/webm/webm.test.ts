@@ -463,6 +463,61 @@ describe('probe WebM across the real corpus', () => {
     });
   });
 
+  it('batches real VP9 packet pulls without changing the packet count', async () => {
+    const NativeReadableStream = globalThis.ReadableStream;
+    const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'ReadableStream');
+    let pulls = 0;
+    class CountingReadableStream<R = unknown> extends NativeReadableStream<R> {
+      constructor(source: UnderlyingSource<R> = {}, strategy?: QueuingStrategy<R>) {
+        const originalPull = source.pull;
+        super(
+          originalPull === undefined
+            ? source
+            : {
+                ...source,
+                pull(controller): void | PromiseLike<void> {
+                  pulls++;
+                  return originalPull.call(source, controller);
+                },
+              },
+          strategy,
+        );
+      }
+    }
+    Object.defineProperty(globalThis, 'ReadableStream', {
+      configurable: true,
+      value: CountingReadableStream as typeof ReadableStream,
+    });
+    try {
+      await withEncodedChunkConstructors(async () => {
+        const bytes = await bytesFromMediaTest('vp9_1080p_10s.webm');
+        const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
+        try {
+          const video = demuxed.tracks.find((track) => track.mediaType === 'video');
+          if (video === undefined) throw new Error('expected VP9 video track');
+          const reader = demuxed.packets(video.id).getReader();
+          let packets = 0;
+          try {
+            for (;;) {
+              const next = await reader.read();
+              if (next.done) break;
+              packets++;
+            }
+          } finally {
+            reader.releaseLock();
+          }
+          expect(packets).toBe(300);
+        } finally {
+          await demuxed.close();
+        }
+      });
+    } finally {
+      if (originalDescriptor === undefined) Reflect.deleteProperty(globalThis, 'ReadableStream');
+      else Object.defineProperty(globalThis, 'ReadableStream', originalDescriptor);
+    }
+    expect(pulls).toBeLessThan(300 / 4);
+  });
+
   it('H.264 Matroska packet streams expose SPS-derived DTS without changing chunk PTS', async () => {
     await withEncodedChunkConstructors(async () => {
       const bytes = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/01.mkv');

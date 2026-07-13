@@ -2091,49 +2091,63 @@ function packetStream(
   const isVideo = track.mediaType === 'video';
   const codecDefinesAudioSync = track.codec === 'opus' || track.codec === 'vorbis';
   const reorderDepth = track.reorderDepth ?? 0;
+  const batchPacketLimit = 32;
+  const batchByteLimit = 128 * 1024;
   const presentationTimeline =
     reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
   let i = 0;
-  return new ReadableStream<Packet>({
-    pull(controller): void {
-      if (signal?.aborted) {
-        controller.error(new MediaError('aborted', 'operation aborted'));
-        return;
-      }
-      const frame = frames[i];
-      if (frame === undefined) {
-        controller.close();
-        return;
-      }
-      i++;
-      const keyframe = codecDefinesAudioSync || frame.keyframe;
-      const init = {
-        // FFmpeg-compatible semantics: self-contained Opus/Vorbis packets are sync packets even when
-        // the Matroska block bit is clear; other codecs preserve their explicit container verdict.
-        type: (keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
-        timestamp: frame.timestampUs,
-        data: frame.data,
-      };
-      // Matroska blocks carry PTS in decode order. H.264's SPS reorder restriction reconstructs DTS;
-      // non-reordered frames keep it implicit under the `undefined => DTS equals PTS` Packet contract.
-      const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
-      const alpha =
-        isVideo && frame.alpha !== undefined
-          ? new EncodedVideoChunk({ ...init, data: frame.alpha })
-          : undefined;
-      const dtsUs =
-        presentationTimeline !== undefined && i - 1 >= reorderDepth
-          ? (presentationTimeline[i - 1 - reorderDepth] ?? frame.timestampUs)
-          : frame.timestampUs;
-      controller.enqueue({
-        chunk,
-        data: frame.data,
-        sizeBytes: frame.data.byteLength,
-        ...(dtsUs !== frame.timestampUs ? { dtsUs } : {}),
-        ...(alpha !== undefined ? { alpha } : {}),
-      });
+  return new ReadableStream<Packet>(
+    {
+      pull(controller): void {
+        let emittedPackets = 0;
+        let emittedBytes = 0;
+        while (
+          emittedPackets < batchPacketLimit &&
+          (emittedPackets === 0 || emittedBytes < batchByteLimit)
+        ) {
+          if (signal?.aborted) {
+            controller.error(new MediaError('aborted', 'operation aborted'));
+            return;
+          }
+          const frame = frames[i];
+          if (frame === undefined) {
+            controller.close();
+            return;
+          }
+          i++;
+          const keyframe = codecDefinesAudioSync || frame.keyframe;
+          const init = {
+            // FFmpeg-compatible semantics: self-contained Opus/Vorbis packets are sync packets even when
+            // the Matroska block bit is clear; other codecs preserve their explicit container verdict.
+            type: (keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+            timestamp: frame.timestampUs,
+            data: frame.data,
+          };
+          // Matroska blocks carry PTS in decode order. H.264's SPS reorder restriction reconstructs DTS;
+          // non-reordered frames keep it implicit under the `undefined => DTS equals PTS` Packet contract.
+          const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+          const alpha =
+            isVideo && frame.alpha !== undefined
+              ? new EncodedVideoChunk({ ...init, data: frame.alpha })
+              : undefined;
+          const dtsUs =
+            presentationTimeline !== undefined && i - 1 >= reorderDepth
+              ? (presentationTimeline[i - 1 - reorderDepth] ?? frame.timestampUs)
+              : frame.timestampUs;
+          controller.enqueue({
+            chunk,
+            data: frame.data,
+            sizeBytes: frame.data.byteLength,
+            ...(dtsUs !== frame.timestampUs ? { dtsUs } : {}),
+            ...(alpha !== undefined ? { alpha } : {}),
+          });
+          emittedPackets++;
+          emittedBytes += frame.data.byteLength;
+        }
+      },
     },
-  });
+    { highWaterMark: 0 },
+  );
   /* v8 ignore stop */
 }
 

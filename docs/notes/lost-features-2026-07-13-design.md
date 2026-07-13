@@ -95,6 +95,19 @@ the existing per-track frame views, and backpressure is unchanged because the fu
 consumer-facing stream is created. HLS, seeking, audio `AudioData` lifetime, and `VideoFrame` lifetime are
 unaffected; no `VideoFrame` or `AudioData` is created by the WebM demux parser.
 
+## Batch F — Bounded WebM packet-pull batching
+
+Fresh browser measurements show the WebM packet seam pays one synchronous Web Streams pull per encoded
+packet, unlike the existing MP4 seam. The packet payloads are already source-buffer views, so a bounded
+batch can amortize stream scheduling without changing packet bytes, B-frame PTS/DTS reconstruction, VFR
+timestamps, keyframe flags, or track order.
+
+The WebM stream will enqueue at most 32 packets or 128 KiB of payload per pull, whichever comes first.
+This is a bounded queue, not eager whole-track materialization: cancellation is checked before every packet,
+the stream remains pull-driven, and a consumer that stops still releases its reader and source references as
+before. No `VideoFrame` or `AudioData` is created by the demux seam, so close-once lifetime rules are
+unchanged; source-backed views retain the existing operation lifetime and memory bound.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

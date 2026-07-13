@@ -8965,3 +8965,23 @@ unchanged because packet streams remain pull-driven.
 
 **Rejected:** removing Segment validation; retaining a second full timing scan; copying packet payloads to
 hide ownership; deriving duration from decoded frame count; or changing the public probe scan contract.
+
+### ADR-296 — WebM packet streams use bounded pull batches
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** WebM demux emitted exactly one `Packet` per underlying-stream pull, creating avoidable
+ scheduling overhead on long VP8/VP9 tracks even though MP4 already used a bounded batch seam. The packets
+ are source-backed views and must remain individually observable to callers.
+
+**Decision.** WebM packet streams enqueue no more than 32 packets or 128 KiB of payload in one pull, then
+yield to the consumer. The stream remains zero-HWM/pull-driven and checks the abort signal for every packet.
+
+**Invariants and consequences.** B-frame and VFR timestamps, DTS reconstruction, keyframe flags, packet
+bytes, track identity, and exact source-view ownership remain unchanged. Batching does not allocate decoded
+frames: every `VideoFrame`/`AudioData` lifetime is unaffected, and no such object is created by demux.
+Memory is bounded to the existing source buffer plus one bounded packet queue; seeking and cancellation
+observe the same packet seam and backpressure remains explicit.
+
+**Rejected:** eagerly enqueueing a complete track; copying payloads into a second queue; raising the HWM
+without a packet-count/byte cap; or delaying abort checks until a batch completes.

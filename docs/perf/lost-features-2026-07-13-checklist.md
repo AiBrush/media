@@ -18,13 +18,13 @@ are green.
 | 7 | `demux/hls_vod` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 8 | `demux/metamorphic_flac_seektable_invariance` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 9 | `demux/realworld_mdn_flower_mp4` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 10 | `demux/realworld_mdn_flower_webm` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 11 | `demux/size_large_large_vp9_1080p_120s` | PROVISIONAL | PASS (fresh; not winner) | performance; mediabunny remains faster and Remotion is still skipped by the public guard | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 372.785 ms vs mediabunny 214.750 ms) | — |
+| 10 | `demux/realworld_mdn_flower_webm` | WON | WON (fresh) | bounded WebM packet-pull batching; strict packet golden passes | `results/raw/chromium-2026-07-13T12-08-18-214Z.json` (`n=5`, all 6 engine cells; aibrush 7.780 ms vs mediabunny 8.070 ms) | `perf: batch WebM packet pulls` |
+| 11 | `demux/size_large_large_vp9_1080p_120s` | PROVISIONAL | PASS (fresh; not winner) | performance; mediabunny remains faster and Remotion is still skipped by the public guard | `results/raw/chromium-2026-07-13T12-08-18-214Z.json` (`n=5`, all 6 engine cells; aibrush 95.215 ms vs mediabunny 75.665 ms) | — |
 | 12 | `demux/size_micro_micro_audio_short` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 13 | `demux/size_tiny_tiny_h264_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 14 | `demux/size_tiny_tiny_vp9_360p_2s` | PASS, competitor winner | WON (fresh) | performance; fused WebM demux timing scan | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 5.515 ms vs mediabunny 7.035 ms; strict packet golden PASS) | `c507755` |
-| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny remains faster on the current selected WebM corpus input | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 15.940 ms vs mediabunny 10.560 ms; strict packet golden PASS) | — |
-| 16 | `demux/vp9_1080p_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny remains faster on the current selected WebM corpus input | `results/raw/chromium-2026-07-13T12-08-18-214Z.json` (`n=5`, all 6 engine cells; aibrush 13.050 ms vs mediabunny 8.745 ms; strict packet golden PASS) | — |
+| 16 | `demux/vp9_1080p_10s` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny remains faster on the current selected WebM corpus input | `results/raw/chromium-2026-07-13T12-08-18-214Z.json` (`n=5`, all 6 engine cells; aibrush 95.395 ms vs mediabunny 23.200 ms; strict packet golden PASS) | — |
 | 17 | `probe/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 18 | `probe/empty-audio-wav` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 19 | `probe/flac_noseektable` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
