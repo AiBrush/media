@@ -10,10 +10,10 @@ are green.
 | # | Scenario | Prior export | Fresh status | Cause | Validation / benchmark evidence | Commit |
 |---:|---|---|---|---|---|---|
 | 1 | `demux/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 2 | `demux/av1_720p_5s` | PASS, competitor winner | PASS (fresh; not winner) | performance; selective registration did not erase the AV1/WebM parse gap | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 35.390 ms vs mediabunny 15.700 ms) | — |
+| 2 | `demux/av1_720p_5s` | PASS, competitor winner | WON (fresh) | performance; fused WebM demux timing scan plus selective registration | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 10.800 ms vs mediabunny 13.440 ms; strict packet golden PASS) | `c507755` |
 | 3 | `demux/h264_4k_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 4 | `demux/h264_multitrack` | PASS, competitor winner | PASS (fresh; not winner) | performance; MP4Box remains faster on this multi-track input | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 12.440 ms vs mp4box 6.455 ms) | — |
-| 5 | `demux/h264_rotated90` | PASS, competitor winner | WON (fresh) | startup/registration; selective MP4 registration wins the passing competitors | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 19.245 ms vs mp4box 21.665 ms; strict packet golden PASS) | `297895b` |
+| 4 | `demux/h264_multitrack` | PASS, competitor winner | WON (fresh) | startup/registration; selective MP4 registration wins the passing competitors | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 9.475 ms vs mp4box 10.365 ms; strict packet golden PASS) | `297895b` |
+| 5 | `demux/h264_rotated90` | PASS, competitor winner | WON (fresh) | startup/registration; selective MP4 registration wins the passing competitors | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 11.690 ms vs mp4box 14.990 ms; strict packet golden PASS) | `297895b` |
 | 6 | `demux/h264_vfr` | PASS, competitor winner | PASS (fresh; not winner) | performance; MP4Box is narrowly faster after the registration change | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 16.465 ms vs mp4box 16.075 ms) | — |
 | 7 | `demux/hls_vod` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 8 | `demux/metamorphic_flac_seektable_invariance` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
@@ -22,8 +22,8 @@ are green.
 | 11 | `demux/size_large_large_vp9_1080p_120s` | PROVISIONAL | PASS (fresh; not winner) | performance; mediabunny remains faster and Remotion is still skipped by the public guard | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 372.785 ms vs mediabunny 214.750 ms) | — |
 | 12 | `demux/size_micro_micro_audio_short` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 13 | `demux/size_tiny_tiny_h264_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 14 | `demux/size_tiny_tiny_vp9_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | WON (fresh) | startup/registration; selective WebM registration wins the passing competitors | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 8.765 ms vs mediabunny 12.155 ms; strict packet golden PASS) | `297895b` |
+| 14 | `demux/size_tiny_tiny_vp9_360p_2s` | PASS, competitor winner | WON (fresh) | performance; fused WebM demux timing scan | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 5.515 ms vs mediabunny 7.035 ms; strict packet golden PASS) | `c507755` |
+| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny remains faster on the current selected WebM corpus input | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 15.940 ms vs mediabunny 10.560 ms; strict packet golden PASS) | — |
 | 16 | `demux/vp9_1080p_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 17 | `probe/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 18 | `probe/empty-audio-wav` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
@@ -38,9 +38,9 @@ are green.
 | 27 | `probe/wav_s16` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 28 | `probe/wav_s24` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 29 | `remux/aac_adts_adts_to_mp4` | PASS, competitor winner | PASS (fresh; not winner) | performance; mediabunny is narrowly faster | `results/raw/chromium-2026-07-13T09-38-46-061Z.json` (`n=5`, all 6 engines; aibrush 10.315 ms vs mediabunny 9.385 ms) | — |
-| 30 | `remux/av1_720p_5s_webm_to_mp4` | PASS, competitor winner | WON (fresh) | performance; selective WebM/MP4 routing wins the applicable competitors | `results/raw/chromium-2026-07-13T09-38-46-061Z.json` (`n=5`, all 6 engine cells; aibrush 11.720 ms vs mediabunny 12.815 ms; strict output packet PASS) | `297895b` |
+| 30 | `remux/av1_720p_5s_webm_to_mp4` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny is faster on the current selected AV1 remux input | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 34.920 ms vs mediabunny 26.850 ms; strict output packet PASS) | — |
 | 31 | `remux/h264_1080p_5s_mov_to_mp4` | PASS, competitor winner | PASS (fresh; not winner) | performance; MP4Box is faster on MOV timing/edit-list remux | `results/raw/chromium-2026-07-13T09-38-46-061Z.json` (`n=5`, all 6 engines; aibrush 29.710 ms vs mp4box 27.895 ms) | — |
-| 32 | `remux/opus_ogg_to_webm` | PASS, competitor winner | WON (fresh) | performance; selective routing wins the applicable competitors | `results/raw/chromium-2026-07-13T09-38-46-061Z.json` (`n=5`, all 6 engine cells; aibrush 4.785 ms vs mediabunny 5.640 ms; strict output packet PASS) | `297895b` |
+| 32 | `remux/opus_ogg_to_webm` | PASS, competitor winner | WON (fresh) | performance; selective routing wins the applicable competitors | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 4.845 ms vs mediabunny 6.130 ms; strict output packet PASS) | `297895b` |
 | 33 | `remux/vp9_1080p_10s_webm_to_mp4` | PASS, competitor winner | PASS (fresh; not winner) | performance; mediabunny remains faster on the long VP9 remux | `results/raw/chromium-2026-07-13T09-38-46-061Z.json` (`n=5`, all 6 engines; aibrush 47.390 ms vs mediabunny 25.900 ms) | — |
 | 34 | `transcode/av1_to_vp9_webm` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 35 | `transcode/extreme_fps_240` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
