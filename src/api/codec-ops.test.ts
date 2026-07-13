@@ -493,7 +493,10 @@ describe('trim — compressed audio packet-copy path', () => {
       const mp3 = await outputBytes(
         await media().trim(await fixtureSource('sound_5.mp3'), { start: 1, end: 3 }),
       );
-      expect(parseMp3(mp3, mp3.byteLength).durationSec).toBeCloseTo(2, 1);
+      // Packet-copy trimming selects complete MPEG frames. The real 22.05 kHz corpus fixture selects
+      // 77 × 576-sample frames; the output intentionally has no source Xing/LAME tuple after the
+      // window changes, so this is the exact coded duration rather than a loose two-second check.
+      expect(parseMp3(mp3, mp3.byteLength).durationSec).toBeCloseTo((77 * 576) / 22_050, 12);
 
       const adts = await outputBytes(
         await media().trim(await fixtureSource('sfx.adts'), { start: 0.04, end: 0.16 }),

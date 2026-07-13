@@ -58,6 +58,7 @@ function mp3TrackInfoForTest(info: Mp3Info): TrackInfo {
     codec: 'mp3',
     durationSec: info.durationSec,
     config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
+    ...(info.gapless !== undefined ? { gapless: info.gapless } : {}),
   };
 }
 
@@ -99,6 +100,16 @@ describe('probe MP3 on the real corpus', () => {
     expect(info).toEqual(await loadGoldenMetadata('sound_5.mp3'));
   });
 
+  it('sound_5.mp3 exposes the real Xing/LAME gapless sample window', async () => {
+    const tracks = await Mp3Driver.probe?.(await fixtureSource('sound_5.mp3'));
+    expect(tracks?.[0]?.durationSec).toBeCloseTo(110_255 / 22_050, 12);
+    expect(tracks?.[0]?.gapless).toEqual({
+      leadingSamples: 576,
+      trailingSamples: 913,
+      totalSamples: 110_255,
+    });
+  });
+
   it('metadata-only probe range-reads one bounded head for known-size sources', async () => {
     const bytes = await loadFixture('sound_5.mp3');
     const ranges: Array<readonly [number, number]> = [];
@@ -128,6 +139,7 @@ describe('probe MP3 on the real corpus', () => {
           sampleRate: expected.sampleRate,
           numberOfChannels: expected.channels,
         },
+        ...(expected.gapless !== undefined ? { gapless: expected.gapless } : {}),
       },
     ]);
   });

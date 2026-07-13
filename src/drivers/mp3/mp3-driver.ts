@@ -6,6 +6,7 @@
  * estimation only for head-only probes). Decode is via WebCodecs/WASM later; the container token is `mp3`.
  */
 
+import { parseMp3FrameHeader, parseVbrHeader } from '../../codecs/wasm-mp3/mp3.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -57,6 +58,7 @@ export interface Mp3Info {
   sampleRate: number;
   channels: number;
   durationSec: number;
+  gapless?: TrackInfo['gapless'];
 }
 
 /** Length (bytes) of the ID3v2 tag at the start, or 0 if absent. */
@@ -165,6 +167,36 @@ function isInfoFrame(dv: DataView, offset: number, header: FrameHeader): boolean
   return tag === 'Xing' || tag === 'Info';
 }
 
+/** Recover the exact program window from a standard Xing/LAME delay-padding tuple. */
+function gaplessFromXingLame(
+  bytes: Uint8Array,
+  first: { offset: number; header: FrameHeader },
+): TrackInfo['gapless'] | undefined {
+  const frameEnd = first.offset + first.header.frameLength;
+  if (frameEnd > bytes.byteLength) return undefined;
+  const parsedHeader = parseMp3FrameHeader(bytes, first.offset);
+  const vbr = parseVbrHeader(bytes.subarray(first.offset, frameEnd), parsedHeader);
+  const frameCount = vbr?.frameCount;
+  const leadingSamples = vbr?.encoderDelay;
+  const trailingSamples = vbr?.encoderPadding;
+  if (
+    frameCount === undefined ||
+    leadingSamples === undefined ||
+    trailingSamples === undefined ||
+    !Number.isSafeInteger(frameCount) ||
+    !Number.isSafeInteger(leadingSamples) ||
+    !Number.isSafeInteger(trailingSamples) ||
+    frameCount <= 0 ||
+    leadingSamples < 0 ||
+    trailingSamples < 0
+  ) {
+    return undefined;
+  }
+  const totalSamples = frameCount * parsedHeader.samplesPerFrame - leadingSamples - trailingSamples;
+  if (!Number.isSafeInteger(totalSamples) || totalSamples <= 0) return undefined;
+  return { leadingSamples, trailingSamples, totalSamples };
+}
+
 /** Exact audio duration from every complete MPEG frame present in `dv`, skipping a leading Xing/Info frame. */
 function fullFrameDurationSec(
   dv: DataView,
@@ -226,8 +258,11 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
   const { offset, header } = first;
 
   const frames = xingFrameCount(dv, offset, header);
+  const gapless = gaplessFromXingLame(bytes, first);
   let durationSec: number;
-  if (frames !== undefined) {
+  if (gapless !== undefined && gapless.totalSamples !== undefined) {
+    durationSec = gapless.totalSamples / header.sampleRate;
+  } else if (frames !== undefined) {
     durationSec = (frames * header.samplesPerFrame) / header.sampleRate;
   } else if (totalSize === undefined || totalSize <= dv.byteLength) {
     durationSec =
@@ -237,7 +272,12 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
     const audioBytes = (totalSize ?? dv.byteLength) - offset;
     durationSec = (audioBytes * 8) / (header.bitrateKbps * 1000);
   }
-  return { sampleRate: header.sampleRate, channels: header.channels, durationSec };
+  return {
+    sampleRate: header.sampleRate,
+    channels: header.channels,
+    durationSec,
+    ...(gapless !== undefined ? { gapless } : {}),
+  };
 }
 
 /**
@@ -302,6 +342,7 @@ function mp3TrackInfo(info: Mp3Info): TrackInfo {
     codec: 'mp3',
     durationSec: info.durationSec,
     config: { codec: 'mp3', sampleRate: info.sampleRate, numberOfChannels: info.channels },
+    ...(info.gapless !== undefined ? { gapless: info.gapless } : {}),
   };
 }
 

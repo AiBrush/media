@@ -69,7 +69,19 @@ async function remuxToMp3(sourceFrames: {
   packets: Mp3Packet[];
 }): Promise<Uint8Array> {
   const muxer = Mp3Driver.createMuxer();
-  const id = muxer.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+  const sourceInfo = parseMp3(sourceFrames.bytes, sourceFrames.bytes.byteLength);
+  const id = muxer.addTrack({
+    id: 0,
+    mediaType: 'audio',
+    codec: 'mp3',
+    durationSec: sourceInfo.durationSec,
+    config: {
+      codec: 'mp3',
+      sampleRate: sourceInfo.sampleRate,
+      numberOfChannels: sourceInfo.channels,
+    },
+    ...(sourceInfo.gapless !== undefined ? { gapless: sourceInfo.gapless } : {}),
+  });
   for (const p of sourceFrames.packets) {
     muxer.addChunkStruct(id, {
       timestampUs: p.ptsUs,

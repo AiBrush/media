@@ -84,8 +84,9 @@ export function trimBoundsUs(startSec: number, endSec: number): TrimBoundsUs {
 }
 
 export function trimPacketCopyTrack(track: TrackInfo, bounds: TrimBoundsUs): TrackInfo {
+  const { gapless: _gapless, ...trackWithoutGapless } = track;
   return {
-    ...track,
+    ...trackWithoutGapless,
     durationSec: Math.max(0, bounds.endUs - bounds.startUs) / MICROS_PER_SECOND,
   };
 }

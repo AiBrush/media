@@ -50,6 +50,7 @@ interface Mp3FrameRun {
 interface Mp3MuxTrack {
   readonly id: number;
   readonly chunks: ChunkStruct[];
+  readonly gapless: TrackInfo['gapless'];
   frameCount: number;
   audioBytes: number;
   firstHeader: Mp3FrameHeader | undefined;
@@ -94,7 +95,14 @@ export class Mp3Muxer implements Muxer {
     this.#assertOpen();
     validateMp3MuxTrack(info, this.#track === undefined ? 0 : 1);
     const id = 0;
-    this.#track = { id, chunks: [], frameCount: 0, audioBytes: 0, firstHeader: undefined };
+    this.#track = {
+      id,
+      chunks: [],
+      gapless: info.gapless,
+      frameCount: 0,
+      audioBytes: 0,
+      firstHeader: undefined,
+    };
     return id;
   }
 
@@ -171,6 +179,7 @@ export function muxPreparedMp3PacketTrack(input: PreparedMp3PacketMuxInput): Uin
   const track: Mp3MuxTrack = {
     id: 0,
     chunks: [],
+    gapless: info.gapless,
     frameCount: 0,
     audioBytes: 0,
     firstHeader: undefined,
@@ -302,10 +311,43 @@ function writeU32BE(out: Uint8Array, at: number, value: number): void {
   out[at + 3] = value & 0xff;
 }
 
+interface Mp3GaplessMetadata {
+  readonly leadingSamples: number;
+  readonly trailingSamples: number;
+}
+
+function gaplessMetadataFor(track: Mp3MuxTrack): Mp3GaplessMetadata | undefined {
+  const gapless = track.gapless;
+  if (gapless === undefined) return undefined;
+  const leadingSamples = gapless.leadingSamples;
+  const trailingSamples = gapless.trailingSamples;
+  const totalSamples = gapless.totalSamples;
+  if (leadingSamples === undefined || trailingSamples === undefined || totalSamples === undefined) {
+    return undefined;
+  }
+  if (
+    !Number.isSafeInteger(leadingSamples) ||
+    !Number.isSafeInteger(trailingSamples) ||
+    !Number.isSafeInteger(totalSamples) ||
+    leadingSamples < 0 ||
+    trailingSamples < 0 ||
+    totalSamples <= 0 ||
+    leadingSamples > 0xfff ||
+    trailingSamples > 0xfff
+  ) {
+    throw new MediaError(
+      'mux-error',
+      'MP3 mux: gapless delay/padding is outside the LAME field range',
+    );
+  }
+  return { leadingSamples, trailingSamples };
+}
+
 function buildXingFrame(track: Mp3MuxTrack): Uint8Array {
   const header = track.firstHeader as Mp3FrameHeader;
   const tagAt = 4 + header.sideInfoBytes;
-  const minLength = tagAt + 16;
+  const gapless = gaplessMetadataFor(track);
+  const minLength = tagAt + (gapless === undefined ? 16 : 40);
   const bitrateIndex = metadataBitrateIndex(header, minLength);
   const bitrateTable = header.version === 3 ? BITRATES_MPEG1_L3 : BITRATES_MPEG2_L3;
   const bitrateKbps = bitrateTable[bitrateIndex] as number;
@@ -319,6 +361,14 @@ function buildXingFrame(track: Mp3MuxTrack): Uint8Array {
   writeU32BE(out, tagAt + 4, 0x00000003);
   writeU32BE(out, tagAt + 8, track.frameCount);
   writeU32BE(out, tagAt + 12, length + track.audioBytes);
+  if (gapless !== undefined) {
+    const lameAt = tagAt + 16;
+    writeAscii(out, lameAt, 'LAME3.99r');
+    const packed = (gapless.leadingSamples << 12) | gapless.trailingSamples;
+    out[lameAt + 21] = (packed >>> 16) & 0xff;
+    out[lameAt + 22] = (packed >>> 8) & 0xff;
+    out[lameAt + 23] = packed & 0xff;
+  }
   return out;
 }
 

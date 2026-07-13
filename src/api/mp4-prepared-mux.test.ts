@@ -930,7 +930,15 @@ describe('prepared MP4 packet mux', () => {
     expect(reparsed.tracks[0]?.codec).toBe('mp4a.6b');
     expect(reparsed.packets).toHaveLength(table.packets.length);
     expect(reparsed.packets.map((row) => row.size)).toEqual(table.packets.map((row) => row.size));
-    expect(reparsed.packets[0]?.ptsUs).toBe(0);
+    const sampleRate =
+      track.config !== undefined && 'sampleRate' in track.config
+        ? track.config.sampleRate
+        : undefined;
+    const leadingSamples = track.gapless?.leadingSamples;
+    if (sampleRate === undefined || leadingSamples === undefined) {
+      throw new Error('expected the MP3 Xing/LAME fixture to expose audio priming metadata');
+    }
+    expect(reparsed.packets[0]?.ptsUs).toBe(-Math.round((leadingSamples * 1_000_000) / sampleRate));
   });
 
   it('exposes payload offsets for medium MP4 packet-table mux preparation', async () => {

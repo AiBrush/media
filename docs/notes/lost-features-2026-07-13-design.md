@@ -29,6 +29,23 @@ not alter packet parsing, B-frame/VFR timestamps, seek behavior, cancellation, f
 memory bounds, or stream backpressure. Validation covers the real MP4/WebM corpus and registration
 invariants; the benchmark compares all affected demux/probe rows with fresh multi-sample runs.
 
+## Batch B — Xing/LAME gapless MP3 propagation
+
+The fresh `transcode/mp3_to_aac_mp4` export reproduced a correctness loss on the real LAME/Xing corpus:
+the MP3 container exposed all coded frames but discarded the standard encoder-delay/padding tuple, so the
+AAC encoder received the coded tail and the MP4 output exceeded the independent source duration. The fix
+reuses the existing pure MP3 VBR parser, carries the exact sample window through `TrackInfo`, trims the
+decoded `AudioData` stream before re-encode, and writes the same window into authored MP4/MP3 metadata. The
+strict real-corpus test checks the baked `sound_5.mp3` LAME tuple and duration; the browser validation checks
+the decoded-output metadata and fresh competitor timing. B-frames are not present on this audio-only row;
+VFR, seek, cancellation, frame/audio lifetime, bounded memory, and sink backpressure remain governed by the
+existing stream pipeline and close-once gapless trim.
+
+Packet-copy trim is a separate boundary case: once a request selects a new coded-frame window, the source
+Xing/LAME tuple is no longer valid for the output and is deliberately removed from the copied track metadata.
+The real `sound_5.mp3` trim oracle therefore checks the exact complete-frame duration, while decode/re-encode
+paths retain the source tuple and perform sample-accurate gapless trimming.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

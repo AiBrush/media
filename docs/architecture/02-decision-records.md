@@ -8840,3 +8840,44 @@ count, duration, scenario, competitor, or score participates in selection.
 names; weakening packet or timestamp goldens; changing competitor selection or scoring; eager-loading the
 full bundle and relying on garbage collection; changing decoder queues or frame lifetime without evidence;
 or claiming all MP4/WebM losses closed from the first post-change matrix.
+
+### ADR-292 - Xing/LAME MP3 gapless facts follow the audio transcode timeline
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** Fresh Chromium evidence
+`../media-test/results/raw/chromium-2026-07-13T09-45-08-817Z.json` reproduced the prior
+`transcode/mp3_to_aac_mp4` correctness loss on the real `01.mp3` fixture: aibrush-media emitted a typed
+duration-oracle failure because the output measured 2.4380 s while the independent source measured 2.3100 s.
+The selected file carries a standard Xing frame and LAME delay/padding values of 576 and 1216 samples.
+The product's pure MP3 VBR helper already parsed those values, but the MP3 container track did not expose
+them, so the decoded stream could not remove the coded priming/tail before AAC encoding.
+
+**Decision.** Reuse the existing pure `parseVbrHeader`/`parseMp3FrameHeader` implementation to derive a
+gapless `TrackInfo` window only when a complete, safe Xing/LAME frame-count plus delay/padding tuple exists.
+Set the track duration to the exact program sample count. The existing close-once gapless `AudioData`
+stream trim consumes that window before re-encode, and MP4 mux receives the same total/leading sample facts
+so AAC packet padding is represented by a standard edit list. The MP3 muxer also emits the preserved
+delay/padding in its synthesized Xing/LAME metadata when the caller provides a complete tuple. Packet-copy
+trim removes the source tuple because a shortened frame window cannot truthfully retain the source delay or
+padding counts. Ordinary
+CBR MP3 and Xing/VBR streams without a complete LAME tuple retain their prior duration and metadata behavior.
+
+**Invariants and consequences.** The real `sound_5.mp3` test now proves the baked corpus tuple
+`576/913/110255` and the independently verified 5.000226757 s duration; the existing MP3 remux tests prove
+the authored Xing/LAME metadata remains parseable and frame bytes remain unchanged; the compressed-audio trim
+test proves packet-copy output has the exact 77-frame coded duration without stale source gapless metadata. No B-frame or VFR
+ordering exists on this audio-only path. Seek and cancellation still terminate through the existing stream
+signal; every decoded `AudioData` is closed by the existing gapless trim; the edit-list writer does not add
+unbounded buffering; and mux sink backpressure remains the existing packet drain contract. The browser row
+must be rerun after vendor sync before it can move from `FAIL` to `WON`.
+
+**Validation.** After the fix and vendor sync, fresh Chromium evidence
+`../media-test/results/raw/chromium-2026-07-13T09-55-20-851Z.json` reports strict output-metadata PASS for
+all four applicable engines. aibrush-media measures 75.120 ms versus mediabunny 71.575 ms and Remotion
+73.015 ms, so correctness is closed while the small performance deficit remains an open follow-up row.
+
+**Rejected:** subtracting a guessed fixed MP3 delay; trimming by fixture name, duration, byte count, or
+competitor result; changing the strict output-duration oracle; padding AAC samples without source proof;
+discarding LAME facts after probe; weakening frame-byte or packet-count validation; or adding a second
+decoder, replay buffer, reorder queue, or uncapped audio staging path.
