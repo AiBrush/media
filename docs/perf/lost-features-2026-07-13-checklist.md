@@ -23,7 +23,7 @@ are green.
 | 12 | `demux/size_micro_micro_audio_short` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 13 | `demux/size_tiny_tiny_h264_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 14 | `demux/size_tiny_tiny_vp9_360p_2s` | PASS, competitor winner | WON (fresh) | performance; fused WebM demux timing scan | `results/raw/chromium-2026-07-13T11-32-44-194Z.json` (`n=5`, all 6 engine cells; aibrush 5.515 ms vs mediabunny 7.035 ms; strict packet golden PASS) | `c507755` |
-| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | PASS (fresh; not winner) | performance; Mediabunny remains faster on the current selected WebM corpus input | `results/raw/chromium-2026-07-13T12-24-38-119Z.json` (`n=5`, all 6 engine cells; aibrush 6.970 ms vs mediabunny 5.725 ms; strict packet golden PASS) | — |
+| 15 | `demux/vp8_720p_10s` | WON | WON (fresh) | payload-free WebM packet metadata avoids encoded-chunk construction; strict packet golden passes | `results/raw/chromium-2026-07-13T12-29-26-564Z.json` (`n=5`, all 6 engine cells; aibrush 5.880 ms vs mediabunny 8.950 ms) | `perf: expose WebM packet metadata` |
 | 16 | `demux/vp9_1080p_10s` | WON | WON (fresh) | payload-free WebM packet metadata avoids encoded-chunk construction; strict packet golden passes | `results/raw/chromium-2026-07-13T12-24-38-119Z.json` (`n=5`, all 6 engine cells; aibrush 25.715 ms vs mediabunny 38.650 ms) | `perf: expose WebM packet metadata` |
 | 17 | `probe/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 18 | `probe/empty-audio-wav` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
