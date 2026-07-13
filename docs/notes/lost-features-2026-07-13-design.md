@@ -207,6 +207,31 @@ byte-exact AES-to-clear stitched-stream oracle, and the parsed encryption classi
 gate must show `probe/hls_aes128` `PASS` with all competitor cells present and aibrush faster than every
 passing competitor; a multi-sample no-reuse matrix remains the benchmark oracle.
 
+### Batch L — resize VPx alpha planes independently
+
+The fresh `transcode/vp9_alpha_to_vp9_keepalpha` matrix showed a real cost in the general alpha path:
+colour and alpha packets were decoded separately, merged into a full RGBA `VideoFrame`, resized, then
+split back into two frames before the dual VPx encoders. The packet-plane route is safe for resize-only
+targets because resize preserves plane identity; crop, pad, rotation, flip, colour, tonemap, and FPS
+changes remain on the merged path until their alpha semantics have their own proof.
+
+The new route decodes colour and alpha independently, applies the same resize stage to each plane, and
+pairs the two encoder outputs by exact timestamp. A one-frame alpha read-ahead overlaps the independent
+branches without changing bounded backpressure: no more than the pending encoder/stream high-water mark
+and one encoded alpha result are retained. B-frame/DTS and VFR/PTS values are never reconstructed or
+restamped, and seek behavior remains the container packet path. Abort cancels both branch readers and
+their pending read promise; the encoder stages close every input `VideoFrame` exactly once, while the
+pairer owns only encoded chunks. Memory avoids the intermediate RGBA copy and remains proportional to the
+bounded stream queues.
+
+The strict validation uses the real `vp9_alpha.webm` corpus family and the baked alpha-plane/playback
+oracles, with the existing unit oracle asserting timestamp pairing, missing-alpha failure, and frame
+close-once behavior. Fresh Chromium matrices are recorded at
+`media-test/results/raw/chromium-2026-07-13T15-09-45-110Z.json`,
+`...15-13-50-343Z.json`, and `...15-14-41-134Z.json`; the exhaustive all-corpus run remains the
+acceptance gate. The multi-sample benchmark uses warmup 1, five measured iterations, no result reuse,
+and all six competitor cells.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

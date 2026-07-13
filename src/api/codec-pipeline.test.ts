@@ -29,6 +29,7 @@ import {
   buildVideoEncoderConfig,
   buildVideoEncoderConfigForRuntime,
   canCopyVpxAlphaSideData,
+  canUseVpxAlphaGeometryPacketTranscode,
   canUseVpxAlphaPacketTranscode,
   chooseOutputContainer,
   containerHasChunkMuxer,
@@ -36,6 +37,7 @@ import {
   decodeVideoPacketsWithAlpha,
   drainEncoderToMuxer,
   encodeVideoFramesWithAlpha,
+  encodeVpxAlphaFrameStreams,
   firefoxAudioTranscodeDeclineReason,
   firefoxOpusAudioEncodeTarget,
   firefoxOpusEncodeUsesWasm,
@@ -345,6 +347,55 @@ describe('encodeVideoFramesWithAlpha frame ownership', () => {
   });
 });
 
+describe('encodeVpxAlphaFrameStreams', () => {
+  const passEncoder = (
+    _config: VideoEncoderConfig,
+    _options?: StageOptions,
+  ): TransformStream<RawFrame, EncodedChunk> =>
+    new TransformStream<RawFrame, EncodedChunk>({
+      transform(frame, controller): void {
+        const timestamp =
+          frame instanceof Object && 'timestamp' in frame
+            ? (frame as { readonly timestamp: number }).timestamp
+            : -1;
+        frame.close();
+        controller.enqueue(alphaEncodedChunk(timestamp));
+      },
+    });
+
+  it('pairs independently resized plane outputs by timestamp and closes each input once', async () => {
+    const color = [
+      new AlphaLifecycleFrame({ timestamp: 100 }),
+      new AlphaLifecycleFrame({ timestamp: 200 }),
+    ];
+    const alpha = [
+      new AlphaLifecycleFrame({ timestamp: 100 }),
+      new AlphaLifecycleFrame({ timestamp: 200 }),
+    ];
+    const reader = encodeVpxAlphaFrameStreams(
+      streamOf(color as unknown as VideoFrame[]),
+      streamOf(alpha as unknown as VideoFrame[]),
+      {
+        encodeConfig: { codec: 'vp09.00.31.08', width: 320, height: 240 },
+        createEncoder: passEncoder,
+      },
+    ).getReader();
+    const first = await reader.read();
+    const second = await reader.read();
+    const end = await reader.read();
+
+    expect(first.done).toBe(false);
+    expect(second.done).toBe(false);
+    expect(end.done).toBe(true);
+    expect(first.value?.chunk.timestamp).toBe(100);
+    expect(first.value?.alpha?.timestamp).toBe(100);
+    expect(second.value?.chunk.timestamp).toBe(200);
+    expect(second.value?.alpha?.timestamp).toBe(200);
+    expect(color.map((frame) => frame.closeCount)).toEqual([1, 1]);
+    expect(alpha.map((frame) => frame.closeCount)).toEqual([1, 1]);
+  });
+});
+
 describe('decodeVideoPacketsWithAlpha frame ownership', () => {
   const passDecoder = (): TransformStream<EncodedChunk, RawFrame> =>
     new TransformStream<EncodedChunk, RawFrame>({
@@ -491,6 +542,48 @@ describe('canUseVpxAlphaPacketTranscode', () => {
       canUse({ codec: 'vp9', alpha: 'keep', bitDepth: 10 }, true, 'vp09.02.31.12', 'vp09.02.31.10'),
     ).toBe(false);
     expect(canUse({ codec: 'vp9', alpha: 'keep' }, true, 'vp9', 'vp09.00.31.08')).toBe(false);
+  });
+});
+
+describe('canUseVpxAlphaGeometryPacketTranscode', () => {
+  const source = 'vp09.00.31.08';
+
+  it('allows resize-only alpha routes and rejects transforms with unproven plane semantics', () => {
+    expect(
+      canUseVpxAlphaGeometryPacketTranscode(
+        { codec: 'vp9', width: 320, height: 240, alpha: 'keep' },
+        true,
+        source,
+        source,
+      ),
+    ).toBe(true);
+    expect(
+      canUseVpxAlphaGeometryPacketTranscode({ codec: 'vp9', alpha: 'keep' }, true, source, source),
+    ).toBe(false);
+    expect(
+      canUseVpxAlphaGeometryPacketTranscode(
+        { codec: 'vp9', width: 320, alpha: 'keep', crop: { x: 0, y: 0, width: 320, height: 240 } },
+        true,
+        source,
+        source,
+      ),
+    ).toBe(false);
+    expect(
+      canUseVpxAlphaGeometryPacketTranscode(
+        { codec: 'vp9', width: 320, height: 240, alpha: 'keep', colorspace: { to: 'bt709' } },
+        true,
+        source,
+        source,
+      ),
+    ).toBe(false);
+    expect(
+      canUseVpxAlphaGeometryPacketTranscode(
+        { codec: 'vp9', width: 320, height: 240, alpha: 'keep' },
+        true,
+        'vp09.02.31.10',
+        source,
+      ),
+    ).toBe(false);
   });
 });
 

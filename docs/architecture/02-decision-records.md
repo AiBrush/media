@@ -9105,3 +9105,33 @@ clear probes retain their lower latency. The full path's materialization and pac
 **Rejected:** probing ciphertext as if it were clear TS; deriving a key or base path from fixture names;
 fetching only the first encrypted segment and guessing metadata; disabling the strict HLS oracle; or
 duplicating AES/decryption logic in the adapter.
+
+### ADR-302 — Resize VPx alpha planes without an intermediate RGBA frame
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The real `vp9_alpha.webm` transcode row requested a 640×480 → 320×240 VP9-alpha resize.
+The general alpha path decoded colour and alpha separately, merged them into RGBA, ran the resize, and
+split the result back into two encoder inputs. The strict alpha-plane and playback oracles passed, but
+the redundant full-frame merge/split made the fresh Chromium path materially slower.
+
+**Decision.** For VPx alpha targets that request only width/height resize, preserve the packet-plane split:
+decode colour and alpha independently, apply the same resize filter to both planes, encode both with the
+resolved target config, and pair output chunks by exact PTS before muxing the WebM BlockAdditional alpha
+side data. The route requires equal proved source/target bit depth and `alpha:'keep'`. Crop, pad,
+rotation, flip, colour, tonemap, and FPS changes remain on the merged RGBA route until their plane
+semantics are independently proven. Explicit rate-control requests remain supported by encoding both
+planes; alpha byte copy is not used when dimensions change.
+
+**Invariants and consequences.** B-frame/DTS and VFR/PTS values are inherited from the decoded frames and
+are never guessed or restamped; seek remains the normal packet/keyframe path. The one-frame alpha
+read-ahead overlaps independent branches but is bounded by the existing stream/encoder high-water marks.
+Cancellation cancels both readers and any pending read promise. Each input `VideoFrame` is owned and
+closed exactly once by its encoder stage; the pairing layer owns only encoded chunks. The route removes
+the intermediate RGBA allocation, so peak memory is bounded by the two independent frame queues plus
+one paired alpha chunk. A missing or out-of-order alpha PTS is a typed encode error, never an opaque
+fallback.
+
+**Rejected:** copying alpha bytes across a dimension change; changing only WebM metadata; merging the
+planes before resize; weakening alpha/playback goldens; or enabling the route for transforms whose alpha
+semantics are not proven.

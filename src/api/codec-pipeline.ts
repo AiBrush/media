@@ -719,6 +719,37 @@ export function canUseVpxAlphaPacketTranscode(
   );
 }
 
+/**
+ * True when a VPx-alpha transcode can resize the colour and alpha elementary streams independently.
+ * Geometry-only resize preserves the two-plane contract without materializing an intermediate RGBA
+ * frame; crop/pad/rotation/colour/timing transforms stay on the merged path until their plane semantics
+ * are independently proven. Rate-control options are intentionally allowed: both planes are encoded.
+ */
+export function canUseVpxAlphaGeometryPacketTranscode(
+  target: VideoTarget,
+  sourceHasAlpha: boolean,
+  sourceCodec: string,
+  targetCodec: string,
+): boolean {
+  const sourceBitDepth = bitDepthFromCodec(sourceCodec);
+  const targetBitDepth = bitDepthFromCodec(targetCodec);
+  const hasResize = target.width !== undefined || target.height !== undefined;
+  return (
+    sourceHasAlpha &&
+    sourceBitDepth !== undefined &&
+    targetBitDepth === sourceBitDepth &&
+    target.alpha === 'keep' &&
+    hasResize &&
+    target.crop === undefined &&
+    target.pad === undefined &&
+    target.rotate === undefined &&
+    target.flip === undefined &&
+    target.colorspace === undefined &&
+    target.tonemap === undefined &&
+    target.fps === undefined
+  );
+}
+
 /** Prefer a proved decoder qualification over the container's bare family token. */
 export function qualifiedVideoSourceCodec(track: Pick<TrackInfo, 'codec' | 'config'>): string {
   return track.config !== undefined && 'codedWidth' in track.config
@@ -1863,6 +1894,20 @@ export interface VpxAlphaPacketTranscodeOptions {
   readonly copyAlpha?: boolean;
 }
 
+export interface VpxAlphaFrameTranscodeOptions {
+  readonly createEncoder: (
+    config: VideoEncoderConfig,
+    o?: StageOptions,
+  ) => TransformStream<RawFrame, EncodedChunk>;
+  readonly encodeConfig: VideoEncoderConfig;
+  readonly colorStage?: StageOptions;
+  readonly alphaStage?: StageOptions;
+}
+
+type EncodedChunkReadResult = Awaited<
+  ReturnType<ReadableStreamDefaultReader<EncodedChunk>['read']>
+>;
+
 /**
  * Encode an RGBA VPx stream as Matroska/WebM-compatible colour packets plus VPx alpha side packets.
  * Chromium's WebCodecs encoder does not expose a second alpha chunk from a single encode call, while our
@@ -2015,6 +2060,12 @@ export function transcodeVpxAlphaPackets(
   const alphaReader = alphaChunks.getReader();
   const alphaByTimestamp = new Map<number, EncodedChunk>();
   let alphaDone = false;
+  let pendingAlphaRead: Promise<EncodedChunkReadResult> | undefined;
+
+  const readAlpha = (): Promise<EncodedChunkReadResult> => {
+    if (pendingAlphaRead === undefined) pendingAlphaRead = alphaReader.read();
+    return pendingAlphaRead;
+  };
 
   const alphaForTimestamp = async (timestamp: number): Promise<EncodedChunk | undefined> => {
     for (const [alphaTimestamp] of alphaByTimestamp) {
@@ -2027,7 +2078,8 @@ export function transcodeVpxAlphaPackets(
       return cached;
     }
     while (!alphaDone) {
-      const { done, value } = await alphaReader.read();
+      const { done, value } = await readAlpha();
+      pendingAlphaRead = undefined;
       if (done) {
         alphaDone = true;
         return undefined;
@@ -2041,12 +2093,19 @@ export function transcodeVpxAlphaPackets(
   };
 
   const cancelReaders = async (reason: unknown): Promise<void> => {
-    await Promise.allSettled([colorReader.cancel(reason), alphaReader.cancel(reason)]);
+    const pending = pendingAlphaRead;
+    pendingAlphaRead = undefined;
+    await Promise.allSettled([
+      colorReader.cancel(reason),
+      alphaReader.cancel(reason),
+      ...(pending === undefined ? [] : [pending]),
+    ]);
   };
 
   return new ReadableStream<Packet>({
     async pull(controller): Promise<void> {
       try {
+        void readAlpha();
         const { done, value: color } = await colorReader.read();
         if (done) {
           await alphaReader.cancel('color stream ended');
@@ -2059,6 +2118,98 @@ export function transcodeVpxAlphaPackets(
             ? { chunk: color }
             : { chunk: color, alpha: alpha as EncodedVideoChunk },
         );
+      } catch (error) {
+        await cancelReaders(error);
+        controller.error(error);
+      }
+    },
+    async cancel(reason): Promise<void> {
+      await cancelReaders(reason);
+    },
+  });
+}
+
+/**
+ * Encode already-separated colour and alpha frames after an independent geometry transform. Both
+ * streams are consumed under normal TransformStream backpressure and paired by exact PTS; a missing
+ * alpha timestamp is a typed encode failure rather than a silent opaque output. The encoder stages own
+ * and close every input `VideoFrame`, while this pairing layer owns only encoded chunks.
+ */
+export function encodeVpxAlphaFrameStreams(
+  colorFrames: ReadableStream<VideoFrame>,
+  alphaFrames: ReadableStream<VideoFrame>,
+  options: VpxAlphaFrameTranscodeOptions,
+): ReadableStream<Packet> {
+  const colorChunks = colorFrames.pipeThrough(
+    options.createEncoder(options.encodeConfig, options.colorStage),
+  );
+  const alphaChunks = alphaFrames.pipeThrough(
+    options.createEncoder(options.encodeConfig, options.alphaStage),
+  );
+  const colorReader = colorChunks.getReader();
+  const alphaReader = alphaChunks.getReader();
+  const alphaByTimestamp = new Map<number, EncodedChunk>();
+  let alphaDone = false;
+  let pendingAlphaRead: Promise<EncodedChunkReadResult> | undefined;
+
+  const readAlpha = (): Promise<EncodedChunkReadResult> => {
+    if (pendingAlphaRead === undefined) pendingAlphaRead = alphaReader.read();
+    return pendingAlphaRead;
+  };
+
+  const alphaForTimestamp = async (timestamp: number): Promise<EncodedChunk | undefined> => {
+    for (const [alphaTimestamp] of alphaByTimestamp) {
+      if (alphaTimestamp >= timestamp) continue;
+      alphaByTimestamp.delete(alphaTimestamp);
+    }
+    const cached = alphaByTimestamp.get(timestamp);
+    if (cached !== undefined) {
+      alphaByTimestamp.delete(timestamp);
+      return cached;
+    }
+    while (!alphaDone) {
+      const { done, value } = await readAlpha();
+      pendingAlphaRead = undefined;
+      if (done) {
+        alphaDone = true;
+        return undefined;
+      }
+      if (value.timestamp < timestamp) continue;
+      if (value.timestamp === timestamp) return value;
+      alphaByTimestamp.set(value.timestamp, value);
+      return undefined;
+    }
+    return undefined;
+  };
+
+  const cancelReaders = async (reason: unknown): Promise<void> => {
+    const pending = pendingAlphaRead;
+    pendingAlphaRead = undefined;
+    await Promise.allSettled([
+      colorReader.cancel(reason),
+      alphaReader.cancel(reason),
+      ...(pending === undefined ? [] : [pending]),
+    ]);
+  };
+
+  return new ReadableStream<Packet>({
+    async pull(controller): Promise<void> {
+      try {
+        void readAlpha();
+        const { done, value: color } = await colorReader.read();
+        if (done) {
+          await alphaReader.cancel('color stream ended');
+          controller.close();
+          return;
+        }
+        const alpha = await alphaForTimestamp(color.timestamp);
+        if (alpha === undefined) {
+          throw new MediaError(
+            'encode-error',
+            `VPx alpha geometry encode produced no alpha packet for timestamp ${color.timestamp}`,
+          );
+        }
+        controller.enqueue({ chunk: color, alpha: alpha as EncodedVideoChunk });
       } catch (error) {
         await cancelReaders(error);
         controller.error(error);
@@ -2091,6 +2242,21 @@ function alphaChunkStream(packets: ReadableStream<Packet>): ReadableStream<Encod
       },
     }),
   );
+}
+
+/** Decode the two elementary VPx planes independently for geometry-only alpha transcodes. */
+export function decodeVpxAlphaPacketStreams(
+  packets: ReadableStream<Packet>,
+  createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+): { readonly color: ReadableStream<VideoFrame>; readonly alpha: ReadableStream<VideoFrame> } {
+  const [colorPackets, alphaPackets] = packets.tee();
+  const color = unwrapPackets(colorPackets).pipeThrough(
+    createDecoder(),
+  ) as ReadableStream<VideoFrame>;
+  const alpha = alphaChunkStream(alphaPackets).pipeThrough(
+    createDecoder(),
+  ) as ReadableStream<VideoFrame>;
+  return { color, alpha };
 }
 
 /**

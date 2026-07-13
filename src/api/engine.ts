@@ -1416,6 +1416,7 @@ export class MediaEngineImpl implements MediaEngine {
         // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
         const {
           buildVideoEncoderConfigForRuntime,
+          canUseVpxAlphaGeometryPacketTranscode,
           canUseVpxAlphaPacketTranscode,
           decodeQueryFor,
           decodeVideoPacketsWithAlpha,
@@ -1431,6 +1432,26 @@ export class MediaEngineImpl implements MediaEngine {
         );
         const sourceVideoCodec = qualifiedVideoSourceCodec(videoTrack);
         if (
+          canUseVpxAlphaGeometryPacketTranscode(
+            videoTarget,
+            videoTrack.alpha === true,
+            sourceVideoCodec,
+            videoEncoderConfig.codec,
+          )
+        ) {
+          const packets = demuxer.packets(videoTrack.id);
+          openStreams.push(packets);
+          tasks.push(
+            this.#transcodeVpxAlphaGeometryPacketStream(
+              packets,
+              videoTarget,
+              videoTrack,
+              muxer,
+              signal,
+              o,
+            ),
+          );
+        } else if (
           canUseVpxAlphaPacketTranscode(
             videoTarget,
             videoTrack.alpha === true,
@@ -1584,6 +1605,77 @@ export class MediaEngineImpl implements MediaEngine {
       applyVideoFilters: this.#applyVideoFilters.bind(this),
       stageOptions: this.#stageOptions.bind(this),
     };
+  }
+
+  /** Resize VPx colour and alpha planes independently, avoiding an intermediate merged RGBA frame. */
+  async #transcodeVpxAlphaGeometryPacketStream(
+    packets: ReadableStream<Packet>,
+    target: VideoTarget,
+    sourceTrack: TrackInfo,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const {
+      buildVideoEncoderConfig,
+      decodeQueryFor,
+      decodeVpxAlphaPacketStreams,
+      drainEncoderToMuxer,
+      encodeVpxAlphaFrameStreams,
+      encodeQueryFor,
+      requireEncoderConfig,
+      videoTrackInfoFromDecoderConfig,
+    } = await loadCodecPipeline();
+    const decodeQuery = await decodeQueryFor(sourceTrack);
+    const decodeCodec = await this.#routeCodec(decodeQuery, o);
+    const encodeConfig = buildVideoEncoderConfig(
+      target,
+      sourceGeometryOf(sourceTrack),
+      sourceTrack.codec,
+    );
+    const encoderConfig: VideoEncoderConfig = { ...encodeConfig, alpha: 'discard' };
+    const decodeStage: VideoDecoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      alpha: 'discard',
+    };
+    const planes = decodeVpxAlphaPacketStreams(packets, () =>
+      decodeCodec.createDecoder(decodeQuery.config, decodeStage),
+    );
+    const colorFrames = await this.#applyVideoFilters(planes.color, target, sourceTrack, signal, o);
+    const alphaFrames = await this.#applyVideoFilters(planes.alpha, target, sourceTrack, signal, o);
+    /* v8 ignore start -- requires live WebCodecs decode/filter/encode; browser-harness validated. */
+    let decoderConfig: VideoDecoderConfig | undefined;
+    const colorStage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      onDecoderConfig: (config) => {
+        decoderConfig = config;
+      },
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    };
+    const alphaStage: VideoEncoderStageOptions = {
+      ...this.#stageOptions(signal, o),
+      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    };
+    const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
+    const chunks = encodeVpxAlphaFrameStreams(colorFrames, alphaFrames, {
+      encodeConfig: encoderConfig,
+      createEncoder: (config, stageOptions) => encodeCodec.createEncoder(config, stageOptions),
+      colorStage,
+      alphaStage,
+    });
+    await drainEncoderToMuxer(
+      chunks,
+      muxer,
+      () =>
+        videoTrackInfoFromDecoderConfig(
+          requireEncoderConfig(decoderConfig, 'video'),
+          target.fps,
+          sourceTrack.durationSec,
+          sourceTrack.rotation,
+        ),
+      signal,
+    );
+    /* v8 ignore stop */
   }
 
   /**
