@@ -19,7 +19,13 @@ import { createMedia } from '../../api/create-media.ts';
 import { InputError } from '../../contracts/errors.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import { encryptHlsSampleAesTs } from '../../test-support/hls-sample-aes.ts';
-import { type HlsResourceFetcher, hlsManifestBaseUrl, resolveHlsSource } from './hls-source.ts';
+import {
+  type HlsResourceFetcher,
+  hlsManifestBaseUrl,
+  hlsPlaylistHasEncryptedSegments,
+  resolveHlsProbeSource,
+  resolveHlsSource,
+} from './hls-source.ts';
 
 const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
@@ -136,6 +142,30 @@ describe('HLS detached-file provenance — real corpus', () => {
 });
 
 describe('resolveHlsSource — real corpus, MPEG-TS segments', () => {
+  it('classifies the real AES playlist as requiring segment resolution before TS probing', async () => {
+    const encrypted = await corpusText('hls_aes128.m3u8');
+    const clear = await corpusText('hls_vod.m3u8');
+
+    // This is a strict structural golden for the probe route: encrypted segments must not enter the
+    // clear-first-segment shortcut, while the clear playlist remains eligible for it.
+    expect(hlsPlaylistHasEncryptedSegments(encrypted)).toBe(true);
+    expect(hlsPlaylistHasEncryptedSegments(clear)).toBe(false);
+  });
+
+  it('decrypts exactly the first real segment for metadata-only probing', async () => {
+    const clear = await resolveHlsProbeSource(await corpusText('hls_vod.m3u8'), {
+      fetchResource: fetchLocal,
+    });
+    const encrypted = await resolveHlsProbeSource(await corpusText('hls_aes128.m3u8'), {
+      fetchResource: fetchLocal,
+    });
+
+    // The probe optimization must preserve the exact first coded segment, not synthesize metadata from
+    // ciphertext or materialize the entire playlist. The baked clear segment is the strict golden.
+    expect(await drain(encrypted.stream())).toEqual(await corpusBytes('hls_vod_000.ts'));
+    expect(await drain(clear.stream())).toEqual(await corpusBytes('hls_vod_000.ts'));
+  });
+
   it('stitches a clear VOD playlist into one TS source the engine probes (≈10s, video track)', async () => {
     const src = await resolveHlsSource(await corpusText('hls_vod.m3u8'), {
       fetchResource: fetchLocal,

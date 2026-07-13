@@ -32,7 +32,9 @@ export {
   type HlsResolveOptions,
   type HlsResourceFetcher,
   type HlsVariantChoice,
+  hlsPlaylistHasEncryptedSegments,
   isHlsPlaylist,
+  resolveHlsProbeSource,
   resolveHlsSource,
   resolveHlsSourceFromSource,
 } from './hls-source.ts';

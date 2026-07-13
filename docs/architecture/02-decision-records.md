@@ -9075,3 +9075,33 @@ the existing typed capability/encode error.
 
 **Rejected:** increasing the requested bitrate, silently ignoring the bitrate target, switching to CRF,
 retaining warmup chunks in the output, or weakening the SSIM oracle.
+
+### ADR-301 — Encrypted HLS playlists bypass the clear-segment probe shortcut
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The browser adapter's HLS probe optimization reads a VOD manifest, fetches its first segment,
+and probes that segment directly to avoid stitching all media. That optimization is valid only for a clear
+playlist. On the real `hls_aes128.m3u8` corpus, the first segment is AES-128 ciphertext; sending it to the
+MPEG-TS parser produced the typed “no transport sync run” error before the existing HLS resolver could
+decrypt it. The fresh Chromium row therefore reported `ERROR` even though the resolver already passed the
+strict byte-exact AES-to-clear corpus oracle.
+
+**Decision.** Parse the playlist structure before the shortcut and use a bounded source-level HLS probe
+resolver whenever any media segment carries an inherited encryption key. That resolver fetches the key,
+decrypts only the first media segment (plus an fMP4 init section when present), and preserves the full
+resolver's relative URI resolution, key caching, finite-playlist validation, and abort checks. Playlist
+duration remains authoritative. Clear media playlists retain the existing one-segment metadata fast path;
+master playlists continue to fall through to normal full resolution because they do not expose segment rows
+at the master level. Demux/decode/transcode keep using the full resolver.
+
+**Invariants and consequences.** Manifest container metadata, track metadata, and playlist duration remain
+the strict probe outputs; no caller-provided key is required for HLS metadata because the playlist's own
+RFC key declaration is resolved. B-frame/DTS and VFR/PCR timing, seek landing, and cancellation remain in
+the existing TS pipeline. Probe creates no `VideoFrame` or `AudioData`, so close ownership is unchanged.
+The encrypted path materializes only the first resolved segment and retains pull-driven TS backpressure;
+clear probes retain their lower latency. The full path's materialization and packet semantics are unchanged.
+
+**Rejected:** probing ciphertext as if it were clear TS; deriving a key or base path from fixture names;
+fetching only the first encrypted segment and guessing metadata; disabling the strict HLS oracle; or
+duplicating AES/decryption logic in the adapter.

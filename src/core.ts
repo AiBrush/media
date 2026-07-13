@@ -183,7 +183,9 @@ export {
   type HlsResolveOptions,
   type HlsResourceFetcher,
   type HlsVariantChoice,
+  hlsPlaylistHasEncryptedSegments,
   isHlsPlaylist,
+  resolveHlsProbeSource,
   resolveHlsSource,
   resolveHlsSourceFromSource,
 } from './drivers/hls/hls-source.ts';

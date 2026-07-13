@@ -152,6 +152,54 @@ export async function resolveHlsSource(
 }
 
 /**
+ * Resolve only the first media segment for metadata probing. The returned source includes the fMP4 init
+ * section when present and applies the exact same key inheritance, IV derivation, and AES decryption as
+ * the full resolver. It deliberately does not claim to be a playable HLS output: callers must supply the
+ * playlist's authoritative duration and use the full resolver for packet enumeration or decoding.
+ */
+export async function resolveHlsProbeSource(
+  playlistText: string,
+  opts: HlsResolveOptions = {},
+): Promise<Source> {
+  const fetchResource = opts.fetchResource ?? defaultFetchResource;
+  const media = await resolveMediaPlaylist(playlistText, opts, fetchResource);
+  if (!media.endList) {
+    throw new InputError(
+      'unsupported-input',
+      'HLS live playlist (no #EXT-X-ENDLIST) cannot be resolved to a finite probe source',
+    );
+  }
+  const first = media.segments[0];
+  if (first === undefined) {
+    throw new InputError('unsupported-input', 'HLS media playlist has no segments');
+  }
+
+  const parts: Uint8Array[] = [];
+  const keyCache: HlsAes128KeyCache = new Map();
+  const fmp4 = await appendInitSection(parts, first, fetchResource, keyCache, opts.signal);
+  throwIfAborted(opts.signal);
+  const raw = await fetchResource(first.uri);
+  parts.push(await decryptSegmentIfNeeded(raw, first, fetchResource, keyCache, opts.signal));
+  throwIfAborted(opts.signal);
+
+  const stitched = concat(parts);
+  return fromBytes(stitched, { mime: mimeForStitched(stitched, fmp4) });
+}
+
+/**
+ * Return whether a media playlist has at least one encrypted segment. This is a routing fact, not a
+ * decryption attempt: callers that only need clear-segment metadata may use a one-segment probe, but an
+ * encrypted segment must first pass through {@link resolveHlsSource}. Parsing here keeps the decision
+ * aligned with RFC key inheritance and METHOD=NONE instead of duplicating a fragile tag/regex scan.
+ */
+export function hlsPlaylistHasEncryptedSegments(playlistText: string, baseUrl?: string): boolean {
+  const playlist = parseM3u8(playlistText, baseUrl);
+  return (
+    playlist.type === 'media' && playlist.segments.some((segment) => segment.key !== undefined)
+  );
+}
+
+/**
  * Resolve an HLS playlist that arrives as a {@link Source} (bytes / URL / Blob) rather than as text:
  * drain the source to its `.m3u8` document, then delegate to {@link resolveHlsSource}. This is the seam
  * the engine's input path uses to auto-resolve a manifest input — one it has detected with

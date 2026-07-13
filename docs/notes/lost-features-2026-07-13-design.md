@@ -181,6 +181,32 @@ Fresh post-fix corpus coverage is recorded in `chromium-2026-07-13T14-02-05-308Z
 `chromium-2026-07-13T14-11-46-525Z.json` (`03.mp4`, SSIM 0.9509/0.9435); all aibrush rows are strict
 PASS and all six competitor cells are present in each export.
 
+### Batch K — encrypted HLS probe must resolve before TS inspection
+
+The fresh Chromium loss for `probe/hls_aes128` is a correctness/capability-routing defect, not a missing
+AES implementation: the adapter's low-latency HLS probe shortcut fetched the first segment and sent it
+directly to the MPEG-TS probe. On the AES-128 corpus this is ciphertext, so the TS driver correctly found
+no sync run and the cell became `ERROR`, while the existing source-level HLS resolver already had the
+manifest key, IV, relative-URI, and cancellation behavior needed to produce clear TS.
+
+The fix classifies the parsed media playlist before taking the clear-first-segment shortcut. Any segment
+with an inherited encryption key uses a bounded first-segment resolver, which fetches the key once,
+decrypts only the first segment (and an fMP4 init section when present), and leaves playlist duration as
+the authoritative metadata value; clear playlists keep the existing one-segment metadata fast path.
+Master playlists already fall through because they do not contain media `EXTINF` rows in the shortcut, and
+demux/decode/transcode continue to use the full resolver.
+B-frames and VFR are downstream TS timing concerns and remain untouched; seeking starts from the resolved
+source's normal keyframe/PCR path. The abort signal is passed through the resolver and checked before every
+resource and segment, frame/audio lifetimes are unchanged because probe creates neither `VideoFrame` nor
+`AudioData`, and memory remains bounded by the first segment plus parser metadata. Backpressure is
+unchanged at the source boundary: the probe resolver returns a re-readable source and the existing TS
+probe consumes it through the normal pull path.
+
+The failing validation uses the real `hls_aes128.m3u8` and `hls_vod.m3u8` corpus playlists, the strict
+byte-exact AES-to-clear stitched-stream oracle, and the parsed encryption classification. The fresh browser
+gate must show `probe/hls_aes128` `PASS` with all competitor cells present and aibrush faster than every
+passing competitor; a multi-sample no-reuse matrix remains the benchmark oracle.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |
