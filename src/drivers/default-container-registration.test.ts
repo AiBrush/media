@@ -55,17 +55,24 @@ describe('query-selective default container registration', () => {
     expect(registry.imageOps()).toBeUndefined();
   });
 
-  it.each(['mp4', 'mov', 'webm', 'mkv'] as const)(
-    'does not selectively register %s for a demux or ambiguous query',
-    async (extension) => {
-      for (const query of [
-        { direction: 'demux' as const, extension },
-        { direction: 'demux' as const, mime: extension === 'mp4' ? 'video/mp4' : 'video/webm' },
-      ]) {
-        const registry = new Registry();
-        await expect(registerDefaultContainerForQuery(registry, query)).resolves.toBe(false);
-        expect(registry.containers()).toHaveLength(0);
-      }
+  it.each([
+    ['mp4', 'mp4'],
+    ['mov', 'mp4'],
+    ['m4a', 'mp4'],
+    ['webm', 'webm'],
+    ['mkv', 'webm'],
+    ['mka', 'webm'],
+  ] as const)(
+    'selects the %s demux module without loading the full fallback',
+    async (extension, id) => {
+      const registry = new Registry();
+      await expect(
+        registerDefaultContainerForQuery(registry, { direction: 'demux', extension }),
+      ).resolves.toBe(true);
+      expect(registry.containers().map((driver) => driver.id)).toEqual([id]);
+      expect(registry.codecs()).toHaveLength(0);
+      expect(registry.filters()).toHaveLength(0);
+      expect(registry.imageOps()).toBeUndefined();
     },
   );
 
@@ -104,7 +111,7 @@ describe('query-selective default container registration', () => {
     expect(unknown.containers()).toHaveLength(0);
   });
 
-  it('keeps selective output-container pins scoped to definite mux queries', async () => {
+  it('keeps selective output-container pins scoped to their query direction', async () => {
     const mux = new Registry();
     await expect(
       registerDefaultContainerForQuery(mux, { direction: 'mux', extension: 'webm' }, 'webm'),
@@ -114,8 +121,8 @@ describe('query-selective default container registration', () => {
     const demux = new Registry();
     await expect(
       registerDefaultContainerForQuery(demux, { direction: 'demux', extension: 'webm' }, 'webm'),
-    ).resolves.toBe(false);
-    expect(demux.containers()).toHaveLength(0);
+    ).resolves.toBe(true);
+    expect(demux.containers().map((driver) => driver.id)).toEqual(['webm']);
   });
 
   it('is idempotent for repeated and concurrent registration', async () => {

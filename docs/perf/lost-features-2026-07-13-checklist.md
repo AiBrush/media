@@ -10,25 +10,25 @@ are green.
 | # | Scenario | Prior export | Fresh status | Cause | Validation / benchmark evidence | Commit |
 |---:|---|---|---|---|---|---|
 | 1 | `demux/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 2 | `demux/av1_720p_5s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 2 | `demux/av1_720p_5s` | PASS, competitor winner | PASS (fresh; not winner) | performance; selective registration did not erase the AV1/WebM parse gap | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 35.390 ms vs mediabunny 15.700 ms) | — |
 | 3 | `demux/h264_4k_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 4 | `demux/h264_multitrack` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 5 | `demux/h264_rotated90` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 6 | `demux/h264_vfr` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 4 | `demux/h264_multitrack` | PASS, competitor winner | PASS (fresh; not winner) | performance; MP4Box remains faster on this multi-track input | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 12.440 ms vs mp4box 6.455 ms) | — |
+| 5 | `demux/h264_rotated90` | PASS, competitor winner | WON (fresh) | startup/registration; selective MP4 registration wins the passing competitors | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 19.245 ms vs mp4box 21.665 ms; strict packet golden PASS) | pending green commit |
+| 6 | `demux/h264_vfr` | PASS, competitor winner | PASS (fresh; not winner) | performance; MP4Box is narrowly faster after the registration change | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 16.465 ms vs mp4box 16.075 ms) | — |
 | 7 | `demux/hls_vod` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 8 | `demux/metamorphic_flac_seektable_invariance` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 9 | `demux/realworld_mdn_flower_mp4` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 10 | `demux/realworld_mdn_flower_webm` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 11 | `demux/size_large_large_vp9_1080p_120s` | PROVISIONAL | PENDING | PENDING | PENDING | — |
+| 11 | `demux/size_large_large_vp9_1080p_120s` | PROVISIONAL | PASS (fresh; not winner) | performance; mediabunny remains faster and Remotion is still skipped by the public guard | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 372.785 ms vs mediabunny 214.750 ms) | — |
 | 12 | `demux/size_micro_micro_audio_short` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 13 | `demux/size_tiny_tiny_h264_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 14 | `demux/size_tiny_tiny_vp9_360p_2s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 15 | `demux/vp8_720p_10s` | PASS, competitor winner | WON (fresh) | startup/registration; selective WebM registration wins the passing competitors | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engine cells; aibrush 8.765 ms vs mediabunny 12.155 ms; strict packet golden PASS) | pending green commit |
 | 16 | `demux/vp9_1080p_10s` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 17 | `probe/aac_adts` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 18 | `probe/empty-audio-wav` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 19 | `probe/flac_noseektable` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 20 | `probe/h264_multitrack` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 20 | `probe/h264_multitrack` | PASS, competitor winner | WON (fresh) | startup/registration; selective MP4 registration wins all passing competitors | `results/raw/chromium-2026-07-13T09-30-11-172Z.json` (`n=5`, all 6 engines; aibrush 4.785 ms vs mediabunny 5.590 ms; strict metadata golden PASS) | pending green commit |
 | 21 | `probe/hls_aes128` | ERROR | ERROR (fresh) | browser AES/HLS path under investigation | `results/raw/chromium-2026-07-13T08-26-16-278Z.json`; source URL probe passes in local browser, detached File reports typed relative-resource miss | — |
 | 22 | `probe/hls_vod` | PASS, competitor winner | PASS (fresh) | performance | `results/raw/chromium-2026-07-13T08-34-33-463Z.json`; winner not yet verified | — |
 | 23 | `probe/mp3_cbr_notoc` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
@@ -72,4 +72,5 @@ are green.
   `/Users/tarek/Home/software/projects/aibrush/aibrush.lib/media-test/results/raw/`.
 - The report export that this checklist supersedes is the user-provided
   `lost-features-chromium-2026-07-13.md`.
-- No row is marked `WON` yet; the first full fresh matrix is the next gate.
+- Three rows are marked `WON` from the qualified post-fix export; each still requires the green commit and
+  the final full-suite rerun before close-out.

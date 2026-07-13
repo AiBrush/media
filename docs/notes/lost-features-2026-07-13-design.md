@@ -20,6 +20,15 @@ the source reader is cancelled.
 These invariants are reviewed for every row below. The row-specific note names the primary risk and the
 strict validation/benchmark axis.
 
+## Batch A — selective MP4/WebM demux registration
+
+The fresh demux/probe export shows a shared startup loss on definitive MP4/WebM inputs. The general fix
+is to register only the matching demux module on a known extension/MIME miss, just as the existing audio
+selectors do; ambiguous or malformed sources still take the complete fallback. The module boundary does
+not alter packet parsing, B-frame/VFR timestamps, seek behavior, cancellation, frame/audio lifetime,
+memory bounds, or stream backpressure. Validation covers the real MP4/WebM corpus and registration
+invariants; the benchmark compares all affected demux/probe rows with fresh multi-sample runs.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

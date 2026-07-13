@@ -8807,3 +8807,36 @@ under a non-native pin; output staging; changing native queue bounds without bro
 decoder/encoder reuse; adding audio runtime replay inside a registration change; fixture/name/hash/size/
 duration/count/scenario/rotation logic; treating RSS as browser memory; weakening byte/timeline/playback or
 frame-lifetime truth; or claiming the public row closed from the local attribution benchmark.
+
+### ADR-291 - Definitive MP4/WebM demux queries use selective registration
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** The fresh Chromium demux/probe export showed repeated startup losses on definitive MP4 and
+WebM inputs even though the product already had family-selective registration for several audio inputs. The
+loss was shared by demux and probe, so changing individual parsers or fixture-specific thresholds would have
+addressed symptoms and risked the strict packet/timeline oracles. The first post-change browser matrix used
+all six configured engines and the real corpus; its qualified `n=5` export is
+`../media-test/results/raw/chromium-2026-07-13T09-30-11-172Z.json`. It confirms a durable win for
+`demux/h264_rotated90`, `demux/vp8_720p_10s`, and `probe/h264_multitrack`, while the other affected rows
+remain measured as losses or correctness failures and therefore stay open in the authoritative checklist.
+
+**Decision.** For a demux query with an unambiguous MP4/MOV/M4A/M4V/QuickTime or WebM/MKV/MKA extension or
+MIME, register only the matching MP4 or WebM module. Keep the complete default bundle for probe, remux,
+transcode, ambiguous MIME/extension combinations, unknown inputs, malformed sources, explicit non-native
+pins, and all existing support/capability misses. Registration remains idempotent and dynamic-import based;
+the source router and custom-driver precedence are unchanged. The strict real-corpus validation and fresh
+multi-sample competitor benchmark remain required before a row is marked won.
+
+**Invariants and consequences.** This is a module-closure optimization only. It does not alter B-frame
+decode order, VFR PTS/DTS mapping, seek indexing, cancellation, `VideoFrame`/`AudioData` ownership, bounded
+memory, or stream backpressure. The focused registrar tests cover positive MP4/WebM demux matches and
+negative direction/ambiguity cases. The browser evidence shows three qualified wins, but also shows that
+selective registration is not itself sufficient for every row; the remaining parser and scheduling losses
+must be fixed with their own strict corpus tests and fresh benchmarks. No source path, hash, size, packet
+count, duration, scenario, competitor, or score participates in selection.
+
+**Rejected:** registering the selective modules for ambiguous inputs; special-casing benchmark fixture
+names; weakening packet or timestamp goldens; changing competitor selection or scoring; eager-loading the
+full bundle and relying on garbage collection; changing decoder queues or frame lifetime without evidence;
+or claiming all MP4/WebM losses closed from the first post-change matrix.

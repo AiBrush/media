@@ -30,6 +30,23 @@ interface SelectiveContainerSpec {
 
 const SELECTIVE_CONTAINERS: readonly SelectiveContainerSpec[] = [
   {
+    id: 'mp4',
+    matches: (query) => matchesDemuxFamily(query, ['mp4', 'mov', 'm4a', 'm4v', 'qt'], MP4_MIMES),
+    load: () => import('./mp4/mp4-driver.ts').then((module) => module.Mp4Module),
+    pinnedRequiresMatch: true,
+  },
+  {
+    id: 'webm',
+    matches: (query) =>
+      matchesDemuxFamily(
+        query,
+        ['webm', 'mkv', 'mka'],
+        ['video/webm', 'audio/webm', 'video/x-matroska', 'audio/x-matroska'],
+      ),
+    load: () => import('./webm/webm-driver.ts').then((module) => module.WebmModule),
+    pinnedRequiresMatch: true,
+  },
+  {
     id: 'wav',
     matches: matchesWav,
     load: () => import('./wav/wav-driver.ts').then((module) => module.default),
@@ -79,6 +96,20 @@ function matchesMuxExtension(query: ContainerQuery, extensions: readonly string[
     query.extension !== undefined &&
     extensions.includes(query.extension.toLowerCase())
   );
+}
+
+const MP4_MIMES = ['video/mp4', 'video/quicktime', 'audio/mp4', 'audio/x-m4a'] as const;
+
+function matchesDemuxFamily(
+  query: ContainerQuery,
+  extensions: readonly string[],
+  mimes: readonly string[],
+): boolean {
+  if (query.direction !== 'demux') return false;
+  const extension = query.extension?.toLowerCase();
+  if (extension !== undefined && extensions.includes(extension)) return true;
+  const mime = query.mime?.toLowerCase().split(';', 1)[0]?.trim();
+  return mime !== undefined && mimes.includes(mime);
 }
 
 /** Register exactly one definite first-party container. `false` means use the full fallback. */
