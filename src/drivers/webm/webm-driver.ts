@@ -20,6 +20,7 @@ import {
   type Muxer,
   type Packet,
   type PacketInfoMetadata,
+  type PacketMetadata,
   type Registry,
   type StageOptions,
   type StreamCopyOptions,
@@ -1359,6 +1360,57 @@ function sourceViewOffset(source: Uint8Array, view: Uint8Array): number | undefi
   return offset;
 }
 
+interface WebmPacketMetadataRow extends PacketMetadata {
+  readonly offset?: number;
+}
+
+function packetMetadataRows(
+  bytes: Uint8Array,
+  tracks: readonly WebmTrack[],
+  framesByIndex: readonly (readonly WebmFrame[])[],
+  sourceDurationUs: number | undefined,
+): readonly WebmPacketMetadataRow[] {
+  const rows: WebmPacketMetadataRow[] = [];
+  for (let trackIndex = 0; trackIndex < framesByIndex.length; trackIndex++) {
+    const frames = framesByIndex[trackIndex];
+    const track = tracks[trackIndex];
+    if (frames === undefined || track === undefined) continue;
+    const codecDefinesAudioSync = track.codec === 'opus' || track.codec === 'vorbis';
+    const reorderDepth = track.reorderDepth ?? 0;
+    const presentationTimeline =
+      reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
+    for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+      const frame = frames[frameIndex];
+      if (frame === undefined) continue;
+      const durationUs = frameDurationUs(frames, frameIndex, sourceDurationUs);
+      if (durationUs === undefined) {
+        throw new MediaError(
+          'demux-error',
+          `WebM packet ${frameIndex} on track ${trackIndex} has no exact duration`,
+        );
+      }
+      const dtsUs =
+        presentationTimeline !== undefined && frameIndex >= reorderDepth
+          ? (presentationTimeline[frameIndex - reorderDepth] ?? frame.timestampUs)
+          : frame.timestampUs;
+      const offset = sourceViewOffset(bytes, frame.data);
+      rows.push({
+        trackId: trackIndex,
+        sizeBytes: frame.data.byteLength,
+        ptsUs: frame.timestampUs,
+        dtsUs,
+        durationUs,
+        keyframe: codecDefinesAudioSync || frame.keyframe,
+        ...(offset !== undefined ? { offset } : {}),
+      });
+    }
+  }
+  return rows.sort(
+    (left, right) =>
+      (left.offset ?? Number.POSITIVE_INFINITY) - (right.offset ?? Number.POSITIVE_INFINITY),
+  );
+}
+
 function packetPayloadRows(
   bytes: Uint8Array,
   tracks: readonly WebmTrack[],
@@ -2116,10 +2168,20 @@ function packetStream(
           }
           i++;
           const keyframe = codecDefinesAudioSync || frame.keyframe;
+          const type = (keyframe ? 'key' : 'delta') as EncodedVideoChunkType;
+          if (presentationTimeline === undefined && frame.alpha === undefined) {
+            const chunk = isVideo
+              ? new EncodedVideoChunk({ type, timestamp: frame.timestampUs, data: frame.data })
+              : new EncodedAudioChunk({ type, timestamp: frame.timestampUs, data: frame.data });
+            controller.enqueue({ chunk, data: frame.data, sizeBytes: frame.data.byteLength });
+            emittedPackets++;
+            emittedBytes += frame.data.byteLength;
+            continue;
+          }
           const init = {
             // FFmpeg-compatible semantics: self-contained Opus/Vorbis packets are sync packets even when
             // the Matroska block bit is clear; other codecs preserve their explicit container verdict.
-            type: (keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+            type,
             timestamp: frame.timestampUs,
             data: frame.data,
           };
@@ -2193,7 +2255,8 @@ export const WebmDriver: ContainerDriver = {
     // frames; `packets()` then wraps each frame as a WebCodecs EncodedChunk (browser-gated). The metadata
     // (tracks/duration/description) comes from the same parse, so probe-fidelity carries into demux.
     const signal = o?.signal;
-    const { info, framesByIndex } = demuxWebm(await readAll(src, signal));
+    const bytes = await readAll(src, signal);
+    const { info, framesByIndex } = demuxWebm(bytes);
     assertNotAborted(signal);
     const tracks = toTrackInfos(info, framesByIndex);
     return {
@@ -2203,6 +2266,11 @@ export const WebmDriver: ContainerDriver = {
         const frames = framesByIndex[trackId];
         if (!track || !frames) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(frames, track, signal);
+      },
+      packetTable(): readonly PacketMetadata[] {
+        const sourceDurationUs =
+          info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
+        return packetMetadataRows(bytes, info.tracks, framesByIndex, sourceDurationUs);
       },
       close: () => Promise.resolve(),
     };

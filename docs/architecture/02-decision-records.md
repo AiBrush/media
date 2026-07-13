@@ -8985,3 +8985,46 @@ observe the same packet seam and backpressure remains explicit.
 
 **Rejected:** eagerly enqueueing a complete track; copying payloads into a second queue; raising the HWM
 without a packet-count/byte cap; or delaying abort checks until a batch completes.
+
+### ADR-297 — WebM ordinary packets use a direct emission shape
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The bounded pull batches in ADR-296 reduced stream scheduling overhead, but ordinary VP8/VP9
+ packets still paid for conditional object spreads on every packet even though they have no DTS override or
+ alpha side data. B-frame WebM and alpha-bearing tracks cannot use that shortcut.
+
+**Decision.** When the current frame has no alpha payload and the track has no presentation-to-decode
+ reorder timeline, emit the `Packet` with its three required fields directly. Keep the existing generic
+ emission shape for reconstructed DTS and alpha chunks.
+
+**Invariants and consequences.** Packet bytes, PTS, keyframe flags, track order, VFR timestamps, B-frame
+ DTS, cancellation, bounded backpressure, and source-view lifetime are unchanged. No `VideoFrame` or
+ `AudioData` is involved. The fast path allocates no second payload buffer and is selected per packet so a
+ mixed track cannot accidentally discard an alpha side stream.
+
+**Rejected:** dropping `dtsUs` or `alpha` universally; copying packet data to normalize shapes; or using a
+ codec-name special case instead of the observable packet facts.
+
+### ADR-298 — WebM exposes its payload-free packet metadata table
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** WebM demux already walks all Clusters and retains source-backed frame views, but the strict
+ browser demux oracle still constructed one `Encoded*Chunk` per packet because the driver exposed only the
+ lazy payload stream. The driver contract permits a payload-free `packetTable()` when exact packet metadata
+ is available.
+
+**Decision.** WebM/MKV implements `packetTable()` from the same parsed frames used by `packets()`. It emits
+ public track ids, byte sizes, PTS, DTS, exact durations, and keyframe flags in source-block order. The
+ payload stream remains available and keeps the bounded pull batches and direct ordinary-packet shape from
+ ADR-296/297.
+
+**Invariants and consequences.** B-frame DTS reconstruction, VFR durations, seek keyframe behavior,
+ cancellation, source-backed payload lifetime, and attachment/alpha semantics remain unchanged. The table
+ creates metadata objects only; it does not create `EncodedVideoChunk`, `EncodedAudioChunk`, `VideoFrame`,
+ or `AudioData`, read a second payload copy, or add a backpressure queue. A missing exact duration is a
+ typed `demux-error`, not a guessed zero.
+
+**Rejected:** reparsing WebM in the harness; returning packet-table rows without exact durations; replacing
+ the payload stream; or duplicating timing/DTS logic separately from the packet seam.

@@ -108,6 +108,33 @@ the stream remains pull-driven, and a consumer that stops still releases its rea
 before. No `VideoFrame` or `AudioData` is created by the demux seam, so close-once lifetime rules are
 unchanged; source-backed views retain the existing operation lifetime and memory bound.
 
+## Batch G — WebM packet fast path for ordinary VPx access units
+
+The fresh WebM matrix confirms packet-table goldens are exact, but browser demux timing still loses on
+the ordinary VP8/VP9 cases. Those packets have no reordered DTS and no alpha BlockAddition, yet the
+generic emission path allocates conditional spread objects for fields that are absent. The fast path will
+construct the same `Packet` shape directly when both facts are absent and retain the generic path for
+B-frame/DTS reconstruction, VFR timestamps, and alpha side data.
+
+Seeking continues to consume the same decode-order stream, cancellation is checked before every packet,
+and pull batching remains bounded. No `VideoFrame` or `AudioData` is created or retained by this path;
+`Encoded*Chunk` ownership and source-backed byte-view lifetime are unchanged. The optimization adds no
+queue or payload copy, so memory and backpressure remain those of Batch F.
+
+## Batch H — Payload-free WebM packet metadata
+
+The browser harness uses the optional `Demuxer.packetTable()` contract when a container can enumerate
+packet facts without constructing encoded chunks. WebM already parses every block into source-backed frame
+views for its lazy packet stream, so it can expose the same exact metadata directly: track id, payload size,
+PTS, DTS, duration, and keyframe verdict, sorted by source block position.
+
+The table derives DTS from the same reorder timeline used by `packets()`, so B-frames and VFR are not
+flattened or averaged. Seeking and cancellation remain on the payload stream and are unchanged; the table
+is synchronous after the cancellable demux operation has completed. No `VideoFrame`, `AudioData`, or
+`Encoded*Chunk` is created by the metadata path, and it adds no payload copy or queue, preserving the
+existing source lifetime and memory/backpressure rules. If an exact duration cannot be proven, the optional
+table raises a typed demux error rather than inventing a duration.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

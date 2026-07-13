@@ -981,6 +981,52 @@ describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm +
     },
   );
 
+  const PACKET_TABLE_GOLDENS = ['av1_720p_5s.webm', 'realworld_mdn_flower.webm'] as const;
+  it.each(PACKET_TABLE_GOLDENS)(
+    '$media — payload-free packetTable matches the baked golden',
+    async (media) => {
+      const bytes = await bytesFromMediaTest(media);
+      const demuxed = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
+      try {
+        const table = demuxed.packetTable?.();
+        expect(table).toBeDefined();
+        const actual =
+          table?.map(
+            (packet): GoldenPacket => ({
+              trackIndex: packet.trackId,
+              size: packet.sizeBytes,
+              ptsUs: packet.ptsUs,
+              dtsUs: packet.dtsUs,
+              keyframe: packet.keyframe,
+            }),
+          ) ?? [];
+        const expected = await golden(media);
+        expect(actual.length).toBe(expected.length);
+        for (const trackIndex of new Set(expected.map((packet) => packet.trackIndex))) {
+          const actualTrack = actual.filter((packet) => packet.trackIndex === trackIndex);
+          const expectedTrack = expected.filter((packet) => packet.trackIndex === trackIndex);
+          const actualOrigin = actualTrack[0]?.ptsUs ?? 0;
+          const expectedOrigin = expectedTrack[0]?.ptsUs ?? 0;
+          expect(
+            actualTrack.map((packet) => ({
+              ...packet,
+              ptsUs: packet.ptsUs - actualOrigin,
+              dtsUs: packet.dtsUs - actualOrigin,
+            })),
+          ).toEqual(
+            expectedTrack.map((packet) => ({
+              ...packet,
+              ptsUs: packet.ptsUs - expectedOrigin,
+              dtsUs: packet.dtsUs - expectedOrigin,
+            })),
+          );
+        }
+      } finally {
+        await demuxed.close();
+      }
+    },
+  );
+
   it('attachment-bearing Matroska exposes JSON as other + JPEG as one MJPEG stream packet', async () => {
     const bytes = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/03.mkv');
     const table = webmPacketPayloadInfoFromBytes(bytes);
