@@ -9027,4 +9027,25 @@ without a packet-count/byte cap; or delaying abort checks until a batch complete
  typed `demux-error`, not a guessed zero.
 
 **Rejected:** reparsing WebM in the harness; returning packet-table rows without exact durations; replacing
- the payload stream; or duplicating timing/DTS logic separately from the packet seam.
+the payload stream; or duplicating timing/DTS logic separately from the packet seam.
+
+### ADR-299 — ADTS and FLAC demuxers expose their existing packet-info tables
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The ADTS and FLAC drivers already implement `ContainerDriver.packetInfo()` with exact,
+source-backed frame metadata, but callers of `demux()` still had to construct one encoded audio chunk per
+packet for metadata-only work. The optional `Demuxer.packetTable()` contract is designed to avoid that
+allocation when a driver has already proved the rows.
+
+**Decision.** ADTS and FLAC `demux()` return `packetTable()` projections of their existing packet-info
+tables. The public metadata uses the same track id, byte size, PTS, DTS, duration, and keyframe values;
+`packets(trackId)` remains the unchanged encoded-payload stream.
+
+**Invariants and consequences.** AAC and FLAC packet bytes, sample durations, cancellation, backpressure,
+source lifetime, and audio `AudioData` close ownership are unchanged. The metadata path creates no
+`EncodedAudioChunk`, `VideoFrame`, or `AudioData`, and no payload copy. A framing/metadata error still
+surfaces as the driver’s typed error instead of an incomplete table.
+
+**Rejected:** reparsing frame boundaries in the harness; weakening packet goldens; returning guessed final
+durations; or removing the payload stream in favor of metadata-only demux.

@@ -20,6 +20,7 @@ import {
   type MuxOptions,
   type Packet,
   type PacketInfoTable,
+  type PacketMetadata,
   type PcmTransform,
   type Registry,
   type StageOptions,
@@ -276,6 +277,17 @@ export function adtsPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
       keyframe: true,
     })),
   };
+}
+
+function adtsPacketMetadataFromFrames(frames: readonly AdtsPacket[]): readonly PacketMetadata[] {
+  return frames.map((frame) => ({
+    trackId: 0,
+    sizeBytes: frame.size,
+    ptsUs: frame.ptsUs,
+    dtsUs: frame.ptsUs,
+    durationUs: frame.durationUs,
+    keyframe: true,
+  }));
 }
 
 function trackInfoFromLayout(layout: AdtsLayout): TrackInfo {
@@ -805,6 +817,9 @@ export const AdtsDriver = {
       packets(trackId: number): ReadableStream<Packet> {
         if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(bytes, layout.frames, track, signal);
+      },
+      packetTable(): readonly PacketMetadata[] {
+        return adtsPacketMetadataFromFrames(layout.frames);
       },
       close: () => Promise.resolve(),
     };

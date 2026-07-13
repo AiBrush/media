@@ -217,6 +217,25 @@ describe('probe ADTS — real corpus', () => {
     }
   });
 
+  it('demux exposes the exact real-corpus ADTS packet metadata without WebCodecs chunks', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const demuxed = await AdtsDriver.demux(fromBytes(bytes, { mime: 'audio/aac' }));
+    try {
+      const table = demuxed.packetTable?.();
+      const expected = adtsPacketInfoFromBytes(bytes).packets.map((packet) => ({
+        trackId: packet.trackIndex,
+        sizeBytes: packet.size,
+        ptsUs: packet.ptsUs,
+        dtsUs: packet.dtsUs,
+        durationUs: packet.durationUs,
+        keyframe: packet.keyframe,
+      }));
+      expect(table).toEqual(expected);
+    } finally {
+      await demuxed.close();
+    }
+  });
+
   it('demux reuses its validated real-file layout for exact raw AAC packet emission', async () => {
     const bytes = await loadFixture('sfx.adts');
     const frames = enumerateAdtsFrames(bytes);

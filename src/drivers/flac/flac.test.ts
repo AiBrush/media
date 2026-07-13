@@ -248,6 +248,25 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     expect(streamReads).toBe(0);
   });
 
+  it('demux exposes the exact real-corpus FLAC packet metadata without WebCodecs chunks', async () => {
+    const bytes = await loadFixture('sfx.flac');
+    const demuxed = await FlacDriver.demux(fromBytes(bytes, { mime: 'audio/flac' }));
+    try {
+      const table = demuxed.packetTable?.();
+      const expected = flacPacketInfoTable(bytes).packets.map((packet) => ({
+        trackId: packet.trackIndex,
+        sizeBytes: packet.size,
+        ptsUs: packet.ptsUs,
+        dtsUs: packet.dtsUs,
+        durationUs: packet.durationUs,
+        keyframe: packet.keyframe,
+      }));
+      expect(table).toEqual(expected);
+    } finally {
+      await demuxed.close();
+    }
+  });
+
   it('known-container packetInfo skips the routing sniff read', async () => {
     const bytes = await loadFixture('sfx.flac');
     const reads: Array<[number, number]> = [];

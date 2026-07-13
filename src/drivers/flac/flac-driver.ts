@@ -31,6 +31,7 @@ import {
   type Muxer,
   type Packet,
   type PacketInfoTable,
+  type PacketMetadata,
   type PcmTransform,
   type Registry,
   type StageOptions,
@@ -140,6 +141,17 @@ function writeFlacPacketCopy(
     at += frame.size;
   }
   return out;
+}
+
+function flacPacketMetadataFromFrames(frames: readonly FlacFrame[]): readonly PacketMetadata[] {
+  return frames.map((frame) => ({
+    trackId: 0,
+    sizeBytes: frame.size,
+    ptsUs: frame.ptsUs,
+    dtsUs: frame.ptsUs,
+    durationUs: frame.durationUs,
+    keyframe: true,
+  }));
 }
 
 function streamInfoForPacketCopy(
@@ -707,6 +719,9 @@ export const FlacDriver: ContainerDriver = {
       packets(trackId: number): ReadableStream<Packet> {
         if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(frames, signal);
+      },
+      packetTable(): readonly PacketMetadata[] {
+        return flacPacketMetadataFromFrames(frames);
       },
       close: () => Promise.resolve(),
     };

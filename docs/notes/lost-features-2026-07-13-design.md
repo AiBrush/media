@@ -135,6 +135,25 @@ is synchronous after the cancellable demux operation has completed. No `VideoFra
 existing source lifetime and memory/backpressure rules. If an exact duration cannot be proven, the optional
 table raises a typed demux error rather than inventing a duration.
 
+## Batch I — Payload-free ADTS and FLAC packet metadata
+
+ADTS and FLAC already have exact pure packet-info enumerators that walk frame headers and produce source
+offsets, sizes, PTS/DTS, durations, and sync flags. Their `demux()` objects will expose those same rows via
+the additive `packetTable()` contract, avoiding browser `EncodedAudioChunk` construction when the caller
+needs only strict demux metadata.
+
+The existing packet streams remain the payload path for decode and remux consumers, so AAC/FLAC frame bytes
+and audio timelines are unchanged. ADTS/FLAC have no B-frame reordering; VFR is not synthesized, and every
+duration comes from frame sample geometry. Cancellation still applies during the source read and before
+table publication. No `VideoFrame` or `AudioData` is created, no payload is copied, and the table adds no
+queue or backpressure seam; an exact enumerator error remains typed rather than returning partial metadata.
+
+The local multi-sample gate is `bench-session13-flac-packet-info` (warmup 5, 21 alternating samples) plus
+the ADTS retained-layout axis in `bench-session13-audio-fixed-cost` (warmup 7, 51 samples). The fresh run
+reported FLAC fused packet-info at 2.444 ms median versus 2.626 ms for the composed baseline, and ADTS
+retained-layout at 0.000327 ms versus 0.000668 ms for a repeated frame walk; browser acceptance used the
+strict six-engine export at `media-test/results/raw/chromium-2026-07-13T13-03-56-825Z.json` with `n=5`.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |
