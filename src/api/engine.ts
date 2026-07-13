@@ -1794,6 +1794,7 @@ export class MediaEngineImpl implements MediaEngine {
       buildAudioEncoderConfig,
       drainEncoderToMuxer,
       encodeQueryFor,
+      outputGaplessForAudioEncoder,
       requireEncoderConfig,
     } = await loadCodecPipeline();
     const config = buildAudioEncoderConfig(
@@ -1820,7 +1821,7 @@ export class MediaEngineImpl implements MediaEngine {
         audioTrackInfoFromDecoderConfig(
           requireEncoderConfig(decoderConfig, 'audio'),
           sourceTrack?.durationSec,
-          sourceTrack?.gapless,
+          outputGaplessForAudioEncoder(requireEncoderConfig(decoderConfig, 'audio'), sourceTrack),
         ),
       signal,
     );

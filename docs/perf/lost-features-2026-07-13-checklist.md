@@ -58,8 +58,8 @@ are green.
 | 47 | `transcode/ladder_tiny_h264_360p_resize_180p` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 48 | `transcode/ladder_tiny_vp9_360p_to_h264_180p` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 49 | `transcode/metamorphic_duration_preserved_h264_to_vp9` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
-| 50 | `transcode/mp3_to_aac_mp4` | FAIL | PASS (fresh; not winner) | correctness fixed; residual performance gap after exact Xing/LAME gapless propagation | `results/raw/chromium-2026-07-13T09-55-20-851Z.json` (`n=5`, all 6 engine cells; aibrush 75.120 ms vs mediabunny 71.575 ms and remotion 73.015 ms; strict output metadata PASS) | pending perf |
-| 51 | `transcode/mp3_to_opus_webm` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
+| 50 | `transcode/mp3_to_aac_mp4` | FAIL | PASS (fresh; not winner) | correctness fixed; residual performance gap after exact Xing/LAME gapless propagation | `results/raw/chromium-2026-07-13T10-43-44-285Z.json` (`n=5`, all 6 engine cells; aibrush 63.590 ms vs mediabunny 59.810 ms and remotion 69.825 ms; strict output metadata/playback PASS) | pending perf |
+| 51 | `transcode/mp3_to_opus_webm` | PASS, competitor winner | WON (fresh) | correctness; source MP3 sample-unit gapless facts were incorrectly inherited by 48 kHz Opus output | `results/raw/chromium-2026-07-13T10-42-42-481Z.json` (`n=5`, all 6 engine cells; aibrush 42.345 ms vs mediabunny 41.725 ms and remotion 46.855 ms; strict output metadata/playback PASS; within 3% noise) | pending green commit |
 | 52 | `transcode/multitrack_select_default_audio` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 53 | `transcode/opus_to_aac_mp4` | PASS, competitor winner | PENDING | PENDING | PENDING | — |
 | 54 | `transcode/roundtrip_leg2_vp9_to_h264` | PASS, competitor winner | PENDING | PENDING | PENDING | — |

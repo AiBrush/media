@@ -8881,3 +8881,34 @@ all four applicable engines. aibrush-media measures 75.120 ms versus mediabunny 
 competitor result; changing the strict output-duration oracle; padding AAC samples without source proof;
 discarding LAME facts after probe; weakening frame-byte or packet-count validation; or adding a second
 decoder, replay buffer, reorder queue, or uncapped audio staging path.
+
+### ADR-293 — Opus re-encode does not inherit source-codec gapless sample counts
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** The first fresh post-fix `transcode/mp3_to_opus_webm` run still failed on a real `02.mp3`
+input after the MP3 parser fix was synced into the browser: the source program duration was 14.1177 s and
+the output was 12.9707 s. The exact output span was `622592 / 48000`, proving that the source Xing/LAME
+sample count was being interpreted as if it were already in Opus' 48 kHz sample domain. The initial
+post-change run also exposed the required vendor-sync boundary: a browser run against the stale sibling
+bundle reproduced the old behavior, so only the synced export is evidence.
+
+**Decision.** Keep source `TrackInfo.gapless` for input decode and sample-accurate `AudioData` trimming.
+When the encoder publishes an Opus decoder config, do not pass the source tuple to the output `TrackInfo`;
+the Opus encoder's own `OpusHead` and `CodecDelay` are the only authoritative output priming facts. AAC and
+other output codecs retain their existing source-gapless bridge until their own independent timing contract
+is validated. This avoids inventing a cross-codec sample-rate conversion or double-applying source delay.
+
+**Invariants and consequences.** The real MP3 corpus test proves the Xing/LAME tuple is parsed and that a
+48 kHz Opus output omits source-unit gapless metadata. The fresh synced Chromium export
+`../media-test/results/raw/chromium-2026-07-13T10-42-42-481Z.json` reports strict metadata/playback PASS
+for aibrush, Mediabunny, and Remotion; aibrush is 42.345 ms versus 41.725 ms for Mediabunny, within the
+3% winner noise band. No B-frame or VFR ordering exists here. Seek/cancellation propagate through the same
+stage signal, every decoded `AudioData` remains close-once owned by the gapless trim, output buffering stays
+bounded, and WebM sink backpressure is unchanged. The related fresh AAC regression export
+`../media-test/results/raw/chromium-2026-07-13T10-43-44-285Z.json` remains strict PASS for all applicable
+engines.
+
+**Rejected:** copying source sample counts into Opus without rescaling; rescaling source delay/padding into
+Opus as a guessed encoder delay; disabling source decode trimming; changing the strict duration/playback
+oracles; or special-casing the selected filename, source rate, output duration, or competitor result.

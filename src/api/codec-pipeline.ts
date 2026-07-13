@@ -1421,6 +1421,18 @@ export function audioTrackInfoFromDecoderConfig(
   };
 }
 
+/**
+ * Select gapless facts for an encoded output track. Source gapless facts are consumed while decoding the
+ * input; an Opus re-encode must instead publish the encoder's own OpusHead/CodecDelay because Opus always
+ * runs at 48 kHz and its priming is not expressed in the source codec's sample units.
+ */
+export function outputGaplessForAudioEncoder(
+  config: AudioDecoderConfig,
+  sourceTrack: Pick<TrackInfo, 'gapless'> | undefined,
+): TrackInfo['gapless'] | undefined {
+  return audioCodecToken(config.codec) === 'opus' ? undefined : sourceTrack?.gapless;
+}
+
 // ============ seek: drop-until-target predicate ============
 
 /**

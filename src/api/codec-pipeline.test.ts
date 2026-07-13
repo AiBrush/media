@@ -49,6 +49,7 @@ import {
   isUnsupportedHevcEncodeProfile,
   normalizeDecoderCodec,
   outputDimensions,
+  outputGaplessForAudioEncoder,
   periodicVideoKeyFrameInterval,
   qualifiedVideoSourceCodec,
   resolveAudioEncodeTargetForRuntime,
@@ -2721,6 +2722,23 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
       config: { codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, description },
       durationSec: 9.75,
     });
+  });
+
+  it('does not copy real MP3 sample-unit gapless facts into a 48 kHz Opus output track', async () => {
+    const { parseMp3 } = await import('../drivers/mp3/mp3-driver.ts');
+    const { loadFixture } = await import('../test-support/corpus.ts');
+    const source = parseMp3(await loadFixture('sound_5.mp3'));
+    expect(source.gapless).toEqual({
+      leadingSamples: 576,
+      trailingSamples: 913,
+      totalSamples: 110_255,
+    });
+    if (source.gapless === undefined) throw new Error('expected the real MP3 gapless tuple');
+    const output = outputGaplessForAudioEncoder(
+      { codec: 'opus', sampleRate: 48_000, numberOfChannels: 1 },
+      { gapless: source.gapless },
+    );
+    expect(output).toBeUndefined();
   });
 });
 

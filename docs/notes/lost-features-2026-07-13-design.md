@@ -46,6 +46,18 @@ Xing/LAME tuple is no longer valid for the output and is deliberately removed fr
 The real `sound_5.mp3` trim oracle therefore checks the exact complete-frame duration, while decode/re-encode
 paths retain the source tuple and perform sample-accurate gapless trimming.
 
+## Batch C — Opus output owns its own priming metadata
+
+The fresh `transcode/mp3_to_opus_webm` result failed on a real MP3 corpus input because the source Xing/LAME
+`totalSamples` count was expressed at 44.1 kHz but was copied verbatim into a 48 kHz Opus output track. The
+resulting Matroska duration was exactly the source sample count divided by 48 kHz (12.9707 s for `02.mp3`),
+not the 14.1177 s source program duration. The fix keeps source gapless facts on the decode side, where the
+close-once `AudioData` trim consumes them, but omits them from an Opus re-encode track so the encoder's own
+OpusHead/CodecDelay describes the output timeline. The real corpus helper test proves the source tuple is
+present and the output selection omits it; the fresh browser export proves strict output metadata and playback.
+B-frames and VFR do not apply to this audio-only row; seek, cancellation, AudioData lifetime, bounded memory,
+and sink backpressure remain the existing stream invariants.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |
