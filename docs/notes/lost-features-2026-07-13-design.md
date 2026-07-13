@@ -74,6 +74,27 @@ clock mapping. Seeking remains against the stitched source, cancellation stops f
 all temporary byte arrays remain operation-scoped, and segment fetches stay sequential to preserve bounded
 memory and backpressure. No `VideoFrame` or `AudioData` is created by the resolver.
 
+## Batch E — WebM full-demux traversal fusion
+
+Fresh Chromium measurements on real VP9 corpus inputs show a performance loss in the full WebM demux
+operation, while the strict packet goldens already match. The hot path currently parses metadata, performs
+a complete Segment-boundary walk, and then walks every Cluster again to materialize packet views. The
+optimization must preserve the same packet byte ranges, decode order, keyframe flags, B-frame presentation
+timestamps/DTS reconstruction, VFR timestamps, and track-index mapping; no packet may outlive the source
+buffer or be copied solely for speed.
+
+The design is to fuse complete top-level Segment validation with the frame walk, retaining the existing
+typed rejection for malformed IDs, sizes, truncated finite elements, and illegal unknown-sized elements.
+The demux caller also avoids the metadata parser's full-cluster timing scan: bounded first-keyframe
+qualification remains available, while the frame materialization pass supplies the authoritative cadence
+and terminal timestamp for tracks whose declarations omit them. Public `parseWebm` probe behavior keeps its
+existing complete scan semantics.
+Cancellation is checked at the public operation boundary and before packet consumption; packet streams
+remain pull-driven with bounded arrays and no decoder-frame allocation. Memory remains one source buffer plus
+the existing per-track frame views, and backpressure is unchanged because the fusion happens before the
+consumer-facing stream is created. HLS, seeking, audio `AudioData` lifetime, and `VideoFrame` lifetime are
+unaffected; no `VideoFrame` or `AudioData` is created by the WebM demux parser.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |

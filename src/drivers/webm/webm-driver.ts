@@ -768,8 +768,10 @@ function collectFrames(
     number,
     { readonly nanoseconds: number; readonly preserveSubTick: boolean }
   >,
-): Map<number, WebmFrame[]> {
+): CollectedWebmFrames {
   const byTrack = new Map<number, WebmFrame[]>();
+  const blockTimes = new Map<number, BlockTiming>();
+  let lastEndTicks = 0;
   const codecDelayForBlock = (
     block: EbmlElement,
   ): { readonly nanoseconds: number; readonly preserveSubTick: boolean } => {
@@ -787,13 +789,19 @@ function collectFrames(
     for (const f of parsed.frames) list.push(f);
     byTrack.set(parsed.trackNumber, list);
   };
-  for (const el of elements(dv, segment.dataStart, segment.dataEnd)) {
+  for (const el of completeSegmentElements(dv, segment)) {
     if (el.id !== ID.Cluster) continue;
     let clusterTimecode = 0;
     for (const c of elements(dv, el.dataStart, el.dataEnd)) {
       if (c.id === ID.Timecode) {
         clusterTimecode = readUint(dv, c);
       } else if (c.id === ID.SimpleBlock) {
+        const trackNumber = blockTrackNumber(dv, c);
+        if (trackNumber !== undefined) {
+          const blockTime = clusterTimecode + blockRelTimecode(dv, c);
+          recordBlockTime(blockTimes, trackNumber, blockTime);
+          lastEndTicks = Math.max(lastEndTicks, blockTime);
+        }
         const delay = codecDelayForBlock(c);
         push(
           blockFrames(
@@ -812,6 +820,12 @@ function collectFrames(
       } else if (c.id === ID.BlockGroup) {
         const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
         if (block) {
+          const trackNumber = blockTrackNumber(dv, block);
+          if (trackNumber !== undefined) {
+            const blockTime = clusterTimecode + blockRelTimecode(dv, block);
+            recordBlockTime(blockTimes, trackNumber, blockTime);
+            lastEndTicks = Math.max(lastEndTicks, blockTime);
+          }
           // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
           const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
           const discardPadding = findChild(dv, c.dataStart, c.dataEnd, ID.DiscardPadding);
@@ -834,7 +848,7 @@ function collectFrames(
       }
     }
   }
-  return byTrack;
+  return { byTrackNumber: byTrack, blockTimes, lastEndTicks };
 }
 
 function readMainBlockAdditional(
@@ -890,6 +904,8 @@ function fpsFromBlockTiming(timing: BlockTiming, timecodeScale: number): number 
 /** Parse WebM/MKV metadata from (enough of) the file head. Pure. */
 interface ParseWebmOptions {
   readonly scanClusters?: boolean;
+  /** Whether to scan only the leading clusters needed to qualify VP9/AV1 without CodecPrivate. */
+  readonly scanFirstKeyframes?: boolean;
   /** Whole-container size, used only as a conservative VP9 bitrate upper bound during prefix probe. */
   readonly sourceSizeBytes?: number;
 }
@@ -999,6 +1015,7 @@ function parseEbmlHeader(dv: DataView, header: EbmlElement): EbmlHeaderFacts {
 export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): WebmInfo {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const scanClusters = options.scanClusters ?? true;
+  const scanFirstKeyframes = options.scanFirstKeyframes ?? true;
   let docType: 'webm' | 'matroska' | undefined;
   let maxIdLength = 4;
   let maxSizeLength = 8;
@@ -1053,6 +1070,7 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
   const tracks: WebmTrack[] = [];
   const blockTimes = new Map<number, BlockTiming>(); // TrackNumber → block-timing, for fps fallback
   const firstKeyframes = new Map<number, Uint8Array>();
+  let keyframeTrackNumbers: readonly number[] = [];
   for (const el of elements(dv, segment.dataStart, segment.dataEnd)) {
     if (el.id === ID.Info) {
       for (const c of elements(dv, el.dataStart, el.dataEnd)) {
@@ -1066,12 +1084,25 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
           if (track) tracks.push(track);
         }
       }
+      keyframeTrackNumbers = tracks.flatMap((track) =>
+        track.mediaType === 'video' &&
+        (track.codec === 'vp9' || track.codec === 'av1') &&
+        track.trackNumber !== undefined &&
+        track.decoderCodecSource !== 'codec-private'
+          ? [track.trackNumber]
+          : [],
+      );
     } else if (el.id === ID.Attachments) {
       tracks.push(...parseAttachments(bytes, dv, el));
     } else if (el.id === ID.Cluster) {
       // Even metadata-only prefix probes inspect one complete key access unit when VP9/AV1 private
       // data is absent. This is bounded by the prefix ladder and does not retain packet tables.
-      collectFirstKeyframes(bytes, dv, el, firstKeyframes);
+      if (
+        scanFirstKeyframes &&
+        keyframeTrackNumbers.some((trackNumber) => !firstKeyframes.has(trackNumber))
+      ) {
+        collectFirstKeyframes(bytes, dv, el, firstKeyframes);
+      }
       if (scanClusters) {
         lastEndTicks = Math.max(lastEndTicks, clusterEnd(dv, el));
         collectClusterBlockTimes(dv, el, blockTimes);
@@ -1139,6 +1170,12 @@ export interface WebmDemux {
   framesByIndex: WebmFrame[][];
 }
 
+interface CollectedWebmFrames {
+  readonly byTrackNumber: Map<number, WebmFrame[]>;
+  readonly blockTimes: Map<number, BlockTiming>;
+  readonly lastEndTicks: number;
+}
+
 export interface WebmPacketPayloadMetadata extends PacketInfoMetadata {
   /** Packet bytes as a view into the parsed source buffer. */
   readonly data: Uint8Array;
@@ -1152,12 +1189,12 @@ export interface WebmPacketPayloadInfoTable {
 }
 
 /**
- * Validate the complete Segment element walk before exposing demux output. `elements()` intentionally
- * stops at an invalid vint so bounded metadata probes can retry with a larger prefix; a full-file demux
- * cannot treat that stop as EOF because doing so accepts a destroyed late element header after otherwise
- * usable Clusters. Unknown-size Clusters remain legal for live WebM and consume the enclosing remainder.
+ * Yield the complete top-level Segment walk while validating each finite element. `elements()`
+ * intentionally stops at an invalid vint so bounded metadata probes can retry with a larger prefix; a
+ * full-file demux cannot treat that stop as EOF because doing so accepts a destroyed late element header
+ * after otherwise usable Clusters. Unknown-size Clusters remain legal and consume the enclosing remainder.
  */
-function assertCompleteSegmentWalk(dv: DataView, segment: EbmlElement): void {
+function* completeSegmentElements(dv: DataView, segment: EbmlElement): Generator<EbmlElement> {
   if (!segment.complete && !segment.unknownSize) {
     throw new MediaError('demux-error', 'WebM Segment is truncated');
   }
@@ -1186,8 +1223,14 @@ function assertCompleteSegmentWalk(dv: DataView, segment: EbmlElement): void {
           `unknown-sized non-Cluster element 0x${id.value.toString(16)} in WebM Segment`,
         );
       }
-      offset = segment.dataEnd;
-      continue;
+      yield {
+        id: id.value,
+        dataStart,
+        dataEnd: segment.dataEnd,
+        complete: false,
+        unknownSize: true,
+      };
+      return;
     }
     const dataEnd = dataStart + size.value;
     if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > segment.dataEnd) {
@@ -1196,6 +1239,13 @@ function assertCompleteSegmentWalk(dv: DataView, segment: EbmlElement): void {
         `EBML element 0x${id.value.toString(16)} escapes the WebM Segment`,
       );
     }
+    yield {
+      id: id.value,
+      dataStart,
+      dataEnd,
+      complete: true,
+      unknownSize: false,
+    };
     offset = dataEnd;
   }
   if (offset !== segment.dataEnd) {
@@ -1210,11 +1260,14 @@ function assertCompleteSegmentWalk(dv: DataView, segment: EbmlElement): void {
  * Node-validated; `packets()` adds only the browser-only `Encoded*Chunk` wrapping on top of this.
  */
 export function demuxWebm(bytes: Uint8Array): WebmDemux {
-  const info = parseWebm(bytes);
+  const info = parseWebm(bytes, {
+    scanClusters: false,
+    scanFirstKeyframes: true,
+    sourceSizeBytes: bytes.byteLength,
+  });
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
   if (!segment) throw new InputError('unsupported-input', 'not a WebM/Matroska (EBML) file');
-  assertCompleteSegmentWalk(dv, segment);
   let timecodeScale = 1_000_000;
   const infoEl = findChild(dv, segment.dataStart, segment.dataEnd, ID.Info);
   if (infoEl) {
@@ -1233,7 +1286,46 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
       });
     }
   }
-  const byTrackNumber = collectFrames(bytes, dv, segment, timecodeScale, codecDelayByTrackNumber);
+  const collected = collectFrames(bytes, dv, segment, timecodeScale, codecDelayByTrackNumber);
+  const byTrackNumber = collected.byTrackNumber;
+  if (info.durationSec <= 0) {
+    info.durationSec = (collected.lastEndTicks * timecodeScale) / 1e9;
+  }
+  for (const track of info.tracks) {
+    if (track.mediaType !== 'video' || track.fps !== undefined || track.trackNumber === undefined)
+      continue;
+    const timing = collected.blockTimes.get(track.trackNumber);
+    const fps = timing === undefined ? undefined : fpsFromBlockTiming(timing, timecodeScale);
+    if (fps !== undefined) track.fps = fps;
+  }
+  for (const track of info.tracks) {
+    if (
+      track.mediaType !== 'video' ||
+      (track.codec !== 'vp9' && track.codec !== 'av1') ||
+      track.decoderCodecSource !== 'unknown' ||
+      track.trackNumber === undefined
+    ) {
+      continue;
+    }
+    const frames = byTrackNumber.get(track.trackNumber) ?? [];
+    const firstKeyframe = frames.find((frame) => frame.keyframe) ?? frames[0];
+    try {
+      const qualification = qualifyWebmVideoCodec({
+        codec: track.codec,
+        ...(firstKeyframe === undefined ? {} : { firstKeyframe: firstKeyframe.data }),
+        ...(track.width === undefined ? {} : { width: track.width }),
+        ...(track.height === undefined ? {} : { height: track.height }),
+        ...(track.fps === undefined ? {} : { fps: track.fps }),
+        sourceSizeBytes: bytes.byteLength,
+        ...(info.durationSec > 0 ? { durationSec: info.durationSec } : {}),
+      });
+      track.decoderCodec = qualification.codec;
+      track.decoderCodecSource = qualification.source;
+      if (qualification.description !== undefined) track.description = qualification.description;
+    } catch (error) {
+      if (!(error instanceof CapabilityError)) throw error;
+    }
+  }
   // Remap TrackNumber → public index. A track without a TrackNumber (or with no blocks) gets an empty
   // list, so `packets()` is always a valid (possibly empty) stream rather than a missing-key surprise.
   const framesByIndex = info.tracks.map((track): WebmFrame[] => {

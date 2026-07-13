@@ -8940,3 +8940,28 @@ the caller's File metadata; no filename, fixture, hash, size, scenario, or page-
 **Rejected:** guessing a fixture directory from a basename; using the current page directory for every
 detached File; reading sibling files from the filesystem; changing the strict HLS probe oracle; or silently
 falling back to cleartext when AES resource resolution fails.
+
+### ADR-295 — Full WebM demux derives terminal timing during packet materialization
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** Fresh Chromium measurements showed that full WebM demux repeated Cluster traversal: metadata
+parsing scanned keyframes, duration, and cadence, complete Segment validation scanned top-level elements,
+and packet materialization scanned every Cluster again. The strict packet goldens already matched, so the
+loss was performance and memory traffic rather than missing codec capability.
+
+**Decision.** Full `demuxWebm()` parses metadata without the complete-cluster timing scan, performs bounded
+first-keyframe discovery only for VP9/AV1 tracks lacking CodecPrivate, and derives missing duration/FPS while
+materializing the authoritative frame views. The same complete Segment validator is fused into that walk;
+public `parseWebm()` probe behavior retains its complete scan semantics. Decoder qualification is rerun from
+the materialized first keyframe when the bounded metadata pass could not prove it.
+
+**Invariants and consequences.** B-frame presentation timestamps and DTS reconstruction, VFR timestamps,
+track order, keyframe flags, exact source-backed payload views, and typed malformed-EBML rejection remain
+unchanged under real packet goldens. Seeking still consumes the same frame table; cancellation remains at
+the operation and pull boundaries. No `VideoFrame` or `AudioData` is created, source views retain the
+existing lifetime, memory is one source buffer plus per-track frame arrays, and consumer backpressure is
+unchanged because packet streams remain pull-driven.
+
+**Rejected:** removing Segment validation; retaining a second full timing scan; copying packet payloads to
+hide ownership; deriving duration from decoded frame count; or changing the public probe scan contract.

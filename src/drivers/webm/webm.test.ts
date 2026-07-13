@@ -860,6 +860,29 @@ describe('demuxWebm — (Simple)Block → frames vs golden-packets (real .webm +
     expect(() => demuxWebm(corrupted)).toThrowError(/no media blocks/);
   });
 
+  it('rejects a real file with a truncated finite Segment element after the last Cluster', async () => {
+    const bytes = await loadFixture('movie_5.webm');
+    const corrupted = new Uint8Array(bytes.byteLength + 1);
+    corrupted.set(bytes);
+    corrupted[corrupted.byteLength - 1] = 0;
+
+    // Grow the finite Segment size by one byte while leaving that final element header incomplete.
+    const segmentOffset = bytes.findIndex(
+      (_byte, index) =>
+        index + E.Segment.length <= bytes.byteLength &&
+        E.Segment.every((part, partIndex) => bytes[index + partIndex] === part),
+    );
+    expect(segmentOffset).toBeGreaterThanOrEqual(0);
+    if (segmentOffset < 0) return;
+    const sizeOffset = segmentOffset + E.Segment.length;
+    expect(corrupted[sizeOffset]).toBeDefined();
+    const sizeLastByte = sizeOffset + 7;
+    expect(corrupted[sizeLastByte]).toBeDefined();
+    corrupted[sizeLastByte] = (corrupted[sizeLastByte] ?? 0) + 1;
+
+    expect(() => demuxWebm(corrupted)).toThrowError(/truncated|malformed|invalid EBML/i);
+  });
+
   interface GoldenPacket {
     trackIndex: number;
     size: number;

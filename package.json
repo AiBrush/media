@@ -123,6 +123,7 @@
     "bench-session13-webm-metadata-window": "bun run scripts/bench-session13-webm-metadata-window.ts",
     "bench-session13-webm-keyframe-prefix": "bun run scripts/bench-session13-webm-keyframe-prefix.ts",
     "bench-session13-webm-terminal-timeline": "bun run scripts/bench-session13-webm-terminal-timeline.ts",
+    "bench-session13-webm-demux-packet-table": "bun run scripts/bench-session13-webm-demux-packet-table.ts",
     "bench-session13-hinted-container-probe-browser": "node scripts/bench-session13-hinted-container-probe-browser.mjs",
     "bench-session13-mp4-multitrack-array-crossover": "bun run scripts/bench-session13-mp4-multitrack-array-crossover.ts",
     "bench-session13-mp4-avc-in-memory": "bun run scripts/bench-session13-mp4-avc-in-memory.ts",
