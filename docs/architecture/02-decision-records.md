@@ -8912,3 +8912,31 @@ engines.
 **Rejected:** copying source sample counts into Opus without rescaling; rescaling source delay/padding into
 Opus as a guessed encoder delay; disabling source decode trimming; changing the strict duration/playback
 oracles; or special-casing the selected filename, source rate, output duration, or competitor result.
+
+### ADR-294 — Detached HLS files may use only explicit relative-path provenance
+
+**Status:** Accepted — 2026-07-13
+
+**Context.** Fresh Chromium evidence for `probe/hls_aes128` showed that the real AES-128 playlist and
+decryptor work when called with the playlist URL, while the harness's detached `File` input failed to fetch
+`hls_aes128_000.ts` because a bare Blob/File has no standard base URL. Resolving a basename against an
+arbitrary fixture directory would be a special case and could fetch a different user's resource.
+
+**Decision.** When a browser `File` exposes a non-empty `webkitRelativePath`, preserve that explicit
+relative path in `Source.filename` and use it with the actual document base URL for HLS playlist URI
+resolution. A plain detached Blob/File with only a basename remains originless and returns the existing typed
+resource-fetch error. URL-backed sources, redirects, injected Node fetchers, and absolute playlist URIs are
+unchanged. This extends provenance transport only; the HLS parser, AES implementation, TS stitcher, and
+container routing remain unchanged.
+
+**Invariants and consequences.** A real corpus test uses the AES-128 manifest and expected clear stitched
+bytes, and a browser rerun must show strict probe metadata plus complete competitor cells. No B-frame reorder
+or VFR rewrite occurs in HLS resolution; downstream seek/PCR handling is unchanged. Abort propagates through
+every sequential fetch and decryption step; no `VideoFrame`/`AudioData` is allocated; byte staging is still
+one operation-scoped stitched output with sequential segment reads, so memory and backpressure remain
+bounded by the existing source-level contract. A relative path is accepted only when explicitly supplied by
+the caller's File metadata; no filename, fixture, hash, size, scenario, or page-path inference is allowed.
+
+**Rejected:** guessing a fixture directory from a basename; using the current page directory for every
+detached File; reading sibling files from the filesystem; changing the strict HLS probe oracle; or silently
+falling back to cleartext when AES resource resolution fails.

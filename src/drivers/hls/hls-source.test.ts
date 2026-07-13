@@ -17,9 +17,9 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { InputError } from '../../contracts/errors.ts';
-import { fromBytes } from '../../sources/source.ts';
+import { type Source, fromBytes } from '../../sources/source.ts';
 import { encryptHlsSampleAesTs } from '../../test-support/hls-sample-aes.ts';
-import { type HlsResourceFetcher, resolveHlsSource } from './hls-source.ts';
+import { type HlsResourceFetcher, hlsManifestBaseUrl, resolveHlsSource } from './hls-source.ts';
 
 const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
@@ -119,6 +119,21 @@ async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   }
   return out;
 }
+
+describe('HLS detached-file provenance — real corpus', () => {
+  it('derives a base URL only from an explicit relative file path', async () => {
+    const manifest = await corpusBytes('hls_aes128.m3u8');
+    const bytes = fromBytes(manifest, { mime: 'application/vnd.apple.mpegurl' });
+    const source: Source = {
+      ...bytes,
+      filename: 'encryption/hls_aes128_decrypt/hls_aes128.m3u8',
+    };
+
+    expect(hlsManifestBaseUrl(source, source, 'https://media.test/player/index.html')).toBe(
+      'https://media.test/player/encryption/hls_aes128_decrypt/hls_aes128.m3u8',
+    );
+  });
+});
 
 describe('resolveHlsSource — real corpus, MPEG-TS segments', () => {
   it('stitches a clear VOD playlist into one TS source the engine probes (≈10s, video track)', async () => {

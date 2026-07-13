@@ -195,7 +195,16 @@ export async function resolveHlsInputIfManifest(
 }
 
 /** Preserve the real playlist URL across input normalization; never invent one for detached bytes. */
-function hlsManifestBaseUrl(input: MediaInput, src: Source): string | undefined {
+export function hlsManifestBaseUrl(
+  input: MediaInput,
+  src: Source,
+  documentBaseUrl: string | undefined = typeof location === 'undefined' ? undefined : location.href,
+): string | undefined {
+  const explicitRelativePath = src.filename?.includes('/') ? src.filename : undefined;
+  const relativeFileUrl =
+    explicitRelativePath !== undefined && documentBaseUrl !== undefined
+      ? new URL(explicitRelativePath, documentBaseUrl).href
+      : undefined;
   // `MediaInput` accepts an already-normalized URL-backed `Source` as well as its original string/URL.
   // `fromURL()` retains the exact href as the source identity, so normalization cannot detach relative
   // key/segment URIs from their manifest. In-memory bytes/Blob sources carry no identity and stay
@@ -203,10 +212,15 @@ function hlsManifestBaseUrl(input: MediaInput, src: Source): string | undefined 
   // RFC 3986 resolution; this is using the caller's actual URL, not guessing a fixture directory.
   const href =
     src[SOURCE_URL_KEY] ??
-    (typeof input === 'string' ? input : input instanceof URL ? input.href : src[SOURCE_CACHE_KEY]);
-  if (href === undefined || typeof location === 'undefined') return href;
+    (typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.href
+        : src[SOURCE_CACHE_KEY]) ??
+    relativeFileUrl;
+  if (href === undefined || documentBaseUrl === undefined) return href;
   try {
-    return new URL(href, location.href).href;
+    return new URL(href, documentBaseUrl).href;
   } catch {
     return href;
   }

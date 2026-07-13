@@ -69,7 +69,7 @@ export interface Source {
   range?(start: number, end: number): Promise<Uint8Array>;
   /** A MIME hint from the origin (Blob type, element, etc.), if any. */
   readonly mimeHint?: string;
-  /** A filename hint (from a `File`), if any. */
+  /** A filename or browser-supplied relative path hint (from a `File`), if any. */
   readonly filename?: string;
   /** Opaque source identity for same-origin, short-lived cache handoffs between operations. */
   readonly [SOURCE_CACHE_KEY]?: string;
@@ -144,7 +144,14 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
 
 /** Wrap a `Blob`/`File`. */
 export function fromBlob(blob: Blob): Source {
-  const filename = typeof File !== 'undefined' && blob instanceof File ? blob.name : undefined;
+  const file =
+    typeof File !== 'undefined' && blob instanceof File
+      ? (blob as File & { readonly webkitRelativePath?: string })
+      : undefined;
+  const filename =
+    file?.webkitRelativePath !== undefined && file.webkitRelativePath.length > 0
+      ? file.webkitRelativePath
+      : file?.name;
   return {
     __media: 'source',
     kind: 'blob',

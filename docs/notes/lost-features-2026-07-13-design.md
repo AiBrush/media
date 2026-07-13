@@ -58,6 +58,22 @@ present and the output selection omits it; the fresh browser export proves stric
 B-frames and VFR do not apply to this audio-only row; seek, cancellation, AudioData lifetime, bounded memory,
 and sink backpressure remain the existing stream invariants.
 
+## Batch D — Preserve explicit relative provenance for detached HLS files
+
+Fresh Chromium evidence reproduced `probe/hls_aes128` as a typed relative-resource fetch miss when the
+manifest arrived as a detached `File`; the same real AES-128 playlist resolves and probes when its URL is
+available. A `File` selected from a directory can carry `webkitRelativePath`, which is caller-supplied
+provenance and may be used with the document base URL. Preserve that path as the source filename hint and
+resolve it only when it is an explicit relative path; a basename-only detached file remains an honest
+relative-resource miss because no segment directory can be inferred.
+
+The playlist parser still resolves every URI by RFC 3986 rules, fetches each key once, decrypts AES-128 with
+the declared IV, and stitches the independently checked TS bytes. HLS has no B-frames in the source-level
+stitch step; downstream TS decode retains the existing WebCodecs presentation-order guarantee and VFR/PCR
+clock mapping. Seeking remains against the stitched source, cancellation stops fetch/decrypt immediately,
+all temporary byte arrays remain operation-scoped, and segment fetches stay sequential to preserve bounded
+memory and backpressure. No `VideoFrame` or `AudioData` is created by the resolver.
+
 | # | Feature | Design note / strict oracle / benchmark axis |
 |---:|---|---|
 | 1 | `demux/aac_adts` | Parse sync/header/frame boundaries without scanning beyond a truncated frame; golden packet table and packets/s across short and long ADTS files. |
