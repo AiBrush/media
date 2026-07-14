@@ -6,6 +6,7 @@ import type { Source } from '../src/sources/source.ts';
 const warmup = 3;
 const samples = 21;
 const latencyMs = 1;
+const wholeFirstMaxBytes = 256 * 1024;
 const media = createMedia({ worker: false });
 const subjects = [
   [
@@ -34,7 +35,7 @@ function median(values: readonly number[]): number {
 
 async function measure(
   bytes: Uint8Array,
-  redundantIntermediateRead: boolean,
+  mode: 'current' | 'redundant-intermediate' | 'whole-small-first',
 ): Promise<Measurement> {
   const reads: Array<readonly [number, number]> = [];
   let bytesRead = 0;
@@ -44,17 +45,24 @@ async function measure(
     mimeHint: 'video/webm',
     size: bytes.byteLength,
     async range(start, end): Promise<Uint8Array> {
-      reads.push([start, end]);
-      bytesRead += end - start;
+      const effectiveEnd =
+        mode === 'whole-small-first' &&
+        bytes.byteLength <= wholeFirstMaxBytes &&
+        reads.length === 0 &&
+        start === 0
+          ? bytes.byteLength
+          : end;
+      reads.push([start, effectiveEnd]);
+      bytesRead += effectiveEnd - start;
       await new Promise<void>((resolve) => setTimeout(resolve, latencyMs));
-      return bytes.subarray(start, end);
+      return bytes.subarray(start, effectiveEnd);
     },
     stream(): ReadableStream<Uint8Array> {
       throw new Error('terminal-timeline benchmark must remain range-backed');
     },
   };
   const started = performance.now();
-  if (redundantIntermediateRead) {
+  if (mode === 'redundant-intermediate') {
     await source.range?.(8 * 1024, Math.min(64 * 1024, bytes.byteLength));
   }
   const info = await media.probe(source);
@@ -65,22 +73,29 @@ const rows = [];
 for (const [id, path] of subjects) {
   const bytes = new Uint8Array(await readFile(new URL(path, import.meta.url)));
   for (let index = 0; index < warmup; index++) {
-    await measure(bytes, false);
-    await measure(bytes, true);
+    await measure(bytes, 'current');
+    await measure(bytes, 'redundant-intermediate');
+    await measure(bytes, 'whole-small-first');
   }
   const current: Measurement[] = [];
   const redundantIntermediateControl: Measurement[] = [];
+  const wholeSmallFirst: Measurement[] = [];
   for (let index = 0; index < samples; index++) {
-    const currentFirst = index % 2 === 0;
-    const first = await measure(bytes, !currentFirst);
-    const second = await measure(bytes, currentFirst);
-    current.push(currentFirst ? first : second);
-    redundantIntermediateControl.push(currentFirst ? second : first);
+    const order =
+      index % 2 === 0
+        ? (['current', 'whole-small-first', 'redundant-intermediate'] as const)
+        : (['redundant-intermediate', 'whole-small-first', 'current'] as const);
+    for (const mode of order) {
+      const result = await measure(bytes, mode);
+      if (mode === 'current') current.push(result);
+      else if (mode === 'whole-small-first') wholeSmallFirst.push(result);
+      else redundantIntermediateControl.push(result);
+    }
   }
   const truth = JSON.stringify(current[0]?.info);
   if (
     truth === undefined ||
-    [...current, ...redundantIntermediateControl].some(
+    [...current, ...wholeSmallFirst, ...redundantIntermediateControl].some(
       (measurement) => JSON.stringify(measurement.info) !== truth,
     )
   ) {
@@ -94,6 +109,11 @@ for (const [id, path] of subjects) {
       reads: current[0]?.reads,
       bytesRead: current[0]?.bytesRead,
     },
+    wholeSmallFirst: {
+      medianMs: median(wholeSmallFirst.map((measurement) => measurement.elapsedMs)),
+      reads: wholeSmallFirst[0]?.reads,
+      bytesRead: wholeSmallFirst[0]?.bytesRead,
+    },
     redundantIntermediateControl: {
       medianMs: median(redundantIntermediateControl.map((measurement) => measurement.elapsedMs)),
       reads: redundantIntermediateControl[0]?.reads,
@@ -104,7 +124,14 @@ for (const [id, path] of subjects) {
 
 console.log(
   JSON.stringify(
-    { benchmark: 'session13-webm-terminal-timeline', warmup, samples, latencyMs, rows },
+    {
+      benchmark: 'session13-webm-terminal-timeline',
+      warmup,
+      samples,
+      latencyMs,
+      wholeFirstMaxBytes,
+      rows,
+    },
     undefined,
     2,
   ),

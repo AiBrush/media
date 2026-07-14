@@ -67,6 +67,8 @@ export interface Source {
   readonly size?: number;
   /** Random access for header-only reads; half-open `[start, end)`. Absent for pure streams. */
   range?(start: number, end: number): Promise<Uint8Array>;
+  /** Owned one-buffer full read, when the backing source can avoid generic stream concatenation. */
+  readAll?(signal?: AbortSignal): Promise<Uint8Array>;
   /** A MIME hint from the origin (Blob type, element, etc.), if any. */
   readonly mimeHint?: string;
   /** A filename or browser-supplied relative path hint (from a `File`), if any. */
@@ -285,6 +287,7 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
       return effectiveUrl;
     },
     stream: () => fetchStream(href, source, learnEffectiveUrl),
+    readAll: (signal) => fetchWhole(href, source, learnEffectiveUrl, signal),
     ...(opts.rangeRequests !== false
       ? { range: (start, end) => fetchRange(href, start, end, source, learnEffectiveUrl) }
       : {}),
@@ -325,6 +328,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
       return effectiveUrl;
     },
     stream: () => fetchStream(href, element, learnEffectiveUrl),
+    readAll: (signal) => fetchWhole(href, element, learnEffectiveUrl, signal),
     range: (start, end) => fetchRange(href, start, end, element, learnEffectiveUrl),
     ...(filename !== undefined ? { filename } : {}),
   };
@@ -418,6 +422,25 @@ function fetchStream(
   });
 }
 
+/** A direct owned full response for operations that genuinely require the complete finite object. */
+async function fetchWhole(
+  href: string,
+  learn?: LearnSize,
+  learnUrl?: (url: string) => void,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const res = await fetch(href, signal === undefined ? undefined : { signal });
+  learnResponseUrl(res, learnUrl);
+  if (!res.ok) {
+    throw new InputError('unsupported-input', `f ${res.status}`);
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  // Fetch exposes the decoded representation. `Content-Length` may describe compressed transfer bytes,
+  // so only the materialized representation length is authoritative for later source-relative ranges.
+  if (learn) learnSize(learn, bytes.byteLength);
+  return bytes;
+}
+
 async function fetchRange(
   href: string,
   start: number,
@@ -444,7 +467,10 @@ async function fetchRange(
   }
 
   // HTTP Range is inclusive; our contract is half-open [lo, hi).
-  const res = await fetch(href, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
+  const res = await fetch(href, {
+    headers: { Range: `bytes=${lo}-${hi - 1}` },
+    priority: 'high',
+  });
   learnResponseUrl(res, learnUrl);
   if (!res.ok) {
     throw new InputError('unsupported-input', `r ${res.status}`);

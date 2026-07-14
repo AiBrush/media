@@ -26,7 +26,8 @@ import { Mp3Muxer, muxPreparedMp3PacketTrack } from './mp3-mux.ts';
 export { muxPreparedMp3PacketTrack };
 export type { PreparedMp3Packet, PreparedMp3PacketMuxInput } from './mp3-mux.ts';
 
-const MP3_PROBE_HEAD_BYTES = 16 * 1024;
+const MP3_PROBE_INITIAL_HEAD_BYTES = 2 * 1024;
+const MP3_PROBE_FALLBACK_HEAD_BYTES = 16 * 1024;
 
 // version: 3=MPEG1, 2=MPEG2, 0=MPEG2.5 (1=reserved). Layer III only (the only one MP3 uses in practice).
 const SAMPLE_RATES: Record<number, readonly number[]> = {
@@ -250,8 +251,11 @@ export function enumerateMp3Packets(bytes: Uint8Array): Mp3Packet[] {
   return packets;
 }
 
-/** Parse MP3 metadata + duration from the file/head. `totalSize` preserves head-only CBR estimation. */
-export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
+/**
+ * Parse MP3 metadata + duration from the file/head. `totalSize` preserves head-only CBR estimation;
+ * `sourceOffset` identifies a targeted post-ID3 window within that complete source.
+ */
+export function parseMp3(bytes: Uint8Array, totalSize?: number, sourceOffset = 0): Mp3Info {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const first = findFirstFrame(dv, id3v2Length(dv));
   if (!first) throw new InputError('unsupported-input', 'no valid MP3 frame header found');
@@ -264,12 +268,12 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number): Mp3Info {
     durationSec = gapless.totalSamples / header.sampleRate;
   } else if (frames !== undefined) {
     durationSec = (frames * header.samplesPerFrame) / header.sampleRate;
-  } else if (totalSize === undefined || totalSize <= dv.byteLength) {
+  } else if (totalSize === undefined || totalSize <= sourceOffset + dv.byteLength) {
     durationSec =
       fullFrameDurationSec(dv, first) ??
       ((dv.byteLength - offset) * 8) / (header.bitrateKbps * 1000);
   } else {
-    const audioBytes = (totalSize ?? dv.byteLength) - offset;
+    const audioBytes = totalSize - (sourceOffset + offset);
     durationSec = (audioBytes * 8) / (header.bitrateKbps * 1000);
   }
   return {
@@ -318,13 +322,42 @@ async function readMp3ProbeInfo(
 ): Promise<Mp3Info> {
   throwIfAborted(signal);
   if (src.range !== undefined && src.size !== undefined && src.size > 0) {
-    const headLength = Math.min(src.size, MP3_PROBE_HEAD_BYTES);
+    const headLength = Math.min(src.size, MP3_PROBE_INITIAL_HEAD_BYTES);
     const head = await src.range(0, headLength);
     throwIfAborted(signal);
     try {
       return parseMp3(head, src.size);
     } catch (error) {
       if (!isInputError(error) || head.byteLength >= src.size) throw error;
+
+      const headView = new DataView(head.buffer, head.byteOffset, head.byteLength);
+      const audioStart = id3v2Length(headView);
+      if (audioStart > 0 && audioStart < src.size) {
+        for (const windowBytes of [MP3_PROBE_INITIAL_HEAD_BYTES, MP3_PROBE_FALLBACK_HEAD_BYTES]) {
+          const audioEnd = Math.min(src.size, audioStart + windowBytes);
+          const audioHead = await src.range(audioStart, audioEnd);
+          throwIfAborted(signal);
+          try {
+            return parseMp3(audioHead, src.size, audioStart);
+          } catch (targetError) {
+            if (!isInputError(targetError) || audioHead.byteLength >= src.size - audioStart) {
+              throw targetError;
+            }
+          }
+        }
+      } else {
+        const fallbackLength = Math.min(src.size, MP3_PROBE_FALLBACK_HEAD_BYTES);
+        const fallbackHead = await src.range(0, fallbackLength);
+        throwIfAborted(signal);
+        try {
+          return parseMp3(fallbackHead, src.size);
+        } catch (fallbackError) {
+          if (!isInputError(fallbackError) || fallbackHead.byteLength >= src.size) {
+            throw fallbackError;
+          }
+        }
+      }
+
       const bytes = await readAll(src);
       throwIfAborted(signal);
       return parseMp3(bytes, bytes.byteLength);

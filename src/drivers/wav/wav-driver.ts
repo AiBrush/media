@@ -77,7 +77,9 @@ interface SequentialWavDecode {
   readonly chunks: PcmChunkReader;
 }
 
-const WAV_PROBE_HEAD_BYTES = 4096;
+const WAV_PROBE_HEAD_BYTES = 128;
+const WAV_REMOTE_PROBE_HEAD_BYTES = 16 * 1024;
+const WAV_PROBE_MAX_SPARSE_WINDOWS = 8;
 const WAV_DEMUX_HEAD_BYTES = 65536;
 const WAV_PACKET_FRAMES = 4096;
 const WAV_DECODE_RANGE_BYTES = 1024 * 1024;
@@ -159,6 +161,97 @@ function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWavHeader 
   if (!format) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');
 
   return parsedWavHeader(format, dataFound ? pos + 8 : 0, dataSize, dataFound);
+}
+
+interface WavProbeWindow {
+  readonly start: number;
+  readonly bytes: Uint8Array;
+}
+
+function wavProbeHeadBytes(src: ByteSource): number {
+  const kind = (src as ByteSource & { readonly kind?: string }).kind;
+  // One remote round trip costs more than copying a modest RIFF metadata prelude. Local byte/blob
+  // sources retain the minimum 128-byte window; URL/element sources amortize ordinary LIST/JUNK/PAD
+  // chunks without changing the sparse declared-offset walk or its fallback bound.
+  return kind === 'url' || kind === 'element' ? WAV_REMOTE_PROBE_HEAD_BYTES : WAV_PROBE_HEAD_BYTES;
+}
+
+/**
+ * Read RIFF metadata without materializing skipped chunk bodies. A small window handles ordinary WAV
+ * headers in one request; declared JUNK/LIST/PAD bodies are crossed by offset and cost only one more
+ * bounded window. An unusually fragmented metadata prelude falls back to the established 64 KiB parser
+ * after a fixed number of sparse requests, so adversarial chunk tables cannot amplify round trips.
+ */
+async function readSparseWavProbeHeader(
+  src: ByteSource,
+  range: NonNullable<ByteSource['range']>,
+  size: number,
+  windowBytes: number,
+  signal: AbortSignal | undefined,
+  initialBytes: Uint8Array,
+): Promise<ParsedWavHeader | undefined> {
+  let windows = 1;
+  let window: WavProbeWindow = { start: 0, bytes: initialBytes };
+  const readAt = async (start: number, length: number): Promise<Uint8Array | undefined> => {
+    if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED, signal.reason);
+    if (
+      start >= window.start &&
+      start + length <= window.start + window.bytes.byteLength
+    ) {
+      return window.bytes.subarray(start - window.start, start - window.start + length);
+    }
+    if (windows >= WAV_PROBE_MAX_SPARSE_WINDOWS) return undefined;
+    const end = Math.min(size, start + Math.max(windowBytes, length));
+    const bytes = await range.call(src, start, end);
+    if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED, signal.reason);
+    windows++;
+    window = { start, bytes };
+    return bytes.subarray(0, Math.min(length, bytes.byteLength));
+  };
+
+  const riff = await readAt(0, 12);
+  if (riff === undefined) return undefined;
+  if (riff.byteLength < 12 || ascii(riff, 0, 4) !== 'RIFF' || ascii(riff, 8, 4) !== 'WAVE') {
+    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+  }
+
+  let format: WavFormat | undefined;
+  let dataOffset = 0;
+  let dataBytes = 0;
+  let dataFound = false;
+  let pos = 12;
+  let chunks = 0;
+  while (pos + 8 <= size && chunks < 8192) {
+    const header = await readAt(pos, 8);
+    if (header === undefined) return undefined;
+    if (header.byteLength < 8) break;
+    const id = ascii(header, 0, 4);
+    const chunkSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(
+      4,
+      true,
+    );
+    const body = pos + 8;
+    if (id === 'fmt ' && chunkSize >= 16) {
+      const needed = chunkSize >= 40 ? 26 : 16;
+      const bodyBytes = await readAt(body, needed);
+      if (bodyBytes === undefined) return undefined;
+      if (bodyBytes.byteLength < needed) {
+        throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
+      }
+      const bodyView = new DataView(bodyBytes.buffer, bodyBytes.byteOffset, bodyBytes.byteLength);
+      format = parseFormat(bodyView, 0, chunkSize);
+    } else if (id === 'data') {
+      dataOffset = body;
+      dataBytes = Math.min(chunkSize, Math.max(0, size - body));
+      dataFound = true;
+      break;
+    }
+    const next = body + chunkSize + (chunkSize & 1);
+    pos = next;
+    chunks++;
+  }
+  if (format === undefined) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');
+  return parsedWavHeader(format, dataOffset, dataBytes, dataFound);
 }
 
 function parsedWavHeader(
@@ -745,9 +838,42 @@ export const WavDriver: ContainerDriver = {
   supports: matchesWav,
   validatesPcmTrim: true,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
-    let head = await readHead(src, WAV_PROBE_HEAD_BYTES);
-    let parsed = parseWavHeader(head, src.size);
+    const range = src.range;
+    const size = src.size;
+    let retainedHead: Uint8Array | undefined;
+    if (range !== undefined && size !== undefined) {
+      const windowBytes = wavProbeHeadBytes(src);
+      if (o?.signal?.aborted) {
+        throw new MediaError('aborted', OPERATION_ABORTED, o.signal.reason);
+      }
+      const head = await range.call(src, 0, Math.min(size, windowBytes));
+      retainedHead = head;
+      if (o?.signal?.aborted) {
+        throw new MediaError('aborted', OPERATION_ABORTED, o.signal.reason);
+      }
+      // Canonical RIFF/WAVE places `fmt ` and `data` in the first transport window. Parse that owned
+      // window synchronously so cached chunk headers do not cross additional async/microtask boundaries.
+      // Unusual legal preludes reuse the same bytes in the sparse declared-offset walker below.
+      try {
+        const common = parseWavHeader(head, size);
+        if (common.dataFound) return [wavTrackInfo(common.info)];
+      } catch {
+        // The sparse parser below replays the same bytes and preserves the exact typed invalid/truncation
+        // error while retaining recovery for a `fmt ` chunk beyond the initial bounded window.
+      }
+      const parsed = await readSparseWavProbeHeader(src, range, size, windowBytes, o?.signal, head);
+      if (parsed !== undefined) return [wavTrackInfo(parsed.info)];
+    }
+    let head = retainedHead ?? (await readHead(src, WAV_PROBE_HEAD_BYTES));
     const maxFallback = Math.min(src.size ?? WAV_DEMUX_HEAD_BYTES, WAV_DEMUX_HEAD_BYTES);
+    let parsed: ParsedWavHeader;
+    try {
+      parsed = parseWavHeader(head, src.size);
+    } catch (error) {
+      if (head.byteLength >= maxFallback) throw error;
+      head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
+      parsed = parseWavHeader(head, src.size);
+    }
     if (!parsed.dataFound && head.byteLength < maxFallback) {
       head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
       parsed = parseWavHeader(head, src.size);

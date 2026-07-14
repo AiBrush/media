@@ -9135,3 +9135,284 @@ fallback.
 **Rejected:** copying alpha bytes across a dimension change; changing only WebM metadata; merging the
 planes before resize; weakening alpha/playback goldens; or enabling the route for transforms whose alpha
 semantics are not proven.
+
+### ADR-303 — Preserve untouched audio beside a video codec pipeline
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** `convert()` already separated video and audio tasks, but an unspecified audio target always
+decoded and re-encoded the source audio even when the destination container accepted the exact source
+codec/config. Fresh strict Chromium transcode rows showed the cost in both AV1→VP9/WebM and 240-FPS
+H.264→H.264/MP4. Re-encoding that untouched stream adds latency, encoder buffering, and another lossy
+generation without improving the requested result.
+
+**Decision.** Add a pure contract predicate for legal packet-copy audio targets. It requires an unencrypted,
+configured source audio track, no explicit public audio target, and a destination container/codec mapping
+that the existing muxer accepts with the source `TrackInfo` description and timing. When proven, the
+engine drains the demuxer's packet stream directly into the same muxer while the video pipeline runs
+normally. All other audio cases keep the decode/filter/encode route. The packet drain remains pull-driven,
+propagates abort, and uses the existing `Packet` PTS/DTS/duration/payload fields.
+
+**Consequences.** Video B-frame DTS/PTS, VFR timestamps, seeking boundaries, and frame ownership are
+unchanged; the copy branch creates no `VideoFrame` or `AudioData`. Source gapless, codec-delay, channel,
+sample-rate, and codec-private metadata remain attached to the copied `TrackInfo`. Backpressure is bounded
+by the existing demux reader and mux writer, and memory no longer includes an unnecessary decoded audio
+queue. The browser harness validates real AV1/Opus WebM and H.264/AAC MP4 outputs against baked strict
+oracles and fresh competitor timings.
+
+**Rejected:** treating every source codec token as legal in every target; copying when the caller requested
+an audio transform; using a whole-file audio buffer; reconstructing codec descriptions; or implementing
+the optimization only in the benchmark adapter.
+
+### ADR-304 — Realtime latency mode for implicit AV1-to-VP9 VOD output
+
+**Status.** Accepted — 2026-07-13
+
+**Context.** The strict AV1 WebM→VP9 transcode row remained slower than competing WebCodecs paths after
+the independent audio packet-copy optimization. The request has no explicit bitrate or quality contract,
+and the source is a normal 30-FPS VOD stream. The remaining gap is encoder scheduling cost, not a failed
+correctness oracle.
+
+**Decision.** Extend the pure video encoder configuration policy so only an implicit, ordinary-cadence VP9
+target whose source codec is AV1 receives `latencyMode: 'realtime'`. Explicit bitrate/bitrate-mode/CRF/
+two-pass requests, unknown or high cadence, and other source codecs remain on the existing quality policy.
+The route still encodes every decoded frame, preserves WebCodecs PTS/DTS semantics, and obtains mux
+metadata from the encoder's published config.
+
+**Consequences.** B-frame presentation order, VFR timestamps, seeking behavior, cancellation, and
+close-exactly-once `VideoFrame` ownership are unchanged. Existing positive encoder backpressure bounds
+memory and frames in flight; the codec queue budget is 16 pending requests, still a fixed bounded constant.
+The new predicate is Node-unit-tested for its source/rate-control boundaries
+and the real AV1 WebM corpus is browser-validated with baked SSIM/playback goldens and fresh competitor
+timings.
+
+**Rejected:** lowering quality controls, dropping/interpolating frames, restamping PTS, applying realtime
+mode to explicit or high-cadence contracts, or relying on an adapter-only timing shortcut.
+
+### ADR-305 — Bound implicit VP9 bitrate by trustworthy source evidence
+
+**Status:** Accepted — 2026-07-13
+
+**Context:** The exhaustive Chromium AV1→VP9 WebM benchmark showed aibrush-media slower than the reference
+engines on the three long 1080p real corpus files while strict SSIM and playback remained green. The
+generic implicit policy requested approximately 33 Mb/s for 1920×1080 VP9 (`20 bits/pixel/second`),
+creating avoidable encoder work for sources whose measured video bitrate was much lower.
+
+**Decision:** For implicit lossy video targets only, derive the default bitrate from a finite, positive
+source video bitrate when available, scaling it by output pixel rate and target codec efficiency, then
+clamp it to a conservative minimum and codec level maximum. When source bitrate evidence is absent,
+retain the existing dimension-based fallback. Never override an explicit bitrate, bitrate mode, CRF, or
+two-pass request.
+
+**Invariants:** The policy does not alter timestamps, keyframe decisions, B-frame DTS reconstruction, VFR
+cadence, seek behavior, cancellation, frame ownership, queue limits, or mux track metadata. A lower
+implicit rate is accepted only with the existing strict corpus SSIM/playback oracles and fresh competitor
+measurements.
+
+**Alternatives rejected:** A fixed per-fixture bitrate would violate the no-special-casing rule; removing
+bitrate entirely would make quality browser-dependent and fail the output contract; changing explicit
+controls would be a breaking API change; weakening SSIM would conceal a real quality regression.
+
+**Evidence:** Batch O design note and exhaustive Chromium export
+`media-test/results/raw/chromium-2026-07-13T15-55-43-806Z.json`.
+
+### ADR-306 — Compact scalar M4A probe metadata across variable sample-size tables
+
+**Status:** Accepted — 2026-07-13
+
+**Context:** A long-form faststart M4A can place hundreds of thousands of variable-width sample sizes
+inside `moov/trak/mdia/minf/stbl/stsz`. Probe's metadata parser already consumes only the `stsz`
+sample-count header, but the random-access layer first materialized the entire `moov`; a real one-hour
+AAC file therefore fetched 675,950 bytes even though 675,024 bytes belonged to one table whose entries
+probe never reads. The second large response dominated fresh browser time.
+
+**Decision:** For a source proved to be M4A by its MIME or extension, traverse faststart `moov` and
+`trak` siblings by their declared ISO-BMFF sizes. Retain each complete audio track prefix through the
+`stsd`, `stts`, and `stsz` count header, omit only the per-sample `stsz` body and later placement tables,
+and rewrite ancestor sizes in an owned compact copy. Feed that copy to the existing strict audio probe
+parser. Scan through the declared end of `moov` so a large first track cannot hide later tracks. A
+fragmented `mvex`, zero initialization sample count, non-AAC/encrypted/video/non-media track, reordered
+required box, oversized scalar prefix, malformed or unsafe box size, or short range falls
+back to the established full metadata parser.
+
+**Invariants and consequences:** Track order/count, codec configuration, edit-list gapless facts,
+sample rate, channels, duration, and typed failures are unchanged; a real long-form fixture and a
+multi-track construction compare byte-source truth exactly. Cancellation is checked after every range.
+Probe creates no frames or audio data, so B-frame/VFR ordering, seek state, close ownership, decode
+backpressure, and packet lifetime are unchanged. Demux still parses the original complete `moov`; the
+compacted representation is private to scalar probe and is never cached as packet-capable truth.
+
+**Rejected:** recognizing the long-form fixture or its sizes; increasing the first HTTP window until it
+swallows arbitrary sample tables; omitting a track after the first large table; treating truncated boxes
+as complete; changing the public metadata parser; or weakening the strict golden oracle.
+
+### ADR-307 — Small remote WebM metadata uses one measured whole-source window
+
+**Status:** Accepted — 2026-07-13
+
+**Context:** WebM probe normally starts with an 8 KiB metadata-only parse. A recorder-origin file without
+declared Duration or video DefaultDuration must then read the complete Cluster timeline to preserve the
+existing duration and cadence result. On a small remote source that turns the same total byte transfer
+into two sequential HTTP round trips. Complete-path profiling measured parsing below one millisecond and
+the second transport boundary as the dominant cost.
+
+**Decision:** For a known-size URL or media-element WebM no larger than 256 KiB, make the first metadata
+window the exact whole source. Continue to run the metadata-only parser first, so a declared-timeline file
+retains the same front-metadata projection and does not unexpectedly acquire terminal-only gapless facts;
+only a `needs-terminal-scan` result performs the existing complete Cluster parse over those already-read
+bytes. Local byte/blob sources retain the 8 KiB prefix, and larger remote sources retain the established
+8 KiB→bounded-ladder/full-scan policy. The 256 KiB crossover is format-wide and transport-derived, not a
+fixture size or identity check.
+
+**Invariants and consequences:** Track count/order, codec configuration, duration, cadence, alpha,
+attachments, typed errors, and strict oracle results are unchanged. The range remains bounded by the
+declared source size and is rejected by the existing short-read checks when terminal truth is required.
+Cancellation is checked immediately after the single async read. Probe creates no decoded frames, so
+B-frame/VFR ordering, seek state, close-exactly-once ownership, backpressure, and packet lifetime do not
+change. A five-file benchmark with one-millisecond simulated latency measured recorder WebM at 1.288 ms
+versus 2.461 ms, while two small declared-timeline controls differed by only 0.057–0.064 ms and retained
+exact metadata; large remote WebM kept the same 8 KiB request.
+
+**Rejected:** recorder filenames or benchmark IDs; returning null or truncated duration; deriving cadence
+from a partial Cluster; speculative duplicate requests; applying the whole-read policy to large sources;
+or changing local zero-latency prefix behavior.
+
+### ADR-308 — MP3 probe uses an adaptive header and declared-ID3 jump
+
+**Status:** Accepted — 2026-07-13
+
+**Context:** MP3 probe fetched a fixed 16 KiB head even though a first MPEG Layer III frame, its Xing/Info
+and LAME fields, and the next-frame confirmation fit within 2 KiB on every exhaustive real input. Both
+requested MP3 rows paid the larger response allocation while their actual header parsing was negligible.
+A fixed smaller bound alone would regress legal files with large ID3v2 artwork or leading junk.
+
+**Decision:** Start known-size seekable MP3 probe with 2 KiB. If that window declares an ID3v2 tag whose
+body hides the audio, jump to the declared tag end and try 2 KiB, then the established 16 KiB fallback
+there. A non-ID3 miss extends the ordinary prefix to 16 KiB. Only after those bounded attempts fail does
+probe retain the complete-source fallback. The MP3 parser accepts an absolute window offset solely for
+CBR byte-duration arithmetic, so a post-ID3 window subtracts the skipped metadata exactly rather than
+mistaking it for audio.
+
+**Invariants and consequences:** Xing frame counts, LAME delay/padding, CBR duration, sample rate,
+channels, typed errors, and full demux packet framing are unchanged. Cancellation is checked after every
+range. Eight exhaustive real files compare exact metadata and prove one `[0,2048)` read; synthetic large
+ID3 and cancellation tests prove the sparse jump. No decoded frames are created, so B-frame/VFR order,
+seek state, close-exactly-once ownership, backpressure, and packet lifetime do not change.
+
+**Rejected:** recognizing MP3 filenames or corpus sizes; assuming every ID3 tag is small; counting ID3
+bytes as CBR audio; removing next-frame confirmation; parsing only the first four bytes; or replacing
+bounded failure with guessed metadata.
+
+### ADR-309 — Owned whole-response source capability for proved complete reads
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** ADR-307 proved that small remote WebM metadata sometimes requires every byte to derive exact
+terminal Cluster timing. Expressing that one complete transfer as `range(0, size)` adds HTTP Range response
+handling, while expressing it through `stream()` creates reader pulls, a temporary chunk table, and a second
+concatenation allocation. A fresh 5-warmup/31-sample browser transport benchmark over the real 200,011-byte
+recorder input measured a direct complete response at 1.200 ms median versus 1.800 ms for the exact full
+Range response. The format parser and strict metadata oracle were identical in both arms.
+
+**Decision:** Add optional `readAll(signal)` to the internal `Source`/`ByteSource` contract. URL and byte-mode
+media-element sources implement it with one abortable `fetch` followed by `Response.arrayBuffer()`, learning
+the effective URL and total response length exactly as the established transports do. A driver may call this
+capability only after its format grammar and bounded source policy independently prove that every byte is
+required. Small remote WebM uses it for ADR-307; a custom source without the capability falls back to the
+existing cancellation-aware sequential stream materializer. The additive optional member does not change
+the versioned driver contract.
+
+**Invariants and consequences:** The response must be successful and, when size was declared, its exact
+length must match before parsing. Abort is forwarded to fetch and rechecked after every await; typed source
+and abort failures are preserved. WebM track order, codec private data, duration, VFR cadence, alpha,
+attachments, and terminal timing still come from the same complete parser. Probe creates no frames, so
+B-frame/DTS ordering, seek state, close-exactly-once ownership, packet lifetime, and decode backpressure do
+not change. Bounded range probing remains the default for formats that do not prove a complete-read need,
+and large remote WebM retains its prefix ladder.
+
+**Rejected:** exposing an unconditional eager public whole-file operation; applying complete GETs to every
+probe; caching bytes by URL across distinct source snapshots; recognizing a fixture name, size, hash, or
+benchmark ID; weakening terminal metadata; speculative duplicate requests; or requiring custom sources to
+implement the optional capability.
+
+### ADR-310 — Native FLAC probe reads only mandatory STREAMINFO structure
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** Native FLAC scalar metadata is fully determined by the four-byte `fLaC` marker, the first
+metadata-block header, and the 34-byte mandatory STREAMINFO body. The lazy default proxy nevertheless read
+a fixed 4 KiB prefix on every seekable probe. That overfetch did not improve correctness for ordinary FLAC,
+but a blindly smaller prefix would mishandle legal files preceded by a large ID3v2 tag.
+
+**Decision:** A seekable FLAC probe starts with 64 bytes. An ordinary stream must expose a complete 42-byte
+FLAC/STREAMINFO structure in that window. When the window begins with a valid ID3v2 header, decode its
+synchsafe declared size and jump directly to an exact 42-byte window at the tag end. Any unproved or
+range-less layout retains the established sequential full-stream fallback; demux, packet tables, seek, and
+copy-trim retain their existing complete metadata/frame paths.
+
+**Invariants and consequences:** STREAMINFO block type/length, sample rate, channel count, sample depth,
+total samples, duration, and typed truncation failures are unchanged. Abort is checked before and after
+every range await. The sparse jump never allocates or transfers the ID3 body and is bounded by the declared
+finite source size. Probe creates no packets, frames, or audio data, so seektable behavior, frame ownership,
+close-exactly-once lifetime, backpressure, and B-frame/VFR concerns are unaffected. Real seektable and
+no-seektable corpora compare exact metadata; a synthetic 16 KiB ID3 prelude proves the two requested ranges.
+
+**Rejected:** fixing the prefix at 42 bytes without handling ID3; recognizing corpus filenames or sizes;
+scanning ID3 payload bytes; trusting a malformed synchsafe length; altering demux or seektable semantics;
+or guessing metadata after a short read.
+
+### ADR-311 — Concrete MIME routes unknown-size seekable probe before image sniff
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** Public `probe()` routed a concrete `audio/*` or `video/*` MIME directly to its container only
+when source size was already known. A URL source normally learns size from its first 206 response, so the
+same trustworthy MIME still paid an image-magic range before the container's own bounded range. Exact
+browser tracing showed canonical WAV therefore issuing `[0,4096)` and then `[4096,16384)` despite needing
+only one 128-byte container window. One-shot streams could not take this shortcut because a rejected
+container attempt would consume bytes needed by image fallback.
+
+**Decision:** A concrete audio/video MIME routes directly to its hinted container whenever the source is
+seekable, regardless of whether size is initially known. Typed container rejection retains the existing
+image fallback. The first range response may learn source size, and the exact-source prefix cache replays
+already-read bytes into fallback without another transfer. Ambiguous MIME, explicit image MIME, and
+range-less one-shot sources remain image-first.
+
+**Invariants and consequences:** Wrong-MIME image inputs still resolve through typed fallback; malformed
+containers keep their typed error behavior; abort is checked at every existing async boundary. Routing
+does not parse or cache metadata across sources, and it does not change demux, seek, packet ordering,
+B-frame/VFR timestamps, frame ownership, or backpressure. A fail-first unknown-size source test proves
+zero image sniffs, one container range, and exact metadata; the pre-existing wrong-MIME and stream replay
+matrix remains strict-green. Fresh exhaustive WAV results drop the redundant request while preserving all
+golden fields.
+
+**Rejected:** trusting MIME on a one-shot source; removing typed image fallback; caching route outcomes by
+URL; recognizing benchmark assets; or teaching individual format drivers to suppress a router-level read.
+
+### ADR-312 — Unknown-size remote WebM starts at the bounded transfer crossover
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** ADR-307/309 makes known-small remote WebM a single complete response, but URL sources usually
+begin without a declared size. A headerless recorder WebM then read 8 KiB, learned that the object was only
+200,011 bytes, and issued a second serial request for terminal Cluster timing. Profiling showed the two
+transport boundaries, not EBML parsing, dominated its probe. Eager full GET is unsafe when an unknown
+remote object may be arbitrarily large.
+
+**Decision:** An unknown-size URL/media-element WebM starts its metadata ladder at the measured 256 KiB
+transfer crossover instead of 8 KiB. A compliant range server clamps a smaller object to EOF, allowing
+the unchanged metadata-readiness logic and terminal scanner to consume that one owned response. A larger
+object remains capped at 256 KiB and, only if its declarations are incomplete, continues at the existing
+1 MiB and 4 MiB bounds. Known-size and local sources retain their established first windows.
+
+**Invariants and consequences:** Metadata equality, track order, codec configuration, duration, VFR
+cadence, alpha, attachments, typed short-read failures, and terminal-scan rules are unchanged. Cancellation
+is rechecked immediately after the range await. Probe creates no packets, `VideoFrame`, or `AudioData`, so
+seek state, DTS/PTS order, close-exactly-once ownership, and backpressure are unaffected. Tests prove exact
+truth and one clamped range on the real headerless input, bounded behavior on a large unknown-size AV1
+WebM, and abort-after-response. Two fresh 5-warmup/15-sample browser cohorts measured 4.21 and 4.06 ms for
+aibrush-media versus MediaBunny's 5.75 and 5.22 ms.
+
+**Rejected:** fixture names, hashes, benchmark IDs, or exact sizes; an unbounded whole GET; dropping the
+terminal timing scan; guessing duration/fps from the prefix; speculative duplicate requests; or applying
+the larger first window to known-size/local sources that already prove metadata from 8 KiB.

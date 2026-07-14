@@ -31,6 +31,7 @@ import { applyPcmTransform } from '../pcm-transform.ts';
 import { trySliceAiffPcm } from './aiff-slice.ts';
 import { locate, parseAiff, readAiffPcm } from './aiff.ts';
 
+const AIFF_PROBE_HEAD_BYTES = 64;
 const AIFF_PACKET_INFO_HEAD_BYTES = 65536;
 const AIFF_PACKET_TARGET_BYTES = 4096;
 const AIFF_PACKET_INFO_PREFIX_TTL_MS = 60_000;
@@ -236,6 +237,23 @@ export const AiffDriver: ContainerDriver = {
   kind: 'container',
   formats: ['aiff'],
   supports: matchesAiff,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    assertNotAborted(o?.signal);
+    let head = await readHead(src, AIFF_PROBE_HEAD_BYTES);
+    assertNotAborted(o?.signal);
+    try {
+      return [aiffTrackInfo(parseAiff(head))];
+    } catch (error) {
+      const maxFallback = Math.min(
+        src.size ?? AIFF_PACKET_INFO_HEAD_BYTES,
+        AIFF_PACKET_INFO_HEAD_BYTES,
+      );
+      if (src.range === undefined || head.byteLength >= maxFallback) throw error;
+      head = await readHead(src, AIFF_PACKET_INFO_HEAD_BYTES);
+      assertNotAborted(o?.signal);
+      return [aiffTrackInfo(parseAiff(head))];
+    }
+  },
   async demux(src: ByteSource): Promise<Demuxer> {
     const info = parseAiff(await readHead(src, 65536));
     const track = aiffTrackInfo(info);

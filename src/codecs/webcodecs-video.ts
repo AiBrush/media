@@ -745,7 +745,7 @@ function readDecoderAlpha(o: StageOptions | undefined): AlphaOption | undefined 
 
 // ── environment guards ───────────────────────────────────────────────────────────────────────────
 
-const HIGH_WATER_MARK = 8 as const; // pending decode/encode requests tolerated before we await `dequeue`
+const HIGH_WATER_MARK = 16 as const; // pending decode/encode requests tolerated before we await `dequeue`
 
 function hasVideoDecoder(): boolean {
   return typeof VideoDecoder !== 'undefined';

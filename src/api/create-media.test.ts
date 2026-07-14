@@ -668,9 +668,62 @@ describe('createMedia', () => {
       .use(imageSniffCounterModule(counts))
       .use(WebmModule)
       .probe(src);
-    expect(calls).toEqual([[0, 8 * 1024]]);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
     expect(counts.sniff).toBe(0);
     expect(info.tracks.find((track) => track.type === 'video')?.codec).toBe('vp9');
+  });
+
+  it('probe sends an unknown-size seekable concrete MIME directly to its container hook', async () => {
+    const bytes = new Uint8Array(16 * 1024);
+    bytes.set([0x52, 0x49, 0x46, 0x46]);
+    const calls: Array<readonly [number, number]> = [];
+    const counts = { sniff: 0 };
+    const driver: ContainerDriver = {
+      id: 'unknown-size-hinted-audio',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['hinted-audio'],
+      supports: (query) => query.mime === 'audio/x-hinted-audio',
+      probe: async (source) => {
+        expect(await source.range?.(0, bytes.byteLength)).toEqual(bytes);
+        return [
+          {
+            id: 0,
+            mediaType: 'audio',
+            codec: 'test-audio',
+            durationSec: 1,
+          },
+        ];
+      },
+      demux: () => Promise.reject(new Error('probe hook must be preferred')),
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/x-hinted-audio',
+      range: (start, end) => {
+        calls.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('unknown-size seekable hinted probe must not stream');
+      },
+    };
+
+    const info = await createMedia()
+      .use(imageSniffCounterModule(counts))
+      .use({
+        apiVersion: DRIVER_API_VERSION,
+        register: (registry) => registry.addContainer(driver),
+      })
+      .probe(source);
+
+    expect(info).toMatchObject({ container: 'hinted-audio', durationSec: 1 });
+    expect(counts.sniff).toBe(0);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
   it('probe reuses the first WebM prefix when exact cadence requires a terminal scan', async () => {
@@ -701,10 +754,7 @@ describe('createMedia', () => {
       sizeBytes: bytes.byteLength,
       tracks: [{ type: 'video', codec: 'vp9', fps: 30, width: 320, height: 240 }],
     });
-    expect(calls).toEqual([
-      [0, 8 * 1024],
-      [8 * 1024, bytes.byteLength],
-    ]);
+    expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
   it('probe preserves a typed hinted-container error when the deferred image fallback misses', async () => {
@@ -1325,7 +1375,8 @@ describe('createMedia', () => {
     const srcForProbe: Source = {
       __media: 'source',
       kind: 'url',
-      mimeHint: 'video/x-delayed',
+      mimeHint: 'video/',
+      filename: 'delayed.mp4',
       [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
       get [SOURCE_URL_KEY](): string {
         return probeEffectiveUrl;
@@ -1349,7 +1400,8 @@ describe('createMedia', () => {
     const srcForDecode: Source = {
       __media: 'source',
       kind: 'url',
-      mimeHint: 'video/x-delayed',
+      mimeHint: 'video/',
+      filename: 'delayed.mp4',
       [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/delayed.mp4',
       get [SOURCE_URL_KEY](): string {
         return decodeEffectiveUrl;

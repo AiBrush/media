@@ -224,6 +224,195 @@ describe('probe WebM across the real corpus', () => {
     expect(tracks.find((track) => track.mediaType === 'audio')?.codec).toBe('opus');
   });
 
+  it('reads small remote terminal-timeline WebM through one owned complete response', async () => {
+    const bytes = await bytesFromMediaTest('recorder_headerless.webm');
+    const reads: Array<readonly [number, number]> = [];
+    let wholeReads = 0;
+    const source: ByteSource & {
+      readonly kind: 'url';
+      readAll(signal?: AbortSignal): Promise<Uint8Array>;
+    } = {
+      kind: 'url',
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      readAll(): Promise<Uint8Array> {
+        wholeReads++;
+        return Promise.resolve(bytes);
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('small remote WebM should use the owned whole-read capability');
+      },
+    };
+    const expected = await probeWithWebmDriver({
+      size: bytes.byteLength,
+      stream: () => new Blob([Uint8Array.from(bytes).buffer]).stream(),
+    });
+
+    expect(await probeWithWebmDriver(source)).toEqual(expected);
+    expect(reads).toEqual([]);
+    expect(wholeReads).toBe(1);
+  });
+
+  it('probes unknown-size remote terminal-timeline WebM in one bounded clamped range', async () => {
+    const bytes = await bytesFromMediaTest('recorder_headerless.webm');
+    const reads: Array<readonly [number, number]> = [];
+    let learnedSize: number | undefined;
+    const expected = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+    const source = {
+      kind: 'url',
+      get size(): number | undefined {
+        return learnedSize;
+      },
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        learnedSize = bytes.byteLength;
+        return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('unknown-size remote WebM probe should remain range-backed');
+      },
+    } as ByteSource & { readonly kind: 'url' };
+
+    expect(await probeWithWebmDriver(source)).toEqual(expected);
+    expect(reads).toEqual([[0, 256 * 1024]]);
+  });
+
+  it('uses the same one-read policy for small remote declared-timeline WebM metadata', async () => {
+    const bytes = await loadFixture('movie_5.webm');
+    const reads: Array<readonly [number, number]> = [];
+    let wholeReads = 0;
+    const expected = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+
+    const actual = await probeWithWebmDriver({
+      kind: 'url',
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      readAll(): Promise<Uint8Array> {
+        wholeReads++;
+        return Promise.resolve(bytes);
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('small remote declared WebM should use the owned whole-read capability');
+      },
+    } as ByteSource & { readonly kind: 'url'; readAll(): Promise<Uint8Array> });
+
+    expect(actual).toEqual(expected);
+    expect(reads).toEqual([]);
+    expect(wholeReads).toBe(1);
+  });
+
+  it('keeps large remote declared-timeline WebM on the bounded metadata prefix', async () => {
+    const bytes = await bytesFromMediaTest('av1_720p_5s.webm');
+    const reads: Array<readonly [number, number]> = [];
+
+    await probeWithWebmDriver({
+      kind: 'url',
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('large remote WebM metadata probe must remain bounded');
+      },
+    } as ByteSource & { readonly kind: 'url' });
+
+    expect(reads).toEqual([[0, 8 * 1024]]);
+  });
+
+  it('keeps unknown-size large remote WebM bounded at the transfer crossover', async () => {
+    const bytes = await bytesFromMediaTest('av1_720p_5s.webm');
+    const reads: Array<readonly [number, number]> = [];
+    let learnedSize: number | undefined;
+
+    await probeWithWebmDriver({
+      kind: 'url',
+      get size(): number | undefined {
+        return learnedSize;
+      },
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        learnedSize = bytes.byteLength;
+        return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('unknown-size large remote WebM metadata probe must remain bounded');
+      },
+    } as ByteSource & { readonly kind: 'url' });
+
+    expect(bytes.byteLength).toBeGreaterThan(256 * 1024);
+    expect(reads).toEqual([[0, 256 * 1024]]);
+  });
+
+  it('rechecks cancellation after an unknown-size remote WebM range response', async () => {
+    const bytes = await bytesFromMediaTest('recorder_headerless.webm');
+    const controller = new AbortController();
+    const reads: Array<readonly [number, number]> = [];
+    let learnedSize: number | undefined;
+
+    await expect(
+      probeWithWebmDriver(
+        {
+          kind: 'url',
+          get size(): number | undefined {
+            return learnedSize;
+          },
+          range(start, end): Promise<Uint8Array> {
+            reads.push([start, end]);
+            learnedSize = bytes.byteLength;
+            controller.abort('cancel unknown-size remote WebM probe');
+            return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
+          },
+          stream(): ReadableStream<Uint8Array> {
+            throw new Error('cancelled unknown-size remote WebM probe should remain range-backed');
+          },
+        } as ByteSource & { readonly kind: 'url' },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toEqual([[0, 256 * 1024]]);
+  });
+
+  it('rechecks cancellation after the owned small remote WebM response', async () => {
+    const bytes = await bytesFromMediaTest('recorder_headerless.webm');
+    const controller = new AbortController();
+    let reads = 0;
+    let wholeReads = 0;
+
+    await expect(
+      probeWithWebmDriver(
+        {
+          kind: 'url',
+          size: bytes.byteLength,
+          range(start, end): Promise<Uint8Array> {
+            reads++;
+            controller.abort('cancel small remote WebM probe');
+            return Promise.resolve(bytes.subarray(start, end));
+          },
+          readAll(): Promise<Uint8Array> {
+            wholeReads++;
+            controller.abort('cancel small remote WebM probe');
+            return Promise.resolve(bytes);
+          },
+          stream(): ReadableStream<Uint8Array> {
+            throw new Error(
+              'cancelled small remote WebM should use the owned whole-read capability',
+            );
+          },
+        } as ByteSource & { readonly kind: 'url'; readAll(): Promise<Uint8Array> },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(0);
+    expect(wholeReads).toBe(1);
+  });
+
   it('WebmDriver.probe matches demux track metadata on the real AV1 WebM fixture', async () => {
     const bytes = await bytesFromMediaTest('av1_720p_5s.webm');
     const probeTracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));

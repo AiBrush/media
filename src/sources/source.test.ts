@@ -221,6 +221,8 @@ describe('fromStream', () => {
 });
 
 describe('fromURL', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('streams bytes from a (data:) URL', async () => {
     const src = fromURL(DATA_URL);
     expect(src.kind).toBe('url');
@@ -230,6 +232,29 @@ describe('fromURL', () => {
   it('ranges over a URL (falling back to a local slice when the server ignores Range)', async () => {
     const src = fromURL(new URL(DATA_URL));
     expect([...(await rangeOf(src, 1, 3))]).toEqual([1, 2]);
+  });
+
+  it('materializes an owned complete response directly and honors cancellation', async () => {
+    const requests: RequestInit[] = [];
+    vi.stubGlobal('fetch', ((_input: unknown, init?: RequestInit) => {
+      requests.push(init ?? {});
+      return Promise.resolve(
+        new Response(toBody(FIVE), {
+          status: 200,
+          // Fetch exposes decoded bytes; a transport Content-Length may describe a compressed body.
+          headers: { 'Content-Length': '999' },
+        }),
+      );
+    }) as typeof fetch);
+    const src = fromURL('https://cdn.test/complete.webm');
+    const readAll = src.readAll;
+    if (readAll === undefined) throw new Error('URL source must expose readAll()');
+    const controller = new AbortController();
+
+    expect(await readAll.call(src, controller.signal)).toEqual(FIVE);
+    expect(src.size).toBe(FIVE.byteLength);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.signal).toBe(controller.signal);
   });
 
   it('omits range() when rangeRequests is disabled', () => {
@@ -360,7 +385,9 @@ describe('stubbed-environment paths', () => {
 
   it('errors the stream when a fetch is not ok', async () => {
     vi.stubGlobal('fetch', () => Promise.resolve(new Response('nope', { status: 404 })));
-    await expect(readAll(fromURL('https://x/y.mp4').stream())).rejects.toBeInstanceOf(InputError);
+    const src = fromURL('https://x/y.mp4');
+    await expect(readAll(src.stream())).rejects.toBeInstanceOf(InputError);
+    await expect(src.readAll?.()).rejects.toBeInstanceOf(InputError);
   });
 
   it('returns a 206 range body verbatim and rejects a failed range fetch', async () => {
@@ -538,6 +565,25 @@ describe('probeUrlSize — body-free size detection', () => {
 
 describe('fromURL — learns size from a range read and clamps past-EOF', () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it('marks latency-critical sparse range reads high priority without changing the window', async () => {
+    let request: RequestInit | undefined;
+    vi.stubGlobal('fetch', ((_input: unknown, init?: RequestInit) => {
+      request = init;
+      return Promise.resolve(
+        new Response(toBody(FIVE.subarray(1, 3)), {
+          status: 206,
+          headers: { 'Content-Range': `bytes 1-2/${FIVE.byteLength}` },
+        }),
+      );
+    }) as typeof fetch);
+
+    expectBytesEqual(await fromURL(HREF).range?.(1, 3), FIVE.subarray(1, 3));
+    expect(request).toMatchObject({
+      headers: { Range: 'bytes=1-2' },
+      priority: 'high',
+    });
+  });
 
   it('memoizes the total length from the first range read (Content-Range)', async () => {
     const truth = await loadFixture(FIXTURE);

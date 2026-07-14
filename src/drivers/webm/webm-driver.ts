@@ -123,10 +123,17 @@ const OPUS_FRAME_SAMPLES: readonly number[] = [
   480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
 ];
 const FULL_RANGE_EPSILON_US = 50_000;
+/** One remote read is cheaper than prefix + terminal scan below this measured transfer crossover. */
+const SMALL_REMOTE_WHOLE_PROBE_MAX_BYTES = 256 * 1024;
 const WEBM_METADATA_PREFIX_BYTES = [
   8 * 1024,
   64 * 1024,
   256 * 1024,
+  1024 * 1024,
+  4 * 1024 * 1024,
+] as const;
+const WEBM_UNKNOWN_REMOTE_METADATA_PREFIX_BYTES = [
+  SMALL_REMOTE_WHOLE_PROBE_MAX_BYTES,
   1024 * 1024,
   4 * 1024 * 1024,
 ] as const;
@@ -1682,6 +1689,12 @@ async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Arra
     assertNotAborted(signal);
     return bytes;
   }
+  return readStreamAll(src, signal);
+}
+
+/** Materialize through the source's sequential stream even when a range facade also exists. */
+async function readStreamAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Array> {
+  assertNotAborted(signal);
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -1715,6 +1728,22 @@ async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Arra
   return out;
 }
 
+async function readOwnedWhole(src: ByteSource, signal?: AbortSignal): Promise<Uint8Array> {
+  const directReadAll = src.readAll;
+  // Custom seekable sources may not expose the optional direct-response seam. Retain the established
+  // known-size range fallback so a whole-metadata read never needlessly opens their stream facade.
+  if (directReadAll === undefined) return readAll(src, signal);
+  assertNotAborted(signal);
+  try {
+    const bytes = await directReadAll.call(src, signal);
+    assertNotAborted(signal);
+    return bytes;
+  } catch (error) {
+    if (signal?.aborted) throw abortedError();
+    throw error;
+  }
+}
+
 function findSegment(dv: DataView): EbmlElement | undefined {
   for (const el of elements(dv, 0, dv.byteLength)) {
     if (el.id === ID.Segment) return el;
@@ -1746,6 +1775,28 @@ function videoTracksHaveDefaultDuration(dv: DataView, segment: EbmlElement): boo
 }
 
 type MetadataReadiness = 'complete' | 'incomplete' | 'needs-terminal-scan';
+
+function isRemoteByteSource(src: ByteSource): boolean {
+  const kind = (src as ByteSource & { readonly kind?: string }).kind;
+  return kind === 'url' || kind === 'element';
+}
+
+type SizedByteSource = ByteSource & { readonly size: number };
+
+function shouldReadWholeRemoteMetadata(src: ByteSource): src is SizedByteSource {
+  return (
+    src.size !== undefined &&
+    src.size > 0 &&
+    src.size <= SMALL_REMOTE_WHOLE_PROBE_MAX_BYTES &&
+    isRemoteByteSource(src)
+  );
+}
+
+function metadataPrefixWindows(src: ByteSource): readonly number[] {
+  return src.size === undefined && isRemoteByteSource(src)
+    ? WEBM_UNKNOWN_REMOTE_METADATA_PREFIX_BYTES
+    : WEBM_METADATA_PREFIX_BYTES;
+}
 
 function metadataReadiness(bytes: Uint8Array, info: WebmInfo): MetadataReadiness {
   if (info.tracks.length === 0) return 'incomplete';
@@ -1794,7 +1845,25 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
   if (range === undefined) return parseWebm(await readAll(src, signal));
 
   let lastError: unknown;
-  for (const prefixBytes of WEBM_METADATA_PREFIX_BYTES) {
+  const wholeRemote = shouldReadWholeRemoteMetadata(src);
+  if (wholeRemote) {
+    const declaredSize = src.size;
+    const bytes = await readOwnedWhole(src, signal);
+    assertNotAborted(signal);
+    if (bytes.byteLength !== declaredSize) {
+      throw new InputError(
+        'unsupported-input',
+        `WebM source returned ${bytes.byteLength} bytes for declared size ${declaredSize}`,
+      );
+    }
+    return parseWebm(bytes, { sourceSizeBytes: bytes.byteLength });
+  }
+
+  // An unknown-size remote source otherwise pays one round trip for the 8 KiB header and another for
+  // the terminal scan as soon as that first 206 response reveals a small file. Start at the measured
+  // transfer crossover: a compliant range server clamps a smaller file to EOF in one response, while a
+  // large source remains bounded and can continue the ordinary metadata ladder without a whole read.
+  for (const prefixBytes of metadataPrefixWindows(src)) {
     assertNotAborted(signal);
     const end = src.size === undefined ? prefixBytes : Math.min(prefixBytes, src.size);
     const bytes = await range.call(src, 0, end);

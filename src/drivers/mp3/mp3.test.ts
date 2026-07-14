@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
@@ -62,6 +63,21 @@ function mp3TrackInfoForTest(info: Mp3Info): TrackInfo {
   };
 }
 
+const MEDIA_TEST_PROBE = new URL(
+  '../../../../media-test/fixtures/media/scenarios/probe/',
+  import.meta.url,
+);
+const EXHAUSTIVE_PROBE_MP3 = [
+  ['realworld_mdn_trex_mp3', 'realworld_mdn_trex.mp3'],
+  ['realworld_mdn_trex_mp3', '01.mp3'],
+  ['realworld_mdn_trex_mp3', '02.mp3'],
+  ['realworld_mdn_trex_mp3', '03.mp3'],
+  ['mp3_cbr_notoc', 'mp3_cbr_notoc.mp3'],
+  ['mp3_cbr_notoc', '01.mp3'],
+  ['mp3_cbr_notoc', '02.mp3'],
+  ['mp3_cbr_notoc', '03.mp3'],
+] as const;
+
 describe('Mp3Driver.supports', () => {
   it('recognizes frame-sync + ID3, mime, and extension; rejects others', async () => {
     const head = (await loadFixture('sound_5.mp3')).subarray(0, 16);
@@ -80,6 +96,31 @@ describe('Mp3Driver.supports', () => {
 });
 
 describe('probe MP3 on the real corpus', () => {
+  it.each(EXHAUSTIVE_PROBE_MP3)(
+    '%s/%s preserves exact metadata from one 2 KiB remote head',
+    async (scenario, file) => {
+      const bytes = new Uint8Array(
+        await readFile(new URL(`${scenario}/${file}`, MEDIA_TEST_PROBE)),
+      );
+      const ranges: Array<readonly [number, number]> = [];
+      const tracks = await Mp3Driver.probe?.({
+        kind: 'url',
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          ranges.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('exhaustive MP3 probe must remain range-backed');
+        },
+      } as ByteSource & { readonly kind: 'url' });
+      const expected = mp3TrackInfoForTest(parseMp3(bytes.subarray(0, 2 * 1024), bytes.byteLength));
+
+      expect(tracks).toEqual([expected]);
+      expect(ranges).toEqual([[0, 2 * 1024]]);
+    },
+  );
+
   it('sound_5.mp3 — sane params (invariants)', async () => {
     const info = await createMedia()
       .use(Mp3Module)
@@ -125,9 +166,9 @@ describe('probe MP3 on the real corpus', () => {
     };
 
     const tracks = await Mp3Driver.probe?.(src);
-    const expected = parseMp3(bytes.subarray(0, 16 * 1024), bytes.byteLength);
+    const expected = parseMp3(bytes.subarray(0, 2 * 1024), bytes.byteLength);
 
-    expect(ranges).toEqual([[0, 16 * 1024]]);
+    expect(ranges).toEqual([[0, 2 * 1024]]);
     expect(tracks).toEqual([
       {
         id: 0,
@@ -142,6 +183,98 @@ describe('probe MP3 on the real corpus', () => {
         ...(expected.gapless !== undefined ? { gapless: expected.gapless } : {}),
       },
     ]);
+  });
+
+  it('seeks over a large declared ID3v2 body and preserves the established CBR estimate', async () => {
+    const tagBodyBytes = 4 * 1024;
+    const id3 = new Uint8Array(10 + tagBodyBytes);
+    id3.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 32, 0]);
+    const audio = new Uint8Array([...pad(header(), frameLen()), ...pad(header(), frameLen())]);
+    const bytes = new Uint8Array(20 * 1024);
+    bytes.set(id3);
+    bytes.set(audio, id3.byteLength);
+    const ranges: Array<readonly [number, number]> = [];
+
+    const tracks = await Mp3Driver.probe?.({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('large-ID3 MP3 probe must remain range-backed');
+      },
+    });
+    const expected = mp3TrackInfoForTest(parseMp3(bytes.subarray(0, 16 * 1024), bytes.byteLength));
+
+    expect(tracks).toEqual([expected]);
+    expect(ranges).toEqual([
+      [0, 2 * 1024],
+      [id3.byteLength, id3.byteLength + 2 * 1024],
+    ]);
+  });
+
+  it('grows the targeted post-ID3 window when frame sync lies beyond the first 2 KiB', async () => {
+    const tagBodyBytes = 4 * 1024;
+    const id3 = new Uint8Array(10 + tagBodyBytes);
+    id3.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 32, 0]);
+    const frameOffset = id3.byteLength + 3 * 1024;
+    const bytes = new Uint8Array(32 * 1024);
+    bytes.set(id3);
+    bytes.set(pad(header(), frameLen()), frameOffset);
+    bytes.set(pad(header(), frameLen()), frameOffset + frameLen());
+    const ranges: Array<readonly [number, number]> = [];
+
+    const tracks = await Mp3Driver.probe?.({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('targeted MP3 metadata growth must remain range-backed');
+      },
+    });
+    const expected = mp3TrackInfoForTest(
+      parseMp3(bytes.subarray(id3.byteLength, id3.byteLength + 16 * 1024), bytes.byteLength, id3.byteLength),
+    );
+
+    expect(tracks).toEqual([expected]);
+    expect(ranges).toEqual([
+      [0, 2 * 1024],
+      [id3.byteLength, id3.byteLength + 2 * 1024],
+      [id3.byteLength, id3.byteLength + 16 * 1024],
+    ]);
+  });
+
+  it('rechecks cancellation after the targeted post-ID3 metadata window', async () => {
+    const tagBodyBytes = 4 * 1024;
+    const id3 = new Uint8Array(10 + tagBodyBytes);
+    id3.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 32, 0]);
+    const audio = new Uint8Array([...pad(header(), frameLen()), ...pad(header(), frameLen())]);
+    const bytes = new Uint8Array(20 * 1024);
+    bytes.set(id3);
+    bytes.set(audio, id3.byteLength);
+    const controller = new AbortController();
+    let reads = 0;
+
+    await expect(
+      Mp3Driver.probe?.(
+        {
+          size: bytes.byteLength,
+          range(start, end): Promise<Uint8Array> {
+            reads++;
+            if (reads === 2) controller.abort('cancel post-ID3 MP3 probe');
+            return Promise.resolve(bytes.subarray(start, end));
+          },
+          stream(): ReadableStream<Uint8Array> {
+            throw new Error('cancelled large-ID3 MP3 probe must remain range-backed');
+          },
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(2);
   });
 });
 

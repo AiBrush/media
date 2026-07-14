@@ -96,6 +96,8 @@ const REMOTE_DEMUX_LAYOUT_PREFETCH_BYTES = 256 * 1024;
 const VIDEO_METADATA_LAYOUT_WINDOW_BYTES = 16 * 1024;
 const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
+const AUDIO_FASTSTART_TRACK_PREFIX_MAX_BYTES = 128 * 1024;
+const AUDIO_FASTSTART_SCALAR_BOX_MAX_BYTES = 128 * 1024;
 const FULL_RANGE_EOF_SLACK_SEC = 0.05;
 const SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES = 1024 * 1024;
 const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
@@ -393,12 +395,23 @@ function rememberTrimDecodeValidation(key: string | undefined): void {
   trimDecodeValidationCache.set(key, nowMs + TRIM_DECODE_VALIDATION_CACHE_TTL_MS);
 }
 
-function shouldTryTinyAudioFaststartProbe(src: ByteSource, ra: RandomAccess): boolean {
-  if (ra.size === undefined || ra.size > TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES) return false;
+function isKnownAudioFaststartSource(src: ByteSource, ra: RandomAccess): ra is SizedRandomAccess {
+  if (ra.size === undefined) return false;
   const mime = sourceMimeHint(src)?.toLowerCase();
   if (mime !== undefined && (mime === 'audio/mp4' || mime === 'audio/x-m4a')) return true;
   const key = sourceCacheKey(src);
   return key !== undefined && /\.m4a(?:[?#]|$)/i.test(key);
+}
+
+function shouldTryTinyAudioFaststartProbe(src: ByteSource, ra: RandomAccess): boolean {
+  return isKnownAudioFaststartSource(src, ra) && ra.size <= TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES;
+}
+
+function shouldTrySparseAudioFaststartProbe(
+  src: ByteSource,
+  ra: RandomAccess,
+): ra is SizedRandomAccess {
+  return isKnownAudioFaststartSource(src, ra) && ra.size > TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES;
 }
 
 function shouldTrySimpleVideoFaststartProbe(
@@ -406,6 +419,7 @@ function shouldTrySimpleVideoFaststartProbe(
   ra: RandomAccess,
 ): ra is SizedRandomAccess {
   if (ra.size === undefined || ra.size <= 0) return false;
+  if (isKnownAudioFaststartSource(src, ra)) return false;
   const mime = sourceMimeHint(src)?.toLowerCase();
   if (mime !== undefined) {
     return mime.startsWith('video/') || mime === 'application/mp4';
@@ -701,6 +715,193 @@ async function readTinyAudioFaststartProbeTracks(
 ): Promise<readonly TrackInfo[] | undefined> {
   const { readTinyAudioFaststartProbe } = await loadFaststartProbeModule();
   return readTinyAudioFaststartProbe(ra);
+}
+
+interface DeclaredProbeBox extends TopBoxHeader {
+  readonly start: number;
+  readonly end: number;
+  readonly payloadStart: number;
+}
+
+function declaredProbeBoxAt(bytes: Uint8Array, start: number): DeclaredProbeBox | undefined {
+  const header = topBoxHeader(bytes, start);
+  if (header === undefined) return undefined;
+  const end = start + header.size;
+  if (!Number.isSafeInteger(end)) return undefined;
+  return { ...header, start, end, payloadStart: start + header.headerSize };
+}
+
+function declaredProbeChild(
+  bytes: Uint8Array,
+  parent: DeclaredProbeBox,
+  type: string,
+): DeclaredProbeBox | undefined {
+  let offset = parent.payloadStart;
+  while (offset + 8 <= Math.min(parent.end, bytes.byteLength)) {
+    const child = declaredProbeBoxAt(bytes, offset);
+    if (child === undefined || child.end > parent.end) return undefined;
+    if (child.type === type) return child;
+    if (child.end > bytes.byteLength) return undefined;
+    offset = child.end;
+  }
+  return undefined;
+}
+
+function patchCompactProbeBoxSize(bytes: Uint8Array, box: DeclaredProbeBox, end: number): void {
+  const size = end - box.start;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const relativeStart = box.start;
+  if (box.headerSize === 8) {
+    view.setUint32(relativeStart, size, false);
+    return;
+  }
+  view.setUint32(relativeStart, 1, false);
+  view.setUint32(relativeStart + 8, Math.floor(size / 2 ** 32), false);
+  view.setUint32(relativeStart + 12, size >>> 0, false);
+}
+
+/**
+ * Compact one audio `trak` prefix at the `stsz` count header. Probe needs the count but never the
+ * per-sample size array or placement tables. Parent sizes are rewritten in an owned copy so the
+ * ordinary strict audio metadata parser remains the sole truth implementation.
+ */
+export function compactAudioProbeTrack(prefix: Uint8Array): Uint8Array | undefined {
+  const trak = declaredProbeBoxAt(prefix, 0);
+  if (trak === undefined || trak.type !== 'trak') return undefined;
+  const mdia = declaredProbeChild(prefix, trak, 'mdia');
+  const minf = mdia === undefined ? undefined : declaredProbeChild(prefix, mdia, 'minf');
+  const stbl = minf === undefined ? undefined : declaredProbeChild(prefix, minf, 'stbl');
+  if (mdia === undefined || minf === undefined || stbl === undefined) return undefined;
+
+  let stsdComplete = false;
+  let sttsComplete = false;
+  let stsz: DeclaredProbeBox | undefined;
+  let offset = stbl.payloadStart;
+  while (offset + 8 <= Math.min(stbl.end, prefix.byteLength)) {
+    const child = declaredProbeBoxAt(prefix, offset);
+    if (child === undefined || child.end > stbl.end) return undefined;
+    if (child.type === 'stsd') stsdComplete = child.end <= prefix.byteLength;
+    if (child.type === 'stts') sttsComplete = child.end <= prefix.byteLength;
+    if (child.type === 'stsz') {
+      stsz = child;
+      break;
+    }
+    if (child.end > prefix.byteLength) return undefined;
+    offset = child.end;
+  }
+  if (stsz === undefined || !stsdComplete || !sttsComplete) return undefined;
+  const compactEnd = stsz.payloadStart + 12;
+  if (compactEnd > prefix.byteLength || compactEnd > stsz.end) return undefined;
+  const sampleCount = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength).getUint32(
+    stsz.payloadStart + 8,
+    false,
+  );
+  if (sampleCount === 0) return undefined;
+
+  const compact = prefix.slice(0, compactEnd);
+  for (const box of [trak, mdia, minf, stbl]) {
+    patchCompactProbeBoxSize(compact, box, compactEnd);
+  }
+  patchCompactProbeBoxSize(compact, stsz, compactEnd);
+  return compact;
+}
+
+function joinProbeBoxes(parts: readonly Uint8Array[]): Uint8Array {
+  let size = 0;
+  for (const part of parts) size += part.byteLength;
+  const out = new Uint8Array(size);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Read an audio-only faststart movie without materializing variable-width `stsz` bodies. Declared
+ * top-level/trak sizes locate every sibling track, so a large first table can never hide a later
+ * track. Any fragmented, reordered, encrypted, non-AAC, or incomplete layout returns `undefined` and
+ * is reparsed by the established full metadata path.
+ */
+async function readSparseAudioFaststartProbeTracks(
+  ra: SizedRandomAccess,
+  signal: AbortSignal | undefined,
+): Promise<readonly TrackInfo[] | undefined> {
+  const prefetchBytes = Math.min(
+    ra.size,
+    ra.metadataPrefetchBytes ?? FASTSTART_METADATA_PREFETCH_BYTES,
+  );
+  let windowStart = 0;
+  let window = await ra.read(0, prefetchBytes);
+  throwIfAborted(signal);
+  let topOffset = 0;
+  let moov: DeclaredProbeBox | undefined;
+  while (topOffset + 8 <= window.byteLength) {
+    const box = declaredProbeBoxAt(window, topOffset);
+    if (box === undefined || box.end > ra.size) return undefined;
+    if (box.type === 'moov') {
+      moov = box;
+      break;
+    }
+    if (box.end > window.byteLength) return undefined;
+    topOffset = box.end;
+  }
+  if (moov === undefined) return undefined;
+
+  const parts: Uint8Array[] = [];
+  let movieHeaderFound = false;
+  let trackCount = 0;
+  let offset = moov.payloadStart;
+  const moovEnd = moov.end;
+  while (offset + 8 <= moovEnd) {
+    const coveredOffset = offset - windowStart;
+    if (coveredOffset < 0 || coveredOffset + 8 > window.byteLength) {
+      const length = Math.min(
+        ra.metadataPrefetchBytes ?? FASTSTART_METADATA_PREFETCH_BYTES,
+        moovEnd - offset,
+      );
+      windowStart = offset;
+      window = await ra.read(offset, length);
+      throwIfAborted(signal);
+    }
+    const relativeOffset = offset - windowStart;
+    const relativeBox = declaredProbeBoxAt(window, relativeOffset);
+    if (relativeBox === undefined) return undefined;
+    const end = offset + relativeBox.size;
+    if (!Number.isSafeInteger(end) || end <= offset || end > moovEnd) return undefined;
+    const availableEnd = Math.min(relativeBox.end, window.byteLength);
+    let available = window.subarray(relativeBox.start, availableEnd);
+
+    if (relativeBox.type === 'mvex') return undefined;
+    if (relativeBox.type === 'mvhd') {
+      if (movieHeaderFound || relativeBox.size > AUDIO_FASTSTART_SCALAR_BOX_MAX_BYTES) {
+        return undefined;
+      }
+      if (available.byteLength < relativeBox.size) {
+        available = await ra.read(offset, relativeBox.size);
+        throwIfAborted(signal);
+      }
+      if (available.byteLength < relativeBox.size) return undefined;
+      parts.push(available.subarray(0, relativeBox.size));
+      movieHeaderFound = true;
+    } else if (relativeBox.type === 'trak') {
+      let compact = compactAudioProbeTrack(available);
+      if (compact === undefined && available.byteLength < relativeBox.size) {
+        const prefixLength = Math.min(relativeBox.size, AUDIO_FASTSTART_TRACK_PREFIX_MAX_BYTES);
+        const prefix = await ra.read(offset, prefixLength);
+        throwIfAborted(signal);
+        compact = compactAudioProbeTrack(prefix);
+      }
+      if (compact === undefined) return undefined;
+      parts.push(compact);
+      trackCount++;
+    }
+    offset = end;
+  }
+  if (offset !== moovEnd || !movieHeaderFound || trackCount === 0) return undefined;
+  const { parseAudioFaststartProbeTracks } = await loadFaststartProbeModule();
+  return parseAudioFaststartProbeTracks(joinProbeBoxes(parts));
 }
 
 /** A fragmented track whose initialization `stbl` declares no progressive samples at all. */
@@ -3939,6 +4140,11 @@ export const Mp4Driver: ContainerDriver = {
     }
     if (shouldTryTinyAudioFaststartProbe(src, ra)) {
       const tracks = await readTinyAudioFaststartProbeTracks(ra);
+      throwIfAborted(signal);
+      if (tracks !== undefined) return tracks;
+    }
+    if (shouldTrySparseAudioFaststartProbe(src, ra)) {
+      const tracks = await readSparseAudioFaststartProbeTracks(ra, signal);
       throwIfAborted(signal);
       if (tracks !== undefined) return tracks;
     }

@@ -1,16 +1,28 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
-import { Mp4Driver, Mp4Module, readMovie, readMovieMetadata } from './mp4-driver.ts';
+import {
+  compactAudioProbeTrack,
+  Mp4Driver,
+  Mp4Module,
+  readMovie,
+  readMovieMetadata,
+} from './mp4-driver.ts';
 import { buildSamples } from './samples.ts';
 import { type MuxTrackInput, writeMp4 } from './write.ts';
 
 type CacheKeyedByteSource = ByteSource & { readonly [SOURCE_CACHE_KEY]: string };
 type MimeHintedByteSource = ByteSource & { readonly mimeHint: string };
 type UrlByteSource = ByteSource & { readonly kind: 'url' };
+
+const LONGFORM_AUDIO_FIXTURE = new URL(
+  '../../../../media-test/fixtures/media/scenarios/probe/longform_1h_audio/longform_1h_audio.m4a',
+  import.meta.url,
+).pathname;
 
 function makeRA(bytes: Uint8Array) {
   return {
@@ -107,6 +119,20 @@ function box64(type: string, ...payload: Uint8Array[]): Uint8Array {
   out.set(u64(out.byteLength), 8);
   out.set(body, 16);
   return out;
+}
+
+function compactProbeTrackFixture(
+  sampleTableChildren: readonly Uint8Array[],
+  parentBox: typeof box | typeof box64 = box,
+): Uint8Array {
+  return parentBox(
+    'trak',
+    parentBox('mdia', parentBox('minf', parentBox('stbl', ...sampleTableChildren))),
+  );
+}
+
+function compactProbeStsz(sampleCount: number, ...sampleSizes: number[]): Uint8Array {
+  return fullBox('stsz', 0, 0, u32(0), u32(sampleCount), ...sampleSizes.map(u32));
 }
 
 function fullBox(
@@ -250,6 +276,76 @@ describe('Mp4Driver.supports', () => {
       false,
     );
     expect(Mp4Driver.supports({ direction: 'demux' })).toBe(false);
+  });
+});
+
+describe('sparse M4A track compaction structural guards', () => {
+  const stsdBox = box('stsd');
+  const sttsBox = box('stts');
+
+  it('compacts both ordinary and extended-size parent boxes through the stsz count', () => {
+    const stszBox = compactProbeStsz(3, 11, 12, 13);
+    const trailing = box('stco', u32(0));
+
+    for (const parentBox of [box, box64]) {
+      const source = compactProbeTrackFixture([stsdBox, sttsBox, stszBox, trailing], parentBox);
+      const compact = compactAudioProbeTrack(source);
+      expect(compact).toBeDefined();
+      expect(compact?.byteLength).toBeLessThan(source.byteLength);
+      if (parentBox === box) {
+        expect(u32At(compact ?? new Uint8Array(4), 0)).toBe(compact?.byteLength);
+      } else {
+        expect(u32At(compact ?? new Uint8Array(16), 0)).toBe(1);
+        expect(u32At(compact ?? new Uint8Array(16), 12)).toBe(compact?.byteLength);
+      }
+    }
+  });
+
+  it('rejects malformed, incomplete, reordered, and zero-sample track structures', () => {
+    const oversizedChild = new Uint8Array(8);
+    new DataView(oversizedChild.buffer).setUint32(0, 100);
+    oversizedChild.set(ascii('stsd'), 4);
+
+    const childBeyondAvailableBytes = new Uint8Array(16);
+    const beyondView = new DataView(childBeyondAvailableBytes.buffer);
+    beyondView.setUint32(0, 1000);
+    childBeyondAvailableBytes.set(ascii('trak'), 4);
+    beyondView.setUint32(8, 500);
+    childBeyondAvailableBytes.set(ascii('free'), 12);
+
+    const unsafeExtendedRoot = new Uint8Array(16);
+    const unsafeView = new DataView(unsafeExtendedRoot.buffer);
+    unsafeView.setUint32(0, 1);
+    unsafeExtendedRoot.set(ascii('trak'), 4);
+    unsafeView.setUint32(8, 0x20_0000);
+
+    const cases: readonly (readonly [string, Uint8Array])[] = [
+      ['short root header', new Uint8Array(7)],
+      ['unsafe extended root size', unsafeExtendedRoot],
+      ['wrong root type', box('free')],
+      ['missing mdia', box('trak')],
+      ['child exceeds parent', box('trak', oversizedChild)],
+      ['child exceeds available prefix', childBeyondAvailableBytes],
+      ['missing minf', box('trak', box('mdia'))],
+      ['missing stbl', box('trak', box('mdia', box('minf')))],
+      ['missing stsd', compactProbeTrackFixture([sttsBox, compactProbeStsz(1, 11)])],
+      ['missing stts', compactProbeTrackFixture([stsdBox, compactProbeStsz(1, 11)])],
+      ['missing stsz', compactProbeTrackFixture([stsdBox, sttsBox])],
+      [
+        'stsz precedes required declarations',
+        compactProbeTrackFixture([compactProbeStsz(1, 11), stsdBox, sttsBox]),
+      ],
+      [
+        'stsz count header is truncated',
+        compactProbeTrackFixture([stsdBox, sttsBox, box('stsz', zeros(8))]),
+      ],
+      ['zero sample count', compactProbeTrackFixture([stsdBox, sttsBox, compactProbeStsz(0)])],
+      ['sample-table child exceeds stbl', compactProbeTrackFixture([oversizedChild])],
+    ];
+
+    for (const [name, bytes] of cases) {
+      expect(compactAudioProbeTrack(bytes), name).toBeUndefined();
+    }
   });
 });
 
@@ -677,6 +773,102 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       trailingSamples: 0,
       totalSamples: 4410,
     });
+  });
+
+  it('metadata-only M4A probe skips a large per-sample stsz body without losing track truth', async () => {
+    const bytes = new Uint8Array(await readFile(LONGFORM_AUDIO_FIXTURE));
+    const expected = await Mp4Driver.probe?.({
+      size: bytes.byteLength,
+      stream: () => streamBytes(bytes),
+    });
+    const reads: Array<readonly [number, number]> = [];
+    const src: CacheKeyedByteSource & UrlByteSource = {
+      size: bytes.byteLength,
+      kind: 'url',
+      [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/longform-audio.m4a',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    const tracks = await Mp4Driver.probe?.(src);
+
+    expect(tracks).toEqual(expected);
+    expect(tracks).toHaveLength(1);
+    expect(tracks?.[0]).toMatchObject({
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      durationSec: 3600.021333333333,
+      config: { sampleRate: 48_000, numberOfChannels: 1 },
+    });
+    expect(reads).toEqual([
+      [0, 128 * 1024],
+      [675_889, 675_950],
+    ]);
+  });
+
+  it('metadata-only M4A compaction cannot hide a second track behind the first large stsz table', async () => {
+    const data = new Uint8Array([0x21]);
+    const samples = Array.from({ length: 20_000 }, () => ({
+      data,
+      durationTicks: 1024,
+      cttsTicks: 0,
+      keyframe: true,
+    }));
+    const bytes = writeMp4(
+      [
+        smallAacTrack({ samples }),
+        smallAacTrack({ channels: 1, description: new Uint8Array([0x12, 0x08]), samples }),
+      ],
+      { faststart: true },
+    );
+    const expected = await Mp4Driver.probe?.({
+      size: bytes.byteLength,
+      stream: () => streamBytes(bytes),
+    });
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await Mp4Driver.probe?.({
+      size: bytes.byteLength,
+      kind: 'url',
+      [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/two-large-tracks.m4a',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    } as CacheKeyedByteSource & UrlByteSource);
+
+    expect(tracks).toEqual(expected);
+    expect(tracks).toHaveLength(2);
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.length).toBeLessThanOrEqual(2);
+    expect(reads[0]?.[0]).toBe(0);
+    expect(reads.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(140 * 1024);
+  });
+
+  it('metadata-only sparse M4A probe rechecks cancellation after its structural tail read', async () => {
+    const bytes = new Uint8Array(await readFile(LONGFORM_AUDIO_FIXTURE));
+    const controller = new AbortController();
+    let reads = 0;
+    await expect(
+      Mp4Driver.probe?.(
+        {
+          size: bytes.byteLength,
+          kind: 'url',
+          [SOURCE_CACHE_KEY]: 'url:https://fixtures.test/cancelled-longform.m4a',
+          stream: () => streamBytes(bytes),
+          range: (start, end) => {
+            reads++;
+            if (reads === 2) controller.abort('cancel sparse tail');
+            return Promise.resolve(bytes.subarray(start, end));
+          },
+        } as CacheKeyedByteSource & UrlByteSource,
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(reads).toBe(2);
   });
 
   it('metadata-only probe uses an audio MIME hint for tiny M4A and omits gapless without edit timing', async () => {

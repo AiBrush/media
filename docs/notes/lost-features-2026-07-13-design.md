@@ -297,3 +297,86 @@ The authoritative status table is `docs/perf/lost-features-2026-07-13-checklist.
 recorded only from a no-reuse Chromium export, with the suite version, corpus checksum, browser/GPU,
 competitor cells, timings, and raw JSON path. Any architecture change is recorded in
 `docs/architecture/02-decision-records.md` in the same green commit.
+
+### Batch M — Copy untouched audio during video transcodes
+
+**Goal.** Remove the avoidable audio decode/filter/encode leg when `convert()` changes video but leaves
+audio unspecified. The fresh Chromium measurements for `transcode/av1_to_vp9_webm` and
+`transcode/extreme_fps_240` both passed strict output oracles but paid the full audio codec cost even
+though the source audio codec/config was legal for the requested output container.
+
+**Design note.** Add a pure destination-contract predicate over the output container, source audio codec,
+and decoder config. Only an unencrypted, configured audio track with `opts.audio === undefined` may use
+the copy route. The engine then feeds the demuxer's real `Packet` stream to the muxer beside the video
+decode/filter/encode task; unsupported codec/container pairs retain the existing audio WebCodecs path.
+Packets carry their source PTS/DTS, duration, and payload view, so B-frame video timing is independent and
+unchanged, while VFR video and audio clock timelines remain exactly as demuxed. Seeking is not introduced
+into convert: a future trim/seek path must still select a keyframe and rebase packets through its own
+contract. Cancellation cancels the packet drain with the same operation signal and aborts sibling video
+tasks. No `VideoFrame` or `AudioData` is created by the copy branch, so no new frame lifetime exists; the
+demuxer and muxer continue to own packet bytes according to their existing contracts.
+
+Backpressure remains bounded by the mux drain's reader and the demuxer's zero-high-water packet stream;
+there is no whole-track audio buffer. Peak memory drops by removing decoded audio frames and encoder
+queueing, while the muxer still buffers only its existing output representation. Gapless metadata,
+codec-delay, channel/rate config, and container-side descriptions are passed through the original
+`TrackInfo`, not reconstructed. Strict validation uses real AV1/Opus WebM and H.264/AAC MP4 corpus inputs
+with baked SSIM/duration/playback oracles; the benchmark is warmup 1 plus five fresh wall samples for all
+registered competitors. The affected unit test proves legal/illegal destination contracts and packet
+drain ownership; the browser matrix is the acceptance gate.
+
+**Rejected:** copying audio for an explicit audio target; assuming a codec is legal from its family token
+without checking the destination contract/config; buffering audio packets to synchronize tracks; dropping
+gapless or codec-delay metadata; or creating an adapter-only audio shortcut.
+
+### Batch N — Use realtime latency for implicit AV1→VP9 VOD encodes
+
+**Goal.** Reduce the remaining `transcode/av1_to_vp9_webm` loss after untouched Opus packet copy removed
+the unrelated audio work. Fresh Chromium strict samples still measured 8.819 s for aibrush-media versus
+7.383 s for Mediabunny and 5.699 s for Remotion, with SSIM and playback passing.
+
+**Design note.** When the caller does not specify bitrate mode, bitrate, CRF, or two-pass allocation, and
+the source is AV1, the target is ordinary-cadence VP9 VOD, select WebCodecs `latencyMode: 'realtime'`.
+Keep quality mode for explicit rate controls, high-cadence targets, unknown cadence, other source codecs,
+and fragmented output. This is an encoder scheduling choice, not a pixel or timestamp shortcut: decoded
+B-frame presentation order and VFR PTS remain untouched, the encoder still receives every frame, and the
+output mux uses the published decoder config. Seeking stays outside convert and retains keyframe semantics.
+Abort closes the same encoder/frame pipeline; every `VideoFrame` remains owned by the encoder stage and is
+closed exactly once. The existing positive stream high-water marks bound frames in flight and realtime
+mode lowers encoder scheduling latency without growing memory. The codec request high-water mark is raised
+from 8 to 16 only as a bounded pipeline constant, so native scheduling can overlap decode and encode without
+turning the stream into an unbounded queue. Strict AV1 WebM→VP9 SSIM/playback oracles
+and fresh five-sample Chromium competitor timings are the acceptance gate; explicit-rate and high-cadence
+unit cases prove the optimization does not broaden beyond its evidence.
+
+**Rejected:** lowering bitrate/CRF to win wall time; skipping AV1 frames; rewriting timestamps; applying
+realtime mode to explicit quality contracts or high-FPS output; or declaring the row won without strict
+pixel/playback validation.
+
+### Batch O — Bound implicit VP9 rate control by trustworthy source evidence
+
+**Goal and diagnosis.** The fresh exhaustive Chromium run for `transcode/av1_to_vp9_webm` measured every
+candidate WebM input with all six competitor cells present. The three longer 1080p AV1 files remained
+strict PASS, but aibrush-media was approximately 20% slower than Mediabunny and Remotion. The common
+cause is the implicit video-rate policy: the generic VP9 path requested `20 bits/pixel/second`, or about
+33 Mb/s at 1920×1080, although the source AV1 files and reference engines produce a materially smaller
+quality-preserving envelope. This is a general policy correction for implicit lossy output, not a
+fixture-path or codec-specific exception.
+
+**Design note.** Only the absence of explicit `bitrate`, `bitrateMode`, `crf`, and two-pass controls may
+use the bounded implicit rate. Explicit controls remain unchanged. The bound is derived from a finite,
+positive source video bitrate when it is trustworthy, scaled for output pixel rate and target codec
+efficiency, and clamped to a conservative floor and codec level ceiling; if no source bitrate is
+available, the existing dimension-based fallback remains. B-frames and VFR retain their input PTS/DTS
+and are not flattened by the rate change. Seeking still uses the original keyframe/timestamp structure.
+Cancellation aborts the same decoder/encoder/mux task group. Every `VideoFrame` and `AudioData` ownership
+path is unchanged and still closes exactly once. Memory stays bounded by the existing decoder/encoder
+queue limits (the current fixed queue budget is 16), and backpressure still waits on `dequeue` before
+submitting more work. Strict validation is the real AV1 WebM corpus with baked SSIM/playback goldens plus
+exhaustive real-file structural/playback checks; the benchmark is five fresh wall samples per candidate
+and competitor.
+
+**Acceptance boundary.** The optimization must preserve strict SSIM/playback PASS for every AV1→VP9
+corpus candidate and must not change explicit rate-control config tests. It is accepted only if the fresh
+exhaustive Chromium aggregate closes the measured loss without adding an NA, changing scoring, or
+weakening any oracle.

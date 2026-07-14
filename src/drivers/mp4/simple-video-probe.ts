@@ -370,7 +370,7 @@ function probeSttsDurationTicks(r: Reader, stbl: BoxHeader): number | undefined 
   return durationTicks;
 }
 
-function parseTinyAudioFaststartProbeTracks(moov: Uint8Array): readonly TrackInfo[] | undefined {
+export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly TrackInfo[] | undefined {
   const r = new Reader(moov);
   const root: BoxHeader = {
     type: 'moov',
@@ -431,7 +431,7 @@ export async function readTinyAudioFaststartProbe(
     if (header === undefined) return undefined;
     if (header.type === 'moov') {
       if (offset + header.size > head.byteLength) return undefined;
-      return parseTinyAudioFaststartProbeTracks(
+      return parseAudioFaststartProbeTracks(
         head.subarray(offset + header.headerSize, offset + header.size),
       );
     }

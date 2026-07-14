@@ -28,7 +28,11 @@ import {
   nativeFlacMetadata,
   parseFlac,
 } from './flac-driver.ts';
-import { flacMetadataLayout, flacPacketInfoTable } from './flac-sniff.ts';
+import {
+  flacMetadataLayout,
+  flacPacketInfoTable,
+  readSeekableFlacStreamInfo,
+} from './flac-sniff.ts';
 
 const md5 = (b: Uint8Array): string => createHash('md5').update(b).digest('hex');
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
@@ -197,8 +201,122 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
 
     const info = await media.probeContainer(src, 'flac');
     expect(info.tracks).toHaveLength(1);
-    expect(reads).toEqual([[0, 4096]]);
+    expect(reads).toEqual([[0, 64]]);
     expect(streamReads).toBe(0);
+  });
+
+  it('sparse-jumps over a large legal ID3v2 prefix instead of transferring its payload', async () => {
+    const native = buildFlac({ sampleRate: 44_100, channels: 2, bps: 24, totalSamples: 88_200 });
+    const tagBytes = 16 * 1024;
+    const flacOffset = 10 + tagBytes;
+    const bytes = new Uint8Array(flacOffset + native.byteLength);
+    bytes.set([0x49, 0x44, 0x33, 0x04, 0, 0], 0);
+    bytes.set(
+      [
+        (tagBytes >>> 21) & 0x7f,
+        (tagBytes >>> 14) & 0x7f,
+        (tagBytes >>> 7) & 0x7f,
+        tagBytes & 0x7f,
+      ],
+      6,
+    );
+    bytes.set(native, flacOffset);
+    const reads: Array<readonly [number, number]> = [];
+    const src: Source = {
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/flac',
+      filename: 'tagged.flac',
+      size: bytes.byteLength,
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream: () => {
+        throw new Error('seekable FLAC probe must not open a stream');
+      },
+    };
+    const media = createMedia() as unknown as {
+      probeContainer(
+        input: Source,
+        container: 'flac',
+      ): Promise<{ readonly durationSec: number; readonly tracks: readonly unknown[] }>;
+    };
+
+    const info = await media.probeContainer(src, 'flac');
+
+    expect(info.durationSec).toBe(2);
+    expect(info.tracks).toHaveLength(1);
+    expect(reads).toEqual([
+      [0, 64],
+      [flacOffset, flacOffset + 42],
+    ]);
+  });
+
+  it('preserves seekable-probe fallback, cancellation, and short-range transport semantics', async () => {
+    const bytes = buildFlac({ sampleRate: 44_100, channels: 2, totalSamples: 44_100 });
+    const stream = (): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+
+    await expect(readSeekableFlacStreamInfo({ stream })).resolves.toBeUndefined();
+
+    let abortedReads = 0;
+    await expect(
+      readSeekableFlacStreamInfo(
+        {
+          stream,
+          range(): Promise<Uint8Array> {
+            abortedReads++;
+            return Promise.resolve(bytes);
+          },
+        },
+        AbortSignal.abort('cancel FLAC probe'),
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(abortedReads).toBe(0);
+
+    const reads: Array<readonly [number, number]> = [];
+    const info = await readSeekableFlacStreamInfo({
+      stream,
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(reads.length === 1 ? bytes.subarray(0, 16) : bytes.subarray(start, end));
+      },
+    });
+    expect(info).toMatchObject({ sampleRate: 44_100, channels: 2, totalSamples: 44_100 });
+    expect(reads).toEqual([
+      [0, 64],
+      [0, 42],
+    ]);
+  });
+
+  it('probes a non-seekable FLAC stream through the canonical full parser', async () => {
+    const bytes = buildFlac({ sampleRate: 48_000, channels: 1, totalSamples: 24_000 });
+    const tracks = await FlacDriver.probe?.({
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+    });
+
+    expect(tracks).toEqual([
+      {
+        id: 0,
+        mediaType: 'audio',
+        codec: 'flac',
+        durationSec: 0.5,
+        config: { codec: 'flac', sampleRate: 48_000, numberOfChannels: 1 },
+      },
+    ]);
   });
 
   it('zero-config packetInfo enumerates native FLAC frame facts without payload streams', async () => {

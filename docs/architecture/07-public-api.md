@@ -196,6 +196,12 @@ ambiguous HLS signature peek consumes and replay-wraps only the single-use kind.
 source it closes the bounded sniff reader and returns the original source identity, so subsequent image and
 container routing may legally open fresh readers (ADR-212).
 
+URL-backed and byte-mode media-element sources may additionally expose the internal optional `readAll`
+capability (ADR-309). It returns one owned buffer from an abortable complete response and learns response
+size/effective URL facts. Drivers may use it only after proving from general format and source policy that
+all bytes are required; it does not replace bounded `range()` probing or the pull-driven `stream()` contract.
+Custom sources may omit it, in which case whole-file consumers retain the cancellation-aware stream path.
+
 A direct `ReadableStream<Uint8Array>` remains one-shot but is fully routable (ADR-231). Increasing HLS,
 image, and container-magic peeks retain only their bounded prefix and replay those exact chunks into the
 sole downstream reader before continuing it under pull backpressure; cancellation owns and releases that

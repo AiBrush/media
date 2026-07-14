@@ -109,6 +109,7 @@ export function sourceGeometryOf(track: TrackInfo): SourceGeometry {
       height: config.codedHeight,
       ...(track.fps !== undefined ? { fps: track.fps } : {}),
       ...(durationSec !== undefined ? { durationSec } : {}),
+      ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
     };
   }
   return {
@@ -116,6 +117,7 @@ export function sourceGeometryOf(track: TrackInfo): SourceGeometry {
     height: undefined,
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(durationSec !== undefined ? { durationSec } : {}),
+    ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
   };
 }
 

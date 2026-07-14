@@ -17,6 +17,7 @@ import type {
   EncodedChunk,
   EncoderConfig,
   Packet,
+  PacketMetadata,
   RawFrame,
   StageOptions,
   TrackInfo,
@@ -527,6 +528,7 @@ export function requireEncoderConfig<T>(config: T | undefined, media: 'video' | 
 /** The public video token a WebCodecs/MP4 codec string denotes (`avc1.*`→`h264`), for preserve-source. */
 export function videoCodecToken(codecString: string): VideoCodec | undefined {
   const c = codecString.toLowerCase();
+  if (c === 'h264' || c === 'hevc' || c === 'vp8' || c === 'vp9' || c === 'av1') return c;
   if (c.startsWith('avc1') || c.startsWith('avc3')) return 'h264';
   if (c.startsWith('hev1') || c.startsWith('hvc1')) return 'hevc';
   if (c.startsWith('vp8')) return 'vp8';
@@ -648,6 +650,43 @@ export interface SourceGeometry {
   fps?: number;
   /** Source declared duration when known; used only for runtime budget/capability planning. */
   durationSec?: number;
+  /** Measured compressed video bitrate in bits/second, when a packet table proves it. */
+  bitrate?: number;
+}
+
+/**
+ * Estimate one track's compressed bitrate from packet metadata without reading payload bytes. The
+ * decode-time span uses DTS plus packet duration, so B-frame reorder and VFR packet cadence remain part
+ * of the evidence rather than being flattened to a nominal FPS. Invalid/incomplete rows return undefined
+ * and let the encoder retain its dimension-based fallback.
+ */
+export function sourceVideoBitrateFromPacketTable(
+  table: readonly PacketMetadata[] | undefined,
+  trackId: number,
+): number | undefined {
+  if (table === undefined) return undefined;
+  let bytes = 0;
+  let firstDtsUs = Number.POSITIVE_INFINITY;
+  let lastEndUs = Number.NEGATIVE_INFINITY;
+  for (const packet of table) {
+    if (
+      packet.trackId !== trackId ||
+      !Number.isSafeInteger(packet.sizeBytes) ||
+      packet.sizeBytes <= 0 ||
+      !Number.isFinite(packet.dtsUs) ||
+      !Number.isFinite(packet.durationUs) ||
+      packet.durationUs <= 0
+    ) {
+      continue;
+    }
+    bytes += packet.sizeBytes;
+    firstDtsUs = Math.min(firstDtsUs, packet.dtsUs);
+    lastEndUs = Math.max(lastEndUs, packet.dtsUs + packet.durationUs);
+  }
+  const spanUs = lastEndUs - firstDtsUs;
+  if (bytes <= 0 || !Number.isFinite(spanUs) || spanUs <= 0) return undefined;
+  const bitrate = Math.round((bytes * 8 * 1_000_000) / spanUs);
+  return Number.isSafeInteger(bitrate) && bitrate > 0 ? bitrate : undefined;
 }
 
 // `videoFilterSpecs` (the crop→resize→rotate→flip→colorspace→tonemap GPU spec builder) lives in
@@ -748,6 +787,46 @@ export function canUseVpxAlphaGeometryPacketTranscode(
     target.tonemap === undefined &&
     target.fps === undefined
   );
+}
+
+/**
+ * Whether a source audio track can be copied packet-for-packet into a chunk-muxed output container.
+ * This is deliberately a destination contract, not a codec-family guess: the source TrackInfo must
+ * carry a WebCodecs audio config/description because the muxer uses those exact facts to author its
+ * codec-private box or Matroska CodecPrivate. The public caller separately proves that no audio option
+ * was requested and that the track is unencrypted.
+ */
+export function canCopyAudioTrackToContainer(
+  container: string,
+  track: Pick<TrackInfo, 'mediaType' | 'codec' | 'config' | 'encrypted'>,
+): boolean {
+  if (track.mediaType !== 'audio' || track.config === undefined || track.encrypted === true) {
+    return false;
+  }
+  const codec = track.codec.toLowerCase();
+  switch (container) {
+    case 'mp4':
+    case 'mov':
+      return (
+        codec.startsWith('mp4a') ||
+        codec === 'aac' ||
+        codec === 'mp3' ||
+        codec.startsWith('opus') ||
+        codec.startsWith('flac')
+      );
+    case 'webm':
+    case 'mkv':
+      return (
+        codec.startsWith('opus') ||
+        codec.startsWith('vorbis') ||
+        codec.startsWith('flac') ||
+        codec.startsWith('mp4a') ||
+        codec === 'aac' ||
+        codec === 'mp3'
+      );
+    default:
+      return false;
+  }
 }
 
 /** Prefer a proved decoder qualification over the container's bare family token. */
@@ -1000,18 +1079,30 @@ function webCodecsQuantizerSupported(codec: VideoCodec | 'unknown'): boolean {
 }
 
 /**
- * Native realtime mode materially reduces implicit H.264 and ordinary-cadence AV1 wall time while
- * retaining their generous implicit quality budgets. Every explicit rate/quantizer/two-pass contract,
- * high-cadence AV1, and all other codecs retain quality mode.
+ * Native realtime mode materially reduces implicit H.264, ordinary-cadence AV1, and the measured
+ * ordinary-cadence AV1→VP9 VOD path while retaining their generous implicit quality budgets. Every
+ * explicit rate/quantizer/two-pass contract, high-cadence output, and unproved source/target pair retains
+ * quality mode.
  */
 export function videoLatencyMode(
   target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
   codec: VideoCodec | 'unknown',
   frameRate: number | undefined,
+  sourceCodecString?: string,
 ): 'quality' | 'realtime' {
   const noExplicitRateControl =
     target.bitrate === undefined && target.bitrateMode === undefined && target.crf === undefined;
   if (codec === 'h264' && noExplicitRateControl && target.twoPass === undefined) return 'realtime';
+  if (
+    codec === 'vp9' &&
+    videoCodecToken(sourceCodecString ?? '') === 'av1' &&
+    frameRate !== undefined &&
+    frameRate <= 30.5 &&
+    noExplicitRateControl &&
+    target.twoPass !== true
+  ) {
+    return 'realtime';
+  }
   return codec === 'av1' &&
     frameRate !== undefined &&
     frameRate <= 30.5 &&
@@ -1027,6 +1118,8 @@ function defaultVideoBitrate(
   height: number,
   maximum: number | undefined,
   frameRate: number | undefined,
+  source: SourceGeometry,
+  sourceCodecString: string | undefined,
 ): number {
   const minBitrate = 300_000;
   // Offline transcodes default to a visually transparent quality budget. Ten aggregate bits per output
@@ -1051,6 +1144,32 @@ function defaultVideoBitrate(
     codec === 'av1' && frameRate !== undefined && frameRate > 30.5
       ? Math.min(1 / efficiency.av1, Math.sqrt(frameRate / 30))
       : 1;
+  const sourceBitrate = source.bitrate;
+  const sourceWidth = source.width;
+  const sourceHeight = source.height;
+  const sourceFrameRate = source.fps;
+  const sourceCodec =
+    sourceCodecString === undefined ? undefined : videoCodecToken(sourceCodecString);
+  const sourceEfficiency = sourceCodec === undefined ? undefined : efficiency[sourceCodec];
+  if (
+    sourceBitrate !== undefined &&
+    Number.isSafeInteger(sourceBitrate) &&
+    sourceBitrate > 0 &&
+    sourceWidth !== undefined &&
+    sourceHeight !== undefined &&
+    sourceWidth > 0 &&
+    sourceHeight > 0
+  ) {
+    const spatialScale = (width * height) / (sourceWidth * sourceHeight);
+    const temporalScale =
+      frameRate !== undefined && sourceFrameRate !== undefined && sourceFrameRate > 0
+        ? frameRate / sourceFrameRate
+        : 1;
+    const codecScale =
+      sourceEfficiency === undefined ? 1 : Math.max(1, efficiency[codec] / sourceEfficiency);
+    const evidenceBased = Math.round(sourceBitrate * spatialScale * temporalScale * codecScale * 2);
+    return Math.min(maximum ?? Number.MAX_SAFE_INTEGER, Math.max(3_750_000, evidenceBased));
+  }
   const planned = Math.max(
     minBitrate,
     Math.round(width * height * bitsPerPixelPerSecond * efficiency[codec] * cadenceScale),
@@ -1093,6 +1212,8 @@ function eagerVideoRateConfig(
   height: number,
   implicitBitrateMaximum: number | undefined,
   frameRate: number | undefined,
+  source: SourceGeometry,
+  sourceCodecString: string | undefined,
 ): {
   readonly bitrate?: number;
   readonly bitrateMode?: VideoEncoderBitrateMode;
@@ -1139,7 +1260,15 @@ function eagerVideoRateConfig(
   return {
     bitrate:
       target.bitrate ??
-      defaultVideoBitrate(codec, width, height, implicitBitrateMaximum, frameRate),
+      defaultVideoBitrate(
+        codec,
+        width,
+        height,
+        implicitBitrateMaximum,
+        frameRate,
+        source,
+        sourceCodecString,
+      ),
     bitrateMode: target.bitrateMode ?? 'variable',
   };
 }
@@ -1340,6 +1469,8 @@ export function buildVideoEncoderConfig(
     height,
     implicitBitrateMaximum,
     frameRate,
+    src,
+    sourceCodecString,
   );
   const codec = resolvedVideoEncoderCodecString(
     target,
@@ -1357,7 +1488,7 @@ export function buildVideoEncoderConfig(
     codec,
     width,
     height,
-    latencyMode: videoLatencyMode(target, rateCodec, frameRate),
+    latencyMode: videoLatencyMode(target, rateCodec, frameRate, sourceCodecString),
     ...rateControl,
     ...(alpha !== undefined ? { alpha } : {}),
     ...(frameRate !== undefined ? { framerate: frameRate } : {}),

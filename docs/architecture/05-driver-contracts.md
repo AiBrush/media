@@ -115,7 +115,13 @@ export interface ByteSource {
   stream(): ReadableStream<Uint8Array>
   size?: number
   range?(start: number, end: number): Promise<Uint8Array>   // enables header-only probe
+  readAll?(signal?: AbortSignal): Promise<Uint8Array>      // owned full response after all-byte need is proved
 }
+
+`readAll` is an optional transport capability, not permission for a driver to materialize eagerly. A
+consumer may call it only after the format grammar and source policy prove that the complete finite object
+is required. URL/element sources implement it as one abortable complete response without generic stream
+chunk collection; custom and one-shot sources may omit it and retain their ordinary stream semantics.
 export interface ContainerQuery { direction: 'demux' | 'mux'; mime?: string; extension?: string; head?: Uint8Array /* magic */ }
 // Exact non-packet metadata follows TrackInfo through ordinary track selection (ADR-210). The first
 // additive kind retains complete ordered Matroska AttachedFile payloads; a projection marker identifies

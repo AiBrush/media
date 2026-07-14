@@ -28,6 +28,7 @@ import {
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
   buildVideoEncoderConfigForRuntime,
+  canCopyAudioTrackToContainer,
   canCopyVpxAlphaSideData,
   canUseVpxAlphaGeometryPacketTranscode,
   canUseVpxAlphaPacketTranscode,
@@ -57,6 +58,7 @@ import {
   resolveAudioEncodeTargetForRuntime,
   seekFrame,
   selectTrackInfos,
+  sourceVideoBitrateFromPacketTable,
   splitRgbaForVpxAlpha,
   transcodeVpxAlphaPackets,
   unwrapPackets,
@@ -542,6 +544,33 @@ describe('canUseVpxAlphaPacketTranscode', () => {
       canUse({ codec: 'vp9', alpha: 'keep', bitDepth: 10 }, true, 'vp09.02.31.12', 'vp09.02.31.10'),
     ).toBe(false);
     expect(canUse({ codec: 'vp9', alpha: 'keep' }, true, 'vp9', 'vp09.00.31.08')).toBe(false);
+  });
+});
+
+describe('canCopyAudioTrackToContainer', () => {
+  const track = (
+    codec: string,
+    config: DecoderConfig | undefined = {
+      codec,
+      sampleRate: 48_000,
+      numberOfChannels: 2,
+    },
+  ): TrackInfo => ({ id: 1, mediaType: 'audio', codec, config });
+
+  it('proves legal configured packet-copy contracts and rejects unsafe guesses', () => {
+    expect(canCopyAudioTrackToContainer('webm', track('opus'))).toBe(true);
+    expect(canCopyAudioTrackToContainer('mp4', track('mp4a.40.2'))).toBe(true);
+    expect(canCopyAudioTrackToContainer('webm', track('aac'))).toBe(true);
+    expect(canCopyAudioTrackToContainer('webm', track('pcm-s16'))).toBe(false);
+    expect(canCopyAudioTrackToContainer('mp4', track('opus'))).toBe(true);
+    expect(
+      canCopyAudioTrackToContainer('webm', {
+        mediaType: 'audio',
+        codec: 'opus',
+      }),
+    ).toBe(false);
+    expect(canCopyAudioTrackToContainer('webm', { ...track('opus'), encrypted: true })).toBe(false);
+    expect(canCopyAudioTrackToContainer('wav', track('opus'))).toBe(false);
   });
 });
 
@@ -1800,6 +1829,10 @@ describe('buildVideoEncoderConfig', () => {
     expect(videoLatencyMode({ twoPass: true }, 'h264', 30)).toBe('quality');
     expect(videoLatencyMode({}, 'hevc', 30)).toBe('quality');
     expect(videoLatencyMode({}, 'vp9', 30)).toBe('quality');
+    expect(videoLatencyMode({}, 'vp9', 30, 'av01.0.05M.08')).toBe('realtime');
+    expect(videoLatencyMode({}, 'vp9', 60, 'av01.0.05M.08')).toBe('quality');
+    expect(videoLatencyMode({}, 'vp9', 30, 'avc1.640028')).toBe('quality');
+    expect(videoLatencyMode({ crf: 30 }, 'vp9', 30, 'av01.0.05M.08')).toBe('quality');
     expect(videoLatencyMode({ bitrate: 2_000_000 }, 'av1', 30)).toBe('quality');
     expect(videoLatencyMode({ bitrateMode: 'constant' }, 'av1', 30)).toBe('quality');
     expect(videoLatencyMode({ crf: 24 }, 'av1', 30)).toBe('quality');
@@ -1856,6 +1889,46 @@ describe('buildVideoEncoderConfig', () => {
       bitrate: 18_432_000,
       bitrateMode: 'variable',
     });
+  });
+
+  it('uses a measured source bitrate for implicit cross-codec output and keeps explicit controls authoritative', () => {
+    expect(
+      sourceVideoBitrateFromPacketTable(
+        [
+          {
+            trackId: 3,
+            sizeBytes: 1_000,
+            ptsUs: 0,
+            dtsUs: 0,
+            durationUs: 1_000_000,
+            keyframe: true,
+          },
+          {
+            trackId: 3,
+            sizeBytes: 1_000,
+            ptsUs: 1_000_000,
+            dtsUs: 1_000_000,
+            durationUs: 1_000_000,
+            keyframe: false,
+          },
+        ],
+        3,
+      ),
+    ).toBe(8_000);
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'vp9' },
+        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
+        'av01.0.05M.08',
+      ),
+    ).toMatchObject({ bitrate: 3_750_000, bitrateMode: 'variable' });
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'vp9', bitrate: 4_000_000 },
+        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
+        'av01.0.05M.08',
+      ),
+    ).toMatchObject({ bitrate: 4_000_000, bitrateMode: 'variable' });
   });
 
   it('builds CRF and the real replay-backed H.264 second pass in quantizer mode', () => {

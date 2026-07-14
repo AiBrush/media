@@ -172,6 +172,93 @@ describe('AiffDriver.supports', () => {
   });
 });
 
+describe('AiffDriver.probe — bounded metadata-only COMM reads', () => {
+  it.each([
+    'scenarios/probe/pcm_s16be/pcm_s16be.aiff',
+    'scenarios/probe/pcm_s16be/01.aiff',
+    'scenarios/probe/pcm_s16be/02.aiff',
+    'scenarios/probe/pcm_s16be/03.aiff',
+  ])('%s matches full-header truth from one 64-byte range', async (id) => {
+    const bytes = await loadHarness(id);
+    const reads: Array<readonly [number, number]> = [];
+    const probe = AiffDriver.probe;
+    if (probe === undefined) throw new Error('AiffDriver must expose a metadata-only probe');
+    const source = {
+      size: bytes.byteLength,
+      range(start: number, end: number): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('known-size AIFF probe must not open the payload stream');
+      },
+    };
+    const expected = await AiffDriver.demux(bytesSource(bytes));
+    try {
+      expect(await probe(source)).toEqual(expected.tracks);
+      expect(reads).toEqual([[0, 64]]);
+    } finally {
+      await expected.close();
+    }
+  });
+
+  it('preserves typed cancellation before performing a metadata read', async () => {
+    const probe = AiffDriver.probe;
+    if (probe === undefined) throw new Error('AiffDriver must expose a metadata-only probe');
+    let reads = 0;
+    await expect(
+      probe(
+        {
+          size: 1024,
+          range(): Promise<Uint8Array> {
+            reads++;
+            return Promise.resolve(new Uint8Array(64));
+          },
+          stream: () => streamOf(new Uint8Array(0)),
+        },
+        { signal: AbortSignal.abort() },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted', message: 'operation aborted' });
+    expect(reads).toBe(0);
+  });
+
+  it('grows once to the bounded metadata window when COMM follows a legal filler chunk', async () => {
+    const original = await loadHarness('scenarios/probe/pcm_s16be/pcm_s16be.aiff');
+    const filler = new Uint8Array(8 + 256);
+    filler.set([0x4a, 0x55, 0x4e, 0x4b], 0);
+    new DataView(filler.buffer).setUint32(4, 256, false);
+    const bytes = new Uint8Array(original.byteLength + filler.byteLength);
+    bytes.set(original.subarray(0, 12), 0);
+    bytes.set(filler, 12);
+    bytes.set(original.subarray(12), 12 + filler.byteLength);
+    new DataView(bytes.buffer).setUint32(4, bytes.byteLength - 8, false);
+
+    const reads: Array<readonly [number, number]> = [];
+    const probe = AiffDriver.probe;
+    if (probe === undefined) throw new Error('AiffDriver must expose a metadata-only probe');
+    const tracks = await probe({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('seekable AIFF fallback must remain range-backed');
+      },
+    });
+    const expected = await AiffDriver.demux(bytesSource(original));
+    try {
+      expect(tracks).toEqual(expected.tracks);
+      expect(reads).toEqual([
+        [0, 64],
+        [0, Math.min(bytes.byteLength, 64 * 1024)],
+      ]);
+    } finally {
+      await expected.close();
+    }
+  });
+});
+
 describe('parseAiff — real AIFF/AIFF-C metadata matches afinfo ground truth', () => {
   for (const a of AIFFS) {
     it(`${a.id}: ${a.codec} ${a.channels}ch ${a.sampleRate}Hz ${a.sampleSize}-bit ${a.kind}`, async () => {

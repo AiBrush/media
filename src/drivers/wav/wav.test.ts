@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource, Packet, TrackInfo } from '../../contracts/driver.ts';
@@ -42,6 +43,15 @@ const riffWave = (extra: number[] = []): Uint8Array =>
     ...[...'WAVE'].map((c) => c.charCodeAt(0)),
     ...extra,
   ]);
+
+function streamBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
 
 async function drain(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = s.getReader();
@@ -267,7 +277,7 @@ describe('probe WAV across the real corpus', () => {
 
     const tracks = await probe(source);
 
-    expect(reads).toEqual([[0, 4096]]);
+    expect(reads).toEqual([[0, 128]]);
     expect(tracks[0]?.codec).toBe('pcm-s16');
     expect(tracks[0]?.durationSec).toBeGreaterThan(0);
   });
@@ -342,8 +352,8 @@ describe('probe WAV across the real corpus', () => {
     const tracks = await probe(source);
 
     expect(reads).toEqual([
-      [0, 4096],
-      [0, 65536],
+      [0, 128],
+      [5044, bytes.byteLength],
     ]);
     expect(tracks[0]?.durationSec).toBeGreaterThan(0);
 
@@ -357,6 +367,270 @@ describe('probe WAV across the real corpus', () => {
     expect(first.value?.frames).toBe(4);
     expect(reads).toEqual([[0, bytes.byteLength]]);
     await reader.cancel('large-header fallback coverage');
+  });
+
+  it('sparse-skips the real exhaustive s24 PAD body and preserves exact probe truth', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = new Uint8Array(
+      await readFile(
+        new URL(
+          '../../../../media-test/fixtures/media/scenarios/probe/wav_s24/03.wav',
+          import.meta.url,
+        ),
+      ),
+    );
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await probe({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('sparse WAV metadata probe must not stream the payload');
+      },
+    });
+
+    const truth = parseWav(bytes, bytes.byteLength);
+    expect(tracks).toEqual([
+      {
+        id: 0,
+        mediaType: 'audio',
+        codec: 'pcm-s24',
+        durationSec: truth.durationSec,
+        config: {
+          codec: 'pcm-s24',
+          sampleRate: truth.sampleRate,
+          numberOfChannels: truth.channels,
+        },
+      },
+    ]);
+    expect(reads).toEqual([
+      [0, 128],
+      [12_280, 12_408],
+    ]);
+  });
+
+  it('amortizes a remote WAV metadata prelude into one bounded range', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = new Uint8Array(
+      await readFile(
+        new URL(
+          '../../../../media-test/fixtures/media/scenarios/probe/wav_s24/03.wav',
+          import.meta.url,
+        ),
+      ),
+    );
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await probe({
+      size: bytes.byteLength,
+      kind: 'url',
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('remote WAV metadata probe must remain range-backed');
+      },
+    } as ByteSource & { readonly kind: 'url' });
+
+    const truth = parseWav(bytes, bytes.byteLength);
+    expect(tracks[0]).toMatchObject({
+      codec: 'pcm-s24',
+      durationSec: truth.durationSec,
+      config: { sampleRate: truth.sampleRate, numberOfChannels: truth.channels },
+    });
+    expect(reads).toEqual([[0, 16 * 1024]]);
+  });
+
+  it('preserves typed probe cancellation before and after initial and sparse range reads', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = new Uint8Array(
+      await readFile(
+        new URL(
+          '../../../../media-test/fixtures/media/scenarios/probe/wav_s24/03.wav',
+          import.meta.url,
+        ),
+      ),
+    );
+
+    const before = new AbortController();
+    before.abort('before WAV probe');
+    let beforeReads = 0;
+    await expect(
+      probe(
+        {
+          size: bytes.byteLength,
+          range: () => {
+            beforeReads++;
+            return Promise.resolve(bytes);
+          },
+          stream: () => streamBytes(bytes),
+        },
+        { signal: before.signal },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(beforeReads).toBe(0);
+
+    for (const abortAfterRead of [1, 2]) {
+      const controller = new AbortController();
+      let reads = 0;
+      await expect(
+        probe(
+          {
+            size: bytes.byteLength,
+            range(start, end): Promise<Uint8Array> {
+              reads++;
+              if (reads === abortAfterRead) controller.abort(`after range ${reads}`);
+              return Promise.resolve(bytes.subarray(start, end));
+            },
+            stream: () => streamBytes(bytes),
+          },
+          { signal: controller.signal },
+        ),
+      ).rejects.toMatchObject({ code: 'aborted' });
+      expect(reads).toBe(abortAfterRead);
+    }
+  });
+
+  it('keeps malformed and truncated sparse WAV probes on typed error paths', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const valid = await loadFixture('speech.wav');
+    const wrongRiff = valid.slice(0, 128);
+    wrongRiff.set([0x42, 0x41, 0x44, 0x21], 0);
+    const wrongWave = valid.slice(0, 128);
+    wrongWave.set([0x42, 0x41, 0x44, 0x21], 8);
+    const dataOnly = riffWave([
+      ...[...'data'].map((c) => c.charCodeAt(0)),
+      0,
+      0,
+      0,
+      0,
+    ]);
+    const truncatedFmt = riffWave([
+      ...[...'fmt '].map((c) => c.charCodeAt(0)),
+      16,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0,
+    ]);
+    const cases: readonly (readonly [Uint8Array, string])[] = [
+      [valid.subarray(0, 7), 'unsupported-input'],
+      [wrongRiff, 'unsupported-input'],
+      [wrongWave, 'unsupported-input'],
+      [dataOnly, 'demux-error'],
+      [truncatedFmt, 'demux-error'],
+    ];
+
+    for (const [bytes, code] of cases) {
+      await expect(
+        probe({
+          size: bytes.byteLength,
+          range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+          stream: () => streamBytes(bytes),
+        }),
+      ).rejects.toMatchObject({ code });
+    }
+  });
+
+  it('bounds adversarial sparse chunk walks before using the established full-head fallback', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const junkChunks: number[] = [];
+    for (let index = 0; index < 8; index++) {
+      junkChunks.push(
+        ...[...'JUNK'].map((c) => c.charCodeAt(0)),
+        0,
+        2,
+        0,
+        0,
+        ...new Array<number>(512).fill(index),
+      );
+    }
+    const fmtAndData = [
+      ...[...'fmt '].map((c) => c.charCodeAt(0)),
+      16,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0x44,
+      0xac,
+      0,
+      0,
+      0x88,
+      0x58,
+      1,
+      0,
+      2,
+      0,
+      16,
+      0,
+      ...[...'data'].map((c) => c.charCodeAt(0)),
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ];
+    const bytes = riffWave([...junkChunks, ...fmtAndData]);
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await probe({
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream: () => streamBytes(bytes),
+    });
+
+    expect(tracks[0]).toMatchObject({ codec: 'pcm-s16', config: { sampleRate: 44_100 } });
+    expect(reads).toHaveLength(9);
+    expect(reads.at(-1)).toEqual([0, 64 * 1024]);
+  });
+
+  it('returns proved format metadata when a later sparse range is short', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = withJunkChunk(await loadFixture('speech.wav'));
+    const fmtEnd = 36;
+    const padded = new Uint8Array(bytes.byteLength + 4096);
+    padded.set(bytes.subarray(0, fmtEnd), 0);
+    padded.set([0x4a, 0x55, 0x4e, 0x4b, 0, 0x10, 0, 0], fmtEnd);
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await probe({
+      size: padded.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(reads.length === 1 ? padded.subarray(start, end) : new Uint8Array(0));
+      },
+      stream: () => streamBytes(padded),
+    });
+
+    expect(reads).toHaveLength(2);
+    expect(tracks[0]).toMatchObject({ codec: 'pcm-s16', durationSec: 0 });
+  });
+
+  it('probes a non-seekable stream through the same bounded RIFF parser', async () => {
+    const probe = WavDriver.probe;
+    if (probe === undefined) throw new Error('WavDriver must expose probe');
+    const bytes = await loadFixture('speech.wav');
+
+    const tracks = await probe({ stream: () => streamBytes(bytes) });
+
+    expect(tracks).toEqual([wavTrack(bytes)]);
   });
 
   it('the demux packet seam is a typed capability gap in node (PCM → audio-dsp)', async () => {
@@ -392,7 +666,7 @@ describe('probe WAV across the real corpus', () => {
     const payload = chunkPayload(bytes, 'data');
     const bytesPerFrame = 3 * (channels ?? 0);
 
-    expect(reads).toEqual([[0, 4096]]);
+    expect(reads).toEqual([[0, 128]]);
     expect(track?.codec).toBe('pcm-s24');
     expect(channels).toBeGreaterThan(0);
     expect(table.packets).toHaveLength(Math.ceil(payload.byteLength / (4096 * bytesPerFrame)));
@@ -886,7 +1160,7 @@ describe('probe WAV across the real corpus', () => {
       expect(table.packets.reduce((total, packet) => total + packet.size, 0)).toBe(
         chunkPayload(bytes, 'data').byteLength,
       );
-      expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-4095', bytes: 4096 }]);
+      expect(server.calls).toEqual([{ method: 'GET', range: 'bytes=0-127', bytes: 128 }]);
     } finally {
       globalThis.fetch = originalFetch;
     }

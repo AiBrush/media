@@ -1,4 +1,5 @@
 import type {
+  ByteSource,
   ContainerQuery,
   PacketInfoMetadata,
   PacketInfoTable,
@@ -101,6 +102,46 @@ export function parseFlacStreamInfo(bytes: Uint8Array): FlacStreamInfo {
     totalSamples,
     durationSec: totalSamples / sampleRate,
   };
+}
+
+const FLAC_PROBE_INITIAL_BYTES = 64;
+const FLAC_STREAMINFO_PREFIX_BYTES = 42;
+
+function throwIfFlacProbeAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new MediaError('aborted', 'operation aborted', signal.reason);
+  }
+}
+
+/**
+ * Parse seekable FLAC probe truth from the mandatory STREAMINFO prefix only. A legal leading ID3v2 tag
+ * is crossed by its declared synchsafe length, so arbitrary tag payloads are neither transferred nor
+ * allocated. `undefined` means the source is not seekable and the caller must retain its stream path.
+ */
+export async function readSeekableFlacStreamInfo(
+  src: ByteSource,
+  signal?: AbortSignal,
+): Promise<FlacStreamInfo | undefined> {
+  const range = src.range;
+  if (range === undefined) return undefined;
+  throwIfFlacProbeAborted(signal);
+  const head = await range.call(src, 0, FLAC_PROBE_INITIAL_BYTES);
+  throwIfFlacProbeAborted(signal);
+  const start = flacOffset(head);
+  const end = start + FLAC_STREAMINFO_PREFIX_BYTES;
+  if (head.byteLength >= end) return parseFlacStreamInfo(head);
+
+  // flacOffset is non-zero only after a complete ten-byte ID3 header, so this jump is structural. Parse
+  // the returned native-FLAC prefix at offset zero rather than materializing the skipped tag body.
+  if (start > 0) {
+    const prefix = await range.call(src, start, end);
+    throwIfFlacProbeAborted(signal);
+    return parseFlacStreamInfo(prefix);
+  }
+
+  const prefix = await range.call(src, 0, FLAC_STREAMINFO_PREFIX_BYTES);
+  throwIfFlacProbeAborted(signal);
+  return parseFlacStreamInfo(prefix);
 }
 
 export function flacMetadataLayout(bytes: Uint8Array): FlacMetadataLayout {

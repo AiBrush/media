@@ -54,6 +54,7 @@ import {
   flacTrackInfo,
   matchesFlac,
   parseFlacStreamInfo,
+  readSeekableFlacStreamInfo,
 } from './flac-sniff.ts';
 
 export type FlacInfo = FlacStreamInfo;
@@ -698,7 +699,8 @@ export const FlacDriver: ContainerDriver = {
   streamCopyTargets: ['ogg'],
   supports: matchesFlac,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
-    const info = parseFlac(await readAll(src));
+    const info =
+      (await readSeekableFlacStreamInfo(src, o?.signal)) ?? parseFlac(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return [flacTrackInfo(info)];
   },

@@ -342,14 +342,14 @@ export class MediaEngineImpl implements MediaEngine {
           src = probeRangeCacheModule.cacheRepeatedProbeRangesFor(this, resolved);
         }
         src = cacheProbeRanges(src, this.#sourcePrefixHandoff, 'store');
-        // A concrete audio/video MIME already identifies the container family cheaply. On a known-size,
-        // seekable source, try that container before spending a separate range read on image magic. MIME
-        // remains only a hint: a typed container rejection falls back to the unchanged image probe, so a
-        // JPEG mislabeled `video/mp4` still resolves as JPEG. One-shot/unknown-size streams stay image-first
-        // because a rejected container probe may consume bytes or because the sniff learns live URL size.
+        // A concrete audio/video MIME already identifies the container family cheaply. On a seekable
+        // source, try that container before spending a separate range read on image magic. This is safe
+        // even before the URL size is known: range reads are replayable, the first 206 learns the size, and
+        // the exact-source prefix cache preserves bytes for the typed-rejection image fallback. MIME remains
+        // only a hint, so a JPEG mislabeled `video/mp4` still resolves as JPEG. One-shot streams stay
+        // image-first because a rejected container probe may consume bytes irreversibly.
         if (
           src.range !== undefined &&
-          src.size !== undefined &&
           probeRangeCacheModule?.hasConcreteAudioVideoMime(src.mimeHint)
         ) {
           try {
@@ -1401,7 +1401,7 @@ export class MediaEngineImpl implements MediaEngine {
     const tasks: Promise<void>[] = [];
     const openStreams: ReadableStream<unknown>[] = [];
     try {
-      const videoTrack =
+      const selectedVideoTrack =
         opts.video === false
           ? undefined
           : demuxer.tracks.find((t) => t.mediaType === 'video' && t.config !== undefined);
@@ -1409,8 +1409,12 @@ export class MediaEngineImpl implements MediaEngine {
         opts.audio === false
           ? undefined
           : demuxer.tracks.find((t) => t.mediaType === 'audio' && t.config !== undefined);
+      const copyAudioPackets =
+        audioTrack !== undefined &&
+        opts.audio === undefined &&
+        (await import('./codec-pipeline.ts')).canCopyAudioTrackToContainer(target, audioTrack);
 
-      if (videoTrack) {
+      if (selectedVideoTrack) {
         // Fail target encode-config errors before creating decode/filter streams. Otherwise a synchronous
         // config miss (for example the benchmark's 1x1 H.264 edge) can reject the encode task while an
         // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
@@ -1421,8 +1425,17 @@ export class MediaEngineImpl implements MediaEngine {
           decodeQueryFor,
           decodeVideoPacketsWithAlpha,
           qualifiedVideoSourceCodec,
+          sourceVideoBitrateFromPacketTable,
           unwrapPackets,
         } = await loadCodecPipeline();
+        const measuredBitrate = sourceVideoBitrateFromPacketTable(
+          demuxer.packetTable?.(),
+          selectedVideoTrack.id,
+        );
+        const videoTrack: TrackInfo =
+          measuredBitrate === undefined
+            ? selectedVideoTrack
+            : { ...selectedVideoTrack, bitrate: measuredBitrate };
         const videoTarget = opts.video || {};
         const sourceGeometry = sourceGeometryOf(videoTrack);
         const videoEncoderConfig = await buildVideoEncoderConfigForRuntime(
@@ -1532,55 +1545,62 @@ export class MediaEngineImpl implements MediaEngine {
         }
       }
       if (audioTrack) {
-        const { resolveAudioEncodeTargetForRuntime } = await loadCodecPipeline();
-        const audioTarget = await resolveAudioEncodeTargetForRuntime(
-          opts.audio || {},
-          audioTrack.codec,
-        );
-        const stage = this.#stageOptions(signal, o);
-        let decoded: ReadableStream<AudioData>;
-        if (
-          (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
-          container.decodePcmInterleavedStream !== undefined
-        ) {
-          const chunks = await container.decodePcmInterleavedStream(src, stage);
-          decoded = (await import('../dsp/audio-data.ts')).interleavedPcmChunksToAudioDataStream(
-            chunks,
-            stage,
-            audioTrack.codec,
-          );
-        } else if (
-          (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
-          container.decodePcmAudioStream !== undefined
-        ) {
-          const chunks = await container.decodePcmAudioStream(src, stage);
-          decoded = (await import('../dsp/audio-data.ts')).pcmAudioChunksToAudioDataStream(
-            chunks,
-            stage,
-            audioTrack.codec,
-            'f32',
-          );
-        } else if (
-          container.decodePcmAudio !== undefined &&
-          (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
-        ) {
-          decoded = (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
-            await container.decodePcmAudio(src, stage),
-            stage,
-            audioTrack.codec,
-            'f32',
-          );
+        if (copyAudioPackets) {
+          const { drainEncoderToMuxer } = await loadCodecPipeline();
+          const packets = demuxer.packets(audioTrack.id);
+          openStreams.push(packets);
+          tasks.push(drainEncoderToMuxer(packets, muxer, audioTrack, signal));
         } else {
-          decoded = await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
+          const { resolveAudioEncodeTargetForRuntime } = await loadCodecPipeline();
+          const audioTarget = await resolveAudioEncodeTargetForRuntime(
+            opts.audio || {},
+            audioTrack.codec,
+          );
+          const stage = this.#stageOptions(signal, o);
+          let decoded: ReadableStream<AudioData>;
+          if (
+            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
+            container.decodePcmInterleavedStream !== undefined
+          ) {
+            const chunks = await container.decodePcmInterleavedStream(src, stage);
+            decoded = (await import('../dsp/audio-data.ts')).interleavedPcmChunksToAudioDataStream(
+              chunks,
+              stage,
+              audioTrack.codec,
+            );
+          } else if (
+            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
+            container.decodePcmAudioStream !== undefined
+          ) {
+            const chunks = await container.decodePcmAudioStream(src, stage);
+            decoded = (await import('../dsp/audio-data.ts')).pcmAudioChunksToAudioDataStream(
+              chunks,
+              stage,
+              audioTrack.codec,
+              'f32',
+            );
+          } else if (
+            container.decodePcmAudio !== undefined &&
+            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
+          ) {
+            decoded = (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
+              await container.decodePcmAudio(src, stage),
+              stage,
+              audioTrack.codec,
+              'f32',
+            );
+          } else {
+            decoded = await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
+          }
+          /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
+          // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
+          // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
+          // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
+          const shaped = await this.#applyAudioFilters(decoded, audioTarget, audioTrack, signal, o);
+          openStreams.push(shaped);
+          tasks.push(this.#encodeAudioStream(shaped, audioTarget, audioTrack, muxer, signal, o));
+          /* v8 ignore stop */
         }
-        /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
-        // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
-        // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
-        // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
-        const shaped = await this.#applyAudioFilters(decoded, audioTarget, audioTrack, signal, o);
-        openStreams.push(shaped);
-        tasks.push(this.#encodeAudioStream(shaped, audioTarget, audioTrack, muxer, signal, o));
-        /* v8 ignore stop */
       }
       if (tasks.length === 0) {
         throw new CapabilityError('capability-miss', 'convert found no decodable track', {
@@ -2222,6 +2242,7 @@ function sourceGeometryOf(track: TrackInfo): {
   height: number | undefined;
   fps?: number;
   durationSec?: number;
+  bitrate?: number;
 } {
   const config = track.config;
   const fps = track.fps;
@@ -2235,6 +2256,7 @@ function sourceGeometryOf(track: TrackInfo): {
       height: config.codedHeight,
       ...(fps !== undefined ? { fps } : {}),
       ...(durationSec !== undefined ? { durationSec } : {}),
+      ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
     };
   }
   return {
@@ -2242,6 +2264,7 @@ function sourceGeometryOf(track: TrackInfo): {
     height: undefined,
     ...(fps !== undefined ? { fps } : {}),
     ...(durationSec !== undefined ? { durationSec } : {}),
+    ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
   };
 }
 

@@ -64,11 +64,11 @@ import {
   type FastFlacFrameSpan,
   fastFlacFrames,
   flacMetadataLayout,
-  flacOffset,
   flacPacketInfoTable,
   flacTrackInfo,
   matchesFlac,
   parseFlacStreamInfo,
+  readSeekableFlacStreamInfo,
 } from './flac/flac-sniff.ts';
 import { Mp4Module } from './mp4/mp4-driver.ts';
 import { MPEG_TS_FORMATS, matchesMpegTs } from './mpegts/mpegts-sniff.ts';
@@ -480,8 +480,6 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
   };
 }
 
-const FLAC_PROBE_HEAD_BYTES = 4096;
-
 function lazyMpegTsContainerDriver(): ContainerDriver {
   let driver: ContainerDriver | undefined;
   let loadPromise: Promise<ContainerDriver> | undefined;
@@ -536,7 +534,9 @@ function lazyFlacContainerDriver(): ContainerDriver {
     },
     async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
       if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const info = parseFlacStreamInfo(await readFlacProbeBytes(src));
+      const info =
+        (await readSeekableFlacStreamInfo(src, o?.signal)) ??
+        parseFlacStreamInfo(await readByteStream(src.stream()));
       if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
       return [flacTrackInfo(info)];
     },
@@ -585,16 +585,6 @@ function lazyFlacContainerDriver(): ContainerDriver {
       return transformPcm(src, o);
     },
   };
-}
-
-async function readFlacProbeBytes(src: ByteSource): Promise<Uint8Array> {
-  if (src.range !== undefined) {
-    const head = await src.range(0, FLAC_PROBE_HEAD_BYTES);
-    const need = flacOffset(head) + 42;
-    if (head.byteLength >= need) return head;
-    return src.range(0, need);
-  }
-  return readByteStream(src.stream());
 }
 
 async function readFlacBytes(src: ByteSource): Promise<Uint8Array> {

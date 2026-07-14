@@ -185,6 +185,8 @@ export interface ByteSource {
   stream(): ReadableStream<Uint8Array>;
   size?: number;
   range?(start: number, end: number): Promise<Uint8Array>;
+  /** Optional owned one-buffer materialization for consumers that have already proved they need all bytes. */
+  readAll?(signal?: AbortSignal): Promise<Uint8Array>;
 }
 
 export interface ContainerQuery {
@@ -230,6 +232,8 @@ export interface TrackInfo {
   id: number;
   mediaType: MediaType;
   codec: string;
+  /** Measured compressed elementary-stream bitrate in bits/second when a packet table proves it. */
+  bitrate?: number;
   /**
    * Marks a declared non-media trak (e.g. a QuickTime `tmcd` timecode trak). It is enumerated by
    * `probe()` for stream count/order parity with ffprobe/mediainfo but carries no decodable `config`,
