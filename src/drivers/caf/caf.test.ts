@@ -252,6 +252,27 @@ describe('CafDriver.transformPcm — PCM-native audio-dsp path (ADR-022)', () =>
       transform(await loadDerived('sfx.caf'), { signal: AbortSignal.abort() }),
     ).rejects.toThrowError(/abort/i);
   });
+
+  it('rechecks cancellation after draining a direct PCM decode source', async () => {
+    const bytes = await loadDerived('sfx.caf');
+    const decodePcmAudio = CafDriver.decodePcmAudio;
+    if (decodePcmAudio === undefined) throw new Error('CafDriver must expose decodePcmAudio');
+
+    await expect(
+      decodePcmAudio(
+        {
+          stream: () =>
+            new ReadableStream<Uint8Array>({
+              start(controller): void {
+                controller.enqueue(bytes);
+                controller.close();
+              },
+            }),
+        },
+        { signal: AbortSignal.abort('cancel CAF decode') },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+  });
 });
 
 describe('convert(→ caf) end-to-end through the engine (CONTAINER_TOKENS + PCM route)', () => {

@@ -194,10 +194,7 @@ async function readSparseWavProbeHeader(
   let window: WavProbeWindow = { start: 0, bytes: initialBytes };
   const readAt = async (start: number, length: number): Promise<Uint8Array | undefined> => {
     if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED, signal.reason);
-    if (
-      start >= window.start &&
-      start + length <= window.start + window.bytes.byteLength
-    ) {
+    if (start >= window.start && start + length <= window.start + window.bytes.byteLength) {
       return window.bytes.subarray(start - window.start, start - window.start + length);
     }
     if (windows >= WAV_PROBE_MAX_SPARSE_WINDOWS) return undefined;

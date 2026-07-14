@@ -196,6 +196,11 @@ ambiguous HLS signature peek consumes and replay-wraps only the single-use kind.
 source it closes the bounded sniff reader and returns the original source identity, so subsequent image and
 container routing may legally open fresh readers (ADR-212).
 
+URL and byte-mode media-element `range(start, end)` calls preserve high-priority HTTP Range semantics for
+every non-empty clamped interval, including a tiny known-size `[0, size)` request. A server that ignores
+Range and returns HTTP 200 remains supported by the complete-response fallback; callers use `readAll()`
+only when they have structurally proved that the complete response is required (ADR-315).
+
 URL-backed and byte-mode media-element sources may additionally expose the internal optional `readAll`
 capability (ADR-309). It returns one owned buffer from an abortable complete response and learns response
 size/effective URL facts. Drivers may use it only after proving from general format and source policy that

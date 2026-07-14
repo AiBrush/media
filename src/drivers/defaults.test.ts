@@ -279,6 +279,61 @@ describe('registerDefaultDrivers', () => {
     }
   });
 
+  it('registers exact lazy MP4 and WebM proxies without weakening their capability surfaces', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const mp4 = findContainer(reg, 'mp4');
+    const webm = findContainer(reg, 'webm');
+    const mp4Head = (await loadFixture('movie_5.mp4')).subarray(0, 16);
+    const webmHead = (await loadFixture('movie_5.webm')).subarray(0, 16);
+
+    expect(mp4).toMatchObject({
+      formats: ['mp4', 'mov'],
+      validatesStreamCopyTrim: true,
+    });
+    expect(typeof mp4.probe).toBe('function');
+    expect(typeof mp4.packetInfo).toBe('function');
+    expect(typeof mp4.streamCopy).toBe('function');
+    expect(typeof mp4.decrypt).toBe('function');
+    expect(mp4.supports({ direction: 'demux', mime: 'audio/x-m4a' })).toBe(true);
+    expect(mp4.supports({ direction: 'demux', extension: 'MOV' })).toBe(true);
+    expect(mp4.supports({ direction: 'demux', head: mp4Head })).toBe(true);
+    expect(mp4.supports({ direction: 'demux', head: webmHead })).toBe(false);
+
+    expect(webm).toMatchObject({ formats: ['webm', 'mkv'] });
+    expect(typeof webm.probe).toBe('function');
+    expect(typeof webm.streamCopy).toBe('function');
+    expect(webm.supports({ direction: 'demux', mime: 'video/x-matroska' })).toBe(true);
+    expect(webm.supports({ direction: 'demux', extension: 'mkv' })).toBe(true);
+    expect(webm.supports({ direction: 'demux', head: webmHead })).toBe(true);
+    expect(webm.supports({ direction: 'demux', head: mp4Head })).toBe(false);
+  });
+
+  it('lazy MP4 and WebM proxies delegate real probes and demux lifecycle exactly', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    const cases = [
+      ['mp4', 'movie_5.mp4', ['avc1.42C01E', 'mp4a.40.2']],
+      ['webm', 'movie_5.webm', ['vp9', 'opus']],
+    ] as const;
+
+    for (const [id, fixture, expectedCodecs] of cases) {
+      const driver = findContainer(reg, id);
+      const probe = driver.probe;
+      if (probe === undefined) throw new Error(`${id} proxy must preserve probe`);
+      const source = await fixtureSource(fixture);
+      const probed = await probe.call(driver, source);
+      expect(probed.map((track) => track.codec)).toEqual(expectedCodecs);
+
+      const demuxer = await driver.demux(source);
+      try {
+        expect(demuxer.tracks).toMatchObject(probed);
+      } finally {
+        await demuxer.close();
+      }
+    }
+  });
+
   it('preserves synchronous mux option, track, and single-track validation before lazy load', () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);

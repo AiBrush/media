@@ -18,8 +18,6 @@ import {
   mediaStreamOf,
 } from './live-source.ts';
 
-const TINY_KNOWN_FULL_RANGE_GET_BYTES = 16 * 1024;
-
 /** Internal identity hook used for short-lived cross-operation source caches. Not exported from the public barrel. */
 export const SOURCE_CACHE_KEY: unique symbol = Symbol('a');
 /** Final effective URL learned from Fetch (after redirects), kept separate from cache identity. */
@@ -454,17 +452,6 @@ async function fetchRange(
   let hi = Math.max(lo, Math.trunc(end));
   if (known !== undefined) hi = Math.min(hi, known);
   if (hi <= lo) return new Uint8Array(0); // empty window (incl. start at/after a known EOF)
-
-  if (known !== undefined && lo === 0 && hi === known && known <= TINY_KNOWN_FULL_RANGE_GET_BYTES) {
-    const res = await fetch(href);
-    learnResponseUrl(res, learnUrl);
-    if (!res.ok) {
-      throw new InputError('unsupported-input', `f ${res.status}`);
-    }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (learn) learnSize(learn, parseContentLength(res.headers) ?? buf.byteLength);
-    return buf;
-  }
 
   // HTTP Range is inclusive; our contract is half-open [lo, hi).
   const res = await fetch(href, {

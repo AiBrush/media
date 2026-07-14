@@ -286,7 +286,9 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
       size: bytes.byteLength,
       range(start, end): Promise<Uint8Array> {
         reads.push([start, end]);
-        return Promise.resolve(reads.length === 1 ? bytes.subarray(0, 16) : bytes.subarray(start, end));
+        return Promise.resolve(
+          reads.length === 1 ? bytes.subarray(0, 16) : bytes.subarray(start, end),
+        );
       },
     });
     expect(info).toMatchObject({ sampleRate: 44_100, channels: 2, totalSamples: 44_100 });

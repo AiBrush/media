@@ -6,9 +6,9 @@ import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import {
-  compactAudioProbeTrack,
   Mp4Driver,
   Mp4Module,
+  compactAudioProbeTrack,
   readMovie,
   readMovieMetadata,
 } from './mp4-driver.ts';
@@ -319,6 +319,12 @@ describe('sparse M4A track compaction structural guards', () => {
     unsafeExtendedRoot.set(ascii('trak'), 4);
     unsafeView.setUint32(8, 0x20_0000);
 
+    const truncatedSampleTable = compactProbeTrackFixture([
+      box('stsd', zeros(16)),
+      sttsBox,
+      compactProbeStsz(1, 11),
+    ]).subarray(0, 40);
+
     const cases: readonly (readonly [string, Uint8Array])[] = [
       ['short root header', new Uint8Array(7)],
       ['unsafe extended root size', unsafeExtendedRoot],
@@ -328,6 +334,7 @@ describe('sparse M4A track compaction structural guards', () => {
       ['child exceeds available prefix', childBeyondAvailableBytes],
       ['missing minf', box('trak', box('mdia'))],
       ['missing stbl', box('trak', box('mdia', box('minf')))],
+      ['sample table declaration exceeds prefix', truncatedSampleTable],
       ['missing stsd', compactProbeTrackFixture([sttsBox, compactProbeStsz(1, 11)])],
       ['missing stts', compactProbeTrackFixture([stsdBox, compactProbeStsz(1, 11)])],
       ['missing stsz', compactProbeTrackFixture([stsdBox, sttsBox])],

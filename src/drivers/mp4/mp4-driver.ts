@@ -9,7 +9,6 @@
 import type {
   ByteSource,
   ContainerDriver,
-  ContainerQuery,
   DecryptParams,
   Demuxer,
   DriverModule,
@@ -44,6 +43,7 @@ import {
 } from './fragment.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
 import { h264AccessUnitRangeIsKeyPicture } from './h264-access-unit.ts';
+import { matchesMp4 } from './mp4-sniff.ts';
 import { Mp4Muxer } from './mux.ts';
 import {
   type Movie,
@@ -75,8 +75,6 @@ import {
   writeMp4,
 } from './write.ts';
 
-const MP4_MIMES = new Set(['video/mp4', 'video/quicktime', 'audio/mp4', 'audio/x-m4a']);
-const MP4_EXTENSIONS = new Set(['mp4', 'mov', 'm4a', 'm4v', 'qt']);
 const TRIM_DECODE_VERIFY_HIGH_WATER = 8 as const;
 const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
@@ -3036,22 +3034,6 @@ async function buildFragmentSampleMap(
   return out;
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && MP4_MIMES.has(q.mime)) return true;
-  if (q.extension !== undefined && MP4_EXTENSIONS.has(q.extension.toLowerCase())) return true;
-  const head = q.head;
-  if (head && head.byteLength >= 8) {
-    const magic = String.fromCharCode(
-      head[4] as number,
-      head[5] as number,
-      head[6] as number,
-      head[7] as number,
-    );
-    if (magic === 'ftyp' || magic === 'styp' || magic === 'moov') return true;
-  }
-  return false;
-}
-
 /**
  * Verify every sample's byte range `[offset, offset+size)` lies within the source before it is read for
  * decryption. A truncated `mdat` (sample bytes promised by the index but missing from the file) would
@@ -4122,7 +4104,7 @@ export const Mp4Driver: ContainerDriver = {
   kind: 'container',
   formats: ['mp4', 'mov'],
   validatesStreamCopyTrim: true,
-  supports: matches,
+  supports: matchesMp4,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
     const ra = await randomAccess(src);

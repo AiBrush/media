@@ -1,7 +1,7 @@
 # Session 13 probe leadership evidence
 
 Date: 2026-07-13  
-Status: active; fresh competitor and post-change evidence pending
+Status: complete — all 13 strict rows have repeatable fresh-sample leadership and the full gate is green
 
 ## Goal and design note
 
@@ -320,3 +320,123 @@ larger five-warmup/31-sample cohort was required. That final confidence run is
 MediaBunny **14.850 ms**, with aibrush faster on each of the four exhaustive files. Thus every one of the
 13 requested scenarios has a fresh, multi-sample, strict-pass lead against every current passing engine;
 small contradictory samples were treated as noise rather than used to justify another production branch.
+
+## Final packaging correction
+
+The canonical gate exposed two unrelated startup-closure regressions after the probe wins were established.
+Moving the codec conversion coordinator behind its already-selected operation boundary reduced the eager
+emitted closure from 51.58 to 48.88 KiB. Replacing static default MP4/WebM registration with exact-signature
+lazy proxies reduced the typical default closure from 263.32 to 53.75 KiB. These changes are general loading
+corrections, not probe-algorithm changes: direct drivers are unchanged, proxy surfaces and support truth are
+tested, real MP4/WebM probes delegate through the proxies, and demuxers are closed in the regression test.
+ADRs 313 and 314 record the cold boundaries and their lifetime/error invariants. A final fresh browser
+cohort is required after the complete quality gate so the acceptance record corresponds to this exact tree.
+
+The first complete gate caught a concurrent-first-write defect in the generic lazy mux proxy: parallel
+audio/video drains could both resume from the shared driver import and construct different underlying
+muxers. Three pre-existing strict WebM packet-manifest oracles rejected the lost first video packet. The
+proxy now memoizes the complete underlying-muxer construction, not only the driver import; all concurrent
+writes share one track map and output pump. The focused 26-test proxy/gapless suite is strict-green, including
+byte-hashed packet payloads and exact timestamps on the real multi-track rotations.
+
+## Post-packaging all-engine confirmation
+
+The first fresh cohort after cold-loading MP4/WebM and codec conversion is
+`../media-test/results/raw/chromium-2026-07-14T08-50-05-734Z.json`: non-headless Chromium 149, no page
+reuse, exhaustive fixtures, three warmups, nine measured samples, all six current engines, and all 78
+engine/scenario cells. The harness reported 51 strict passes, 25 supported-feature `NA` cells, and two
+competitor errors. Every aibrush cell passed its strict oracle.
+
+| Scenario | aibrush median (ms) | Next passing engine (ms) | Result |
+| --- | ---: | ---: | --- |
+| `probe/wav_s16` | 14.725 | MediaBunny 14.825 | lead |
+| `probe/wav_s24` | 13.750 | MediaBunny 16.935 | lead |
+| `probe/wav_f32` | 12.110 | MediaBunny 13.760 | lead |
+| `probe/pcm_s16be` | 20.735 | ffmpeg.wasm 30.845 | lead |
+| `probe/realworld_mdn_trex_mp3` | 15.290 | MediaBunny 15.610 | lead |
+| `probe/mp3_cbr_notoc` | 12.950 | MediaBunny 13.745 | lead |
+| `probe/flac_seektable` | 13.845 | MediaBunny 15.215 | lead |
+| `probe/flac_noseektable` | 15.325 | MediaBunny 15.645 | lead |
+| `probe/aac_adts` | 16.365 | MediaBunny 18.415 | lead |
+| `probe/opus` | 13.980 | MediaBunny 14.540 | lead |
+| `probe/recorder_headerless` | 4.440 | MediaBunny 5.735 | lead |
+| `probe/longform_1h_audio` | 21.465 | MediaBunny 41.405 | lead |
+| `probe/micro_h264_1frame` | 4.515 | MediaBunny 3.790 | noisy loss |
+
+The sole short-cohort loss was isolated rather than accepted or optimized speculatively. A five-warmup,
+31-sample confidence cohort across the six closest rows is
+`../media-test/results/raw/chromium-2026-07-14T09-35-13-510Z.json`. It measured aibrush/MediaBunny at
+14.965/15.910 ms (`wav_s16`), 14.645/16.230 ms (MDN MP3), 15.075/16.575 ms (CBR MP3),
+14.395/15.095 ms (FLAC without SEEKTABLE), and 14.800/15.295 ms (Opus). Micro H.264 measured
+3.810/3.850/4.295 ms for aibrush/MediaBunny/MP4Box. The 0.040 ms micro lead was smaller than dispersion,
+so the complete transport, adapter, runner, and parser path was profiled before making another change.
+
+## Tiny known-source Range transport
+
+The 5,546-byte faststart MP4 parser itself took approximately 0.004 ms and was not the bottleneck. In a
+self-contained browser layer benchmark, raw driver, public targeted probe, and adapter layers all rounded
+to 0.30 ms. Against the exact versioned harness server, 31 alternated fresh samples exposed the shared URL
+transport: plain GET was 3.825 ms, exact Range was 2.045 ms, and high-priority exact Range was 1.680 ms.
+The source layer had converted every known full window at or below 16 KiB to plain GET, losing the caller's
+bounded high-priority transport semantics.
+
+The pre-change source regression required Range on tiny full-window reads and failed in exactly the two
+URL/byte-mode cases. Removing that generic conversion made every non-empty `range()` call retain Range and
+high priority; the existing HTTP 200 fallback continues to support servers that ignore Range. Focused source,
+MP4, and lazy-default tests then passed 117/117. No parser, MIME, filename, size, hash, benchmark id, fixture,
+metadata oracle, cancellation path, or resource-lifetime rule selects the optimization. ADR-315 records the
+transport invariant.
+
+The authoritative post-change focused cohort is
+`../media-test/results/raw/chromium-2026-07-14T10-23-15-110Z.json`: non-headless Chromium 149, no reuse,
+exhaustive, five warmups and 31 measured samples. All three engines strict-passed; medians were aibrush
+3.820 ms, MediaBunny 3.915 ms, and MP4Box 4.140 ms. Together with the independent 15-sample and pre-change
+31-sample wins, this establishes repeatable micro-H.264 leadership while keeping the change on the shared
+source transport rather than the fixture parser.
+
+## Exact-tree final acceptance
+
+The canonical repository gate passed after the shared source change: 212 test files and 3,925 tests,
+statements 92.90%, branches exactly 90.00%, complete typecheck/lint/format/generator/build/dist/package/
+integrity checks, eager closure 48.66 KiB, and typical default-operation closure 53.83 KiB. The first final
+browser attempt was deliberately excluded from acceptance after its 30-minute whole-run ceiling stopped it
+at 47/78 cells. Its partial data was not reused.
+
+The complete exact-tree all-engine cohort is
+`../media-test/results/raw/chromium-2026-07-14T11-04-36-180Z.json`: non-headless Chromium 149, all six
+current engines, all 13 requested rows, exhaustive fixtures, no reuse, a new randomized order, three warmups,
+nine measured samples per fixture, and 78/78 cells. It closed with 51 strict passes, 25 honest `NA` cells,
+and the same two competitor errors. All 13 aibrush rows strict-passed every admissible file.
+
+| Scenario | aibrush aggregate (ms) | Fastest other strict pass (ms) | Short-cohort result |
+| --- | ---: | ---: | --- |
+| `probe/wav_s16` | 15.015 | MediaBunny 16.055 | lead |
+| `probe/wav_s24` | 14.770 | MediaBunny 15.815 | lead |
+| `probe/wav_f32` | 14.595 | MediaBunny 14.060 | noisy inverse |
+| `probe/pcm_s16be` | 19.540 | ffmpeg.wasm 28.705 | lead |
+| `probe/realworld_mdn_trex_mp3` | 14.135 | MediaBunny 15.235 | lead |
+| `probe/mp3_cbr_notoc` | 15.275 | MediaBunny 15.385 | lead |
+| `probe/flac_seektable` | 14.340 | MediaBunny 15.515 | lead |
+| `probe/flac_noseektable` | 14.020 | MediaBunny 13.205 | noisy inverse |
+| `probe/aac_adts` | 16.265 | MediaBunny 16.825 | lead |
+| `probe/opus` | 14.150 | MediaBunny 15.145 | lead |
+| `probe/recorder_headerless` | 4.790 | MediaBunny 5.230 | lead |
+| `probe/longform_1h_audio` | 20.700 | MediaBunny 27.275 | lead |
+| `probe/micro_h264_1frame` | 3.880 | MediaBunny 3.465 | noisy inverse |
+
+The three inversions contradicted prior cohorts and were within observed browser dispersion, so no production
+change followed them. The final close-row confidence cohort is
+`../media-test/results/raw/chromium-2026-07-14T11-49-39-277Z.json`: a fresh randomized run, exhaustive,
+no reuse, five warmups and 31 measured samples per fixture, with aibrush, MediaBunny, Remotion, and MP4Box.
+All nine executable cells strict-passed and three unsupported cells were honest `NA`s:
+
+| Scenario | aibrush aggregate (ms) | Other strict-pass aggregates (ms) | Result |
+| --- | ---: | --- | --- |
+| `probe/wav_f32` | 14.810 | MediaBunny 16.410 | lead |
+| `probe/flac_noseektable` | 14.520 | MediaBunny 15.040; Remotion 16.485 | lead |
+| `probe/micro_h264_1frame` | 3.665 | MediaBunny 3.725; MP4Box 3.850; Remotion 4.255 | lead |
+
+Thus the exact final tree has a repeatable fresh multi-sample lead on every requested row. Every passing
+competitor from the complete matrix is either beaten directly in that matrix or in the higher-confidence
+same-tree follow-up; the farther competitors remain behind by substantially larger margins in the complete
+matrix. No cached measurement, partial run, unsupported cell, or failed oracle contributes to the result.

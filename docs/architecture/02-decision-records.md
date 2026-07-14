@@ -9416,3 +9416,86 @@ aibrush-media versus MediaBunny's 5.75 and 5.22 ms.
 **Rejected:** fixture names, hashes, benchmark IDs, or exact sizes; an unbounded whole GET; dropping the
 terminal timing scan; guessing duration/fps from the prefix; speculative duplicate requests; or applying
 the larger first window to known-size/local sources that already prove metadata from 8 KiB.
+
+### ADR-313 — Codec conversion orchestration stays behind the conversion boundary
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** The complete codec conversion coordinator was a private method on `MediaEngine`, so its static
+imports entered the eager kernel even when an application only probed or remuxed media. The emitted eager
+closure reached 51.58 KiB against the binding 50 KiB budget. The coordinator owns substantial but cold
+logic: demux packet scheduling, two-pass handling, codec selection, frame filtering, packet drains, VPx
+alpha pairing, cancellation fan-out, mux finalization, and exact teardown.
+
+**Decision:** Move that coordinator unchanged into an operation-lazy module and dynamically import it only
+after the engine has selected the residual conversion route. That module still proves semantic stream-copy
+before constructing the codec graph. Pass a typed context containing the
+engine's existing private routing seams; do not duplicate registry state, capability decisions, caches, or
+source ownership. The runner remains the single implementation of the codec path and calls the same
+demuxer, decoder, filter, encoder, muxer, cancellation, and finalization helpers in the same order.
+
+**Invariants and consequences:** Probe, remux, PCM-native conversion, and semantic stream-copy no longer
+carry codec-conversion orchestration. The eager emitted closure is 48.88 KiB. Codec conversion pays one
+memoized module boundary after route selection. B-frame/VFR DTS/PTS order, two-pass replay, backpressure,
+primary-error precedence, abort propagation, mux finalization, and close-exactly-once ownership are
+unchanged and remain covered by the codec-operation and engine suites.
+
+**Rejected:** deleting codec-path validation; weakening teardown to save awaits; copying mutable registry
+state into the runner; importing the runner during capability detection; or splitting scheduling into
+format-specific fixture paths.
+
+### ADR-314 — Default MP4 and WebM registration uses exact lazy proxies
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** Default registration statically imported both complete MP4 and WebM implementations. A probe
+of any audio-only format therefore pulled ISO BMFF parsing, EBML parsing, muxing, encryption, and streaming
+writers into the typical default closure. After the eager-kernel correction in ADR-313, that closure still
+measured 263.32 KiB against the binding 256 KiB limit, and the unused parsers added first-operation parse
+and evaluation work to every format.
+
+**Decision:** Extract each full driver's exact synchronous MIME, extension, and magic predicate into a
+small side-effect-free sniff module. Default registration installs `lazyContainer` proxies with the same
+ids, formats, support predicates, probe/packet-info/stream-copy/decrypt surfaces, and trim-validation flag.
+The selected full driver is imported once on the first asynchronous container operation. Direct driver
+exports and selective operation loading remain unchanged.
+
+**Invariants and consequences:** Registration order and router truth are identical. Real MP4 and WebM
+probe/demux tests prove proxy delegation and demuxer closure, while the full container suites continue to
+own metadata, malformed-input, seek, encryption, mux, packet, cancellation, B-frame/VFR, backpressure, and
+lifetime truth. Concurrent first writes share one memoized underlying muxer construction, so parallel
+audio/video drains cannot split packets across duplicate muxers. The measured typical default closure falls
+from 263.32 KiB to 53.75 KiB; an audio-only
+operation loads neither parser, and an MP4 operation does not load WebM (or vice versa).
+
+**Rejected:** approximate or broader sniffing; removing declared driver capabilities; caching across
+different sources; recognizing fixture names, sizes, hashes, or benchmark ids; combining both full drivers
+in one lazy chunk; or changing container parser behavior to meet a packaging budget.
+
+### ADR-315 — Seekable URL full-window reads retain Range semantics
+
+**Status:** Accepted — 2026-07-14
+
+**Context:** A URL source with a known size at or below 16 KiB converted an exact `range(0, size)` call
+into a plain GET. That shortcut preserved bytes but discarded both the caller's range semantics and the
+high fetch priority used by bounded metadata reads. A browser profile against the exact versioned harness
+server, with 31 alternated fresh samples per mode, measured the plain GET path at 3.825 ms, an exact Range
+request at 2.045 ms, and the same Range request at high priority at 1.680 ms. The conversion therefore made
+small structurally bounded metadata reads slower while also obscuring the source contract.
+
+**Decision:** Remove the size-based plain-GET exception. Every non-empty `Source.range(start, end)` call
+for URL and byte-mode media-element sources issues the corresponding high-priority HTTP Range request,
+including a known-size `[0, size)` interval. Servers that ignore Range remain supported through the existing
+HTTP 200 complete-response fallback and exact interval slicing. Callers that have structurally proved that
+the complete response is required use `readAll()` explicitly.
+
+**Invariants and consequences:** The source regression suite requires the exact `Range` header for tiny
+full-window reads and separately proves HTTP 200 fallback. Clamping, empty ranges, abort propagation,
+short-response errors, size discovery, exact-source prefix caching, metadata, parser selection, and
+resource-lifetime behavior are unchanged. No parser or fixture condition participates in transport
+selection. In a final five-warmup/31-sample exhaustive cohort, micro H.264 remained strict-pass and led at
+3.820 ms versus MediaBunny at 3.915 ms and MP4Box at 4.140 ms.
+
+**Rejected:** cross-URL response caching; fixture-name, hash, benchmark-id, or exact-size recognition;
+unbounded GET substitution; weakening HTTP error or cancellation behavior; or changing MP4 parsing when
+the measured bottleneck was the shared URL transport.

@@ -23,7 +23,6 @@ import type {
   Demuxer,
   Determinism,
   DriverModule,
-  EncodedChunk,
   FilterDriver,
   FilterSpec,
   Muxer,
@@ -36,7 +35,7 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
-import { composeChain, lazyPipeThrough } from '../kernel/executor.ts';
+import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { Router, type StageSelectOptions } from '../kernel/router.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
@@ -1347,275 +1346,28 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
     input: MediaInput,
   ): Promise<Output> {
-    const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
-    const target = chooseOutputContainer(opts.to, container.formats[0]);
-
-    // Preferred fast path: exact container-only requests and source-proved semantic no-ops remain behind
-    // an operation-lazy planner so the default entry does not carry optional copy strategies.
-    const copied = await (await import('./convert-stream-copy.ts')).tryConvertStreamCopy(
-      container,
-      target,
-      src,
-      opts,
-      this.#stageOptions(signal, o),
-      input,
-    );
-    if (copied !== undefined) {
-      if ('output' in copied) return copied.output;
-      return materializeOutput(opts.sink ?? toBlob(), copied.stream, mimeOpts(signal, target));
-    }
-
-    if (!containerHasChunkMuxer(target)) {
-      throw new CapabilityError('capability-miss', `convert to '${target}' has no muxer`, {
-        op: 'convert',
-        tried: [target],
-      });
-    }
-
-    // Heavy decode→filter→encode→mux: run it OFF the main thread when worker offload is selected + a
-    // WebCodecs-capable worker handshook (doc 06 §4, ADR-019). The worker reconstructs THIS same graph
-    // (worker-main.ts) and streams encoded bytes back; the sink is materialized here (it may hold a DOM
-    // element). `undefined` means "no worker — run inline" (the honest fallback below).
-    const offloaded = await this.#offloadStream(src, 'convert', opts, signal, o);
-    /* v8 ignore next -- the offload branch needs a live worker bridge (browser); harness validated. */
-    if (offloaded !== undefined) {
-      return materializeOutput(opts.sink ?? toBlob(), offloaded, mimeOpts(signal, target));
-    }
-
-    const twoPassPlan =
-      opts.video !== false && opts.video?.twoPass === true
-        ? await (await import('./video-two-pass-runner.ts')).analyzeH264TwoPass(
-            src,
-            container,
-            opts.video,
-            signal,
-            o,
-            opts.fragmented === true,
-            this.#videoRunnerContext(),
-          )
-        : undefined;
-    const demuxer = await container.demux(src, this.#stageOptions(signal, o));
-    const muxer = (await this.#routeMuxer(target, o.strategy?.pinDriver)).createMuxer(
-      muxOptionsFrom(opts, target),
-    );
-    const tasks: Promise<void>[] = [];
-    const openStreams: ReadableStream<unknown>[] = [];
-    try {
-      const selectedVideoTrack =
-        opts.video === false
-          ? undefined
-          : demuxer.tracks.find((t) => t.mediaType === 'video' && t.config !== undefined);
-      const audioTrack =
-        opts.audio === false
-          ? undefined
-          : demuxer.tracks.find((t) => t.mediaType === 'audio' && t.config !== undefined);
-      const copyAudioPackets =
-        audioTrack !== undefined &&
-        opts.audio === undefined &&
-        (await import('./codec-pipeline.ts')).canCopyAudioTrackToContainer(target, audioTrack);
-
-      if (selectedVideoTrack) {
-        // Fail target encode-config errors before creating decode/filter streams. Otherwise a synchronous
-        // config miss (for example the benchmark's 1x1 H.264 edge) can reject the encode task while an
-        // already-built upstream stream is still tearing down, surfacing as an escaped async rejection.
-        const {
-          buildVideoEncoderConfigForRuntime,
-          canUseVpxAlphaGeometryPacketTranscode,
-          canUseVpxAlphaPacketTranscode,
-          decodeQueryFor,
-          decodeVideoPacketsWithAlpha,
-          qualifiedVideoSourceCodec,
-          sourceVideoBitrateFromPacketTable,
-          unwrapPackets,
-        } = await loadCodecPipeline();
-        const measuredBitrate = sourceVideoBitrateFromPacketTable(
-          demuxer.packetTable?.(),
-          selectedVideoTrack.id,
-        );
-        const videoTrack: TrackInfo =
-          measuredBitrate === undefined
-            ? selectedVideoTrack
-            : { ...selectedVideoTrack, bitrate: measuredBitrate };
-        const videoTarget = opts.video || {};
-        const sourceGeometry = sourceGeometryOf(videoTrack);
-        const videoEncoderConfig = await buildVideoEncoderConfigForRuntime(
-          videoTarget,
-          sourceGeometry,
-          videoTrack.codec,
-        );
-        const sourceVideoCodec = qualifiedVideoSourceCodec(videoTrack);
-        if (
-          canUseVpxAlphaGeometryPacketTranscode(
-            videoTarget,
-            videoTrack.alpha === true,
-            sourceVideoCodec,
-            videoEncoderConfig.codec,
-          )
-        ) {
-          const packets = demuxer.packets(videoTrack.id);
-          openStreams.push(packets);
-          tasks.push(
-            this.#transcodeVpxAlphaGeometryPacketStream(
-              packets,
-              videoTarget,
-              videoTrack,
-              muxer,
-              signal,
-              o,
-            ),
-          );
-        } else if (
-          canUseVpxAlphaPacketTranscode(
-            videoTarget,
-            videoTrack.alpha === true,
-            sourceVideoCodec,
-            videoEncoderConfig.codec,
-          )
-        ) {
-          const packets = demuxer.packets(videoTrack.id);
-          openStreams.push(packets);
-          tasks.push(
-            this.#transcodeVpxAlphaPacketStream(packets, videoTarget, videoTrack, muxer, signal, o),
-          );
-        } else {
-          // Resolve the decode codec first (this throws a typed miss in Node where WebCodecs is absent);
-          // the composition below is the live path, browser-validated.
-          const decodeQuery = await decodeQueryFor(videoTrack);
-          const videoCodec = await this.#routeCodec(decodeQuery, o);
-          const config = decodeQuery.config;
-          const decodeStage = this.#stageOptions(signal, o);
-          /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
-          const decoded =
-            videoTrack.alpha === true
-              ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
-                  videoCodec.createDecoder(config, decodeStage),
-                )
-              : o.strategy?.pinDriver !== videoCodec.id &&
-                  videoCodec.id !== 'wasm-vpx' &&
-                  /^vp(?:8|9|09)/.test(config.codec)
-                ? (await import('./replayable-video-decoder.ts')).decodeVideoWithRuntimeFallback(
-                    unwrapPackets(demuxer.packets(videoTrack.id)),
-                    () =>
-                      videoCodec.createDecoder(config, decodeStage) as TransformStream<
-                        EncodedChunk,
-                        VideoFrame
-                      >,
-                    async () => {
-                      const fallback = await this.#routeCodec(decodeQuery, {
-                        ...o,
-                        strategy: { ...o.strategy, pinDriver: 'wasm-vpx' },
-                      });
-                      return fallback.createDecoder(config, decodeStage) as TransformStream<
-                        EncodedChunk,
-                        VideoFrame
-                      >;
-                    },
-                    { signal },
-                  )
-                : lazyPipeThrough<EncodedChunk, VideoFrame>(
-                    unwrapPackets(demuxer.packets(videoTrack.id)),
-                    () =>
-                      videoCodec.createDecoder(config, decodeStage) as TransformStream<
-                        EncodedChunk,
-                        VideoFrame
-                      >,
-                    { closeValue: closeIfClosable },
-                  );
-          const filtered = await this.#applyVideoFilters(
-            decoded as ReadableStream<VideoFrame>,
-            opts.video || {},
-            videoTrack,
-            signal,
-            o,
-          );
-          openStreams.push(filtered);
-          tasks.push(
-            this.#encodeVideoStream(
-              filtered,
-              opts.video || {},
-              videoTrack,
-              muxer,
-              signal,
-              o,
-              opts.fragmented === true,
-              twoPassPlan,
-            ),
-          );
-          /* v8 ignore stop */
-        }
-      }
-      if (audioTrack) {
-        if (copyAudioPackets) {
-          const { drainEncoderToMuxer } = await loadCodecPipeline();
-          const packets = demuxer.packets(audioTrack.id);
-          openStreams.push(packets);
-          tasks.push(drainEncoderToMuxer(packets, muxer, audioTrack, signal));
-        } else {
-          const { resolveAudioEncodeTargetForRuntime } = await loadCodecPipeline();
-          const audioTarget = await resolveAudioEncodeTargetForRuntime(
-            opts.audio || {},
-            audioTrack.codec,
-          );
-          const stage = this.#stageOptions(signal, o);
-          let decoded: ReadableStream<AudioData>;
-          if (
-            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
-            container.decodePcmInterleavedStream !== undefined
-          ) {
-            const chunks = await container.decodePcmInterleavedStream(src, stage);
-            decoded = (await import('../dsp/audio-data.ts')).interleavedPcmChunksToAudioDataStream(
-              chunks,
-              stage,
-              audioTrack.codec,
-            );
-          } else if (
-            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
-            container.decodePcmAudioStream !== undefined
-          ) {
-            const chunks = await container.decodePcmAudioStream(src, stage);
-            decoded = (await import('../dsp/audio-data.ts')).pcmAudioChunksToAudioDataStream(
-              chunks,
-              stage,
-              audioTrack.codec,
-              'f32',
-            );
-          } else if (
-            container.decodePcmAudio !== undefined &&
-            (isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
-          ) {
-            decoded = (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
-              await container.decodePcmAudio(src, stage),
-              stage,
-              audioTrack.codec,
-              'f32',
-            );
-          } else {
-            decoded = await this.#decodeAudioTrackPackets(demuxer, audioTrack, stage, o);
-          }
-          /* v8 ignore start -- live decode→[remix/resample]→encode requires AudioData/WebCodecs; browser-validated. */
-          // Channel/rate change → remix/resample the decoded AudioData to the target layout BEFORE the
-          // encoder, so the buffers match the encoder's configured numberOfChannels/sampleRate exactly (a
-          // stereo buffer into a mono-configured AudioEncoder is rejected). No change ⇒ passes through.
-          const shaped = await this.#applyAudioFilters(decoded, audioTarget, audioTrack, signal, o);
-          openStreams.push(shaped);
-          tasks.push(this.#encodeAudioStream(shaped, audioTarget, audioTrack, muxer, signal, o));
-          /* v8 ignore stop */
-        }
-      }
-      if (tasks.length === 0) {
-        throw new CapabilityError('capability-miss', 'convert found no decodable track', {
-          op: 'convert',
-          tried: [container.id],
-        });
-      }
-      /* v8 ignore start -- reached only when a live codec was resolved (browser); harness-validated. */
-      await allOrCancelStreams(tasks, openStreams);
-      await muxer.finalize();
-      return await materializeOutput(opts.sink ?? toBlob(), muxer.output, mimeOpts(signal, target));
-      /* v8 ignore stop */
-    } finally {
-      await demuxer.close();
-    }
+    const { runCodecConvert } = await import('./codec-convert-runner.ts');
+    return runCodecConvert(src, opts, signal, o, input, {
+      routeContainer: this.#routeContainer.bind(this),
+      stageOptions: this.#stageOptions.bind(this),
+      offloadStream: this.#offloadStream.bind(this),
+      videoRunnerContext: () => this.#videoRunnerContext(),
+      routeMuxer: this.#routeMuxer.bind(this),
+      muxOptions: muxOptionsFrom,
+      materializeOutput,
+      mimeOptions: mimeOpts,
+      sourceGeometry: sourceGeometryOf,
+      transcodeVpxAlphaGeometry: this.#transcodeVpxAlphaGeometryPacketStream.bind(this),
+      transcodeVpxAlpha: this.#transcodeVpxAlphaPacketStream.bind(this),
+      routeCodec: this.#routeCodec.bind(this),
+      closeIfClosable,
+      applyVideoFilters: this.#applyVideoFilters.bind(this),
+      encodeVideoStream: this.#encodeVideoStream.bind(this),
+      isRawPcmTrack,
+      decodeAudioTrackPackets: this.#decodeAudioTrackPackets.bind(this),
+      applyAudioFilters: this.#applyAudioFilters.bind(this),
+      encodeAudioStream: this.#encodeAudioStream.bind(this),
+    });
   }
 
   /** Bind the engine-owned router/filter capabilities shared by both lazy video-runner entry points. */
@@ -2191,19 +1943,6 @@ async function allOrCancel(tasks: readonly Promise<void>[], frames: MediaStreams
       frames.video ? cancelStream(frames.video) : Promise.resolve(),
       frames.audio ? cancelStream(frames.audio) : Promise.resolve(),
     ]);
-    throw e;
-  }
-}
-
-/** Like {@link allOrCancel} but for the internally-composed convert streams (decode/filter outputs). */
-async function allOrCancelStreams(
-  tasks: readonly Promise<void>[],
-  streams: readonly ReadableStream<unknown>[],
-): Promise<void> {
-  try {
-    await Promise.all(tasks);
-  } catch (e) {
-    await Promise.all(streams.map((s) => cancelStream(s)));
     throw e;
   }
 }

@@ -9,7 +9,6 @@ import { probeJpeg } from '../../codecs/image/probe.ts';
 import {
   type ByteSource,
   type ContainerDriver,
-  type ContainerQuery,
   type ContainerSideData,
   DRIVER_API_VERSION,
   type Demuxer,
@@ -46,6 +45,7 @@ import {
   type WebmVideoCodecQualification,
   qualifyWebmVideoCodec,
 } from './video-codec-qualification.ts';
+import { matchesWebm } from './webm-sniff.ts';
 
 const ID = {
   EBML: 0x1a45dfa3,
@@ -2282,36 +2282,12 @@ function packetStream(
   /* v8 ignore stop */
 }
 
-function matches(q: ContainerQuery): boolean {
-  if (
-    q.mime !== undefined &&
-    (q.mime === 'video/webm' || q.mime === 'audio/webm' || q.mime === 'video/x-matroska')
-  ) {
-    return true;
-  }
-  if (
-    q.extension !== undefined &&
-    (q.extension === 'webm' || q.extension === 'mkv' || q.extension === 'mka')
-  ) {
-    return true;
-  }
-  const head = q.head;
-  return (
-    head !== undefined &&
-    head.byteLength >= 4 &&
-    head[0] === 0x1a &&
-    head[1] === 0x45 &&
-    head[2] === 0xdf &&
-    head[3] === 0xa3
-  );
-}
-
 export const WebmDriver: ContainerDriver = {
   id: 'webm',
   apiVersion: DRIVER_API_VERSION,
   kind: 'container',
   formats: ['webm', 'mkv'],
-  supports: matches,
+  supports: matchesWebm,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
     assertNotAborted(signal);

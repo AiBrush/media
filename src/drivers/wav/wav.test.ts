@@ -504,13 +504,7 @@ describe('probe WAV across the real corpus', () => {
     wrongRiff.set([0x42, 0x41, 0x44, 0x21], 0);
     const wrongWave = valid.slice(0, 128);
     wrongWave.set([0x42, 0x41, 0x44, 0x21], 8);
-    const dataOnly = riffWave([
-      ...[...'data'].map((c) => c.charCodeAt(0)),
-      0,
-      0,
-      0,
-      0,
-    ]);
+    const dataOnly = riffWave([...[...'data'].map((c) => c.charCodeAt(0)), 0, 0, 0, 0]);
     const truncatedFmt = riffWave([
       ...[...'fmt '].map((c) => c.charCodeAt(0)),
       16,
@@ -614,7 +608,9 @@ describe('probe WAV across the real corpus', () => {
       size: padded.byteLength,
       range(start, end): Promise<Uint8Array> {
         reads.push([start, end]);
-        return Promise.resolve(reads.length === 1 ? padded.subarray(start, end) : new Uint8Array(0));
+        return Promise.resolve(
+          reads.length === 1 ? padded.subarray(start, end) : new Uint8Array(0),
+        );
       },
       stream: () => streamBytes(padded),
     });
@@ -1200,7 +1196,13 @@ describe('probe WAV across the real corpus', () => {
         chunkPayload(bytes, 'data').subarray(2 * 2, 7 * 2),
       );
       expect(readWavPcm(first).frames).toBe(5);
-      expect(server.calls).toEqual([{ method: 'GET', range: null, bytes: bytes.byteLength }]);
+      expect(server.calls).toEqual([
+        {
+          method: 'GET',
+          range: `bytes=0-${bytes.byteLength - 1}`,
+          bytes: bytes.byteLength,
+        },
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
     }

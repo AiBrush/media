@@ -131,6 +131,12 @@ describe('fromBlob', () => {
     const file = new File([FIVE], 'clip.mp4', { type: 'video/mp4' });
     expect(fromBlob(file).filename).toBe('clip.mp4');
   });
+
+  it('prefers a File webkitRelativePath when directory upload metadata is present', () => {
+    const file = new File([FIVE], 'clip.mp4', { type: 'video/mp4' });
+    Object.defineProperty(file, 'webkitRelativePath', { value: 'media/clips/clip.mp4' });
+    expect(fromBlob(file).filename).toBe('media/clips/clip.mp4');
+  });
 });
 
 describe('fromStream', () => {
@@ -277,6 +283,7 @@ describe('fromURL', () => {
     );
     expect(fromURL('relative/clip.mp4?download=1').filename).toBe('clip.mp4');
     expect(fromURL(DATA_URL).filename).toBeUndefined();
+    expect(fromURL('mailto:media@example.test').filename).toBeUndefined();
   });
 });
 
@@ -286,6 +293,12 @@ describe('fromElement', () => {
     const src = fromElement(el);
     expect(src.kind).toBe('element');
     expect([...(await readAll(src.stream()))]).toEqual([0, 1, 2, 3, 4]);
+
+    const named = fromElement({
+      currentSrc: 'https://cdn.test/media/clip.webm?token=one',
+      src: '',
+    } as unknown as HTMLMediaElement);
+    expect(named.filename).toBe('clip.webm');
   });
 
   it('uses captureStream only in explicit capture mode and rejects a missing byte src', () => {
@@ -302,6 +315,7 @@ describe('fromElement', () => {
     const captured = fromElement(el, { mode: 'capture' });
     expect(captured.kind).toBe('media-stream');
     expect(captured.mediaStream).toBe(mediaStream);
+    expect(from(captured)).toBe(captured);
     expect(() => fromElement({} as HTMLMediaElement, { mode: 'capture' })).toThrowError(
       CapabilityError,
     );
@@ -677,17 +691,17 @@ describe('fromURL — learns size from a range read and clamps past-EOF', () => 
     expect(src.size).toBe(12345);
   });
 
-  it('uses a plain GET for a tiny known-size full-window range', async () => {
+  it('preserves high-priority Range semantics for a tiny known-size full window', async () => {
     const { fetch, calls } = rangeServer(FIVE);
     vi.stubGlobal('fetch', fetch);
     const src = fromURL(HREF, { size: FIVE.byteLength });
 
     expectBytesEqual(await src.range?.(0, FIVE.byteLength), FIVE);
 
-    expect(calls).toEqual([{ method: 'GET', range: null }]);
+    expect(calls).toEqual([{ method: 'GET', range: 'bytes=0-4' }]);
   });
 
-  it('learns tiny full-window GET size from the body when Content-Length is absent', async () => {
+  it('keeps the known size when a server ignores a tiny full-window Range without Content-Length', async () => {
     const calls: { method: string; range: string | null }[] = [];
     vi.stubGlobal('fetch', ((_input: unknown, init?: RequestInit) => {
       const method = (init?.method ?? 'GET').toUpperCase();
@@ -700,10 +714,10 @@ describe('fromURL — learns size from a range read and clamps past-EOF', () => 
     expectBytesEqual(await src.range?.(0, FIVE.byteLength), FIVE);
 
     expect(src.size).toBe(FIVE.byteLength);
-    expect(calls).toEqual([{ method: 'GET', range: null }]);
+    expect(calls).toEqual([{ method: 'GET', range: 'bytes=0-4' }]);
   });
 
-  it('rejects a failed tiny full-window GET with a typed InputError', async () => {
+  it('rejects a failed tiny full-window Range with a typed InputError', async () => {
     vi.stubGlobal('fetch', () => Promise.resolve(new Response('err', { status: 503 })));
     const src = fromURL(HREF, { size: FIVE.byteLength });
 

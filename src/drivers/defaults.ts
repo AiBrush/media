@@ -70,9 +70,9 @@ import {
   parseFlacStreamInfo,
   readSeekableFlacStreamInfo,
 } from './flac/flac-sniff.ts';
-import { Mp4Module } from './mp4/mp4-driver.ts';
+import { matchesMp4 } from './mp4/mp4-sniff.ts';
 import { MPEG_TS_FORMATS, matchesMpegTs } from './mpegts/mpegts-sniff.ts';
-import { WebmModule } from './webm/webm-driver.ts';
+import { matchesWebm } from './webm/webm-sniff.ts';
 
 /**
  * Register all first-party drivers (idempotent by id): the TS containers, the WebCodecs codec tier
@@ -82,14 +82,14 @@ import { WebmModule } from './webm/webm-driver.ts';
  */
 export function registerDefaultDrivers(reg: Registry): void {
   const modules: DriverModule[] = [
-    Mp4Module,
-    WebmModule,
     WebcodecsVideoModule,
     WebCodecsAudioModule,
     // All software codec tails now co-vendor their wasm via scripts/vendor-wasm.ts (rust both-files pairs:
     // Vorbis/AAC/MP3 + dav1d AV1; self-contained inlined tails: Opus/VPx) for the lazy import.meta.url load
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
+  reg.addContainer(lazyMp4ContainerDriver());
+  reg.addContainer(lazyWebmContainerDriver());
   for (const mod of modules) mod.register(reg);
   for (const driver of lazyAudioContainerDrivers()) reg.addContainer(driver);
   for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
@@ -98,6 +98,31 @@ export function registerDefaultDrivers(reg: Registry): void {
   reg.addContainer(lazyFlacContainerDriver());
   reg.addContainer(lazyAviContainerDriver());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
+}
+
+function lazyMp4ContainerDriver(): ContainerDriver {
+  return lazyContainer({
+    id: 'mp4',
+    formats: ['mp4', 'mov'],
+    supports: matchesMp4,
+    load: () => import('./mp4/mp4-driver.ts').then((module) => module.Mp4Driver),
+    probe: true,
+    packetInfo: true,
+    streamCopy: true,
+    decrypt: true,
+    validatesStreamCopyTrim: true,
+  });
+}
+
+function lazyWebmContainerDriver(): ContainerDriver {
+  return lazyContainer({
+    id: 'webm',
+    formats: ['webm', 'mkv'],
+    supports: matchesWebm,
+    load: () => import('./webm/webm-driver.ts').then((module) => module.WebmDriver),
+    probe: true,
+    streamCopy: true,
+  });
 }
 
 const IMAGE_FORMATS: readonly ImageFormat[] = ['gif', 'png', 'jpeg', 'webp', 'avif'];
@@ -945,6 +970,7 @@ class LazyFlacMuxer implements Muxer {
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   #resolveReady: (() => void) | undefined;
   #muxer: Muxer | undefined;
+  #muxerPromise: Promise<Muxer> | undefined;
   #track: TrackInfo | undefined;
   #targetTrackId: number | undefined;
 
@@ -992,6 +1018,11 @@ class LazyFlacMuxer implements Muxer {
 
   async #ensureMuxer(): Promise<Muxer> {
     if (this.#muxer !== undefined) return this.#muxer;
+    this.#muxerPromise ??= this.#createMuxer();
+    return this.#muxerPromise;
+  }
+
+  async #createMuxer(): Promise<Muxer> {
     try {
       const driver = await this.#load();
       const muxer = driver.createMuxer(this.#options);
@@ -1045,6 +1076,7 @@ class LazyContainerMuxer implements Muxer {
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   #resolveReady: (() => void) | undefined;
   #muxer: Muxer | undefined;
+  #muxerPromise: Promise<Muxer> | undefined;
 
   constructor(
     load: LazyContainerLoader,
@@ -1104,6 +1136,11 @@ class LazyContainerMuxer implements Muxer {
 
   async #ensureMuxer(): Promise<Muxer> {
     if (this.#muxer !== undefined) return this.#muxer;
+    this.#muxerPromise ??= this.#createMuxer();
+    return this.#muxerPromise;
+  }
+
+  async #createMuxer(): Promise<Muxer> {
     try {
       const driver = await this.#load();
       const muxer = driver.createMuxer(this.#options);

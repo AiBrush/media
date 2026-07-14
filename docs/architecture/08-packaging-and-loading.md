@@ -46,7 +46,7 @@ Author in **TypeScript (strict)**; emit:
 
 - The **default export** is the tiny kernel + bare-function sugar (ADR-009).
 - Op modules and driver modules live behind **dynamic `import()`** inside the kernel, so a consumer's bundler code-splits them automatically — only used chunks are emitted/downloaded (ADR-004). A definite long-tail audio container query first imports only that container's native driver (ADR-285). A definite MP4/MOV or WebM/Matroska mux target and an automatic supported WebCodecs audio query likewise register only their immediately-needed native modules (ADR-290); native support misses, deterministic software, non-native pins, ambiguous/unknown queries, filters, images, preload, and failed selective retries retain the complete register-all fallback.
-- Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103).
+- Default driver registration may use a cheap proxy when a driver has a tiny synchronous `supports()` predicate but a heavy implementation. The proxy is what enters the default bundle; the real driver chunk is imported only once the router selects that capability (ADR-103). MP4 and WebM follow this rule with exact extracted signature predicates, so unrelated default operations load neither parser and selecting one does not load the other (ADR-314).
 - `./image` keeps the pure image parser and browser `ImageDecoder` helper barrel off the eager default entry while zero-config `probe`/`decode` image support still registers through defaults (ADR-049).
 - Live input normalization similarly keeps only the tiny `LiveMediaSource` brand/capture/shape module eager;
   `MediaStreamTrackProcessor` decode/probe and live-convert coordination are separate lazy chunks and are
@@ -59,6 +59,7 @@ Author in **TypeScript (strict)**; emit:
 ```
 index.js  (eager kernel: normalizer, planner, router, registry, executor stubs)  <= ~50 kB
   └─ import('./ops/convert.js')        // on first media.convert(...)
+        └─ import('./api/codec-convert-runner.js') // only after the codec route is selected
   └─ import('./ops/probe.js')          // on first media.probe(...)
         └─ import('./drivers/mp4.js')         // when router selects it
         └─ import('./drivers/webcodecs.js')   // 0-byte runtime; glue only
@@ -104,7 +105,7 @@ Same `import.meta.url` mechanism — the worker entry is emitted as a same-origi
 | Bucket | Target | Counts toward 500 kB JS budget? |
 |---|---|---|
 | eager kernel | ≤ ~50 kB | yes |
-| typical app (kernel + a couple of ops + WebCodecs/TS drivers) | ~150–250 kB | yes |
+| typical app (kernel + a couple of ops + selected WebCodecs/TS drivers) | ≤ 256 kB | yes |
 | GPU-filter driver | small JS | yes |
 | WASM codec cores (flac/opus/soxr/…) | per-codec, lazy | **no** — separate, miss-only assets |
 

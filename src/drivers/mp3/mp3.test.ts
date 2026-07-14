@@ -236,7 +236,11 @@ describe('probe MP3 on the real corpus', () => {
       },
     });
     const expected = mp3TrackInfoForTest(
-      parseMp3(bytes.subarray(id3.byteLength, id3.byteLength + 16 * 1024), bytes.byteLength, id3.byteLength),
+      parseMp3(
+        bytes.subarray(id3.byteLength, id3.byteLength + 16 * 1024),
+        bytes.byteLength,
+        id3.byteLength,
+      ),
     );
 
     expect(tracks).toEqual([expected]);
