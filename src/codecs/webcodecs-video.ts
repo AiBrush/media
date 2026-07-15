@@ -1537,6 +1537,519 @@ function createVideoEncoder(
 
 /* v8 ignore stop */
 
+// ── warm decoder pool: reuse a configured VideoDecoder across sequential same-config decodes ───────
+
+/**
+ * The active borrow's decoded-frame + error sink. The pool rebinds this on every borrow so the ONE warm
+ * `VideoDecoder`'s native `output`/`error` callbacks always reach the *current* stream — never a previous
+ * borrow's (which has detached; a stray frame that still arrives is closed, not leaked). {@link onFrame}
+ * takes ownership of the frame (enqueues it to the readable, or closes it if the readable is already gone).
+ */
+export interface WarmDecoderSink {
+  onFrame(frame: VideoFrame): void;
+  onError(error: DOMException): void;
+}
+
+/**
+ * A reusable, already-configured decoder the {@link WarmVideoDecoderPool} drives. The browser default
+ * ({@link createRealWarmDecoderHandle}) wraps a live `VideoDecoder` configured once (hardware-first, with
+ * the software fallback) and kept CONFIGURED between borrows — reuse then skips the per-call construct +
+ * configure + hardware-init barrier a fresh decoder pays. Tests inject a fake so the pool's
+ * frame-lifetime / backpressure / reuse state machine runs in Node (where WebCodecs is absent).
+ */
+export interface WarmDecoderHandle {
+  /** Route native output/error to `sink`; `undefined` detaches (a stray frame is closed, never leaked). */
+  bind(sink: WarmDecoderSink | undefined): void;
+  /** Submit one chunk to the native control queue. */
+  decode(chunk: EncodedChunk): void;
+  /** Complete all queued work, emitting every pending frame; LEAVES the decoder configured for reuse. */
+  flush(): Promise<void>;
+  /** Pending decode requests (the backpressure signal). */
+  readonly decodeQueueSize: number;
+  /** Resolve on the next queue-drain (backpressure release) or reject on abort. */
+  awaitDequeue(signal: AbortSignal | undefined): Promise<void>;
+  /** Permanently close the decoder + free its hardware session. Idempotent. */
+  close(): void;
+  /** Whether the decoder has been closed (so the pool never reuses a dead handle). */
+  readonly closed: boolean;
+}
+
+/** Build + configure a decoder for `config`/`o`, ready to decode, wired to route output via {@link WarmDecoderHandle.bind}. */
+export type WarmDecoderFactory = (
+  config: VideoDecoderConfig,
+  o: StageOptions | undefined,
+) => Promise<WarmDecoderHandle>;
+
+/**
+ * A per-engine-instance warm decoder pool for the SEQUENTIAL single-frame / seek path (doc 09). It holds
+ * at most one configured `VideoDecoder`, keyed by the exact decode config (codec + coded dims + description
+ * bytes + effective VPx alpha). A same-config borrow REUSES it — eliminating the per-seek construct +
+ * configure + hardware-init cost a fresh decoder pays; a different-config borrow closes the old decoder and
+ * builds a new one; and a borrow that arrives while another is still active is REFUSED (`undefined`) so the
+ * caller builds its own fresh decoder — one decoder never serves two concurrent streams. Any decode
+ * error/abort drops (closes) the pooled decoder so the next borrow rebuilds. It never caches decoded frames
+ * and holds no cross-input state (different inputs with the same config decode identically), so reuse is
+ * correct.
+ */
+export interface WarmVideoDecoderPool {
+  /**
+   * A decoder seam that reuses the warm decoder for `config`/`o`, or `undefined` when pooling cannot apply
+   * right now (another borrow is active, the pool is disposed, or the config is not a poolable WebCodecs
+   * video config) — the caller then falls back to a fresh `createDecoder`.
+   */
+  borrow(
+    config: DecoderConfig,
+    o: StageOptions | undefined,
+  ): TransformStream<EncodedChunk, RawFrame> | undefined;
+  /** Close the warm decoder and free its hardware session (engine dispose / teardown). Idempotent. */
+  dispose(): void;
+}
+
+/** The exact-config miss raised when neither a hardware nor a software configuration is accepted. */
+function unsupportedExactVideoConfigError(config: VideoDecoderConfig): CapabilityError {
+  return new CapabilityError(
+    'capability-miss',
+    `webcodecs-video cannot configure ${config.codec} with hardware or software fallback`,
+    { op: 'decode', tried: ['webcodecs-video'] },
+  );
+}
+
+/* v8 ignore start -- requires a real WebCodecs VideoDecoder; the pool state machine below is Node-tested
+   with an injected fake handle, while this real build+configure path is validated in the browser harness. */
+/**
+ * The browser default {@link WarmDecoderFactory}: construct ONE `VideoDecoder` with a stable trampoline
+ * (native output/error forward to the currently-bound sink), resolve the acceleration hardware-first with a
+ * software fallback (reusing the shared verdict cache), and configure it once behind the empty-`flush()`
+ * control-queue barrier. The returned handle keeps the decoder configured across borrows — the whole point
+ * of pooling — until the pool closes it (config change, decode error, or dispose).
+ */
+const createRealWarmDecoderHandle: WarmDecoderFactory = async (config, o) => {
+  const alpha = readDecoderAlpha(o);
+  let sink: WarmDecoderSink | undefined;
+  const decoder = new VideoDecoder({
+    output: (frame: VideoFrame): void => {
+      // Route to the active borrow, or release the frame if none is bound (never leak a stray output).
+      if (sink !== undefined) sink.onFrame(frame);
+      else frame.close();
+    },
+    error: (e: DOMException): void => sink?.onError(e),
+  });
+  const configureAt = async (acceleration: HardwareAcceleration): Promise<void> => {
+    decoder.configure(normalizeVideoDecoderConfig(config, acceleration, alpha));
+    // `configure()` only queues the support check; an empty `flush()` is the spec-grounded control-queue
+    // barrier that cannot resolve until configuration succeeded (and `flush()` leaves it CONFIGURED).
+    await decoder.flush();
+  };
+  const handle: WarmDecoderHandle = {
+    bind: (s): void => {
+      sink = s;
+    },
+    decode: (chunk): void => decoder.decode(chunk),
+    flush: (): Promise<void> => decoder.flush(),
+    get decodeQueueSize(): number {
+      return decoder.decodeQueueSize;
+    },
+    awaitDequeue: (activeSignal): Promise<void> => awaitDequeueOrAbort(decoder, activeSignal),
+    close: (): void => {
+      if (decoder.state !== 'closed') decoder.close();
+    },
+    get closed(): boolean {
+      return decoder.state === 'closed';
+    },
+  };
+  try {
+    const cached = recallVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+    const acceleration =
+      immediateVideoDecoderAcceleration(o?.determinism, cached) ??
+      (await resolveVideoDecoderAcceleration(o?.determinism, undefined, (requested) =>
+        probeVideoDecoderAcceleration(config, alpha, requested),
+      ));
+    if (acceleration === undefined) throw unsupportedExactVideoConfigError(config);
+    try {
+      await configureAt(acceleration);
+      if (o?.determinism !== 'force-software') {
+        rememberVideoDecoderAcceleration(
+          videoDecoderAccelerationCache,
+          config,
+          alpha,
+          acceleration,
+        );
+      }
+    } catch (error) {
+      // A stale hardware verdict must not erase a real software capability: probe + configure software once.
+      forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+      if (o?.determinism === 'force-software' || acceleration === 'no-preference') {
+        throw error instanceof CapabilityError || error instanceof MediaError
+          ? error
+          : unsupportedExactVideoConfigError(config);
+      }
+      const probe = await probeVideoDecoderAcceleration(config, alpha, 'no-preference');
+      if (!probe.supported) throw unsupportedExactVideoConfigError(config);
+      const software = probe.acceptedAcceleration ?? 'no-preference';
+      await configureAt(software);
+      rememberVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha, software);
+    }
+    return handle;
+  } catch (error) {
+    if (decoder.state !== 'closed') decoder.close();
+    throw error;
+  }
+};
+/* v8 ignore stop */
+
+/** The engine-private pool operations a single borrow drives (acquire the warm handle, then release/discard it). */
+interface WarmBorrowPoolOps {
+  acquire(
+    config: VideoDecoderConfig,
+    o: StageOptions | undefined,
+    key: string,
+  ): Promise<WarmDecoderHandle>;
+  /** The borrow ended cleanly (drained, still configured): keep the decoder warm for the next borrow. */
+  release(): void;
+  /** The borrow errored/aborted: drop (close) the decoder so the next borrow rebuilds. */
+  discard(): void;
+}
+
+/**
+ * One borrow of the warm decoder as a `TransformStream<EncodedChunk, RawFrame>`, structurally mirroring the
+ * fresh {@link createVideoDecoder} (pull-driven frame queue, output backpressure, close-exactly-once,
+ * typed cancellation) — the ONE difference is decoder lifetime: on a clean end (EOF, or a seek that found
+ * its frame and cancelled the reader) it DRAINS the decoder with a `flush()` and RELEASES it warm rather
+ * than closing it; on any error/abort it DISCARDS it. The frame plumbing is Node-testable via the injected
+ * {@link WarmDecoderHandle}; only the real handle touches WebCodecs.
+ */
+function createWarmBorrowStream(
+  config: VideoDecoderConfig,
+  o: StageOptions | undefined,
+  key: string,
+  pool: WarmBorrowPoolOps,
+): TransformStream<EncodedChunk, RawFrame> {
+  const signal = o?.signal;
+  const alpha = readDecoderAlpha(o);
+  let decoder: WarmDecoderHandle | undefined;
+  let readableController: ReadableStreamDefaultController<RawFrame> | undefined;
+  const frameQueue: VideoFrame[] = [];
+  const queueWaiters = new Set<{ resolve(): void; reject(error: Error): void }>();
+  let closed = false; // the readable is dead: `onFrame` closes frames instead of enqueuing them
+  let decoderDone = false; // EOF flush finished; the readable closes once the frame queue drains
+  let pullWaiting = false;
+  let settled = false;
+  let writeInFlight = false;
+  let terminalError: Error | undefined;
+  let onAbort: (() => void) | undefined;
+  // The writable has stopped issuing `decode()`s (a clean-cancel drain must not race a pending decode).
+  let openWriteGate: (() => void) | undefined;
+  const writeGate = new Promise<void>((resolve) => {
+    openWriteGate = resolve;
+  });
+  const releaseWriteGate = (): void => {
+    const resolve = openWriteGate;
+    openWriteGate = undefined;
+    resolve?.();
+  };
+  // Resolves once `closed` becomes true, so an in-flight decode-backpressure await releases promptly on a
+  // non-abort close (a found-target seek cancel) instead of blocking on a `dequeue` that may never fire.
+  let signalClosed: (() => void) | undefined;
+  const closedPromise = new Promise<void>((resolve) => {
+    signalClosed = resolve;
+  });
+  const markClosed = (): void => {
+    closed = true;
+    const resolve = signalClosed;
+    signalClosed = undefined;
+    resolve?.();
+  };
+
+  const streamClosedError = (): Error =>
+    terminalError ?? new MediaError('aborted', 'video decoder stream closed');
+  const removeAbortListener = (): void => {
+    if (signal !== undefined && onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+    onAbort = undefined;
+  };
+  const closeQueuedFrames = (): void => {
+    for (const frame of frameQueue.splice(0)) frame.close();
+  };
+  const rejectQueueWaiters = (error: Error): void => {
+    for (const waiter of queueWaiters) waiter.reject(error);
+    queueWaiters.clear();
+  };
+  const resolveQueueWaiters = (): void => {
+    if (frameQueue.length >= HIGH_WATER_MARK) return;
+    for (const waiter of queueWaiters) waiter.resolve();
+    queueWaiters.clear();
+  };
+  const settleOnce = (mode: 'release' | 'discard'): void => {
+    if (settled) return;
+    settled = true;
+    decoder?.bind(undefined); // detach this borrow before the pool reuses or drops the decoder
+    if (mode === 'release') pool.release();
+    else pool.discard();
+  };
+  function fail(error: Error): void {
+    if (closed) return;
+    terminalError = error;
+    markClosed();
+    pullWaiting = false;
+    closeQueuedFrames();
+    rejectQueueWaiters(error);
+    removeAbortListener();
+    releaseWriteGate();
+    readableController?.error(error);
+    settleOnce('discard'); // every error path drops the pooled decoder; the next borrow rebuilds
+  }
+  const finishReadableIfDrained = (): void => {
+    if (closed || !decoderDone || frameQueue.length !== 0 || readableController === undefined)
+      return;
+    markClosed();
+    removeAbortListener();
+    resolveQueueWaiters();
+    readableController.close();
+    releaseWriteGate();
+    settleOnce('release'); // clean EOF: the decoder is drained + still configured → keep it warm
+  };
+  const deliverQueuedFrame = (): void => {
+    if (!pullWaiting || closed || readableController === undefined) return;
+    const frame = frameQueue.shift();
+    if (frame === undefined) {
+      finishReadableIfDrained();
+      return;
+    }
+    pullWaiting = false;
+    try {
+      readableController.enqueue(frame); // ownership transfers to the consumer
+    } catch (error) {
+      frame.close();
+      fail(new MediaError('decode-error', describeError(error), error));
+      return;
+    }
+    resolveQueueWaiters();
+    finishReadableIfDrained();
+  };
+  const waitForOutputRoom = async (): Promise<void> => {
+    while (!closed && frameQueue.length >= HIGH_WATER_MARK) {
+      await new Promise<void>((resolve, reject) => {
+        queueWaiters.add({ resolve, reject });
+      });
+    }
+    if (closed) throw streamClosedError();
+  };
+  const sink: WarmDecoderSink = {
+    onFrame(frame): void {
+      if (closed) {
+        frame.close(); // readable gone → release now; the consumer will never see it
+        return;
+      }
+      frameQueue.push(frame);
+      deliverQueuedFrame();
+    },
+    onError(error): void {
+      if (closed) return;
+      if (error.name === 'NotSupportedError') {
+        forgetVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
+      }
+      fail(decoderErrorToCapabilityMiss(error, 'webcodecs-video', config.codec));
+    },
+  };
+  const cancelBorrow = async (reason: unknown): Promise<void> => {
+    if (closed) return;
+    if (reason instanceof Error) {
+      fail(reason); // an error/abort propagated from the consumer → never reuse the decoder
+      return;
+    }
+    // A CLEAN early stop (a seek that found its target frame and cancelled the reader): stop enqueuing,
+    // release the still-queued drop frames, then DRAIN the pooled decoder's remaining work with a `flush()`
+    // so it returns to an empty, still-configured, reusable state — no reset/close, so no hardware re-init.
+    markClosed();
+    pullWaiting = false;
+    closeQueuedFrames();
+    rejectQueueWaiters(new MediaError('aborted', 'video decoder stream cancelled'));
+    removeAbortListener();
+    if (!writeInFlight) releaseWriteGate(); // no in-flight decode issuer → safe to drain immediately
+    try {
+      await writeGate; // the writable has stopped issuing decode()s; nothing new will queue
+      if (decoder !== undefined && !decoder.closed) await decoder.flush();
+      settleOnce('release');
+    } catch {
+      settleOnce('discard'); // a drain failure means the decoder is not safely reusable
+    }
+  };
+  const failStart = (cause: unknown): never => {
+    const error =
+      cause instanceof CapabilityError || cause instanceof MediaError
+        ? cause
+        : new MediaError('decode-error', describeError(cause), cause);
+    fail(error);
+    throw error;
+  };
+
+  const readable = new ReadableStream<RawFrame>(
+    {
+      start(controller): void {
+        readableController = controller;
+      },
+      pull(): void {
+        pullWaiting = true;
+        deliverQueuedFrame();
+      },
+      async cancel(reason): Promise<void> {
+        await cancelBorrow(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  const writable = new WritableStream<EncodedChunk>(
+    {
+      start(): Promise<void> {
+        onAbort = () => fail(new MediaError('aborted', 'operation aborted'));
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) {
+          const error = new MediaError('aborted', 'operation aborted');
+          fail(error);
+          return Promise.reject(error);
+        }
+        return pool
+          .acquire(config, o, key)
+          .then((handle) => {
+            if (closed || signal?.aborted) throw streamClosedError();
+            decoder = handle;
+            handle.bind(sink); // route this warm decoder's output/error to THIS borrow
+          })
+          .catch(failStart);
+      },
+      async write(chunk): Promise<void> {
+        writeInFlight = true;
+        try {
+          if (closed) throw streamClosedError();
+          if (decoder === undefined) throw new MediaError('decode-error', 'decoder not configured');
+          if (typeof EncodedVideoChunk !== 'undefined' && !(chunk instanceof EncodedVideoChunk)) {
+            throw new MediaError(
+              'decode-error',
+              'webcodecs-video decoder expects EncodedVideoChunk',
+            );
+          }
+          await waitForOutputRoom();
+          while (!closed && queueIsBackpressured(decoder.decodeQueueSize, HIGH_WATER_MARK)) {
+            await Promise.race([
+              decoder.awaitDequeue(signal).catch(() => undefined),
+              closedPromise,
+            ]);
+          }
+          if (closed) throw streamClosedError();
+          if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+          try {
+            decoder.decode(chunk);
+          } catch (error) {
+            fail(new MediaError('decode-error', describeError(error), error));
+            throw streamClosedError();
+          }
+        } finally {
+          writeInFlight = false;
+          if (closed) releaseWriteGate(); // this was the last decode issuer; a pending drain may proceed
+        }
+      },
+      async close(): Promise<void> {
+        if (closed) {
+          releaseWriteGate();
+          if (terminalError) throw terminalError;
+          return;
+        }
+        try {
+          if (decoder !== undefined && !decoder.closed) await decoder.flush();
+        } catch (error) {
+          const wrapped =
+            terminalError ?? new MediaError('decode-error', describeError(error), error);
+          fail(wrapped);
+          throw wrapped;
+        }
+        if (closed) {
+          releaseWriteGate();
+          if (terminalError) throw terminalError;
+          return;
+        }
+        decoderDone = true;
+        releaseWriteGate();
+        finishReadableIfDrained();
+      },
+      abort(reason): void {
+        fail(
+          reason instanceof Error
+            ? reason
+            : new MediaError('aborted', 'video decoder stream aborted'),
+        );
+      },
+    },
+    { highWaterMark: 1 },
+  );
+
+  return { readable, writable } as TransformStream<EncodedChunk, RawFrame>;
+}
+
+/**
+ * Create a {@link WarmVideoDecoderPool}. The `factory` seam defaults to the real WebCodecs build+configure
+ * ({@link createRealWarmDecoderHandle}); tests inject a fake to drive the pool's reuse / discard /
+ * frame-lifetime state machine in Node. The pool is single-borrow (the sequential seek path): `borrow`
+ * refuses (`undefined`) while a borrow is active, so a decoder is never shared across concurrent streams.
+ */
+export function createWarmVideoDecoderPool(
+  factory: WarmDecoderFactory = createRealWarmDecoderHandle,
+): WarmVideoDecoderPool {
+  let handle: WarmDecoderHandle | undefined;
+  let handleKey: string | undefined;
+  let busy = false;
+  let disposed = false;
+
+  const closeHandle = (): void => {
+    const current = handle;
+    handle = undefined;
+    handleKey = undefined;
+    if (current !== undefined && !current.closed) current.close();
+  };
+  const ops: WarmBorrowPoolOps = {
+    async acquire(config, o, key): Promise<WarmDecoderHandle> {
+      if (handle !== undefined && handleKey === key && !handle.closed) return handle; // warm reuse
+      if (handle !== undefined) closeHandle(); // config changed → the warm decoder no longer matches
+      const built = await factory(config, o);
+      if (disposed) {
+        built.close();
+        throw new MediaError('aborted', 'video decoder pool disposed');
+      }
+      handle = built;
+      handleKey = key;
+      return built;
+    },
+    release(): void {
+      busy = false; // the decoder stays configured + warm for the next same-config borrow
+    },
+    discard(): void {
+      busy = false;
+      closeHandle();
+    },
+  };
+
+  return {
+    borrow(config, o): TransformStream<EncodedChunk, RawFrame> | undefined {
+      if (disposed || busy) return undefined; // disposed, or a borrow is active → caller uses a fresh decoder
+      const videoConfig = asVideoDecoderConfig(config);
+      if (videoConfig === undefined || !isVideoCodecString(videoConfig.codec)) return undefined;
+      const alpha = readDecoderAlpha(o);
+      let key: string;
+      try {
+        key = videoDecoderCapabilityKey(videoConfig, alpha);
+      } catch {
+        return undefined; // an uncacheable/cyclic config is not poolable; the caller uses a fresh decoder
+      }
+      busy = true;
+      return createWarmBorrowStream(videoConfig, o, key, ops);
+    },
+    dispose(): void {
+      disposed = true;
+      busy = false;
+      closeHandle();
+    },
+  };
+}
+
 // ── the driver + module ──────────────────────────────────────────────────────────────────────────
 
 /**

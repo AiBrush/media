@@ -9,14 +9,19 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import type { EncodedChunk, RawFrame } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import WebcodecsVideoModule, {
   ACCELERATION_PROBE_ORDER,
   type EnqueueSink,
   type SupportProbe,
   VIDEO_CODEC_PREFIXES,
+  type WarmDecoderFactory,
+  type WarmDecoderHandle,
+  type WarmDecoderSink,
   WebcodecsVideoDriver,
   combineSupport,
+  createWarmVideoDecoderPool,
   decoderErrorToCapabilityMiss,
   enqueueOrClose,
   enqueueOrDrop,
@@ -524,5 +529,224 @@ describe('WebcodecsVideoDriver coder factories — typed miss when WebCodecs is 
     expect(() =>
       WebcodecsVideoDriver.createEncoder({ codec: 'ap4h', width: 16, height: 16 }),
     ).toThrow(CapabilityError);
+  });
+});
+
+// ── warm VideoDecoder pool (reuse / discard / frame-lifetime state machine, Node-driven with a fake) ──
+// WebCodecs is absent in Node and must never be mocked; instead a fake WarmDecoderHandle (NOT a fake
+// VideoDecoder) is injected through the pool's factory seam, so the reuse-vs-rebuild, concurrent-refusal,
+// discard-on-error, and close-exactly-once logic is exercised as real code. The real handle's
+// build+configure is browser-harness-validated (v8-ignored). Every frame is a Closable that counts closes.
+
+/** A fake decoded frame: a Closable with a PTS, recording close-exactly-once. */
+class PoolFakeFrame {
+  closeCount = 0;
+  constructor(readonly timestamp: number) {}
+  close(): void {
+    this.closeCount++;
+  }
+}
+
+/** A fake encoded chunk (only its `timestamp` and keyframe-ish `type` are read by the fake). */
+class PoolFakeChunk {
+  constructor(
+    readonly timestamp: number,
+    readonly type: 'key' | 'delta' = 'key',
+  ) {}
+}
+
+interface FakePoolState {
+  builds: number;
+  closes: number;
+  readonly frames: PoolFakeFrame[];
+  /** When a chunk with this PTS is decoded, the fake raises a native decoder error instead of a frame. */
+  failAt: number | undefined;
+}
+
+/**
+ * A {@link WarmDecoderFactory} that builds a fake handle: `decode` produces a frame (async, mirroring a
+ * real decoder's `output` callback) unless the chunk's PTS matches `failAt`, in which case it raises a
+ * native error; `flush` drains pending frames; `close` counts. It never touches WebCodecs, so the pool's
+ * whole state machine runs in Node.
+ */
+function fakeWarmFactory(state: FakePoolState): WarmDecoderFactory {
+  return () => {
+    state.builds++;
+    let sink: WarmDecoderSink | undefined;
+    let closed = false;
+    const pending: PoolFakeFrame[] = [];
+    const emit = (): void => {
+      for (let frame = pending.shift(); frame !== undefined; frame = pending.shift()) {
+        if (sink !== undefined) sink.onFrame(frame as unknown as VideoFrame);
+        else frame.close();
+      }
+    };
+    const handle: WarmDecoderHandle = {
+      bind: (s): void => {
+        sink = s;
+      },
+      decode: (chunk): void => {
+        const ts = (chunk as unknown as PoolFakeChunk).timestamp;
+        if (state.failAt !== undefined && ts === state.failAt) {
+          sink?.onError(new DOMException('Decoder failure', 'EncodingError'));
+          return;
+        }
+        const frame = new PoolFakeFrame(ts);
+        state.frames.push(frame);
+        pending.push(frame);
+        queueMicrotask(emit);
+      },
+      flush: (): Promise<void> => {
+        emit();
+        return Promise.resolve();
+      },
+      get decodeQueueSize(): number {
+        return 0;
+      },
+      awaitDequeue: (): Promise<void> => Promise.resolve(),
+      close: (): void => {
+        if (closed) return;
+        closed = true;
+        state.closes++;
+      },
+      get closed(): boolean {
+        return closed;
+      },
+    };
+    return Promise.resolve(handle);
+  };
+}
+
+/** Drive a borrow like `seekFrame`: drop frames before `targetUs` (closing them), return the first at/after. */
+async function runFakeSeek(
+  stream: TransformStream<EncodedChunk, RawFrame> | undefined,
+  chunks: readonly PoolFakeChunk[],
+  targetUs: number,
+): Promise<PoolFakeFrame> {
+  if (stream === undefined) throw new Error('expected a pooled decoder transform stream');
+  const source = new ReadableStream<EncodedChunk>({
+    start(controller): void {
+      for (const chunk of chunks) controller.enqueue(chunk as unknown as EncodedChunk);
+      controller.close();
+    },
+  });
+  const out = source.pipeThrough(stream) as unknown as ReadableStream<PoolFakeFrame>;
+  const reader = out.getReader();
+  let last: PoolFakeFrame | undefined;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.timestamp >= targetUs) {
+        if (last !== undefined) last.close();
+        await reader.cancel(); // clean early stop → the pool drains + keeps the decoder warm
+        return value;
+      }
+      if (last !== undefined) last.close();
+      last = value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (last !== undefined) return last; // sought past the last PTS → closest available
+  throw new Error('no frame decoded');
+}
+
+const POOL_H264: VideoDecoderConfig = { codec: 'avc1.640028', codedWidth: 64, codedHeight: 64 };
+
+describe('createWarmVideoDecoderPool — reuse a configured decoder across sequential same-config seeks', () => {
+  it('builds ONE decoder and reuses it across many same-config seeks (warm, never closed between them)', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    for (let i = 0; i < 4; i++) {
+      const frame = await runFakeSeek(
+        pool.borrow(POOL_H264, undefined),
+        [new PoolFakeChunk(0), new PoolFakeChunk(1000, 'delta')],
+        0,
+      );
+      expect(frame.timestamp).toBe(0);
+      expect(frame.closeCount).toBe(0); // the target frame is the caller's; the pool never closed it
+      frame.close();
+    }
+    expect(state.builds).toBe(1); // constructed + configured exactly once, then reused
+    expect(state.closes).toBe(0); // kept warm across every seek (the whole optimization)
+    for (const frame of state.frames) expect(frame.closeCount).toBe(1); // every frame closed exactly once
+  });
+
+  it('returns the closest frame when seeking past the last PTS and still keeps the decoder warm (EOF drain)', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    const frame = await runFakeSeek(
+      pool.borrow(POOL_H264, undefined),
+      [new PoolFakeChunk(0), new PoolFakeChunk(1000, 'delta')],
+      9_999_999,
+    );
+    expect(frame.timestamp).toBe(1000); // closest available (last decoded)
+    expect(frame.closeCount).toBe(0);
+    frame.close();
+    // reuse after a clean EOF drain
+    const next = await runFakeSeek(pool.borrow(POOL_H264, undefined), [new PoolFakeChunk(0)], 0);
+    next.close();
+    expect(state.builds).toBe(1);
+    expect(state.closes).toBe(0);
+    for (const f of state.frames) expect(f.closeCount).toBe(1);
+  });
+
+  it('closes the old decoder and builds a new one when the config changes (config-keyed)', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    (await runFakeSeek(pool.borrow(POOL_H264, undefined), [new PoolFakeChunk(0)], 0)).close();
+    const other: VideoDecoderConfig = { codec: 'vp09.00.10.08', codedWidth: 32, codedHeight: 32 };
+    (await runFakeSeek(pool.borrow(other, undefined), [new PoolFakeChunk(0)], 0)).close();
+    expect(state.builds).toBe(2); // the changed config forced a rebuild
+    expect(state.closes).toBe(1); // the previous warm decoder was closed on the config change
+  });
+
+  it('refuses a concurrent borrow (one decoder never serves two streams) — the caller falls back to fresh', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    const first = pool.borrow(POOL_H264, undefined);
+    const second = pool.borrow(POOL_H264, undefined); // a borrow is already active
+    expect(first).toBeDefined();
+    expect(second).toBeUndefined(); // busy → undefined, so the seek path uses a fresh decoder
+    (await runFakeSeek(first, [new PoolFakeChunk(0)], 0)).close();
+    // once released, the pool serves again (reusing the same warm decoder)
+    expect(pool.borrow(POOL_H264, undefined)).toBeDefined();
+  });
+
+  it('discards (closes) the decoder on a decode error, then rebuilds on the next borrow', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: 0 };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    await expect(
+      runFakeSeek(pool.borrow(POOL_H264, undefined), [new PoolFakeChunk(0)], 0),
+    ).rejects.toBeInstanceOf(CapabilityError); // native decoder failure → typed capability miss
+    expect(state.builds).toBe(1);
+    expect(state.closes).toBe(1); // the errored decoder is dropped, not reused
+    state.failAt = undefined;
+    const frame = await runFakeSeek(pool.borrow(POOL_H264, undefined), [new PoolFakeChunk(0)], 0);
+    frame.close();
+    expect(state.builds).toBe(2); // rebuilt after the discard
+  });
+
+  it('dispose closes the warm decoder and refuses further borrows', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    (await runFakeSeek(pool.borrow(POOL_H264, undefined), [new PoolFakeChunk(0)], 0)).close();
+    expect(state.closes).toBe(0); // warm
+    pool.dispose();
+    expect(state.closes).toBe(1); // disposed → the warm decoder is closed
+    expect(pool.borrow(POOL_H264, undefined)).toBeUndefined(); // and no further borrows are served
+  });
+
+  it('returns undefined (no build) for audio / non-video-codec configs — the caller uses a fresh path', () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    expect(
+      pool.borrow({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 }, undefined),
+    ).toBeUndefined(); // not a video decoder config
+    expect(
+      pool.borrow({ codec: 'theora', codedWidth: 16, codedHeight: 16 }, undefined),
+    ).toBeUndefined(); // not a codec this driver routes
+    expect(state.builds).toBe(0);
   });
 });

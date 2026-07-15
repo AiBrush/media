@@ -14,6 +14,7 @@ import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
 import type {
   VideoDecoderStageOptions,
   VideoEncoderStageOptions,
+  WarmVideoDecoderPool,
 } from '../codecs/webcodecs-video.ts';
 import type {
   CodecDriver,
@@ -126,6 +127,8 @@ const CONTAINER_MIME: Record<string, string> = {
   mpegts: 'video/mp2t',
 };
 const SOURCE_PREFIX_HANDOFF_TTL_MS = 250;
+/** The routed-codec id that builds native `VideoDecoder`s — the only driver the warm decoder pool serves. */
+const WEBCODECS_VIDEO_DRIVER_ID = 'webcodecs-video';
 
 interface SourcePrefixHandoff {
   readonly bytes: Uint8Array;
@@ -224,6 +227,14 @@ export class MediaEngineImpl implements MediaEngine {
    */
   readonly #poolCache: OffloadPoolCache = {};
   readonly #sourcePrefixHandoff = new Map<string, SourcePrefixHandoff>();
+  /**
+   * Per-instance warm `VideoDecoder` pool for the sequential single-frame/seek path (doc 09): created
+   * lazily the first time a WebCodecs-video seek runs (a probe-only app never builds it), then reused so
+   * repeated same-config seeks decode through ONE warm decoder instead of constructing + configuring a
+   * fresh one each call. The pool object lives in the (lazily-imported) `webcodecs-video` chunk, so the
+   * eager kernel never carries it; the engine holds only this by-reference handle (browser-only path).
+   */
+  #videoDecoderPool: WarmVideoDecoderPool | undefined;
 
   constructor(
     opts: CreateMediaOptions = {},
@@ -828,6 +839,16 @@ export class MediaEngineImpl implements MediaEngine {
         const codec = await this.#routeCodec(decodeQuery, o);
         /* v8 ignore start -- live decode requires a real VideoDecoder; browser-harness validated. */
         const config = decodeQuery.config;
+        // Reuse a warm VideoDecoder across successive same-config seeks on this engine instance: the
+        // harness seeks the same input many times, so a pooled decoder skips the per-call construct +
+        // configure + hardware-init the fresh path pays each call. Only the WebCodecs-video driver builds a
+        // native VideoDecoder, so pool only when it was the routed codec; other drivers (or a busy /
+        // unpoolable config) fall back to a fresh `createDecoder`. The pool is single-borrow, so this
+        // sequential seek decode is safe; the alpha branch (two concurrent decoders) always stays fresh.
+        const decoderPool =
+          codec.id === WEBCODECS_VIDEO_DRIVER_ID ? await this.#ensureVideoDecoderPool() : undefined;
+        const makeSeekDecoder = (): ReturnType<CodecDriver['createDecoder']> =>
+          decoderPool?.borrow(config, stage) ?? codec.createDecoder(config, stage);
         const packetInfoRows = (demuxer as DemuxerWithPacketInfoTable).packetInfoTable?.();
         const trackIndex = demuxer.tracks.findIndex((candidate) => candidate.id === track.id);
         let packetInfoSeekStream: ReadableStream<EncodedVideoChunk> | undefined;
@@ -851,9 +872,7 @@ export class MediaEngineImpl implements MediaEngine {
         }
         const out =
           packetInfoSeekStream !== undefined
-            ? (packetInfoSeekStream.pipeThrough(
-                codec.createDecoder(config, stage),
-              ) as ReadableStream<VideoFrame>)
+            ? (packetInfoSeekStream.pipeThrough(makeSeekDecoder()) as ReadableStream<VideoFrame>)
             : track.alpha === true
               ? decodeVideoPacketsWithAlpha(
                   await startAtSeekKeyframePackets(demuxer.packets(track.id), timeUs),
@@ -861,7 +880,7 @@ export class MediaEngineImpl implements MediaEngine {
                 )
               : ((
                   await startAtSeekKeyframe(unwrapPackets(demuxer.packets(track.id)), timeUs)
-                ).pipeThrough(codec.createDecoder(config, stage)) as ReadableStream<VideoFrame>);
+                ).pipeThrough(makeSeekDecoder()) as ReadableStream<VideoFrame>);
         return await seekFrame(out, timeUs);
         /* v8 ignore stop */
       } finally {
@@ -1098,6 +1117,21 @@ export class MediaEngineImpl implements MediaEngine {
       );
     }
   }
+
+  /**
+   * Lazily create (once) the per-instance warm `VideoDecoder` pool used by the sequential seek path. Loaded
+   * from the already-resident `webcodecs-video` chunk (the seek's routed codec is that driver), so this adds
+   * no eager-kernel weight. Reached only on the browser-only live-decode seek path.
+   */
+  /* v8 ignore start -- requires a real VideoDecoder (browser); the pool logic is Node-tested directly. */
+  async #ensureVideoDecoderPool(): Promise<WarmVideoDecoderPool> {
+    if (this.#videoDecoderPool === undefined) {
+      const { createWarmVideoDecoderPool } = await import('../codecs/webcodecs-video.ts');
+      this.#videoDecoderPool ??= createWarmVideoDecoderPool();
+    }
+    return this.#videoDecoderPool;
+  }
+  /* v8 ignore stop */
 
   /** Resolve a filter driver for a spec, loading the first-party defaults on a miss then retrying once. */
   async #routeFilter(spec: FilterSpec, o: CallOptions, cost?: RouteCost): Promise<FilterDriver> {

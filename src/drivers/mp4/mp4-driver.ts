@@ -30,6 +30,9 @@ import {
   registerNativePacketSource,
 } from '../../internal/packet-provenance.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
+// Type-only: erased at compile time, so it does not create a runtime import of the lazily-loaded CENC
+// module (the `import.meta`-gated `loadCencModule` remains the only value-level entry point to `cenc.ts`).
+import type { SampleDecryptedCallback } from './cenc.ts';
 import {
   fragmentSamplesToDemuxSamples,
   mergeMoovAndFragmentSamples,
@@ -2359,21 +2362,26 @@ async function drainDecoderBelowHighWater(
   }
 }
 
-async function verifyTrimmedAvcDecodeIfAvailable(
+/**
+ * The shared bounded/backpressured AVC decode-validation core. It submits one `EncodedVideoChunk` per
+ * `selected` sample **in decode order** — sourcing each sample's coded bytes from `bytesForSample`, which
+ * may resolve synchronously (a materialized array) or asynchronously (a decrypt pipeline's reorder gate) —
+ * while honouring the decoder's high-water mark, `signal`, and the codec `error` callback. Returns `true`
+ * once validation runs to completion (so the caller may cache the result) and `false` when the decoder
+ * declines to configure (nothing was validated). Every emitted `VideoFrame` is closed exactly once; an
+ * `expectedOutputFrames` mismatch — one AVC access unit owes exactly one output frame — throws, rejecting
+ * corruption an unauthenticated cipher cannot otherwise reveal. `bytesForSample` returning `undefined`
+ * skips that ordinal (a hole with no coded bytes).
+ */
+async function decodeValidateInOrder(
   track: ParsedTrack,
   selected: readonly SampleData[],
-  samples: readonly MuxSampleInput[],
+  config: VideoDecoderConfig,
+  bytesForSample: (index: number) => Uint8Array | Promise<Uint8Array> | undefined,
   signal: AbortSignal | undefined,
-  validationCacheBase: string | undefined,
-  operation = 'MP4 trim',
-  expectedOutputFrames?: number,
-): Promise<void> {
-  if (selected.length === 0) return;
-  const config = avcDecodeConfig(track);
-  const validationCacheKey = trimDecodeValidationCacheKey(validationCacheBase, track, selected);
-  if (hasTrimDecodeValidationCacheHit(validationCacheKey)) return;
-  if (!config || !(await canBrowserDecodeForTrim(config))) return;
-
+  operation: string,
+  expectedOutputFrames: number | undefined,
+): Promise<boolean> {
   let decoder: VideoDecoder | undefined;
   let outputFrames = 0;
   let settled = false;
@@ -2401,20 +2409,24 @@ async function verifyTrimmedAvcDecodeIfAvailable(
     try {
       decoder.configure(config);
     } catch {
-      return;
+      return false;
     }
     for (let i = 0; i < selected.length; i++) {
       throwIfAborted(signal);
       const sample = selected[i];
-      const muxSample = samples[i];
-      if (!sample || !muxSample) continue;
+      if (sample === undefined) continue;
+      const pending = bytesForSample(i);
+      if (pending === undefined) continue;
+      // Await this sample's clear bytes (immediate for a materialized array; a decrypt in flight for the
+      // pipeline) while racing the error/abort channel so a codec error never blocks behind slow crypto.
+      const data = await Promise.race([Promise.resolve(pending), errorPromise]);
       await Promise.race([drainDecoderBelowHighWater(decoder, signal), errorPromise]);
       decoder.decode(
         new EncodedVideoChunk({
           type: sample.keyframe ? 'key' : 'delta',
           timestamp: toUs(sample.dtsTicks + sample.cttsTicks, track.timescale),
           duration: toUs(sample.durationTicks, track.timescale),
-          data: muxSample.data,
+          data,
         }),
       );
     }
@@ -2425,7 +2437,7 @@ async function verifyTrimmedAvcDecodeIfAvailable(
         `track ${track.id} failed browser decode validation during ${operation}: decoded ${outputFrames} frames from ${expectedOutputFrames} AVC access units`,
       );
     }
-    rememberTrimDecodeValidation(validationCacheKey);
+    return true;
   } catch (e) {
     throw e instanceof MediaError ? e : avcDecodeValidationError(track, operation, e);
   } finally {
@@ -2433,6 +2445,32 @@ async function verifyTrimmedAvcDecodeIfAvailable(
     signal?.removeEventListener('abort', onAbort);
     closeDecoder(decoder);
   }
+}
+
+async function verifyTrimmedAvcDecodeIfAvailable(
+  track: ParsedTrack,
+  selected: readonly SampleData[],
+  samples: readonly MuxSampleInput[],
+  signal: AbortSignal | undefined,
+  validationCacheBase: string | undefined,
+  operation = 'MP4 trim',
+  expectedOutputFrames?: number,
+): Promise<void> {
+  if (selected.length === 0) return;
+  const config = avcDecodeConfig(track);
+  const validationCacheKey = trimDecodeValidationCacheKey(validationCacheBase, track, selected);
+  if (hasTrimDecodeValidationCacheHit(validationCacheKey)) return;
+  if (!config || !(await canBrowserDecodeForTrim(config))) return;
+  const validated = await decodeValidateInOrder(
+    track,
+    selected,
+    config,
+    (index) => samples[index]?.data,
+    signal,
+    operation,
+    expectedOutputFrames,
+  );
+  if (validated) rememberTrimDecodeValidation(validationCacheKey);
 }
 
 async function verifyTrimmedAvcDecodeFromSourceIfAvailable(
@@ -3116,6 +3154,7 @@ async function decryptCencTrack(
   keys: Record<string, string>,
   declaredScheme: CencScheme,
   sourceSize: number | undefined,
+  onSampleClear?: SampleDecryptedCallback,
 ): Promise<MuxTrackInput> {
   const containerScheme = supportedCencScheme(enc.schemeType);
   if (!containerScheme) {
@@ -3159,6 +3198,7 @@ async function decryptCencTrack(
           senc,
           tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 }, // version-0 cbcs ⇒ full CBC, no pattern
           tenc.constantIv,
+          onSampleClear,
         )
       : containerScheme === CENS_SCHEME
         ? await cenc.decryptSamplesCens(
@@ -3166,12 +3206,138 @@ async function decryptCencTrack(
             cipher,
             senc,
             tenc.pattern ?? { cryptByteBlock: 1, skipByteBlock: 0 },
+            onSampleClear,
           )
-        : await cenc.decryptSamples(key, cipher, senc);
+        : await cenc.decryptSamples(key, cipher, senc, onSampleClear);
   return {
     ...track,
     samples: track.samples.map((s, j) => ({ ...s, data: clear[j] ?? s.data })),
   };
+}
+
+/**
+ * An in-order reorder gate bridging the out-of-order decrypt window to the strictly-in-decode-order
+ * validation decoder. The decrypt pool `provide`s each sample's clear bytes the instant its transform
+ * finishes (any order, once per index); the decoder `get`s them ordinal by ordinal. A slot already held is
+ * returned immediately, otherwise the `get` parks until its `provide` (or `fail`) arrives — never a busy
+ * wait. `fail` rejects every parked/future `get` so a decoder blocked on a sample the decrypt will never
+ * deliver (a rejected/aborted crypto pass) unwinds and closes. Storage is bounded by the track's sample
+ * count, and holds the very same buffers the returned clear track already owns — no extra copy.
+ */
+interface OrderedSampleGate {
+  /** Publish sample `index`'s clear bytes and release any parked reader (idempotent per index). */
+  readonly provide: SampleDecryptedCallback;
+  /** Backfill any slot not published by `provide` from the final clear samples (no-`senc` passthrough). */
+  readonly provideRemaining: (samples: readonly MuxSampleInput[]) => void;
+  /** Await sample `index`'s clear bytes in decode order; rejects once the gate has failed. */
+  readonly get: (index: number) => Promise<Uint8Array>;
+  /** Reject every parked and future `get` so a stalled consumer unwinds and closes its decoder. */
+  readonly fail: (error: unknown) => void;
+}
+
+function createOrderedSampleGate(count: number): OrderedSampleGate {
+  const ready = new Array<Uint8Array | undefined>(count);
+  const waiters = new Map<
+    number,
+    { readonly resolve: (bytes: Uint8Array) => void; readonly reject: (error: unknown) => void }
+  >();
+  let failure: { readonly error: unknown } | undefined;
+  const provide: SampleDecryptedCallback = (index, clear): void => {
+    if (index < 0 || index >= count || ready[index] !== undefined) return;
+    ready[index] = clear;
+    const waiter = waiters.get(index);
+    if (waiter !== undefined) {
+      waiters.delete(index);
+      waiter.resolve(clear);
+    }
+  };
+  const provideRemaining = (samples: readonly MuxSampleInput[]): void => {
+    for (let index = 0; index < count; index++) {
+      if (ready[index] !== undefined) continue;
+      const sample = samples[index];
+      if (sample !== undefined) provide(index, sample.data);
+    }
+  };
+  const get = (index: number): Promise<Uint8Array> => {
+    if (failure !== undefined) return Promise.reject(failure.error);
+    const held = ready[index];
+    if (held !== undefined) return Promise.resolve(held);
+    return new Promise<Uint8Array>((resolve, reject) => {
+      waiters.set(index, { resolve, reject });
+    });
+  };
+  const fail = (error: unknown): void => {
+    if (failure !== undefined) return;
+    failure = { error };
+    for (const waiter of waiters.values()) waiter.reject(error);
+    waiters.clear();
+  };
+  return { provide, provideRemaining, get, fail };
+}
+
+/**
+ * Decrypt one CENC-protected track and, in browsers, validate every recovered AVC access unit — with the
+ * two stages PIPELINED so the wall is `max(decrypt, decode)` rather than their sum (decrypt/decode overlap).
+ * The decrypt pool feeds each clear access unit to the bounded/backpressured validation decoder the moment
+ * its AES-CTR/CBC transform completes (via {@link createOrderedSampleGate}), instead of decrypting the whole
+ * track then decoding the whole track. The emitted bytes are byte-identical to the crypto-only path (the
+ * exact same `decryptCencTrack` output flows to `writeMp4`); only the decode-verify's *timing* changes. A
+ * structurally valid IV/payload mutation still decrypts to garbage and is still rejected by the frame-count
+ * oracle before any output is produced. B-frame reorder is transparent: chunks are submitted in decode
+ * (DTS) order and the codec reorders internally. When no browser decoder applies (Node, audio, non-AVC, or
+ * a declining decoder) it degrades to the plain crypto-only decrypt with no gate and no overlap.
+ */
+async function decryptAndVerifyCencTrack(
+  cenc: CencModule,
+  parsed: ParsedTrack,
+  track: MuxTrackInput,
+  enc: NonNullable<ParsedTrack['encryption']>,
+  keys: Record<string, string>,
+  scheme: CencScheme,
+  sourceSize: number | undefined,
+  sampleData: readonly SampleData[],
+  signal: AbortSignal | undefined,
+): Promise<MuxTrackInput> {
+  const config = avcDecodeConfig(parsed);
+  if (sampleData.length === 0 || config === undefined || !(await canBrowserDecodeForTrim(config))) {
+    // No browser decode validation applies (audio, non-AVC, or an absent/declining decoder such as Node):
+    // the crypto-only decrypt is already the exact, bit-identical result — there is nothing to overlap.
+    return decryptCencTrack(cenc, parsed, track, enc, keys, scheme, sourceSize);
+  }
+  const gate = createOrderedSampleGate(sampleData.length);
+  const decryptStage = (async (): Promise<MuxTrackInput> => {
+    try {
+      const clearTrack = await decryptCencTrack(
+        cenc,
+        parsed,
+        track,
+        enc,
+        keys,
+        scheme,
+        sourceSize,
+        gate.provide,
+      );
+      // The no-`senc` passthrough returns without per-sample callbacks; publish its clear bytes so the
+      // consumer (which decodes every ordinal) never parks on a slot the decrypt loop skipped.
+      gate.provideRemaining(clearTrack.samples);
+      return clearTrack;
+    } catch (error) {
+      gate.fail(error); // a rejected decrypt (erased/truncated/malformed) unblocks the parked decoder
+      throw error;
+    }
+  })();
+  // One AVC access unit owes exactly one output frame: `sampleData.length` frames validate the whole track.
+  const validateStage = decodeValidateInOrder(
+    parsed,
+    sampleData,
+    config,
+    gate.get,
+    signal,
+    'CENC decrypt',
+    sampleData.length,
+  );
+  const [clearTrack] = await Promise.all([decryptStage, validateStage]);
+  return clearTrack;
 }
 
 /** Hex (16-byte) value from the HLS key map, or a typed error naming the missing/short field. */
@@ -4235,6 +4401,14 @@ export const Mp4Driver: ContainerDriver = {
       );
     }
     const movie = await readMovie(ra);
+    // No-op decrypt: a container with NO protected track has nothing to decrypt. The CENC contract
+    // (docs 09 §encryption; metamorphic "unencrypted input must be left untouched") is to reproduce the
+    // source, so return the source bytes VERBATIM — the fastest correct result and byte-identical to the
+    // input (a re-mux would only be decode-equal, and needlessly copies every sample + rewrites `moov`).
+    // The CENC module load, sample materialization, and re-mux below are all skipped when unprotected.
+    if (!movie.tracks.some((t) => t.encryption !== undefined)) {
+      return oneShot(await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
+    }
     const cenc = await loadCencModule();
     // Fragmented/CMAF protected files carry sample-encryption metadata in `moof`/`traf`, not the (empty)
     // `moov` sample tables — the per-track flat path below cannot see it and would reject the file with
@@ -4313,30 +4487,26 @@ export const Mp4Driver: ContainerDriver = {
       // decision. That path rejects undecryptable protected input (empty sample table / scheme mismatch /
       // missing required aux data) and only strips protection metadata without AES when the file has no
       // sample auxiliary encryption data (Bento4 mp4decrypt leaves those bytes unchanged too).
-      const clearTrack = await decryptCencTrack(
-        cenc,
-        parsed,
-        track,
-        enc,
-        o.keys,
-        o.scheme,
-        sourceSize,
-      );
+      //
       // AES-CTR is intentionally unauthenticated: structurally valid ciphertext corruption is only
-      // observable after decrypt at the codec seam. In browsers, validate every recovered AVC access unit
-      // with the same bounded/backpressured decoder path used by MP4 trim; any decode error rejects before
-      // clear output is emitted. Node/unsupported decoders retain the bit-exact crypto-only path.
-      const sampleData = buildSampleData(parsed);
-      await verifyTrimmedAvcDecodeIfAvailable(
-        parsed,
-        sampleData,
-        clearTrack.samples,
-        o.signal,
-        undefined,
-        'CENC decrypt',
-        sampleData.length,
+      // observable after decrypt at the codec seam. In browsers, every recovered AVC access unit is
+      // validated with the same bounded/backpressured decoder path used by MP4 trim, PIPELINED with the
+      // decrypt so the wall is max(decrypt, decode) not their sum; any decode error (or frame-count
+      // shortfall) rejects before clear output is emitted. Node/unsupported decoders retain the bit-exact
+      // crypto-only path.
+      out.push(
+        await decryptAndVerifyCencTrack(
+          cenc,
+          parsed,
+          track,
+          enc,
+          o.keys,
+          o.scheme,
+          sourceSize,
+          buildSampleData(parsed),
+          o.signal,
+        ),
       );
-      out.push(clearTrack);
     }
     return oneShot(writeMp4(out, { faststart: true }));
   },

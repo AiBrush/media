@@ -44,6 +44,16 @@ describe('media.decrypt — CENC (cenc / AES-CTR) on real MP4 (ADR-023)', () => 
     expect(await audioSamples(out)).toEqual(clearAudio);
   });
 
+  it('decrypt of an UNENCRYPTED MP4 returns the source bytes verbatim (no-op leaves input untouched)', async () => {
+    // §A.16 metamorphic no-op idempotence: an unprotected input must be reproduced, not re-muxed. The
+    // fastest correct result is the source itself — byte-identical, not merely decode-equal.
+    const clear = await loadFixture('movie_5.mp4');
+    const out = await blobBytes(
+      await createMedia().decrypt(encSource(clear), { scheme: 'cenc', keys: { [KID]: KEY } }),
+    );
+    expect(out).toEqual(clear);
+  });
+
   it('probe sees through CENC to the original codec (enca → mp4a)', async () => {
     const enc = await encryptCenc(await loadFixture('movie_5.mp4'), { keyHex: KEY, kidHex: KID });
     const info = await createMedia().probe(encSource(enc));

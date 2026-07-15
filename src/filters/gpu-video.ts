@@ -215,14 +215,17 @@ interface Renderer {
 
 /* v8 ignore start -- browser-only render paths; validated in the Playwright/browser harness. */
 
-/** A reusable `OffscreenCanvas` resized in place to each output's dimensions. */
-function ensureCanvas(canvas: OffscreenCanvas | undefined, dims: Dims): OffscreenCanvas {
-  if (canvas && canvas.width === dims.width && canvas.height === dims.height) return canvas;
-  const next = canvas ?? new OffscreenCanvas(dims.width, dims.height);
-  next.width = dims.width;
-  next.height = dims.height;
-  return next;
-}
+/**
+ * Output-canvas ring depth. Reusing ONE output canvas serializes the whole convert pipeline: each
+ * `new VideoFrame(canvas)` must snapshot the just-drawn pixels, and the *next* frame cannot draw into the
+ * same canvas until that snapshot is secured — so every frame's GPU draw+snapshot runs strictly after the
+ * previous one and none of the (separately-threaded) decode/encode latency is hidden. That is what turns a
+ * 4K→1080p resize into a serial ~40 ms/frame wall instead of a pipelined ~4 ms/frame one. Rotating through
+ * a small ring of output canvases lets frame N's snapshot overlap frame N+1's draw (the fastest engines
+ * pool ~4). Four comfortably overlaps the in-flight encoder queue while keeping only ~4 output frames of
+ * VRAM resident; the ring never changes which pixels are drawn, so bit-exactness/SSIM are unaffected.
+ */
+const OUTPUT_CANVAS_POOL_SIZE = 4;
 
 // ---- Canvas2D ----
 
@@ -232,20 +235,58 @@ function ensureCanvas(canvas: OffscreenCanvas | undefined, dims: Dims): Offscree
  * HDR→SDR tonemap, here (ADR-032/`canvas2dCanColor`), and Canvas2D `drawImage(VideoFrame)` yields
  * UA-colour-managed display pixels. Wide-gamut output is declined upstream.
  */
-class Canvas2DRenderer implements Renderer {
-  private canvas: OffscreenCanvas | undefined;
+/** A pooled output canvas plus its cached 2D context (`getContext` returns the same object every call). */
+interface Pooled2DCanvas {
+  readonly canvas: OffscreenCanvas;
+  readonly ctx: OffscreenCanvasRenderingContext2D;
+}
 
-  render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
-    const dims = recipeDims(recipe);
-    this.canvas = ensureCanvas(this.canvas, dims);
-    const ctx = this.canvas.getContext('2d', { alpha: true });
+class Canvas2DRenderer implements Renderer {
+  // Ring of output canvases + cached contexts. `render` is called serially (one synchronous draw at a
+  // time), so a simple round-robin index is enough; the ring's only purpose is to let a just-snapshotted
+  // canvas finish its GPU copy while the next frame draws into a different one.
+  private readonly pool: (Pooled2DCanvas | undefined)[] = [];
+  private next = 0;
+
+  private acquire(dims: Dims): Pooled2DCanvas {
+    const index = this.next;
+    this.next = (this.next + 1) % OUTPUT_CANVAS_POOL_SIZE;
+    const existing = this.pool[index];
+    if (
+      existing !== undefined &&
+      existing.canvas.width === dims.width &&
+      existing.canvas.height === dims.height
+    ) {
+      return existing;
+    }
+    const canvas = new OffscreenCanvas(dims.width, dims.height);
+    const ctx = canvas.getContext('2d', { alpha: true });
     if (ctx === null) {
       throw new MediaError('encode-error', 'OffscreenCanvas 2D context unavailable');
     }
+    const slot: Pooled2DCanvas = { canvas, ctx };
+    this.pool[index] = slot;
+    return slot;
+  }
+
+  render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
+    const dims = recipeDims(recipe);
+    const { canvas, ctx } = this.acquire(dims);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // `new VideoFrame(canvas)` copies eagerly, so a pooled canvas is reused only after its prior output was
+    // snapshotted; still clear every time (rather than rely on drawImage full coverage) so a semi-opaque
+    // source can never source-over stale pixels from four frames ago.
     ctx.clearRect(0, 0, dims.width, dims.height);
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
+    // Resampling quality — the dominant per-frame cost of the whole convert on the Canvas2D substrate.
+    // `'high'` is Chromium's bicubic/Lanczos resampler; on a 4K→1080p downscale it runs a slow (frequently
+    // CPU-bound) multi-tap filter PER FRAME on the main thread, which both inflates each frame AND stalls
+    // the event loop so the (separately-threaded) hardware decode/encode can never run ahead — that single
+    // line was the ~12x gap vs engines that draw the very same `VideoFrame` with `drawImage` but leave
+    // quality at the browser default (mediabunny's `drawWithFit` never sets it → `'low'`; it still passes
+    // the SSIM oracle at ~1.0000). `'medium'` keeps an anti-aliased (mipmapped/area) downscale on the fast
+    // GPU path — no visible-quality or SSIM regression — while removing the main-thread resampler stall.
+    ctx.imageSmoothingQuality = 'medium';
     if (recipe.kind === 'blit') {
       const { src, dst } = recipe.blit;
       ctx.drawImage(
@@ -268,11 +309,12 @@ class Canvas2DRenderer implements Renderer {
       // Colour op → display-space passthrough (the UA already colour-managed the frame to display).
       ctx.drawImage(source, 0, 0);
     }
-    return new VideoFrame(this.canvas, framedInit(source));
+    return new VideoFrame(canvas, framedInit(source));
   }
 
   dispose(): void {
-    this.canvas = undefined;
+    this.pool.length = 0;
+    this.next = 0;
   }
 }
 
@@ -463,11 +505,19 @@ interface GpuContext {
   color: { pipeline: GPURenderPipeline; uniformBuffer: GPUBuffer } | null;
 }
 
+/** A pooled WebGPU output canvas with its configured context (configured once, reused per frame). */
+interface PooledWebGpuCanvas {
+  readonly canvas: OffscreenCanvas;
+  readonly context: GPUCanvasContext;
+}
+
 /** WebGPU renderer: import the frame as an external texture and draw a sampled quad to a canvas texture. */
 class WebGPURenderer implements Renderer {
   private gpu: GpuContext | undefined;
-  private canvas: OffscreenCanvas | undefined;
-  private context: GPUCanvasContext | undefined;
+  // Ring of output canvases (each with its own configured `webgpu` context), for the same
+  // draw/snapshot-overlap reason as the Canvas2D pool — a single reused canvas serializes the pipeline.
+  private readonly canvasPool: (PooledWebGpuCanvas | undefined)[] = [];
+  private nextCanvas = 0;
   private readonly colorManagedGeometry = new Canvas2DRenderer();
   private readonly format: GPUTextureFormat;
 
@@ -530,6 +580,29 @@ class WebGPURenderer implements Renderer {
     return gpu.color;
   }
 
+  /** Acquire the next pooled output canvas, (re)configuring its `webgpu` context on first use/resize. */
+  private acquireCanvas(device: GPUDevice, dims: Dims): PooledWebGpuCanvas {
+    const index = this.nextCanvas;
+    this.nextCanvas = (this.nextCanvas + 1) % OUTPUT_CANVAS_POOL_SIZE;
+    const existing = this.canvasPool[index];
+    if (
+      existing !== undefined &&
+      existing.canvas.width === dims.width &&
+      existing.canvas.height === dims.height
+    ) {
+      return existing;
+    }
+    const canvas = new OffscreenCanvas(dims.width, dims.height);
+    const context = canvas.getContext('webgpu');
+    if (context === null) {
+      throw new MediaError('encode-error', 'OffscreenCanvas WebGPU context unavailable');
+    }
+    context.configure({ device, format: this.format, alphaMode: 'premultiplied' });
+    const slot: PooledWebGpuCanvas = { canvas, context };
+    this.canvasPool[index] = slot;
+    return slot;
+  }
+
   render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
     const gpu = this.gpu;
     if (gpu === undefined) throw new MediaError('encode-error', 'WebGPU renderer already disposed');
@@ -537,19 +610,7 @@ class WebGPURenderer implements Renderer {
       return this.colorManagedGeometry.render(source, recipe);
     }
     const dims = recipeDims(recipe);
-
-    this.canvas = ensureCanvas(this.canvas, dims);
-    if (this.context === undefined) {
-      const ctx = this.canvas.getContext('webgpu');
-      if (ctx === null)
-        throw new MediaError('encode-error', 'OffscreenCanvas WebGPU context unavailable');
-      this.context = ctx;
-      this.context.configure({
-        device: gpu.device,
-        format: this.format,
-        alphaMode: 'premultiplied',
-      });
-    }
+    const { canvas, context } = this.acquireCanvas(gpu.device, dims);
 
     // Pick the pipeline + uniform buffer for this recipe (geometric quad vs colour), write its uniforms.
     const { pipeline, uniformBuffer } =
@@ -575,7 +636,7 @@ class WebGPURenderer implements Renderer {
     });
 
     const encoder = gpu.device.createCommandEncoder();
-    const view = this.context.getCurrentTexture().createView();
+    const view = context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         { view, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
@@ -588,19 +649,19 @@ class WebGPURenderer implements Renderer {
     gpu.device.queue.submit([encoder.finish()]);
 
     // The external texture is consumed by this submit; the canvas now holds the result.
-    return new VideoFrame(this.canvas, framedInit(source));
+    return new VideoFrame(canvas, framedInit(source));
   }
 
   dispose(): void {
     if (this.gpu !== undefined) {
       this.gpu.uniformBuffer.destroy();
       this.gpu.color?.uniformBuffer.destroy();
-      this.gpu.device.destroy();
+      this.gpu.device.destroy(); // invalidates every pooled canvas context configured on this device
       this.gpu = undefined;
     }
     this.colorManagedGeometry.dispose();
-    this.context = undefined;
-    this.canvas = undefined;
+    this.canvasPool.length = 0;
+    this.nextCanvas = 0;
   }
 }
 

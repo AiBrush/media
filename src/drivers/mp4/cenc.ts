@@ -574,20 +574,31 @@ export async function decryptSampleCbcs(
   );
 }
 
+/**
+ * A per-sample completion hook: invoked with sample `index`'s clear bytes the instant its transform
+ * finishes (out of order, within the bounded window). It lets a caller pipeline downstream work — e.g.
+ * feeding each recovered AVC access unit to a validation decoder — instead of waiting for the whole track.
+ * The hook must be side-effect-pure and non-throwing; the returned array stays the ordered source of truth.
+ */
+export type SampleDecryptedCallback = (index: number, clear: Uint8Array) => void;
+
 /** Decrypt a `cenc` track's samples in order (sample `i` uses `senc[i]`). */
 export async function decryptSamples(
   key: Uint8Array<ArrayBuffer>,
   data: readonly Uint8Array[],
   senc: readonly SencSample[],
+  onDecrypted?: SampleDecryptedCallback,
 ): Promise<Uint8Array[]> {
   if (data.length === 0) return [];
   const prepared = await prepareAesCtrKey(key);
   const out = new Array<Uint8Array>(data.length);
   await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
-    out[i] = sample
+    const clear = sample
       ? await decryptSamplePrepared(prepared, sample, bytes)
       : asArrayBufferBytes(bytes);
+    out[i] = clear;
+    onDecrypted?.(i, clear);
   });
   return out;
 }
@@ -598,15 +609,18 @@ export async function decryptSamplesCens(
   data: readonly Uint8Array[],
   senc: readonly SencSample[],
   pattern: CencPattern,
+  onDecrypted?: SampleDecryptedCallback,
 ): Promise<Uint8Array[]> {
   if (data.length === 0) return [];
   const prepared = await prepareAesCtrKey(key);
   const out = new Array<Uint8Array>(data.length);
   await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
-    out[i] = sample
+    const clear = sample
       ? await decryptSampleCensPrepared(prepared, pattern, sample, bytes)
       : asArrayBufferBytes(bytes);
+    out[i] = clear;
+    onDecrypted?.(i, clear);
   });
   return out;
 }
@@ -621,6 +635,7 @@ export async function decryptSamplesCbcs(
   senc: readonly SencSample[],
   pattern: CencPattern,
   constantIv?: Uint8Array,
+  onDecrypted?: SampleDecryptedCallback,
 ): Promise<Uint8Array[]> {
   if (data.length === 0) return [];
   const prepared = await prepareAesCbcKey(key, 'no-padding-decrypt');
@@ -628,7 +643,9 @@ export async function decryptSamplesCbcs(
   await forEachSampleBounded(data, async (bytes, i) => {
     const sample = senc[i];
     if (!sample) {
-      out[i] = asArrayBufferBytes(bytes);
+      const clear = asArrayBufferBytes(bytes);
+      out[i] = clear;
+      onDecrypted?.(i, clear);
       return;
     }
     const iv = sample.iv.byteLength > 0 ? sample.iv : constantIv;
@@ -638,7 +655,9 @@ export async function decryptSamplesCbcs(
         `cbcs sample ${i} has neither a per-sample IV nor a default_constant_IV (malformed protection)`,
       );
     }
-    out[i] = await decryptSampleCbcsPrepared(prepared, pattern, iv, bytes, sample.subsamples);
+    const clear = await decryptSampleCbcsPrepared(prepared, pattern, iv, bytes, sample.subsamples);
+    out[i] = clear;
+    onDecrypted?.(i, clear);
   });
   return out;
 }
