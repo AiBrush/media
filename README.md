@@ -1,166 +1,67 @@
 # aibrush-media
 
-`@aibrush/media` is a browser-first media engine with a flat, intent-only API. You ask for work such as
-`probe`, `convert`, `trim`, or `mux`; the engine chooses the best available route internally
-(WebCodecs -> GPU -> WASM -> TypeScript) and raises typed errors when the runtime cannot satisfy the job.
+A unified, **capability-routed, in-browser media engine**. One flat, verb-based API — `probe`, `demux`,
+`decode`/`seek`, `encode`, `convert` (transcode), `mux`, `remux`, `trim`, `decrypt` — behind which the engine
+routes every stage of every operation to the best available substrate: **hardware WebCodecs → GPU → hand-written
+TypeScript → WASM (downloaded only on a hardware miss)**. You express *intent* ("convert this to Opus in
+WebM"); the engine picks the mechanism. It only fails loudly, with a typed `CapabilityError`, when nothing can
+do the work — never a silent wrong result.
 
-## Quickstart
+## Why
 
-Install and build the package before running the local examples:
+No single in-browser engine spans all the substrates that win: hardware WebCodecs, hand-written TS containers,
+the GPU for pixel filters, and a WASM tail for the codec/DSP work browsers don't cover. aibrush-media unifies
+them behind one API where **the developer never names a backend**, aiming to be best-in-aggregate across a
+13-family, 7-engine benchmark.
 
-```sh
-bun install
-bun run build
-bun run vendor-wasm
-```
+**Design principles:** intent not mechanism · pay-for-what-you-use lazy loading · correctness gated by strict
+bit-exact/structural oracles · deployable by default (no cross-origin isolation on the common path; WASM
+self-hosted, no CDN).
 
-In an app, import the package entry and call the operation you need:
-
-```ts
-import { convert, probe, trim } from '@aibrush/media';
-
-const info = await probe(file);
-const mp4 = await convert(file, {
-  to: 'mp4',
-  video: { codec: 'h264', height: 720 },
-  audio: { codec: 'aac' },
-  faststart: true,
-});
-const clip = await trim(file, { start: 1.5, end: 4.0, mode: 'keyframe' });
-```
-
-All async operations return cancellable promises:
+## Usage
 
 ```ts
-const controller = new AbortController();
-const job = convert(file, { to: 'mp4' }, { signal: controller.signal });
+import { createMedia, convert, probe, toOPFS } from '@aibrush/media';
 
-controller.abort();
-job.cancel();
-```
-
-## Common Tasks
-
-Probe metadata without decoding the whole file:
-
-```ts
-import { probe } from '@aibrush/media';
-
-const info = await probe(file);
-console.log(info.container, info.durationSec, info.tracks);
-```
-
-Convert or transcode to an MP4 target:
-
-```ts
-import { convert } from '@aibrush/media';
-
-const output = await convert(file, {
-  to: 'mp4',
-  video: { codec: 'h264', height: 720, fit: 'contain' },
-  audio: { codec: 'aac', sampleRate: 48_000 },
-  faststart: true,
-});
-```
-
-Change frame rate, preserve VPx alpha, or write container metadata with the same intent-only surface:
-
-```ts
-import { convert, remux } from '@aibrush/media';
-
-const cfr = await convert(file, {
-  to: 'mp4',
-  video: { codec: 'h264', fps: 30 },
-  audio: { codec: 'aac' },
+// One-shot, verb-based — the engine routes WebCodecs → GPU → TS → WASM internally:
+const info = await probe(file);                    // MediaInfo (tracks, codecs, duration)
+const webm = await convert(file, {                 // → Blob by default
+  video: { codec: 'vp9' },
+  audio: { codec: 'opus' },
+  container: 'webm',
 });
 
-const alphaWebm = await convert(file, {
-  to: 'webm',
-  video: { codec: 'vp8', alpha: 'keep' },
-  audio: { codec: 'vorbis' },
-});
-
-const tagged = await remux(file, {
-  to: 'mp4',
-  tags: { title: 'Review cut', artist: 'aibrush-media' },
-});
-```
-
-Trim a clip on keyframes for a fast stream-copy edit:
-
-```ts
-import { trim } from '@aibrush/media';
-
-const clip = await trim(file, {
-  start: 10,
-  end: 20,
-  mode: 'keyframe',
-});
-```
-
-Mux explicit packet streams after demuxing:
-
-```ts
-import { createMedia } from '@aibrush/media';
-import type { PacketStreams } from '@aibrush/media';
-
+// Or a reusable, isolated engine instance (multi-instance, SSR-safe):
 const media = createMedia();
-const demuxed = await media.demux(file);
+const out = await media.convert(file, { audio: { codec: 'flac' }, container: 'flac', sink: toOPFS('out.flac') });
 
-try {
-  const video = demuxed.tracks.find((track) => track.mediaType === 'video');
-  const audio = demuxed.tracks.find((track) => track.mediaType === 'audio');
-  const streams: PacketStreams = {};
-
-  if (video) streams.video = { track: video, packets: demuxed.packets(video.id) };
-  if (audio) streams.audio = { track: audio, packets: demuxed.packets(audio.id) };
-
-  const output = await media.mux(streams, { container: 'mp4', faststart: true });
-} finally {
-  await demuxed.close();
-}
+// Every async op is cancellable:
+const job = media.convert(bigFile, { video: { codec: 'av1' } });
+// job.cancel();
+await job;
 ```
 
-## Runnable Examples
+Inputs (`MediaInput`) accept `Blob`/`File`, a URL, a `ReadableStream<Uint8Array>`, `ArrayBuffer`/`Uint8Array`,
+a `MediaStream` (live), or OPFS handles. Outputs go to a `Sink` — `toBlob()` (default), `toFile()`,
+`toStream()`, `toOPFS()`, `toElement()`, or `toStreamTarget()` for live/streaming output. Codec and container
+names (`Container`, `VideoCodec`, `AudioCodec`, `PcmCodec`) are **intent tokens**, never driver ids.
 
-The `examples/` directory contains complete scripts for the same common tasks:
+## Documentation
 
-```sh
-bun examples/probe.ts ./fixtures/media/movie_5.mp4
-bun examples/convert.ts ./fixtures/media/movie_5.mp4 ./out.mp4
-bun examples/trim.ts ./fixtures/media/movie_5.mp4 ./clip.mp4 1.5 4.0 keyframe
-bun examples/mux.ts ./fixtures/media/movie_5.mp4 ./muxed.mp4
-```
+The docs are the authoritative **target spec**. Start at
+**[`docs/architecture/README.md`](docs/architecture/README.md)** for the full index — architecture spine,
+per-operation family docs, container/codec drivers, the decision log, and the glossary. Locked decisions live
+in [`docs/decisions/`](docs/decisions/README.md).
 
-Video decode/encode examples use browser media APIs where the current runtime provides them. Pure
-TypeScript container and PCM paths run in Bun; unavailable capabilities fail with `MediaError` subclasses
-instead of silent passthrough output.
+## Building & testing
 
-## Package Checks
+See **[`BUILD_INSTRUCTIONS.md`](BUILD_INSTRUCTIONS.md)** for the Definition of Done and the per-feature loop
+(ultrathink → failing validation test → implement → pass → benchmark → full gate → green commit). Validation
+is **tier-split**: the pure-TS tier is validated in Node (CI); the WebCodecs/GPU/WASM tier is validated in a
+browser on a target machine. The acceptance benchmark harness (13 scenario families × 7 engines) is the
+sibling project [`../media-test`](../media-test).
 
-Before publishing or vendoring the package, run the focused packaging gates:
+## License
 
-```sh
-bun run build
-bun run vendor-wasm
-bun run vendor-wasm:check
-bun run test:dist
-bun run check-budgets
-bun run verify:package
-```
-
-`vendor-wasm` co-locates the built WASM tails with the emitted chunks after `tsup` cleans `dist/`.
-`vendor-wasm:check` proves those co-vendored artifacts are present and byte-identical without writing.
-`test:dist` imports through the published `exports` map and exercises the built package.
-`check-budgets` inspects `dist/` for the eager kernel budget, typical first-operation JS budget,
-code-splitting, and lazy same-origin WASM asset loading.
-`verify:package` packs the built package, installs the tarball into a clean app, typechecks the public
-exports, runs a package-name import, and measures a tree-shaken probe-only browser bundle with zero emitted
-WASM assets.
-
-## Loading Model
-
-The default entry stays small and lazy-loads first-party drivers on demand. WASM codec assets are emitted
-as same-origin files and addressed with `new URL('./core.wasm', import.meta.url)` from lazy driver code;
-they are not statically imported by the default entry or probe-only path. The common path does not require
-COOP/COEP. Threaded/SIMD WASM remains an explicit isolation-profile opt-in.
+See package metadata. Third-party WASM codec cores retain their own licenses and attribution — see the
+`THIRD_PARTY_NOTICES` and `BUILD.md` files under `src/codecs/wasm-*/`.
