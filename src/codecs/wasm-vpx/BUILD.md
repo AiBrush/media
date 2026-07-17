@@ -40,7 +40,7 @@ ogv-vp8-wasm.js `e88760eaed22be03e2efc3a8ada0e9ec2faa274eda6a2e539580f18a1ef02b0
 
 **Shape:** ogv.js's `OGVDecoderVideoVPxW({...})` is an Emscripten MODULARIZE factory that runs in Node; the
 glue feeds each module its base64-embedded wasm via `instantiateWasm` (no separate `.wasm`), so the tail is
-**self-contained** — `tsup` bundles it into the lazy `vpx-core.js` chunk and `vendor-wasm.ts` skips it (the
+**self-contained** — esbuild bundles it into the lazy `vpx-core.js` chunk and `vendor-wasm.ts` skips it (the
 `selfContained` branch, ADR-090). The driver's `new URL('./vpx.wasm', import.meta.url)` is vestigial (the
 glue's `init` ignores it). ogv returns **stride-aligned** planes; the glue **de-strides** to packed I420.
 

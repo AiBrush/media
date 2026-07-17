@@ -9,7 +9,7 @@
  * `worker-main.ts` is pure and Node-validated; the `self`-bound boot + the real `MediaEngineImpl`
  * construction can only run in a worker, so isolating it here keeps `worker-main.ts` 100%-coverable in Node
  * while this file rides the `worker.ts` coverage exclusion (vitest.config glob) and is validated in the
- * browser harness. It is a **separate tsup entry/chunk** referenced only via the runtime asset URL above —
+ * browser harness. It is a **separate esbuild entry/chunk** referenced only via the runtime asset URL above —
  * never a static import from the eager `index` closure — so the kernel byte budget (BUILD §2, doc 08 §7) is
  * untouched (the engine reaches it lazily, only when `worker` is enabled and a `Worker` exists).
  *

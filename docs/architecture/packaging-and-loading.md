@@ -8,7 +8,7 @@
 
 **Concrete restatement of the task:** describe the best design for *how the compiled `@aibrush/media`
 package is shaped and delivered to a browser* — which files the `package.json` `exports` map publishes, how
-`tsup`/esbuild code-splits the engine so the eager kernel stays tiny, how the per-codec WebAssembly cores and
+the direct esbuild pipeline code-splits the engine so the eager kernel stays tiny, how the per-codec WebAssembly cores and
 the offload worker are loaded lazily and same-origin at runtime (never a CDN, never up-front), and what
 Content-Security-Policy / cross-origin-isolation the common path requires — then list where today's build
 diverges from that best design.
@@ -83,9 +83,9 @@ loaded up front. aibrush targets mediabunny-class eager JS with the WASM strictl
 
 ### 3.1 Data model — the published surface
 
-The package is **ESM-only** (`"type": "module"`, `package.json:5`; `format: ['esm']`, `tsup.config.ts:52`) —
+The package is **ESM-only** (`"type": "module"`, `package.json:5`; `format: 'esm'`, `scripts/build.mjs`) —
 no CJS, because CJS would break `import()` code-splitting and the `new URL(..., import.meta.url)` same-origin
-asset references (`tsup.config.ts:16-19`). The public surface is a small, deliberate `exports` map
+asset references. The public surface is a small, deliberate `exports` map
 (`package.json:23-41`):
 
 | Subpath | Emitted entry | Purpose |
@@ -98,9 +98,10 @@ asset references (`tsup.config.ts:16-19`). The public surface is a small, delibe
 
 `"sideEffects": false` (`package.json:7`) is what authorizes the bundler to drop every subpath a consumer
 never reaches — it is honest because registration is by explicit function call, never an import-time side
-effect. `tsup` emits one entry per public surface plus a **separate `worker` entry**
-(`tsup.config.ts:34-51`), producing `index/core/image/worker` + `drivers/<container>` chunks, all code-split
-(`splitting: true`, `treeshake: true`, `minify: true`, `sourcemap: true`; `tsup.config.ts:73-76`).
+effect. `scripts/build.mjs` asks esbuild for one entry per public surface plus a **separate `worker` entry**,
+producing `index/core/image/worker` + `drivers/<container>` chunks, all code-split, tree-shaken, minified,
+and source-mapped. TypeScript 7 separately emits the declaration graph from `tsconfig.json`; the build
+script changes its default `noEmit` mode to `false` for that invocation.
 
 ### 3.2 Seams — the three lazy boundaries
 
@@ -123,7 +124,7 @@ specifier:
    `new URL('./worker.js', import.meta.url)`, spawned as a module worker (`src/kernel/worker-host.ts:124,137`),
    reached only via a lazy `import('./worker-host.ts')` (`src/kernel/worker-host.ts:5,332`). The worker entry
    is an **entry-map key** (not an array element) precisely so it flattens to `dist/worker.js`, a sibling of
-   the `worker-host` chunk that holds the `new URL` site, so the asset URL resolves (`tsup.config.ts:26-33`).
+   the `worker-host` chunk that holds the `new URL` site, so the asset URL resolves (`scripts/build.mjs`).
 
 ### 3.3 Capability routing (WebCodecs → GPU → WASM, miss-only)
 
@@ -152,7 +153,7 @@ requires **only** `'wasm-unsafe-eval'` and no isolation headers; SIMD+threads is
 
 ### 3.4 Self-hosting + co-vendoring (why `vendor-wasm.ts` exists)
 
-esbuild/tsup does **not** copy a `.wasm` referenced by a plain `new URL('./x.wasm', import.meta.url)` into
+esbuild does **not** copy a `.wasm` referenced by a plain `new URL('./x.wasm', import.meta.url)` into
 `dist/` — it is not a recognized asset import (`docs/measured-evidence.md` ADR-042). `scripts/vendor-wasm.ts` fills the
 gap: it discovers each real tail (`*_wasm_bg.wasm` + `*-core.js` pair) and copies both into `dist/` flat, so
 the `.wasm` sits next to its emitted `*-core.js` chunk and the `import.meta.url` resolution holds
@@ -208,11 +209,12 @@ codec pipeline (S13). Honest one-liners:
 What exists today, with citations, and the smells.
 
 **Build config (owned surface).** `package.json` `exports` map is correct and minimal (`:23-41`),
-`sideEffects:false` set (`:7`), `files:["dist"]` (`:56`), `engines.node>=18` (`:20-22`). `tsup.config.ts`
-emits ESM-only, code-split, minified, with the worker as a flattened entry key and node built-ins marked
-external (`:34-77`). The three tsconfigs (`tsconfig.json`, `tsconfig.test.json`, `tsconfig.scripts.json`) all
-extend `tsconfig.base.json`, which is strict, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
-`moduleResolution:"Bundler"`, `allowImportingTsExtensions` (`tsconfig.base.json:1-27`) — the `.ts`-specifier
+`sideEffects:false` set (`:7`), `files:["dist"]` (`:56`), `engines.node>=18` (`:20-22`).
+`scripts/build.mjs` emits ESM-only, code-split, minified JavaScript with the worker as a flattened entry key
+and node built-ins marked external. `tsconfig.json` owns the strict browser-library and declaration-emission
+settings; `tsconfig.test.json` inherits them and adds the Bun environment for tests and repository scripts.
+The root configuration enables `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+`moduleResolution:"Bundler"`, and `allowImportingTsExtensions` — the `.ts`-specifier
 imports (`import('../drivers/defaults.ts')`) are why `allowImportingTsExtensions` + Bundler resolution are
 required.
 
@@ -227,14 +229,15 @@ the per-driver `new URL('./x.wasm', import.meta.url)` sites across `src/codecs/w
   accumulate per session and never retire — a maintenance liability that dwarfs the meaningful scripts and
   obscures the real gate.
 - **Duplicated node-builtin exclusion.** The top-level `browser` field maps `module/fs/path/crypto/os/url/…`
-  to `false` (`package.json:44-55`) AND tsup lists the same builtins in `external` (`tsup.config.ts:61-71`).
+  to `false` (`package.json:44-55`) AND the esbuild configuration lists the same builtins in `external`
+  (`scripts/build.mjs`).
   Two sources of truth for one fact → drift risk. Modern bundlers with `exports` present may also ignore the
   legacy top-level `browser` field.
 - **Codec-name capability leak in the packaging layer.** `check-budgets.ts` hardcodes the codec set
   `aac|av1|mp3|opus|vorbis|vpx` in the leak-guard regexes (`:42,46,50,59,125`). A new wasm tail added under
   `src/codecs/wasm-*` is invisible to the leak guard until a human edits these regexes — a codec identity
   leaking into a build script that should be codec-agnostic.
-- **Manual co-vendoring is a second build step with a drift window.** `vendor-wasm.ts` runs *after* `tsup`
+- **Manual co-vendoring is a second build step with a drift window.** `vendor-wasm.ts` runs *after* esbuild
   and must be re-run whenever a core changes; the split (`build` vs `vendor-wasm` vs `vendor-wasm:check`,
   `package.json:70-73`) means `dist/` is only complete after two commands, and CI relies on the `--check`
   oracle to catch staleness rather than the build producing a complete artifact.
@@ -248,14 +251,14 @@ the per-driver `new URL('./x.wasm', import.meta.url)` sites across `src/codecs/w
   58 kB / 264 kB before recovery to 48.98 kB / 224.16 kB (`docs/measured-evidence.md` ADR-092, session12-eager-budget-recovery).
   The `TYPICAL_APP_BUDGET` comment openly calls itself "a tight ceiling over the current ~254 kB" with the
   real fix (per-driver lazy registration) still tracked (`check-budgets.ts:28-32`).
-- **`worker` entry has no `exports` subpath.** `tsup` emits `dist/worker.js` (`tsup.config.ts:38`) but the
+- **`worker` entry has no `exports` subpath.** esbuild emits `dist/worker.js` (`scripts/build.mjs`) but the
   `exports` map (`package.json:23-41`) publishes no `./worker` — intentional (it is a runtime asset, not a
   public import), but undocumented in the surface.
 
 ## 5. Delta / punch-list (ordered)
 
 1. **Fold WASM co-vendoring into the build; kill the drift window.** Replace the standalone
-   `scripts/vendor-wasm.ts` post-step with a `tsup`/esbuild `onEnd` plugin that emits each tail's `.wasm`
+   `scripts/vendor-wasm.ts` post-step with an esbuild `onEnd` plugin that emits each tail's `.wasm`
    next to its `*-core.js` chunk as part of the single `build`.
    *Acceptance:* after `bun run build` **alone** (no separate `vendor-wasm`), `scripts/vendor-wasm.ts --check`
    (`vendor-wasm.ts:260-276`) reports every pair already present and copies zero files; remove `vendor-wasm`
@@ -271,9 +274,9 @@ the per-driver `new URL('./x.wasm', import.meta.url)` sites across `src/codecs/w
    `margin ≥ MIN_BUDGET_MARGIN`.
 
 3. **De-duplicate the node-builtin exclusion to one source of truth.** The `browser` field (`package.json:44-55`)
-   and tsup `external` (`tsup.config.ts:61-71`) encode the same list twice.
+   and esbuild `external` (`scripts/build.mjs`) encode the same list twice.
    *Acceptance:* both derive from one exported array (or drop the legacy `browser` field entirely, since
-   `exports`-based ESM + tsup `external` already covers browsers); `verify-package-install.ts` bundle report
+   `exports`-based ESM + esbuild `external` already covers browsers); `verify-package-install.ts` bundle report
    emits zero node-builtin `require`s and typechecks green (`verify-package-install.ts:45-57`).
 
 4. **Remove the codec-name capability leak from `check-budgets.ts`.** Derive the guarded codec set from the
@@ -282,7 +285,7 @@ the per-driver `new URL('./x.wasm', import.meta.url)` sites across `src/codecs/w
    *Acceptance:* a synthetic `src/codecs/wasm-foo/` tail leaking into the eager closure is caught by the guard
    **without** editing any regex (add a fixture-driven test asserting the guard set is computed, not literal).
 
-5. **Publish or explicitly document the `worker` asset.** `dist/worker.js` (`tsup.config.ts:38`) has no
+5. **Publish or explicitly document the `worker` asset.** `dist/worker.js` (`scripts/build.mjs`) has no
    `exports` entry (`package.json:23-41`).
    *Acceptance:* `src/dist-smoke.test.ts` asserts `dist/worker.js` exists AND that `@aibrush/media/worker` is
    either a resolvable subpath or a documented-private asset (mirror the `fragmentMp4` on-`/core` assertion at
@@ -313,7 +316,7 @@ the per-driver `new URL('./x.wasm', import.meta.url)` sites across `src/codecs/w
 
 10. **Add Subresource-Integrity / content-hashing for same-origin `.wasm`+`worker` assets.** Today
     `vendor-wasm.ts` copies the `.wasm` with its **original flat filename** (`vendor-wasm.ts:252-257`) while
-    tsup content-hashes JS chunks — so a core update cannot bust the HTTP cache and cannot carry an integrity
+    esbuild content-hashes JS chunks — so a core update cannot bust the HTTP cache and cannot carry an integrity
     hash under strict CSP.
     *Acceptance:* emitted `.wasm` filenames carry a content hash and (optionally) the loader passes an
     `integrity`; `check-budgets.ts` WASM-reference assertion (`:547-559`) still matches every emitted asset to

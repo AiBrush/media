@@ -158,14 +158,15 @@ function fakeCodec(id: string, opts: FakeCodecOptions): FakeCodec {
           : {}),
       }),
   );
-  const driver: CodecDriver & { readonly ensureLoaded?: () => void } = {
+  const driver: CodecDriver & {
+    readonly ensureLoaded?: () => void;
+    readonly supportsWarmDecoderReuse?: boolean;
+  } = {
     id,
     apiVersion: DRIVER_API_VERSION,
     kind: 'codec',
     tier: 'hardware',
-    ...(opts.warmReuse === true
-      ? ({ supportsWarmDecoderReuse: true } as Record<string, never>)
-      : {}),
+    ...(opts.warmReuse === true ? { supportsWarmDecoderReuse: true } : {}),
     ...(opts.ensureLoaded !== undefined ? { ensureLoaded: opts.ensureLoaded } : {}),
     supports,
     createDecoder: (config) => {
@@ -273,9 +274,7 @@ describe('routed acceleration verdict (R-S01.2 / ADR-203)', () => {
     expect(routed).not.toBe(config);
     expect(routed).toMatchObject({ codec: 'vp8', hardwareAcceleration: 'prefer-hardware' });
     expect('hardwareAcceleration' in config).toBe(false);
-    expect(
-      decoderConfigWithRoutedAcceleration(config, { supported: true }),
-    ).toBe(config);
+    expect(decoderConfigWithRoutedAcceleration(config, { supported: true })).toBe(config);
   });
 });
 

@@ -54,7 +54,7 @@ bunx vitest run src/codecs/wasm-av1                        # must stay green
 ```
 
 `vendor-wasm.ts` discovers the `dav1d_wasm_bg.wasm` + `dav1d-core.js` pair (standard both-files path); the
-glue statically imports `./dav1d-wasm.js`, which `tsup` bundles into the lazy `dav1d-core.js` chunk.
+glue statically imports `./dav1d-wasm.js`, which esbuild bundles into the lazy `dav1d-core.js` chunk.
 
 ---
 

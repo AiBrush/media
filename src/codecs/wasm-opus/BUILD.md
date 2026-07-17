@@ -36,7 +36,7 @@ planar↔interleaved f32, config validation, OpusHead) lives in `opus.ts` and is
 is a no-op that ignores the URL and only pre-instantiates libopus; coder *creation* is async (the contract's
 `createDecoder`/`createEncoder` return Promises, `await`ed in the driver's async `start`), the hot
 `encode`/`decode` are sync. The inlined wasm is a normal JS import chain (`opus-core.js` → `libopus-wasm.js`
-→ `generated/*.mjs`), so `tsup` bundles it into the lazy `opus-core.js` code-split chunk; there is **no `new
+→ `generated/*.mjs`), so esbuild bundles it into the lazy `opus-core.js` code-split chunk; there is **no `new
 URL('./*.wasm')` asset to co-vendor**, so `scripts/vendor-wasm.ts` recognizes this as a **self-contained
 inlined tail** (its `selfContained` branch) and SKIPs it — correctly, not as a "broken" half-pair (the
 Rust/Symphonia tails still require BOTH `*_wasm_bg.wasm` + `*-core.js`).

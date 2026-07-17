@@ -81,6 +81,7 @@ These are the highest-leverage patterns; the per-shard items in §4 are the conc
 ## A. Architecture & cross-cutting core
 
 ### S01 — Capability Router & Tier Ladder
+
 Source: [`docs/architecture/capability-router.md`](docs/architecture/capability-router.md) · owned code + rationale in the doc.
 
 #### 5.1 Evict a cached codec driver on an execution-time (async runtime) capability miss
@@ -193,6 +194,7 @@ because** containers have no tier and `clearCache` fires on registration (`src/a
   `src/api/engine.ts:265` invalidated the stale entry). Reference `src/kernel/router.ts:114-138`, `:180-184`.
 
 ### S02 — Execution & Runtime
+
 Source: [`docs/architecture/execution-runtime.md`](docs/architecture/execution-runtime.md) · owned code + rationale in the doc.
 
 Ordered for the coder. Each item = the change + a concrete acceptance test.
@@ -258,6 +260,7 @@ Ordered for the coder. Each item = the change + a concrete acceptance test.
    asserts **zero** matches, so a future capability leak into this layer fails CI.
 
 ### S03 — Worker & WASM Runtime
+
 Source: [`docs/architecture/worker-and-wasm-runtime.md`](docs/architecture/worker-and-wasm-runtime.md) · owned code + rationale in the doc.
 
 Ordered by severity. Each item: the change + a concrete acceptance test referencing `path:line`.
@@ -285,7 +288,7 @@ Ordered by severity. Each item: the change + a concrete acceptance test referenc
 
 3. **Make the `isolated-simd-threads` profile load a distinct asset — or stop claiming it.**
    `wasmInitForProfile` returns identical `module_or_path` for `baseline` and `isolated-simd-threads`
-   (`wasm-loader-runtime.ts:45-51`), so threads/SIMD are resolved but never used (measured-evidence.md_ ADR-006
+   (`wasm-loader-runtime.ts:45-51`), so threads/SIMD are resolved but never used (measured-evidence.md_ADR-006
    debt). Choose one: (a) select a sibling threaded core URL (e.g. `*.threads.wasm`) for the isolated
    profile; or (b) until a threaded core is vendored, route the isolated verdict through
    `requireIsolatedWasmProfile`/decline so no code advertises threads it can't run (defensible — no
@@ -347,6 +350,7 @@ Ordered by severity. Each item: the change + a concrete acceptance test referenc
    dropped nothing.
 
 ### S04 — Driver Contracts & Registry
+
 Source: [`docs/architecture/driver-contracts.md`](docs/architecture/driver-contracts.md) · owned code + rationale in the doc.
 
 Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 5–10 are structure/typing.
@@ -428,6 +432,7 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
     two engines and asserts no shared promise identity leaks between them).
 
 ### S05 — Public API
+
 Source: [`docs/architecture/public-api.md`](docs/architecture/public-api.md) · owned code + rationale in the doc.
 
 Ordered for a coding agent. Each item names the change, the `path:line`, and a concrete acceptance test.
@@ -519,6 +524,7 @@ Ordered for a coding agent. Each item names the change, the `path:line`, and a c
 ---
 
 ### S06 — Input Sources
+
 Source: [`docs/architecture/sources.md`](docs/architecture/sources.md) · owned code + rationale in the doc.
 
 Each item: the change, the `path:line`, and the oracle that proves it.
@@ -600,10 +606,11 @@ Each item: the change, the `path:line`, and the oracle that proves it.
     the `fetch` init carried the signal (spy).
 
 ### S08 — Packaging & Loading
+
 Source: [`docs/architecture/packaging-and-loading.md`](docs/architecture/packaging-and-loading.md) · owned code + rationale in the doc.
 
 1. **Fold WASM co-vendoring into the build; kill the drift window.** Replace the standalone
-   `scripts/vendor-wasm.ts` post-step with a `tsup`/esbuild `onEnd` plugin that emits each tail's `.wasm`
+   `scripts/vendor-wasm.ts` post-step with an esbuild `onEnd` plugin that emits each tail's `.wasm`
    next to its `*-core.js` chunk as part of the single `build`.
    *Acceptance:* after `bun run build` **alone** (no separate `vendor-wasm`), `scripts/vendor-wasm.ts --check`
    (`vendor-wasm.ts:260-276`) reports every pair already present and copies zero files; remove `vendor-wasm`
@@ -619,9 +626,9 @@ Source: [`docs/architecture/packaging-and-loading.md`](docs/architecture/packagi
    `margin ≥ MIN_BUDGET_MARGIN`.
 
 3. **De-duplicate the node-builtin exclusion to one source of truth.** The `browser` field (`package.json:44-55`)
-   and tsup `external` (`tsup.config.ts:61-71`) encode the same list twice.
+   and esbuild `external` (`scripts/build.mjs`) encode the same list twice.
    *Acceptance:* both derive from one exported array (or drop the legacy `browser` field entirely, since
-   `exports`-based ESM + tsup `external` already covers browsers); `verify-package-install.ts` bundle report
+   `exports`-based ESM + esbuild `external` already covers browsers); `verify-package-install.ts` bundle report
    emits zero node-builtin `require`s and typechecks green (`verify-package-install.ts:45-57`).
 
 4. **Remove the codec-name capability leak from `check-budgets.ts`.** Derive the guarded codec set from the
@@ -630,7 +637,7 @@ Source: [`docs/architecture/packaging-and-loading.md`](docs/architecture/packagi
    *Acceptance:* a synthetic `src/codecs/wasm-foo/` tail leaking into the eager closure is caught by the guard
    **without** editing any regex (add a fixture-driven test asserting the guard set is computed, not literal).
 
-5. **Publish or explicitly document the `worker` asset.** `dist/worker.js` (`tsup.config.ts:38`) has no
+5. **Publish or explicitly document the `worker` asset.** `dist/worker.js` (`scripts/build.mjs`) has no
    `exports` entry (`package.json:23-41`).
    *Acceptance:* `src/dist-smoke.test.ts` asserts `dist/worker.js` exists AND that `@aibrush/media/worker` is
    either a resolvable subpath or a documented-private asset (mirror the `fragmentMp4` on-`/core` assertion at
@@ -661,13 +668,14 @@ Source: [`docs/architecture/packaging-and-loading.md`](docs/architecture/packagi
 
 10. **Add Subresource-Integrity / content-hashing for same-origin `.wasm`+`worker` assets.** Today
     `vendor-wasm.ts` copies the `.wasm` with its **original flat filename** (`vendor-wasm.ts:252-257`) while
-    tsup content-hashes JS chunks — so a core update cannot bust the HTTP cache and cannot carry an integrity
+    esbuild content-hashes JS chunks — so a core update cannot bust the HTTP cache and cannot carry an integrity
     hash under strict CSP.
     *Acceptance:* emitted `.wasm` filenames carry a content hash and (optionally) the loader passes an
     `integrity`; `check-budgets.ts` WASM-reference assertion (`:547-559`) still matches every emitted asset to
     a `new URL(...)` site.
 
 ### S13 — Codec Pipeline (shared brain)
+
 Source: [`docs/architecture/codec-pipeline.md`](docs/architecture/codec-pipeline.md) · owned code + rationale in the doc.
 
 1. **Split the god-file into the three target layers.** Extract `codec-strings.ts` (level tables +
@@ -739,6 +747,7 @@ Source: [`docs/architecture/codec-pipeline.md`](docs/architecture/codec-pipeline
     they arrive only via `engine.ts:191`'s `import('./codec-pipeline.ts')`).
 
 ### S33 — Testing & Validation
+
 Source: [`docs/architecture/testing-and-validation.md`](docs/architecture/testing-and-validation.md) · owned code + rationale in the doc.
 
 Ordered by leverage. Each item names the change, the `path:line`, and a concrete acceptance test /
@@ -815,6 +824,7 @@ oracle that proves it.
 ## B. Operations (benchmark families)
 
 ### S07 — Sinks & Streaming Output
+
 Source: [`docs/operations/streaming-output.md`](docs/operations/streaming-output.md) · owned code + rationale in the doc.
 
 Ordered, each with a concrete acceptance test / oracle.
@@ -902,6 +912,7 @@ Ordered, each with a concrete acceptance test / oracle.
    (default-entry closure size) is unchanged, proving the seam is still lazily loaded.
 
 ### S09 — Probe & Demux
+
 Source: [`docs/operations/probe-and-demux.md`](docs/operations/probe-and-demux.md) · owned code + rationale in the doc.
 
 1. **Consolidate all container sniffers behind one registry with a declared head contract.** Move
@@ -969,6 +980,7 @@ Source: [`docs/operations/probe-and-demux.md`](docs/operations/probe-and-demux.m
    `golden-packets` on the same asset shows zero packets for the `tmcd` track.
 
 ### S10 — Decode & Seek
+
 Source: [`docs/operations/decode-seek.md`](docs/operations/decode-seek.md) · owned code + rationale in the doc.
 
 Ordered, each with a concrete acceptance oracle.
@@ -1040,6 +1052,7 @@ Ordered, each with a concrete acceptance oracle.
    because it is a `decode-seek` acceptance gate.
 
 ### S11 — Transcode — Video
+
 Source: [`docs/operations/transcode-video.md`](docs/operations/transcode-video.md) · owned code + rationale in the doc.
 
 Ordered by leverage. Each item names the change, the `path:line`, and a concrete acceptance oracle.
@@ -1116,6 +1129,7 @@ Ordered by leverage. Each item names the change, the `path:line`, and a concrete
     (`measured-evidence.md`).
 
 ### S12 — Transcode — Audio & Convert
+
 Source: [`docs/operations/transcode-audio-convert.md`](docs/operations/transcode-audio-convert.md) · owned code + rationale in the doc.
 
 Ordered, each with a concrete acceptance test / oracle. Reference `path:line`.
@@ -1214,9 +1228,11 @@ Ordered, each with a concrete acceptance test / oracle. Reference `path:line`.
     fast path defers to the streaming `authorFlacStream` path (`:105`-`111`).
 
 ### S14 — Mux
+
 Source: [`docs/operations/mux.md`](docs/operations/mux.md) · owned code + rationale in the doc.
 
 #### 5.1 Extract one shared packet-normalization + stream-drain module
+
 `chunkStructFrom`, `packetBytes`, `encodedChunkBytes`, `isPacket`, `isObject`, `isReadableStream(Like)`,
 `assertNotAborted`, `streamFromBytes`, and the `packetValues`/`packetChunks` drain loops are duplicated
 across `mux-packet-streams.ts` (`:97-133`), `mp4-prepared-mux.ts` (`:245-298`),
@@ -1228,6 +1244,7 @@ across `mux-packet-streams.ts` (`:97-133`), `mp4-prepared-mux.ts` (`:245-298`),
 typecheck + full mux suite stay green with byte-identical golden outputs.
 
 #### 5.2 Rename & split the `flac-mkv-mux.ts` god-file
+
 Move `muxSingleTrackMp4`/`muxPreparedMp4PacketStreams` (`flac-mkv-mux.ts:79-153`) into
 `mp4-prepared-mux.ts`; move `muxSingleTrackOggAudio` (`:176-188`) into an `ogg-prepared-mux` wrapper;
 keep WebM/MKV/FLAC-in-MKV in a `webm-prepared-mux.ts`. No file named for FLAC+MKV should export MP4 or
@@ -1238,6 +1255,7 @@ stay within their caps (`docs/measured-evidence.md` records 49.66 kB / 50.00 kB 
 `mux/*` goldens byte-identical.
 
 #### 5.3 Replace `runMux` nested ternaries with a declarative route table
+
 `mux-runner.ts:49-97` decides the route with `target === 'mp4' || target === 'mov'` literals in five
 places. Replace with `const MUX_ROUTES: Record<Container, MuxRoute>` where `MuxRoute` names
 `{ native?, prepared, streamOnly? }`, and iterate.
@@ -1246,6 +1264,7 @@ token in `CODEC_MUX_CONTAINERS` (`src/api/codec-routing.ts:21`) and asserts each
 route (or a typed `CapabilityError` with `op:'mux'` and `tried:[token]`), proving the table is total.
 
 #### 5.4 Give prepared muxers incremental (streaming) output
+
 Prepared/native paths emit the whole container as one `streamFromBytes` chunk
 (`flac-mkv-mux.ts:762`, `native-packet-mux.ts:59-64`) and fully buffer packets
 (`packetValues`/`packetChunks`). For a `'stream'` sink this defeats backpressure and pins peak RSS to
@@ -1256,6 +1275,7 @@ for the buffered-Blob path (ADR-268).
 sub-linearly vs. N; the buffered Blob path still produces exactly one `ArrayBuffer`; goldens unchanged.
 
 #### 5.5 Extend native zero-copy fusion to WebM/MKV and Ogg
+
 `muxNativeFirstPartyPacketStreams` covers only MP4/MOV (`native-packet-mux.ts:22`). The WebM/Ogg swap
 rows still construct per-packet host objects at the public boundary — `docs/measured-evidence.md` records
 `mux/swap_audio_video_with_opus_to_mkv` at 202.4 ms vs. mediabunny 53.1 ms (3.6×) and
@@ -1266,6 +1286,7 @@ provenance-claim spy), a fresh multi-sample benchmark beats the recorded 202.4 m
 (packets/frames/colour/HDR preserved), and DTS/alpha survive byte-exact.
 
 #### 5.6 Prove the faststart one-pass `moov` (no double serialize)
+
 `docs/measured-evidence.md` records `mux/h264_aac_to_mov` as a 1.52× loss from "faststart serializing the
 complete `moov` twice." The current writer serializes `moov` once with zero offsets then **patches
 offsets in place** (`src/drivers/mp4/write.ts:944-950`), which should be one pass. Confirm and lock it.
@@ -1273,6 +1294,7 @@ offsets in place** (`src/drivers/mp4/write.ts:944-950`), which should be one pas
 `mux/h264_aac_to_mov` bench median beats mediabunny fresh; output byte-identical to the two-pass golden.
 
 #### 5.7 VFR monotonic-DTS guard at the mux seam (ADR-191)
+
 A muxer must not derive DTS from summed *nominal* durations (fabricates PTS<DTS reorder,
 `docs/measured-evidence.md`: 626 VFR frames). Add an assertion at the packet→sample-table conversion that DTS is
 monotonic and never exceeds the packet's PTS unless a real reorder (`dtsUs < ptsUs`) was supplied.
@@ -1280,6 +1302,7 @@ monotonic and never exceeds the packet's PTS unless a real reorder (`dtsUs < pts
 corrections — parses back with **zero** PTS/DTS inversions and one keyframe (the recorded fix result).
 
 #### 5.8 Standardize the mux `CapabilityError`/`MediaError` shape
+
 `mux-runner.ts:43-48` throws `CapabilityError('capability-miss', ..., { op:'mux', tried:[target] })`
 while the prepared muxers throw `{ op:{ op:'mux', container }, tried:[...] }`
 (`mp4-prepared-mux.ts:88-97`, `mpegts-prepared-mux.ts:33-51`, `flac-mkv-mux.ts:194-215`). Pick the
@@ -1289,12 +1312,14 @@ zero tracks, illegal codec) and asserts each error's `op` is a structured `{ op:
 }` with a non-empty `tried[]`.
 
 #### 5.9 Relocate demux-side helpers out of `mp4-prepared-mux.ts`
+
 `mp4PacketInfoFromBytes`/`mp4PacketInfoFromUrl` (`mp4-prepared-mux.ts:192-229`) probe packet-info; they
 belong to S09 (probe/demux), not a mux module.
 **Acceptance:** `mp4-prepared-mux.ts` imports no `readMovie`/`mp4PacketInfoTable`; the probe helpers live
 under demux ownership and their tests move with them; mux bundle shrinks or is unchanged.
 
 #### 5.10 Assert DTS-ordered interleave from the concurrent generic drain
+
 The generic path drains all tracks concurrently into a shared muxer (`mux-runner.ts:116-122`); writes
 arrive interleaved and the muxer must order by DTS (MP4 sample tables per track; WebM Clusters in
 decode order; TS PES by PTS/DTS). Add a golden proving correct cross-track interleave.
@@ -1303,6 +1328,7 @@ order / MP4 `stco`+`ctts`) that a reference demux reads back with `maxPtsDrift =
 per-track packet counts.
 
 ### S15 — Remux
+
 Source: [`docs/operations/remux.md`](docs/operations/remux.md) · owned code + rationale in the doc.
 
 1. **Kill the container-token capability leak in the runner.** Replace the literal `opts.to === 'webm' |
@@ -1363,7 +1389,7 @@ Source: [`docs/operations/remux.md`](docs/operations/remux.md) · owned code + r
 8. **Nail the anti-passthrough invariant (ADR-155).** The MP4 blob/byte-direct fast paths already run a
    validation demux (`remux-runner.ts:119-123, 143-147`); make the guarantee a first-class test: a same-
    container no-op remux must return either a genuine re-layout or the exact bytes *only after* structural
-   + sample-range validation, never a raw passthrough.
+   - sample-range validation, never a raw passthrough.
    *Acceptance:* (a) a bit-flip inside `mdat` makes the validation `demux()` throw (no output emitted);
    (b) an `ftyp`-only-flipped input is rejected as a cheat by the anti-cheat oracle; (c) a legitimate
    MOV→MP4 brand rewrite passes only after sample-range validation.
@@ -1381,6 +1407,7 @@ Source: [`docs/operations/remux.md`](docs/operations/remux.md) · owned code + r
     track's packets are **absent** and the kept track's coded bytes are **byte-identical** to source.
 
 ### S16 — Trim
+
 Source: [`docs/operations/trim.md`](docs/operations/trim.md) · owned code + rationale in the doc.
 
 1. **Collapse the `runTrim` ladder into a declarative route table.** Replace the nine inline branches
@@ -1431,6 +1458,7 @@ Source: [`docs/operations/trim.md`](docs/operations/trim.md) · owned code + rat
     oracle) and calls `demuxer.close()` exactly once (`src/api/trim-runner.ts:398`–`:404`).
 
 ### S17 — Audio DSP & PCM Convert
+
 Source: [`docs/operations/audio-dsp.md`](docs/operations/audio-dsp.md) · owned code + rationale in the doc.
 
 1. **Fix the s24 decode perf loss.** Give `decodePcm` (Float64) the same raw-byte s24 (and s16/s32) fast
@@ -1509,6 +1537,7 @@ Source: [`docs/operations/audio-dsp.md`](docs/operations/audio-dsp.md) · owned 
     `ABORT_CHECK_INTERVAL` window; output for a completed run matches a golden.
 
 ### S18 — Video Filters
+
 Source: [`docs/operations/video-filters.md`](docs/operations/video-filters.md) · owned code + rationale in the doc.
 
 Ordered by impact. Each item states the change and a concrete acceptance oracle.
@@ -1534,7 +1563,7 @@ Ordered by impact. Each item states the change and a concrete acceptance oracle.
    (`src/filters/gpu-video.ts:409-420`) from the TS constants in `gpu-uniforms.ts:266-283`, or add a guard
    test that parses each `const X : f32 = N;` out of the shader string and asserts equality with the TS value
    to full precision.
-   *Acceptance:* a Node test extracts every WGSL `f32` constant and asserts `=== ` the TS constant; a browser
+   *Acceptance:* a Node test extracts every WGSL `f32` constant and asserts `===` the TS constant; a browser
    GPU-vs-CPU parity test on PQ/HLG/BT.2020 fixtures asserts SSIM ≥ threshold.
 
 4. **De-duplicate and de-UA-sniff capability detection.** One shared `capabilities` module; express the
@@ -1593,6 +1622,7 @@ Ordered by impact. Each item states the change and a concrete acceptance oracle.
     floor.
 
 ### S19 — Encryption / Decrypt
+
 Source: [`docs/operations/encryption.md`](docs/operations/encryption.md) · owned code + rationale in the doc.
 
 1. **Unify MP4 CENC on the whole-file engine; delete `decryptCencTrack`.** Route *all* `cenc`/`cens`/
@@ -1637,6 +1667,7 @@ Source: [`docs/operations/encryption.md`](docs/operations/encryption.md) · owne
    — proving there is **no** silent JS-cipher fallback (contrast hls.js `aes-decryptor.ts`).
 
 ### S20 — Metadata
+
 Source: [`docs/operations/metadata.md`](docs/operations/metadata.md) · owned code + rationale in the doc.
 
 1. **Add the symmetric read dispatcher.** Create `readMetadataTags(bytes, container)` in
@@ -1696,6 +1727,7 @@ Source: [`docs/operations/metadata.md`](docs/operations/metadata.md) · owned co
     `stco`/`co64`) differs; all other bytes SHA-256-equal.
 
 ### S21 — Performance Methodology
+
 Source: [`docs/operations/performance.md`](docs/operations/performance.md) · owned code + rationale in the doc.
 
 1. **Extract one shared `scripts/bench/harness.ts` (or `src/bench/`) and delete the 78 copies of
@@ -1771,6 +1803,7 @@ Source: [`docs/operations/performance.md`](docs/operations/performance.md) · ow
 ---
 
 ### S22 — Robustness
+
 Source: [`docs/operations/robustness.md`](docs/operations/robustness.md) · owned code + rationale in the doc.
 
 Each item: the change, the `path:line` anchor, and a concrete acceptance oracle.
@@ -1841,6 +1874,7 @@ Each item: the change, the `path:line` anchor, and a concrete acceptance oracle.
 ## C. Container drivers
 
 ### S23 — MP4 / MOV Driver
+
 Source: [`docs/drivers/mp4.md`](docs/drivers/mp4.md) · owned code + rationale in the doc.
 
 Ordered for a coding agent. Each item names the change, the `path:line`, and a concrete acceptance
@@ -1848,7 +1882,7 @@ oracle. Behavior-preserving refactors (items 1, 4–8) must keep the existing MP
 produce **byte-identical** output on the corpus.
 
 1. **Decompose `mp4-driver.ts` (4,528 lines).** Split into the modules named in §4.1, leaving a thin
-   `ContainerDriver` wiring file. _Acceptance:_ no owned file over ~800 lines; every extracted module
+   `ContainerDriver` wiring file. *Acceptance:* no owned file over ~800 lines; every extracted module
    has its own unit test; `parse(write(x)) === x` and all existing `roundtrip.test.ts` /
    `mp4.test.ts` / `demux-resident-ranges.test.ts` pass with byte-identical goldens; typecheck + lint
    green; zero `any`.
@@ -1856,7 +1890,7 @@ produce **byte-identical** output on the corpus.
 2. **Remove or engine-scope the two module-global `Map` caches.** `movieParseHandoff`
    (`mp4-driver.ts:168`) and `trimDecodeValidationCache` (`:169`) must not be process-global mutable
    state. Thread the parse-handoff token through the `demux()`/`StageOptions` so a probe→demux handoff
-   is explicit, and make the trim-validation memo engine-scoped (or drop it). _Acceptance:_ a test
+   is explicit, and make the trim-validation memo engine-scoped (or drop it). *Acceptance:* a test
    that runs two independent `createMedia()` engines over the same URL asserts no cache entry from
    engine A is observable to engine B (probe engine B still issues its own range reads); `grep -nE
    'new (Map|Set)\(' src/drivers/mp4/mp4-driver.ts` at module scope returns 0.
@@ -1864,7 +1898,7 @@ produce **byte-identical** output on the corpus.
 3. **Close the capability leak: stop constructing `VideoDecoder` in the driver.** Replace the inline
    decoders (`mp4-driver.ts:2402`, `:2512`) and `isConfigSupported` (`:2322`) with a
    `decodeValidate` capability injected via `StageOptions`/executor, resolved by the router
-   (WebCodecs → GPU → WASM, miss-only). _Acceptance:_ `grep -rn 'new VideoDecoder\|VideoDecoder\.'
+   (WebCodecs → GPU → WASM, miss-only). *Acceptance:* `grep -rn 'new VideoDecoder\|VideoDecoder\.'
    src/drivers/mp4` returns 0; a corrupt-ciphertext CENC fixture still rejects at the codec seam (a
    test flips one `senc` IV byte and asserts the decrypt throws before emitting output); a Node run
    with no `VideoDecoder` still takes the crypto-only path and passes the bit-exact twin.
@@ -1873,59 +1907,60 @@ produce **byte-identical** output on the corpus.
    (`simple-video-probe.ts:60`, `:105`), `readTopLevelBox` (`compatible-mov-rewrite.ts:44`), and
    `topBoxHeader`/`declaredProbeBoxAt` (`mp4-driver.ts:512`, `:727`); route all header reads through
    `readBoxHeader` (adding a random-access variant if a box header can straddle a read window).
-   _Acceptance:_ one box-header implementation remains; the fuzz corpus (`test-support/fuzz/corrupt.ts`)
+   *Acceptance:* one box-header implementation remains; the fuzz corpus (`test-support/fuzz/corrupt.ts`)
    of truncated / `size===1` / `size===0` / oversized boxes passes through the single parser without a
    crash and with identical probe output on the clean corpus.
 
 5. **Collapse the two fragment (trun/tfhd) parsers into one.** Have `parse.ts` aggregate timing
    (`parseTraf`, `:357`) and per-sample recovery (`appendTrafSamples`,
    `fragment-samples.ts:128`) share one `trun`/`tfhd` reader and one set of flag constants.
-   _Acceptance:_ on the fragmented corpus, `sum(fragmentSamplesToDemuxSamples(...).durationUs)` equals
+   *Acceptance:* on the fragmented corpus, `sum(fragmentSamplesToDemuxSamples(...).durationUs)` equals
    the `FragmentTiming.mediaTicks` the aggregate path reports for every track; `hybrid-fragmented` and
    `fragmented-probe` tests stay green.
 
 6. **Deduplicate the AVC key-picture classifier.** Route `classifyAvcSample` (`mp4-driver.ts:1616`)
-   through `h264AccessUnitRangeIsKeyPicture` (`h264-access-unit.ts:34`). _Acceptance:_ the
+   through `h264AccessUnitRangeIsKeyPicture` (`h264-access-unit.ts:34`). *Acceptance:* the
    packet-truth fixture still reports exactly 1,941 video key pictures (1,680 declared sync + 261
    non-IDR intra) on the 725 MiB/two-hour rotation (measured-evidence.md_).
 
 7. **Lift codec bitstream reframing out of `mux.ts`.** Move Annex-B→AVCC (`mux.ts:179-517`) and
    ADTS→raw-AAC (`mux.ts:518-707`) behind a codec-owned transmux seam; the container muxer accepts
-   already-elementary samples + `description`. _Acceptance:_ `mux.ts` no longer imports/implements NAL
+   already-elementary samples + `description`. *Acceptance:* `mux.ts` no longer imports/implements NAL
    or ADTS parsing; `mux-avc-passthrough.test.ts` and the ADTS→MP4 mux fixture
    (`mux/audio_only_aac_to_mp4`, 6.240 ms vs ffmpeg 10.140 ms, measured-evidence.md_) round-trip
    byte-identically.
 
 8. **Consolidate scalar helpers.** One shared `toUs` (drop `samples.ts:56`, `fragment-samples.ts:300`,
-   `mp4-driver.ts:2278` duplicates) and one big-endian byte-write helper set. _Acceptance:_ `grep -rn
+   `mp4-driver.ts:2278` duplicates) and one big-endian byte-write helper set. *Acceptance:* `grep -rn
    'function toUs' src/drivers/mp4` returns 1; typecheck green.
 
 9. **Reconcile the two `supports()` predicates.** `matchesMp4` (`mp4-sniff.ts:7`) and `supportsMux`
    (`mp4-mux-driver.ts:17`) must agree on the MIME/extension universe (mux-vs-demux direction gating
-   aside). _Acceptance:_ a table-driven test asserts `application/mp4` and `audio/x-m4a` are treated
+   aside). *Acceptance:* a table-driven test asserts `application/mp4` and `audio/x-m4a` are treated
    consistently by both; the container-selection matrix (`container-integrity.test.ts`) stays green.
 
 10. **Support >4 GiB non-fragmented output (or fail loudly and route to CMAF).** `writeMp4`
     (`write.ts:991`) + `assertSingleBufferSize` (`write.ts:602`) cap at 4 GiB with a 32-bit `stco`.
     Either emit `co64` + a 64-bit `mdat` largesize when `mdatPayloadLen > 0xffffffff`, or raise a
-    typed `CapabilityError` steering the caller to `fragmented: true`. _Acceptance:_ a synthetic layout
+    typed `CapabilityError` steering the caller to `fragmented: true`. *Acceptance:* a synthetic layout
     *plan* (no real bytes) whose payload exceeds 4 GiB asserts `co64` selection and a 16-byte `mdat`
     header (or the typed error); sub-4 GiB layouts stay `stco` and byte-identical.
 
 11. **Prove the demuxer releases its source lease on terminal/cancel.** The revocable `sourceCell`
     (`mp4-driver.ts:3000`, `:2994` comment) and packet-stream `release()` (`:2792-2800`) are the
-    memory contract. _Acceptance:_ a heap-snapshot test (per measured-evidence.md_, JSC may defer `WeakRef`
+    memory contract. *Acceptance:* a heap-snapshot test (per measured-evidence.md_, JSC may defer `WeakRef`
     clearing so use a self-describing V8 snapshot checking zero strong inbound retainers) asserts that
     after a full drain **and** after an early `cancel()`, the full-source `RandomAccess` and its
     window buffers have zero strong retainers.
 
 12. **Golden the packet-info table against ffprobe truth on the massive rung.** `mp4PacketInfoTable`
     (`mp4-driver.ts:2647`) must preserve all 553,501 payload-free packet sizes of the two-hour MP4
-    (measured-evidence.md_, `performance/size-ladder-iterate-packets-massive`). _Acceptance:_ the table matches
+    (measured-evidence.md_, `performance/size-ladder-iterate-packets-massive`). *Acceptance:* the table matches
     independent `ffprobe -show_packets` sizes row-for-row; the header-only path
     (`readMoviePacketInfo`, `:1059`) and the offset path (`readMovie`, `:965`) agree on counts.
 
 ### S24 — WebM / MKV Driver
+
 Source: [`docs/drivers/webm-mkv.md`](docs/drivers/webm-mkv.md) · owned code + rationale in the doc.
 
 Ordered, each with a concrete acceptance test (oracle).
@@ -1988,6 +2023,7 @@ Ordered, each with a concrete acceptance test (oracle).
    measurably vs the one-block-per-packet path; decode parity unchanged.
 
 ### S25 — MPEG-TS & HLS Driver
+
 Source: [`docs/drivers/mpegts-hls.md`](docs/drivers/mpegts-hls.md) · owned code + rationale in the doc.
 
 1. **Extract codec framing out of `ts-parse.ts` into shared codec modules.** Move `h264HasIdr`,
@@ -2076,6 +2112,7 @@ Source: [`docs/drivers/mpegts-hls.md`](docs/drivers/mpegts-hls.md) · owned code
     compile unchanged; full gate green.
 
 ### S26 — Ogg Driver
+
 Source: [`docs/drivers/ogg.md`](docs/drivers/ogg.md) · owned code + rationale in the doc.
 
 1. **Exact Vorbis per-packet durations (replace even-split).** Parse the Vorbis setup header for the
@@ -2149,6 +2186,7 @@ Source: [`docs/drivers/ogg.md`](docs/drivers/ogg.md) · owned code + rationale i
     (`ogg.test.ts`, `ogg-write.test.ts`) passes with no behavior change.
 
 ### S27 — WAV / AIFF / CAF Drivers
+
 Source: [`docs/drivers/wav-aiff-caf.md`](docs/drivers/wav-aiff-caf.md) · owned code + rationale in the doc.
 
 1. **Give CAF a bounded probe + packet table.**
@@ -2204,6 +2242,7 @@ Source: [`docs/drivers/wav-aiff-caf.md`](docs/drivers/wav-aiff-caf.md) · owned 
     *Acceptance:* a `RIFX` fixture parses correctly or raises `InputError`/`CapabilityError` — asserted, not misparsed.
 
 ### S28 — MP3 / ADTS / FLAC Drivers
+
 Source: [`docs/drivers/mp3-adts-flac.md`](docs/drivers/mp3-adts-flac.md) · owned code + rationale in the doc.
 
 Ordered by leverage (shared seam first, then per-driver correctness, then streaming).
@@ -2286,6 +2325,7 @@ Ordered by leverage (shared seam first, then per-driver correctness, then stream
     module with an explicit `clear()` used by tests; full shard test + bench gate stays green.
 
 ### S29 — AVI Driver
+
 Source: [`docs/drivers/avi.md`](docs/drivers/avi.md) · owned code + rationale in the doc.
 
 Ordered for a coding agent. Each item names the change, the `path:line`, and a concrete acceptance
@@ -2296,7 +2336,7 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
    `riffChunk`/`listChunk`/`riffFile`/`writeFourCC` primitives, `avi-mux.ts:111-165`), `avi-codec-map.ts`
    (shared with the parser, see item 4), `avi-timing.ts` (`videoTiming`/`audioTiming`/
    `compressedAudioTiming`, `avi-mux.ts:313-383`), and `avi-layout.ts` (header + movi + idx1 builders),
-   leaving a thin `avi-mux.ts` that only wires the `Muxer`. _Acceptance:_ no owned non-test file over
+   leaving a thin `avi-mux.ts` that only wires the `Muxer`. *Acceptance:* no owned non-test file over
    ~350 lines; each extracted module has its own unit test; `writeAviFromTracks` produces
    byte-identical output to `git HEAD` on all five `avi.test.ts` mux cases (MJPEG+PCM, MPEG-4+MP3,
    video-only, audio-only PCM, audio-only MP3); typecheck + lint green; zero `any`.
@@ -2304,7 +2344,7 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
 2. **Read the index for real keyframe flags; keep the index-free `movi` walk.** Replace the
    `defaultKeyframe` first-frame heuristic (`avi-parse.ts:317-322,363-366`) with `AVIIF_KEYFRAME` read
    from `idx1` (or OpenDML index length sign bit, per ffmpeg `read_odml_index`) **when a sane index is
-   present**, falling back to the heuristic only when it is missing/inconsistent. _Acceptance:_ a
+   present**, falling back to the heuristic only when it is missing/inconsistent. *Acceptance:* a
    golden test on a real MPEG-4/XVID AVI asserts the set of keyframe chunk indices equals
    `ffprobe -show_frames`' `key_frame=1` set (not just `{0}`); on an AVI with the `idx1` chunk stripped,
    the walk still demuxes and the heuristic set is reported (a "degraded, documented" flag); the
@@ -2315,7 +2355,7 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
    (`avi-driver.ts:33-51`). Add `probe(src)` that reads only enough for `hdrl` (via `src.range` when
    available), deriving duration from `avih.dwTotalFrames`/`strh.dwLength` without walking `movi`; add
    `packetInfo(src)` that walks `movi` headers only (offsets + sizes + PTS + keyframe), never
-   materializing payload. _Acceptance:_ `probe()` on the two fixtures returns tracks/dims/fps/duration
+   materializing payload. *Acceptance:* `probe()` on the two fixtures returns tracks/dims/fps/duration
    equal to today's demux-backed probe within `FRAME_TOLERANCE_SEC` (mjpeg 1.000 s, mpeg4 1.083 s —
    measured-evidence.md_) while issuing a bounded read (assert bytes read ≪ file size on a `range`-capable
    source); `packetInfo().packets` row count/sizes equal the `movi` chunk table with **zero** payload
@@ -2323,7 +2363,7 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
 
 4. **Unify the codec↔4CC/format-tag map into one bidirectional module.** Merge `videoCodec`/
    `audioCodec` (`avi-parse.ts:77-117`) and `videoFourCC`/`audioFormat` (`avi-mux.ts:171-277`) into one
-   `avi-codec-map.ts` with a single source-of-truth table. _Acceptance:_ a table-driven round-trip test
+   `avi-codec-map.ts` with a single source-of-truth table. *Acceptance:* a table-driven round-trip test
    asserts `fourCCToCodec(codecToFourCC(c)) === c` for every muxable codec and that every 4CC the
    reader recognizes has a defined inverse (or an explicit "read-only" marker); the anti-cheat tests
    (`avi.test.ts:1242,1262`, 4CC/format-tag mutation flips the reported codec) stay green.
@@ -2331,13 +2371,13 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
 5. **Fix backpressure + frame-pinning in the packet stream.** Construct the packet `ReadableStream`
    with `{ highWaterMark: 0 }` (today default, `avi-driver.ts:85`) and, for a `range`-capable source,
    window the `movi` read and copy small payloads out instead of subarray-viewing the whole-file
-   backing (`avi-parse.ts:357`). _Acceptance:_ a heap/retention test asserts that after pulling and
+   backing (`avi-parse.ts:357`). *Acceptance:* a heap/retention test asserts that after pulling and
    dropping one packet from a large synthetic AVI, the full-file buffer has zero strong retainers;
    `pull` is invoked exactly once per consumer `read()` (assert via an instrumented reader), not
    eagerly.
 
 6. **Thread `AbortSignal` through the whole-file read.** `readAll` (`avi-driver.ts:33-51`) and `parse`
-   (`avi-driver.ts:129-131`) must `throwIfAborted` in both the `range` and `stream` loops. _Acceptance:_
+   (`avi-driver.ts:129-131`) must `throwIfAborted` in both the `range` and `stream` loops. *Acceptance:*
    a test aborts mid-read of a chunked stream source and asserts `demux()` rejects with
    `MediaError('aborted', …)` before parsing, and that no further reads occur after abort.
 
@@ -2345,47 +2385,48 @@ oracle. Behavior-preserving refactors (items 1, 4) must keep `avi.test.ts` green
    The muxer writes only `idx1`+`odml/dmlh` for multi-segment output (`avi-mux.ts:502-506,608-612`).
    Either author the `indx` super-index in each `strl` plus per-segment `ix##` (matching ffmpeg
    `avienc.c`), or raise a typed `CapabilityError` when a mux would exceed one RIFF and the caller has
-   not opted into a documented "idx1-only, linear-seek" mode. _Acceptance:_ ffmpeg (or another AVI 2.0
+   not opted into a documented "idx1-only, linear-seek" mode. *Acceptance:* ffmpeg (or another AVI 2.0
    reader) can seek into an `AVIX` segment of the muxer's >threshold output and reports the correct
    frame; a sub-threshold single-RIFF mux is byte-identical to today.
 
 8. **Cross-validate the authored `idx1` against a third-party reader.** Because our demux ignores
    `idx1`, add an oracle that proves `buildIdx1` offsets (`avi-mux.ts:569-580`) are correct.
-   _Acceptance:_ `ffprobe`/`ffmpeg` seeking by the authored `idx1` lands on the byte-exact chunk for
+   *Acceptance:* `ffprobe`/`ffmpeg` seeking by the authored `idx1` lands on the byte-exact chunk for
    every entry on the five mux fixtures; a unit test recomputes each `dwChunkOffset` from the emitted
    layout and asserts it points at the chunk's FourCC relative to the documented base.
 
 9. **Collapse the mux double-copy; prefer `Packet.data`.** `write()` should read `packet.data`
    (`driver.ts:92-93`) when present instead of `copyChunkBytes` (`avi-mux.ts:93-97,707-716`), and
    `addChunkStruct` should store the already-owned bytes without a second `slice()`
-   (`avi-mux.ts:726`). _Acceptance:_ a packet whose `data` view is a distinct owned buffer is stored
+   (`avi-mux.ts:726`). *Acceptance:* a packet whose `data` view is a distinct owned buffer is stored
    with **one** copy (assert via a spy/`copyTo` counter = 0 when `data` is present); mux output stays
    byte-identical on the fixtures; the mux micro-benchmark geomean does not regress below the 226 MB/s
    baseline (measured-evidence.md_).
 
 10. **Type the chunk introspection.** Replace the `EncodedChunkMeta` `unknown` cast
     (`avi-mux.ts:88-109`) with the real `EncodedVideoChunk`/`EncodedAudioChunk` `type`/`duration`
-    fields (browser-gated like the demux seam). _Acceptance:_ `grep -n 'unknown' src/drivers/avi/avi-mux.ts`
+    fields (browser-gated like the demux seam). *Acceptance:* `grep -n 'unknown' src/drivers/avi/avi-mux.ts`
     returns 0 for the chunk-meta shape; typecheck green; keyframe/duration behavior unchanged on the
     mux tests.
 
 11. **Author compressed-audio codec-private (AAC `AudioSpecificConfig`) or reject.** `buildAudioStrf`
     writes `cbSize = 0` with no extradata (`avi-mux.ts:482-492`) while accepting AAC
     (`avi-mux.ts:270-272`). Either append the ASC after `cbSize`, or raise a typed `CapabilityError`
-    for AAC-in-AVI until it can be authored conformantly. _Acceptance:_ an AAC AVI mux either produces
+    for AAC-in-AVI until it can be authored conformantly. *Acceptance:* an AAC AVI mux either produces
     a `strf` whose trailing bytes equal the source ASC (byte-compared) and decodes in ffmpeg, or throws
     `CapabilityError` with `op.codec === 'aac'`; PCM/MP3 mux is unchanged.
 
 12. **Commit a runnable AVI case to the `media-test` corpus.** AVI has no manifest asset/golden
     (`demux/index.ts:43-44`), so it never runs in the 558/563-cell suite. Register a `demux` and a
     `mux` scenario over `mjpeg_pcm_160p.avi`/`mpeg4_mp3_160p.avi` with ffprobe-derived goldens (mjpeg
-    dur 1.000 s, mpeg4 dur 1.083 s — measured-evidence.md_). _Acceptance:_ the AVI rows appear in the harness,
+    dur 1.000 s, mpeg4 dur 1.083 s — measured-evidence.md_). *Acceptance:* the AVI rows appear in the harness,
     pass their strict oracle, and the driver wins/ties the demux+mux aggregate vs the reference
     engines; the local mux bench (`scripts/bench-containers.ts`) remains ≥226 MB/s geomean.
 
 ## D. Codec drivers
 
 ### S30 — WebCodecs Codec Tier
+
 Source: [`docs/codecs/webcodecs.md`](docs/codecs/webcodecs.md) · owned code + rationale in the doc.
 
 1. **Extract one shared decoder core; make the warm pool a lifetime policy over it.** Factor the pull-driven
@@ -2452,6 +2493,7 @@ Source: [`docs/codecs/webcodecs.md`](docs/codecs/webcodecs.md) · owned code + r
    the driver `id`s are unchanged (import-surface test green).
 
 ### S31 — WASM Codec Tail
+
 Source: [`docs/codecs/wasm-tail.md`](docs/codecs/wasm-tail.md) · owned code + rationale in the doc.
 
 Ordered by risk-to-correctness, then by leverage. Each item names the change, the `path:line`, and a
@@ -2540,6 +2582,7 @@ decode path is wired to it. *Acceptance:* `grep decodeMany src/codecs` shows onl
 actually called, or none.
 
 ### S32 — FLAC & Image Codecs
+
 Source: [`docs/codecs/flac-and-image.md`](docs/codecs/flac-and-image.md) · owned code + rationale in the doc.
 
 Ordered; each item names the change, the `path:line`, and a concrete acceptance oracle.
@@ -2605,4 +2648,4 @@ Several items above can't be finished until a design question is decided. Each s
 - **S32** FLAC & Image Codecs — [flac-and-image.md §6](docs/codecs/flac-and-image.md#6-open-questions)
 
 ---
-_Generated from the 33 target-spec docs' Delta/punch-lists (334 requirements). Regenerate after editing any doc's §5 so this stays the single source of truth for the fix backlog._
+*Generated from the 33 target-spec docs' Delta/punch-lists (334 requirements). Regenerate after editing any doc's §5 so this stays the single source of truth for the fix backlog.*

@@ -7,7 +7,7 @@
  * (committed + served same-origin, NOT a runtime CDN dep). Provenance: `provenance.json` / `BUILD.md`.
  *
  * Self-contained: each ogv module's wasm is base64-embedded in a sibling `*-data-wasm.js` and fed to the
- * Emscripten module via `instantiateWasm`, so there is NO separate `*.wasm` asset to co-vendor — `tsup`
+ * Emscripten module via `instantiateWasm`, so there is NO separate `*.wasm` asset to co-vendor — esbuild
  * bundles the whole tail into the lazy `vpx-core.js` chunk and `scripts/vendor-wasm.ts` recognizes it as a
  * self-contained inlined tail (its `selfContained` branch) and skips co-vendoring (ADR-090).
  *

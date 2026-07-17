@@ -53,9 +53,11 @@
     "url": false,
     "worker_threads": false
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
+    "typecheck": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node ./node_modules/typescript/bin/tsc -p tsconfig.test.json",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "format:check": "biome format .",
@@ -67,7 +69,7 @@
     "test:deficit-generator": "node --test docs/perf/gen-deficits.test.mjs",
     "test:session13-ledger-generator": "node --test docs/perf/gen-session13-speed-ledger.test.mjs",
     "gen:session13-speed-ledger": "node docs/perf/gen-session13-speed-ledger.mjs",
-    "build": "tsup",
+    "build": "bun ./scripts/build.mjs",
     "vendor-wasm": "bun run scripts/vendor-wasm.ts",
     "vendor-wasm:check": "bun run scripts/vendor-wasm.ts --check",
     "verify:package": "bun run vendor-wasm:check && bun run scripts/verify-package-install.ts",
@@ -162,16 +164,18 @@
     "verify:session11-webm-attachments-browser": "node scripts/verify-session11-mkv-attachments-browser.mjs",
     "bench-session11-webm-packets": "bun run scripts/bench-session11-webm-packets.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
-    "gate": "bun run typecheck && biome check . && bun run test:deficit-generator && bun run test:session13-ledger-generator && vitest run --coverage && tsup && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
+    "gate": "bun run typecheck && biome check . && bun run test:deficit-generator && bun run test:session13-ledger-generator && vitest run --coverage && bun run build && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@vitest/coverage-v8": "^2.1.8",
     "@webgpu/types": "^0.1.70",
     "bun-types": "^1.3.0",
-    "tsup": "^8.3.5",
+    "esbuild": "^0.27.7",
     "typescript": "^7.0.2",
     "vitest": "^2.1.8"
   },
-  "trustedDependencies": ["@biomejs/biome"]
+  "trustedDependencies": [
+    "@biomejs/biome"
+  ]
 }

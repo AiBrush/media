@@ -8,7 +8,7 @@
  *   - `*_wasm_bg.wasm` — the compiled core, and
  *   - `*-core.js`      — the wasm-bindgen `--target web` glue the driver `import()`s.
  * The driver loads the core via `new URL('./<id>_wasm_bg.wasm', import.meta.url)`, so at runtime the
- * `.wasm` must sit **next to the emitted `*-core.js` chunk**. `tsup` code-splits the string-literal
+ * `.wasm` must sit **next to the emitted `*-core.js` chunk**. esbuild code-splits the string-literal
  * `import('./<id>-core.js')` into `dist/`, but it does **not** copy the `import.meta.url`-referenced
  * `.wasm` (it is a plain `new URL`, not a recognized asset import). This script fills that gap: it copies
  * every real tail's `.wasm` + glue into `dist/` (flat, original filenames), so the pair is co-located and
@@ -67,7 +67,7 @@ interface DiscoveryReport {
  *   1. NEITHER half present → a not-yet-built scaffold (skipped; nothing to vendor).
  *   2. A **self-contained inlined-wasm** tail — a `*-core.js` glue PLUS an inlined-wasm carrier (a
  *      `*-wasm.js` single-file module and/or a `generated/*.generated.mjs` blob) and NO separate
- *      `*_wasm_bg.wasm` (ADR-090). `tsup` bundles the wasm into the glue chunk, so there is nothing
+ *      `*_wasm_bg.wasm` (ADR-090). esbuild bundles the wasm into the glue chunk, so there is nothing
  *      separate to copy → skipped. This is the Option-A path for prebuilt cores: libopus (`wasm-opus`),
  *      ogv.js libvpx (`wasm-vpx`).
  * A directory with exactly ONE half of the standard pair and NO inlined carrier is a genuinely broken
@@ -100,7 +100,7 @@ async function discoverTails(): Promise<DiscoveryReport> {
     // A self-contained core INLINES its wasm into the glue rather than shipping a separate
     // `*_wasm_bg.wasm`: a prebuilt Emscripten single-file module (`*-wasm.js`, e.g. `libopus-wasm.js`,
     // `vpx-vp8-data-wasm.js`, `ogv-vp9-wasm.js`) and/or a generated ESM blob (`*.generated.mjs`, kept under
-    // a `generated/` dir). `tsup` bundles that whole into the lazy `*-core.js` chunk, so there is NOTHING
+    // a `generated/` dir). esbuild bundles that whole into the lazy `*-core.js` chunk, so there is NOTHING
     // separate for this script to co-vendor next to the emitted chunk (ADR-090). Detect any inlined-wasm
     // carrier so such a tail is SKIPPED — never mistaken for a broken half-vendor. (A standard Rust/Symphonia
     // tail has no such carrier, so it still REQUIRES both `*_wasm_bg.wasm` + `*-core.js`.)
@@ -139,7 +139,7 @@ async function discoverTails(): Promise<DiscoveryReport> {
         continue;
       }
       selfContained.push({ id, glueName, carrierNames: reachedCarriers });
-      continue; // self-contained inlined-wasm core: tsup bundles the reached carrier(s)
+      continue; // self-contained inlined-wasm core: esbuild bundles the reached carrier(s)
     }
     if (wasmName === undefined || glueName === undefined) {
       broken.push(

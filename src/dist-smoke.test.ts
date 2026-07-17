@@ -11,7 +11,7 @@
  *
  * Requires a prior `bun run build` (it reads `dist/`). When `dist/` is absent (a fresh checkout running
  * `vitest run` before the build) the suite SKIPS rather than fails; the `test:dist` script and the `gate`
- * run it after `tsup`, where `dist/` is guaranteed present.
+ * run it after `bun run build`, where `dist/` is guaranteed present.
  */
 
 import { existsSync } from 'node:fs';

@@ -143,6 +143,7 @@ function outputBytes(
     case 'stream':
       return oneChunk(bytes);
     case 'opfs':
+    case 'opfs-target':
     case 'element':
     case 'stream-target':
       return materialize(sink, oneChunk(bytes), opts);
@@ -173,6 +174,7 @@ function outputWavPcmCopy(
     case 'stream':
       return streamWavPcmCopy(plan, opts.signal);
     case 'opfs':
+    case 'opfs-target':
     case 'element':
     case 'stream-target':
       return materialize(sink, streamWavPcmCopy(plan, opts.signal), opts);
