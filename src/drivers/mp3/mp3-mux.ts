@@ -171,9 +171,8 @@ export function muxPreparedMp3PacketTrack(input: PreparedMp3PacketMuxInput): Uin
   const { track: info } = input;
   if (info.mediaType !== 'audio' || info.codec !== 'mp3') {
     throw new CapabilityError(
-      'capability-miss',
       `MP3 container carries a single MP3 audio track, not ${info.mediaType}/${info.codec}`,
-      { op: { op: 'mux' }, tried: ['mp3'] },
+      { op: { kind: 'route', id: 'mux' }, tried: ['mp3'] },
     );
   }
   const track: Mp3MuxTrack = {

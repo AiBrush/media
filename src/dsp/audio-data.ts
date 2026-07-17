@@ -121,8 +121,8 @@ export function pcmAudioToAudioDataStream(
   format: 'f32' | 'f32-planar' = 'f32-planar',
 ): ReadableStream<AudioData> {
   if (typeof AudioData === 'undefined') {
-    throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
-      op: 'decode',
+    throw new CapabilityError('AudioData missing for PCM decode', {
+      op: { kind: 'route', id: 'decode' },
       tried: [label],
       suggestion: 'run in a browser or worker with AudioData',
     });
@@ -235,8 +235,8 @@ function pcmChunksToAudioDataStream<T extends TimedPcmChunk>(
   initFor: (chunk: T, timestamp: number) => AudioDataInit,
 ): ReadableStream<AudioData> {
   if (typeof AudioData === 'undefined') {
-    throw new CapabilityError('capability-miss', 'AudioData missing for PCM decode', {
-      op: 'decode',
+    throw new CapabilityError('AudioData missing for PCM decode', {
+      op: { kind: 'route', id: 'decode' },
       tried: [label],
       suggestion: 'run in a browser or worker with AudioData',
     });

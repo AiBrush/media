@@ -1,6 +1,7 @@
 /** Lazy one-shot source prefix replay and cancellation (ADR-231). */
 
 import { InputError, MediaError } from '../contracts/errors.ts';
+import { readWithAbort, throwIfSourceAborted } from './abort.ts';
 import {
   SOURCE_STREAM_STATE,
   type Source,
@@ -24,7 +25,7 @@ export async function peekUnseekableSourceHead(
     return state.cursor.peek(limit, signal);
   }
   if (src.kind === 'stream') {
-    throw new InputError('unsupported-input', 'stream source must be normalized with fromStream()');
+    throw new InputError('stream source must be normalized with fromStream()');
   }
   return peekRereadableSource(src, limit, signal);
 }
@@ -53,7 +54,7 @@ function createStreamCursor(state: StreamSourceState): StreamCursor {
 
   const acquire = (): ReadableStreamDefaultReader<Uint8Array> => {
     if (reader !== undefined) return reader;
-    if (state.consumed) throw new InputError('unsupported-input', 'used');
+    if (state.consumed) throw new InputError('used');
     state.consumed = true;
     reader = acquireReader(state.readable);
     return reader;
@@ -81,10 +82,10 @@ function createStreamCursor(state: StreamSourceState): StreamCursor {
   const peek = (limit: number, signal?: AbortSignal): Promise<Uint8Array> => {
     pendingPeeks++;
     const task = peekTail.then(async (): Promise<Uint8Array> => {
-      if (opened || cancelled) throw new InputError('unsupported-input', 'used');
+      if (opened || cancelled) throw new InputError('used');
       const bounded = Math.max(0, Math.trunc(limit));
       try {
-        throwIfAborted(signal);
+        throwIfSourceAborted(signal);
         while (!upstreamDone && retainedBytes < bounded) {
           const result = await readWithAbort(acquire(), signal);
           if (result.done) {
@@ -95,7 +96,7 @@ function createStreamCursor(state: StreamSourceState): StreamCursor {
           retained.push(result.value);
           retainedBytes += result.value.byteLength;
         }
-        throwIfAborted(signal);
+        throwIfSourceAborted(signal);
         return copyPrefix(retained, Math.min(retainedBytes, bounded));
       } catch (error) {
         await cancel(error);
@@ -116,7 +117,7 @@ function createStreamCursor(state: StreamSourceState): StreamCursor {
 
   const open = (): ReadableStream<Uint8Array> => {
     if (opened || cancelled || pendingPeeks > 0) {
-      throw new InputError('unsupported-input', pendingPeeks > 0 ? 'routing read pending' : 'used');
+      throw new InputError(pendingPeeks > 0 ? 'routing read pending' : 'used');
     }
     opened = true;
     let retainedIndex = 0;
@@ -171,7 +172,7 @@ async function peekRereadableSource(
       chunks.push(value);
       total += value.byteLength;
     }
-    throwIfAborted(signal);
+    throwIfSourceAborted(signal);
     return copyPrefix(chunks, Math.min(total, limit));
   } catch (error) {
     cancelReason = error;
@@ -188,26 +189,7 @@ function acquireReader(
   try {
     return readable.getReader();
   } catch (error) {
-    throw new InputError('unsupported-input', 'stream is already locked', error);
-  }
-}
-
-async function readWithAbort(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  signal: AbortSignal | undefined,
-): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>> {
-  throwIfAborted(signal);
-  if (signal === undefined) return reader.read();
-  let rejectAbort: ((reason: MediaError) => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAbort = reject;
-  });
-  const onAbort = (): void => rejectAbort?.(abortError(signal));
-  signal.addEventListener('abort', onAbort, { once: true });
-  try {
-    return await Promise.race([reader.read(), aborted]);
-  } finally {
-    signal.removeEventListener('abort', onAbort);
+    throw new InputError('stream is already locked', error);
   }
 }
 
@@ -223,18 +205,6 @@ function copyPrefix(chunks: readonly Uint8Array[], length: number): Uint8Array {
   return out;
 }
 
-function abortError(signal: AbortSignal): MediaError {
-  return signal.reason instanceof MediaError && signal.reason.code === 'aborted'
-    ? signal.reason
-    : new MediaError('aborted', 'source read aborted', signal.reason);
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted === true) throw abortError(signal);
-}
-
 function toMediaError(error: unknown): MediaError {
-  return error instanceof MediaError
-    ? error
-    : new InputError('unsupported-input', 'stream read failed', error);
+  return error instanceof MediaError ? error : new InputError('stream read failed', error);
 }

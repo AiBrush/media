@@ -28,13 +28,13 @@ function wavFrameWindow(
 ): { readonly startByte: number; readonly endByte: number } | undefined {
   const { fmt, format } = parsed;
   if (!Number.isFinite(bounds.startSec) || !Number.isFinite(bounds.endSec)) {
-    throw new InputError('unsupported-input', 'bad trim');
+    throw new InputError('bad trim');
   }
   if (bounds.startSec < 0) {
-    throw new InputError('unsupported-input', 'start<0');
+    throw new InputError('start<0');
   }
   if (bounds.endSec <= bounds.startSec) {
-    throw new InputError('unsupported-input', 'empty trim');
+    throw new InputError('empty trim');
   }
   if (fmt.channels <= 0 || fmt.sampleRate <= 0) return undefined;
   const frameBytes = fmt.channels * bytesPerSample(format);
@@ -42,10 +42,10 @@ function wavFrameWindow(
   const durationSec = totalFrames / fmt.sampleRate;
   if (durationSec > 0) {
     if (bounds.startSec >= durationSec) {
-      throw new InputError('unsupported-input', 'start>=duration');
+      throw new InputError('start>=duration');
     }
     if (bounds.endSec > durationSec + TRIM_END_SLACK_SEC) {
-      throw new InputError('unsupported-input', 'end>duration');
+      throw new InputError('end>duration');
     }
   }
   const startFrame = Math.min(

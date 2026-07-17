@@ -758,7 +758,7 @@ describe('createMedia', () => {
   });
 
   it('probe preserves a typed hinted-container error when the deferred image fallback misses', async () => {
-    const failure = new InputError('unsupported-input', 'exact container rejection');
+    const failure = new InputError('exact container rejection');
     const counts = { sniff: 0 };
     const calls: Array<readonly [number, number]> = [];
     const driver: ContainerDriver = {
@@ -969,7 +969,7 @@ describe('createMedia', () => {
       supports: (q) => q.mime === 'audio/mpeg',
       probe: async (src) => {
         const head = await src.range?.(0, original.byteLength);
-        if (head?.[0] !== 0xff) throw new InputError('unsupported-input', 'mutated header');
+        if (head?.[0] !== 0xff) throw new InputError('mutated header');
         return tracks;
       },
       demux: () => {

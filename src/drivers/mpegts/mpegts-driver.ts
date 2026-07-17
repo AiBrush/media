@@ -23,7 +23,13 @@ import type {
   TrackInfo,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
-import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import {
+  CapabilityError,
+  type CapabilityErrorDetail,
+  InputError,
+  MediaError,
+  type OperationFacts,
+} from '../../contracts/errors.ts';
 import { MPEG_TS_FORMATS, isMpegTsExtension, matchesMpegTs } from './mpegts-sniff.ts';
 import { type TsAccessUnit, type TsParse, type TsTrack, parseTs } from './ts-parse.ts';
 import { MpegTsMuxer } from './ts-write.ts';
@@ -84,22 +90,20 @@ function toTrackInfo(track: TsTrack, id: number): TrackInfo {
   };
 }
 
-function capabilityDetail(extra: Record<string, unknown>): Record<string, unknown> {
-  return { op: 'stream-copy:mpegts', tried: ['mpegts'], ...extra };
+function capabilityDetail(facts: OperationFacts): CapabilityErrorDetail {
+  return { op: { kind: 'route', id: 'stream-copy:mpegts', facts }, tried: ['mpegts'] };
 }
 
 function assertStreamCopyOptions(options: StreamCopyOptions | undefined): void {
   const target = options?.container?.toLowerCase();
   if (target !== undefined && !isMpegTsExtension(target)) {
     throw new CapabilityError(
-      'capability-miss',
       `MPEG-TS stream-copy cannot write '${options?.container}' output.`,
       capabilityDetail({ container: options?.container }),
     );
   }
   if (options?.fragmented === true) {
     throw new CapabilityError(
-      'capability-miss',
       'MPEG-TS stream-copy does not support fragmented output.',
       capabilityDetail({ container: target ?? 'ts', fragmented: true }),
     );
@@ -111,14 +115,13 @@ function normalizeTrimRange(trim: StreamCopyOptions['trim']): NormalizedTrimRang
   const { startSec, endSec } = trim;
   const range = `[${startSec}s, ${endSec}s]`;
   if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
-    throw new InputError('unsupported-input', `trim range ${range} is not a finite interval`);
+    throw new InputError(`trim range ${range} is not a finite interval`);
   }
   if (startSec < 0) {
-    throw new InputError('unsupported-input', `trim start ${startSec}s is negative`);
+    throw new InputError(`trim start ${startSec}s is negative`);
   }
   if (endSec <= startSec) {
     throw new InputError(
-      'unsupported-input',
       `trim range ${range} is empty or inverted (end must be greater than start)`,
     );
   }
@@ -274,9 +277,8 @@ function packetStream(
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'WebCodecs EncodedVideoChunk/EncodedAudioChunk are unavailable in this environment',
-      { op: 'demux', tried: [] },
+      { op: { kind: 'route', id: 'demux' }, tried: [] },
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */

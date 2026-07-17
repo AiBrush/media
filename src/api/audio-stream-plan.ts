@@ -52,17 +52,14 @@ function fadeFramesAt(
 ): number {
   if (sec === undefined) return 0;
   if (typeof sec !== 'number' || !Number.isFinite(sec) || sec < 0) {
-    throw new InputError('unsupported-input', `${label} must be a finite non-negative duration`);
+    throw new InputError(`${label} must be a finite non-negative duration`);
   }
   if (sampleRate === undefined || !Number.isInteger(sampleRate) || sampleRate <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      `cannot resolve ${label} without a known source sample rate`,
-    );
+    throw new InputError(`cannot resolve ${label} without a known source sample rate`);
   }
   const frames = Math.round(sec * sampleRate);
   if (!Number.isSafeInteger(frames)) {
-    throw new InputError('unsupported-input', `${label} is too large for a safe frame count`);
+    throw new InputError(`${label} is too large for a safe frame count`);
   }
   return frames;
 }
@@ -71,7 +68,7 @@ function fadeFramesAt(
 function fadeCurve(curve: 'linear' | 'equal-power' | undefined): FadeShape {
   if (curve === undefined || curve === 'linear') return 'linear';
   if (curve === 'equal-power') return 'equal-power';
-  throw new InputError('unsupported-input', `unsupported audio fade curve '${String(curve)}'`);
+  throw new InputError(`unsupported audio fade curve '${String(curve)}'`);
 }
 
 /** Resolve the public {@link PcmDynamics} into the dsp {@link DynamicsSpec} (same defaults as `transformPcm`). */
@@ -80,16 +77,10 @@ function resolveDynamics(dynamics: PcmDynamics): DynamicsSpec {
   if (dynamics.normalize !== undefined) {
     const { mode, targetDbfs } = dynamics.normalize;
     if (mode !== 'peak' && mode !== 'rms') {
-      throw new InputError(
-        'unsupported-input',
-        `audio normalize mode '${String(mode)}' is not supported`,
-      );
+      throw new InputError(`audio normalize mode '${String(mode)}' is not supported`);
     }
     if (!Number.isFinite(targetDbfs)) {
-      throw new InputError(
-        'unsupported-input',
-        'audio normalize targetDbfs must be a finite number',
-      );
+      throw new InputError('audio normalize targetDbfs must be a finite number');
     }
     normalize = { mode, targetDbfs };
   }
@@ -98,20 +89,14 @@ function resolveDynamics(dynamics: PcmDynamics): DynamicsSpec {
     const { ceilingDbfs, mode, knee } = dynamics.limit;
     const resolvedCeiling = ceilingDbfs ?? 0;
     if (!Number.isFinite(resolvedCeiling)) {
-      throw new InputError(
-        'unsupported-input',
-        'audio limiter ceilingDbfs must be a finite number',
-      );
+      throw new InputError('audio limiter ceilingDbfs must be a finite number');
     }
     const resolvedMode = mode ?? 'hard';
     if (resolvedMode !== 'hard' && resolvedMode !== 'soft') {
-      throw new InputError(
-        'unsupported-input',
-        `audio limiter mode '${String(resolvedMode)}' is not supported`,
-      );
+      throw new InputError(`audio limiter mode '${String(resolvedMode)}' is not supported`);
     }
     if (knee !== undefined && !Number.isFinite(knee)) {
-      throw new InputError('unsupported-input', 'audio limiter knee must be a finite number');
+      throw new InputError('audio limiter knee must be a finite number');
     }
     limit = {
       ceilingDbfs: resolvedCeiling,
@@ -120,10 +105,7 @@ function resolveDynamics(dynamics: PcmDynamics): DynamicsSpec {
     };
   }
   if (normalize === undefined && limit === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'audio dynamics needs a normalize and/or limit stage',
-    );
+    throw new InputError('audio dynamics needs a normalize and/or limit stage');
   }
   return {
     ...(normalize !== undefined ? { normalize } : {}),
@@ -149,7 +131,7 @@ export function audioFilterSpecs(target: AudioTarget, src: SourceAudio): FilterS
   const specs: FilterSpec[] = [];
   if (target.gainDb !== undefined) {
     if (!Number.isFinite(target.gainDb)) {
-      throw new InputError('unsupported-input', `audio gain ${target.gainDb} dB must be finite`);
+      throw new InputError(`audio gain ${target.gainDb} dB must be finite`);
     }
     if (target.gainDb !== 0) specs.push({ mediaType: 'audio', type: 'gain', db: target.gainDb });
   }
@@ -163,19 +145,13 @@ export function audioFilterSpecs(target: AudioTarget, src: SourceAudio): FilterS
   }
   if (target.channels !== undefined && target.channels !== src.channels) {
     if (target.channels <= 0 || !Number.isInteger(target.channels)) {
-      throw new InputError(
-        'unsupported-input',
-        `audio channel count ${target.channels} must be a positive integer`,
-      );
+      throw new InputError(`audio channel count ${target.channels} must be a positive integer`);
     }
     specs.push({ mediaType: 'audio', type: 'remix', channels: target.channels });
   }
   if (target.sampleRate !== undefined && target.sampleRate !== src.sampleRate) {
     if (target.sampleRate <= 0 || !Number.isInteger(target.sampleRate)) {
-      throw new InputError(
-        'unsupported-input',
-        `audio sample rate ${target.sampleRate} must be a positive integer`,
-      );
+      throw new InputError(`audio sample rate ${target.sampleRate} must be a positive integer`);
     }
     specs.push({ mediaType: 'audio', type: 'resample', sampleRate: target.sampleRate });
   }

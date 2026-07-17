@@ -34,6 +34,7 @@ import {
   collectTransferables,
   deserializeError,
   isFrameLike,
+  offloadJobTransferList,
   serializeError,
 } from './worker-protocol.ts';
 
@@ -182,15 +183,53 @@ describe('worker-protocol: transferable detection', () => {
   });
 });
 
+describe('worker-protocol: typed transfer list (offloadJobTransferList)', () => {
+  it('lists exactly the payload’s declared `input` buffer — a frame-shaped options field is NOT moved', () => {
+    // Punch-list 7: the failure modes of the heuristic walk are (a) wrongly transferring a plain options
+    // object that merely looks like a frame and (b) silently missing a deep transferable. The typed
+    // extractor has neither: it reads the ONE declared transferable field of the payload contract.
+    const input = new ArrayBuffer(8);
+    const frameShapedOption = { close: (): void => {}, width: 2 };
+    const deepBuffer = new ArrayBuffer(4);
+    const job: OffloadJob = {
+      op: 'convert',
+      payload: {
+        kind: 'convert',
+        input,
+        opts: { overlay: frameShapedOption, a: { b: { c: { d: { e: { deepBuffer } } } } } },
+      },
+    };
+    const transfer = offloadJobTransferList(job);
+    expect(transfer).toEqual([input]); // exactly the declared field
+    expect(transfer).not.toContain(frameShapedOption); // never moved by shape
+    expect(transfer).not.toContain(deepBuffer); // opts are structured-cloned, not moved
+  });
+
+  it('transfers nothing for a payload without a declared input buffer (total, never throws)', () => {
+    expect(offloadJobTransferList({ op: 'convert', payload: { n: 3 } })).toEqual([]);
+    expect(offloadJobTransferList({ op: 'convert', payload: null })).toEqual([]);
+    expect(offloadJobTransferList({ op: 'convert', payload: 'opaque' })).toEqual([]);
+    expect(offloadJobTransferList({ op: 'convert', payload: { input: 'not-a-buffer' } })).toEqual(
+      [],
+    );
+  });
+});
+
 describe('worker-protocol: typed-error round-trip', () => {
   it('preserves CapabilityError / InputError / MediaError subclass + code + detail', () => {
-    const cap = new CapabilityError('capability-miss', 'no driver', { op: 'encode', tried: ['x'] });
+    const cap = new CapabilityError('no driver', {
+      op: { kind: 'route', id: 'encode' },
+      tried: ['x'],
+    });
     const back = deserializeError(serializeError(cap));
     expect(back).toBeInstanceOf(CapabilityError);
     expect((back as CapabilityError).code).toBe('capability-miss');
-    expect((back as CapabilityError).detail).toEqual({ op: 'encode', tried: ['x'] });
+    expect((back as CapabilityError).detail).toEqual({
+      op: { kind: 'route', id: 'encode' },
+      tried: ['x'],
+    });
 
-    const input = deserializeError(serializeError(new InputError('unsupported-input', 'bad')));
+    const input = deserializeError(serializeError(new InputError('bad')));
     expect(input).toBeInstanceOf(InputError);
 
     const media = deserializeError(serializeError(new MediaError('decode-error', 'boom')));
@@ -293,8 +332,8 @@ describe('error propagation across the worker boundary', () => {
     const runJob: JobRunner = () =>
       new ReadableStream<Transferable>({
         start(): void {
-          throw new CapabilityError('capability-miss', 'no codec in worker', {
-            op: 'encode',
+          throw new CapabilityError('no codec in worker', {
+            op: { kind: 'route', id: 'encode' },
             tried: ['webcodecs-video'],
           });
         },

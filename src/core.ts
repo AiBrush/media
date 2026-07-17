@@ -18,8 +18,10 @@ export {
   supportedApiVersions,
 } from './kernel/registry.ts';
 export {
+  type CodecRoute,
   type EnsureLoaded,
   Router,
+  type RouterCacheSnapshot,
   type RouterDeps,
   type StageSelectOptions,
 } from './kernel/router.ts';

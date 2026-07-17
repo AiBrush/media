@@ -21,9 +21,10 @@ import {
   type MessageLike,
   type OffloadJob,
   type TerminableTransport,
+  type WorkerMediaCaps,
   type WorkerMessage,
-  collectTransferables,
   deserializeError,
+  offloadJobTransferList,
 } from './worker-protocol.ts';
 
 /** A closure-based unit of work, on a worker or inline depending on the bridge (cheap-op path). */
@@ -71,6 +72,13 @@ export const DEFAULT_CREDIT = 4;
 export class WorkerStreamBridge implements TerminableTransport {
   readonly #port: MessageLike<WorkerMessage, HostMessage>;
   readonly #terminate: (() => void) | undefined;
+  /**
+   * The per-media-kind caps the worker announced in its `ready` handshake (backend-neutral, doc 06 §4).
+   * `undefined` means the transport was constructed without a handshake (a direct embedder wiring); the
+   * per-op gate treats that as unrestricted. Production bridges built by `ensureWorkerBridge` always
+   * carry the handshaken caps so a job is offloaded only to a worker that has the kinds it needs.
+   */
+  readonly caps: WorkerMediaCaps | undefined;
   #busy = false;
   #terminated = false;
   /**
@@ -81,9 +89,14 @@ export class WorkerStreamBridge implements TerminableTransport {
    */
   #epoch = 0;
 
-  constructor(port: MessageLike<WorkerMessage, HostMessage>, terminate?: () => void) {
+  constructor(
+    port: MessageLike<WorkerMessage, HostMessage>,
+    terminate?: () => void,
+    caps?: WorkerMediaCaps,
+  ) {
     this.#port = port;
     this.#terminate = terminate;
+    this.caps = caps;
   }
 
   /**
@@ -248,9 +261,10 @@ export class WorkerStreamBridge implements TerminableTransport {
             };
             signal.addEventListener('abort', onAbort, { once: true });
           }
-          // Post the job, transferring the input byte buffers (moved, not copied — doc 06 §4). The
-          // initial `credit` is the backpressure window the worker may fill before awaiting more.
-          const transfer = collectTransferables(job.payload);
+          // Post the job, transferring the payload's DECLARED input buffer (moved, not copied — doc 06
+          // §4). The transfer list is derived from the typed payload contract, never a heuristic walk
+          // (punch-list 7). The initial `credit` is the window the worker may fill before awaiting more.
+          const transfer = offloadJobTransferList(job);
           post(port, { t: 'job', epoch, job, credit }, transfer);
         },
         pull: (): void => {

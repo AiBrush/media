@@ -193,7 +193,7 @@ export class FlacFrameEncoder {
    * decorrelation; each subframe picks the cheapest of CONSTANT / FIXED / VERBATIM.
    */
   encodeBlock(planes: readonly Int32Array[], samples: number): FlacFrame {
-    if (samples < 1) throw new InputError('unsupported-input', 'FLAC frame needs ≥1 sample');
+    if (samples < 1) throw new InputError('FLAC frame needs ≥1 sample');
     if (planes.length !== this.#config.channels) {
       throw new MediaError(
         'encode-error',
@@ -215,7 +215,7 @@ export class FlacFrameEncoder {
   /** Build the final STREAMINFO metadata block from the accumulated framing stats + the PCM MD5. */
   finalizeStreamInfo(md5: Uint8Array): Uint8Array<ArrayBuffer> {
     if (this.#totalSamples === 0) {
-      throw new InputError('unsupported-input', 'FLAC encode produced no frames');
+      throw new InputError('FLAC encode produced no frames');
     }
     if (md5.byteLength !== 16) throw new MediaError('encode-error', 'FLAC MD5 must be 16 bytes');
     // Declared block size is the nominal (max) for every frame: min == max marks a fixed-blocksize
@@ -255,10 +255,7 @@ function bitsPerSampleFor(formatOrBits: SampleFormat | number): number {
 
 function quantizePcmSample(value: number, bitsPerSample: number): number {
   if (!Number.isFinite(value)) {
-    throw new InputError(
-      'unsupported-input',
-      'FLAC encode cannot quantize a non-finite PCM sample',
-    );
+    throw new InputError('FLAC encode cannot quantize a non-finite PCM sample');
   }
   const scale = 2 ** (bitsPerSample - 1);
   const min = -scale;
@@ -270,7 +267,6 @@ function validatePcm(pcm: FlacPcm): void {
   validateLayout(pcm.sampleRate, pcm.channels, pcm.bitsPerSample, pcm.totalSamples);
   if (pcm.samples.length !== pcm.channels) {
     throw new InputError(
-      'unsupported-input',
       `FLAC encode expected ${pcm.channels} channel planes, got ${pcm.samples.length}`,
     );
   }
@@ -280,14 +276,12 @@ function validatePcm(pcm: FlacPcm): void {
     const plane = pcm.samples[ch];
     if (plane === undefined || plane.length !== pcm.totalSamples) {
       throw new InputError(
-        'unsupported-input',
         `FLAC encode channel ${ch} length must equal totalSamples (${pcm.totalSamples})`,
       );
     }
     for (const sample of plane) {
       if (!Number.isInteger(sample) || sample < min || sample > max) {
         throw new InputError(
-          'unsupported-input',
           `FLAC encode sample ${sample} is outside signed ${pcm.bitsPerSample}-bit range`,
         );
       }
@@ -302,36 +296,30 @@ function validateLayout(
   totalSamples: number,
 ): void {
   if (!Number.isInteger(sampleRate) || sampleRate <= 0 || sampleRate > MAX_SAMPLE_RATE) {
-    throw new InputError('unsupported-input', `FLAC encode sample rate ${sampleRate} is invalid`);
+    throw new InputError(`FLAC encode sample rate ${sampleRate} is invalid`);
   }
   if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
-    throw new InputError('unsupported-input', `FLAC encode channel count ${channels} is invalid`);
+    throw new InputError(`FLAC encode channel count ${channels} is invalid`);
   }
   if (
     !Number.isInteger(bitsPerSample) ||
     bitsPerSample < MIN_BITS_PER_SAMPLE ||
     bitsPerSample > MAX_BITS_PER_SAMPLE
   ) {
-    throw new InputError(
-      'unsupported-input',
-      `FLAC encode bitsPerSample ${bitsPerSample} is invalid`,
-    );
+    throw new InputError(`FLAC encode bitsPerSample ${bitsPerSample} is invalid`);
   }
   if (
     !Number.isSafeInteger(totalSamples) ||
     totalSamples <= 0 ||
     totalSamples > MAX_TOTAL_SAMPLES
   ) {
-    throw new InputError(
-      'unsupported-input',
-      `FLAC encode totalSamples ${totalSamples} is invalid`,
-    );
+    throw new InputError(`FLAC encode totalSamples ${totalSamples} is invalid`);
   }
 }
 
 function validateBlockSize(blockSize: number): void {
   if (!Number.isInteger(blockSize) || blockSize < 1 || blockSize > MAX_BLOCK_SIZE) {
-    throw new InputError('unsupported-input', `FLAC encode blockSize ${blockSize} is invalid`);
+    throw new InputError(`FLAC encode blockSize ${blockSize} is invalid`);
   }
 }
 

@@ -37,7 +37,10 @@ function decoder(failFirst: boolean): TransformStream<EncodedChunk, VideoFrame> 
     transform(chunk, controller): void {
       if (failFirst && first) {
         first = false;
-        throw new CapabilityError('capability-miss', 'bench native runtime miss');
+        throw new CapabilityError('bench native runtime miss', {
+          op: { kind: 'route', id: 'decode' },
+          tried: ['bench-native'],
+        });
       }
       controller.enqueue(new BenchFrame(chunk.timestamp) as unknown as RawFrame);
     },

@@ -38,10 +38,7 @@ function sampleFormat(formatTag: number, bits: number): SampleFormat {
     if (bits === 32) return 'f32';
     if (bits === 64) return 'f64';
   }
-  throw new InputError(
-    'unsupported-input',
-    `unsupported WAV PCM layout (tag ${formatTag}, ${bits}-bit)`,
-  );
+  throw new InputError(`unsupported WAV PCM layout (tag ${formatTag}, ${bits}-bit)`);
 }
 
 export interface WavFmt {
@@ -80,7 +77,7 @@ function parseFmt(dv: DataView, body: number, size: number): WavFmt {
 
 export function parseWavPcmData(bytes: Uint8Array, totalSize = bytes.byteLength): WavPcmData {
   if (bytes.byteLength < 12 || !tagEquals(bytes, 0, 'RIFF') || !tagEquals(bytes, 8, 'WAVE')) {
-    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+    throw new InputError('not a RIFF/WAVE file');
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let fmt: WavFmt | undefined;
@@ -251,8 +248,8 @@ export function writeWav(
   endian: Endianness = 'le',
 ): Uint8Array<ArrayBuffer> {
   if (format === 's8') {
-    throw new CapabilityError('capability-miss', 'WAV 8-bit PCM is unsigned; use pcm-u8', {
-      op: { op: 'pcm-write', container: 'wav', sampleFormat: format },
+    throw new CapabilityError('WAV 8-bit PCM is unsigned; use pcm-u8', {
+      op: { kind: 'route', id: 'pcm-write', facts: { container: 'wav', sampleFormat: format } },
       tried: ['wav'],
     });
   }

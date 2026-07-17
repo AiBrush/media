@@ -116,16 +116,25 @@ shapes (`driver.ts:103-134`) — the Node-safe, host-object-free path that probe
 
 ### 3.3 Registry — the single write/read split
 
-The registry is the one place drivers land. The **write side** is `Registry` (`driver.ts:544-549`:
-`addCodec`/`addContainer`/`addFilter`); the **read side** the router consumes is `RegistryView`
-(`registry.ts:23-28`: `codecs()`/`containers()`/`filters()`/`imageOps()`, snapshots in insertion order).
-The concrete `Registry` class implements both plus `ImageRegistry` (`registry.ts:45`), storing each kind in
-a `Map<string, Driver>` keyed by id (`registry.ts:46-49`). Two invariants are load-bearing:
+The registry is the one place drivers land. The **write side** is `Registry`
+(`src/contracts/driver.ts`: `addCodec`/`addContainer`/`addFilter` plus the optional image slot
+`addImageOps?`); the **read side** the router consumes is `RegistryView` (also declared in the contract
+file: `codecs()`/`containers()`/`filters()`/`imageOps()`, snapshots in insertion order; re-exported from
+`src/kernel/registry.ts` for the kernel/`core` surface). The concrete `Registry` class implements both,
+storing each kind in a `Map<string, Driver>` keyed by id. Three invariants are load-bearing:
 
 1. **Version-gated registration.** `#add` refuses any driver whose `apiVersion` is outside the supported
-   window with a typed `driver-incompatible` `MediaError` (`registry.ts:88-95`) — never a later crash.
-2. **Idempotent by id, first-wins.** `if (into.has(driver.id)) return;` (`registry.ts:96-98`) makes a
-   re-import of the same chunk (HMR, double dynamic-import) a safe no-op.
+   window with a typed `driver-incompatible` `MediaError` — never a later crash. The window is
+   `[current]` until a real previous major (≥ 1) exists; the phantom major 0 is never accepted
+   (`supportedApiVersions`, `registry.ts`).
+2. **Honest capability advertisement.** A driver may declare `DriverBase.capabilities` (names of the
+   additive optional contract members it implements); registration refuses an advertisement its surface
+   does not back with a typed `driver-incompatible` (`assertHonestCapabilities`, `registry.ts`).
+3. **Idempotent by id — first-wins, unless strictly superseded.** A re-import of the same chunk (HMR,
+   double dynamic-import) is a safe no-op; but a later same-id driver whose capability surface is a
+   *strict superset* of the incumbent's (e.g. the full demux+mux module arriving after its mux-only
+   sibling) replaces it, so op order can never silently drop a capability
+   (`isStrictlyMoreCapable` over `OPTIONAL_CONTAINER_CAPABILITIES`, `registry.ts`).
 
 ### 3.4 Capability routing — WebCodecs → GPU → WASM, miss-only
 
@@ -149,7 +158,7 @@ missed — the "download heavy WASM only on a hardware miss" rule is a routing c
 case. On a true miss the router throws `CapabilityError` naming, in ladder order, every driver id it tried
 (`router.ts:105-111`) — fail loudly, never a silent wrong result (`errors.ts:1-7`).
 
-The **lazy driver proxies** (`defaults.ts:372-506`, `lazyCodec` `1250-1291`, `lazyFilter` `768-807`) are
+The **lazy driver proxies** (`lazyContainer`, `lazyCodec`, `lazyFilter` in `defaults.ts`) are
 what make miss-only real: each proxy carries the driver's `id`/`kind`/`tier` and a **cheap pre-load
 `supports`/`matches` gate**, but defers `spec.load()` until a frame or packet actually flows. `lazyCodec.
 supports` first runs the string-prefix `matches(q)` and only then imports and delegates to the real
@@ -172,15 +181,15 @@ supports` first runs the string-prefix `matches(q)` and only then imports and de
 - **Cancel.** Every stage takes `StageOptions.signal?: AbortSignal` (`driver.ts:45-46`). A coder is a
   `TransformStream`; cancellation must release the WebCodecs/WASM object and `close()` in-flight frames
   (`driver.ts:167-171`). The reference implementation of cancel-correct teardown is
-  `createLazyFilterStream.cancel` (`defaults.ts:893-900`): it sets `outerDead`, then **initiates**
+  `createLazyFilterStream.cancel` (`src/drivers/lazy-filter-stream.ts`): it sets `outerDead`, then **initiates**
   `writer.abort` / `reader.cancel` without awaiting them, because WHATWG cancel settles only after any
   in-flight inner write finishes — awaiting would let a stuck stage block cancellation forever.
 - **Frame lifetime — `close()` exactly once.** The contract states raw frames are ref-counted and must be
   closed exactly once (`driver.ts:69-70`). Ownership transfers with the stream operation: writing a frame
   into a coder relinquishes it; reading transfers it to the reader. The reference owner is again
-  `createLazyFilterStream` (`defaults.ts:836-904`), which closes a frame in every branch that does **not**
-  hand it onward: input the inner sink never accepted (`884`), an inner output that lost the enqueue race
-  against a downstream cancel (`858, 864`). `@aibrush/media/core` exports `closeFrame`/`closeFrames`/
+  `createLazyFilterStream` (`src/drivers/lazy-filter-stream.ts`), which closes a frame in every branch that does **not**
+  hand it onward: input the inner sink never accepted, an inner output that lost the enqueue race
+  against a downstream cancel. `@aibrush/media/core` exports `closeFrame`/`closeFrames`/
   `Closable`/`isClosable` (`src/core.ts:37`) as the shared helpers every driver should use.
 - **Backpressure.** Coders/filters are `TransformStream`s, so WHATWG queueing strategies apply. The
   contract's non-obvious rule (documented at `defaults.ts:823-834`): a lazy filter stage's **writable
@@ -191,81 +200,59 @@ supports` first runs the string-prefix `matches(q)` and only then imports and de
 
 ## 4. Current state
 
-**What exists and is good.** The contract file (`driver.ts`) is a clean, `any`-free set of interfaces with
-the correct WebCodecs-native seam types and a well-designed `Packet` (`driver.ts:89-100`). The `Registry`
-class is small and correct: version-gated, idempotent, Map-backed (`registry.ts:45-113`). The typed error
-tree (`MediaError` → `CapabilityError`/`InputError`, `errors.ts:25-63`) exists and is used. The lazy proxy
-pattern genuinely delivers miss-only loading, and `createLazyFilterStream` (`defaults.ts:836-904`) is a
-model of cancel-correct, close-once, backpressure-aware stream wiring.
+**The R-S04 punch-list (§5) is implemented; this section describes the code as it now stands.**
 
-**God-file: `src/drivers/defaults.ts` (1291 lines).** This one file conflates at least six unrelated
-responsibilities:
-1. Registration wiring — `registerDefaultDrivers` (`defaults.ts:83-101`).
-2. **A full FLAC container driver implemented inline** — `lazyFlacContainerDriver` implements
-   `probe`/`packetInfo`/`demux` directly and constructs `EncodedAudioChunk`s in `flacPacketStream`
-   (`defaults.ts:542-655`). Real demux logic living in the *registration* file is a layering violation;
-   it belongs in `src/drivers/flac/`.
-3. **Image format sniffing** — `sniffImageFormat`, `hasAvifBrand`, `brand`, `tag`, `u32be`
-   (`defaults.ts:185-244`): byte-level magic parsing embedded in the registration module.
-4. Byte-source IO — `readByteStream`, `readFlacBytes` (`defaults.ts:615-686`).
-5. Two near-duplicate lazy muxer classes — `LazyFlacMuxer` (`965-1066`) and `LazyContainerMuxer`
-   (`1068-1184`) share ~120 lines of ready/pump/error machinery.
-6. **Browser UA capability detection** — `webgpuAvailable`, `canvas2dAvailable`,
-   `chromiumCanvasTonemapAvailable`, Firefox/Chrome UA regexes (`defaults.ts:906-963`): capability
-   detection that belongs in the router/tier layer (S01), not the driver-registration file.
+**Contract file.** `driver.ts` is a clean, `any`-free set of interfaces with the correct WebCodecs-native
+seam types and a well-designed `Packet`. It now owns the **full** registry surface: the write-side
+`Registry` (including the optional image slot `addImageOps?`) and the read-side `RegistryView` are both
+declared in the contract file, so image support is no longer smuggled in through a structural cast.
+`DriverBase` gained an optional `capabilities: readonly string[]` handshake naming the additive optional
+contract members a driver implements, and `OPTIONAL_CONTAINER_CAPABILITIES` is the single exported list
+of the container contract's optional members (the registry's supersession comparison and the lazy-spec
+conformance test both key off it).
 
-**Module-global mutable state.** `imageOpsPromise` (`defaults.ts:130`) is a module-level `let` shared by
-**every** engine instance in the process — the one genuine global-mutable cache in this family, defeating
-the per-engine-registry isolation the rest of the design earns.
+**Registry.** Version-gated (window `[current]`, phantom major 0 refused), capability-advertisement-
+validated (`driver-incompatible` for a dishonest `capabilities` entry), idempotent by id with
+strict-superset supersession (see §3.3). Selective registration specs
+(`default-container-registration.ts`) carry the **real registered driver id** (`'mp4-mux'`,
+`'webm-mux'`), so pins resolve against the same ids the registry holds.
 
-**Layering smell — drivers reach up into the kernel router.** Both registration helpers import
-`../kernel/router.ts` and drive selection + cache invalidation themselves:
-`default-codec-registration.ts:11` and `default-container-registration.ts:13` import `Router`;
-`pickCodecWithDefaultFallback`/`pickContainerWithDefaultFallback` call `router.clearCache()` and
-`router.pickCodec/pickContainer` (`default-codec-registration.ts:54-63`,
-`default-container-registration.ts:143-152`). The `src/drivers/*` layer should describe *what to register*,
-not orchestrate *how to re-route* — the retry/clear-cache orchestration belongs in the engine/kernel.
+**Error model.** `CapabilityError` fixes `code = 'capability-miss'` intrinsically and takes
+`(message, detail?: CapabilityErrorDetail, options?: ErrorOptions)`; `InputError` fixes
+`'unsupported-input'`. `CapabilityErrorDetail.op` is the discriminated `OperationDescriptor` union
+(`{kind:'codec', query}` | `{kind:'container', query}` | `{kind:'filter', spec}` |
+`{kind:'route', id, facts?}`), and `isCapabilityErrorDetail` guards untyped payloads (the structured-clone
+worker wire) so the subclass is only ever rebuilt with a genuine typed detail. The typed detail is
+optional-by-presence: an error rebuilt from a wire that carried none stays a `CapabilityError` rather
+than gaining a fabricated descriptor. Every owned throw site names what it tried (`LazyMuxer`'s PCM miss
+reports the driver id, never `tried: []`).
 
-**Capability leak — the driver's optional-method surface is re-declared as boolean flags.** `lazyContainer`
-rebuilds each container's capability surface from a hand-maintained `LazyContainerSpec` flag table
-(`defaults.ts:270-290`) and, per flag, installs a wrapper that loads the real module and throws
-`missingLazyMethod` if the real driver lacks the method (`defaults.ts:388-505`, helper `732-737`). The
-advertised capability (method present on the proxy) and the real capability (method present on the loaded
-module) are two sources of truth that can drift; when they drift the router routes to a driver that then
-throws `capability-miss` at call time instead of routing elsewhere.
+**Registration bundle (`defaults.ts`, ~665 lines).** Now only registration wiring plus the lazy proxy
+factories:
+- The lazy container roster is one exported data table, `DEFAULT_LAZY_CONTAINER_SPECS` (mp4, webm, wav,
+  mp3, ogg, adts, aiff, caf, mpegts, avi), consumed by `lazyContainer()`; FLAC's bespoke fast-path proxy
+  lives in `src/drivers/flac/flac-lazy-driver.ts`. The spec flag table is drift-proof: a conformance test
+  (`lazy-container-conformance.test.ts`) loads every spec and fails if the flags disagree with the loaded
+  module's real surface in either direction.
+- The two lazy muxers are folded into one parameterized `LazyMuxer`
+  (`src/drivers/lazy-muxer.ts`): single-track vs multi-track is a `validateTrack` config, and the raw-PCM
+  seam is exposed only when configured (`pcmSeam`), so FLAC never advertises a `writePcm` its real muxer
+  lacks. `missingLazyMethod` lives beside it.
+- `createLazyFilterStream` — still the model of cancel-correct, close-once, backpressure-aware stream
+  wiring (ADR-186) — lives in `src/drivers/lazy-filter-stream.ts` next to its test.
+- Image sniffing is the image codec module's own `sniffImageFormat` (`src/codecs/image/probe.ts`);
+  byte-stream draining is the shared `src/util/byte-stream.ts`.
+- Browser/UA capability detection (`webgpuAvailable`/`canvas2dAvailable`/
+  `chromiumCanvasTonemapAvailable`/UA predicates) lives in the tier layer,
+  `src/kernel/runtime-capabilities.ts`; `defaults.ts` contains no UA regex and no module-level mutable
+  state — the image-ops load promise is closure-scoped per registration, so engines in one process never
+  share resolution state.
 
-**Id/spec-id inconsistency in selective registration (owned code).** `SelectiveContainerSpec.id`
-(`default-container-registration.ts:23-29`) is used both to pin-resolve (`candidate.id === pinDriver`,
-`:125`) and is assumed to equal the registered driver's id — but for the mux entries it does **not**: the
-`'mp4'` mux spec loads a driver whose real id is `'mp4-mux'` (`default-container-registration.ts:80-84`
-vs `src/drivers/mp4/mp4-mux-driver.ts:32`), and likewise `'webm'` vs `'webm-mux'`
-(`:86-90` vs `src/drivers/webm/webm-mux-driver.ts:27`). Combined with **first-wins by bare id**
-(`registry.ts:96-98`), the capability surface registered under a container family can depend on which
-operation ran first, and a pin on the real driver id (`'mp4-mux'`) is unresolvable through this table.
-
-**Off-contract fourth kind.** Image ops are not one of the three driver kinds; they are bolted onto the
-registry through `addImageOps` (`registry.ts:63-65`), which implements `ImageRegistry` declared in a codec
-module (`src/codecs/image/image-driver.ts`), not the contract file. `defaults.ts:96` reaches it through a
-structural cast: `(reg as Registry & { addImageOps?: ... }).addImageOps?.(...)`. So the canonical contract
-(`driver.ts:544-549`) does not own the full registry surface, and image is smuggled in through a side door.
-
-**Error-model smells.**
-- `CapabilityErrorDetail.op` is `unknown` (`errors.ts:39`), and call sites pass wildly different shapes:
-  a bare string (`'codec'`, `'demux'`, `defaults.ts:1261, 733`), a `CodecQuery` (`router.ts:83`), and a
-  *doubly-nested* `{ op: 'mux' }` (`defaults.ts:993, 1002`). The `unknown` papers over an unstable shape.
-- `tried` is sometimes `[]` even though work was attempted, e.g. the `writePcm` miss reports
-  `tried: []` (`defaults.ts:1126`), contradicting the field's contract ("driver ids that were probed").
-- Both `CapabilityError` and `InputError` constructors take an arbitrary `code: MediaErrorCode`
-  (`errors.ts:51, 59`), so a `CapabilityError` with code `'decode-error'` is type-legal though nonsensical;
-  every call site redundantly passes `'capability-miss'`. `detail` is typed `unknown` (`errors.ts:51`)
-  rather than the `CapabilityErrorDetail` the class documents (`errors.ts:36-44`).
-
-**Versioning is a bare major with a suspect window.** `DRIVER_API_VERSION = 1` (`driver.ts:21`).
-`supportedApiVersions()` returns `[current, current-1]` guarded by `prev >= 0` (`registry.ts:31-34`), so
-today the window is `[1, 0]` — a driver declaring `apiVersion: 0` is **accepted**, though major 0 was
-never a real contract. There is no minor version or capability handshake, so the dozen additive optional
-`ContainerDriver` methods (`probe … decodePcmInterleavedStream`) are undiscoverable except by duck-typed
-runtime probing (`if (loaded.streamCopy === undefined) throw …`, `defaults.ts:425`).
+**Remaining layering smell (open).** Both registration helpers still import `../kernel/router.ts` and
+drive selection + cache invalidation themselves (`pickCodecWithDefaultFallback` /
+`pickContainerWithDefaultFallback` call `router.clearCache()` and retry). The `src/drivers/*` layer should
+describe *what to register*, not orchestrate *how to re-route* — moving that orchestration into the
+engine/kernel remains open question §6.4 (not part of the R-S04 list).
 
 ## 5. Delta / punch-list
 
@@ -278,6 +265,9 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    *Acceptance:* a unit test iterates `SELECTIVE_CONTAINERS`, calls each `load()`, and asserts the
    registered driver's `id` equals the value used for pin matching; and `pickContainer({direction:'mux'},
    {pinDriver:'mp4-mux'})` after selective registration resolves the mux driver (currently a miss).
+   **✅ Done** — `src/drivers/default-container-registration.test.ts`: “every selective spec id equals the
+   id its load() actually registers (pin truth)” and “resolves a pin on the real mux driver id through
+   selective registration”.
 
 2. **Defend the registry against id-collision capability loss.** With two modules per container family
    (full demux+mux vs mux-only) and first-wins-by-id, the surviving surface depends on op order. Either
@@ -285,6 +275,9 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    later driver of the same id is strictly more capable. Ref `registry.ts:96-98`.
    *Acceptance:* register mux-only `mp4-mux`, then attempt to register full-capability `mp4`, then assert
    an MP4 **demux** resolves to a demux-capable driver (today it can be silently dropped by first-wins).
+   **✅ Done** — `src/kernel/registry.test.ts`: “replaces a registered container when a same-id driver is
+   strictly more capable”, “keeps the wider surface when a narrower same-id driver registers second”,
+   “never loses demux across the real mux-only/full MP4 module pair”.
 
 3. **Make `CapabilityError`/`InputError` codes intrinsic and details typed.** `CapabilityError` should fix
    `code = 'capability-miss'` and take `(message, detail: CapabilityErrorDetail)`; `InputError` should fix
@@ -293,6 +286,10 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    *Acceptance:* `new CapabilityError('the message', {op, tried})` typechecks and `err.code ===
    'capability-miss'`; passing any other code no longer compiles; a grep proves no call site passes a
    redundant `'capability-miss'` literal.
+   **✅ Done** — `src/contracts/errors.test.ts`: “fixes code = capability-miss intrinsically and carries
+   the typed detail”, “fixes code = unsupported-input intrinsically…”, and the source-scan oracle “no
+   call site passes a redundant code literal”. (Detail is typed but optional: a worker-wire error that
+   carried no structured detail stays a `CapabilityError` — see §4.)
 
 4. **Type `CapabilityErrorDetail.op` as a discriminated `OperationDescriptor` and forbid empty `tried`
    when work was attempted.** Replace `op: unknown` with a union
@@ -301,6 +298,10 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    `defaults.ts:993, 1002, 1126, 1261`; `router.ts:83`.
    *Acceptance:* a test constructs each thrown `CapabilityError` in owned code and asserts `detail.op`
    matches the union and `detail.tried.length > 0` whenever the message claims a probe happened.
+   **✅ Done** — `src/kernel/router.test.ts`: “every routed miss carries the discriminated op descriptor
+   and names what was probed”; `src/contracts/errors.test.ts`: “accepts every OperationDescriptor kind of
+   the discriminated union”; `src/drivers/lazy-muxer.test.ts`: “raises a typed PCM miss naming the tried
+   driver…” (the former `tried: []` writePcm miss).
 
 5. **Assert the lazy flag table against the real modules (kill the drift).** For every `LazyContainerSpec`
    boolean flag (`probe`, `packetInfo`, `streamCopy`, `decrypt`, `transformPcm`, `decodePcm*`,
@@ -310,6 +311,9 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    *Acceptance:* a conformance test loads every lazy spec, and for each `flag: true` asserts
    `typeof loaded[flag] === 'function'` (and for each *false/omitted* flag that the proxy does not
    advertise it); the test fails if any real driver's surface disagrees with its spec flags.
+   **✅ Done** — `src/drivers/lazy-container-conformance.test.ts`: “the %s proxy advertises exactly the
+   surface its loaded module implements” (both directions, over `DEFAULT_LAZY_CONTAINER_SPECS`; caught
+   and fixed a real drift — the aiff spec had hidden the real driver's `probe`).
 
 6. **Fix the version window and add a discoverable minor/capabilities handshake.** `supportedApiVersions`
    must not accept `apiVersion: 0` while `DRIVER_API_VERSION === 1`; the window should be `[current]`
@@ -318,6 +322,9 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    `registry.ts:31-39`; `driver.ts:21, 137-142`.
    *Acceptance:* `isApiVersionSupported(0) === false`; a driver advertising `capabilities: ['streamCopy']`
    without implementing `streamCopy` is refused at registration with `driver-incompatible`.
+   **✅ Done** — `src/kernel/registry.test.ts`: “accepts only real contract majors — never the phantom
+   major 0”, “refuses the phantom previous major 0…”, “refuses a driver advertising a capability its
+   surface does not implement”, “accepts an honest capabilities advertisement…”.
 
 7. **Move image ops into the contract as a first-class kind.** Either add a fourth registerable kind or
    declare `addImageOps`/`imageOps()` in `src/contracts/driver.ts` so the canonical contract owns the full
@@ -325,6 +332,10 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    `driver.ts:544-549`.
    *Acceptance:* `defaults.ts` registers image ops through a typed contract method with no `as` cast, and
    `RegistryView.imageOps()` / the write method are both declared in the contract file.
+   **✅ Done** — `Registry.addImageOps?` and `RegistryView` are declared in `src/contracts/driver.ts`;
+   `defaults.ts` calls `reg.addImageOps?.(…)` with no cast. Proof: `src/kernel/registry.test.ts`: “holds
+   image ops idempotently outside the container/codec/filter driver maps”; `src/drivers/defaults.test.ts`:
+   “registers image support on the default registry host”.
 
 8. **Extract the FLAC driver, image sniff, and byte-IO out of `defaults.ts`.** Move `lazyFlacContainerDriver`
    /`flacPacketStream` into `src/drivers/flac/`; move `sniffImageFormat`+helpers into the image codec
@@ -332,12 +343,22 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    only registration wiring + lazy proxy factories. Ref `defaults.ts:130-244, 542-686`.
    *Acceptance:* `defaults.ts` drops below ~500 lines and imports zero `EncodedAudioChunk` construction;
    FLAC demux tests import from `src/drivers/flac/`, not `drivers/defaults.ts`; all existing tests pass.
+   **✅ Done** — FLAC proxy in `src/drivers/flac/flac-lazy-driver.ts` (tests:
+   `src/drivers/flac/flac-lazy-driver.test.ts`), byte IO in `src/util/byte-stream.ts`, image sniff deduped
+   into `src/codecs/image/probe.ts`. `defaults.ts` is ~665 lines of registration wiring + proxy factories
+   (the spec table and factories carry the remainder); zero `EncodedAudioChunk` construction, enforced by
+   `src/drivers/defaults.test.ts`: “contains only registration wiring: no UA sniffing, no module-level
+   mutable state”.
 
 9. **De-duplicate the two lazy muxers.** Fold `LazyFlacMuxer` and `LazyContainerMuxer` into one
    parameterized lazy muxer (single-track vs multi-track is a config, not a class). Ref
    `defaults.ts:965-1184`.
    *Acceptance:* one muxer class remains; the FLAC single-stream constraint is expressed as a
    `validateTrack`/`maxTracks: 1` option; mux golden tests for FLAC and every container still pass.
+   **✅ Done** — one `LazyMuxer` (`src/drivers/lazy-muxer.ts`); FLAC's constraint is
+   `validateFlacMuxTrack` passed as `validateTrack`. Proof: `src/drivers/lazy-muxer.test.ts` (all four
+   tests) and `src/drivers/flac/flac-lazy-driver.test.ts`: “routes the lazy FLAC muxer through the real
+   muxer and preserves typed misuse errors”.
 
 10. **Relocate browser/UA capability detection to the tier layer, and remove the module global.** Move
     `webgpuAvailable`/`canvas2dAvailable`/`chromiumCanvasTonemapAvailable`/UA regexes into S01's
@@ -346,6 +367,11 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
     *Acceptance:* `defaults.ts` contains no `navigator.userAgent` regex and no module-level mutable `let`;
     two `createMedia()` engines in one process each resolve image ops independently (a test that creates
     two engines and asserts no shared promise identity leaks between them).
+    **✅ Done** — detection lives in `src/kernel/runtime-capabilities.ts`; the image-ops promise is
+    closure-scoped per registration. Proof: `src/drivers/defaults.test.ts`: “contains only registration
+    wiring: no UA sniffing, no module-level mutable state” (source oracle) and “two registries resolve
+    image ops independently — no shared promise identity” (each engine holds its own registry, so
+    per-registry independence is exactly the engine-level property).
 
 ## 6. Open questions
 

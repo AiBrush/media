@@ -1,23 +1,37 @@
 /**
- * `StreamTarget` — a streaming output sink (doc 07 §4 sinks, doc 09 streaming-output, ADR-013).
+ * `StreamTarget` drain — the lazily-loaded byte-writer seam (doc 07 §4 sinks, doc 09 streaming-output,
+ * ADR-013). The public module (`stream-target.ts`) owns the descriptor + pure plan; this seam owns only
+ * the drain paths, all sharing one **positioned pump** so every arm honors producer-intended offsets
+ * ({@link chunkWritePosition}, doc 09 §5 item 2) and the opt-in run coalescer (doc 09 §5 item 7):
  *
- * The default `blob`/`file` sinks (`sink.ts`) collect the whole output into one buffer; that is fine for a
- * faststart MP4 but defeats a *streaming* producer (a fragmented/CMAF muxer, a long live recording) whose
- * point is bounded memory. A `StreamTarget` instead writes each produced chunk straight to a caller-owned
- * destination — a `WritableStream<Uint8Array>` (OPFS/`FileSystemWritableFileStream`, a `fetch` upload body,
- * a `TransformStream` tee) or a plain callback — as the chunk is produced, so peak memory stays at one
- * chunk regardless of the output's total size.
+ *  - **callback** — pull chunks in order, hand each to the writer with its intended position, `await`
+ *    the returned promise (backpressure). The first invocation happens at the first produced chunk —
+ *    the TTFB signal (doc 09 §5 item 5).
+ *  - **random-access `WritableStream`** — a destination exposing OPFS-style `seek` (e.g.
+ *    `FileSystemWritableFileStream`) is driven through a writer: contiguous chunks use plain
+ *    cursor writes, a discontinuity uses an explicit `{ type: 'write', position, data }` per the WHATWG
+ *    File System spec, so re-write-a-region producers (faststart patches) land bytes exactly.
+ *  - **append-only `WritableStream`** — the native `pipeTo` path (streams-runtime backpressure +
+ *    cancellation) through a position guard that raises a typed `CapabilityError` if a producer asks
+ *    for a non-contiguous write the destination cannot honor — never a silent wrong offset. With
+ *    `chunked` on, the manual pump replaces `pipeTo` so runs can coalesce before each write.
  *
- * The lightweight public module owns the descriptor and constructor; this lazy implementation owns only
- * the byte-drain path. Writing is built on the executor's {@link runToSink} for the `WritableStream` case
- * (cancellation + typed error mapping) and on a cancellable pull loop for the callback case — both honour
- * `signal` and surface a typed {@link MediaError}.
+ * Every arm honours `signal` (each await is abort-raced so a stalled producer/writer cannot pin the op),
+ * cancels the source reader on failure, aborts a held destination writer, and surfaces typed errors.
+ * The one OPFS seam (`opfs-target-materialize.ts`) reuses {@link drainToRandomAccessWritable} with the
+ * plan's `startPosition` as the base offset, so there is exactly one positioned byte pump.
  */
 
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import type { ExecuteOptions } from '../kernel/executor.ts';
 import { runToSink } from '../kernel/executor.ts';
-import type { StreamDestination, StreamTarget, StreamTargetWriter } from './stream-target.ts';
+import type {
+  StreamDestination,
+  StreamTarget,
+  StreamTargetWritePlan,
+  StreamTargetWriter,
+} from './stream-target.ts';
+import { chunkWritePosition, planStreamTargetWrite } from './stream-target.ts';
 
 /** Narrow a {@link StreamDestination} to the `WritableStream` arm (vs the callback arm). */
 function isWritableStream(d: unknown): d is WritableStream<Uint8Array> {
@@ -34,19 +48,54 @@ function isStreamTargetWriter(d: unknown): d is StreamTargetWriter {
   return typeof d === 'function';
 }
 
+/**
+ * True when the destination is random-access: it exposes the WHATWG File System `seek(position)`
+ * surface (`FileSystemWritableFileStream`), so positioned writes can be honored.
+ */
+function isRandomAccessWritable(d: WritableStream<Uint8Array>): boolean {
+  return typeof (d as { seek?: unknown }).seek === 'function';
+}
+
+/** An explicit positioned write per the WHATWG File System `WriteParams` dictionary. */
+interface PositionedWriteParams {
+  readonly type: 'write';
+  readonly position: number;
+  readonly data: Uint8Array;
+}
+
+/**
+ * The no-coalescing plan for drains that take a {@link StreamTargetWritePlan} but have no `chunked`
+ * knob (the OPFS seam — a local file write has no per-write overhead worth buffering for). The
+ * `chunkSize` is inert while `chunked` is false.
+ */
+export const UNCHUNKED_WRITE_PLAN: StreamTargetWritePlan = { chunked: false, chunkSize: 1 };
+
+/** The writer view of a random-access destination: plain bytes or explicit positioned writes. */
+type RandomAccessWriter = WritableStreamDefaultWriter<Uint8Array | PositionedWriteParams>;
+
 /** Runtime-validate the descriptor before pulling from the produced byte stream. */
 function streamDestinationOf(target: StreamTarget): StreamDestination {
   const destination = (target as { readonly destination?: unknown }).destination;
   if (isStreamTargetWriter(destination) || isWritableStream(destination)) return destination;
   throw new CapabilityError(
-    'capability-miss',
     'stream-target destination must be a WritableStream<Uint8Array> or a callback writer',
-    { op: { op: 'stream-target' }, tried: [] },
+    { op: { kind: 'route', id: 'stream-target' }, tried: [] },
   );
 }
 
 function abortedError(): MediaError {
   return new MediaError('aborted', 'operation aborted');
+}
+
+/** The typed miss for a positioned write an append-only destination cannot land (doc 09 §5 item 2). */
+function appendOnlyPositionMiss(position: number, appendPosition: number): CapabilityError {
+  return new CapabilityError(
+    `append-only stream-target destination cannot honor a positioned write at byte ${position} (append cursor is at ${appendPosition}); use a seekable destination (OPFS) or a callback writer`,
+    {
+      op: { kind: 'route', id: 'stream-target', facts: { position, appendPosition } },
+      tried: [],
+    },
+  );
 }
 
 /** Race one async step against cancellation so a stalled producer/writer cannot pin the op forever. */
@@ -70,28 +119,115 @@ function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promis
 }
 
 /**
- * Drive a callback destination from the source readable: pull chunks in order and hand each to `write`
- * with its running byte position, awaiting the callback (backpressure). Cancels the reader on abort/throw
- * so the upstream pipeline tears down and releases resources; maps any failure to a typed error.
+ * One positioned write reaching the destination. `appendPosition` is the destination's current cursor
+ * (the offset a plain append would land at); `position === appendPosition` is the contiguous common
+ * case, letting writer arms keep plain cursor writes and name the real cursor in a typed miss.
  */
-async function writeToCallback(
+type EmitWrite = (data: Uint8Array, position: number, appendPosition: number) => Promise<void>;
+
+/**
+ * Coalesce contiguous writes into ≥`chunkSize` runs (doc 09 §5 item 7, mediabunny `chunked` parity).
+ * A positioned discontinuity flushes the pending run (a run never spans a seek); a chunk at least one
+ * whole run long bypasses the copy and ships directly. Peak buffering: one `chunkSize` buffer + the
+ * produced chunk in flight. The emitted view is a fresh buffer per run — never reused after delivery.
+ */
+class RunCoalescer {
+  readonly #chunkSize: number;
+  readonly #deliver: (data: Uint8Array, position: number) => Promise<void>;
+  #buffer: Uint8Array | undefined;
+  #filled = 0;
+  #runStart = 0;
+
+  constructor(chunkSize: number, deliver: (data: Uint8Array, position: number) => Promise<void>) {
+    this.#chunkSize = chunkSize;
+    this.#deliver = deliver;
+  }
+
+  /** The offset an untagged chunk lands at: the end of the pending run, else the delivered cursor. */
+  nextPosition(cursor: number): number {
+    return this.#buffer === undefined ? cursor : this.#runStart + this.#filled;
+  }
+
+  async push(data: Uint8Array, intended: number): Promise<void> {
+    if (this.#buffer !== undefined && intended !== this.#runStart + this.#filled) {
+      await this.flush(); // a coalesced run never spans a positioned jump
+    }
+    let offset = 0;
+    let position = intended;
+    while (offset < data.byteLength) {
+      if (this.#buffer === undefined) {
+        const remaining = data.byteLength - offset;
+        if (remaining >= this.#chunkSize) {
+          // Nothing pending and at least one whole run in hand: ship it without re-buffering.
+          await this.#deliver(offset === 0 ? data : data.subarray(offset), position);
+          return;
+        }
+        this.#buffer = new Uint8Array(this.#chunkSize);
+        this.#filled = 0;
+        this.#runStart = position;
+      }
+      const take = Math.min(this.#chunkSize - this.#filled, data.byteLength - offset);
+      this.#buffer.set(data.subarray(offset, offset + take), this.#filled);
+      this.#filled += take;
+      offset += take;
+      position += take;
+      if (this.#filled === this.#chunkSize) await this.flush();
+    }
+  }
+
+  async flush(): Promise<void> {
+    const buffer = this.#buffer;
+    if (buffer === undefined) return;
+    // Invariant: a run buffer is only allocated immediately before ≥1 byte is copied in, so a pending
+    // run is never empty — flushing always delivers.
+    const run = buffer.subarray(0, this.#filled);
+    const start = this.#runStart;
+    this.#buffer = undefined; // downstream owns the emitted view; a new run allocates fresh
+    this.#filled = 0;
+    await this.#deliver(run, start);
+  }
+}
+
+/**
+ * The one positioned byte pump every arm shares: pull chunks in order, resolve each chunk's intended
+ * offset (tag ⇒ `basePosition + tag`; untagged ⇒ end of the previous write), optionally coalesce, and
+ * emit. Cancels the reader on abort/throw so the upstream pipeline tears down; maps failures to typed
+ * errors. Backpressure is one chunk in flight — each `emit` is awaited before the next pull.
+ */
+async function drainPositioned(
   readable: ReadableStream<Uint8Array>,
-  write: StreamTargetWriter,
+  emit: EmitWrite,
   opts: ExecuteOptions,
+  plan: StreamTargetWritePlan,
+  basePosition: number,
 ): Promise<void> {
   const { signal } = opts;
-  if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+  if (signal?.aborted) throw abortedError();
 
   const reader = readable.getReader();
-  let position = 0;
+  let cursor = basePosition;
+  const deliver = async (data: Uint8Array, position: number): Promise<void> => {
+    await emit(data, position, cursor);
+    cursor = position + data.byteLength;
+  };
+  const coalescer = plan.chunked ? new RunCoalescer(plan.chunkSize, deliver) : undefined;
   try {
     for (;;) {
-      if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+      if (signal?.aborted) throw abortedError();
       const { done, value } = await raceAbort(reader.read(), signal);
       if (done) break;
-      await raceAbort(Promise.resolve(write(value, position)), signal);
-      position += value.byteLength;
+      if (value.byteLength === 0) continue;
+      const tag = chunkWritePosition(value);
+      const intended =
+        tag !== undefined
+          ? basePosition + tag
+          : coalescer !== undefined
+            ? coalescer.nextPosition(cursor)
+            : cursor;
+      if (coalescer !== undefined) await coalescer.push(value, intended);
+      else await deliver(value, intended);
     }
+    await coalescer?.flush();
   } catch (err) {
     // Await upstream cleanup, but preserve the primary typed failure if cancellation itself rejects.
     await reader.cancel(err).catch(() => undefined);
@@ -105,9 +241,98 @@ async function writeToCallback(
   }
 }
 
+/** The callback arm's emitter: hand the chunk + intended position to the writer and await it. */
+function emitToCallback(write: StreamTargetWriter, signal: AbortSignal | undefined): EmitWrite {
+  return async (data, position) => {
+    await raceAbort(Promise.resolve(write(data, position)), signal);
+  };
+}
+
 /**
- * Write a produced byte stream to a {@link StreamTarget}'s destination incrementally (never buffering the
- * whole output). Returns `undefined` — like the OPFS/element sinks — because the bytes went to the
+ * Drive a destination `WritableStream` through a held writer with the positioned pump: on success the
+ * destination is closed (committing e.g. an OPFS file), on any failure it is aborted so a half-written
+ * output is discarded rather than left looking complete.
+ */
+async function drainThroughWriter(
+  readable: ReadableStream<Uint8Array>,
+  writer: RandomAccessWriter,
+  emit: EmitWrite,
+  opts: ExecuteOptions,
+  plan: StreamTargetWritePlan,
+  basePosition: number,
+): Promise<void> {
+  try {
+    await drainPositioned(readable, emit, opts, plan, basePosition);
+    await raceAbort(writer.close(), opts.signal);
+  } catch (err) {
+    await writer.abort(err).catch(() => undefined);
+    throw mapToMediaError(err, opts.signal);
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+/**
+ * Drain into a random-access writable (OPFS-style `seek` present): contiguous chunks stay plain cursor
+ * writes; a discontinuity becomes an explicit positioned `WriteParams` write. Exported for the OPFS
+ * seam (`opfs-target-materialize.ts`), which passes its plan's `startPosition` as the base offset.
+ */
+export async function drainToRandomAccessWritable(
+  readable: ReadableStream<Uint8Array>,
+  destination: WritableStream<Uint8Array>,
+  opts: ExecuteOptions,
+  plan: StreamTargetWritePlan,
+  basePosition = 0,
+): Promise<void> {
+  const writer = (
+    destination as unknown as WritableStream<Uint8Array | PositionedWriteParams>
+  ).getWriter();
+  const emit: EmitWrite = async (data, position, appendPosition) => {
+    await raceAbort(
+      position === appendPosition
+        ? writer.write(data)
+        : writer.write({ type: 'write', position, data }),
+      opts.signal,
+    );
+  };
+  await drainThroughWriter(readable, writer, emit, opts, plan, basePosition);
+}
+
+/** Drain into an append-only writable with coalescing: plain writes, discontinuities are a typed miss. */
+async function drainToAppendOnlyWritable(
+  readable: ReadableStream<Uint8Array>,
+  destination: WritableStream<Uint8Array>,
+  opts: ExecuteOptions,
+  plan: StreamTargetWritePlan,
+): Promise<void> {
+  const writer = destination.getWriter() as RandomAccessWriter;
+  const emit: EmitWrite = async (data, position, appendPosition) => {
+    if (position !== appendPosition) throw appendOnlyPositionMiss(position, appendPosition);
+    await raceAbort(writer.write(data), opts.signal);
+  };
+  await drainThroughWriter(readable, writer, emit, opts, plan, 0);
+}
+
+/**
+ * The append-only `pipeTo` guard: an identity transform that verifies every tagged chunk is contiguous
+ * with the append cursor, erroring the pipe (and cancelling the source) with a typed `CapabilityError`
+ * on a positioned write the destination cannot honor — bytes never silently land at the wrong offset.
+ */
+function appendPositionGuard(): TransformStream<Uint8Array, Uint8Array> {
+  let cursor = 0;
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller): void {
+      const tag = chunkWritePosition(chunk);
+      if (tag !== undefined && tag !== cursor) throw appendOnlyPositionMiss(tag, cursor);
+      cursor += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+/**
+ * Write a produced byte stream to a {@link StreamTarget}'s destination incrementally (never buffering
+ * the whole output). Returns `undefined` — like the OPFS/element sinks — because the bytes went to the
  * caller-owned target rather than being handed back as a value.
  */
 export async function writeToStreamTarget(
@@ -116,18 +341,30 @@ export async function writeToStreamTarget(
   opts: ExecuteOptions = {},
 ): Promise<undefined> {
   const dest = streamDestinationOf(target);
+  const plan = planStreamTargetWrite(target); // pure validation before any pull (InputError on bad options)
   if (isWritableStream(dest)) {
-    // Native pipe: backpressure + abort are handled by the streams runtime. Tag the stage with
-    // `mux-error` so a destination-side write failure surfaces as a typed MediaError (runToSink passes
-    // an abort through as `aborted` and an already-typed MediaError unchanged), matching the callback arm.
-    await runToSink(stream, dest, { ...opts, errorCode: 'mux-error' });
+    if (isRandomAccessWritable(dest)) {
+      await drainToRandomAccessWritable(stream, dest, opts, plan);
+      return undefined;
+    }
+    if (plan.chunked) {
+      await drainToAppendOnlyWritable(stream, dest, opts, plan);
+      return undefined;
+    }
+    // Native pipe for the plain append case: backpressure + abort are handled by the streams runtime.
+    // Tag the stage with `mux-error` so a destination-side write failure surfaces as a typed MediaError
+    // (runToSink passes an abort through as `aborted` and an already-typed MediaError unchanged).
+    await runToSink(stream.pipeThrough(appendPositionGuard()), dest, {
+      ...opts,
+      errorCode: 'mux-error',
+    });
     return undefined;
   }
-  await writeToCallback(stream, dest, opts);
+  await drainPositioned(stream, emitToCallback(dest, opts.signal), opts, plan, 0);
   return undefined;
 }
 
-/** Map a thrown value from the callback loop to the typed model (abort → `aborted`, else `mux-error`). */
+/** Map a thrown value from a drain arm to the typed model (abort → `aborted`, else `mux-error`). */
 function mapToMediaError(err: unknown, signal: AbortSignal | undefined): MediaError {
   if (signal?.aborted) return new MediaError('aborted', 'operation aborted');
   if (err instanceof MediaError) return err;

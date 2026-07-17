@@ -17,12 +17,11 @@ import { CapabilityError, InputError } from '../contracts/errors.ts';
 
 /** Parse an even-length hex string into bytes (throws a typed error on malformed input). */
 export function hexToBytes(hex: string): Uint8Array<ArrayBuffer> {
-  if (hex.length % 2 !== 0) throw new InputError('unsupported-input', 'hex string has odd length');
+  if (hex.length % 2 !== 0) throw new InputError('hex string has odd length');
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) {
     const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-    if (Number.isNaN(byte))
-      throw new InputError('unsupported-input', `invalid hex byte at ${i * 2}`);
+    if (Number.isNaN(byte)) throw new InputError(`invalid hex byte at ${i * 2}`);
     out[i] = byte;
   }
   return out;
@@ -40,8 +39,8 @@ export const AES_BLOCK = 16;
 function subtle(): SubtleCrypto {
   const s = globalThis.crypto?.subtle;
   if (!s) {
-    throw new CapabilityError('capability-miss', 'WebCrypto crypto.subtle is unavailable', {
-      op: 'decrypt',
+    throw new CapabilityError('WebCrypto crypto.subtle is unavailable', {
+      op: { kind: 'route', id: 'decrypt' },
       tried: [],
     });
   }
@@ -93,7 +92,7 @@ export async function aesCtrWithPreparedKey(
   counterBits = 64,
 ): Promise<Uint8Array<ArrayBuffer>> {
   if (prepared.algorithm !== 'AES-CTR') {
-    throw new InputError('unsupported-input', 'prepared AES key is not an AES-CTR key');
+    throw new InputError('prepared AES key is not an AES-CTR key');
   }
   const result = await prepared.subtle.encrypt(
     { name: 'AES-CTR', counter: webCryptoView(counter), length: counterBits },
@@ -176,18 +175,14 @@ export async function aesCbcNoPaddingWithPreparedKey(
   if (data.byteLength === 0) return new Uint8Array(0);
   if (data.byteLength % AES_BLOCK !== 0) {
     throw new InputError(
-      'unsupported-input',
       `AES-CBC no-padding needs a multiple of ${AES_BLOCK} bytes, got ${data.byteLength}`,
     );
   }
   if (iv.byteLength !== AES_BLOCK) {
-    throw new InputError(
-      'unsupported-input',
-      `AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
-    );
+    throw new InputError(`AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`);
   }
   if (prepared.algorithm !== 'AES-CBC') {
-    throw new InputError('unsupported-input', 'prepared AES key is not an AES-CBC key');
+    throw new InputError('prepared AES key is not an AES-CBC key');
   }
   const { subtle: s, key: cbcKey } = prepared;
 
@@ -249,10 +244,7 @@ export async function aesCbcPkcs7(
   direction: 'encrypt' | 'decrypt',
 ): Promise<Uint8Array<ArrayBuffer>> {
   if (iv.byteLength !== AES_BLOCK) {
-    throw new InputError(
-      'unsupported-input',
-      `AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
-    );
+    throw new InputError(`AES-CBC IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`);
   }
   const s = subtle();
   const cbcKey = await importCbcKey(s, key, direction);

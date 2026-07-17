@@ -209,8 +209,8 @@ function errName(e: unknown): string {
 }
 
 function decodeCapabilityMiss(message: string, tried: readonly string[]): CapabilityError {
-  return new CapabilityError('capability-miss', message, {
-    op: 'decode',
+  return new CapabilityError(message, {
+    op: { kind: 'route', id: 'decode' },
     tried,
     suggestion: 'use a browser with AAC AudioDecoder support or the vendored wasm-aac tail',
   });
@@ -257,7 +257,6 @@ function assertDecryptedAdtsSegment(bytes: Uint8Array): void {
     stats.truncated
   ) {
     throw new InputError(
-      'unsupported-input',
       'HLS AES-128 plaintext is not a complete ADTS segment with a valid leading frame or ID3 prefix',
     );
   }
@@ -388,8 +387,8 @@ function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
 
 function assertAdtsStreamCopyTarget(container: string | undefined): void {
   if (container === undefined || container === 'adts' || container === 'aac') return;
-  throw new CapabilityError('capability-miss', `ADTS stream-copy cannot write '${container}'`, {
-    op: { op: 'streamCopy', container },
+  throw new CapabilityError(`ADTS stream-copy cannot write '${container}'`, {
+    op: { kind: 'route', id: 'streamCopy', facts: { container } },
     tried: ['adts'],
   });
 }
@@ -400,20 +399,20 @@ function assertAdtsTrimRange(
 ): void {
   if (trim === undefined) return;
   if (!Number.isFinite(trim.startSec) || !Number.isFinite(trim.endSec)) {
-    throw new InputError('unsupported-input', 'bad trim');
+    throw new InputError('bad trim');
   }
   if (trim.startSec < 0) {
-    throw new InputError('unsupported-input', 'start<0');
+    throw new InputError('start<0');
   }
   if (trim.endSec <= trim.startSec) {
-    throw new InputError('unsupported-input', 'empty trim');
+    throw new InputError('empty trim');
   }
   if (durationSec > 0) {
     if (trim.startSec >= durationSec) {
-      throw new InputError('unsupported-input', 'start>=duration');
+      throw new InputError('start>=duration');
     }
     if (trim.endSec > durationSec + ADTS_TRIM_END_SLACK_SEC) {
-      throw new InputError('unsupported-input', 'end>duration');
+      throw new InputError('end>duration');
     }
   }
 }
@@ -441,7 +440,7 @@ function writeAdtsPacketCopy(
   assertAdtsTrimRange(trim, adtsFramesDurationSec(frames));
   const selected = selectAdtsFrames(frames, trim);
   if (selected.length === 0) {
-    throw new InputError('unsupported-input', 'ADTS trim selected no audio frames');
+    throw new InputError('ADTS trim selected no audio frames');
   }
   let total = 0;
   for (const frame of selected) total += frame.size;
@@ -639,15 +638,11 @@ function aacPcmPlanMiss(
     details.push('webcodecs-audio was not attempted by this runtime/determinism decode plan');
   }
   if (wasmMiss !== undefined) details.push(wasmMiss.message);
-  return new CapabilityError(
-    'capability-miss',
-    `ADTS AAC → WAV PCM extract is unavailable (${details.join('; ')})`,
-    {
-      op: 'convert',
-      tried: plan,
-      suggestion: 'enable native AAC AudioDecoder support or ship the vendored wasm-aac core',
-    },
-  );
+  return new CapabilityError(`ADTS AAC → WAV PCM extract is unavailable (${details.join('; ')})`, {
+    op: { kind: 'route', id: 'convert' },
+    tried: plan,
+    suggestion: 'enable native AAC AudioDecoder support or ship the vendored wasm-aac core',
+  });
 }
 
 async function firefoxRuntimeForAdtsPcm(): Promise<boolean> {
@@ -708,11 +703,10 @@ function packetStream(
   signal: AbortSignal | undefined,
 ): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
-    throw new CapabilityError(
-      'capability-miss',
-      'WebCodecs EncodedAudioChunk is unavailable in this environment',
-      { op: 'demux', tried: ['adts'] },
-    );
+    throw new CapabilityError('WebCodecs EncodedAudioChunk is unavailable in this environment', {
+      op: { kind: 'route', id: 'demux' },
+      tried: ['adts'],
+    });
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
   let i = 0;
@@ -838,8 +832,8 @@ export const AdtsDriver = {
   },
   async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
     if (o.scheme !== 'hls-aes128') {
-      throw new CapabilityError('capability-miss', `ADTS decrypt does not support '${o.scheme}'`, {
-        op: 'decrypt',
+      throw new CapabilityError(`ADTS decrypt does not support '${o.scheme}'`, {
+        op: { kind: 'route', id: 'decrypt' },
         tried: ['adts'],
       });
     }

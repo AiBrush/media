@@ -4,27 +4,8 @@ import type {
   FilterSpec,
   WasmRuntimeProfile,
 } from '../contracts/driver.ts';
+import { CONTAINER_MIME } from './container-mime.ts';
 import type { LogEvent, PreloadSpec } from './types.ts';
-
-const CONTAINER_MIME: Record<string, string> = {
-  mp4: 'video/mp4',
-  mov: 'video/quicktime',
-  webm: 'video/webm',
-  mkv: 'video/x-matroska',
-  ogg: 'audio/ogg',
-  wav: 'audio/wav',
-  mp3: 'audio/mpeg',
-  flac: 'audio/flac',
-  adts: 'audio/aac',
-  aac: 'audio/aac',
-  aiff: 'audio/aiff',
-  caf: 'audio/x-caf',
-  avi: 'video/x-msvideo',
-  ts: 'video/mp2t',
-  m2ts: 'video/mp2t',
-  mts: 'video/mp2t',
-  mpegts: 'video/mp2t',
-};
 
 type PreloadLevel = 'chunks' | 'compile' | 'ready';
 type PreloadCodecDirection = 'decode' | 'encode';
@@ -252,6 +233,20 @@ function preloadCodecDirections(op: string): readonly PreloadCodecDirection[] {
     default:
       return ['decode', 'encode'];
   }
+}
+
+/**
+ * Canonical tiny encode-direction video query for the public capability pre-flight (`canConvert`,
+ * R-S05.7) — the same intent-token → probe-config mapping `preload` warms with, so a pre-flight verdict
+ * and a warmed route agree by construction.
+ */
+export function preflightVideoEncodeQuery(codec: string): CodecQuery {
+  return { mediaType: 'video', direction: 'encode', config: preloadVideoConfig(codec, 'encode') };
+}
+
+/** Canonical tiny encode-direction audio query for the public capability pre-flight (R-S05.7). */
+export function preflightAudioEncodeQuery(codec: string): CodecQuery {
+  return { mediaType: 'audio', direction: 'encode', config: preloadAudioConfig(codec, 'encode') };
 }
 
 function preloadVideoConfig(

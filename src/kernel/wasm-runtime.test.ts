@@ -4,6 +4,7 @@ import { CapabilityError, InputError } from '../contracts/errors.ts';
 import {
   requireIsolatedWasmProfile,
   resolveWasmAssetUrl,
+  resolveWasmCoreProfile,
   wasmInitForProfile,
 } from './wasm-loader-runtime.ts';
 import { normalizeWasmAssetBaseUrl, resolveWasmRuntimeProfile } from './wasm-runtime.ts';
@@ -100,6 +101,62 @@ describe('requireIsolatedWasmProfile', () => {
     });
 
     expect(profile.kind).toBe('isolated-simd-threads');
+  });
+});
+
+describe('resolveWasmCoreProfile — no core ever resolves to isolated-simd-threads (punch-list 3b)', () => {
+  it('caps a fully-isolated environment verdict at baseline while no threaded core is vendored', () => {
+    // The ENVIRONMENT honestly supports threads… (resolveWasmRuntimeProfile says so)
+    const env = resolveWasmRuntimeProfile({
+      enableThreads: true,
+      crossOriginIsolated: true,
+      sharedArrayBuffer: true,
+    });
+    expect(env.kind).toBe('isolated-simd-threads');
+    // …but the CORE resolution never claims it: exactly one single-thread core build is vendored per
+    // codec, so advertising a threaded capability would be a fake (Prime Directive 6).
+    const core = resolveWasmCoreProfile({
+      enableThreads: true,
+      crossOriginIsolated: true,
+      sharedArrayBuffer: true,
+    });
+    expect(core.kind).toBe('baseline');
+    expect(core.threads).toBe(false);
+    expect(core.simd).toBe(false);
+    expect(core.reason).toMatch(/no threaded WASM core/i);
+  });
+
+  it('passes a non-isolated verdict through untouched (reason preserved)', () => {
+    const core = resolveWasmCoreProfile({
+      enableThreads: true,
+      crossOriginIsolated: false,
+      sharedArrayBuffer: true,
+    });
+    expect(core.kind).toBe('baseline');
+    expect(core.reason).toMatch(/crossOriginIsolated/);
+  });
+
+  it('drives wasmInitForProfile by default: an isolated page still loads the baseline asset honestly', () => {
+    // Pin an isolated-looking global environment; the DEFAULT profile of wasmInitForProfile must be the
+    // capped core resolution, so no registered core is ever initialized under a threaded claim.
+    vi.stubGlobal('crossOriginIsolated', true);
+    const url = new URL('file:///tmp/core.wasm');
+    expect(wasmInitForProfile(url)).toEqual({ module_or_path: url });
+    expect(resolveWasmCoreProfile().kind).toBe('baseline');
+  });
+
+  it('a future threaded-only core declines with a typed CapabilityError, never a silent wrong claim', () => {
+    // The one sanctioned path to a threaded profile is requireIsolatedWasmProfile — outside isolation it
+    // raises the typed miss (already covered above); WITH isolation it resolves, and the loader still
+    // serves the single vendored asset for BOTH kinds (no distinct `*.threads.wasm` sibling exists).
+    const isolated = requireIsolatedWasmProfile({
+      crossOriginIsolated: true,
+      sharedArrayBuffer: true,
+    });
+    const url = new URL('file:///tmp/core.wasm');
+    const viaIsolated = wasmInitForProfile(url, isolated);
+    const viaBaseline = wasmInitForProfile(url, resolveWasmCoreProfile());
+    expect(viaIsolated.module_or_path.href).toBe(viaBaseline.module_or_path.href);
   });
 });
 

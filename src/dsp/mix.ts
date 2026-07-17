@@ -91,8 +91,8 @@ function surroundToMono(a: PcmAudio): PcmAudio {
 export function remix(audio: PcmAudio, toChannels: number): PcmAudio {
   const from = audio.channels;
   if (toChannels <= 0 || !Number.isInteger(toChannels)) {
-    throw new CapabilityError('capability-miss', `invalid target channel count ${toChannels}`, {
-      op: 'filter',
+    throw new CapabilityError(`invalid target channel count ${toChannels}`, {
+      op: { kind: 'route', id: 'filter' },
       tried: [],
     });
   }
@@ -103,8 +103,7 @@ export function remix(audio: PcmAudio, toChannels: number): PcmAudio {
   if (from === 6 && toChannels === 2) return surroundToStereo(audio);
   if (from === 6 && toChannels === 1) return surroundToMono(audio);
   throw new CapabilityError(
-    'capability-miss',
     `unsupported channel remix ${from}→${toChannels} (supported: 1↔2, 2↔6, 6→1, N→N)`,
-    { op: 'filter', tried: [] },
+    { op: { kind: 'route', id: 'filter' }, tried: [] },
   );
 }

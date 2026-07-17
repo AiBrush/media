@@ -19,7 +19,8 @@ interface ParsedTrackSelector {
 function parseTrackSelector(raw: string): ParsedTrackSelector {
   const match = TRACK_SELECTOR.exec(raw);
   if (!match) {
-    throw new InputError('unsupported-input', 'bad selector');
+    // Name the offending selector (R-S05.10) so a caller mixing several can see which one is malformed.
+    throw new InputError(`bad selector '${raw}' (expected 'video:N' | 'audio:N' | '…@S')`, { raw });
   }
   const mediaType = match[1] === 'video' ? 'video' : 'audio';
   const index = Number(match[2]);
@@ -29,7 +30,7 @@ function parseTrackSelector(raw: string): ParsedTrackSelector {
     index < 0 ||
     (sourceIndex !== undefined && (!Number.isSafeInteger(sourceIndex) || sourceIndex < 0))
   ) {
-    throw new InputError('unsupported-input', `invalid track selector '${raw}'`);
+    throw new InputError(`invalid track selector '${raw}'`);
   }
   return { mediaType, index, sourceIndex };
 }
@@ -43,6 +44,13 @@ export function hasTrackSelection(selectors: readonly string[] | undefined): boo
  * Select tracks by harness/public selectors (`audio:0`, `video:1`, optional single-source `@0`). The
  * order of selectors is preserved and duplicates are collapsed, so muxers see the caller's intended
  * track order without writing the same source track twice.
+ *
+ * **Selector contract — non-zero source suffixes (documented drop, R-S05.10):** the `@S` suffix names a
+ * source *slot*; this single-source path serves slot `0` only, so a well-formed selector addressed to
+ * another slot (`video:0@1`) is deliberately skipped — it belongs to a different source, not to this
+ * one, and dropping it here is what lets one selector list be fanned across the future multi-source
+ * assembly seam without per-source rewrites. When *every* selector addresses another slot the selection
+ * is empty and a typed `InputError('no track')` still surfaces (never a silent empty mux).
  */
 export function selectTrackInfos<T extends Pick<TrackInfo, 'mediaType'>>(
   tracks: readonly T[],
@@ -54,7 +62,7 @@ export function selectTrackInfos<T extends Pick<TrackInfo, 'mediaType'>>(
   const seen = new Set<T>();
   for (const raw of requested) {
     const selector = parseTrackSelector(raw);
-    if (selector.sourceIndex !== undefined && selector.sourceIndex !== 0) continue;
+    if (selector.sourceIndex !== undefined && selector.sourceIndex !== 0) continue; // other-slot selector: documented drop (see contract above)
     const matching = tracks.filter((track) => track.mediaType === selector.mediaType);
     const track = matching[selector.index];
     if (track && !seen.has(track)) {
@@ -63,7 +71,7 @@ export function selectTrackInfos<T extends Pick<TrackInfo, 'mediaType'>>(
     }
   }
   if (out.length === 0) {
-    throw new InputError('unsupported-input', 'no track');
+    throw new InputError('no track');
   }
   return out;
 }

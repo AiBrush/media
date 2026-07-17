@@ -7,6 +7,7 @@
 
 // Engine + bare-function sugar
 export {
+  canConvert,
   convert,
   createMedia,
   decode,
@@ -19,6 +20,7 @@ export {
   preload,
   probe,
   remux,
+  resetDefaultMedia,
   run,
   seek,
   transcode,

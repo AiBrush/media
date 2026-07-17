@@ -138,8 +138,8 @@ export function resetAacCoreForTest(): void {
 
 /** The {@link CapabilityError} a coder throws when the vendored AAC wasm core is unavailable. */
 function coreMissing(): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-aac core is not available', {
-    op: 'decode',
+  return new CapabilityError('wasm-aac core is not available', {
+    op: { kind: 'route', id: 'decode' },
     tried: ['wasm-aac'],
     suggestion: 'build + vendor the AAC wasm core per src/codecs/wasm-aac/BUILD.md',
   });
@@ -328,8 +328,8 @@ function createEncoder(
   _config: EncoderConfig,
   _o?: StageOptions,
 ): TransformStream<RawFrame, EncodedChunk> {
-  throw new CapabilityError('capability-miss', 'wasm-aac does not support AAC encode', {
-    op: 'encode',
+  throw new CapabilityError('wasm-aac does not support AAC encode', {
+    op: { kind: 'route', id: 'encode' },
     tried: ['wasm-aac'],
     suggestion: 'encode to Opus instead (no pure-Rust AAC encoder exists)',
   });

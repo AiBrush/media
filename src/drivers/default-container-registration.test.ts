@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { Registry } from '../kernel/registry.ts';
-import { registerDefaultContainerForQuery } from './default-container-registration.ts';
+import { Router } from '../kernel/router.ts';
+import {
+  SELECTIVE_CONTAINERS,
+  registerDefaultContainerForQuery,
+} from './default-container-registration.ts';
 
 describe('query-selective default container registration', () => {
   it.each([
@@ -111,12 +115,41 @@ describe('query-selective default container registration', () => {
     expect(unknown.containers()).toHaveLength(0);
   });
 
+  it('every selective spec id equals the id its load() actually registers (pin truth)', async () => {
+    for (const spec of SELECTIVE_CONTAINERS) {
+      const registry = new Registry();
+      (await spec.load()).register(registry);
+      expect(registry.containers().map((driver) => driver.id)).toContain(spec.id);
+    }
+  });
+
+  it('resolves a pin on the real mux driver id through selective registration', async () => {
+    const registry = new Registry();
+    const query = { direction: 'mux', extension: 'mp4' } as const;
+    await expect(registerDefaultContainerForQuery(registry, query, 'mp4-mux')).resolves.toBe(true);
+    expect(registry.containers().map((driver) => driver.id)).toEqual(['mp4-mux']);
+    const picked = new Router({ registry }).pickContainer(query, { pinDriver: 'mp4-mux' });
+    expect(picked.id).toBe('mp4-mux');
+  });
+
   it('keeps selective output-container pins scoped to their query direction', async () => {
     const mux = new Registry();
     await expect(
-      registerDefaultContainerForQuery(mux, { direction: 'mux', extension: 'webm' }, 'webm'),
+      registerDefaultContainerForQuery(mux, { direction: 'mux', extension: 'webm' }, 'webm-mux'),
     ).resolves.toBe(true);
     expect(mux.containers().map((driver) => driver.id)).toEqual(['webm-mux']);
+
+    // A pin naming the full driver on a mux query declines the mux-only module (their ids differ
+    // now); the caller falls back to the complete defaults, where the full driver satisfies the pin.
+    const fullPinOnMux = new Registry();
+    await expect(
+      registerDefaultContainerForQuery(
+        fullPinOnMux,
+        { direction: 'mux', extension: 'webm' },
+        'webm',
+      ),
+    ).resolves.toBe(false);
+    expect(fullPinOnMux.containers()).toHaveLength(0);
 
     const demux = new Registry();
     await expect(

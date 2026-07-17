@@ -83,7 +83,7 @@ describe('media.decrypt — EME/ClearKey (no provided key) is an immediate NA', 
         () => undefined,
         (e: unknown) => e,
       )) as CapabilityError;
-    expect(err.detail).toMatchObject({ op: 'decrypt' });
+    expect(err.detail).toMatchObject({ op: { kind: 'route', id: 'decrypt' } });
   });
 
   it('a PROVIDED key does NOT short-circuit (the guard is empty-keys-only)', async () => {
@@ -114,7 +114,10 @@ describe('media.decrypt — unsupported encrypted-media schemes are typed misses
       expect(err).toBeInstanceOf(CapabilityError);
       expect((err as CapabilityError).code).toBe('capability-miss');
       expect((err as CapabilityError).message).toBe('bad decrypt');
-      expect((err as CapabilityError).detail).toMatchObject({ op: 'decrypt', tried: [] });
+      expect((err as CapabilityError).detail).toMatchObject({
+        op: { kind: 'route', id: 'decrypt' },
+        tried: [],
+      });
     });
   }
 });

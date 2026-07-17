@@ -10,6 +10,7 @@
  * `DRIVER_API_VERSION` event (§5).
  */
 
+import type { ImageOps } from '../codecs/image/image-driver.ts';
 import type { BiquadSpec } from '../dsp/biquad.ts';
 import type { DynamicsSpec, LimitMode } from '../dsp/dynamics.ts';
 import type { FadeShape } from '../dsp/fade.ts';
@@ -139,6 +140,14 @@ export interface DriverBase {
   readonly id: string;
   /** The {@link DRIVER_API_VERSION} this driver was built against (checked at registration). */
   readonly apiVersion: number;
+  /**
+   * Optional-capability handshake: the additive optional contract members this driver implements
+   * (e.g. `'streamCopy'`, `'probe'`, `'validatesPcmTrim'`). Registration refuses a driver that
+   * advertises a member its surface does not actually expose (typed `driver-incompatible`), so
+   * consumers can trust the advertisement instead of duck-typing methods at call time. Omitted ⇒
+   * consumers fall back to method-presence checks.
+   */
+  readonly capabilities?: readonly string[];
 }
 
 // ============ 1) CodecDriver ============
@@ -541,11 +550,45 @@ export interface FilterDriver extends DriverBase {
 
 // ============ registration ============
 
+/**
+ * The additive optional {@link ContainerDriver} members, in contract order — the capability surface a
+ * container may advertise beyond mandatory `supports`/`demux`/`createMuxer`. This is the single list the
+ * registry compares on an id collision (a strictly wider surface supersedes) and conformance checks
+ * assert lazy proxies against, so the advertised and real surfaces cannot drift apart silently.
+ */
+export const OPTIONAL_CONTAINER_CAPABILITIES = [
+  'probe',
+  'packetInfo',
+  'streamCopy',
+  'validatesStreamCopyTrim',
+  'transformPcm',
+  'validatesPcmTrim',
+  'decrypt',
+  'decodePcm',
+  'decodePcmAudio',
+  'decodePcmAudioStream',
+  'decodePcmInterleavedStream',
+] as const satisfies readonly (keyof ContainerDriver)[];
+
 /** Drivers register themselves here, by kind. */
 export interface Registry {
   addCodec(d: CodecDriver): void;
   addContainer(d: ContainerDriver): void;
   addFilter(d: FilterDriver): void;
+  /**
+   * Attach the still/animated-image capability surface (idempotent: the first ops win). Image support
+   * is an {@link ImageOps} object rather than a packet-seam driver, so hosts without an image slot may
+   * omit this method; registration modules call it optionally.
+   */
+  addImageOps?(ops: ImageOps): void;
+}
+
+/** The read side the router consumes (snapshots in insertion order). */
+export interface RegistryView {
+  codecs(): readonly CodecDriver[];
+  containers(): readonly ContainerDriver[];
+  filters(): readonly FilterDriver[];
+  imageOps(): ImageOps | undefined;
 }
 
 /** A lazily-imported driver chunk default-exports a {@link DriverModule}. */

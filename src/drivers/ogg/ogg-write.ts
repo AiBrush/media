@@ -260,9 +260,8 @@ function opusTags(): Uint8Array {
 function splitVorbisHeaders(description: Uint8Array): [Uint8Array, Uint8Array, Uint8Array] {
   const fail = (): never => {
     throw new CapabilityError(
-      'capability-miss',
       'the ogg muxer needs the 3 Vorbis setup headers (Xiph-laced) in the track description',
-      { op: { op: 'mux', codec: 'vorbis' }, tried: ['ogg'] },
+      { op: { kind: 'route', id: 'mux', facts: { codec: 'vorbis' } }, tried: ['ogg'] },
     );
   };
   if (description.byteLength < 3 || description[0] !== 2) fail();
@@ -294,9 +293,8 @@ interface FlacMetadataBlock {
 
 function flacFail(): never {
   throw new CapabilityError(
-    'capability-miss',
     'the ogg muxer needs native FLAC metadata (fLaC + STREAMINFO) in the track description',
-    { op: { op: 'mux', codec: 'flac' }, tried: ['ogg'] },
+    { op: { kind: 'route', id: 'mux', facts: { codec: 'flac' } }, tried: ['ogg'] },
   );
 }
 
@@ -468,9 +466,8 @@ function headerPackets(track: TrackState): { idHeader: Uint8Array; setupHeaders:
   }
   if (track.description === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'the ogg muxer needs the Vorbis setup headers in the track description',
-      { op: { op: 'mux', codec: 'vorbis' }, tried: ['ogg'] },
+      { op: { kind: 'route', id: 'mux', facts: { codec: 'vorbis' } }, tried: ['ogg'] },
     );
   }
   const [id, comment, setup] = splitVorbisHeaders(track.description);

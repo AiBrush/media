@@ -75,7 +75,7 @@ export function uniformsForRecipe(recipe: DrawRecipe, srcW: number, srcH: number
   if (recipe.kind === 'blit') return uniformsForBlit(recipe.blit, srcW, srcH);
   if (recipe.kind === 'oriented') return uniformsForOriented(recipe.draw);
   /* v8 ignore next 2 -- unreachable: colour recipes use packColorUniforms, never the geometric pipeline. */
-  throw new InputError('unsupported-input', 'colour recipe has no geometric uniforms');
+  throw new InputError('colour recipe has no geometric uniforms');
 }
 
 /** Pack {@link UniformValues} into the {@link UNIFORM_BYTES} std140 layout, on its own `ArrayBuffer`. */
@@ -193,7 +193,7 @@ function invMat3(m: Mat3): Mat3 {
   const B = -(d * i - f * g);
   const C = d * h - e * g;
   const det = a * A + b * B + c * C;
-  if (det === 0) throw new InputError('unsupported-input', 'singular colour matrix');
+  if (det === 0) throw new InputError('singular colour matrix');
   const D = -(b * i - c * h);
   const E = a * i - c * g;
   const F = -(a * h - b * g);
@@ -518,5 +518,5 @@ export function packColorUniforms(plan: ColorPlan): Float32Array<ArrayBuffer> {
 
 /* v8 ignore next 3 -- unreachable exhaustiveness guard for the TransferId union. */
 function assertNeverTransfer(value: never): never {
-  throw new InputError('unsupported-input', `unhandled transfer characteristic: ${String(value)}`);
+  throw new InputError(`unhandled transfer characteristic: ${String(value)}`);
 }

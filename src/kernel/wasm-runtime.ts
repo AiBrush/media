@@ -70,14 +70,14 @@ export function resolveWasmRuntimeProfile(req: WasmRuntimeRequest = {}): WasmRun
   const isolated = req.crossOriginIsolated ?? currentCrossOriginIsolation();
   const enableThreads = req.enableThreads ?? isolated;
   if (!enableThreads) {
-    return baselineProfile('threads disabled by request');
+    return baselineWasmRuntimeProfile('threads disabled by request');
   }
   if (!isolated) {
-    return baselineProfile('crossOriginIsolated is false');
+    return baselineWasmRuntimeProfile('crossOriginIsolated is false');
   }
   const hasSharedArrayBuffer = req.sharedArrayBuffer ?? currentSharedArrayBuffer();
   if (!hasSharedArrayBuffer) {
-    return baselineProfile('SharedArrayBuffer is unavailable');
+    return baselineWasmRuntimeProfile('SharedArrayBuffer is unavailable');
   }
   return {
     kind: 'isolated-simd-threads',
@@ -87,7 +87,12 @@ export function resolveWasmRuntimeProfile(req: WasmRuntimeRequest = {}): WasmRun
   };
 }
 
-function baselineProfile(reason: string): WasmRuntimeProfile {
+/**
+ * The single-thread, no-SAB profile with an honest `reason` — the common, COOP/COEP-free path. Exported
+ * for the loader layer, which downgrades an isolated *environment* verdict to this profile while no
+ * threaded core asset is vendored (`resolveWasmCoreProfile`, wasm-loader-runtime).
+ */
+export function baselineWasmRuntimeProfile(reason: string): WasmRuntimeProfile {
   return {
     kind: 'baseline',
     simd: false,
@@ -126,5 +131,5 @@ function parseRuntimeUrl(value: unknown): URL | undefined {
 }
 
 function invalidAssetBase(message: string): InputError {
-  return new InputError('unsupported-input', message, { field: 'assetBaseUrl' });
+  return new InputError(message, { field: 'assetBaseUrl' });
 }

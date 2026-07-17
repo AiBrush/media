@@ -104,14 +104,14 @@ export type InnerEngineFactory = (
  */
 export function decodeOffloadPayload(payload: unknown): OffloadJobPayload {
   if (typeof payload !== 'object' || payload === null) {
-    throw new InputError('unsupported-input', 'worker job payload is not an object');
+    throw new InputError('worker job payload is not an object');
   }
   const p = payload as { kind?: unknown; input?: unknown; opts?: unknown };
   if (!(p.input instanceof ArrayBuffer)) {
-    throw new InputError('unsupported-input', 'worker job payload.input must be an ArrayBuffer');
+    throw new InputError('worker job payload.input must be an ArrayBuffer');
   }
   if (p.kind !== 'convert' && p.kind !== 'trim') {
-    throw new InputError('unsupported-input', `unknown worker job kind '${String(p.kind)}'`);
+    throw new InputError(`unknown worker job kind '${String(p.kind)}'`);
   }
   return payload as OffloadJobPayload;
 }

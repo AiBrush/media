@@ -47,10 +47,7 @@ export async function encodeWavFrames(
   const audioStream = frames.audio;
   const audioTarget = opts.audio;
   if (audioStream === undefined || audioTarget === undefined) {
-    const error = new InputError(
-      'unsupported-input',
-      'WAV encode needs an audio stream and target',
-    );
+    const error = new InputError('WAV encode needs an audio stream and target');
     await cancelFrameStreams(frames, error);
     throw error;
   }
@@ -73,11 +70,10 @@ export async function encodeWavFrames(
     throw error;
   }
   if (!isPcmWavMuxer(muxer)) {
-    const error = new CapabilityError(
-      'capability-miss',
-      'the selected WAV muxer has no raw PCM frame seam',
-      { op: 'encode', tried: ['wav'] },
-    );
+    const error = new CapabilityError('the selected WAV muxer has no raw PCM frame seam', {
+      op: { kind: 'route', id: 'encode' },
+      tried: ['wav'],
+    });
     await cancelFrameStreams(frames, error);
     throw error;
   }
@@ -133,7 +129,7 @@ export async function encodeWavFrames(
       if (frameFailure !== undefined) throw frameFailure;
     }
     if (trackId === undefined || totalFrames === 0) {
-      throw new InputError('unsupported-input', 'WAV encode received no PCM sample frames');
+      throw new InputError('WAV encode received no PCM sample frames');
     }
     throwIfAborted(signal);
     await muxer.finalize();
@@ -153,17 +149,17 @@ export async function encodeWavFrames(
 
 function validateInputShape(frames: MediaStreams, opts: EncodeOptions): MediaError | undefined {
   if (frames.video === undefined && frames.audio === undefined) {
-    return new InputError('unsupported-input', 'encode needs streams');
+    return new InputError('encode needs streams');
   }
   if (frames.video !== undefined && opts.video === undefined) {
-    return new InputError('unsupported-input', 'video target missing');
+    return new InputError('video target missing');
   }
   if (frames.audio !== undefined && opts.audio === undefined) {
-    return new InputError('unsupported-input', 'audio target missing');
+    return new InputError('audio target missing');
   }
   if (frames.video !== undefined) {
-    return new CapabilityError('capability-miss', 'WAV encode accepts audio frames only', {
-      op: 'encode',
+    return new CapabilityError('WAV encode accepts audio frames only', {
+      op: { kind: 'route', id: 'encode' },
       tried: ['wav'],
     });
   }
@@ -205,20 +201,19 @@ function pcmWireTarget(codec: AudioTarget['codec']): PcmWireTarget | MediaError 
     case 'mp3':
     case 'flac':
     case 'vorbis':
-      return new CapabilityError(
-        'capability-miss',
-        `WAV frame encode accepts raw PCM, not '${codec}'`,
-        { op: 'encode', tried: ['wav'] },
-      );
+      return new CapabilityError(`WAV frame encode accepts raw PCM, not '${codec}'`, {
+        op: { kind: 'route', id: 'encode' },
+        tried: ['wav'],
+      });
     default:
-      return new InputError('unsupported-input', `unsupported WAV PCM codec '${String(codec)}'`);
+      return new InputError(`unsupported WAV PCM codec '${String(codec)}'`);
   }
 }
 
 function validatePcmOptions(target: NonNullable<EncodeOptions['audio']>): MediaError | undefined {
   if (target.bitrate !== undefined) {
-    return new CapabilityError('capability-miss', 'PCM WAV has no bitrate control', {
-      op: 'encode',
+    return new CapabilityError('PCM WAV has no bitrate control', {
+      op: { kind: 'route', id: 'encode' },
       tried: ['wav'],
     });
   }
@@ -228,48 +223,41 @@ function validatePcmOptions(target: NonNullable<EncodeOptions['audio']>): MediaE
     target.dynamics !== undefined ||
     target.biquad !== undefined
   ) {
-    return new CapabilityError(
-      'capability-miss',
-      'WAV frame encode expects already-filtered AudioData frames',
-      { op: 'encode', tried: ['wav'] },
-    );
+    return new CapabilityError('WAV frame encode expects already-filtered AudioData frames', {
+      op: { kind: 'route', id: 'encode' },
+      tried: ['wav'],
+    });
   }
   if (target.sampleRate !== undefined && !isValidSampleRate(target.sampleRate)) {
-    return new InputError('unsupported-input', `invalid WAV sample rate ${target.sampleRate}`);
+    return new InputError(`invalid WAV sample rate ${target.sampleRate}`);
   }
   if (target.channels !== undefined && !isValidChannelCount(target.channels)) {
-    return new InputError('unsupported-input', `invalid WAV channel count ${target.channels}`);
+    return new InputError(`invalid WAV channel count ${target.channels}`);
   }
   return undefined;
 }
 
 function validateFrame(frame: AudioData): void {
   if (!Number.isSafeInteger(frame.numberOfFrames) || frame.numberOfFrames < 0) {
-    throw new InputError(
-      'unsupported-input',
-      'AudioData frame count must be a non-negative integer',
-    );
+    throw new InputError('AudioData frame count must be a non-negative integer');
   }
   if (!isValidSampleRate(frame.sampleRate)) {
-    throw new InputError('unsupported-input', `invalid AudioData sample rate ${frame.sampleRate}`);
+    throw new InputError(`invalid AudioData sample rate ${frame.sampleRate}`);
   }
   if (!isValidChannelCount(frame.numberOfChannels)) {
-    throw new InputError(
-      'unsupported-input',
-      `invalid AudioData channel count ${frame.numberOfChannels}`,
-    );
+    throw new InputError(`invalid AudioData channel count ${frame.numberOfChannels}`);
   }
   if (!Number.isFinite(frame.timestamp) || !Number.isSafeInteger(frame.timestamp)) {
-    throw new InputError('unsupported-input', 'AudioData timestamp must be a finite integer');
+    throw new InputError('AudioData timestamp must be a finite integer');
   }
 }
 
 function validateOutputGeometry(sampleRate: number, channels: number): void {
   if (!isValidSampleRate(sampleRate)) {
-    throw new InputError('unsupported-input', `invalid WAV sample rate ${sampleRate}`);
+    throw new InputError(`invalid WAV sample rate ${sampleRate}`);
   }
   if (!isValidChannelCount(channels)) {
-    throw new InputError('unsupported-input', `invalid WAV channel count ${channels}`);
+    throw new InputError(`invalid WAV channel count ${channels}`);
   }
 }
 
@@ -280,7 +268,6 @@ function assertFrameGeometry(
 ): void {
   if (frame.sampleRate !== sampleRate || frame.numberOfChannels !== channels) {
     throw new InputError(
-      'unsupported-input',
       `WAV encode frame layout ${frame.sampleRate} Hz/${frame.numberOfChannels} ch does not match ${String(sampleRate)} Hz/${String(channels)} ch`,
     );
   }
@@ -298,7 +285,6 @@ function assertContinuousTimestamp(
   const expected = baseTimestampUs + Math.round((totalFrames / sampleRate) * MICROS_PER_SECOND);
   if (Math.abs(timestampUs - expected) > TIMESTAMP_ROUNDING_TOLERANCE_US) {
     throw new InputError(
-      'unsupported-input',
       `WAV encode requires contiguous AudioData timestamps (expected ${expected}, received ${timestampUs})`,
     );
   }

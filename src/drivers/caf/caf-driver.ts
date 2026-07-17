@@ -73,9 +73,8 @@ export const CafDriver: ContainerDriver = {
       tracks: [track],
       packets(): ReadableStream<Packet> {
         throw new CapabilityError(
-          'capability-miss',
           'CAF PCM flows through the TS audio-dsp path (browser seam), not WebCodecs',
-          { op: 'demux', tried: ['caf'] },
+          { op: { kind: 'route', id: 'demux' }, tried: ['caf'] },
         );
       },
       close: () => Promise.resolve(),

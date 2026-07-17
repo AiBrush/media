@@ -1,6 +1,15 @@
-/** Bounded exact-source byte-interval reuse for repeated metadata probes (ADR-246). */
+/**
+ * Bounded exact-source byte-interval reuse for repeated metadata probes (ADR-246;
+ * docs/architecture/sources.md §3.2). The wrapper is a forwarding `Proxy` that overrides **only**
+ * `range` — every other own key, symbol, getter, and later-learned fact (redirected URL, memoized
+ * size, `rangesHonored`) stays live on the wrapped source and is observed through the wrapper
+ * without hand-listed fields. Cache state is owned by the probing engine itself (installed as a
+ * non-enumerable instance field), so this module holds **no** mutable state: two engines probing
+ * the same `Source` never share bytes, and disposing an engine drops its cache with it.
+ */
 
-import { SOURCE_URL_KEY, type Source } from './source.ts';
+import { throwIfSourceAborted } from './abort.ts';
+import type { Source } from './source.ts';
 
 interface ProbeRangeEntry {
   readonly start: number;
@@ -22,12 +31,12 @@ export interface ProbeRangeCacheOptions {
   readonly ttlMs: number;
 }
 
-const DEFAULT_OPTIONS: ProbeRangeCacheOptions = {
+/** The frozen default reuse policy (ADR-246): ≤ 1 MiB, ≤ 8 intervals, 60 s TTL. */
+export const DEFAULT_PROBE_RANGE_CACHE_OPTIONS: ProbeRangeCacheOptions = Object.freeze({
   maxBytes: 1024 * 1024,
   maxIntervals: 8,
   ttlMs: 60_000,
-};
-const cachesByOwner = new WeakMap<object, WeakMap<Source, ProbeRangeCacheState>>();
+});
 
 /** True only for a syntactically concrete encoded audio/video MIME hint. */
 export function hasConcreteAudioVideoMime(mimeHint: string | undefined): boolean {
@@ -138,24 +147,25 @@ function retainRange(
   state.expiresAtMs = Date.now() + options.ttlMs;
 }
 
-function preserveLiveSourceFacts(
-  wrapped: Source,
-  src: Source,
+/**
+ * Learn EOF only from a short **prefix** read (`start === 0`): a `Source.range` never short-reads
+ * before EOF (source.ts contract), so a short prefix pins the total, while a short *mid-file* read
+ * can only mean a violating transport and must never be trusted as EOF.
+ */
+function learnEndOfFile(
   state: ProbeRangeCacheState,
-): Source {
-  Object.defineProperties(wrapped, {
-    size: {
-      configurable: true,
-      enumerable: true,
-      get: () => src.size ?? state.size,
-    },
-    [SOURCE_URL_KEY]: {
-      configurable: true,
-      enumerable: true,
-      get: () => src[SOURCE_URL_KEY],
-    },
-  });
-  return wrapped;
+  src: Source,
+  start: number,
+  requestedEnd: number,
+  bytes: Uint8Array,
+): void {
+  const learned =
+    src.size ??
+    state.size ??
+    (start === 0 && bytes.byteLength < Math.max(0, Math.trunc(requestedEnd))
+      ? bytes.byteLength
+      : undefined);
+  if (learned !== undefined) state.size = learned;
 }
 
 /**
@@ -178,52 +188,64 @@ export function cacheRepeatedProbeRanges(
       : freshState(src, nowMs + options.ttlMs);
   if (state !== prior) cache.set(src, state);
 
-  const wrapped: Source = {
-    ...src,
-    range: (start, end) => {
-      const sourceSize = src.size ?? state.size;
-      const hit = cachedCopy(state, start, end, sourceSize);
-      if (hit !== undefined) return Promise.resolve(hit);
+  const cachedRange = async (
+    start: number,
+    end: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> => {
+    throwIfSourceAborted(signal); // deterministic: even a cache hit rejects once aborted
+    const sourceSize = src.size ?? state.size;
+    const hit = cachedCopy(state, start, end, sourceSize);
+    if (hit !== undefined) return hit;
 
-      const leading = cachedLeadingInterval(state, start, end, sourceSize);
-      if (leading !== undefined) {
-        const effectiveEnd = sourceSize === undefined ? end : Math.min(end, sourceSize);
-        return range.call(src, leading.end, effectiveEnd).then((suffix) => {
-          const bytes = joinLeadingInterval(leading, start, suffix);
-          const learnedSize =
-            src.size ??
-            state.size ??
-            (start === 0 && bytes.byteLength < Math.max(0, Math.trunc(end))
-              ? bytes.byteLength
-              : undefined);
-          if (learnedSize !== undefined) state.size = learnedSize;
-          retainRange(state, start, end, bytes, options);
-          return bytes;
-        });
-      }
+    const leading = cachedLeadingInterval(state, start, end, sourceSize);
+    if (leading !== undefined) {
+      const effectiveEnd = sourceSize === undefined ? end : Math.min(end, sourceSize);
+      const suffix = await range.call(src, leading.end, effectiveEnd, signal);
+      const bytes = joinLeadingInterval(leading, start, suffix);
+      learnEndOfFile(state, src, start, end, bytes);
+      retainRange(state, start, end, bytes, options);
+      return bytes;
+    }
 
-      return range.call(src, start, end).then((bytes) => {
-        const learnedSize =
-          src.size ??
-          state.size ??
-          (start === 0 && bytes.byteLength < Math.max(0, Math.trunc(end))
-            ? bytes.byteLength
-            : undefined);
-        if (learnedSize !== undefined) state.size = learnedSize;
-        retainRange(state, start, end, bytes, options);
-        return bytes;
-      });
-    },
+    const bytes = await range.call(src, start, end, signal);
+    learnEndOfFile(state, src, start, end, bytes);
+    retainRange(state, start, end, bytes, options);
+    return bytes;
   };
-  return preserveLiveSourceFacts(wrapped, src, state);
+
+  // A forwarding wrapper, not a clone: every own key/symbol/getter (and every fact learned onto the
+  // source *after* wrapping — redirected URL, size, rangesHonored) is read live off the original.
+  return new Proxy(src, {
+    get(target, property, receiver): unknown {
+      if (property === 'range') return cachedRange;
+      return Reflect.get(target, property, receiver);
+    },
+    getOwnPropertyDescriptor(target, property): PropertyDescriptor | undefined {
+      if (property === 'range') {
+        return { value: cachedRange, writable: true, enumerable: true, configurable: true };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+}
+
+/**
+ * The engine-owned cache field: installed once on the owner itself (non-enumerable, symbol-keyed)
+ * so cache lifetime is exactly the engine's lifetime and no module-level registry exists.
+ */
+const OWNER_PROBE_CACHES: unique symbol = Symbol('probe-range-caches');
+
+interface ProbeCacheOwner {
+  readonly [OWNER_PROBE_CACHES]?: WeakMap<Source, ProbeRangeCacheState>;
 }
 
 /** Reuse ranges within one engine without retaining either the engine or its immutable source snapshots. */
 export function cacheRepeatedProbeRangesFor(owner: object, src: Source): Source {
-  let cache = cachesByOwner.get(owner);
+  let cache = (owner as ProbeCacheOwner)[OWNER_PROBE_CACHES];
   if (cache === undefined) {
     cache = new WeakMap();
-    cachesByOwner.set(owner, cache);
+    Object.defineProperty(owner, OWNER_PROBE_CACHES, { value: cache });
   }
-  return cacheRepeatedProbeRanges(src, cache, DEFAULT_OPTIONS);
+  return cacheRepeatedProbeRanges(src, cache, DEFAULT_PROBE_RANGE_CACHE_OPTIONS);
 }

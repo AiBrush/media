@@ -17,9 +17,21 @@ import {
   type HostMessage,
   type MessageLike,
   type OffloadJob,
+  type WorkerMediaCaps,
   type WorkerMessage,
   serializeError,
 } from './worker-protocol.ts';
+
+/**
+ * Injectable overrides for the caps the worker announces in its `ready` handshake. Production leaves both
+ * unset (the scope is probed); Node tests and embedders pin them. `caps` is the per-kind form; the boolean
+ * `webcodecs` knob (uniform caps for both kinds) is kept live for existing embedder wiring and maps to
+ * `{ video: webcodecs, audio: webcodecs }`. When both are set, `caps` wins (it is strictly more precise).
+ */
+export interface WorkerCapsOverrides {
+  caps?: WorkerMediaCaps;
+  webcodecs?: boolean;
+}
 
 /** A progress sink the worker pipeline calls; forwarded to the host as a `progress` message. */
 export type ProgressSink = (p: { done: number; total?: number; stage: string }) => void;
@@ -47,7 +59,7 @@ export type JobRunner = (
  * in-flight + not-yet-sent frames are drained closed. Exactly one close per frame, here or on the host.
  */
 export function runOffloadWorker(
-  scope: MessageLike<HostMessage, WorkerMessage> & { webcodecs?: boolean },
+  scope: MessageLike<HostMessage, WorkerMessage> & WorkerCapsOverrides,
   runJob: JobRunner,
 ): () => void {
   let active: AbortController | undefined;
@@ -146,15 +158,29 @@ export function runOffloadWorker(
   };
 
   scope.addEventListener('message', onMessage);
-  // Announce readiness + whether the worker substrate (WebCodecs) is actually present — the honest gate
-  // (the host downgrades to InlineBridge when this is false).
-  scope.postMessage({ t: 'ready', webcodecs: scope.webcodecs ?? hasWebCodecs() });
+  // Announce readiness + the per-media-kind substrate this scope actually has — the honest, per-op gate
+  // (the host downgrades a job to the inline path when the worker lacks the kinds that job needs).
+  scope.postMessage({ t: 'ready', caps: announcedCaps(scope) });
   return () => scope.removeEventListener('message', onMessage);
 }
 
-/** True when WebCodecs is available in this worker scope (the real off-main-thread substrate, doc 06 §4). */
-function hasWebCodecs(): boolean {
-  return typeof VideoDecoder !== 'undefined' && typeof VideoEncoder !== 'undefined';
+/** Resolve the caps to announce: explicit per-kind override → uniform legacy knob → probe the scope. */
+function announcedCaps(scope: WorkerCapsOverrides): WorkerMediaCaps {
+  if (scope.caps !== undefined) return scope.caps;
+  if (scope.webcodecs !== undefined) return { video: scope.webcodecs, audio: scope.webcodecs };
+  return probeMediaCodecCaps();
+}
+
+/**
+ * Probe the worker scope's per-kind codec substrate (doc 06 §4). A kind is capable only when both its
+ * decoder and encoder constructors exist — a convert needs the full decode→encode graph for that kind.
+ * The probe necessarily touches the scope's globals; the *wire* stays backend-neutral (`caps`).
+ */
+function probeMediaCodecCaps(): WorkerMediaCaps {
+  return {
+    video: typeof VideoDecoder !== 'undefined' && typeof VideoEncoder !== 'undefined',
+    audio: typeof AudioDecoder !== 'undefined' && typeof AudioEncoder !== 'undefined',
+  };
 }
 
 function abortError(): DOMException {

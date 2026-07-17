@@ -191,24 +191,23 @@ export function muxPreparedWebmAudioPacketTrack(
   input: PreparedWebmAudioPacketMuxInput,
 ): Uint8Array {
   if (input.container !== 'webm' && input.container !== 'mkv') {
-    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
-      op: { op: 'mux', container: input.container },
+    throw new CapabilityError(`WebM mux cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
       tried: ['webm', 'mkv'],
     });
   }
   if (input.track.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'WebM mux requires one audio track', {
-      op: { op: 'mux', container: input.container },
+    throw new CapabilityError('WebM mux requires one audio track', {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
       tried: ['webm', 'mkv'],
     });
   }
   const codecId = webmAudioCodecId(input.track.codec, input.container);
   if (codecId === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       `WebM mux cannot carry '${input.track.codec}' in '${input.container}'`,
       {
-        op: { op: 'mux', container: input.container },
+        op: { kind: 'route', id: 'mux', facts: { container: input.container } },
         tried: ['webm', 'mkv'],
       },
     );
@@ -224,8 +223,8 @@ export function muxPreparedWebmAudioPacketTrack(
 /** Fast WebM/Matroska packet mux for callers that already hold prepared packet bytes. */
 export function muxPreparedWebmPacketTracks(input: PreparedWebmPacketMuxInput): Uint8Array {
   if (input.container !== 'webm' && input.container !== 'mkv') {
-    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
-      op: { op: 'mux', container: input.container },
+    throw new CapabilityError(`WebM mux cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
       tried: ['webm', 'mkv'],
     });
   }
@@ -254,8 +253,8 @@ export function muxPreparedWebmPacketTracks(input: PreparedWebmPacketMuxInput): 
 /** Fast WebM/Matroska mux for callers that already hold timestamped packet byte views. */
 export function muxPreparedWebmChunkTracks(input: PreparedWebmChunkMuxInput): Uint8Array {
   if (input.container !== 'webm' && input.container !== 'mkv') {
-    throw new CapabilityError('capability-miss', `WebM mux cannot write '${input.container}'`, {
-      op: { op: 'mux', container: input.container },
+    throw new CapabilityError(`WebM mux cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
       tried: ['webm', 'mkv'],
     });
   }

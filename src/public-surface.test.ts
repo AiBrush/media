@@ -7,8 +7,10 @@ describe('public surface', () => {
   it('default entry re-exports the typed error classes and version', () => {
     expect(index.VERSION).toBe('0.0.0');
     expect(new index.MediaError('aborted', 'x')).toBeInstanceOf(index.MediaError);
-    expect(new index.CapabilityError('capability-miss', 'x')).toBeInstanceOf(index.MediaError);
-    expect(new index.InputError('unsupported-input', 'x')).toBeInstanceOf(index.MediaError);
+    expect(
+      new index.CapabilityError('x', { op: { kind: 'route', id: 'probe' }, tried: [] }),
+    ).toBeInstanceOf(index.MediaError);
+    expect(new index.InputError('x')).toBeInstanceOf(index.MediaError);
   });
 
   it('core entry exposes the driver-author surface', () => {

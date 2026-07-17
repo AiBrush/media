@@ -135,7 +135,7 @@ export function parseVp8FrameInfo(packet: Uint8Array): Vp8FrameInfo {
   const b1 = packet[1];
   const b2 = packet[2];
   if (b0 === undefined || b1 === undefined || b2 === undefined) {
-    throw new InputError('unsupported-input', 'vpx: VP8 frame shorter than its 3-byte tag');
+    throw new InputError('vpx: VP8 frame shorter than its 3-byte tag');
   }
   const tag = b0 | (b1 << 8) | (b2 << 16);
   const keyFrame = (tag & 0x1) === 0; // inverted: 0 ⇒ key frame
@@ -148,7 +148,7 @@ export function parseVp8FrameInfo(packet: Uint8Array): Vp8FrameInfo {
   if (!keyFrame) return info; // inter frames inherit the keyframe's dimensions
   for (let i = 0; i < VP8_KEYFRAME_START_CODE.length; i++) {
     if (packet[3 + i] !== VP8_KEYFRAME_START_CODE[i]) {
-      throw new InputError('unsupported-input', 'vpx: VP8 keyframe missing the 9d012a start code');
+      throw new InputError('vpx: VP8 keyframe missing the 9d012a start code');
     }
   }
   const wLo = packet[6];
@@ -156,7 +156,7 @@ export function parseVp8FrameInfo(packet: Uint8Array): Vp8FrameInfo {
   const hLo = packet[8];
   const hHi = packet[9];
   if (wLo === undefined || wHi === undefined || hLo === undefined || hHi === undefined) {
-    throw new InputError('unsupported-input', 'vpx: VP8 keyframe truncated before dimensions');
+    throw new InputError('vpx: VP8 keyframe truncated before dimensions');
   }
   info.width = (wLo | (wHi << 8)) & 0x3fff; // low 14 bits; top 2 are the horizontal scale
   info.height = (hLo | (hHi << 8)) & 0x3fff; // low 14 bits; top 2 are the vertical scale
@@ -179,7 +179,7 @@ class BitReader {
     const byteIndex = this.#bitPos >> 3;
     const byte = this.#bytes[byteIndex];
     if (byte === undefined) {
-      throw new InputError('unsupported-input', 'vpx: VP9 header truncated (out of bits)');
+      throw new InputError('vpx: VP9 header truncated (out of bits)');
     }
     const bit = (byte >> (7 - (this.#bitPos & 0x7))) & 0x1;
     this.#bitPos++;
@@ -219,7 +219,7 @@ const VP9_FRAME_MARKER = 0b10; // §6.2: the header opens with this 2-bit marker
 export function parseVp9FrameInfo(packet: Uint8Array): Vp9FrameInfo {
   const r = new BitReader(packet);
   if (r.readBits(2) !== VP9_FRAME_MARKER) {
-    throw new InputError('unsupported-input', 'vpx: VP9 frame_marker is not 0b10');
+    throw new InputError('vpx: VP9 frame_marker is not 0b10');
   }
   const profileLow = r.readBit();
   const profileHigh = r.readBit();
@@ -265,7 +265,7 @@ export function parseSuperframeIndex(packet: Uint8Array): Superframe {
   const framesInSuperframe = (last & 0x7) + 1;
   const indexSize = 2 + framesInSuperframe * bytesPerFrameSize;
   if (indexSize > n) {
-    throw new InputError('unsupported-input', 'vpx: VP9 superframe index larger than the packet');
+    throw new InputError('vpx: VP9 superframe index larger than the packet');
   }
   const indexStart = n - indexSize;
   if (packet[indexStart] !== last) {
@@ -281,12 +281,12 @@ export function parseSuperframeIndex(packet: Uint8Array): Superframe {
     for (let i = 0; i < bytesPerFrameSize; i++) {
       const byte = packet[cursor++];
       if (byte === undefined) {
-        throw new InputError('unsupported-input', 'vpx: VP9 superframe index truncated');
+        throw new InputError('vpx: VP9 superframe index truncated');
       }
       size |= byte << (8 * i); // little-endian frame size
     }
     if (offset + size > indexStart) {
-      throw new InputError('unsupported-input', 'vpx: VP9 superframe sizes overrun the packet');
+      throw new InputError('vpx: VP9 superframe sizes overrun the packet');
     }
     frames.push([offset, size]);
     offset += size;
@@ -319,7 +319,7 @@ function readU16LE(bytes: Uint8Array, off: number): number {
   const a = bytes[off];
   const b = bytes[off + 1];
   if (a === undefined || b === undefined) {
-    throw new InputError('unsupported-input', `vpx: IVF truncated reading u16 at ${off}`);
+    throw new InputError(`vpx: IVF truncated reading u16 at ${off}`);
   }
   return a | (b << 8);
 }
@@ -331,7 +331,7 @@ function readU32LE(bytes: Uint8Array, off: number): number {
   const c = bytes[off + 2];
   const d = bytes[off + 3];
   if (a === undefined || b === undefined || c === undefined || d === undefined) {
-    throw new InputError('unsupported-input', `vpx: IVF truncated reading u32 at ${off}`);
+    throw new InputError(`vpx: IVF truncated reading u32 at ${off}`);
   }
   return (a | (b << 8) | (c << 16) | (d << 24)) >>> 0;
 }
@@ -358,16 +358,16 @@ function ivfFourCcToCodec(bytes: Uint8Array): VpxCodec | undefined {
  */
 export function parseIvfHeader(bytes: Uint8Array): IvfHeader {
   if (bytes.length < IVF_FILE_HEADER_MIN) {
-    throw new InputError('unsupported-input', 'vpx: IVF header shorter than 32 bytes');
+    throw new InputError('vpx: IVF header shorter than 32 bytes');
   }
   for (let i = 0; i < IVF_MAGIC.length; i++) {
     if (bytes[i] !== IVF_MAGIC[i]) {
-      throw new InputError('unsupported-input', 'vpx: not an IVF stream (missing DKIF magic)');
+      throw new InputError('vpx: not an IVF stream (missing DKIF magic)');
     }
   }
   const codec = ivfFourCcToCodec(bytes);
   if (codec === undefined) {
-    throw new InputError('unsupported-input', 'vpx: IVF FourCC is not VP80/VP90');
+    throw new InputError('vpx: IVF FourCC is not VP80/VP90');
   }
   return {
     codec,
@@ -405,7 +405,7 @@ export function* iterateIvfFrames(bytes: Uint8Array): Generator<IvfFrame, void, 
     const start = pos + IVF_FRAME_HEADER_SIZE;
     const end = start + size;
     if (end > bytes.length) {
-      throw new InputError('unsupported-input', 'vpx: IVF frame runs past end of stream');
+      throw new InputError('vpx: IVF frame runs past end of stream');
     }
     yield { timestamp, data: bytes.subarray(start, end) };
     pos = end;

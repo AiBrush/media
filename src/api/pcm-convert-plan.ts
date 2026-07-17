@@ -380,21 +380,17 @@ export async function pcm(
 ): Promise<Output | Uint8Array> {
   const target = opts.to;
   if (!isPcmContainer(target)) {
-    throw new CapabilityError('capability-miss', 'target is not a raw PCM container', {
-      op: 'convert',
+    throw new CapabilityError('target is not a raw PCM container', {
+      op: { kind: 'route', id: 'convert' },
       tried: [target],
     });
   }
   const audio = opts.audio;
   if (audio === false || !isPcmCodec(audio?.codec)) {
-    throw new CapabilityError(
-      'capability-miss',
-      'PCM container transform requires a PCM audio target',
-      {
-        op: 'convert',
-        tried: [target],
-      },
-    );
+    throw new CapabilityError('PCM container transform requires a PCM audio target', {
+      op: { kind: 'route', id: 'convert' },
+      tried: [target],
+    });
   }
   const activeSignal = signal ?? new AbortController().signal;
   if (src instanceof Uint8Array) {
@@ -426,8 +422,8 @@ export async function pcm(
         return outputBytes(opts.sink, copied, deps.mimeOpts(activeSignal, target));
       }
     }
-    throw new CapabilityError('capability-miss', 'PCM byte rewrite path not registered', {
-      op: 'convert',
+    throw new CapabilityError('PCM byte rewrite path not registered', {
+      op: { kind: 'route', id: 'convert' },
       tried: [sourceContainer, target],
     });
   }
@@ -439,8 +435,8 @@ export async function pcm(
       ? await container.decodePcm(src, pcmOpts)
       : undefined;
   if (stream === undefined) {
-    throw new CapabilityError('capability-miss', 'container PCM transform path not registered', {
-      op: 'convert',
+    throw new CapabilityError('container PCM transform path not registered', {
+      op: { kind: 'route', id: 'convert' },
       tried: [container.id, target],
     });
   }
@@ -454,34 +450,22 @@ export function wavPcmPacketCopy(
   const format = deps.pcmSampleFormat(input.codec);
   const endian = deps.pcmEndian(input.codec) ?? 'le';
   if (format === undefined || endian !== 'le') {
-    throw new CapabilityError(
-      'capability-miss',
-      'WAV packet copy requires little-endian PCM packets',
-      {
-        op: 'mux',
-        tried: [input.codec],
-      },
-    );
+    throw new CapabilityError('WAV packet copy requires little-endian PCM packets', {
+      op: { kind: 'route', id: 'mux' },
+      tried: [input.codec],
+    });
   }
   if (!Number.isSafeInteger(input.sampleRate) || input.sampleRate <= 0) {
-    throw new CapabilityError(
-      'capability-miss',
-      'WAV packet copy requires a positive sample rate',
-      {
-        op: 'mux',
-        tried: [input.codec],
-      },
-    );
+    throw new CapabilityError('WAV packet copy requires a positive sample rate', {
+      op: { kind: 'route', id: 'mux' },
+      tried: [input.codec],
+    });
   }
   if (!Number.isSafeInteger(input.channels) || input.channels <= 0) {
-    throw new CapabilityError(
-      'capability-miss',
-      'WAV packet copy requires a positive channel count',
-      {
-        op: 'mux',
-        tried: [input.codec],
-      },
-    );
+    throw new CapabilityError('WAV packet copy requires a positive channel count', {
+      op: { kind: 'route', id: 'mux' },
+      tried: [input.codec],
+    });
   }
   const sourceBytes = input.sourceBytes;
   if (sourceBytes !== undefined && input.payload.buffer === sourceBytes.buffer) {

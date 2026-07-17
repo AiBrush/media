@@ -1189,7 +1189,7 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     expect(error.code).toBe('capability-miss');
     expect(error.message).toContain('hvcC description');
     expect(error.detail).toEqual({
-      op: { op: 'mux', mediaType: 'video', codec: 'hvc1' },
+      op: { kind: 'route', id: 'mux', facts: { mediaType: 'video', codec: 'hvc1' } },
       tried: ['mp4'],
     });
   });

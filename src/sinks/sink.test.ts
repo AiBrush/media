@@ -1,6 +1,8 @@
+import { readFile, readdir } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { InputError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { loadFixture } from '../test-support/corpus.ts';
+import { toOpfsTarget } from './opfs-target.ts';
 import { type Sink, materialize, toBlob, toElement, toFile, toOPFS, toStream } from './sink.ts';
 import { toStreamTarget } from './stream-target.ts';
 
@@ -142,14 +144,17 @@ describe('materialize — stubbed environment sinks', () => {
     expect(written).toEqual([4, 5, 6]);
   });
 
-  it('rejects an OPFS sink when OPFS is unavailable', async () => {
+  it('rejects an OPFS sink with a typed capability miss when OPFS is unavailable (doc 09 §5 item 6)', async () => {
+    // OPFS-absent is a capability miss, not bad input — the basic path must agree with opfs-target.
     vi.stubGlobal('navigator', {});
-    await expect(materialize(toOPFS('/x'), bytesStream([1]))).rejects.toBeInstanceOf(InputError);
+    const err = await materialize(toOPFS('/x'), bytesStream([1])).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CapabilityError);
+    expect((err as CapabilityError).code).toBe('capability-miss');
   });
 
   it('rejects an OPFS path with no file name after normalization', async () => {
     vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve({}) } });
-    await expect(materialize(toOPFS('///'), bytesStream([1]))).rejects.toThrow(/invalid OPFS path/);
+    await expect(materialize(toOPFS('///'), bytesStream([1]))).rejects.toBeInstanceOf(InputError);
   });
 
   it('attaches a Blob URL to an event-capable media element (via:blob)', async () => {
@@ -221,5 +226,124 @@ describe('materialize — bit-exact output on a real corpus file', () => {
       off += c.byteLength;
     }
     expectBytesEqual(merged, truth);
+  });
+});
+
+/**
+ * `OpfsTarget` is wired into the public sink path (doc 09 §5 item 1): the union member routes through
+ * `materialize` to `writeToOpfsTarget`, and the richer options (`keepExistingData`, `position`) reach
+ * the FileSystemWritableFileStream seam — asserted against a recording mock, never a stub that can't fail.
+ */
+describe('materialize — opfs-target (the rich OPFS streaming sink)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  interface RecordingFs {
+    root: {
+      getDirectoryHandle: (name: string, opts?: { create?: boolean }) => Promise<unknown>;
+      getFileHandle: (name: string, opts?: { create?: boolean }) => Promise<unknown>;
+    };
+    dirs: string[];
+    files: string[];
+    createWritableOptions: unknown[];
+    seeks: number[];
+    written: Uint8Array[];
+    closed: () => boolean;
+  }
+
+  function recordingFs(): RecordingFs {
+    const dirs: string[] = [];
+    const files: string[] = [];
+    const createWritableOptions: unknown[] = [];
+    const seeks: number[] = [];
+    const written: Uint8Array[] = [];
+    let closed = false;
+    const writable = Object.assign(
+      new WritableStream<Uint8Array>({
+        write(chunk): void {
+          written.push(chunk.slice());
+        },
+        close(): void {
+          closed = true;
+        },
+      }),
+      {
+        seek(position: number): Promise<void> {
+          seeks.push(position);
+          return Promise.resolve();
+        },
+      },
+    );
+    const handle = {
+      createWritable(opts?: unknown): Promise<unknown> {
+        createWritableOptions.push(opts);
+        return Promise.resolve(writable);
+      },
+    };
+    const root = {
+      getDirectoryHandle(name: string): Promise<unknown> {
+        dirs.push(name);
+        return Promise.resolve(root);
+      },
+      getFileHandle(name: string): Promise<unknown> {
+        files.push(name);
+        return Promise.resolve(handle);
+      },
+    };
+    return { root, dirs, files, createWritableOptions, seeks, written, closed: () => closed };
+  }
+
+  it('routes toOpfsTarget through materialize: createWritable({keepExistingData:true}) and seek(N) run', async () => {
+    const fs = recordingFs();
+    vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve(fs.root) } });
+
+    const out = await materialize(
+      toOpfsTarget('/a/b/out.mp4', { keepExistingData: true, position: 32 }),
+      bytesStream([1, 2, 3], [4]),
+    );
+
+    expect(out).toBeUndefined();
+    expect(fs.dirs).toEqual(['a', 'b']);
+    expect(fs.files).toEqual(['out.mp4']);
+    expect(fs.createWritableOptions).toEqual([{ keepExistingData: true }]);
+    expect(fs.seeks).toEqual([32]); // the patch-write seam actually ran via the public path
+    expect(fs.written.map((c) => [...c])).toEqual([[1, 2, 3], [4]]);
+    expect(fs.closed()).toBe(true); // the write was committed, not left dangling
+  });
+
+  it('defaults to a truncating write at position 0 (no seek)', async () => {
+    const fs = recordingFs();
+    vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve(fs.root) } });
+
+    await materialize(toOpfsTarget('/out.bin'), bytesStream([7, 8]));
+    expect(fs.createWritableOptions).toEqual([{ keepExistingData: false }]);
+    expect(fs.seeks).toEqual([]);
+    expect(fs.written.map((c) => [...c])).toEqual([[7, 8]]);
+  });
+
+  it('agrees with the basic opfs path: OPFS-absent is a CapabilityError capability-miss (item 6)', async () => {
+    vi.stubGlobal('navigator', {});
+    const viaTarget = await materialize(toOpfsTarget('/x.bin'), bytesStream([1])).catch(
+      (e: unknown) => e,
+    );
+    const viaBasic = await materialize(toOPFS('/x.bin'), bytesStream([1])).catch((e: unknown) => e);
+    for (const err of [viaTarget, viaBasic]) {
+      expect(err).toBeInstanceOf(CapabilityError);
+      expect((err as CapabilityError).code).toBe('capability-miss');
+    }
+  });
+
+  it('opfs-target.ts has a non-test importer (the sink is not orphaned)', async () => {
+    // Coverage-shaped wiring check (doc 09 §4 "OpfsTarget is ORPHANED"): fails if no non-test module
+    // under src/sinks imports the opfs-target module, i.e. if the good implementation is unreachable.
+    const dir = new URL('.', import.meta.url).pathname;
+    const entries = (await readdir(dir)).filter(
+      (f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && f !== 'opfs-target.ts',
+    );
+    const importers: string[] = [];
+    for (const entry of entries) {
+      const text = await readFile(`${dir}/${entry}`, 'utf8');
+      if (/from '\.\/opfs-target\.ts'/.test(text)) importers.push(entry);
+    }
+    expect(importers.length).toBeGreaterThan(0);
   });
 });

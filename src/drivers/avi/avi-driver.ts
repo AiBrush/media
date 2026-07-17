@@ -74,9 +74,8 @@ function packetStream(
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'WebCodecs EncodedVideoChunk/EncodedAudioChunk are unavailable in this environment',
-      { op: 'demux', tried: [] },
+      { op: { kind: 'route', id: 'demux' }, tried: [] },
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */

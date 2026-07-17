@@ -171,7 +171,6 @@ function parseKeyIv(raw: string | undefined, method: HlsKey['method']): Uint8Arr
   if (iv !== undefined) return iv;
   if (method === 'AES-128' || method === 'SAMPLE-AES') {
     throw new InputError(
-      'unsupported-input',
       `malformed EXT-X-KEY IV "${raw.trim()}" for METHOD=${method} (RFC 8216 §4.3.2.4)`,
     );
   }
@@ -269,10 +268,7 @@ export function parseM3u8(text: string, baseUrl?: string): HlsPlaylist {
     .split(/\r?\n/)
     .map((l) => l.trim());
   if (lines[0] !== '#EXTM3U') {
-    throw new InputError(
-      'unsupported-input',
-      'not an HLS playlist (missing #EXTM3U on the first line)',
-    );
+    throw new InputError('not an HLS playlist (missing #EXTM3U on the first line)');
   }
 
   // Decide master-vs-media lazily: a master has EXT-X-STREAM-INF; a media has EXTINF/segment URIs. We
@@ -459,7 +455,6 @@ function continuationOffset(media: MediaState, uri: string): number {
   const cursor = media.byteRangeCursor;
   if (cursor === undefined || cursor.uri !== uri) {
     throw new InputError(
-      'unsupported-input',
       'EXT-X-BYTERANGE without an offset must continue a sub-range of the same preceding media resource (RFC 8216 §4.3.2.2)',
     );
   }

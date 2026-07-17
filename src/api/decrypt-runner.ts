@@ -49,13 +49,13 @@ export async function runDecrypt(
   // Empty keys mean a live EME/license exchange, which is deliberately outside this byte-transform API.
   // Reject before normalization/routing so a one-shot source is untouched.
   if (Object.keys(opts.keys).length === 0) {
-    throw new CapabilityError('capability-miss', 'keys', { op: 'decrypt', tried: [] });
+    throw new CapabilityError('keys', { op: { kind: 'route', id: 'decrypt' }, tried: [] });
   }
   const source = normalizeByteInput(input, 'decrypt');
   const container = await context.container(source, 'demux', signal, options.strategy?.pinDriver);
   if (container.decrypt === undefined) {
-    throw new CapabilityError('capability-miss', 'no decrypt', {
-      op: 'decrypt',
+    throw new CapabilityError('no decrypt', {
+      op: { kind: 'route', id: 'decrypt' },
       tried: [container.id],
     });
   }
@@ -80,16 +80,15 @@ function assertSupportedDecryptScheme(scheme: unknown): asserts scheme is Decryp
     case 'hls-sample-aes':
       return;
   }
-  throw new CapabilityError('capability-miss', 'bad decrypt', { op: 'decrypt', tried: [] });
+  throw new CapabilityError('bad decrypt', { op: { kind: 'route', id: 'decrypt' }, tried: [] });
 }
 
 function normalizeByteInput(input: MediaInput, op: string): Source {
   const normalized = normalizeInput(input);
   if (!isLiveMediaSource(normalized)) return normalized;
   throw new CapabilityError(
-    'capability-miss',
     `${op} requires finite encoded/container bytes and is unavailable for a raw live MediaStream`,
-    { op, tried: ['media-stream/raw-frames'] },
+    { op: { kind: 'route', id: op }, tried: ['media-stream/raw-frames'] },
   );
 }
 

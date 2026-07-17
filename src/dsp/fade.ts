@@ -39,7 +39,7 @@ function gainOut(t: number, shape: FadeShape): number {
 /** Validate a frame-count argument: a non-negative integer (negatives are clamped to "no fade" upstream). */
 function checkDuration(durationFrames: number, what: string): void {
   if (!Number.isInteger(durationFrames)) {
-    throw new InputError('unsupported-input', `${what} must be an integer frame count`);
+    throw new InputError(`${what} must be an integer frame count`);
   }
 }
 
@@ -118,9 +118,8 @@ export function crossfade(
   checkDuration(overlapFrames, 'cross-fade overlap');
   if (a.channels !== b.channels || a.sampleRate !== b.sampleRate) {
     throw new CapabilityError(
-      'capability-miss',
       `cannot cross-fade incompatible audio (${a.channels}ch@${a.sampleRate} vs ${b.channels}ch@${b.sampleRate})`,
-      { op: 'filter', tried: [] },
+      { op: { kind: 'route', id: 'filter' }, tried: [] },
     );
   }
   const overlap = Math.max(0, Math.min(overlapFrames, a.frames, b.frames));

@@ -110,8 +110,8 @@ async function failureGroup(): Promise<void> {
   const muxer: MuxerSink = {
     addTrack(track): number {
       if (track.codec === 'illegal') {
-        throw new CapabilityError('capability-miss', 'benchmark illegal track', {
-          op: 'mux',
+        throw new CapabilityError('benchmark illegal track', {
+          op: { kind: 'route', id: 'mux' },
           tried: ['benchmark'],
         });
       }

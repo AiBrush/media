@@ -1,4 +1,5 @@
 import { InputError } from '../contracts/errors.ts';
+import { runCancellable } from '../kernel/executor.ts';
 import type { Sink } from '../sinks/sink.ts';
 import { toBlob, toFile, toStream } from '../sinks/sink.ts';
 import type { MediaInput } from '../sources/source.ts';
@@ -32,31 +33,27 @@ export function runMediaChain(
   cancelSignal: AbortSignal,
 ): Cancellable<Output | Blob | File | ReadableStream<Uint8Array>> {
   const { ops, sink, callOptions } = compileChain(steps, terminal, terminalArgs);
-  const abort = new AbortController();
-  const signal = linkedSignal(callOptions.signal, cancelSignal, abort);
-  const callWithSignal: CallOptions = { ...callOptions, signal };
-  let active: Cancellable<Output> | undefined;
-  const promise = (async (): Promise<Output | Blob | File | ReadableStream<Uint8Array>> => {
+  return runCancellable([callOptions.signal, cancelSignal], async (scope) => {
+    const callWithSignal: CallOptions = { ...callOptions, signal: scope.signal };
     if (ops.length === 0) {
-      throw new InputError('unsupported-input', 'fluent chain has no operation to run');
+      throw new InputError('fluent chain has no operation to run');
     }
     let input = firstInput;
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (op === undefined) break;
       const final = i === ops.length - 1;
-      active = runOp(engine, input, op, final ? sink : toBlob(), callWithSignal);
-      const out = await active;
+      // Non-final boundaries are lazy byte streams (the fused single-pipe path, execution-runtime §3.5):
+      // the upstream op's output stream feeds the next op directly, so the source opens once and nothing
+      // materializes between operations.
+      const out = await scope.dispatch(
+        runOp(engine, input, op, final ? sink : toStream(), callWithSignal),
+      );
       if (final) return expectTerminal(out, terminal);
-      input = expectBlob(out);
+      input = expectPipeable(out);
     }
     return undefined;
-  })() as Cancellable<Output | Blob | File | ReadableStream<Uint8Array>>;
-  promise.cancel = (): void => {
-    abort.abort();
-    active?.cancel();
-  };
-  return promise;
+  });
 }
 
 function compileChain(
@@ -140,7 +137,7 @@ function compileChain(
         pending = mergeConvert(pending, { to: stringArg(step, 0) as Container });
         break;
       default:
-        throw new InputError('unsupported-input', `unknown fluent chain method '${step.method}'`);
+        throw new InputError(`unknown fluent chain method '${step.method}'`);
     }
   }
   flush();
@@ -216,43 +213,30 @@ function mergeTarget<T extends object>(
   return b;
 }
 
-function linkedSignal(
-  parent: AbortSignal | undefined,
-  cancelSignal: AbortSignal,
-  abort: AbortController,
-): AbortSignal {
-  if (parent?.aborted === true || cancelSignal.aborted) abort.abort();
-  else {
-    parent?.addEventListener('abort', () => abort.abort(), { once: true });
-    cancelSignal.addEventListener('abort', () => abort.abort(), { once: true });
-  }
-  return abort.signal;
-}
-
 function objectArg<T extends object>(step: ChainStep, index: number): T {
   const value = step.args[index];
   if (isObject(value)) return value as T;
-  throw new InputError('unsupported-input', `fluent ${step.method} expects an object argument`);
+  throw new InputError(`fluent ${step.method} expects an object argument`);
 }
 
 function optionalObjectArg<T extends object>(step: ChainStep, index: number): T | undefined {
   const value = step.args[index];
   if (value === undefined) return undefined;
   if (isObject(value)) return value as T;
-  throw new InputError('unsupported-input', `fluent ${step.method} expects an object argument`);
+  throw new InputError(`fluent ${step.method} expects an object argument`);
 }
 
 function targetArg<T extends object>(step: ChainStep, index: number): false | T {
   const value = step.args[index];
   if (value === false) return false;
   if (isObject(value)) return value as T;
-  throw new InputError('unsupported-input', `fluent ${step.method} expects false or an object`);
+  throw new InputError(`fluent ${step.method} expects false or an object`);
 }
 
 function numberArg(step: ChainStep, index: number): number {
   const value = step.args[index];
   if (typeof value === 'number' && Number.isFinite(value)) return value;
-  throw new InputError('unsupported-input', `fluent ${step.method} expects a finite number`);
+  throw new InputError(`fluent ${step.method} expects a finite number`);
 }
 
 function stringArg(step: ChainStep, index: number): string {
@@ -267,12 +251,12 @@ function optionalStringArg(step: ChainStep, index: number): string | undefined {
 function optionalCallOptions(value: unknown): CallOptions {
   if (value === undefined) return {};
   if (isObject(value)) return value as CallOptions;
-  throw new InputError('unsupported-input', 'fluent chain terminal expects CallOptions');
+  throw new InputError('fluent chain terminal expects CallOptions');
 }
 
 function stringValue(value: unknown, label: string): string {
   if (typeof value === 'string' && value.trim() !== '') return value;
-  throw new InputError('unsupported-input', `${label} must be a non-empty string`);
+  throw new InputError(`${label} must be a non-empty string`);
 }
 
 function isObject(value: unknown): value is object {
@@ -299,15 +283,21 @@ function expectTerminal(
 
 function expectBlob(out: Output): Blob {
   if (out instanceof Blob) return out;
-  throw new InputError('unsupported-input', 'fluent chain expected a Blob output');
+  throw new InputError('fluent chain expected a Blob output');
+}
+
+/** An intermediate boundary must yield input the next op can consume: a lazy stream or a `Blob`. */
+function expectPipeable(out: Output): ReadableStream<Uint8Array> | Blob {
+  if (out instanceof ReadableStream || out instanceof Blob) return out;
+  throw new InputError('fluent chain intermediate sink did not produce pipeable media');
 }
 
 function expectFile(out: Output): File {
   if (typeof File === 'function' && out instanceof File) return out;
-  throw new InputError('unsupported-input', 'fluent chain expected a File output');
+  throw new InputError('fluent chain expected a File output');
 }
 
 function expectStream(out: Output): ReadableStream<Uint8Array> {
   if (out instanceof ReadableStream) return out;
-  throw new InputError('unsupported-input', 'fluent chain expected a stream output');
+  throw new InputError('fluent chain expected a stream output');
 }

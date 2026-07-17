@@ -132,8 +132,8 @@ export function resetMp3CoreForTest(): void {
 
 /** The {@link CapabilityError} a coder throws when the vendored MP3 wasm core is unavailable. */
 function coreMissing(): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-mp3 core is not available', {
-    op: 'decode',
+  return new CapabilityError('wasm-mp3 core is not available', {
+    op: { kind: 'route', id: 'decode' },
     tried: ['wasm-mp3'],
     suggestion: 'build + vendor the MP3 wasm core per src/codecs/wasm-mp3/BUILD.md',
   });
@@ -321,10 +321,9 @@ function createEncoder(
   _o?: StageOptions,
 ): TransformStream<RawFrame, EncodedChunk> {
   throw new CapabilityError(
-    'capability-miss',
     'wasm-mp3 does not support MP3 encode (no approved MP3 encoder core is vendored)',
     {
-      op: 'encode',
+      op: { kind: 'route', id: 'encode' },
       tried: ['wasm-mp3'],
       suggestion:
         'encode to Opus/AAC, or explicitly approve and isolate an LGPL libmp3lame tail before registering MP3 encode',

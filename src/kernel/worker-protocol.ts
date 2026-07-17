@@ -19,6 +19,7 @@ import {
   InputError,
   MediaError,
   type MediaErrorCode,
+  isCapabilityErrorDetail,
 } from '../contracts/errors.ts';
 
 // ============ transport ============
@@ -99,11 +100,22 @@ export type HostMessage = JobMessage | CreditMessage | CancelMessage;
 
 // ============ worker → host ============
 
+/**
+ * Per-media-kind codec substrate available inside a worker scope — the **backend-neutral** readiness
+ * descriptor (doc 06 §4 / punch-list 6). The wire deliberately names *media kinds*, never a backend, so
+ * nothing above the driver layer can branch on a backend name; the host gates a job on the kinds that job
+ * actually needs (an audio-only convert offloads to an audio-capable worker even when video is absent).
+ */
+export interface WorkerMediaCaps {
+  readonly video: boolean;
+  readonly audio: boolean;
+}
+
 /** The worker is initialized and ready to accept a job (sent once on worker start). */
 export interface ReadyMessage {
   readonly t: 'ready';
-  /** Whether the worker-side substrate (WebCodecs) is actually available — the honest offload gate. */
-  readonly webcodecs: boolean;
+  /** What the worker scope can actually run, per media kind — the honest, per-op offload gate. */
+  readonly caps: WorkerMediaCaps;
 }
 
 /**
@@ -186,9 +198,13 @@ export function serializeError(e: unknown): SerializedError {
 export function deserializeError(s: SerializedError, fallbackCode?: MediaErrorCode): Error {
   switch (s.kind) {
     case 'capability':
-      return new CapabilityError(s.code ?? 'capability-miss', s.message, s.detail);
+      // The wire strips types; only a payload proving the exact typed detail is carried across.
+      return new CapabilityError(
+        s.message,
+        isCapabilityErrorDetail(s.detail) ? s.detail : undefined,
+      );
     case 'input':
-      return new InputError(s.code ?? 'unsupported-input', s.message, s.detail);
+      return new InputError(s.message, s.detail);
     case 'media':
       return new MediaError(s.code ?? 'decode-error', s.message, s.detail);
     case 'generic':
@@ -214,8 +230,26 @@ function safeDetail(detail: unknown): unknown {
 // ============ transferables ============
 
 /**
+ * The **declared** transfer list of an {@link OffloadJob} (punch-list 7): the serializable payload
+ * contract (`OffloadJobPayload`, worker-main) declares exactly **one** transferable field — the `input`
+ * byte buffer — so the bridge derives the `postMessage` transfer list from that typed contract instead of
+ * a heuristic deep walk. This can neither silently *miss* a transferable hidden past a depth cap nor
+ * wrongly *move* a frame-shaped plain options object (`{ close(){}, width }`), the two failure modes of
+ * a structural walk. Total and pure: a payload without an `input: ArrayBuffer` transfers nothing.
+ */
+export function offloadJobTransferList(job: OffloadJob): Transferable[] {
+  const payload = job.payload;
+  if (payload === null || typeof payload !== 'object') return [];
+  const input = (payload as { readonly input?: unknown }).input;
+  return input instanceof ArrayBuffer ? [input] : [];
+}
+
+/**
  * Collect the Transferables reachable in `value` (for the `postMessage` transfer list) so each is **moved,
- * not structured-clone-copied** (doc 06 §4). Recognizes the spec Transferable interfaces —
+ * not structured-clone-copied** (doc 06 §4). The production bridge posts jobs with the typed
+ * {@link offloadJobTransferList} extractor; this bounded structural walk remains the *generic* helper on
+ * the public `core` surface for embedders composing their own protocols over arbitrary payload shapes.
+ * Recognizes the spec Transferable interfaces —
  * `ArrayBuffer`, `MessagePort`, the stream types, `ImageBitmap`, and the WebCodecs `VideoFrame`/
  * `AudioData` (and `OffscreenCanvas`) — plus a typed array / `DataView`, whose backing `.buffer` is the
  * Transferable. A frame is matched structurally (a `close`-bearing object exposing `codedWidth` or

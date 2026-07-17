@@ -86,14 +86,10 @@ export function muxPreparedMp4PacketTracks(input: PreparedMp4PacketTracksMuxInpu
 /** Author already-validated first-party packet structs without WebCodecs host-chunk projection. */
 export function muxPreparedMp4NativeTracks(input: PreparedMp4NativeTracksMuxInput): Uint8Array {
   if (input.container !== 'mp4' && input.container !== 'mov') {
-    throw new CapabilityError(
-      'capability-miss',
-      `prepared MP4 native mux cannot write '${input.container}'`,
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['mp4'],
-      },
-    );
+    throw new CapabilityError(`prepared MP4 native mux cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
+      tried: ['mp4'],
+    });
   }
   assertNotAborted(input.signal);
   const tracks: Mp4PacketTrackInput[] = input.tracks.map(({ track, chunks }) => ({
@@ -132,21 +128,16 @@ function assertPreparedMp4MuxInput(
   mode: 'mux' | 'stream mux',
 ): void {
   if (input.container !== 'mp4' && input.container !== 'mov') {
-    throw new CapabilityError(
-      'capability-miss',
-      `prepared MP4 packet ${mode} cannot write '${input.container}'`,
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['mp4'],
-      },
-    );
+    throw new CapabilityError(`prepared MP4 packet ${mode} cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
+      tried: ['mp4'],
+    });
   }
   if (input.fragmented === true && input.container !== 'mp4') {
     throw new CapabilityError(
-      'capability-miss',
       `prepared MP4 packet ${mode} cannot author fragmented '${input.container}' output`,
       {
-        op: { op: 'mux', container: input.container },
+        op: { kind: 'route', id: 'mux', facts: { container: input.container } },
         tried: ['mp4'],
       },
     );
@@ -234,8 +225,8 @@ async function mp4PacketInfoFromSource(
 ): Promise<PacketInfoTable> {
   const packetInfo = Mp4Driver.packetInfo;
   if (packetInfo === undefined) {
-    throw new CapabilityError('capability-miss', 'MP4 packet-info is not available', {
-      op: { op: 'demux', container: 'mp4' },
+    throw new CapabilityError('MP4 packet-info is not available', {
+      op: { kind: 'route', id: 'demux', facts: { container: 'mp4' } },
       tried: ['mp4'],
     });
   }

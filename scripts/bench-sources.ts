@@ -17,7 +17,9 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { resolveHlsSource } from '../src/drivers/hls/hls-source.ts';
 import { cacheSource } from '../src/sources/cache.ts';
-import { type Source, fromBytes } from '../src/sources/source.ts';
+import { cacheRepeatedProbeRangesFor } from '../src/sources/probe-range-cache.ts';
+import { drainStream, readAllBytes } from '../src/sources/read-all.ts';
+import { type Source, fromBytes, fromURL } from '../src/sources/source.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const FILES = ['h264.mp4', 'bear-1280x720.mp4', 'movie_5.mp4'];
@@ -181,6 +183,41 @@ async function main(): Promise<void> {
     const rangeCached = await timeMedian(() => readRanges(primed, windows));
     const refetches = calls() - baseHits;
 
+    // 4) Whole-object read (sources.md §5 items 5/6): the canonical `readAllBytes` fast paths —
+    //    owned in-memory buffer, one plain full GET via `Source.readAll` — vs the generic
+    //    multi-pull stream drain of the same URL source.
+    const wholeOwned = await timeMedian(async () => {
+      const out = await readAllBytes(fromBytes(bytes));
+      sink = (sink + (out[0] ?? 0)) | 0;
+      return out.byteLength;
+    });
+    const wholeUrl = await timeMedian(async () => {
+      const out = await readAllBytes(fromURL(`mem://${id}`));
+      sink = (sink + (out[0] ?? 0)) | 0;
+      return out.byteLength;
+    });
+    const wholeDrain = await timeMedian(async () => {
+      const out = await drainStream(fromURL(`mem://${id}`).stream());
+      sink = (sink + (out[0] ?? 0)) | 0;
+      return out.byteLength;
+    });
+
+    // 5) Repeated probes of the same source object through the per-engine probe-range cache
+    //    (sources.md §5 items 3/9): after one warm pass every window is a bounded in-memory hit
+    //    served through the forwarding-Proxy wrapper — zero re-fetch — vs a fresh uncached scatter.
+    const reuseWindows = windows.slice(0, 6); // head + tail + 4 mid windows (≤ 8 cached intervals)
+    const engine = {};
+    const probeSrc = fromURL(`mem://${id}`);
+    await readRanges(cacheRepeatedProbeRangesFor(engine, probeSrc), reuseWindows); // warm
+    const probeBase = calls();
+    const probeCached = await timeMedian(() =>
+      readRanges(cacheRepeatedProbeRangesFor(engine, probeSrc), reuseWindows),
+    );
+    const probeRefetches = calls() - probeBase;
+    const freshBase = calls();
+    const probeFresh = await timeMedian(() => readRanges(fromURL(`mem://${id}`), reuseWindows));
+    const probeFreshFetches = (calls() - freshBase) / (WARMUP + ITERS);
+
     console.info(`  ${id}  (${(bytes.byteLength / 1024).toFixed(0)} KiB)`);
     console.info(
       `    full drain   bytes-src ${mibPerSec(fullBytes.bytes, fullBytes.ms).toFixed(0).padStart(6)} MiB/s` +
@@ -191,6 +228,17 @@ async function main(): Promise<void> {
         ` uncached ${rangeUrl.ms.toFixed(3)} ms (${fetchesPerPass.toFixed(0)} fetch/pass)` +
         ` · cached ${rangeCached.ms.toFixed(3)} ms (${refetches} re-fetch)` +
         ` → ${(rangeUrl.ms / Math.max(rangeCached.ms, 1e-6)).toFixed(1)}× faster`,
+    );
+    console.info(
+      `    whole read   owned ${mibPerSec(wholeOwned.bytes, wholeOwned.ms).toFixed(0).padStart(6)} MiB/s` +
+        ` · url readAll ${mibPerSec(wholeUrl.bytes, wholeUrl.ms).toFixed(0).padStart(6)} MiB/s` +
+        ` · url drain ${mibPerSec(wholeDrain.bytes, wholeDrain.ms).toFixed(0).padStart(6)} MiB/s` +
+        ` → readAll ${(wholeDrain.ms / Math.max(wholeUrl.ms, 1e-6)).toFixed(1)}× vs drain`,
+    );
+    console.info(
+      `    probe reuse  ${reuseWindows.length} windows: fresh ${probeFresh.ms.toFixed(3)} ms` +
+        ` (${probeFreshFetches.toFixed(0)} fetch/pass) · engine-cached ${probeCached.ms.toFixed(3)} ms` +
+        ` (${probeRefetches} re-fetch) → ${(probeFresh.ms / Math.max(probeCached.ms, 1e-6)).toFixed(1)}× faster`,
     );
   }
   await benchHls();

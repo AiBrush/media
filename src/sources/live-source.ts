@@ -16,7 +16,7 @@ interface CaptureCapableElement {
 /** Normalize a caller-owned `MediaStream` without converting it into a byte source. */
 export function fromMediaStream(mediaStream: MediaStream): LiveMediaSource {
   if (!isMediaStreamShape(mediaStream)) {
-    throw new InputError('unsupported-input', 'invalid MediaStream input');
+    throw new InputError('invalid MediaStream input');
   }
   return { __media: 'live-source', kind: 'media-stream', mediaStream };
 }
@@ -25,8 +25,8 @@ export function fromMediaStream(mediaStream: MediaStream): LiveMediaSource {
 export function captureElementMediaStream(element: HTMLMediaElement): LiveMediaSource {
   const capture = (element as unknown as CaptureCapableElement).captureStream;
   if (typeof capture !== 'function') {
-    throw new CapabilityError('capability-miss', 'HTMLMediaElement.captureStream is unavailable', {
-      op: 'fromElement(capture)',
+    throw new CapabilityError('HTMLMediaElement.captureStream is unavailable', {
+      op: { kind: 'route', id: 'fromElement(capture)' },
       tried: ['captureStream'],
     });
   }
@@ -34,18 +34,17 @@ export function captureElementMediaStream(element: HTMLMediaElement): LiveMediaS
   try {
     captured = capture.call(element);
   } catch (error) {
-    throw new CapabilityError('capability-miss', 'HTMLMediaElement.captureStream failed', {
-      op: 'fromElement(capture)',
-      tried: ['captureStream'],
-      cause: error,
-    });
+    throw new CapabilityError(
+      'HTMLMediaElement.captureStream failed',
+      { op: { kind: 'route', id: 'fromElement(capture)' }, tried: ['captureStream'] },
+      { cause: error },
+    );
   }
   if (!isMediaStreamShape(captured)) {
-    throw new CapabilityError(
-      'capability-miss',
-      'HTMLMediaElement.captureStream returned no MediaStream',
-      { op: 'fromElement(capture)', tried: ['captureStream'] },
-    );
+    throw new CapabilityError('HTMLMediaElement.captureStream returned no MediaStream', {
+      op: { kind: 'route', id: 'fromElement(capture)' },
+      tried: ['captureStream'],
+    });
   }
   return fromMediaStream(captured);
 }

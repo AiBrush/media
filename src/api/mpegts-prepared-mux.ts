@@ -30,24 +30,16 @@ export interface PreparedMpegTsPacketMuxInput {
 
 export function muxPreparedMpegTsPacketTracks(input: PreparedMpegTsPacketMuxInput): Uint8Array {
   if (input.fragmented === true) {
-    throw new CapabilityError(
-      'capability-miss',
-      'prepared MPEG-TS packet mux does not author fragmented output',
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['ts'],
-      },
-    );
+    throw new CapabilityError('prepared MPEG-TS packet mux does not author fragmented output', {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
+      tried: ['ts'],
+    });
   }
   if (input.container !== 'ts') {
-    throw new CapabilityError(
-      'capability-miss',
-      `prepared MPEG-TS packet mux cannot write '${input.container}'`,
-      {
-        op: { op: 'mux', container: input.container },
-        tried: ['ts'],
-      },
-    );
+    throw new CapabilityError(`prepared MPEG-TS packet mux cannot write '${input.container}'`, {
+      op: { kind: 'route', id: 'mux', facts: { container: input.container } },
+      tried: ['ts'],
+    });
   }
   if (input.tracks.length === 0) {
     throw new MediaError('mux-error', 'prepared MPEG-TS packet mux received no tracks');

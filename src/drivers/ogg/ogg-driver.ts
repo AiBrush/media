@@ -485,7 +485,7 @@ function codecPrivateDescription(data: Uint8Array): Uint8Array | undefined {
 export function oggAudioPackets(data: Uint8Array): OggPacket[] {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const stream = firstRecognizedStream(dv);
-  if (!stream) throw new InputError('unsupported-input', 'no recognized Ogg codec stream found');
+  if (!stream) throw new InputError('no recognized Ogg codec stream found');
 
   const preSkip = stream.codec === 'opus' ? readOpusPreSkip(dv, stream.serial) : 0;
   const raw = delacePackets(dv, stream.serial);
@@ -608,7 +608,7 @@ export function parseOgg(head: Uint8Array, tail?: Uint8Array): OggInfo {
     if (page.headerType & 0x02) stream = identifyStream(dv, page); // BOS page
     at = page.pageEnd > at ? page.pageEnd : at + 1;
   }
-  if (!stream) throw new InputError('unsupported-input', 'no recognized Ogg codec stream found');
+  if (!stream) throw new InputError('no recognized Ogg codec stream found');
 
   let granule = maxGranule(dv, stream.serial);
   if (tail) {
@@ -681,8 +681,8 @@ function validateOggStreamCopyTarget(container: string | undefined): void {
   ) {
     return;
   }
-  throw new CapabilityError('capability-miss', `Ogg stream-copy cannot write '${container}'`, {
-    op: { op: 'streamCopy', container },
+  throw new CapabilityError(`Ogg stream-copy cannot write '${container}'`, {
+    op: { kind: 'route', id: 'streamCopy', facts: { container } },
     tried: ['ogg'],
   });
 }
@@ -759,14 +759,14 @@ async function writeOggWebmPacketCopy(
   const table = oggPacketInfoTable(bytes);
   const track = table.tracks[0];
   if (track === undefined || track.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'Ogg remux needs one audio track', {
-      op: 'remux',
+    throw new CapabilityError('Ogg remux needs one audio track', {
+      op: { kind: 'route', id: 'remux' },
       tried: ['ogg', container],
     });
   }
   if (container === 'webm' && track.codec.toLowerCase().startsWith('flac')) {
-    throw new CapabilityError('capability-miss', 'WebM does not support FLAC audio', {
-      op: 'remux',
+    throw new CapabilityError('WebM does not support FLAC audio', {
+      op: { kind: 'route', id: 'remux' },
       tried: ['ogg', 'webm'],
     });
   }
@@ -823,23 +823,20 @@ function validateOggTrimRange(
   trim: NonNullable<StreamCopyOptions['trim']>,
 ): void {
   if (!Number.isFinite(trim.startSec) || !Number.isFinite(trim.endSec)) {
-    throw new InputError('unsupported-input', 'bad trim');
+    throw new InputError('bad trim');
   }
   if (durationSec === undefined || !Number.isFinite(durationSec) || durationSec <= 0) {
     throw new MediaError('demux-error', 'Ogg trim needs a finite source duration');
   }
-  if (trim.startSec < 0) throw new InputError('unsupported-input', 'trim start < 0');
+  if (trim.startSec < 0) throw new InputError('trim start < 0');
   if (trim.endSec <= trim.startSec) {
-    throw new InputError(
-      'unsupported-input',
-      trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range',
-    );
+    throw new InputError(trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range');
   }
   if (trim.startSec >= durationSec) {
-    throw new InputError('unsupported-input', 'trim start >= duration');
+    throw new InputError('trim start >= duration');
   }
   if (trim.endSec > durationSec + 1e-3) {
-    throw new InputError('unsupported-input', 'trim end > duration');
+    throw new InputError('trim end > duration');
   }
 }
 
@@ -850,8 +847,8 @@ function writeOggPacketCopyTrim(
   const table = oggPacketInfoTable(bytes);
   const track = table.tracks[0];
   if (track === undefined || track.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'Ogg trim needs one audio track', {
-      op: 'trim',
+    throw new CapabilityError('Ogg trim needs one audio track', {
+      op: { kind: 'route', id: 'trim' },
       tried: ['ogg'],
     });
   }
@@ -992,9 +989,8 @@ function packetStreamFromInfo(
 ): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'Ogg packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-      { op: 'demux', tried: ['ogg'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['ogg'] },
     );
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */

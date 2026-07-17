@@ -36,8 +36,8 @@ export const Mp4MuxOnlyDriver: ContainerDriver = {
   supports: supportsMux,
   demux(_src: ByteSource): Promise<Demuxer> {
     return Promise.reject(
-      new CapabilityError('capability-miss', 'mp4-mux is output-only', {
-        op: 'demux',
+      new CapabilityError('mp4-mux is output-only', {
+        op: { kind: 'route', id: 'demux' },
         tried: ['mp4-mux'],
       }),
     );

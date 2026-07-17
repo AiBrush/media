@@ -283,14 +283,14 @@ export const audioDspFilterDriver: FilterDriver = {
   },
   createFilter(f: FilterSpec, o?: StageOptions): TransformStream<AudioData, AudioData> {
     if (!isAudioDspSpec(f)) {
-      throw new CapabilityError('capability-miss', `audio-dsp filter does not handle ${f.type}`, {
-        op: 'filter',
+      throw new CapabilityError(`audio-dsp filter does not handle ${f.type}`, {
+        op: { kind: 'route', id: 'filter' },
         tried: [audioDspFilterDriver.id],
       });
     }
     if (!audioDataAvailable()) {
-      throw new CapabilityError('capability-miss', 'WebCodecs AudioData is unavailable', {
-        op: 'filter',
+      throw new CapabilityError('WebCodecs AudioData is unavailable', {
+        op: { kind: 'route', id: 'filter' },
         tried: [audioDspFilterDriver.id],
         suggestion: 'run the audio filter in a browser/worker where AudioData exists',
       });

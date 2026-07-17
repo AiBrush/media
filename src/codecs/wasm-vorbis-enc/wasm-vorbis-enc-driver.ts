@@ -92,8 +92,8 @@ export function resetVorbisEncCoreForTest(): void {
 }
 
 function coreMissing(): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-vorbis-enc core is not available', {
-    op: 'encode',
+  return new CapabilityError('wasm-vorbis-enc core is not available', {
+    op: { kind: 'route', id: 'encode' },
     tried: ['wasm-vorbis-enc'],
     suggestion: 'build + vendor the Vorbis encoder core per src/codecs/wasm-vorbis-enc/BUILD.md',
   });
@@ -173,8 +173,8 @@ function createDecoder(
   _config: DecoderConfig,
   _o?: StageOptions,
 ): TransformStream<EncodedChunk, RawFrame> {
-  throw new CapabilityError('capability-miss', 'wasm-vorbis-enc is encode-only', {
-    op: 'decode',
+  throw new CapabilityError('wasm-vorbis-enc is encode-only', {
+    op: { kind: 'route', id: 'decode' },
     tried: ['wasm-vorbis-enc'],
   });
 }

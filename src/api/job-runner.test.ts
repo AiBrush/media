@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { InputError, MediaError } from '../contracts/errors.ts';
-import { toBlob } from '../sinks/sink.ts';
+import { toBlob, toStream } from '../sinks/sink.ts';
 import type { MediaInput } from '../sources/source.ts';
 import { runMediaJob } from './job-runner.ts';
 import type { JobEngine, MediaJob } from './job.ts';
@@ -100,7 +100,7 @@ function baseJob(overrides: Partial<MediaJob> = {}): MediaJob {
 }
 
 describe('declarative job runner', () => {
-  it('executes documented trim → resize → output as the minimum two honest stages', async () => {
+  it('executes documented trim → resize → output as one linked two-stage pipe', async () => {
     const clipped = new Blob([new Uint8Array([4, 5])]);
     const finished = new Blob([new Uint8Array([6, 7, 8])], { type: 'video/mp4' });
     const { engine, calls } = host([clipped, finished]);
@@ -125,7 +125,7 @@ describe('declarative job runner', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
       op: 'trim',
-      opts: { start: 0, end: 5, sink: toBlob() },
+      opts: { start: 0, end: 5, sink: toStream() },
     });
     expect(calls[1]).toMatchObject({
       op: 'convert',
@@ -138,6 +138,87 @@ describe('declarative job runner', () => {
       },
     });
     expect(calls[1]?.opts).not.toHaveProperty('sink');
+  });
+
+  it('runs trim → resize → mp4 as one pipe: source opened once, decode/encode once, bytes exact', async () => {
+    const source = new Uint8Array([10, 20, 30, 40, 50]);
+    let sourceOpens = 0;
+    let decodes = 0;
+    let encodes = 0;
+    let trimPulls = 0;
+    let trimPullsWhenConvertStarted = -1;
+    let intermediate: ReadableStream<Uint8Array> | undefined;
+    let convertInput: unknown;
+
+    const engine: JobEngine = {
+      trim(input, opts, call = {}) {
+        void call;
+        if (input === source) sourceOpens++;
+        expect(opts.sink).toEqual(toStream());
+        // Simulated packet copy of the trim window [1, 4): lazy, pull-driven, chunked — no decode.
+        const window = source.subarray(1, 4);
+        let offset = 0;
+        intermediate = new ReadableStream<Uint8Array>(
+          {
+            pull(controller): void {
+              trimPulls++;
+              if (offset >= window.byteLength) {
+                controller.close();
+                return;
+              }
+              const next = Math.min(offset + 2, window.byteLength);
+              controller.enqueue(window.subarray(offset, next));
+              offset = next;
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        return cancellable(Promise.resolve(intermediate));
+      },
+      convert(input, opts, call = {}) {
+        void call;
+        if (input === source) sourceOpens++;
+        convertInput = input;
+        trimPullsWhenConvertStarted = trimPulls;
+        expect(opts).not.toHaveProperty('sink');
+        decodes++;
+        const run = (async (): Promise<Blob> => {
+          const reader = (input as ReadableStream<Uint8Array>).getReader();
+          const bytes: number[] = [];
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            for (const byte of value) bytes.push(byte + 1); // the single simulated re-encode
+          }
+          encodes++;
+          return new Blob([new Uint8Array(bytes)], { type: 'video/mp4' });
+        })();
+        return cancellable(run);
+      },
+      remux: vi.fn(),
+      decrypt: vi.fn(),
+    };
+
+    const result = await runMediaJob(
+      engine,
+      baseJob({
+        input: source,
+        ops: [
+          { op: 'trim', start: 1, end: 4 },
+          { op: 'resize', width: 640, height: 360 },
+        ],
+        output: { container: 'mp4', video: { codec: 'h264' } },
+      }),
+    );
+
+    expect(sourceOpens).toBe(1);
+    expect(decodes).toBe(1);
+    expect(encodes).toBe(1);
+    // The exact lazily-produced stream is what convert consumed — no hidden rematerialization…
+    expect(convertInput).toBe(intermediate);
+    // …and nothing had drained it before the downstream op pulled (true pipe, not a buffered copy).
+    expect(trimPullsWhenConvertStarted).toBe(0);
+    expect(new Uint8Array(await result.arrayBuffer())).toEqual(new Uint8Array([21, 31, 41]));
   });
 
   it('validates and snapshots the complete serializable video/audio target schema', async () => {
@@ -284,7 +365,7 @@ describe('declarative job runner', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
       op: 'convert',
-      opts: { video: { width: 640, height: 360, fit: 'cover' }, sink: toBlob() },
+      opts: { video: { width: 640, height: 360, fit: 'cover' }, sink: toStream() },
     });
     expect(calls[1]).toMatchObject({
       op: 'convert',
@@ -329,7 +410,7 @@ describe('declarative job runner', () => {
           width: 320,
           height: 180,
         },
-        sink: toBlob(),
+        sink: toStream(),
       },
     });
 
@@ -352,14 +433,14 @@ describe('declarative job runner', () => {
     );
     expect(unsafe.calls).toHaveLength(3);
     expect(unsafe.calls[0]).toMatchObject({
-      opts: { video: { width: 640, height: 360 }, sink: toBlob() },
+      opts: { video: { width: 640, height: 360 }, sink: toStream() },
     });
     expect(unsafe.calls[1]).toMatchObject({
       input: resized,
       opts: {
         to: 'webm',
         video: { codec: 'vp9', crop: { x: 1, y: 2, width: 320, height: 180 } },
-        sink: toBlob(),
+        sink: toStream(),
       },
     });
 
@@ -381,7 +462,7 @@ describe('declarative job runner', () => {
     });
   });
 
-  it('dispatches explicit convert, remux, and decrypt through real Blob boundaries', async () => {
+  it('dispatches explicit convert, remux, and decrypt through lazy stream boundaries', async () => {
     const converted = new Blob(['converted']);
     const remuxed = new Blob(['remuxed']);
     const clear = new Blob(['clear']);
@@ -409,7 +490,7 @@ describe('declarative job runner', () => {
 
     expect(calls.map((call) => call.op)).toEqual(['convert', 'remux', 'decrypt', 'convert']);
     expect(calls[0]).toMatchObject({
-      opts: { to: 'webm', video: { codec: 'vp9' }, audio: false, sink: toBlob() },
+      opts: { to: 'webm', video: { codec: 'vp9' }, audio: false, sink: toStream() },
     });
     expect(calls[1]).toMatchObject({
       input: converted,
@@ -419,12 +500,12 @@ describe('declarative job runner', () => {
         fragmented: true,
         tags: { title: 'clear' },
         trackSelect: ['video:0', 'audio:0'],
-        sink: toBlob(),
+        sink: toStream(),
       },
     });
     expect(calls[2]).toMatchObject({
       input: remuxed,
-      opts: { scheme: 'cenc', keys: { abc: '0011' }, sink: toBlob() },
+      opts: { scheme: 'cenc', keys: { abc: '0011' }, sink: toStream() },
     });
     expect(calls[3]).toMatchObject({ input: clear, opts: { to: 'mp4', video: { codec: 'h264' } } });
   });
@@ -613,8 +694,8 @@ describe('declarative job runner', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('rejects non-Blob intermediate and final default-sink results', async () => {
-    const badIntermediate = host([new ReadableStream<Uint8Array>(), new Blob()]);
+  it('rejects non-pipeable intermediate and non-Blob final results', async () => {
+    const badIntermediate = host([undefined, new Blob()]);
     await expect(
       runMediaJob(badIntermediate.engine, baseJob({ ops: [{ op: 'trim', start: 0, end: 1 }] })),
     ).rejects.toBeInstanceOf(InputError);
@@ -622,6 +703,10 @@ describe('declarative job runner', () => {
 
     const badFinal = host([undefined]);
     await expect(runMediaJob(badFinal.engine, baseJob())).rejects.toBeInstanceOf(InputError);
+
+    // The final default sink is a materialized Blob — a raw stream terminal result is a defect.
+    const streamFinal = host([new ReadableStream<Uint8Array>()]);
+    await expect(runMediaJob(streamFinal.engine, baseJob())).rejects.toBeInstanceOf(InputError);
   });
 
   it('snapshots validated targets before awaiting an intermediate stage', async () => {

@@ -112,7 +112,6 @@ function pcmSampleFormat(fmt: WavFormat): SampleFormat {
     if (fmt.bitsPerSample === 64) return 'f64';
   }
   throw new InputError(
-    'unsupported-input',
     `unsupported WAV PCM layout (tag ${fmt.formatTag}, ${fmt.bitsPerSample}-bit)`,
   );
 }
@@ -134,7 +133,7 @@ function parseFormat(dv: DataView, body: number, size: number): WavFormat {
 
 function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWavHeader {
   if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
-    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+    throw new InputError('not a RIFF/WAVE file');
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let format: WavFormat | undefined;
@@ -209,7 +208,7 @@ async function readSparseWavProbeHeader(
   const riff = await readAt(0, 12);
   if (riff === undefined) return undefined;
   if (riff.byteLength < 12 || ascii(riff, 0, 4) !== 'RIFF' || ascii(riff, 8, 4) !== 'WAVE') {
-    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+    throw new InputError('not a RIFF/WAVE file');
   }
 
   let format: WavFormat | undefined;
@@ -363,8 +362,8 @@ export async function wavPacketInfoFromUrl(
 ): Promise<PacketInfoTable> {
   const packetInfo = WavDriver.packetInfo;
   if (packetInfo === undefined) {
-    throw new CapabilityError('capability-miss', 'WAV packet-info is not available', {
-      op: { op: 'demux', container: 'wav' },
+    throw new CapabilityError('WAV packet-info is not available', {
+      op: { kind: 'route', id: 'demux', facts: { container: 'wav' } },
       tried: ['wav'],
     });
   }
@@ -658,7 +657,7 @@ async function sequentialWavDecode(
   try {
     const riff = await cursor.read(12);
     if (riff.byteLength < 12 || ascii(riff, 0, 4) !== 'RIFF' || ascii(riff, 8, 4) !== 'WAVE') {
-      throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+      throw new InputError('not a RIFF/WAVE file');
     }
     let format: WavFormat | undefined;
     for (;;) {
@@ -886,9 +885,8 @@ export const WavDriver: ContainerDriver = {
       tracks: [track],
       packets(): ReadableStream<Packet> {
         throw new CapabilityError(
-          'capability-miss',
           'WAV PCM packets flow through the TS audio-dsp path (browser seam), not WebCodecs',
-          { op: 'demux', tried: [] },
+          { op: { kind: 'route', id: 'demux' }, tried: [] },
         );
       },
       close: () => Promise.resolve(),

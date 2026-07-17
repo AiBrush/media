@@ -121,12 +121,11 @@ export async function resolveHlsSource(
   const media = await resolveMediaPlaylist(playlistText, opts, fetchResource);
   if (!media.endList) {
     throw new InputError(
-      'unsupported-input',
       'HLS live playlist (no #EXT-X-ENDLIST) cannot be resolved to a single finite source',
     );
   }
   if (media.segments.length === 0) {
-    throw new InputError('unsupported-input', 'HLS media playlist has no segments');
+    throw new InputError('HLS media playlist has no segments');
   }
 
   const parts: Uint8Array[] = [];
@@ -165,13 +164,12 @@ export async function resolveHlsProbeSource(
   const media = await resolveMediaPlaylist(playlistText, opts, fetchResource);
   if (!media.endList) {
     throw new InputError(
-      'unsupported-input',
       'HLS live playlist (no #EXT-X-ENDLIST) cannot be resolved to a finite probe source',
     );
   }
   const first = media.segments[0];
   if (first === undefined) {
-    throw new InputError('unsupported-input', 'HLS media playlist has no segments');
+    throw new InputError('HLS media playlist has no segments');
   }
 
   const parts: Uint8Array[] = [];
@@ -321,7 +319,7 @@ async function resolveMediaPlaylist(
   /* v8 ignore next 3 -- defensive: a STREAM-INF URI pointing at another master (nested multivariant) is
      degenerate and not produced by real packagers; guarded so it is an honest typed error, not a crash. */
   if (sub.type !== 'media') {
-    throw new InputError('unsupported-input', 'HLS variant playlist is not a media playlist');
+    throw new InputError('HLS variant playlist is not a media playlist');
   }
   return sub;
 }
@@ -331,15 +329,12 @@ function pickVariant(variants: readonly HlsVariant[], choice: HlsVariantChoice):
   /* v8 ignore next 3 -- unreachable: `parseM3u8` only classifies a playlist as `master` when it parsed ≥1
      variant, and `pickVariant` is called only on a master — so `variants` is never empty here. */
   if (variants.length === 0) {
-    throw new InputError('unsupported-input', 'HLS master playlist has no variants');
+    throw new InputError('HLS master playlist has no variants');
   }
   if (typeof choice === 'number') {
     const v = variants[choice];
     if (v === undefined) {
-      throw new InputError(
-        'unsupported-input',
-        `HLS variant index ${choice} out of range (0..${variants.length - 1})`,
-      );
+      throw new InputError(`HLS variant index ${choice} out of range (0..${variants.length - 1})`);
     }
     return v;
   }
@@ -377,7 +372,6 @@ async function appendInitSection(
   const iv = key.iv;
   if (iv === undefined) {
     throw new InputError(
-      'unsupported-input',
       'HLS encrypted EXT-X-MAP (media initialization section) requires an explicit IV on its EXT-X-KEY (RFC 8216 §4.3.2.5)',
     );
   }
@@ -442,10 +436,7 @@ async function decryptWithKey(
     );
   }
   if (key.uri === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      `HLS ${key.method} #EXT-X-KEY is missing its key URI`,
-    );
+    throw new InputError(`HLS ${key.method} #EXT-X-KEY is missing its key URI`);
   }
   throwIfAborted(signal);
   const keyBytes = await fetchAes128Key(key.uri, fetchResource, keyCache);
@@ -472,7 +463,6 @@ function fetchAes128Key(
 function exactAes128Key(uri: string, bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   if (bytes.byteLength !== AES128_KEY_LEN) {
     throw new InputError(
-      'unsupported-input',
       `HLS AES-128 key ${uri} must be ${AES128_KEY_LEN} bytes, got ${bytes.byteLength}`,
       { uri, expectedBytes: AES128_KEY_LEN, actualBytes: bytes.byteLength },
     );
@@ -528,17 +518,11 @@ function decodeUtf8(bytes: Uint8Array): string {
 /* v8 ignore start -- the real network fetch path; Node tests inject a local-file fetcher. */
 async function defaultFetchResource(uri: string): Promise<Uint8Array> {
   if (typeof fetch !== 'function') {
-    throw new InputError(
-      'unsupported-input',
-      'no `fetch` available to load HLS resources — provide `fetchResource`',
-    );
+    throw new InputError('no `fetch` available to load HLS resources — provide `fetchResource`');
   }
   const res = await fetch(uri);
   if (!res.ok) {
-    throw new InputError(
-      'unsupported-input',
-      `HLS resource fetch failed for ${uri} (${res.status})`,
-    );
+    throw new InputError(`HLS resource fetch failed for ${uri} (${res.status})`);
   }
   return new Uint8Array(await res.arrayBuffer());
 }

@@ -48,7 +48,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 function fadeRecord(value: unknown): FadeInput {
   if (typeof value !== 'object' || value === null) {
-    throw new InputError('unsupported-input', 'audio fade must be an object');
+    throw new InputError('audio fade must be an object');
   }
   return value as FadeInput;
 }
@@ -56,17 +56,17 @@ function fadeRecord(value: unknown): FadeInput {
 function fadeShape(value: unknown): FadeShape {
   if (value === undefined || value === 'linear') return 'linear';
   if (value === 'equal-power') return 'equal-power';
-  throw new InputError('unsupported-input', `unsupported audio fade curve '${String(value)}'`);
+  throw new InputError(`unsupported audio fade curve '${String(value)}'`);
 }
 
 function fadeFrames(value: unknown, sampleRate: number, label: string): number {
   if (value === undefined) return 0;
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    throw new InputError('unsupported-input', `${label} must be a finite non-negative duration`);
+    throw new InputError(`${label} must be a finite non-negative duration`);
   }
   const frames = Math.round(value * sampleRate);
   if (!Number.isSafeInteger(frames)) {
-    throw new InputError('unsupported-input', `${label} is too large for a safe frame count`);
+    throw new InputError(`${label} is too large for a safe frame count`);
   }
   return frames;
 }
@@ -83,14 +83,14 @@ function fadePlan(o: PcmTransform | undefined, sampleRate: number): FadePlan | u
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null) {
-    throw new InputError('unsupported-input', `${label} must be an object`);
+    throw new InputError(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
 }
 
 function finiteNumber(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new InputError('unsupported-input', `${label} must be a finite number`);
+    throw new InputError(`${label} must be a finite number`);
   }
   return value;
 }
@@ -110,10 +110,7 @@ function dynamicsLimit(value: unknown): DynamicsLimitInput {
 function limitMode(value: unknown): 'hard' | 'soft' {
   if (value === undefined || value === 'hard') return 'hard';
   if (value === 'soft') return 'soft';
-  throw new InputError(
-    'unsupported-input',
-    `audio limiter mode '${String(value)}' is not supported`,
-  );
+  throw new InputError(`audio limiter mode '${String(value)}' is not supported`);
 }
 
 function applyDynamics(audio: PcmAudio, value: unknown): PcmAudio {
@@ -125,10 +122,7 @@ function applyDynamics(audio: PcmAudio, value: unknown): PcmAudio {
     if (normalize.mode === 'peak') result = normalizePeak(result, target);
     else if (normalize.mode === 'rms') result = normalizeRms(result, target);
     else {
-      throw new InputError(
-        'unsupported-input',
-        `audio normalize mode '${String(normalize.mode)}' is not supported`,
-      );
+      throw new InputError(`audio normalize mode '${String(normalize.mode)}' is not supported`);
     }
   }
   if (dynamics.limit !== undefined) {
@@ -147,7 +141,7 @@ function applyDynamics(audio: PcmAudio, value: unknown): PcmAudio {
 
 function biquadSpec(value: unknown): BiquadSpec {
   if (typeof value !== 'object' || value === null) {
-    throw new InputError('unsupported-input', 'audio biquad must be an object');
+    throw new InputError('audio biquad must be an object');
   }
   return value as BiquadSpec;
 }
@@ -204,9 +198,8 @@ export function applyPcmTransform(
   if (o?.sampleRate !== undefined && o.sampleRate !== result.sampleRate) {
     if (options.resample === 'reject') {
       throw new CapabilityError(
-        'capability-miss',
         `audio resample ${result.sampleRate}→${o.sampleRate} Hz needs the WASM/WebAudio tail`,
-        { op: options.op ?? 'convert', tried: [...(options.tried ?? [])] },
+        { op: { kind: 'route', id: options.op ?? 'convert' }, tried: [...(options.tried ?? [])] },
       );
     }
     result = resample(result, o.sampleRate, { signal: o.signal });

@@ -281,17 +281,15 @@ export function parseVp9UncompressedHeader(bytes: Uint8Array): Vp9HeaderFacts {
   }
   if (bits.read(1, 'show_existing_frame') !== 0) {
     throw new CapabilityError(
-      'capability-miss',
       'VP9 show-existing access unit carries no sequence profile/depth header',
-      { op: 'demux', tried: ['webm-vp9-uncompressed-header'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['webm-vp9-uncompressed-header'] },
     );
   }
   if (bits.read(1, 'frame_type') !== 0) {
-    throw new CapabilityError(
-      'capability-miss',
-      'VP9 inter frame cannot qualify a decoder configuration',
-      { op: 'demux', tried: ['webm-vp9-keyframe-header'] },
-    );
+    throw new CapabilityError('VP9 inter frame cannot qualify a decoder configuration', {
+      op: { kind: 'route', id: 'demux' },
+      tried: ['webm-vp9-keyframe-header'],
+    });
   }
   bits.read(1, 'show_frame');
   bits.read(1, 'error_resilient_mode');
@@ -509,8 +507,8 @@ function sequenceHeaderPayload(obus: Uint8Array): Uint8Array {
     if (!hasSize) break;
     offset = payloadEnd;
   }
-  throw new CapabilityError('capability-miss', 'AV1 access unit contains no sequence-header OBU', {
-    op: 'demux',
+  throw new CapabilityError('AV1 access unit contains no sequence-header OBU', {
+    op: { kind: 'route', id: 'demux' },
     tried: ['webm-av1-sequence-header'],
   });
 }
@@ -677,9 +675,8 @@ function vp9LevelForFacts(request: WebmVideoCodecRequest, width: number, height:
     height <= top[2];
   if (!validGeometry) {
     throw new CapabilityError(
-      'capability-miss',
       `VP9 input geometry ${width}x${height} exceeds the defined level envelope`,
-      { op: 'demux', tried: ['webm-vp9-levels'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['webm-vp9-levels'] },
     );
   }
   const fps = request.fps;
@@ -707,9 +704,8 @@ function vp9LevelForFacts(request: WebmVideoCodecRequest, width: number, height:
     }
   }
   throw new CapabilityError(
-    'capability-miss',
     `VP9 input ${width}x${height}@${fps} exceeds the defined level envelope`,
-    { op: 'demux', tried: ['webm-vp9-levels'] },
+    { op: { kind: 'route', id: 'demux' }, tried: ['webm-vp9-levels'] },
   );
 }
 
@@ -843,11 +839,10 @@ export function webmVideoCodecPrivate(
     }
   }
   if (!codec.toLowerCase().startsWith('av01.')) {
-    throw new CapabilityError(
-      'capability-miss',
-      `WebM AV1 mux needs an exact av01 codec string, got '${codec}'`,
-      { op: 'mux', tried: ['webm-av1-codec-private'] },
-    );
+    throw new CapabilityError(`WebM AV1 mux needs an exact av01 codec string, got '${codec}'`, {
+      op: { kind: 'route', id: 'mux' },
+      tried: ['webm-av1-codec-private'],
+    });
   }
   return av1CodecPrivateFromCodecString(codec);
 }

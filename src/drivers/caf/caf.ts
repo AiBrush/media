@@ -52,9 +52,8 @@ function ascii(bytes: Uint8Array, offset: number, length: number): string {
 function formatFromAsbd(asbd: CafAsbd): { format: SampleFormat; endian: Endianness } {
   if (asbd.formatId !== 'lpcm') {
     throw new CapabilityError(
-      'capability-miss',
       `CAF format '${asbd.formatId}' is not linear PCM (needs a codec tier)`,
-      { op: 'demux', tried: ['caf'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['caf'] },
     );
   }
   const endian: Endianness = asbd.formatFlags & FLAG_LITTLE_ENDIAN ? 'le' : 'be';
@@ -62,13 +61,13 @@ function formatFromAsbd(asbd: CafAsbd): { format: SampleFormat; endian: Endianne
   if (asbd.formatFlags & FLAG_FLOAT) {
     if (bits === 32) return { format: 'f32', endian };
     if (bits === 64) return { format: 'f64', endian };
-    throw new InputError('unsupported-input', `unsupported CAF float depth ${bits}-bit`);
+    throw new InputError(`unsupported CAF float depth ${bits}-bit`);
   }
   if (bits === 8) return { format: 's8', endian };
   if (bits === 16) return { format: 's16', endian };
   if (bits === 24) return { format: 's24', endian };
   if (bits === 32) return { format: 's32', endian };
-  throw new InputError('unsupported-input', `unsupported CAF PCM depth ${bits}-bit`);
+  throw new InputError(`unsupported CAF PCM depth ${bits}-bit`);
 }
 
 /** Read a signed 64-bit big-endian integer (CAF chunk sizes; `-1` is legal for a trailing `data`). */
@@ -117,7 +116,7 @@ function locate(bytes: Uint8Array): {
   sampleBytes: number;
 } {
   if (bytes.byteLength < 8 || ascii(bytes, 0, 4) !== 'caff') {
-    throw new InputError('unsupported-input', 'not a CAF (caff) file');
+    throw new InputError('not a CAF (caff) file');
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let asbd: CafAsbd | undefined;
@@ -208,8 +207,8 @@ export function writeCaf(
   endian: Endianness = 'le',
 ): Uint8Array<ArrayBuffer> {
   if (format === 'u8') {
-    throw new CapabilityError('capability-miss', 'CAF 8-bit PCM is signed; use pcm-s8', {
-      op: { op: 'pcm-write', container: 'caf', sampleFormat: format },
+    throw new CapabilityError('CAF 8-bit PCM is signed; use pcm-s8', {
+      op: { kind: 'route', id: 'pcm-write', facts: { container: 'caf', sampleFormat: format } },
       tried: ['caf'],
     });
   }

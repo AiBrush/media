@@ -1,11 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   type ProbeRangeCacheOptions,
   type ProbeRangeCacheState,
   cacheRepeatedProbeRanges,
   cacheRepeatedProbeRangesFor,
 } from './probe-range-cache.ts';
-import type { Source } from './source.ts';
+import { SOURCE_CACHE_KEY, SOURCE_URL_KEY, type Source, fromURL, isSource } from './source.ts';
 
 const OPTIONS: ProbeRangeCacheOptions = {
   maxBytes: 1024,
@@ -13,10 +13,15 @@ const OPTIONS: ProbeRangeCacheOptions = {
   ttlMs: 60_000,
 };
 
-function rangeOf(src: Source, start: number, end: number): Promise<Uint8Array> {
+function rangeOf(
+  src: Source,
+  start: number,
+  end: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const range = src.range;
   if (range === undefined) throw new Error('expected a seekable source');
-  return range.call(src, start, end);
+  return range.call(src, start, end, signal);
 }
 
 function sourceWithCalls(bytes: Uint8Array): {
@@ -294,5 +299,128 @@ describe('repeated probe interval cache', () => {
       [4, 4],
     ]);
     expect(cache.get(source)).toMatchObject({ entries: [], totalBytes: 0 });
+  });
+
+  it('never treats a mid-file short read as EOF — only start === 0 learns size', async () => {
+    const bytes = Uint8Array.from({ length: 12 }, (_value, index) => index);
+    // A deliberately short-reading transport: at most 4 bytes per read, wherever it starts.
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      range: (start, end) => Promise.resolve(bytes.subarray(start, Math.min(end, start + 4))),
+      stream: () => new ReadableStream({ start: (controller) => controller.close() }),
+    };
+    const cache = new WeakMap<Source, ProbeRangeCacheState>();
+    const wrapped = cacheRepeatedProbeRanges(source, cache, OPTIONS);
+
+    expect((await rangeOf(wrapped, 6, 20)).byteLength).toBe(4); // short mid-file read…
+    expect(cache.get(source)?.size).toBeUndefined(); // …is NOT interpreted as EOF
+    expect((await rangeOf(wrapped, 0, 32)).byteLength).toBe(4); // a short prefix read…
+    expect(cache.get(source)?.size).toBe(4); // …is the only EOF teacher
+  });
+});
+
+// ── Forwarding wrapper (docs/architecture/sources.md §5 item 3) ──────────────────────────────────
+
+describe('forwarding wrapper — every fact of the wrapped source stays live', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('forwards keys, symbols, getters, and later-learned facts; overrides only range', async () => {
+    const redirected = 'https://cdn.test/after-redirect/clip.mp4';
+    const total = 4096;
+    vi.stubGlobal('fetch', ((_input: unknown, _init?: RequestInit) => {
+      const body = Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8);
+      const response = new Response(body.slice().buffer, {
+        status: 206,
+        headers: { 'Content-Range': `bytes 0-${body.byteLength - 1}/${total}` },
+      });
+      Object.defineProperty(response, 'url', { value: redirected });
+      return Promise.resolve(response);
+    }) as typeof fetch);
+
+    const src = fromURL('https://cdn.test/clip.mp4');
+    const wrapped = cacheRepeatedProbeRangesFor({}, src);
+    expect(wrapped).not.toBe(src);
+    expect(isSource(wrapped)).toBe(true);
+    expect(wrapped.range).not.toBe(src.range); // the one deliberate override
+    expect(wrapped.readAll).toBe(src.readAll); // method identity forwarded, not rewrapped
+    expect(wrapped.stream).toBe(src.stream);
+    expect(wrapped.kind).toBe('url');
+    expect(wrapped[SOURCE_CACHE_KEY]).toBe(src[SOURCE_CACHE_KEY]);
+
+    // Learn a redirect, a size, and range compliance on the ORIGINAL via a direct range read…
+    await src.range?.(0, 8);
+    // …and observe every learned fact through the wrapper, without hand-listed fields.
+    expect(wrapped[SOURCE_URL_KEY]).toBe(redirected);
+    expect(wrapped.size).toBe(total);
+    expect(wrapped.rangesHonored).toBe(true);
+
+    const keys = Reflect.ownKeys(wrapped);
+    expect(keys).toContain(SOURCE_CACHE_KEY);
+    expect(keys).toContain('size'); // the own field learned after wrapping is enumerable here too
+    expect({ ...wrapped }.range).toBe(wrapped.range); // spread picks up the override, not the original
+  });
+
+  it('threads the caller signal through wrapped reads and honors abort even on cache hits', async () => {
+    const bytes = Uint8Array.from({ length: 64 }, (_value, index) => index);
+    const signals: Array<AbortSignal | undefined> = [];
+    const source: Source = {
+      __media: 'source',
+      kind: 'url',
+      size: bytes.byteLength,
+      range: (start, end, signal) => {
+        signals.push(signal);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream: () => new ReadableStream({ start: (controller) => controller.close() }),
+    };
+    const cache = new WeakMap<Source, ProbeRangeCacheState>();
+    const wrapped = cacheRepeatedProbeRanges(source, cache, OPTIONS);
+    const controller = new AbortController();
+
+    expect((await rangeOf(wrapped, 0, 8, controller.signal)).byteLength).toBe(8);
+    expect(signals).toEqual([controller.signal]); // forwarded into the inner transport
+
+    controller.abort();
+    await expect(rangeOf(wrapped, 0, 8, controller.signal)).rejects.toMatchObject({
+      code: 'aborted',
+    });
+    expect(signals).toHaveLength(1); // the aborted cache hit never touched the inner source
+  });
+});
+
+// ── Per-engine ownership (docs/architecture/sources.md §5 item 9) ────────────────────────────────
+
+describe('per-engine cache ownership — no module-level mutable state', () => {
+  it('installs a fresh cache map on each engine instance itself, invisibly to enumeration', async () => {
+    const bytes = Uint8Array.from({ length: 32 }, (_value, index) => index);
+    const { source, calls } = sourceWithCalls(bytes);
+    const left = {};
+    const right = {};
+
+    await rangeOf(cacheRepeatedProbeRangesFor(left, source), 0, 8);
+    await rangeOf(cacheRepeatedProbeRangesFor(right, source), 0, 8);
+    expect(calls).toEqual([
+      [0, 8],
+      [0, 8],
+    ]); // two engines probing the same Source keep independent state
+
+    const mapOf = (owner: object): WeakMap<Source, ProbeRangeCacheState> => {
+      const symbols = Object.getOwnPropertySymbols(owner);
+      expect(symbols).toHaveLength(1);
+      const symbol = symbols[0];
+      if (symbol === undefined) throw new Error('expected the owner to hold its cache field');
+      expect(Object.getOwnPropertyDescriptor(owner, symbol)?.enumerable).toBe(false);
+      const value = (owner as Record<symbol, unknown>)[symbol];
+      if (!(value instanceof WeakMap)) throw new Error('expected a WeakMap instance field');
+      return value as WeakMap<Source, ProbeRangeCacheState>;
+    };
+    const leftMap = mapOf(left);
+    const rightMap = mapOf(right);
+    expect(leftMap).not.toBe(rightMap); // a fresh cache map per engine
+    expect(leftMap.get(source)?.entries).toHaveLength(1);
+    expect(rightMap.get(source)?.entries).toHaveLength(1);
+    expect(leftMap.get(source)).not.toBe(rightMap.get(source));
+    expect(Object.keys(left)).toHaveLength(0); // never visible to Object.keys/JSON/spread audits
   });
 });

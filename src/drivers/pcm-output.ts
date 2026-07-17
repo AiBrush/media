@@ -18,8 +18,8 @@ function unsupportedSampleFormat(
     container === 'wav'
       ? 'WAV 8-bit PCM is unsigned; use pcm-u8 instead of pcm-s8'
       : `${container.toUpperCase()} 8-bit PCM is signed; use pcm-s8 instead of pcm-u8`;
-  return new CapabilityError('capability-miss', message, {
-    op: { op: 'pcm-write', container, sampleFormat },
+  return new CapabilityError(message, {
+    op: { kind: 'route', id: 'pcm-write', facts: { container, sampleFormat } },
     tried: [container],
   });
 }

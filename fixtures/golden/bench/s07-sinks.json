@@ -1,0 +1,127 @@
+{
+  "generatedAt": "2026-07-17T09:13:24.123Z",
+  "warmup": 3,
+  "iters": 15,
+  "cases": {
+    "bear-1280x720.ts#callback-unchunked": {
+      "bytes": 780012,
+      "wallMs": 1.094,
+      "mbPerSec": 679.7,
+      "firstWriteMs": 0.0065,
+      "writes": 4149,
+      "maxWriteBytes": 188
+    },
+    "bear-1280x720.ts#callback-chunked-1MiB": {
+      "bytes": 780012,
+      "wallMs": 0.857,
+      "mbPerSec": 868.2,
+      "firstWriteMs": 0.8357,
+      "writes": 1,
+      "maxWriteBytes": 780012
+    },
+    "bear-1280x720.ts#positioned-random-access": {
+      "bytes": 780012,
+      "wallMs": 1.577,
+      "mbPerSec": 471.6,
+      "firstWriteMs": 0.0175,
+      "writes": 4150,
+      "maxWriteBytes": 188
+    },
+    "h264.mp4#callback-unchunked": {
+      "bytes": 9821,
+      "wallMs": 0.005,
+      "mbPerSec": 1904.8,
+      "firstWriteMs": 0.0031,
+      "writes": 3,
+      "maxWriteBytes": 4096
+    },
+    "h264.mp4#callback-chunked-1MiB": {
+      "bytes": 9821,
+      "wallMs": 0.008,
+      "mbPerSec": 1176.9,
+      "firstWriteMs": 0.0067,
+      "writes": 1,
+      "maxWriteBytes": 9821
+    },
+    "h264.mp4#positioned-random-access": {
+      "bytes": 9821,
+      "wallMs": 0.012,
+      "mbPerSec": 767.1,
+      "firstWriteMs": 0.0062,
+      "writes": 4,
+      "maxWriteBytes": 4096
+    },
+    "movie_5.mp4#callback-unchunked": {
+      "bytes": 31603,
+      "wallMs": 0.007,
+      "mbPerSec": 4063.5,
+      "firstWriteMs": 0.0038,
+      "writes": 8,
+      "maxWriteBytes": 4096
+    },
+    "movie_5.mp4#callback-chunked-1MiB": {
+      "bytes": 31603,
+      "wallMs": 0.014,
+      "mbPerSec": 2185.3,
+      "firstWriteMs": 0.0101,
+      "writes": 1,
+      "maxWriteBytes": 31603
+    },
+    "movie_5.mp4#positioned-random-access": {
+      "bytes": 31603,
+      "wallMs": 0.013,
+      "mbPerSec": 2340.9,
+      "firstWriteMs": 0.006,
+      "writes": 9,
+      "maxWriteBytes": 4096
+    },
+    "test.mp4#callback-unchunked": {
+      "bytes": 192844,
+      "wallMs": 0.019,
+      "mbPerSec": 9431.3,
+      "firstWriteMs": 0.0028,
+      "writes": 48,
+      "maxWriteBytes": 4096
+    },
+    "test.mp4#callback-chunked-1MiB": {
+      "bytes": 192844,
+      "wallMs": 0.027,
+      "mbPerSec": 6864.4,
+      "firstWriteMs": 0.0232,
+      "writes": 1,
+      "maxWriteBytes": 192844
+    },
+    "test.mp4#positioned-random-access": {
+      "bytes": 192844,
+      "wallMs": 0.029,
+      "mbPerSec": 6443.7,
+      "firstWriteMs": 0.005,
+      "writes": 49,
+      "maxWriteBytes": 4096
+    },
+    "four-colors.mp4#callback-unchunked": {
+      "bytes": 709,
+      "wallMs": 0.004,
+      "mbPerSec": 193.2,
+      "firstWriteMs": 0.0025,
+      "writes": 1,
+      "maxWriteBytes": 709
+    },
+    "four-colors.mp4#callback-chunked-1MiB": {
+      "bytes": 709,
+      "wallMs": 0.007,
+      "mbPerSec": 91.2,
+      "firstWriteMs": 0.0062,
+      "writes": 1,
+      "maxWriteBytes": 709
+    },
+    "four-colors.mp4#positioned-random-access": {
+      "bytes": 709,
+      "wallMs": 0.007,
+      "mbPerSec": 95.4,
+      "firstWriteMs": 0.0048,
+      "writes": 2,
+      "maxWriteBytes": 709
+    }
+  }
+}

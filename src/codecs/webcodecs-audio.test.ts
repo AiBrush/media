@@ -112,7 +112,10 @@ describe('decoderErrorToCapabilityMiss — native-decoder failure → cross-brow
     expect(err.code).toBe('capability-miss');
     expect(err.message).toContain('opus');
     expect(err.message).toContain('EncodingError');
-    expect(err.detail).toMatchObject({ op: 'decode', tried: ['webcodecs-audio'] });
+    expect(err.detail).toMatchObject({
+      op: { kind: 'route', id: 'decode' },
+      tried: ['webcodecs-audio'],
+    });
   });
   it('degrades gracefully when the codec is unknown', () => {
     const err = decoderErrorToCapabilityMiss(new Error('boom'), undefined);

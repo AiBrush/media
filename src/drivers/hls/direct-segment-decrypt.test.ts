@@ -487,7 +487,7 @@ describe('direct HLS AES-128 failure and lifecycle truth', () => {
   });
 
   it('preserves typed range errors and maps an abort that races a range failure to aborted', async () => {
-    const typed = new InputError('unsupported-input', 'typed range failure');
+    const typed = new InputError('typed range failure');
     const typedSource: Source = {
       __media: 'source',
       kind: 'bytes',
@@ -553,7 +553,7 @@ describe('direct HLS AES-128 failure and lifecycle truth', () => {
           containerLabel: 'test container',
           validate: (clear) => {
             recovered = clear;
-            throw new InputError('unsupported-input', 'validation failed');
+            throw new InputError('validation failed');
           },
         },
       ),

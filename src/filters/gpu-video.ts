@@ -177,7 +177,7 @@ export function planColor(spec: ColorVideoSpec, source: SourceColor): ColorPlan 
   if (spec.type === 'tonemap') return planTonemap(source);
   const dst = parseColorSpace(spec.to);
   if (dst === null) {
-    throw new InputError('unsupported-input', `unknown colorspace target '${spec.to}'`);
+    throw new InputError(`unknown colorspace target '${spec.to}'`);
   }
   return planColorspace(source, dst);
 }
@@ -530,16 +530,16 @@ class WebGPURenderer implements Renderer {
   static async create(signal?: AbortSignal): Promise<WebGPURenderer> {
     const gpuApi = (navigator as Navigator & { gpu?: GPU }).gpu;
     if (gpuApi === undefined) {
-      throw new CapabilityError('capability-miss', 'WebGPU is not available in this environment', {
-        op: 'filter',
+      throw new CapabilityError('WebGPU is not available in this environment', {
+        op: { kind: 'route', id: 'filter' },
         tried: ['webgpu'],
         suggestion: 'use the canvas2d filter driver',
       });
     }
     const adapter = await gpuApi.requestAdapter();
     if (adapter === null) {
-      throw new CapabilityError('capability-miss', 'no WebGPU adapter could be acquired', {
-        op: 'filter',
+      throw new CapabilityError('no WebGPU adapter could be acquired', {
+        op: { kind: 'route', id: 'filter' },
         tried: ['webgpu'],
         suggestion: 'use the canvas2d filter driver',
       });
@@ -800,8 +800,8 @@ export const webgpuVideoFilterDriver: FilterDriver = {
   },
   createFilter(f: FilterSpec, o?: StageOptions): TransformStream<VideoFrame, VideoFrame> {
     if (!webgpuHandles(f)) {
-      throw new CapabilityError('capability-miss', `webgpu filter does not handle ${f.type}`, {
-        op: 'filter',
+      throw new CapabilityError(`webgpu filter does not handle ${f.type}`, {
+        op: { kind: 'route', id: 'filter' },
         tried: [webgpuVideoFilterDriver.id],
       });
     }
@@ -830,8 +830,8 @@ export const canvas2dVideoFilterDriver: FilterDriver = {
   },
   createFilter(f: FilterSpec, o?: StageOptions): TransformStream<VideoFrame, VideoFrame> {
     if (!canvas2dHandles(f)) {
-      throw new CapabilityError('capability-miss', `canvas2d filter does not handle ${f.type}`, {
-        op: 'filter',
+      throw new CapabilityError(`canvas2d filter does not handle ${f.type}`, {
+        op: { kind: 'route', id: 'filter' },
         tried: [canvas2dVideoFilterDriver.id],
       });
     }

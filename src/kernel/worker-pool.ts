@@ -28,7 +28,7 @@
 
 import { MediaError } from '../contracts/errors.ts';
 import { InlineBridge, type RunStreamOptions, type WorkerStreamBridge } from './worker-bridge.ts';
-import type { OffloadJob } from './worker-protocol.ts';
+import type { OffloadJob, WorkerMediaCaps } from './worker-protocol.ts';
 
 /** Spawn one host-side {@link WorkerStreamBridge} (a real `Worker` in production; a channel in tests). */
 export type WorkerPoolTransport = () => WorkerStreamBridge;
@@ -39,6 +39,12 @@ export interface WorkerPoolOptions {
   readonly size: number;
   /** How to spawn each bridge (injected so production uses a real `Worker`, tests a channel). */
   readonly transport: WorkerPoolTransport;
+  /**
+   * The per-media-kind caps the pool's probe worker announced (identical workers in one environment share
+   * one substrate, so the probe's handshake speaks for the pool — doc 06 §4). Absent for a pool built
+   * without a handshake (direct embedder wiring); the per-op gate treats that as unrestricted.
+   */
+  readonly caps?: WorkerMediaCaps;
 }
 
 /**
@@ -67,17 +73,24 @@ export class WorkerPool {
   readonly #queue: PendingJob[] = [];
   /** In-flight controllers, one per running job, so {@link abortAll} can cancel each. */
   readonly #inFlight = new Set<AbortController>();
+  readonly #caps: WorkerMediaCaps | undefined;
   #terminated = false;
 
   constructor(options: WorkerPoolOptions) {
     const size = Math.max(1, Math.floor(options.size));
     this.#bridges = Array.from({ length: size }, () => options.transport());
     this.#idle = [...this.#bridges];
+    this.#caps = options.caps;
   }
 
   /** The number of worker bridges in the pool. */
   get size(): number {
     return this.#bridges.length;
+  }
+
+  /** The probe worker's handshaken per-kind caps; `undefined` ⇒ built without a handshake (unrestricted). */
+  get caps(): WorkerMediaCaps | undefined {
+    return this.#caps;
   }
 
   /**

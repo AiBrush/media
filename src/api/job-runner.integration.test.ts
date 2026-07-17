@@ -1,6 +1,20 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import { toBlob } from '../sinks/sink.ts';
 import { createMedia } from './create-media.ts';
+
+/**
+ * Baked golden for the documented `trim 0–0.1s → wav pcm-s16` job on `sfx-pcm-s16.wav`, produced by the
+ * staged reference path (`trim → Blob → convert`) on the pure-TS tier. The fused single-pipe runner must
+ * reproduce it bit-exactly.
+ */
+const TRIM_WAV_SHA256 = '210de71b0c07a557db5c229f0af69f628126cdf7c05ac312573745c309289cc1';
+const TRIM_WAV_BYTES = 9_644;
+
+function sha256(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
 
 interface WavDataChunk {
   readonly offset: number;
@@ -64,5 +78,64 @@ describe('declarative job runner — real engine', () => {
     });
     expect(info.durationSec).toBeCloseTo(0.1, 12);
     expect(info.tracks[0]?.durationSec).toBeCloseTo(0.1, 12);
+  });
+
+  it('fused single-pipe job output ≡ staged two-op output, byte-for-byte, matching the baked golden', async () => {
+    const source = new Uint8Array(
+      await readFile(new URL('../../fixtures/media/sfx-pcm-s16.wav', import.meta.url)),
+    );
+    const engine = createMedia();
+
+    // Fused: the declarative runner executes trim → convert as one pipe (lazy stream boundary,
+    // source opened once, nothing materialized between the operations).
+    const fused = await engine.run({
+      input: source,
+      ops: [{ op: 'trim', start: 0, end: 0.1 }],
+      output: { container: 'wav', video: false, audio: { codec: 'pcm-s16' } },
+    });
+    const fusedBytes = new Uint8Array(await fused.arrayBuffer());
+
+    // Staged reference: the same two flat operations with an explicit Blob materialization boundary —
+    // the metamorphic oracle: changing the boundary must not change one output byte.
+    const trimmed = await engine.trim(source, { start: 0, end: 0.1, sink: toBlob() });
+    expect(trimmed).toBeInstanceOf(Blob);
+    const staged = await engine.convert(trimmed as Blob, {
+      to: 'wav',
+      video: false,
+      audio: { codec: 'pcm-s16' },
+    });
+    expect(staged).toBeInstanceOf(Blob);
+    const stagedBytes = new Uint8Array(await (staged as Blob).arrayBuffer());
+
+    expect(fusedBytes.byteLength).toBe(TRIM_WAV_BYTES);
+    expect(fusedBytes).toEqual(stagedBytes);
+    expect(sha256(fusedBytes)).toBe(TRIM_WAV_SHA256);
+    expect(sha256(stagedBytes)).toBe(TRIM_WAV_SHA256);
+  });
+
+  it('fused ≡ staged holds on a real video container too (mp4 keyframe trim → mp4)', async () => {
+    const source = new Uint8Array(
+      await readFile(new URL('../../fixtures/media/bear-1280x720.mp4', import.meta.url)),
+    );
+    const engine = createMedia();
+
+    const fused = await engine.run({
+      input: source,
+      ops: [{ op: 'trim', start: 0, end: 1 }],
+      output: { container: 'mp4' },
+    });
+    const fusedBytes = new Uint8Array(await fused.arrayBuffer());
+
+    const trimmed = await engine.trim(source, { start: 0, end: 1, sink: toBlob() });
+    expect(trimmed).toBeInstanceOf(Blob);
+    const staged = await engine.convert(trimmed as Blob, { to: 'mp4' });
+    expect(staged).toBeInstanceOf(Blob);
+    const stagedBytes = new Uint8Array(await (staged as Blob).arrayBuffer());
+
+    // Metamorphic only (no baked hash): the mp4 muxer may legitimately evolve in its own family, but
+    // moving the op boundary from a Blob to the fused lazy pipe must never change one output byte.
+    expect(fusedBytes.byteLength).toBeGreaterThan(0);
+    expect(sha256(fusedBytes)).toBe(sha256(stagedBytes));
+    expect(fusedBytes).toEqual(stagedBytes);
   });
 });

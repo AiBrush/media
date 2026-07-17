@@ -77,8 +77,8 @@ export async function tryRemuxPacketInfoToMpegTs(
   const describedTracks = table.tracks.filter((track) => track.config !== undefined);
   const selected = selectTrackInfos(describedTracks, opts.trackSelect);
   if (selected.length === 0) {
-    throw new CapabilityError('capability-miss', 'no packet-info MPEG-TS remux track', {
-      op: 'remux',
+    throw new CapabilityError('no packet-info MPEG-TS remux track', {
+      op: { kind: 'route', id: 'remux' },
       tried: [container.id, opts.to],
     });
   }
@@ -117,8 +117,8 @@ async function packetInfoFromBytes(
   stage: StageOptions,
 ): Promise<PacketInfoTable> {
   if (container.packetInfo === undefined) {
-    throw new CapabilityError('capability-miss', 'MP4 packet-info is not available', {
-      op: 'remux',
+    throw new CapabilityError('MP4 packet-info is not available', {
+      op: { kind: 'route', id: 'remux' },
       tried: [container.id, 'ts'],
     });
   }

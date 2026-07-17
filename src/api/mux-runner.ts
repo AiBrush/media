@@ -41,8 +41,8 @@ export async function runMux(
 ): Promise<Output> {
   const target = opts.container;
   if (!containerHasChunkMuxer(target)) {
-    throw new CapabilityError('capability-miss', `no muxer '${target}'`, {
-      op: 'mux',
+    throw new CapabilityError(`no muxer '${target}'`, {
+      op: { kind: 'route', id: 'mux' },
       tried: [target],
     });
   }

@@ -166,8 +166,8 @@ export function resetOpusCoreForTest(): void {
 
 /** The {@link CapabilityError} a coder throws when the vendored Opus wasm core is unavailable. */
 function coreMissing(op: 'decode' | 'encode'): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-opus core is not available (not vendored)', {
-    op,
+  return new CapabilityError('wasm-opus core is not available (not vendored)', {
+    op: { kind: 'route', id: op },
     tried: ['wasm-opus'],
     suggestion: 'build + vendor the Opus wasm core per src/codecs/wasm-opus/BUILD.md',
   });

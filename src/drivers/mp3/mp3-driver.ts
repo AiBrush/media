@@ -229,7 +229,7 @@ function fullFrameDurationSec(
 export function enumerateMp3Packets(bytes: Uint8Array): Mp3Packet[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const first = findFirstFrame(dv, id3v2Length(dv));
-  if (!first) throw new InputError('unsupported-input', 'no valid MP3 frame header found');
+  if (!first) throw new InputError('no valid MP3 frame header found');
 
   const packets: Mp3Packet[] = [];
   let cumulativeSamples = 0;
@@ -258,7 +258,7 @@ export function enumerateMp3Packets(bytes: Uint8Array): Mp3Packet[] {
 export function parseMp3(bytes: Uint8Array, totalSize?: number, sourceOffset = 0): Mp3Info {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const first = findFirstFrame(dv, id3v2Length(dv));
-  if (!first) throw new InputError('unsupported-input', 'no valid MP3 frame header found');
+  if (!first) throw new InputError('no valid MP3 frame header found');
   const { offset, header } = first;
 
   const frames = xingFrameCount(dv, offset, header);
@@ -404,9 +404,8 @@ export function mp3PacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
 function packetStream(bytes: Uint8Array, signal: AbortSignal | undefined): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'MP3 packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-      { op: 'demux', tried: ['mp3'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['mp3'] },
     );
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */

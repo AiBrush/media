@@ -46,6 +46,21 @@ interface ElementAttachment {
   detach(): void;
 }
 
+/**
+ * Per-element session/attachment registries (doc 09 §5 item 8 — the recorded invariant).
+ *
+ * INVARIANT: **at most one active sink session per media element.** A media element is a single
+ * contended playback resource — two producers appending into one element would interleave bytes and
+ * fight over `src`/`srcObject` — so a newer attachment deterministically displaces the prior session,
+ * aborting it with the typed `MediaError('aborted', 'element sink was replaced by a newer attachment')`.
+ *
+ * Scoping is deliberately by *element*, not by engine: the DOM node is the resource, so two `Engine`
+ * instances attaching to the SAME element must still displace each other (an engine-scoped registry
+ * would let them corrupt one element in parallel), while sessions on DIFFERENT elements never interact
+ * because each `WeakMap` entry is keyed by its own element. The maps are weak so an entry can never
+ * outlive its element, and module state holds no element alive. Both properties are pinned by
+ * `element-sink.test.ts` ("element sink sessions — per-element scoping").
+ */
 const activeElementSessions = new WeakMap<HTMLMediaElement, ElementSession>();
 const activeElementAttachments = new WeakMap<HTMLMediaElement, ElementAttachment>();
 
@@ -101,10 +116,7 @@ async function writeElementMediaSource(
 ): Promise<void> {
   const mime = opts.mime?.trim();
   if (!mime) {
-    throw new InputError(
-      'unsupported-input',
-      `element sink via '${via}' requires an output MIME type`,
-    );
+    throw new InputError(`element sink via '${via}' requires an output MIME type`);
   }
   throwIfAborted(session.controller.signal);
   requireElementEvents(el);
@@ -281,7 +293,7 @@ function requireElementEvents(el: HTMLMediaElement): void {
     typeof el.removeAttribute !== 'function' ||
     typeof el.load !== 'function'
   ) {
-    throw new InputError('unsupported-input', 'element sink requires an HTMLMediaElement');
+    throw new InputError('element sink requires an HTMLMediaElement');
   }
 }
 
@@ -485,8 +497,12 @@ async function cancelUnlockedStream(
 }
 
 function mapElementFailure(error: unknown, signal: AbortSignal): unknown {
-  if (error instanceof MediaError) return error;
+  // A concrete stage failure (mux/decode/...) always wins, but a *generic* aborted error raised while
+  // the session signal is aborted is upgraded to the signal's typed reason — so a displaced session
+  // surfaces 'element sink was replaced by a newer attachment', never a vague 'operation aborted'.
+  if (error instanceof MediaError && error.code !== 'aborted') return error;
   if (signal.aborted) return signalFailure(signal);
+  if (error instanceof MediaError) return error;
   return toMuxError(error, 'element sink failed');
 }
 
@@ -516,13 +532,13 @@ function elementCapability(
   message: string,
   cause?: unknown,
 ): CapabilityError {
-  return new CapabilityError('capability-miss', message, {
-    op: { op: 'element-sink', via },
+  return new CapabilityError(message, {
+    op: { kind: 'route', id: 'element-sink', facts: { via } },
     tried: [],
     ...(cause === undefined ? {} : { cause }),
   });
 }
 
 function assertNever(x: never): never {
-  throw new InputError('unsupported-input', `unknown sink ${JSON.stringify(x)}`);
+  throw new InputError(`unknown sink ${JSON.stringify(x)}`);
 }

@@ -71,8 +71,9 @@ describe('worker protocol serialization boundaries', () => {
       message: 'media',
       detail: cloneSafe,
     });
-    expect(serializeError(new InputError('unsupported-input', 'input', null)).detail).toBeNull();
-    expect(serializeError(new CapabilityError('capability-miss', 'cap')).detail).toBeUndefined();
+    expect(serializeError(new InputError('input', null)).detail).toBeNull();
+    const capDetail = { op: { kind: 'route', id: 'probe' }, tried: [] } as const;
+    expect(serializeError(new CapabilityError('cap', capDetail)).detail).toEqual(capDetail);
   });
 
   it('serializes generic Error and non-Error throws without fabricating a media code', () => {

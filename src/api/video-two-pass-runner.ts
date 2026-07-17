@@ -77,10 +77,7 @@ export function installH264TwoPassQuantizer(
       ...baseStage,
       quantizerAt: ({ timestampUs }) => {
         if (usedTimestamps.has(timestampUs)) {
-          throw new InputError(
-            'unsupported-input',
-            `H.264 two-pass replay duplicated picture PTS ${timestampUs}`,
-          );
+          throw new InputError(`H.264 two-pass replay duplicated picture PTS ${timestampUs}`);
         }
         usedTimestamps.add(timestampUs);
         return plan.quantizerForTimestamp(timestampUs);
@@ -89,7 +86,6 @@ export function installH264TwoPassQuantizer(
     assertComplete: () => {
       if (usedTimestamps.size !== plan.sampleCount) {
         throw new InputError(
-          'unsupported-input',
           `H.264 two-pass replay encoded ${usedTimestamps.size}/${plan.sampleCount} analyzed pictures`,
         );
       }
@@ -147,10 +143,9 @@ export async function analyzeH264TwoPass(
 ): Promise<H264TwoPassPlan> {
   if (src.kind === 'stream') {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 two-pass convert requires a replayable source; a ReadableStream is single-use',
       {
-        op: 'convert',
+        op: { kind: 'route', id: 'convert' },
         tried: ['webcodecs-video'],
         suggestion:
           'provide bytes, Blob, URL, or OPFS input so the filtered source can be replayed',
@@ -158,10 +153,7 @@ export async function analyzeH264TwoPass(
     );
   }
   if (target.bitrate === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'H.264 two-pass video encode requires a target bitrate',
-    );
+    throw new InputError('H.264 two-pass video encode requires a target bitrate');
   }
 
   const demuxer: Demuxer = await container.demux(src, context.stageOptions(signal, options));
@@ -173,11 +165,10 @@ export async function analyzeH264TwoPass(
       (candidate) => candidate.mediaType === 'video' && candidate.config !== undefined,
     );
     if (track === undefined) {
-      throw new CapabilityError(
-        'capability-miss',
-        'H.264 two-pass source has no decodable video track',
-        { op: 'convert', tried: [container.id] },
-      );
+      throw new CapabilityError('H.264 two-pass source has no decodable video track', {
+        op: { kind: 'route', id: 'convert' },
+        tried: [container.id],
+      });
     }
     const {
       buildVideoEncoderConfigForRuntime,
@@ -211,9 +202,8 @@ export async function analyzeH264TwoPass(
       !config.codec.toLowerCase().startsWith('avc3.')
     ) {
       throw new CapabilityError(
-        'capability-miss',
         `two-pass rate allocation is implemented for H.264, not '${config.codec}'`,
-        { op: 'encode', tried: ['webcodecs-video'] },
+        { op: { kind: 'route', id: 'encode' }, tried: ['webcodecs-video'] },
       );
     }
     const decodeQuery = await decodeQueryFor(track);
@@ -327,10 +317,9 @@ export async function encodeVideoStream(
     target.alpha === 'keep' ? { ...config, alpha: 'discard' } : config;
   if (target.twoPass === true && twoPassPlan === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 two-pass encode needs a replayable convert source and cannot consume a one-shot frame stream',
       {
-        op: 'encode',
+        op: { kind: 'route', id: 'encode' },
         tried: ['webcodecs-video'],
         suggestion: 'use convert() with bytes, Blob, URL, or OPFS input',
       },

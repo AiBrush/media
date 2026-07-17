@@ -134,7 +134,10 @@ describe('decoderErrorToCapabilityMiss — native-decoder failure → cross-brow
     expect(err.message).toContain('avc1.64000A');
     expect(err.message).toContain('EncodingError');
     expect(err.message).toContain('Decoder failure');
-    expect(err.detail).toMatchObject({ op: 'decode', tried: ['webcodecs-video'] });
+    expect(err.detail).toMatchObject({
+      op: { kind: 'route', id: 'decode' },
+      tried: ['webcodecs-video'],
+    });
   });
   it('names the driver and degrades gracefully when the codec is unknown', () => {
     const err = decoderErrorToCapabilityMiss(new Error('boom'), 'webcodecs-video', undefined);

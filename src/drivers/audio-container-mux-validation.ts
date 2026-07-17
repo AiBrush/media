@@ -28,32 +28,31 @@ export function assertAudioMuxOptions(
       : kind === 'ogg'
         ? 'fragmented ogg unsupported'
         : `${kind.toUpperCase()} has no fragmented/segmented mux form`;
-  throw new CapabilityError('capability-miss', message, {
-    op: { op: 'mux', fragmented: true },
+  throw new CapabilityError(message, {
+    op: { kind: 'route', id: 'mux', facts: { fragmented: true } },
     tried: [kind],
   });
 }
 
 export function wavMuxTrackConfig(info: TrackInfo, trackCount: number): WavMuxTrackConfig {
   if (trackCount > 0) {
-    throw new CapabilityError('capability-miss', 'the WAV muxer writes one audio stream', {
-      op: { op: 'mux' },
+    throw new CapabilityError('the WAV muxer writes one audio stream', {
+      op: { kind: 'route', id: 'mux' },
       tried: ['wav'],
     });
   }
   if (info.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'WAV muxing accepts audio tracks only', {
-      op: { op: 'mux', mediaType: info.mediaType },
+    throw new CapabilityError('WAV muxing accepts audio tracks only', {
+      op: { kind: 'route', id: 'mux', facts: { mediaType: info.mediaType } },
       tried: ['wav'],
     });
   }
   const wire = pcmWireFormat(info.codec);
   if (wire === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      `WAV muxing accepts raw PCM packets, not '${info.codec}'`,
-      { op: { op: 'mux', codec: info.codec }, tried: ['wav'] },
-    );
+    throw new CapabilityError(`WAV muxing accepts raw PCM packets, not '${info.codec}'`, {
+      op: { kind: 'route', id: 'mux', facts: { codec: info.codec } },
+      tried: ['wav'],
+    });
   }
   const config = info.config;
   if (
@@ -81,24 +80,23 @@ export function wavMuxTrackConfig(info: TrackInfo, trackCount: number): WavMuxTr
 
 export function validateMp3MuxTrack(info: TrackInfo, trackCount: number): void {
   if (trackCount > 0) {
-    throw new CapabilityError('capability-miss', 'the MP3 muxer writes a single audio stream', {
-      op: { op: 'mux' },
+    throw new CapabilityError('the MP3 muxer writes a single audio stream', {
+      op: { kind: 'route', id: 'mux' },
       tried: ['mp3'],
     });
   }
   if (info.mediaType !== 'audio' || info.codec !== 'mp3') {
     throw new CapabilityError(
-      'capability-miss',
       `MP3 container carries a single MP3 audio track, not ${info.mediaType}/${info.codec}`,
-      { op: { op: 'mux' }, tried: ['mp3'] },
+      { op: { kind: 'route', id: 'mux' }, tried: ['mp3'] },
     );
   }
 }
 
 export function oggMuxCodec(info: TrackInfo): 'opus' | 'vorbis' | 'flac' {
   if (info.mediaType !== 'audio') {
-    throw new CapabilityError('capability-miss', 'the ogg muxer writes audio only', {
-      op: { op: 'mux', mediaType: info.mediaType },
+    throw new CapabilityError('the ogg muxer writes audio only', {
+      op: { kind: 'route', id: 'mux', facts: { mediaType: info.mediaType } },
       tried: ['ogg'],
     });
   }
@@ -107,16 +105,15 @@ export function oggMuxCodec(info: TrackInfo): 'opus' | 'vorbis' | 'flac' {
   if (codec.startsWith('vorbis')) return 'vorbis';
   if (codec.startsWith('flac')) return 'flac';
   throw new CapabilityError(
-    'capability-miss',
     `the ogg muxer cannot write audio codec '${info.codec}' (Opus/Vorbis/FLAC only)`,
-    { op: { op: 'mux', codec: info.codec }, tried: ['ogg'] },
+    { op: { kind: 'route', id: 'mux', facts: { codec: info.codec } }, tried: ['ogg'] },
   );
 }
 
 export function validateOggMuxTrack(info: TrackInfo, trackCount: number): void {
   if (trackCount > 0) {
-    throw new CapabilityError('capability-miss', 'ogg muxer writes one stream', {
-      op: { op: 'mux' },
+    throw new CapabilityError('ogg muxer writes one stream', {
+      op: { kind: 'route', id: 'mux' },
       tried: ['ogg'],
     });
   }
@@ -131,16 +128,15 @@ export interface AdtsMuxTrackConfig {
 
 export function adtsMuxTrackConfig(info: TrackInfo, trackCount: number): AdtsMuxTrackConfig {
   if (trackCount > 0) {
-    throw new CapabilityError('capability-miss', 'the ADTS muxer writes a single audio stream', {
-      op: { op: 'mux' },
+    throw new CapabilityError('the ADTS muxer writes a single audio stream', {
+      op: { kind: 'route', id: 'mux' },
       tried: ['adts'],
     });
   }
   if (info.mediaType !== 'audio' || !info.codec.toLowerCase().startsWith('mp4a.40.')) {
     throw new CapabilityError(
-      'capability-miss',
       `ADTS container carries a single AAC audio track, not ${info.mediaType}/${info.codec}`,
-      { op: { op: 'mux' }, tried: ['adts'] },
+      { op: { kind: 'route', id: 'mux' }, tried: ['adts'] },
     );
   }
   const description = info.config?.description;

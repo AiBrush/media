@@ -21,6 +21,7 @@
  * unaffected unless you ask to cache it.
  */
 
+import { drainStream } from './read-all.ts';
 import { type Source, type SourceKind, fromURL, isSource, probeUrlSize } from './source.ts';
 
 /** Options for {@link cacheSource}. */
@@ -209,7 +210,7 @@ class RangeCache implements CachingSource {
     if (this.#src.range && this.size !== undefined) {
       return this.#src.range(0, this.size);
     }
-    return drain(this.#src.stream());
+    return drainStream(this.#src.stream());
   }
 
   /** Fetch a window from the underlying source, de-duplicating identical concurrent requests. */
@@ -289,24 +290,4 @@ function bytesStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
       c.close();
     },
   });
-}
-
-/** Drain a readable fully into one contiguous `Uint8Array`. */
-async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
 }

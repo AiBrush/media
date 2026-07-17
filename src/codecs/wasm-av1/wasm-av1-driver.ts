@@ -123,23 +123,18 @@ export function resetAv1CoreForTest(): void {
 }
 
 function coreMissing(op: 'decode' | 'encode'): CapabilityError {
-  return new CapabilityError(
-    'capability-miss',
-    'wasm-av1 dav1d core is not available (not vendored)',
-    {
-      op,
-      tried: ['wasm-av1'],
-      suggestion: 'build + vendor dav1d per src/codecs/wasm-av1/BUILD.md',
-    },
-  );
+  return new CapabilityError('wasm-av1 dav1d core is not available (not vendored)', {
+    op: { kind: 'route', id: op },
+    tried: ['wasm-av1'],
+    suggestion: 'build + vendor dav1d per src/codecs/wasm-av1/BUILD.md',
+  });
 }
 
 function seamMissing(): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     'wasm-av1 requires browser EncodedVideoChunk and VideoFrame host objects',
     {
-      op: 'decode',
+      op: { kind: 'route', id: 'decode' },
       tried: ['wasm-av1'],
       suggestion: 'run AV1 software decode in a browser runtime with WebCodecs frame objects',
     },
@@ -148,10 +143,9 @@ function seamMissing(): CapabilityError {
 
 function encodeUnsupported(): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     'wasm-av1 is a dav1d decode-only fallback; AV1 software encode is out of scope',
     {
-      op: 'encode',
+      op: { kind: 'route', id: 'encode' },
       tried: ['wasm-av1'],
       suggestion: 'encode AV1 via WebCodecs or a future SVT-AV1 tail',
     },
@@ -304,16 +298,12 @@ function createDecoder(
       }
       if (core.supports?.(init) === false) {
         controller.error(
-          new CapabilityError(
-            'capability-miss',
-            'wasm-av1 dav1d core does not support this AV1 config',
-            {
-              op: init,
-              tried: ['wasm-av1'],
-              suggestion:
-                'try WebCodecs, another browser, or a dav1d build with broader pixel-format support',
-            },
-          ),
+          new CapabilityError('wasm-av1 dav1d core does not support this AV1 config', {
+            op: { kind: 'route', id: 'decode' },
+            tried: ['wasm-av1'],
+            suggestion:
+              'try WebCodecs, another browser, or a dav1d build with broader pixel-format support',
+          }),
         );
         return;
       }

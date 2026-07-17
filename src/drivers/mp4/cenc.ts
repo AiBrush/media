@@ -1346,11 +1346,10 @@ export async function decryptCencFile(
         raw.schemeType !== CENS_SCHEME &&
         raw.schemeType !== CBCS_SCHEME
       ) {
-        throw new CapabilityError(
-          'capability-miss',
-          `unsupported MP4 protection scheme '${raw.schemeType}'`,
-          { op: 'decrypt', tried: ['mp4'] },
-        );
+        throw new CapabilityError(`unsupported MP4 protection scheme '${raw.schemeType}'`, {
+          op: { kind: 'route', id: 'decrypt' },
+          tried: ['mp4'],
+        });
       }
       if (raw.schemeType !== opts.scheme) {
         throw new MediaError(
@@ -1378,8 +1377,8 @@ export async function decryptCencFile(
     if (cached) return cached;
     const hex = opts.keys[id];
     if (hex === undefined) {
-      throw new CapabilityError('capability-miss', `no key provided for KID ${id}`, {
-        op: 'decrypt',
+      throw new CapabilityError(`no key provided for KID ${id}`, {
+        op: { kind: 'route', id: 'decrypt' },
         tried: ['mp4'],
       });
     }
@@ -1421,8 +1420,8 @@ export async function decryptCencFile(
     } else if (saiz && saio) {
       const offsets = parseSaioOffsets(bytes, saio);
       if (offsets.length !== 1) {
-        throw new CapabilityError('capability-miss', 'multi-entry saio is not supported', {
-          op: 'decrypt',
+        throw new CapabilityError('multi-entry saio is not supported', {
+          op: { kind: 'route', id: 'decrypt' },
           tried: ['mp4'],
         });
       }
@@ -1497,8 +1496,8 @@ export async function decryptCencFile(
         } else if (saiz && saio) {
           const offsets = parseSaioOffsets(bytes, saio);
           if (offsets.length !== 1) {
-            throw new CapabilityError('capability-miss', 'multi-entry saio is not supported', {
-              op: 'decrypt',
+            throw new CapabilityError('multi-entry saio is not supported', {
+              op: { kind: 'route', id: 'decrypt' },
               tried: ['mp4'],
             });
           }

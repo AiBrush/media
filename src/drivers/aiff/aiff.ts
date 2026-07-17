@@ -113,9 +113,8 @@ function formatFromCompression(
       return { format: 'f64', endian: 'be' };
     default:
       throw new CapabilityError(
-        'capability-miss',
         `AIFF-C compression '${compression}' is not linear PCM (needs a codec tier)`,
-        { op: 'demux', tried: ['aiff'] },
+        { op: { kind: 'route', id: 'demux' }, tried: ['aiff'] },
       );
   }
 }
@@ -125,7 +124,7 @@ function intFormat(sampleSize: number): SampleFormat {
   if (sampleSize <= 16) return 's16';
   if (sampleSize <= 24) return 's24';
   if (sampleSize <= 32) return 's32';
-  throw new InputError('unsupported-input', `unsupported AIFF sample size ${sampleSize}-bit`);
+  throw new InputError(`unsupported AIFF sample size ${sampleSize}-bit`);
 }
 
 interface Chunk {
@@ -187,7 +186,7 @@ export function locate(
     ascii(bytes, 0, 4) !== 'FORM' ||
     (ascii(bytes, 8, 4) !== 'AIFF' && ascii(bytes, 8, 4) !== 'AIFC')
   ) {
-    throw new InputError('unsupported-input', 'not an AIFF/AIFF-C (FORM…AIFF/AIFC) file');
+    throw new InputError('not an AIFF/AIFF-C (FORM…AIFF/AIFC) file');
   }
   const kind: AiffKind = ascii(bytes, 8, 4) === 'AIFC' ? 'aifc' : 'aiff';
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -298,8 +297,8 @@ export function writeAiff(
   opts: { kind?: AiffKind; endian?: Endianness } = {},
 ): Uint8Array<ArrayBuffer> {
   if (format === 'u8') {
-    throw new CapabilityError('capability-miss', 'AIFF 8-bit PCM is signed; use pcm-s8', {
-      op: { op: 'pcm-write', container: 'aiff', sampleFormat: format },
+    throw new CapabilityError('AIFF 8-bit PCM is signed; use pcm-s8', {
+      op: { kind: 'route', id: 'pcm-write', facts: { container: 'aiff', sampleFormat: format } },
       tried: ['aiff'],
     });
   }

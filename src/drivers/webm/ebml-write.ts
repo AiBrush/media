@@ -327,11 +327,10 @@ function toCodecId(mediaType: 'video' | 'audio', codec: string): string {
     if (c.startsWith('flac')) return 'A_FLAC';
     if (c === 'mp3' || c.startsWith('mp3')) return 'A_MPEG/L3';
   }
-  throw new CapabilityError(
-    'capability-miss',
-    `the webm muxer cannot write ${mediaType} codec '${codec}'`,
-    { op: { op: 'mux', mediaType, codec }, tried: ['webm'] },
-  );
+  throw new CapabilityError(`the webm muxer cannot write ${mediaType} codec '${codec}'`, {
+    op: { kind: 'route', id: 'mux', facts: { mediaType, codec } },
+    tried: ['webm'],
+  });
 }
 
 /** Public codec-id projection for prepared-packet WebM/Matroska helpers. */
@@ -553,9 +552,8 @@ function opusHeadPreSkip(bytes: Uint8Array | undefined): number {
 function buildOpusHead(channels: number, preSkip: number, inputSampleRate: number): Uint8Array {
   if (!Number.isInteger(channels) || channels < 1 || channels > 2) {
     throw new CapabilityError(
-      'capability-miss',
       `WebM Opus without CodecPrivate needs a mono/stereo mapping-family-0 track, got ${channels}`,
-      { op: 'mux', tried: ['webm', 'opus'] },
+      { op: { kind: 'route', id: 'mux' }, tried: ['webm', 'opus'] },
     );
   }
   if (!Number.isInteger(preSkip) || preSkip < 0 || preSkip > 0xffff) {
@@ -957,11 +955,10 @@ export class WebmContainerSideData {
       }
       if (payloads.length === 0) continue;
       if (this.#docType !== 'matroska') {
-        throw new CapabilityError(
-          'capability-miss',
-          'WebM output cannot contain Matroska Attachments',
-          { op: 'mux', tried: ['webm', 'matroska-attachments'] },
-        );
+        throw new CapabilityError('WebM output cannot contain Matroska Attachments', {
+          op: { kind: 'route', id: 'mux' },
+          tried: ['webm', 'matroska-attachments'],
+        });
       }
       if (this.#seenAttachmentBundles.has(item)) continue;
       this.#seenAttachmentBundles.add(item);
@@ -1716,11 +1713,10 @@ export class WebmMuxer implements Muxer {
   addAttachment(attachedFilePayload: Uint8Array): void {
     this.#assertOpen();
     if (this.#docType !== 'matroska') {
-      throw new CapabilityError(
-        'capability-miss',
-        'WebM output cannot contain Matroska Attachments',
-        { op: 'mux', tried: ['webm', 'matroska-attachments'] },
-      );
+      throw new CapabilityError('WebM output cannot contain Matroska Attachments', {
+        op: { kind: 'route', id: 'mux' },
+        tried: ['webm', 'matroska-attachments'],
+      });
     }
     this.#attachedFilePayloads.push(attachedFilePayload.slice());
   }

@@ -142,8 +142,8 @@ export function resetVpxCoreForTest(): void {
 
 /** The {@link CapabilityError} a coder throws when the vendored VPX wasm core is unavailable. */
 function coreMissing(op: 'decode' | 'encode'): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-vpx core is not available (not vendored)', {
-    op,
+  return new CapabilityError('wasm-vpx core is not available (not vendored)', {
+    op: { kind: 'route', id: op },
     tried: ['wasm-vpx'],
     suggestion: 'build + vendor the libvpx wasm core per src/codecs/wasm-vpx/BUILD.md',
   });
@@ -152,9 +152,12 @@ function coreMissing(op: 'decode' | 'encode'): CapabilityError {
 /** The {@link CapabilityError} for VP9/VP8 *encode* — out of this decode-only fallback's scope (ADR-017). */
 function encodeUnsupported(): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     'wasm-vpx is a decode-only fallback; VP8/VP9 software encode is out of scope',
-    { op: 'encode', tried: ['wasm-vpx'], suggestion: 'encode VP8/VP9 via WebCodecs VideoEncoder' },
+    {
+      op: { kind: 'route', id: 'encode' },
+      tried: ['wasm-vpx'],
+      suggestion: 'encode VP8/VP9 via WebCodecs VideoEncoder',
+    },
   );
 }
 

@@ -23,7 +23,7 @@ export function assertHlsSegmentNotAborted(signal: AbortSignal | undefined): voi
 
 function sourceReadError(error: unknown): MediaError {
   if (error instanceof MediaError) return error;
-  return new InputError('unsupported-input', 'failed to read the encrypted HLS segment', error);
+  return new InputError('failed to read the encrypted HLS segment', error);
 }
 
 /**
@@ -37,7 +37,7 @@ export async function readHlsSegment(
   assertHlsSegmentNotAborted(signal);
   if (source.range !== undefined && source.size !== undefined) {
     if (!Number.isSafeInteger(source.size) || source.size < 0) {
-      throw new InputError('unsupported-input', `invalid HLS segment size ${source.size}`);
+      throw new InputError(`invalid HLS segment size ${source.size}`);
     }
     try {
       const bytes = await source.range(0, source.size);
@@ -70,7 +70,7 @@ export async function readHlsSegment(
       chunks.push(next.value);
       total += next.value.byteLength;
       if (!Number.isSafeInteger(total)) {
-        throw new InputError('unsupported-input', 'HLS segment is too large to materialize safely');
+        throw new InputError('HLS segment is too large to materialize safely');
       }
     }
   } catch (error) {
@@ -133,11 +133,10 @@ function requiredKeyField(
 ): Uint8Array<ArrayBuffer> {
   const value = keys[field];
   if (value === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      `HLS AES-128 needs '${field}' (hex) in keys; none provided`,
-      { op: 'decrypt', tried: [driverId] },
-    );
+    throw new CapabilityError(`HLS AES-128 needs '${field}' (hex) in keys; none provided`, {
+      op: { kind: 'route', id: 'decrypt' },
+      tried: [driverId],
+    });
   }
   return hexToBytes(value);
 }
@@ -153,9 +152,8 @@ export async function decryptHlsAes128ContainerSegment(
 ): Promise<ReadableStream<Uint8Array>> {
   if (options.scheme !== 'hls-aes128') {
     throw new CapabilityError(
-      'capability-miss',
       `${validation.containerLabel} direct segment decrypt does not support '${options.scheme}'`,
-      { op: 'decrypt', tried: [validation.driverId] },
+      { op: { kind: 'route', id: 'decrypt' }, tried: [validation.driverId] },
     );
   }
   const key = requiredKeyField(options.keys, 'key', validation.driverId);

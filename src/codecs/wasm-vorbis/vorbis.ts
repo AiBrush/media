@@ -91,7 +91,7 @@ export interface VorbisHeaders {
 export function parseVorbisExtradata(blob: Uint8Array): VorbisHeaders {
   const lead = blob[0];
   if (lead !== XIPH_LACED_LEADING) {
-    throw new InputError('unsupported-input', `vorbis: extradata is not Xiph-laced (lead ${lead})`);
+    throw new InputError(`vorbis: extradata is not Xiph-laced (lead ${lead})`);
   }
   let i = 1;
   const readLen = (): number => {
@@ -142,7 +142,7 @@ export function readOggPackets(bytes: Uint8Array): OggPacket[] {
 
   while (offset + 27 <= bytes.length) {
     if (view.getUint32(offset) !== OGG_CAPTURE) {
-      throw new InputError('unsupported-input', `vorbis: lost Ogg capture at byte ${offset}`);
+      throw new InputError(`vorbis: lost Ogg capture at byte ${offset}`);
     }
     const granuleLo = view.getUint32(offset + 6, true);
     const granuleHi = view.getUint32(offset + 10, true);

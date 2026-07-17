@@ -16,6 +16,7 @@ import {
   toOpfsTarget,
   writeToOpfsTarget,
 } from './opfs-target.ts';
+import { positionedChunk } from './stream-target.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -187,5 +188,190 @@ describe('writeToOpfsTarget — Node-reachable guards (the DOM seam is browser-o
     expect(err).toBeInstanceOf(MediaError);
     expect((err as MediaError).code).toBe('aborted');
     expect(cancelled).toBe(true);
+  });
+
+  it('cancels an unlocked source stream when the capability guard misses', async () => {
+    // Failure before the drain locks the stream must still release the producer (wrapper parity with
+    // the stream-target lazy wrapper — doc 09 §5 item 9, one convention for both streaming sinks).
+    let cancelled: unknown;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(new Uint8Array([1]));
+      },
+      cancel(reason): void {
+        cancelled = reason;
+      },
+    });
+    const err = await writeToOpfsTarget(toOpfsTarget('/out.mp4'), stream).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CapabilityError);
+    expect(cancelled).toBe(err);
+  });
+});
+
+/**
+ * The DOM seam, exercised end-to-end against recording FileSystem doubles (the shapes the WHATWG File
+ * System spec defines): directory walk, createWritable options, seek, positioned writes, commit-close,
+ * and abort-on-failure so a half-written file is never left looking complete.
+ */
+describe('writeToOpfsTarget — seam behaviors (recording FileSystem doubles)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  interface SeamFs {
+    stub(): void;
+    seeks: number[];
+    written: { data: Uint8Array; position: number | undefined }[];
+    closed: () => boolean;
+    abortedWith: () => unknown;
+    failNextWrite: (error: unknown) => void;
+  }
+
+  function seamFs(): SeamFs {
+    const seeks: number[] = [];
+    const written: { data: Uint8Array; position: number | undefined }[] = [];
+    let closed = false;
+    let abortedWith: unknown;
+    let writeFailure: unknown;
+    const writable = Object.assign(
+      new WritableStream<
+        | Uint8Array
+        | { readonly type: 'write'; readonly position: number; readonly data: Uint8Array }
+      >({
+        write(chunk): void {
+          if (writeFailure !== undefined) throw writeFailure;
+          if (chunk instanceof Uint8Array)
+            written.push({ data: chunk.slice(), position: undefined });
+          else written.push({ data: chunk.data.slice(), position: chunk.position });
+        },
+        close(): void {
+          closed = true;
+        },
+        abort(reason): void {
+          abortedWith = reason;
+        },
+      }),
+      {
+        seek(position: number): Promise<void> {
+          seeks.push(position);
+          return Promise.resolve();
+        },
+      },
+    );
+    const handle = { createWritable: () => Promise.resolve(writable) };
+    const root = {
+      getDirectoryHandle: () => Promise.resolve(root),
+      getFileHandle: () => Promise.resolve(handle),
+    };
+    return {
+      stub(): void {
+        vi.stubGlobal('navigator', { storage: { getDirectory: () => Promise.resolve(root) } });
+      },
+      seeks,
+      written,
+      closed: () => closed,
+      abortedWith: () => abortedWith,
+      failNextWrite(error: unknown): void {
+        writeFailure = error;
+      },
+    };
+  }
+
+  function streamOf(...chunks: readonly Uint8Array[]): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(c): void {
+        for (const chunk of chunks) c.enqueue(chunk);
+        c.close();
+      },
+    });
+  }
+
+  it('streams, commits (close), and never aborts on success', async () => {
+    const fs = seamFs();
+    fs.stub();
+    await writeToOpfsTarget(
+      toOpfsTarget('/ok.bin'),
+      streamOf(new Uint8Array([1]), new Uint8Array([2, 3])),
+    );
+    expect(fs.written.map((w) => [...w.data])).toEqual([[1], [2, 3]]);
+    expect(fs.closed()).toBe(true);
+    expect(fs.abortedWith()).toBeUndefined();
+  });
+
+  it('honors producer-positioned chunks relative to the startPosition base (positioned patch)', async () => {
+    // startPosition 100 + a producer re-write tagged at output offset 0 ⇒ absolute file offset 100.
+    const fs = seamFs();
+    fs.stub();
+    await writeToOpfsTarget(
+      toOpfsTarget('/patch.bin', { keepExistingData: true, position: 100 }),
+      streamOf(
+        new Uint8Array([9, 9]), // cursor-append at 100 (after the seek)
+        positionedChunk(new Uint8Array([1, 2]), 0), // re-write output offset 0 ⇒ file offset 100
+      ),
+    );
+    expect(fs.seeks).toEqual([100]);
+    expect(fs.written).toHaveLength(2);
+    expect(fs.written[0]?.position).toBeUndefined(); // contiguous ⇒ plain cursor write
+    expect(fs.written[1]?.position).toBe(100); // discontinuity ⇒ explicit WriteParams position
+    expect([...(fs.written[1]?.data ?? [])]).toEqual([1, 2]);
+    expect(fs.closed()).toBe(true);
+  });
+
+  it('aborts the writable and surfaces a typed mux-error when a write fails (no fake-complete file)', async () => {
+    const fs = seamFs();
+    fs.stub();
+    const failure = new Error('disk full');
+    fs.failNextWrite(failure);
+    let cancelled: unknown;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c): void {
+        c.enqueue(new Uint8Array([1]));
+      },
+      cancel(reason): void {
+        cancelled = reason;
+      },
+    });
+    const err = await writeToOpfsTarget(toOpfsTarget('/fail.bin'), stream).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('mux-error');
+    // The failed write errored the writable itself, so the file was never committed: close() must not
+    // have run, and per the Streams spec aborting an already-errored stream skips the abort hook.
+    expect(fs.closed()).toBe(false);
+    expect(cancelled).toBeDefined(); // upstream released
+  });
+
+  it('maps a failing directory walk to a typed mux-error', async () => {
+    vi.stubGlobal('navigator', {
+      storage: {
+        getDirectory: () => Promise.reject(new Error('storage exploded')),
+      },
+    });
+    const err = await writeToOpfsTarget(
+      toOpfsTarget('/x.bin'),
+      streamOf(new Uint8Array([1])),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('mux-error');
+    expect((err as MediaError).message).toContain('storage exploded');
+  });
+
+  it('a mid-stream abort rejects aborted and aborts the writable', async () => {
+    const fs = seamFs();
+    fs.stub();
+    const ac = new AbortController();
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(c): void {
+          c.enqueue(new Uint8Array([1]));
+          ac.abort();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const err = await writeToOpfsTarget(toOpfsTarget('/aborted.bin'), stream, {
+      signal: ac.signal,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('aborted');
+    expect(fs.closed()).toBe(false);
+    expect(fs.abortedWith()).toBeDefined();
   });
 });

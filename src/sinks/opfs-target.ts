@@ -2,22 +2,27 @@
  * `OpfsTarget` — a streaming output sink that writes into the **Origin Private File System** (OPFS), the
  * browser's same-origin, sandboxed file storage (doc 07 §4 sinks, doc 09 streaming-output, ADR-013).
  *
- * Like {@link import('./stream-target.ts').StreamTarget}, this is a *streaming* sink: it pipes the
+ * Like {@link import('./stream-target.ts').StreamTarget}, this is a *streaming* sink: it pumps the
  * produced byte stream straight into a `FileSystemWritableFileStream` as chunks arrive, so peak memory
  * stays at one chunk no matter how large the output (a long recording, a fragmented MP4) — never the
  * whole-file buffering the Blob/File sink does. OPFS is the natural durable target for that: it is
- * origin-private (no picker, no user prompt), fast, and writable incrementally.
+ * origin-private (no picker, no user prompt), fast, and writable incrementally. Being random-access, it
+ * also honors producer-positioned re-writes ({@link import('./stream-target.ts').positionedChunk}) —
+ * the patch-a-region seek case (doc 09 §3.3 seek).
  *
- * The work splits cleanly into a **pure core** and a **browser seam**:
- *  - pure (Node-tested, can-fail): {@link parseOpfsPath} normalizes a `'/a/b/out.mp4'` path into the
- *    ordered parent directories + the leaf filename, rejecting empty/`.`/`..`/trailing-slash paths; and
- *    {@link planOpfsWrite} turns the sink + options into a {@link OpfsWritePlan} (the dirs to create, the
- *    filename, the `createWritable` options, the start position) — the exact instructions the seam runs.
- *  - seam (browser-only, guarded + `/* v8 ignore *​/`): {@link writeToOpfsTarget} feature-detects
- *    `navigator.storage.getDirectory` (absent ⇒ typed {@link CapabilityError}), walks/creates the parent
- *    directories, opens the file, and streams the input into it with native backpressure; an abort or a
- *    write failure aborts the writable (so a half-written file is not left as if complete) and surfaces a
- *    typed {@link MediaError}.
+ * The module follows the same two-file descriptor+seam convention as `stream-target.ts` /
+ * `stream-target-materialize.ts` (doc 09 §5 item 9):
+ *  - **this file (public, pure, Node-tested):** the descriptor + constructor; {@link parseOpfsPath}
+ *    normalizes a `'/a/b/out.mp4'` path into ordered parent directories + the leaf filename, rejecting
+ *    empty/`.`/`..`/trailing-slash paths; {@link planOpfsWrite} turns the sink + options into an
+ *    {@link OpfsWritePlan} (the dirs to create, the filename, the `createWritable` options, the start
+ *    position) — the exact instructions the seam runs; {@link isOpfsAvailable} probes the capability;
+ *    and {@link writeToOpfsTarget} guards (typed {@link CapabilityError} when OPFS is absent — a
+ *    capability miss, never an input error, doc 09 §5 item 6) then lazily loads the seam.
+ *  - **`opfs-target-materialize.ts` (the seam, lazily imported):** walks/creates the directories, opens
+ *    the file, seeks to the start position, and drives the shared positioned pump with native
+ *    backpressure; an abort or a write failure aborts the writable (so a half-written file is discarded
+ *    rather than left as if complete) and surfaces a typed {@link MediaError}.
  */
 
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
@@ -39,7 +44,7 @@ export interface OpfsTargetOptions {
   position?: number;
 }
 
-/** The OPFS streaming sink descriptor (a sink-union member, parallel to the basic `opfs` kind). */
+/** The OPFS streaming sink descriptor (a member of the public sink union, next to the basic `opfs`). */
 export interface OpfsTarget {
   readonly kind: 'opfs-target';
   readonly path: string;
@@ -74,21 +79,15 @@ export interface OpfsPath {
  */
 export function parseOpfsPath(path: string): OpfsPath {
   if (typeof path !== 'string' || path.length === 0) {
-    throw new InputError('unsupported-input', 'OPFS path must be a non-empty string');
+    throw new InputError('OPFS path must be a non-empty string');
   }
   if (path.endsWith('/')) {
-    throw new InputError(
-      'unsupported-input',
-      `OPFS path '${path}' names a directory (trailing '/'), not a file`,
-    );
+    throw new InputError(`OPFS path '${path}' names a directory (trailing '/'), not a file`);
   }
   const segments = path.split('/').filter((s) => s.length > 0);
   for (const s of segments) {
     if (s === '.' || s === '..') {
-      throw new InputError(
-        'unsupported-input',
-        `OPFS path '${path}' may not contain '.' or '..' segments`,
-      );
+      throw new InputError(`OPFS path '${path}' may not contain '.' or '..' segments`);
     }
   }
   // The empty-string and trailing-slash guards above reject every "no filename" input ('', '/', '//',
@@ -106,7 +105,7 @@ export interface OpfsWritePlan {
   readonly name: string;
   /** Whether to preserve the file's existing bytes (`createWritable({ keepExistingData })`). */
   readonly keepExistingData: boolean;
-  /** Byte offset for the first chunk. */
+  /** Byte offset for the first chunk (and the base for producer-positioned re-writes). */
   readonly startPosition: number;
 }
 
@@ -120,7 +119,6 @@ export function planOpfsWrite(target: OpfsTarget): OpfsWritePlan {
   const position = target.options.position ?? 0;
   if (!Number.isFinite(position) || position < 0 || !Number.isInteger(position)) {
     throw new InputError(
-      'unsupported-input',
       `OPFS write position must be a non-negative integer, got ${String(target.options.position)}`,
     );
   }
@@ -151,63 +149,31 @@ export function isOpfsAvailable(): boolean {
  * Stream a produced byte stream into the {@link OpfsTarget}'s OPFS file incrementally (one chunk at a
  * time, with backpressure). Returns `undefined` — the bytes went to the file, not back to the caller.
  *
- * The {@link OpfsWritePlan} (pure) decides the directories/filename/options; this function only performs
- * the DOM I/O. OPFS unavailable ⇒ {@link CapabilityError}; an abort or any write failure aborts the
- * writable (discarding a partial file rather than leaving it as if complete) and rejects with a typed
- * {@link MediaError}.
+ * The {@link OpfsWritePlan} (pure) decides the directories/filename/options; the lazily-loaded seam
+ * performs the DOM I/O. OPFS unavailable ⇒ typed {@link CapabilityError} (`capability-miss`, agreeing
+ * with the basic `opfs` sink — doc 09 §5 item 6); any failure cancels the unlocked source stream and
+ * rejects with a typed {@link MediaError}, mirroring the `stream-target` lazy wrapper.
  */
 export async function writeToOpfsTarget(
   target: OpfsTarget,
   stream: ReadableStream<Uint8Array>,
   opts: ExecuteOptions = {},
 ): Promise<undefined> {
-  const plan = planOpfsWrite(target); // pure validation first (throws InputError on a bad path/position)
-  const storage = opfsRootProvider();
-  if (storage === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      'OPFS is unavailable in this environment (navigator.storage.getDirectory missing)',
-      { op: 'opfs-write', tried: [] },
-    );
-  }
-  const { signal } = opts;
-  if (signal?.aborted) {
-    await stream.cancel(new MediaError('aborted', 'operation aborted')).catch(() => undefined);
-    throw new MediaError('aborted', 'operation aborted');
-  }
-  /* v8 ignore start -- requires a real OPFS (FileSystemWritableFileStream); browser-validated (ADR-025) */
-  let writable: FileSystemWritableFileStream | undefined;
   try {
-    let dir = await storage.getDirectory();
-    for (const segment of plan.dirs) {
-      dir = await dir.getDirectoryHandle(segment, { create: true });
+    const plan = planOpfsWrite(target); // pure validation first (throws InputError on a bad path/position)
+    const storage = opfsRootProvider();
+    if (storage === undefined) {
+      throw new CapabilityError(
+        'OPFS is unavailable in this environment (navigator.storage.getDirectory missing)',
+        { op: { kind: 'route', id: 'opfs-write' }, tried: [] },
+      );
     }
-    const handle = await dir.getFileHandle(plan.name, { create: true });
-    writable = await handle.createWritable({ keepExistingData: plan.keepExistingData });
-    if (plan.startPosition > 0) await writable.seek(plan.startPosition);
-
-    // Pipe with native backpressure; `signal` aborts the pipe, which rejects here and triggers the catch.
-    await stream.pipeTo(writable, signal ? { signal } : {});
-    return undefined;
-  } catch (err) {
-    // Abort the writable so a half-written file is discarded rather than left looking complete.
-    if (writable) await writable.abort().catch(() => undefined);
-    throw mapOpfsError(err, signal);
+    if (opts.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+    const seam = await import('./opfs-target-materialize.ts');
+    return await seam.writeToOpfsFile(storage, plan, stream, opts);
+  } catch (error) {
+    if (!stream.locked) await stream.cancel(error).catch(() => undefined);
+    if (error instanceof MediaError) throw error;
+    throw new MediaError('mux-error', 'opfs-target materializer failed', error);
   }
-  /* v8 ignore stop */
 }
-
-/* v8 ignore start -- only reachable from the browser-only seam above */
-/** Map a thrown value from the OPFS seam to the typed model (abort → `aborted`, else `mux-error`). */
-function mapOpfsError(err: unknown, signal: AbortSignal | undefined): MediaError {
-  if (signal?.aborted) return new MediaError('aborted', 'operation aborted');
-  if (err instanceof MediaError) return err;
-  const isAbort =
-    (typeof DOMException !== 'undefined' &&
-      err instanceof DOMException &&
-      (err.name === 'AbortError' || err.name === 'NotAllowedError')) ||
-    (err instanceof Error && err.name === 'AbortError');
-  if (isAbort) return new MediaError('aborted', 'operation aborted');
-  return new MediaError('mux-error', err instanceof Error ? err.message : String(err), err);
-}
-/* v8 ignore stop */

@@ -133,8 +133,8 @@ export function resetVorbisCoreForTest(): void {
 
 /** The {@link CapabilityError} a coder throws when the vendored Vorbis wasm core is unavailable. */
 function coreMissing(): CapabilityError {
-  return new CapabilityError('capability-miss', 'wasm-vorbis core is not available', {
-    op: 'decode',
+  return new CapabilityError('wasm-vorbis core is not available', {
+    op: { kind: 'route', id: 'decode' },
     tried: ['wasm-vorbis'],
     suggestion: 'build + vendor the Vorbis wasm core per src/codecs/wasm-vorbis/BUILD.md',
   });
@@ -321,10 +321,9 @@ function createEncoder(
   _o?: StageOptions,
 ): TransformStream<RawFrame, EncodedChunk> {
   throw new CapabilityError(
-    'capability-miss',
     'wasm-vorbis does not support Vorbis encode (no vetted permissive encoder core is vendored)',
     {
-      op: 'encode',
+      op: { kind: 'route', id: 'encode' },
       tried: ['wasm-vorbis'],
       suggestion:
         'vendor a permissive libvorbis/libogg encoder core with notices, or encode to Opus/AAC',

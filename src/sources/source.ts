@@ -9,7 +9,9 @@
  * translates it to the inclusive HTTP `Range` header.
  */
 
-import { InputError, MediaError } from '../contracts/errors.ts';
+import { InputError } from '../contracts/errors.ts';
+import { raceAbort, throwIfSourceAborted } from './abort.ts';
+import { parseContentLength, parseContentRangeTotal } from './http-range.ts';
 import {
   type LiveMediaSource,
   captureElementMediaStream,
@@ -63,14 +65,29 @@ export interface Source {
   stream(): ReadableStream<Uint8Array>;
   /** Total byte length when known ahead of time (absent/`undefined` ⇒ unknown until probed). */
   readonly size?: number;
-  /** Random access for header-only reads; half-open `[start, end)`. Absent for pure streams. */
-  range?(start: number, end: number): Promise<Uint8Array>;
+  /**
+   * Random access for header-only reads; half-open `[start, end)`, negative `start` clamped to 0.
+   *
+   * **Contract — never a short read before EOF:** resolves exactly `max(0, min(end, size) − start)`
+   * bytes. A window past EOF is clamped (empty at/after EOF), never an error, so a shorter-than-
+   * requested result always means the end of the resource was reached. Rejects with a typed
+   * `MediaError('aborted')` once `signal` aborts. Absent for pure streams.
+   */
+  range?(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
   /** Owned one-buffer full read, when the backing source can avoid generic stream concatenation. */
   readAll?(signal?: AbortSignal): Promise<Uint8Array>;
   /** A MIME hint from the origin (Blob type, element, etc.), if any. */
   readonly mimeHint?: string;
   /** A filename or browser-supplied relative path hint (from a `File`), if any. */
   readonly filename?: string;
+  /**
+   * Learned range-compliance fact (RFC 9110 §14 lets a server ignore `Range` and answer `200`):
+   * `false` once any `Range` request came back `200` with the full body — sticky, so seek planning
+   * stops trusting ranges on that transport — and `true` after a compliant `206`. Absent while
+   * there is no transport evidence; local sources never set it (their `range()` is honored by
+   * construction, signalled structurally by `range` being present).
+   */
+  readonly rangesHonored?: boolean;
   /** Opaque source identity for same-origin, short-lived cache handoffs between operations. */
   readonly [SOURCE_CACHE_KEY]?: string;
   /** Effective resource URL, updated from `Response.url` after a URL/element fetch follows redirects. */
@@ -136,8 +153,15 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
           c.close();
         },
       }),
-    range: (start, end) =>
-      Promise.resolve(u8.subarray(clamp(start, u8.byteLength), clamp(end, u8.byteLength))),
+    range: async (start, end, signal) => {
+      throwIfSourceAborted(signal);
+      return u8.subarray(clamp(start, u8.byteLength), clamp(end, u8.byteLength));
+    },
+    // The owned single-buffer read: the wrapped view itself, in one call (never a concatenation).
+    readAll: async (signal) => {
+      throwIfSourceAborted(signal);
+      return u8;
+    },
   };
   return source;
 }
@@ -159,7 +183,22 @@ export function fromBlob(blob: Blob): Source {
     ...(blob.type ? { mimeHint: blob.type } : {}),
     ...(filename !== undefined ? { filename } : {}),
     stream: () => blob.stream() as ReadableStream<Uint8Array>,
-    range: async (start, end) => new Uint8Array(await blob.slice(start, end).arrayBuffer()),
+    range: async (start, end, signal) => {
+      throwIfSourceAborted(signal);
+      // Clamp to the contract's semantics: `Blob.slice` would treat a negative start as from-end.
+      const lo = Math.max(0, Math.trunc(start));
+      const hi = Math.max(lo, Math.trunc(end));
+      const bytes = new Uint8Array(await blob.slice(lo, hi).arrayBuffer());
+      throwIfSourceAborted(signal);
+      return bytes;
+    },
+    // One platform-native materialization (`Blob.arrayBuffer`), never a reader-pull concatenation.
+    readAll: async (signal) => {
+      throwIfSourceAborted(signal);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      throwIfSourceAborted(signal);
+      return bytes;
+    },
   };
 }
 
@@ -193,7 +232,7 @@ export function fromStream(
   opts: FromStreamOptions = {},
 ): Source {
   if (readable.locked) {
-    throw new InputError('unsupported-input', 'stream is already locked');
+    throw new InputError('stream is already locked');
   }
   const state: StreamSourceState = { readable, consumed: false };
   const source: StreamStateSource = {
@@ -203,7 +242,7 @@ export function fromStream(
     ...(opts.mime !== undefined ? { mimeHint: opts.mime } : {}),
     stream: () => {
       if (state.cursor !== undefined) return state.cursor.open();
-      if (state.consumed) throw new InputError('unsupported-input', 'used');
+      if (state.consumed) throw new InputError('used');
       state.consumed = true;
       return readable;
     },
@@ -222,10 +261,10 @@ export async function peekSourceHead(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   const bounded = Math.max(0, Math.trunc(limit));
-  assertSourceNotAborted(signal);
+  throwIfSourceAborted(signal);
   if (src.range !== undefined) {
-    const head = await src.range(0, bounded);
-    assertSourceNotAborted(signal);
+    const head = await src.range(0, bounded, signal);
+    throwIfSourceAborted(signal);
     return head;
   }
   const { peekUnseekableSourceHead } = await import('./stream-input.ts');
@@ -237,12 +276,6 @@ export async function cancelSource(src: Source, reason?: unknown): Promise<void>
   if (!(SOURCE_STREAM_STATE in src)) return;
   const { cancelOneShotSource } = await import('./stream-input.ts');
   await cancelOneShotSource(src, reason);
-}
-
-function assertSourceNotAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted === true) {
-    throw new MediaError('aborted', 'source read aborted', signal.reason);
-  }
 }
 
 /** Derive a query/hash-free last pathname component without mistaking opaque data/blob URLs for files. */
@@ -287,7 +320,10 @@ export function fromURL(url: string | URL, opts: FromUrlOptions = {}): Source {
     stream: () => fetchStream(href, source, learnEffectiveUrl),
     readAll: (signal) => fetchWhole(href, source, learnEffectiveUrl, signal),
     ...(opts.rangeRequests !== false
-      ? { range: (start, end) => fetchRange(href, start, end, source, learnEffectiveUrl) }
+      ? {
+          range: (start: number, end: number, signal?: AbortSignal) =>
+            fetchRange(href, start, end, source, learnEffectiveUrl, signal),
+        }
       : {}),
   };
   return source;
@@ -309,7 +345,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
   if (mode === 'capture') return captureElementMediaStream(el);
   const href = el.currentSrc || el.src;
   if (!href) {
-    throw new InputError('unsupported-input', 'src');
+    throw new InputError('src');
   }
   const filename = filenameFromHref(href);
   let effectiveUrl = href;
@@ -327,7 +363,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
     },
     stream: () => fetchStream(href, element, learnEffectiveUrl),
     readAll: (signal) => fetchWhole(href, element, learnEffectiveUrl, signal),
-    range: (start, end) => fetchRange(href, start, end, element, learnEffectiveUrl),
+    range: (start, end, signal) => fetchRange(href, start, end, element, learnEffectiveUrl, signal),
     ...(filename !== undefined ? { filename } : {}),
   };
   return element;
@@ -370,19 +406,30 @@ export function from(input: MediaInput, opts: FromOptions = {}): NormalizedSourc
   if (input instanceof URL) return fromURL(input, opts);
   if (typeof input === 'string') return fromURL(input, opts);
   if (isMediaElement(input)) return fromElement(input, opts);
-  throw new InputError('unsupported-input', 'bad');
+  throw new InputError('bad');
 }
 
 // ── Internals ───────────────────────────────────────────────────────────────────────────────────
 
-/** A write-through view used to memoize a learned total length onto a source object (never to `undefined`). */
-interface LearnSize {
+/** A write-through view used to memoize learned transport facts onto a source (never explicit `undefined`). */
+interface LearnedSourceFacts {
   size?: number;
+  rangesHonored?: boolean;
 }
 
 /** Record a freshly-learned total length onto the source, but only once (first writer wins). */
-function learnSize(target: LearnSize, total: number | undefined): void {
+function learnSize(target: LearnedSourceFacts, total: number | undefined): void {
   if (total !== undefined && target.size === undefined) target.size = total;
+}
+
+/**
+ * Record whether the server actually honored a `Range` request (RFC 9110 §14 lets it ignore one).
+ * `false` is sticky — one ignored `Range` disqualifies range-based seek planning for this source —
+ * while `true` only ever fills absence.
+ */
+function learnRangesHonored(target: LearnedSourceFacts, honored: boolean): void {
+  if (!honored) target.rangesHonored = false;
+  else if (target.rangesHonored === undefined) target.rangesHonored = true;
 }
 
 function learnResponseUrl(response: Response, learn?: (url: string) => void): void {
@@ -391,17 +438,21 @@ function learnResponseUrl(response: Response, learn?: (url: string) => void): vo
 
 function fetchStream(
   href: string,
-  learn?: LearnSize,
+  learn?: LearnedSourceFacts,
   learnUrl?: (url: string) => void,
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  // Owns the request lifetime: cancelling the stream before the first chunk arrives aborts the
+  // in-flight fetch itself instead of leaking a running download (docs/architecture/sources.md §5.11).
+  const aborter = new AbortController();
   return new ReadableStream<Uint8Array>({
     async pull(controller): Promise<void> {
       if (!reader) {
-        const res = await fetch(href);
+        const res = await raceAbort(fetch(href, { signal: aborter.signal }), aborter.signal);
+        throwIfSourceAborted(aborter.signal); // cancelled while resolving — never open the body
         learnResponseUrl(res, learnUrl);
         if (!res.ok || !res.body) {
-          throw new InputError('unsupported-input', `f ${res.status}`);
+          throw new InputError(`f ${res.status}`);
         }
         // A full GET exposes the total via `Content-Length` — memoize it for later range clamping.
         if (learn) learnSize(learn, parseContentLength(res.headers));
@@ -415,7 +466,8 @@ function fetchStream(
       controller.enqueue(value);
     },
     cancel(reason): void {
-      void reader?.cancel(reason);
+      aborter.abort(reason);
+      void reader?.cancel(reason).catch(() => {});
     },
   });
 }
@@ -423,16 +475,17 @@ function fetchStream(
 /** A direct owned full response for operations that genuinely require the complete finite object. */
 async function fetchWhole(
   href: string,
-  learn?: LearnSize,
+  learn?: LearnedSourceFacts,
   learnUrl?: (url: string) => void,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  const res = await fetch(href, signal === undefined ? undefined : { signal });
+  throwIfSourceAborted(signal);
+  const res = await raceAbort(fetch(href, signal === undefined ? undefined : { signal }), signal);
   learnResponseUrl(res, learnUrl);
   if (!res.ok) {
-    throw new InputError('unsupported-input', `f ${res.status}`);
+    throw new InputError(`f ${res.status}`);
   }
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  const bytes = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
   // Fetch exposes the decoded representation. `Content-Length` may describe compressed transfer bytes,
   // so only the materialized representation length is authoritative for later source-relative ranges.
   if (learn) learnSize(learn, bytes.byteLength);
@@ -443,8 +496,9 @@ async function fetchRange(
   href: string,
   start: number,
   end: number,
-  learn?: LearnSize,
+  learn?: LearnedSourceFacts,
   learnUrl?: (url: string) => void,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
   // Clamp a never-negative, ordered window first; if we already know the size, never ask past EOF.
   const known = learn?.size;
@@ -452,26 +506,48 @@ async function fetchRange(
   let hi = Math.max(lo, Math.trunc(end));
   if (known !== undefined) hi = Math.min(hi, known);
   if (hi <= lo) return new Uint8Array(0); // empty window (incl. start at/after a known EOF)
+  throwIfSourceAborted(signal);
 
-  // HTTP Range is inclusive; our contract is half-open [lo, hi).
-  const res = await fetch(href, {
-    headers: { Range: `bytes=${lo}-${hi - 1}` },
-    priority: 'high',
-  });
+  // HTTP Range is inclusive; our contract is half-open [lo, hi). The caller's signal is bound into
+  // the request itself so an abort tears the transfer down mid-flight.
+  const res = await raceAbort(
+    fetch(href, {
+      headers: { Range: `bytes=${lo}-${hi - 1}` },
+      priority: 'high',
+      ...(signal !== undefined ? { signal } : {}),
+    }),
+    signal,
+  );
   learnResponseUrl(res, learnUrl);
-  if (!res.ok) {
-    throw new InputError('unsupported-input', `r ${res.status}`);
+  if (res.status === 416) {
+    // RFC 9110 §14.4: an unsatisfied range SHOULD carry `Content-Range: bytes */<total>`. A request
+    // at/past EOF on a not-yet-sized resource is then a clamped empty read, never an error.
+    await res.arrayBuffer().catch(() => {}); // release the (empty) body
+    const total = parseContentRangeTotal(res.headers.get('Content-Range'));
+    if (learn) learnSize(learn, total);
+    const eof = learn?.size ?? total;
+    if (eof !== undefined && lo >= eof) return new Uint8Array(0);
+    throw new InputError(`r ${res.status}`);
   }
-  const buf = new Uint8Array(await res.arrayBuffer());
+  if (!res.ok) {
+    throw new InputError(`r ${res.status}`);
+  }
+  const buf = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
   if (res.status === 206) {
-    // Learn the authoritative total from `Content-Range: bytes lo-hi/total` for future clamping.
-    if (learn) learnSize(learn, parseContentRangeTotal(res.headers.get('Content-Range')));
+    if (learn) {
+      // Learn the authoritative total from `Content-Range: bytes lo-hi/total` for future clamping.
+      learnSize(learn, parseContentRangeTotal(res.headers.get('Content-Range')));
+      learnRangesHonored(learn, true);
+    }
     // A spec-compliant 206 returns exactly the requested window; guard a server that over-returns.
     return buf.byteLength > hi - lo ? buf.subarray(0, hi - lo) : buf;
   }
-  // A server that ignores Range returns 200 with the whole body → it is the full resource: memoize its
-  // length and slice the requested window locally.
-  if (learn) learnSize(learn, buf.byteLength);
+  // A server that ignores Range returns 200 with the whole body → it is the full resource: memoize
+  // its length, record the sticky non-compliance fact, and slice the requested window locally.
+  if (learn) {
+    learnSize(learn, buf.byteLength);
+    learnRangesHonored(learn, false);
+  }
   return buf.subarray(clamp(lo, buf.byteLength), clamp(hi, buf.byteLength));
 }
 
@@ -485,23 +561,6 @@ async function fetchRange(
 export async function probeUrlSize(url: string | URL): Promise<number | undefined> {
   const { probeUrlSizeImpl } = await import('./url-size.ts');
   return probeUrlSizeImpl(url);
-}
-
-/** Parse a non-negative integer `Content-Length`, or `undefined` if absent/malformed. */
-function parseContentLength(headers: Headers): number | undefined {
-  const raw = headers.get('Content-Length');
-  if (raw === null) return undefined;
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : undefined;
-}
-
-/** Parse the `total` from `Content-Range: bytes <start>-<end>/<total>` (`*` total ⇒ `undefined`). */
-function parseContentRangeTotal(value: string | null): number | undefined {
-  if (value === null || !value.includes('/')) return undefined;
-  const tail = value.slice(value.lastIndexOf('/') + 1).trim();
-  if (tail === '*' || tail === '') return undefined;
-  const n = Number(tail);
-  return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 function isMediaElement(x: unknown): x is HTMLMediaElement {

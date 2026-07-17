@@ -250,8 +250,8 @@ async function remuxViaSeam(
   options: CallOptions,
 ): Promise<ReadableStream<Uint8Array>> {
   if (!containerHasChunkMuxer(opts.to)) {
-    throw new CapabilityError('capability-miss', `no remux muxer '${opts.to}'`, {
-      op: 'remux',
+    throw new CapabilityError(`no remux muxer '${opts.to}'`, {
+      op: { kind: 'route', id: 'remux' },
       tried: [container.id, opts.to],
     });
   }
@@ -274,8 +274,8 @@ async function remuxViaSeam(
     if (stream !== undefined) return stream;
   }
   if (source.size !== undefined && source.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
-    throw new CapabilityError('capability-miss', `remux '${opts.to}' over buffer limit`, {
-      op: 'remux',
+    throw new CapabilityError(`remux '${opts.to}' over buffer limit`, {
+      op: { kind: 'route', id: 'remux' },
       tried: [container.id, opts.to],
     });
   }
@@ -291,8 +291,8 @@ async function remuxViaSeam(
   );
   if (tracks.length === 0) {
     await demuxer.close();
-    throw new CapabilityError('capability-miss', 'no remux track', {
-      op: 'remux',
+    throw new CapabilityError('no remux track', {
+      op: { kind: 'route', id: 'remux' },
       tried: [container.id],
     });
   }
@@ -323,9 +323,8 @@ function normalizeByteInput(input: MediaInput, op: string): Source {
   const normalized = normalizeInput(input);
   if (!isLiveMediaSource(normalized)) return normalized;
   throw new CapabilityError(
-    'capability-miss',
     `${op} requires finite encoded/container bytes and is unavailable for a raw live MediaStream`,
-    { op, tried: ['media-stream/raw-frames'] },
+    { op: { kind: 'route', id: op }, tried: ['media-stream/raw-frames'] },
   );
 }
 

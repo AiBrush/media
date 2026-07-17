@@ -1,5 +1,6 @@
 import { InputError, MediaError } from '../contracts/errors.ts';
-import { type ExecuteOptions, collect, runToSink } from '../kernel/executor.ts';
+import { type ExecuteOptions, collect } from '../kernel/executor.ts';
+import { toOpfsTarget, writeToOpfsTarget } from './opfs-target.ts';
 import type { Output, Sink } from './sink.ts';
 import { writeToStreamTarget } from './stream-target.ts';
 
@@ -27,8 +28,13 @@ export async function materialize(
       return new File([bytes], sink.name, type ? { type } : {});
     }
     case 'opfs':
-      await writeOpfs(sink.path, stream, opts);
-      return undefined;
+      // One OPFS drain (doc 09 §5 items 1 + 6): the basic path is the rich opfs-target writer with
+      // default options, so replace-the-file semantics, abort-on-failure, and the typed
+      // CapabilityError capability-miss when OPFS is absent are identical on both spellings.
+      return writeToOpfsTarget(toOpfsTarget(sink.path), stream, opts);
+    case 'opfs-target':
+      // The rich OPFS streaming sink: keepExistingData/position patch writes (doc 09 §5 item 1).
+      return writeToOpfsTarget(sink, stream, opts);
     case 'element': {
       try {
         const { writeElement } = await import('./element-materialize.ts');
@@ -48,27 +54,6 @@ export async function materialize(
   }
 }
 
-async function writeOpfs(
-  path: string,
-  stream: ReadableStream<Uint8Array>,
-  opts: ExecuteOptions,
-): Promise<void> {
-  const storage = (globalThis.navigator as Navigator | undefined)?.storage;
-  if (!storage || typeof storage.getDirectory !== 'function') {
-    throw new InputError('unsupported-input', 'OPFS is unavailable in this environment');
-  }
-  const parts = path.split('/').filter((part) => part.length > 0);
-  const name = parts.pop();
-  if (name === undefined) throw new InputError('unsupported-input', `invalid OPFS path '${path}'`);
-  let dir = await storage.getDirectory();
-  for (const part of parts) {
-    dir = await dir.getDirectoryHandle(part, { create: true });
-  }
-  const handle = await dir.getFileHandle(name, { create: true });
-  const writable = await handle.createWritable();
-  await runToSink(stream, writable, opts);
-}
-
 function assertNever(value: never): never {
-  throw new InputError('unsupported-input', `unknown sink ${JSON.stringify(value)}`);
+  throw new InputError(`unknown sink ${JSON.stringify(value)}`);
 }

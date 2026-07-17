@@ -106,7 +106,7 @@ function outputForSink(sink: Sink | undefined, label: string): Output {
 }
 
 describe('MediaChain', () => {
-  it('runs ordered flat ops and materializes intermediate steps as blobs', async () => {
+  it('runs ordered flat ops linked by lazy stream boundaries into the terminal sink', async () => {
     const engine = fakeEngine();
     const input = new Uint8Array([1, 2, 3]);
 
@@ -123,9 +123,9 @@ describe('MediaChain', () => {
       start: 1,
       end: 2,
       mode: 'accurate',
-      sink: { kind: 'blob' },
+      sink: { kind: 'stream' },
     });
-    expect(engine.calls[1]?.input).toBeInstanceOf(Blob);
+    expect(engine.calls[1]?.input).toBeInstanceOf(ReadableStream);
     expect(engine.calls[1]?.opts).toMatchObject({
       to: 'mp4',
       video: { width: 320, height: 180, fit: 'contain' },
@@ -198,12 +198,12 @@ describe('MediaChain', () => {
     expect(engine.calls[0]?.opts).toMatchObject({
       to: 'mkv',
       fragmented: true,
-      sink: { kind: 'blob' },
+      sink: { kind: 'stream' },
     });
     expect(engine.calls[1]?.opts).toMatchObject({
       scheme: 'cenc',
       keys: { keyId: '00112233' },
-      sink: { kind: 'blob' },
+      sink: { kind: 'stream' },
     });
     expect(engine.calls[2]?.opts).toEqual({ video: false, audio: false, to: 'mp4' });
   });

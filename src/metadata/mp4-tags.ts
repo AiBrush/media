@@ -496,16 +496,14 @@ function trknDataValue(payload: Uint8Array): string {
 
 function topLevelMoov(bytes: Uint8Array): Mp4Box {
   const moov = boxes(bytes, 0, bytes.byteLength).find((child) => child.type === 'moov');
-  if (moov === undefined)
-    throw new InputError('unsupported-input', 'not an MP4/MOV file (no moov)');
+  if (moov === undefined) throw new InputError('not an MP4/MOV file (no moov)');
   return moov;
 }
 
 export function writeMp4Tags(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
   const top = boxes(bytes, 0, bytes.byteLength);
   const moov = top.find((child) => child.type === 'moov');
-  if (moov === undefined)
-    throw new InputError('unsupported-input', 'not an MP4/MOV file (no moov)');
+  if (moov === undefined) throw new InputError('not an MP4/MOV file (no moov)');
   const oldMoov = bytes.slice(moov.start, moov.end);
   const newMoov = updateMoov(oldMoov, tags);
   const delta = newMoov.byteLength - oldMoov.byteLength;

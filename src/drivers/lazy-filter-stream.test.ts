@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { createLazyFilterStream } from './defaults.ts';
+import { createLazyFilterStream } from './lazy-filter-stream.ts';
 
 /** Minimal closable frame stub — structurally what the wrapper needs (close-once discipline counted). */
 interface StubFrame {

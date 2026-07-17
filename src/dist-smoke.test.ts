@@ -138,7 +138,10 @@ suite('dist smoke (built package via exports map)', () => {
 
   it('default entry exposes the typed-error model and VERSION', () => {
     expect(typeof media.VERSION).toBe('string');
-    const err = new media.CapabilityError('capability-miss', 'x', { op: 'probe', tried: [] });
+    const err = new media.CapabilityError('x', {
+      op: { kind: 'route', id: 'probe' },
+      tried: [],
+    });
     expect(err).toBeInstanceOf(media.MediaError);
     expect(err).toBeInstanceOf(media.CapabilityError);
     expect(err.code).toBe('capability-miss');

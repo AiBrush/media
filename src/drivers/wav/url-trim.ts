@@ -83,14 +83,10 @@ async function writeWavPcmTrim(
   const { slice } = await import('./pcm-slice.ts');
   const out = slice(bytes, { startSec: opts.startSec, endSec: opts.endSec });
   if (out === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      'WAV PCM byte-trim is not available for this layout',
-      {
-        op: { op: 'trim', container: 'wav' },
-        tried: ['wav'],
-      },
-    );
+    throw new CapabilityError('WAV PCM byte-trim is not available for this layout', {
+      op: { kind: 'route', id: 'trim', facts: { container: 'wav' } },
+      tried: ['wav'],
+    });
   }
   return out;
 }

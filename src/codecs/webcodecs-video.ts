@@ -119,14 +119,10 @@ function quantizerEncodeOptions(
   if (lower.startsWith('avc1') || lower.startsWith('avc3')) return { avc: { quantizer } };
   if (lower.startsWith('hev1') || lower.startsWith('hvc1')) return { hevc: { quantizer } };
   if (lower.startsWith('vp09')) return { vp9: { quantizer } };
-  throw new CapabilityError(
-    'capability-miss',
-    `codec '${codec}' has no WebCodecs quantizer option`,
-    {
-      op: 'encode',
-      tried: ['webcodecs-video'],
-    },
-  );
+  throw new CapabilityError(`codec '${codec}' has no WebCodecs quantizer option`, {
+    op: { kind: 'route', id: 'encode' },
+    tried: ['webcodecs-video'],
+  });
 }
 
 export function videoEncodeOptions(
@@ -243,10 +239,13 @@ export function decoderErrorToCapabilityMiss(
   codec: string | undefined,
 ): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     `${driverId}: this browser's native decoder cannot decode ${codec ?? 'this stream'} ` +
       `(${e.name}: ${e.message}); routing to a capability miss`,
-    { op: 'decode', tried: [driverId], suggestion: 'try another browser or a WASM decode tail' },
+    {
+      op: { kind: 'route', id: 'decode' },
+      tried: [driverId],
+      suggestion: 'try another browser or a WASM decode tail',
+    },
   );
 }
 
@@ -757,17 +756,15 @@ function hasVideoEncoder(): boolean {
 
 function absentWebCodecsError(op: 'decode' | 'encode'): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     `WebCodecs Video${op === 'decode' ? 'Decoder' : 'Encoder'} is unavailable in this environment`,
-    { op, tried: [] },
+    { op: { kind: 'route', id: op }, tried: [] },
   );
 }
 
 function unsupportedVideoCodecError(op: 'decode' | 'encode', codec: string): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     `webcodecs-video cannot ${op} unsupported video codec string '${codec}'`,
-    { op, tried: ['webcodecs-video'] },
+    { op: { kind: 'route', id: op }, tried: ['webcodecs-video'] },
   );
 }
 
@@ -1117,9 +1114,8 @@ function createVideoDecoder(
   };
   const unsupportedExactConfig = (): CapabilityError =>
     new CapabilityError(
-      'capability-miss',
       `webcodecs-video cannot configure ${config.codec} with hardware or software fallback`,
-      { op: 'decode', tried: ['webcodecs-video'] },
+      { op: { kind: 'route', id: 'decode' }, tried: ['webcodecs-video'] },
     );
   const configureSoftwareFallback = async (): Promise<void> => {
     if (closed || signal?.aborted) throw streamClosedError();
@@ -1608,9 +1604,8 @@ export interface WarmVideoDecoderPool {
 /** The exact-config miss raised when neither a hardware nor a software configuration is accepted. */
 function unsupportedExactVideoConfigError(config: VideoDecoderConfig): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     `webcodecs-video cannot configure ${config.codec} with hardware or software fallback`,
-    { op: 'decode', tried: ['webcodecs-video'] },
+    { op: { kind: 'route', id: 'decode' }, tried: ['webcodecs-video'] },
   );
 }
 
@@ -2073,8 +2068,8 @@ export const WebcodecsVideoDriver: CodecDriver = {
   createDecoder(c: DecoderConfig, o?: StageOptions): TransformStream<EncodedChunk, RawFrame> {
     const videoConfig = asVideoDecoderConfig(c);
     if (!videoConfig) {
-      throw new CapabilityError('capability-miss', 'webcodecs-video decodes video, not audio', {
-        op: 'decode',
+      throw new CapabilityError('webcodecs-video decodes video, not audio', {
+        op: { kind: 'route', id: 'decode' },
         tried: ['webcodecs-video'],
       });
     }
@@ -2088,8 +2083,8 @@ export const WebcodecsVideoDriver: CodecDriver = {
   createEncoder(c: EncoderConfig, o?: StageOptions): TransformStream<RawFrame, EncodedChunk> {
     const videoConfig = asVideoEncoderConfig(c);
     if (!videoConfig) {
-      throw new CapabilityError('capability-miss', 'webcodecs-video encodes video, not audio', {
-        op: 'encode',
+      throw new CapabilityError('webcodecs-video encodes video, not audio', {
+        op: { kind: 'route', id: 'encode' },
         tried: ['webcodecs-video'],
       });
     }

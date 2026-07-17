@@ -13,9 +13,9 @@ export type WorkerSelection = 'offload' | 'inline';
 /**
  * Decide whether heavy ops can actually be offloaded to a Worker in this environment — the honest gate for
  * the inline fallback (Prime Directive 6 / ADR-025). Returns `true` only when the `Worker` constructor
- * exists; the deeper "WebCodecs runs *inside* the worker" check is answered by the worker's
- * `ready.webcodecs` handshake (the host downgrades to the inline bridge when a freshly-spawned worker
- * reports `webcodecs:false`). Never assumes isolation that isn't there.
+ * exists; the deeper "does the worker have the codec substrate this job needs" check is answered by the
+ * spawned worker's `ready.caps` handshake (the host downgrades a job to the inline bridge when the worker
+ * lacks the media kinds it needs). Never assumes isolation that isn't there.
  */
 export function workerOffloadAvailable(): boolean {
   return typeof Worker === 'function';
@@ -23,11 +23,12 @@ export function workerOffloadAvailable(): boolean {
 
 /**
  * Resolve whether the heavy graph should run off the main thread, from the public `worker` option
- * ({@link CreateMediaOptions.worker}) and whether a `Worker` constructor exists. `worker:false` is an
- * explicit opt-out (always inline); `true`/`{pool}`/unset default to offload **only when a `Worker`
- * actually exists** — no `Worker` ⇒ inline, the honest fallback (a missing platform capability is never
- * faked). The deeper "WebCodecs inside the worker" gate is the spawned worker's `ready.webcodecs`
- * handshake, applied by the engine after this static decision.
+ * ({@link CreateMediaOptions.worker}) and whether a `Worker` constructor exists. Offload is **opt-in**
+ * (ADR-087): an unset or `false` `worker` always runs INLINE — the safe, predictable default (no surprise
+ * Worker spawn per heavy op). Only an explicit `worker:true`/`worker:{pool}` selects offload, and even
+ * then only when a `Worker` constructor actually exists — no `Worker` ⇒ inline, the honest fallback (a
+ * missing platform capability is never faked). The deeper "codec substrate inside the worker" gate is the
+ * spawned worker's `ready.caps` handshake, applied by the engine after this static decision.
  */
 export function selectWorkerMode(
   worker: boolean | { pool?: number } | undefined,

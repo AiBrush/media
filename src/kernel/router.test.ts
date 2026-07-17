@@ -193,9 +193,45 @@ describe('Router.pickCodec', () => {
     await expect(router.pickCodec(decodeQuery)).rejects.toMatchObject({
       name: 'CapabilityError',
       code: 'capability-miss',
-      detail: { tried: ['hw', 'wasm'] },
+      detail: { op: { kind: 'codec', query: decodeQuery }, tried: ['hw', 'wasm'] },
     });
     await expect(router.pickCodec(decodeQuery)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('every routed miss carries the discriminated op descriptor and names what was probed', async () => {
+    // R-S04.4: `detail.op` is the typed OperationDescriptor union and `tried` is never empty when
+    // candidates were actually probed.
+    const { router } = routerWith((reg) => {
+      reg.addCodec(makeCodec('hw', 'hardware', false).driver);
+      reg.addContainer(makeContainer('mp4', false).driver);
+      reg.addFilter(makeFilter('gpu', 'webgpu', false).driver);
+    });
+
+    const codecMiss = await router.pickCodec(decodeQuery).then(
+      () => undefined,
+      (e: unknown) => e as CapabilityError,
+    );
+    expect(codecMiss?.detail?.op).toEqual({ kind: 'codec', query: decodeQuery });
+    expect(codecMiss?.detail?.tried.length).toBeGreaterThan(0);
+
+    const containerQuery = { direction: 'demux', extension: 'mp4' } as const;
+    let containerMiss: CapabilityError | undefined;
+    try {
+      router.pickContainer(containerQuery);
+    } catch (e) {
+      containerMiss = e as CapabilityError;
+    }
+    expect(containerMiss?.detail?.op).toEqual({ kind: 'container', query: containerQuery });
+    expect(containerMiss?.detail?.tried.length).toBeGreaterThan(0);
+
+    let filterMiss: CapabilityError | undefined;
+    try {
+      router.pickFilter(resizeSpec);
+    } catch (e) {
+      filterMiss = e as CapabilityError;
+    }
+    expect(filterMiss?.detail?.op).toEqual({ kind: 'filter', spec: resizeSpec });
+    expect(filterMiss?.detail?.tried.length).toBeGreaterThan(0);
   });
 
   it('caches a positive verdict and re-probes only on a different determinism key', async () => {
@@ -859,5 +895,694 @@ describe('Router with the default (no-op) ensureLoaded', () => {
     reg.addCodec(makeCodec('wasm', 'wasm', true).driver);
     const router = new Router({ registry: reg });
     expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+  });
+});
+
+describe('Router.probeCodec surfaces the capability verdict (R-S01.2, ADR-203)', () => {
+  it('carries hardwareAccelerated === true with exactly one probe per exact config', async () => {
+    const supports = vi.fn(
+      async (): Promise<CodecSupport> => ({ supported: true, hardwareAccelerated: true }),
+    );
+    const { router } = routerWith((reg) =>
+      reg.addCodec({ ...makeCodec('hw', 'hardware', true).driver, supports }),
+    );
+
+    const first = await router.probeCodec(decodeQuery);
+    expect(first.driver.id).toBe('hw');
+    expect(first.support).toEqual({ supported: true, hardwareAccelerated: true });
+
+    // The cached verdict is served without a second supports()/isConfigSupported-style probe.
+    const second = await router.probeCodec(decodeQuery);
+    expect(second.driver).toBe(first.driver);
+    expect(second.support.hardwareAccelerated).toBe(true);
+    expect(supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares one verdict cache with pickCodec in both directions', async () => {
+    const supports = vi.fn(
+      async (): Promise<CodecSupport> => ({ supported: true, hardwareAccelerated: false }),
+    );
+    const { router } = routerWith((reg) =>
+      reg.addCodec({ ...makeCodec('hw', 'hardware', true).driver, supports }),
+    );
+
+    expect((await router.pickCodec(decodeQuery)).id).toBe('hw');
+    const route = await router.probeCodec(decodeQuery);
+    expect(route.support.hardwareAccelerated).toBe(false);
+    expect((await router.pickCodec(decodeQuery)).id).toBe('hw');
+    expect(supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('freezes the surfaced snapshot so no caller or driver can corrupt a cached verdict', async () => {
+    const verdict: CodecSupport = { supported: true, hardwareAccelerated: true, reason: 'dGPU' };
+    const supports = vi.fn(async (): Promise<CodecSupport> => verdict);
+    const { router } = routerWith((reg) =>
+      reg.addCodec({ ...makeCodec('hw', 'hardware', true).driver, supports }),
+    );
+
+    const first = await router.probeCodec(decodeQuery);
+    expect(Object.isFrozen(first.support)).toBe(true);
+    expect(first.support).not.toBe(verdict);
+
+    // A driver mutating the object it returned must not rewrite the already-cached verdict.
+    verdict.hardwareAccelerated = false;
+    const second = await router.probeCodec(decodeQuery);
+    expect(second.support).toEqual({ supported: true, hardwareAccelerated: true, reason: 'dGPU' });
+  });
+
+  it('surfaces the verdict of the driver that actually won the walk', async () => {
+    const { router } = routerWith((reg) => {
+      reg.addCodec(makeCodec('hw', 'hardware', false).driver);
+      reg.addCodec(makeCodec('wasm', 'wasm', true).driver);
+    });
+    const route = await router.probeCodec(decodeQuery);
+    expect(route.driver.id).toBe('wasm');
+    expect(route.support.supported).toBe(true);
+  });
+});
+
+describe('Router.evictCodec on an execution-time capability miss (R-S01.1, ADR-284)', () => {
+  /** A hardware driver whose probe lies `true` but whose decoder throws on the first coded packet. */
+  function makeRuntimeLiar(id: string) {
+    const supports = vi.fn(
+      async (): Promise<CodecSupport> => ({ supported: true, hardwareAccelerated: true }),
+    );
+    const driver: CodecDriver = {
+      id,
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'codec',
+      tier: 'hardware',
+      supports,
+      createDecoder: () =>
+        new TransformStream<EncodedChunk, RawFrame>({
+          transform(): void {
+            throw new CapabilityError(`'${id}' failed on the first coded packets`, {
+              op: { kind: 'codec', query: decodeQuery },
+              tried: [id],
+            });
+          },
+        }),
+      createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+    };
+    return { driver, supports };
+  }
+
+  /** A wasm driver that decodes each chunk into a close-counted fake frame. */
+  function makeCountingWasmDecoder(id: string) {
+    const supports = vi.fn(async (): Promise<CodecSupport> => ({ supported: true }));
+    const closeCounts = new Map<number, number>();
+    const driver: CodecDriver = {
+      id,
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'codec',
+      tier: 'wasm',
+      supports,
+      createDecoder: () =>
+        new TransformStream<EncodedChunk, RawFrame>({
+          transform(chunk, controller): void {
+            const timestamp = (chunk as { timestamp?: number }).timestamp ?? -1;
+            closeCounts.set(timestamp, 0);
+            const frame = {
+              timestamp,
+              close(): void {
+                closeCounts.set(timestamp, (closeCounts.get(timestamp) ?? 0) + 1);
+              },
+            };
+            controller.enqueue(frame as unknown as RawFrame);
+          },
+        }),
+      createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+    };
+    return { driver, supports, closeCounts };
+  }
+
+  function chunk(timestamp: number): EncodedChunk {
+    return { timestamp, byteLength: 64 } as unknown as EncodedChunk;
+  }
+
+  async function decodeAll(
+    decoder: TransformStream<EncodedChunk, RawFrame>,
+    chunks: readonly EncodedChunk[],
+  ): Promise<readonly number[]> {
+    const writer = decoder.writable.getWriter();
+    const reader = decoder.readable.getReader();
+    const writing = (async () => {
+      for (const c of chunks) await writer.write(c);
+      await writer.close();
+    })();
+    const timestamps: number[] = [];
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      timestamps.push(result.value.timestamp ?? -1);
+      result.value.close();
+    }
+    await writing;
+    return timestamps;
+  }
+
+  it('re-routes the exact config to the wasm tail and produces output, closing frames exactly once', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    // 1) Selection accepts the lying probe (this is exactly what ADR-284 measured in browsers).
+    const picked = await router.pickCodec(decodeQuery);
+    expect(picked.id).toBe('hw');
+
+    // 2) The first coded packet raises the typed runtime miss. A reader must pull first: a fresh
+    // TransformStream exerts backpressure (readable HWM 0) until read demand arrives.
+    const failing = picked.createDecoder(decodeQuery.config);
+    const failingReader = failing.readable.getReader();
+    const pendingRead = failingReader.read().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const failingWriter = failing.writable.getWriter();
+    const runtimeError = await failingWriter.write(chunk(0)).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(runtimeError).toBeInstanceOf(CapabilityError);
+    expect(await pendingRead).toBeInstanceOf(CapabilityError);
+
+    // 3) The executor evicts the verdict and re-routes the *same* config to the next rung.
+    expect(router.evictCodec(decodeQuery, picked.id)).toBe(true);
+    const rerouted = await router.pickCodec(decodeQuery);
+    expect(rerouted.id).toBe('wasm');
+
+    // 4) The wasm rung genuinely decodes: exact timestamp sequence out, every frame closed once.
+    const chunks = [chunk(0), chunk(33_333), chunk(66_666)];
+    const timestamps = await decodeAll(rerouted.createDecoder(decodeQuery.config), chunks);
+    expect(timestamps).toEqual([0, 33_333, 66_666]);
+    expect([...wasm.closeCounts.entries()]).toEqual([
+      [0, 1],
+      [33_333, 1],
+      [66_666, 1],
+    ]);
+
+    // 5) The failed driver stays evicted for this exact config: never re-probed, never re-returned.
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+    expect(liar.supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('never caches a fallback verdict under an evicted ladder head (recovery stays possible)', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    await router.pickCodec(decodeQuery);
+    router.evictCodec(decodeQuery, 'hw');
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+    // The wasm verdict is re-probed per pick (ADR-207: cached fallbacks would mask later recovery)…
+    expect(wasm.supports).toHaveBeenCalledTimes(2);
+    // …and nothing was cached for the evicted-head key.
+    expect(router.cacheSnapshot().codec).toEqual([]);
+  });
+
+  it('scopes the eviction to the exact selection context (config bytes, tiny regime)', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    await router.pickCodec(decodeQuery);
+    router.evictCodec(decodeQuery, 'hw');
+
+    // Same codec string, different config bytes → different selection context → hardware still wins.
+    const widerQuery: CodecQuery = {
+      ...decodeQuery,
+      config: { codec: decodeQuery.config.codec, codedWidth: 1920, codedHeight: 1080 },
+    };
+    expect((await router.pickCodec(widerQuery)).id).toBe('hw');
+
+    // Same config under the tiny regime is a different exact verdict key as well.
+    expect((await router.pickCodec(decodeQuery, { cost: { inputBytes: 64 } })).id).toBe('hw');
+
+    // The evicted context itself keeps routing to the tail.
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+  });
+
+  it('survives clearCache so a registration retry cannot resurrect the liar mid-fallback', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    await router.pickCodec(decodeQuery);
+    router.evictCodec(decodeQuery, 'hw');
+    // The engine clears verdict caches on every driver registration; the runtime-miss record is an
+    // execution-time fact about the driver, not a registry-composition verdict, and must survive.
+    router.clearCache();
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+    expect(liar.supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an evicted pinned driver as a typed miss naming the runtime eviction, probing nothing', async () => {
+    const liar = makeRuntimeLiar('pinned-hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    expect((await router.pickCodec(decodeQuery, { pinDriver: 'pinned-hw' })).id).toBe('pinned-hw');
+    expect(router.evictCodec(decodeQuery, 'pinned-hw', { pinDriver: 'pinned-hw' })).toBe(true);
+
+    const miss = await router.pickCodec(decodeQuery, { pinDriver: 'pinned-hw' }).then(
+      () => undefined,
+      (error: unknown) => error as CapabilityError,
+    );
+    expect(miss).toBeInstanceOf(CapabilityError);
+    expect(miss?.detail?.tried).toEqual([]);
+    expect(miss?.detail?.suggestion).toContain('pinned-hw');
+    expect(liar.supports).toHaveBeenCalledTimes(1);
+  });
+
+  it('declines to record an eviction for a config that has no exact byte identity', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const { router } = routerWith((reg) => reg.addCodec(liar.driver));
+    const hostile: CodecQuery = {
+      ...decodeQuery,
+      config: new Proxy(
+        { codec: 'avc1.42001f' },
+        {
+          ownKeys(): never {
+            throw new TypeError('hostile ownKeys');
+          },
+        },
+      ) as VideoDecoderConfig,
+    };
+    expect((await router.pickCodec(hostile)).id).toBe('hw');
+    expect(router.evictCodec(hostile, 'hw')).toBe(false);
+  });
+
+  it('is idempotent per (config, driver) and evicts independently per driver id', async () => {
+    const liar = makeRuntimeLiar('hw');
+    const wasm = makeCountingWasmDecoder('wasm');
+    const { router } = routerWith((reg) => {
+      reg.addCodec(liar.driver);
+      reg.addCodec(wasm.driver);
+    });
+
+    await router.pickCodec(decodeQuery);
+    expect(router.evictCodec(decodeQuery, 'hw')).toBe(true);
+    expect(router.evictCodec(decodeQuery, 'hw')).toBe(true);
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+
+    // Evicting the tail too exhausts the ladder with the typed miss naming what was runtime-tried.
+    expect(router.evictCodec(decodeQuery, 'wasm')).toBe(true);
+    const miss = await router.pickCodec(decodeQuery).then(
+      () => undefined,
+      (error: unknown) => error as CapabilityError,
+    );
+    expect(miss).toBeInstanceOf(CapabilityError);
+    expect(miss?.detail?.tried).toEqual([]);
+    expect(miss?.detail?.suggestion).toMatch(/hw.*wasm|wasm.*hw/);
+  });
+});
+
+describe('tier ladder golden rank order (R-S01.6)', () => {
+  function loggingCodec(id: string, tier: Tier, log: string[]) {
+    const supports = vi.fn(async (): Promise<CodecSupport> => {
+      log.push(id);
+      return { supported: false };
+    });
+    return { ...makeCodec(id, tier, false).driver, supports };
+  }
+
+  function loggingFilter(id: string, substrate: FilterSubstrate, log: string[]) {
+    const supports = vi.fn((_f: FilterSpec): boolean => {
+      log.push(id);
+      return false;
+    });
+    return { ...makeFilter(id, substrate, false).driver, supports };
+  }
+
+  it('probes codecs hardware → gpu → native → wasm when work is not tiny', async () => {
+    const log: string[] = [];
+    const { router } = routerWith((reg) => {
+      // Deliberately registered worst-first: rank, not registration order, must decide.
+      reg.addCodec(loggingCodec('wasm', 'wasm', log));
+      reg.addCodec(loggingCodec('native', 'native', log));
+      reg.addCodec(loggingCodec('gpu', 'gpu', log));
+      reg.addCodec(loggingCodec('hw', 'hardware', log));
+    });
+    const miss = await router.pickCodec(decodeQuery).then(
+      () => undefined,
+      (error: unknown) => error as CapabilityError,
+    );
+    expect(miss?.detail?.tried).toEqual(['hw', 'gpu', 'native', 'wasm']);
+    expect(log).toEqual(['hw', 'gpu', 'native', 'wasm']);
+  });
+
+  it('inverts native ↔ gpu below the ADR-020 thresholds (tiny regime)', async () => {
+    const log: string[] = [];
+    const { router } = routerWith((reg) => {
+      reg.addCodec(loggingCodec('wasm', 'wasm', log));
+      reg.addCodec(loggingCodec('gpu', 'gpu', log));
+      reg.addCodec(loggingCodec('native', 'native', log));
+      reg.addCodec(loggingCodec('hw', 'hardware', log));
+    });
+    const miss = await router.pickCodec(decodeQuery, { cost: { inputBytes: 64 } }).then(
+      () => undefined,
+      (error: unknown) => error as CapabilityError,
+    );
+    expect(miss?.detail?.tried).toEqual(['hw', 'native', 'gpu', 'wasm']);
+    expect(log).toEqual(['hw', 'native', 'gpu', 'wasm']);
+  });
+
+  it('keeps registration order among equal codec ranks (stable sort)', async () => {
+    const log: string[] = [];
+    const { router } = routerWith((reg) => {
+      reg.addCodec(loggingCodec('hw-b', 'hardware', log));
+      reg.addCodec(loggingCodec('hw-a', 'hardware', log));
+      reg.addCodec(loggingCodec('wasm-b', 'wasm', log));
+      reg.addCodec(loggingCodec('wasm-a', 'wasm', log));
+    });
+    const miss = await router.pickCodec(decodeQuery).then(
+      () => undefined,
+      (error: unknown) => error as CapabilityError,
+    );
+    expect(miss?.detail?.tried).toEqual(['hw-b', 'hw-a', 'wasm-b', 'wasm-a']);
+  });
+
+  it('ranks filter substrates webgpu → webgl → canvas2d → native → wasm when not tiny', () => {
+    const log: string[] = [];
+    const { router } = routerWith((reg) => {
+      reg.addFilter(loggingFilter('wasm', 'wasm', log));
+      reg.addFilter(loggingFilter('native', 'native', log));
+      reg.addFilter(loggingFilter('canvas', 'canvas2d', log));
+      reg.addFilter(loggingFilter('gl', 'webgl', log));
+      reg.addFilter(loggingFilter('gpu', 'webgpu', log));
+    });
+    let miss: CapabilityError | undefined;
+    try {
+      router.pickFilter(resizeSpec, { cost: { videoPixelWork: TINY_VIDEO_PIXEL_WORK + 1 } });
+    } catch (error) {
+      miss = error as CapabilityError;
+    }
+    expect(miss?.detail?.tried).toEqual(['gpu', 'gl', 'canvas', 'native', 'wasm']);
+    expect(log).toEqual(['gpu', 'gl', 'canvas', 'native', 'wasm']);
+  });
+
+  it('re-ranks filters native → canvas2d → webgpu → webgl → wasm for tiny work', () => {
+    const log: string[] = [];
+    const { router } = routerWith((reg) => {
+      reg.addFilter(loggingFilter('wasm', 'wasm', log));
+      reg.addFilter(loggingFilter('gl', 'webgl', log));
+      reg.addFilter(loggingFilter('gpu', 'webgpu', log));
+      reg.addFilter(loggingFilter('canvas', 'canvas2d', log));
+      reg.addFilter(loggingFilter('native', 'native', log));
+    });
+    let miss: CapabilityError | undefined;
+    try {
+      router.pickFilter(resizeSpec, { cost: { videoPixelWork: TINY_VIDEO_PIXEL_WORK } });
+    } catch (error) {
+      miss = error as CapabilityError;
+    }
+    expect(miss?.detail?.tried).toEqual(['native', 'canvas', 'gpu', 'gl', 'wasm']);
+    expect(log).toEqual(['native', 'canvas', 'gpu', 'gl', 'wasm']);
+  });
+});
+
+describe('exact codec cache key vs JSON.stringify memos (R-S01.7)', () => {
+  it('keys same-codec configs with different avcC bytes distinctly where JSON.stringify collides', async () => {
+    const avcC = (profile: number): VideoDecoderConfig => ({
+      codec: 'avc1.42001f',
+      codedWidth: 640,
+      codedHeight: 360,
+      description: Uint8Array.from([0x01, profile, 0x00, 0x1f, 0xff]).buffer as ArrayBuffer,
+    });
+    const configA = avcC(0x42);
+    const configB = avcC(0x64);
+    // The mediabunny-style memo key cannot tell these apart: ArrayBuffers stringify as `{}`.
+    expect(JSON.stringify(configA)).toBe(JSON.stringify(configB));
+
+    const hardwareSupports = vi.fn(async (q: CodecQuery): Promise<CodecSupport> => {
+      const description = (q.config as VideoDecoderConfig).description;
+      const bytes =
+        description instanceof ArrayBuffer ? new Uint8Array(description) : new Uint8Array(0);
+      return { supported: bytes[1] === 0x42 };
+    });
+    const fallback = makeCodec('wasm', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addCodec({ ...makeCodec('hw', 'hardware', false).driver, supports: hardwareSupports });
+      reg.addCodec(fallback.driver);
+    });
+
+    expect((await router.pickCodec({ ...decodeQuery, config: configA })).id).toBe('hw');
+    expect((await router.pickCodec({ ...decodeQuery, config: configB })).id).toBe('wasm');
+    // Distinct keys: the second pick of configA is a cache hit, no re-probe.
+    expect((await router.pickCodec({ ...decodeQuery, config: configA })).id).toBe('hw');
+    expect(hardwareSupports).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-probes an accessor-carrying config without ever invoking the getter', async () => {
+    const getter = vi.fn(() => 640);
+    const config: VideoDecoderConfig = { codec: 'avc1.42001f' };
+    Object.defineProperty(config, 'codedWidth', {
+      get: getter,
+      enumerable: true,
+      configurable: true,
+    });
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect(codec.supports).toHaveBeenCalledTimes(2); // never cached → re-probed
+    expect(getter).not.toHaveBeenCalled(); // the keyer must not execute caller accessors
+  });
+
+  it('re-probes a hostile Proxy config and never throws out of pickCodec', async () => {
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+    const config = new Proxy(
+      { codec: 'avc1.42001f' },
+      {
+        getOwnPropertyDescriptor(): never {
+          throw new TypeError('hostile descriptor trap');
+        },
+      },
+    ) as VideoDecoderConfig;
+
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect(codec.supports).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-probes a cyclic config and never throws out of pickCodec', async () => {
+    interface CyclicConfig extends VideoDecoderConfig {
+      self?: unknown;
+    }
+    const config: CyclicConfig = { codec: 'avc1.42001f' };
+    config.self = config;
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect(codec.supports).toHaveBeenCalledTimes(2);
+  });
+
+  it('routes a bigint-carrying config that would explode a JSON.stringify memo', async () => {
+    const config = {
+      codec: 'avc1.42001f',
+      hostileTag: 1n,
+    } as unknown as VideoDecoderConfig;
+    expect(() => JSON.stringify(config)).toThrow(TypeError);
+
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect((await router.pickCodec({ ...decodeQuery, config })).id).toBe('hw');
+    expect(codec.supports).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('bounded LRU caches (R-S01.5)', () => {
+  const BOUND = 64;
+
+  it('bounds the container cache, evicting the least-recently-used key first', () => {
+    const { driver, supports } = makeContainer('all-mimes', true);
+    const { router } = routerWith((reg) => reg.addContainer(driver));
+    const mimeQuery = (index: number): ContainerQuery => ({
+      direction: 'demux',
+      mime: `video/format-${index}`,
+    });
+
+    router.pickContainer(mimeQuery(0));
+    const [oldestKey] = router.cacheSnapshot().container;
+    expect(oldestKey).toBeDefined();
+    for (let index = 1; index <= BOUND; index++) router.pickContainer(mimeQuery(index));
+
+    const snapshot = router.cacheSnapshot().container;
+    expect(snapshot.length).toBe(BOUND);
+    expect(snapshot).not.toContain(oldestKey ?? '');
+    expect(supports).toHaveBeenCalledTimes(BOUND + 1);
+
+    // The evicted oldest key re-probes; a resident recent key is served from cache.
+    router.pickContainer(mimeQuery(BOUND));
+    expect(supports).toHaveBeenCalledTimes(BOUND + 1);
+    router.pickContainer(mimeQuery(0));
+    expect(supports).toHaveBeenCalledTimes(BOUND + 2);
+  });
+
+  it('refreshes container recency on a hit so hot routes survive churn', () => {
+    const { driver, supports } = makeContainer('all-mimes', true);
+    const { router } = routerWith((reg) => reg.addContainer(driver));
+    const mimeQuery = (index: number): ContainerQuery => ({
+      direction: 'demux',
+      mime: `video/format-${index}`,
+    });
+
+    for (let index = 0; index < BOUND; index++) router.pickContainer(mimeQuery(index));
+    router.pickContainer(mimeQuery(0)); // hit → most-recently-used
+    router.pickContainer(mimeQuery(BOUND)); // evicts key 1, not the refreshed key 0
+
+    const probesBefore = supports.mock.calls.length;
+    router.pickContainer(mimeQuery(0));
+    expect(supports.mock.calls.length).toBe(probesBefore); // still cached
+    router.pickContainer(mimeQuery(1));
+    expect(supports.mock.calls.length).toBe(probesBefore + 1); // evicted → re-probed
+  });
+
+  it('bounds the filter cache with the same LRU discipline (insertion-order probe)', () => {
+    const { router } = routerWith((reg) => {
+      for (let index = 0; index <= BOUND + 4; index++) {
+        reg.addFilter(makeFilter(`f${index}`, 'native', true).driver);
+      }
+    });
+
+    router.pickFilter(resizeSpec, { pinDriver: 'f0' });
+    const [oldestKey] = router.cacheSnapshot().filter;
+    expect(oldestKey).toBeDefined();
+    router.pickFilter(resizeSpec, { pinDriver: 'f1' });
+    const secondKey = router.cacheSnapshot().filter[1];
+    expect(secondKey).toBeDefined();
+
+    for (let index = 2; index < BOUND; index++) {
+      router.pickFilter(resizeSpec, { pinDriver: `f${index}` });
+    }
+    const full = router.cacheSnapshot().filter;
+    expect(full.length).toBe(BOUND);
+    expect(full[0]).toBe(oldestKey ?? '');
+
+    router.pickFilter(resizeSpec, { pinDriver: `f${BOUND}` });
+    const evicted = router.cacheSnapshot().filter;
+    expect(evicted.length).toBe(BOUND);
+    expect(evicted).not.toContain(oldestKey ?? '');
+    expect(evicted[0]).toBe(secondKey ?? '');
+  });
+
+  it('bounds the codec verdict cache (existing LRU law holds through the route cache)', async () => {
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+    for (let codedWidth = 1; codedWidth <= BOUND + 1; codedWidth++) {
+      await router.pickCodec({
+        ...decodeQuery,
+        config: { codec: decodeQuery.config.codec, codedWidth, codedHeight: 1 },
+      });
+    }
+    expect(router.cacheSnapshot().codec.length).toBe(BOUND);
+  });
+
+  it('bounds the runtime-miss record map alongside the verdict caches', async () => {
+    const codec = makeCodec('hw', 'hardware', true);
+    const { router } = routerWith((reg) => reg.addCodec(codec.driver));
+    for (let codedWidth = 1; codedWidth <= BOUND + 8; codedWidth++) {
+      const query: CodecQuery = {
+        ...decodeQuery,
+        config: { codec: decodeQuery.config.codec, codedWidth, codedHeight: 1 },
+      };
+      expect(router.evictCodec(query, 'hw')).toBe(true);
+    }
+    expect(router.cacheSnapshot().runtimeMisses.length).toBe(BOUND);
+  });
+});
+
+describe('ensureLoaded embedder seam (R-S01.4)', () => {
+  it('awaits the hook once per probed candidate, in ladder order, before that candidate probes', async () => {
+    const log: string[] = [];
+    const hw = makeCodec('hw', 'hardware', false);
+    hw.supports.mockImplementation(async (): Promise<CodecSupport> => {
+      log.push('probe:hw');
+      return { supported: false };
+    });
+    const wasm = makeCodec('wasm', 'wasm', true);
+    wasm.supports.mockImplementation(async (): Promise<CodecSupport> => {
+      log.push('probe:wasm');
+      return { supported: true };
+    });
+    const registry = new Registry();
+    registry.addCodec(wasm.driver);
+    registry.addCodec(hw.driver);
+    const router = new Router({
+      registry,
+      ensureLoaded: (driver) => {
+        log.push(`load:${driver.id}`);
+      },
+    });
+
+    expect((await router.pickCodec(decodeQuery)).id).toBe('wasm');
+    expect(log).toEqual(['load:hw', 'probe:hw', 'load:wasm', 'probe:wasm']);
+  });
+
+  it('never loads drivers ranked below the accepted candidate, and skips the hook on a cache hit', async () => {
+    const loader = vi.fn();
+    const hw = makeCodec('hw', 'hardware', true);
+    const wasm = makeCodec('wasm', 'wasm', true);
+    const { router } = routerWith((reg) => {
+      reg.addCodec(wasm.driver);
+      reg.addCodec(hw.driver);
+    }, loader);
+
+    expect((await router.pickCodec(decodeQuery)).id).toBe('hw');
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(loader).toHaveBeenCalledWith(hw.driver);
+    expect(wasm.supports).not.toHaveBeenCalled();
+
+    expect((await router.pickCodec(decodeQuery)).id).toBe('hw');
+    expect(loader).toHaveBeenCalledTimes(1); // cached verdict → no loading work at all
+  });
+});
+
+describe('container first-match cache + clearCache-on-registration invariant (R-S01.8)', () => {
+  it('serves the stale first-match until clearCache, then routes to the superseding registration', () => {
+    const baseline = makeContainer('mp4', true);
+    const supersedingSupports = vi.fn((_q: ContainerQuery): boolean => true);
+    const superseding: ContainerDriver = {
+      ...baseline.driver,
+      supports: supersedingSupports,
+      // A strictly wider capability surface (optional `probe`) supersedes the same id in place.
+      probe: () => Promise.resolve([]),
+      capabilities: ['probe'],
+    };
+    const registry = new Registry();
+    registry.addContainer(baseline.driver);
+    const router = new Router({ registry });
+
+    expect(router.pickContainer(demuxQuery)).toBe(baseline.driver); // cached first match
+
+    registry.addContainer(superseding);
+    // Without clearCache the stale verdict keeps winning — this is why every registration path in the
+    // engine (`use()`, default-bundle loads) must call clearCache().
+    expect(router.pickContainer(demuxQuery)).toBe(baseline.driver);
+
+    router.clearCache();
+    expect(router.pickContainer(demuxQuery)).toBe(superseding); // the new route wins
+    expect(supersedingSupports).toHaveBeenCalledTimes(1);
   });
 });

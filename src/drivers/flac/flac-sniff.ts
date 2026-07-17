@@ -73,7 +73,7 @@ export function matchesFlac(q: ContainerQuery): boolean {
 export function parseFlacStreamInfo(bytes: Uint8Array): FlacStreamInfo {
   const start = flacOffset(bytes);
   if (bytes.byteLength < start + 8 || ascii(bytes, start, 4) !== 'fLaC') {
-    throw new InputError('unsupported-input', 'not a native FLAC stream (no fLaC marker)');
+    throw new InputError('not a native FLAC stream (no fLaC marker)');
   }
   const blockHeader = start + 4;
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -147,7 +147,7 @@ export async function readSeekableFlacStreamInfo(
 export function flacMetadataLayout(bytes: Uint8Array): FlacMetadataLayout {
   const start = flacOffset(bytes);
   if (bytes.byteLength < start + 8 || ascii(bytes, start, 4) !== 'fLaC') {
-    throw new InputError('unsupported-input', 'not a native FLAC stream (no fLaC marker)');
+    throw new InputError('not a native FLAC stream (no fLaC marker)');
   }
   const info = parseFlacStreamInfo(bytes);
   let at = start + 4;

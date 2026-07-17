@@ -41,21 +41,21 @@ function validateBounds(
   sampleRate: number,
 ): { readonly startFrame: number; readonly endFrame: number } {
   if (!Number.isFinite(bounds.startSec) || !Number.isFinite(bounds.endSec)) {
-    throw new InputError('unsupported-input', 'bad trim');
+    throw new InputError('bad trim');
   }
   if (bounds.startSec < 0) {
-    throw new InputError('unsupported-input', 'start<0');
+    throw new InputError('start<0');
   }
   if (bounds.endSec <= bounds.startSec) {
-    throw new InputError('unsupported-input', 'empty trim');
+    throw new InputError('empty trim');
   }
   const durationSec = sampleRate > 0 ? totalFrames / sampleRate : 0;
   if (durationSec > 0) {
     if (bounds.startSec >= durationSec) {
-      throw new InputError('unsupported-input', 'start>=duration');
+      throw new InputError('start>=duration');
     }
     if (bounds.endSec > durationSec + TRIM_END_SLACK_SEC) {
-      throw new InputError('unsupported-input', 'end>duration');
+      throw new InputError('end>duration');
     }
   }
   const startFrame = Math.min(totalFrames, Math.max(0, Math.round(bounds.startSec * sampleRate)));

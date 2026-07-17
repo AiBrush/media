@@ -166,8 +166,8 @@ export async function runCodecConvert(
   }
 
   if (!containerHasChunkMuxer(target)) {
-    throw new CapabilityError('capability-miss', `convert to '${target}' has no muxer`, {
-      op: 'convert',
+    throw new CapabilityError(`convert to '${target}' has no muxer`, {
+      op: { kind: 'route', id: 'convert' },
       tried: [target],
     });
   }
@@ -393,8 +393,8 @@ export async function runCodecConvert(
     }
 
     if (tasks.length === 0) {
-      throw new CapabilityError('capability-miss', 'convert found no decodable track', {
-        op: 'convert',
+      throw new CapabilityError('convert found no decodable track', {
+        op: { kind: 'route', id: 'convert' },
         tried: [container.id],
       });
     }

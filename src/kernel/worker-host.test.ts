@@ -4,7 +4,7 @@
  * {@link OffloadJob}, stream the worker's encoded bytes back, and re-expose them as a
  * `ReadableStream<Uint8Array>` the engine materializes into the caller's sink. Tested in Node with the
  * Worker **mocked as transport** (a `MessageChannel` driving the real worker runtime) so the glue —
- * payload assembly, byte round-trip, the `ready.webcodecs` handshake gate, and abort — is provable.
+ * payload assembly, byte round-trip, the `ready.caps` handshake gate, and abort — is provable.
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -16,7 +16,7 @@ import {
   type OffloadPoolCache,
   type OffloadStreamOptions,
   type SpawnedWorker,
-  __resetSharedOffloadPools,
+  createOffloadRuntime,
   createWorkerPool,
   ensureOffloadPool,
   ensureWorkerBridge,
@@ -25,7 +25,12 @@ import {
   runOffloadStream,
 } from './worker-host.ts';
 import { type OffloadJobPayload, makeJobRunner } from './worker-main.ts';
-import type { HostMessage, MessageLike, WorkerMessage } from './worker-protocol.ts';
+import type {
+  HostMessage,
+  MessageLike,
+  WorkerMediaCaps,
+  WorkerMessage,
+} from './worker-protocol.ts';
 
 // ── a MessageChannel transport driving the real worker runtime ───────────────────────────────────────
 
@@ -317,7 +322,7 @@ describe('runOffloadStream', () => {
  * when the handshake fails).
  */
 function fakeSpawnedWorker(opts: {
-  ready?: { webcodecs: boolean };
+  ready?: { caps: WorkerMediaCaps };
   terminated: { value: boolean };
 }): SpawnedWorker {
   const channel = new MessageChannel();
@@ -326,9 +331,7 @@ function fakeSpawnedWorker(opts: {
   // The "worker" side posts the ready handshake (if requested) on the next tick, mirroring a booted worker.
   if (opts.ready !== undefined) {
     channel.port2.start();
-    queueMicrotask(() =>
-      channel.port2.postMessage({ t: 'ready', webcodecs: opts.ready?.webcodecs }),
-    );
+    queueMicrotask(() => channel.port2.postMessage({ t: 'ready', caps: opts.ready?.caps }));
   }
   return {
     postMessage: (m, transfer) => host.postMessage(m, transfer),
@@ -342,22 +345,39 @@ function fakeSpawnedWorker(opts: {
   };
 }
 
+const ALL_CAPS: WorkerMediaCaps = { video: true, audio: true };
+const NO_CAPS: WorkerMediaCaps = { video: false, audio: false };
+
 describe('ensureWorkerBridge handshake', () => {
-  it('resolves a bridge when the worker reports ready{webcodecs:true}', async () => {
+  it('resolves a bridge carrying the caps when the worker reports a capable ready{caps}', async () => {
     const terminated = { value: false };
     const bridge = await ensureWorkerBridge(
-      () => fakeSpawnedWorker({ ready: { webcodecs: true }, terminated }),
+      () => fakeSpawnedWorker({ ready: { caps: ALL_CAPS }, terminated }),
       1000,
     );
     expect(bridge).toBeInstanceOf(WorkerStreamBridge);
+    expect(bridge?.caps).toEqual(ALL_CAPS);
     expect(terminated.value).toBe(false);
     bridge?.terminate();
   });
 
-  it('downgrades to inline (undefined) + terminates the worker when webcodecs:false', async () => {
+  it('keeps a PARTIALLY capable worker (audio-only) and records its caps for the per-op gate', async () => {
+    const terminated = { value: false };
+    const audioOnly: WorkerMediaCaps = { video: false, audio: true };
+    const bridge = await ensureWorkerBridge(
+      () => fakeSpawnedWorker({ ready: { caps: audioOnly }, terminated }),
+      1000,
+    );
+    expect(bridge).toBeInstanceOf(WorkerStreamBridge);
+    expect(bridge?.caps).toEqual(audioOnly);
+    expect(terminated.value).toBe(false);
+    bridge?.terminate();
+  });
+
+  it('downgrades to inline (undefined) + terminates the worker when NO media kind is capable', async () => {
     const terminated = { value: false };
     const bridge = await ensureWorkerBridge(
-      () => fakeSpawnedWorker({ ready: { webcodecs: false }, terminated }),
+      () => fakeSpawnedWorker({ ready: { caps: NO_CAPS }, terminated }),
       1000,
     );
     expect(bridge).toBeUndefined();
@@ -389,15 +409,15 @@ describe('ensureWorkerBridge handshake', () => {
 
 /**
  * A fake {@link SpawnedWorker} that ALSO runs the real {@link runOffloadWorker} on its far side (driven by
- * `runJob`) so a pool built from it can actually process jobs — and posts the `ready{webcodecs:true}`
- * handshake. Used to exercise `createWorkerPool` end to end (gate → pool → job) in Node.
+ * `runJob`) so a pool built from it can actually process jobs — and posts the `ready{caps}` handshake.
+ * Used to exercise `createWorkerPool` end to end (gate → pool → job) in Node.
  */
-function fakeRunningWorker(runJob: JobRunner): SpawnedWorker {
+function fakeRunningWorker(runJob: JobRunner, caps: WorkerMediaCaps = ALL_CAPS): SpawnedWorker {
   const channel = new MessageChannel();
   channels.push(channel);
   const host = adaptPort<WorkerMessage, HostMessage>(channel.port1);
   const workerPort = adaptPort<HostMessage, WorkerMessage>(channel.port2);
-  runOffloadWorker({ ...workerPort, webcodecs: true }, runJob);
+  runOffloadWorker({ ...workerPort, caps }, runJob);
   return {
     postMessage: (m, transfer) => host.postMessage(m, transfer),
     addEventListener: (t, l) => host.addEventListener(t, l),
@@ -422,6 +442,7 @@ describe('createWorkerPool', () => {
     );
     expect(pool).toBeDefined();
     expect(pool?.size).toBe(2);
+    expect(pool?.caps).toEqual(ALL_CAPS); // the probe's handshaken caps speak for the pool
     expect(spawned).toBe(2); // the probe is reused as worker #1; one more bare-spawned
     // The pool actually runs a job end to end through offloadHeavyOp. The convert opts are typed (the
     // generic infers the caller's concrete shape; a bare inline literal would hit excess-property check).
@@ -436,11 +457,11 @@ describe('createWorkerPool', () => {
     await pool?.terminate();
   });
 
-  it('downgrades to undefined (run inline) when the probe handshake fails', async () => {
+  it('downgrades to undefined (run inline) when the probe handshake reports no capable kind', async () => {
     const terminated = { value: false };
     const pool = await createWorkerPool(
       4,
-      () => fakeSpawnedWorker({ ready: { webcodecs: false }, terminated }),
+      () => fakeSpawnedWorker({ ready: { caps: NO_CAPS }, terminated }),
       1000,
     );
     expect(pool).toBeUndefined();
@@ -475,25 +496,24 @@ describe('offloadAbrLadder (ABR fan-out)', () => {
   });
 });
 
-// ── process-wide single-worker reuse (the §3.E crash fix) ─────────────────────────────────────────────
+// ── runtime-scoped single-worker reuse (the §3.E crash fix, now on an owned runtime) ──────────────────
 
-describe('ensureOffloadPool — one Worker per page, shared across engines', () => {
-  afterEach(() => __resetSharedOffloadPools());
-
+describe('ensureOffloadPool — one Worker per runtime, shared across engines', () => {
   it('spawns ONE worker for N engines at the same pool size (no per-engine spawn storm)', async () => {
     // The media-test adapter creates a fresh `createMedia({worker:true})` PER op, so each engine gets its
-    // own OffloadPoolCache. Without the module-level shared pool, that is one Worker per op → the wasm
+    // own OffloadPoolCache. Without the runtime-shared pool, that is one Worker per op → the wasm
     // re-load storm that crashed the baseline. Assert the injected spawn runs exactly once across N caches.
+    const runtime = createOffloadRuntime();
     let spawnCount = 0;
     const terminated = { value: false };
     const spawn = () => {
       spawnCount += 1;
-      return fakeSpawnedWorker({ ready: { webcodecs: true }, terminated });
+      return fakeSpawnedWorker({ ready: { caps: ALL_CAPS }, terminated });
     };
     const pools = await Promise.all(
       Array.from({ length: 6 }, () => {
         const cache: OffloadPoolCache = {}; // a DISTINCT per-engine cache each time
-        return ensureOffloadPool(cache, 1, spawn);
+        return ensureOffloadPool(cache, 1, spawn, runtime);
       }),
     );
     expect(spawnCount).toBe(1); // ONE worker for all six engines
@@ -501,40 +521,42 @@ describe('ensureOffloadPool — one Worker per page, shared across engines', () 
     const first = pools[0];
     expect(first).not.toBeNull();
     for (const p of pools) expect(p).toBe(first);
-    first?.terminate();
+    await runtime.dispose(); // scoped lifetime: the OWNER terminates the shared pool, no backdoor reset
+    expect(terminated.value).toBe(true);
   });
 
   it('keeps distinct pools for distinct sizes (a {pool:N} engine does not share a worker:true pool)', async () => {
+    const runtime = createOffloadRuntime();
     let spawnCount = 0;
     const terminated = { value: false };
     const spawn = () => {
       spawnCount += 1;
-      return fakeSpawnedWorker({ ready: { webcodecs: true }, terminated });
+      return fakeSpawnedWorker({ ready: { caps: ALL_CAPS }, terminated });
     };
-    const a = await ensureOffloadPool({}, 1, spawn); // size-1 pool: 1 worker
+    const a = await ensureOffloadPool({}, 1, spawn, runtime); // size-1 pool: 1 worker
     expect(spawnCount).toBe(1);
-    const b = await ensureOffloadPool({}, 3, spawn); // size-3 pool: its OWN 3 workers (separate pool)
+    const b = await ensureOffloadPool({}, 3, spawn, runtime); // size-3 pool: its OWN 3 workers
     expect(spawnCount).toBe(4); // 1 (size-1) + 3 (size-3)
     const beforeReuse = spawnCount;
-    const aAgain = await ensureOffloadPool({}, 1, spawn); // size 1 reuses the first pool — ZERO new spawns
+    const aAgain = await ensureOffloadPool({}, 1, spawn, runtime); // size 1 reuses — ZERO new spawns
     expect(spawnCount).toBe(beforeReuse);
     expect(aAgain).toBe(a);
     expect(b).not.toBe(a);
-    a?.terminate();
-    b?.terminate();
+    await runtime.dispose();
   });
 
   it('memoizes within a single engine cache (repeat ops never re-await a spawn)', async () => {
+    const runtime = createOffloadRuntime();
     let spawnCount = 0;
     const spawn = () => {
       spawnCount += 1;
-      return fakeSpawnedWorker({ ready: { webcodecs: true }, terminated: { value: false } });
+      return fakeSpawnedWorker({ ready: { caps: ALL_CAPS }, terminated: { value: false } });
     };
     const cache: OffloadPoolCache = {};
-    const p1 = await ensureOffloadPool(cache, 1, spawn);
-    const p2 = await ensureOffloadPool(cache, 1, spawn); // same cache, second op
+    const p1 = await ensureOffloadPool(cache, 1, spawn, runtime);
+    const p2 = await ensureOffloadPool(cache, 1, spawn, runtime); // same cache, second op
     expect(spawnCount).toBe(1);
     expect(p2).toBe(p1);
-    p1?.terminate();
+    await runtime.dispose();
   });
 });

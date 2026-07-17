@@ -274,8 +274,7 @@ function readStreamInfo(bytes: Uint8Array): StreamInfo {
       (at(bytes, 9) & 0x7f);
     off = 10 + size;
   }
-  if (ascii(bytes, off, 4) !== 'fLaC')
-    throw new InputError('unsupported-input', 'not a native FLAC stream');
+  if (ascii(bytes, off, 4) !== 'fLaC') throw new InputError('not a native FLAC stream');
   off += 4;
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let info: StreamInfo | undefined;

@@ -3,8 +3,12 @@
  *
  * A capability miss is always a typed `CapabilityError`, never a silent wrong result; bad input is an
  * `InputError`; stage failures carry a specific `MediaErrorCode`. Strings are never thrown and errors
- * are never swallowed (ADR-018).
+ * are never swallowed (ADR-018). The subclass codes are intrinsic: a `CapabilityError` is always
+ * `capability-miss` and an `InputError` always `unsupported-input` — call sites name only the message
+ * and the structured detail.
  */
+
+import type { CodecQuery, ContainerQuery, FilterSpec } from './driver.ts';
 
 /** Discriminant for every {@link MediaError}. */
 export type MediaErrorCode =
@@ -27,37 +31,87 @@ export class MediaError extends Error {
     readonly code: MediaErrorCode,
     message: string,
     readonly detail?: unknown,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'MediaError';
   }
 }
 
+/** Structured facts about an unsatisfiable named route (container/codec tokens, counts, flags). */
+export type OperationFacts = Readonly<Record<string, string | number | boolean | undefined>>;
+
+/**
+ * The operation a capability probe could not satisfy, as a discriminated union over the three driver
+ * seams plus named engine routes. `codec`/`container` carry the exact routed query, `filter` the exact
+ * spec, and `route` names any other operation (an engine op, a driver-internal constraint, a runtime
+ * gate) with optional structured {@link OperationFacts}.
+ */
+export type OperationDescriptor =
+  | { readonly kind: 'codec'; readonly query: CodecQuery }
+  | { readonly kind: 'container'; readonly query: ContainerQuery }
+  | { readonly kind: 'filter'; readonly spec: FilterSpec }
+  | { readonly kind: 'route'; readonly id: string; readonly facts?: OperationFacts };
+
 /** Structured payload attached to a {@link CapabilityError} (`detail`). */
 export interface CapabilityErrorDetail {
-  /** A description of the operation/query that could not be satisfied. */
-  op: unknown;
-  /** Driver ids that were probed, in ladder order, before giving up. */
-  tried: readonly string[];
+  /** The operation/query that could not be satisfied. */
+  readonly op: OperationDescriptor;
+  /** Driver ids probed, in ladder order, before giving up; empty only when nothing was probed. */
+  readonly tried: readonly string[];
   /** Optional actionable hint (e.g. "register the WASM FLAC driver"). */
-  suggestion?: string;
+  readonly suggestion?: string;
 }
 
 /**
- * No eligible driver exists for an operation in this environment (code `capability-miss`). `detail`
- * carries {@link CapabilityErrorDetail} naming what was tried and how to enable it (ADR-017).
+ * True when a value carries the exact {@link CapabilityErrorDetail} shape. Used where a detail arrives
+ * untyped — e.g. rebuilt from the structured-clone worker wire — so a `CapabilityError` is only ever
+ * constructed with a genuine typed detail, never a cast.
+ */
+export function isCapabilityErrorDetail(value: unknown): value is CapabilityErrorDetail {
+  if (typeof value !== 'object' || value === null) return false;
+  const detail = value as { op?: unknown; tried?: unknown; suggestion?: unknown };
+  if (!Array.isArray(detail.tried) || !detail.tried.every((id) => typeof id === 'string')) {
+    return false;
+  }
+  if (detail.suggestion !== undefined && typeof detail.suggestion !== 'string') return false;
+  if (typeof detail.op !== 'object' || detail.op === null) return false;
+  const op = detail.op as { kind?: unknown; query?: unknown; spec?: unknown; id?: unknown };
+  switch (op.kind) {
+    case 'codec':
+    case 'container':
+      return typeof op.query === 'object' && op.query !== null;
+    case 'filter':
+      return typeof op.spec === 'object' && op.spec !== null;
+    case 'route':
+      return typeof op.id === 'string';
+    default:
+      return false;
+  }
+}
+
+/**
+ * No eligible driver exists for an operation in this environment. The code is intrinsically
+ * `capability-miss`; `detail` names what was tried and how to enable it (ADR-017). The detail is
+ * typed but optional: an error rebuilt from a wire that carried none stays a `CapabilityError`
+ * rather than gaining a fabricated operation descriptor.
  */
 export class CapabilityError extends MediaError {
-  constructor(code: MediaErrorCode, message: string, detail?: unknown) {
-    super(code, message, detail);
+  declare readonly detail?: CapabilityErrorDetail;
+
+  constructor(message: string, detail?: CapabilityErrorDetail, options?: ErrorOptions) {
+    super('capability-miss', message, detail, options);
     this.name = 'CapabilityError';
   }
 }
 
-/** The source bytes are garbled, empty, or of an unknown/unsupported kind (code `unsupported-input`). */
+/**
+ * The source bytes are garbled, empty, or of an unknown/unsupported kind. The code is intrinsically
+ * `unsupported-input`.
+ */
 export class InputError extends MediaError {
-  constructor(code: MediaErrorCode, message: string, detail?: unknown) {
-    super(code, message, detail);
+  constructor(message: string, detail?: unknown, options?: ErrorOptions) {
+    super('unsupported-input', message, detail, options);
     this.name = 'InputError';
   }
 }

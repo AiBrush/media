@@ -206,8 +206,8 @@ class PacketInfoWindowReader {
   ): Uint8Array | Promise<Uint8Array> {
     const range = this.#source.range;
     if (range === undefined) {
-      throw new CapabilityError('capability-miss', 'packet-info remux needs range reads', {
-        op: 'remux',
+      throw new CapabilityError('packet-info remux needs range reads', {
+        op: { kind: 'route', id: 'remux' },
         tried: ['packet-info'],
       });
     }
@@ -277,8 +277,8 @@ function tryCreatePacketInfoStreamingWebm(
     opts.trackSelect,
   );
   if (tracks.length === 0) {
-    throw new CapabilityError('capability-miss', 'remux found no copyable track in the source', {
-      op: 'remux',
+    throw new CapabilityError('remux found no copyable track in the source', {
+      op: { kind: 'route', id: 'remux' },
       tried: [containerId],
     });
   }
@@ -387,9 +387,8 @@ export async function remuxViaStreamingWebm(
 ): Promise<ReadableStream<Uint8Array>> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'streaming WebM/MKV remux requires browser EncodedChunk constructors',
-      { op: 'remux', tried: [container.id, opts.to] },
+      { op: { kind: 'route', id: 'remux' }, tried: [container.id, opts.to] },
     );
   }
 
@@ -416,8 +415,8 @@ export async function remuxViaStreamingWebm(
       opts.trackSelect,
     );
     if (tracks.length === 0) {
-      throw new CapabilityError('capability-miss', 'remux found no copyable track in the source', {
-        op: 'remux',
+      throw new CapabilityError('remux found no copyable track in the source', {
+        op: { kind: 'route', id: 'remux' },
         tried: [container.id],
       });
     }

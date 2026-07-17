@@ -1,3 +1,4 @@
+import { runCancellable } from '../kernel/executor.ts';
 import type { MediaInput } from '../sources/source.ts';
 import type {
   CallOptions,
@@ -58,16 +59,14 @@ function runLazy<T>(
   terminal: ChainTerminal,
   args: readonly unknown[],
 ): Cancellable<T> {
-  const abort = new AbortController();
-  let active: Cancellable<T> | undefined;
-  const promise = (async (): Promise<T> => {
-    const { runMediaChain } = await import('./chain-runner.ts');
-    active = runMediaChain(engine, input, steps, terminal, args, abort.signal) as Cancellable<T>;
-    return active;
-  })() as Cancellable<T>;
-  promise.cancel = (): void => {
-    abort.abort();
-    active?.cancel();
-  };
-  return promise;
+  // One shared cancellation shape (execution-runtime §5 item 8): the terminal lazily imports the chain
+  // runner, and `.cancel()` reaches the imported runner through the tracked dispatch even when it lands
+  // after this wrapper has already resolved.
+  return runCancellable([], (scope) =>
+    import('./chain-runner.ts').then(({ runMediaChain }) =>
+      scope.dispatch(
+        runMediaChain(engine, input, steps, terminal, args, scope.signal) as Cancellable<T>,
+      ),
+    ),
+  );
 }

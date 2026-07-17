@@ -31,8 +31,8 @@ export const WebmMuxOnlyDriver: ContainerDriver = {
   supports: supportsMux,
   demux(_src: ByteSource): Promise<Demuxer> {
     return Promise.reject(
-      new CapabilityError('capability-miss', 'webm-mux is output-only', {
-        op: 'demux',
+      new CapabilityError('webm-mux is output-only', {
+        op: { kind: 'route', id: 'demux' },
         tried: ['webm-mux'],
       }),
     );

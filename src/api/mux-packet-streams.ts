@@ -37,7 +37,7 @@ export function muxPacketStreams(streams: PacketStreams): MuxPacketStream[] {
     for (const track of streams.tracks) appendMuxPacketStream(out, undefined, track);
   }
   if (out.length === 0) {
-    throw new InputError('unsupported-input', 'mux received no packet streams');
+    throw new InputError('mux received no packet streams');
   }
   return out;
 }
@@ -91,7 +91,7 @@ function collectReadablePacketStream(out: ReadableStream<unknown>[], input: unkn
 }
 
 function invalidMuxPacketStream(): InputError {
-  return new InputError('unsupported-input', INVALID_MUX_PACKET_STREAM);
+  return new InputError(INVALID_MUX_PACKET_STREAM);
 }
 
 function isObject(value: unknown): value is object {

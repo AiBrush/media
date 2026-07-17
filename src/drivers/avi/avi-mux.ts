@@ -248,8 +248,8 @@ function audioFormat(info: TrackInfo): AudioFormat | undefined {
   const pcm = pcmBits(c);
   if (pcm !== undefined) {
     if (c === 'pcm-f64') {
-      throw new CapabilityError('capability-miss', 'AVI muxing does not author 64-bit float PCM', {
-        op: { op: 'mux', codec: info.codec },
+      throw new CapabilityError('AVI muxing does not author 64-bit float PCM', {
+        op: { kind: 'route', id: 'mux', facts: { codec: info.codec } },
         tried: ['avi'],
       });
     }
@@ -527,8 +527,8 @@ function splitSegments(samples: readonly AviStoredChunk[], limit: number): MoviS
   for (const sample of samples) {
     const bytes = chunkWireBytes(sample);
     if (bytes > limit) {
-      throw new CapabilityError('capability-miss', 'AVI packet exceeds one RIFF segment', {
-        op: { op: 'mux', bytes },
+      throw new CapabilityError('AVI packet exceeds one RIFF segment', {
+        op: { kind: 'route', id: 'mux', facts: { bytes } },
         tried: ['avi'],
       });
     }
@@ -626,14 +626,10 @@ export class AviMuxer implements Muxer {
 
   constructor(options?: AviMuxOptions) {
     if (options?.fragmented === true) {
-      throw new CapabilityError(
-        'capability-miss',
-        'AVI muxing does not support fragmented output',
-        {
-          op: { op: 'mux', fragmented: true },
-          tried: ['avi'],
-        },
-      );
+      throw new CapabilityError('AVI muxing does not support fragmented output', {
+        op: { kind: 'route', id: 'mux', facts: { fragmented: true } },
+        tried: ['avi'],
+      });
     }
     this.#options = options;
     this.#ready = new Promise<void>((resolve) => {
@@ -650,16 +646,16 @@ export class AviMuxer implements Muxer {
   addTrack(info: TrackInfo): number {
     this.#assertOpen();
     if (this.#tracks.length >= 100) {
-      throw new CapabilityError('capability-miss', 'AVI muxing supports at most 100 streams', {
-        op: { op: 'mux', tracks: this.#tracks.length + 1 },
+      throw new CapabilityError('AVI muxing supports at most 100 streams', {
+        op: { kind: 'route', id: 'mux', facts: { tracks: this.#tracks.length + 1 } },
         tried: ['avi'],
       });
     }
     if (info.mediaType === 'video') {
       const video = videoConfig(info);
       if (video === undefined) {
-        throw new CapabilityError('capability-miss', `AVI cannot mux video codec '${info.codec}'`, {
-          op: { op: 'mux', codec: info.codec },
+        throw new CapabilityError(`AVI cannot mux video codec '${info.codec}'`, {
+          op: { kind: 'route', id: 'mux', facts: { codec: info.codec } },
           tried: ['avi'],
         });
       }
@@ -677,8 +673,8 @@ export class AviMuxer implements Muxer {
     if (info.mediaType === 'audio') {
       const audio = audioFormat(info);
       if (audio === undefined) {
-        throw new CapabilityError('capability-miss', `AVI cannot mux audio codec '${info.codec}'`, {
-          op: { op: 'mux', codec: info.codec },
+        throw new CapabilityError(`AVI cannot mux audio codec '${info.codec}'`, {
+          op: { kind: 'route', id: 'mux', facts: { codec: info.codec } },
           tried: ['avi'],
         });
       }
@@ -693,8 +689,8 @@ export class AviMuxer implements Muxer {
         maxChunkBytes: 0,
       });
     }
-    throw new CapabilityError('capability-miss', `AVI cannot mux media type '${info.mediaType}'`, {
-      op: { op: 'mux', mediaType: info.mediaType },
+    throw new CapabilityError(`AVI cannot mux media type '${info.mediaType}'`, {
+      op: { kind: 'route', id: 'mux', facts: { mediaType: info.mediaType } },
       tried: ['avi'],
     });
   }

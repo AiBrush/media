@@ -5,6 +5,7 @@
  */
 
 import type { MaterializeOptions } from './materialize.ts';
+import type { OpfsTarget } from './opfs-target.ts';
 import type { StreamTarget } from './stream-target.ts';
 
 export type Sink =
@@ -20,7 +21,11 @@ export type Sink =
   // A streaming destination (doc 09 streaming-output, ADR-034): each produced chunk is written straight
   // to a caller-owned `WritableStream`/callback as it is produced, so peak memory stays at one chunk —
   // the point of a fragmented/CMAF or long-recording output. Its materializer lives in stream-target.ts.
-  | StreamTarget;
+  | StreamTarget
+  // The rich OPFS streaming sink (doc 09 §5 item 1): `keepExistingData`/`position` patch writes on top
+  // of what the basic `opfs` kind offers (which routes to the same drain). Constructor `toOpfsTarget`;
+  // its descriptor + pure core live in opfs-target.ts, the File System seam in opfs-target-materialize.ts.
+  | OpfsTarget;
 
 /** What an op returns, depending on the sink (`undefined` = wrote to a target, no value). */
 export type Output = Blob | File | ReadableStream<Uint8Array> | undefined;

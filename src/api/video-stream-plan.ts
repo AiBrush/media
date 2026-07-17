@@ -39,7 +39,7 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
   if (target.crop) {
     const { x, y, width, height } = target.crop;
     if (width <= 0 || height <= 0) {
-      throw new InputError('unsupported-input', `crop ${width}x${height} must be positive`);
+      throw new InputError(`crop ${width}x${height} must be positive`);
     }
     specs.push({ mediaType: 'video', type: 'crop', x, y, width, height });
   }
@@ -48,12 +48,11 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     const height = target.height ?? src.height;
     if (width === undefined || height === undefined) {
       throw new InputError(
-        'unsupported-input',
         'resize needs both width and height (source dimensions are unknown; pass both)',
       );
     }
     if (width <= 0 || height <= 0) {
-      throw new InputError('unsupported-input', `resize ${width}x${height} must be positive`);
+      throw new InputError(`resize ${width}x${height} must be positive`);
     }
     const inputWidth = target.crop?.width ?? src.width;
     const inputHeight = target.crop?.height ?? src.height;
@@ -72,20 +71,15 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     const currentHeight = target.height ?? target.crop?.height ?? src.height;
     if (currentWidth === undefined || currentHeight === undefined) {
       throw new InputError(
-        'unsupported-input',
         'pad needs known source dimensions (or an explicit resize width and height)',
       );
     }
     const { width, height } = target.pad;
     if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
-      throw new InputError(
-        'unsupported-input',
-        `pad ${width}x${height} must use positive integers`,
-      );
+      throw new InputError(`pad ${width}x${height} must use positive integers`);
     }
     if (width < currentWidth || height < currentHeight) {
       throw new InputError(
-        'unsupported-input',
         `pad ${width}x${height} cannot contain ${currentWidth}x${currentHeight}`,
       );
     }
@@ -100,7 +94,6 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
       y + currentHeight > height
     ) {
       throw new InputError(
-        'unsupported-input',
         `pad placement ${x},${y} + ${currentWidth}x${currentHeight} is outside ${width}x${height}`,
       );
     }
@@ -117,14 +110,14 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
   if (target.colorspace !== undefined) {
     const to = target.colorspace.to.trim();
     if (to.length === 0) {
-      throw new InputError('unsupported-input', 'colorspace target must be a non-empty string');
+      throw new InputError('colorspace target must be a non-empty string');
     }
     specs.push({ mediaType: 'video', type: 'colorspace', to });
   }
   if (target.tonemap !== undefined) {
     const to = (target.tonemap as { to?: unknown }).to;
     if (to !== 'sdr') {
-      throw new InputError('unsupported-input', `tonemap target '${String(to)}' is not supported`);
+      throw new InputError(`tonemap target '${String(to)}' is not supported`);
     }
     specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
   }
@@ -266,13 +259,13 @@ export interface RetimeTimedFrameStreamOptions<F extends TimedClosableFrame>
 
 function assertPositiveFinite(name: string, value: number): void {
   if (!Number.isFinite(value) || value <= 0) {
-    throw new InputError('unsupported-input', `${name} must be a finite positive number`);
+    throw new InputError(`${name} must be a finite positive number`);
   }
 }
 
 function assertPositiveInteger(name: string, value: number): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new InputError('unsupported-input', `${name} must be a positive safe integer`);
+    throw new InputError(`${name} must be a positive safe integer`);
   }
 }
 
@@ -300,11 +293,11 @@ function buildRetimingIntervals(
   for (let index = 0; index < frames.length; index++) {
     const frame = frames[index];
     if (frame === undefined || !Number.isFinite(frame.timestamp)) {
-      throw new InputError('unsupported-input', 'frame timestamps must be finite numbers');
+      throw new InputError('frame timestamps must be finite numbers');
     }
     const next = frames[index + 1];
     if (next !== undefined && next.timestamp <= frame.timestamp) {
-      throw new InputError('unsupported-input', 'frame timestamps must be strictly increasing');
+      throw new InputError('frame timestamps must be strictly increasing');
     }
     const inferred = next !== undefined ? next.timestamp - frame.timestamp : undefined;
     const declared = positiveFrameDuration(frame);
@@ -316,7 +309,7 @@ function buildRetimingIntervals(
         ? first.timestamp + durationUs
         : frame.timestamp + (declared ?? inferred ?? fallback ?? 0);
     if (!Number.isFinite(end) || end <= frame.timestamp) {
-      throw new InputError('unsupported-input', 'cannot infer a positive frame duration');
+      throw new InputError('cannot infer a positive frame duration');
     }
     intervals.push({ index, timestamp: frame.timestamp, end });
   }
@@ -349,7 +342,7 @@ export function planCfrFrameRetiming(
   const first = intervals[0];
   const last = intervals[intervals.length - 1];
   if (first === undefined || last === undefined) {
-    throw new InputError('unsupported-input', 'cannot retime an empty frame interval plan');
+    throw new InputError('cannot retime an empty frame interval plan');
   }
   const durationUs = last.end - first.timestamp;
   const outputCount = Math.max(1, Math.round((durationUs * options.fps) / 1_000_000));
@@ -365,7 +358,7 @@ export function planCfrFrameRetiming(
     }
     const interval = intervals[sourceCursor];
     if (interval === undefined) {
-      throw new InputError('unsupported-input', 'retiming source interval was not found');
+      throw new InputError('retiming source interval was not found');
     }
     const previous = outputs[outputs.length - 1];
     // Interior frames hold a uniform 1/fps; the final grid frame is clamped to the source end so
@@ -429,7 +422,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
   const processFrameInterval = (frame: F, endUs: number, isFinal = false): void => {
     try {
       if (!Number.isFinite(endUs) || endUs <= frame.timestamp) {
-        throw new InputError('unsupported-input', 'cannot infer a positive frame duration');
+        throw new InputError('cannot infer a positive frame duration');
       }
       const start = startUs ?? frame.timestamp;
       startUs = start;
@@ -456,10 +449,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
           hardEndUs !== undefined ? Math.min(uniform, hardEndUs - timestamp) : uniform;
         const out = options.restamp(frame, { timestamp, duration });
         if (Object.is(frame, out)) {
-          throw new InputError(
-            'unsupported-input',
-            'retime restamp must return a fresh output frame',
-          );
+          throw new InputError('retime restamp must return a fresh output frame');
         }
         pending.push(out);
         outputIndex++;
@@ -494,7 +484,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
       const frame = read.value;
       if (!Number.isFinite(frame.timestamp)) {
         closeFrame(frame);
-        throw new InputError('unsupported-input', 'frame timestamps must be finite numbers');
+        throw new InputError('frame timestamps must be finite numbers');
       }
       if (previous === undefined) {
         previous = frame;
@@ -505,7 +495,7 @@ export function retimeTimedFrameStream<F extends TimedClosableFrame>(
         closeFrame(frame);
         closeFrame(previous);
         previous = undefined;
-        throw new InputError('unsupported-input', 'frame timestamps must be strictly increasing');
+        throw new InputError('frame timestamps must be strictly increasing');
       }
       const end = frame.timestamp;
       const frameToProcess = previous;
@@ -629,10 +619,7 @@ function crfBounds(codec: VideoCodec | 'unknown'): { min: number; max: number } 
 function assertValidCrf(crf: number, codec: VideoCodec | 'unknown'): void {
   const bounds = crfBounds(codec);
   if (!Number.isFinite(crf) || crf < bounds.min || crf > bounds.max) {
-    throw new InputError(
-      'unsupported-input',
-      `video CRF for ${codec} must be in [${bounds.min}, ${bounds.max}]`,
-    );
+    throw new InputError(`video CRF for ${codec} must be in [${bounds.min}, ${bounds.max}]`);
   }
 }
 
@@ -654,14 +641,14 @@ export function planVideoRateControl(
   if (bitrate !== undefined) assertValidBitrate(bitrate);
   if (crf !== undefined) assertValidCrf(crf, codec);
   if (hasBitrate && hasCrf) {
-    throw new InputError('unsupported-input', 'video bitrate and CRF are mutually exclusive');
+    throw new InputError('video bitrate and CRF are mutually exclusive');
   }
   if (twoPass && !hasBitrate) {
-    throw new InputError('unsupported-input', 'two-pass video encode requires a target bitrate');
+    throw new InputError('two-pass video encode requires a target bitrate');
   }
   if (twoPass) {
     if (bitrate === undefined) {
-      throw new InputError('unsupported-input', 'two-pass video encode requires a target bitrate');
+      throw new InputError('two-pass video encode requires a target bitrate');
     }
     return {
       mode: 'two-pass-bitrate',
@@ -674,7 +661,7 @@ export function planVideoRateControl(
   }
   if (hasCrf) {
     if (crf === undefined) {
-      throw new InputError('unsupported-input', 'video CRF is missing');
+      throw new InputError('video CRF is missing');
     }
     return webCodecsQuantizerSupported(codec)
       ? {
@@ -695,7 +682,7 @@ export function planVideoRateControl(
   }
   if (hasBitrate) {
     if (bitrate === undefined) {
-      throw new InputError('unsupported-input', 'video bitrate is missing');
+      throw new InputError('video bitrate is missing');
     }
     return { mode: 'bitrate', bitrate, bitrateMode: target.bitrateMode ?? 'variable' };
   }
@@ -740,7 +727,7 @@ export type VideoBitDepthConversionPlan =
 function normalizeBitDepth(depth: number | undefined): VideoBitDepth | undefined {
   if (depth === undefined) return undefined;
   if (depth === 8 || depth === 10 || depth === 12) return depth;
-  throw new InputError('unsupported-input', `unsupported video bit depth ${depth}`);
+  throw new InputError(`unsupported video bit depth ${depth}`);
 }
 
 function bitDepthFromAvc(codec: string): VideoBitDepth | undefined {
@@ -806,10 +793,9 @@ export function planVideoBitDepthConversion(
     (sourceBitDepth === undefined || sourceBitDepth > pixelPathBitDepth)
   ) {
     throw new CapabilityError(
-      'capability-miss',
       `${targetBitDepth}-bit output would cross a ${pixelPathBitDepth}-bit video filter boundary`,
       {
-        op: 'convert',
+        op: { kind: 'route', id: 'convert' },
         tried: ['webcodecs-video', 'gpu-video-filter'],
         suggestion:
           'remove pixel filters, target 8-bit output, or add a proven high-bit-depth filter path',
@@ -838,10 +824,9 @@ export function planVideoBitDepthConversion(
     return { kind: 'encoder-widen', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
   }
   throw new CapabilityError(
-    'capability-miss',
     `video bit-depth conversion ${sourceBitDepth}-bit → ${targetBitDepth}-bit is not available in the current codec pipeline`,
     {
-      op: 'convert',
+      op: { kind: 'route', id: 'convert' },
       tried: ['webcodecs-video', 'gpu-video-filter'],
       suggestion:
         'add a proven pixel-depth conversion stage and an encoder that can author the target depth',
@@ -868,7 +853,7 @@ export interface PlannedH264AbrRung {
 
 function assertValidBitrate(bitrate: number): void {
   if (!Number.isSafeInteger(bitrate) || bitrate <= 0) {
-    throw new InputError('unsupported-input', 'video bitrate must be a positive safe integer');
+    throw new InputError('video bitrate must be a positive safe integer');
   }
 }
 
@@ -878,7 +863,7 @@ export function planH264AbrLadder(
   source: SourceGeometry,
 ): readonly PlannedH264AbrRung[] {
   if (ladder.length === 0) {
-    throw new InputError('unsupported-input', 'H.264 ABR ladder must contain at least one rung');
+    throw new InputError('H.264 ABR ladder must contain at least one rung');
   }
   return ladder.map((rung, index): PlannedH264AbrRung => {
     assertPositiveInteger('ABR rung width', rung.width);

@@ -197,8 +197,8 @@ export async function aiffPacketInfoFromUrl(
   assertNotAborted(opts.signal);
   const packetInfo = AiffDriver.packetInfo;
   if (packetInfo === undefined) {
-    throw new CapabilityError('capability-miss', 'AIFF packet-info is not available', {
-      op: { op: 'demux', container: 'aiff' },
+    throw new CapabilityError('AIFF packet-info is not available', {
+      op: { kind: 'route', id: 'demux', facts: { container: 'aiff' } },
       tried: ['aiff'],
     });
   }
@@ -261,9 +261,8 @@ export const AiffDriver: ContainerDriver = {
       tracks: [track],
       packets(): ReadableStream<Packet> {
         throw new CapabilityError(
-          'capability-miss',
           'AIFF PCM flows through the TS audio-dsp path (browser seam), not WebCodecs',
-          { op: 'demux', tried: ['aiff'] },
+          { op: { kind: 'route', id: 'demux' }, tried: ['aiff'] },
         );
       },
       close: () => Promise.resolve(),

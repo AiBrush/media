@@ -167,30 +167,23 @@ export function convertLiveMediaStream<Output>(
 export function validateLiveConvertOptions(input: LiveInput, options: ConvertOptions): void {
   const stream = requireLiveStream(input);
   if (options.to === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'live conversion requires an explicit output container',
-    );
+    throw new InputError('live conversion requires an explicit output container');
   }
   const videoTracks = liveTracks(stream.getVideoTracks());
   const audioTracks = liveTracks(stream.getAudioTracks());
   if (videoTracks.length > 1 || audioTracks.length > 1) {
-    throw new InputError(
-      'unsupported-input',
-      'live conversion supports at most one video and one audio track',
-    );
+    throw new InputError('live conversion supports at most one video and one audio track');
   }
   const includesVideo = videoTracks.length === 1 && options.video !== false;
   const includesAudio = audioTracks.length === 1 && options.audio !== false;
   if (!includesVideo && !includesAudio) {
-    throw new InputError('unsupported-input', 'live conversion selected no active tracks');
+    throw new InputError('live conversion selected no active tracks');
   }
   if (includesVideo) {
     liveTrackInfo(stream, 'video');
     const target = options.video || {};
     if (target.codec === undefined) {
       throw new InputError(
-        'unsupported-input',
         'live video target codec is required because raw frames expose no encoded source codec',
       );
     }
@@ -198,9 +191,8 @@ export function validateLiveConvertOptions(input: LiveInput, options: ConvertOpt
     requirePositiveInteger(target.height, 'live video target height');
     if (target.twoPass === true) {
       throw new CapabilityError(
-        'capability-miss',
         'two-pass video encode requires a finite replayable source, not a live MediaStream',
-        { op: 'convert', tried: ['media-stream', 'two-pass'] },
+        { op: { kind: 'route', id: 'convert' }, tried: ['media-stream', 'two-pass'] },
       );
     }
   }
@@ -209,7 +201,6 @@ export function validateLiveConvertOptions(input: LiveInput, options: ConvertOpt
     const target = options.audio || {};
     if (target.codec === undefined) {
       throw new InputError(
-        'unsupported-input',
         'live audio target codec is required because raw frames expose no encoded source codec',
       );
     }
@@ -228,11 +219,11 @@ export async function runLiveFramePipeline<Output>(
 ): Promise<Output> {
   const target = options.to;
   if (target === undefined) {
-    throw new InputError('unsupported-input', 'live conversion requires an output container');
+    throw new InputError('live conversion requires an output container');
   }
   if (!dependencies.supportsContainer(target)) {
-    throw new CapabilityError('capability-miss', `convert to '${target}' has no muxer`, {
-      op: 'convert',
+    throw new CapabilityError(`convert to '${target}' has no muxer`, {
+      op: { kind: 'route', id: 'convert' },
       tried: [target],
     });
   }
@@ -244,7 +235,7 @@ export async function runLiveFramePipeline<Output>(
       const videoTarget = options.video || {};
       const source = liveTrackInfo(mediaStream, 'video');
       if (source === undefined) {
-        throw new InputError('unsupported-input', 'live video frame stream has no active track');
+        throw new InputError('live video frame stream has no active track');
       }
       const filtered = await dependencies.applyVideoFilters(
         frames.video,
@@ -267,7 +258,7 @@ export async function runLiveFramePipeline<Output>(
     if (frames.audio !== undefined && options.audio !== false) {
       const source = liveTrackInfo(mediaStream, 'audio');
       if (source === undefined) {
-        throw new InputError('unsupported-input', 'live audio frame stream has no active track');
+        throw new InputError('live audio frame stream has no active track');
       }
       const audioTarget = await dependencies.resolveAudioTarget(options.audio || {}, source.codec);
       const filtered = await dependencies.applyAudioFilters(
@@ -280,7 +271,7 @@ export async function runLiveFramePipeline<Output>(
       tasks.push(dependencies.encodeAudio(filtered, audioTarget, source, muxer, signal));
     }
     if (tasks.length === 0) {
-      throw new InputError('unsupported-input', 'live conversion selected no active frame streams');
+      throw new InputError('live conversion selected no active frame streams');
     }
     await allOrCancelPipelineStreams(tasks, openStreams);
     await muxer.finalize();
@@ -296,7 +287,7 @@ export async function runLiveFramePipeline<Output>(
 
 function requireLiveStream(input: LiveInput): MediaStream {
   const stream = mediaStreamOf(input);
-  if (stream === undefined) throw new InputError('unsupported-input', 'invalid MediaStream input');
+  if (stream === undefined) throw new InputError('invalid MediaStream input');
   return stream;
 }
 
@@ -306,7 +297,7 @@ function liveTracks(tracks: readonly MediaStreamTrack[]): readonly MediaStreamTr
 
 function requirePositiveInteger(value: number | undefined, name: string): asserts value is number {
   if (value === undefined || !Number.isSafeInteger(value) || value <= 0) {
-    throw new InputError('unsupported-input', `${name} must be a positive integer`);
+    throw new InputError(`${name} must be a positive integer`);
   }
 }
 

@@ -148,10 +148,10 @@ export function parseMp3FrameHeader(bytes: Uint8Array, offset = 0): Mp3FrameHead
   const b2 = bytes[offset + 2];
   const b3 = bytes[offset + 3];
   if (b0 === undefined || b1 === undefined || b2 === undefined || b3 === undefined) {
-    throw new InputError('unsupported-input', 'mp3: frame shorter than its 4-byte header');
+    throw new InputError('mp3: frame shorter than its 4-byte header');
   }
   if (!isFrameSync(b0, b1)) {
-    throw new InputError('unsupported-input', 'mp3: no MPEG-audio frame sync at offset');
+    throw new InputError('mp3: no MPEG-audio frame sync at offset');
   }
   const version = versionFromBits((b1 >> 3) & 0x3);
   const layer = layerFromBits((b1 >> 1) & 0x3);
@@ -281,7 +281,7 @@ export function firstFrameOffset(bytes: Uint8Array): number {
       }
     }
   }
-  throw new InputError('unsupported-input', 'mp3: no MPEG-audio frame found');
+  throw new InputError('mp3: no MPEG-audio frame found');
 }
 
 /**

@@ -40,7 +40,7 @@ function parseFlacBlocks(
   start: number,
 ): { blocks: readonly FlacBlock[]; end: number } {
   if (bytes.byteLength < start + 4 || ascii(bytes, start, 4) !== FLAC_MAGIC) {
-    throw new InputError('unsupported-input', 'not a native FLAC stream');
+    throw new InputError('not a native FLAC stream');
   }
   const blocks: FlacBlock[] = [];
   let offset = start + 4;

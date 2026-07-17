@@ -202,8 +202,8 @@ async function trimAudioPacketsViaSeam(
   options: CallOptions,
 ): Promise<ReadableStream<Uint8Array>> {
   if (typeof EncodedAudioChunk === 'undefined') {
-    throw new CapabilityError('capability-miss', 'audio trim needs EncodedAudioChunk', {
-      op: 'trim',
+    throw new CapabilityError('audio trim needs EncodedAudioChunk', {
+      op: { kind: 'route', id: 'trim' },
       tried: [container.id, target],
     });
   }
@@ -217,8 +217,8 @@ async function trimAudioPacketsViaSeam(
   });
   try {
     if (demuxer.tracks.some((track) => track.mediaType === 'video')) {
-      throw new CapabilityError('capability-miss', 'audio trim rejects video', {
-        op: 'trim',
+      throw new CapabilityError('audio trim rejects video', {
+        op: { kind: 'route', id: 'trim' },
         tried: [container.id, target],
       });
     }
@@ -226,16 +226,15 @@ async function trimAudioPacketsViaSeam(
       (track) => track.mediaType === 'audio' && track.config !== undefined,
     );
     if (tracks.length !== 1) {
-      throw new CapabilityError(
-        'capability-miss',
-        `audio trim needs one track, found ${tracks.length}`,
-        { op: 'trim', tried: [container.id, target] },
-      );
+      throw new CapabilityError(`audio trim needs one track, found ${tracks.length}`, {
+        op: { kind: 'route', id: 'trim' },
+        tried: [container.id, target],
+      });
     }
     const track = tracks[0];
     if (track === undefined) {
-      throw new CapabilityError('capability-miss', 'no audio trim track', {
-        op: 'trim',
+      throw new CapabilityError('no audio trim track', {
+        op: { kind: 'route', id: 'trim' },
         tried: [container.id, target],
       });
     }
@@ -260,8 +259,8 @@ async function trimViaCodec(
   options: CallOptions,
 ): Promise<ReadableStream<Uint8Array>> {
   if (!containerHasChunkMuxer(target)) {
-    throw new CapabilityError('capability-miss', `accurate trim to '${target}' has no muxer`, {
-      op: 'trim',
+    throw new CapabilityError(`accurate trim to '${target}' has no muxer`, {
+      op: { kind: 'route', id: 'trim' },
       tried: [target],
     });
   }
@@ -384,8 +383,8 @@ async function trimViaCodec(
     }
 
     if (tasks.length === 0) {
-      throw new CapabilityError('capability-miss', 'accurate trim found no track', {
-        op: 'trim',
+      throw new CapabilityError('accurate trim found no track', {
+        op: { kind: 'route', id: 'trim' },
         tried: [container.id],
       });
     }
@@ -431,8 +430,8 @@ async function streamCopyOrThrow(
   opts: StreamCopyOptions,
 ): Promise<ReadableStream<Uint8Array>> {
   if (container.streamCopy === undefined || !container.formats.includes(target)) {
-    throw new CapabilityError('capability-miss', `${op} to '${target}' needs codec seam`, {
-      op,
+    throw new CapabilityError(`${op} to '${target}' needs codec seam`, {
+      op: { kind: 'route', id: op },
       tried: [container.id],
     });
   }
@@ -443,9 +442,8 @@ function normalizeByteInput(input: MediaInput, op: string): Source {
   const normalized = normalizeInput(input);
   if (!isLiveMediaSource(normalized)) return normalized;
   throw new CapabilityError(
-    'capability-miss',
     `${op} requires finite encoded/container bytes and is unavailable for a raw live MediaStream`,
-    { op, tried: ['media-stream/raw-frames'] },
+    { op: { kind: 'route', id: op }, tried: ['media-stream/raw-frames'] },
   );
 }
 

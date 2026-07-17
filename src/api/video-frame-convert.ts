@@ -11,8 +11,8 @@ function createVideoCanvas(width: number, height: number): VideoCanvas {
     canvas.height = height;
     return canvas;
   }
-  throw new CapabilityError('capability-miss', '8-bit pixel conversion requires a canvas surface', {
-    op: 'convert',
+  throw new CapabilityError('8-bit pixel conversion requires a canvas surface', {
+    op: { kind: 'route', id: 'convert' },
     tried: ['canvas-video-frame'],
   });
 }
@@ -20,14 +20,10 @@ function createVideoCanvas(width: number, height: number): VideoCanvas {
 function canvas2d(canvas: VideoCanvas): VideoCanvasContext {
   const ctx = canvas.getContext('2d', { alpha: true }) as VideoCanvasContext | null;
   if (ctx === null) {
-    throw new CapabilityError(
-      'capability-miss',
-      '8-bit pixel conversion could not allocate 2D canvas',
-      {
-        op: 'convert',
-        tried: ['canvas-video-frame'],
-      },
-    );
+    throw new CapabilityError('8-bit pixel conversion could not allocate 2D canvas', {
+      op: { kind: 'route', id: 'convert' },
+      tried: ['canvas-video-frame'],
+    });
   }
   return ctx;
 }
@@ -53,10 +49,7 @@ export function canvasBackedVideoFrameStream(): TransformStream<VideoFrame, Vide
           !Number.isSafeInteger(height) ||
           height <= 0
         ) {
-          throw new InputError(
-            'unsupported-input',
-            'video frame dimensions required for 8-bit conversion',
-          );
+          throw new InputError('video frame dimensions required for 8-bit conversion');
         }
         canvas =
           canvas === undefined

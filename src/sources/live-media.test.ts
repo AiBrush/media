@@ -392,7 +392,10 @@ describe('decodeLiveMediaStream', () => {
     await expect(locked.read()).rejects.toBeInstanceOf(CapabilityError);
     held.releaseLock();
 
-    const primary = new CapabilityError('capability-miss', 'known host miss');
+    const primary = new CapabilityError('known host miss', {
+      op: { kind: 'route', id: 'live-decode' },
+      tried: [],
+    });
     const preserved = decodeLiveMediaStream(liveSource([new FakeTrack('video')]), {
       processorFactory: factoryFor(() => {
         throw primary;

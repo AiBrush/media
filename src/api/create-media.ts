@@ -40,6 +40,20 @@ function shared(): MediaEngine {
   return defaultInstance;
 }
 
+/**
+ * Dispose and drop the shared default instance behind the bare-function sugar (R-S05.5, ADR-321), so
+ * SSR request handlers and test suites can guarantee the *next* bare call builds a fresh, isolated
+ * engine (fresh registry/router/pool caches) instead of silently sharing state process-wide. Anything
+ * still holding the old instance (e.g. a chain captured before the reset) sees typed
+ * `MediaError('aborted', 'engine disposed')` failures rather than resurrecting torn-down pools.
+ * No-op when no default instance was ever created.
+ */
+export async function resetDefaultMedia(): Promise<void> {
+  const current = defaultInstance;
+  defaultInstance = undefined;
+  if (current !== undefined) await current.dispose();
+}
+
 export function probe(input: MediaInput, o?: CallOptions): Cancellable<MediaInfo> {
   return shared().probe(input, o);
 }
@@ -91,6 +105,10 @@ export function decrypt(
   o?: CallOptions,
 ): Cancellable<Output> {
   return shared().decrypt(input, opts, o);
+}
+/** Intent-level capability pre-flight: `true` iff the requested target is producible (never throws). */
+export function canConvert(opts: ConvertOptions): Promise<boolean> {
+  return shared().canConvert(opts);
 }
 export function preload(...specs: PreloadSpec[]): Promise<void> {
   return shared().preload(...specs);

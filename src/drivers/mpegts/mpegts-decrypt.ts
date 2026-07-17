@@ -13,10 +13,7 @@ import { detectFraming, parseTs } from './ts-parse.ts';
 function validateMpegTsSegment(clear: Uint8Array): void {
   const framing = detectFraming(clear);
   if (framing === undefined || framing.start !== 0 || clear.byteLength % framing.packetSize !== 0) {
-    throw new InputError(
-      'unsupported-input',
-      'HLS AES-128 plaintext is not a complete packet-aligned MPEG-TS segment',
-    );
+    throw new InputError('HLS AES-128 plaintext is not a complete packet-aligned MPEG-TS segment');
   }
   parseTs(clear);
 }
@@ -34,8 +31,8 @@ export async function decryptMpegTs(
     });
   }
   if (o.scheme === 'hls-sample-aes') return decryptMpegTsSampleAes(src, o);
-  throw new CapabilityError('capability-miss', `bad TS decrypt '${o.scheme}'`, {
-    op: 'decrypt',
+  throw new CapabilityError(`bad TS decrypt '${o.scheme}'`, {
+    op: { kind: 'route', id: 'decrypt' },
     tried: ['mpegts'],
   });
 }
@@ -45,15 +42,15 @@ export async function decryptMpegTsSampleAes(
   o: DecryptParams,
 ): Promise<ReadableStream<Uint8Array>> {
   if (o.scheme !== 'hls-sample-aes') {
-    throw new CapabilityError('capability-miss', `bad TS decrypt '${o.scheme}'`, {
-      op: 'decrypt',
+    throw new CapabilityError(`bad TS decrypt '${o.scheme}'`, {
+      op: { kind: 'route', id: 'decrypt' },
       tried: ['mpegts'],
     });
   }
   const { key, iv } = o.keys;
   if (key === undefined || iv === undefined) {
-    throw new CapabilityError('capability-miss', 'need key/iv hex', {
-      op: 'decrypt',
+    throw new CapabilityError('need key/iv hex', {
+      op: { kind: 'route', id: 'decrypt' },
       tried: ['mpegts'],
     });
   }

@@ -111,7 +111,7 @@ function parsePages(bytes: Uint8Array): readonly OggPage[] {
     });
     offset = end;
   }
-  if (pages.length === 0) throw new InputError('unsupported-input', 'not an Ogg stream');
+  if (pages.length === 0) throw new InputError('not an Ogg stream');
   return pages;
 }
 
@@ -260,11 +260,10 @@ function buildCommentPacket(kind: 'opus' | 'vorbis', body: Uint8Array): Uint8Arr
 export function writeOggVorbisComment(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
   const pages = parsePages(bytes);
   const bos = pages.find((page) => (page.headerType & HT_BOS) !== 0);
-  if (bos === undefined) throw new InputError('unsupported-input', 'Ogg stream has no BOS page');
+  if (bos === undefined) throw new InputError('Ogg stream has no BOS page');
   const packets = delace(bytes, pages, bos.serial);
   const first = packets[0]?.data;
-  if (first === undefined)
-    throw new InputError('unsupported-input', 'Ogg stream has no header packet');
+  if (first === undefined) throw new InputError('Ogg stream has no header packet');
   const second = packets[1]?.data;
   const header = codecHeaderPackets(first, second);
   const headerEnd = packets[header.headerCount - 1]?.completedOnPage;

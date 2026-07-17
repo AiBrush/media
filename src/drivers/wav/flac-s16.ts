@@ -67,10 +67,7 @@ export function tryAuthorWavS16Flac(bytes: Uint8Array): Uint8Array<ArrayBuffer> 
     totalBytes += frameBytes;
   }
   if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      `WAV s16 -> FLAC output is too large (${totalBytes})`,
-    );
+    throw new InputError(`WAV s16 -> FLAC output is too large (${totalBytes})`);
   }
 
   const out = new Uint8Array(totalBytes) as Uint8Array<ArrayBuffer>;
@@ -107,14 +104,14 @@ export function tryAuthorWavS16Flac(bytes: Uint8Array): Uint8Array<ArrayBuffer> 
 
 function validateS16FlacLayout(channels: number, sampleRate: number, dataBytes: number): void {
   if (!Number.isInteger(channels) || channels < 1 || channels > MAX_FLAC_CHANNELS) {
-    throw new InputError('unsupported-input', `FLAC encode channel count ${channels} is invalid`);
+    throw new InputError(`FLAC encode channel count ${channels} is invalid`);
   }
   if (!Number.isInteger(sampleRate) || sampleRate <= 0 || sampleRate > MAX_FLAC_SAMPLE_RATE) {
-    throw new InputError('unsupported-input', `FLAC encode sample rate ${sampleRate} is invalid`);
+    throw new InputError(`FLAC encode sample rate ${sampleRate} is invalid`);
   }
   const blockAlign = channels * S16_BYTES;
   if (dataBytes % blockAlign !== 0) {
-    throw new InputError('unsupported-input', 'WAV s16 PCM data is not sample-frame aligned');
+    throw new InputError('WAV s16 PCM data is not sample-frame aligned');
   }
   const totalSamples = dataBytes / blockAlign;
   if (
@@ -122,10 +119,7 @@ function validateS16FlacLayout(channels: number, sampleRate: number, dataBytes: 
     totalSamples <= 0 ||
     totalSamples > MAX_FLAC_TOTAL_SAMPLES
   ) {
-    throw new InputError(
-      'unsupported-input',
-      `FLAC encode totalSamples ${totalSamples} is invalid`,
-    );
+    throw new InputError(`FLAC encode totalSamples ${totalSamples} is invalid`);
   }
 }
 

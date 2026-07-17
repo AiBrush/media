@@ -19,7 +19,7 @@
  */
 
 import type { Determinism } from '../contracts/driver.ts';
-import { runOffloadWorker } from './worker-entry.ts';
+import { type WorkerCapsOverrides, runOffloadWorker } from './worker-entry.ts';
 import {
   type InnerEngine,
   type InnerEngineFactory,
@@ -36,7 +36,7 @@ import type { HostMessage, MessageLike, WorkerMessage } from './worker-protocol.
  * never statically pulls it.
  */
 export function startWorkerMain(
-  scope: MessageLike<HostMessage, WorkerMessage> & { webcodecs?: boolean },
+  scope: MessageLike<HostMessage, WorkerMessage> & WorkerCapsOverrides,
 ): () => void {
   let enginePromise: Promise<typeof import('../api/engine.ts')> | undefined;
   const makeInner: InnerEngineFactory = (determinism, runtime) =>

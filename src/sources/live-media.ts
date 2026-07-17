@@ -86,7 +86,7 @@ const defaultProcessorFactory: LiveTrackProcessorFactory = {
 export function probeLiveMediaStream(input: MediaStream | LiveMediaSource): MediaInfo {
   const mediaStream = isLiveMediaSource(input) ? input.mediaStream : input;
   if (!isMediaStreamShape(mediaStream)) {
-    throw new InputError('unsupported-input', 'invalid MediaStream input');
+    throw new InputError('invalid MediaStream input');
   }
   const tracks: MediaInfoTrack[] = [];
   for (const track of mediaStream.getTracks()) {
@@ -128,7 +128,7 @@ export function liveTrackInfo(
 ): TrackInfo | undefined {
   const mediaStream = isLiveMediaSource(input) ? input.mediaStream : input;
   if (!isMediaStreamShape(mediaStream)) {
-    throw new InputError('unsupported-input', 'invalid MediaStream input');
+    throw new InputError('invalid MediaStream input');
   }
   const track = singleLiveTrack(
     kind === 'video' ? mediaStream.getVideoTracks() : mediaStream.getAudioTracks(),
@@ -140,10 +140,7 @@ export function liveTrackInfo(
     const width = positiveSafeInteger(settings.width);
     const height = positiveSafeInteger(settings.height);
     if (width === undefined || height === undefined) {
-      throw new InputError(
-        'unsupported-input',
-        'live video source track settings must expose width and height',
-      );
+      throw new InputError('live video source track settings must expose width and height');
     }
     const fps = positiveSetting(settings.frameRate);
     return {
@@ -158,7 +155,6 @@ export function liveTrackInfo(
   const channels = positiveSafeInteger(settings.channelCount);
   if (sampleRate === undefined || channels === undefined) {
     throw new InputError(
-      'unsupported-input',
       'live audio source track settings must expose sampleRate and channelCount',
     );
   }
@@ -180,7 +176,7 @@ export function decodeLiveMediaStream(
 ): MediaStreams {
   const mediaStream = isLiveMediaSource(input) ? input.mediaStream : input;
   if (!isMediaStreamShape(mediaStream)) {
-    throw new InputError('unsupported-input', 'invalid MediaStream input');
+    throw new InputError('invalid MediaStream input');
   }
   const videoTrack = singleLiveTrack(mediaStream.getVideoTracks(), 'video');
   const audioTrack = singleLiveTrack(mediaStream.getAudioTracks(), 'audio');
@@ -211,10 +207,10 @@ export function decodeLiveMediaStream(
 
 /** Typed decline for operations whose byte/container contract cannot represent a raw live source. */
 export function rejectLiveByteOperation(op: string): never {
-  throw new CapabilityError('capability-miss', `${op} is unavailable for a raw live MediaStream`, {
-    op,
+  throw new CapabilityError(`${op} is unavailable for a raw live MediaStream`, {
+    op: { kind: 'route', id: op },
     tried: ['media-stream/raw-frames'],
-    suggestion: op === 'convert' ? 'use the dedicated live decode→encode path' : undefined,
+    ...(op === 'convert' ? { suggestion: 'use the dedicated live decode→encode path' } : {}),
   });
 }
 
@@ -224,11 +220,10 @@ function singleLiveTrack(
 ): MediaStreamTrack | undefined {
   const live = tracks.filter((track) => track.readyState !== 'ended');
   if (live.length > 1) {
-    throw new InputError(
-      'unsupported-input',
-      `MediaStreams cannot represent ${live.length} live ${kind} tracks`,
-      { kind, trackCount: live.length },
-    );
+    throw new InputError(`MediaStreams cannot represent ${live.length} live ${kind} tracks`, {
+      kind,
+      trackCount: live.length,
+    });
   }
   return live[0];
 }
@@ -485,8 +480,8 @@ function trackHasEnded(track: MediaStreamTrack): boolean {
 }
 
 function liveCapability(kind: LiveTrackKind, message: string, cause?: unknown): CapabilityError {
-  return new CapabilityError('capability-miss', message, {
-    op: { op: 'decode', input: 'media-stream', mediaType: kind },
+  return new CapabilityError(message, {
+    op: { kind: 'route', id: 'decode', facts: { input: 'media-stream', mediaType: kind } },
     tried: ['MediaStreamTrackProcessor'],
     ...(cause === undefined ? {} : { cause }),
   });

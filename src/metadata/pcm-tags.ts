@@ -248,7 +248,7 @@ function isInfoList(bytes: Uint8Array, chunk: Chunk): boolean {
 
 export function writeWavTags(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
   if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
-    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+    throw new InputError('not a RIFF/WAVE file');
   }
   const kept = riffChunks(bytes)
     .filter((chunk) => chunk.id !== 'bext' && !isInfoList(bytes, chunk))
@@ -271,7 +271,7 @@ export function writeWavTags(bytes: Uint8Array, tags: MetadataTags): Uint8Array 
 
 export function readWavTags(bytes: Uint8Array): Record<string, string> {
   if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
-    throw new InputError('unsupported-input', 'not a RIFF/WAVE file');
+    throw new InputError('not a RIFF/WAVE file');
   }
   const out: Record<string, string> = {};
   for (const chunk of riffChunks(bytes)) {
@@ -311,7 +311,7 @@ export function writeAiffTags(bytes: Uint8Array, tags: MetadataTags): Uint8Array
     ascii(bytes, 0, 4) !== 'FORM' ||
     (ascii(bytes, 8, 4) !== 'AIFF' && ascii(bytes, 8, 4) !== 'AIFC')
   ) {
-    throw new InputError('unsupported-input', 'not an AIFF/AIFF-C file');
+    throw new InputError('not an AIFF/AIFF-C file');
   }
   const formType = ascii(bytes, 8, 4);
   const kept = iffChunks(bytes)
@@ -334,7 +334,7 @@ export function readAiffTags(bytes: Uint8Array): Record<string, string> {
     ascii(bytes, 0, 4) !== 'FORM' ||
     (ascii(bytes, 8, 4) !== 'AIFF' && ascii(bytes, 8, 4) !== 'AIFC')
   ) {
-    throw new InputError('unsupported-input', 'not an AIFF/AIFF-C file');
+    throw new InputError('not an AIFF/AIFF-C file');
   }
   const out: Record<string, string> = {};
   for (const chunk of iffChunks(bytes)) {
@@ -378,7 +378,7 @@ function readCafInfoBody(body: Uint8Array): Record<string, string> {
 
 export function writeCafTags(bytes: Uint8Array, tags: MetadataTags): Uint8Array {
   if (bytes.byteLength < 8 || ascii(bytes, 0, 4) !== 'caff') {
-    throw new InputError('unsupported-input', 'not a CAF (caff) file');
+    throw new InputError('not a CAF (caff) file');
   }
   const info = cafChunk('info', cafInfoBody(tags));
   const chunks: Uint8Array[] = [];
@@ -397,7 +397,7 @@ export function writeCafTags(bytes: Uint8Array, tags: MetadataTags): Uint8Array 
 
 export function readCafTags(bytes: Uint8Array): Record<string, string> {
   if (bytes.byteLength < 8 || ascii(bytes, 0, 4) !== 'caff') {
-    throw new InputError('unsupported-input', 'not a CAF (caff) file');
+    throw new InputError('not a CAF (caff) file');
   }
   const out: Record<string, string> = {};
   for (const chunk of cafChunks(bytes)) {

@@ -102,11 +102,10 @@ function mapCodec(
       return { sampleEntryType: 'fLaC', config: { kind: 'raw-box', boxType: 'dfLa' } };
     }
   }
-  throw new CapabilityError(
-    'capability-miss',
-    `the mp4 muxer cannot write ${mediaType} codec '${codec}'`,
-    { op: { op: 'mux', mediaType, codec }, tried: ['mp4'] },
-  );
+  throw new CapabilityError(`the mp4 muxer cannot write ${mediaType} codec '${codec}'`, {
+    op: { kind: 'route', id: 'mux', facts: { mediaType, codec } },
+    tried: ['mp4'],
+  });
 }
 
 /** Video timescale: derive a clean clock from the frame rate when known, else the 90 kHz default. */
@@ -230,9 +229,11 @@ function assertParameterSetLength(kind: 'SPS' | 'PPS', nal: Uint8Array): void {
 function avcCFromParameterSets(sets: H264ParameterSets): Uint8Array {
   if (sets.sps.length === 0 || sets.pps.length === 0) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 MP4 muxing requires avcC description or Annex-B SPS/PPS parameter sets',
-      { op: { op: 'mux', mediaType: 'video', codec: 'h264' }, tried: ['mp4'] },
+      {
+        op: { kind: 'route', id: 'mux', facts: { mediaType: 'video', codec: 'h264' } },
+        tried: ['mp4'],
+      },
     );
   }
   if (sets.sps.length > AVC_MAX_SPS_COUNT || sets.pps.length > AVC_MAX_PPS_COUNT) {
@@ -403,9 +404,11 @@ function dOpsFromOpusHeadOrTrack(
   const fallbackRate = sampleRate ?? 48_000;
   if (fallbackChannels < 1 || fallbackChannels > 2) {
     throw new CapabilityError(
-      'capability-miss',
       `Opus MP4 muxing requires a family-0 mono/stereo channel layout, got ${fallbackChannels}`,
-      { op: { op: 'mux', mediaType: 'audio', codec: 'opus' }, tried: ['mp4'] },
+      {
+        op: { kind: 'route', id: 'mux', facts: { mediaType: 'audio', codec: 'opus' } },
+        tried: ['mp4'],
+      },
     );
   }
   if (isOpusHead(description)) {
@@ -417,9 +420,11 @@ function dOpsFromOpusHeadOrTrack(
     const mapping = dv.getUint8(18);
     if (mapping !== 0 || ch < 1 || ch > 2) {
       throw new CapabilityError(
-        'capability-miss',
         'Opus MP4 muxing currently supports OpusHead mapping-family 0 mono/stereo tracks',
-        { op: { op: 'mux', mediaType: 'audio', codec: 'opus' }, tried: ['mp4'] },
+        {
+          op: { kind: 'route', id: 'mux', facts: { mediaType: 'audio', codec: 'opus' } },
+          tried: ['mp4'],
+        },
       );
     }
     return Uint8Array.from([
@@ -507,9 +512,11 @@ function prepareAvcSamples(
   if (description !== undefined) return { chunks: normalized, description };
   if (!sawAnnexB) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 MP4 muxing requires avcC description or Annex-B access units with SPS/PPS',
-      { op: { op: 'mux', mediaType: 'video', codec: 'h264' }, tried: ['mp4'] },
+      {
+        op: { kind: 'route', id: 'mux', facts: { mediaType: 'video', codec: 'h264' } },
+        tried: ['mp4'],
+      },
     );
   }
   return { chunks: normalized, description: avcCFromParameterSets(sets) };
@@ -550,25 +557,29 @@ function audioSpecificConfig(
   channelConfig: number,
 ): Uint8Array {
   if (!Number.isInteger(objectType) || objectType < 1 || objectType > 31) {
-    throw new CapabilityError(
-      'capability-miss',
-      'AAC MP4 muxing requires a representable MPEG-4 audio object type',
-      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', objectType }, tried: ['mp4'] },
-    );
+    throw new CapabilityError('AAC MP4 muxing requires a representable MPEG-4 audio object type', {
+      op: { kind: 'route', id: 'mux', facts: { mediaType: 'audio', codec: 'aac', objectType } },
+      tried: ['mp4'],
+    });
   }
   if (MPEG4_SAMPLE_RATES[sampleRateIndex] === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'AAC MP4 muxing requires a representable MPEG-4 sampling-frequency index',
-      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', sampleRateIndex }, tried: ['mp4'] },
+      {
+        op: {
+          kind: 'route',
+          id: 'mux',
+          facts: { mediaType: 'audio', codec: 'aac', sampleRateIndex },
+        },
+        tried: ['mp4'],
+      },
     );
   }
   if (!Number.isInteger(channelConfig) || channelConfig < 1 || channelConfig > 7) {
-    throw new CapabilityError(
-      'capability-miss',
-      'AAC MP4 muxing requires a representable channel configuration',
-      { op: { op: 'mux', mediaType: 'audio', codec: 'aac', channelConfig }, tried: ['mp4'] },
-    );
+    throw new CapabilityError('AAC MP4 muxing requires a representable channel configuration', {
+      op: { kind: 'route', id: 'mux', facts: { mediaType: 'audio', codec: 'aac', channelConfig } },
+      tried: ['mp4'],
+    });
   }
   return new Uint8Array([
     (objectType << 3) | (sampleRateIndex >> 1),
@@ -676,9 +687,11 @@ function prepareAacSamples(
     if (normalizedDescription !== undefined)
       return { chunks: [...chunks], description: normalizedDescription };
     throw new CapabilityError(
-      'capability-miss',
       'AAC MP4 muxing requires AudioSpecificConfig description or ADTS-framed samples',
-      { op: { op: 'mux', mediaType: 'audio', codec: 'aac' }, tried: ['mp4'] },
+      {
+        op: { kind: 'route', id: 'mux', facts: { mediaType: 'audio', codec: 'aac' } },
+        tried: ['mp4'],
+      },
     );
   }
   if (adtsCount !== chunks.length) {
@@ -971,10 +984,13 @@ export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
     const description = prepared.description ?? synthesizeRawBoxDescription(t);
     if (description === undefined) {
       throw new CapabilityError(
-        'capability-miss',
         `${t.sampleEntryType} MP4 muxing requires ${t.config.boxType} description`,
         {
-          op: { op: 'mux', mediaType: t.mediaType, codec: t.sampleEntryType },
+          op: {
+            kind: 'route',
+            id: 'mux',
+            facts: { mediaType: t.mediaType, codec: t.sampleEntryType },
+          },
           tried: ['mp4'],
         },
       );

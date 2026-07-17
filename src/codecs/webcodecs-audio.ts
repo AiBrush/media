@@ -164,11 +164,10 @@ export function decoderErrorToCapabilityMiss(
   codec: string | undefined,
 ): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     `webcodecs-audio: this browser's native decoder cannot decode ${codec ?? 'this stream'} ` +
       `(${e.name}: ${e.message}); routing to a capability miss`,
     {
-      op: 'decode',
+      op: { kind: 'route', id: 'decode' },
       tried: ['webcodecs-audio'],
       suggestion: 'try another browser or a WASM decode tail',
     },
@@ -464,8 +463,8 @@ function createDecoder(
   const determinism = o?.determinism;
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted before decode');
   if (typeof AudioDecoder === 'undefined') {
-    throw new CapabilityError('capability-miss', 'WebCodecs AudioDecoder is unavailable', {
-      op: 'decode',
+    throw new CapabilityError('WebCodecs AudioDecoder is unavailable', {
+      op: { kind: 'route', id: 'decode' },
       tried: ['webcodecs-audio'],
     });
   }
@@ -549,8 +548,8 @@ function createEncoder(
   const onConfig = configSink(o);
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted before encode');
   if (typeof AudioEncoder === 'undefined') {
-    throw new CapabilityError('capability-miss', 'WebCodecs AudioEncoder is unavailable', {
-      op: 'encode',
+    throw new CapabilityError('WebCodecs AudioEncoder is unavailable', {
+      op: { kind: 'route', id: 'encode' },
       tried: ['webcodecs-audio'],
     });
   }

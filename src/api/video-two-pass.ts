@@ -43,13 +43,13 @@ interface TimedSample extends H264FirstPassSample {
 
 function finiteNonNegativeInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw new InputError('unsupported-input', `${label} must be a non-negative safe integer`);
+    throw new InputError(`${label} must be a non-negative safe integer`);
   }
 }
 
 function positiveFinite(value: number, label: string): void {
   if (!Number.isFinite(value) || value <= 0) {
-    throw new InputError('unsupported-input', `${label} must be finite and positive`);
+    throw new InputError(`${label} must be finite and positive`);
   }
 }
 
@@ -62,7 +62,7 @@ function normalizeTimeline(
   declaredDurationSec: number | undefined,
 ): { readonly samples: readonly TimedSample[]; readonly durationUs: number } {
   if (samples.length === 0) {
-    throw new InputError('unsupported-input', 'H.264 two-pass first pass produced no pictures');
+    throw new InputError('H.264 two-pass first pass produced no pictures');
   }
   const sorted = [...samples].sort((a, b) => a.timestampUs - b.timestampUs);
   const declaredDurationUs =
@@ -77,25 +77,19 @@ function normalizeTimeline(
     finiteNonNegativeInteger(current.timestampUs, 'first-pass timestamp');
     finiteNonNegativeInteger(current.byteLength, 'first-pass byte length');
     if (current.byteLength === 0) {
-      throw new InputError(
-        'unsupported-input',
-        'H.264 two-pass first pass emitted an empty picture',
-      );
+      throw new InputError('H.264 two-pass first pass emitted an empty picture');
     }
     if (current.durationUs !== undefined) positiveFinite(current.durationUs, 'picture duration');
     const previous = sorted[index - 1];
     if (previous?.timestampUs === current.timestampUs) {
-      throw new InputError(
-        'unsupported-input',
-        `H.264 two-pass first pass duplicated PTS ${current.timestampUs}`,
-      );
+      throw new InputError(`H.264 two-pass first pass duplicated PTS ${current.timestampUs}`);
     }
   }
 
   const firstTimestamp = sorted[0]?.timestampUs ?? 0;
   const last = sorted.at(-1);
   if (last === undefined) {
-    throw new InputError('unsupported-input', 'H.264 two-pass first pass produced no pictures');
+    throw new InputError('H.264 two-pass first pass produced no pictures');
   }
   const declaredEndUs =
     declaredDurationUs === undefined ? undefined : firstTimestamp + declaredDurationUs;
@@ -106,10 +100,7 @@ function normalizeTimeline(
       ? last.timestampUs - (sorted.at(-2)?.timestampUs ?? last.timestampUs)
       : undefined);
   if (fallbackLastDuration === undefined || fallbackLastDuration <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      'H.264 two-pass needs a duration for its final picture',
-    );
+    throw new InputError('H.264 two-pass needs a duration for its final picture');
   }
 
   const timed = sorted.map((current, index): TimedSample => {
@@ -159,7 +150,7 @@ function predictedBytesForQuantizers(
   return samples.reduce((total, sample, index) => {
     const quantizer = quantizers[index];
     if (quantizer === undefined) {
-      throw new InputError('unsupported-input', 'H.264 two-pass quantizer schedule is incomplete');
+      throw new InputError('H.264 two-pass quantizer schedule is incomplete');
     }
     return (
       total +
@@ -204,27 +195,18 @@ export function planH264TwoPass(
   declaredDurationSec?: number,
 ): H264TwoPassPlan {
   if (!Number.isSafeInteger(targetBitrate) || targetBitrate <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      'H.264 two-pass bitrate must be a positive safe integer',
-    );
+    throw new InputError('H.264 two-pass bitrate must be a positive safe integer');
   }
   const timeline = normalizeTimeline(firstPass, declaredDurationSec);
   const targetBytes = Math.round(
     (targetBitrate * timeline.durationUs) / (BITS_PER_BYTE * MICROS_PER_SECOND),
   );
   if (!Number.isSafeInteger(targetBytes) || targetBytes <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      'H.264 two-pass target byte budget is not representable',
-    );
+    throw new InputError('H.264 two-pass target byte budget is not representable');
   }
   const firstPassBytes = timeline.samples.reduce((total, sample) => total + sample.byteLength, 0);
   if (!Number.isSafeInteger(firstPassBytes) || firstPassBytes <= 0) {
-    throw new InputError(
-      'unsupported-input',
-      'H.264 two-pass first-pass size is not representable',
-    );
+    throw new InputError('H.264 two-pass first-pass size is not representable');
   }
 
   const weights = timeline.samples.map((sample) => {
@@ -237,7 +219,7 @@ export function planH264TwoPass(
   const rawQuantizers = timeline.samples.map((sample, index) => {
     const weight = weights[index];
     if (weight === undefined || weight <= 0) {
-      throw new InputError('unsupported-input', 'H.264 two-pass picture has no complexity weight');
+      throw new InputError('H.264 two-pass picture has no complexity weight');
     }
     const allocatedBytes = (targetBytes * weight) / totalWeight;
     const sizeRatio = sample.byteLength / allocatedBytes;
@@ -252,7 +234,7 @@ export function planH264TwoPass(
   timeline.samples.forEach((sample, index) => {
     const quantizer = quantizers[index];
     if (quantizer === undefined) {
-      throw new InputError('unsupported-input', 'H.264 two-pass quantizer schedule is incomplete');
+      throw new InputError('H.264 two-pass quantizer schedule is incomplete');
     }
     timestampsUs[index] = sample.timestampUs;
     packedQuantizers[index] = quantizer;
@@ -262,7 +244,7 @@ export function planH264TwoPass(
   const quantizerAtIndex = (index: number): number => {
     const quantizer = packedQuantizers[index];
     if (quantizer === undefined) {
-      throw new InputError('unsupported-input', 'H.264 two-pass quantizer schedule is incomplete');
+      throw new InputError('H.264 two-pass quantizer schedule is incomplete');
     }
     return quantizer;
   };
@@ -299,10 +281,7 @@ export function planH264TwoPass(
       }
       const index = findTimestamp(timestampUs);
       if (index < 0) {
-        throw new InputError(
-          'unsupported-input',
-          `H.264 two-pass replay changed picture PTS ${timestampUs}`,
-        );
+        throw new InputError(`H.264 two-pass replay changed picture PTS ${timestampUs}`);
       }
       return quantizerAtIndex(index);
     },

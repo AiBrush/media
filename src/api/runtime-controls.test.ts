@@ -152,7 +152,10 @@ describe('createMedia public runtime controls', () => {
       name: 'CapabilityError',
       code: 'capability-miss',
       message: expect.stringContaining('missing-driver'),
-      detail: { tried: ['missing-driver'] },
+      detail: {
+        op: { kind: 'route', id: 'missing-driver' },
+        tried: ['missing-driver'],
+      },
     } satisfies Partial<CapabilityError>);
     expect(opens).toBe(0);
     expect(cancels).toBe(0);

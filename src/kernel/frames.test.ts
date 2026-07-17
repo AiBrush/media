@@ -23,4 +23,20 @@ describe('frame-lifetime helpers', () => {
     expect(a).toHaveBeenCalledTimes(1);
     expect(b).toHaveBeenCalledTimes(1);
   });
+
+  it('pins the close-error policy: a teardown close() throw is swallowed, never rethrown', () => {
+    const close = vi.fn(() => {
+      throw new Error('handle already released');
+    });
+    expect(() => closeFrame({ close })).not.toThrow();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('pins double-close behavior: the helper never dedupes — close-once stays with the caller', () => {
+    const close = vi.fn();
+    const frame = { close };
+    closeFrame(frame);
+    closeFrame(frame);
+    expect(close).toHaveBeenCalledTimes(2);
+  });
 });

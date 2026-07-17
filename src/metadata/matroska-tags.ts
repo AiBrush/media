@@ -117,7 +117,7 @@ function tagsElement(tags: MetadataTags): Uint8Array | undefined {
 }
 
 function invalidStructure(message: string): InputError {
-  return new InputError('unsupported-input', `invalid Matroska structure: ${message}`);
+  return new InputError(`invalid Matroska structure: ${message}`);
 }
 
 function parseElement(
@@ -195,7 +195,7 @@ function findSegment(bytes: Uint8Array): ElementSpan {
     }
     offset = root.dataEnd;
   }
-  throw new InputError('unsupported-input', 'not a Matroska/WebM file (no Segment)');
+  throw new InputError('not a Matroska/WebM file (no Segment)');
 }
 
 function crc32(parts: readonly Uint8Array[]): number {

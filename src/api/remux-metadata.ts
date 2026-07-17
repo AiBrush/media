@@ -70,8 +70,8 @@ export function planRemuxMetadata(
   tags: Record<string, string>,
 ): RemuxMetadataPlan {
   if (!METADATA_TARGETS.has(target)) {
-    throw new CapabilityError('capability-miss', 'metadata tag rewrite is not available', {
-      op: 'remux',
+    throw new CapabilityError('metadata tag rewrite is not available', {
+      op: { kind: 'route', id: 'remux' },
       tried: [target],
     });
   }
@@ -80,12 +80,12 @@ export function planRemuxMetadata(
 
 function snapshotTagRecord(tags: Record<string, string>): Readonly<Record<string, string>> {
   if (typeof tags !== 'object' || tags === null || Array.isArray(tags)) {
-    throw new InputError('unsupported-input', 'remux tags must be a string record');
+    throw new InputError('remux tags must be a string record');
   }
   try {
     const prototype = Object.getPrototypeOf(tags);
     if (prototype !== Object.prototype && prototype !== null) {
-      throw new InputError('unsupported-input', 'remux tags must be a plain string record');
+      throw new InputError('remux tags must be a plain string record');
     }
     const entries: [string, string][] = [];
     for (const key of Reflect.ownKeys(tags)) {
@@ -97,17 +97,14 @@ function snapshotTagRecord(tags: Record<string, string>): Readonly<Record<string
         !('value' in descriptor) ||
         typeof descriptor.value !== 'string'
       ) {
-        throw new InputError(
-          'unsupported-input',
-          'remux tags must contain only enumerable string data fields',
-        );
+        throw new InputError('remux tags must contain only enumerable string data fields');
       }
       entries.push([key, descriptor.value]);
     }
     return Object.freeze(Object.fromEntries(entries));
   } catch (error) {
     if (error instanceof InputError) throw error;
-    throw new InputError('unsupported-input', 'remux tags could not be read', error);
+    throw new InputError('remux tags could not be read', error);
   }
 }
 

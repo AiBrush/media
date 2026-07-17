@@ -69,20 +69,13 @@ export async function decryptHlsAes128(
   iv: Uint8Array<ArrayBuffer>,
 ): Promise<Uint8Array<ArrayBuffer>> {
   if (key.byteLength !== AES128_KEY_LEN) {
-    throw new InputError(
-      'unsupported-input',
-      `HLS AES-128 key must be ${AES128_KEY_LEN} bytes, got ${key.byteLength}`,
-    );
+    throw new InputError(`HLS AES-128 key must be ${AES128_KEY_LEN} bytes, got ${key.byteLength}`);
   }
   if (iv.byteLength !== AES_BLOCK) {
-    throw new InputError(
-      'unsupported-input',
-      `HLS AES-128 IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
-    );
+    throw new InputError(`HLS AES-128 IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`);
   }
   if (payload.byteLength === 0 || payload.byteLength % AES_BLOCK !== 0) {
     throw new InputError(
-      'unsupported-input',
       `HLS AES-128 segment must be a positive multiple of ${AES_BLOCK} bytes (CBC), got ${payload.byteLength}`,
     );
   }
@@ -107,12 +100,12 @@ export async function decryptHlsSampleAesTs(
 ): Promise<Uint8Array<ArrayBuffer>> {
   assertSampleAesKeyIv(key, iv);
   if (payload.byteLength === 0) {
-    throw new InputError('unsupported-input', 'HLS SAMPLE-AES segment is empty');
+    throw new InputError('HLS SAMPLE-AES segment is empty');
   }
 
   const framing = detectTsFraming(payload);
   if (framing === undefined) {
-    throw new InputError('unsupported-input', 'HLS SAMPLE-AES decrypt expects an MPEG-TS segment');
+    throw new InputError('HLS SAMPLE-AES decrypt expects an MPEG-TS segment');
   }
 
   const out = payload.slice();
@@ -191,10 +184,7 @@ export async function decryptHlsSampleAesTs(
 
   if (!sawSupportedStream) {
     if (sawScrambled) {
-      throw new InputError(
-        'unsupported-input',
-        'MPEG-TS transport scrambling is not HLS SAMPLE-AES',
-      );
+      throw new InputError('MPEG-TS transport scrambling is not HLS SAMPLE-AES');
     }
     throw new MediaError('decode-error', 'HLS SAMPLE-AES found no H.264/AAC TS streams');
   }
@@ -207,15 +197,11 @@ export async function decryptHlsSampleAesTs(
 function assertSampleAesKeyIv(key: Uint8Array<ArrayBuffer>, iv: Uint8Array<ArrayBuffer>): void {
   if (key.byteLength !== AES128_KEY_LEN) {
     throw new InputError(
-      'unsupported-input',
       `HLS SAMPLE-AES key must be ${AES128_KEY_LEN} bytes, got ${key.byteLength}`,
     );
   }
   if (iv.byteLength !== AES_BLOCK) {
-    throw new InputError(
-      'unsupported-input',
-      `HLS SAMPLE-AES IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`,
-    );
+    throw new InputError(`HLS SAMPLE-AES IV must be ${AES_BLOCK} bytes, got ${iv.byteLength}`);
   }
 }
 

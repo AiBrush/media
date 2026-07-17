@@ -33,7 +33,7 @@ export type LimitMode = 'hard' | 'soft';
 /** Validate a dBFS argument is a finite number — `±Infinity`/`NaN` would yield non-finite gain/output. */
 function checkDb(db: number, what: string): void {
   if (!Number.isFinite(db)) {
-    throw new InputError('unsupported-input', `${what} must be a finite number (dBFS); got ${db}`);
+    throw new InputError(`${what} must be a finite number (dBFS); got ${db}`);
   }
 }
 
@@ -144,7 +144,7 @@ export function limit(
     return mapSamples(audio, (x) => (x > ceiling ? ceiling : x < -ceiling ? -ceiling : x));
   }
   if (!(knee > 0 && knee <= 1)) {
-    throw new InputError('unsupported-input', `limiter knee must be in (0, 1]; got ${knee}`);
+    throw new InputError(`limiter knee must be in (0, 1]; got ${knee}`);
   }
   return mapSamples(audio, (x) => softLimitSample(x, ceiling, knee));
 }

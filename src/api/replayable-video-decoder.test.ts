@@ -92,8 +92,8 @@ describe('decodeVideoWithRuntimeFallback', () => {
         chunks([0, 33_333, 70_001]),
         () =>
           decoder(primaryPackets, () => {
-            throw new CapabilityError('capability-miss', 'native VP9 runtime miss', {
-              op: 'decode',
+            throw new CapabilityError('native VP9 runtime miss', {
+              op: { kind: 'route', id: 'decode' },
               tried: ['webcodecs-video'],
             });
           }),
@@ -133,7 +133,10 @@ describe('decodeVideoWithRuntimeFallback', () => {
         source,
         () =>
           decoder([], () => {
-            throw new CapabilityError('capability-miss', 'native miss');
+            throw new CapabilityError('native miss', {
+              op: { kind: 'route', id: 'decode' },
+              tried: ['native'],
+            });
           }),
         async () =>
           new TransformStream<EncodedChunk, VideoFrame>({
@@ -192,8 +195,8 @@ describe('decodeVideoWithRuntimeFallback', () => {
       () =>
         decoder([], (chunk, controller) => {
           if (chunk.timestamp === 20) {
-            throw new CapabilityError('capability-miss', 'late native failure', {
-              op: 'decode',
+            throw new CapabilityError('late native failure', {
+              op: { kind: 'route', id: 'decode' },
               tried: ['webcodecs-video'],
             });
           }
@@ -214,15 +217,18 @@ describe('decodeVideoWithRuntimeFallback', () => {
   });
 
   it('propagates the typed fallback miss when the WASM tail is absent', async () => {
-    const fallbackMiss = new CapabilityError('capability-miss', 'WASM VP9 unavailable', {
-      op: 'decode',
+    const fallbackMiss = new CapabilityError('WASM VP9 unavailable', {
+      op: { kind: 'route', id: 'decode' },
       tried: ['wasm-vpx'],
     });
     const reader = decodeVideoWithRuntimeFallback(
       chunks([0]),
       () =>
         decoder([], () => {
-          throw new CapabilityError('capability-miss', 'native miss');
+          throw new CapabilityError('native miss', {
+            op: { kind: 'route', id: 'decode' },
+            tried: ['native'],
+          });
         }),
       () => Promise.reject(fallbackMiss),
     ).getReader();
@@ -275,7 +281,10 @@ describe('decodeVideoWithRuntimeFallback', () => {
       () =>
         decoder([], (chunk) => {
           if (chunk.timestamp === 257) {
-            throw new CapabilityError('capability-miss', 'native failed after replay bound');
+            throw new CapabilityError('native failed after replay bound', {
+              op: { kind: 'route', id: 'decode' },
+              tried: ['native'],
+            });
           }
         }),
       async () => {
@@ -306,7 +315,10 @@ describe('decodeVideoWithRuntimeFallback', () => {
       () =>
         decoder([], (chunk) => {
           if (chunk.timestamp === 2) {
-            throw new CapabilityError('capability-miss', 'native failed after byte bound');
+            throw new CapabilityError('native failed after byte bound', {
+              op: { kind: 'route', id: 'decode' },
+              tried: ['native'],
+            });
           }
         }),
       async () => {

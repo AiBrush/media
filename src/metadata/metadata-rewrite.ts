@@ -29,8 +29,8 @@ export async function rewriteMetadataTags(
     case 'caf':
       return (await import('./pcm-tags.ts')).writeCafTags(bytes, tags);
     default:
-      throw new CapabilityError('capability-miss', 'metadata tag rewrite is not available', {
-        op: 'remux',
+      throw new CapabilityError('metadata tag rewrite is not available', {
+        op: { kind: 'route', id: 'remux' },
         tried: [target],
       });
   }

@@ -925,10 +925,7 @@ interface EbmlHeaderFacts {
 }
 
 function ebmlHeaderError(reason: string): InputError {
-  return new InputError(
-    'unsupported-input',
-    `not a WebM/Matroska file (invalid EBML header: ${reason})`,
-  );
+  return new InputError(`not a WebM/Matroska file (invalid EBML header: ${reason})`);
 }
 
 function headerUint(dv: DataView, element: EbmlElement, name: string): number {
@@ -1032,10 +1029,7 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
   let topLevelIndex = 0;
   for (const el of elements(dv, 0, dv.byteLength)) {
     if (topLevelIndex === 0 && (el.id !== ID.EBML || !el.complete)) {
-      throw new InputError(
-        'unsupported-input',
-        'not a WebM/Matroska file (missing complete leading EBML header)',
-      );
+      throw new InputError('not a WebM/Matroska file (missing complete leading EBML header)');
     }
     topLevelIndex += 1;
     if (el.id === ID.EBML) {
@@ -1065,12 +1059,9 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
     }
   }
   if (topLevelIndex === 0 || docType === undefined) {
-    throw new InputError(
-      'unsupported-input',
-      'not a WebM/Matroska file (missing complete leading EBML header)',
-    );
+    throw new InputError('not a WebM/Matroska file (missing complete leading EBML header)');
   }
-  if (!segment) throw new InputError('unsupported-input', 'not a WebM/Matroska (EBML) file');
+  if (!segment) throw new InputError('not a WebM/Matroska (EBML) file');
 
   let timecodeScale = 1_000_000;
   let duration = 0;
@@ -1275,7 +1266,7 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
   });
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
-  if (!segment) throw new InputError('unsupported-input', 'not a WebM/Matroska (EBML) file');
+  if (!segment) throw new InputError('not a WebM/Matroska (EBML) file');
   let timecodeScale = 1_000_000;
   const infoEl = findChild(dv, segment.dataStart, segment.dataEnd, ID.Info);
   if (infoEl) {
@@ -1852,7 +1843,6 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
     assertNotAborted(signal);
     if (bytes.byteLength !== declaredSize) {
       throw new InputError(
-        'unsupported-input',
         `WebM source returned ${bytes.byteLength} bytes for declared size ${declaredSize}`,
       );
     }
@@ -1889,7 +1879,6 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
       assertNotAborted(signal);
       if (completeBytes.byteLength < src.size) {
         throw new InputError(
-          'unsupported-input',
           `WebM source ended at ${completeBytes.byteLength} bytes before declared size ${src.size}`,
         );
       }
@@ -1934,10 +1923,7 @@ function normalizeTrimRange(
   const startUs = Math.round(trim.startSec * MICROS_PER_SECOND);
   const endUs = Math.round(trim.endSec * MICROS_PER_SECOND);
   if (!Number.isFinite(startUs) || !Number.isFinite(endUs) || startUs < 0 || endUs <= startUs) {
-    throw new InputError(
-      'unsupported-input',
-      `invalid WebM trim range ${trim.startSec}s..${trim.endSec}s`,
-    );
+    throw new InputError(`invalid WebM trim range ${trim.startSec}s..${trim.endSec}s`);
   }
   const sourceDurationUs =
     Number.isFinite(durationSec) && durationSec > 0
@@ -2116,11 +2102,10 @@ async function streamCopyWebm(
     options.container !== 'webm' &&
     options.container !== 'mkv'
   ) {
-    throw new CapabilityError(
-      'capability-miss',
-      `the webm driver cannot stream-copy to '${options.container}'`,
-      { op: 'streamCopy', tried: ['webm', 'mkv'] },
-    );
+    throw new CapabilityError(`the webm driver cannot stream-copy to '${options.container}'`, {
+      op: { kind: 'route', id: 'streamCopy' },
+      tried: ['webm', 'mkv'],
+    });
   }
   assertNotAborted(options?.signal);
   const demux = demuxWebm(await readAll(src, options?.signal));
@@ -2203,9 +2188,8 @@ function packetStream(
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'WebM packet demux requires WebCodecs EncodedVideoChunk/EncodedAudioChunk (browser/worker only)',
-      { op: 'demux', tried: [] },
+      { op: { kind: 'route', id: 'demux' }, tried: [] },
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */

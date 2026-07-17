@@ -70,7 +70,7 @@ function id3v2Length(bytes: Uint8Array): number {
   if (bytes.byteLength < ID3_HEADER_LEN || ascii(bytes, 0, 3) !== 'ID3') return 0;
   const size = readSynchsafe(bytes, 6);
   if (size === undefined || ID3_HEADER_LEN + size > bytes.byteLength) {
-    throw new InputError('unsupported-input', 'truncated or malformed ID3v2 header');
+    throw new InputError('truncated or malformed ID3v2 header');
   }
   return ID3_HEADER_LEN + size;
 }

@@ -83,13 +83,13 @@ export function parseAdtsFrame(
   offset: number,
 ): { frame: AdtsFrame; next: number } {
   if (offset + 7 > bytes.length) {
-    throw new InputError('unsupported-input', 'aac: ADTS frame truncated (header)');
+    throw new InputError('aac: ADTS frame truncated (header)');
   }
   const b0 = bytes[offset] as number;
   const b1 = bytes[offset + 1] as number;
   const sync = (b0 << 4) | (b1 >> 4);
   if (sync !== ADTS_SYNC) {
-    throw new InputError('unsupported-input', `aac: lost ADTS sync at byte ${offset}`);
+    throw new InputError(`aac: lost ADTS sync at byte ${offset}`);
   }
   const protectionAbsent = b1 & 0x01;
   const b2 = bytes[offset + 2] as number;
@@ -151,7 +151,7 @@ export function readAdtsFrames(bytes: Uint8Array): {
     offset = next;
   }
   if (frames.length === 0) {
-    throw new InputError('unsupported-input', 'aac: no ADTS frames found');
+    throw new InputError('aac: no ADTS frames found');
   }
   return { frames, sampleRate, channels, objectType };
 }
@@ -185,15 +185,13 @@ export interface AscFields {
  * ASC itself, but the driver needs the rate/channels to shape `AudioData` before the first decode.
  */
 export function parseAsc(asc: Uint8Array): AscFields {
-  if (asc.length < 2)
-    throw new InputError('unsupported-input', 'aac: AudioSpecificConfig too short');
+  if (asc.length < 2) throw new InputError('aac: AudioSpecificConfig too short');
   const b0 = asc[0] as number;
   const b1 = asc[1] as number;
   const objectType = b0 >> 3;
   const freqIndex = ((b0 & 0x07) << 1) | (b1 >> 7);
   if (freqIndex === 15) {
-    if (asc.length < 5)
-      throw new InputError('unsupported-input', 'aac: explicit-rate ASC too short');
+    if (asc.length < 5) throw new InputError('aac: explicit-rate ASC too short');
     // Explicit 24-bit rate spanning b1[6:0] | b2 | b3 | b4[7]; channelConfig is the next 4 bits (b4[6:3]).
     const b2 = asc[2] as number;
     const b3 = asc[3] as number;

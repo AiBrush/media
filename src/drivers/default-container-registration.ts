@@ -21,6 +21,7 @@ import {
 } from './audio-container-sniff.ts';
 
 interface SelectiveContainerSpec {
+  /** The exact id of the driver this spec's `load()` registers — pins resolve against it. */
   readonly id: string;
   readonly matches: (query: ContainerQuery) => boolean;
   readonly load: () => Promise<DriverModule>;
@@ -28,7 +29,8 @@ interface SelectiveContainerSpec {
   readonly pinnedRequiresMatch?: true;
 }
 
-const SELECTIVE_CONTAINERS: readonly SelectiveContainerSpec[] = [
+/** Every query-selective first-party container, keyed by the real registered driver id. */
+export const SELECTIVE_CONTAINERS: readonly SelectiveContainerSpec[] = [
   {
     id: 'mp4',
     matches: (query) => matchesDemuxFamily(query, ['mp4', 'mov', 'm4a', 'm4v', 'qt'], MP4_MIMES),
@@ -77,13 +79,13 @@ const SELECTIVE_CONTAINERS: readonly SelectiveContainerSpec[] = [
     load: () => import('./caf/caf-driver.ts').then((module) => module.default),
   },
   {
-    id: 'mp4',
+    id: 'mp4-mux',
     matches: (query) => matchesMuxExtension(query, ['mp4', 'mov']),
     load: () => import('./mp4/mp4-mux-driver.ts').then((module) => module.default),
     pinnedRequiresMatch: true,
   },
   {
-    id: 'webm',
+    id: 'webm-mux',
     matches: (query) => matchesMuxExtension(query, ['webm', 'mkv', 'mka']),
     load: () => import('./webm/webm-mux-driver.ts').then((module) => module.default),
     pinnedRequiresMatch: true,

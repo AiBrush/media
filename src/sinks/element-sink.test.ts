@@ -982,3 +982,105 @@ describe('toElement materialization', () => {
     expect(source.endErrors).toEqual([undefined]);
   });
 });
+
+/**
+ * One-active-session-per-element invariant (doc 09 §5 item 8): the per-element weak registries mean a
+ * newer attachment displaces the prior session on the SAME element with the exact typed abort, while
+ * sessions owned by independent engines on DIFFERENT elements never interact.
+ */
+describe('element sink sessions — per-element scoping', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function gatedStream(byte: number): {
+    stream: ReadableStream<Uint8Array>;
+    release: () => void;
+    cancelled: () => unknown;
+  } {
+    let release!: () => void;
+    let cancelled: unknown;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let emitted = false;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        async pull(c): Promise<void> {
+          if (!emitted) {
+            emitted = true;
+            c.enqueue(new Uint8Array([byte]));
+            return;
+          }
+          await gate;
+          c.close();
+        },
+        cancel(reason): void {
+          cancelled = reason;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { stream, release, cancelled: () => cancelled };
+  }
+
+  it('a second attachment to the SAME element aborts the first with the typed replacement error', async () => {
+    // The gated first session never finishes collecting, so the only object URL created belongs to
+    // the replacement attachment — which must win the element.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:replacement');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const element = mediaElement();
+
+    const first = gatedStream(1);
+    const firstRun = materialize(toElement(element), first.stream, { mime: 'video/mp4' });
+    const firstObserved = firstRun.then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    await waitUntil(() => first.stream.locked, 'first session never started collecting');
+
+    await materialize(toElement(element), bytesStream([2]), { mime: 'video/mp4' });
+    expect(element.src).toBe('blob:replacement');
+
+    const err = await firstObserved;
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).code).toBe('aborted');
+    expect((err as MediaError).message).toBe('element sink was replaced by a newer attachment');
+    expect(first.cancelled()).toBeDefined(); // the displaced session released its producer
+  });
+
+  it('two independent engines on DIFFERENT elements never cross-abort', async () => {
+    let urlCount = 0;
+    vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:${++urlCount}`);
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const elementA = mediaElement();
+    const elementB = mediaElement();
+    const engineA = new AbortController(); // one cancellation domain per engine
+    const engineB = new AbortController();
+
+    const a = gatedStream(1);
+    const b = gatedStream(2);
+    const runA = materialize(toElement(elementA), a.stream, {
+      mime: 'video/mp4',
+      signal: engineA.signal,
+    });
+    const runB = materialize(toElement(elementB), b.stream, {
+      mime: 'video/webm',
+      signal: engineB.signal,
+    });
+    await waitUntil(() => a.stream.locked && b.stream.locked, 'sessions never started');
+
+    // Both sessions are live concurrently; finishing B must not disturb A and vice versa.
+    b.release();
+    await expect(runB).resolves.toBeUndefined();
+    expect(a.cancelled()).toBeUndefined();
+
+    a.release();
+    await expect(runA).resolves.toBeUndefined();
+    expect(elementA.src).toMatch(/^blob:/);
+    expect(elementB.src).toMatch(/^blob:/);
+    expect(elementA.src).not.toBe(elementB.src); // each element kept its own session's output
+    expect(b.cancelled()).toBeUndefined();
+  });
+});

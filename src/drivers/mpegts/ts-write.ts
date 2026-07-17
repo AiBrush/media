@@ -1,6 +1,11 @@
 import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
 import type { MediaType, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import {
+  CapabilityError,
+  type CapabilityErrorDetail,
+  MediaError,
+  type OperationFacts,
+} from '../../contracts/errors.ts';
 
 const TS_PACKET_SIZE = 188;
 const TS_CLOCK_HZ = 90_000;
@@ -110,7 +115,6 @@ export class MpegTsMuxer implements Muxer {
   constructor(options: MpegTsMuxerOptions = {}) {
     if (options.fragmented === true) {
       throw new CapabilityError(
-        'capability-miss',
         'MPEG-TS fragmented muxing is not supported; use a regular TS output target.',
         capabilityDetail({ container: 'ts', fragmented: true }),
       );
@@ -280,7 +284,6 @@ function mpegTsTrackStateFromInfo(
 
   if (track.mediaType !== info.mediaType) {
     throw new CapabilityError(
-      'capability-miss',
       'Track media type does not match MPEG-TS codec support.',
       capabilityDetail({ codec: info.codec, mediaType: info.mediaType }),
     );
@@ -400,7 +403,6 @@ function validateAccessUnitPayload(track: TrackState, chunk: MpegTsChunk): void 
   }
   if (track.aacConfig === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'AAC MPEG-TS muxing requires an AAC encoder config.',
       capabilityDetail({ codec: track.codec, trackId: track.inputTrackId }),
     );
@@ -412,7 +414,6 @@ function validateH264AccessUnit(data: Uint8Array, avcConfig: AvcDecoderConfig | 
   if (isAnnexB(data)) return;
   if (avcConfig === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 MPEG-TS muxing requires Annex B samples or avcC decoder configuration.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -425,8 +426,8 @@ function validateAacAccessUnit(data: Uint8Array): void {
   validateAdtsPayloadLength(data.byteLength);
 }
 
-function capabilityDetail(extra: Record<string, unknown>): Record<string, unknown> {
-  return { op: 'mux:mpegts', tried: ['mpegts'], ...extra };
+function capabilityDetail(facts: OperationFacts): CapabilityErrorDetail {
+  return { op: { kind: 'route', id: 'mux:mpegts', facts }, tried: ['mpegts'] };
 }
 
 function buildTimedAccessUnits(tracks: readonly TrackState[]): TimedAccessUnit[] {
@@ -471,7 +472,6 @@ function accessUnitPayload(track: TrackState, chunk: MpegTsChunk): Uint8Array {
   }
   if (track.aacConfig === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'AAC MPEG-TS muxing requires an AAC encoder config.',
       capabilityDetail({ codec: track.codec, trackId: track.inputTrackId }),
     );
@@ -489,7 +489,6 @@ function h264AnnexBAccessUnit(
   }
   if (avcConfig === undefined) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 MPEG-TS muxing requires Annex B samples or avcC decoder configuration.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -708,7 +707,6 @@ function parseAvcDecoderConfig(description: Uint8Array | undefined): AvcDecoderC
   }
   if (description.byteLength < 7 || description[0] !== 1) {
     throw new CapabilityError(
-      'capability-miss',
       'Invalid avcC description for MPEG-TS H.264 muxing.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -716,7 +714,6 @@ function parseAvcDecoderConfig(description: Uint8Array | undefined): AvcDecoderC
   const lengthSize = ((description[4] as number) & 0x03) + 1;
   if (lengthSize < 1 || lengthSize > 4) {
     throw new CapabilityError(
-      'capability-miss',
       'Unsupported H.264 NAL length size in avcC description.',
       capabilityDetail({ codec: 'h264', lengthSize }),
     );
@@ -732,7 +729,6 @@ function parseAvcDecoderConfig(description: Uint8Array | undefined): AvcDecoderC
   }
   if (offset >= description.byteLength) {
     throw new CapabilityError(
-      'capability-miss',
       'Invalid avcC PPS table for MPEG-TS muxing.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -746,7 +742,6 @@ function parseAvcDecoderConfig(description: Uint8Array | undefined): AvcDecoderC
   }
   if (parameterSets.length === 0) {
     throw new CapabilityError(
-      'capability-miss',
       'H.264 avcC description is missing SPS/PPS parameter sets.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -762,7 +757,6 @@ function parseAacEncoderConfig(info: TrackInfo): AacEncoderConfig {
   const objectType = asc?.objectType ?? 2;
   if (objectType < 1 || objectType > 4) {
     throw new CapabilityError(
-      'capability-miss',
       'ADTS-in-TS output supports AAC object types 1 through 4.',
       capabilityDetail({ codec: info.codec, objectType }),
     );
@@ -770,14 +764,12 @@ function parseAacEncoderConfig(info: TrackInfo): AacEncoderConfig {
   const sampleRateIndex = MPEG4_SAMPLE_RATES.indexOf(sampleRate);
   if (sampleRateIndex < 0) {
     throw new CapabilityError(
-      'capability-miss',
       'AAC sample rate is not representable in ADTS.',
       capabilityDetail({ codec: info.codec, sampleRate }),
     );
   }
   if (!Number.isInteger(channelConfig) || channelConfig < 1 || channelConfig > 7) {
     throw new CapabilityError(
-      'capability-miss',
       'AAC channel count is not representable in ADTS.',
       capabilityDetail({ codec: info.codec, channelConfig }),
     );
@@ -804,7 +796,6 @@ function audioConfigNumber(info: TrackInfo, key: 'sampleRate' | 'numberOfChannel
     return config.numberOfChannels;
   }
   throw new CapabilityError(
-    'capability-miss',
     `AAC MPEG-TS muxing requires ${key} metadata.`,
     capabilityDetail({ codec: info.codec }),
   );
@@ -824,7 +815,6 @@ function readLengthPrefixedBytes(
 ): { readonly bytes: Uint8Array; readonly nextOffset: number } {
   if (offset + 2 > data.byteLength) {
     throw new CapabilityError(
-      'capability-miss',
       'Truncated H.264 avcC parameter set.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -834,7 +824,6 @@ function readLengthPrefixedBytes(
   const nextOffset = bytesOffset + length;
   if (length <= 0 || nextOffset > data.byteLength) {
     throw new CapabilityError(
-      'capability-miss',
       'Invalid H.264 avcC parameter set length.',
       capabilityDetail({ codec: 'h264' }),
     );
@@ -851,7 +840,6 @@ function normalizeCodec(codec: string): SupportedCodec {
     return 'aac';
   }
   throw new CapabilityError(
-    'capability-miss',
     'MPEG-TS muxing currently supports H.264 and AAC tracks.',
     capabilityDetail({ codec }),
   );

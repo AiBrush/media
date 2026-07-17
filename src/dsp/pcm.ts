@@ -147,7 +147,7 @@ export function decodePcm(
   endian: Endianness = 'le',
 ): PcmAudio {
   if (channels <= 0 || !Number.isInteger(channels)) {
-    throw new InputError('unsupported-input', `invalid channel count ${channels}`);
+    throw new InputError(`invalid channel count ${channels}`);
   }
   const bps = BYTES_PER_SAMPLE[format];
   const frameBytes = bps * channels;
@@ -178,7 +178,7 @@ export function decodePcmToInterleavedF32(
   endian: Endianness = 'le',
 ): InterleavedPcmF32 {
   if (channels <= 0 || !Number.isInteger(channels)) {
-    throw new InputError('unsupported-input', `invalid channel count ${channels}`);
+    throw new InputError(`invalid channel count ${channels}`);
   }
   const bps = BYTES_PER_SAMPLE[format];
   const frames = Math.floor(bytes.byteLength / (bps * channels));

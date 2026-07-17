@@ -37,10 +37,9 @@ export function hasImageDecoder(): boolean {
 
 function absentImageDecoderError(): CapabilityError {
   return new CapabilityError(
-    'capability-miss',
     'WebCodecs ImageDecoder is unavailable in this environment (e.g. Node); image decode is browser-only',
     {
-      op: 'decode-image',
+      op: { kind: 'route', id: 'decode-image' },
       tried: [],
       suggestion: 'run the browser image path (WebCodecs ImageDecoder)',
     },

@@ -2,7 +2,10 @@
  * First-party driver bundle — registered into an engine on demand so `media.probe(file)` works
  * zero-config (doc 07) while the eager kernel stays tiny (ADR-004). The engine `import()`s this module
  * only on a capability miss, so it (and the container parsers it pulls in) is a lazy code-split chunk,
- * never part of the eager bundle.
+ * never part of the eager bundle. This file holds only registration wiring plus the lazy proxy
+ * factories; real parsing lives in the per-family driver modules (`./flac/flac-lazy-driver.ts` for
+ * the FLAC fast paths), byte IO in `../util/byte-stream.ts`, image sniffing in the image codec module,
+ * and runtime capability detection in `../kernel/runtime-capabilities.ts`.
  */
 
 import type {
@@ -11,6 +14,7 @@ import type {
   ImageInfo,
   ImageOps,
 } from '../codecs/image/index.ts';
+import { sniffImageFormat } from '../codecs/image/probe.ts';
 import { WebCodecsAudioModule } from '../codecs/webcodecs-audio.ts';
 import { WebcodecsVideoModule } from '../codecs/webcodecs-video.ts';
 import type {
@@ -31,7 +35,6 @@ import type {
   FilterSubstrate,
   MuxOptions,
   Muxer,
-  Packet,
   PacketInfoTable,
   PcmTransform,
   RawFrame,
@@ -41,8 +44,13 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError } from '../contracts/errors.ts';
 import type { InterleavedPcmF32, PcmAudio } from '../dsp/index.ts';
+import {
+  canvas2dAvailable,
+  chromiumCanvasTonemapAvailable,
+  webgpuAvailable,
+} from '../kernel/runtime-capabilities.ts';
 import {
   type LazyAudioMuxKind,
   adtsMuxTrackConfig,
@@ -60,16 +68,10 @@ import {
   matchesOgg,
   matchesWav,
 } from './audio-container-sniff.ts';
-import {
-  type FastFlacFrameSpan,
-  fastFlacFrames,
-  flacMetadataLayout,
-  flacPacketInfoTable,
-  flacTrackInfo,
-  matchesFlac,
-  parseFlacStreamInfo,
-  readSeekableFlacStreamInfo,
-} from './flac/flac-sniff.ts';
+import { matchesAvi } from './avi/avi-sniff.ts';
+import { lazyFlacContainerDriver } from './flac/flac-lazy-driver.ts';
+import { createLazyFilterStream } from './lazy-filter-stream.ts';
+import { type LazyContainerLoader, LazyMuxer, missingLazyMethod } from './lazy-muxer.ts';
 import { matchesMp4 } from './mp4/mp4-sniff.ts';
 import { MPEG_TS_FORMATS, matchesMpegTs } from './mpegts/mpegts-sniff.ts';
 import { matchesWebm } from './webm/webm-sniff.ts';
@@ -88,162 +90,16 @@ export function registerDefaultDrivers(reg: Registry): void {
     // Vorbis/AAC/MP3 + dav1d AV1; self-contained inlined tails: Opus/VPx) for the lazy import.meta.url load
     // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
   ];
-  reg.addContainer(lazyMp4ContainerDriver());
-  reg.addContainer(lazyWebmContainerDriver());
   for (const mod of modules) mod.register(reg);
-  for (const driver of lazyAudioContainerDrivers()) reg.addContainer(driver);
-  for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
-  (reg as Registry & { addImageOps?: (ops: ImageOps) => void }).addImageOps?.(lazyImageOps());
-  reg.addContainer(lazyMpegTsContainerDriver());
+  for (const spec of DEFAULT_LAZY_CONTAINER_SPECS) reg.addContainer(lazyContainer(spec));
   reg.addContainer(lazyFlacContainerDriver());
-  reg.addContainer(lazyAviContainerDriver());
+  for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
+  reg.addImageOps?.(lazyImageOps());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
 }
 
-function lazyMp4ContainerDriver(): ContainerDriver {
-  return lazyContainer({
-    id: 'mp4',
-    formats: ['mp4', 'mov'],
-    supports: matchesMp4,
-    load: () => import('./mp4/mp4-driver.ts').then((module) => module.Mp4Driver),
-    probe: true,
-    packetInfo: true,
-    streamCopy: true,
-    decrypt: true,
-    validatesStreamCopyTrim: true,
-  });
-}
-
-function lazyWebmContainerDriver(): ContainerDriver {
-  return lazyContainer({
-    id: 'webm',
-    formats: ['webm', 'mkv'],
-    supports: matchesWebm,
-    load: () => import('./webm/webm-driver.ts').then((module) => module.WebmDriver),
-    probe: true,
-    streamCopy: true,
-  });
-}
-
-const IMAGE_FORMATS: readonly ImageFormat[] = ['gif', 'png', 'jpeg', 'webp', 'avif'];
-
-let imageOpsPromise: Promise<ImageOps> | undefined;
-
-function loadImageOps(): Promise<ImageOps> {
-  imageOpsPromise ??= import('../codecs/image/image-driver.ts').then((m) => m.imageOps);
-  return imageOpsPromise;
-}
-
-function lazyImageOps(): ImageOps {
-  return {
-    formats: IMAGE_FORMATS,
-    sniff: sniffImageFormat,
-    probe(bytes: Uint8Array): Promise<ImageInfo> {
-      return loadImageOps().then((ops) => ops.probe(bytes));
-    },
-    canDecode(): boolean {
-      return typeof ImageDecoder !== 'undefined';
-    },
-    decode(bytes: Uint8Array, options?: DecodeImageOptions): ReadableStream<VideoFrame> {
-      let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
-      return new ReadableStream<VideoFrame>(
-        {
-          async pull(controller): Promise<void> {
-            try {
-              reader ??= (await loadImageOps()).decode(bytes, options).getReader();
-              const { done, value } = await reader.read();
-              if (done) {
-                controller.close();
-                return;
-              }
-              try {
-                controller.enqueue(value);
-              } catch (e) {
-                value.close();
-                throw e;
-              }
-            } catch (e) {
-              controller.error(e);
-            }
-          },
-          async cancel(reason): Promise<void> {
-            await reader?.cancel(reason).catch(() => {});
-          },
-        },
-        { highWaterMark: 0 },
-      );
-    },
-    async *decodeFrames(
-      bytes: Uint8Array,
-      options?: DecodeImageOptions,
-    ): AsyncGenerator<VideoFrame, void, undefined> {
-      yield* (await loadImageOps()).decodeFrames(bytes, options);
-    },
-  };
-}
-
-function sniffImageFormat(bytes: Uint8Array): ImageFormat | undefined {
-  if (bytes.byteLength >= 6 && (tag(bytes, 0, 'GIF87a') || tag(bytes, 0, 'GIF89a'))) {
-    return 'gif';
-  }
-  if (
-    bytes.byteLength >= 8 &&
-    bytes[0] === 0x89 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x4e &&
-    bytes[3] === 0x47 &&
-    bytes[4] === 0x0d &&
-    bytes[5] === 0x0a &&
-    bytes[6] === 0x1a &&
-    bytes[7] === 0x0a
-  ) {
-    return 'png';
-  }
-  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'jpeg';
-  }
-  if (bytes.byteLength >= 12 && tag(bytes, 0, 'RIFF') && tag(bytes, 8, 'WEBP')) {
-    return 'webp';
-  }
-  if (bytes.byteLength >= 12 && tag(bytes, 4, 'ftyp') && hasAvifBrand(bytes)) {
-    return 'avif';
-  }
-  return undefined;
-}
-
-function hasAvifBrand(bytes: Uint8Array): boolean {
-  if (brand(bytes, 8)) return true;
-  const size = u32be(bytes, 0);
-  const end = Math.min(size > 0 ? size : bytes.byteLength, bytes.byteLength);
-  for (let offset = 16; offset + 4 <= end; offset += 4) {
-    if (brand(bytes, offset)) return true;
-  }
-  return false;
-}
-
-function brand(bytes: Uint8Array, offset: number): boolean {
-  return tag(bytes, offset, 'avif') || tag(bytes, offset, 'avis');
-}
-
-function tag(bytes: Uint8Array, offset: number, value: string): boolean {
-  if (offset + value.length > bytes.byteLength) return false;
-  for (let i = 0; i < value.length; i++) {
-    if (bytes[offset + i] !== value.charCodeAt(i)) return false;
-  }
-  return true;
-}
-
-function u32be(bytes: Uint8Array, offset: number): number {
-  return (
-    (((bytes[offset] ?? 0) << 24) |
-      ((bytes[offset + 1] ?? 0) << 16) |
-      ((bytes[offset + 2] ?? 0) << 8) |
-      (bytes[offset + 3] ?? 0)) >>>
-    0
-  );
-}
-
 type LazyCodecLoader = () => Promise<CodecDriver>;
+type LazyFilterLoader = () => Promise<FilterDriver>;
 
 interface LazyCodecSpec {
   readonly id: string;
@@ -252,22 +108,13 @@ interface LazyCodecSpec {
   readonly load: LazyCodecLoader;
 }
 
-function codec(q: CodecQuery): string {
-  return q.config.codec.toLowerCase();
-}
-
-function audioDecode(q: CodecQuery): boolean {
-  return q.mediaType === 'audio' && q.direction === 'decode';
-}
-
-function videoDecode(q: CodecQuery): boolean {
-  return q.mediaType === 'video' && q.direction === 'decode';
-}
-
-type LazyContainerLoader = () => Promise<ContainerDriver>;
-type LazyFilterLoader = () => Promise<FilterDriver>;
-
-interface LazyContainerSpec {
+/**
+ * A lazy container proxy description. The boolean flags mirror the loaded module's optional method
+ * surface **exactly** — `lazy-container-conformance.test.ts` loads every spec and fails on any drift
+ * in either direction, so an advertised method can never miss at call time and a real method can
+ * never be silently hidden from the router.
+ */
+export interface LazyContainerSpec {
   readonly id: string;
   readonly formats: readonly string[];
   readonly streamCopyTargets?: readonly string[];
@@ -289,87 +136,121 @@ interface LazyContainerSpec {
   readonly validateTrack?: (track: TrackInfo, trackCount: number) => void;
 }
 
-function lazyAudioContainerDrivers(): readonly ContainerDriver[] {
-  return [
-    lazyContainer({
-      id: 'wav',
-      formats: ['wav'],
-      supports: matchesWav,
-      load: () => import('./wav/wav-driver.ts').then((module) => module.WavDriver),
-      probe: true,
-      packetInfo: true,
-      transformPcm: true,
-      decodePcmAudio: true,
-      decodePcmAudioStream: true,
-      decodePcmInterleavedStream: true,
-      validatesPcmTrim: true,
-      muxKind: 'wav',
-      validateTrack: (track, trackCount) => {
-        wavMuxTrackConfig(track, trackCount);
-      },
-    }),
-    lazyContainer({
-      id: 'mp3',
-      formats: ['mp3'],
-      supports: matchesMp3,
-      load: () => import('./mp3/mp3-driver.ts').then((module) => module.Mp3Driver),
-      probe: true,
-      packetInfo: true,
-      muxKind: 'mp3',
-      validateTrack: validateMp3MuxTrack,
-    }),
-    lazyContainer({
-      id: 'ogg',
-      formats: ['ogg'],
-      streamCopyTargets: ['webm', 'mkv'],
-      supports: matchesOgg,
-      load: () => import('./ogg/ogg-driver.ts').then((module) => module.OggDriver),
-      probe: true,
-      packetInfo: true,
-      streamCopy: true,
-      validatesStreamCopyTrim: true,
-      muxKind: 'ogg',
-      validateTrack: validateOggMuxTrack,
-    }),
-    lazyContainer({
-      id: 'adts',
-      formats: ['adts', 'aac'],
-      supports: matchesAdts,
-      load: () => import('./adts/adts-driver.ts').then((module) => module.AdtsDriver),
-      probe: true,
-      packetInfo: true,
-      streamCopy: true,
-      decrypt: true,
-      decodePcm: true,
-      validatesStreamCopyTrim: true,
-      muxKind: 'adts',
-      validateTrack: (track, trackCount) => {
-        adtsMuxTrackConfig(track, trackCount);
-      },
-    }),
-    lazyContainer({
-      id: 'aiff',
-      formats: ['aiff'],
-      supports: matchesAiff,
-      load: () => import('./aiff/aiff-driver.ts').then((module) => module.AiffDriver),
-      packetInfo: true,
-      transformPcm: true,
-      decodePcmAudio: true,
-      rejectChunkMux: 'aiff',
-    }),
-    lazyContainer({
-      id: 'caf',
-      formats: ['caf'],
-      supports: matchesCaf,
-      load: () => import('./caf/caf-driver.ts').then((module) => module.CafDriver),
-      transformPcm: true,
-      decodePcmAudio: true,
-      rejectChunkMux: 'caf',
-    }),
-  ];
-}
+/** Every spec-registered first-party container, in registration (routing ladder) order. */
+export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
+  {
+    id: 'mp4',
+    formats: ['mp4', 'mov'],
+    supports: matchesMp4,
+    load: () => import('./mp4/mp4-driver.ts').then((module) => module.Mp4Driver),
+    probe: true,
+    packetInfo: true,
+    streamCopy: true,
+    decrypt: true,
+    validatesStreamCopyTrim: true,
+  },
+  {
+    id: 'webm',
+    formats: ['webm', 'mkv'],
+    supports: matchesWebm,
+    load: () => import('./webm/webm-driver.ts').then((module) => module.WebmDriver),
+    probe: true,
+    streamCopy: true,
+  },
+  {
+    id: 'wav',
+    formats: ['wav'],
+    supports: matchesWav,
+    load: () => import('./wav/wav-driver.ts').then((module) => module.WavDriver),
+    probe: true,
+    packetInfo: true,
+    transformPcm: true,
+    decodePcmAudio: true,
+    decodePcmAudioStream: true,
+    decodePcmInterleavedStream: true,
+    validatesPcmTrim: true,
+    muxKind: 'wav',
+    validateTrack: (track, trackCount) => {
+      wavMuxTrackConfig(track, trackCount);
+    },
+  },
+  {
+    id: 'mp3',
+    formats: ['mp3'],
+    supports: matchesMp3,
+    load: () => import('./mp3/mp3-driver.ts').then((module) => module.Mp3Driver),
+    probe: true,
+    packetInfo: true,
+    muxKind: 'mp3',
+    validateTrack: validateMp3MuxTrack,
+  },
+  {
+    id: 'ogg',
+    formats: ['ogg'],
+    streamCopyTargets: ['webm', 'mkv'],
+    supports: matchesOgg,
+    load: () => import('./ogg/ogg-driver.ts').then((module) => module.OggDriver),
+    probe: true,
+    packetInfo: true,
+    streamCopy: true,
+    validatesStreamCopyTrim: true,
+    muxKind: 'ogg',
+    validateTrack: validateOggMuxTrack,
+  },
+  {
+    id: 'adts',
+    formats: ['adts', 'aac'],
+    supports: matchesAdts,
+    load: () => import('./adts/adts-driver.ts').then((module) => module.AdtsDriver),
+    probe: true,
+    packetInfo: true,
+    streamCopy: true,
+    decrypt: true,
+    decodePcm: true,
+    validatesStreamCopyTrim: true,
+    muxKind: 'adts',
+    validateTrack: (track, trackCount) => {
+      adtsMuxTrackConfig(track, trackCount);
+    },
+  },
+  {
+    id: 'aiff',
+    formats: ['aiff'],
+    supports: matchesAiff,
+    load: () => import('./aiff/aiff-driver.ts').then((module) => module.AiffDriver),
+    probe: true,
+    packetInfo: true,
+    transformPcm: true,
+    decodePcmAudio: true,
+    rejectChunkMux: 'aiff',
+  },
+  {
+    id: 'caf',
+    formats: ['caf'],
+    supports: matchesCaf,
+    load: () => import('./caf/caf-driver.ts').then((module) => module.CafDriver),
+    transformPcm: true,
+    decodePcmAudio: true,
+    rejectChunkMux: 'caf',
+  },
+  {
+    id: 'mpegts',
+    formats: MPEG_TS_FORMATS,
+    supports: matchesMpegTs,
+    load: () => import('./mpegts/mpegts-driver.ts').then((m) => m.MpegTsDriver),
+    streamCopy: true,
+    decrypt: true,
+  },
+  {
+    id: 'avi',
+    formats: ['avi'],
+    supports: matchesAvi,
+    load: () => import('./avi/avi-driver.ts').then((m) => m.AviDriver),
+  },
+];
 
-function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
+/** Build the lazy proxy for one container spec: cheap pre-load gates, load-on-first-flow methods. */
+export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
   let driver: ContainerDriver | undefined;
   let loadPromise: Promise<ContainerDriver> | undefined;
   const load = async (): Promise<ContainerDriver> => {
@@ -412,7 +293,13 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
     createMuxer(o?: MuxOptions): Muxer {
       if (spec.rejectChunkMux !== undefined) return rejectRawPcmChunkMux(spec.rejectChunkMux);
       if (spec.muxKind !== undefined) assertAudioMuxOptions(spec.muxKind, o);
-      return new LazyContainerMuxer(load, o, spec.validateTrack);
+      return new LazyMuxer({
+        driverId: spec.id,
+        load,
+        muxOptions: o,
+        validateTrack: spec.validateTrack,
+        pcmSeam: true,
+      });
     },
     ...(spec.streamCopy === true
       ? {
@@ -505,235 +392,63 @@ function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
   };
 }
 
-function lazyMpegTsContainerDriver(): ContainerDriver {
-  let driver: ContainerDriver | undefined;
-  let loadPromise: Promise<ContainerDriver> | undefined;
-  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
-    if (driver !== undefined) return driver;
-    loadPromise ??= import('./mpegts/mpegts-driver.ts').then((m) => m.MpegTsDriver);
-    driver = await loadPromise;
-    return driver;
-  };
-  return {
-    id: 'mpegts',
-    apiVersion: DRIVER_API_VERSION,
-    kind: 'container',
-    formats: MPEG_TS_FORMATS,
-    supports: matchesMpegTs,
-    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-      return (driver ?? (await load())).demux(src, o);
-    },
-    async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
-      const loaded = driver ?? (await load());
-      if (loaded.streamCopy === undefined) throw missingLazyMethod('mpegts', 'streamCopy');
-      return loaded.streamCopy(src, o);
-    },
-    async decrypt(src: ByteSource, o: DecryptParams): Promise<ReadableStream<Uint8Array>> {
-      const loaded = driver ?? (await load());
-      if (loaded.decrypt === undefined) throw missingLazyMethod('mpegts', 'decrypt');
-      return loaded.decrypt(src, o);
-    },
-    createMuxer(o?: MuxOptions): Muxer {
-      return new LazyContainerMuxer(load, o);
-    },
-  };
-}
+const IMAGE_FORMATS: readonly ImageFormat[] = ['gif', 'png', 'jpeg', 'webp', 'avif'];
 
-function lazyFlacContainerDriver(): ContainerDriver {
-  let driver: ContainerDriver | undefined;
-  let loadPromise: Promise<ContainerDriver> | undefined;
-  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
-    if (driver !== undefined) return driver;
-    loadPromise ??= import('./flac/flac-driver.ts').then((m) => m.FlacDriver);
-    driver = await loadPromise;
-    return driver;
+/**
+ * The lazily-loaded image capability surface. The load promise lives in this closure — one per
+ * registration, so engines in the same process never share resolution state through a module global.
+ */
+function lazyImageOps(): ImageOps {
+  let imageOpsPromise: Promise<ImageOps> | undefined;
+  const loadImageOps = (): Promise<ImageOps> => {
+    imageOpsPromise ??= import('../codecs/image/image-driver.ts').then((m) => m.imageOps);
+    return imageOpsPromise;
   };
   return {
-    id: 'flac',
-    apiVersion: DRIVER_API_VERSION,
-    kind: 'container',
-    formats: ['flac'],
-    streamCopyTargets: ['ogg'],
-    supports(q: ContainerQuery): boolean {
-      return matchesFlac(q);
+    formats: IMAGE_FORMATS,
+    sniff: sniffImageFormat,
+    probe(bytes: Uint8Array): Promise<ImageInfo> {
+      return loadImageOps().then((ops) => ops.probe(bytes));
     },
-    async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
-      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const info =
-        (await readSeekableFlacStreamInfo(src, o?.signal)) ??
-        parseFlacStreamInfo(await readByteStream(src.stream()));
-      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      return [flacTrackInfo(info)];
+    canDecode(): boolean {
+      return typeof ImageDecoder !== 'undefined';
     },
-    async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
-      const bytes = await readFlacBytes(src);
-      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      const table = flacPacketInfoTable(bytes);
-      if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-      return table;
-    },
-    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-      const bytes = await readFlacBytes(src);
-      const layout = flacMetadataLayout(bytes);
-      const frames = fastFlacFrames(bytes, layout);
-      const track = flacTrackInfo(layout.info, bytes.slice(layout.start, layout.audioStart));
-      return {
-        tracks: [track],
-        packets(trackId: number): ReadableStream<Packet> {
-          if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
-          return flacPacketStream(bytes, frames, o?.signal);
+    decode(bytes: Uint8Array, options?: DecodeImageOptions): ReadableStream<VideoFrame> {
+      let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
+      return new ReadableStream<VideoFrame>(
+        {
+          async pull(controller): Promise<void> {
+            try {
+              reader ??= (await loadImageOps()).decode(bytes, options).getReader();
+              const { done, value } = await reader.read();
+              if (done) {
+                controller.close();
+                return;
+              }
+              try {
+                controller.enqueue(value);
+              } catch (e) {
+                value.close();
+                throw e;
+              }
+            } catch (e) {
+              controller.error(e);
+            }
+          },
+          async cancel(reason): Promise<void> {
+            await reader?.cancel(reason).catch(() => {});
+          },
         },
-        close: () => Promise.resolve(),
-      };
+        { highWaterMark: 0 },
+      );
     },
-    createMuxer(o?: MuxOptions): Muxer {
-      return new LazyFlacMuxer(load, o);
-    },
-    async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
-      const streamCopy = (await load()).streamCopy;
-      if (streamCopy === undefined) throw missingLazyMethod('flac', 'streamCopy');
-      return streamCopy(src, o);
-    },
-    async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-      const decodePcm = (await load()).decodePcm;
-      if (decodePcm === undefined) throw missingLazyMethod('flac', 'decodePcm');
-      return decodePcm(src, o);
-    },
-    async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
-      const decodePcmAudio = (await load()).decodePcmAudio;
-      if (decodePcmAudio === undefined) throw missingLazyMethod('flac', 'decodePcmAudio');
-      return decodePcmAudio(src, o);
-    },
-    async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-      const transformPcm = (await load()).transformPcm;
-      if (transformPcm === undefined) throw missingLazyMethod('flac', 'transformPcm');
-      return transformPcm(src, o);
+    async *decodeFrames(
+      bytes: Uint8Array,
+      options?: DecodeImageOptions,
+    ): AsyncGenerator<VideoFrame, void, undefined> {
+      yield* (await loadImageOps()).decodeFrames(bytes, options);
     },
   };
-}
-
-async function readFlacBytes(src: ByteSource): Promise<Uint8Array> {
-  if (src.range !== undefined && src.size !== undefined) return src.range(0, src.size);
-  return readByteStream(src.stream());
-}
-
-function flacPacketStream(
-  bytes: Uint8Array,
-  frames: readonly FastFlacFrameSpan[],
-  signal: AbortSignal | undefined,
-): ReadableStream<Packet> {
-  if (typeof EncodedAudioChunk === 'undefined') {
-    throw new CapabilityError(
-      'capability-miss',
-      'FLAC packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-      { op: 'demux', tried: ['flac'] },
-    );
-  }
-  let i = 0;
-  return new ReadableStream<Packet>({
-    pull(controller): void {
-      if (signal?.aborted) {
-        controller.error(new MediaError('aborted', 'operation aborted'));
-        return;
-      }
-      const frame = frames[i];
-      if (frame === undefined) {
-        controller.close();
-        return;
-      }
-      i++;
-      const data = bytes.slice(frame.offset, frame.offset + frame.size);
-      const chunk = new EncodedAudioChunk({
-        type: 'key',
-        timestamp: frame.ptsUs,
-        duration: frame.durationUs,
-        data,
-      });
-      controller.enqueue({ chunk, data, sizeBytes: frame.size });
-    },
-  });
-}
-
-async function readByteStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  try {
-    const first = await reader.read();
-    if (first.done) return new Uint8Array(0);
-    const second = await reader.read();
-    if (second.done) return first.value;
-
-    const chunks = [first.value, second.value];
-    let total = first.value.byteLength + second.value.byteLength;
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      chunks.push(next.value);
-      total += next.value.byteLength;
-    }
-    const out = new Uint8Array(total);
-    let at = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, at);
-      at += chunk.byteLength;
-    }
-    return out;
-  } catch (error) {
-    await reader.cancel(error).catch(() => undefined);
-    throw error;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-const AVI_MIMES = new Set(['video/avi', 'video/x-msvideo', 'video/msvideo', 'video/vnd.avi']);
-
-function lazyAviContainerDriver(): ContainerDriver {
-  let driver: ContainerDriver | undefined;
-  let loadPromise: Promise<ContainerDriver> | undefined;
-  const load: LazyContainerLoader = async (): Promise<ContainerDriver> => {
-    if (driver !== undefined) return driver;
-    loadPromise ??= import('./avi/avi-driver.ts').then((m) => m.AviDriver);
-    driver = await loadPromise;
-    return driver;
-  };
-  return {
-    id: 'avi',
-    apiVersion: DRIVER_API_VERSION,
-    kind: 'container',
-    formats: ['avi'],
-    supports: matchesAvi,
-    async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
-      return (await load()).demux(src, o);
-    },
-    createMuxer(o?: MuxOptions): Muxer {
-      return new LazyContainerMuxer(load, o);
-    },
-  };
-}
-
-function matchesAvi(q: ContainerQuery): boolean {
-  if (q.mime !== undefined && AVI_MIMES.has(q.mime)) return true;
-  if (q.extension?.toLowerCase() === 'avi') return true;
-  const head = q.head;
-  return (
-    head !== undefined &&
-    head.byteLength >= 12 &&
-    head[0] === 0x52 &&
-    head[1] === 0x49 &&
-    head[2] === 0x46 &&
-    head[3] === 0x46 &&
-    head[8] === 0x41 &&
-    head[9] === 0x56 &&
-    head[10] === 0x49 &&
-    head[11] === 0x20
-  );
-}
-
-function missingLazyMethod(id: string, method: string): CapabilityError {
-  return new CapabilityError('capability-miss', `lazy ${id} driver lacks ${method}`, {
-    op: id,
-    tried: [id],
-  });
 }
 
 function lazyFilterDrivers(): readonly FilterDriver[] {
@@ -790,117 +505,16 @@ function lazyFilter(options: {
       stage?: StageOptions,
     ): TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData> {
       if (!options.supports(spec)) {
-        throw new CapabilityError(
-          'capability-miss',
-          `${options.id} does not support ${spec.type}`,
-          {
-            op: 'filter',
-            tried: [options.id],
-          },
-        );
+        throw new CapabilityError(`${options.id} does not support ${spec.type}`, {
+          op: { kind: 'filter', spec },
+          tried: [options.id],
+        });
       }
       return createLazyFilterStream(
         async () => (await load()).createFilter(spec, stage) as TransformStream<RawFrame, RawFrame>,
       ) as TransformStream<VideoFrame, VideoFrame> | TransformStream<AudioData, AudioData>;
     },
   };
-}
-
-/** Minimal closable-frame shape the lazy wrapper touches (a `VideoFrame`/`AudioData`, structurally). */
-export interface LazyFilterFrame {
-  close(): void;
-}
-
-/**
- * `Transformer` plus the standard `cancel(reason)` hook (invoked when the readable side is cancelled).
- * The bundled `lib.dom` `Transformer` predates `cancel`; the local extension keeps strict mode honest
- * (same idiom as `webcodecs-video.ts`).
- */
-interface TransformerWithCancel<I, O> extends Transformer<I, O> {
-  cancel?: (reason?: unknown) => void | PromiseLike<void>;
-}
-
-/**
- * Wrap a lazily-created same-type filter stage so its driver module loads only when a frame actually
- * flows (doc 08 §7 budget split). The wiring is load-bearing for every filtered convert:
- *
- * - **Writable `highWaterMark` must be ≥ 1.** A zero-HWM writable never reports room, so the upstream
- *   `pipeTo` waits on `writer.ready` forever and the whole decode→filter→encode chain stalls silently
- *   before the first frame — the Session-10 transcode-timeout regression (ADR-186).
- * - **Backpressure is real in both directions:** `transform` awaits the inner write, and the output pump
- *   enqueues into the outer readable (HWM 1) whose fullness throttles the outer writable, so in-flight
- *   frames stay bounded for any stage shape (1:1, buffering-with-flush-tail, or fan-out).
- * - **Close-once:** an input the inner sink never accepted is closed here; an inner output that loses
- *   the race against a downstream cancel is closed instead of thrown out of the pump.
- */
-export function createLazyFilterStream<F extends LazyFilterFrame>(
-  create: () => Promise<TransformStream<F, F>>,
-): TransformStream<F, F> {
-  let writer: WritableStreamDefaultWriter<F> | undefined;
-  let reader: ReadableStreamDefaultReader<F> | undefined;
-  let pump: Promise<void> | undefined;
-  let outerDead = false;
-
-  const ensure = async (
-    controller: TransformStreamDefaultController<F>,
-  ): Promise<WritableStreamDefaultWriter<F>> => {
-    if (writer !== undefined) return writer;
-    const stream = await create();
-    writer = stream.writable.getWriter();
-    const activeReader = stream.readable.getReader();
-    reader = activeReader;
-    pump = (async (): Promise<void> => {
-      try {
-        for (;;) {
-          const { done, value } = await activeReader.read();
-          if (done) return;
-          if (outerDead) {
-            value.close(); // downstream already cancelled: release, never enqueue into a dead stream
-            continue;
-          }
-          try {
-            controller.enqueue(value);
-          } catch {
-            value.close(); // lost the close→enqueue race: release the frame, stop pumping
-            return;
-          }
-        }
-      } catch (error) {
-        if (!outerDead) controller.error(error);
-      } finally {
-        activeReader.releaseLock();
-      }
-    })();
-    return writer;
-  };
-
-  const transformer: TransformerWithCancel<F, F> = {
-    async transform(frame, controller): Promise<void> {
-      let activeWriter: WritableStreamDefaultWriter<F>;
-      try {
-        activeWriter = await ensure(controller);
-      } catch (error) {
-        frame.close();
-        throw error;
-      }
-      await activeWriter.write(frame);
-    },
-    async flush(): Promise<void> {
-      if (writer === undefined) return;
-      await writer.close();
-      await pump;
-    },
-    cancel(reason): void {
-      // Initiate teardown without awaiting it: WHATWG abort/cancel settle only after any in-flight
-      // inner write finishes, so awaiting here would let a stuck stage block cancellation forever.
-      // The inner driver releases its own resources via its abort/cancel hooks and StageOptions signal.
-      outerDead = true;
-      void writer?.abort(reason).catch(() => {});
-      void reader?.cancel(reason).catch(() => {});
-    },
-  };
-
-  return new TransformStream<F, F>(transformer, { highWaterMark: 1 }, { highWaterMark: 1 });
 }
 
 function webgpuFilterSupports(spec: FilterSpec): boolean {
@@ -915,34 +529,11 @@ function canvas2dFilterSupports(spec: FilterSpec): boolean {
   return spec.mediaType === 'video' && spec.type === 'colorspace' && isDisplayColorToken(spec.to);
 }
 
-function webgpuAvailable(): boolean {
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  if (/\bFirefox\//.test(ua)) return false;
-  return (
-    typeof navigator !== 'undefined' &&
-    typeof (navigator as Navigator & { gpu?: unknown }).gpu !== 'undefined' &&
-    typeof OffscreenCanvas !== 'undefined' &&
-    typeof VideoFrame !== 'undefined'
-  );
-}
-
-function canvas2dAvailable(): boolean {
-  return typeof OffscreenCanvas !== 'undefined' && typeof VideoFrame !== 'undefined';
-}
-
 function cpuVideoFilterSupports(spec: FilterSpec): boolean {
   if (spec.mediaType !== 'video' || typeof VideoFrame === 'undefined') return false;
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   const chromiumCanvasTonemap =
-    typeof OffscreenCanvas !== 'undefined' &&
-    /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) &&
-    !/\bFirefox\//.test(ua);
+    typeof OffscreenCanvas !== 'undefined' && chromiumCanvasTonemapAvailable();
   return !(spec.type === 'tonemap' && chromiumCanvasTonemap);
-}
-
-function chromiumCanvasTonemapAvailable(): boolean {
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  return /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) && !/\bFirefox\//.test(ua);
 }
 
 function isGeometricVideoFilterSpec(spec: FilterSpec): boolean {
@@ -962,225 +553,16 @@ function isDisplayColorToken(token: string): boolean {
   );
 }
 
-class LazyFlacMuxer implements Muxer {
-  readonly output: ReadableStream<Uint8Array>;
-  readonly #load: LazyContainerLoader;
-  readonly #options: MuxOptions | undefined;
-  readonly #ready: Promise<void>;
-  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-  #resolveReady: (() => void) | undefined;
-  #muxer: Muxer | undefined;
-  #muxerPromise: Promise<Muxer> | undefined;
-  #track: TrackInfo | undefined;
-  #targetTrackId: number | undefined;
-
-  constructor(load: LazyContainerLoader, options?: MuxOptions) {
-    this.#load = load;
-    this.#options = options;
-    this.#ready = new Promise<void>((resolve) => {
-      this.#resolveReady = resolve;
-    });
-    this.output = new ReadableStream<Uint8Array>({
-      start: (controller): void => {
-        this.#controller = controller;
-        this.#resolveReady?.();
-      },
-    });
-  }
-
-  addTrack(info: TrackInfo): number {
-    if (this.#track !== undefined) {
-      throw new CapabilityError('capability-miss', 'the FLAC muxer writes a single audio stream', {
-        op: { op: 'mux' },
-        tried: ['flac'],
-      });
-    }
-    if (info.mediaType !== 'audio' || info.codec !== 'flac') {
-      throw new CapabilityError(
-        'capability-miss',
-        `FLAC container carries a single FLAC audio track, not ${info.mediaType}/${info.codec}`,
-        { op: { op: 'mux' }, tried: ['flac'] },
-      );
-    }
-    this.#track = info;
-    return 0;
-  }
-
-  async write(trackId: number, packet: Packet): Promise<void> {
-    const muxer = await this.#ensureMuxer();
-    await muxer.write(this.#targetTrackId ?? trackId, packet);
-  }
-
-  async finalize(): Promise<void> {
-    const muxer = await this.#ensureMuxer();
-    await muxer.finalize();
-  }
-
-  async #ensureMuxer(): Promise<Muxer> {
-    if (this.#muxer !== undefined) return this.#muxer;
-    this.#muxerPromise ??= this.#createMuxer();
-    return this.#muxerPromise;
-  }
-
-  async #createMuxer(): Promise<Muxer> {
-    try {
-      const driver = await this.#load();
-      const muxer = driver.createMuxer(this.#options);
-      this.#muxer = muxer;
-      this.#pumpOutput(muxer.output);
-      if (this.#track !== undefined) this.#targetTrackId = muxer.addTrack(this.#track);
-      return muxer;
-    } catch (error) {
-      await this.#errorOutput(error);
-      throw error;
-    }
-  }
-
-  #pumpOutput(output: ReadableStream<Uint8Array>): void {
-    void (async (): Promise<void> => {
-      await this.#ready;
-      const controller = this.#controller;
-      if (controller === undefined) return;
-      const reader = output.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) {
-            controller.close();
-            return;
-          }
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        controller.error(error);
-      } finally {
-        reader.releaseLock();
-      }
-    })();
-  }
-
-  async #errorOutput(error: unknown): Promise<void> {
-    await this.#ready;
-    this.#controller?.error(error);
-  }
+function codec(q: CodecQuery): string {
+  return q.config.codec.toLowerCase();
 }
 
-class LazyContainerMuxer implements Muxer {
-  readonly output: ReadableStream<Uint8Array>;
-  readonly #load: LazyContainerLoader;
-  readonly #options: MuxOptions | undefined;
-  readonly #validateTrack: ((track: TrackInfo, trackCount: number) => void) | undefined;
-  readonly #ready: Promise<void>;
-  readonly #tracks: TrackInfo[] = [];
-  readonly #targetTrackIds: number[] = [];
-  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-  #resolveReady: (() => void) | undefined;
-  #muxer: Muxer | undefined;
-  #muxerPromise: Promise<Muxer> | undefined;
+function audioDecode(q: CodecQuery): boolean {
+  return q.mediaType === 'audio' && q.direction === 'decode';
+}
 
-  constructor(
-    load: LazyContainerLoader,
-    options?: MuxOptions,
-    validateTrack?: (track: TrackInfo, trackCount: number) => void,
-  ) {
-    this.#load = load;
-    this.#options = options;
-    this.#validateTrack = validateTrack;
-    this.#ready = new Promise<void>((resolve) => {
-      this.#resolveReady = resolve;
-    });
-    this.output = new ReadableStream<Uint8Array>({
-      start: (controller): void => {
-        this.#controller = controller;
-        this.#resolveReady?.();
-      },
-    });
-  }
-
-  addTrack(info: TrackInfo): number {
-    this.#validateTrack?.(info, this.#tracks.length);
-    const id = this.#tracks.length;
-    this.#tracks.push(info);
-    if (this.#muxer !== undefined) {
-      this.#targetTrackIds[id] = this.#muxer.addTrack(info);
-    }
-    return id;
-  }
-
-  async write(trackId: number, packet: Packet): Promise<void> {
-    const muxer = await this.#ensureMuxer();
-    const targetTrackId = this.#targetTrackIds[trackId];
-    if (targetTrackId === undefined)
-      throw new MediaError('mux-error', `write to unknown track ${trackId}`);
-    await muxer.write(targetTrackId, packet);
-  }
-
-  async writePcm(trackId: number, data: Uint8Array): Promise<void> {
-    const muxer = await this.#ensureMuxer();
-    const targetTrackId = this.#targetTrackIds[trackId];
-    if (targetTrackId === undefined)
-      throw new MediaError('mux-error', `write PCM to unknown track ${trackId}`);
-    if (muxer.writePcm === undefined) {
-      throw new CapabilityError('capability-miss', 'the selected muxer has no raw PCM frame seam', {
-        op: { op: 'mux', mediaType: 'audio', codec: 'pcm' },
-        tried: [],
-      });
-    }
-    await muxer.writePcm(targetTrackId, data);
-  }
-
-  async finalize(): Promise<void> {
-    const muxer = await this.#ensureMuxer();
-    await muxer.finalize();
-  }
-
-  async #ensureMuxer(): Promise<Muxer> {
-    if (this.#muxer !== undefined) return this.#muxer;
-    this.#muxerPromise ??= this.#createMuxer();
-    return this.#muxerPromise;
-  }
-
-  async #createMuxer(): Promise<Muxer> {
-    try {
-      const driver = await this.#load();
-      const muxer = driver.createMuxer(this.#options);
-      this.#muxer = muxer;
-      this.#pumpOutput(muxer.output);
-      for (const track of this.#tracks) this.#targetTrackIds.push(muxer.addTrack(track));
-      return muxer;
-    } catch (error) {
-      await this.#errorOutput(error);
-      throw error;
-    }
-  }
-
-  #pumpOutput(output: ReadableStream<Uint8Array>): void {
-    void (async (): Promise<void> => {
-      await this.#ready;
-      const controller = this.#controller;
-      if (controller === undefined) return;
-      const reader = output.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) {
-            controller.close();
-            return;
-          }
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        controller.error(error);
-      } finally {
-        reader.releaseLock();
-      }
-    })();
-  }
-
-  async #errorOutput(error: unknown): Promise<void> {
-    await this.#ready;
-    this.#controller?.error(error);
-  }
+function videoDecode(q: CodecQuery): boolean {
+  return q.mediaType === 'video' && q.direction === 'decode';
 }
 
 function lazyCodecDrivers(): readonly CodecDriver[] {
@@ -1257,8 +639,8 @@ function lazyCodec(spec: LazyCodecSpec): CodecDriver {
     return driver;
   };
   const unavailable = (): CapabilityError =>
-    new CapabilityError('capability-miss', `${spec.id} was not loaded`, {
-      op: 'codec',
+    new CapabilityError(`${spec.id} was not loaded`, {
+      op: { kind: 'route', id: 'codec' },
       tried: [spec.id],
     });
   return {

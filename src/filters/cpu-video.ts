@@ -94,17 +94,11 @@ const RGBA = 4;
  */
 export function rgbaCopyBufferSize(width: number, height: number): number {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
-    throw new InputError(
-      'unsupported-input',
-      `RGBA copy dimensions must be positive integers (${width}×${height})`,
-    );
+    throw new InputError(`RGBA copy dimensions must be positive integers (${width}×${height})`);
   }
   const size = width * height * RGBA;
   if (!Number.isSafeInteger(size)) {
-    throw new InputError(
-      'unsupported-input',
-      `RGBA copy buffer size is not safely representable (${width}×${height})`,
-    );
+    throw new InputError(`RGBA copy buffer size is not safely representable (${width}×${height})`);
   }
   return size;
 }
@@ -218,7 +212,7 @@ export function applyColorPlanToRgba(plan: ColorPlan, src: RgbaImage): RgbaImage
 function invertAffine(t: Affine): Affine {
   // For [[a c][b d]] (Canvas order) with translation (e,f): inverse linear part / -inv·translation.
   const det = t.a * t.d - t.b * t.c;
-  if (det === 0) throw new InputError('unsupported-input', 'degenerate orientation transform');
+  if (det === 0) throw new InputError('degenerate orientation transform');
   const ia = t.d / det;
   const ib = -t.b / det;
   const ic = -t.c / det;
@@ -401,7 +395,7 @@ export function planCpuColor(spec: ColorVideoSpec, source: SourceColor): ColorPl
   if (spec.type === 'tonemap') return planTonemap(source);
   const dst = parseColorSpace(spec.to);
   if (dst === null) {
-    throw new InputError('unsupported-input', `unknown colorspace target '${spec.to}'`);
+    throw new InputError(`unknown colorspace target '${spec.to}'`);
   }
   return planColorspace(source, dst);
 }
@@ -580,8 +574,8 @@ export const cpuVideoFilterDriver: FilterDriver = {
   },
   createFilter(f: FilterSpec, o?: StageOptions): TransformStream<VideoFrame, VideoFrame> {
     if (!isCpuVideoSpec(f)) {
-      throw new CapabilityError('capability-miss', `cpu filter does not handle ${f.type}`, {
-        op: 'filter',
+      throw new CapabilityError(`cpu filter does not handle ${f.type}`, {
+        op: { kind: 'route', id: 'filter' },
         tried: [cpuVideoFilterDriver.id],
       });
     }

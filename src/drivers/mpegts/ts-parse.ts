@@ -562,7 +562,6 @@ export function parseTs(bytes: Uint8Array): TsParse {
   const framing = detectFraming(bytes);
   if (!framing) {
     throw new InputError(
-      'unsupported-input',
       'not an MPEG-TS stream (no transport sync run found — encrypted, scrambled, or not a transport stream)',
     );
   }
@@ -673,12 +672,11 @@ export function parseTs(bytes: Uint8Array): TsParse {
   }
 
   if (!sawSync) {
-    throw new InputError('unsupported-input', 'no readable transport packets (corrupt MPEG-TS)');
+    throw new InputError('no readable transport packets (corrupt MPEG-TS)');
   }
   if (streamsByPid.size === 0) {
     if (sawScrambled) {
       throw new InputError(
-        'unsupported-input',
         'MPEG-TS payloads are scrambled/encrypted (no cleartext PSI) — decrypt before demux',
       );
     }

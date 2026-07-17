@@ -197,8 +197,8 @@ export class AdtsFrameWalker {
     const firstHeader = this.#firstHeader;
     if (firstHeader === undefined || this.#frames === 0) {
       throw this.#sawSyncAtStart
-        ? new InputError('unsupported-input', 'ADTS: no decodable frames')
-        : new InputError('unsupported-input', 'not an ADTS/AAC stream (no 0xFFF syncword)');
+        ? new InputError('ADTS: no decodable frames')
+        : new InputError('not an ADTS/AAC stream (no 0xFFF syncword)');
     }
     return {
       frames: this.#frames,

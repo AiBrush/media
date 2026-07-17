@@ -70,7 +70,7 @@ export function parseFlac(bytes: Uint8Array): FlacInfo {
 export function nativeFlacMetadata(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   const start = flacOffset(bytes);
   if (bytes.byteLength < start + 8 || ascii(bytes, start, 4) !== 'fLaC') {
-    throw new InputError('unsupported-input', 'not a native FLAC stream (no fLaC marker)');
+    throw new InputError('not a native FLAC stream (no fLaC marker)');
   }
   let at = start + 4;
   for (;;) {
@@ -95,18 +95,15 @@ function writeFlacPacketCopy(
 ): Uint8Array<ArrayBuffer> {
   const layout = flacMetadataLayout(bytes);
   if (trim !== undefined) {
-    if (trim.startSec < 0) throw new InputError('unsupported-input', 'trim start < 0');
+    if (trim.startSec < 0) throw new InputError('trim start < 0');
     if (trim.endSec <= trim.startSec) {
-      throw new InputError(
-        'unsupported-input',
-        trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range',
-      );
+      throw new InputError(trim.endSec === trim.startSec ? 'empty trim range' : 'bad trim range');
     }
     if (trim.startSec >= layout.info.durationSec) {
-      throw new InputError('unsupported-input', 'trim start >= duration');
+      throw new InputError('trim start >= duration');
     }
     if (trim.endSec > layout.info.durationSec) {
-      throw new InputError('unsupported-input', 'trim end > duration');
+      throw new InputError('trim end > duration');
     }
   }
   const frames = fastFlacFrames(bytes, layout);
@@ -123,7 +120,7 @@ function writeFlacPacketCopy(
           return frameEnd > (startSample ?? 0) && frameStart < (endSample ?? 0);
         });
   if (selected.length === 0) {
-    throw new InputError('unsupported-input', 'FLAC trim selected no audio frames');
+    throw new InputError('FLAC trim selected no audio frames');
   }
   const fullSelection =
     selected.length === frames.length &&
@@ -255,9 +252,8 @@ function packetStream(
 ): ReadableStream<Packet> {
   if (typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'FLAC packet demux requires the browser codec layer (WebCodecs EncodedAudioChunk)',
-      { op: 'demux', tried: ['flac'] },
+      { op: { kind: 'route', id: 'demux' }, tried: ['flac'] },
     );
   }
   /* v8 ignore start -- requires WebCodecs EncodedAudioChunk; validated under browser-mode (codec phase) */
@@ -733,14 +729,10 @@ export const FlacDriver: ContainerDriver = {
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     if (o?.container === 'ogg') {
       if (o.trim !== undefined) {
-        throw new CapabilityError(
-          'capability-miss',
-          'FLAC to Ogg packet-copy trim is not declared',
-          {
-            op: { op: 'streamCopy', container: 'ogg', trim: true },
-            tried: ['flac', 'ogg'],
-          },
-        );
+        throw new CapabilityError('FLAC to Ogg packet-copy trim is not declared', {
+          op: { kind: 'route', id: 'streamCopy', facts: { container: 'ogg', trim: true } },
+          tried: ['flac', 'ogg'],
+        });
       }
       return await writeFlacOggPacketCopy(bytes);
     }
@@ -790,8 +782,8 @@ export const FlacDriver: ContainerDriver = {
   },
   createMuxer(o?: MuxOptions): Muxer {
     if (o?.fragmented === true) {
-      throw new CapabilityError('capability-miss', 'FLAC has no fragmented/segmented mux form', {
-        op: { op: 'mux', fragmented: true },
+      throw new CapabilityError('FLAC has no fragmented/segmented mux form', {
+        op: { kind: 'route', id: 'mux', facts: { fragmented: true } },
         tried: ['flac'],
       });
     }

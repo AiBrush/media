@@ -107,7 +107,7 @@ export function imageInfoToMediaMetadata(
 
 /** A read past the end of the buffer means the header is truncated — reject, never fabricate. */
 function truncated(format: string): never {
-  throw new InputError('unsupported-input', `${format}: truncated/garbled image header`);
+  throw new InputError(`${format}: truncated/garbled image header`);
 }
 
 function u8(b: Uint8Array, i: number, format: string): number {
@@ -206,7 +206,7 @@ export function probeGif(b: Uint8Array): ImageInfo {
   const fmt = 'gif';
   const version = ascii(b, 0, 6);
   if (version !== 'GIF87a' && version !== 'GIF89a') {
-    throw new InputError('unsupported-input', 'gif: bad signature');
+    throw new InputError('gif: bad signature');
   }
   const width = u16le(b, 6, fmt);
   const height = u16le(b, 8, fmt);
@@ -254,10 +254,10 @@ export function probeGif(b: Uint8Array): ImageInfo {
       }
       i = skipGifSubBlocks(b, j, fmt);
     } else {
-      throw new InputError('unsupported-input', `gif: unknown block 0x${block.toString(16)}`);
+      throw new InputError(`gif: unknown block 0x${block.toString(16)}`);
     }
   }
-  if (frameCount === 0) throw new InputError('unsupported-input', 'gif: no image frames');
+  if (frameCount === 0) throw new InputError('gif: no image frames');
   return {
     format: fmt,
     width,
@@ -302,7 +302,7 @@ export function probePng(b: Uint8Array): ImageInfo {
   const fmt = 'png';
   for (let k = 0; k < PNG_SIGNATURE.length; k++) {
     if (u8(b, k, fmt) !== PNG_SIGNATURE[k]) {
-      throw new InputError('unsupported-input', 'png: bad signature');
+      throw new InputError('png: bad signature');
     }
   }
   let width = 0;
@@ -338,7 +338,7 @@ export function probePng(b: Uint8Array): ImageInfo {
     if (type === 'IEND') break;
     i = body + len + 4; // skip body + CRC32
   }
-  if (width === 0 || height === 0) throw new InputError('unsupported-input', 'png: missing IHDR');
+  if (width === 0 || height === 0) throw new InputError('png: missing IHDR');
   return {
     format: fmt,
     width,
@@ -367,12 +367,12 @@ function isSofMarker(m: number): boolean {
 export function probeJpeg(b: Uint8Array): ImageInfo {
   const fmt = 'jpeg';
   if (u8(b, 0, fmt) !== 0xff || u8(b, 1, fmt) !== 0xd8) {
-    throw new InputError('unsupported-input', 'jpeg: missing SOI');
+    throw new InputError('jpeg: missing SOI');
   }
   let i = 2;
   for (;;) {
     if (u8(b, i, fmt) !== 0xff) {
-      throw new InputError('unsupported-input', 'jpeg: lost marker sync');
+      throw new InputError('jpeg: lost marker sync');
     }
     // Skip fill bytes (0xFF padding) before the marker code.
     let marker = u8(b, i + 1, fmt);
@@ -422,13 +422,13 @@ export function probeJpeg(b: Uint8Array): ImageInfo {
  */
 export function probeWebp(b: Uint8Array): ImageInfo {
   if (!tagEquals(b, 0, 'RIFF') || !tagEquals(b, 8, 'WEBP')) {
-    throw new InputError('unsupported-input', 'webp: not a RIFF/WEBP container');
+    throw new InputError('webp: not a RIFF/WEBP container');
   }
   const fourcc = ascii(b, 12, 4);
   if (fourcc === 'VP8X') return probeWebpExtended(b);
   if (fourcc === 'VP8 ') return probeWebpLossy(b);
   if (fourcc === 'VP8L') return probeWebpLossless(b);
-  throw new InputError('unsupported-input', `webp: unknown stream '${fourcc.trim()}'`);
+  throw new InputError(`webp: unknown stream '${fourcc.trim()}'`);
 }
 
 /** VP8 lossy simple: the keyframe header has 14-bit width/height (+ a 2-bit scale) after the start code. */
@@ -443,8 +443,7 @@ function probeWebpLossy(b: Uint8Array): ImageInfo {
 /** VP8L lossless simple: a 1-byte signature then 14-bit (width-1) and 14-bit (height-1), little-endian. */
 function probeWebpLossless(b: Uint8Array): ImageInfo {
   const fmt = 'webp';
-  if (u8(b, 20, fmt) !== 0x2f)
-    throw new InputError('unsupported-input', 'webp: bad VP8L signature');
+  if (u8(b, 20, fmt) !== 0x2f) throw new InputError('webp: bad VP8L signature');
   const bits = u32le(b, 21, fmt);
   const width = (bits & 0x3fff) + 1;
   const height = ((bits >> 14) & 0x3fff) + 1;
@@ -487,7 +486,7 @@ function probeWebpExtended(b: Uint8Array): ImageInfo {
 
   const color = alpha ? 'rgba' : 'rgb';
   if (animatedFlag) {
-    if (frameCount === 0) throw new InputError('unsupported-input', 'webp: animated but no frames');
+    if (frameCount === 0) throw new InputError('webp: animated but no frames');
     return {
       format: fmt,
       width,
@@ -543,12 +542,12 @@ const FULLBOX_CONTAINERS = new Set(['meta']);
  */
 export function probeAvif(b: Uint8Array): ImageInfo {
   const fmt = 'avif';
-  if (!tagEquals(b, 4, 'ftyp')) throw new InputError('unsupported-input', 'avif: missing ftyp');
+  if (!tagEquals(b, 4, 'ftyp')) throw new InputError('avif: missing ftyp');
   const sequence = ftypHasBrand(b, 'avis');
   const acc: AvifAcc = { width: 0, height: 0, bitDepth: 8, sampleCount: 0 };
   walkAvifBoxes(b, 0, b.length, acc, fmt);
   if (acc.width === 0 || acc.height === 0) {
-    throw new InputError('unsupported-input', 'avif: no ispe (image dimensions)');
+    throw new InputError('avif: no ispe (image dimensions)');
   }
   const frameCount = sequence ? Math.max(1, acc.sampleCount) : 1;
   return {
@@ -580,8 +579,7 @@ function walkAvifBoxes(b: Uint8Array, start: number, end: number, acc: AvifAcc, 
     let header = 8;
     if (size === 1) {
       // 64-bit largesize: the low 32 bits suffice for our small fixtures (high word must be 0).
-      if (u32be(b, i + 8, fmt) !== 0)
-        throw new InputError('unsupported-input', 'avif: box too large');
+      if (u32be(b, i + 8, fmt) !== 0) throw new InputError('avif: box too large');
       size = u32be(b, i + 12, fmt);
       header = 16;
     } else if (size === 0) {
@@ -589,7 +587,7 @@ function walkAvifBoxes(b: Uint8Array, start: number, end: number, acc: AvifAcc, 
     }
     if (size < header || i + size > end) {
       // A box that overruns its parent is a malformed/truncated file — reject, never guess.
-      throw new InputError('unsupported-input', 'avif: malformed box length');
+      throw new InputError('avif: malformed box length');
     }
     const body = i + header;
     readAvifBox(b, type, body, i + size, acc, fmt);
@@ -650,10 +648,7 @@ export function probeImage(bytes: Uint8Array): ImageInfo {
     case 'avif':
       return probeAvif(bytes);
     case undefined:
-      throw new InputError(
-        'unsupported-input',
-        'not a recognized image (expected GIF/PNG/JPEG/WebP/AVIF magic)',
-      );
+      throw new InputError('not a recognized image (expected GIF/PNG/JPEG/WebP/AVIF magic)');
     /* v8 ignore next 2 -- ImageFormat is exhaustive; TypeScript prevents this branch. */
     default:
       return assertNever(format);
@@ -663,5 +658,5 @@ export function probeImage(bytes: Uint8Array): ImageInfo {
 /** Exhaustiveness guard: the `switch` above covers every {@link ImageFormat}; this is unreachable. */
 /* v8 ignore next 3 -- Defensive runtime guard for impossible future format widening. */
 function assertNever(x: never): never {
-  throw new InputError('unsupported-input', `unhandled image format ${String(x)}`);
+  throw new InputError(`unhandled image format ${String(x)}`);
 }

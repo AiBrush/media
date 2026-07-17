@@ -345,8 +345,8 @@ export function resample(
   options: ResampleOptions = {},
 ): PcmAudio {
   if (!Number.isInteger(outRate) || outRate <= 0) {
-    throw new CapabilityError('capability-miss', `invalid target sample rate ${outRate}`, {
-      op: 'filter',
+    throw new CapabilityError(`invalid target sample rate ${outRate}`, {
+      op: { kind: 'route', id: 'filter' },
       tried: [],
     });
   }

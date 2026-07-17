@@ -2740,9 +2740,8 @@ function packetStream(
 ): ReadableStream<Packet> {
   if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
     throw new CapabilityError(
-      'capability-miss',
       'WebCodecs EncodedVideoChunk/EncodedAudioChunk are unavailable in this environment',
-      { op: 'demux', tried: [] },
+      { op: { kind: 'route', id: 'demux' }, tried: [] },
     );
   }
   /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
@@ -3099,8 +3098,8 @@ function resolveKey(
   const kidId = formatKid(kid);
   const hexKey = keys[kidId];
   if (hexKey === undefined) {
-    throw new CapabilityError('capability-miss', `no key provided for KID ${kidId}`, {
-      op: 'decrypt',
+    throw new CapabilityError(`no key provided for KID ${kidId}`, {
+      op: { kind: 'route', id: 'decrypt' },
       tried: ['mp4'],
     });
   }
@@ -3158,11 +3157,10 @@ async function decryptCencTrack(
 ): Promise<MuxTrackInput> {
   const containerScheme = supportedCencScheme(enc.schemeType);
   if (!containerScheme) {
-    throw new CapabilityError(
-      'capability-miss',
-      `unsupported MP4 protection scheme '${enc.schemeType}'`,
-      { op: 'decrypt', tried: ['mp4'] },
-    );
+    throw new CapabilityError(`unsupported MP4 protection scheme '${enc.schemeType}'`, {
+      op: { kind: 'route', id: 'decrypt' },
+      tried: ['mp4'],
+    });
   }
   if (containerScheme !== declaredScheme) {
     throw new MediaError(
@@ -3344,11 +3342,10 @@ async function decryptAndVerifyCencTrack(
 function hlsKeyField(keys: Record<string, string>, field: 'key' | 'iv'): Uint8Array<ArrayBuffer> {
   const hex = keys[field];
   if (hex === undefined) {
-    throw new CapabilityError(
-      'capability-miss',
-      `HLS AES-128 needs '${field}' (hex) in keys; none provided`,
-      { op: 'decrypt', tried: ['mp4'] },
-    );
+    throw new CapabilityError(`HLS AES-128 needs '${field}' (hex) in keys; none provided`, {
+      op: { kind: 'route', id: 'decrypt' },
+      tried: ['mp4'],
+    });
   }
   return hexToBytes(hex);
 }
@@ -4146,21 +4143,21 @@ function validateStreamCopyTrimRange(
   const startSec = trim.startSec;
   const endSec = trim.endSec;
   if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
-    throw new InputError('unsupported-input', 'bad trim');
+    throw new InputError('bad trim');
   }
   if (startSec < 0) {
-    throw new InputError('unsupported-input', 'start<0');
+    throw new InputError('start<0');
   }
   if (endSec <= startSec) {
-    throw new InputError('unsupported-input', 'empty trim');
+    throw new InputError('empty trim');
   }
   const durationSec = movie.tracks.reduce((max, track) => Math.max(max, track.durationSec), 0);
   if (durationSec > 0) {
     if (startSec >= durationSec) {
-      throw new InputError('unsupported-input', 'start>=duration');
+      throw new InputError('start>=duration');
     }
     if (endSec > durationSec + TRIM_END_RANGE_SLACK_SEC) {
-      throw new InputError('unsupported-input', 'end>duration');
+      throw new InputError('end>duration');
     }
   }
 }
@@ -4395,9 +4392,8 @@ export const Mp4Driver: ContainerDriver = {
     // CENC sample decryption: 'cenc' (AES-CTR), 'cens' (AES-CTR pattern), or 'cbcs' (AES-CBC pattern).
     if (o.scheme !== CENC_SCHEME && o.scheme !== CENS_SCHEME && o.scheme !== CBCS_SCHEME) {
       throw new CapabilityError(
-        'capability-miss',
         `mp4 decrypt supports cenc/cens/cbcs/hls-aes128, not '${o.scheme}'`,
-        { op: 'decrypt', tried: ['mp4'] },
+        { op: { kind: 'route', id: 'decrypt' }, tried: ['mp4'] },
       );
     }
     const movie = await readMovie(ra);

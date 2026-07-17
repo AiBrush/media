@@ -93,7 +93,7 @@ export function frameSamplesForConfig(config: number): number {
 export function parseToc(packet: Uint8Array): OpusToc {
   const toc = packet[0];
   if (toc === undefined) {
-    throw new InputError('unsupported-input', 'opus: empty packet has no TOC byte');
+    throw new InputError('opus: empty packet has no TOC byte');
   }
   const config = toc >> 3;
   return {
@@ -122,7 +122,7 @@ export function packetFrameCount(packet: Uint8Array): number {
     case 3: {
       const fc = packet[1];
       if (fc === undefined) {
-        throw new InputError('unsupported-input', 'opus: code-3 packet missing frame-count byte');
+        throw new InputError('opus: code-3 packet missing frame-count byte');
       }
       const count = fc & 0x3f; // M: low 6 bits (bit 7 = VBR, bit 6 = padding)
       if (count < 1 || count > 48) {

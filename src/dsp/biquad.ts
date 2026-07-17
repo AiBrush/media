@@ -56,7 +56,7 @@ export interface BiquadCoeffs {
 /** Read the required `gainDb` for a parametric-EQ/shelf design (the others ignore it). */
 function requireGain(spec: BiquadSpec): number {
   if (spec.gainDb === undefined || !Number.isFinite(spec.gainDb)) {
-    throw new InputError('unsupported-input', `${spec.type} requires a finite gainDb`);
+    throw new InputError(`${spec.type} requires a finite gainDb`);
   }
   return spec.gainDb;
 }
@@ -70,12 +70,9 @@ function requireGain(spec: BiquadSpec): number {
 export function designBiquad(spec: BiquadSpec, sampleRate: number): BiquadCoeffs {
   const { frequency, q } = spec;
   if (!(frequency > 0 && frequency < sampleRate / 2)) {
-    throw new InputError(
-      'unsupported-input',
-      `biquad frequency ${frequency} must be in (0, ${sampleRate / 2}) Hz`,
-    );
+    throw new InputError(`biquad frequency ${frequency} must be in (0, ${sampleRate / 2}) Hz`);
   }
-  if (!(q > 0)) throw new InputError('unsupported-input', `biquad Q ${q} must be > 0`);
+  if (!(q > 0)) throw new InputError(`biquad Q ${q} must be > 0`);
 
   const w0 = (2 * Math.PI * frequency) / sampleRate;
   const cos = Math.cos(w0);
@@ -279,6 +276,6 @@ export function biquadStage(spec: BiquadSpec, sampleRate: number): StatefulAudio
 /* v8 ignore start -- unreachable exhaustiveness guard (a `never` parameter). */
 /** Exhaustiveness guard — unreachable if the {@link BiquadType} union is fully handled. */
 function exhaustive(value: never): never {
-  throw new InputError('unsupported-input', `unhandled biquad type: ${String(value)}`);
+  throw new InputError(`unhandled biquad type: ${String(value)}`);
 }
 /* v8 ignore stop */

@@ -7,6 +7,8 @@
  * `drainEncoderToMuxer`) are exercised with fake closable items so close-once and ordering are pinned.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type {
   DecoderConfig,
@@ -56,6 +58,7 @@ import {
   periodicVideoKeyFrameInterval,
   qualifiedVideoSourceCodec,
   resolveAudioEncodeTargetForRuntime,
+  resolveVideoEncoderCodecString,
   seekFrame,
   selectTrackInfos,
   sourceVideoBitrateFromPacketTable,
@@ -63,13 +66,21 @@ import {
   transcodeVpxAlphaPackets,
   unwrapPackets,
   videoCodecToken,
-  videoEncoderCodecString,
   videoLatencyMode,
   videoTrackInfoFromDecoderConfig,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
   webkitVideoTranscodeDeclineReason,
 } from './codec-pipeline.ts';
+import {
+  CADENCE_BASELINE_FPS,
+  EVIDENCE_BITRATE_FLOOR,
+  EVIDENCE_BITRATE_HEADROOM,
+  HIGH_CADENCE_FPS_THRESHOLD,
+  IMPLICIT_BITS_PER_PIXEL_PER_SECOND,
+  IMPLICIT_VIDEO_BITRATE_FLOOR,
+  VIDEO_CODEC_RATE_EFFICIENCY,
+} from './encoder-config.ts';
 import type { VideoTarget } from './types.ts';
 import {
   planCfrFrameRetiming,
@@ -977,28 +988,101 @@ describe('videoCodecToken / audioCodecToken', () => {
   });
 });
 
-describe('videoEncoderCodecString', () => {
-  it('maps a token to its default profile string', () => {
-    expect(videoEncoderCodecString('h264', undefined)).toBe('avc1.42E01E');
-    expect(videoEncoderCodecString('hevc', undefined)).toBe('hev1.1.6.L93.B0');
-    expect(videoEncoderCodecString('vp9', undefined)).toBe('vp09.00.10.08');
-    expect(videoEncoderCodecString('av1', undefined)).toBe('av01.0.04M.08');
+describe('resolveVideoEncoderCodecString — the single public video codec-string resolver (item 4)', () => {
+  const src = { width: 1920, height: 1080 };
+
+  it('is the only exported target/source resolver; the legacy doors are private helpers of it', async () => {
+    const surface: Record<string, unknown> & { resolveVideoEncoderCodecString?: unknown } =
+      await import('./codec-pipeline.ts');
+    expect(typeof surface.resolveVideoEncoderCodecString).toBe('function');
+    // The two former public doors (videoEncoderCodecString, h264CodecStringForSourceProfile) and the
+    // internal plan projection must not be exported: one room, one door.
+    expect('videoEncoderCodecString' in surface).toBe(false);
+    expect('h264CodecStringForSourceProfile' in surface).toBe(false);
+    expect('resolvedVideoEncoderCodecString' in surface).toBe(false);
   });
 
-  it('preserves the source codec string when no token is given (same-codec transcode)', () => {
-    expect(videoEncoderCodecString(undefined, 'avc1.640028')).toBe('avc1.640028');
-    expect(videoEncoderCodecString(undefined, 'hvc1.1.6.L150.90')).toBe('hvc1.1.6.L150.90');
-    expect(videoEncoderCodecString(undefined, 'vp09.00.10.08')).toBe('vp09.00.10.08');
+  it('pins explicit-token strings bit-for-bit against the config builder outputs', () => {
+    // Every row equals today's buildVideoEncoderConfig().codec — the resolver projects the SAME plan.
+    const rows: readonly [Parameters<typeof resolveVideoEncoderCodecString>, string][] = [
+      [[{ codec: 'h264' }, src, undefined], 'avc1.42E028'], // 1080p → L4.0
+      [[{ codec: 'h264', width: 320, height: 180 }, src, undefined], 'avc1.42E01E'], // L3.0 floor
+      [[{ codec: 'hevc' }, src, undefined], 'hev1.1.6.L93.B0'],
+      [[{ codec: 'vp8' }, src, undefined], 'vp8'],
+      [[{ codec: 'vp9', width: 1280, height: 720, fps: 30 }, src, undefined], 'vp09.00.40.08'],
+      [[{ codec: 'av1', width: 1280, height: 720, fps: 30 }, src, undefined], 'av01.0.08M.08'],
+    ];
+    for (const [args, expected] of rows) {
+      expect(resolveVideoEncoderCodecString(...args)).toBe(expected);
+      expect(buildVideoEncoderConfig(...args).codec).toBe(expected);
+    }
   });
 
-  it('throws a typed CapabilityError when neither a token nor a recognizable source codec is available', () => {
-    expect(() => videoEncoderCodecString(undefined, undefined)).toThrow(CapabilityError);
-    expect(() => videoEncoderCodecString(undefined, 'mp4a.40.2')).toThrow(CapabilityError); // audio source
+  it('preserves qualified sources verbatim when target facts are unchanged', () => {
+    expect(resolveVideoEncoderCodecString({}, src, 'avc1.640028')).toBe('avc1.640028');
+    expect(resolveVideoEncoderCodecString({}, src, 'hvc1.1.6.L150.90')).toBe('hvc1.1.6.L150.90');
+    expect(resolveVideoEncoderCodecString({}, src, 'vp09.02.50.10')).toBe('vp09.02.50.10');
   });
 
-  it('preserves HEVC Main10 but rejects profiles outside Main/Main10', () => {
-    expect(videoEncoderCodecString(undefined, 'hev1.2.4.L93.90')).toBe('hev1.2.4.L93.90');
-    expect(() => videoEncoderCodecString(undefined, 'hev1.3.4.L120.B0')).toThrow(CapabilityError);
+  it('retains a source H.264 Main/High profile for an explicit h264 token (private helper path)', () => {
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'h264', bitrate: 2_000_000 },
+        { width: 1080, height: 1920, fps: 60 },
+        'avc1.64002A',
+      ),
+    ).toBe('avc1.64002A'); // High (64) retained, level resized to 4.2
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'h264' },
+        { width: 1280, height: 720, fps: 30 },
+        'avc1.4D401F',
+      ),
+    ).toBe('avc1.4D001F'); // Main (4D) retained, compat cleared, L3.1
+  });
+
+  it('authors HEVC Main10 for a 10-bit request and sizes VP9/AV1 level boundaries', () => {
+    expect(resolveVideoEncoderCodecString({ codec: 'hevc', bitDepth: 10 }, src, undefined)).toBe(
+      'hev1.2.4.L120.B0',
+    );
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'vp9', width: 1920, height: 1080, fps: 60 },
+        src,
+        undefined,
+      ),
+    ).toBe('vp09.00.50.08');
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'vp9', width: 3840, height: 2160, fps: 30 },
+        src,
+        undefined,
+      ),
+    ).toBe('vp09.00.52.08');
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'av1', width: 7680, height: 4320, fps: 60 },
+        src,
+        undefined,
+      ),
+    ).toBe('av01.0.18M.08');
+    // An explicit bitrate promotes the level exactly as the config builder does.
+    expect(
+      resolveVideoEncoderCodecString(
+        { codec: 'av1', width: 1280, height: 720, fps: 30, bitrate: 50_000_000 },
+        src,
+        undefined,
+      ),
+    ).toBe('av01.0.14M.08');
+  });
+
+  it('throws the same typed misses as the config builder — never a string for an impossible encode', () => {
+    expect(() => resolveVideoEncoderCodecString({}, src, undefined)).toThrow(CapabilityError);
+    expect(() => resolveVideoEncoderCodecString({}, src, 'mp4a.40.2')).toThrow(CapabilityError);
+    expect(resolveVideoEncoderCodecString({}, src, 'hev1.2.4.L93.90')).toBe('hev1.2.4.L93.90');
+    expect(() => resolveVideoEncoderCodecString({}, src, 'hev1.3.4.L120.B0')).toThrow(
+      CapabilityError,
+    );
   });
 });
 
@@ -3234,8 +3318,8 @@ describe('drainEncoderToMuxer', () => {
     );
     const muxer = {
       addTrack(): number {
-        throw new CapabilityError('capability-miss', 'illegal track/container pair', {
-          op: 'mux',
+        throw new CapabilityError('illegal track/container pair', {
+          op: { kind: 'route', id: 'mux' },
           tried: ['test'],
         });
       },
@@ -3367,8 +3451,8 @@ describe('drainEncoderToMuxer', () => {
     const originalAddTrack = muxer.addTrack;
     muxer.addTrack = (track): number => {
       if (track.codec === 'illegal') {
-        throw new CapabilityError('capability-miss', 'illegal sibling track', {
-          op: 'mux',
+        throw new CapabilityError('illegal sibling track', {
+          op: { kind: 'route', id: 'mux' },
           tried: ['test'],
         });
       }
@@ -3399,5 +3483,877 @@ describe('drainEncoderToMuxer', () => {
     expect(validCancels).toBe(1);
     expect(invalidPulls).toBe(0);
     expect(invalidCancels).toBe(1);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// S13 punch-list oracles (docs/architecture/codec-pipeline.md §5) — layering, sidecar, rate goldens,
+// frame-lifetime accounting, pairing bounds, capability-miss surfaces, and the VFR/B-frame evidence.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+const s13ModuleSource = (name: string): string =>
+  readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8');
+
+describe('S13 layering: the pure config modules are frame-free and runtime-free (items 2/3)', () => {
+  const pureModules = [
+    'codec-strings.ts',
+    'codec-queries.ts',
+    'encoder-config.ts',
+    'mux-trackinfo.ts',
+    'codec-routing.ts',
+  ] as const;
+  // Frame construction/lifetime tokens (layer 3 only) + capability/runtime leak tokens (router-only).
+  const forbidden = [
+    'new VideoFrame(',
+    'new AudioData(',
+    '.close(',
+    'isWebKitRuntime',
+    'isFirefoxRuntime',
+    'runtime-detect',
+    'WebKit',
+    'Firefox',
+    'wasm-opus',
+  ] as const;
+
+  it('pure modules contain none of the frame/runtime tokens', () => {
+    for (const module of pureModules) {
+      const source = s13ModuleSource(module);
+      for (const token of forbidden) {
+        expect(source.includes(token), `${module} must not contain "${token}"`).toBe(false);
+      }
+    }
+  });
+
+  it('the facade is re-exports only (no frame construction, no runtime probing)', () => {
+    const source = s13ModuleSource('codec-pipeline.ts');
+    for (const token of ['new VideoFrame(', 'new AudioData(', '.close(', 'runtime-detect']) {
+      expect(source.includes(token), `facade must not contain "${token}"`).toBe(false);
+    }
+  });
+
+  it('the quirk quarantine is the only S13 module naming a browser runtime', () => {
+    const quirks = s13ModuleSource('codec-runtime-quirks.ts');
+    expect(quirks).toContain('runtime-detect');
+    for (const module of ['vpx-alpha.ts', 'codec-live.ts']) {
+      const source = s13ModuleSource(module);
+      for (const token of ['isWebKitRuntime', 'isFirefoxRuntime', 'runtime-detect']) {
+        expect(source.includes(token), `${module} must not contain "${token}"`).toBe(false);
+      }
+    }
+  });
+
+  it('every S13 module respects the < 600-line budget (item 1)', () => {
+    const modules = [
+      'codec-pipeline.ts',
+      'codec-strings.ts',
+      'codec-queries.ts',
+      'encoder-config.ts',
+      'mux-trackinfo.ts',
+      'vpx-alpha.ts',
+      'codec-live.ts',
+      'codec-runtime-quirks.ts',
+      'codec-routing.ts',
+    ] as const;
+    for (const module of modules) {
+      const lines = s13ModuleSource(module).split('\n').length;
+      expect(lines, `${module} is ${lines} lines`).toBeLessThan(600);
+    }
+  });
+});
+
+// ── item 5: WeakMap RGBA sidecar (no expando) — split→merge→split stays bit-exact ────────────────
+
+/** Frozen fake VideoFrame with private counters: rejects expandos BY CONSTRUCTION (Object.freeze). */
+class SidecarPixelFrame {
+  #closeCount = 0;
+  #copyToCalls = 0;
+  readonly timestamp: number;
+  readonly duration: number | null = null;
+  readonly format: VideoPixelFormat | null = null;
+  readonly codedWidth: number;
+  readonly codedHeight: number;
+  readonly displayWidth: number;
+  readonly displayHeight: number;
+  readonly #pixels: Uint8ClampedArray;
+  readonly #copyToFailure: Error | undefined;
+
+  constructor(
+    timestamp: number,
+    width: number,
+    height: number,
+    pixels: Uint8ClampedArray,
+    copyToFailure?: Error,
+  ) {
+    this.timestamp = timestamp;
+    this.codedWidth = width;
+    this.codedHeight = height;
+    this.displayWidth = width;
+    this.displayHeight = height;
+    this.#pixels = pixels.slice();
+    this.#copyToFailure = copyToFailure;
+    Object.freeze(this); // a host object that rejects expando properties
+  }
+
+  get closeCount(): number {
+    return this.#closeCount;
+  }
+  get copyToCalls(): number {
+    return this.#copyToCalls;
+  }
+  allocationSize(): number {
+    return this.#pixels.length;
+  }
+  copyTo(destination: AllowSharedBufferSource): Promise<PlaneLayout[]> {
+    this.#copyToCalls++;
+    if (this.#copyToFailure !== undefined) return Promise.reject(this.#copyToFailure);
+    const bytes = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    bytes.set(this.#pixels.subarray(0, Math.min(this.#pixels.length, bytes.length)));
+    return Promise.resolve([{ offset: 0, stride: this.codedWidth * 4 }]);
+  }
+  close(): void {
+    this.#closeCount++;
+  }
+}
+
+function sidecarFrameConstructor(
+  constructed: { frame: SidecarPixelFrame; data: Uint8ClampedArray }[],
+): typeof VideoFrame {
+  function FakeVideoFrame(
+    data: AllowSharedBufferSource,
+    init: VideoFrameBufferInit,
+  ): SidecarPixelFrame {
+    const bytes = ArrayBuffer.isView(data)
+      ? new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength)
+      : new Uint8ClampedArray(data as ArrayBuffer);
+    const frame = new SidecarPixelFrame(init.timestamp, init.codedWidth, init.codedHeight, bytes);
+    constructed.push({ frame, data: bytes.slice() });
+    return frame;
+  }
+  return FakeVideoFrame as unknown as typeof VideoFrame;
+}
+
+describe('vpx-alpha RGBA sidecar is a WeakMap, never a frame expando (item 5)', () => {
+  it('the module keeps no expando machinery', () => {
+    const source = s13ModuleSource('vpx-alpha.ts');
+    expect(source.includes('__aibrushRgbaPixels')).toBe(false);
+    expect(source.includes('defineProperty')).toBe(false);
+    expect(source).toContain('WeakMap<VideoFrame, RgbaFramePixels>');
+  });
+
+  it('merge→split round-trips bit-exactly through frozen frames and reads pixels via the sidecar', async () => {
+    const colorRgba = Uint8ClampedArray.from([10, 20, 30, 255, 40, 50, 60, 255]);
+    const alphaRgba = Uint8ClampedArray.from([7, 7, 7, 255, 200, 200, 200, 255]);
+    const expectedMerged = Uint8ClampedArray.from([10, 20, 30, 7, 40, 50, 60, 200]);
+    const expectedSplit = splitRgbaForVpxAlpha({ data: expectedMerged, width: 2, height: 1 });
+
+    const constructed: { frame: SidecarPixelFrame; data: Uint8ClampedArray }[] = [];
+    await withVideoFrameConstructor(sidecarFrameConstructor(constructed), async () => {
+      // Decode phase: pair + merge two decoded planes into one RGBA frame.
+      const color = new SidecarPixelFrame(100, 2, 1, colorRgba);
+      const alpha = new SidecarPixelFrame(100, 2, 1, alphaRgba);
+      let decoderCount = 0;
+      const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
+        decoderCount++;
+        const plane = decoderCount === 1 ? color : alpha;
+        return new TransformStream<EncodedChunk, RawFrame>({
+          transform(_chunk, controller): void {
+            controller.enqueue(plane as unknown as RawFrame);
+          },
+        });
+      };
+      const decodeReader = decodeVideoPacketsWithAlpha(
+        streamOf([alphaPacket(100, 100)]),
+        createDecoder,
+      ).getReader();
+      const mergedRead = await decodeReader.read();
+      if (mergedRead.done) throw new Error('expected a merged frame');
+      expect((await decodeReader.read()).done).toBe(true);
+      const merged = mergedRead.value as unknown as SidecarPixelFrame;
+
+      // The merged frame's pixels are bit-exact and its inputs were closed exactly once.
+      expect(constructed).toHaveLength(1);
+      expect([...(constructed[0]?.data ?? [])]).toEqual([...expectedMerged]);
+      expect(color.closeCount).toBe(1);
+      expect(alpha.closeCount).toBe(1);
+
+      // Encode phase: split the SAME frozen frame; pixels must come from the WeakMap sidecar.
+      const packets: Packet[] = [];
+      const encodeReader = encodeVideoFramesWithAlpha(streamOf([merged as unknown as VideoFrame]), {
+        config: { codec: 'vp09.00.10.08', width: 2, height: 1 },
+        createEncoder: () =>
+          new TransformStream<RawFrame, EncodedChunk>({
+            transform(frame, controller): void {
+              const timestamp = (frame as unknown as { timestamp: number }).timestamp;
+              frame.close();
+              controller.enqueue(alphaEncodedChunk(timestamp));
+            },
+          }),
+      }).getReader();
+      for (;;) {
+        const { done, value } = await encodeReader.read();
+        if (done) break;
+        packets.push(value);
+      }
+
+      expect(packets).toHaveLength(1);
+      // Sidecar hit: the frozen merged frame was NEVER read back through copyTo.
+      expect(merged.copyToCalls).toBe(0);
+      expect(merged.closeCount).toBe(1);
+      // Derived colour/alpha frames carry the exact split of the merged pixels (bit-for-bit).
+      expect(constructed).toHaveLength(3);
+      expect([...(constructed[1]?.data ?? [])]).toEqual([...expectedSplit.color.data]);
+      expect([...(constructed[2]?.data ?? [])]).toEqual([...expectedSplit.alpha.data]);
+      expect(constructed[1]?.frame.closeCount).toBe(1);
+      expect(constructed[2]?.frame.closeCount).toBe(1);
+    });
+  });
+});
+
+// ── item 6: the rate model is pinned by a golden {codec × resolution × fps × source} table ───────
+
+describe('defaultVideoBitrate golden table (item 6 — named constants, hand-derived rows)', () => {
+  it('pins the documented constants themselves', () => {
+    expect(IMPLICIT_VIDEO_BITRATE_FLOOR).toBe(300_000);
+    expect(IMPLICIT_BITS_PER_PIXEL_PER_SECOND).toBe(20);
+    expect(VIDEO_CODEC_RATE_EFFICIENCY).toEqual({
+      h264: 1,
+      hevc: 0.7,
+      vp8: 1.1,
+      vp9: 0.8,
+      av1: 0.6,
+      unknown: 1,
+    });
+    expect(HIGH_CADENCE_FPS_THRESHOLD).toBe(30.5);
+    expect(CADENCE_BASELINE_FPS).toBe(30);
+    expect(EVIDENCE_BITRATE_HEADROOM).toBe(2);
+    expect(EVIDENCE_BITRATE_FLOOR).toBe(3_750_000);
+  });
+
+  it('planned path: width × height × 20 bpp/s × efficiency (× AV1 cadence), floored and capped', () => {
+    const bitrateOf = (
+      target: VideoTarget,
+      src: { width: number; height: number; fps?: number; bitrate?: number },
+      sourceCodec?: string,
+    ): number | undefined => buildVideoEncoderConfig(target, src, sourceCodec).bitrate;
+
+    // 1280×720×20×1.0 = 18_432_000 (H.264 baseline budget)
+    expect(
+      bitrateOf(
+        { codec: 'h264', width: 1280, height: 720, fps: 30 },
+        { width: 1920, height: 1080 },
+      ),
+    ).toBe(18_432_000);
+    // 1920×1080×20×0.7 = 29_030_400 (HEVC efficiency)
+    expect(
+      bitrateOf(
+        { codec: 'hevc', width: 1920, height: 1080, fps: 30 },
+        { width: 1920, height: 1080 },
+      ),
+    ).toBe(29_030_400);
+    // 640×360×20×1.1 = 5_068_800 (VP8, cadence unknown)
+    expect(
+      bitrateOf({ codec: 'vp8', width: 640, height: 360 }, { width: 1920, height: 1080 }),
+    ).toBe(5_068_800);
+    // 1280×720×20×0.8 = 14_745_600 (VP9)
+    expect(
+      bitrateOf({ codec: 'vp9', width: 1280, height: 720, fps: 30 }, { width: 1920, height: 1080 }),
+    ).toBe(14_745_600);
+    // 1280×720×20×0.6 = 11_059_200 (AV1 @30 — no cadence scale at/below 30.5)
+    expect(
+      bitrateOf({ codec: 'av1', width: 1280, height: 720, fps: 30 }, { width: 1920, height: 1080 }),
+    ).toBe(11_059_200);
+    // AV1 @60: 11_059_200 × √(60/30) = 15_640_070.59 → 15_640_071 (ADR-252 cadence row)
+    expect(
+      bitrateOf({ codec: 'av1', width: 1280, height: 720, fps: 60 }, { width: 1920, height: 1080 }),
+    ).toBe(15_640_071);
+    // AV1 @240: √(240/30)=2.83 capped at 1/0.6 → 11_059_200 × 1.666… = 18_432_000 (H.264 budget cap)
+    expect(
+      bitrateOf(
+        { codec: 'av1', width: 1280, height: 720, fps: 240 },
+        { width: 1920, height: 1080 },
+      ),
+    ).toBe(18_432_000);
+    // Floor: 8×8×20 = 1_280 → 300_000
+    expect(
+      bitrateOf({ codec: 'h264', width: 8, height: 8, fps: 30 }, { width: 1920, height: 1080 }),
+    ).toBe(300_000);
+    // Preserve-source cap at the DECLARED level ceiling: 640×360×20×0.8 = 3_686_400 → min(level-2.1 cap 3_600_000)
+    const preserved = buildVideoEncoderConfig(
+      {},
+      { width: 640, height: 360, fps: 30 },
+      'vp09.00.21.08',
+    );
+    expect(preserved.codec).toBe('vp09.00.21.08');
+    expect(preserved.bitrate).toBe(3_600_000);
+  });
+
+  it('evidence path: source bitrate × spatial × temporal × codec-scale × headroom, floored (av1→vp9 row)', () => {
+    // 271_201 × 1 × 1 × (0.8/0.6) × 2 = 723_203 → floored at 3_750_000 (the harvested av1→vp9 row)
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'vp9' },
+        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
+        'av01.0.05M.08',
+      ).bitrate,
+    ).toBe(3_750_000);
+    // 4_000_000 × (0.8/0.6) × 2 = 10_666_666.67 → 10_666_667 (above the floor, below the VP9 cap)
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'vp9' },
+        { width: 1920, height: 1080, fps: 24, bitrate: 4_000_000 },
+        'av01.0.05M.08',
+      ).bitrate,
+    ).toBe(10_666_667);
+    // Spatial ¼ × temporal 2 × same-codec 1 × headroom 2: 10_000_000 × 0.25 × 2 × 2 = 10_000_000
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'h264', width: 640, height: 360, fps: 30 },
+        { width: 1280, height: 720, fps: 15, bitrate: 10_000_000 },
+        'avc1.42E01E',
+      ).bitrate,
+    ).toBe(10_000_000);
+    // An explicit bitrate always wins over evidence.
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'vp9', bitrate: 4_000_000 },
+        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
+        'av01.0.05M.08',
+      ).bitrate,
+    ).toBe(4_000_000);
+  });
+});
+
+// ── item 7: frame lifetime is exactly-once under success, cancel, and injected throws ────────────
+
+/** Pull-based tracked source honouring the decoder contract: cancel closes undelivered frames. */
+function trackedFrameSource(frames: readonly AlphaLifecycleFrame[]): ReadableStream<VideoFrame> {
+  let next = 0;
+  return new ReadableStream<VideoFrame>(
+    {
+      pull(controller): void {
+        const frame = frames[next];
+        next++;
+        if (frame === undefined) controller.close();
+        else controller.enqueue(frame as unknown as VideoFrame);
+      },
+      cancel(): void {
+        for (let i = next; i < frames.length; i++) frames[i]?.close();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+describe('frame-lifetime oracle: closeCount === createCount on every path (item 7)', () => {
+  const closingEncoder = (): TransformStream<RawFrame, EncodedChunk> =>
+    new TransformStream<RawFrame, EncodedChunk>({
+      transform(frame, controller): void {
+        const timestamp = (frame as unknown as { timestamp: number }).timestamp;
+        frame.close();
+        controller.enqueue(alphaEncodedChunk(timestamp));
+      },
+    });
+
+  async function collectAll(stream: ReadableStream<Packet>): Promise<Packet[]> {
+    const reader = stream.getReader();
+    const out: Packet[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return out;
+      out.push(value);
+    }
+  }
+
+  it('encodeVideoFramesWithAlpha success: every input, clone, and constructed frame closes once', async () => {
+    const derived: AlphaLifecycleFrame[] = [];
+    const inputs = [100, 200, 300].map(
+      (timestamp) => new AlphaLifecycleFrame({ timestamp, clones: derived }),
+    );
+    await withVideoFrameConstructor(alphaVideoFrameConstructor(derived), async () => {
+      const packets = await collectAll(
+        encodeVideoFramesWithAlpha(trackedFrameSource(inputs), {
+          config: { codec: 'vp09.00.10.08', width: 2, height: 2 },
+          createEncoder: closingEncoder,
+        }),
+      );
+      expect(packets.map((p) => p.chunk.timestamp)).toEqual([100, 200, 300]);
+      expect(packets.every((p) => p.alpha !== undefined)).toBe(true);
+    });
+    expect(inputs.map((f) => f.closeCount)).toEqual([1, 1, 1]);
+    expect(derived.length).toBe(6); // colour + alpha per input (generic RGBA split path)
+    expect(derived.map((f) => f.closeCount)).toEqual([1, 1, 1, 1, 1, 1]);
+  });
+
+  it('encodeVideoFramesWithAlpha mid-stream cancel: delivered AND undelivered frames close once', async () => {
+    const derived: AlphaLifecycleFrame[] = [];
+    const inputs = [100, 200, 300, 400, 500].map(
+      (timestamp) => new AlphaLifecycleFrame({ timestamp, clones: derived }),
+    );
+    await withVideoFrameConstructor(alphaVideoFrameConstructor(derived), async () => {
+      const reader = encodeVideoFramesWithAlpha(trackedFrameSource(inputs), {
+        config: { codec: 'vp09.00.10.08', width: 2, height: 2 },
+        createEncoder: closingEncoder,
+      }).getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      await reader.cancel('consumer stopped');
+    });
+    for (const [index, frame] of inputs.entries()) {
+      expect(frame.closeCount, `input ${index} must close exactly once`).toBe(1);
+    }
+    for (const [index, frame] of derived.entries()) {
+      expect(frame.closeCount, `derived ${index} must close exactly once`).toBe(1);
+    }
+  });
+
+  it('encodeVideoFramesWithAlpha split failure: cancels upstream so undelivered frames still close', async () => {
+    const derived: AlphaLifecycleFrame[] = [];
+    const good = new AlphaLifecycleFrame({ timestamp: 100, clones: derived });
+    const poisoned = new AlphaLifecycleFrame({ timestamp: 200, clones: derived });
+    poisoned.copyTo = (): Promise<readonly PlaneLayout[]> =>
+      Promise.reject(new Error('GPU readback failed'));
+    const never = new AlphaLifecycleFrame({ timestamp: 300, clones: derived });
+    const inputs = [good, poisoned, never];
+    await withVideoFrameConstructor(alphaVideoFrameConstructor(derived), async () => {
+      const reader = encodeVideoFramesWithAlpha(trackedFrameSource(inputs), {
+        config: { codec: 'vp09.00.10.08', width: 2, height: 2 },
+        createEncoder: closingEncoder,
+      }).getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      await expect(reader.read()).rejects.toThrow('GPU readback failed');
+    });
+    expect(good.closeCount).toBe(1);
+    expect(poisoned.closeCount).toBe(1); // closed by the split's finally
+    expect(never.closeCount).toBe(1); // upstream cancelled on failure — no orphaned frame
+    expect(derived.map((f) => f.closeCount)).toEqual([1, 1]); // only the first split constructed
+  });
+
+  it('decodeVideoPacketsWithAlpha success with merges: planes close once, outputs owned by consumer', async () => {
+    const constructed: { frame: SidecarPixelFrame; data: Uint8ClampedArray }[] = [];
+    const colors = [
+      new SidecarPixelFrame(100, 2, 2, new Uint8ClampedArray(16).fill(9)),
+      new SidecarPixelFrame(200, 2, 2, new Uint8ClampedArray(16).fill(5)),
+    ];
+    const alphas = [
+      new SidecarPixelFrame(100, 2, 2, new Uint8ClampedArray(16).fill(255)),
+      new SidecarPixelFrame(200, 2, 2, new Uint8ClampedArray(16).fill(128)),
+    ];
+    await withVideoFrameConstructor(sidecarFrameConstructor(constructed), async () => {
+      let decoderCount = 0;
+      const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
+        decoderCount++;
+        const planes = decoderCount === 1 ? colors : alphas;
+        let i = 0;
+        return new TransformStream<EncodedChunk, RawFrame>({
+          transform(_chunk, controller): void {
+            const plane = planes[i++];
+            if (plane !== undefined) controller.enqueue(plane as unknown as RawFrame);
+          },
+        });
+      };
+      const reader = decodeVideoPacketsWithAlpha(
+        streamOf([alphaPacket(100, 100), alphaPacket(200, 200)]),
+        createDecoder,
+      ).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        value.close(); // the consumer owns each merged output
+      }
+    });
+    expect(colors.map((f) => f.closeCount)).toEqual([1, 1]);
+    expect(alphas.map((f) => f.closeCount)).toEqual([1, 1]);
+    expect(constructed).toHaveLength(2);
+    expect(constructed.map((c) => c.frame.closeCount)).toEqual([1, 1]);
+  });
+
+  it('decodeVideoPacketsWithAlpha merge failure: both in-flight planes close exactly once', async () => {
+    const constructed: { frame: SidecarPixelFrame; data: Uint8ClampedArray }[] = [];
+    const color = new SidecarPixelFrame(100, 2, 2, new Uint8ClampedArray(16));
+    const alpha = new SidecarPixelFrame(
+      100,
+      2,
+      2,
+      new Uint8ClampedArray(16),
+      new Error('alpha readback failed'),
+    );
+    await withVideoFrameConstructor(sidecarFrameConstructor(constructed), async () => {
+      let decoderCount = 0;
+      const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
+        decoderCount++;
+        const plane = decoderCount === 1 ? color : alpha;
+        return new TransformStream<EncodedChunk, RawFrame>({
+          transform(_chunk, controller): void {
+            controller.enqueue(plane as unknown as RawFrame);
+          },
+        });
+      };
+      const reader = decodeVideoPacketsWithAlpha(
+        streamOf([alphaPacket(100, 100)]),
+        createDecoder,
+      ).getReader();
+      await expect(reader.read()).rejects.toThrow('alpha readback failed');
+    });
+    expect(color.closeCount).toBe(1);
+    expect(alpha.closeCount).toBe(1);
+    expect(constructed).toHaveLength(0); // merge never completed — nothing constructed, nothing leaked
+  });
+
+  it('seekFrame aggregate accounting: drops close once, the returned frame is the only survivor', async () => {
+    const frames = [0, 1000, 2000, 3000, 4000].map((t) => new FakeFrame(t));
+    const got = (await seekFrame(
+      streamOf(frames) as unknown as ReadableStream<VideoFrame>,
+      2500,
+    )) as unknown as FakeFrame;
+    expect(got.timestamp).toBe(3000);
+    expect(frames.map((f) => f.closed)).toEqual([true, true, true, false, false]); // 4000 never pulled
+    got.close();
+    expect(got.closed).toBe(true);
+  });
+
+  it('drainEncoderToMuxer never closes packets (the encoder already owned every RawFrame)', async () => {
+    let chunkCloses = 0;
+    const chunks = [0, 1].map(
+      (timestamp) =>
+        ({
+          timestamp,
+          close: () => {
+            chunkCloses++;
+          },
+        }) as unknown as EncodedChunk,
+    );
+    const written: Packet[] = [];
+    await drainEncoderToMuxer(
+      streamOf(chunks),
+      {
+        addTrack: () => 1,
+        write: (_trackId, packet) => {
+          written.push(packet);
+          return Promise.resolve();
+        },
+      },
+      () => ({ id: 0, mediaType: 'video', codec: 'vp8' }),
+    );
+    expect(written).toHaveLength(2);
+    expect(chunkCloses).toBe(0);
+  });
+});
+
+// ── item 8: alpha pairing is bounded by the reorder distance and pinned at highWaterMark 0 ───────
+
+describe('alpha pairing bound + backpressure (item 8)', () => {
+  function countingEncoder(counter: { runs: number }): () => TransformStream<
+    RawFrame,
+    EncodedChunk
+  > {
+    return () =>
+      new TransformStream<RawFrame, EncodedChunk>({
+        transform(frame, controller): void {
+          counter.runs++;
+          const timestamp = (frame as unknown as { timestamp: number }).timestamp;
+          frame.close();
+          controller.enqueue(alphaEncodedChunk(timestamp));
+        },
+      });
+  }
+
+  it('encodeVpxAlphaFrameStreams: HWM 0 — no encode work happens before the consumer pulls', async () => {
+    const color = { runs: 0 };
+    const alpha = { runs: 0 };
+    let factoryCalls = 0;
+    const clip = 64;
+    const colorFrames = Array.from(
+      { length: clip },
+      (_, i) => new AlphaLifecycleFrame({ timestamp: i }),
+    );
+    const alphaFrames = Array.from(
+      { length: clip },
+      (_, i) => new AlphaLifecycleFrame({ timestamp: i }),
+    );
+    const stream = encodeVpxAlphaFrameStreams(
+      trackedFrameSource(colorFrames),
+      trackedFrameSource(alphaFrames),
+      {
+        encodeConfig: { codec: 'vp09.00.10.08', width: 2, height: 2 },
+        createEncoder: () => {
+          factoryCalls++;
+          return countingEncoder(factoryCalls === 1 ? color : alpha)();
+        },
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(color.runs).toBe(0); // highWaterMark 0: zero eager encode ahead of demand
+    expect(alpha.runs).toBe(0);
+
+    // Slow consumer: after each pull the pairing skew never exceeds a small constant — not clip length.
+    const reader = stream.getReader();
+    for (let i = 0; i < clip; i++) {
+      const { done, value } = await reader.read();
+      expect(done).toBe(false);
+      expect(value?.chunk.timestamp).toBe(i);
+      expect(value?.alpha?.timestamp).toBe(i);
+      expect(color.runs - (i + 1)).toBeLessThanOrEqual(2);
+      expect(alpha.runs - (i + 1)).toBeLessThanOrEqual(2);
+    }
+    expect((await reader.read()).done).toBe(true);
+    expect(colorFrames.every((f) => f.closeCount === 1)).toBe(true);
+    expect(alphaFrames.every((f) => f.closeCount === 1)).toBe(true);
+  });
+
+  it('transcodeVpxAlphaPackets: pathological misalignment fails loudly at the fixed reorder bound', async () => {
+    const clip = 64; // ≫ the 16-item bound: the buffer must never scale with clip length
+    const packets = Array.from({ length: clip }, (_, i) => alphaPacket(i, 1_000 + i));
+    const reader = transcodeVpxAlphaPackets(streamOf(packets), {
+      decodeConfig: { codec: 'vp09.00.10.08' },
+      encodeConfig: { codec: 'vp8', width: 2, height: 2 },
+      createDecoder: () =>
+        new TransformStream<EncodedChunk, RawFrame>({
+          transform(chunk, controller): void {
+            controller.enqueue(chunk as unknown as RawFrame);
+          },
+        }),
+      createEncoder: () =>
+        new TransformStream<RawFrame, EncodedChunk>({
+          transform(chunk, controller): void {
+            controller.enqueue(chunk as unknown as EncodedChunk);
+          },
+        }),
+      copyAlpha: true,
+    }).getReader();
+
+    let emitted = 0;
+    let failure: unknown;
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+        emitted++;
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(MediaError);
+    expect((failure as MediaError).code).toBe('encode-error');
+    expect((failure as MediaError).message).toMatch(/reorder bound/);
+    expect(emitted).toBe(16); // exactly the bound — never the clip length
+  });
+
+  it('decodeVideoPacketsWithAlpha: misaligned alpha frames hit the bound and every buffered frame closes', async () => {
+    const clip = 40;
+    const colors = Array.from(
+      { length: clip },
+      (_, i) => new AlphaLifecycleFrame({ timestamp: i, format: 'RGBA' }),
+    );
+    const alphas = Array.from(
+      { length: clip },
+      (_, i) => new AlphaLifecycleFrame({ timestamp: 1_000 + i, format: 'RGBA' }),
+    );
+    let decoderCount = 0;
+    const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
+      decoderCount++;
+      const planes = decoderCount === 1 ? colors : alphas;
+      let i = 0;
+      return new TransformStream<EncodedChunk, RawFrame>({
+        transform(_chunk, controller): void {
+          const plane = planes[i++];
+          if (plane !== undefined) controller.enqueue(plane as unknown as RawFrame);
+        },
+      });
+    };
+    const reader = decodeVideoPacketsWithAlpha(
+      streamOf(Array.from({ length: clip }, (_, i) => alphaPacket(i, 1_000 + i))),
+      createDecoder,
+    ).getReader();
+
+    let emitted = 0;
+    let failure: unknown;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        emitted++;
+        value.close();
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(MediaError);
+    expect((failure as MediaError).code).toBe('decode-error');
+    expect((failure as MediaError).message).toMatch(/reorder bound/);
+    expect(emitted).toBe(16);
+    // Every buffered ahead-of-target alpha frame was drained and closed exactly once — no leak, no double.
+    const touchedAlphas = alphas.slice(0, 17);
+    expect(touchedAlphas.map((f) => f.closeCount)).toEqual(Array.from({ length: 17 }, () => 1));
+    // Delivered colours were closed by this consumer; the failing colour was closed by the error path.
+    expect(colors.slice(0, 17).every((f) => f.closeCount === 1)).toBe(true);
+  });
+
+  it('the pairing sources pin { highWaterMark: 0 } in code, matching unwrapPackets', () => {
+    const live = s13ModuleSource('codec-live.ts');
+    const vpx = s13ModuleSource('vpx-alpha.ts');
+    // Three pairing factories in codec-live + unwrap/decode in vpx-alpha all pin HWM 0.
+    expect(live.match(/\{ highWaterMark: 0 \}/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    expect(vpx.match(/\{ highWaterMark: 0 \}/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    expect(live.includes('new ReadableStream<Packet>(')).toBe(true);
+  });
+});
+
+// ── item 9: encode-surface limits are explicit typed capability misses ───────────────────────────
+
+describe('encode-surface capability misses carry exact suggestions (item 9)', () => {
+  const src = { width: 1920, height: 1080 };
+
+  function captureCapabilityError(run: () => unknown): CapabilityError {
+    try {
+      run();
+    } catch (error) {
+      if (error instanceof CapabilityError) return error;
+      throw error;
+    }
+    throw new Error('expected a CapabilityError');
+  }
+
+  it('two-pass outside H.264 misses with the exact allocator suggestion', () => {
+    const error = captureCapabilityError(() =>
+      buildVideoEncoderConfig({ codec: 'av1', bitrate: 2_000_000, twoPass: true }, src, undefined),
+    );
+    expect(error.code).toBe('capability-miss');
+    expect(error.message).toBe(
+      'two-pass video encode is currently available only for H.264, not av1',
+    );
+    expect(error.detail?.suggestion).toBe(
+      'target H.264 or add a validated two-pass allocator for the requested codec',
+    );
+    expect(error.detail?.tried).toEqual(['webcodecs-video']);
+  });
+
+  it('CRF on VP8 misses with the exact encoder-tail suggestion', () => {
+    const error = captureCapabilityError(() =>
+      buildVideoEncoderConfig({ codec: 'vp8', crf: 30 }, src, undefined),
+    );
+    expect(error.code).toBe('capability-miss');
+    expect(error.message).toBe('CRF/quantizer encode unsupported for vp8');
+    expect(error.detail?.suggestion).toBe('route to an encoder tail with native CRF support');
+  });
+
+  it('HEVC profiles beyond Main/Main10 and impossible bit depths are typed misses', () => {
+    const profile = captureCapabilityError(() =>
+      buildVideoEncoderConfig({}, src, 'hev1.3.4.L120.B0'),
+    );
+    expect(profile.message).toBe('bad HEVC profile');
+    expect(profile.detail?.suggestion).toBe(
+      'use HEVC Main or Main10, or add a proven encoder tail for the requested profile',
+    );
+
+    const hevc12 = captureCapabilityError(() =>
+      buildVideoEncoderConfig({ codec: 'hevc', bitDepth: 12 }, src, undefined),
+    );
+    expect(hevc12.message).toBe('video 12-bit output is not available for hevc');
+    expect(hevc12.detail?.suggestion).toBe('use HEVC Main or Main10');
+
+    const h26410 = captureCapabilityError(() =>
+      buildVideoEncoderConfig({ codec: 'h264', bitDepth: 10 }, src, undefined),
+    );
+    expect(h26410.detail?.suggestion).toBe(
+      'use 8-bit H.264 until a High10 encode+mux path is browser-proven',
+    );
+
+    const vp810 = captureCapabilityError(() =>
+      buildVideoEncoderConfig({ codec: 'vp8', bitDepth: 10 }, src, undefined),
+    );
+    expect(vp810.detail?.suggestion).toBe('target VP9 or AV1 for a probed high-bit-depth encode');
+  });
+});
+
+// ── item 10: bitrate evidence uses the DTS+duration span, never PTS ──────────────────────────────
+
+describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () => {
+  it('VFR: non-uniform durations — bits ÷ (max(dts+dur) − min(dts)) exactly', () => {
+    // bytes = 1500+500+2000 = 4000; span = (50_000+50_000) − 0 = 100_000 µs
+    // → 4000×8×1e6 / 100_000 = 320_000 b/s exactly.
+    const vfr = [
+      { trackId: 1, sizeBytes: 1500, ptsUs: 0, dtsUs: 0, durationUs: 33_333, keyframe: true },
+      {
+        trackId: 1,
+        sizeBytes: 500,
+        ptsUs: 33_333,
+        dtsUs: 33_333,
+        durationUs: 16_667,
+        keyframe: false,
+      },
+      {
+        trackId: 1,
+        sizeBytes: 2000,
+        ptsUs: 50_000,
+        dtsUs: 50_000,
+        durationUs: 50_000,
+        keyframe: false,
+      },
+    ];
+    expect(sourceVideoBitrateFromPacketTable(vfr, 1)).toBe(320_000);
+  });
+
+  it('B-frames: reordered DTS rows with adversarial PTS give the identical hand-derived rate', () => {
+    // bytes = 6000; span = (120_000+40_000) − 0 = 160_000 µs → 6000×8×1e6/160_000 = 300_000 b/s.
+    const presentationOrder = [
+      { trackId: 2, sizeBytes: 1000, ptsUs: 40_000, dtsUs: 0, durationUs: 40_000, keyframe: true },
+      {
+        trackId: 2,
+        sizeBytes: 1500,
+        ptsUs: 80_000,
+        dtsUs: 80_000,
+        durationUs: 40_000,
+        keyframe: false,
+      },
+      {
+        trackId: 2,
+        sizeBytes: 2000,
+        ptsUs: 160_000,
+        dtsUs: 40_000,
+        durationUs: 40_000,
+        keyframe: false,
+      },
+      {
+        trackId: 2,
+        sizeBytes: 1500,
+        ptsUs: 120_000,
+        dtsUs: 120_000,
+        durationUs: 40_000,
+        keyframe: false,
+      },
+    ];
+    expect(sourceVideoBitrateFromPacketTable(presentationOrder, 2)).toBe(300_000);
+
+    // Insensitive to PTS values AND row order: scramble both; only DTS+duration may matter.
+    const scrambled = [
+      { ...presentationOrder[3], ptsUs: 999_999 },
+      { ...presentationOrder[0], ptsUs: 0 },
+      { ...presentationOrder[2], ptsUs: 5 },
+      { ...presentationOrder[1], ptsUs: 123_456_789 },
+    ] as typeof presentationOrder;
+    expect(sourceVideoBitrateFromPacketTable(scrambled, 2)).toBe(300_000);
+  });
+
+  it('ignores other tracks and invalid rows rather than polluting the evidence', () => {
+    const table = [
+      { trackId: 1, sizeBytes: 4000, ptsUs: 0, dtsUs: 0, durationUs: 100_000, keyframe: true },
+      { trackId: 9, sizeBytes: 999_999, ptsUs: 0, dtsUs: 0, durationUs: 1, keyframe: true },
+      { trackId: 1, sizeBytes: -5, ptsUs: 0, dtsUs: 0, durationUs: 100_000, keyframe: false },
+      {
+        trackId: 1,
+        sizeBytes: 4000,
+        ptsUs: 0,
+        dtsUs: Number.NaN,
+        durationUs: 100_000,
+        keyframe: false,
+      },
+      { trackId: 1, sizeBytes: 4000, ptsUs: 0, dtsUs: 100_000, durationUs: 0, keyframe: false },
+    ];
+    expect(sourceVideoBitrateFromPacketTable(table, 1)).toBe(320_000);
+    expect(sourceVideoBitrateFromPacketTable([], 1)).toBeUndefined();
+    expect(sourceVideoBitrateFromPacketTable(undefined, 1)).toBeUndefined();
   });
 });

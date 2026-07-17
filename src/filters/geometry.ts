@@ -71,7 +71,7 @@ export function applyAffine(t: Affine, x: number, y: number): readonly [number, 
 /** Validate a dimension is a finite integer ≥ 1 (output frames must have real, non-degenerate size). */
 function requirePositiveInt(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1) {
-    throw new InputError('unsupported-input', `${label} must be a positive integer, got ${value}`);
+    throw new InputError(`${label} must be a positive integer, got ${value}`);
   }
   return value;
 }
@@ -79,7 +79,7 @@ function requirePositiveInt(value: number, label: string): number {
 /** Validate source dimensions decoded from a `VideoFrame` (display size). */
 function requireSourceDims(srcW: number, srcH: number): void {
   if (!Number.isSafeInteger(srcW) || !Number.isSafeInteger(srcH) || srcW < 1 || srcH < 1) {
-    throw new InputError('unsupported-input', `invalid source dimensions ${srcW}×${srcH}`);
+    throw new InputError(`invalid source dimensions ${srcW}×${srcH}`);
   }
 }
 
@@ -142,17 +142,13 @@ export function cropBlit(srcW: number, srcH: number, spec: CropSpec): Blit {
   requireSourceDims(srcW, srcH);
   const { x, y, width, height } = spec;
   if (![x, y, width, height].every((n) => Number.isSafeInteger(n))) {
-    throw new InputError(
-      'unsupported-input',
-      `crop rect must be integers, got ${x},${y} ${width}×${height}`,
-    );
+    throw new InputError(`crop rect must be integers, got ${x},${y} ${width}×${height}`);
   }
   if (width < 1 || height < 1) {
-    throw new InputError('unsupported-input', `crop size must be ≥ 1, got ${width}×${height}`);
+    throw new InputError(`crop size must be ≥ 1, got ${width}×${height}`);
   }
   if (x < 0 || y < 0 || x + width > srcW || y + height > srcH) {
     throw new InputError(
-      'unsupported-input',
       `crop rect ${x},${y} ${width}×${height} is outside the ${srcW}×${srcH} source`,
     );
   }
@@ -178,14 +174,10 @@ export function padBlit(srcW: number, srcH: number, spec: PadSpec): Blit {
   const width = requirePositiveInt(spec.width, 'pad width');
   const height = requirePositiveInt(spec.height, 'pad height');
   if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0) {
-    throw new InputError(
-      'unsupported-input',
-      `pad offsets must be non-negative integers, got ${x},${y}`,
-    );
+    throw new InputError(`pad offsets must be non-negative integers, got ${x},${y}`);
   }
   if (width < srcW || height < srcH || x + srcW > width || y + srcH > height) {
     throw new InputError(
-      'unsupported-input',
       `pad placement ${x},${y} + ${srcW}×${srcH} is outside the ${width}×${height} canvas`,
     );
   }
@@ -259,5 +251,5 @@ export function flipGeometry(srcW: number, srcH: number, axis: FlipSpec['axis'])
 /** Exhaustiveness guard for discriminated unions — unreachable at runtime if the types are honored. */
 function assertNever(value: never): never {
   /* v8 ignore next */
-  throw new InputError('unsupported-input', `unhandled filter geometry case: ${String(value)}`);
+  throw new InputError(`unhandled filter geometry case: ${String(value)}`);
 }
