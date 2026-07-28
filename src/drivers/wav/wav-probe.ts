@@ -81,7 +81,8 @@ export function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWav
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
     if (id === 'fmt ' && size >= 16) {
-      if (body + 16 > bytes.byteLength) {
+      const needed = size >= 40 ? 26 : 16;
+      if (body + needed > bytes.byteLength) {
         throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
       }
       format = parseFormat(dv, body, size);

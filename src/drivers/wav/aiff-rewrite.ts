@@ -12,6 +12,14 @@ const ABORT_CHECK_INTERVAL = 16_384;
 
 type SwappableFormat = 's16' | 's24';
 
+export interface WavPcmToAiffOptions {
+  readonly sampleFormat?: SampleFormat;
+  readonly endian?: 'le' | 'be';
+  readonly channels?: number;
+  readonly sampleRate?: number;
+  readonly signal?: AbortSignal;
+}
+
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw new MediaError('aborted', 'operation aborted');
 }
@@ -138,4 +146,23 @@ export function tryRewriteWavPcmToAiffBe(
   );
   throwIfAborted(opts.signal);
   return out;
+}
+
+/**
+ * Re-author unmodified little-endian WAV PCM as a canonical AIFF PCM file. This public driver-author
+ * seam keeps the cross-wrapper transform observable without decoding samples into planar DSP buffers;
+ * canonical AIFF defaults to big-endian sample words.
+ */
+export function wavPcmToAiffFromBytes(
+  bytes: Uint8Array,
+  opts: WavPcmToAiffOptions = {},
+): Uint8Array<ArrayBuffer> | undefined {
+  return tryRewriteWavPcmToAiffBe(bytes, {
+    container: 'aiff',
+    endian: opts.endian ?? 'be',
+    ...(opts.sampleFormat !== undefined ? { sampleFormat: opts.sampleFormat } : {}),
+    ...(opts.channels !== undefined ? { channels: opts.channels } : {}),
+    ...(opts.sampleRate !== undefined ? { sampleRate: opts.sampleRate } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+  });
 }

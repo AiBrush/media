@@ -33,6 +33,10 @@
       "types": "./dist/image.d.ts",
       "import": "./dist/image.js"
     },
+    "./wav": {
+      "types": "./dist/wav.d.ts",
+      "import": "./dist/wav.js"
+    },
     "./drivers/*": {
       "types": "./dist/drivers/*.d.ts",
       "import": "./dist/drivers/*.js"

@@ -4,6 +4,8 @@ export const RGBA_BYTES_PER_PIXEL = 4;
 
 export type VpxAlphaPackedSourceFormat = 'RGBA' | 'BGRA';
 
+const HOST_IS_LITTLE_ENDIAN = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
+
 export interface VpxAlphaI420Plane {
   readonly data: Uint8Array;
   readonly layout: readonly PlaneLayout[];
@@ -116,4 +118,38 @@ export function vpxAlphaI420FromPackedRgba(
   }
   fillNeutralI420Chroma(data, layout, height);
   return { data, layout };
+}
+
+/**
+ * Replace packed RGBA alpha with the red channel of a grayscale RGBA plane. The 32-bit path performs
+ * one load/store per pixel on little-endian browser targets; the byte path preserves portability.
+ */
+export function mergeVpxAlphaRgba(color: Uint8ClampedArray, alpha: Uint8ClampedArray): void {
+  const byteLength = Math.min(color.byteLength, alpha.byteLength);
+  const packedLength = byteLength - (byteLength % RGBA_BYTES_PER_PIXEL);
+  if (
+    HOST_IS_LITTLE_ENDIAN &&
+    color.byteOffset % Uint32Array.BYTES_PER_ELEMENT === 0 &&
+    alpha.byteOffset % Uint32Array.BYTES_PER_ELEMENT === 0
+  ) {
+    const colorWords = new Uint32Array(
+      color.buffer,
+      color.byteOffset,
+      packedLength / RGBA_BYTES_PER_PIXEL,
+    );
+    const alphaWords = new Uint32Array(
+      alpha.buffer,
+      alpha.byteOffset,
+      packedLength / RGBA_BYTES_PER_PIXEL,
+    );
+    for (let index = 0; index < colorWords.length; index++) {
+      colorWords[index] =
+        ((colorWords[index] as number) & 0x00ff_ffff) |
+        (((alphaWords[index] as number) & 0xff) << 24);
+    }
+    return;
+  }
+  for (let index = 0; index < packedLength; index += RGBA_BYTES_PER_PIXEL) {
+    color[index + 3] = alpha[index] as number;
+  }
 }

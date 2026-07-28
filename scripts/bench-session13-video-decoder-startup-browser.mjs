@@ -523,6 +523,30 @@ try {
       seekSamples: SEEK_SAMPLES,
     },
   );
+  const compactReport = {
+    ...report,
+    rows: report.rows.map(({ nativeClockTruth, pixelTruth, ...row }) => ({
+      ...row,
+      ...(nativeClockTruth === undefined
+        ? {}
+        : {
+            nativeClockTruth: {
+              closedFrames: nativeClockTruth.closedFrames,
+              frames: nativeClockTruth.frames,
+            },
+          }),
+      ...(pixelTruth === undefined
+        ? {}
+        : {
+            pixelTruth: {
+              closedFrames: pixelTruth.closedFrames,
+              frames: pixelTruth.frames,
+              rgbaSha256: pixelTruth.rgbaSha256,
+              timestampFold: pixelTruth.timestampFold,
+            },
+          }),
+    })),
+  };
   console.info(
     JSON.stringify(
       {
@@ -530,7 +554,7 @@ try {
         warmups: WARMUPS,
         samples: SAMPLES,
         seekSamples: SEEK_SAMPLES,
-        ...report,
+        ...compactReport,
       },
       null,
       2,

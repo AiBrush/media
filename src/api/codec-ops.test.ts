@@ -1756,6 +1756,12 @@ describe('decode — lazy frame streams (contract)', () => {
     }
   });
 
+  it('validates video pulls instead of trusting a misleading raw-audio MIME hint', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const streams = media().decode(fromBytes(bytes, { mime: 'audio/wav' }));
+    await expect(readFirstFrame(streams.video)).rejects.toBeInstanceOf(MediaError);
+  });
+
   it('routes raw PCM audio decode through the PCM-native path before the WebCodecs codec ladder', async () => {
     // Node has no `AudioData`, so the PCM route must still reject here; the important assertion is that
     // WAV/AIFF/CAF reject at the raw-PCM AudioData bridge, not later as bogus WebCodecs `pcm-*` misses.

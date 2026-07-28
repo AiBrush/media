@@ -375,6 +375,7 @@ async function verifyInstalledPackage(installedDir: string): Promise<InstalledPa
     './dist/image.js',
     './dist/image.d.ts',
   );
+  await verifyExportEntry(installedDir, exportsMap, './wav', './dist/wav.js', './dist/wav.d.ts');
   const driversExport = expectRecord(
     exportsMap['./drivers/*'],
     'exports["./drivers/*"]',

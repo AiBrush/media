@@ -1,6 +1,9 @@
 /**
- * Public decode orchestration. The engine loads this module on the first pull from either returned frame
- * stream, keeping image sniffing, demux/decode setup, and PCM bridges outside the eager package closure.
+ * Lightweight public decode dispatcher.
+ *
+ * Explicit WAV/AIFF/CAF hints take a narrow raw-PCM route, so a first audio pull does not evaluate the
+ * image, HLS, generic demux, track-selection, codec-routing, and video-rotation orchestration needed by
+ * arbitrary media. Ambiguous inputs and custom containers retain the complete general route.
  */
 
 import type { ImageOps } from '../codecs/image/index.ts';
@@ -11,28 +14,11 @@ import type {
   FilterSpec,
   StageOptions,
 } from '../contracts/driver.ts';
-import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import type { CodecRoute } from '../kernel/router.ts';
-import { type LiveMediaSource, isLiveMediaSource } from '../sources/live-source.ts';
-import {
-  type MediaInput,
-  type NormalizedSource,
-  type Source,
-  cancelSource,
-  from as normalizeInput,
-} from '../sources/source.ts';
-import { decoderConfigWithRoutedAcceleration } from './codec-route.ts';
+import { isLiveMediaSource } from '../sources/live-source.ts';
+import type { MediaInput, NormalizedSource, Source } from '../sources/source.ts';
 import { memoizeAsync } from './frame-streams.ts';
-import { isRawPcmTrack, stageStrategy } from './op-support.ts';
-import { readAllSource, sourceMayBeHlsManifest } from './source-io.ts';
 import type { CallOptions, DecodeOptions } from './types.ts';
-
-interface ImageDecodeRoute {
-  readonly ops: ImageOps;
-  readonly bytes: Uint8Array;
-}
-
-type ImageDecodeRouteLoader = () => Promise<ImageDecodeRoute | undefined>;
 
 export interface DecodeRunnerContext {
   cacheSource(source: Source): Source;
@@ -54,6 +40,44 @@ export interface DecodeRunner {
   audio(): Promise<ReadableStream<AudioData> | undefined>;
 }
 
+interface DirectPcmRoute {
+  readonly kind: 'direct-pcm';
+  readonly container: ContainerDriver;
+  readonly source: Source;
+  readonly stage: StageOptions;
+}
+
+interface GeneralRoute {
+  readonly kind: 'general';
+  readonly runner: DecodeRunner;
+}
+
+type DecodeRoute = DirectPcmRoute | GeneralRoute;
+
+type RawPcmFamily = 'wav' | 'aiff' | 'caf';
+
+const RAW_PCM_MIME_FAMILIES: ReadonlyMap<string, RawPcmFamily> = new Map([
+  ['audio/wav', 'wav'],
+  ['audio/wave', 'wav'],
+  ['audio/x-wav', 'wav'],
+  ['audio/vnd.wave', 'wav'],
+  ['audio/aiff', 'aiff'],
+  ['audio/x-aiff', 'aiff'],
+  ['audio/aifc', 'aiff'],
+  ['audio/x-aifc', 'aiff'],
+  ['audio/x-caf', 'caf'],
+  ['audio/caf', 'caf'],
+]);
+const RAW_PCM_EXTENSION_FAMILIES: readonly (readonly [string, RawPcmFamily])[] = [
+  ['.wav', 'wav'],
+  ['.wave', 'wav'],
+  ['.aiff', 'aiff'],
+  ['.aif', 'aiff'],
+  ['.aifc', 'aiff'],
+  ['.caf', 'caf'],
+  ['.caff', 'caf'],
+];
+
 export function createDecodeRunner(
   context: DecodeRunnerContext,
   input: MediaInput,
@@ -61,257 +85,108 @@ export function createDecodeRunner(
   options: DecodeOptions,
   signal: AbortSignal,
 ): DecodeRunner {
-  if (isLiveMediaSource(normalized)) {
-    return liveDecodeRunner(context, normalized, options, signal);
-  }
+  const general = memoizeAsync(async (): Promise<DecodeRunner> => {
+    const { createGeneralDecodeRunner } = await import('./general-decode-runner.ts');
+    return createGeneralDecodeRunner(context, input, normalized, options, signal);
+  });
 
-  const source = context.cacheSource(normalized);
-  const stage = context.stage(signal, options);
-  const resolvedInputSource = memoizeAsync(async () => {
+  if (!isDirectPcmCandidate(normalized, options)) return forward(general);
+  const family = rawPcmFamily(normalized);
+  if (family === undefined) return forward(general);
+
+  const route = memoizeAsync(async (): Promise<DecodeRoute> => {
     if (options.strategy?.pinDriver !== undefined) await context.ensurePin(options);
-    return context.resolveHls(input, source, signal);
+    const source = context.cacheSource(normalized);
+    const stage = context.stage(signal, options);
+    const container = await context.routeContainer(source, stage.signal, stage.pinDriver);
+    if (container.id !== family || !hasDirectPcmDecode(container)) {
+      return { kind: 'general', runner: await general() };
+    }
+    return { kind: 'direct-pcm', container, source, stage };
   });
-  const replayableSource = memoizeAsync(async (): Promise<Source> => {
-    const resolved = await resolvedInputSource();
-    if (resolved.kind !== 'stream') return resolved;
-    const bytes = await readAllSource(resolved, signal);
-    return normalizeInput(
-      bytes,
-      resolved.mimeHint === undefined ? {} : { mime: resolved.mimeHint },
-    );
-  });
-  const mime = source.mimeHint?.toLowerCase();
-  const imageRoute: ImageDecodeRouteLoader =
-    mime === undefined
-      ? sourceMayBeHlsManifest(source)
-        ? memoizeAsync(() =>
-            imageDecodeRoute(context, resolvedInputSource, signal, stage.determinism ?? 'auto'),
-          )
-        : noImageDecodeRoute
-      : !/^(?:audio|video)\//.test(mime)
-        ? memoizeAsync(() =>
-            imageDecodeRoute(context, resolvedInputSource, signal, stage.determinism ?? 'auto'),
-          )
-        : noImageDecodeRoute;
 
   return {
-    video: async () => {
-      const image = await imageRoute();
-      if (image !== undefined) {
-        if (!(await selectedImageTrack('video', options.trackSelect))) return undefined;
-        return image.ops.decode(image.bytes, stage.signal ? { signal: stage.signal } : {});
-      }
-      return decodeTrack(context, await replayableSource(), 'video', stage, options.trackSelect);
-    },
+    // A raw-audio hint is not proof that arbitrary bytes contain no video. Keep video pulls on the
+    // validating general route; re-readable raw-PCM sources can still take the narrow audio route.
+    video: async () => (await general()).video(),
     audio: async () => {
-      if ((await imageRoute()) !== undefined) {
-        await selectedImageTrack('audio', options.trackSelect);
-        return undefined;
+      const [selected, bridges] = await Promise.all([
+        route(),
+        import('../dsp/audio-data.ts'),
+        preloadBuiltInRawPcmDriver(family),
+      ]);
+      if (selected.kind === 'general') return selected.runner.audio();
+      const {
+        interleavedPcmChunksToAudioDataStream,
+        pcmAudioChunksToAudioDataStream,
+        pcmAudioToAudioDataStream,
+      } = bridges;
+      const { container, source, stage } = selected;
+      if (container.decodePcmInterleavedStream !== undefined) {
+        const chunks = await container.decodePcmInterleavedStream(source, stage);
+        return interleavedPcmChunksToAudioDataStream(chunks, stage, container.id);
       }
-      return decodeTrack(context, await replayableSource(), 'audio', stage, options.trackSelect);
+      if (container.decodePcmAudioStream !== undefined) {
+        const chunks = await container.decodePcmAudioStream(source, stage);
+        return pcmAudioChunksToAudioDataStream(chunks, stage, container.id, 'f32');
+      }
+      const audio = await container.decodePcmAudio?.(source, stage);
+      return audio === undefined
+        ? (await general()).audio()
+        : pcmAudioToAudioDataStream(audio, stage, container.id, 'f32');
     },
   };
 }
 
-function liveDecodeRunner(
-  context: DecodeRunnerContext,
-  source: LiveMediaSource,
-  options: DecodeOptions,
-  signal: AbortSignal,
-): DecodeRunner {
-  const streams = memoizeAsync(async () => {
-    if (options.trackSelect !== undefined && options.trackSelect.length > 0) {
-      throw new InputError('decode trackSelect is unavailable for a live MediaStream input');
-    }
-    if (options.strategy?.pinDriver !== undefined) await context.ensurePin(options);
-    const { decodeLiveMediaStream } = await import('../sources/live-media.ts');
-    return decodeLiveMediaStream(source, { signal });
-  });
+function forward(load: () => Promise<DecodeRunner>): DecodeRunner {
   return {
-    video: async () => (await streams()).video,
-    audio: async () => (await streams()).audio,
+    video: async () => (await load()).video(),
+    audio: async () => (await load()).audio(),
   };
 }
 
-const noImageDecodeRoute: ImageDecodeRouteLoader = () => Promise.resolve(undefined);
-
-async function selectedImageTrack(
-  mediaType: 'video' | 'audio',
-  selectors: readonly string[] | undefined,
-): Promise<boolean> {
-  if (selectors === undefined || selectors.length === 0) return mediaType === 'video';
-  const { selectDecodeTrackInfo } = await import('./track-select.ts');
+function hasDirectPcmDecode(container: ContainerDriver): boolean {
   return (
-    selectDecodeTrackInfo([{ mediaType: 'video' }] as const, mediaType, selectors) !== undefined
+    container.decodePcmInterleavedStream !== undefined ||
+    container.decodePcmAudioStream !== undefined ||
+    container.decodePcmAudio !== undefined
   );
 }
 
-async function imageDecodeRoute(
-  context: DecodeRunnerContext,
-  source: () => Promise<Source>,
-  signal: AbortSignal,
-  determinism: StageOptions['determinism'],
-): Promise<ImageDecodeRoute | undefined> {
-  const resolved = await source();
-  const ops = await context.imageOps(resolved, signal);
-  if (ops === undefined) return undefined;
-  if (determinism === 'force-software') {
-    const error = new CapabilityError(
-      'force-software image decode has no proved software substrate',
-      {
-        op: { kind: 'route', id: 'decode', facts: { mediaType: 'video', source: 'image' } },
-        tried: ['image-decoder'],
-      },
-    );
-    await cancelSource(resolved, error);
-    throw error;
+function isDirectPcmCandidate(source: NormalizedSource, options: DecodeOptions): source is Source {
+  if (
+    isLiveMediaSource(source) ||
+    source.kind === 'stream' ||
+    (options.trackSelect?.length ?? 0) > 0
+  ) {
+    return false;
   }
-  return { ops, bytes: await readAllSource(resolved, signal) };
+  return rawPcmFamily(source) !== undefined;
 }
 
-async function applyDisplayRotation(
-  context: DecodeRunnerContext,
-  frames: ReadableStream<VideoFrame>,
-  rotation: number | undefined,
-  stage: StageOptions,
-): Promise<ReadableStream<VideoFrame>> {
-  if (rotation === undefined || rotation === 0) return frames;
-  const { applyDecodedDisplayRotation } = await import('./decoded-display-rotation.ts');
-  return applyDecodedDisplayRotation(frames, rotation, stage, (spec) =>
-    context.routeFilter(spec, { strategy: stageStrategy(stage) }),
-  );
+function rawPcmFamily(source: Source): RawPcmFamily | undefined {
+  const mime = source.mimeHint?.split(';', 1)[0]?.trim().toLowerCase();
+  if (mime !== undefined) {
+    const family = RAW_PCM_MIME_FAMILIES.get(mime);
+    if (family !== undefined) return family;
+  }
+  const filename = source.filename?.toLowerCase();
+  if (filename === undefined) return undefined;
+  return RAW_PCM_EXTENSION_FAMILIES.find(([extension]) => filename.endsWith(extension))?.[1];
 }
 
-type RawFrameOf<M extends 'video' | 'audio'> = M extends 'video' ? VideoFrame : AudioData;
-
-async function decodeTrack<M extends 'video' | 'audio'>(
-  context: DecodeRunnerContext,
-  source: Source,
-  mediaType: M,
-  stage: StageOptions,
-  selectors: readonly string[] | undefined,
-): Promise<ReadableStream<RawFrameOf<M>> | undefined> {
-  const container = await context.routeContainer(source, stage.signal, stage.pinDriver);
-  if (
-    (selectors === undefined || selectors.length === 0) &&
-    mediaType === 'audio' &&
-    (container.decodePcmInterleavedStream !== undefined ||
-      container.decodePcmAudioStream !== undefined)
-  ) {
-    const { interleavedPcmChunksToAudioDataStream, pcmAudioChunksToAudioDataStream } = await import(
-      '../dsp/audio-data.ts'
-    );
-    if (container.decodePcmInterleavedStream !== undefined) {
-      const chunks = await container.decodePcmInterleavedStream(source, stage);
-      return interleavedPcmChunksToAudioDataStream(chunks, stage, container.id) as ReadableStream<
-        RawFrameOf<M>
-      >;
-    }
-    if (container.decodePcmAudioStream !== undefined) {
-      const chunks = await container.decodePcmAudioStream(source, stage);
-      return pcmAudioChunksToAudioDataStream(chunks, stage, container.id, 'f32') as ReadableStream<
-        RawFrameOf<M>
-      >;
-    }
+async function preloadBuiltInRawPcmDriver(family: RawPcmFamily): Promise<void> {
+  switch (family) {
+    case 'wav':
+      await Promise.all([
+        import('../drivers/wav/wav-lazy-driver.ts'),
+        import('../drivers/wav/wav-driver.ts'),
+      ]);
+      return;
+    case 'aiff':
+      await import('../drivers/aiff/aiff-driver.ts');
+      return;
+    case 'caf':
+      await import('../drivers/caf/caf-driver.ts');
   }
-
-  const demuxer = await container.demux(source, stage);
-  let track: (typeof demuxer.tracks)[number] | undefined;
-  try {
-    track =
-      selectors !== undefined && selectors.length > 0
-        ? (await import('./track-select.ts')).selectDecodeTrackInfo(
-            demuxer.tracks,
-            mediaType,
-            selectors,
-          )
-        : demuxer.tracks.find(
-            (candidate) => candidate.mediaType === mediaType && candidate.config !== undefined,
-          );
-  } catch (error) {
-    await demuxer.close();
-    throw error;
-  }
-  if (!track) {
-    await demuxer.close();
-    return undefined;
-  }
-  if (track.config === undefined) {
-    await demuxer.close();
-    throw new MediaError('decode-error', `track ${track.id} has no decoder config`);
-  }
-  if (track.encrypted === true) {
-    await demuxer.close();
-    throw new MediaError('decode-error', `protected ${mediaType} needs decrypt()`);
-  }
-  if (
-    mediaType === 'audio' &&
-    container.decodePcmAudio &&
-    (isRawPcmTrack(track) || track.codec === 'flac')
-  ) {
-    await demuxer.close();
-    const {
-      interleavedPcmChunksToAudioDataStream,
-      pcmAudioChunksToAudioDataStream,
-      pcmAudioToAudioDataStream,
-    } = await import('../dsp/audio-data.ts');
-    if (container.decodePcmInterleavedStream !== undefined) {
-      const chunks = await container.decodePcmInterleavedStream(source, stage);
-      return interleavedPcmChunksToAudioDataStream(chunks, stage, track.codec) as ReadableStream<
-        RawFrameOf<M>
-      >;
-    }
-    if (container.decodePcmAudioStream !== undefined) {
-      const chunks = await container.decodePcmAudioStream(source, stage);
-      return pcmAudioChunksToAudioDataStream(chunks, stage, track.codec, 'f32') as ReadableStream<
-        RawFrameOf<M>
-      >;
-    }
-    const audio = await container.decodePcmAudio(source, stage);
-    return pcmAudioToAudioDataStream(audio, stage, track.codec, 'f32') as ReadableStream<
-      RawFrameOf<M>
-    >;
-  }
-
-  const {
-    decodeQueryFor,
-    decodeVideoPacketsWithAlpha,
-    decodedAudioStreamWithGapless,
-    unwrapPackets,
-  } = await import('./codec-pipeline.ts');
-  const decodeQuery = await decodeQueryFor(track);
-  const route = await context.probeCodec(decodeQuery, {
-    strategy: stageStrategy(stage),
-  });
-  const codec = route.driver;
-  const config = decoderConfigWithRoutedAcceleration(decodeQuery.config, route.support);
-  /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
-  if (mediaType === 'video' && track.alpha === true) {
-    const decodedWithAlpha = decodeVideoPacketsWithAlpha(demuxer.packets(track.id), () =>
-      codec.createDecoder(config, stage),
-    );
-    return (await applyDisplayRotation(
-      context,
-      decodedWithAlpha,
-      track.rotation,
-      stage,
-    )) as ReadableStream<RawFrameOf<M>>;
-  }
-  const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(
-    codec.createDecoder(config, stage),
-  ) as ReadableStream<RawFrameOf<M>>;
-  if (mediaType === 'audio') {
-    return (await decodedAudioStreamWithGapless(decoded as ReadableStream<AudioData>, track, {
-      packets: demuxer.packets(track.id),
-      createDecoder: () => codec.createDecoder(config, stage),
-      signal: stage.signal,
-    })) as ReadableStream<RawFrameOf<M>>;
-  }
-  return (await applyDisplayRotation(
-    context,
-    decoded as ReadableStream<VideoFrame>,
-    track.rotation,
-    stage,
-  )) as ReadableStream<RawFrameOf<M>>;
-  /* v8 ignore stop */
 }

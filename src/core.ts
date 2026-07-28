@@ -166,7 +166,12 @@ export type { WavPacketInfoFromUrlOptions } from './drivers/wav/wav-packet-info.
 export { wavF32GainToWavFromBytes } from './drivers/wav/f32-gain.ts';
 export type { WavF32GainOptions } from './drivers/wav/f32-gain.ts';
 export { wavPcmFormatToWavFromBytes } from './drivers/wav/format-convert.ts';
-export type { WavPcmFormatConvertOptions } from './drivers/wav/format-convert.ts';
+export type {
+  WavPcmFormatConvertOptions,
+  WavPcmQuantizationOptions,
+} from './drivers/wav/format-convert.ts';
+export { wavPcmToAiffFromBytes } from './drivers/wav/aiff-rewrite.ts';
+export type { WavPcmToAiffOptions } from './drivers/wav/aiff-rewrite.ts';
 export { wavS16ResampleToWavFromBytes } from './drivers/wav/s16-resample.ts';
 export type { WavS16ResampleOptions } from './drivers/wav/s16-resample.ts';
 export { wavTrimFromUrl } from './drivers/wav/url-trim.ts';

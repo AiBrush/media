@@ -9,9 +9,9 @@ import { type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { sha256Hex } from '../../util/digest.ts';
 import { readAiffPcm, writeAiff } from '../aiff/aiff.ts';
-import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
+import { tryRewriteWavPcmToAiffBe, wavPcmToAiffFromBytes } from './aiff-rewrite.ts';
 import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
-import { tryConvertWavPcmFormatToWav } from './format-convert.ts';
+import { tryConvertWavPcmFormatToWav, wavPcmFormatToWavFromBytes } from './format-convert.ts';
 import { readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
 import { tryResampleWavS16ToS16Wav, wavS16ResampleToWavFromBytes } from './s16-resample.ts';
 import { wavTrimFromUrl } from './url-trim.ts';
@@ -95,6 +95,47 @@ function u32le(bytes: Uint8Array, offset: number): number {
       ((bytes[offset + 3] ?? 0) << 24)) >>>
     0
   );
+}
+
+function seededWavUint32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+}
+
+function testRiffChunk(id: string, body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + body.byteLength + (body.byteLength & 1));
+  out.set(
+    Uint8Array.from(id, (character) => character.charCodeAt(0)),
+    0,
+  );
+  new DataView(out.buffer).setUint32(4, body.byteLength, true);
+  out.set(body, 8);
+  return out;
+}
+
+function testRiffWave(chunks: readonly Uint8Array[]): Uint8Array {
+  const byteLength = 12 + chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(byteLength);
+  out.set(
+    Uint8Array.from('RIFF', (character) => character.charCodeAt(0)),
+    0,
+  );
+  new DataView(out.buffer).setUint32(4, byteLength - 8, true);
+  out.set(
+    Uint8Array.from('WAVE', (character) => character.charCodeAt(0)),
+    8,
+  );
+  let offset = 12;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 function rangeServer(bytes: Uint8Array): {
@@ -1406,6 +1447,102 @@ describe('parseWav — robustness + format variants', () => {
     expect(info.sampleRate).toBe(48000);
     expect(info.durationSec).toBeGreaterThan(0); // byteRate derived from blockAlign × sampleRate
   });
+
+  it('parses seeded valid PCM headers with arbitrary aligned metadata preludes', () => {
+    const next = seededWavUint32(0xa11ce55e);
+    const sampleRates = [8_000, 11_025, 22_050, 44_100, 48_000, 96_000] as const;
+    const bitDepths = [8, 16, 24, 32] as const;
+    const unknownIds = ['JUNK', 'LIST', 'PAD '] as const;
+
+    for (let caseIndex = 0; caseIndex < 128; caseIndex++) {
+      const channels = 1 + (next() % 8);
+      const sampleRate = sampleRates[next() % sampleRates.length] ?? 48_000;
+      const bits = bitDepths[next() % bitDepths.length] ?? 16;
+      const bytesPerFrame = channels * (bits >> 3);
+      const frames = next() % 129;
+      const data = new Uint8Array(frames * bytesPerFrame);
+      for (let index = 0; index < data.byteLength; index++) data[index] = next() & 0xff;
+
+      const fmt = new Uint8Array(16);
+      const formatView = new DataView(fmt.buffer);
+      formatView.setUint16(0, 1, true);
+      formatView.setUint16(2, channels, true);
+      formatView.setUint32(4, sampleRate, true);
+      formatView.setUint32(8, sampleRate * bytesPerFrame, true);
+      formatView.setUint16(12, bytesPerFrame, true);
+      formatView.setUint16(14, bits, true);
+
+      const metadata: Uint8Array[] = [];
+      const metadataCount = next() % 4;
+      for (let chunkIndex = 0; chunkIndex < metadataCount; chunkIndex++) {
+        const body = new Uint8Array(next() % 34);
+        for (let index = 0; index < body.byteLength; index++) body[index] = next() & 0xff;
+        metadata.push(testRiffChunk(unknownIds[next() % unknownIds.length] ?? 'JUNK', body));
+      }
+      const split = next() % (metadata.length + 1);
+      const bytes = testRiffWave([
+        ...metadata.slice(0, split),
+        testRiffChunk('fmt ', fmt),
+        ...metadata.slice(split),
+        testRiffChunk('data', data),
+      ]);
+      const info = parseWav(bytes, bytes.byteLength);
+
+      expect(info).toEqual({
+        codec: bits === 8 ? 'pcm-u8' : `pcm-s${bits}`,
+        sampleRate,
+        channels,
+        durationSec: frames / sampleRate,
+      });
+    }
+  });
+
+  it('keeps seeded truncations and header mutations on typed bounded outcomes', () => {
+    const next = seededWavUint32(0xbadf00d);
+    const fmt = new Uint8Array(16);
+    const formatView = new DataView(fmt.buffer);
+    formatView.setUint16(0, 1, true);
+    formatView.setUint16(2, 2, true);
+    formatView.setUint32(4, 48_000, true);
+    formatView.setUint32(8, 192_000, true);
+    formatView.setUint16(12, 4, true);
+    formatView.setUint16(14, 16, true);
+    const valid = testRiffWave([
+      testRiffChunk('JUNK', Uint8Array.of(1, 2, 3, 4, 5)),
+      testRiffChunk('fmt ', fmt),
+      testRiffChunk('data', new Uint8Array(257)),
+    ]);
+
+    const malformed: Uint8Array[] = [];
+    for (let caseIndex = 0; caseIndex < 192; caseIndex++) {
+      const candidate = valid.slice(0, next() % (valid.byteLength + 1));
+      if (candidate.byteLength > 12 && (next() & 1) === 1) {
+        const mutationOffset = 12 + (next() % Math.min(48, candidate.byteLength - 12));
+        candidate[mutationOffset] = (candidate[mutationOffset] ?? 0) ^ (1 << (next() % 8));
+      }
+      malformed.push(candidate);
+    }
+
+    const extensibleTruncation = testRiffWave([testRiffChunk('fmt ', fmt)]).subarray(0, 40);
+    new DataView(
+      extensibleTruncation.buffer,
+      extensibleTruncation.byteOffset,
+      extensibleTruncation.byteLength,
+    ).setUint32(16, 40, true);
+    malformed.push(extensibleTruncation);
+
+    for (const candidate of malformed) {
+      try {
+        const info = parseWav(candidate, candidate.byteLength);
+        expect(Number.isFinite(info.durationSec)).toBe(true);
+        expect(Number.isSafeInteger(info.channels)).toBe(true);
+        expect(Number.isSafeInteger(info.sampleRate)).toBe(true);
+      } catch (error) {
+        expect(error).toBeInstanceOf(MediaError);
+      }
+    }
+    expect(() => readWavPcm(extensibleTruncation)).toThrowError(MediaError);
+  });
 });
 
 describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
@@ -2242,6 +2379,116 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     },
   );
 
+  it('applies exact floor truncation for public s24-to-s16 byte conversion', () => {
+    const sourceCodes = [
+      -8_388_608, -32_769, -32_768, -257, -256, -255, -1, 0, 1, 255, 256, 257, 32_767, 32_768,
+      8_388_607,
+    ];
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: sourceCodes.length,
+        planar: [Float64Array.from(sourceCodes, (code) => code / 8_388_608)],
+      },
+      's24',
+    );
+    const output = wavPcmFormatToWavFromBytes(input, {
+      sampleFormat: 's16',
+      quantization: {
+        dither: 'none',
+        rounding: 'truncate-toward-negative-infinity',
+        clipping: 'saturate',
+      },
+    });
+    if (output === undefined) throw new Error('expected direct floor-truncating PCM conversion');
+    const decoded = readWavPcm(output);
+    expect(Array.from(channelAt(decoded.planar, 0), (sample) => sample * 32_768)).toEqual(
+      sourceCodes.map((code) => Math.floor(code / 256)),
+    );
+  });
+
+  it('accepts only quantization policies implemented by the direct sample-format pair', () => {
+    const s24 = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: 2,
+        planar: [Float64Array.of(-0.25, 0.25)],
+      },
+      's24',
+    );
+    const s16 = writeWav(readWavPcm(s24), 's16');
+    const f32 = writeWav(readWavPcm(s24), 'f32');
+    const base = {
+      sampleFormat: 's16' as const,
+      quantization: {
+        dither: 'none' as const,
+        rounding: 'nearest-even' as const,
+        clipping: 'saturate' as const,
+      },
+    };
+    expect(wavPcmFormatToWavFromBytes(s24, base)).toBeDefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s24, {
+        ...base,
+        quantization: { ...base.quantization, rounding: 'identity' },
+      }),
+    ).toBeUndefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s24, {
+        ...base,
+        quantization: { ...base.quantization, dither: 'triangular' as never },
+      }),
+    ).toBeUndefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s24, {
+        ...base,
+        quantization: { ...base.quantization, clipping: 'wrap' as never },
+      }),
+    ).toBeUndefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s16, {
+        sampleFormat: 's24',
+        quantization: { ...base.quantization, rounding: 'identity' },
+      }),
+    ).toBeDefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s16, {
+        sampleFormat: 's24',
+        quantization: { ...base.quantization, rounding: 'nearest-even' },
+      }),
+    ).toBeDefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s16, {
+        sampleFormat: 's24',
+        quantization: {
+          ...base.quantization,
+          rounding: 'truncate-toward-negative-infinity',
+        },
+      }),
+    ).toBeUndefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s24, {
+        sampleFormat: 'f32',
+        quantization: { ...base.quantization, rounding: 'identity' },
+      }),
+    ).toBeDefined();
+    expect(
+      wavPcmFormatToWavFromBytes(s24, {
+        sampleFormat: 'f32',
+        quantization: { ...base.quantization, rounding: 'nearest-even' },
+      }),
+    ).toBeUndefined();
+    expect(wavPcmFormatToWavFromBytes(f32, base)).toBeDefined();
+    expect(
+      wavPcmFormatToWavFromBytes(f32, {
+        ...base,
+        quantization: { ...base.quantization, rounding: 'identity' },
+      }),
+    ).toBeUndefined();
+  });
+
   it.each([
     ['sfx-pcm-s24.wav', 's16'],
     ['sfx-pcm-f32.wav', 's24'],
@@ -2385,6 +2632,43 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
       }
     },
   );
+
+  it('exposes the canonical WAV-to-AIFF byte-swap through the public driver-author helper', () => {
+    const input = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 3,
+        planar: [Float64Array.of(-1, 0, 1), Float64Array.of(0.5, -0.5, 0.25)],
+      },
+      's16',
+    );
+    const output = wavPcmToAiffFromBytes(input, {
+      sampleFormat: 's16',
+      channels: 2,
+      sampleRate: 48_000,
+    });
+    expect(wavPcmToAiffFromBytes(input)).toEqual(output);
+    expect(output).toEqual(
+      tryRewriteWavPcmToAiffBe(input, {
+        container: 'aiff',
+        sampleFormat: 's16',
+        endian: 'be',
+        channels: 2,
+        sampleRate: 48_000,
+      }),
+    );
+    const decoded = readAiffPcm(output ?? new Uint8Array());
+    expect(decoded.endian).toBe('be');
+    expect(decoded.frames).toBe(3);
+    expect(decoded.channels).toBe(2);
+    expect(() =>
+      wavPcmToAiffFromBytes(input, {
+        endian: 'be',
+        signal: AbortSignal.abort(),
+      }),
+    ).toThrowError(MediaError);
+  });
 
   it('routes clean WAV to big-endian AIFF transforms through the direct byte-swap writer', async () => {
     const bytes = withJunkChunk(await loadFixture('sfx-pcm-s16.wav'));

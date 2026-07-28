@@ -19,6 +19,7 @@ import { closeFrame } from '../kernel/frames.ts';
 import {
   RGBA_BYTES_PER_PIXEL,
   type VpxAlphaPackedSourceFormat,
+  mergeVpxAlphaRgba,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
 } from './vpx-alpha-pixels.ts';
@@ -94,7 +95,11 @@ async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFramePixels> 
   };
 }
 
-function rgbaPixelsToFrame(pixels: RgbaFramePixels, color: VideoFrame): VideoFrame {
+function rgbaPixelsToFrame(
+  pixels: RgbaFramePixels,
+  color: VideoFrame,
+  sidecarOwnership: 'copy' | 'adopt' = 'copy',
+): VideoFrame {
   const base: VideoFrameBufferInit = {
     format: 'RGBA',
     codedWidth: pixels.width,
@@ -106,7 +111,7 @@ function rgbaPixelsToFrame(pixels: RgbaFramePixels, color: VideoFrame): VideoFra
     color.duration === null ? base : { ...base, duration: color.duration };
   const frame = new VideoFrame(pixels.data, init);
   rgbaPixelSidecars.set(frame, {
-    data: pixels.data.slice(),
+    data: sidecarOwnership === 'adopt' ? pixels.data : pixels.data.slice(),
     width: pixels.width,
     height: pixels.height,
   });
@@ -274,12 +279,12 @@ export async function mergeAlphaFrames(color: VideoFrame, alpha: VideoFrame): Pr
     );
   }
 
-  const colorPixels = await rgbaPixelsFromFrame(color);
-  const alphaPixels = await rgbaPixelsFromFrame(alpha);
-  for (let i = 0; i < colorPixels.data.length; i += RGBA_BYTES_PER_PIXEL) {
-    colorPixels.data[i + 3] = alphaPixels.data[i] as number;
-  }
-  return rgbaPixelsToFrame(colorPixels, color);
+  const [colorPixels, alphaPixels] = await Promise.all([
+    rgbaPixelsFromFrame(color),
+    rgbaPixelsFromFrame(alpha),
+  ]);
+  mergeVpxAlphaRgba(colorPixels.data, alphaPixels.data);
+  return rgbaPixelsToFrame(colorPixels, color, 'adopt');
 }
 
 /** Enqueue a frame, closing it if the controller rejects it (stream already errored/cancelled). */

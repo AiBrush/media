@@ -82,6 +82,27 @@ async function bundleJavaScript() {
     chunkNames: '[name]-[hash]',
     logLevel: 'info',
   });
+
+  // `@aibrush/media/wav` is the startup-sensitive, short-lived-worker surface. Build it as one small
+  // self-contained module instead of making consumers pay several shared-chunk request/evaluation hops.
+  // The full engine/core/driver graph above remains split normally; only this deliberately narrow
+  // synchronous envelope utility duplicates its few kilobytes.
+  await build({
+    absWorkingDir: ROOT,
+    entryPoints: { wav: 'src/wav.ts' },
+    outdir: DIST,
+    bundle: true,
+    format: 'esm',
+    target: 'es2022',
+    platform: 'browser',
+    external: EXTERNAL_NODE_MODULES,
+    splitting: false,
+    treeShaking: true,
+    minify: true,
+    sourcemap: 'external',
+    entryNames: '[name]',
+    logLevel: 'info',
+  });
 }
 
 async function emitDeclarations() {

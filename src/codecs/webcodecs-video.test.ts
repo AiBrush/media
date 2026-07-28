@@ -752,6 +752,39 @@ describe('createWarmVideoDecoderPool — reuse a configured decoder across seque
     for (const f of state.frames) expect(f.closeCount).toBe(1);
   });
 
+  it('reuses one decoder across a seeded sequence of forward, backward, repeated, and boundary targets', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    const timestamps = [0, 1_000, 2_500, 9_000] as const;
+    const targets = [-1_000, 0, 2_500, 2_500, 9_001, 0, 9_000, 1_001];
+    let randomState = 0x51ee7a11;
+    for (let index = 0; index < 64; index++) {
+      randomState ^= randomState << 13;
+      randomState ^= randomState >>> 17;
+      randomState ^= randomState << 5;
+      targets.push(((randomState >>> 0) % 12_001) - 1_000);
+    }
+
+    for (const target of targets) {
+      const frame = await runFakeSeek(
+        pool.borrow(POOL_H264, undefined),
+        timestamps.map(
+          (timestamp, index) => new PoolFakeChunk(timestamp, index === 0 ? 'key' : 'delta'),
+        ),
+        target,
+      );
+      const expected = timestamps.find((timestamp) => timestamp >= target) ?? timestamps.at(-1);
+      expect(frame.timestamp).toBe(expected);
+      frame.close();
+    }
+
+    expect(state.builds).toBe(1);
+    expect(state.closes).toBe(0);
+    for (const frame of state.frames) expect(frame.closeCount).toBe(1);
+    pool.dispose();
+    expect(state.closes).toBe(1);
+  });
+
   it('closes the old decoder and builds a new one when the config changes (config-keyed)', async () => {
     const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
     const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));

@@ -5,7 +5,13 @@ import { gain } from '../../dsp/index.ts';
 import { channelAt, encodePcm } from '../../dsp/pcm.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { slice as rewriteWavPcmSlice } from './pcm-slice.ts';
-import { planWavPcmCopy, readWavPcm, rewriteWavPcmCopy, writeWav } from './pcm.ts';
+import {
+  planWavPcmCopy,
+  readWavPcm,
+  rewriteOwnedWavPcmCopy,
+  rewriteWavPcmCopy,
+  writeWav,
+} from './pcm.ts';
 import { parseWav } from './wav-driver.ts';
 
 /** Independent `data`-chunk locator — the byte-exact oracle must not depend on the code under test. */
@@ -186,6 +192,54 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     expect(plan.header).not.toBe(wav.subarray(0, 44));
     expect(plan.payload.buffer).toBe(wav.buffer);
     expect(materializeCopyPlan(plan)).toEqual(rewriteWavPcmCopy(wav, 's16', 'le', 2, 48_000));
+  });
+
+  it('normalizes a transferred canonical snapshot in place while immutable copy stays distinct', () => {
+    const owned = writeWav(
+      {
+        sampleRate: 48_000,
+        channels: 2,
+        frames: 2,
+        planar: [Float64Array.of(0.25, -0.25), Float64Array.of(-0.5, 0.5)],
+      },
+      's16',
+    );
+    const original = owned.slice();
+    new DataView(owned.buffer).setUint32(4, 0, true);
+    const rewritten = rewriteOwnedWavPcmCopy(owned, 's16', 'le', 2, 48_000);
+    expect(rewritten).toBe(owned);
+    expect(rewritten).toEqual(original);
+
+    const immutableInput = original.slice();
+    const immutable = rewriteWavPcmCopy(immutableInput, 's16', 'le', 2, 48_000);
+    expect(immutable).not.toBe(immutableInput);
+    expect(immutableInput).toEqual(original);
+    expect(immutable).toEqual(original);
+  });
+
+  it('declines mismatched owned snapshots and canonically re-envelopes noncanonical ones', () => {
+    const canonical = writeWav(
+      {
+        sampleRate: 8_000,
+        channels: 1,
+        frames: 2,
+        planar: [Float64Array.of(0.25, -0.25)],
+      },
+      's16',
+    );
+    expect(rewriteOwnedWavPcmCopy(canonical.slice(), 's24')).toBeUndefined();
+
+    const noncanonical = riff([
+      canonical.subarray(12, 36),
+      chunk('JUNK', Uint8Array.of(0x61)),
+      canonical.subarray(36),
+    ]) as Uint8Array<ArrayBuffer>;
+    const expectedPayload = dataChunk(noncanonical).slice();
+    const rewritten = rewriteOwnedWavPcmCopy(noncanonical, 's16', 'le', 1, 8_000);
+    if (rewritten === undefined) throw new Error('expected owned WAV rewrite');
+    expect(rewritten).not.toBe(noncanonical);
+    expect(rewritten.byteLength).toBe(44 + expectedPayload.byteLength);
+    expect(dataChunk(rewritten)).toEqual(expectedPayload);
   });
 
   it('keeps truncated declared data behavior byte-exact and mismatched plans ineligible', () => {

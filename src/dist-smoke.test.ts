@@ -48,12 +48,51 @@ import type { DecodeImageOptions, ImageFormat, ImageInfo } from './image.ts';
 const distBuilt =
   existsSync(fileURLToPath(new URL('../dist/index.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/core.js', import.meta.url))) &&
-  existsSync(fileURLToPath(new URL('../dist/image.js', import.meta.url)));
+  existsSync(fileURLToPath(new URL('../dist/image.js', import.meta.url))) &&
+  existsSync(fileURLToPath(new URL('../dist/wav.js', import.meta.url)));
 const suite = distBuilt ? describe : describe.skip;
 const packageSubpath = (subpath: string): string => `@aibrush/media/${subpath}`;
 type ImageEntry = typeof import('./image.ts');
+type WavEntry = typeof import('./wav.ts');
+type CoreEntryWithWavPcmToAiff = typeof core & {
+  readonly wavPcmToAiffFromBytes?: unknown;
+};
 
 suite('dist smoke (built package via exports map)', () => {
+  it('wav subpath re-authors a valid empty PCM WAV without loading the engine surface', async () => {
+    const wav = (await import(packageSubpath('wav'))) as WavEntry;
+    expect(typeof wav.decodeWavPcmInterleavedPrefix).toBe('function');
+    expect(typeof wav.parseWavHeader).toBe('function');
+    expect(typeof wav.rewriteOwnedWavPcmCopy).toBe('function');
+    const input = new Uint8Array(44);
+    const view = new DataView(input.buffer);
+    for (const [offset, text] of [
+      [0, 'RIFF'],
+      [8, 'WAVE'],
+      [12, 'fmt '],
+      [36, 'data'],
+    ] as const) {
+      for (let index = 0; index < text.length; index++)
+        input[offset + index] = text.charCodeAt(index);
+    }
+    view.setUint32(4, 36, true);
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, 48_000, true);
+    view.setUint32(28, 96_000, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(40, 0, true);
+
+    const output = wav.rewriteEmptyWavPcm(input, 's16', 'le', 1, 44_100);
+    expect(output?.byteLength).toBe(44);
+    if (output === undefined) throw new Error('zero-frame rewrite unexpectedly declined');
+    expect(new DataView(output.buffer).getUint32(24, true)).toBe(44_100);
+    expect(new DataView(output.buffer).getUint32(40, true)).toBe(0);
+    expect('createMedia' in wav).toBe(false);
+  });
+
   it('default entry exposes the engine factory + every bare-function op as callables', () => {
     expect(typeof media.createMedia).toBe('function');
     const mediaSurface = media as unknown as Record<string, unknown>;
@@ -157,6 +196,7 @@ suite('dist smoke (built package via exports map)', () => {
     expect(typeof core.createMedia).toBe('function');
     expect(typeof core.Registry).toBe('function');
     expect(typeof core.MediaEngineImpl).toBe('function');
+    expect(typeof (core as CoreEntryWithWavPcmToAiff).wavPcmToAiffFromBytes).toBe('function');
     // The error model is shared across both entries (same code semantics).
     expect(new core.MediaError('demux-error', 'x').code).toBe('demux-error');
   });

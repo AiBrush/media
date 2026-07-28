@@ -16,6 +16,16 @@ function pattern(length: number): Uint8Array {
   return Uint8Array.from({ length }, (_, i) => (i * 37 + 11) & 0xff);
 }
 
+function seededUint32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+}
+
 const INT_FORMATS: SampleFormat[] = ['u8', 's8', 's16', 's24', 's32'];
 
 describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => {
@@ -37,6 +47,46 @@ describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => 
     const bytes = pattern(2 * 2 * 40);
     const audio = decodePcm(bytes, 's16', 2, 44100, 'be');
     expect(encodePcm(audio, 's16', 'be')).toEqual(bytes);
+  });
+
+  it('seeded signed-16/24 endian properties hold across channels, unaligned views, and partial frames', () => {
+    const next = seededUint32(0x5eeda11c);
+    const formats = ['s16', 's24'] as const;
+    const endians = ['le', 'be'] as const;
+
+    for (let caseIndex = 0; caseIndex < 192; caseIndex++) {
+      const format = formats[next() % formats.length] ?? 's16';
+      const endian = endians[next() % endians.length] ?? 'le';
+      const channels = 1 + (next() % 8);
+      const frames = next() % 97;
+      const frameBytes = bytesPerSample(format) * channels;
+      const trailingBytes = next() % frameBytes;
+      const completeBytes = frames * frameBytes;
+      const backing = new Uint8Array(1 + completeBytes + trailingBytes);
+      for (let index = 1; index < backing.byteLength; index++) {
+        backing[index] = next() & 0xff;
+      }
+      const unaligned = backing.subarray(1);
+      const audio = decodePcm(unaligned, format, channels, 8_000 + (next() % 88_001), endian);
+
+      expect(audio.frames).toBe(frames);
+      expect(encodePcm(audio, format, endian)).toEqual(unaligned.subarray(0, completeBytes));
+
+      const direct = decodePcmToInterleavedF32(
+        unaligned,
+        format,
+        channels,
+        audio.sampleRate,
+        endian,
+      );
+      const canonical = new Float32Array(frames * channels);
+      for (let frame = 0; frame < frames; frame++) {
+        for (let channel = 0; channel < channels; channel++) {
+          canonical[frame * channels + channel] = audio.planar[channel]?.[frame] ?? 0;
+        }
+      }
+      expect(new Uint32Array(direct.data.buffer)).toEqual(new Uint32Array(canonical.buffer));
+    }
   });
 
   it('f32 / f64 round-trip finite floats byte-for-byte', () => {

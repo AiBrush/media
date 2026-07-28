@@ -8,10 +8,12 @@
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import {
   type Endianness,
+  type InterleavedPcmF32,
   type PcmAudio,
   type SampleFormat,
   bytesPerSample,
   decodePcm,
+  decodePcmToInterleavedF32,
   encodePcm,
 } from '../../dsp/pcm.ts';
 
@@ -56,6 +58,11 @@ export interface WavPcmData {
   readonly dataSize: number;
 }
 
+/** A bounded, exact-owned interleaved Float32 prefix decoded from a WAV PCM payload. */
+export interface WavPcmInterleavedPrefix extends InterleavedPcmF32 {
+  readonly format: SampleFormat;
+}
+
 /** A fresh canonical WAV header plus the validated immutable PCM payload view it describes. */
 export interface WavPcmCopyPlan {
   readonly header: Uint8Array<ArrayBuffer>;
@@ -88,7 +95,8 @@ export function parseWavPcmData(bytes: Uint8Array, totalSize = bytes.byteLength)
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
     if (tagEquals(bytes, pos, 'fmt ') && size >= 16) {
-      if (body + 16 > bytes.byteLength) {
+      const needed = size >= 40 ? 26 : 16;
+      if (body + needed > bytes.byteLength) {
         throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
       }
       fmt = parseFmt(dv, body, size);
@@ -104,6 +112,39 @@ export function parseWavPcmData(bytes: Uint8Array, totalSize = bytes.byteLength)
   const data =
     dataOffset < 0 ? new Uint8Array(0) : bytes.subarray(dataOffset, dataOffset + dataSize);
   return { fmt, format, data, dataOffset, dataSize };
+}
+
+/**
+ * Decode at most `maxFrames` sample-frames from the beginning of a RIFF/WAVE PCM payload. This is the
+ * bounded inspection/decode seam for callers that need a small prefix: it validates the real container
+ * and format, reads no samples beyond the requested prefix, and never constructs the full media engine.
+ */
+export function decodeWavPcmInterleavedPrefix(
+  bytes: Uint8Array,
+  maxFrames: number,
+): WavPcmInterleavedPrefix {
+  if (!Number.isSafeInteger(maxFrames) || maxFrames < 0) {
+    throw new InputError(`invalid WAV PCM prefix frame count ${maxFrames}`);
+  }
+  const parsed = parseWavPcmData(bytes);
+  if (
+    !Number.isSafeInteger(parsed.fmt.channels) ||
+    parsed.fmt.channels <= 0 ||
+    !Number.isSafeInteger(parsed.fmt.sampleRate) ||
+    parsed.fmt.sampleRate <= 0
+  ) {
+    throw new InputError(
+      `invalid WAV PCM shape (${parsed.fmt.channels} channel(s), ${parsed.fmt.sampleRate}Hz)`,
+    );
+  }
+  const frameBytes = bytesPerSample(parsed.format) * parsed.fmt.channels;
+  const availableFrames = Math.floor(parsed.data.byteLength / frameBytes);
+  const frames = Math.min(maxFrames, availableFrames);
+  const prefix = parsed.data.subarray(0, frames * frameBytes);
+  return {
+    ...decodePcmToInterleavedF32(prefix, parsed.format, parsed.fmt.channels, parsed.fmt.sampleRate),
+    format: parsed.format,
+  };
 }
 
 /** Read a RIFF/WAVE file's PCM into canonical planar audio (little-endian wire format). */
@@ -239,6 +280,75 @@ export function rewriteWavPcmCopy(
     return out;
   }
   return writeWavContainer(data, fmt.channels, fmt.sampleRate, format);
+}
+
+/**
+ * Re-author an exclusively owned WAV snapshot without a second full-file copy when its envelope is
+ * already canonical. The caller transfers ownership of `bytes`: on success this function may normalize
+ * its RIFF/data declarations in place and return the same object. Shared or caller-retained inputs must
+ * use {@link rewriteWavPcmCopy} instead.
+ */
+export function rewriteOwnedWavPcmCopy(
+  bytes: Uint8Array<ArrayBuffer>,
+  requestedFormat?: SampleFormat,
+  endian: Endianness = 'le',
+  requestedChannels?: number,
+  requestedSampleRate?: number,
+): Uint8Array<ArrayBuffer> | undefined {
+  const parsed = validatedWavPcmCopy(
+    bytes,
+    requestedFormat,
+    endian,
+    requestedChannels,
+    requestedSampleRate,
+  );
+  if (parsed === undefined) return undefined;
+  const { fmt, format, data } = parsed;
+  if (isCanonicalWavPcmEnvelope(bytes, parsed)) {
+    writeWavHeader(bytes, data.byteLength, fmt.channels, fmt.sampleRate, format);
+    return bytes;
+  }
+  return writeWavContainer(data, fmt.channels, fmt.sampleRate, format);
+}
+
+/**
+ * Re-author a structurally valid zero-frame WAV with a different PCM declaration. With no sample
+ * payload there is no resampling, channel mapping, or quantization work to perform; only the canonical
+ * RIFF/WAVE envelope changes. Non-empty or truncated payloads deliberately decline this fast path.
+ */
+export function rewriteEmptyWavPcm(
+  bytes: Uint8Array,
+  requestedFormat?: SampleFormat,
+  endian: Endianness = 'le',
+  requestedChannels?: number,
+  requestedSampleRate?: number,
+): Uint8Array<ArrayBuffer> | undefined {
+  if (endian !== 'le') return undefined;
+  const parsed = parseWavPcmData(bytes);
+  if (parsed.dataOffset < 8 || parsed.dataSize !== 0) return undefined;
+  const declaredDataSize = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+    parsed.dataOffset - 4,
+    true,
+  );
+  if (declaredDataSize !== 0) return undefined;
+
+  const format = requestedFormat ?? parsed.format;
+  // WAV's 8-bit integer PCM representation is unsigned.
+  if (format === 's8') return undefined;
+  const channels = requestedChannels ?? parsed.fmt.channels;
+  const sampleRate = requestedSampleRate ?? parsed.fmt.sampleRate;
+  if (
+    !Number.isSafeInteger(channels) ||
+    channels <= 0 ||
+    channels > 0xffff ||
+    !Number.isSafeInteger(sampleRate) ||
+    sampleRate <= 0 ||
+    sampleRate > 0xffffffff ||
+    sampleRate * channels * bytesPerSample(format) > 0xffffffff
+  ) {
+    return undefined;
+  }
+  return writeWavContainer(new Uint8Array(0), channels, sampleRate, format);
 }
 
 /** Serialize canonical audio to a canonical 44-byte-header RIFF/WAVE file (little-endian). */

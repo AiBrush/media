@@ -27,8 +27,17 @@ export interface WavPcmFormatConvertOptions {
   readonly sampleFormat: DirectOutputFormat;
   readonly channels?: number;
   readonly sampleRate?: number;
+  readonly quantization?: WavPcmQuantizationOptions;
   readonly signal?: AbortSignal;
 }
+
+export interface WavPcmQuantizationOptions {
+  readonly dither: 'none';
+  readonly rounding: 'identity' | 'nearest-even' | 'truncate-toward-negative-infinity';
+  readonly clipping: 'saturate';
+}
+
+type DirectRounding = WavPcmQuantizationOptions['rounding'];
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw new MediaError('aborted', 'operation aborted');
@@ -97,6 +106,7 @@ function convertSamples(
   sampleCount: number,
   signal: AbortSignal | undefined,
   hostLittleEndian: boolean,
+  rounding: DirectRounding,
 ): void {
   throwIfAborted(signal);
 
@@ -168,6 +178,21 @@ function convertSamples(
           if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
           target.setFloat32(sample * 4, readS24Le(input, offset) / 8_388_608, true);
         }
+      }
+      return;
+    }
+    if (rounding === 'truncate-toward-negative-infinity') {
+      // Arithmetic s24 >> 8 is exactly the source sample's middle/high bytes in little-endian
+      // two's-complement form. Copying those bytes avoids sign extension, division, rounding, and
+      // host-endian branches while preserving floor semantics for negative residuals.
+      for (
+        let sample = 0, inputOffset = dataOffset, outputOffset = WAV_HEADER_BYTES;
+        sample < sampleCount;
+        sample++, inputOffset += 3, outputOffset += 2
+      ) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        output[outputOffset] = input[inputOffset + 1] as number;
+        output[outputOffset + 1] = input[inputOffset + 2] as number;
       }
       return;
     }
@@ -280,15 +305,31 @@ function eligibleOutputFormat(opts: PcmTransform): DirectOutputFormat | undefine
   return directOutputFormat(opts.sampleFormat);
 }
 
-/**
- * Try the bounded direct conversion. `hostLittleEndian` is injectable so portability tests can exercise
- * the DataView-only path that a big-endian JS host must use; production callers leave it at the native
- * default.
- */
-export function tryConvertWavPcmFormatToWav(
+function requestedRounding(
+  inputFormat: DirectInputFormat,
+  outputFormat: DirectOutputFormat,
+  quantization: WavPcmQuantizationOptions | undefined,
+): DirectRounding | undefined {
+  if (quantization === undefined) return 'nearest-even';
+  if (quantization.dither !== 'none' || quantization.clipping !== 'saturate') return undefined;
+  const rounding = quantization.rounding;
+  if (outputFormat === 'f32') return rounding === 'identity' ? rounding : undefined;
+  if (inputFormat === 's16' && outputFormat === 's24') {
+    return rounding === 'identity' || rounding === 'nearest-even' ? rounding : undefined;
+  }
+  if (inputFormat === 's24' && outputFormat === 's16') {
+    return rounding === 'nearest-even' || rounding === 'truncate-toward-negative-infinity'
+      ? rounding
+      : undefined;
+  }
+  return rounding === 'nearest-even' ? rounding : undefined;
+}
+
+function convertWavPcmFormatToWav(
   bytes: Uint8Array,
   opts: PcmTransform,
-  hostLittleEndian = nativeLittleEndian,
+  hostLittleEndian: boolean,
+  quantization: WavPcmQuantizationOptions | undefined,
 ): Uint8Array<ArrayBuffer> | undefined {
   const outputFormat = eligibleOutputFormat(opts);
   if (outputFormat === undefined) return undefined;
@@ -296,6 +337,8 @@ export function tryConvertWavPcmFormatToWav(
   const parsed = parseWavPcmData(bytes);
   const inputFormat = directInputFormat(parsed.format);
   if (inputFormat === undefined || inputFormat === outputFormat) return undefined;
+  const rounding = requestedRounding(inputFormat, outputFormat, quantization);
+  if (rounding === undefined) return undefined;
   const { fmt } = parsed;
   if (fmt.channels <= 0 || !Number.isInteger(fmt.channels)) return undefined;
   if (fmt.sampleRate <= 0 || !Number.isInteger(fmt.sampleRate)) return undefined;
@@ -323,15 +366,35 @@ export function tryConvertWavPcmFormatToWav(
     sampleCount,
     opts.signal,
     hostLittleEndian,
+    rounding,
   );
   writeWavHeader(out, outputDataBytes, fmt.channels, fmt.sampleRate, outputFormat);
   throwIfAborted(opts.signal);
   return out;
 }
 
+/**
+ * Try the bounded direct conversion. `hostLittleEndian` is injectable so portability tests can exercise
+ * the DataView-only path that a big-endian JS host must use; production callers leave it at the native
+ * default.
+ */
+export function tryConvertWavPcmFormatToWav(
+  bytes: Uint8Array,
+  opts: PcmTransform,
+  hostLittleEndian = nativeLittleEndian,
+): Uint8Array<ArrayBuffer> | undefined {
+  return convertWavPcmFormatToWav(bytes, opts, hostLittleEndian, undefined);
+}
+
 export function wavPcmFormatToWavFromBytes(
   bytes: Uint8Array,
   opts: WavPcmFormatConvertOptions,
 ): Uint8Array<ArrayBuffer> | undefined {
-  return tryConvertWavPcmFormatToWav(bytes, { container: 'wav', ...opts });
+  const { quantization, ...transform } = opts;
+  return convertWavPcmFormatToWav(
+    bytes,
+    { container: 'wav', ...transform },
+    nativeLittleEndian,
+    quantization,
+  );
 }

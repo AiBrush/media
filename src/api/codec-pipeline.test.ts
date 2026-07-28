@@ -52,6 +52,7 @@ import {
   isPcmContainer,
   isPureStreamCopy,
   isUnsupportedHevcEncodeProfile,
+  mergeVpxAlphaRgba,
   normalizeDecoderCodec,
   outputDimensions,
   outputGaplessForAudioEncoder,
@@ -226,6 +227,37 @@ describe('splitRgbaForVpxAlpha', () => {
 
     expect([...split.color.data]).toEqual([10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255]);
     expect([...split.alpha.data]).toEqual([0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+  });
+});
+
+describe('mergeVpxAlphaRgba', () => {
+  it('preserves randomized RGB bytes and takes alpha from the grayscale red channel', () => {
+    let state = 0x8c03_d274;
+    const nextByte = (): number => {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      return state >>> 24;
+    };
+    const color = Uint8ClampedArray.from({ length: 4_096 * 4 }, nextByte);
+    const alpha = Uint8ClampedArray.from({ length: color.length }, nextByte);
+    const expected = color.slice();
+    for (let offset = 0; offset < expected.length; offset += 4) {
+      expected[offset + 3] = alpha[offset] as number;
+    }
+
+    mergeVpxAlphaRgba(color, alpha);
+
+    expect(color).toEqual(expected);
+  });
+
+  it('preserves exact bytes for unaligned views through the portable path', () => {
+    const colorBacking = Uint8ClampedArray.from([99, 10, 20, 30, 40, 50, 60, 70, 80, 88]);
+    const alphaBacking = Uint8ClampedArray.from([77, 1, 2, 3, 4, 5, 6, 7, 8, 66]);
+    const color = colorBacking.subarray(1, 9);
+    const alpha = alphaBacking.subarray(1, 9);
+
+    mergeVpxAlphaRgba(color, alpha);
+
+    expect([...colorBacking]).toEqual([99, 10, 20, 30, 1, 50, 60, 70, 5, 88]);
   });
 });
 

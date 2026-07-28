@@ -101,6 +101,7 @@ export {
   type VpxAlphaSplitPixels,
 } from './vpx-alpha.ts';
 export {
+  mergeVpxAlphaRgba,
   type VpxAlphaI420Plane,
   type VpxAlphaPackedSourceFormat,
   vpxAlphaI420FromPackedRgba,
