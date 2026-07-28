@@ -51,6 +51,7 @@ export interface PlainRecord extends Record<string, unknown> {
   readonly channels?: unknown;
   readonly gainDb?: unknown;
   readonly fade?: unknown;
+  readonly mixMatrix?: unknown;
   readonly dynamics?: unknown;
   readonly biquad?: unknown;
   readonly inSec?: unknown;

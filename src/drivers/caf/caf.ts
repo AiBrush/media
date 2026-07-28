@@ -70,9 +70,21 @@ function formatFromAsbd(asbd: CafAsbd): { format: SampleFormat; endian: Endianne
   throw new InputError(`unsupported CAF PCM depth ${bits}-bit`);
 }
 
-/** Read a signed 64-bit big-endian integer (CAF chunk sizes; `-1` is legal for a trailing `data`). */
-function getInt64(dv: DataView, off: number): number {
-  return Number(dv.getBigInt64(off));
+const MAX_SAFE_CAF_CHUNK_SIZE = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * Validate one signed CAF chunk size before converting it to a JS number. `-1` is the sole negative
+ * sentinel and is legal only for a trailing `data` chunk ("through EOF").
+ */
+export function parseCafChunkSize(raw: bigint, type: string): number {
+  if (raw < -1n) throw new InputError(`CAF: invalid negative '${type}' chunk size`);
+  if (raw === -1n && type !== 'data') {
+    throw new InputError('CAF: only a final data chunk may declare size -1');
+  }
+  if (raw > MAX_SAFE_CAF_CHUNK_SIZE) {
+    throw new InputError(`CAF: '${type}' chunk size exceeds the safe integer range`);
+  }
+  return Number(raw);
 }
 
 interface CafChunk {
@@ -84,29 +96,45 @@ interface CafChunk {
 /** Walk CAF chunks after the 8-byte `caff` header (no even-padding — sizes are exact s64). */
 function* cafChunks(bytes: Uint8Array, dv: DataView): Generator<CafChunk> {
   let pos = 8; // 'caff'(4) + mFileVersion(2) + mFileFlags(2)
-  while (pos + 12 <= bytes.byteLength) {
+  while (pos < bytes.byteLength) {
+    if (bytes.byteLength - pos < 12) {
+      throw new MediaError('demux-error', 'CAF: truncated chunk header');
+    }
     const type = ascii(bytes, pos, 4);
-    const size = getInt64(dv, pos + 4);
+    const size = parseCafChunkSize(dv.getBigInt64(pos + 4), type);
     const body = pos + 12;
+    const availableBodyBytes = bytes.byteLength - body;
+    if (size !== -1 && size > availableBodyBytes) {
+      throw new MediaError('demux-error', `CAF: truncated '${type}' chunk`);
+    }
     yield { type, body, size };
-    if (size < 0) return; // a -1 ("to EOF") chunk is necessarily the last one
+    if (size === -1) return; // a -1 ("to EOF") data chunk is necessarily the last one
     pos = body + size;
   }
 }
 
-function parseDesc(dv: DataView, bytes: Uint8Array, c: CafChunk): CafAsbd {
+/** Parse the fixed 32-byte Audio Stream Basic Description body of a CAF `desc` chunk. */
+export function parseCafAsbd(bytes: Uint8Array): CafAsbd {
+  if (bytes.byteLength < 32) {
+    throw new MediaError('demux-error', 'CAF: truncated Audio Description (desc) chunk');
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    sampleRate: dv.getFloat64(0),
+    formatId: ascii(bytes, 8, 4),
+    formatFlags: dv.getUint32(12),
+    bytesPerPacket: dv.getUint32(16),
+    framesPerPacket: dv.getUint32(20),
+    channels: dv.getUint32(24),
+    bitsPerChannel: dv.getUint32(28),
+  };
+}
+
+function parseDesc(bytes: Uint8Array, c: CafChunk): CafAsbd {
   if (c.size < 32 || c.body + 32 > bytes.byteLength) {
     throw new MediaError('demux-error', 'CAF: truncated Audio Description (desc) chunk');
   }
-  return {
-    sampleRate: dv.getFloat64(c.body),
-    formatId: ascii(bytes, c.body + 8, 4),
-    formatFlags: dv.getUint32(c.body + 12),
-    bytesPerPacket: dv.getUint32(c.body + 16),
-    framesPerPacket: dv.getUint32(c.body + 20),
-    channels: dv.getUint32(c.body + 24),
-    bitsPerChannel: dv.getUint32(c.body + 28),
-  };
+  return parseCafAsbd(bytes.subarray(c.body, c.body + 32));
 }
 
 /** Locate the `desc` ASBD + the `data` chunk's sample range in a CAF file (pure; big-endian). */
@@ -123,11 +151,18 @@ function locate(bytes: Uint8Array): {
   let data: { sampleOffset: number; sampleBytes: number } | undefined;
   for (const c of cafChunks(bytes, dv)) {
     if (c.type === 'desc' && asbd === undefined) {
-      asbd = parseDesc(dv, bytes, c);
+      asbd = parseDesc(bytes, c);
     } else if (c.type === 'data' && data === undefined) {
       // The data chunk opens with a u32 mEditCount; the samples follow. A size of -1 runs to EOF.
+      const availableBodyBytes = bytes.byteLength - c.body;
+      if (availableBodyBytes < 4) {
+        throw new MediaError('demux-error', 'CAF: truncated data chunk edit count');
+      }
+      if (c.size !== -1 && c.size < 4) {
+        throw new MediaError('demux-error', 'CAF: data chunk is smaller than its edit count');
+      }
       const samples = c.body + 4;
-      const declared = c.size < 0 ? bytes.byteLength - samples : c.size - 4;
+      const declared = c.size === -1 ? bytes.byteLength - samples : c.size - 4;
       data = {
         sampleOffset: samples,
         sampleBytes: Math.max(0, Math.min(declared, bytes.byteLength - samples)),
@@ -166,9 +201,8 @@ function frameCount(asbd: CafAsbd, sampleBytes: number, format: SampleFormat): n
   return frameBytes > 0 ? Math.floor(sampleBytes / frameBytes) : 0;
 }
 
-/** Parse a CAF header into the audio layout + duration (pure; reads no samples beyond the header). */
-export function parseCaf(bytes: Uint8Array): CafInfo {
-  const { asbd, sampleBytes } = locate(bytes);
+/** Build public CAF metadata from a parsed ASBD and the exact number of available sample bytes. */
+export function cafInfoFromAsbd(asbd: CafAsbd, sampleBytes: number): CafInfo {
   const { format, endian } = formatFromAsbd(asbd);
   const frames = frameCount(asbd, sampleBytes, format);
   return {
@@ -180,6 +214,12 @@ export function parseCaf(bytes: Uint8Array): CafInfo {
     frames,
     durationSec: asbd.sampleRate > 0 ? frames / asbd.sampleRate : 0,
   };
+}
+
+/** Parse a CAF header into the audio layout + duration (pure; reads no samples beyond the header). */
+export function parseCaf(bytes: Uint8Array): CafInfo {
+  const { asbd, sampleBytes } = locate(bytes);
+  return cafInfoFromAsbd(asbd, sampleBytes);
 }
 
 /** Read a CAF file's samples into canonical planar Float64 audio (honors the ASBD endianness). */

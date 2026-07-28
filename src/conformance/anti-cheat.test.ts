@@ -237,7 +237,7 @@ describe('anti-cheat §5: plausibility (real physical ranges)', () => {
     expect(info.tracks.some((t) => t.type === 'audio')).toBe(true);
   });
 
-  it('decrypt with a missing key is a typed CapabilityError (graceful, not wrong output)', async () => {
+  it('decrypt with an empty key map is a typed CapabilityError (graceful, not wrong output)', async () => {
     const twin = await json<{ cipherFile: string }>('decrypt/cenc-aes-ctr.json');
     const enc = await goldenBytes(`decrypt/${twin.cipherFile}`);
     await expect(

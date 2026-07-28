@@ -4,7 +4,7 @@ import type { ContainerDriver, Demuxer, Muxer, PcmTransform } from '../contracts
 import { InputError } from '../contracts/errors.ts';
 import { tryAuthorWavS16Flac } from '../drivers/wav/flac-s16.ts';
 import { parseWavPcmData, writeWav } from '../drivers/wav/pcm.ts';
-import type { PcmAudio, SampleFormat } from '../dsp/pcm.ts';
+import type { PcmAudio } from '../dsp/pcm.ts';
 import { type Source, fromBytes } from '../sources/source.ts';
 import { type FlacConvertDeps, convertToFlac } from './flac-convert-plan.ts';
 import type { AudioTarget, CallOptions } from './types.ts';
@@ -49,27 +49,6 @@ function depsFor(container: ContainerDriver): FlacConvertDeps {
       signal,
     }),
     mimeOpts: (signal, containerName) => ({ signal, mime: `audio/${containerName}` }),
-    pcmSampleFormat: (codec) => {
-      switch (codec) {
-        case 'pcm-u8':
-          return 'u8';
-        case 'pcm-s8':
-          return 's8';
-        case 'pcm-s16':
-          return 's16';
-        case 'pcm-s24':
-        case 'pcm-s24be':
-          return 's24';
-        case 'pcm-s32':
-          return 's32';
-        case 'pcm-f32':
-          return 'f32';
-        case 'pcm-f64':
-          return 'f64';
-        default:
-          return undefined;
-      }
-    },
   };
 }
 
@@ -173,6 +152,10 @@ describe('convertToFlac — lazy FLAC authoring route planner', () => {
       sampleRate: 44_100,
       gainDb: -3,
       fade: { inSec: 0.1, outSec: 0.2, curve: 'linear' },
+      mixMatrix: [
+        [1, 0],
+        [0, -1],
+      ],
       dynamics: { limit: { ceilingDbfs: -1 } },
       biquad: { type: 'highpass', frequency: 80, q: Math.SQRT1_2 },
     };
@@ -209,26 +192,19 @@ describe('convertToFlac — lazy FLAC authoring route planner', () => {
       sampleRate: 44_100,
       gainDb: -3,
       fade: audio.fade,
+      mixMatrix: audio.mixMatrix,
       dynamics: audio.dynamics,
       biquad: audio.biquad,
     });
   });
 
   it('authors raw PCM to a real FLAC stream using an explicit requested PCM depth', async () => {
-    const requestedFormats: SampleFormat[] = [];
     const container = containerDriver({
       decodePcmAudio: () => Promise.resolve(pcmAudio()),
     });
     const deps = depsFor(container);
     const output = await convertToFlac(
-      {
-        ...deps,
-        pcmSampleFormat: (codec) => {
-          const format = deps.pcmSampleFormat(codec);
-          if (format !== undefined) requestedFormats.push(format);
-          return format;
-        },
-      },
+      deps,
       source,
       { to: 'flac', sink: { kind: 'stream' } },
       { codec: 'pcm-s16' },
@@ -239,7 +215,39 @@ describe('convertToFlac — lazy FLAC authoring route planner', () => {
     expect(output).toBeInstanceOf(ReadableStream);
     const bytes = await collect(output as ReadableStream<Uint8Array>);
     expect([...bytes.subarray(0, 4)]).toEqual([0x66, 0x4c, 0x61, 0x43]);
-    expect(requestedFormats).toEqual(['s16']);
+    expect(decodeFlac(bytes).bitsPerSample).toBe(16);
+  });
+
+  it('applies an explicit mix matrix before authoring raw PCM as FLAC', async () => {
+    const container = containerDriver({
+      decodePcmAudio: () => Promise.resolve(stereoPcmAudio()),
+    });
+    const bytes = await convertRawPcm(container, {
+      codec: 'pcm-s16',
+      channels: 1,
+      mixMatrix: [[0.5, 0.5]],
+    });
+    const decoded = decodeFlac(bytes);
+
+    expect(decoded.channels).toBe(1);
+    expect(decoded.bitsPerSample).toBe(16);
+    expect(interleavedPcmBytes(decoded)).toEqual(
+      Uint8Array.of(0x00, 0x20, 0x00, 0xf0, 0x00, 0xf0, 0x00, 0x30),
+    );
+  });
+
+  it('resamples raw PCM before authoring a native FLAC stream', async () => {
+    const container = containerDriver({
+      decodePcmAudio: () => Promise.resolve(pcmAudio()),
+    });
+    const bytes = await convertRawPcm(container, {
+      codec: 'pcm-s16',
+      sampleRate: 24_000,
+    });
+    const decoded = decodeFlac(bytes);
+
+    expect(decoded.sampleRate).toBe(24_000);
+    expect(decoded.totalSamples).toBe(2);
   });
 
   it('authors no-DSP WAV s16 sources directly to verbatim FLAC without demuxing or Float64 decode', async () => {

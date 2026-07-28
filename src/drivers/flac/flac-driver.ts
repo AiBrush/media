@@ -336,12 +336,12 @@ export function authorFlacFromPcm(
 }
 
 /**
- * The engine's cross-container FLAC authoring entry (ADR-024): apply the audio-dsp {@link PcmTransform}
- * (gain / remix / fade / dynamics / biquad; resample is a typed miss without the wasm/WebAudio tail) to the
- * source's decoded PCM, then author a native FLAC stream at the source's `format` depth. Lives here (not in
- * the engine) so the FLAC encoder + audio-dsp wiring stay in the lazily-loaded FLAC driver chunk — the
- * engine reaches it via a dynamic `import()` only when a FLAC convert actually runs, keeping the eager
- * kernel free of codec code (docs/architecture/08). Returns a one-chunk stream the engine materializes.
+ * The engine's cross-container FLAC authoring entry (ADR-024): apply the audio-dsp
+ * {@link PcmTransform} (gain / remix / fade / resample / dynamics / biquad) to the source's decoded
+ * PCM, then author a native FLAC stream at the source's `format` depth. Lives here (not in the engine)
+ * so the FLAC encoder + audio-dsp wiring stay in the lazily-loaded FLAC driver chunk — the engine
+ * reaches it via a dynamic `import()` only when a FLAC convert actually runs, keeping the eager kernel
+ * free of codec code (docs/architecture/08). Returns a one-chunk stream the engine materializes.
  */
 export function authorFlacStream(
   audio: PcmAudio,
@@ -349,7 +349,7 @@ export function authorFlacStream(
   o?: PcmTransform,
 ): ReadableStream<Uint8Array> {
   if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-  const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
+  const result = applyPcmTransform(audio, o);
   const out = authorFlacFromPcm(result, format);
   return new ReadableStream<Uint8Array>({
     start(c): void {
@@ -747,7 +747,7 @@ export const FlacDriver: ContainerDriver = {
   async decodePcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const { audio, format } = flacToPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
+    const result = applyPcmTransform(audio, o);
     const out = writeWav(result, format);
     return new ReadableStream<Uint8Array>({
       start(c): void {
@@ -763,14 +763,14 @@ export const FlacDriver: ContainerDriver = {
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     // FLAC authoring + FLAC → WAV decode share this PCM-native seam (ADR-022/024): decode the source FLAC
-    // to canonical PCM, apply the audio-dsp transform (gain/remix/fade/dynamics/biquad; resample is a
-    // typed miss without the wasm/WebAudio tail), then serialize per the requested `container`. A `flac`
-    // (or unspecified) target re-encodes a fresh lossless native FLAC via the verbatim-correct pure-TS
-    // encoder; a `wav` target writes RIFF/WAVE PCM (the FLAC → WAV bridge). The engine's cross-container
-    // route (WAV/AIFF/CAF → FLAC) instead reuses {@link authorFlacStream} with the source's decoded PCM.
+    // to canonical PCM, apply the audio-dsp transform (gain/remix/fade/resample/dynamics/biquad), then
+    // serialize per the requested `container`. A `flac` (or unspecified) target re-encodes a fresh
+    // lossless native FLAC via the verbatim-correct pure-TS encoder; a `wav` target writes RIFF/WAVE PCM
+    // (the FLAC → WAV bridge). The engine's cross-container route (WAV/AIFF/CAF → FLAC) instead reuses
+    // {@link authorFlacStream} with the source's decoded PCM.
     const { audio, format } = flacToPcm(await readAll(src));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
-    const result = applyPcmTransform(audio, o, { resample: 'reject', tried: ['flac'] });
+    const result = applyPcmTransform(audio, o);
     const out =
       o?.container === 'wav' ? writeWav(result, format) : authorFlacFromPcm(result, format);
     return new ReadableStream<Uint8Array>({

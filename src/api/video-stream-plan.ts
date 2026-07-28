@@ -21,6 +21,7 @@ import {
   buildVideoEncoderConfig,
   outputDimensions,
   videoCodecToken,
+  videoPixelRotation,
 } from './codec-pipeline.ts';
 import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
 
@@ -101,8 +102,9 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
       specs.push({ mediaType: 'video', type: 'pad', width, height, x, y });
     }
   }
-  if (target.rotate !== undefined && target.rotate !== 0) {
-    specs.push({ mediaType: 'video', type: 'rotate', degrees: target.rotate });
+  const rotation = videoPixelRotation(target, src);
+  if (rotation !== 0) {
+    specs.push({ mediaType: 'video', type: 'rotate', degrees: rotation });
   }
   if (target.flip !== undefined) {
     specs.push({ mediaType: 'video', type: 'flip', axis: target.flip });

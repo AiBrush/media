@@ -5,10 +5,12 @@ import type { VideoTarget } from './types.ts';
 
 const MICROS_PER_SECOND = 1_000_000;
 const TRIM_VIDEO_BITS_PER_PIXEL = 0.45;
+const TRIM_H264_BITS_PER_PIXEL = 0.9;
 const TRIM_VIDEO_MIN_BITRATE = 4_000_000;
 const TRIM_VIDEO_MAX_BITRATE = 50_000_000;
+const TRIM_H264_MAX_BITRATE = 62_500_000;
 const TRIM_VIDEO_DEFAULT_BITRATE = 20_000_000;
-const TRIM_VIDEO_SOURCE_BITRATE_HEADROOM = 1.5;
+const TRIM_VIDEO_SOURCE_BITRATE_HEADROOM = 2;
 const TRIM_AUDIO_PACKET_INFO_WINDOW_BYTES = 8 * 1024 * 1024;
 const TRIM_AUDIO_PACKET_INFO_GAP_BYTES = 256 * 1024;
 
@@ -125,17 +127,27 @@ export function planTrimAudioPacketInfoRows(
   bounds: TrimBoundsUs,
 ): readonly TrimAudioPacketInfoRow[] | undefined {
   const rows: TrimAudioPacketInfoRow[] = [];
-  let baseUs: number | undefined;
 
   for (const packet of packets) {
     if (packet.trackIndex !== trackIndex) continue;
-    const row = trimAudioPacketInfoRow(packet, bounds, baseUs);
+    const row = trimAudioPacketInfoRow(packet, bounds);
     if (row === undefined) continue;
     if (row === false) return undefined;
-    baseUs ??= row.sourceTimestampUs;
     rows.push(row);
   }
 
+  // A range shorter than one compressed access unit cannot own a packet by its end timestamp. Keep
+  // the single covering unit in that exact shape instead of falling through to a fresh encoder whose
+  // codec priming would move a sub-frame trim away from origin zero.
+  if (rows.length === 0) {
+    for (const packet of packets) {
+      if (packet.trackIndex !== trackIndex) continue;
+      const row = trimAudioPacketInfoRow(packet, bounds, true);
+      if (row === undefined) continue;
+      if (row === false) return undefined;
+      rows.push(row);
+    }
+  }
   if (rows.length === 0) return undefined;
   assignTrimPacketInfoWindows(rows);
   return rows;
@@ -310,25 +322,32 @@ export function trimVideoEncodeTarget(track: TrackInfo, sourceBitrate?: number):
   const width = track.config && 'codedWidth' in track.config ? track.config.codedWidth : undefined;
   const height =
     track.config && 'codedHeight' in track.config ? track.config.codedHeight : undefined;
+  const isH264 = /^(?:avc[13](?:\.|$)|h264$)/i.test(track.codec);
+  const maximumBitrate = isH264 ? TRIM_H264_MAX_BITRATE : TRIM_VIDEO_MAX_BITRATE;
   if (!positiveFinite(width) || !positiveFinite(height)) {
     return { bitrate: TRIM_VIDEO_DEFAULT_BITRATE, bitrateMode: 'variable' };
   }
   const fps = positiveFinite(track.fps) ? track.fps : 30;
+  // High-cadence H.264 needs a picture-quality contract rather than another level-bound ABR increase:
+  // fixed QP 8 keeps later open-GOP anchors transparent without inflating ordinary-cadence trims.
+  if (isH264 && fps > 30.5) return { crf: 8 };
   const geometryBitrate = clampInt(
-    width * height * fps * TRIM_VIDEO_BITS_PER_PIXEL,
+    width * height * fps * (isH264 ? TRIM_H264_BITS_PER_PIXEL : TRIM_VIDEO_BITS_PER_PIXEL),
     TRIM_VIDEO_MIN_BITRATE,
-    TRIM_VIDEO_MAX_BITRATE,
+    maximumBitrate,
   );
   const sourceAwareBitrate =
     sourceBitrate !== undefined && Number.isFinite(sourceBitrate) && sourceBitrate > 0
       ? clampInt(
           sourceBitrate * TRIM_VIDEO_SOURCE_BITRATE_HEADROOM,
           TRIM_VIDEO_MIN_BITRATE,
-          geometryBitrate,
+          maximumBitrate,
         )
       : undefined;
   return {
-    bitrate: sourceAwareBitrate ?? geometryBitrate,
+    // Geometry is the minimum quality budget, not a cap. A measured low-rate source still needs that
+    // budget to survive a second generation, while a dense source retains 2× evidence headroom.
+    bitrate: Math.max(geometryBitrate, sourceAwareBitrate ?? 0),
     bitrateMode: 'variable',
   };
 }
@@ -598,7 +617,7 @@ function trimVideoPacketInfoRow(packet: PacketInfoMetadata): TrimVideoPacketInfo
 function trimAudioPacketInfoRow(
   packet: PacketInfoMetadata,
   bounds: TrimBoundsUs,
-  baseUs: number | undefined,
+  allowEndOverlap = false,
 ): TrimAudioPacketInfoRow | undefined | false {
   const offset = packet.offset;
   if (
@@ -616,14 +635,21 @@ function trimAudioPacketInfoRow(
   const timestampUs = Math.round(packet.ptsUs);
   const durationUs = Math.round(packet.durationUs);
   const endUs = timestampUs + durationUs;
-  if (endUs <= bounds.startUs || timestampUs >= bounds.endUs) return undefined;
-  const base = baseUs ?? timestampUs;
+  // Assign a packet that crosses an adjacent-cut boundary to the range on the right. Overlap-based
+  // selection would emit that encoded access unit from both ranges, so trim(a..b) + trim(b..c) would
+  // contain one more audio packet than trim(a..c).
+  if (
+    endUs <= bounds.startUs ||
+    (allowEndOverlap ? timestampUs >= bounds.endUs : endUs > bounds.endUs)
+  ) {
+    return undefined;
+  }
   return {
     offset: Math.round(offset),
     size: Math.round(packet.size),
     sourceTimestampUs: timestampUs,
-    timestampUs: Math.max(0, timestampUs - base),
-    dtsUs: Math.max(0, Math.round(packet.dtsUs) - base),
+    timestampUs: Math.max(0, timestampUs - bounds.startUs),
+    dtsUs: Math.max(0, Math.round(packet.dtsUs) - bounds.startUs),
     durationUs,
     window: undefined,
   };

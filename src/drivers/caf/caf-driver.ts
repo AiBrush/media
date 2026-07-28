@@ -22,34 +22,22 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/pcm.ts';
+import { readAllBytes } from '../../sources/read-all.ts';
 import { rejectRawPcmChunkMux } from '../audio-container-mux-validation.ts';
 import { matchesCaf } from '../audio-container-sniff.ts';
 import { resolvePcmSampleFormat, writePcmContainer } from '../pcm-output.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
+import { probeCaf } from './caf-probe.ts';
 import { parseCaf, readCafPcm } from './caf.ts';
 
-/**
- * Read the whole source. CAF's `data` chunk may declare size `-1` ("to EOF"), so both probe and PCM
- * transforms need the full byte length; the file is bounded and PCM carries no separate index.
- */
-async function readAll(src: ByteSource): Promise<Uint8Array> {
-  if (src.range && src.size !== undefined) return src.range(0, src.size);
-  const reader = src.stream().getReader();
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    total += value.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of parts) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
+function cafTrackInfo(info: ReturnType<typeof parseCaf>): TrackInfo {
+  return {
+    id: 0,
+    mediaType: 'audio',
+    codec: info.codec,
+    durationSec: info.durationSec,
+    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
+  };
 }
 
 export const CafDriver: ContainerDriver = {
@@ -58,17 +46,12 @@ export const CafDriver: ContainerDriver = {
   kind: 'container',
   formats: ['caf'],
   supports: matchesCaf,
-  async demux(src: ByteSource): Promise<Demuxer> {
-    // A CAF `data` chunk may declare size -1 ("to EOF"); duration then needs the whole file. Reading it
-    // all keeps probe correct for both forms (the file is bounded and PCM has no separate index).
-    const info = parseCaf(await readAll(src));
-    const track: TrackInfo = {
-      id: 0,
-      mediaType: 'audio',
-      codec: info.codec,
-      durationSec: info.durationSec,
-      config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
-    };
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    return [cafTrackInfo(await probeCaf(src, o?.signal))];
+  },
+  async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
+    const info = parseCaf(await readAllBytes(src, o?.signal));
+    const track = cafTrackInfo(info);
     return {
       tracks: [track],
       packets(): ReadableStream<Packet> {
@@ -81,7 +64,7 @@ export const CafDriver: ContainerDriver = {
     };
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
-    const caf = readCafPcm(await readAll(src));
+    const caf = readCafPcm(await readAllBytes(src, o?.signal));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const audio = applyPcmTransform(caf, o);
     const container = o?.container ?? 'caf';
@@ -99,7 +82,7 @@ export const CafDriver: ContainerDriver = {
     });
   },
   async decodePcmAudio(src: ByteSource, o?: StageOptions): Promise<PcmAudio> {
-    const caf = readCafPcm(await readAll(src));
+    const caf = readCafPcm(await readAllBytes(src, o?.signal));
     if (o?.signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return caf;
   },

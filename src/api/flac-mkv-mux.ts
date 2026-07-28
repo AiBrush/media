@@ -10,6 +10,7 @@ import { muxPreparedOggAudioPacketTrack } from '../drivers/ogg/ogg-prepared-mux.
 import type { ChunkStruct as WebmChunkStruct } from '../drivers/webm/ebml-write.ts';
 import {
   WebmContainerSideData,
+  matroskaAacCodecDelayNs,
   webmCodecIdForTrack,
   writeWebm,
 } from '../drivers/webm/ebml-write.ts';
@@ -80,7 +81,12 @@ export async function muxSingleTrackMp4(
   streams: PacketStreams,
   options: MuxOptions & StageOptions,
 ): Promise<ReadableStream<Uint8Array> | undefined> {
-  if (options.fragmented === true || !isMp4Family(options.container)) return undefined;
+  if (
+    options.fragmented === true ||
+    options.faststart === 'reserve' ||
+    !isMp4Family(options.container)
+  )
+    return undefined;
   const input = singlePacketStream(streams);
   if (input === undefined) return undefined;
   const packets: Array<EncodedChunk | Packet> = [];
@@ -125,7 +131,12 @@ export async function muxPreparedMp4PacketStreams(
   streams: PacketStreams,
   options: PreparedMp4StreamOptions,
 ): Promise<ReadableStream<Uint8Array> | undefined> {
-  if (options.fragmented === true || !isMp4Family(options.container)) return undefined;
+  if (
+    options.fragmented === true ||
+    options.faststart === 'reserve' ||
+    !isMp4Family(options.container)
+  )
+    return undefined;
   const inputs = mp4PacketArrayStreams(streams);
   if (
     inputs === undefined ||
@@ -664,9 +675,14 @@ function webmTrackStateFromPreparedTrack(
       mediaType: 'video',
       codecId: webmCodecIdForTrack(track.mediaType, track.codec),
       codecPrivate,
+      ...(track.codecDelayNs !== undefined ? { codecDelayNs: track.codecDelayNs } : {}),
+      ...(track.seekPreRollNs !== undefined ? { seekPreRollNs: track.seekPreRollNs } : {}),
+      ...(track.codecDelayNs !== undefined ? { timestampAdjustmentNs: track.codecDelayNs } : {}),
       width: videoConfig?.codedWidth,
       height: videoConfig?.codedHeight,
       alpha: track.alpha === true,
+      ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
+      ...(track.color !== undefined ? { color: track.color } : {}),
       fps: track.fps,
       durationSec: track.durationSec,
       sampleRate: undefined,
@@ -675,16 +691,22 @@ function webmTrackStateFromPreparedTrack(
     };
   }
   const audioConfig = config as AudioDecoderConfig | undefined;
+  const aacGaplessDelayNs = matroskaAacCodecDelayNs(track);
+  const codecDelayNs = track.codecDelayNs ?? aacGaplessDelayNs;
   return {
     trackNumber,
     mediaType: 'audio',
     codecId: webmCodecIdForTrack(track.mediaType, track.codec),
     codecPrivate,
+    ...(codecDelayNs !== undefined ? { codecDelayNs } : {}),
+    ...(track.seekPreRollNs !== undefined ? { seekPreRollNs: track.seekPreRollNs } : {}),
+    ...(codecDelayNs !== undefined ? { timestampAdjustmentNs: codecDelayNs } : {}),
     width: undefined,
     height: undefined,
     alpha: false,
     fps: undefined,
     durationSec: track.durationSec,
+    ...(track.gapless !== undefined ? { gapless: track.gapless } : {}),
     sampleRate: audioConfig?.sampleRate,
     channels: audioConfig?.numberOfChannels,
     chunks,

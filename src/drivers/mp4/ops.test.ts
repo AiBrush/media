@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { ByteSource, StreamCopyOptions } from '../../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { toStreamTarget } from '../../sinks/stream-target.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import { materializeCompatibleMovToMp4Bytes } from './compatible-mov-rewrite.ts';
@@ -136,6 +137,18 @@ async function bytesOf(
 ): Promise<Uint8Array> {
   if (!(out instanceof Blob)) throw new Error('expected a Blob output');
   return new Uint8Array(await out.arrayBuffer());
+}
+
+function applyPositionedWrites(
+  writes: ReadonlyArray<{ readonly position: number; readonly data: Uint8Array }>,
+): Uint8Array {
+  const length = writes.reduce(
+    (maximum, write) => Math.max(maximum, write.position + write.data.byteLength),
+    0,
+  );
+  const output = new Uint8Array(length);
+  for (const write of writes) output.set(write.data, write.position);
+  return output;
 }
 
 describe('media.remux (mp4 → mp4 stream-copy)', () => {
@@ -325,6 +338,78 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     }
   });
 
+  it("faststart:'reserve' streams past a bounded moov gap, then patches it positionally", async () => {
+    const writes: Array<{ readonly position: number; readonly data: Uint8Array }> = [];
+    let outstanding = 0;
+    let maximumOutstanding = 0;
+    const output = await media().remux(await fixtureSource('movie_5.mp4'), {
+      to: 'mp4',
+      faststart: 'reserve',
+      maximumPacketCount: 4096,
+      sink: toStreamTarget(async (data, position) => {
+        outstanding++;
+        maximumOutstanding = Math.max(maximumOutstanding, outstanding);
+        await Promise.resolve();
+        writes.push({ position, data: data.slice() });
+        outstanding--;
+      }),
+    });
+    expect(output).toBeUndefined();
+    expect(writes.length).toBeGreaterThan(3);
+    expect(maximumOutstanding).toBe(1);
+
+    const first = writes[0];
+    const forward = writes[1];
+    const patch = writes[writes.length - 1];
+    if (first === undefined || forward === undefined || patch === undefined) {
+      throw new Error('reserve stream did not emit its structural writes');
+    }
+    expect(first.position).toBe(0);
+    expect(fourccAt(first.data, 4)).toBe('ftyp');
+    expect(forward.position).toBeGreaterThan(first.data.byteLength);
+    expect(fourccAt(forward.data, 4)).toBe('mdat');
+    expect(patch.position).toBe(first.data.byteLength);
+    expect(patch.position + patch.data.byteLength).toBe(forward.position);
+    expect(fourccAt(patch.data, 4)).toBe('moov');
+
+    const assembled = applyPositionedWrites(writes);
+    expect(topLevelBoxTypes(assembled)).toEqual(['ftyp', 'moov', 'free', 'mdat']);
+    const original = await readMovie(ra(await loadFixture('movie_5.mp4')));
+    const reserved = await readMovie(ra(assembled));
+    expect(reserved.durationSec).toBeCloseTo(original.durationSec, 2);
+    expect(reserved.tracks).toHaveLength(original.tracks.length);
+    for (let index = 0; index < original.tracks.length; index++) {
+      const before = original.tracks[index];
+      const after = reserved.tracks[index];
+      if (before === undefined || after === undefined) throw new Error(`missing track ${index}`);
+      expect(buildSampleData(after).map(strip)).toEqual(buildSampleData(before).map(strip));
+    }
+  });
+
+  it('rejects reserve overflow before any target write and requires a positioned sink', async () => {
+    const input = await fixtureSource('movie_5.mp4');
+    await expect(
+      media().remux(input, {
+        to: 'mp4',
+        faststart: 'reserve',
+        maximumPacketCount: 4096,
+      }),
+    ).rejects.toBeInstanceOf(InputError);
+
+    const writes: Uint8Array[] = [];
+    await expect(
+      media().remux(await fixtureSource('movie_5.mp4'), {
+        to: 'mp4',
+        faststart: 'reserve',
+        maximumPacketCount: 1,
+        sink: toStreamTarget((data) => {
+          writes.push(data.slice());
+        }),
+      }),
+    ).rejects.toThrowError(/MP4_FASTSTART_RESERVE_PACKET_OVERFLOW/);
+    expect(writes).toHaveLength(0);
+  });
+
   it('fragmented:true emits an init segment + moof media segments (CMAF), re-parsing to the same tracks', async () => {
     const out = await bytesOf(
       await media().remux(await fixtureSource('movie_5.mp4'), { to: 'mp4', fragmented: true }),
@@ -417,6 +502,37 @@ describe('media.trim (mp4 keyframe-copy)', () => {
       expect(b?.codec).toBe(a?.codec);
       if (a && b) expect(buildSampleData(b).map(strip)).toEqual(buildSampleData(a).map(strip));
     }
+  });
+
+  it('trims a fragmented input to fragmented output with real retained media fragments', async () => {
+    const input = await loadFixture('bear-av-frag.mp4');
+    const original = await readMovie(ra(input));
+    const out = await bytesOf(
+      await media().trim(await fixtureSource('bear-av-frag.mp4'), {
+        // The second-to-last video fragment starts at 60_060/30_000 = 2.002 s. Express the public
+        // boundary one rounded microsecond below it to pin native-tick rounding: selecting by the raw
+        // float would incorrectly fall back to the keyframe at 0 and retain the whole video track.
+        start: 2.001_999,
+        end: 2.75,
+        mode: 'keyframe',
+        fragmented: true,
+      }),
+    );
+
+    const boxes = topLevelBoxTypes(out);
+    expect(boxes.slice(0, 2)).toEqual(['ftyp', 'moov']);
+    expect(boxes.filter((type) => type === 'moof').length).toBeGreaterThan(0);
+    expect(boxes.filter((type) => type === 'mdat').length).toBeGreaterThan(0);
+    const trimmed = await readMovie(ra(out));
+    expect(trimmed.tracks).toHaveLength(original.tracks.length);
+    for (let index = 0; index < trimmed.tracks.length; index++) {
+      const before = original.tracks[index]?.fragmentSampleCount ?? 0;
+      const after = trimmed.tracks[index]?.fragmentSampleCount ?? 0;
+      expect(after).toBeGreaterThan(0);
+      expect(after).toBeLessThan(before);
+    }
+    expect(trimmed.durationSec).toBeGreaterThan(0);
+    expect(trimmed.durationSec).toBeLessThan(original.durationSec);
   });
 
   it('rejects frame-accurate trim with a typed CapabilityError (needs the codec seam)', async () => {

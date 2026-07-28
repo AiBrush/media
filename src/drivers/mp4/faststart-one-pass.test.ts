@@ -55,8 +55,14 @@ function trackShape(track: Awaited<ReturnType<typeof mp4PacketInfoFromBytes>>['t
   readonly mediaType: string;
   readonly codec: string;
   readonly rotation: number | undefined;
+  readonly color: typeof track.color;
 } {
-  return { mediaType: track.mediaType, codec: track.codec, rotation: track.rotation };
+  return {
+    mediaType: track.mediaType,
+    codec: track.codec,
+    rotation: track.rotation,
+    color: track.color,
+  };
 }
 
 function expectPacketTruth(
@@ -92,7 +98,9 @@ describe('one-pass faststart moov offset patch', () => {
     {
       fixture: 'obs-remux-variable-aac.mp4',
       container: 'mov',
-      sha: '78444151c8fa8563cc17f3045f0a6b94977eabfa110015ec7f884ef0b1d42243',
+      // The deterministic post-colr-preservation output: packet bytes/timing stay identical and the
+      // semantic assertion below now pins the source's exact H.273 colour facts too.
+      sha: 'fad4825699e2e7368a27a4debcab18be99bafe2deb7c18c6395c90233462e92c',
     },
     {
       fixture: 'bear-rotate-90.mp4',
@@ -105,7 +113,7 @@ describe('one-pass faststart moov offset patch', () => {
       sha: '957f4009ab8cd5bae5bc36fa30f1d49a968afbe98b21adaa68789a03aebe783b',
     },
   ] as const)(
-    'keeps the retained pre-change $fixture output byte-identical',
+    'keeps the deterministic $fixture output and metadata byte-identical',
     async ({ fixture, container, sha }) => {
       const { sourceTable, output } = await preparedOutput(fixture, container);
       const reparsed = await mp4PacketInfoFromBytes(output);

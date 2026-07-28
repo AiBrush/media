@@ -64,6 +64,7 @@ function audioTargetRequestsReencode(target: AudioTarget): boolean {
     target.bitrate !== undefined ||
     (target.gainDb !== undefined && target.gainDb !== 0) ||
     target.fade !== undefined ||
+    target.mixMatrix !== undefined ||
     target.dynamics !== undefined ||
     target.biquad !== undefined
   );
@@ -112,6 +113,7 @@ export function mayBeSemanticStreamCopy(opts: ConvertOptions): boolean {
       audio.bitrate !== undefined ||
       (audio.gainDb !== undefined && audio.gainDb !== 0) ||
       audio.fade !== undefined ||
+      audio.mixMatrix !== undefined ||
       audio.dynamics !== undefined ||
       audio.biquad !== undefined
     ) {

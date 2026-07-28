@@ -136,6 +136,10 @@ export type {
   PreparedMp4PacketTrackMuxInput,
   PreparedMp4PacketTracksMuxInput,
 } from './api/mp4-prepared-mux.ts';
+export {
+  type Mp4PacketInfoBatchSourceOptions,
+  mp4PacketInfoBatchesFromSource,
+} from './drivers/mp4/mp4-driver.ts';
 export type {
   PreparedMpegTsPacketMuxInput,
   PreparedMpegTsPacketTrackInput,
@@ -157,8 +161,8 @@ export type {
 export {
   wavPacketInfoFromBytes,
   wavPacketInfoFromUrl,
-} from './drivers/wav/wav-driver.ts';
-export type { WavPacketInfoFromUrlOptions } from './drivers/wav/wav-driver.ts';
+} from './drivers/wav/wav-packet-info.ts';
+export type { WavPacketInfoFromUrlOptions } from './drivers/wav/wav-packet-info.ts';
 export { wavF32GainToWavFromBytes } from './drivers/wav/f32-gain.ts';
 export type { WavF32GainOptions } from './drivers/wav/f32-gain.ts';
 export { wavPcmFormatToWavFromBytes } from './drivers/wav/format-convert.ts';

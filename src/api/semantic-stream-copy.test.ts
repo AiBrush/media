@@ -371,6 +371,12 @@ describe('semantic stream-copy eligibility', () => {
     expect(
       isSemanticStreamCopy({ to: 'mp4', audio: { bitrate: 128_000 } }, [H264_VIDEO, AAC_AUDIO]),
     ).toBe(false);
+    const matrixRequest: ConvertOptions = {
+      to: 'mp4',
+      audio: { mixMatrix: [[0.5, 0.5]], channels: 1 },
+    };
+    expect(mayBeSemanticStreamCopy(matrixRequest)).toBe(false);
+    expect(isSemanticStreamCopy(matrixRequest, [H264_VIDEO, AAC_AUDIO])).toBe(false);
     expect(isSemanticStreamCopy({ to: 'mp4', video: false }, [H264_VIDEO, AAC_AUDIO])).toBe(false);
     expect(isSemanticStreamCopy({ to: 'mp4', audio: false }, [H264_VIDEO, AAC_AUDIO])).toBe(false);
     expect(

@@ -1,7 +1,7 @@
 import type { Endianness, SampleFormat } from '../../dsp/pcm.ts';
-import { bytesPerSample } from '../../dsp/pcm.ts';
+import { bytesPerSample, roundHalfToEven } from '../../dsp/pcm.ts';
 import { writeWavHeader } from '../wav/pcm.ts';
-import { locate } from './aiff.ts';
+import { aiffPcmSampleBytes, locate } from './aiff.ts';
 
 export interface AiffPcmToWavOptions {
   readonly sampleFormat?: SampleFormat;
@@ -35,12 +35,8 @@ export function rewriteAiffPcmToWav(
   if (requestedSampleRate !== undefined && requestedSampleRate !== sampleRate) return undefined;
 
   const sourceBytesPer = bytesPerSample(layout.format);
-  const sourceFrameBytes = layout.channels * sourceBytesPer;
-  const frames =
-    ssndSampleOffset < 0 || sourceFrameBytes <= 0
-      ? 0
-      : Math.floor(ssndSampleBytes / sourceFrameBytes);
-  const sourceDataBytes = frames * sourceFrameBytes;
+  const sourceDataBytes = aiffPcmSampleBytes(layout, ssndSampleOffset, ssndSampleBytes);
+  const frames = layout.frames;
   const outputDataBytes = frames * layout.channels * bytesPerSample(outputFormat);
   const out = new Uint8Array(44 + outputDataBytes);
   writeWavHeader(out, outputDataBytes, layout.channels, sampleRate, outputFormat);
@@ -115,7 +111,7 @@ function copyS24ToS16Samples(
     const b2 = src[srcOffset + 2] ?? 0;
     const raw = littleEndian ? b0 | (b1 << 8) | (b2 << 16) : b2 | (b1 << 8) | (b0 << 16);
     const signed = raw & 0x800000 ? raw - 0x1000000 : raw;
-    const narrowed = Math.min(32767, Math.max(-32768, Math.round(signed / 256)));
+    const narrowed = Math.min(32767, Math.max(-32768, roundHalfToEven(signed / 256)));
     dst[dstOffset] = narrowed & 0xff;
     dst[dstOffset + 1] = (narrowed >> 8) & 0xff;
     srcOffset += 3;

@@ -14,12 +14,10 @@ import {
   type MuxOptions,
   type Muxer,
   type Packet,
-  type PacketInfoMetadata,
   type PacketInfoTable,
   type PcmTransform,
   type Registry,
   type StageOptions,
-  type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import {
@@ -29,77 +27,38 @@ import {
   decodePcm,
   decodePcmToInterleavedF32,
 } from '../../dsp/pcm.ts';
-import { fromURL } from '../../sources/source.ts';
 import { matchesWav } from '../audio-container-sniff.ts';
 import { planWavPcmCopy } from './pcm.ts';
 import { streamWavPcmCopy } from './wav-copy-stream.ts';
 import { WavMuxer } from './wav-mux.ts';
+import { WAV_PACKET_FRAMES, wavPacketInfoFromSource } from './wav-packet-info.ts';
+import {
+  type ParsedWavHeader,
+  WAV_DEMUX_HEAD_BYTES,
+  type WavFormat,
+  ascii,
+  parseFormat,
+  parseWav,
+  parseWavHeader,
+  parsedWavHeader,
+  probeWav,
+  readWavHead,
+  wavTrackInfo,
+} from './wav-probe.ts';
 
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  let out = '';
-  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
-  return out;
-}
-
-interface WavFormat {
-  formatTag: number;
-  channels: number;
-  sampleRate: number;
-  byteRate: number;
-  blockAlign: number;
-  bitsPerSample: number;
-}
-
-export interface WavInfo {
-  codec: string;
-  sampleRate: number;
-  channels: number;
-  durationSec: number;
-}
-
-export interface WavPacketInfoFromUrlOptions {
-  readonly mime?: string;
-  readonly size?: number;
-  readonly signal?: AbortSignal;
-}
-
-interface ParsedWavHeader {
-  info: WavInfo;
-  format: WavFormat;
-  dataOffset: number;
-  dataBytes: number;
-  bytesPerFrame: number;
-  dataFound: boolean;
-}
+export { wavPacketInfoFromBytes, wavPacketInfoFromUrl } from './wav-packet-info.ts';
+export type { WavPacketInfoFromUrlOptions } from './wav-packet-info.ts';
+export { parseWav } from './wav-probe.ts';
+export type { WavInfo } from './wav-probe.ts';
 
 interface SequentialWavDecode {
   readonly parsed: ParsedWavHeader;
   readonly chunks: PcmChunkReader;
 }
 
-const WAV_PROBE_HEAD_BYTES = 128;
-const WAV_REMOTE_PROBE_HEAD_BYTES = 16 * 1024;
-const WAV_PROBE_MAX_SPARSE_WINDOWS = 8;
-const WAV_DEMUX_HEAD_BYTES = 65536;
-const WAV_PACKET_FRAMES = 4096;
 const WAV_DECODE_RANGE_BYTES = 1024 * 1024;
-const WAV_PACKET_INFO_PREFIX_TTL_MS = 60_000;
-const WAV_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES = 64;
+const WAV_RANGE_RESAMPLE_MIN_SOURCE_BYTES = 8 * 1024 * 1024;
 const OPERATION_ABORTED = 'operation aborted';
-
-interface WavPacketInfoPrefixCacheEntry {
-  readonly bytes: Uint8Array;
-  readonly expiresAtMs: number;
-}
-
-const wavPacketInfoPrefixCache = new Map<string, WavPacketInfoPrefixCacheEntry>();
-
-/** PCM/float codec token per WebCodecs/harness vocabulary (LE; WAV BE variants are out of scope). */
-function pcmCodec(fmt: WavFormat): string {
-  if (fmt.formatTag === 3) return fmt.bitsPerSample === 64 ? 'pcm-f64' : 'pcm-f32';
-  if (fmt.bitsPerSample === 8) return 'pcm-u8'; // 8-bit WAV PCM is unsigned (offset binary)
-  return `pcm-s${fmt.bitsPerSample}`;
-}
 
 function pcmSampleFormat(fmt: WavFormat): SampleFormat {
   if (fmt.formatTag === 1) {
@@ -114,295 +73,6 @@ function pcmSampleFormat(fmt: WavFormat): SampleFormat {
   throw new InputError(
     `unsupported WAV PCM layout (tag ${fmt.formatTag}, ${fmt.bitsPerSample}-bit)`,
   );
-}
-
-function parseFormat(dv: DataView, body: number, size: number): WavFormat {
-  let formatTag = dv.getUint16(body, true);
-  // WAVE_FORMAT_EXTENSIBLE: the effective tag is the first 2 bytes of the SubFormat GUID (+24), so
-  // float-extensible (tag 3) is not mislabeled as PCM. Fall back to PCM if the chunk is too short.
-  if (formatTag === 0xfffe) formatTag = size >= 40 ? dv.getUint16(body + 24, true) : 1;
-  return {
-    formatTag,
-    channels: dv.getUint16(body + 2, true),
-    sampleRate: dv.getUint32(body + 4, true),
-    byteRate: dv.getUint32(body + 8, true),
-    blockAlign: dv.getUint16(body + 12, true),
-    bitsPerSample: dv.getUint16(body + 14, true),
-  };
-}
-
-function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWavHeader {
-  if (bytes.byteLength < 12 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
-    throw new InputError('not a RIFF/WAVE file');
-  }
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let format: WavFormat | undefined;
-  let dataSize = 0;
-  let dataFound = false;
-  let pos = 12;
-  while (pos + 8 <= bytes.byteLength) {
-    const id = ascii(bytes, pos, 4);
-    const size = dv.getUint32(pos + 4, true);
-    const body = pos + 8;
-    if (id === 'fmt ' && size >= 16) {
-      if (body + 16 > bytes.byteLength) {
-        throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
-      }
-      format = parseFormat(dv, body, size);
-    } else if (id === 'data') {
-      // Trust the declared size for duration, but never exceed the real file length.
-      dataSize = totalSize !== undefined ? Math.min(size, Math.max(0, totalSize - body)) : size;
-      dataFound = true;
-      break;
-    }
-    pos = body + size + (size & 1); // chunks are padded to an even size
-  }
-  if (!format) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');
-
-  return parsedWavHeader(format, dataFound ? pos + 8 : 0, dataSize, dataFound);
-}
-
-interface WavProbeWindow {
-  readonly start: number;
-  readonly bytes: Uint8Array;
-}
-
-function wavProbeHeadBytes(src: ByteSource): number {
-  const kind = (src as ByteSource & { readonly kind?: string }).kind;
-  // One remote round trip costs more than copying a modest RIFF metadata prelude. Local byte/blob
-  // sources retain the minimum 128-byte window; URL/element sources amortize ordinary LIST/JUNK/PAD
-  // chunks without changing the sparse declared-offset walk or its fallback bound.
-  return kind === 'url' || kind === 'element' ? WAV_REMOTE_PROBE_HEAD_BYTES : WAV_PROBE_HEAD_BYTES;
-}
-
-/**
- * Read RIFF metadata without materializing skipped chunk bodies. A small window handles ordinary WAV
- * headers in one request; declared JUNK/LIST/PAD bodies are crossed by offset and cost only one more
- * bounded window. An unusually fragmented metadata prelude falls back to the established 64 KiB parser
- * after a fixed number of sparse requests, so adversarial chunk tables cannot amplify round trips.
- */
-async function readSparseWavProbeHeader(
-  src: ByteSource,
-  range: NonNullable<ByteSource['range']>,
-  size: number,
-  windowBytes: number,
-  signal: AbortSignal | undefined,
-  initialBytes: Uint8Array,
-): Promise<ParsedWavHeader | undefined> {
-  let windows = 1;
-  let window: WavProbeWindow = { start: 0, bytes: initialBytes };
-  const readAt = async (start: number, length: number): Promise<Uint8Array | undefined> => {
-    if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED, signal.reason);
-    if (start >= window.start && start + length <= window.start + window.bytes.byteLength) {
-      return window.bytes.subarray(start - window.start, start - window.start + length);
-    }
-    if (windows >= WAV_PROBE_MAX_SPARSE_WINDOWS) return undefined;
-    const end = Math.min(size, start + Math.max(windowBytes, length));
-    const bytes = await range.call(src, start, end);
-    if (signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED, signal.reason);
-    windows++;
-    window = { start, bytes };
-    return bytes.subarray(0, Math.min(length, bytes.byteLength));
-  };
-
-  const riff = await readAt(0, 12);
-  if (riff === undefined) return undefined;
-  if (riff.byteLength < 12 || ascii(riff, 0, 4) !== 'RIFF' || ascii(riff, 8, 4) !== 'WAVE') {
-    throw new InputError('not a RIFF/WAVE file');
-  }
-
-  let format: WavFormat | undefined;
-  let dataOffset = 0;
-  let dataBytes = 0;
-  let dataFound = false;
-  let pos = 12;
-  let chunks = 0;
-  while (pos + 8 <= size && chunks < 8192) {
-    const header = await readAt(pos, 8);
-    if (header === undefined) return undefined;
-    if (header.byteLength < 8) break;
-    const id = ascii(header, 0, 4);
-    const chunkSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(
-      4,
-      true,
-    );
-    const body = pos + 8;
-    if (id === 'fmt ' && chunkSize >= 16) {
-      const needed = chunkSize >= 40 ? 26 : 16;
-      const bodyBytes = await readAt(body, needed);
-      if (bodyBytes === undefined) return undefined;
-      if (bodyBytes.byteLength < needed) {
-        throw new MediaError('demux-error', 'WAVE: truncated fmt chunk');
-      }
-      const bodyView = new DataView(bodyBytes.buffer, bodyBytes.byteOffset, bodyBytes.byteLength);
-      format = parseFormat(bodyView, 0, chunkSize);
-    } else if (id === 'data') {
-      dataOffset = body;
-      dataBytes = Math.min(chunkSize, Math.max(0, size - body));
-      dataFound = true;
-      break;
-    }
-    const next = body + chunkSize + (chunkSize & 1);
-    pos = next;
-    chunks++;
-  }
-  if (format === undefined) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');
-  return parsedWavHeader(format, dataOffset, dataBytes, dataFound);
-}
-
-function parsedWavHeader(
-  format: WavFormat,
-  dataOffset: number,
-  dataBytes: number,
-  dataFound: boolean,
-): ParsedWavHeader {
-  const bytesPerFrame =
-    format.blockAlign > 0 ? format.blockAlign : (format.bitsPerSample >> 3) * format.channels;
-  const byteRate = format.byteRate > 0 ? format.byteRate : bytesPerFrame * format.sampleRate;
-  return {
-    info: {
-      codec: pcmCodec(format),
-      sampleRate: format.sampleRate,
-      channels: format.channels,
-      durationSec: byteRate > 0 ? dataBytes / byteRate : 0,
-    },
-    format,
-    dataOffset,
-    dataBytes,
-    bytesPerFrame,
-    dataFound,
-  };
-}
-
-/** Parse a RIFF/WAVE header into the audio layout + duration. Pure; little-endian. */
-export function parseWav(bytes: Uint8Array, totalSize?: number): WavInfo {
-  return parseWavHeader(bytes, totalSize).info;
-}
-
-function wavTrackInfo(info: WavInfo): TrackInfo {
-  return {
-    id: 0,
-    mediaType: 'audio',
-    codec: info.codec,
-    durationSec: info.durationSec,
-    config: { codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.channels },
-  };
-}
-
-function wavPacketInfoFromHeader(parsed: ParsedWavHeader): PacketInfoTable {
-  const track = wavTrackInfo(parsed.info);
-  const packets: PacketInfoMetadata[] = [];
-  const { bytesPerFrame, dataBytes } = parsed;
-  if (parsed.dataFound && bytesPerFrame > 0 && parsed.info.sampleRate > 0 && dataBytes > 0) {
-    const totalFrames = Math.floor(dataBytes / bytesPerFrame);
-    for (let frame = 0; frame < totalFrames; frame += WAV_PACKET_FRAMES) {
-      const frames = Math.min(WAV_PACKET_FRAMES, totalFrames - frame);
-      const ptsUs = Math.round((frame / parsed.info.sampleRate) * 1_000_000);
-      packets.push({
-        trackIndex: 0,
-        offset: parsed.dataOffset + frame * bytesPerFrame,
-        size: frames * bytesPerFrame,
-        ptsUs,
-        dtsUs: ptsUs,
-        durationUs: Math.round((frames / parsed.info.sampleRate) * 1_000_000),
-        keyframe: true,
-      });
-    }
-  }
-  return { tracks: [track], packets };
-}
-
-export function wavPacketInfoFromBytes(bytes: Uint8Array): PacketInfoTable {
-  return wavPacketInfoFromHeader(parseWavHeader(bytes, bytes.byteLength));
-}
-
-function wavPacketInfoUrlCacheKey(url: string | URL, opts: WavPacketInfoFromUrlOptions): string {
-  const href = typeof url === 'string' ? url : url.href;
-  return `${href}#${opts.size ?? 'unknown'}`;
-}
-
-function cachedWavPacketInfoPrefix(
-  key: string,
-  totalSize: number | undefined,
-): PacketInfoTable | undefined {
-  const entry = wavPacketInfoPrefixCache.get(key);
-  if (entry === undefined) return undefined;
-  if (entry.expiresAtMs <= Date.now()) {
-    wavPacketInfoPrefixCache.delete(key);
-    return undefined;
-  }
-  try {
-    const parsed = parseWavHeader(entry.bytes, totalSize);
-    return parsed.dataFound ? wavPacketInfoFromHeader(parsed) : undefined;
-  } catch {
-    wavPacketInfoPrefixCache.delete(key);
-    return undefined;
-  }
-}
-
-function storeWavPacketInfoPrefix(key: string, bytes: Uint8Array): void {
-  const now = Date.now();
-  for (const [entryKey, entry] of wavPacketInfoPrefixCache) {
-    if (entry.expiresAtMs <= now) wavPacketInfoPrefixCache.delete(entryKey);
-  }
-  while (wavPacketInfoPrefixCache.size >= WAV_PACKET_INFO_PREFIX_CACHE_MAX_ENTRIES) {
-    const oldest = wavPacketInfoPrefixCache.keys().next().value;
-    if (oldest === undefined) break;
-    wavPacketInfoPrefixCache.delete(oldest);
-  }
-  wavPacketInfoPrefixCache.set(key, {
-    bytes: bytes.slice(),
-    expiresAtMs: now + WAV_PACKET_INFO_PREFIX_TTL_MS,
-  });
-}
-
-export async function wavPacketInfoFromUrl(
-  url: string | URL,
-  opts: WavPacketInfoFromUrlOptions = {},
-): Promise<PacketInfoTable> {
-  const packetInfo = WavDriver.packetInfo;
-  if (packetInfo === undefined) {
-    throw new CapabilityError('WAV packet-info is not available', {
-      op: { kind: 'route', id: 'demux', facts: { container: 'wav' } },
-      tried: ['wav'],
-    });
-  }
-  const key = wavPacketInfoUrlCacheKey(url, opts);
-  const cached = cachedWavPacketInfoPrefix(key, opts.size);
-  if (cached !== undefined) return cached;
-  const src = fromURL(url, {
-    mime: opts.mime ?? 'audio/wav',
-    ...(opts.size !== undefined ? { size: opts.size } : {}),
-  });
-  if (src.range !== undefined) {
-    const prefix = await src.range(
-      0,
-      opts.size !== undefined ? Math.min(opts.size, WAV_PROBE_HEAD_BYTES) : WAV_PROBE_HEAD_BYTES,
-    );
-    if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
-    const parsed = parseWavHeader(prefix, opts.size);
-    if (parsed.dataFound) {
-      storeWavPacketInfoPrefix(key, prefix);
-      return wavPacketInfoFromHeader(parsed);
-    }
-  }
-  return packetInfo.call(
-    WavDriver,
-    src,
-    opts.signal !== undefined ? { signal: opts.signal } : undefined,
-  );
-}
-
-async function readHead(src: ByteSource, n: number): Promise<Uint8Array> {
-  if (src.range) return src.range(0, n);
-  const reader = src.stream().getReader();
-  try {
-    const { value } = await reader.read();
-    return value ?? new Uint8Array(0);
-  } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
 }
 
 /** Read the whole source into one buffer — PCM transforms need every sample (bounded by file size). */
@@ -833,52 +503,9 @@ export const WavDriver: ContainerDriver = {
   formats: ['wav'],
   supports: matchesWav,
   validatesPcmTrim: true,
-  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
-    const range = src.range;
-    const size = src.size;
-    let retainedHead: Uint8Array | undefined;
-    if (range !== undefined && size !== undefined) {
-      const windowBytes = wavProbeHeadBytes(src);
-      if (o?.signal?.aborted) {
-        throw new MediaError('aborted', OPERATION_ABORTED, o.signal.reason);
-      }
-      const head = await range.call(src, 0, Math.min(size, windowBytes));
-      retainedHead = head;
-      if (o?.signal?.aborted) {
-        throw new MediaError('aborted', OPERATION_ABORTED, o.signal.reason);
-      }
-      // Canonical RIFF/WAVE places `fmt ` and `data` in the first transport window. Parse that owned
-      // window synchronously so cached chunk headers do not cross additional async/microtask boundaries.
-      // Unusual legal preludes reuse the same bytes in the sparse declared-offset walker below.
-      try {
-        const common = parseWavHeader(head, size);
-        if (common.dataFound) return [wavTrackInfo(common.info)];
-      } catch {
-        // The sparse parser below replays the same bytes and preserves the exact typed invalid/truncation
-        // error while retaining recovery for a `fmt ` chunk beyond the initial bounded window.
-      }
-      const parsed = await readSparseWavProbeHeader(src, range, size, windowBytes, o?.signal, head);
-      if (parsed !== undefined) return [wavTrackInfo(parsed.info)];
-    }
-    let head = retainedHead ?? (await readHead(src, WAV_PROBE_HEAD_BYTES));
-    const maxFallback = Math.min(src.size ?? WAV_DEMUX_HEAD_BYTES, WAV_DEMUX_HEAD_BYTES);
-    let parsed: ParsedWavHeader;
-    try {
-      parsed = parseWavHeader(head, src.size);
-    } catch (error) {
-      if (head.byteLength >= maxFallback) throw error;
-      head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
-      parsed = parseWavHeader(head, src.size);
-    }
-    if (!parsed.dataFound && head.byteLength < maxFallback) {
-      head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
-      parsed = parseWavHeader(head, src.size);
-    }
-    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
-    return [wavTrackInfo(parsed.info)];
-  },
+  probe: probeWav,
   async demux(src: ByteSource): Promise<Demuxer> {
-    const head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
+    const head = await readWavHead(src, WAV_DEMUX_HEAD_BYTES);
     const info = parseWav(head, src.size);
     const track = wavTrackInfo(info);
     return {
@@ -893,19 +520,7 @@ export const WavDriver: ContainerDriver = {
     };
   },
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
-    let head = await readHead(src, WAV_PROBE_HEAD_BYTES);
-    let parsed = parseWavHeader(head, src.size);
-    const maxFallback = Math.min(src.size ?? WAV_DEMUX_HEAD_BYTES, WAV_DEMUX_HEAD_BYTES);
-    if (!parsed.dataFound && head.byteLength < maxFallback) {
-      head = await readHead(src, WAV_DEMUX_HEAD_BYTES);
-      parsed = parseWavHeader(head, src.size);
-    }
-    if (!parsed.dataFound && src.size !== undefined) {
-      head = await readAll(src, o?.signal);
-      parsed = parseWavHeader(head, src.size);
-    }
-    if (o?.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
-    return wavPacketInfoFromHeader(parsed);
+    return wavPacketInfoFromSource(src, o);
   },
   async transformPcm(src: ByteSource, o?: PcmTransform): Promise<ReadableStream<Uint8Array>> {
     const opts: PcmTransform = o ?? {};
@@ -916,10 +531,26 @@ export const WavDriver: ContainerDriver = {
       transformDependencies ??= import('./transform-dependencies.ts');
       return transformDependencies;
     };
+    let sampleTransformDependencies: Promise<typeof import('./sample-transform.ts')> | undefined;
+    const loadSampleTransformDependencies = (): Promise<typeof import('./sample-transform.ts')> => {
+      sampleTransformDependencies ??= import('./sample-transform.ts');
+      return sampleTransformDependencies;
+    };
+    let s16ResampleDependencies: Promise<typeof import('./s16-resample.ts')> | undefined;
+    const loadS16ResampleDependencies = (): Promise<typeof import('./s16-resample.ts')> => {
+      s16ResampleDependencies ??= import('./s16-resample.ts');
+      return s16ResampleDependencies;
+    };
+    let f32GainDependencies: Promise<typeof import('./f32-gain.ts')> | undefined;
+    const loadF32GainDependencies = (): Promise<typeof import('./f32-gain.ts')> => {
+      f32GainDependencies ??= import('./f32-gain.ts');
+      return f32GainDependencies;
+    };
     if (
       container === 'wav' &&
       opts.gainDb === undefined &&
       opts.fade === undefined &&
+      opts.mixMatrix === undefined &&
       opts.dynamics === undefined &&
       opts.biquad === undefined
     ) {
@@ -928,6 +559,16 @@ export const WavDriver: ContainerDriver = {
         const sliced = await tryTimeSlice(src, opts);
         if (sliced !== undefined) return sliced;
       } else {
+        if (
+          opts.sampleRate !== undefined &&
+          src.range !== undefined &&
+          src.size !== undefined &&
+          src.size >= WAV_RANGE_RESAMPLE_MIN_SOURCE_BYTES
+        ) {
+          const loadedResampler = await loadS16ResampleDependencies();
+          const streamed = await loadedResampler.tryStreamResampleWavS16ToS16Wav(src, opts);
+          if (streamed !== undefined) return streamed;
+        }
         bytes = await readAll(src, opts.signal);
         if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
         const copyPlan = planWavPcmCopy(
@@ -940,10 +581,17 @@ export const WavDriver: ContainerDriver = {
         if (copyPlan !== undefined) {
           return streamWavPcmCopy(copyPlan, opts.signal);
         }
-        const { tryResampleWavS16ToS16Wav } = await import('./s16-resample.ts');
-        const resampled = tryResampleWavS16ToS16Wav(bytes, opts);
-        if (resampled !== undefined) {
-          return byteStream(resampled);
+        if (opts.sampleRate !== undefined) {
+          const loadedResampler = await loadS16ResampleDependencies();
+          const resampled = loadedResampler.tryResampleWavS16ToS16Wav(bytes, opts);
+          if (resampled !== undefined) {
+            return byteStream(resampled);
+          }
+        }
+        if (opts.channels !== undefined || opts.mixMatrix !== undefined) {
+          const loadedDirect = await loadSampleTransformDependencies();
+          const transformed = loadedDirect.tryTransformWavSamplesToWav(bytes, opts);
+          if (transformed !== undefined) return byteStream(transformed);
         }
         const loaded = await loadTransformDependencies();
         const converted = loaded.tryConvertWavPcmFormatToWav(bytes, opts);
@@ -951,6 +599,23 @@ export const WavDriver: ContainerDriver = {
           return byteStream(converted);
         }
       }
+    }
+    if (
+      container === 'wav' &&
+      opts.dynamics === undefined &&
+      opts.biquad === undefined &&
+      opts.timeBounds === undefined
+    ) {
+      bytes ??= await readAll(src, opts.signal);
+      if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);
+      if (opts.gainDb !== undefined) {
+        const loadedGain = await loadF32GainDependencies();
+        const gained = loadedGain.tryGainWavF32ToF32Wav(bytes, opts);
+        if (gained !== undefined) return byteStream(gained);
+      }
+      const loadedDirect = await loadSampleTransformDependencies();
+      const transformed = loadedDirect.tryTransformWavSamplesToWav(bytes, opts);
+      if (transformed !== undefined) return byteStream(transformed);
     }
     let loaded: typeof import('./transform-dependencies.ts');
     if (bytes === undefined) {
@@ -962,10 +627,6 @@ export const WavDriver: ContainerDriver = {
     const aiff = loaded.tryRewriteWavPcmToAiffBe(bytes, opts);
     if (aiff !== undefined) {
       return byteStream(aiff);
-    }
-    const gained = loaded.tryGainWavF32ToF32Wav(bytes, opts);
-    if (gained !== undefined) {
-      return byteStream(gained);
     }
     const wav = loaded.readWavPcm(bytes);
     if (opts.signal?.aborted) throw new MediaError('aborted', OPERATION_ABORTED);

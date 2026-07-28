@@ -55,8 +55,15 @@ export async function tryConvertStreamCopy(
       ...stage,
       container: target,
       ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+      ...(opts.maximumPacketCount !== undefined
+        ? { maximumPacketCount: opts.maximumPacketCount }
+        : {}),
       ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
-      ...(opts.sink?.kind === 'stream-target' ? { streaming: true } : { buffered: true }),
+      ...(opts.sink?.kind === 'stream-target' ||
+      opts.sink?.kind === 'opfs' ||
+      opts.sink?.kind === 'opfs-target'
+        ? { streaming: true }
+        : { buffered: true }),
     }),
   };
 }

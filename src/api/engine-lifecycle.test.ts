@@ -15,8 +15,7 @@ import * as sugar from './create-media.ts';
 import { createMedia } from './create-media.ts';
 
 const MEDIA = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/media');
-const wavBytes = (): Uint8Array =>
-  Uint8Array.from(readFileSync(resolve(MEDIA, 'sfx-pcm-s16.wav')));
+const wavBytes = (): Uint8Array => Uint8Array.from(readFileSync(resolve(MEDIA, 'sfx-pcm-s16.wav')));
 
 function expectDisposedError(fn: () => unknown): void {
   try {

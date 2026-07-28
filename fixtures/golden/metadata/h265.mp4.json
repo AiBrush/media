@@ -8,6 +8,7 @@
       "type": "video",
       "codec": "hvc1.1.6.L60.90",
       "durationSec": 1,
+      "language": "und",
       "fps": 10,
       "rotation": 0,
       "width": 320,

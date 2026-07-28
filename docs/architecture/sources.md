@@ -121,7 +121,10 @@ a live source decline with a typed `CapabilityError` (`src/sources/live-media.ts
 **Invariants the whole engine relies on:**
 
 - **Immutability of a snapshot.** Every read from one `Source` object describes the *same* immutable
-  bytes; a mutable URL/OPFS resource that changes requires a *new* `Source` (`source.ts:55`).
+  bytes; a mutable URL/OPFS resource that changes requires a *new* `Source` (`source.ts:55`). A finite
+  `blob:` URL plus an explicitly seeded size is the caller's assertion that URL+size names one immutable
+  snapshot across short-lived Source wrappers — not an inference from the scheme. A mutable `MediaSource`
+  must omit that finite cache identity or mint a new object URL / Source identity when its bytes change.
 - **`range()` is half-open `[start, end)`** (JS `subarray`/`slice` semantics); the URL source
   translates it to the *inclusive* HTTP `Range: bytes=lo-(hi-1)` (`source.ts:9`, `:457`).
 - **`range()` never short-reads before EOF.** A compliant `range(a, b)` returns exactly
@@ -143,7 +146,7 @@ caller value ──from()──▶ Source | LiveMediaSource        (source.ts:36
  (probe/demux/seek)  (small finite audio)             (VideoFrame/AudioData)
 ```
 
-Two optional *decorators* wrap a `Source` without changing its type:
+Three bounded reuse seams wrap a `Source` without changing its type:
 
 - **`CachingSource` (opt-in, public)** — `cacheSource(src|url)` → coalescing in-memory range cache +
   `prime()` preload; **never on the default path** (`src/sources/cache.ts:72`, `:123`).
@@ -151,6 +154,11 @@ Two optional *decorators* wrap a `Source` without changing its type:
   engine bounded (≤8 intervals, ≤1 MiB, 60 s TTL) byte reuse across repeated probes of the *same*
   source object (`src/sources/probe-range-cache.ts:222`, `:25`). Wired in `api/engine.ts` probe path
   only, behind `range !== undefined`.
+- **Finite blob-URL prefix handoff (implicit)** — an explicitly sized URL Source whose internal key is
+  the same `blob:` URL may reuse an owned start-at-zero prefix across fresh Source wrappers in one engine.
+  Admission is bounded to ≤1 MiB per entry, eight entries / 8 MiB total, and an absolute ≤250 ms lifetime;
+  hits update only LRU order and never extend expiry. This relies on the immutable-snapshot assertion above.
+  Unknown-size blob URLs, ordinary HTTP URLs, and mutable `MediaSource` identities do not enter this path.
 
 The `ByteSource` the drivers consume (`src/contracts/driver.ts:184`) is the *structural subset*
 `{ stream(); size?; range?(); readAll?() }` — drivers never see `MediaInput`, the constructors, or the
@@ -377,8 +385,9 @@ Each item: the change, the `path:line`, and the oracle that proves it.
    `InputError` (`live-media.ts:226`; `measured-evidence.md`). Confirm we never expose multi-track live (e.g.
    multi-cam / multi-mic) — log the decision and its rationale (`MediaStreams` has one slot per kind).
 
-6. **Cross-call size memoization.** Two `fromURL()` calls to the same href each learn `size`
-   independently; only `cacheSource`/`probe-range-cache` memoize per-object. Should an engine memoize
-   `probeUrlSize` results by href within its lifetime to save a round-trip on re-probe?
+6. **Cross-call size memoization.** Two ordinary HTTP `fromURL()` calls to the same href each learn
+   `size` independently; the finite blob-URL handoff is the narrow immutable-snapshot exception. Should
+   an engine memoize `probeUrlSize` results for other hrefs within its lifetime to save a round-trip, and
+   if so what explicit validator prevents mutable-URL staleness?
 </content>
 </invoke>

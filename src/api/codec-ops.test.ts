@@ -487,6 +487,16 @@ describe('convert — codec seam reached and fails honestly without WebCodecs', 
 });
 
 describe('trim — compressed audio packet-copy path', () => {
+  it('rejects fragmented output for a non-MP4 trim before packet-copy work starts', async () => {
+    await expect(
+      media().trim(await fixtureSource('sfx-opus.ogg'), {
+        start: 0.04,
+        end: 0.16,
+        fragmented: true,
+      }),
+    ).rejects.toBeInstanceOf(InputError);
+  });
+
   it('trims MP3, ADTS, and Ogg/Opus as real shortened packet streams', async () => {
     const restore = installEncodedChunkShims();
     try {
@@ -536,12 +546,22 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     expect(info.tracks.length).toBeGreaterThan(0);
   });
 
-  it('cross-container remux (mp4 → mkv) routes the packet seam → typed miss in Node (browser path)', async () => {
-    // mkv now HAS a muxer, so remux proceeds to demux→muxer; the verbatim packet copy needs WebCodecs
-    // EncodedChunk (absent in Node) → a typed CapabilityError, never a crash or a wrong/empty container.
-    await expect(
-      media().remux(await fixtureSource('movie_5.mp4'), { to: 'mkv' }),
-    ).rejects.toBeInstanceOf(CapabilityError);
+  it('cross-container remux (mp4 → mkv) writes directly from packet offsets without host chunks', async () => {
+    const input = await loadFixture('movie_5.mp4');
+    const packetInfo = Mp4Driver.packetInfo;
+    if (packetInfo === undefined) throw new Error('expected MP4 packet-info');
+    const sourceTable = await packetInfo.call(Mp4Driver, fromBytes(input, { mime: 'video/mp4' }));
+    const out = await outputBytes(
+      await media().remux(fromBytes(input, { mime: 'video/mp4' }), { to: 'mkv' }),
+    );
+    const parsed = await demuxWebm(out);
+
+    expect(parsed.info.container).toBe('mkv');
+    expect(sourceTable.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
+    expect(parsed.info.tracks.map((track) => track.codec)).toEqual(['h264', 'aac']);
+    expect(parsed.framesByIndex.reduce((total, frames) => total + frames.length, 0)).toBe(
+      sourceTable.packets.length,
+    );
   });
 
   it('cross-container remux (mp4 → ts) accepts foreign H.264/AAC packets through the muxer seam', async () => {

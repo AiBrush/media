@@ -391,6 +391,17 @@ describe('FLAC codec-seam pure helpers (flac-codec.ts)', () => {
     expect([...(out[0] ?? [])]).toEqual([0, 16384, -16384, 32767, -32768]);
   });
 
+  it('quantizePlanes uses nearest-even for exact positive and negative half-LSB values', () => {
+    const codes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+    const out = quantizePlanes(
+      [Float32Array.from(codes, (code) => code / 32_768)],
+      codes.length,
+      16,
+    );
+
+    expect([...(out[0] ?? [])]).toEqual([-2, -2, 0, 0, 2, 2]);
+  });
+
   it('PlanarBlockAccumulator re-chunks to fixed blocks and yields the true partial tail', () => {
     const acc = new PlanarBlockAccumulator(1, 4);
     // Push 10 samples across two uneven pushes → blocks [4],[4] then a [2] tail.

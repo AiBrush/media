@@ -124,6 +124,13 @@ never a driver or backend. A token with no chunk-seam muxer raises a typed `Capa
 (`mux-runner.ts:43-48`), and an illegal codec-in-container is rejected by the muxer's own `addTrack`
 (`src/api/codec-routing.ts:19`) — the single source of codec-legality truth.
 
+MP4/MOV exposes three deliberate layout choices through `faststart?: boolean | 'reserve'` plus
+`fragmented?: boolean`: ordinary metadata-last output, in-memory `moov`-first output, reserved
+progressive output, or fragmented output. Reserved output requires a positive per-track
+`maximumPacketCount` and a positioned callback/seekable/OPFS sink. Validation runs before any
+caller-owned packet stream is pulled; the generic writer enforces the ceiling again while packets
+arrive and raises the stable `MP4_FASTSTART_RESERVE_PACKET_OVERFLOW` failure on overflow.
+
 ### 3.2 Capability routing (WebCodecs → GPU → WASM, miss-only)
 
 Muxing is **container serialization in pure TypeScript** — there is no WebCodecs/GPU/WASM tier for
@@ -354,20 +361,15 @@ per-track packet counts.
    parallel code paths (native, prepared-buffered, general-streaming) exist for perf. If §5.4 + §5.5
    land, is the prepared-buffered tier still worth its duplication, or does one streaming muxer per
    family with an optional buffered-Blob finalize suffice? Decide the target path count.
-2. **Adopt a mediabunny-style `fastStart` enum (`false | 'in-memory' | 'reserve' | 'fragmented'`)?**
-   Today `faststart` is a boolean and the writer uses zero-offset-then-patch
-   (`src/drivers/mp4/write.ts:946-950`). Is a `'reserve'` mode (pre-sized `moov` given
-   `maximumPacketCount`) worth it for single-pass streaming faststart, and should the public `MuxSpec`
-   surface it? (`MuxSpec.faststart?: boolean`, `src/api/types.ts:228`.)
-3. **Own a formal container↔codec capability registry in the mux layer?** Codec legality is currently
+2. **Own a formal container↔codec capability registry in the mux layer?** Codec legality is currently
    asserted late by each muxer's `addTrack` plus ad-hoc literals (`webmAudioCodecId`,
    `flac-mkv-mux.ts:542-548`; `CODEC_MUX_CONTAINERS`, `codec-routing.ts:21`). Should a single declarative
    registry (mirroring mediabunny's `format.getSupportedVideo/AudioCodecs()`) be the one arbiter, with
    the API layer holding no codec-id strings?
-4. **Prepared-path fragmented (CMAF / live) output.** Fragmented WebM/MKV and MP4 currently fall to the
+3. **Prepared-path fragmented (CMAF / live) output.** Fragmented WebM/MKV and MP4 currently fall to the
    general muxer (`mux-runner.ts:49-53`); the prepared muxers reject `fragmented` outright
    (`mp4-prepared-mux.ts:144-153`). Should the streaming muxer become the sole fragmented author for
    live/MSE targets, sharing S07's streaming sink? (Ties to streaming-output S07.)
-5. **Is `MP4_PREPARED_MULTITRACK_MIN_PACKETS = 256` a robust device-independent crossover?**
+4. **Is `MP4_PREPARED_MULTITRACK_MIN_PACKETS = 256` a robust device-independent crossover?**
    (`flac-mkv-mux.ts:41`, ADR-256.) A single baked constant governs prepared-vs-stream selection; should
    it be tier-threshold-driven (S01) or measured per session rather than a compiled literal?

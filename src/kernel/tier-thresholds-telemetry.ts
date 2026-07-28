@@ -45,7 +45,7 @@ export const TELEMETRY_SEEDED_TIER_THRESHOLDS: TelemetrySeededTierThresholds = {
     },
     {
       path: 'fixtures/golden/bench/audio-dsp.json',
-      generatedAt: '2026-06-26T04:04:54.458Z',
+      generatedAt: '2026-07-28T00:37:28.036Z',
       runtime: 'bun 1.3.14',
     },
     {

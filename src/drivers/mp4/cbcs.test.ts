@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK, hexToBytes } from '../../crypto/aes.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { encryptCbcs, encryptSampleCbcs } from '../../test-support/cbcs-encrypt.ts';
@@ -200,6 +200,46 @@ function audioEntry(type: string, ...children: Bytes[]): number[] {
     u32(22050 << 16),
     ...children,
   );
+}
+
+/** A minimal visual sample entry (78-byte body + children), protected (`encv`) or clear (`avc1`). */
+function videoEntry(type: string, ...children: Bytes[]): number[] {
+  return box(
+    type,
+    [0, 0, 0, 0, 0, 0],
+    u16(1), // data_reference_index
+    u16(0),
+    u16(0),
+    u32(0),
+    u32(0),
+    u32(0),
+    u16(320),
+    u16(180),
+    u32(0x00480000),
+    u32(0x00480000),
+    u32(0),
+    u16(1),
+    new Array(32).fill(0),
+    u16(0x0018),
+    u16(0xffff),
+    ...children,
+  );
+}
+
+/** A deterministic, structurally valid four-byte-length-prefixed AVC access unit with SEI + VCL. */
+function avcSample(size: number, seed: number): Uint8Array {
+  if (size < 32) throw new Error('AVC test sample must be at least 32 bytes');
+  const seiSize = 11;
+  const vclSize = size - 8 - seiSize;
+  const out = new Uint8Array(size);
+  out.set(u32(seiSize), 0);
+  out[4] = 0x06;
+  for (let i = 5; i < 4 + seiSize; i++) out[i] = (seed + i * 13) & 0xff;
+  out.set(u32(vclSize), 4 + seiSize);
+  const vclStart = 8 + seiSize;
+  out[vclStart] = seed % 2 === 0 ? 0x65 : 0x41;
+  for (let i = vclStart + 1; i < out.length; i++) out[i] = (seed + i * 29) & 0xff;
+  return out;
 }
 
 /** `sgpd` grouping_type 'seig' (version 1, default_length 0 ⇒ per-entry description_length). */
@@ -616,7 +656,7 @@ describe('decryptCencFile — cbcs layout (i): constant IV, NO aux data at all (
     expectSampleBytes(out, file.ranges, plain);
   });
 
-  it('a wrong key does not recover the plaintext; a missing key is a typed CapabilityError', async () => {
+  it('a wrong key does not recover the plaintext; a missing key is a typed InputError', async () => {
     const plain = await realPayloads([64, 64]);
     const cipher = plain.map((p) => osslEncryptCbcs(KEYB, CONST_IV, p, 0, 0));
     const file = buildFragmentedFile(fragMoov([{ id: 1, entries: [entry] }]), [
@@ -627,7 +667,7 @@ describe('decryptCencFile — cbcs layout (i): constant IV, NO aux data at all (
       toHex(out.subarray(file.ranges[0]?.start ?? 0, (file.ranges[0]?.start ?? 0) + 64)),
     ).not.toBe(toHex(plain[0] ?? new Uint8Array()));
     await expect(decryptCencFile(file.bytes, { scheme: 'cbcs', keys: {} })).rejects.toBeInstanceOf(
-      CapabilityError,
+      InputError,
     );
   });
 
@@ -802,7 +842,7 @@ describe('decryptCencFile — cbcs layout (iii): sbgp/sgpd seig overrides (clear
     expectSampleBytes(out, file.ranges, plain);
   });
 
-  it('a used seig KID without a key is a typed CapabilityError; an unused KID needs no key', async () => {
+  it('a used seig KID without a key is a typed InputError; an unused KID needs no key', async () => {
     const plain = await realPayloads([64, 64], 5);
     const cipher = [
       osslEncryptCbcs(KEY2B, CONST_IV2, plain[0] ?? new Uint8Array(), 0, 0),
@@ -829,7 +869,7 @@ describe('decryptCencFile — cbcs layout (iii): sbgp/sgpd seig overrides (clear
     expectSampleBytes(out, file.ranges, plain);
     await expect(
       decryptCencFile(file.bytes, { scheme: 'cbcs', keys: { [KID]: KEY } }),
-    ).rejects.toBeInstanceOf(CapabilityError);
+    ).rejects.toBeInstanceOf(InputError);
   });
 });
 
@@ -960,6 +1000,7 @@ describe('decryptCencFile — flat (non-fragmented) generality: stbl tables, sai
   function buildFlatFile(o: {
     entries: number[][];
     chunks: { sampleDescriptionIndex: number; samples: Uint8Array[] }[];
+    handler?: 'soun' | 'vide';
     senc?: { iv?: Uint8Array; subsamples?: { clear: number; protected: number }[] }[];
     auxBeforeSamples?: Uint8Array[];
     /** Emit a 64-bit `co64` chunk-offset table instead of the 32-bit `stco`. */
@@ -1116,7 +1157,7 @@ describe('decryptCencFile — flat (non-fragmented) generality: stbl tables, sai
           box(
             'mdia',
             full('mdhd', 0, 0, u32(0), u32(0), u32(22050), u32(0), u16(0x55c4), u16(0)),
-            full('hdlr', 0, 0, u32(0), fcc('soun'), u32(0), u32(0), u32(0), [0]),
+            full('hdlr', 0, 0, u32(0), fcc(o.handler ?? 'soun'), u32(0), u32(0), u32(0), [0]),
             box(
               'minf',
               box(
@@ -1240,6 +1281,58 @@ describe('decryptCencFile — flat (non-fragmented) generality: stbl tables, sai
       chunks: [{ sampleDescriptionIndex: 1, samples: cipher }],
       co64: true,
       uniformSampleSize: size,
+    });
+    const out = await decryptCencFile(file.bytes, { scheme: 'cbcs', keys: { [KID]: KEY } });
+    expectSampleBytes(out, file.ranges, plain);
+  });
+
+  it('recovers a flat signaling-only CBCS AVC wrapper whose payload is already clear', async () => {
+    const plain = [avcSample(320, 31), avcSample(288, 32), avcSample(416, 33)];
+    const entry = videoEntry(
+      'encv',
+      box('avcC', [1, 0x64, 0, 0x1f, 0xff]),
+      sinfBox('avc1', 'cbcs', {
+        ivSize: 0,
+        kid: KIDB,
+        constantIv: CONST_IV,
+        crypt: 1,
+        skip: 9,
+      }),
+    );
+    const file = buildFlatFile({
+      entries: [entry],
+      chunks: [{ sampleDescriptionIndex: 1, samples: plain }],
+      handler: 'vide',
+    });
+    const out = await decryptCencFile(file.bytes, { scheme: 'cbcs', keys: { [KID]: KEY } });
+    expectSampleBytes(out, file.ranges, plain);
+    const structuralEnd = file.ranges[0]?.start ?? 0;
+    const structure = Array.from(out.subarray(0, structuralEnd), (x) =>
+      String.fromCharCode(x),
+    ).join('');
+    expect(structure).toContain('avc1');
+    expect(structure).not.toContain('encv');
+    expect(structure).not.toContain('sinf');
+  });
+
+  it('still decrypts genuine flat constant-IV CBCS AVC when no auxiliary boxes exist', async () => {
+    const plain = [avcSample(320, 41), avcSample(288, 42), avcSample(416, 43)];
+    const cipher = plain.map((sample) => osslEncryptCbcs(KEYB, CONST_IV, sample, 1, 9));
+    const entry = videoEntry(
+      'encv',
+      box('avcC', [1, 0x64, 0, 0x1f, 0xff]),
+      sinfBox('avc1', 'cbcs', {
+        ivSize: 0,
+        kid: KIDB,
+        constantIv: CONST_IV,
+        crypt: 1,
+        skip: 9,
+      }),
+    );
+    const file = buildFlatFile({
+      entries: [entry],
+      chunks: [{ sampleDescriptionIndex: 1, samples: cipher }],
+      handler: 'vide',
     });
     const out = await decryptCencFile(file.bytes, { scheme: 'cbcs', keys: { [KID]: KEY } });
     expectSampleBytes(out, file.ranges, plain);

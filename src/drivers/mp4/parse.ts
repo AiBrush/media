@@ -20,6 +20,7 @@ import {
   type Mp4DisplayTransform,
   clockwiseRotationFromMp4Matrix,
 } from './display-transform.ts';
+import { decodeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 export type { ColrInfo } from './codec-strings.ts';
@@ -38,6 +39,9 @@ export interface SampleToChunk {
   descIndex: number;
 }
 
+/** ISO-BMFF `sdtp.sample_depends_on`: 0 unknown, 1 dependent, 2 independent, 3 reserved. */
+export type SampleDependency = 0 | 1 | 2 | 3;
+
 export interface SampleTable {
   timeToSample: TimeToSample[];
   compositionOffsets: CompositionOffset[];
@@ -47,6 +51,8 @@ export interface SampleTable {
   chunkOffsets: number[];
   /** 1-based sample numbers that are sync (keyframes); empty means "every sample is sync". */
   syncSamples: number[];
+  /** Per-sample `sdtp.sample_depends_on` values; missing/short entries mean unknown. */
+  sampleDependencies: SampleDependency[];
 }
 
 /** The raw codec-configuration box (`avcC`/`esds`) preserved verbatim for lossless stream-copy. */
@@ -100,6 +106,8 @@ export interface OtherTrack {
   codec: string;
   timescale: number;
   durationSec: number;
+  /** Packed `mdhd` ISO-639-2/T language, when valid; explicit `und` is retained. */
+  language?: string;
   sampleCount: number;
   /** Present in full/packet-info parses when a readable packet table exists. */
   samples?: SampleTable;
@@ -131,6 +139,8 @@ export interface ParsedTrack {
   /** mdhd timescale (ticks per second). */
   timescale: number;
   durationSec: number;
+  /** Packed `mdhd` ISO-639-2/T language, when valid; explicit `und` is retained. */
+  language?: string;
   /** Exact source `mdhd.duration` in this track timescale, distinct from summed sample durations. */
   mediaDurationTicks?: number;
   /** Present for a normal single-rate edit list; applied by the packet/WebCodecs seam. */
@@ -650,6 +660,7 @@ function parseOtherTrak(
     codec: codec ?? '',
     timescale: timing?.timescale ?? 0,
     durationSec: timing?.durationSec ?? 0,
+    ...(timing?.language !== undefined ? { language: timing.language } : {}),
     sampleCount: parsedSamples?.sampleCount ?? sampleCountFallback ?? 0,
     ...(parsedSamples !== undefined && parsedSamples.sampleCount > 0
       ? { samples: parsedSamples.samples }
@@ -683,7 +694,12 @@ function parseTrak(
 
   const mdia = child(r, trak, 'mdia') ?? fail('trak has no mdia');
   const mdhd = child(r, mdia, 'mdhd') ?? fail('mdia has no mdhd');
-  const { timescale, durationSec, durationTicks: mediaDurationTicks } = parseMdhd(r, mdhd);
+  const {
+    timescale,
+    durationSec,
+    durationTicks: mediaDurationTicks,
+    language,
+  } = parseMdhd(r, mdhd);
 
   const minf = child(r, mdia, 'minf') ?? fail('mdia has no minf');
   const stbl = child(r, minf, 'stbl') ?? fail('minf has no stbl');
@@ -709,6 +725,7 @@ function parseTrak(
     mediaType,
     timescale,
     durationSec,
+    ...(language !== undefined ? { language } : {}),
     mediaDurationTicks,
     moovSampleCount: sampleCount,
     trakIndex,
@@ -827,16 +844,18 @@ function parseTkhd(
 function parseMdhd(
   r: Reader,
   box: BoxHeader,
-): { timescale: number; durationSec: number; durationTicks: number } {
+): { timescale: number; durationSec: number; durationTicks: number; language?: string } {
   r.seek(box.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
+  const language = r.pos + 2 <= box.end ? decodeMdhdLanguage(r.u16()) : undefined;
   return {
     timescale,
     durationSec: timescale > 0 ? duration / timescale : 0,
     durationTicks: duration,
+    ...(language !== undefined ? { language } : {}),
   };
 }
 
@@ -1296,6 +1315,7 @@ function emptySampleTable(): SampleTable {
     sampleToChunk: [],
     chunkOffsets: [],
     syncSamples: [],
+    sampleDependencies: [],
   };
 }
 
@@ -1313,6 +1333,7 @@ function parseSampleTableWithCount(r: Reader, stbl: BoxHeader): ParsedSampleTabl
     sampleToChunk: parseStsc(r, child(r, stbl, 'stsc')),
     chunkOffsets: parseChunkOffsets(r, child(r, stbl, 'stco'), child(r, stbl, 'co64')),
     syncSamples: parseStss(r, child(r, stbl, 'stss')),
+    sampleDependencies: parseSdtp(r, child(r, stbl, 'sdtp')),
   };
   return { samples, sampleCount: samples.sampleSizes.length };
 }
@@ -1325,6 +1346,7 @@ function parsePacketInfoSampleTable(r: Reader, stbl: BoxHeader): ParsedSampleTab
     sampleToChunk: [],
     chunkOffsets: [],
     syncSamples: parseStss(r, child(r, stbl, 'stss')),
+    sampleDependencies: parseSdtp(r, child(r, stbl, 'sdtp')),
   };
   return { samples, sampleCount: samples.sampleSizes.length };
 }
@@ -1440,5 +1462,14 @@ function parseStss(r: Reader, box: BoxHeader | undefined): number[] {
   const n = r.u32();
   const out: number[] = [];
   for (let i = 0; i < n; i++) out.push(r.u32());
+  return out;
+}
+
+function parseSdtp(r: Reader, box: BoxHeader | undefined): SampleDependency[] {
+  if (!box) return [];
+  r.seek(box.payloadStart);
+  readFullBoxHeader(r);
+  const out: SampleDependency[] = [];
+  while (r.pos < box.end) out.push(((r.u8() >> 4) & 3) as SampleDependency);
   return out;
 }

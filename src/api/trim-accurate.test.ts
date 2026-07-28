@@ -203,15 +203,15 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
       config: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 },
     };
     expect(trimVideoEncodeTarget(sourceTrack)).toEqual({
-      bitrate: 27_993_600,
+      bitrate: 55_987_200,
       bitrateMode: 'variable',
     });
     expect(trimVideoEncodeTarget(sourceTrack, 5_836_579)).toEqual({
-      bitrate: 8_754_869,
+      bitrate: 55_987_200,
       bitrateMode: 'variable',
     });
     expect(trimVideoEncodeTarget(sourceTrack, 40_000_000)).toEqual({
-      bitrate: 27_993_600,
+      bitrate: 62_500_000,
       bitrateMode: 'variable',
     });
   });
@@ -241,7 +241,7 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
         fps: 120,
         config: { codec: 'avc1.640028', codedWidth: 8192, codedHeight: 4320 },
       }),
-    ).toEqual({ bitrate: 50_000_000, bitrateMode: 'variable' });
+    ).toEqual({ crf: 8 });
   });
 
   it('packet-copy trims audio packets by overlap and preserves packet metadata', async () => {
@@ -338,11 +338,69 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
 
     expect(rows?.map((row) => [row.offset, row.size, row.timestampUs, row.dtsUs])).toEqual([
       [2_020, 20, 0, 0],
-      [2_040, 20, 10, 9],
+      [2_040, 20, 5, 4],
     ]);
     expect(rows?.map((row) => row.window)).toEqual([
       { start: 2_020, end: 2_060 },
       { start: 2_020, end: 2_060 },
+    ]);
+  });
+
+  it('assigns boundary-crossing packet-info audio rows to exactly one adjacent range', () => {
+    const packets: PacketInfoMetadata[] = Array.from({ length: 5 }, (_value, index) => ({
+      trackIndex: 0,
+      offset: 100 + index * 10,
+      size: 10,
+      ptsUs: index * 10,
+      dtsUs: index * 10,
+      durationUs: 10,
+      keyframe: true,
+    }));
+    const direct = planTrimAudioPacketInfoRows(packets, 0, { startUs: 5, endUs: 45 });
+    const left = planTrimAudioPacketInfoRows(packets, 0, { startUs: 5, endUs: 25 });
+    const right = planTrimAudioPacketInfoRows(packets, 0, { startUs: 25, endUs: 45 });
+
+    expect(direct?.map((row) => row.offset)).toEqual([100, 110, 120, 130]);
+    expect(left?.map((row) => row.offset)).toEqual([100, 110]);
+    expect(right?.map((row) => row.offset)).toEqual([120, 130]);
+    expect([...(left ?? []), ...(right ?? [])].map((row) => row.offset)).toEqual(
+      direct?.map((row) => row.offset),
+    );
+    expect(
+      [...(left ?? []), ...(right ?? [])].every(
+        (row, index) => row.timestampUs + row.durationUs <= (index < 2 ? 20 : 20),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps the covering audio access unit when the trim is shorter than one packet', () => {
+    const rows = planTrimAudioPacketInfoRows(
+      [
+        {
+          trackIndex: 0,
+          offset: 100,
+          size: 10,
+          ptsUs: 0,
+          dtsUs: 0,
+          durationUs: 10,
+          keyframe: true,
+        },
+        {
+          trackIndex: 0,
+          offset: 110,
+          size: 10,
+          ptsUs: 10,
+          dtsUs: 10,
+          durationUs: 10,
+          keyframe: true,
+        },
+      ],
+      0,
+      { startUs: 5, endUs: 6 },
+    );
+
+    expect(rows?.map((row) => [row.offset, row.timestampUs, row.durationUs])).toEqual([
+      [100, 0, 10],
     ]);
   });
 

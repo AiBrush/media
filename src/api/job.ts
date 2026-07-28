@@ -36,10 +36,22 @@ export interface MediaJobOutput {
   readonly fragmented?: boolean;
 }
 
+/**
+ * Declarative jobs always end in the runner-owned Blob sink (and use append-only stream sinks between
+ * stages), so positioned-sink-only reserved faststart is intentionally available only on the flat API.
+ */
+type MediaJobConvertOptions = Omit<ConvertOptions, 'sink' | 'faststart' | 'maximumPacketCount'> & {
+  readonly faststart?: boolean;
+};
+
+type MediaJobRemuxOptions = Omit<RemuxOptions, 'sink' | 'faststart' | 'maximumPacketCount'> & {
+  readonly faststart?: boolean;
+};
+
 export type MediaJobOperation =
   | ({ readonly op: 'trim' } & Omit<TrimOptions, 'sink'>)
-  | ({ readonly op: 'convert' } & Omit<ConvertOptions, 'sink'>)
-  | ({ readonly op: 'remux' } & Omit<RemuxOptions, 'sink'>)
+  | ({ readonly op: 'convert' } & MediaJobConvertOptions)
+  | ({ readonly op: 'remux' } & MediaJobRemuxOptions)
   | ({ readonly op: 'decrypt' } & Omit<DecryptOptions, 'sink'>)
   | {
       readonly op: 'resize';

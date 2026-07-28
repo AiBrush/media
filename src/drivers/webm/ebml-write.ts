@@ -389,6 +389,8 @@ function usToMs(us: number): number {
 interface TrackChunks {
   trackNumber: number;
   mediaType?: 'video' | 'audio';
+  /** Matroska codec ID, when projected from a real mux track. */
+  codecId?: string;
   durationSec?: number;
   sampleRate?: number;
   gapless?: TrackInfo['gapless'];
@@ -455,7 +457,10 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
     }
     const declaredEndMs = durationSecToMs(t.durationSec);
     if (declaredEndMs !== undefined) {
+      const authorsGaplessTimeline =
+        t.codecId === undefined || t.codecId === 'A_AAC' || t.codecId === 'A_OPUS';
       const gaplessEndMs =
+        authorsGaplessTimeline &&
         t.mediaType === 'audio' &&
         t.gapless?.totalSamples !== undefined &&
         Number.isFinite(t.gapless.totalSamples) &&
@@ -576,6 +581,40 @@ function buildOpusHead(channels: number, preSkip: number, inputSampleRate: numbe
 
 function opusDelayNanoseconds(preSkip: number): number {
   return Math.round((preSkip * NANOS_PER_SECOND) / OPUS_SAMPLE_RATE);
+}
+
+/**
+ * Translate MP4/AAC priming samples into Matroska's codec-neutral `CodecDelay`.
+ *
+ * MP4 represents AAC encoder delay with an edit list, while Matroska represents the same fact in
+ * nanoseconds on the TrackEntry. Carrying the delay across the container boundary is essential: the
+ * AAC packets retain their edit-adjusted (negative) presentation timestamps, and a later Matroska→MP4
+ * remux needs this declaration to reconstruct the edit instead of mistaking priming for a program-wide
+ * negative start.
+ */
+export function matroskaAacCodecDelayNs(info: TrackInfo): number | undefined {
+  const codec = info.codec.toLowerCase();
+  if (
+    info.mediaType !== 'audio' ||
+    !(codec === 'aac' || codec.startsWith('mp4a')) ||
+    info.gapless?.leadingSamples === undefined
+  ) {
+    return undefined;
+  }
+  const config = info.config as AudioDecoderConfig | undefined;
+  const sampleRate = config?.sampleRate;
+  const leadingSamples = info.gapless.leadingSamples;
+  if (
+    sampleRate === undefined ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    !Number.isFinite(leadingSamples) ||
+    leadingSamples <= 0
+  ) {
+    return undefined;
+  }
+  const delay = Math.round((leadingSamples * NANOS_PER_SECOND) / sampleRate);
+  return Number.isSafeInteger(delay) && delay > 0 ? delay : undefined;
 }
 
 function opusPrivateAndDelay(
@@ -729,8 +768,10 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     ac?.numberOfChannels ?? 0,
     ac?.sampleRate ?? OPUS_SAMPLE_RATE,
   );
-  const codecDelayNs = info.codecDelayNs ?? opus.codecDelayNs;
+  const aacGaplessDelayNs = matroskaAacCodecDelayNs(info);
+  const codecDelayNs = info.codecDelayNs ?? aacGaplessDelayNs ?? opus.codecDelayNs;
   const seekPreRollNs = info.seekPreRollNs ?? opus.seekPreRollNs;
+  const timestampAdjustmentNs = info.codecDelayNs ?? aacGaplessDelayNs;
   return {
     trackNumber,
     mediaType: 'audio',
@@ -738,7 +779,7 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
     codecPrivate: opus.codecPrivate,
     ...(codecDelayNs !== undefined ? { codecDelayNs } : {}),
     ...(seekPreRollNs !== undefined ? { seekPreRollNs } : {}),
-    ...(info.codecDelayNs !== undefined ? { timestampAdjustmentNs: info.codecDelayNs } : {}),
+    ...(timestampAdjustmentNs !== undefined ? { timestampAdjustmentNs } : {}),
     width: undefined,
     height: undefined,
     alpha: false,
@@ -757,8 +798,15 @@ function timelineTrack(t: TrackState): TrackChunks {
   const base = {
     trackNumber: t.trackNumber,
     mediaType: t.mediaType,
+    codecId: t.codecId,
     chunks: t.chunks,
-    ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
+    // Opus packet/gapless counts are always expressed on RFC 6716's fixed 48 kHz clock, independent
+    // of the TrackEntry's declared input sampling frequency (which may legitimately be 8–48 kHz).
+    ...(t.codecId === 'A_OPUS'
+      ? { sampleRate: OPUS_SAMPLE_RATE }
+      : t.sampleRate !== undefined
+        ? { sampleRate: t.sampleRate }
+        : {}),
     ...(t.gapless !== undefined ? { gapless: t.gapless } : {}),
     ...(t.timestampAdjustmentNs !== undefined
       ? { timestampAdjustmentNs: t.timestampAdjustmentNs }

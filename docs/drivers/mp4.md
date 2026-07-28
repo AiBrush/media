@@ -18,8 +18,8 @@ Benchmark families served (per `docs/architecture/COVERAGE.md`):
   `stsz`/`stsc`/`stco`/`co64`/`stss` into a flat per-sample list, stream packets with correct
   PTS/DTS and keyframe flags. Also serves **probe** (header-only track facts) and packet-info
   (payload-free packet tables) via the same parser at three fidelity levels.
-- **mux** — accept `Packet`s (decode order) and author a single-`moov` faststart MP4/MOV, or a
-  fragmented/CMAF stream of `moof`+`mdat` segments.
+- **mux** — accept `Packet`s (decode order) and author metadata-last, in-memory faststart, positioned
+  reserved-faststart MP4/MOV, or a fragmented/CMAF stream of `moof`+`mdat` segments.
 - **remux** — lossless demux→mux stream-copy: preserve every sample byte, DTS, composition offset
   (B-frame reorder), codec-private box, edit list, and display matrix, with optional trim,
   fragmentation, and a same-family compatible-brand MOV→MP4 rewrite.
@@ -107,7 +107,7 @@ Bytes flow through four typed layers; each is pure and independently testable:
    timescale (ADR-045).
 
 The public surface is the `ContainerDriver` object `Mp4Driver` (`mp4-driver.ts:4267-4518`):
-`supports` (sync magic/mime, `mp4-sniff.ts:7`), `probe`, `packetInfo`, `demux`, `streamCopy`,
+`supports` (sync magic/mime, `mp4-sniff.ts:7`), `probe`, `packetInfo`, `packetInfoBatches`, `demux`, `streamCopy`,
 `decrypt`, `createMuxer`. A **mux-only** twin `Mp4MuxOnlyDriver` (`mp4-mux-driver.ts:31-48`) registers
 the writer without importing the parser (ADR-290 selective registration).
 
@@ -186,6 +186,13 @@ never pays for sample tables it won't read:
   tables, for payload-free packet tables over huge files.
 - `parseMovie` (`parse.ts:223`) — full tables, for demux/stream-copy.
 
+`packetInfoBatches` walks the parsed `stts`/`ctts`/`stsc`/`stsz`/`stco` primitive tables with persistent
+cursors in declared track order and creates at most one requested batch of packet row objects. Unknown
+AVC pictures read bounded payload windows for that pulled batch; other rows stay payload-free. Early
+return/abort stops range reads. Legacy `packetInfo` collects this same path, so
+DTS/PTS/duration/keyframe/offset truth has one implementation. Large non-AVC and complete-`sdtp` sources
+retain the offset-free metadata parse.
+
 On top, `probe()` tries header-only faststart shortcuts before any full read
 (`mp4-driver.ts:4274-4301`): bounded video-metadata, `readSimpleVideoFaststartProbe`
 (`simple-video-probe.ts:77-103`), tiny-audio and sparse-audio faststart probes — each parses only the
@@ -203,6 +210,15 @@ learn its exact length, then patch the absolute chunk offsets for `mdat` placed 
 (0.894 vs 0.903 ms after the fix; an array-only MOV specialization was reverted after it regressed)
 (measured-evidence.md_). `planMp4ByteStreamLayout` (`write.ts:969-982`) exposes the same layout for the
 streaming writer so the byte layout is identical whether emitted whole or chunked.
+
+`faststart:'reserve'` is the progressive, bounded-memory alternative. The public API requires a
+positive per-track `maximumPacketCount` and a positioned callback, seekable writable, or OPFS sink
+before it pulls input. `planReservedMp4ByteStreamLayout` reserves a deterministic metadata region,
+places the `mdat` header and payload after it, then emits a positioned `moov` patch followed by a valid
+`free` box filling unused reservation bytes. The driver streams payload forward, keeps one destination
+write outstanding, enforces the per-track packet ceiling, and returns a standard `ftyp`→`moov`→`free`
+→`mdat` file. Ordinary boolean faststart retains the small-input in-memory path; fragmentation remains
+the append-only live/CMAF path.
 
 ## 4. Current state
 

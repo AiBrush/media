@@ -98,6 +98,23 @@ function clampInt(x: number, lo: number, hi: number): number {
   return x;
 }
 
+/**
+ * Round to the nearest integer, resolving exact half-way values toward the even integer.
+ *
+ * PCM quantizers share this primitive so canonical and specialized writers cannot disagree at an LSB
+ * boundary. Adding a sub-2^52 value to 2^52 shifts it onto an integer-spaced IEEE-754 grid, whose
+ * mandatory round-to-nearest-ties-to-even rule performs the quantization without a second hot-path
+ * rounding branch. Values outside that range are already integral at binary64 precision; non-finite
+ * values pass through for the caller's existing validation/clamping policy.
+ */
+const HALF_EVEN_MAGIC = 2 ** 52;
+
+export function roundHalfToEven(value: number): number {
+  if (value > 0 && value < HALF_EVEN_MAGIC) return value + HALF_EVEN_MAGIC - HALF_EVEN_MAGIC;
+  if (value < 0 && value > -HALF_EVEN_MAGIC) return value - HALF_EVEN_MAGIC + HALF_EVEN_MAGIC;
+  return value;
+}
+
 function writeSample(
   dv: DataView,
   off: number,
@@ -107,16 +124,16 @@ function writeSample(
 ): void {
   switch (format) {
     case 'u8':
-      dv.setUint8(off, clampInt(Math.round(x * 128) + 128, 0, 255));
+      dv.setUint8(off, clampInt(roundHalfToEven(x * 128) + 128, 0, 255));
       return;
     case 's8':
-      dv.setInt8(off, clampInt(Math.round(x * 128), -128, 127));
+      dv.setInt8(off, clampInt(roundHalfToEven(x * 128), -128, 127));
       return;
     case 's16':
-      dv.setInt16(off, clampInt(Math.round(x * 32768), -32768, 32767), le);
+      dv.setInt16(off, clampInt(roundHalfToEven(x * 32768), -32768, 32767), le);
       return;
     case 's24': {
-      const v = clampInt(Math.round(x * 8388608), -8388608, 8388607);
+      const v = clampInt(roundHalfToEven(x * 8388608), -8388608, 8388607);
       const u = v < 0 ? v + 0x1000000 : v;
       const lo = u & 0xff;
       const mid = (u >> 8) & 0xff;
@@ -127,7 +144,7 @@ function writeSample(
       return;
     }
     case 's32':
-      dv.setInt32(off, clampInt(Math.round(x * 2147483648), -2147483648, 2147483647), le);
+      dv.setInt32(off, clampInt(roundHalfToEven(x * 2147483648), -2147483648, 2147483647), le);
       return;
     case 'f32':
       dv.setFloat32(off, x, le);
@@ -186,7 +203,19 @@ export function decodePcmToInterleavedF32(
   const data = new Float32Array(new ArrayBuffer(sampleCount * 4));
   const le = endian === 'le';
 
-  if (format === 's24') {
+  if (format === 's16') {
+    if (le) {
+      for (let sample = 0, offset = 0; sample < sampleCount; sample++, offset += 2) {
+        const raw = (bytes[offset] as number) | ((bytes[offset + 1] as number) << 8);
+        data[sample] = ((raw << 16) >> 16) / 32_768;
+      }
+    } else {
+      for (let sample = 0, offset = 0; sample < sampleCount; sample++, offset += 2) {
+        const raw = ((bytes[offset] as number) << 8) | (bytes[offset + 1] as number);
+        data[sample] = ((raw << 16) >> 16) / 32_768;
+      }
+    }
+  } else if (format === 's24') {
     for (let sample = 0, offset = 0; sample < sampleCount; sample++, offset += 3) {
       const first = bytes[offset] as number;
       const middle = bytes[offset + 1] as number;

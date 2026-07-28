@@ -53,6 +53,7 @@ const AUDIO_TARGET_KEYS = [
   'bitrate',
   'gainDb',
   'fade',
+  'mixMatrix',
   'dynamics',
   'biquad',
 ] as const;
@@ -126,9 +127,38 @@ export function validateAudioTarget(value: unknown, label: string): AudioTarget 
   optionalPositiveInteger(target.bitrate, `${label}.bitrate`);
   optionalFiniteNumber(target.gainDb, `${label}.gainDb`);
   if (target.fade !== undefined) fadeTarget(target.fade, `${label}.fade`);
+  if (target.mixMatrix !== undefined) {
+    const matrix = mixMatrixTarget(target.mixMatrix, `${label}.mixMatrix`);
+    if (target.channels !== undefined && matrix.length !== target.channels) {
+      throw new InputError(
+        `${label}.mixMatrix has ${matrix.length} output row(s), expected ${target.channels}`,
+      );
+    }
+  }
   if (target.dynamics !== undefined) dynamicsTarget(target.dynamics, `${label}.dynamics`);
   if (target.biquad !== undefined) biquadTarget(target.biquad, `${label}.biquad`);
   return clonePlainData(target) as AudioTarget;
+}
+
+function mixMatrixTarget(value: unknown, label: string): readonly (readonly number[])[] {
+  const matrix = plainArray(value, label);
+  if (matrix.length === 0) throw new InputError(`${label} must contain at least one output row`);
+  let inputChannels: number | undefined;
+  for (let output = 0; output < matrix.length; output++) {
+    const rowLabel = `${label}[${output}]`;
+    const row = plainArray(matrix[output], rowLabel);
+    if (row.length === 0) throw new InputError(`${rowLabel} must contain at least one coefficient`);
+    inputChannels ??= row.length;
+    if (row.length !== inputChannels) {
+      throw new InputError(
+        `${rowLabel} has ${row.length} coefficient(s), expected ${inputChannels}`,
+      );
+    }
+    for (let input = 0; input < row.length; input++) {
+      finiteNumber(row[input], `${rowLabel}[${input}]`);
+    }
+  }
+  return matrix as readonly (readonly number[])[];
 }
 
 /** Validate `undefined` (absent), `false` (stream disabled), or a target object via `validate`. */

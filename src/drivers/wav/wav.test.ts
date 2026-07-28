@@ -7,6 +7,7 @@ import { gain } from '../../dsp/gain.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
+import { sha256Hex } from '../../util/digest.ts';
 import { readAiffPcm, writeAiff } from '../aiff/aiff.ts';
 import { tryRewriteWavPcmToAiffBe } from './aiff-rewrite.ts';
 import { tryGainWavF32ToF32Wav } from './f32-gain.ts';
@@ -1642,6 +1643,54 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(reads.at(-1)).toEqual([0, input.byteLength]);
   });
 
+  it('forwards cancellation into the direct WAV copy-plan range read', async () => {
+    const input = await loadFixture('stereo-48000.wav');
+    const abort = new AbortController();
+    let entered!: () => void;
+    const rangeEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let rangeSignal: AbortSignal | undefined;
+    const source: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: input.byteLength,
+      mimeHint: 'audio/wav',
+      stream: () => {
+        throw new Error('direct range copy must not open a stream');
+      },
+      range: (_start, _end, signal) => {
+        rangeSignal = signal;
+        entered();
+        if (signal === undefined) {
+          return Promise.reject(new Error('direct copy range read requires the operation signal'));
+        }
+        return new Promise<Uint8Array>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject(new MediaError('aborted', 'operation aborted', signal.reason)),
+            { once: true },
+          );
+        });
+      },
+    };
+
+    const pending = createMedia().convert(
+      source,
+      {
+        to: 'wav',
+        audio: { codec: 'pcm-s16', channels: 2, sampleRate: 48_000 },
+      },
+      { signal: abort.signal },
+    );
+    await rangeEntered;
+    abort.abort('cancel direct copy read');
+
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
+    expect(rangeSignal?.aborted).toBe(true);
+    expect(rangeSignal?.reason).toBe('cancel direct copy read');
+  });
+
   it('direct-resamples s16 WAV to canonical s16 WAV for sample-rate-only transforms', () => {
     const input = sineWav(997, 44_100, 44_100, 0.65);
     const out = tryResampleWavS16ToS16Wav(input, { container: 'wav', sampleRate: 16_000 });
@@ -1653,6 +1702,69 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(re.frames).toBe(16_000);
     expect(peak(channelAt(re.planar, 0))).toBeGreaterThan(0.5);
   });
+
+  it.each([
+    {
+      sourceRate: 44_100,
+      targetRate: 48_000,
+      sourceFrames: 100,
+      outputFrames: 109,
+      sha256: '20e3eeddc6bc8e71be81fff96c8f1990a359db0d5653e5b70a80aa5da78f40ca',
+      first: [-20423, -13667, -5414, 906, 9839, 12837, 31120, 3059, -32768, -17713, -14017, -5814],
+      last: [23994, -29863, -21719, -12978, -6883, 645, 9143, 12339, 29872, 6434, -32768, -15404],
+    },
+    {
+      sourceRate: 48_000,
+      targetRate: 44_100,
+      sourceFrames: 101,
+      outputFrames: 93,
+      sha256: '23c21db3ce2f186cc7ea22a284127c01eecb17d40c8b6a015a1056d81e90c2a0',
+      first: [-19422, -12065, -3337, 6399, 11233, 30179, -3593, -32768, -14287, -9434, 882, 7645],
+      last: [26980, 14835, -32678, -14808, -9569, 119, 8807, 16392, 27947, -26436, -24350, -11989],
+    },
+    {
+      sourceRate: 48_000,
+      targetRate: 16_000,
+      sourceFrames: 100,
+      outputFrames: 33,
+      sha256: '90318225348e52a246aa38b276b4f0e34bda16dd14e76b8e27a8297026419c9d',
+      first: [
+        -13083, 6002, 6524, -21229, 15296, -10869, -15154, 21247, -6083, -6908, 18857, -19558,
+      ],
+      last: [18040, -20375, 5390, 4565, -22765, 13636, 9346, -16793, 19651, -7900, -7901, 15336],
+    },
+  ] as const)(
+    'keeps paired mono FIR byte-exact with scalar boundaries at $sourceRate→$targetRate Hz',
+    async ({ sourceRate, targetRate, sourceFrames, outputFrames, sha256, first, last }) => {
+      const input = writeWav(
+        {
+          sampleRate: sourceRate,
+          channels: 1,
+          frames: sourceFrames,
+          planar: [
+            Float64Array.from(
+              { length: sourceFrames },
+              (_, frame) => (((frame * 7_919 + 12_345) & 0xffff) - 32_768) / 32_768,
+            ),
+          ],
+        },
+        's16',
+      );
+      const out = tryResampleWavS16ToS16Wav(input, {
+        container: 'wav',
+        sampleRate: targetRate,
+      });
+      if (out === undefined) throw new Error('mono s16 FIR fast path must be eligible');
+
+      const decoded = readWavPcm(out);
+      const samples = new Int16Array(out.buffer, out.byteOffset + 44, decoded.frames);
+      expect(decoded.frames).toBe(outputFrames);
+      expect(decoded.frames & 1).toBe(1);
+      expect(await sha256Hex(out)).toBe(sha256);
+      expect(Array.from(samples.subarray(0, first.length))).toEqual(first);
+      expect(Array.from(samples.subarray(samples.length - last.length))).toEqual(last);
+    },
+  );
 
   it('keeps a real low-pass filter in the s16 WAV direct resampler', () => {
     const input = sineWav(12_000, 44_100, 44_100, 0.8);
@@ -1681,6 +1793,47 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     expect(differs(channelAt(re.planar, 0), channelAt(re.planar, 1))).toBe(true);
     expect(cached).toEqual(first);
   });
+
+  it.each([
+    [44_100, 48_000],
+    [48_000, 44_100],
+    [48_000, 16_000],
+  ] as const)(
+    'keeps the fused stereo FIR byte-exact with two independent mono FIRs at %i→%i Hz',
+    (sourceRate, targetRate) => {
+      const input = readWavPcm(stereoSineWav(sourceRate, sourceRate));
+      const stereoBytes = writeWav(input, 's16');
+      const mono = (channel: number): Uint8Array =>
+        writeWav(
+          {
+            sampleRate: sourceRate,
+            channels: 1,
+            frames: input.frames,
+            planar: [channelAt(input.planar, channel)],
+          },
+          's16',
+        );
+      const stereoOut = tryResampleWavS16ToS16Wav(stereoBytes, {
+        container: 'wav',
+        sampleRate: targetRate,
+      });
+      const leftOut = tryResampleWavS16ToS16Wav(mono(0), {
+        container: 'wav',
+        sampleRate: targetRate,
+      });
+      const rightOut = tryResampleWavS16ToS16Wav(mono(1), {
+        container: 'wav',
+        sampleRate: targetRate,
+      });
+      if (stereoOut === undefined || leftOut === undefined || rightOut === undefined) {
+        throw new Error('stereo and mono s16 FIR paths must be eligible');
+      }
+
+      const stereo = readWavPcm(stereoOut);
+      expect(channelAt(stereo.planar, 0)).toEqual(channelAt(readWavPcm(leftOut).planar, 0));
+      expect(channelAt(stereo.planar, 1)).toEqual(channelAt(readWavPcm(rightOut).planar, 0));
+    },
+  );
 
   it('exposes the same direct s16 resampler through the core byte helper', () => {
     const input = stereoSineWav(48_000, 48_000);
@@ -1751,6 +1904,26 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
         signal: AbortSignal.abort(),
       }),
     ).toThrowError(MediaError);
+  });
+
+  it('polls abort signals at the scalar cadence inside the paired mono FIR loop', () => {
+    const input = sineWav(997, 44_100, 5_000, 0.65);
+    let polls = 0;
+    const signal = {
+      get aborted(): boolean {
+        polls++;
+        return polls === 4;
+      },
+    } as unknown as AbortSignal;
+
+    expect(() =>
+      tryResampleWavS16ToS16Wav(input, {
+        container: 'wav',
+        sampleRate: 48_000,
+        signal,
+      }),
+    ).toThrowError(MediaError);
+    expect(polls).toBe(4);
   });
 
   it('routes sample-rate-only s16 WAV transforms through the direct resample writer', async () => {
@@ -1994,8 +2167,10 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
 
   it.each([
     ['f32', 's16'],
+    ['f32', 's24'],
     ['s24', 's16'],
     ['s24', 'f32'],
+    ['s16', 's24'],
     ['s16', 'f32'],
   ] as const)(
     'direct-converts %s WAV to %s bytes equal to the canonical PCM reference',
@@ -2018,31 +2193,81 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
         sampleFormat: targetFormat,
         endian: 'le',
       });
+      const forcedDataView = tryConvertWavPcmFormatToWav(
+        withJunk,
+        {
+          container: 'wav',
+          sampleFormat: targetFormat,
+          endian: 'le',
+        },
+        false,
+      );
       const reference = writeWav(readWavPcm(withJunk), targetFormat);
 
       expect(direct).toEqual(reference);
+      expect(forcedDataView).toEqual(reference);
       expect(direct).not.toEqual(withJunk);
     },
   );
 
-  it('routes clean WAV sample-format-only transforms through the direct converter', async () => {
-    const bytes = withJunkChunk(await loadFixture('sfx-pcm-s24.wav'));
-    const expected = tryConvertWavPcmFormatToWav(bytes, {
-      container: 'wav',
-      sampleFormat: 's16',
-      endian: 'le',
-    });
-    if (expected === undefined) throw new Error('s24→s16 WAV format fast path must be eligible');
-
-    const out = await drain(
-      await transformPcm(streamOnly(bytes), {
+  it.each([
+    ['f32', 's16', 32_768],
+    ['f32', 's24', 8_388_608],
+    ['s24', 's16', 32_768],
+  ] as const)(
+    'keeps direct %s→%s exact-half quantization byte-equal to canonical nearest-even output',
+    (sourceFormat, targetFormat, targetScale) => {
+      const targetCodes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+      const input = writeWav(
+        {
+          sampleRate: 48_000,
+          channels: 1,
+          frames: targetCodes.length,
+          planar: [Float64Array.from(targetCodes, (code) => code / targetScale)],
+        },
+        sourceFormat,
+      );
+      const direct = tryConvertWavPcmFormatToWav(input, {
         container: 'wav',
-        sampleFormat: 's16',
+        sampleFormat: targetFormat,
+      });
+      const reference = writeWav(readWavPcm(input), targetFormat);
+
+      expect(direct).toEqual(reference);
+      if (direct === undefined) throw new Error('expected direct PCM conversion');
+      const quantized = readWavPcm(direct);
+      expect(Array.from(channelAt(quantized.planar, 0), (sample) => sample * targetScale)).toEqual([
+        -2, -2, 0, 0, 2, 2,
+      ]);
+    },
+  );
+
+  it.each([
+    ['sfx-pcm-s24.wav', 's16'],
+    ['sfx-pcm-f32.wav', 's24'],
+  ] as const)(
+    'routes clean %s sample-format-only transforms to %s through the direct converter',
+    async (fixture, sampleFormat) => {
+      const bytes = withJunkChunk(await loadFixture(fixture));
+      const expected = tryConvertWavPcmFormatToWav(bytes, {
+        container: 'wav',
+        sampleFormat,
         endian: 'le',
-      }),
-    );
-    expect(out).toEqual(expected);
-  });
+      });
+      if (expected === undefined) {
+        throw new Error(`${fixture}→${sampleFormat} WAV format fast path must be eligible`);
+      }
+
+      const out = await drain(
+        await transformPcm(streamOnly(bytes), {
+          container: 'wav',
+          sampleFormat,
+          endian: 'le',
+        }),
+      );
+      expect(out).toEqual(expected);
+    },
+  );
 
   it('declines unsupported WAV sample-format fast-path shapes before the canonical PCM fallback', () => {
     const input = writeWav(
@@ -2061,7 +2286,7 @@ describe('WavDriver.transformPcm — PCM-native path (ADR-022)', () => {
     ).toBeUndefined();
     expect(tryConvertWavPcmFormatToWav(input, { container: 'wav' })).toBeUndefined();
     expect(
-      tryConvertWavPcmFormatToWav(input, { container: 'wav', sampleFormat: 's24' }),
+      tryConvertWavPcmFormatToWav(input, { container: 'wav', sampleFormat: 's32' }),
     ).toBeUndefined();
     expect(
       tryConvertWavPcmFormatToWav(input, { container: 'wav', sampleFormat: 'f32' }),

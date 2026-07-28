@@ -15,6 +15,8 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketInfoBatchOptions,
+  PacketInfoBatchStream,
   PacketInfoTable,
   PacketMetadata,
   Registry,
@@ -29,6 +31,9 @@ import {
   type NativePacketChunk,
   registerNativePacketSource,
 } from '../../internal/packet-provenance.ts';
+import { positionedChunk } from '../../sinks/stream-target.ts';
+import { raceAbort } from '../../sources/abort.ts';
+import { drainStream } from '../../sources/read-all.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
 // Type-only: erased at compile time, so it does not create a runtime import of the lazily-loaded CENC
 // module (the `import.meta`-gated `loadCencModule` remains the only value-level entry point to `cenc.ts`).
@@ -64,7 +69,6 @@ import {
   type SampleData,
   buildSampleData,
   buildSamples,
-  walkSampleClassificationRanges,
   walkSampleRanges,
 } from './samples.ts';
 import {
@@ -75,6 +79,7 @@ import {
   type MuxTrackInput,
   type MuxTrackLayoutInput,
   planMp4ByteStreamLayout,
+  planReservedMp4ByteStreamLayout,
   writeMp4,
 } from './write.ts';
 
@@ -83,7 +88,8 @@ const SAMPLE_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 const SAMPLE_READ_GAP_BYTES = 256 * 1024;
 const PACKET_STREAM_BATCH_BYTES = 256 * 1024;
 const PACKET_STREAM_BATCH_PACKETS = 256;
-const AVC_IN_MEMORY_READ_BATCH_SAMPLES = 2048;
+const PACKET_INFO_DEFAULT_BATCH_ROWS = 2048;
+const PACKET_INFO_MAX_BATCH_ROWS = 65_536;
 const LAZY_FRAGMENT_TARGET_SAMPLES = 900;
 const LAZY_FRAGMENT_BUFFERED_SEGMENT_MULTIPLIER = 32;
 const LAZY_FRAGMENT_BUFFERED_TARGET_SAMPLES =
@@ -99,6 +105,9 @@ const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 const AUDIO_FASTSTART_TRACK_PREFIX_MAX_BYTES = 128 * 1024;
 const AUDIO_FASTSTART_SCALAR_BOX_MAX_BYTES = 128 * 1024;
+const FRAGMENT_PROBE_SCAN_WINDOW_BYTES = 32 * 1024;
+const FRAGMENT_PROBE_MAX_RANGE_READS = 64;
+const FRAGMENT_PROBE_MAX_METADATA_BYTES = 8 * 1024 * 1024;
 const FULL_RANGE_EOF_SLACK_SEC = 0.05;
 const SMALL_MOVIE_PARSE_HANDOFF_MAX_BYTES = 1024 * 1024;
 const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
@@ -120,7 +129,7 @@ function brandFor(container: string | undefined): ContainerBrand {
 
 /** A random-access view over a source: range reads when available, else a one-time buffer. */
 interface RandomAccess {
-  read(offset: number, length: number): Promise<Uint8Array>;
+  read(offset: number, length: number, signal?: AbortSignal): Promise<Uint8Array>;
   size?: number | undefined;
   /** Source-aware first-window policy for metadata-only reads. */
   readonly metadataPrefetchBytes?: number;
@@ -134,6 +143,7 @@ type SizedRandomAccess = RandomAccess & { readonly size: number };
 
 interface RandomAccessOptions {
   readonly eagerReadMaxBytes?: number;
+  readonly signal?: AbortSignal;
 }
 
 /** Return a zero-copy view only when retained bytes cover the complete safe half-open interval. */
@@ -218,13 +228,17 @@ async function randomAccess(
   src: ByteSource,
   opts: RandomAccessOptions = {},
 ): Promise<RandomAccess> {
+  const defaultSignal = opts.signal;
   const range = src.range;
   if (range) {
     const metadataPrefetchBytes = metadataProbePrefetchBytes(src);
     if (shouldEagerReadRandomAccess(src, opts.eagerReadMaxBytes)) {
-      const buffered = await range.call(src, 0, src.size);
+      const buffered = await raceAbort(range.call(src, 0, src.size, defaultSignal), defaultSignal);
       return {
-        read: (offset, length) => Promise.resolve(buffered.subarray(offset, offset + length)),
+        read: (offset, length, signal) => {
+          throwIfAborted(signal ?? defaultSignal);
+          return Promise.resolve(buffered.subarray(offset, offset + length));
+        },
         size: buffered.byteLength,
         metadataPrefetchBytes,
         inMemory: true,
@@ -233,10 +247,15 @@ async function randomAccess(
     }
     let cachedWhole: Uint8Array | undefined;
     return {
-      async read(offset, length): Promise<Uint8Array> {
+      async read(offset, length, signal): Promise<Uint8Array> {
+        const activeSignal = signal ?? defaultSignal;
+        throwIfAborted(activeSignal);
         const retained = coveredByteView(cachedWhole, offset, length);
         if (retained !== undefined) return retained;
-        const bytes = await range.call(src, offset, offset + length);
+        const bytes = await raceAbort(
+          range.call(src, offset, offset + length, activeSignal),
+          activeSignal,
+        );
         const learnedSize = src.size;
         if (
           offset === 0 &&
@@ -259,9 +278,15 @@ async function randomAccess(
       cachedWhole: () => cachedWhole,
     };
   }
-  const buffered = await readAll(src.stream());
+  const buffered =
+    src.readAll !== undefined
+      ? await raceAbort(src.readAll(defaultSignal), defaultSignal)
+      : await drainStream(src.stream(), defaultSignal);
   return {
-    read: (o, l) => Promise.resolve(buffered.subarray(o, o + l)),
+    read: (o, l, signal) => {
+      throwIfAborted(signal ?? defaultSignal);
+      return Promise.resolve(buffered.subarray(o, o + l));
+    },
     size: buffered.byteLength,
     inMemory: true,
     cachedWhole: () => buffered,
@@ -484,25 +509,6 @@ async function readMovieForDemux(src: ByteSource, ra: RandomAccess): Promise<Mov
   return readMovieAndMediaDataRanges(src, ra);
 }
 
-async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
-}
-
 interface TopBoxHeader {
   size: number;
   type: string;
@@ -530,11 +536,13 @@ interface FaststartMetadataContinuation {
   readonly kind: 'continue';
   readonly offset: number;
   readonly brand: string;
+  readonly initialPrefix: Uint8Array;
 }
 
 interface FaststartMetadataMovie {
   readonly kind: 'movie';
   readonly movie: MovieMetadata;
+  readonly initialPrefix: Uint8Array;
 }
 
 type FaststartMetadataResult = FaststartMetadataContinuation | FaststartMetadataMovie | undefined;
@@ -547,6 +555,7 @@ async function readFaststartMetadata(
   const requestedPrefetchBytes = ra.metadataPrefetchBytes ?? FASTSTART_METADATA_PREFETCH_BYTES;
   const prefetchBytes = Math.min(requestedPrefetchBytes, ra.size ?? requestedPrefetchBytes);
   let window = await ra.read(0, prefetchBytes);
+  const initialPrefix = window;
   let windowStart = 0;
   let offset = 0;
   let brand = 'mp42';
@@ -556,7 +565,7 @@ async function readFaststartMetadata(
     if (header === undefined) {
       return windowStart === 0
         ? undefined
-        : { kind: 'continue', offset: windowStart + offset, brand };
+        : { kind: 'continue', offset: windowStart + offset, brand, initialPrefix };
     }
     const absoluteOffset = windowStart + offset;
     if (header.type === 'ftyp' && offset + 12 <= window.byteLength) {
@@ -566,7 +575,7 @@ async function readFaststartMetadata(
       if (offset + header.size <= window.byteLength) {
         const moov = window.subarray(offset + header.headerSize, offset + header.size);
         onMoov?.(brand, moov);
-        return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
+        return { kind: 'movie', movie: parseMovieMetadata(brand, moov), initialPrefix };
       }
       const moovEnd = absoluteOffset + header.size;
       if (windowStart === 0 && moovEnd <= FASTSTART_PREFIX_CACHE_READ_MAX_BYTES) {
@@ -574,14 +583,14 @@ async function readFaststartMetadata(
         if (prefix.byteLength >= moovEnd) {
           const moov = prefix.subarray(absoluteOffset + header.headerSize, moovEnd);
           onMoov?.(brand, moov);
-          return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
+          return { kind: 'movie', movie: parseMovieMetadata(brand, moov), initialPrefix };
         }
       }
       const box = await ra.read(absoluteOffset, header.size);
       if (box.byteLength < header.headerSize) return undefined;
       const moov = box.subarray(header.headerSize);
       onMoov?.(brand, moov);
-      return { kind: 'movie', movie: parseMovieMetadata(brand, moov) };
+      return { kind: 'movie', movie: parseMovieMetadata(brand, moov), initialPrefix };
     }
     const nextOffset = absoluteOffset + header.size;
     if (!Number.isSafeInteger(nextOffset)) {
@@ -595,7 +604,7 @@ async function readFaststartMetadata(
       ra.size === undefined ? FASTSTART_METADATA_PREFETCH_BYTES : Math.max(0, ra.size - nextOffset),
     );
     if (continuationBytes < 8) {
-      return { kind: 'continue', offset: nextOffset, brand };
+      return { kind: 'continue', offset: nextOffset, brand, initialPrefix };
     }
     window = await ra.read(nextOffset, continuationBytes);
     windowStart = nextOffset;
@@ -603,9 +612,127 @@ async function readFaststartMetadata(
   }
 }
 
+/**
+ * Recover the exact bytes consumed by `parseFragments` without materializing media payloads.
+ *
+ * Fragment timing depends only on complete top-level `moov`, `sidx`, and `moof` boxes. Their internal
+ * `trun.data_offset`/`sidx.first_offset` fields are not dereferenced by the timing parser, so preserving
+ * each selected box verbatim in file order is sufficient; `mdat`, `free`, and other payload boxes can be
+ * skipped by their validated declared sizes. Any unknown size, malformed walk, oversized metadata set,
+ * or range-count/byte budget miss returns `undefined` and keeps the exact whole-file fallback.
+ */
+async function readSparseFragmentTimingBoxes(
+  ra: RandomAccess,
+  signal: AbortSignal | undefined,
+  initialPrefix?: Uint8Array,
+): Promise<Uint8Array | undefined> {
+  const sourceSize = ra.size;
+  if (sourceSize === undefined || !Number.isSafeInteger(sourceSize) || sourceSize < 8) {
+    return undefined;
+  }
+
+  let rangeReads = 0;
+  let requestedBytes = initialPrefix?.byteLength ?? 0;
+  const requestBudget = Math.max(
+    requestedBytes,
+    Math.min(FRAGMENT_PROBE_MAX_METADATA_BYTES, Math.floor(sourceSize / 2)),
+  );
+  const readWindow = async (start: number, length: number): Promise<Uint8Array | undefined> => {
+    if (
+      length <= 0 ||
+      rangeReads >= FRAGMENT_PROBE_MAX_RANGE_READS ||
+      requestedBytes + length > requestBudget
+    ) {
+      return undefined;
+    }
+    rangeReads++;
+    requestedBytes += length;
+    const bytes = await ra.read(start, length, signal);
+    throwIfAborted(signal);
+    return bytes.byteLength >= length ? bytes.subarray(0, length) : undefined;
+  };
+
+  let windowStart = 0;
+  let window = initialPrefix;
+  if (window === undefined || window.byteLength < 8) {
+    window = await readWindow(0, Math.min(sourceSize, FRAGMENT_PROBE_SCAN_WINDOW_BYTES));
+    if (window === undefined) return undefined;
+  }
+
+  const selected: Uint8Array[] = [];
+  let selectedBytes = 0;
+  let sawMoov = false;
+  let sawMoof = false;
+  let offset = 0;
+  while (offset + 8 <= sourceSize) {
+    throwIfAborted(signal);
+    let relativeOffset = offset - windowStart;
+    if (relativeOffset < 0 || relativeOffset + 8 > window.byteLength) {
+      const next = await readWindow(
+        offset,
+        Math.min(sourceSize - offset, FRAGMENT_PROBE_SCAN_WINDOW_BYTES),
+      );
+      if (next === undefined) return undefined;
+      windowStart = offset;
+      window = next;
+      relativeOffset = 0;
+    }
+
+    let header = topBoxHeader(window, relativeOffset);
+    if (header === undefined && windowStart !== offset) {
+      const next = await readWindow(
+        offset,
+        Math.min(sourceSize - offset, FRAGMENT_PROBE_SCAN_WINDOW_BYTES),
+      );
+      if (next === undefined) return undefined;
+      windowStart = offset;
+      window = next;
+      relativeOffset = 0;
+      header = topBoxHeader(window, relativeOffset);
+    }
+    if (header === undefined) return undefined;
+
+    const boxEnd = offset + header.size;
+    if (!Number.isSafeInteger(boxEnd) || boxEnd <= offset || boxEnd > sourceSize) {
+      return undefined;
+    }
+
+    if (header.type === 'moov' || header.type === 'sidx' || header.type === 'moof') {
+      if (selectedBytes + header.size > FRAGMENT_PROBE_MAX_METADATA_BYTES) return undefined;
+      const relativeEnd = relativeOffset + header.size;
+      let boxBytes: Uint8Array | undefined;
+      if (relativeEnd <= window.byteLength) {
+        boxBytes = window.subarray(relativeOffset, relativeEnd);
+      } else {
+        boxBytes = await readWindow(offset, header.size);
+      }
+      if (boxBytes === undefined || boxBytes.byteLength < header.size) return undefined;
+      selected.push(boxBytes.subarray(0, header.size));
+      selectedBytes += header.size;
+      sawMoov ||= header.type === 'moov';
+      sawMoof ||= header.type === 'moof';
+    }
+    offset = boxEnd;
+  }
+
+  if (offset !== sourceSize) return undefined;
+  return sawMoov && sawMoof ? joinProbeBoxes(selected) : undefined;
+}
+
+async function applyFragmentTimingForProbe(
+  movie: Movie,
+  ra: RandomAccess,
+  signal?: AbortSignal,
+  initialPrefix?: Uint8Array,
+): Promise<Movie> {
+  const sparse = await readSparseFragmentTimingBoxes(ra, signal, initialPrefix);
+  if (sparse !== undefined) return applyFragmentTiming(movie, sparse);
+  return applyFragmentTiming(movie, await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
+}
+
 type SmallFaststartMetadataProbeTracks = readonly TrackInfo[] | false | undefined;
 
-function isBoundedVideoMetadataTrack(track: ParsedTrack): boolean {
+function isBoundedVideoMetadataTrack(track: ParsedTrack, fragmentTimingPending = false): boolean {
   if (track.mediaType === 'video') {
     return (
       (track.sampleEntryType === 'avc1' ||
@@ -614,8 +741,7 @@ function isBoundedVideoMetadataTrack(track: ParsedTrack): boolean {
         track.sampleEntryType === 'hev1') &&
       track.width !== undefined &&
       track.height !== undefined &&
-      track.fps !== undefined &&
-      track.fps > 0
+      (fragmentTimingPending || (track.fps !== undefined && track.fps > 0))
     );
   }
   return (
@@ -640,6 +766,7 @@ async function readBoundedVideoMetadataProbeTracks(
       : VIDEO_METADATA_LAYOUT_WINDOW_BYTES;
   let windowStart = 0;
   let window = await ra.read(0, Math.min(ra.size, layoutWindowBytes));
+  const initialPrefix = window;
   throwIfAborted(signal);
   let absoluteOffset = 0;
   let brand = 'mp42';
@@ -676,19 +803,31 @@ async function readBoundedVideoMetadataProbeTracks(
       }
       try {
         const movie = parseMovieMetadata(brand, moov);
+        const authoritativeFragmentedAudio = hasAuthoritativeFragmentedAudioInitDuration(movie);
         if (
-          movie.needsFragmentTiming ||
-          !movie.tracks.some((track) => track.mediaType === 'video') ||
-          !movie.tracks.every(isBoundedVideoMetadataTrack)
+          movie.tracks.length === 0 ||
+          !movie.tracks.every((track) =>
+            isBoundedVideoMetadataTrack(track, movie.needsFragmentTiming),
+          )
         ) {
           return false;
         }
+        if (movie.needsFragmentTiming && !authoritativeFragmentedAudio) {
+          return toProbeTracks(await applyFragmentTimingForProbe(movie, ra, signal, initialPrefix));
+        }
+        // A `video/mp4` MIME or `.mp4` suffix identifies the container, not the track set. If the
+        // canonical metadata parser proves the complete moov is AAC-only, its result is just as final
+        // as an AVC/HEVC moov. The narrow positive-duration fragmented-audio shape is also final by the
+        // same predicate used by readMovieMetadata below; every video, edit, hybrid table, zero duration,
+        // unsupported entry, or malformed layout still takes the conservative sparse/exact fallback.
         const key = sourceCacheKey(src);
         if (key !== undefined && canHandoffFullMovie(src, ra)) {
           storeFaststartMoovParseHandoff(key, brand, moov.slice());
         }
         return toProbeTracks(movie);
-      } catch {
+      } catch (error) {
+        throwIfAborted(signal);
+        if (error instanceof MediaError && error.code === 'aborted') throw error;
         return false;
       }
     }
@@ -1009,10 +1148,7 @@ export async function readMovieMetadata(ra: RandomAccess, onMoov?: MoovObserver)
     const movie = faststart.movie;
     if (movie.needsFragmentTiming) {
       if (hasAuthoritativeFragmentedAudioInitDuration(movie)) return movie;
-      return applyFragmentTiming(
-        movie,
-        await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER),
-      );
+      return applyFragmentTimingForProbe(movie, ra, undefined, faststart.initialPrefix);
     }
     return movie;
   }
@@ -1046,7 +1182,7 @@ export async function readMovieMetadata(ra: RandomAccess, onMoov?: MoovObserver)
       const movie = parseMovieMetadata(brand, moov);
       if (movie.needsFragmentTiming) {
         if (hasAuthoritativeFragmentedAudioInitDuration(movie)) return movie;
-        return applyFragmentTiming(movie, await readWholeFile(ra, limit));
+        return applyFragmentTimingForProbe(movie, ra, undefined, faststart?.initialPrefix);
       }
       return movie;
     }
@@ -1590,156 +1726,24 @@ function avcNalLengthSize(track: ParsedTrack): 1 | 2 | 4 | undefined {
   return lengthSize === 1 || lengthSize === 2 || lengthSize === 4 ? lengthSize : undefined;
 }
 
-/** Whether packet truth needs payload inspection beyond the container's `stss` sync table. */
-function trackNeedsAvcPictureClassification(track: ParsedTrack): boolean {
-  return (
-    avcNalLengthSize(track) !== undefined &&
-    track.samples.sampleSizes.length > 0 &&
-    track.samples.syncSamples.length > 0 &&
-    track.samples.syncSamples.length < track.samples.sampleSizes.length
-  );
-}
-
-function movieNeedsAvcPictureClassification(movie: Movie): boolean {
-  return movie.tracks.some(trackNeedsAvcPictureClassification);
-}
-
-function mergeSampleNumbers(
-  declaredSyncSamples: readonly number[],
-  inferredIntraSamples: readonly number[],
-): number[] {
-  const merged = new Set<number>(declaredSyncSamples);
-  for (const sampleNumber of inferredIntraSamples) merged.add(sampleNumber);
-  return [...merged].sort((left, right) => left - right);
-}
-
-function classifyAvcSample(
-  sampleIndex: number,
-  storage: Uint8Array,
-  offset: number,
-  size: number,
-  lengthSize: 1 | 2 | 4,
-  inferredIntraSamples: number[],
-): void {
-  if (h264AccessUnitRangeIsKeyPicture(storage, offset, size, lengthSize) === true) {
-    inferredIntraSamples.push(sampleIndex + 1);
-  }
-}
-
 /**
- * Add non-IDR I/SI pictures to packet-reporting key flags by parsing real AVC sample payloads.
- * Declared `stss` samples are never removed. Payload memory is bounded: cheap in-memory sources are
- * visited in fixed-size batches of zero-copy views; I/O sources reuse the 8 MiB sample-window plan.
+ * The offset-free packet-table parse is sufficient unless an AVC track has non-sync pictures whose
+ * dependency table cannot decide intra/dependent status. The conservative metadata scan avoids a
+ * second/full moov parse for large audio, non-AVC video, and complete-sdtp AVC inputs.
  */
-async function enrichAvcPictureClassification(
-  movie: Movie,
-  ra: RandomAccess,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  for (const track of movie.tracks) {
-    const lengthSize = avcNalLengthSize(track);
-    if (lengthSize === undefined || !trackNeedsAvcPictureClassification(track)) continue;
-
-    const inferredIntraSamples: number[] = [];
-
-    let inMemoryWhole = ra.cachedWhole?.();
-    if (ra.inMemory === true && inMemoryWhole === undefined && ra.size !== undefined) {
-      throwIfAborted(signal);
-      inMemoryWhole = await ra.read(0, ra.size);
+function packetInfoMovieNeedsPhysicalAvc(movie: Movie): boolean {
+  return movie.tracks.some((track) => {
+    if (
+      avcNalLengthSize(track) === undefined ||
+      track.samples.sampleSizes.length === 0 ||
+      track.samples.syncSamples.length === 0
+    ) {
+      return false;
     }
-
-    if (ra.inMemory === true && inMemoryWhole !== undefined) {
-      walkSampleClassificationRanges(track, (sampleIndex, offset, size, declaredSync) => {
-        if ((sampleIndex & (AVC_IN_MEMORY_READ_BATCH_SAMPLES - 1)) === 0) {
-          throwIfAborted(signal);
-        }
-        if (declaredSync) return;
-        validateSampleRange(sampleIndex, offset, size, ra.size);
-        const end = offset + size;
-        if (end > inMemoryWhole.byteLength) {
-          const available =
-            offset < 0 || offset >= inMemoryWhole.byteLength
-              ? 0
-              : Math.min(size, inMemoryWhole.byteLength - offset);
-          throw new MediaError(
-            'demux-error',
-            `sample ${sampleIndex} short read: got ${available} of ${size} bytes (truncated MP4)`,
-          );
-        }
-        classifyAvcSample(
-          sampleIndex,
-          inMemoryWhole,
-          offset,
-          size,
-          lengthSize,
-          inferredIntraSamples,
-        );
-      });
-    } else {
-      const samples = buildSampleData(track).filter((sample) => !sample.keyframe);
-      if (samples.length === 0) continue;
-      validateSampleRanges(samples, ra.size);
-      if (ra.inMemory === true) {
-        for (let start = 0; start < samples.length; start += AVC_IN_MEMORY_READ_BATCH_SAMPLES) {
-          throwIfAborted(signal);
-          const batch = samples.slice(start, start + AVC_IN_MEMORY_READ_BATCH_SAMPLES);
-          const bytes = await Promise.all(
-            batch.map((sample) => ra.read(sample.offset, sample.size)),
-          );
-          for (let index = 0; index < batch.length; index++) {
-            const sample = batch[index];
-            const accessUnit = bytes[index];
-            if (sample === undefined || accessUnit === undefined) continue;
-            if (accessUnit.byteLength !== sample.size) {
-              throw new MediaError(
-                'demux-error',
-                `sample ${sample.index} short read: got ${accessUnit.byteLength} of ${sample.size} bytes (truncated MP4)`,
-              );
-            }
-            classifyAvcSample(
-              sample.index,
-              accessUnit,
-              0,
-              accessUnit.byteLength,
-              lengthSize,
-              inferredIntraSamples,
-            );
-          }
-        }
-      } else {
-        for (const window of planSampleReadWindows(samples)) {
-          throwIfAborted(signal);
-          const span = await ra.read(window.start, window.end - window.start);
-          if (span.byteLength !== window.end - window.start) {
-            throw new MediaError(
-              'demux-error',
-              `sample window [${window.start}, ${window.end}) short read: got ${span.byteLength} of ${
-                window.end - window.start
-              } bytes (truncated MP4)`,
-            );
-          }
-          for (const item of window.items) {
-            const relativeOffset = item.sample.offset - window.start;
-            classifyAvcSample(
-              item.sample.index,
-              span,
-              relativeOffset,
-              item.sample.size,
-              lengthSize,
-              inferredIntraSamples,
-            );
-          }
-        }
-      }
-    }
-
-    if (inferredIntraSamples.length > 0) {
-      track.samples.syncSamples = mergeSampleNumbers(
-        track.samples.syncSamples,
-        inferredIntraSamples,
-      );
-    }
-  }
+    const dependencies = track.samples.sampleDependencies;
+    if (dependencies.length < track.samples.sampleSizes.length) return true;
+    return dependencies.some((dependency) => dependency !== 1 && dependency !== 2);
+  });
 }
 
 /** Turn a parsed movie + its bytes into mux-ready tracks (lossless stream-copy), for `remux`. */
@@ -1834,6 +1838,46 @@ export interface Mp4PacketInfoMetadata {
   dtsUs: number;
   durationUs?: number;
   keyframe: boolean;
+}
+
+function appendFragmentTrackPacketInfo(
+  packets: Mp4PacketInfoMetadata[],
+  packetIndex: number,
+  track: ParsedTrack,
+  trackIndex: number,
+  samples: readonly SampleData[],
+  sourceSize: number | undefined,
+  includeOffsets: boolean,
+): number {
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  let writeIndex = packetIndex;
+  for (const sample of samples) {
+    validateSampleRange(sample.index, sample.offset, sample.size, sourceSize);
+    if (!sampleStartsBeforeActiveEditEnd(track, sample.dtsTicks)) continue;
+    const ptsUs = ticksToUs(sample.dtsTicks + sample.cttsTicks - editOffsetTicks, track.timescale);
+    const dtsUs = ticksToUs(sample.dtsTicks - editOffsetTicks, track.timescale);
+    const durationUs = ticksToUs(sample.durationTicks, track.timescale);
+    packets[writeIndex] = includeOffsets
+      ? {
+          trackIndex,
+          offset: sample.offset,
+          size: sample.size,
+          ptsUs,
+          dtsUs,
+          durationUs,
+          keyframe: sample.keyframe,
+        }
+      : {
+          trackIndex,
+          size: sample.size,
+          ptsUs,
+          dtsUs,
+          durationUs,
+          keyframe: sample.keyframe,
+        };
+    writeIndex++;
+  }
+  return writeIndex;
 }
 
 interface SampleTableRunCursor {
@@ -2180,14 +2224,381 @@ function appendTrackPacketInfoMetadata(
   return writeIndex;
 }
 
+interface PendingAvcPacketInfo {
+  readonly row: Mp4PacketInfoMetadata;
+  readonly index: number;
+  readonly offset: number;
+  readonly size: number;
+  readonly lengthSize: 1 | 2 | 4;
+}
+
+interface PendingPacketInfoRow {
+  readonly row: Mp4PacketInfoMetadata;
+  readonly avc?: PendingAvcPacketInfo;
+}
+
+function packetInfoBatchSize(value: number | undefined): number {
+  if (value === undefined) return PACKET_INFO_DEFAULT_BATCH_ROWS;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > PACKET_INFO_MAX_BATCH_ROWS) {
+    throw new InputError(
+      `packet-info batchSize must be an integer from 1 to ${PACKET_INFO_MAX_BATCH_ROWS}`,
+    );
+  }
+  return value;
+}
+
+function packetInfoKeyDecision(
+  track: ParsedTrack | undefined,
+  sampleIndex: number,
+  declaredSync: boolean,
+): { readonly keyframe: boolean; readonly lengthSize?: 1 | 2 | 4 } {
+  if (declaredSync || track === undefined) return { keyframe: declaredSync };
+  const lengthSize = avcNalLengthSize(track);
+  // An absent stss means every sample is sync and therefore reaches the declaredSync branch above.
+  if (lengthSize === undefined || track.samples.syncSamples.length === 0) {
+    return { keyframe: false };
+  }
+  const dependency = track.samples.sampleDependencies[sampleIndex];
+  if (dependency === 2) return { keyframe: true };
+  if (dependency === 1) return { keyframe: false };
+  return { keyframe: false, lengthSize };
+}
+
+function packetInfoRow(
+  track: PacketTimelineTrack,
+  classificationTrack: ParsedTrack | undefined,
+  trackIndex: number,
+  sampleIndex: number,
+  offset: number | undefined,
+  size: number,
+  dtsTicks: number,
+  durationTicks: number,
+  cttsTicks: number,
+  declaredSync: boolean,
+  includeOffsets: boolean,
+): PendingPacketInfoRow {
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  const decision = packetInfoKeyDecision(classificationTrack, sampleIndex, declaredSync);
+  const row: Mp4PacketInfoMetadata =
+    includeOffsets && offset !== undefined
+      ? {
+          trackIndex,
+          offset,
+          size,
+          ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, track.timescale),
+          dtsUs: ticksToUs(dtsTicks - editOffsetTicks, track.timescale),
+          durationUs: ticksToUs(durationTicks, track.timescale),
+          keyframe: decision.keyframe,
+        }
+      : {
+          trackIndex,
+          size,
+          ptsUs: ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, track.timescale),
+          dtsUs: ticksToUs(dtsTicks - editOffsetTicks, track.timescale),
+          durationUs: ticksToUs(durationTicks, track.timescale),
+          keyframe: decision.keyframe,
+        };
+  return decision.lengthSize !== undefined && offset !== undefined
+    ? {
+        row,
+        avc: {
+          row,
+          index: sampleIndex,
+          offset,
+          size,
+          lengthSize: decision.lengthSize,
+        },
+      }
+    : { row };
+}
+
+/** Pull rows directly from one progressive track's run tables without a flat sample/row array. */
+function* progressiveTrackPacketInfoRows(
+  track: PacketTimelineTrack,
+  classificationTrack: ParsedTrack | undefined,
+  trackIndex: number,
+  sourceSize: number | undefined,
+  includeOffsets: boolean,
+): Generator<PendingPacketInfoRow> {
+  const st = track.samples;
+  const sizes = st.sampleSizes;
+  const timeToSample = st.timeToSample;
+  const compositionOffsets = st.compositionOffsets;
+  const syncSamples = st.syncSamples;
+  const hasCtts = compositionOffsets.length > 0;
+  const allSync = syncSamples.length === 0;
+  const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
+  const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
+  const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  let syncIndex = 0;
+  let dtsTicks = 0;
+  const declaredSyncAt = (sampleIndex: number): boolean => {
+    const sampleNumber = sampleIndex + 1;
+    let syncSample = syncSamples[syncIndex];
+    while (syncSample !== undefined && syncSample < sampleNumber) {
+      syncIndex++;
+      syncSample = syncSamples[syncIndex];
+    }
+    return allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber;
+  };
+
+  if (st.chunkOffsets.length === 0 && st.sampleToChunk.length === 0) {
+    for (let sampleIndex = 0; sampleIndex < sizes.length; sampleIndex++) {
+      const size = sizes[sampleIndex] ?? 0;
+      const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
+      const cttsTicks = hasCtts ? nextPacketCompositionOffset(compositionOffsets, cttsCursor) : 0;
+      if (size < 0) validateSampleRange(sampleIndex, 0, size, undefined);
+      const declaredSync = declaredSyncAt(sampleIndex);
+      if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+        yield packetInfoRow(
+          track,
+          classificationTrack,
+          trackIndex,
+          sampleIndex,
+          undefined,
+          size,
+          dtsTicks,
+          durationTicks,
+          cttsTicks,
+          declaredSync,
+          false,
+        );
+      }
+      dtsTicks += durationTicks;
+    }
+    return;
+  }
+
+  let stscIndex = 0;
+  let samplesPerChunk = 0;
+  let sampleIndex = 0;
+  for (
+    let chunkIndex = 0;
+    chunkIndex < st.chunkOffsets.length && sampleIndex < sizes.length;
+    chunkIndex++
+  ) {
+    const chunkOffset = st.chunkOffsets[chunkIndex];
+    if (chunkOffset === undefined) break;
+    const chunkNumber = chunkIndex + 1;
+    while (true) {
+      const entry = st.sampleToChunk[stscIndex];
+      if (entry === undefined || entry.firstChunk > chunkNumber) break;
+      samplesPerChunk = entry.samplesPerChunk;
+      stscIndex++;
+    }
+    let offset = chunkOffset;
+    for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < sizes.length; inChunk++) {
+      const size = sizes[sampleIndex] ?? 0;
+      const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
+      const cttsTicks = hasCtts ? nextPacketCompositionOffset(compositionOffsets, cttsCursor) : 0;
+      validateSampleRange(sampleIndex, offset, size, sourceSize);
+      const declaredSync = declaredSyncAt(sampleIndex);
+      if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+        yield packetInfoRow(
+          track,
+          classificationTrack,
+          trackIndex,
+          sampleIndex,
+          offset,
+          size,
+          dtsTicks,
+          durationTicks,
+          cttsTicks,
+          declaredSync,
+          includeOffsets,
+        );
+      }
+      offset += size;
+      dtsTicks += durationTicks;
+      sampleIndex++;
+    }
+  }
+}
+
+function* fragmentTrackPacketInfoRows(
+  track: ParsedTrack,
+  trackIndex: number,
+  samples: readonly SampleData[],
+  sourceSize: number | undefined,
+  includeOffsets: boolean,
+): Generator<PendingPacketInfoRow> {
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  for (const sample of samples) {
+    validateSampleRange(sample.index, sample.offset, sample.size, sourceSize);
+    if (!sampleStartsBeforeActiveEditEnd(track, sample.dtsTicks)) continue;
+    const base = {
+      trackIndex,
+      size: sample.size,
+      ptsUs: ticksToUs(sample.dtsTicks + sample.cttsTicks - editOffsetTicks, track.timescale),
+      dtsUs: ticksToUs(sample.dtsTicks - editOffsetTicks, track.timescale),
+      durationUs: ticksToUs(sample.durationTicks, track.timescale),
+      keyframe: sample.keyframe,
+    };
+    yield {
+      row: includeOffsets ? { ...base, offset: sample.offset } : base,
+    };
+  }
+}
+
+function* moviePacketInfoRows(
+  movie: Movie,
+  sourceSize: number | undefined,
+  includeOffsets: boolean,
+  fragmentSamples?: ReadonlyMap<number, readonly SampleData[]>,
+): Generator<PendingPacketInfoRow> {
+  const entries = declaredTrackEntries(movie);
+  for (let trackIndex = 0; trackIndex < entries.length; trackIndex++) {
+    const entry = entries[trackIndex];
+    if (entry === undefined) continue;
+    if (entry.kind === 'av') {
+      const fragments = fragmentSamples?.get(entry.track.id);
+      if (fragments !== undefined) {
+        yield* fragmentTrackPacketInfoRows(
+          entry.track,
+          trackIndex,
+          fragments,
+          sourceSize,
+          includeOffsets,
+        );
+      } else {
+        yield* progressiveTrackPacketInfoRows(
+          entry.track,
+          entry.track,
+          trackIndex,
+          sourceSize,
+          includeOffsets,
+        );
+      }
+    } else if (otherTrackHasSamples(entry.track)) {
+      yield* progressiveTrackPacketInfoRows(
+        entry.track,
+        undefined,
+        trackIndex,
+        sourceSize,
+        includeOffsets,
+      );
+    }
+  }
+}
+
+async function classifyAvcPacketInfoBatch(
+  rows: readonly PendingAvcPacketInfo[],
+  ra: RandomAccess,
+  signal: AbortSignal,
+): Promise<void> {
+  if (rows.length === 0) return;
+  for (const row of rows) validateSampleRange(row.index, row.offset, row.size, ra.size);
+  for (const window of planSampleReadWindows(rows)) {
+    throwIfAborted(signal);
+    const expected = window.end - window.start;
+    const bytes = await ra.read(window.start, expected, signal);
+    if (bytes.byteLength !== expected) {
+      throw new MediaError(
+        'demux-error',
+        `sample window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes (truncated MP4)`,
+      );
+    }
+    for (const item of window.items) {
+      const sample = item.sample;
+      if (
+        h264AccessUnitRangeIsKeyPicture(
+          bytes,
+          sample.offset - window.start,
+          sample.size,
+          sample.lengthSize,
+        ) === true
+      ) {
+        sample.row.keyframe = true;
+      }
+    }
+  }
+  throwIfAborted(signal);
+}
+
+function packetInfoTracks(movie: Movie): readonly TrackInfo[] {
+  return declaredTrackEntries(movie).map((entry) =>
+    entry.kind === 'av' ? toTrackInfo(entry.track) : toOtherProbeTrackInfo(entry.track),
+  );
+}
+
+function createMp4PacketInfoBatchStream(
+  movie: Movie,
+  ra: RandomAccess,
+  batchSize: number,
+  includeOffsets: boolean,
+  externalSignal: AbortSignal | undefined,
+  fragmentSamples?: ReadonlyMap<number, readonly SampleData[]>,
+): PacketInfoBatchStream {
+  const controller = new AbortController();
+  const onAbort = (): void => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted === true) onAbort();
+  else externalSignal?.addEventListener('abort', onAbort, { once: true });
+  let claimed = false;
+  let closed = false;
+  const close = (reason?: unknown): Promise<void> => {
+    if (!closed) {
+      closed = true;
+      externalSignal?.removeEventListener('abort', onAbort);
+      if (!controller.signal.aborted) controller.abort(reason);
+    }
+    return Promise.resolve();
+  };
+  return {
+    tracks: packetInfoTracks(movie),
+    cancel: close,
+    [Symbol.asyncIterator](): AsyncIterator<readonly Mp4PacketInfoMetadata[]> {
+      if (claimed) throw new TypeError('packet-info batches are single-use');
+      claimed = true;
+      const iterate = async function* (): AsyncGenerator<readonly Mp4PacketInfoMetadata[]> {
+        try {
+          throwIfAborted(controller.signal);
+          const pendingRows = moviePacketInfoRows(
+            movie,
+            includeOffsets ? ra.size : undefined,
+            includeOffsets,
+            fragmentSamples,
+          );
+          let batch: Mp4PacketInfoMetadata[] = [];
+          let avc: PendingAvcPacketInfo[] = [];
+          for (const pending of pendingRows) {
+            throwIfAborted(controller.signal);
+            batch.push(pending.row);
+            if (pending.avc !== undefined) avc.push(pending.avc);
+            if (batch.length < batchSize) continue;
+            await classifyAvcPacketInfoBatch(avc, ra, controller.signal);
+            const ready = batch;
+            batch = [];
+            avc = [];
+            yield ready;
+          }
+          if (batch.length > 0) {
+            await classifyAvcPacketInfoBatch(avc, ra, controller.signal);
+            yield batch;
+          }
+        } finally {
+          await close(controller.signal.reason);
+        }
+      };
+      return iterate();
+    },
+  };
+}
+
 export function mp4PacketInfoMetadata(
   movie: Movie,
   sourceSize?: number,
   includeOffsets = true,
+  fragmentSamples?: ReadonlyMap<number, readonly SampleData[]>,
 ): readonly Mp4PacketInfoMetadata[] {
   const entries = declaredTrackEntries(movie);
   const packetCount = entries.reduce((sum, entry) => {
-    if (entry.kind === 'av') return sum + entry.track.samples.sampleSizes.length;
+    if (entry.kind === 'av') {
+      return (
+        sum +
+        (fragmentSamples?.get(entry.track.id)?.length ?? entry.track.samples.sampleSizes.length)
+      );
+    }
     return sum + (entry.track.samples?.sampleSizes.length ?? 0);
   }, 0);
   const packets = new Array<Mp4PacketInfoMetadata>(packetCount);
@@ -2208,8 +2619,24 @@ export function mp4PacketInfoMetadata(
   for (let trackIndex = 0; trackIndex < entries.length; trackIndex++) {
     const entry = entries[trackIndex];
     if (entry === undefined) continue;
-    if (entry.kind === 'av') appendTrack(entry.track, trackIndex);
-    else if (otherTrackHasSamples(entry.track)) appendTrack(entry.track, trackIndex);
+    if (entry.kind === 'av') {
+      const fragments = fragmentSamples?.get(entry.track.id);
+      if (fragments !== undefined) {
+        packetIndex = appendFragmentTrackPacketInfo(
+          packets,
+          packetIndex,
+          entry.track,
+          trackIndex,
+          fragments,
+          sourceSize,
+          includeOffsets,
+        );
+      } else {
+        appendTrack(entry.track, trackIndex);
+      }
+    } else if (otherTrackHasSamples(entry.track)) {
+      appendTrack(entry.track, trackIndex);
+    }
   }
   packets.length = packetIndex;
   return packets;
@@ -2224,11 +2651,19 @@ function ticksToUs(ticks: number, timescale: number): number {
  * `startSec` (the GOP head, so the cut decodes), audio at the first sample overlapping it; both end at
  * the last sample before `endSec`. The muxer re-bases DTS to 0, preserving each sample's `ctts`.
  */
-function selectTrimmed(track: ParsedTrack, startSec: number, endSec: number): SampleData[] {
-  const all = buildSampleData(track);
-  if (all.length === 0) return all;
-  const startTicks = startSec * track.timescale;
-  const endTicks = endSec * track.timescale;
+function selectTrimmed(
+  track: ParsedTrack,
+  startSec: number,
+  endSec: number,
+  samples?: readonly SampleData[],
+): SampleData[] {
+  const all = samples ?? buildSampleData(track);
+  if (all.length === 0) return [];
+  // Public trim bounds are second floats rounded from integer microseconds. Round back to the closest
+  // native tick so a requested CMAF boundary such as 2_021_354 µs still selects the exact tfdt=31_048
+  // keyframe instead of the preceding fragment because of a sub-tick decimal representation error.
+  const startTicks = Math.round(startSec * track.timescale);
+  const endTicks = Math.round(endSec * track.timescale);
 
   let startIdx = 0;
   if (track.mediaType === 'video') {
@@ -2581,14 +3016,23 @@ async function trimMuxTracks(
   signal: AbortSignal | undefined,
   validationCacheBase: string | undefined,
 ): Promise<MuxTrackInput[]> {
+  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
   const out: MuxTrackInput[] = [];
   for (const track of movie.tracks) {
-    const selected = selectTrimmed(track, startSec, endSec);
+    const selected = selectTrimmed(track, startSec, endSec, fragmentSamples?.get(track.id));
     const samples = await readSamples(ra, selected);
     await verifyTrimmedAvcDecodeIfAvailable(track, selected, samples, signal, validationCacheBase);
     const edit = trimPresentationEdit(track, selected, startSec, endSec);
+    const mediaDurationTicks = selected.reduce(
+      (duration, sample) => duration + sample.durationTicks,
+      0,
+    );
     out.push({
       ...muxTrackMeta(track),
+      // A fragmented init segment has empty sample tables, so applyFragmentTiming compares the later
+      // trun span with this mdhd declaration. Carrying the source duration would make an actually
+      // shortened AAC track probe as the original full length even though only selected packets remain.
+      mediaDurationTicks,
       ...(edit !== undefined ? { edit } : {}),
       samples,
     });
@@ -2612,6 +3056,7 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
     mediaType: t.mediaType,
     codec: t.codec,
     durationSec: presentationDurationSec(t),
+    ...(t.language !== undefined ? { language: t.language } : {}),
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
     ...(t.encryption !== undefined ? { encrypted: true } : {}),
@@ -2644,14 +3089,18 @@ function toProbeTrackInfo(track: ParsedTrack): TrackInfo {
   return toTrackInfo(track);
 }
 
-export function mp4PacketInfoTable(movie: Movie, sourceSize?: number): PacketInfoTable {
+export function mp4PacketInfoTable(
+  movie: Movie,
+  sourceSize?: number,
+  fragmentSamples?: ReadonlyMap<number, readonly SampleData[]>,
+): PacketInfoTable {
   return {
     tracks: declaredTrackEntries(movie).map((entry) =>
       entry.kind === 'av' ? toTrackInfo(entry.track) : toOtherProbeTrackInfo(entry.track),
     ),
     // A full parse may have been required internally to classify AVC pictures in a large source.
     // Keep the public large-file shape identical to the offset-free packet-info fast path.
-    packets: mp4PacketInfoMetadata(movie, sourceSize, sourceSize !== undefined),
+    packets: mp4PacketInfoMetadata(movie, sourceSize, sourceSize !== undefined, fragmentSamples),
   };
 }
 
@@ -2669,6 +3118,7 @@ function toOtherProbeTrackInfo(track: OtherTrack): TrackInfo {
     nonMedia: true,
     codec: '',
     ...(track.durationSec > 0 ? { durationSec: track.durationSec } : {}),
+    ...(track.language !== undefined ? { language: track.language } : {}),
   };
 }
 
@@ -3089,7 +3539,7 @@ function assertSampleRangesInBounds(track: ParsedTrack, sourceSize: number): voi
   }
 }
 
-/** Look up the AES key (bytes) for a track's KID, or raise a typed miss if the caller didn't supply it. */
+/** Look up the AES key for a track's KID, or reject the caller's incomplete decrypt options. */
 function resolveKey(
   keys: Record<string, string>,
   kid: Uint8Array,
@@ -3098,10 +3548,7 @@ function resolveKey(
   const kidId = formatKid(kid);
   const hexKey = keys[kidId];
   if (hexKey === undefined) {
-    throw new CapabilityError(`no key provided for KID ${kidId}`, {
-      op: { kind: 'route', id: 'decrypt' },
-      tried: ['mp4'],
-    });
+    throw new InputError(`no key provided for KID ${kidId}`, { kid: kidId });
   }
   return hexToBytes(hexKey);
 }
@@ -3667,7 +4114,11 @@ function progressiveLayoutFromTracks(
 ): Mp4ByteStreamLayout {
   return planMp4ByteStreamLayout(
     tracks.map((track) => track.metadata),
-    { faststart: o?.faststart ?? true, brand: brandFor(o?.container), movieTimescale },
+    {
+      faststart: o?.faststart !== false,
+      brand: brandFor(o?.container),
+      movieTimescale,
+    },
   );
 }
 
@@ -3707,6 +4158,28 @@ async function* progressiveSegmentsFromTracks(
   payloadSamples?: readonly InterleavedPayloadSample[],
 ): AsyncGenerator<Uint8Array, void, undefined> {
   const signal = o?.signal;
+  if (o?.faststart === 'reserve') {
+    const maximumPacketCount = o.maximumPacketCount;
+    if (maximumPacketCount === undefined) {
+      throw new MediaError('mux-error', "MP4 faststart:'reserve' requires maximumPacketCount");
+    }
+    const layout = planReservedMp4ByteStreamLayout(
+      tracks.map((track) => track.metadata),
+      maximumPacketCount,
+      { brand: brandFor(o.container), movieTimescale },
+    );
+    throwIfAborted(signal);
+    yield layout.ftyp;
+    yield positionedChunk(layout.mdatHeader, layout.mdatPosition);
+    if (payloadSamples !== undefined) {
+      yield* interleavedProgressivePayloadSegments(ra, payloadSamples, signal);
+    } else {
+      yield* progressivePayloadSegments(ra, tracks, signal);
+    }
+    throwIfAborted(signal);
+    yield positionedChunk(layout.moovPatch, layout.reservationPosition);
+    return;
+  }
   const layout = progressiveLayoutFromTracks(tracks, o, movieTimescale);
 
   throwIfAborted(signal);
@@ -4261,6 +4734,50 @@ function fragmentedSourceStream(
   );
 }
 
+export interface Mp4PacketInfoBatchSourceOptions extends PacketInfoBatchOptions {
+  readonly includeOffsets?: boolean;
+}
+
+/** Shared authoritative MP4 packet-info session used by the driver and byte-oriented helpers. */
+export async function mp4PacketInfoBatchesFromSource(
+  src: ByteSource,
+  options?: Mp4PacketInfoBatchSourceOptions,
+): Promise<PacketInfoBatchStream> {
+  const batchSize = packetInfoBatchSize(options?.batchSize);
+  const signal = options?.signal;
+  throwIfAborted(signal);
+  const ra = await randomAccess(src, signal === undefined ? {} : { signal });
+  throwIfAborted(signal);
+  const includeOffsets =
+    options?.includeOffsets ??
+    (ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES);
+  let movie = includeOffsets ? await readMovie(ra) : await readMoviePacketInfo(ra);
+  // Only unknown AVC picture status needs physical sample placement. Other large sources retain the
+  // prior offset-free/header-only parse while their row objects are still produced pull-by-pull.
+  if (!includeOffsets && packetInfoMovieNeedsPhysicalAvc(movie)) movie = await readMovie(ra);
+  throwIfAborted(signal);
+  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
+  throwIfAborted(signal);
+  return createMp4PacketInfoBatchStream(
+    movie,
+    ra,
+    batchSize,
+    includeOffsets,
+    signal,
+    fragmentSamples,
+  );
+}
+
+async function collectPacketInfoBatches(stream: PacketInfoBatchStream): Promise<PacketInfoTable> {
+  const packets: import('../../contracts/driver.ts').PacketInfoMetadata[] = [];
+  try {
+    for await (const batch of stream) packets.push(...batch);
+    return { tracks: stream.tracks, packets };
+  } finally {
+    await stream.cancel();
+  }
+}
+
 export const Mp4Driver: ContainerDriver = {
   id: 'mp4',
   apiVersion: DRIVER_API_VERSION,
@@ -4270,7 +4787,7 @@ export const Mp4Driver: ContainerDriver = {
   supports: matchesMp4,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
-    const ra = await randomAccess(src);
+    const ra = await randomAccess(src, signal === undefined ? {} : { signal });
     throwIfAborted(signal);
     if (shouldTrySimpleVideoFaststartProbe(src, ra)) {
       const metadataTracks = await readBoundedVideoMetadataProbeTracks(src, ra, signal);
@@ -4298,18 +4815,17 @@ export const Mp4Driver: ContainerDriver = {
     return toProbeTracks(movie);
   },
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
-    const signal = o?.signal;
-    const ra = await randomAccess(src);
-    throwIfAborted(signal);
-    const wantsOffsets = ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES;
-    let movie = wantsOffsets ? await readMovie(ra) : await readMoviePacketInfo(ra);
-    // The large-file timeline parser intentionally omits chunk offsets. Re-read the same `moov` in
-    // full mode only when AVC picture classification genuinely needs payload offsets; other large
-    // codecs retain the header-only fast path.
-    if (!wantsOffsets && movieNeedsAvcPictureClassification(movie)) movie = await readMovie(ra);
-    await enrichAvcPictureClassification(movie, ra, signal);
-    throwIfAborted(signal);
-    return mp4PacketInfoTable(movie, wantsOffsets ? ra.size : undefined);
+    // This compatibility result retains every row by definition. Use a wide producer batch so AVC
+    // range planning keeps its historical 8 MiB windows; the scalable public method stays at 2,048.
+    return collectPacketInfoBatches(
+      await mp4PacketInfoBatchesFromSource(src, { ...o, batchSize: PACKET_INFO_MAX_BATCH_ROWS }),
+    );
+  },
+  async packetInfoBatches(
+    src: ByteSource,
+    o?: PacketInfoBatchOptions,
+  ): Promise<PacketInfoBatchStream> {
+    return mp4PacketInfoBatchesFromSource(src, o);
   },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const ra = await randomAccess(src);
@@ -4338,6 +4854,22 @@ export const Mp4Driver: ContainerDriver = {
         : {}),
     });
     const movie = await readMovie(ra);
+    if (o?.faststart === 'reserve') {
+      if (o.streaming !== true) {
+        throw new CapabilityError(
+          "MP4 faststart:'reserve' requires a position-aware streaming sink",
+          { op: { kind: 'route', id: 'mp4-faststart-reserve' }, tried: ['stream-target', 'opfs'] },
+        );
+      }
+      if (!Number.isSafeInteger(o.maximumPacketCount) || (o.maximumPacketCount ?? 0) < 1) {
+        throw new InputError(
+          "MP4 faststart:'reserve' requires a positive integer maximumPacketCount",
+        );
+      }
+      if (o.fragmented === true) {
+        throw new InputError("MP4 faststart:'reserve' cannot be fragmented");
+      }
+    }
     const requestedTrim = o?.trim;
     if (requestedTrim !== undefined) validateStreamCopyTrimRange(movie, requestedTrim);
     const trim =
@@ -4354,6 +4886,12 @@ export const Mp4Driver: ContainerDriver = {
     if (o?.fragmented === true && trim === undefined) {
       return fragmentedSourceStream(ra, movie, o, await buildFragmentSampleDataMap(movie, ra));
     }
+    if (o?.fragmented === true && trim !== undefined) {
+      return fragmentedStream(
+        await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o.signal, validationCacheBase),
+        movie.timescale,
+      );
+    }
     if (o?.streaming === true && trim === undefined) {
       return progressiveSourceStream(ra, movie, o);
     }
@@ -4369,12 +4907,8 @@ export const Mp4Driver: ContainerDriver = {
     const tracks = trim
       ? await trimMuxTracks(ra, movie, trim.startSec, trim.endSec, o?.signal, validationCacheBase)
       : await muxTracksFromMovie(ra, movie);
-    // Fragmented/CMAF output (ADR-034): a sequence of self-describing `moof`+`mdat` segments after the
-    // init segment, streamed one at a time so a StreamTarget never buffers the whole movie. The lossless
-    // sample copy (DTS/ctts/codec-private preserved) is identical; only the on-disk box layout differs.
-    if (o?.fragmented === true) return fragmentedStream(tracks, movie.timescale);
     const bytes = writeMp4(tracks, {
-      faststart: o?.faststart ?? true,
+      faststart: o?.faststart !== false,
       brand: brandFor(o?.container),
       movieTimescale: movie.timescale,
     });

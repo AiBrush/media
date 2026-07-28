@@ -91,6 +91,11 @@ tie* remotion on the two contested rows it wins today — `decode_extreme_fps_24
   stream, one shard up in S09). `EncodedChunk`/`EncodedVideoChunk` carries **only a presentation
   timestamp — never a DTS** (ADR-021/ADR-045, `measured-evidence.md`); decode order and B-frame composition are
   the container's/UA's job, which is why remux and keyframe-trim never route through the codec seam.
+- **Public track selection:** `decode(input, { trackSelect })` accepts the same single-source,
+  zero-based per-media-type grammar as remux (`video:1`, `audio:0`). An explicit selector list is a
+  whitelist: omitting a media type omits that output stream. Because `MediaStreams` exposes only one
+  video and one audio slot, selecting more than one distinct track of either type raises a typed
+  `InputError` before any packet stream is opened.
 - **Decoder seam:** a `TransformStream<EncodedChunk, VideoFrame>`. The concrete decoder is produced by a
   factory the router hands in; **no layer above the codec adapter names a backend** (WebCodecs vs
   wasm-vpx). The replay wrapper's whole contract is expressed in factory terms:
@@ -146,6 +151,11 @@ first frame, is terminal because already-emitted frames cannot honestly be retra
   (the family's `vfr-seek-lands-on-true-pts` invariant). The known VFR pain is *memory*, not timing:
   `decode_vfr_timing` passed the 12-frame oracle but peaked 672 MB vs a 107 MB rival, attributed to
   consumer-retained GPU-backed surfaces (~11.2 MB/frame), not driver queues (`measured-evidence.md`).
+- **Non-default tracks.** Selection is resolved against the complete demux track list before opening a
+  packet stream. `video:N` and `audio:N` count only tracks of that media type; a selected track without
+  a decoder config fails with a typed `MediaError` instead of silently falling back to the primary.
+  Raw live `MediaStream` inputs reject explicit selection because they do not expose stable container
+  track identities. Still images behave as one synthetic `video:0` track.
 - **Seek.** Keyframe seeks must land **exactly**; non-keyframe seeks within tolerance
   (scenario `seek-accuracy`). Seek is the sharpest `cancel` case: the consumer `cancel()`s the instant
   it finds its target frame, so the decode graph must tear down without leaking the in-flight surface
@@ -195,6 +205,19 @@ B-frames/VFR/seek/backpressure **do not apply** to this pure function — it is 
 transform with no frames, streams, or timing.
 
 ## 4. Current state
+
+### Public decode track selection
+
+- `DecodeOptions.trackSelect` is threaded through the engine and bare `createMedia().decode`
+  entrypoints. `selectDecodeTrackInfo` applies the established `video:N` / `audio:N` selector grammar
+  as an explicit whitelist and rejects ambiguous same-type selections.
+- The lazy decode runner opens packets for the selected demux track ID rather than the first configured
+  track. Integration coverage selects `video:1`, proves that only secondary track ID `20` is opened,
+  and proves a two-video request rejects before packet acquisition.
+- The immutable media-test adapter still states that the public decode surface has no selector and
+  rejects every non-primary request with
+  `AIBRUSH_DECODE_TRACK_SELECTION_UNSUPPORTED` before calling `decode`. That retained benchmark
+  `NA_ENGINE` is therefore stale adapter applicability, not evidence that the product lacks selection.
 
 ### `src/api/replayable-video-decoder.ts` (bounded runtime-miss replay)
 

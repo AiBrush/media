@@ -157,12 +157,28 @@ function tkhdV0(id: number): Uint8Array {
   );
 }
 
-function mdhdV1(timescale: number, duration: number): Uint8Array {
-  return fullBox('mdhd', 1, 0, zeros(16), u32(timescale), u64(duration));
+function mdhdV1(timescale: number, duration: number, language?: number): Uint8Array {
+  return fullBox(
+    'mdhd',
+    1,
+    0,
+    zeros(16),
+    u32(timescale),
+    u64(duration),
+    ...(language === undefined ? [] : [u16(language), u16(0)]),
+  );
 }
 
-function mdhdV0(timescale: number, duration: number): Uint8Array {
-  return fullBox('mdhd', 0, 0, zeros(8), u32(timescale), u32(duration));
+function mdhdV0(timescale: number, duration: number, language?: number): Uint8Array {
+  return fullBox(
+    'mdhd',
+    0,
+    0,
+    zeros(8),
+    u32(timescale),
+    u32(duration),
+    ...(language === undefined ? [] : [u16(language), u16(0)]),
+  );
 }
 
 function hdlr(handler: string): Uint8Array {
@@ -421,6 +437,34 @@ describe('simple MP4 faststart probes', () => {
       sampleRate: 44100,
       numberOfChannels: 2,
     });
+  });
+
+  it('surfaces packed ISO-639-2/T language from both bounded probe paths', async () => {
+    const simple = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(
+            joinBytes([stsd(box('mp4a', mp4aV0Payload())), stts(2, 1024), stsz([1, 1])]),
+            mdhdV0(44100, 2048, 0x55c4),
+            tkhdV0(2),
+          ),
+          simpleVideoTrack(undefined, mdhdV1(600, 1200, 0x15c7), tkhdV1(1)),
+        ),
+      ),
+    );
+    expect(simple?.tracks.map(({ id, language }) => ({ id, language }))).toEqual([
+      { id: 2, language: 'und' },
+      { id: 1, language: 'eng' },
+    ]);
+
+    const tinyAudio = await readTinyAudioFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(44100, 2048, 0x15c7)),
+        ),
+      ),
+    );
+    expect(tinyAudio?.[0]?.language).toBe('eng');
   });
 
   it('covers direct version-0 AAC, HE-AAC SBR, zero timing, and absent timing tables', async () => {

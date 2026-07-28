@@ -174,11 +174,11 @@ function tkhd0(trackId: number): number[] {
   );
 }
 
-function mdiaFor(handler: string, stblChildren: number[]): number[] {
+function mdiaFor(handler: string, stblChildren: number[], language = 0): number[] {
   return box(
     'mdia',
     cat(
-      full('mdhd', 0, cat(zeros(8), be32(600), be32(1200), zeros(4))),
+      full('mdhd', 0, cat(zeros(8), be32(600), be32(1200), be16(language), be16(0))),
       full('hdlr', 0, cat(zeros(4), str(handler), zeros(12))),
       box('minf', box('stbl', stblChildren)),
     ),
@@ -186,7 +186,7 @@ function mdiaFor(handler: string, stblChildren: number[]): number[] {
 }
 
 /** A minimal avc1 video trak whose sample entry carries the given extension boxes. */
-function videoTrakWith(extensions: number[]): number[] {
+function videoTrakWith(extensions: number[], language = 0): number[] {
   const avcC = box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
   const entry = box(
     'avc1',
@@ -205,6 +205,7 @@ function videoTrakWith(extensions: number[]): number[] {
           full('stsc', 0, cat(be32(1), be32(1), be32(1), be32(1))),
           full('stco', 0, cat(be32(1), be32(1000))),
         ),
+        language,
       ),
     ),
   );
@@ -291,6 +292,27 @@ describe('parseMovie — colr/pasp/clap sample-entry extensions', () => {
 });
 
 describe('parseMovie — non-media traks are never dropped, however malformed', () => {
+  it('decodes mdhd language for both AV and non-media tracks, retaining explicit undetermined', () => {
+    const dataTrak = box(
+      'trak',
+      cat(
+        tkhd0(7),
+        box(
+          'mdia',
+          cat(
+            full('mdhd', 0, cat(zeros(8), be32(1000), be32(500), be16(0x55c4), be16(0))),
+            full('hdlr', 0, cat(zeros(4), str('meta'), zeros(12))),
+          ),
+        ),
+      ),
+    );
+
+    const movie = movieWith([videoTrakWith([], 0x15c7), dataTrak]);
+
+    expect(movie.tracks[0]?.language).toBe('eng');
+    expect(movie.otherTracks?.[0]?.language).toBe('und');
+  });
+
   it('a data trak with a handler but no minf/stbl still surfaces (codec falls back to empty)', () => {
     const dataTrak = box(
       'trak',

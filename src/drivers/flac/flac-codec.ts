@@ -36,6 +36,7 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
+import { roundHalfToEven } from '../../dsp/pcm.ts';
 
 // ============ pure, Node-testable helpers ============
 
@@ -163,7 +164,7 @@ export function quantizePlanes(
   return planes.map((plane) => {
     const out = new Int32Array(frames);
     for (let i = 0; i < frames; i++) {
-      const v = Math.round((plane[i] ?? 0) * scale);
+      const v = roundHalfToEven((plane[i] ?? 0) * scale);
       out[i] = v < min ? min : v > max ? max : v;
     }
     return out;

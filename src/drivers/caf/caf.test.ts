@@ -138,6 +138,201 @@ describe('parseCaf — real CAF metadata matches afinfo/meta-golden ground truth
   }
 });
 
+describe('CafDriver.probe — bounded sparse metadata path', () => {
+  for (const c of CAFS) {
+    it(`${c.id}: matches the full parse without materializing the PCM payload`, async () => {
+      const file = await c.load(c.id);
+      const expected = parseCaf(file);
+      const ranges: Array<readonly [number, number]> = [];
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const signal = new AbortController().signal;
+      const [track] = await probeCafTrack(
+        {
+          stream: () => streamOf(file),
+          size: file.byteLength,
+          range: (start, end, rangeSignal) => {
+            ranges.push([start, end]);
+            seenSignals.push(rangeSignal);
+            return Promise.resolve(file.subarray(start, end));
+          },
+        },
+        { signal },
+      );
+
+      expect(track).toMatchObject({
+        codec: expected.codec,
+        durationSec: expected.durationSec,
+        config: {
+          codec: expected.codec,
+          sampleRate: expected.sampleRate,
+          numberOfChannels: expected.channels,
+        },
+      });
+      expect(ranges.length).toBeGreaterThan(0);
+      expect(ranges.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(
+        file.byteLength,
+      );
+      expect(seenSignals.every((seen) => seen === signal)).toBe(true);
+    });
+  }
+
+  it('accepts a final data chunk whose declared size is -1 through both source strategies', async () => {
+    const pcm = readCafPcmFromValues([0, 0.5, -0.5, 0.25], 8000);
+    const file = writeCaf(pcm, 's16', 'le');
+    setCafDataSize(file, -1n);
+
+    for (const source of [bytesSource(file), sequentialSource(file)]) {
+      const [track] = await probeCafTrack(source);
+      expect(track).toMatchObject({
+        codec: 'pcm-s16',
+        durationSec: 4 / 8000,
+        config: { sampleRate: 8000, numberOfChannels: 1 },
+      });
+    }
+  });
+
+  it('skips a multi-megabyte irrelevant chunk by declared offset', async () => {
+    const file = caff([
+      cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+      cafChunk('free', new Uint8Array(2 * 1024 * 1024)),
+      cafChunk('data', new Uint8Array([0, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0])),
+    ]);
+    const ranges: Array<readonly [number, number]> = [];
+    let streamCalls = 0;
+    const [track] = await probeCafTrack({
+      stream: () => {
+        streamCalls++;
+        return streamOf(file);
+      },
+      size: file.byteLength,
+      range: (start, end) => {
+        ranges.push([start, end]);
+        return Promise.resolve(file.subarray(start, end));
+      },
+    });
+
+    expect(track).toMatchObject({
+      codec: 'pcm-s16',
+      durationSec: 4 / 48000,
+    });
+    expect(ranges).toHaveLength(2);
+    expect(streamCalls).toBe(0);
+    expect(ranges.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(8192);
+  });
+
+  it('falls back exactly once to an unknown-size sequential source split at every byte', async () => {
+    const file = writeCaf(readCafPcmFromValues([0, 0.25, -0.25], 12000), 's16', 'be');
+    let streamCalls = 0;
+    const [track] = await probeCafTrack({
+      stream: () => {
+        streamCalls++;
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            for (const byte of file) controller.enqueue(Uint8Array.of(byte));
+            controller.close();
+          },
+        });
+      },
+    });
+
+    expect(streamCalls).toBe(1);
+    expect(track).toMatchObject({
+      codec: 'pcm-s16be',
+      durationSec: 3 / 12000,
+      config: { sampleRate: 12000, numberOfChannels: 1 },
+    });
+  });
+
+  it('rejects promptly on abort and propagates the signal into range reads', async () => {
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    const pending = probeCafTrack(
+      {
+        stream: () => streamOf(new Uint8Array(0)),
+        size: 1024,
+        range: (_start, _end, signal) => {
+          seenSignal = signal;
+          return new Promise<Uint8Array>(() => {});
+        },
+      },
+      { signal: controller.signal },
+    );
+
+    controller.abort('test abort');
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
+    expect(seenSignal).toBe(controller.signal);
+  });
+
+  it('rejects identical malformed chunk tables through seekable and sequential sources', async () => {
+    const malformed = [
+      {
+        file: caff([cafChunk('desc', new Uint8Array(16))]),
+        message: /desc/i,
+      },
+      {
+        file: caff([
+          cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+          cafChunk('data', new Uint8Array(2)),
+        ]),
+        message: /edit count|data chunk/i,
+      },
+      {
+        file: caff([
+          cafChunkDeclared('free', BigInt(Number.MAX_SAFE_INTEGER) + 1n, new Uint8Array(0)),
+        ]),
+        message: /safe integer/i,
+      },
+      {
+        file: caff([cafChunkDeclared('free', -2n, new Uint8Array(0))]),
+        message: /negative/i,
+      },
+      {
+        file: caff([cafChunkDeclared('free', -1n, new Uint8Array(0))]),
+        message: /only a final data chunk/i,
+      },
+      {
+        file: caff([
+          cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+          cafChunkDeclared('data', -2n, new Uint8Array(0)),
+        ]),
+        message: /negative/i,
+      },
+      {
+        file: caff([
+          cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+          cafChunkDeclared('free', 8n, Uint8Array.of(1, 2)),
+        ]),
+        message: /truncated 'free' chunk/i,
+      },
+      {
+        file: caff([
+          cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+          cafChunkDeclared('data', 8n, new Uint8Array(4)),
+        ]),
+        message: /truncated 'data' chunk/i,
+      },
+      {
+        file: caff([cafChunk('desc', desc('lpcm', 0x2, 16, 1)), Uint8Array.of(1, 2, 3)]),
+        message: /truncated chunk header/i,
+      },
+      {
+        file: caff([
+          cafChunk('desc', desc('lpcm', 0x2, 16, 1)),
+          cafChunk('data', new Uint8Array(4)),
+          Uint8Array.of(1, 2, 3),
+        ]),
+        message: /truncated chunk header/i,
+      },
+    ] as const;
+
+    for (const { file, message } of malformed) {
+      for (const source of [bytesSource(file), sequentialSource(file)]) {
+        await expect(probeCafTrack(source)).rejects.toThrowError(message);
+      }
+    }
+  });
+});
+
 describe('CafDriver.demux — TrackInfo + audio-dsp seam', () => {
   for (const c of CAFS) {
     it(`${c.id}: one audio track; packets() is the typed audio-dsp gap`, async () => {
@@ -413,16 +608,32 @@ function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+function sequentialSource(bytes: Uint8Array): { stream: () => ReadableStream<Uint8Array> } {
+  return { stream: () => streamOf(bytes) };
+}
+
 function bytesSource(bytes: Uint8Array): {
   stream: () => ReadableStream<Uint8Array>;
   size: number;
-  range: (s: number, e: number) => Promise<Uint8Array>;
+  range: (s: number, e: number, signal?: AbortSignal) => Promise<Uint8Array>;
 } {
   return {
     stream: () => streamOf(bytes),
     size: bytes.byteLength,
-    range: (s, e) => Promise.resolve(bytes.subarray(s, e)),
+    range: (s, e, signal) =>
+      signal?.aborted
+        ? Promise.reject(new MediaError('aborted', 'test source aborted', signal.reason))
+        : Promise.resolve(bytes.subarray(s, e)),
   };
+}
+
+async function probeCafTrack(
+  source: Parameters<NonNullable<typeof CafDriver.probe>>[0],
+  options?: Parameters<NonNullable<typeof CafDriver.probe>>[1],
+) {
+  const probe = CafDriver.probe;
+  if (probe === undefined) throw new Error('CafDriver must expose probe');
+  return probe.call(CafDriver, source, options);
 }
 
 async function transform(
@@ -474,12 +685,34 @@ function desc(formatId: string, flags: number, bits: number, channels: number): 
   return body;
 }
 function cafChunk(type: string, body: Uint8Array): Uint8Array {
+  return cafChunkDeclared(type, BigInt(body.byteLength), body);
+}
+function cafChunkDeclared(type: string, declaredSize: bigint, body: Uint8Array): Uint8Array {
   const out = new Uint8Array(12 + body.byteLength);
   const dv = new DataView(out.buffer);
   for (let i = 0; i < 4; i++) dv.setUint8(i, type.charCodeAt(i));
-  dv.setBigInt64(4, BigInt(body.byteLength));
+  dv.setBigInt64(4, declaredSize);
   out.set(body, 12);
   return out;
+}
+function setCafDataSize(file: Uint8Array, declaredSize: bigint): void {
+  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  let position = 8;
+  while (position + 12 <= file.byteLength) {
+    const type = String.fromCharCode(
+      file[position] ?? 0,
+      file[position + 1] ?? 0,
+      file[position + 2] ?? 0,
+      file[position + 3] ?? 0,
+    );
+    const size = Number(view.getBigInt64(position + 4));
+    if (type === 'data') {
+      view.setBigInt64(position + 4, declaredSize);
+      return;
+    }
+    position += 12 + size;
+  }
+  throw new Error('no CAF data chunk');
 }
 function caff(chunks: Uint8Array[]): Uint8Array {
   const bodyLen = chunks.reduce((n, c) => n + c.byteLength, 0);

@@ -154,7 +154,9 @@ describe('createOffloadRuntime — owned registry, disposable lifetime', () => {
   it('dispose is idempotent and safe while a spawn is still settling', async () => {
     const runtime = createOffloadRuntime();
     const terminated = { value: false };
-    const pending = runtime.ensurePool(1, () => echoWorker({ video: true, audio: true }, terminated));
+    const pending = runtime.ensurePool(1, () =>
+      echoWorker({ video: true, audio: true }, terminated),
+    );
     await runtime.dispose();
     await runtime.dispose(); // idempotent
     await pending; // the in-flight spawn settles…

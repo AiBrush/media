@@ -44,10 +44,12 @@ export {
   encodeQueryFor,
   normalizeDecoderCodec,
   outputDimensions,
+  outputVideoRotation,
   qualifiedVideoSourceCodec,
   requireEncoderConfig,
   type SourceGeometry,
   sourceVideoBitrateFromPacketTable,
+  videoPixelRotation,
 } from './codec-queries.ts';
 export {
   chooseOutputContainer,

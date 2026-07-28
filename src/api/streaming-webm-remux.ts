@@ -13,6 +13,7 @@ import { WebmStreamingMuxer } from '../drivers/webm/ebml-write.ts';
 import type { Source } from '../sources/source.ts';
 import { selectTrackInfos } from './track-select.ts';
 import type { RemuxOptions } from './types.ts';
+import { assertWebmRemuxTracksLegal } from './webm-remux-legality.ts';
 
 const PACKET_INFO_REMUX_WINDOW_BYTES = 8 * 1024 * 1024;
 const PACKET_INFO_REMUX_GAP_BYTES = 256 * 1024;
@@ -282,6 +283,7 @@ function tryCreatePacketInfoStreamingWebm(
       tried: [containerId],
     });
   }
+  assertWebmRemuxTracksLegal(opts.to, tracks);
 
   const selectedIds = new Set(tracks.map((track) => track.id));
   const selectedTrackIndexes = new Set<number>();
@@ -420,6 +422,7 @@ export async function remuxViaStreamingWebm(
         tried: [container.id],
       });
     }
+    assertWebmRemuxTracksLegal(opts.to, tracks);
 
     const timelineBaseUs = streamingWebmTimelineBaseUs(tracks, demuxer.packetTable?.());
     const muxer = new WebmStreamingMuxer(

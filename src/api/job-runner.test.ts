@@ -109,7 +109,7 @@ describe('declarative job runner', () => {
       engine,
       baseJob({
         ops: [
-          { op: 'trim', start: 0, end: 5 },
+          { op: 'trim', start: 0, end: 5, fragmented: true },
           { op: 'resize', width: 1280, height: 720 },
         ],
         output: {
@@ -125,7 +125,7 @@ describe('declarative job runner', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
       op: 'trim',
-      opts: { start: 0, end: 5, sink: toStream() },
+      opts: { start: 0, end: 5, fragmented: true, sink: toStream() },
     });
     expect(calls[1]).toMatchObject({
       op: 'convert',
@@ -254,6 +254,10 @@ describe('declarative job runner', () => {
             bitrate: 256_000,
             gainDb: -3,
             fade: { inSec: 0.1, outSec: 0.2, curve: 'equal-power' },
+            mixMatrix: [
+              [1, 0],
+              [0, -1],
+            ],
             dynamics: {
               normalize: { mode: 'rms', targetDbfs: -18 },
               limit: { ceilingDbfs: -1, mode: 'soft', knee: 2 },
@@ -279,6 +283,10 @@ describe('declarative job runner', () => {
           tonemap: { to: 'sdr' },
         },
         audio: {
+          mixMatrix: [
+            [1, 0],
+            [0, -1],
+          ],
           dynamics: {
             normalize: { mode: 'rms', targetDbfs: -18 },
             limit: { ceilingDbfs: -1, mode: 'soft', knee: 2 },
@@ -513,6 +521,7 @@ describe('declarative job runner', () => {
   it.each([
     baseJob({ ops: [{ op: 'trim', start: 2, end: 1 }] }),
     baseJob({ ops: [{ op: 'trim', start: 0, end: 1, mode: 'nearest' as 'accurate' }] }),
+    baseJob({ ops: [{ op: 'trim', start: 0, end: 1, fragmented: 'yes' as never }] }),
     baseJob({ ops: [{ op: 'resize', width: 0, height: 720 }] }),
     baseJob({ ops: [{ op: 'resize', width: 1.5, height: 720 }] }),
     baseJob({ ops: [{ op: 'resize', width: 1, height: 1, fit: 'inside' as 'contain' }] }),
@@ -553,6 +562,10 @@ describe('declarative job runner', () => {
     baseJob({ output: { container: 'mp4', audio: { fade: { inSec: -1 } } } }),
     baseJob({ output: { container: 'mp4', audio: { bitrate: 0 } } }),
     baseJob({ output: { container: 'mp4', audio: { fade: { curve: 'log' as 'linear' } } } }),
+    baseJob({ output: { container: 'wav', audio: { mixMatrix: [] } } }),
+    baseJob({ output: { container: 'wav', audio: { mixMatrix: [[1], [1, 0]] } } }),
+    baseJob({ output: { container: 'wav', audio: { mixMatrix: [[Number.NaN]] } } }),
+    baseJob({ output: { container: 'wav', audio: { channels: 2, mixMatrix: [[1]] } } }),
     baseJob({ output: { container: 'mp4', audio: { dynamics: {} } } }),
     baseJob({
       output: {

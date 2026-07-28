@@ -23,7 +23,9 @@ export interface WasmBindgenInit {
 export function resolveWasmCoreProfile(req: WasmRuntimeRequest = {}): WasmRuntimeProfile {
   const profile = resolveWasmRuntimeProfile(req);
   return profile.kind === 'isolated-simd-threads'
-    ? baselineWasmRuntimeProfile('no threaded WASM core is vendored (single-thread cores are the measured fast path)')
+    ? baselineWasmRuntimeProfile(
+        'no threaded WASM core is vendored (single-thread cores are the measured fast path)',
+      )
     : profile;
 }
 

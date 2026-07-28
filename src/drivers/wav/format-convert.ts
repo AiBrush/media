@@ -1,14 +1,15 @@
 import type { PcmTransform } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
-import type { SampleFormat } from '../../dsp/pcm.ts';
+import { type SampleFormat, roundHalfToEven } from '../../dsp/pcm.ts';
 import { parseWavPcmData, writeWavHeader } from './pcm.ts';
 
 const WAV_HEADER_BYTES = 44;
 const RIFF_HEADER_REMAINDER_BYTES = 36;
 const ABORT_CHECK_INTERVAL = 16_384;
+const nativeLittleEndian = new Uint8Array(new Uint16Array([0x00ff]).buffer)[0] === 0xff;
 
 type DirectInputFormat = 's16' | 's24' | 'f32';
-type DirectOutputFormat = 's16' | 'f32';
+type DirectOutputFormat = 's16' | 's24' | 'f32';
 
 const INPUT_BYTES: Record<DirectInputFormat, number> = {
   s16: 2,
@@ -18,6 +19,7 @@ const INPUT_BYTES: Record<DirectInputFormat, number> = {
 
 const OUTPUT_BYTES: Record<DirectOutputFormat, number> = {
   s16: 2,
+  s24: 3,
   f32: 4,
 };
 
@@ -36,6 +38,7 @@ function hasOtherPcmWork(o: PcmTransform): boolean {
   return (
     o.gainDb !== undefined ||
     o.fade !== undefined ||
+    o.mixMatrix !== undefined ||
     o.dynamics !== undefined ||
     o.biquad !== undefined ||
     o.timeBounds !== undefined
@@ -56,6 +59,7 @@ function directInputFormat(format: SampleFormat): DirectInputFormat | undefined 
 function directOutputFormat(format: SampleFormat | undefined): DirectOutputFormat | undefined {
   switch (format) {
     case 's16':
+    case 's24':
     case 'f32':
       return format;
     default:
@@ -69,60 +73,203 @@ function clampInt(x: number, lo: number, hi: number): number {
   return x;
 }
 
-function readS24Le(input: DataView, offset: number): number {
+function readS24Le(input: Uint8Array, offset: number): number {
   const raw =
-    input.getUint8(offset) | (input.getUint8(offset + 1) << 8) | (input.getUint8(offset + 2) << 16);
+    (input[offset] as number) |
+    ((input[offset + 1] as number) << 8) |
+    ((input[offset + 2] as number) << 16);
   return raw & 0x80_0000 ? raw - 0x100_0000 : raw;
 }
 
-function readSample(input: DataView, offset: number, format: DirectInputFormat): number {
-  switch (format) {
-    case 's16':
-      return input.getInt16(offset, true) / 32_768;
-    case 's24':
-      return readS24Le(input, offset) / 8_388_608;
-    case 'f32':
-      return input.getFloat32(offset, true);
-  }
-}
-
-function writeSample(
-  output: DataView,
-  offset: number,
-  value: number,
-  format: DirectOutputFormat,
-): void {
-  switch (format) {
-    case 's16':
-      output.setInt16(offset, clampInt(Math.round(value * 32_768), -32_768, 32_767), true);
-      return;
-    case 'f32':
-      output.setFloat32(offset, value, true);
-      return;
-  }
+function writeS24Le(output: Uint8Array, offset: number, signed: number): void {
+  const raw = signed < 0 ? signed + 0x100_0000 : signed;
+  output[offset] = raw & 0xff;
+  output[offset + 1] = (raw >> 8) & 0xff;
+  output[offset + 2] = (raw >> 16) & 0xff;
 }
 
 function convertSamples(
-  input: DataView,
+  input: Uint8Array,
   dataOffset: number,
   inputFormat: DirectInputFormat,
-  output: DataView,
+  output: Uint8Array<ArrayBuffer>,
   outputFormat: DirectOutputFormat,
   sampleCount: number,
   signal: AbortSignal | undefined,
+  hostLittleEndian: boolean,
 ): void {
-  const inputBytes = INPUT_BYTES[inputFormat];
-  const outputBytes = OUTPUT_BYTES[outputFormat];
   throwIfAborted(signal);
-  for (let sample = 0; sample < sampleCount; sample++) {
-    if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
-    writeSample(
-      output,
-      WAV_HEADER_BYTES + sample * outputBytes,
-      readSample(input, dataOffset + sample * inputBytes, inputFormat),
-      outputFormat,
-    );
+
+  if (inputFormat === 's16' && outputFormat === 'f32') {
+    const absoluteOffset = input.byteOffset + dataOffset;
+    if (hostLittleEndian) {
+      const target = new Float32Array(output.buffer, WAV_HEADER_BYTES, sampleCount);
+      if ((absoluteOffset & 1) === 0) {
+        const source = new Int16Array(input.buffer, absoluteOffset, sampleCount);
+        for (let sample = 0; sample < sampleCount; sample++) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target[sample] = (source[sample] as number) / 32_768;
+        }
+      } else {
+        const source = new DataView(input.buffer, absoluteOffset, sampleCount * 2);
+        for (let sample = 0; sample < sampleCount; sample++) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target[sample] = source.getInt16(sample * 2, true) / 32_768;
+        }
+      }
+    } else {
+      const source = new DataView(input.buffer, absoluteOffset, sampleCount * 2);
+      const target = new DataView(output.buffer, WAV_HEADER_BYTES, sampleCount * 4);
+      for (let sample = 0; sample < sampleCount; sample++) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        target.setFloat32(sample * 4, source.getInt16(sample * 2, true) / 32_768, true);
+      }
+    }
+    return;
   }
+
+  if (inputFormat === 's16' && outputFormat === 's24') {
+    const absoluteOffset = input.byteOffset + dataOffset;
+    if (hostLittleEndian && (absoluteOffset & 1) === 0) {
+      const source = new Int16Array(input.buffer, absoluteOffset, sampleCount);
+      for (
+        let sample = 0, outputOffset = WAV_HEADER_BYTES;
+        sample < sampleCount;
+        sample++, outputOffset += 3
+      ) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        writeS24Le(output, outputOffset, (source[sample] as number) * 256);
+      }
+    } else {
+      const source = new DataView(input.buffer, absoluteOffset, sampleCount * 2);
+      for (
+        let sample = 0, outputOffset = WAV_HEADER_BYTES;
+        sample < sampleCount;
+        sample++, outputOffset += 3
+      ) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        writeS24Le(output, outputOffset, source.getInt16(sample * 2, true) * 256);
+      }
+    }
+    return;
+  }
+
+  if (inputFormat === 's24') {
+    if (outputFormat === 'f32') {
+      if (hostLittleEndian) {
+        const target = new Float32Array(output.buffer, WAV_HEADER_BYTES, sampleCount);
+        for (let sample = 0, offset = dataOffset; sample < sampleCount; sample++, offset += 3) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target[sample] = readS24Le(input, offset) / 8_388_608;
+        }
+      } else {
+        const target = new DataView(output.buffer, WAV_HEADER_BYTES, sampleCount * 4);
+        for (let sample = 0, offset = dataOffset; sample < sampleCount; sample++, offset += 3) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target.setFloat32(sample * 4, readS24Le(input, offset) / 8_388_608, true);
+        }
+      }
+      return;
+    }
+    if (hostLittleEndian) {
+      const target = new Int16Array(output.buffer, WAV_HEADER_BYTES, sampleCount);
+      for (let sample = 0, offset = dataOffset; sample < sampleCount; sample++, offset += 3) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        target[sample] = clampInt(roundHalfToEven(readS24Le(input, offset) / 256), -32_768, 32_767);
+      }
+    } else {
+      const target = new DataView(output.buffer, WAV_HEADER_BYTES, sampleCount * 2);
+      for (let sample = 0, offset = dataOffset; sample < sampleCount; sample++, offset += 3) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        target.setInt16(
+          sample * 2,
+          clampInt(roundHalfToEven(readS24Le(input, offset) / 256), -32_768, 32_767),
+          true,
+        );
+      }
+    }
+    return;
+  }
+
+  if (inputFormat === 'f32' && outputFormat === 's16') {
+    const absoluteOffset = input.byteOffset + dataOffset;
+    if (hostLittleEndian) {
+      const target = new Int16Array(output.buffer, WAV_HEADER_BYTES, sampleCount);
+      if ((absoluteOffset & 3) === 0) {
+        const source = new Float32Array(input.buffer, absoluteOffset, sampleCount);
+        for (let sample = 0; sample < sampleCount; sample++) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target[sample] = clampInt(
+            roundHalfToEven((source[sample] as number) * 32_768),
+            -32_768,
+            32_767,
+          );
+        }
+      } else {
+        const source = new DataView(input.buffer, absoluteOffset, sampleCount * 4);
+        for (let sample = 0; sample < sampleCount; sample++) {
+          if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+          target[sample] = clampInt(
+            roundHalfToEven(source.getFloat32(sample * 4, true) * 32_768),
+            -32_768,
+            32_767,
+          );
+        }
+      }
+    } else {
+      const source = new DataView(input.buffer, absoluteOffset, sampleCount * 4);
+      const target = new DataView(output.buffer, WAV_HEADER_BYTES, sampleCount * 2);
+      for (let sample = 0; sample < sampleCount; sample++) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        target.setInt16(
+          sample * 2,
+          clampInt(roundHalfToEven(source.getFloat32(sample * 4, true) * 32_768), -32_768, 32_767),
+          true,
+        );
+      }
+    }
+    return;
+  }
+
+  if (inputFormat === 'f32' && outputFormat === 's24') {
+    const absoluteOffset = input.byteOffset + dataOffset;
+    if (hostLittleEndian && (absoluteOffset & 3) === 0) {
+      const source = new Float32Array(input.buffer, absoluteOffset, sampleCount);
+      for (
+        let sample = 0, outputOffset = WAV_HEADER_BYTES;
+        sample < sampleCount;
+        sample++, outputOffset += 3
+      ) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        let signed = roundHalfToEven((source[sample] as number) * 8_388_608);
+        if (signed < -8_388_608) signed = -8_388_608;
+        else if (signed > 8_388_607) signed = 8_388_607;
+        const raw = signed < 0 ? signed + 0x100_0000 : signed;
+        output[outputOffset] = raw & 0xff;
+        output[outputOffset + 1] = (raw >> 8) & 0xff;
+        output[outputOffset + 2] = (raw >> 16) & 0xff;
+      }
+    } else {
+      const source = new DataView(input.buffer, absoluteOffset, sampleCount * 4);
+      for (
+        let sample = 0, outputOffset = WAV_HEADER_BYTES;
+        sample < sampleCount;
+        sample++, outputOffset += 3
+      ) {
+        if ((sample & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(signal);
+        let signed = roundHalfToEven(source.getFloat32(sample * 4, true) * 8_388_608);
+        if (signed < -8_388_608) signed = -8_388_608;
+        else if (signed > 8_388_607) signed = 8_388_607;
+        const raw = signed < 0 ? signed + 0x100_0000 : signed;
+        output[outputOffset] = raw & 0xff;
+        output[outputOffset + 1] = (raw >> 8) & 0xff;
+        output[outputOffset + 2] = (raw >> 16) & 0xff;
+      }
+    }
+    return;
+  }
+
+  throw new Error(`unreachable direct PCM conversion ${inputFormat}→${outputFormat}`);
 }
 
 function eligibleOutputFormat(opts: PcmTransform): DirectOutputFormat | undefined {
@@ -133,9 +280,15 @@ function eligibleOutputFormat(opts: PcmTransform): DirectOutputFormat | undefine
   return directOutputFormat(opts.sampleFormat);
 }
 
+/**
+ * Try the bounded direct conversion. `hostLittleEndian` is injectable so portability tests can exercise
+ * the DataView-only path that a big-endian JS host must use; production callers leave it at the native
+ * default.
+ */
 export function tryConvertWavPcmFormatToWav(
   bytes: Uint8Array,
   opts: PcmTransform,
+  hostLittleEndian = nativeLittleEndian,
 ): Uint8Array<ArrayBuffer> | undefined {
   const outputFormat = eligibleOutputFormat(opts);
   if (outputFormat === undefined) return undefined;
@@ -162,13 +315,14 @@ export function tryConvertWavPcmFormatToWav(
 
   const out = new Uint8Array(WAV_HEADER_BYTES + outputDataBytes);
   convertSamples(
-    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    bytes,
     parsed.dataOffset,
     inputFormat,
-    new DataView(out.buffer),
+    out,
     outputFormat,
     sampleCount,
     opts.signal,
+    hostLittleEndian,
   );
   writeWavHeader(out, outputDataBytes, fmt.channels, fmt.sampleRate, outputFormat);
   throwIfAborted(opts.signal);

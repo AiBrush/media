@@ -269,16 +269,21 @@ export async function runCodecConvert(
         const videoCodec = await context.routeCodec(decodeQuery, callOptions);
         const config = decodeQuery.config;
         const decodeStage = context.stageOptions(signal, callOptions);
+        const runtimeFallback =
+          videoTrack.alpha === true ? undefined : await import('./replayable-video-decoder.ts');
+        const fallbackKind = runtimeFallback?.planRuntimeVideoFallback(
+          videoCodec.id,
+          config.codec,
+          callOptions.strategy,
+        );
         /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
         const decoded =
           videoTrack.alpha === true
             ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
                 videoCodec.createDecoder(config, decodeStage),
               )
-            : callOptions.strategy?.pinDriver !== videoCodec.id &&
-                videoCodec.id !== 'wasm-vpx' &&
-                /^vp(?:8|9|09)/.test(config.codec)
-              ? (await import('./replayable-video-decoder.ts')).decodeVideoWithRuntimeFallback(
+            : runtimeFallback !== undefined && fallbackKind !== undefined
+              ? runtimeFallback.decodeVideoWithRuntimeFallback(
                   unwrapPackets(demuxer.packets(videoTrack.id)),
                   () =>
                     videoCodec.createDecoder(config, decodeStage) as TransformStream<
@@ -286,14 +291,27 @@ export async function runCodecConvert(
                       VideoFrame
                     >,
                   async () => {
-                    const fallback = await context.routeCodec(decodeQuery, {
+                    if (fallbackKind === 'wasm-vpx') {
+                      const fallback = await context.routeCodec(decodeQuery, {
+                        ...callOptions,
+                        strategy: { ...callOptions.strategy, pinDriver: 'wasm-vpx' },
+                      });
+                      return fallback.createDecoder(config, decodeStage) as TransformStream<
+                        EncodedChunk,
+                        VideoFrame
+                      >;
+                    }
+                    const softwareOptions: CallOptions = {
                       ...callOptions,
-                      strategy: { ...callOptions.strategy, pinDriver: 'wasm-vpx' },
-                    });
-                    return fallback.createDecoder(config, decodeStage) as TransformStream<
-                      EncodedChunk,
-                      VideoFrame
-                    >;
+                      strategy: {
+                        ...callOptions.strategy,
+                        determinism: 'force-software',
+                      },
+                    };
+                    return videoCodec.createDecoder(
+                      config,
+                      context.stageOptions(signal, softwareOptions),
+                    ) as TransformStream<EncodedChunk, VideoFrame>;
                   },
                   { signal },
                 )

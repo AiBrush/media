@@ -14,7 +14,7 @@
  *  - **append-only `WritableStream`** — the native `pipeTo` path (streams-runtime backpressure +
  *    cancellation) through a position guard that raises a typed `CapabilityError` if a producer asks
  *    for a non-contiguous write the destination cannot honor — never a silent wrong offset. With
- *    `chunked` on, the manual pump replaces `pipeTo` so runs can coalesce before each write.
+ *    write shaping on, the manual pump replaces `pipeTo` so runs can coalesce/split before each write.
  *
  * Every arm honours `signal` (each await is abort-raced so a stalled producer/writer cannot pin the op),
  * cancels the source reader on failure, aborts a held destination writer, and surfaces typed errors.
@@ -186,6 +186,98 @@ class RunCoalescer {
     this.#filled = 0;
     await this.#deliver(run, start);
   }
+
+  finish(): Promise<void> {
+    return this.flush();
+  }
+}
+
+/** A destination-write shaper shared by the coalescing and exact-size modes. */
+interface WriteShaper {
+  nextPosition(cursor: number): number;
+  push(data: Uint8Array, intended: number): Promise<void>;
+  finish(): Promise<void>;
+}
+
+/**
+ * Split/coalesce one contiguous producer run into exact `writeBytes` destination writes. Unlike
+ * `RunCoalescer`, an oversized input never bypasses the shaper: aligned subviews are delivered one at
+ * a time and the tail is retained. A short run cannot satisfy an exact-write contract, so finalization
+ * (or a positioned discontinuity) rejects rather than emitting a knowingly non-conforming write.
+ */
+class ExactWriteShaper implements WriteShaper {
+  readonly #writeBytes: number;
+  readonly #deliver: (data: Uint8Array, position: number) => Promise<void>;
+  #buffer: Uint8Array | undefined;
+  #filled = 0;
+  #runStart = 0;
+
+  constructor(writeBytes: number, deliver: (data: Uint8Array, position: number) => Promise<void>) {
+    this.#writeBytes = writeBytes;
+    this.#deliver = deliver;
+  }
+
+  nextPosition(cursor: number): number {
+    return this.#buffer === undefined ? cursor : this.#runStart + this.#filled;
+  }
+
+  async push(data: Uint8Array, intended: number): Promise<void> {
+    if (this.#buffer !== undefined && intended !== this.#runStart + this.#filled) {
+      throw this.#partialRunError('before a positioned discontinuity');
+    }
+
+    let offset = 0;
+    let position = intended;
+    while (offset < data.byteLength) {
+      if (this.#buffer === undefined) {
+        const remaining = data.byteLength - offset;
+        if (remaining >= this.#writeBytes) {
+          const exact = data.subarray(offset, offset + this.#writeBytes);
+          await this.#deliver(exact, position);
+          offset += this.#writeBytes;
+          position += this.#writeBytes;
+          continue;
+        }
+        this.#buffer = new Uint8Array(this.#writeBytes);
+        this.#filled = 0;
+        this.#runStart = position;
+      }
+
+      const take = Math.min(this.#writeBytes - this.#filled, data.byteLength - offset);
+      this.#buffer.set(data.subarray(offset, offset + take), this.#filled);
+      this.#filled += take;
+      offset += take;
+      position += take;
+      if (this.#filled === this.#writeBytes) await this.#flushExact();
+    }
+  }
+
+  async finish(): Promise<void> {
+    if (this.#buffer !== undefined) throw this.#partialRunError('at end of output');
+  }
+
+  async #flushExact(): Promise<void> {
+    const buffer = this.#buffer;
+    if (buffer === undefined || this.#filled !== this.#writeBytes) return;
+    const start = this.#runStart;
+    this.#buffer = undefined;
+    this.#filled = 0;
+    await this.#deliver(buffer, start);
+  }
+
+  #partialRunError(where: string): CapabilityError {
+    return new CapabilityError(
+      `stream-target writeChunkBytes=${this.#writeBytes} cannot emit the ${this.#filled}-byte partial write ${where}; output runs must be exact multiples of ${this.#writeBytes} bytes`,
+      {
+        op: {
+          kind: 'route',
+          id: 'stream-target-exact-writes',
+          facts: { writeChunkBytes: this.#writeBytes, partialBytes: this.#filled },
+        },
+        tried: [],
+      },
+    );
+  }
 }
 
 /**
@@ -210,7 +302,12 @@ async function drainPositioned(
     await emit(data, position, cursor);
     cursor = position + data.byteLength;
   };
-  const coalescer = plan.chunked ? new RunCoalescer(plan.chunkSize, deliver) : undefined;
+  const shaper: WriteShaper | undefined =
+    plan.writeChunkBytes !== undefined
+      ? new ExactWriteShaper(plan.writeChunkBytes, deliver)
+      : plan.chunked
+        ? new RunCoalescer(plan.chunkSize, deliver)
+        : undefined;
   try {
     for (;;) {
       if (signal?.aborted) throw abortedError();
@@ -221,13 +318,13 @@ async function drainPositioned(
       const intended =
         tag !== undefined
           ? basePosition + tag
-          : coalescer !== undefined
-            ? coalescer.nextPosition(cursor)
+          : shaper !== undefined
+            ? shaper.nextPosition(cursor)
             : cursor;
-      if (coalescer !== undefined) await coalescer.push(value, intended);
+      if (shaper !== undefined) await shaper.push(value, intended);
       else await deliver(value, intended);
     }
-    await coalescer?.flush();
+    await shaper?.finish();
   } catch (err) {
     // Await upstream cleanup, but preserve the primary typed failure if cancellation itself rejects.
     await reader.cancel(err).catch(() => undefined);
@@ -347,7 +444,7 @@ export async function writeToStreamTarget(
       await drainToRandomAccessWritable(stream, dest, opts, plan);
       return undefined;
     }
-    if (plan.chunked) {
+    if (plan.chunked || plan.writeChunkBytes !== undefined) {
       await drainToAppendOnlyWritable(stream, dest, opts, plan);
       return undefined;
     }

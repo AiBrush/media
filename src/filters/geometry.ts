@@ -12,8 +12,9 @@
  *   directly to Canvas2D `setTransform(a,b,c,d,e,f)` + `drawImage(img, 0, 0)` and to a vertex transform
  *   on the GPU. `setTransform` sends source point `(x, y)` to `(a·x + c·y + e, b·x + d·y + f)`.
  *
- * All output dimensions are integers ≥ 1; pixel rects use `Math.round`/`Math.floor` consistently so the
- * recipe is deterministic and reproducible across machines (ADR-007).
+ * All output dimensions are integers ≥ 1. Source crops and drawn sizes use deterministic integer
+ * rounding; contain placement may land on a half-pixel when an odd remainder must be split evenly
+ * between both bars.
  */
 
 import type { FilterSpec } from '../contracts/driver.ts';
@@ -111,8 +112,10 @@ export function resizeBlit(srcW: number, srcH: number, spec: ResizeSpec): Blit {
     const scale = Math.min(width / srcW, height / srcH);
     const drawW = Math.max(1, Math.round(srcW * scale));
     const drawH = Math.max(1, Math.round(srcH * scale));
-    const dx = Math.floor((width - drawW) / 2);
-    const dy = Math.floor((height - drawH) / 2);
+    // Canvas2D and WebGPU both accept fractional destination coordinates. Preserve exact centering when
+    // an odd number of remaining pixels would otherwise make the trailing bar one pixel wider.
+    const dx = (width - drawW) / 2;
+    const dy = (height - drawH) / 2;
     return { dims, src: fullSrc, dst: { x: dx, y: dy, width: drawW, height: drawH } };
   }
 

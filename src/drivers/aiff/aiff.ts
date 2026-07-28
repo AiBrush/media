@@ -145,29 +145,38 @@ function* chunks(bytes: Uint8Array, dv: DataView): Generator<Chunk> {
   }
 }
 
-function parseComm(
-  bytes: Uint8Array,
-  dv: DataView,
-  c: Chunk,
-  kind: AiffKind,
-): Omit<AiffLayout, 'kind'> {
-  if (c.size < 18 || c.body + 18 > bytes.byteLength) {
+/** @internal Parse one isolated AIFF `COMM` body for bounded container readers. */
+export function parseAiffCommBody(bytes: Uint8Array, kind: AiffKind): Omit<AiffLayout, 'kind'> {
+  if (bytes.byteLength < 18) {
     throw new MediaError('demux-error', 'AIFF: truncated COMM chunk');
   }
-  const channels = dv.getUint16(c.body);
-  const frames = dv.getUint32(c.body + 2);
-  const sampleSize = dv.getUint16(c.body + 6);
-  const sampleRate = readExtendedFloat80(dv, c.body + 8);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const channels = dv.getUint16(0);
+  const frames = dv.getUint32(2);
+  const sampleSize = dv.getUint16(6);
+  const sampleRate = readExtendedFloat80(dv, 8);
   let compression = 'NONE';
   if (kind === 'aifc') {
-    if (c.size < 22 || c.body + 22 > bytes.byteLength) {
+    if (bytes.byteLength < 22) {
       throw new MediaError('demux-error', 'AIFF-C: COMM missing compressionType');
     }
-    compression = ascii(bytes, c.body + 18, 4);
+    compression = ascii(bytes, 18, 4);
   }
   const { format, endian } = formatFromCompression(compression, sampleSize);
   if (channels <= 0) throw new MediaError('demux-error', `AIFF: invalid channel count ${channels}`);
   return { compression, channels, frames, sampleSize, sampleRate, format, endian };
+}
+
+function parseComm(
+  bytes: Uint8Array,
+  _dv: DataView,
+  c: Chunk,
+  kind: AiffKind,
+): Omit<AiffLayout, 'kind'> {
+  return parseAiffCommBody(
+    bytes.subarray(c.body, Math.min(bytes.byteLength, c.body + c.size)),
+    kind,
+  );
 }
 
 /** Locate the `COMM` layout + `SSND` sample bytes in an AIFF/AIFF-C file (pure; big-endian). */
@@ -200,6 +209,9 @@ export function locate(
         throw new MediaError('demux-error', 'AIFF: truncated SSND chunk');
       }
       const dataOffset = dv.getUint32(c.body); // skip N alignment bytes before the first sample
+      if (dataOffset > c.size - 8) {
+        throw new MediaError('demux-error', 'AIFF: invalid SSND sample offset');
+      }
       const samples = c.body + 8 + dataOffset;
       const declared = c.size - 8 - dataOffset;
       ssnd = {
@@ -216,6 +228,36 @@ export function locate(
     ssndSampleOffset: ssnd?.sampleOffset ?? -1,
     ssndSampleBytes: ssnd?.sampleBytes ?? 0,
   };
+}
+
+/**
+ * Return the exact valid PCM byte count declared by `COMM`, rejecting a missing or truncated required
+ * `SSND`. AIFF permits block-alignment bytes after the last valid frame, so SSND's chunk size is only
+ * an availability bound; `COMM.numSampleFrames` is authoritative.
+ *
+ * @internal Shared by bounded readers and whole-buffer PCM paths.
+ */
+export function aiffPcmSampleBytes(
+  layout: AiffLayout,
+  ssndSampleOffset: number,
+  availableSampleBytes: number,
+): number {
+  const bytesPerFrame = bytesPerSample(layout.format) * layout.channels;
+  const declaredSampleBytes = layout.frames * bytesPerFrame;
+  if (!Number.isSafeInteger(declaredSampleBytes) || declaredSampleBytes < 0) {
+    throw new MediaError('demux-error', 'AIFF: COMM sample payload exceeds the safe byte range');
+  }
+  if (declaredSampleBytes === 0) return 0;
+  if (ssndSampleOffset < 0) {
+    throw new MediaError('demux-error', 'AIFF: COMM declares sample frames but SSND is missing');
+  }
+  if (availableSampleBytes < declaredSampleBytes) {
+    throw new MediaError(
+      'demux-error',
+      `AIFF: SSND payload is truncated (${availableSampleBytes} bytes available; COMM requires ${declaredSampleBytes})`,
+    );
+  }
+  return declaredSampleBytes;
 }
 
 export interface AiffInfo {
@@ -255,10 +297,11 @@ export function parseAiff(bytes: Uint8Array): AiffInfo {
 /** Read an AIFF/AIFF-C file's samples into canonical planar Float64 audio (honors the wire endianness). */
 export function readAiffPcm(bytes: Uint8Array): AiffPcm {
   const { layout, ssndSampleOffset, ssndSampleBytes } = locate(bytes);
+  const sampleBytes = aiffPcmSampleBytes(layout, ssndSampleOffset, ssndSampleBytes);
   const data =
     ssndSampleOffset < 0
       ? new Uint8Array(0)
-      : bytes.subarray(ssndSampleOffset, ssndSampleOffset + ssndSampleBytes);
+      : bytes.subarray(ssndSampleOffset, ssndSampleOffset + sampleBytes);
   const audio = decodePcm(
     data,
     layout.format,

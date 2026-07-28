@@ -7,7 +7,7 @@ import { SOURCE_CACHE_KEY, type Source, fromBytes } from '../../sources/source.t
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import { readAiffPcm } from '../aiff/aiff.ts';
 import { readCafPcm } from '../caf/caf.ts';
-import { parseWavPcmData, readWavPcm, writeWavHeader } from './pcm.ts';
+import { parseWavPcmData, readWavPcm } from './pcm.ts';
 
 const SIN = 'sin_440Hz_-6dBFS_1s.wav';
 const DERIVED = new URL('../../../fixtures/media-derived/aiff-caf/', import.meta.url).pathname;
@@ -24,30 +24,6 @@ const aiffSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audi
 const cafSource = (bytes: Uint8Array): Source => fromBytes(bytes, { mime: 'audio/x-caf' });
 const loadDerived = async (id: string): Promise<Uint8Array> =>
   new Uint8Array(await readFile(`${DERIVED}${id}`));
-
-function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(c): void {
-      c.enqueue(bytes);
-      c.close();
-    },
-  });
-}
-
-function repeatedCanonicalStereoWav(seed: Uint8Array, totalBytes: number): Uint8Array<ArrayBuffer> {
-  const parsed = parseWavPcmData(seed);
-  const blockAlign = 4;
-  const payloadBytes = Math.floor((totalBytes - 44) / blockAlign) * blockAlign;
-  const bytes = new Uint8Array(44 + payloadBytes);
-  writeWavHeader(bytes, payloadBytes, 2, 48_000, 's16');
-  let offset = 44;
-  while (offset < bytes.byteLength) {
-    const length = Math.min(parsed.data.byteLength, bytes.byteLength - offset);
-    bytes.set(parsed.data.subarray(0, length), offset);
-    offset += length;
-  }
-  return bytes;
-}
 
 function keyedWavSource(
   bytes: Uint8Array,
@@ -97,6 +73,31 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     const re = readWavPcm(monoBack);
     expect(re.channels).toBe(1);
     expect(channelAt(re.planar, 0)).toEqual(channelAt(orig.planar, 0));
+  });
+
+  it('applies an explicit remix matrix through the public PCM convert API', async () => {
+    const orig = readWavPcm(await loadFixture(SIN));
+    const out = await bytesOf(
+      await media().convert(await fixtureSource(SIN), {
+        to: 'wav',
+        audio: {
+          codec: 'pcm-s16',
+          channels: 2,
+          mixMatrix: [[1], [-1]],
+        },
+      }),
+    );
+
+    const re = readWavPcm(out);
+    expect(re.channels).toBe(2);
+    expect(re.frames).toBe(orig.frames);
+    const source = channelAt(orig.planar, 0);
+    const positive = channelAt(re.planar, 0);
+    const inverted = channelAt(re.planar, 1);
+    for (let frame = 0; frame < orig.frames; frame++) {
+      expect(positive[frame]).toBe(source[frame]);
+      expect(inverted[frame]).toBe(source[frame] === 0 ? 0 : -(source[frame] as number));
+    }
   });
 
   it('a no-op convert (no audio opts) is lossless — PCM survives byte-for-byte', async () => {
@@ -228,6 +229,31 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(info.tracks[0]?.codec).toBe('pcm-s16');
   });
 
+  it('reads a range-backed WAV only once when a sample-format conversion needs the driver', async () => {
+    const input = await loadFixture('sfx-pcm-f32.wav');
+    const ranges: Array<readonly [number, number]> = [];
+    const source = keyedWavSource(
+      input,
+      `test:wav:single-read:f32-s24:${input.byteLength}`,
+      (start, end) => {
+        ranges.push([start, end]);
+        return Promise.resolve(input.slice(start, end));
+      },
+    );
+
+    const out = await bytesOf(
+      await media().convert(source, {
+        to: 'wav',
+        audio: { codec: 'pcm-s24' as never },
+      }),
+    );
+
+    expect(ranges).toEqual([[0, input.byteLength]]);
+    const reparsed = readWavPcm(out);
+    expect(reparsed.format).toBe('s24');
+    expect(reparsed.frames).toBe(readWavPcm(input).frames);
+  });
+
   it('converts big-endian AIFF PCM to little-endian WAV without changing samples', async () => {
     const input = await loadDerived('sfx.aiff');
     const orig = readAiffPcm(input);
@@ -252,170 +278,37 @@ describe('media.convert — PCM-native audio path (ADR-022)', () => {
     expect(info.tracks[0]?.codec).toBe('pcm-s16');
   });
 
-  it('reuses raw URL bytes for repeated identical AIFF → WAV byte rewrites', async () => {
-    const input = await loadDerived('sfx.aiff');
-    let rangeReads = 0;
-    const keyedAiff: Source = {
-      __media: 'source',
-      kind: 'url',
-      size: input.byteLength,
-      mimeHint: 'audio/aiff',
-      [SOURCE_CACHE_KEY]: `test:aiff:${input.byteLength}`,
-      stream: () => streamOf(input),
-      range: (start, end) => {
-        rangeReads += 1;
-        return Promise.resolve(input.subarray(start, end));
-      },
-    };
-    const engine = media();
-    const opts = { to: 'wav', audio: { codec: 'pcm-s16' as never } } as const;
+  it('reads fresh bytes from newly-created same-URL, same-size sources', async () => {
+    const firstInput = await loadFixture('stereo-48000.wav');
+    const secondInput = firstInput.slice();
+    const secondPcm = parseWavPcmData(secondInput).data;
+    secondPcm[0] = (secondPcm[0] ?? 0) ^ 0xff;
+    expect(secondInput.byteLength).toBe(firstInput.byteLength);
 
-    const first = await bytesOf(await engine.convert(keyedAiff, opts));
-    const second = await bytesOf(await engine.convert(keyedAiff, opts));
-
-    expect(rangeReads).toBe(1);
-    expect(second).toEqual(first);
-    const original = readAiffPcm(input);
-    const reparsed = readWavPcm(second);
-    expect(channelAt(reparsed.planar, 0)).toEqual(channelAt(original.planar, 0));
-  });
-
-  it('bounds raw PCM rewrite retention by total bytes and refreshes exact-source recency', async () => {
-    const seed = await loadFixture('stereo-48000.wav');
-    const bytes = repeatedCanonicalStereoWav(seed, 3 * 1024 * 1024);
-    const reads = new Map<string, number>();
-    const source = (key: string): Source =>
-      keyedWavSource(bytes, `test:pcm-cache-lru:${key}`, (start, end) => {
-        reads.set(key, (reads.get(key) ?? 0) + 1);
-        return Promise.resolve(bytes.slice(start, end));
-      });
+    const cacheKey = 'https://example.test/mutable.wav';
+    let firstReads = 0;
+    let secondReads = 0;
+    const firstSource = keyedWavSource(firstInput, cacheKey, (start, end) => {
+      firstReads++;
+      return Promise.resolve(firstInput.slice(start, end));
+    });
+    const secondSource = keyedWavSource(secondInput, cacheKey, (start, end) => {
+      secondReads++;
+      return Promise.resolve(secondInput.slice(start, end));
+    });
     const engine = media();
     const opts = {
       to: 'wav',
       audio: { codec: 'pcm-s16' as never, sampleRate: 48_000, channels: 2 },
     } as const;
 
-    await engine.convert(source('a'), opts);
-    await engine.convert(source('b'), opts);
-    await engine.convert(source('a'), opts); // refresh A; B is now least-recently used
-    await engine.convert(source('c'), opts); // A+B+C exceeds the 8 MiB total budget
-    const a = await bytesOf(await engine.convert(source('a'), opts));
-    await engine.convert(source('b'), opts);
+    const first = await bytesOf(await engine.convert(firstSource, opts));
+    const second = await bytesOf(await engine.convert(secondSource, opts));
 
-    expect(reads.get('a')).toBe(1);
-    expect(reads.get('b')).toBe(2);
-    expect(reads.get('c')).toBe(1);
-    expect(Buffer.from(a).equals(Buffer.from(bytes))).toBe(true);
-  });
-
-  it('accounts concurrent exact-key replacement once inside the total cache budget', async () => {
-    const seed = await loadFixture('stereo-48000.wav');
-    const bytes = repeatedCanonicalStereoWav(seed, 4 * 1024 * 1024);
-    const engine = media();
-    const opts = {
-      to: 'wav',
-      audio: { codec: 'pcm-s16' as never, sampleRate: 48_000, channels: 2 },
-    } as const;
-    let sameKeyReads = 0;
-    const waiters: Array<(bytes: Uint8Array) => void> = [];
-    const concurrent = (): Source =>
-      keyedWavSource(bytes, 'test:pcm-cache-concurrent:a', (start, end) => {
-        sameKeyReads++;
-        return new Promise((resolve) => {
-          waiters.push(() => resolve(bytes.slice(start, end)));
-        });
-      });
-    const left = engine.convert(concurrent(), opts);
-    const right = engine.convert(concurrent(), opts);
-    while (waiters.length < 2) await Promise.resolve();
-    for (const resolve of waiters) resolve(bytes);
-    await Promise.all([left, right]);
-
-    let siblingReads = 0;
-    const sibling = keyedWavSource(bytes, 'test:pcm-cache-concurrent:b', (start, end) => {
-      siblingReads++;
-      return Promise.resolve(bytes.slice(start, end));
-    });
-    await engine.convert(sibling, opts);
-    await engine.convert(
-      keyedWavSource(bytes, 'test:pcm-cache-concurrent:a', (start, end) => {
-        sameKeyReads++;
-        return Promise.resolve(bytes.slice(start, end));
-      }),
-      opts,
-    );
-
-    expect(sameKeyReads).toBe(2);
-    expect(siblingReads).toBe(1);
-  });
-
-  it('never inserts aborted or failed raw-source reads into the rewrite cache', async () => {
-    const bytes = await loadFixture('stereo-48000.wav');
-    const opts = {
-      to: 'wav',
-      audio: { codec: 'pcm-s16' as never, sampleRate: 48_000, channels: 2 },
-    } as const;
-    const engine = media();
-    const abort = new AbortController();
-    let abortedReads = 0;
-    const aborted = keyedWavSource(bytes, 'test:pcm-cache-aborted', (start, end) => {
-      abortedReads++;
-      abort.abort('stop before cache insertion');
-      return Promise.resolve(bytes.slice(start, end));
-    });
-    await expect(engine.convert(aborted, opts, { signal: abort.signal })).rejects.toMatchObject({
-      code: 'aborted',
-    });
-    await engine.convert(
-      keyedWavSource(bytes, 'test:pcm-cache-aborted', (start, end) => {
-        abortedReads++;
-        return Promise.resolve(bytes.slice(start, end));
-      }),
-      opts,
-    );
-
-    const failure = new Error('profiled range failure');
-    let failedReads = 0;
-    await expect(
-      engine.convert(
-        keyedWavSource(bytes, 'test:pcm-cache-failed', () => {
-          failedReads++;
-          return Promise.reject(failure);
-        }),
-        opts,
-      ),
-    ).rejects.toBe(failure);
-    await engine.convert(
-      keyedWavSource(bytes, 'test:pcm-cache-failed', (start, end) => {
-        failedReads++;
-        return Promise.resolve(bytes.slice(start, end));
-      }),
-      opts,
-    );
-
-    const malformed = bytes.slice();
-    malformed[0] = 0;
-    let malformedReads = 0;
-    await expect(
-      engine.convert(
-        keyedWavSource(malformed, 'test:pcm-cache-malformed', (start, end) => {
-          malformedReads++;
-          return Promise.resolve(malformed.slice(start, end));
-        }),
-        opts,
-      ),
-    ).rejects.toMatchObject({ code: 'unsupported-input' });
-    await engine.convert(
-      keyedWavSource(bytes, 'test:pcm-cache-malformed', (start, end) => {
-        malformedReads++;
-        return Promise.resolve(bytes.slice(start, end));
-      }),
-      opts,
-    );
-
-    expect(abortedReads).toBe(2);
-    expect(failedReads).toBe(2);
-    expect(malformedReads).toBe(2);
+    expect(firstReads).toBe(1);
+    expect(secondReads).toBe(1);
+    expect(second).not.toEqual(first);
+    expect(parseWavPcmData(second).data).toEqual(parseWavPcmData(secondInput).data);
   });
 
   it('converts little-endian WAV PCM to big-endian AIFF without changing samples', async () => {

@@ -149,6 +149,90 @@ export function queueIsBackpressured(queueSize: number, highWaterMark: number): 
   return queueSize >= highWaterMark;
 }
 
+interface PendingOutputWaiter {
+  resolve(): void;
+  reject(error: Error): void;
+  cleanup(): void;
+}
+
+/**
+ * Bounds submitted encoder frames by completed outputs instead of `VideoEncoder.encodeQueueSize`.
+ *
+ * Chromium's native `dequeue` signal can lag the actual encoder output callback enough to serialize an
+ * otherwise healthy pipeline. Output completion is the resource boundary that matters here: until an
+ * encoded chunk arrives, the encoder may still retain the submitted frame. This tracker therefore keeps
+ * that exact population bounded without allowing the native control queue to grow without limit.
+ *
+ * The class is WebCodecs-independent so its wakeup, abort, and terminal-error behavior is unit-tested in
+ * Node. Call {@link submitted} immediately before `encode()`, and {@link completed} once from the output
+ * callback (or if `encode()` throws synchronously).
+ */
+export class PendingOutputBackpressure {
+  readonly highWaterMark: number;
+  #pending = 0;
+  #terminalError: Error | undefined;
+  readonly #waiters = new Set<PendingOutputWaiter>();
+
+  constructor(highWaterMark: number) {
+    if (!(highWaterMark > 0)) {
+      throw new RangeError(`highWaterMark must be positive, got ${highWaterMark}`);
+    }
+    this.highWaterMark = highWaterMark;
+  }
+
+  get pending(): number {
+    return this.#pending;
+  }
+
+  submitted(): void {
+    if (this.#terminalError) throw this.#terminalError;
+    this.#pending++;
+  }
+
+  completed(): void {
+    if (this.#pending > 0) this.#pending--;
+    if (!queueIsBackpressured(this.#pending, this.highWaterMark)) {
+      for (const waiter of this.#waiters) waiter.resolve();
+      this.#waiters.clear();
+    }
+  }
+
+  waitForRoom(signal: AbortSignal | undefined): Promise<void> {
+    if (this.#terminalError) return Promise.reject(this.#terminalError);
+    if (signal?.aborted) {
+      return Promise.reject(new MediaError('aborted', 'operation aborted'));
+    }
+    if (!queueIsBackpressured(this.#pending, this.highWaterMark)) return Promise.resolve();
+
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        this.#waiters.delete(waiter);
+        waiter.reject(new MediaError('aborted', 'operation aborted'));
+      };
+      const cleanup = (): void => signal?.removeEventListener('abort', onAbort);
+      const waiter: PendingOutputWaiter = {
+        resolve: () => {
+          cleanup();
+          resolve();
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+        cleanup,
+      };
+      this.#waiters.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  fail(error: Error): void {
+    if (this.#terminalError === undefined) this.#terminalError = error;
+    for (const waiter of this.#waiters) waiter.reject(this.#terminalError);
+    this.#waiters.clear();
+  }
+}
+
 /**
  * `Transformer` plus the standard `cancel(reason)` hook (fired when the readable is cancelled — e.g. a
  * consumer `reader.cancel()`). The bundled `lib.dom` `Transformer` predates `cancel`, so we add it with a
@@ -744,7 +828,8 @@ function readDecoderAlpha(o: StageOptions | undefined): AlphaOption | undefined 
 
 // ── environment guards ───────────────────────────────────────────────────────────────────────────
 
-const HIGH_WATER_MARK = 16 as const; // pending decode/encode requests tolerated before we await `dequeue`
+const HIGH_WATER_MARK = 16 as const; // pending decoder requests tolerated before awaiting `dequeue`
+const ENCODER_OUTPUT_HIGH_WATER_MARK = 10 as const;
 
 function hasVideoDecoder(): boolean {
   return typeof VideoDecoder !== 'undefined';
@@ -1323,6 +1408,7 @@ function createVideoEncoder(
   let encoder: VideoEncoder | undefined;
   let frameIndex = 0;
   const rateControlWarmupTimestampsPending = new Set<number>();
+  const outputBackpressure = new PendingOutputBackpressure(ENCODER_OUTPUT_HIGH_WATER_MARK);
   let alignmentCanvas: OffscreenCanvas | undefined;
   const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(
     config,
@@ -1336,11 +1422,26 @@ function createVideoEncoder(
   // closes/cancels early (mux error, early-stop trim, abort) while the encoder is still draining.
   let closed = false;
 
-  const dispose = (): void => {
+  const dispose = (error = new MediaError('aborted', 'video encoder stream closed')): void => {
     closed = true;
+    outputBackpressure.fail(error);
     if (encoder && encoder.state !== 'closed') encoder.close(); // stop WebCodecs emitting
     alignmentCanvas = undefined;
     rateControlWarmupTimestampsPending.clear();
+  };
+
+  const submitEncode = (
+    frame: VideoFrame,
+    options: VideoEncoderEncodeOptionsWithCodecQuantizer,
+  ): void => {
+    if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
+    outputBackpressure.submitted();
+    try {
+      encoder.encode(frame, options);
+    } catch (error) {
+      outputBackpressure.completed();
+      throw error;
+    }
   };
 
   const transformer: TransformerWithCancel<RawFrame, EncodedChunk> = {
@@ -1348,13 +1449,15 @@ function createVideoEncoder(
       signal?.addEventListener(
         'abort',
         () => {
-          dispose();
-          controller.error(new MediaError('aborted', 'operation aborted'));
+          const error = new MediaError('aborted', 'operation aborted');
+          dispose(error);
+          controller.error(error);
         },
         { once: true },
       );
       encoder = new VideoEncoder({
         output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata): void => {
+          outputBackpressure.completed();
           // The encoder emits the decoder config (codec string + `description`) with (typically) the
           // first chunk; hand it to the muxer out-of-band, since the chunk stream is bytes-only.
           const decoderConfig = metadata?.decoderConfig;
@@ -1366,16 +1469,16 @@ function createVideoEncoder(
                   : decoderConfig,
               );
             } catch (error) {
-              dispose();
-              controller.error(
+              const mapped =
                 error instanceof MediaError
                   ? error
                   : new MediaError(
                       'encode-error',
                       `failed to align Apple H.264 visible width: ${describeError(error)}`,
                       error,
-                    ),
-              );
+                    );
+              dispose(mapped);
+              controller.error(mapped);
               return;
             }
           }
@@ -1387,8 +1490,9 @@ function createVideoEncoder(
           enqueueOrDrop(controller, chunk, () => closed);
         },
         error: (e: DOMException): void => {
-          dispose();
-          controller.error(new MediaError('encode-error', e.message, e));
+          const error = new MediaError('encode-error', e.message, e);
+          dispose(error);
+          controller.error(error);
         },
       });
       // Default to the hardware hint (this is the hardware-tier driver) unless the caller pinned one;
@@ -1411,7 +1515,7 @@ function createVideoEncoder(
       try {
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
-        await drainBelowHighWater(encoder, signal);
+        await outputBackpressure.waitForRoom(signal);
         if (alignHorizontalPhase) {
           if (frame.displayWidth !== config.width || frame.displayHeight !== config.height) {
             throw new MediaError(
@@ -1465,7 +1569,7 @@ function createVideoEncoder(
           for (let index = 0; index < timestamps.length; index++) {
             if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
             if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
-            await drainBelowHighWater(encoder, signal);
+            await outputBackpressure.waitForRoom(signal);
             const timestamp = timestamps[index];
             if (timestamp === undefined)
               throw new MediaError('encode-error', 'invalid warmup timeline');
@@ -1475,7 +1579,7 @@ function createVideoEncoder(
             });
             rateControlWarmupTimestampsPending.add(timestamp);
             try {
-              encoder.encode(
+              submitEncode(
                 warmupFrame,
                 videoEncodeOptions(index, undefined, config.codec, quantizer),
               );
@@ -1495,7 +1599,7 @@ function createVideoEncoder(
             durationUs: frame.duration,
             keyFrame,
           }) ?? quantizer;
-        encoder.encode(
+        submitEncode(
           encodeFrame,
           videoEncodeOptions(frameIndex, keyFrameInterval, config.codec, frameQuantizer),
         );
@@ -1509,8 +1613,9 @@ function createVideoEncoder(
       try {
         if (encoder && encoder.state === 'configured') await encoder.flush();
       } catch (e) {
-        dispose();
-        controller.error(new MediaError('encode-error', describeError(e), e));
+        const error = new MediaError('encode-error', describeError(e), e);
+        dispose(error);
+        controller.error(error);
         return;
       }
       closed = true; // the readable is about to close; reject any late `output` (none expected post-flush)

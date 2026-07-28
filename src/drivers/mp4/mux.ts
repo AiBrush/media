@@ -19,10 +19,11 @@ import { parseAv1Codec } from '../../codecs/wasm-av1/av1.ts';
 import { parseVpxCodec } from '../../codecs/wasm-vpx/vpx.ts';
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { positionedChunk } from '../../sinks/stream-target.ts';
 import { parseEsds } from './codec-strings.ts';
 import { fragmentMp4 } from './fragment.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
-import { type ContainerBrand, writeMp4 } from './write.ts';
+import { type ContainerBrand, planReservedMp4ByteStreamLayout, writeMp4 } from './write.ts';
 
 /** The MPEG 90 kHz media clock — the default video timescale (divides 24/25/30/50/60 fps exactly). */
 const DEFAULT_VIDEO_TIMESCALE = 90_000;
@@ -752,6 +753,62 @@ function recoverDurationsUs(chunks: readonly ChunkStruct[]): number[] {
 }
 
 /**
+ * Restore one source-timed access-unit interval when independently trimmed adjacent segments were
+ * concatenated by a caller that cannot retain a negative first DTS. That clamp creates a distinctive,
+ * lossless timing signature: one interval grows by X, the next shrinks by the same X, and the declared
+ * durations on both sides agree. Rebalancing only that complementary pair reconstructs the original
+ * continuous packet clock; unrelated VFR gaps and stale duration fields remain DTS-authoritative.
+ */
+function sourceTimedDurationsUs(
+  chunks: readonly ChunkStruct[],
+  fallbackDurationsUs: readonly number[],
+): number[] {
+  const durations = chunks.map((chunk, index) => {
+    const dts = chunk.dtsUs as number;
+    const nextDts = chunks[index + 1]?.dtsUs;
+    return nextDts !== undefined
+      ? Math.max(0, nextDts - dts)
+      : (fallbackDurationsUs[index] as number);
+  });
+  const toleranceUs = 2;
+  for (let index = 0; index + 2 < chunks.length; index++) {
+    const current = chunks[index] as ChunkStruct;
+    const seamFirst = chunks[index + 1] as ChunkStruct;
+    const following = chunks[index + 2] as ChunkStruct;
+    const currentDeclared = current.durationUs;
+    const seamDeclared = seamFirst.durationUs;
+    const followingDeclared = following.durationUs;
+    if (
+      currentDeclared === undefined ||
+      seamDeclared === undefined ||
+      followingDeclared === undefined ||
+      currentDeclared <= 0 ||
+      seamDeclared <= 0 ||
+      followingDeclared <= 0 ||
+      Math.abs(currentDeclared - followingDeclared) > toleranceUs
+    ) {
+      continue;
+    }
+    const currentGap = durations[index] as number;
+    const seamGap = durations[index + 1] as number;
+    const excessUs = currentGap - currentDeclared;
+    const deficitUs = followingDeclared - seamGap;
+    if (
+      excessUs <= toleranceUs ||
+      deficitUs <= toleranceUs ||
+      excessUs >= currentDeclared ||
+      Math.abs(seamDeclared - seamGap) > toleranceUs ||
+      Math.abs(excessUs - deficitUs) > toleranceUs
+    ) {
+      continue;
+    }
+    durations[index] = currentDeclared;
+    durations[index + 1] = followingDeclared;
+  }
+  return durations;
+}
+
+/**
  * Convert buffered chunk-structs (decode order) into {@link MuxSampleInput}s with correct B-frame timing.
  *
  * The DTS timeline is the cumulative sum of durations in decode order. For monotonic encoder output,
@@ -793,12 +850,12 @@ export function buildMuxSamples(
   // decode timeline 1:1 — preserving the original B-frame/open-GOP structure losslessly (ADR-045). The
   // chunks arrive in decode order, so DTS is monotonic and every gap is ≥ 0.
   if (chunks.every((c) => c.dtsUs !== undefined)) {
+    const sourceDurationsUs = sourceTimedDurationsUs(chunks, durationsUs);
     const out: MuxSampleInput[] = [];
     for (let i = 0; i < n; i++) {
       const c = chunks[i] as ChunkStruct;
       const dts = c.dtsUs as number;
-      const next = chunks[i + 1]?.dtsUs;
-      const durUs = next !== undefined ? Math.max(0, next - dts) : (durationsUs[i] as number);
+      const durUs = sourceDurationsUs[i] as number;
       out.push({
         data: c.data,
         durationTicks: ticks(durUs, timescale),
@@ -840,10 +897,97 @@ export interface TrackState {
   readonly width: number | undefined;
   readonly height: number | undefined;
   readonly rotation: number | undefined;
+  readonly colr: MuxTrackInput['colr'];
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
   readonly gapless: TrackInfo['gapless'];
   readonly chunks: ChunkStruct[];
+}
+
+function mp4GaplessFromTrack(
+  info: TrackInfo,
+  sampleRate: number | undefined,
+  config: ConfigKind,
+): TrackInfo['gapless'] {
+  if (info.gapless !== undefined) return info.gapless;
+  if (
+    info.mediaType !== 'audio' ||
+    config.kind !== 'esds-from-description' ||
+    sampleRate === undefined ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    info.codecDelayNs === undefined ||
+    !Number.isFinite(info.codecDelayNs) ||
+    info.codecDelayNs <= 0
+  ) {
+    return undefined;
+  }
+  const leadingSamples = Math.round((info.codecDelayNs * sampleRate) / 1_000_000_000);
+  return Number.isSafeInteger(leadingSamples) && leadingSamples > 0
+    ? { leadingSamples }
+    : undefined;
+}
+
+/** Codec priming is not a negative program origin when comparing source-timed track starts. */
+export function trackPresentationDelayUs(track: TrackState): number {
+  const leadingSamples = track.gapless?.leadingSamples;
+  const sampleRate = track.sampleRate;
+  if (
+    track.mediaType !== 'audio' ||
+    track.sampleEntryType !== 'mp4a' ||
+    leadingSamples === undefined ||
+    !Number.isFinite(leadingSamples) ||
+    leadingSamples <= 0 ||
+    sampleRate === undefined ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0
+  ) {
+    return 0;
+  }
+  return (leadingSamples * MICROS_PER_SECOND) / sampleRate;
+}
+
+function h273CodePoint(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isInteger(value) && value >= 0 && value <= 0xffff
+    ? value
+    : undefined;
+}
+
+/**
+ * Translate exact container-neutral H.273 facts into an ISO-BMFF `colr` declaration. Matroska and
+ * nclc/nclx use the same numeric primaries/transfer/matrix code points, so known values cross the
+ * container boundary losslessly. Missing fields become H.273 "unspecified" (2), never a guessed colour
+ * space. Only Matroska range values 1/2 have an exact nclx flag representation; otherwise nclc retains
+ * the three colour code points without asserting a range that the source did not declare.
+ */
+function mp4ColrFromTrackColor(color: TrackInfo['color']): MuxTrackInput['colr'] {
+  if (color === undefined) return undefined;
+  const primaries = h273CodePoint(color.primaries);
+  const transfer = h273CodePoint(color.transferCharacteristics);
+  const matrix = h273CodePoint(color.matrixCoefficients);
+  const exactRange = color.range === 1 || color.range === 2 ? color.range : undefined;
+  if (
+    primaries === undefined &&
+    transfer === undefined &&
+    matrix === undefined &&
+    exactRange === undefined
+  ) {
+    return undefined;
+  }
+  return exactRange === undefined
+    ? {
+        colourType: 'nclc',
+        primaries: primaries ?? 2,
+        transfer: transfer ?? 2,
+        matrix: matrix ?? 2,
+      }
+    : {
+        colourType: 'nclx',
+        primaries: primaries ?? 2,
+        transfer: transfer ?? 2,
+        matrix: matrix ?? 2,
+        fullRange: exactRange === 2,
+      };
 }
 
 /** Resolve geometry/config fields from a track's WebCodecs `DecoderConfig` (narrowed by `mediaType`). */
@@ -865,6 +1009,7 @@ export function trackStateFrom(info: TrackInfo): TrackState {
       width: vc?.codedWidth,
       height: vc?.codedHeight,
       rotation: info.rotation,
+      colr: mp4ColrFromTrackColor(info.color),
       sampleRate: undefined,
       channels: undefined,
       gapless: undefined,
@@ -884,9 +1029,10 @@ export function trackStateFrom(info: TrackInfo): TrackState {
     width: undefined,
     height: undefined,
     rotation: undefined,
+    colr: undefined,
     sampleRate,
     channels: ac?.numberOfChannels,
-    gapless: info.gapless,
+    gapless: mp4GaplessFromTrack(info, sampleRate, config),
     chunks: [],
   };
 }
@@ -916,28 +1062,53 @@ function clampSamplesToDuration(
 }
 
 function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): GaplessMuxLayout {
-  const totalSamples = t.gapless?.totalSamples;
   const sampleRate = t.sampleRate ?? t.timescale;
   if (
     t.mediaType !== 'audio' ||
     t.sampleEntryType !== 'mp4a' ||
-    totalSamples === undefined ||
-    !Number.isFinite(totalSamples) ||
-    totalSamples <= 0 ||
+    t.gapless === undefined ||
     sampleRate <= 0
   ) {
     return { samples: [...samples] };
   }
 
   const rawDurationTicks = samples.reduce((total, sample) => total + sample.durationTicks, 0);
+  const leadingSamples =
+    t.gapless.leadingSamples !== undefined &&
+    Number.isFinite(t.gapless.leadingSamples) &&
+    t.gapless.leadingSamples > 0
+      ? t.gapless.leadingSamples
+      : undefined;
+  const trailingSamples =
+    t.gapless.trailingSamples !== undefined &&
+    Number.isFinite(t.gapless.trailingSamples) &&
+    t.gapless.trailingSamples > 0
+      ? t.gapless.trailingSamples
+      : undefined;
+  const declaredTotalSamples =
+    t.gapless.totalSamples !== undefined &&
+    Number.isFinite(t.gapless.totalSamples) &&
+    t.gapless.totalSamples > 0
+      ? t.gapless.totalSamples
+      : undefined;
+  const rawDecodedSamples = Math.round((rawDurationTicks * sampleRate) / t.timescale);
+  const totalSamples =
+    declaredTotalSamples ??
+    (leadingSamples !== undefined || trailingSamples !== undefined
+      ? rawDecodedSamples - (leadingSamples ?? 0) - (trailingSamples ?? 0)
+      : undefined);
+  if (totalSamples === undefined || !Number.isFinite(totalSamples) || totalSamples <= 0) {
+    return { samples: [...samples] };
+  }
   const durationTicks = Math.round((totalSamples * t.timescale) / sampleRate);
   if (durationTicks <= 0 || durationTicks > rawDurationTicks) return { samples: [...samples] };
 
-  const leadingSamples = t.gapless?.leadingSamples;
   const requestedMediaTime =
-    leadingSamples !== undefined && Number.isFinite(leadingSamples) && leadingSamples > 0
+    leadingSamples !== undefined
       ? Math.round((leadingSamples * t.timescale) / sampleRate)
-      : rawDurationTicks - durationTicks;
+      : trailingSamples !== undefined
+        ? 0
+        : rawDurationTicks - durationTicks;
   const maxMediaTime = rawDurationTicks - durationTicks;
   const mediaTimeTicks = Math.min(Math.max(0, requestedMediaTime), maxMediaTime);
   const targetDurationTicks = mediaTimeTicks + durationTicks;
@@ -976,6 +1147,7 @@ export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
     ...(t.width !== undefined ? { width: t.width } : {}),
     ...(t.height !== undefined ? { height: t.height } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
+    ...(t.colr !== undefined ? { colr: t.colr } : {}),
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
     ...(muxEdit !== undefined ? { edit: muxEdit } : {}),
@@ -1012,7 +1184,8 @@ export class Mp4Muxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
 
   readonly #tracks = new Map<number, TrackState>();
-  readonly #faststart: boolean;
+  readonly #faststart: boolean | 'reserve';
+  readonly #maximumPacketCount: number | undefined;
   readonly #fragmented: boolean;
   readonly #brand: ContainerBrand;
   #nextId = 1;
@@ -1026,6 +1199,26 @@ export class Mp4Muxer implements Muxer {
     // via {@link fragmentMp4}, instead of the single faststart `moov`+`mdat` from {@link writeMp4}.
     this.#fragmented = options?.fragmented === true;
     this.#faststart = options?.faststart ?? true;
+    this.#maximumPacketCount = options?.maximumPacketCount;
+    if (this.#faststart === 'reserve') {
+      if (!Number.isSafeInteger(this.#maximumPacketCount) || (this.#maximumPacketCount ?? 0) < 1) {
+        throw new MediaError(
+          'mux-error',
+          "MP4 faststart:'reserve' requires a positive integer maximumPacketCount",
+        );
+      }
+      if (this.#fragmented) {
+        throw new MediaError(
+          'mux-error',
+          "MP4 faststart:'reserve' cannot be combined with fragmented output",
+        );
+      }
+    } else if (this.#maximumPacketCount !== undefined) {
+      throw new MediaError(
+        'mux-error',
+        "MP4 maximumPacketCount is valid only with faststart:'reserve'",
+      );
+    }
     this.#brand = options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
@@ -1076,6 +1269,15 @@ export class Mp4Muxer implements Muxer {
     if (track === undefined) {
       throw new MediaError('mux-error', `write to unknown track ${trackId}`);
     }
+    if (
+      this.#faststart === 'reserve' &&
+      track.chunks.length >= (this.#maximumPacketCount as number)
+    ) {
+      throw new MediaError(
+        'mux-error',
+        `[MP4_FASTSTART_RESERVE_PACKET_OVERFLOW] track ${trackId} exceeds maximumPacketCount ${this.#maximumPacketCount}`,
+      );
+    }
     track.chunks.push(chunk);
   }
 
@@ -1089,6 +1291,19 @@ export class Mp4Muxer implements Muxer {
       if (this.#fragmented) {
         // Stream the init segment then one media segment per fragment (bounded memory, ADR-034).
         for (const segment of fragmentMp4(tracks)) controller.enqueue(segment);
+      } else if (this.#faststart === 'reserve') {
+        const maximumPacketCount = this.#maximumPacketCount as number;
+        const layout = planReservedMp4ByteStreamLayout(tracks, maximumPacketCount, {
+          brand: this.#brand,
+        });
+        controller.enqueue(layout.ftyp);
+        controller.enqueue(positionedChunk(layout.mdatHeader, layout.mdatPosition));
+        for (const track of tracks) {
+          for (const sample of track.samples) {
+            if (sample.data.byteLength > 0) controller.enqueue(sample.data);
+          }
+        }
+        controller.enqueue(positionedChunk(layout.moovPatch, layout.reservationPosition));
       } else {
         controller.enqueue(writeMp4(tracks, { faststart: this.#faststart, brand: this.#brand }));
       }
@@ -1110,8 +1325,12 @@ export class Mp4Muxer implements Muxer {
     let globalPresentationOriginUs = Number.POSITIVE_INFINITY;
     if (sourceTimed) {
       for (const track of this.#tracks.values()) {
+        const presentationDelayUs = trackPresentationDelayUs(track);
         for (const chunk of track.chunks) {
-          globalPresentationOriginUs = Math.min(globalPresentationOriginUs, chunk.timestampUs);
+          globalPresentationOriginUs = Math.min(
+            globalPresentationOriginUs,
+            chunk.timestampUs + presentationDelayUs,
+          );
         }
       }
     }

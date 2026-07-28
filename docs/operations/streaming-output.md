@@ -21,9 +21,10 @@ Sinks fall into two classes:
   defeat a streaming producer whose entire point is bounded memory.
 - **Streaming sinks** write each produced chunk straight to a caller-owned destination as it is
   produced, so peak memory stays at one chunk regardless of total output size: `toStreamTarget()` over
-  a `WritableStream`/callback (`src/sinks/stream-target.ts:17`), the OPFS path (`toOPFS()`
-  `src/sinks/sink.ts:43`; the richer `toOpfsTarget()` `src/sinks/opfs-target.ts:54`), and the media
-  element MSE path (`toElement(el, { via: 'mse' | 'stream' })` `src/sinks/sink.ts:47`).
+  a `WritableStream`/callback (`src/sinks/stream-target.ts:17`), the public OPFS path (`toOPFS()`
+  `src/sinks/sink.ts:43`; backed by the richer internal `OpfsTarget` descriptor in
+  `src/sinks/opfs-target.ts:54`), and the media element MSE path
+  (`toElement(el, { via: 'mse' | 'stream' })` `src/sinks/sink.ts:47`).
 
 This shard serves the **`streaming-output`** benchmark family (`../media-test/src/scenarios/streaming-output/`).
 That family measures, per case, `bytesOut`, `peakMemory` (the buffer-vs-stream discriminator),
@@ -82,10 +83,14 @@ export type StreamTargetChunk = {
   data: Uint8Array<ArrayBuffer>;
   position: number;
 };
-export type StreamTargetOptions = { chunked?: boolean; chunkSize?: number };
+export type StreamTargetOptions = {
+  chunked?: boolean;
+  chunkSize?: number;
+  writeChunkBytes?: number;
+};
 ```
 
-Three properties matter for our design:
+Four properties matter for our design:
 
 1. **Position is the producer's intended byte offset, not a running append counter.** mediabunny's docs
    are explicit: *"some byte regions in the output file may be written to multiple times"* — the muxer
@@ -95,11 +100,13 @@ Three properties matter for our design:
    frequency — a knob trading peak memory for fewer `targetWrites`.
 3. **Backpressure** is native: it checks `desiredSize <= 0` and awaits the writer's `ready`, which
    propagates through the `Output` to throttle the encoders.
+4. **Exact transport writes are a separate contract from coalescing.** `writeChunkBytes` reshapes
+   arbitrary producer chunks into strictly fixed-size awaited writes. It rejects a short final run
+   instead of weakening the promise; this is what makes packet-aligned transports such as 188-byte
+   MPEG-TS observable and testable.
 
-Our design must **match** #3 (we do, via `pipeTo`/awaited callback — §3) and **beat** the ergonomics by
-never making the developer name a backend; it must **close the gap** on #1 (today our position is a
-materializer-side running counter, so we are append-only by construction — §4/§5) and should **adopt**
-#2 as an explicit option rather than leaving write-coalescing to the caller.
+Our design matches #1–#3 and adds #4 while keeping the ergonomics backend-free: the caller provides a
+`WritableStream` or callback, and the descriptor selects raw, coalesced, or exact-sized writes.
 
 ## 3. Target design
 
@@ -152,8 +159,8 @@ Where a sink *does* touch a platform capability it must **fail loudly with a typ
 silently downgrade:
 
 - OPFS absent (`navigator.storage.getDirectory` missing) ⇒ `CapabilityError('capability-miss', …)`
-  (`src/sinks/opfs-target.ts:167`; the basic path throws `InputError('unsupported-input')`
-  at `src/sinks/materialize.ts:57`, which §5 harmonizes).
+  from the shared OPFS materializer. The public `toOPFS()` descriptor and internal rich `OpfsTarget`
+  descriptor deliberately route through the same seam and therefore have identical miss behavior.
 - MSE absent / MIME unsupported / `srcObject` MediaProvider unsupported ⇒ typed `CapabilityError` via
   `elementCapability(...)` (`src/sinks/element-materialize.ts:514`); it must **not** fall back to a
   whole-file Blob (silent buffering would defeat the streaming request — measured-evidence.md session12-element-sinks).
@@ -161,13 +168,14 @@ silently downgrade:
   (`src/sinks/stream-target-materialize.ts:41`).
 
 **Bounded-memory invariant (the family's whole point):** a streaming sink only delivers bounded peak
-memory when paired with a *streaming-capable muxer*. Fragmented/CMAF MP4 (init segment, then `moof`+`mdat`
-per keyframe run) is required because a non-fragmented MP4's `moov` sample tables name absolute byte
-offsets and therefore force the whole file to buffer (ADR-034, measured-evidence.md). Fragmented WebM uses the
-EBML unknown-size `Segment` with live top-level `Cluster`s, split only on video keyframes (ADR-091,
-measured-evidence.md). A `StreamTarget` wrapped around a faststart non-fragmented muxer still buffers upstream —
-the sink cannot fix a producer that emits everything at `finalize()`. This is documented, not enforced,
-and §5 adds the assertion.
+memory when paired with a *streaming-capable muxer*. Fragmented/CMAF MP4 emits an init segment followed
+by `moof`+`mdat` runs. Non-fragmented MP4/MOV can instead use `faststart:'reserve'`: the writer reserves
+a bounded `moov` region from the caller's per-track `maximumPacketCount`, writes `mdat` payload forward,
+then patches `moov` plus a valid `free` remainder into the reserved range through a positioned sink.
+Ordinary in-memory faststart still buffers upstream and is intentionally a different mode. Live WebM
+uses an unknown-size EBML `Segment`; finite WebM remux precomputes a definite Segment size from packet
+metadata and streams contiguous clusters. These are producer guarantees—the sink never pretends an
+upstream whole-file buffer is streaming.
 
 ### 3.3 Edge cases
 
@@ -183,14 +191,11 @@ and §5 adds the assertion.
   assuming a fixed fps (`src/api/streaming-webm-remux.ts:366`), and by choosing fragment boundaries on
   keyframes/block-count caps, never on a frame-rate assumption (ADR-091, measured-evidence.md). The byte sinks
   themselves are duration-agnostic.
-- **Seek.** Streaming *output* is forward-only append; seeking is an *input* concern (S10). The one
-  place a sink seeks is a **positioned write** — patching an earlier byte region (e.g. writing `moov`
-  after `mdat` for a faststart layout). `OpfsTarget` supports this via `position` + `keepExistingData`
-  and `writable.seek(startPosition)` (`src/sinks/opfs-target.ts:187`,
-  `src/sinks/opfs-target.ts:118`). The append-only `WritableStream`/callback arm does **not** — its
-  `position` is a running counter, so it can stream a fragmented format but cannot patch a faststart
-  one. §5 item 2 elevates `position` to a real offset so a random-access `WritableStream` (a seekable
-  OPFS file) can receive out-of-order writes, matching the exemplar.
+- **Seek / positioned writes.** Ordinary output is append-only, but reserved faststart must patch an
+  earlier byte region after streaming `mdat`. Producers tag such chunks with their intended offset.
+  A callback receives that offset verbatim; `OpfsTarget` and seekable writable destinations perform an
+  explicit positioned write; an append-only `WritableStream` rejects a discontinuity with a typed
+  `CapabilityError`. Untagged chunks retain the common `position == Σ previous lengths` behavior.
 - **Cancel.** Every sink must cancel the source reader *and* abort the destination, and surface a typed
   `MediaError('aborted', …)`:
   - `WritableStream` arm: `runToSink` aborts both source and sink on a pre-aborted signal and pipes with
@@ -220,8 +225,9 @@ and §5 adds the assertion.
 
 ## 4. Current state
 
-What exists today, with precise citations. The streaming-sink *machinery* is largely SOTA; the
-problems are **wiring gaps**, **an orphaned module**, and **one layering leak**.
+What exists today, with precise citations. The streaming-sink machinery is position-aware,
+backpressured, and reachable from the public API; remaining work is primarily architectural cleanup
+outside the benchmark contract.
 
 **Descriptor + materializer (good).** `src/sinks/sink.ts` owns the union and lazy loader
 (`sink.ts:10`, `sink.ts:55`); `src/sinks/materialize.ts` owns the exhaustive `switch` with
@@ -231,26 +237,21 @@ via `writeOpfs` → `runToSink` (`materialize.ts:29`, `materialize.ts:69`); `str
 `writeToStreamTarget` (`materialize.ts:43`); `element` lazy-loads `writeElement` and cancels an unlocked
 stream on failure (`materialize.ts:32`).
 
-**`StreamTarget` (good, but append-only).** `src/sinks/stream-target.ts` owns the descriptor +
-constructor + a lazy wrapper that maps any failure to a typed `MediaError` and cancels the unlocked
-stream (`stream-target.ts:22`). `src/sinks/stream-target-materialize.ts` owns the drain: feature-detect
-`WritableStream` vs callback (`stream-target-materialize.ts:23`), native `pipeTo` for the former
-(tagged `errorCode: 'mux-error'`, `stream-target-materialize.ts:123`), a cancellable pull loop for the
-latter (`stream-target-materialize.ts:77`). **Smell:** the callback `position` is a materializer-side
-running counter — `position += value.byteLength` (`stream-target-materialize.ts:93`) — so this sink is
-**append-only by construction** and cannot express the exemplar's re-write-a-region semantics.
+**`StreamTarget` (position-aware and backpressured).** `src/sinks/stream-target.ts` owns the descriptor,
+producer-position tag, pure write plan, and lazy wrapper. `src/sinks/stream-target-materialize.ts` owns
+the common positioned pump and destination-specific emitters. Callbacks receive producer-intended
+positions verbatim; seekable writables receive explicit positioned writes; append-only writables reject
+non-contiguous output with a typed `CapabilityError`. The same pump provides optional bounded
+coalescing and strict fixed-size writes without allowing more than one outstanding destination write.
 
-**`OpfsTarget` is ORPHANED (dead code).** `src/sinks/opfs-target.ts` is a fully-built, well-factored
-streaming OPFS sink — pure `parseOpfsPath`/`planOpfsWrite` core (`opfs-target.ts:75`,
-`opfs-target.ts:118`) + a guarded browser seam with `seek`/`keepExistingData`/`position` and
-abort-on-failure (`opfs-target.ts:159`), plus an `isOpfsAvailable()` probe (`opfs-target.ts:146`). But
-`{ kind: 'opfs-target' }` is **not a member of the `Sink` union** (`sink.ts:10`), `materialize.ts`
-never routes it, and nothing imports `toOpfsTarget`/`writeToOpfsTarget`/`OpfsTarget` outside its own
-test. Verified: `grep -rn 'toOpfsTarget|OpfsTarget|writeToOpfsTarget' src/` matches only
-`opfs-target.ts` and `opfs-target.test.ts`. Meanwhile the *live* OPFS path is the weaker basic
-`opfs` sink (`materialize.ts:51`) that lacks `keepExistingData`/`position`/`seek` and throws
-`InputError` (not `CapabilityError`) when OPFS is absent (`materialize.ts:57`). This is the single
-biggest defect in the shard: the good implementation is unreachable and the reachable one is inferior.
+**`OpfsTarget` (wired and shared).** `src/sinks/opfs-target.ts` owns the advanced descriptor and pure
+`parseOpfsPath`/`planOpfsWrite` core; `opfs-target-materialize.ts` owns the guarded browser seam with
+`seek`/`keepExistingData`/`position` and abort-on-failure. `OpfsTarget` is a member of `Sink`,
+`materialize` routes it, and the default entry exports the compact `toOPFS()` constructor, which
+delegates to the same writer with replace-file semantics. The richer source-level constructor stays
+off the eager default entry so ordinary imports do not carry its planning code. Product tests drive
+the shared materializer through directory creation, `createWritable({keepExistingData:true})`, and a
+nonzero positioned write.
 
 **Element/MSE sink (good, with module-global state).** `src/sinks/element-materialize.ts` is a large
 (529-line) but cohesive module: blob-URL whole-file, and MSE/`srcObject` streaming with a proper
@@ -285,28 +286,15 @@ cannot delay cancellation. Correct, but a magic one-task deadline that deserves 
 
 Ordered, each with a concrete acceptance test / oracle.
 
-1. **Wire `OpfsTarget` into the `Sink` union and delete the redundant basic `opfs` path — or make
-   `opfs` delegate to it.** Add `OpfsTarget` to `Sink` (`src/sinks/sink.ts:10`), add a
-   `case 'opfs-target':` to the materializer `switch` calling `writeToOpfsTarget`
-   (`src/sinks/materialize.ts:17`), and re-export `toOpfsTarget` from `src/index.ts` next to
-   `toStreamTarget` (`src/index.ts:64`). Re-point the basic `opfs` case (`materialize.ts:29`) at the
-   same `writeToOpfsTarget` so there is one OPFS drain.
-   *Acceptance:* `grep -rn 'toOpfsTarget|writeToOpfsTarget' src/` shows a call site outside
-   `opfs-target.ts`/tests; a test constructs `toOpfsTarget('/a/b/out.mp4', { keepExistingData: true,
-   position: N })`, runs it through `materialize`, and the mocked `FileSystemWritableFileStream` records
-   `createWritable({ keepExistingData: true })` and `seek(N)` (asserting `opfs-target.ts:186`–`187`
-   actually run via the public path); a coverage check fails if `opfs-target.ts` has zero non-test
-   importers.
+1. **Implemented: one reachable OPFS drain.** `OpfsTarget` is in the `Sink` union and both OPFS
+   descriptors route through `writeToOpfsTarget`; the default entry exports `toOPFS()` while keeping
+   the richer constructor behind the internal lazy materializer boundary. Tests record
+   `createWritable({keepExistingData:true})`, `seek(N)`, and verify the public compact descriptor and
+   rich internal descriptor share the same writer.
 
-2. **Make the streaming `position` the producer's intended byte offset, not a running counter.** Change
-   the drain so the muxer supplies each chunk's target `position` (a `{ data, position }` pair,
-   mirroring mediabunny's `StreamTargetChunk`) instead of deriving it from `position += value.byteLength`
-   (`src/sinks/stream-target-materialize.ts:93`). For the `WritableStream` arm, use a seekable write
-   (OPFS `seek`) when the destination is random-access, and keep `pipeTo` for append-only.
-   *Acceptance:* a test whose producer emits chunks with non-monotonic positions (write region B, then
-   re-write region A) is delivered to a fake destination in the producer's order with correct offsets;
-   the current append-only code fails this test (the byte at A would land at the wrong offset), the new
-   code passes. Append-only producers still see `position == Σ previous lengths`.
+2. **Implemented: producer-intended positions.** `positionedChunk` tags producer offsets without
+   copying payload; the common pump preserves them for callback/seekable destinations and rejects
+   impossible append-only rewrites. Tests cover non-monotonic patches and contiguous append output.
 
 3. **Remove the driver leak from `streaming-webm-remux.ts`.** Obtain the streaming muxer through the
    driver/registry contract (a `container.streamingMux(...)` capability) rather than
@@ -318,40 +306,23 @@ Ordered, each with a concrete acceptance test / oracle.
    `streaming-output` WebM-live oracle (`webm-live-layout`) stays green; a second streaming container
    (e.g. fragmented MP4) can be added without editing this file.
 
-4. **Enforce the bounded-memory invariant instead of only documenting it.** When a `StreamTarget`/
-   `OpfsTarget` is paired with a non-streaming (faststart, non-fragmented) muxer, either auto-select a
-   streaming muxer or raise a typed `CapabilityError` — never silently buffer the whole file behind a
-   streaming descriptor.
-   *Acceptance:* the `peakMemory` metric for a `target:'stream'` case stays within one-fragment bounds
-   (does not scale with output size) in `../media-test/src/scenarios/streaming-output/` at two sizes;
-   a case that requests `target:'stream'` with an explicitly non-fragmented MP4 either succeeds with
-   bounded `peakMemory` or fails with a `capability-miss`, asserted by an oracle — it must not pass with
-   `peakMemory ≈ bytesOut`.
+4. **Implemented for progressive MP4/MOV: reserved faststart.** `faststart:'reserve'` requires a
+   positive per-track `maximumPacketCount` and a positioned callback/seekable/OPFS sink before input is
+   pulled. It emits `ftyp`, jumps forward to stream `mdat`, then patches a bounded `moov`+`free` region.
+   Packet-ceiling overflow is a stable typed failure; buffer and append-only sinks are rejected instead
+   of silently materializing. Fragmented MP4 remains the append-only streaming choice.
 
-5. **Expose a first-byte / write hook so TTFB and `targetWrites` are measurable through the public
-   sink.** The callback arm already receives `(chunk, position)` per write
-   (`src/sinks/stream-target-materialize.ts:92`); guarantee the first invocation happens at the first
-   produced chunk (not at finalize) and document it as the TTFB signal the harness reads.
-   *Acceptance:* `../media-test/src/scenarios/streaming-output/ttfb.ts` reports
-   `mp4_ttfb_streaming_target.timeToFirstByte` markedly below `mp4_ttfb_buffer_target.timeToFirstByte`
-   on the same asset, and a unit test asserts the `StreamTargetWriter` fires before the source stream
-   completes; both cases still pass the reference-reimport correctness oracle (a fast-but-wrong output
-   cannot win the crown, per `ttfb.ts:1`).
+5. **Implemented: first-byte/write hook.** The callback receives `(chunk, position)` as soon as the
+   first producer chunk exists, providing the TTFB and write-count signal without waiting for finalize.
+   Unit and exhaustive browser oracles re-import the result before accepting the measurement.
 
-6. **Harmonize the "OPFS unavailable" error type.** The basic path throws
-   `InputError('unsupported-input')` (`src/sinks/materialize.ts:57`) while the streaming path throws
-   `CapabilityError('capability-miss')` (`src/sinks/opfs-target.ts:167`). OPFS-absent is a capability
-   miss, not bad input.
-   *Acceptance:* a test running any OPFS sink in an environment without `navigator.storage.getDirectory`
-   asserts the thrown error `instanceof CapabilityError` with code `capability-miss`; both paths agree.
+6. **Implemented: one OPFS capability error.** Both public descriptors use the same materializer and
+   report OPFS absence as `CapabilityError('capability-miss')`.
 
-7. **Add `chunked`/`chunkSize` write-coalescing to `StreamTarget`.** Mirror mediabunny's
-   `StreamTargetOptions` so a caller can trade a bounded amount of memory for fewer `targetWrites`
-   (default off; default `chunkSize` 16 MiB when on), coalescing in the drain
-   (`src/sinks/stream-target-materialize.ts:77`/`:113`).
-   *Acceptance:* with `chunked: true, chunkSize: 2**20`, a streaming-output case's `targetWrites`
-   drops sharply versus unchunked while `bytesOut` and the byte-validity oracle are unchanged, and
-   `peakMemory` stays ≤ `chunkSize + one fragment`.
+7. **Implemented: write shaping on `StreamTarget`.** `chunked`/`chunkSize` provides bounded
+   coalescing (default off; default 16 MiB), while `writeChunkBytes` provides a distinct strict
+   fixed-write contract. Product tests cover byte identity, write counts and positions, oversized
+   producer chunks, one-at-a-time backpressure, append-only writables, and typed partial-run rejection.
 
 8. **Record the module-global element-session state as an ADR (or scope it).** The two `WeakMap`s
    (`src/sinks/element-materialize.ts:49`–`:50`) are module-global mutable singletons. Either document
@@ -371,34 +342,22 @@ Ordered, each with a concrete acceptance test / oracle.
 
 Each seeds a decision record in `docs/decisions/`.
 
-1. **Positioned vs append-only StreamTarget (delta #2).** Should the public `StreamTargetWriter`
-   signature change from `(chunk, position)` with a derived position to a `{ data, position }` chunk
-   with a producer-supplied position (mediabunny parity), and does any first-party producer besides a
-   faststart layout actually re-write byte regions? If nothing patches, append-only may be the correct
-   simpler contract and mediabunny's positioning is over-general for us. Decide and log.
-
-2. **Streaming-muxer capability in the driver contract (delta #3).** What is the exact registry seam —
+1. **Streaming-muxer capability in the driver contract (delta #3).** What is the exact registry seam —
    a `ContainerDriver.streamingMux()` returning a `WebmStreamingMuxer`-shaped sink, or a generic
    `chunkMux` the remux runner already probes (`containerHasChunkMuxer`,
    `src/api/remux-runner.ts:252`)? Reconcile with S14 (mux) so `streaming-webm-remux.ts` and the
    MP4/MPEG-TS streaming paths share one contract.
 
-3. **Enforcement vs documentation of the bounded-memory invariant (delta #4).** Auto-upgrade a
-   faststart request to fragmented when a streaming sink is attached, or hard-fail with
-   `CapabilityError`? Auto-upgrade is friendlier but silently changes the output layout (breaks a
-   caller who wanted a single non-fragmented file); failing is honest but noisier. Log the chosen
-   policy and its oracle.
-
-4. **`chunked` default (delta #7).** Off by default (lowest latency/TTFB, most writes) matches the
+2. **`chunked` default (delta #7).** Off by default (lowest latency/TTFB, most writes) matches the
    family's headline metric, but a network `WritableStream` upload usually wants coalescing. Should the
    default depend on the destination kind (append-only network body ⇒ chunk; seekable OPFS ⇒ raw)?
 
-5. **Element/MSE cross-browser playback (delta #8).** The MSE sink's playback has never been verified
+3. **Element/MSE cross-browser playback (delta #8).** The MSE sink's playback has never been verified
    in a real browser — it was validated against deterministic event doubles only (measured-evidence.md
    session12-element-sinks). This is an explicit parent-session browser gate, not a claim; log it as an
    open verification item with the exact assets/MIME types to test.
 
-6. **`deferred-stream-cleanup` one-task deadline (`src/api/deferred-stream-cleanup.ts:28`).** Is a
+4. **`deferred-stream-cleanup` one-task deadline (`src/api/deferred-stream-cleanup.ts:28`).** Is a
    single `setTimeout(0)` macrotask the right bound for claiming an already-produced frame before
    cancel, or should it be a microtask/`queueMicrotask` (tighter) or a configurable budget? Record the
    rationale for the current value.

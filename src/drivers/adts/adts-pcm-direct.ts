@@ -1,6 +1,7 @@
 import { loadAacCore } from '../../codecs/wasm-aac/wasm-aac-driver.ts';
 import type { PcmTransform } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
+import { roundHalfToEven } from '../../dsp/pcm.ts';
 import { writeWavHeader } from '../wav/pcm.ts';
 import type { AdtsLayout, AdtsPacket } from './adts-driver.ts';
 
@@ -15,6 +16,7 @@ function hasPcmDomainWork(o: PcmTransform | undefined): boolean {
   return (
     o?.gainDb !== undefined ||
     o?.fade !== undefined ||
+    o?.mixMatrix !== undefined ||
     o?.dynamics !== undefined ||
     o?.biquad !== undefined ||
     o?.timeBounds !== undefined
@@ -53,7 +55,7 @@ function errMessage(e: unknown): string {
 }
 
 function s16FromUnitFloat(x: number): number {
-  const v = Math.round(x * 32768);
+  const v = roundHalfToEven(x * 32768);
   if (v < -32768) return -32768;
   if (v > 32767) return 32767;
   return v;

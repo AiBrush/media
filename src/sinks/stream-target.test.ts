@@ -527,7 +527,7 @@ describe('first-write timing — the TTFB signal (doc 09 §5 item 5)', () => {
   });
 });
 
-describe('planStreamTargetWrite — chunked coalescing options (doc 09 §5 item 7)', () => {
+describe('planStreamTargetWrite — write-shaping options', () => {
   it('defaults to unchunked; chunked defaults chunkSize to 16 MiB', () => {
     expect(planStreamTargetWrite(toStreamTarget(() => undefined))).toEqual({
       chunked: false,
@@ -548,6 +548,117 @@ describe('planStreamTargetWrite — chunked coalescing options (doc 09 §5 item 
         planStreamTargetWrite(toStreamTarget(() => undefined, { chunked: true, chunkSize })),
       ).toThrowError(InputError);
     }
+  });
+
+  it('resolves and validates strict exact-write sizing independently from coalescing', () => {
+    expect(
+      planStreamTargetWrite(toStreamTarget(() => undefined, { writeChunkBytes: 188 })),
+    ).toEqual({
+      chunked: false,
+      chunkSize: 16 * 1024 * 1024,
+      writeChunkBytes: 188,
+    });
+    for (const writeChunkBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() =>
+        planStreamTargetWrite(toStreamTarget(() => undefined, { writeChunkBytes })),
+      ).toThrowError(InputError);
+    }
+    expect(() =>
+      planStreamTargetWrite(
+        toStreamTarget(() => undefined, {
+          chunked: true,
+          chunkSize: 1024,
+          writeChunkBytes: 188,
+        }),
+      ),
+    ).toThrowError(InputError);
+  });
+});
+
+describe('writeChunkBytes StreamTarget — exact destination writes', () => {
+  it('splits and coalesces arbitrary producer chunks into exact 188-byte awaited writes', async () => {
+    const writeChunkBytes = 188;
+    const truth = new Uint8Array(writeChunkBytes * 7);
+    for (let i = 0; i < truth.byteLength; i++) truth[i] = i % 251;
+    const producerChunks = [
+      truth.subarray(0, 17),
+      truth.subarray(17, 17 + 900),
+      truth.subarray(917, 1001),
+      truth.subarray(1001),
+    ];
+    const writes: { data: Uint8Array; position: number }[] = [];
+    let outstanding = 0;
+    let maximumOutstanding = 0;
+    await writeToStreamTarget(
+      toStreamTarget(
+        async (chunk, position) => {
+          outstanding++;
+          maximumOutstanding = Math.max(maximumOutstanding, outstanding);
+          await Promise.resolve();
+          writes.push({ data: chunk.slice(), position });
+          outstanding--;
+        },
+        { writeChunkBytes },
+      ),
+      chunkStream(...producerChunks),
+    );
+
+    expect(writes).toHaveLength(truth.byteLength / writeChunkBytes);
+    expect(writes.every((write) => write.data.byteLength === writeChunkBytes)).toBe(true);
+    expect(writes.map((write) => write.position)).toEqual(
+      writes.map((_, index) => index * writeChunkBytes),
+    );
+    expect(maximumOutstanding).toBe(1);
+    expect(Buffer.from(applyWrites(writes)).equals(Buffer.from(truth))).toBe(true);
+  });
+
+  it('uses the shaped manual pump for an append-only WritableStream', async () => {
+    const writes: Uint8Array[] = [];
+    const destination = new WritableStream<Uint8Array>({
+      write(chunk): void {
+        writes.push(chunk.slice());
+      },
+    });
+    await writeToStreamTarget(
+      toStreamTarget(destination, { writeChunkBytes: 4 }),
+      bytesStream([1], [2, 3, 4, 5, 6, 7], [8]),
+    );
+    expect(writes.map((write) => [...write])).toEqual([
+      [1, 2, 3, 4],
+      [5, 6, 7, 8],
+    ]);
+  });
+
+  it('rejects instead of emitting a short final or pre-seek write', async () => {
+    const finalWrites: number[] = [];
+    const finalError = await writeToStreamTarget(
+      toStreamTarget(
+        (chunk) => {
+          finalWrites.push(chunk.byteLength);
+        },
+        { writeChunkBytes: 4 },
+      ),
+      bytesStream([1, 2, 3, 4, 5]),
+    ).catch((error: unknown) => error);
+    expect(finalWrites).toEqual([4]);
+    expect(finalError).toBeInstanceOf(CapabilityError);
+    expect((finalError as CapabilityError).message).toContain('1-byte partial write at end');
+
+    const seekWrites: number[] = [];
+    const seekError = await writeToStreamTarget(
+      toStreamTarget(
+        (chunk) => {
+          seekWrites.push(chunk.byteLength);
+        },
+        { writeChunkBytes: 4 },
+      ),
+      chunkStream(new Uint8Array([1, 2]), positionedChunk(new Uint8Array([3, 4, 5, 6]), 12)),
+    ).catch((error: unknown) => error);
+    expect(seekWrites).toEqual([]);
+    expect(seekError).toBeInstanceOf(CapabilityError);
+    expect((seekError as CapabilityError).message).toContain(
+      '2-byte partial write before a positioned discontinuity',
+    );
   });
 });
 

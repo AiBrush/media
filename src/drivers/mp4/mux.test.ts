@@ -13,6 +13,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
+import { toStreamTarget, writeToStreamTarget } from '../../sinks/stream-target.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { enumerateMp3Packets, parseMp3 } from '../mp3/mp3-driver.ts';
 import { parseTs } from '../mpegts/ts-parse.ts';
@@ -224,6 +225,20 @@ describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
     // ctts = PTS − DTS: [0−0, 300k−100k, 100k−200k, 200k−300k] = [0, 200k, −100k, −100k] µs → ticks.
     expect(samples.map((s) => s.cttsTicks)).toEqual([0, 18_000, -9000, -9000]);
     expect(samples.map((s) => s.keyframe)).toEqual([true, false, false, false]);
+  });
+
+  it('repairs the complementary DTS distortion left by clamped concat preroll', () => {
+    const chunks: ChunkStruct[] = [
+      { timestampUs: 0, dtsUs: 0, durationUs: 10, key: true, data: new Uint8Array([0]) },
+      { timestampUs: 14, dtsUs: 14, durationUs: 6, key: true, data: new Uint8Array([1]) },
+      { timestampUs: 20, dtsUs: 20, durationUs: 10, key: true, data: new Uint8Array([2]) },
+      { timestampUs: 30, dtsUs: 30, durationUs: 10, key: true, data: new Uint8Array([3]) },
+    ];
+
+    const samples = buildMuxSamples(chunks, 1_000_000);
+
+    expect(samples.map((sample) => sample.durationTicks)).toEqual([10, 10, 10, 10]);
+    expect(samples.map((sample) => sample.cttsTicks)).toEqual([0, 0, 0, 0]);
   });
 
   it('VFR: durations vary; DTS stays contiguous so ctts stays 0 when not reordered', () => {
@@ -780,6 +795,57 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(track?.samples.compositionOffsets).toEqual([]);
   });
 
+  it('maps Matroska H.273 colour facts into an MP4 colr box without guessing missing fields', async () => {
+    const exact = new Mp4Muxer();
+    const exactVideo = exact.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      color: {
+        matrixCoefficients: 1,
+        transferCharacteristics: 1,
+        primaries: 1,
+        range: 1,
+      },
+      config: { codec: 'avc1.42C01E', codedWidth: 16, codedHeight: 8, description: AVCC },
+    });
+    exact.addChunkStruct(exactVideo, videoChunk(0, 33_333, true, 120));
+    await exact.finalize();
+    const exactTrack = (await readMovie(ra(await collect(exact.output)))).tracks[0];
+    expect(exactTrack?.colr).toEqual({
+      colourType: 'nclx',
+      primaries: 1,
+      transfer: 1,
+      matrix: 1,
+      fullRange: false,
+    });
+    expect((exactTrack?.config as VideoDecoderConfig | undefined)?.colorSpace).toEqual({
+      primaries: 'bt709',
+      transfer: 'bt709',
+      matrix: 'bt709',
+      fullRange: false,
+    });
+
+    const partial = new Mp4Muxer();
+    const partialVideo = partial.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      color: { primaries: 9 },
+      config: { codec: 'avc1.42C01E', codedWidth: 16, codedHeight: 8, description: AVCC },
+    });
+    partial.addChunkStruct(partialVideo, videoChunk(0, 33_333, true, 120));
+    await partial.finalize();
+    expect((await readMovie(ra(await collect(partial.output)))).tracks[0]?.colr).toEqual({
+      colourType: 'nclc',
+      primaries: 9,
+      transfer: 2,
+      matrix: 2,
+    });
+  });
+
   it('B-frame reorder: re-parses with the exact ctts (PTS−DTS) per sample', async () => {
     const muxer = new Mp4Muxer();
     const fps = 25;
@@ -909,6 +975,47 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(movie.durationSec).toBe(0.187);
     expect(video?.edit?.mediaTimeTicks).toBe(0);
     expect(video?.edit?.durationSec).toBe(0.067);
+  });
+
+  it('treats declared AAC codec delay as priming, not a negative cross-track origin', async () => {
+    const muxer = new Mp4Muxer();
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      config: { codec: 'avc1.42C01E', codedWidth: 32, codedHeight: 18, description: AVCC },
+    });
+    const aud = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'aac',
+      codecDelayNs: 42_666_667,
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 2, description: ASC },
+    });
+    muxer.addChunkStruct(vid, { ...videoChunk(0, 33_333, true, 80), dtsUs: 0 });
+    muxer.addChunkStruct(vid, {
+      ...videoChunk(33_333, 33_333, false, 30),
+      dtsUs: 33_333,
+    });
+    for (let index = 0; index < 4; index++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round(((index * 1024 - 2048) * 1_000_000) / 48_000),
+        dtsUs: Math.round((index * 1024 * 1_000_000) / 48_000),
+        durationUs: Math.round((1024 * 1_000_000) / 48_000),
+        key: true,
+        data: new Uint8Array([0x21, index]),
+      });
+    }
+    await muxer.finalize();
+
+    const movie = await readMovie(ra(await collect(muxer.output)));
+    const video = movie.tracks.find((track) => track.mediaType === 'video');
+    const audio = movie.tracks.find((track) => track.mediaType === 'audio');
+    expect(video?.edit?.leadingEmptyDurationSec).toBeUndefined();
+    expect(audio?.edit?.mediaTimeTicks).toBe(2048);
+    expect(audio?.edit?.leadingEmptyDurationSec).toBeUndefined();
+    expect(audio ? buildSampleData(audio) : []).toHaveLength(4);
   });
 
   it('materializes the full ffprobe container span of the rotated TS into MP4', async () => {
@@ -1351,6 +1458,56 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
       data: adtsFrame(new Uint8Array([1, 2, 3]), 4, 2),
     });
     await expect(muxer.finalize()).rejects.toThrowError(/does not match/);
+  });
+
+  it('generic Mp4Muxer reserve mode emits a sparse forward write and bounded moov patch', async () => {
+    const muxer = new Mp4Muxer({ faststart: 'reserve', maximumPacketCount: 4 });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 16, codedHeight: 8, description: AVCC },
+    });
+    muxer.addChunkStruct(vid, videoChunk(0, 33_333, true, 20));
+    muxer.addChunkStruct(vid, videoChunk(33_333, 33_333, false, 10));
+    await muxer.finalize();
+
+    const writes: Array<{ readonly position: number; readonly data: Uint8Array }> = [];
+    await writeToStreamTarget(
+      toStreamTarget((data, position) => {
+        writes.push({ position, data: data.slice() });
+      }),
+      muxer.output,
+    );
+    const length = writes.reduce(
+      (maximum, write) => Math.max(maximum, write.position + write.data.byteLength),
+      0,
+    );
+    const bytes = new Uint8Array(length);
+    for (const write of writes) bytes.set(write.data, write.position);
+
+    expect(writes[1]?.position ?? 0).toBeGreaterThan(
+      (writes[0]?.position ?? 0) + (writes[0]?.data.byteLength ?? 0),
+    );
+    expect(writes[writes.length - 1]?.position).toBe(writes[0]?.data.byteLength);
+    expect(topLevelBoxes(bytes)).toEqual(['ftyp', 'moov', 'free', 'mdat']);
+    const movie = await readMovie(ra(bytes));
+    expect(movie.tracks).toHaveLength(1);
+    const reservedTrack = movie.tracks[0];
+    if (reservedTrack === undefined) throw new Error('reserved mux lost its video track');
+    expect(buildSampleData(reservedTrack)).toHaveLength(2);
+
+    const overflow = new Mp4Muxer({ faststart: 'reserve', maximumPacketCount: 1 });
+    const overflowTrack = overflow.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 16, codedHeight: 8, description: AVCC },
+    });
+    overflow.addChunkStruct(overflowTrack, videoChunk(0, 33_333, true, 1));
+    expect(() =>
+      overflow.addChunkStruct(overflowTrack, videoChunk(33_333, 33_333, false, 1)),
+    ).toThrowError(/MP4_FASTSTART_RESERVE_PACKET_OVERFLOW/);
   });
 
   it('fragmented mux emits a CMAF init segment + moof media segments, re-parsing to the right track', async () => {

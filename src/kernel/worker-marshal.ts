@@ -199,7 +199,10 @@ function asBytes(stream: ReadableStream<Transferable>): ReadableStream<Uint8Arra
       // A non-buffer Transferable on the byte path is an internal contract break (the convert/trim worker
       // only ever transfers encoded ArrayBuffers) — fail loudly rather than emit a wrong-typed chunk.
       controller.error(
-        new MediaError('encode-error', 'worker offload produced a non-byte result on the byte path'),
+        new MediaError(
+          'encode-error',
+          'worker offload produced a non-byte result on the byte path',
+        ),
       );
     },
     async cancel(reason): Promise<void> {

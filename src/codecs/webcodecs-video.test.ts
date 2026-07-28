@@ -14,6 +14,7 @@ import { CapabilityError } from '../contracts/errors.ts';
 import WebcodecsVideoModule, {
   ACCELERATION_PROBE_ORDER,
   type EnqueueSink,
+  PendingOutputBackpressure,
   type SupportProbe,
   VIDEO_CODEC_PREFIXES,
   type WarmDecoderFactory,
@@ -372,6 +373,62 @@ describe('queueIsBackpressured — decode/encode queue threshold', () => {
   it('rejects a non-positive high-water mark (would stall forever)', () => {
     expect(() => queueIsBackpressured(1, 0)).toThrow(RangeError);
     expect(() => queueIsBackpressured(1, -1)).toThrow(RangeError);
+  });
+});
+
+describe('PendingOutputBackpressure — bounded encoder output accounting', () => {
+  it('waits at the exact bound and wakes when one output completes', async () => {
+    const gate = new PendingOutputBackpressure(2);
+    gate.submitted();
+    gate.submitted();
+    let released = false;
+    const waiting = gate.waitForRoom(undefined).then(() => {
+      released = true;
+    });
+    await Promise.resolve();
+    expect(released).toBe(false);
+    expect(gate.pending).toBe(2);
+
+    gate.completed();
+    await waiting;
+    expect(released).toBe(true);
+    expect(gate.pending).toBe(1);
+  });
+
+  it('accounts for synchronous encode failure without underflowing', async () => {
+    const gate = new PendingOutputBackpressure(1);
+    gate.submitted();
+    gate.completed();
+    gate.completed();
+    expect(gate.pending).toBe(0);
+    await expect(gate.waitForRoom(undefined)).resolves.toBeUndefined();
+  });
+
+  it('rejects a blocked writer on abort and removes its waiter', async () => {
+    const gate = new PendingOutputBackpressure(1);
+    const abort = new AbortController();
+    gate.submitted();
+    const waiting = gate.waitForRoom(abort.signal);
+    abort.abort();
+    await expect(waiting).rejects.toMatchObject({ code: 'aborted' });
+    gate.completed();
+    await expect(gate.waitForRoom(undefined)).resolves.toBeUndefined();
+  });
+
+  it('propagates a terminal encoder error to current and future submissions', async () => {
+    const gate = new PendingOutputBackpressure(1);
+    const error = new Error('native encoder failed');
+    gate.submitted();
+    const waiting = gate.waitForRoom(undefined);
+    gate.fail(error);
+    await expect(waiting).rejects.toBe(error);
+    expect(() => gate.submitted()).toThrow(error);
+    await expect(gate.waitForRoom(undefined)).rejects.toBe(error);
+  });
+
+  it('rejects a non-positive bound', () => {
+    expect(() => new PendingOutputBackpressure(0)).toThrow(RangeError);
+    expect(() => new PendingOutputBackpressure(-1)).toThrow(RangeError);
   });
 });
 

@@ -96,19 +96,13 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
   it('packet-copy authors a canonical WAV from real raw PCM bytes without sample decode', async () => {
     const file = await loadFixture('speech.wav');
     const source = readWavPcm(file);
-    const out = wavPcmPacketCopy(
-      {
-        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
-        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
-      },
-      {
-        payload: dataChunk(file),
-        sourceBytes: file,
-        codec: 'pcm-s16',
-        sampleRate: source.sampleRate,
-        channels: source.channels,
-      },
-    );
+    const out = wavPcmPacketCopy({
+      payload: dataChunk(file),
+      sourceBytes: file,
+      codec: 'pcm-s16',
+      sampleRate: source.sampleRate,
+      channels: source.channels,
+    });
     const probe = parseWav(out, out.byteLength);
     expect(probe.sampleRate).toBe(source.sampleRate);
     expect(probe.channels).toBe(source.channels);
@@ -120,19 +114,13 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     const sourceBytes = new Uint8Array(46);
     const payload = sourceBytes.subarray(0, 2);
     payload.set([0x34, 0x12]);
-    const out = wavPcmPacketCopy(
-      {
-        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
-        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
-      },
-      {
-        payload,
-        sourceBytes,
-        codec: 'pcm-s16',
-        sampleRate: 8000,
-        channels: 1,
-      },
-    );
+    const out = wavPcmPacketCopy({
+      payload,
+      sourceBytes,
+      codec: 'pcm-s16',
+      sampleRate: 8000,
+      channels: 1,
+    });
     expect(dataChunk(out)).toEqual(payload);
   });
 
@@ -140,42 +128,30 @@ describe('readWavPcm / writeWav — formats, edges & rejects', () => {
     const sourceBytes = new Uint8Array(46);
     const payload = sourceBytes.subarray(44);
     payload.set([0x34, 0x12]);
-    const out = wavPcmPacketCopy(
-      {
-        pcmSampleFormat: (codec) => (codec === 'pcm-s16' ? 's16' : undefined),
-        pcmEndian: (codec) => (codec === 'pcm-s16' ? 'le' : undefined),
-      },
-      {
-        payload,
-        sourceBytes,
-        codec: 'pcm-s16',
-        sampleRate: 8000,
-        channels: 1,
-      },
-    );
+    const out = wavPcmPacketCopy({
+      payload,
+      sourceBytes,
+      codec: 'pcm-s16',
+      sampleRate: 8000,
+      channels: 1,
+    });
     expect(out).not.toBe(sourceBytes);
     expect(dataChunk(out)).toEqual(payload);
   });
 
   it('packet-copy rejects metadata that would mislabel raw WAV payloads', () => {
-    const deps = {
-      pcmSampleFormat: (codec: string | undefined) =>
-        codec === 'pcm-s16' || codec === 'pcm-s16be' ? 's16' : undefined,
-      pcmEndian: (codec: string | undefined) =>
-        codec === 'pcm-s16be' ? 'be' : codec === 'pcm-s16' ? 'le' : undefined,
-    } satisfies Parameters<typeof wavPcmPacketCopy>[0];
     const payload = Uint8Array.of(0, 0);
     expect(() =>
-      wavPcmPacketCopy(deps, { payload, codec: 'pcm-unknown', sampleRate: 8000, channels: 1 }),
+      wavPcmPacketCopy({ payload, codec: 'pcm-unknown', sampleRate: 8000, channels: 1 }),
     ).toThrow(CapabilityError);
     expect(() =>
-      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16be', sampleRate: 8000, channels: 1 }),
+      wavPcmPacketCopy({ payload, codec: 'pcm-s16be', sampleRate: 8000, channels: 1 }),
     ).toThrow(CapabilityError);
     expect(() =>
-      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16', sampleRate: 0, channels: 1 }),
+      wavPcmPacketCopy({ payload, codec: 'pcm-s16', sampleRate: 0, channels: 1 }),
     ).toThrow(CapabilityError);
     expect(() =>
-      wavPcmPacketCopy(deps, { payload, codec: 'pcm-s16', sampleRate: 8000, channels: 0 }),
+      wavPcmPacketCopy({ payload, codec: 'pcm-s16', sampleRate: 8000, channels: 0 }),
     ).toThrow(CapabilityError);
   });
 

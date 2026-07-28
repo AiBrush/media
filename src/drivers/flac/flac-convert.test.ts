@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { decodeFlac } from '../../codecs/flac/decode.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
 import { readWavPcm } from '../wav/pcm.ts';
@@ -74,13 +74,17 @@ describe('media.convert — FLAC → WAV (pure-TS decode, ADR-024)', () => {
     expect(wav.frames).toBe(10240);
   });
 
-  it('rejects true resampling with a typed CapabilityError', async () => {
-    await expect(
-      createMedia().convert(await fixtureSource('sfx.flac'), {
+  it('resamples during decode (48 kHz sfx.flac → 22.05 kHz WAV)', async () => {
+    const out = await blobBytes(
+      await createMedia().convert(await fixtureSource('sfx.flac'), {
         to: 'wav',
         audio: { sampleRate: 22050 },
       }),
-    ).rejects.toBeInstanceOf(CapabilityError);
+    );
+    const wav = readWavPcm(out);
+    expect(wav.sampleRate).toBe(22050);
+    expect(wav.channels).toBe(1);
+    expect(wav.frames).toBe(Math.round((10240 * 22050) / 48000));
   });
 
   it('is cancellable via the handle', async () => {

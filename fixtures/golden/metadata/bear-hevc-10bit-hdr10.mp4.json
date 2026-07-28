@@ -8,6 +8,7 @@
       "type": "video",
       "codec": "hev1.2.4.L93.90",
       "durationSec": 2.736066666666667,
+      "language": "und",
       "fps": 29.97002997002997,
       "rotation": 0,
       "width": 1280,
@@ -18,6 +19,7 @@
       "type": "audio",
       "codec": "mp4a.40.2",
       "durationSec": 2.7631746031746034,
+      "language": "und",
       "sampleRate": 44100,
       "channels": 2
     }

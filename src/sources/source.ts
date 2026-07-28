@@ -20,7 +20,11 @@ import {
   mediaStreamOf,
 } from './live-source.ts';
 
-/** Internal identity hook used for short-lived cross-operation source caches. Not exported from the public barrel. */
+/**
+ * Internal identity hook used for short-lived cross-operation source caches. Not exported from the
+ * public barrel. A finite `blob:` URL paired with an explicit size is a caller assertion that this key
+ * names one immutable byte snapshot; the scheme alone is not proof of immutability.
+ */
 export const SOURCE_CACHE_KEY: unique symbol = Symbol('a');
 /** Final effective URL learned from Fetch (after redirects), kept separate from cache identity. */
 export const SOURCE_URL_KEY: unique symbol = Symbol('u');
@@ -57,6 +61,11 @@ export type SourceKind = 'bytes' | 'blob' | 'stream' | 'url' | 'opfs' | 'element
 /**
  * A normalized, re-readable byte snapshot. Every read from one Source object must describe the same
  * immutable media bytes; create a new Source when a mutable URL/OPFS resource changes.
+ *
+ * The engine may also reuse a bounded prefix across distinct finite URL Sources when their internal
+ * cache key is the same `blob:` URL and their explicit sizes match. Supplying that pair asserts an
+ * immutable Blob-backed snapshot. A mutable `MediaSource` must omit the finite-size cache identity or
+ * use a new object URL / Source identity whenever its bytes change.
  */
 export interface Source {
   readonly __media: 'source';
@@ -102,6 +111,8 @@ export interface FromUrlOptions {
   /**
    * A known total byte length, when the caller already has it (e.g. from a prior `Content-Length`). Seeds
    * {@link Source.size} without a round-trip; otherwise size is learned lazily from a `Content-Range`.
+   * For a `blob:` URL, supplying this value also opts that URL+size into the engine's short-lived immutable
+   * snapshot handoff. Do not seed it for a mutable `MediaSource`; mint a new URL/Source when content changes.
    */
   size?: number;
 }
@@ -558,9 +569,12 @@ async function fetchRange(
  * neither header is present (an unknown-length / chunked resource). Used by the caching/preload layer to
  * learn size eagerly so tail-seeking probes work on remote files.
  */
-export async function probeUrlSize(url: string | URL): Promise<number | undefined> {
+export async function probeUrlSize(
+  url: string | URL,
+  signal?: AbortSignal,
+): Promise<number | undefined> {
   const { probeUrlSizeImpl } = await import('./url-size.ts');
-  return probeUrlSizeImpl(url);
+  return probeUrlSizeImpl(url, signal);
 }
 
 function isMediaElement(x: unknown): x is HTMLMediaElement {

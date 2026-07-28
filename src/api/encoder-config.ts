@@ -152,6 +152,21 @@ export const EVIDENCE_BITRATE_HEADROOM = 2;
 export const EVIDENCE_BITRATE_FLOOR = 3_750_000;
 
 /**
+ * Ordinary-cadence H.264 evidence floor in bits per output pixel per second. Chromium's realtime
+ * encoder needs this density to keep a second-generation 720p scale above the independent SSIM gate;
+ * source-rate projection remains authoritative whenever it is already higher.
+ */
+export const H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND = 10;
+
+/**
+ * High-cadence H.264 evidence floor in bits per output pixel per second. A source-rate projection
+ * alone underbudgets 50/60 fps spatial transforms after generation loss; 20 bpp/s is the first shared
+ * budget that keeps the independently decoded 60 fps corpus above the visual quality gate while
+ * matching the 20 bpp/s no-evidence budget.
+ */
+export const HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND = 20;
+
+/**
  * Cadence scale for high-fps AV1 output: temporal prediction makes bitrate sublinear in cadence, but a
  * 60 fps stream still needs more rate than the 30 fps-shaped default. `sqrt(fps/30)`, scale-up only,
  * capped at H.264's common budget (1/efficiency) rather than erasing AV1's efficiency advantage
@@ -165,10 +180,10 @@ function av1CadenceScale(codec: VideoCodec | 'unknown', frameRate: number | unde
 }
 
 /**
- * Native realtime mode materially reduces implicit H.264, ordinary-cadence AV1, and the measured
- * ordinary-cadence AV1→VP9 VOD path while retaining their generous implicit quality budgets. Every
- * explicit rate/quantizer/two-pass contract, high-cadence output, and unproved source/target pair retains
- * quality mode.
+ * Native realtime mode materially reduces ordinary-cadence AV1 and the measured ordinary-cadence
+ * AV1→VP9 VOD path while retaining their generous implicit quality budgets. H.264 and every explicit
+ * rate/quantizer/two-pass contract, high-cadence output, and unproved source/target pair retain quality
+ * mode.
  */
 export function videoLatencyMode(
   target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
@@ -178,7 +193,6 @@ export function videoLatencyMode(
 ): 'quality' | 'realtime' {
   const noExplicitRateControl =
     target.bitrate === undefined && target.bitrateMode === undefined && target.crf === undefined;
-  if (codec === 'h264' && noExplicitRateControl && target.twoPass === undefined) return 'realtime';
   if (
     codec === 'vp9' &&
     videoCodecToken(sourceCodecString ?? '') === 'av1' &&
@@ -245,9 +259,16 @@ function defaultVideoBitrate(
     const evidenceBased = Math.round(
       sourceBitrate * spatialScale * temporalScale * codecScale * EVIDENCE_BITRATE_HEADROOM,
     );
+    const h264EvidenceDensity =
+      codec === 'h264'
+        ? frameRate !== undefined && frameRate > HIGH_CADENCE_FPS_THRESHOLD
+          ? HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND
+          : H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND
+        : 0;
+    const evidencePixelFloor = Math.round(width * height * h264EvidenceDensity);
     return Math.min(
       maximum ?? Number.MAX_SAFE_INTEGER,
-      Math.max(EVIDENCE_BITRATE_FLOOR, evidenceBased),
+      Math.max(EVIDENCE_BITRATE_FLOOR, evidencePixelFloor, evidenceBased),
     );
   }
   const planned = Math.max(

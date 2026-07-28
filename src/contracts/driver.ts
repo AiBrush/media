@@ -134,6 +134,24 @@ export interface PacketInfoTable {
   readonly packets: readonly PacketInfoMetadata[];
 }
 
+/** Options for a pull-driven packet-info enumeration. */
+export interface PacketInfoBatchOptions extends StageOptions {
+  /**
+   * Maximum packet rows returned by one pull. Drivers must not retain prior batches after yielding
+   * them; callers therefore control row-object memory through consumption/backpressure.
+   */
+  readonly batchSize?: number;
+}
+
+/**
+ * A single-use, pull-driven packet-info table. Each iterator pull produces at most `batchSize` rows;
+ * breaking iteration or calling {@link cancel} releases in-flight driver work.
+ */
+export interface PacketInfoBatchStream extends AsyncIterable<readonly PacketInfoMetadata[]> {
+  readonly tracks: readonly TrackInfo[];
+  cancel(reason?: unknown): Promise<void>;
+}
+
 /** Common identity every driver declares. */
 export interface DriverBase {
   /** Unique driver id, e.g. 'webcodecs-video', 'wasm-flac', 'mp4'. */
@@ -193,7 +211,8 @@ export interface CodecDriver extends DriverBase {
 export interface ByteSource {
   stream(): ReadableStream<Uint8Array>;
   size?: number;
-  range?(start: number, end: number): Promise<Uint8Array>;
+  /** Half-open random-access read. Implementations must reject promptly when `signal` aborts. */
+  range?(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
   /** Optional owned one-buffer materialization for consumers that have already proved they need all bytes. */
   readAll?(signal?: AbortSignal): Promise<Uint8Array>;
 }
@@ -251,6 +270,8 @@ export interface TrackInfo {
    */
   nonMedia?: true;
   durationSec?: number;
+  /** ISO-639-2/T language declared by the container, including the explicit `und` code. */
+  language?: string;
   /** Video frame rate (frames ÷ duration) and display rotation in degrees, when known. */
   fps?: number;
   rotation?: number;
@@ -318,8 +339,12 @@ export interface Demuxer {
   close(): Promise<void>;
 }
 
+export type FaststartMode = boolean | 'reserve';
+
 export interface MuxOptions {
-  faststart?: boolean;
+  faststart?: FaststartMode;
+  /** Per-track packet ceiling used to bound an MP4 `faststart:'reserve'` moov reservation. */
+  maximumPacketCount?: number;
   fragmented?: boolean;
   /**
    * The target container token the caller requested (one of the driver's {@link ContainerDriver.formats}).
@@ -343,7 +368,9 @@ export interface Muxer {
 export interface StreamCopyOptions extends StageOptions {
   /** Keyframe-aligned time-range copy (trim), in seconds. Omit for a full remux. */
   trim?: { startSec: number; endSec: number };
-  faststart?: boolean;
+  faststart?: FaststartMode;
+  /** Per-track packet ceiling required by MP4 `faststart:'reserve'`. */
+  maximumPacketCount?: number;
   fragmented?: boolean;
   /** True when the caller will materialize the copy into a streaming sink rather than a whole buffer. */
   streaming?: boolean;
@@ -398,6 +425,8 @@ export interface PcmTransform extends StageOptions {
   sampleRate?: number;
   gainDb?: number;
   fade?: PcmFade;
+  /** Explicit output-channel × input-channel coefficients; raw-PCM transforms only. */
+  mixMatrix?: readonly (readonly number[])[];
   dynamics?: PcmDynamics;
   biquad?: PcmBiquad | readonly PcmBiquad[];
   /**
@@ -432,6 +461,12 @@ export interface ContainerDriver extends DriverBase {
    * payload streams. Drivers that omit it keep the normal `demux()` path.
    */
   packetInfo?(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable>;
+  /**
+   * Optional bounded-memory packet-info probe. Rows are derived only as the caller pulls batches;
+   * cancellation/early iterator return must stop outstanding reads. Existing `packetInfo()` remains the
+   * compatibility array surface and may collect this path.
+   */
+  packetInfoBatches?(src: ByteSource, o?: PacketInfoBatchOptions): Promise<PacketInfoBatchStream>;
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
   createMuxer(o?: MuxOptions): Muxer;
   /**
@@ -559,6 +594,7 @@ export interface FilterDriver extends DriverBase {
 export const OPTIONAL_CONTAINER_CAPABILITIES = [
   'probe',
   'packetInfo',
+  'packetInfoBatches',
   'streamCopy',
   'validatesStreamCopyTrim',
   'transformPcm',

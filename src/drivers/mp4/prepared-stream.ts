@@ -1,6 +1,12 @@
 import type { MuxOptions, TrackInfo } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
-import { type ChunkStruct, type Mp4PacketTrackInput, toMuxTrack, trackStateFrom } from './mux.ts';
+import {
+  type ChunkStruct,
+  type Mp4PacketTrackInput,
+  toMuxTrack,
+  trackPresentationDelayUs,
+  trackStateFrom,
+} from './mux.ts';
 import type { MuxTrackInput } from './write.ts';
 import { type ContainerBrand, planMp4ByteStreamLayout, writeMp4 } from './write.ts';
 
@@ -69,6 +75,12 @@ function writeOptionsFromMuxOptions(options?: MuxOptions): {
   readonly faststart?: boolean;
   readonly brand: ContainerBrand;
 } {
+  if (options?.faststart === 'reserve') {
+    throw new MediaError(
+      'mux-error',
+      "prepared MP4 byte streams do not implement faststart:'reserve'; use Mp4Muxer",
+    );
+  }
   const brand: ContainerBrand =
     options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
   return {
@@ -99,8 +111,12 @@ export function mp4PacketMuxTracks(inputs: readonly Mp4PacketTrackInput[]): MuxT
   let globalPresentationOriginUs = Number.POSITIVE_INFINITY;
   if (sourceTimed) {
     for (const state of states) {
+      const presentationDelayUs = trackPresentationDelayUs(state);
       for (const chunk of state.chunks) {
-        globalPresentationOriginUs = Math.min(globalPresentationOriginUs, chunk.timestampUs);
+        globalPresentationOriginUs = Math.min(
+          globalPresentationOriginUs,
+          chunk.timestampUs + presentationDelayUs,
+        );
       }
     }
   }

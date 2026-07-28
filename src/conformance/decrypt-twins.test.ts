@@ -155,7 +155,7 @@ describe('decrypt twin — CENC (cenc-aes-ctr) MP4 produced by ffmpeg', () => {
     expect(shas).not.toEqual(twin.clearAudioSampleSha256);
   });
 
-  it('the oracle can fail — a missing key for the KID is a typed CapabilityError', async () => {
+  it('the oracle can fail — an empty key map is a typed CapabilityError', async () => {
     const twin = await readJson<CencTwin>('cenc-aes-ctr.json');
     const enc = await readBin(twin.cipherFile);
     await expect(

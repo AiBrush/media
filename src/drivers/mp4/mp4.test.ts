@@ -422,8 +422,8 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     }
   });
 
-  it('large-probe metadata proof conservatively falls back for fragments and malformed layout', async () => {
-    const fragmented = await loadFixture('bear-open-gop-frag.mp4');
+  it('large-probe metadata proof skips fragment payloads and rejects malformed layout', async () => {
+    const fragmented = await loadFixture('bear-av-frag.mp4');
     const fragmentReads: Array<readonly [number, number]> = [];
     const fragmentSource: MimeHintedByteSource = {
       ...byteSource(fragmented),
@@ -441,7 +441,10 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       await fragmentDemuxer.close();
     }
     expect(fragmentReads.some(([start, end]) => start === 0 && end === fragmented.byteLength)).toBe(
-      true,
+      false,
+    );
+    expect(fragmentReads.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(
+      fragmented.byteLength / 2,
     );
 
     const malformed = (await loadFixture('bear-4k-hevc.mp4')).slice();

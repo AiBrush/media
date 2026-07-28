@@ -8,6 +8,7 @@
       "type": "video",
       "codec": "avc1.64000B",
       "durationSec": 1,
+      "language": "und",
       "fps": 10,
       "rotation": 0,
       "width": 320,

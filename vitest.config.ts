@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
+    // The resampler file contains a CPU-throughput regression guard. Give it its own process so
+    // process.cpuUsage() measures that kernel rather than every concurrently running worker thread.
+    poolMatchGlobs: [['**/src/dsp/resample.test.ts', 'forks']],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

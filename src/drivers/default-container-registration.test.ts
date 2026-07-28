@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Registry } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
+import { fromBytes } from '../sources/source.ts';
+import { loadFixture } from '../test-support/corpus.ts';
 import {
   SELECTIVE_CONTAINERS,
   registerDefaultContainerForQuery,
 } from './default-container-registration.ts';
+import { WAV_LAZY_CONTAINER_SPEC } from './wav/wav-lazy-driver.ts';
 
 describe('query-selective default container registration', () => {
   it.each([
@@ -167,5 +170,30 @@ describe('query-selective default container registration', () => {
       registerDefaultContainerForQuery(registry, query),
     ]);
     expect(registry.containers().map((driver) => driver.id)).toEqual(['wav']);
+  });
+
+  it('selective WAV registration probes without resolving the full driver', async () => {
+    const fullLoad = vi.spyOn(WAV_LAZY_CONTAINER_SPEC, 'load');
+    try {
+      const registry = new Registry();
+      await expect(
+        registerDefaultContainerForQuery(registry, {
+          direction: 'demux',
+          mime: 'audio/wav',
+        }),
+      ).resolves.toBe(true);
+      const driver = registry.containers()[0];
+      const probe = driver?.probe;
+      if (driver === undefined || probe === undefined) {
+        throw new Error('selective WAV registration must expose a probe-capable driver');
+      }
+      const bytes = await loadFixture('speech.wav');
+      await expect(
+        probe.call(driver, fromBytes(bytes, { mime: 'audio/wav' })),
+      ).resolves.toMatchObject([{ mediaType: 'audio', codec: 'pcm-s16' }]);
+      expect(fullLoad).not.toHaveBeenCalled();
+    } finally {
+      fullLoad.mockRestore();
+    }
   });
 });

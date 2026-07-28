@@ -19,19 +19,18 @@ import { MediaError } from '../contracts/errors.ts';
 import type { SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { Source } from '../sources/source.ts';
+import { pcmSampleFormat } from './pcm-codec-format.ts';
 import type { AudioTarget, CallOptions, ConvertOptions, Output } from './types.ts';
 
 /**
  * The engine capabilities {@link convertToFlac} needs, threaded in so the routine never reaches into the
  * engine's private state: route the source container, build a per-call {@link StageOptions}, build the
- * materialize MIME options, and map a `pcm-*` codec token to its {@link SampleFormat} (the shared helper the
- * eager PCM-native path also uses — kept single-sourced in the engine rather than duplicated here).
+ * materialize MIME options. Codec-token projection stays local to the lazy PCM-family authoring chunks.
  */
 export interface FlacConvertDeps {
   routeContainer(src: Source, direction: 'demux'): Promise<ContainerDriver>;
   stageOptions(signal: AbortSignal, o: CallOptions): StageOptions;
   mimeOpts(signal: AbortSignal, container: string): { signal: AbortSignal; mime?: string };
-  pcmSampleFormat(codec: string | undefined): SampleFormat | undefined;
 }
 
 /**
@@ -47,6 +46,7 @@ function flacPcmTransformOpts(stage: StageOptions, audio: AudioTarget | undefine
     ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
     ...(audio?.gainDb !== undefined ? { gainDb: audio.gainDb } : {}),
     ...(audio?.fade !== undefined ? { fade: audio.fade } : {}),
+    ...(audio?.mixMatrix !== undefined ? { mixMatrix: audio.mixMatrix } : {}),
     ...(audio?.dynamics !== undefined ? { dynamics: audio.dynamics } : {}),
     ...(audio?.biquad !== undefined ? { biquad: audio.biquad } : {}),
   };
@@ -85,7 +85,7 @@ export async function convertToFlac(
   // from the interleaved PCM payload: no Float64 planar bridge and no LPC/Rice search. Unsupported WAV
   // layouts fall through to the canonical path unless the source is single-use, where consuming it would
   // make fallback impossible.
-  if (canTryDirectWavS16Flac(container, deps, src, audio, pcmOpts)) {
+  if (canTryDirectWavS16Flac(container, src, audio, pcmOpts)) {
     const bytes = await readAllSource(src);
     if (signal.aborted) throw new MediaError('aborted', 'operation aborted');
     const { tryAuthorWavS16Flac } = await import('../drivers/wav/flac-s16.ts');
@@ -113,7 +113,6 @@ export async function convertToFlac(
 
 function canTryDirectWavS16Flac(
   container: ContainerDriver,
-  deps: FlacConvertDeps,
   src: Source,
   audio: AudioTarget | undefined,
   pcmOpts: PcmTransform,
@@ -124,12 +123,13 @@ function canTryDirectWavS16Flac(
   if (
     pcmOpts.gainDb !== undefined ||
     pcmOpts.fade !== undefined ||
+    pcmOpts.mixMatrix !== undefined ||
     pcmOpts.dynamics !== undefined ||
     pcmOpts.biquad !== undefined
   ) {
     return false;
   }
-  const requestedFormat = deps.pcmSampleFormat(audio?.codec);
+  const requestedFormat = pcmSampleFormat(audio?.codec);
   return requestedFormat === undefined || requestedFormat === 's16';
 }
 
@@ -176,12 +176,12 @@ async function sourcePcmFormat(
   signal: AbortSignal,
   o: CallOptions,
 ): Promise<SampleFormat | undefined> {
-  const requested = deps.pcmSampleFormat(audio?.codec);
+  const requested = pcmSampleFormat(audio?.codec);
   if (requested !== undefined) return requested;
   const demuxer = await container.demux(src, deps.stageOptions(signal, o));
   try {
     const track = demuxer.tracks.find((t) => t.mediaType === 'audio');
-    return track ? deps.pcmSampleFormat(track.codec) : undefined;
+    return track ? pcmSampleFormat(track.codec) : undefined;
   } finally {
     await demuxer.close();
   }

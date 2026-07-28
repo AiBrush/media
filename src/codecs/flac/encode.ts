@@ -14,7 +14,13 @@
  */
 
 import { InputError, MediaError } from '../../contracts/errors.ts';
-import { type PcmAudio, type SampleFormat, channelAt, sampleAt } from '../../dsp/pcm.ts';
+import {
+  type PcmAudio,
+  type SampleFormat,
+  channelAt,
+  roundHalfToEven,
+  sampleAt,
+} from '../../dsp/pcm.ts';
 import type { FlacDecoded } from './decode.ts';
 
 export interface FlacPcm {
@@ -260,7 +266,7 @@ function quantizePcmSample(value: number, bitsPerSample: number): number {
   const scale = 2 ** (bitsPerSample - 1);
   const min = -scale;
   const max = scale - 1;
-  return clampInt(Math.round(value * scale), min, max);
+  return clampInt(roundHalfToEven(value * scale), min, max);
 }
 
 function validatePcm(pcm: FlacPcm): void {

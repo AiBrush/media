@@ -4,28 +4,8 @@
  * simple one-liner apps.
  */
 
-import type { MediaInput } from '../sources/source.ts';
 import { type MediaEngine, MediaEngineImpl } from './engine.ts';
-import type { MediaJob } from './job.ts';
-import type {
-  CallOptions,
-  Cancellable,
-  ConvertOptions,
-  CreateMediaOptions,
-  DecryptOptions,
-  Demuxed,
-  EncodeOptions,
-  H264AbrRung,
-  MediaChain,
-  MediaInfo,
-  MediaStreams,
-  MuxSpec,
-  Output,
-  PacketStreams,
-  PreloadSpec,
-  RemuxOptions,
-  TrimOptions,
-} from './types.ts';
+import type { CreateMediaOptions } from './types.ts';
 
 /** Create an engine instance. Backend choice is invisible; pass options per ADR-006/007/019. */
 export function createMedia(opts?: CreateMediaOptions): MediaEngine {
@@ -38,6 +18,14 @@ let defaultInstance: MediaEngine | undefined;
 function shared(): MediaEngine {
   defaultInstance ??= createMedia();
   return defaultInstance;
+}
+
+/** Build the typed one-line wrappers without duplicating one closure body for every engine verb. */
+function bare<K extends keyof MediaEngine>(method: K): MediaEngine[K] {
+  return ((...args: unknown[]) => {
+    const media = shared();
+    return (media[method] as (...values: unknown[]) => unknown)(...args);
+  }) as MediaEngine[K];
 }
 
 /**
@@ -54,68 +42,26 @@ export async function resetDefaultMedia(): Promise<void> {
   if (current !== undefined) await current.dispose();
 }
 
-export function probe(input: MediaInput, o?: CallOptions): Cancellable<MediaInfo> {
-  return shared().probe(input, o);
-}
-export function convert(
-  input: MediaInput,
-  opts: ConvertOptions,
-  o?: CallOptions,
-): Cancellable<Output> {
-  return shared().convert(input, opts, o);
-}
-export function h264AbrLadder(
-  input: MediaInput,
-  ladder: readonly H264AbrRung[],
-  o?: CallOptions,
-): Cancellable<readonly Output[]> {
-  return shared().h264AbrLadder(input, ladder, o);
-}
+export const probe: MediaEngine['probe'] = bare('probe');
+export const convert: MediaEngine['convert'] = bare('convert');
+export const h264AbrLadder: MediaEngine['h264AbrLadder'] = bare('h264AbrLadder');
 /** `transcode` is an exported alias of `convert` (ADR-012). */
 export const transcode = convert;
-export function remux(input: MediaInput, opts: RemuxOptions, o?: CallOptions): Cancellable<Output> {
-  return shared().remux(input, opts, o);
-}
-export function trim(input: MediaInput, opts: TrimOptions, o?: CallOptions): Cancellable<Output> {
-  return shared().trim(input, opts, o);
-}
-export function demux(input: MediaInput, o?: CallOptions): Cancellable<Demuxed> {
-  return shared().demux(input, o);
-}
-export function decode(input: MediaInput, o?: CallOptions): MediaStreams {
-  return shared().decode(input, o);
-}
+export const remux: MediaEngine['remux'] = bare('remux');
+export const trim: MediaEngine['trim'] = bare('trim');
+export const demux: MediaEngine['demux'] = bare('demux');
+/** Materialize all packet-info rows. Prefer {@link packetInfoBatches} for very large files. */
+export const packetInfo: MediaEngine['packetInfo'] = bare('packetInfo');
+/** Enumerate packet-info rows pull-by-pull without retaining prior batches. */
+export const packetInfoBatches: MediaEngine['packetInfoBatches'] = bare('packetInfoBatches');
+export const decode: MediaEngine['decode'] = bare('decode');
 /** Decode and return the single frame at/just-after `timeUs` (frame-accurate seek). */
-export function seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame> {
-  return shared().seek(input, timeUs, o);
-}
-export function encode(
-  frames: MediaStreams,
-  opts: EncodeOptions,
-  o?: CallOptions,
-): Cancellable<Output> {
-  return shared().encode(frames, opts, o);
-}
-export function mux(streams: PacketStreams, opts: MuxSpec, o?: CallOptions): Cancellable<Output> {
-  return shared().mux(streams, opts, o);
-}
-export function decrypt(
-  input: MediaInput,
-  opts: DecryptOptions,
-  o?: CallOptions,
-): Cancellable<Output> {
-  return shared().decrypt(input, opts, o);
-}
+export const seek: MediaEngine['seek'] = bare('seek');
+export const encode: MediaEngine['encode'] = bare('encode');
+export const mux: MediaEngine['mux'] = bare('mux');
+export const decrypt: MediaEngine['decrypt'] = bare('decrypt');
 /** Intent-level capability pre-flight: `true` iff the requested target is producible (never throws). */
-export function canConvert(opts: ConvertOptions): Promise<boolean> {
-  return shared().canConvert(opts);
-}
-export function preload(...specs: PreloadSpec[]): Promise<void> {
-  return shared().preload(...specs);
-}
-export function load(input: MediaInput): MediaChain {
-  return shared().load(input);
-}
-export function run(job: MediaJob, o?: CallOptions): Cancellable<Blob> {
-  return shared().run(job, o);
-}
+export const canConvert: MediaEngine['canConvert'] = bare('canConvert');
+export const preload: MediaEngine['preload'] = bare('preload');
+export const load: MediaEngine['load'] = bare('load');
+export const run: MediaEngine['run'] = bare('run');

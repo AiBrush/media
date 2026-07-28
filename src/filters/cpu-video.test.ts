@@ -411,8 +411,9 @@ describe('geometryToRgba — resize (bilinear)', () => {
     expect(r).toBeLessThan(255);
   });
 
-  it('contain leaves transparent letterbox bars outside the drawn rect', () => {
-    // 2×1 source into a 2×2 contain box ⇒ scaled to 2×1, centred vertically, rows 0 and ? bars.
+  it('contain splits an odd letterbox remainder symmetrically across both edge rows', () => {
+    // 2×1 source into a 2×2 contain box ⇒ a 2×1 draw centred at y=0.5. Each row receives exactly
+    // half of the source coverage instead of biasing the whole one-pixel remainder to one side.
     const src = img(2, 1, [255, 0, 0, 255, 0, 0, 255, 255]);
     const recipe = planCpuGeometry(
       { mediaType: 'video', type: 'resize', width: 2, height: 2, fit: 'contain' },
@@ -420,9 +421,9 @@ describe('geometryToRgba — resize (bilinear)', () => {
       1,
     );
     const out = geometryToRgba(recipe, src);
-    // One of the two rows is the drawn image, the other is a transparent bar (alpha 0).
     const rowAlpha = (y: number): number => at(out, 0, y)[3] + at(out, 1, y)[3];
-    expect(rowAlpha(0) === 0 || rowAlpha(1) === 0).toBe(true);
+    expect(rowAlpha(0)).toBe(256);
+    expect(rowAlpha(1)).toBe(256);
   });
 });
 

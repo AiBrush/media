@@ -5,22 +5,26 @@
 > **`convert`**.
 >
 > This document is the **target spec** (the best design) plus an **honest delta** against today's code.
-> Every claim is cited to `path:line` or an external source. Unverifiable claims are marked
-> `UNVERIFIED`. Measured numbers are quoted from `docs/measured-evidence.md` (cited `(measured-evidence.md)`).
+> Every claim is cited to a source path, named evidence artifact, or external source. Unverifiable claims
+> are marked `UNVERIFIED`. Measured numbers are quoted from `docs/measured-evidence.md` (cited
+> `(measured-evidence.md)`).
 
 ## 1. Purpose & scope
 
 Audio DSP is the family of **pure-signal transforms on decoded PCM**: sample-format & endianness
 conversion, gain, channel up/down-mix, band-limited sample-rate conversion (resample), fade/cross-fade,
 peak/RMS normalize + limiter (dynamics), and RBJ-cookbook biquad / parametric EQ. These are the
-"cheap-majority" of audio work — kilobytes of TypeScript over a canonical planar Float64 buffer, no
-codec involved (`src/dsp/pcm.ts:1`, `src/dsp/index.ts:1`).
+"cheap-majority" of audio work — kilobytes of TypeScript, no codec involved
+(`src/dsp/pcm.ts`, `src/dsp/index.ts`). The general graph uses a canonical planar Float64 buffer; exact
+single-operation WAV paths and browser-frame decode use byte-level or interleaved typed-array kernels so
+they do not pay for an unnecessary Float64 round trip.
 
 It exists as its own shard because of a deliberate architectural finding (ADR-022, `measured-evidence.md`): **PCM
 is not a WebCodecs codec** (there is no `AudioDecoder`/`AudioEncoder` for raw LPCM), so PCM containers
-(WAV/AIFF/CAF) take a *driver-native* `transformPcm` path — decode bytes → planar Float64 → DSP → encode
-bytes — rather than the `decode→filter→encode` codec seam. Of ffmpeg.wasm's audio-dsp wins, essentially
-all are this kind of format/gain/mix/fade glue; only lossy **encode** genuinely needs WASM
+(WAV/AIFF/CAF) take a *driver-native* `transformPcm` path rather than the
+`decode→filter→encode` codec seam. That path selects either an exact direct kernel or the general
+decode-to-Float64 graph. Of ffmpeg.wasm's audio-dsp wins, essentially all are this kind of
+format/gain/mix/fade glue; only lossy **encode** genuinely needs WASM
 (`measured-evidence.md`, "Finding 4"). Shipping these in-tier is what lets a WebCodecs+TS engine reclaim them
 natively.
 
@@ -84,15 +88,18 @@ OSS exemplars to study & beat:
 higher-precision Float64 canonical (every integer width *and* f32 round-trips bit-exact,
 `src/dsp/pcm.ts:6`); we match `rematrix`'s BS.775 downmix (`src/dsp/mix.ts:51`); we match the RBJ
 cookbook exactly (`src/dsp/biquad.ts:70`); our resampler is a Kaiser windowed-sinc in the
-libsamplerate/soxr lineage (`src/dsp/resample.ts:1`). We **beat** ffmpeg.wasm on the two axes that matter
-in-browser: **bundle** (kilobytes of TS, zero WASM download on the common path) and **determinism**
-(runs in Node, force-software-safe). We currently **lag** the exemplar on: dither on integer
-downconversion, true EBU-R128 LUFS / true-peak dynamics, and arbitrary channel-layout rematrixing — see
-the delta.
+libsamplerate/soxr lineage (`src/dsp/resample.ts:1`). Compared with ffmpeg.wasm, this design has two
+inherent browser-deployment advantages: **bundle locality** (kilobytes of TS and no WASM download on
+the common PCM path) and **determinism** (the same force-software-safe implementation runs in Node and
+browsers). Those properties are not a cross-engine speed claim. We currently **lag** the exemplar on:
+dither on integer
+downconversion, true EBU-R128 LUFS / true-peak dynamics, and automatic semantic channel-layout mapping.
+An explicit finite output×input coefficient matrix is supported, but the caller must still derive it
+from container channel-layout metadata — see the delta.
 
 ## 3. Target design
 
-### 3.1 Data model — one canonical buffer
+### 3.1 Data model — one canonical buffer plus exact fast-path representations
 
 Everything DSP operates on `PcmAudio`: de-interleaved, `[-1,1]`-normalized **Float64** planes
 (`src/dsp/pcm.ts:20`):
@@ -107,7 +114,7 @@ export interface PcmAudio {           // src/dsp/pcm.ts:21
 ```
 
 Float64 is the working precision **on purpose**: a 32-bit mantissa needs 53 bits of headroom to survive
-`int → x/2ⁿ → round(x·2ⁿ)` bit-exactly, so every width u8…s32 *and* f32 round-trips losslessly
+`int → x/2ⁿ → round-half-to-even(x·2ⁿ)` bit-exactly, so every width u8…s32 *and* f32 round-trips losslessly
 (`src/dsp/pcm.ts:6`). Every kernel is **pure**: it returns *new* audio and leaves the input untouched
 (`gain` `src/dsp/gain.ts:16`; `biquad` `src/dsp/biquad.ts:238`; `remix` `src/dsp/mix.ts:91`), so the
 graph is referentially transparent and a chunk stream can be validated against the whole-signal result.
@@ -122,13 +129,28 @@ interleaved Float32 that transfers zero-copy into `AudioData` (`src/dsp/pcm.ts:2
 `src/dsp/audio-data.ts:196`). It intentionally drops Float64 working precision because it is the last hop
 before the platform frame (`src/dsp/pcm.ts:168`).
 
+The PCM-container drivers also have operation-specific byte lanes. `src/drivers/wav/format-convert.ts`,
+`sample-transform.ts`, and `s16-resample.ts` operate directly on interleaved WAV samples when the
+requested graph can be represented exactly by that kernel. They are guarded by operation semantics, not
+asset names or benchmark scenario IDs; any unsupported composition falls through to the canonical graph.
+For a known-size, range-capable WAV of at least 8 MiB, a rate-only s16→s16 transform keeps the same
+polyphase coefficients, phase schedule, rounding, sample count, and canonical header but evaluates them
+as a pull-driven stream. A 64 KiB speculative prefix must contain the ordinary `fmt ` and `data` headers;
+each later pull owns at most 2 MiB of output and range-reads only the corresponding input frames plus the
+fixed Kaiser halo. Exactly one range is pending at a time and `cancel()` aborts that range. A valid
+noncanonical file whose data header lies beyond the prefix falls through to the whole-file path, while
+smaller inputs retain the lower-overhead contiguous fast path.
+The AIFF decoder similarly parses COMM/SSND incrementally and emits bounded owned interleaved Float32
+chunks instead of materializing a second whole-file planar copy. Range-less files that legally place
+SSND before COMM use immutable ≤1 MiB Blob segments with a 16 MiB total spool cap; larger reversed-order
+files require a range-capable source instead of risking unbounded memory.
+
 ### 3.2 Seams & layering (target)
 
 ```
 bytes ─decodePcm→ PcmAudio ─(gain·fade·remix·resample·biquad·dynamics)→ PcmAudio ─encodePcm→ bytes
-  │                                                                                        │
-  └── PCM container path (transformPcm): pcm-transform.ts orchestrates, pcm-output.ts serializes
-  │
+  ├── PCM container path (transformPcm): pcm-transform.ts orchestrates, pcm-output.ts serializes
+  └── exact fast lane: format-convert / sample-transform / s16-resample (fall through if ineligible)
 AudioData ─audioDataToPcm→ PcmAudio ─(kernel/stage)→ pcm*Init→ AudioData      ← codec/filter seam
 ```
 
@@ -161,8 +183,8 @@ The routing philosophy has a specific, honest shape here:
   encoder re-encodes. The DSP kernels are always the pure-TS native tier in that chain.
 - **For PCM containers there is no codec at all:** `transformPcm` (`src/drivers/pcm-transform.ts:184`)
   runs the kernels directly on decoded bytes and re-serializes (ADR-022).
-- **A true miss fails loudly, typed.** An unsupported channel remix
-  (`CapabilityError('capability-miss', …)`, `src/dsp/mix.ts:105`), an invalid/irrational target rate
+- **A true miss fails loudly, typed.** An unsupported implicit channel remix
+  (`CapabilityError('capability-miss', …)`, `src/dsp/mix.ts), an invalid/irrational target rate
   (`src/dsp/resample.ts:347`), an out-of-band biquad frequency (`InputError`,
   `src/dsp/biquad.ts:72`), or an absent `AudioData` seam (`src/filters/audio-dsp.ts:291`) all raise a
   typed error — the developer never names a backend.
@@ -188,6 +210,8 @@ The routing philosophy has a specific, honest shape here:
   (`src/drivers/pcm-transform.ts:189,218`); the `AudioData` streams check `stage.signal?.aborted` in
   `pull` and propagate cancel upstream (`src/dsp/audio-data.ts:136,267,309`); the filter transforms
   listen on the abort signal and throw `MediaError('aborted', …)` (`src/filters/audio-dsp.ts:166`).
+  The large-WAV direct lane combines the operation signal with a stream-owned cancel signal and passes
+  it into every pending `ByteSource.range`, so cancellation interrupts transport I/O as well as FIR work.
 - **Frame lifetime — every `AudioData` `close()`d exactly once.** Each *input* frame is closed
   synchronously in a `finally` right after `copyTo` fully reads it — nothing is buffered across an
   `await` (`src/filters/audio-dsp.ts:169` stateless, `:235` stateful). Emitted *output* frames are owned
@@ -205,14 +229,18 @@ The routing philosophy has a specific, honest shape here:
 
 - **Format convert** (`src/dsp/pcm.ts`): `readSample`/`writeSample` cover u8 (offset-128), s8, s16, s24
   (hand-packed 3-byte, both endians), s32, f32, f64 (`src/dsp/pcm.ts:70,101`). Integer *narrowing*
-  rounds then clamps: e.g. s16 is `clampInt(Math.round(x*32768), -32768, 32767)`
-  (`src/dsp/pcm.ts:116`). `decodePcm` drops trailing partial frames (`src/dsp/pcm.ts:154`).
+  uses the shared round-half-to-even policy and then clamps: e.g. s16 is
+  `clampInt(roundHalfToEven(x*32768), -32768, 32767)`. `decodePcm` drops trailing partial frames. WAV
+  s16/s24/f32 conversions use an equivalent direct interleaved implementation when no other DSP is
+  requested, including exact s16→s24 and canonical-clamp-equivalent f32→s16/s24.
 - **Gain** — `factor = 10^(dB/20)`, multiply; `0 dB` is bit-exact identity (`src/dsp/gain.ts:11,16`).
-- **Remix** — supported pairs `1↔2`, `2↔6`, `6→2`, `6→1`, and `N→N` identity; 5.1 order is
+- **Remix** — implicit defaults support pairs `1↔2`, `2↔6`, `6→2`, `6→1`, and `N→N` identity; 5.1 order is
   `L,R,C,LFE,Ls,Rs` (WAV/SMPTE). BS.775: `Lo = L + (1/√2)C + (1/√2)Ls`, `Ro = R + (1/√2)C + (1/√2)Rs`,
   LFE dropped (`src/dsp/mix.ts:51`); `6→1` fuses the downmix and the L/R average in one pass with no
   temporary planes (`src/dsp/mix.ts:71`, ADR-223). Anything else → typed `CapabilityError`
-  (`src/dsp/mix.ts:105`).
+  (`src/dsp/mix.ts`). `AudioTarget.mixMatrix` supplies an arbitrary finite output-channel ×
+  input-channel coefficient matrix. The canonical kernel validates every row and coefficient; the WAV
+  direct kernel compiles sparse rows once and fuses matrix, gain, and fade in a single sample pass.
 - **Resample** — a Kaiser-windowed sinc (`ZERO_CROSSINGS = 32`, `SAMPLES_PER_ZERO_CROSSING = 512`,
   `KAISER_BETA = 9.42` ≈ 80 dB stopband, `src/dsp/resample.ts:31-33`) sampled once into a dense prototype
   table (`buildFilterTable`, `src/dsp/resample.ts:67`), evaluated as a **rational polyphase bank** when
@@ -222,7 +250,14 @@ The routing philosophy has a specific, honest shape here:
   fallback for irrational/huge-phase ratios (`src/dsp/resample.ts:308`). Cutoff drops to the *lower*
   Nyquist `min(in,out)/2` on downsampling (anti-alias) via `cutoff = min(1, ratio)`
   (`src/dsp/resample.ts:177,316`); DC-normalized; zero-extended edges; equal rates return a bit-exact
-  copy (`src/dsp/resample.ts:355`).
+  copy (`src/dsp/resample.ts:355`). Eligible interleaved s16 WAV transforms use a separate
+  six-zero-crossing, β=8.6 Kaiser polyphase bank in `src/drivers/wav/s16-resample.ts`: this preserves a
+  proper band-limited/anti-aliased resampler while avoiding planar Float64 decode/encode. Stereo shares
+  each phase/tap walk and mono evaluates adjacent interior outputs together; edges and odd tails retain
+  the scalar oracle. Both tiers preflight pathological tap/bank/output allocations before constructing
+  typed arrays. The canonical tier caps the aggregate Float64 output across every channel, rather than
+  only each individually allocatable plane; zero-rounded outputs return before filter construction,
+  while legitimate hour-scale 44.1→16 kHz stereo remains accepted.
 - **Fade / cross-fade** — `linear` (`t`, `1−t`) and `equal-power` (`sin`, `cos`, the default cross-fade
   curve so `sin²+cos²=1` has no midpoint hole) (`src/dsp/fade.ts:30`); endpoints exact via
   `t = i/(N−1)` (`src/dsp/fade.ts:18`).
@@ -270,24 +305,24 @@ frames closed once, typed errors). The following are the **precise** current-cod
 **Owned files (all present):** `src/dsp/{pcm,gain,mix,resample,fade,dynamics,biquad,stream,audio-data,index}.ts`,
 `src/filters/audio-dsp.ts`, `src/drivers/pcm-output.ts`, `src/drivers/pcm-transform.ts`.
 
-**Module-global mutable state (resample):**
-- `let FILTER_TABLE: Float64Array | undefined` — a lazily-built memoized *constant* (deterministic, fine
-  as a cache but is module-global) (`src/dsp/resample.ts:81`).
-- `const POLYPHASE_CACHE = new Map<string, PolyphaseBank>()` — keyed by `"inRate:outRate"`, **never
-  evicted, no size cap** (`src/dsp/resample.ts:112,185`). Each entry is bounded (≤4096 phases) and the
-  set of rate pairs is small in practice, but this is exactly the "module-global mutable cache with
-  unbounded growth" smell the target design should bound. It also survives across otherwise-independent
-  engine instances / jobs, so it is shared global process state.
+**Module-global bounded state (resample):**
+- `FILTER_TABLE` is one lazily-built, deterministic ~128 KiB prototype table. It is module-private,
+  never escapes, and polyphase banks copy coefficients rather than retaining views into it.
+- Canonical Float64 polyphase banks use a deterministic **8-entry / 4 MiB** retained-byte LRU
+  (`src/dsp/resample-cache.ts`); the direct interleaved s16 tier uses a **32-entry / 32 MiB** LRU.
+  Actual typed-array payloads plus conservative object/view/key overhead are counted. Oversized
+  canonical banks execute through the dense fallback but are not retained; unsafe individual kernels
+  are rejected before allocation.
 
 **Duplication / DRY smells:**
 - `clonePlanar` is re-defined three times — `src/dsp/mix.ts:22`, `src/dsp/fade.ts:46`,
   `src/dsp/dynamics.ts:76` — plus an equivalent `.planar.map(ch => ch.slice())` inline in
   `src/dsp/resample.ts:360` and `src/dsp/biquad.ts` / `gain.ts` output construction. One shared
   `clonePlanar`/`mapSamples`/`buildAudio` helper belongs in `pcm.ts`.
-- **s24 decode is implemented twice, differently:** the slow per-sample `DataView.getUint8×3` path in
-  `readSample` (`src/dsp/pcm.ts:78`) used by `decodePcm`, and the fast raw-byte path in
-  `decodePcmToInterleavedF32` (`src/dsp/pcm.ts:189`). This is both duplication and the source of the perf
-  loss below.
+- **Wire-format decode is implemented at two precision seams:** the Float64 canonical reader in
+  `decodePcm` and the raw-byte interleaved Float32 reader in `decodePcmToInterleavedF32`. The latter is
+  deliberately faster because it serves browser-frame egress, but the duplicated s16/s24 sign-extension
+  logic is a maintenance smell. Differential tests must keep the two implementations sample-exact.
 
 **Layering observations (mild):**
 - The streaming twins live *inside* the per-effect files (`biquadStage` in `biquad.ts:255`,
@@ -301,19 +336,31 @@ frames closed once, typed errors). The following are the **precise** current-cod
   Not a god-file, but the largest file in the shard and a candidate to split pure-dispatch from
   stream-wiring.
 
-**Capability-message smell:**
-- When resample is *policy-disallowed* on the stream-copy path, `applyPcmTransform` throws
-  `capability-miss` with the message *"audio resample X→Y Hz needs the WASM/WebAudio tail"*
-  (`src/drivers/pcm-transform.ts:207`). This is misleading: resample is pure-TS and never needs
-  WASM/WebAudio — the real reason is the caller passed `resample: 'reject'`. The message names backends
-  that do not participate (a capability-leak-flavored wording bug).
+**Capability routing:**
+- `applyPcmTransform` performs pure-TS resampling for WAV/AIFF/CAF/FLAC authoring and FLAC→WAV decode.
+  A caller that deliberately supplies `resample:'reject'` receives an accurate typed capability miss
+  stating that the selected PCM route disallows the rate change; the message names no backend.
 
-**Known performance gap (measured, `measured-evidence.md`):**
-- `audio-dsp/throughput_decode_s24` on `rotated:03.wav` — **aibrush 58.3 ms vs mediabunny 27.7 ms
-  (2.11×), the only active wall-time loss** (`measured-evidence.md`, performance-deficits). Peak memory 33.7 MB
-  vs mediabunny 24.0 MB (`measured-evidence.md`, session13 speed-ledger). Root cause: the Float64 `decodePcm` s24
-  path is per-sample `DataView` reads (`src/dsp/pcm.ts:78`) while the fast path
-  (`decodePcmToInterleavedF32`, `src/dsp/pcm.ts:189`) is raw bytes.
+**Performance-proof status:**
+- The old `audio-dsp/throughput_decode_s24` loss was traced to whole-file/canonical materialization.
+  WAV and AIFF browser-frame decode now emit bounded interleaved Float32 chunks, and conversion routes
+  reuse an already-read source instead of reading the complete input up to three times.
+- `UNVERIFIED` development microbenchmarks (the one-off runner was not committed) on real fixture
+  shapes showed: f32→s24 direct
+  **1.002 ms vs 4.904 ms canonical (4.89×)**; AIFF s16be decode **0.317 ms vs 1.429 ms (4.51×)** and
+  s24be **0.364 ms vs 1.741 ms (4.78×)**; a five-minute 44.1k→16k mono direct resample
+  **93.079 ms vs 122.506 ms (1.316×)**; and a 240k-frame explicit 6→2 matrix
+  **3.107 ms vs 9.711 ms canonical (3.13×)**. They are retained only as development context, not
+  release evidence.
+- The reproducible product-only gate is `bun scripts/bench-dsp.ts --check`. Against
+  `fixtures/golden/bench/audio-dsp.json` (Bun 1.3.14, generated 2026-07-28, 20 warmups and 200 measured
+  iterations), the current run passed with checksum `439301100`; its eight-file resample aggregate was
+  **1224× realtime geomean / 925× worst**. This validates the pure-TS product baseline but does not
+  compare rival engines.
+- These are local implementation measurements, not the final cross-engine verdict. A current immutable
+  media-test vendor sync and fresh exhaustive all-engine run are still required before declaring the
+  family fastest. Older single-sample, timeout-dominated, reader-failed, or stale-provenance cells are
+  functional evidence only and must not be ranked.
 
 **Measured wins to preserve (regression guards, `measured-evidence.md`):**
 - longform 1-hour 44.1k→16k resample closed at **3610.68 ms** (from 12415.14 ms) with peak 462 MB, via
@@ -329,27 +376,22 @@ frames closed once, typed errors). The following are the **precise** current-cod
 
 ## 5. Delta / punch-list (ordered, actionable)
 
-1. **Fix the s24 decode perf loss.** Give `decodePcm` (Float64) the same raw-byte s24 (and s16/s32) fast
-   path already in `decodePcmToInterleavedF32` (`src/dsp/pcm.ts:189`), replacing the per-sample
-   `DataView.getUint8×3` in `readSample` (`src/dsp/pcm.ts:78`) — or route both through one shared
-   byte-level reader.
-   **Acceptance:** re-run `audio-dsp/throughput_decode_s24` on `rotated:03.wav`; assert aibrush median
-   ≤ mediabunny (currently 58.3 ms vs 27.7 ms, `measured-evidence.md`) and peak memory within the rival's;
-   `pcm-corpus.test.ts` + `golden.test.ts` stay bit-exact.
+1. **Close the cross-engine audio proof.** The general direct/bounded paths are implemented, but local
+   speedups are not a substitute for a fresh immutable matrix.
+   **Acceptance:** vendor-sync the exact product build, then run every `audio-dsp` scenario on every
+   applicable engine with a fixed seed, at least one warmup, and at least five measured iterations.
+   Compare only identical passing operations with valid measured samples and complete provenance;
+   correctness, peak-memory, and wall-time gates all pass.
 
-2. **Bound `POLYPHASE_CACHE`.** Replace the unbounded module-global `Map` (`src/dsp/resample.ts:112`)
-   with a bounded LRU (small `N`, e.g. 8–16 rate pairs) *or* make it engine-instance-scoped so it is not
-   shared global process state.
-   **Acceptance:** a unit test builds >N distinct rate pairs and asserts `cache.size ≤ N` (eviction
-   happens); the longform 44.1k→16k resample still returns checksum 439301100 (`measured-evidence.md`, ADR-058)
-   proving warm-path correctness is unchanged.
+2. **Completed — bound resampler state and pathological allocation.** Canonical banks use an
+   8-entry/4 MiB LRU; direct s16 banks use a 32-entry/32 MiB LRU. Entry and byte eviction, warm-hit
+   promotion, oversized non-retention, dangerous tap counts, safe dense fallback, zero-output planning,
+   invalid PCM shapes, aggregate high-channel output, safe-integer sample accounting, and one-hour
+   stereo acceptance all have focused regressions. Common output hashes remain bit-exact.
 
-3. **Fix the misleading resample-reject message.** In `applyPcmTransform` (`src/drivers/pcm-transform.ts:207`)
-   the `resample:'reject'` path must not claim resample "needs the WASM/WebAudio tail." Reword to state
-   the real cause (stream-copy policy disallows a rate change), keeping the `capability-miss` code and
-   `op`/`tried`.
-   **Acceptance:** a unit test asserts the thrown `CapabilityError.message` does not contain "WASM" or
-   "WebAudio" and does name the disallowed rate change; the copy-path routing test still rejects.
+3. **Completed — honest resample routing.** WAV/AIFF/CAF/FLAC PCM transforms all use the native
+   band-limited resampler. An explicitly policy-disabled route raises a typed miss that names the
+   disallowed rate change and never claims a WASM/WebAudio dependency; focused tests pin the wording.
 
 4. **De-duplicate `clonePlanar` / audio construction.** Hoist one `clonePlanar`, `mapSamples`, and a
    `buildAudio({sampleRate,channels,frames,planar})` helper into `pcm.ts`; delete the three copies
@@ -358,30 +400,26 @@ frames closed once, typed errors). The following are the **precise** current-cod
    **Acceptance:** `grep -c "function clonePlanar" src/dsp/*.ts` returns 1 (in `pcm.ts`); the full
    `src/dsp/*.test.ts` suite stays green with no behavioral change.
 
-5. **Decide & make explicit the integer-rounding policy.** The benchmark oracle notes state
-   round-**half-to-even** at the LSB for `gain_minus6db_s16` / `pcm_f32_to_s16`
-   (`../media-test/src/scenarios/audio-dsp/index.ts`), but `writeSample` uses `Math.round` (half-away-
-   from-zero for positives, toward +∞) (`src/dsp/pcm.ts:110-130`). These differ on exact halves. Either
-   switch `writeSample` to round-half-to-even, or bake goldens under the documented policy and record the
-   choice.
-   **Acceptance:** a table-driven unit test asserts the rounding of exact-half inputs (e.g. ±0.5 LSB) for
-   u8/s8/s16/s24/s32 matches the chosen policy; `pcm_f32_to_s16` golden regenerated to match; ADR logged.
+5. **Completed — canonical integer-rounding policy.** Integer PCM quantization now uses the shared
+   round-**half-to-even** helper in canonical PCM, native FLAC, and every direct WAV/AIFF/ADTS integer
+   writer. Table-driven tests cover exact positive and negative half-LSB inputs for u8/s8/s16/s24/s32,
+   and direct format/remix paths are checked byte-for-byte against canonical output.
 
 6. **Add optional dither for integer downconversion (beat `aformat`).** ffmpeg offers
-   triangular/rectangular/high-pass dither on narrowing; today `writeSample` is plain round (no dither,
-   `src/dsp/pcm.ts:101`). Add an opt-in TPDF dither at the s24→s16 / f32→s16 boundary, off by default
-   (goldens require deterministic output).
+   triangular/rectangular/high-pass dither on narrowing; today `writeSample` uses deterministic
+   nearest-even quantization with no dither. Add an opt-in TPDF dither at the s24→s16 / f32→s16
+   boundary, off by default (goldens require deterministic output).
    **Acceptance:** with dither off, `golden.test.ts` is unchanged (bit-exact); with dither on (fixed
    seed), a unit test asserts the quantization-noise spectrum is whitened (no correlated distortion at a
    test-tone harmonic) and output is deterministic for the seed.
 
-7. **Generalize `remix` toward a channel matrix (beat `rematrix`).** Today `remix` is a hardcoded switch
-   of 5 pairs (`src/dsp/mix.ts:91`); ffmpeg rematrixes arbitrary layouts. Introduce a coefficient-matrix
-   remixer (BS.775 for the standard down/upmixes, identity/duplicate for trivial cases) so e.g. 5.1→mono,
-   quad, or 7.1 are first-class; keep the typed `CapabilityError` for genuinely undefined layouts.
-   **Acceptance:** new cells `downmix_5_1_to_mono` and one unsupported layout: the first matches a
-   BS.775-derived golden; the second raises `CapabilityError('capability-miss', …)`; existing 5 pairs
-   stay bit-exact.
+7. **Derive mix matrices from semantic channel layouts.** The explicit coefficient-matrix API and
+   sparse fused kernel are implemented; the remaining gap versus `libswresample` is automatically
+   deriving those coefficients from container layout metadata (WAV channel masks, side-vs-back
+   surrounds, quad/7.1).
+   **Acceptance:** at least WAV channel-mask metadata maps to a documented matrix; quad and 7.1 fixtures
+   match independent coefficient goldens; an undefined layout remains a typed capability miss; the
+   existing implicit pairs stay bit-exact.
 
 8. **Split `filters/audio-dsp.ts` pure-dispatch from stream-wiring.** Move `applyAudioFilter` /
    `createStatefulStage` (`src/filters/audio-dsp.ts:77,98`) into a `src/dsp`-side pure module and keep
@@ -406,31 +444,27 @@ frames closed once, typed errors). The following are the **precise** current-cod
 
 ## 6. Open questions (seed `docs/decisions/`)
 
-1. **Integer-rounding policy** — round-half-to-even (matches the benchmark oracle notes) vs the current
-   `Math.round` half-away (`src/dsp/pcm.ts:110`)? Decide the canonical policy for all integer widths and
-   whether goldens follow the code or vice-versa. (Blocks delta #5.)
-
-2. **Dither** — should integer downconversion dither by default, or stay deterministic-by-default with
+1. **Dither** — should integer downconversion dither by default, or stay deterministic-by-default with
    dither opt-in? Deterministic output is required by the byte-exact goldens; dither improves perceptual
    quality but breaks bit-reproducibility. (Blocks delta #6.)
 
-3. **`POLYPHASE_CACHE` scope & lifetime** — process-global (current), engine-instance-scoped, or
-   bounded-LRU? Global sharing helps repeated same-rate jobs but is hidden cross-job state. (Blocks
-   delta #2.)
+2. **Cache-budget tuning** — canonical and direct resampler state is now deterministically bounded at
+   8 entries/4 MiB and 32 entries/32 MiB respectively. Should future production telemetry justify
+   smaller budgets, or engine-instance scoping for stricter cross-job isolation?
 
-4. **Resample quality tier** — is the fixed 80 dB Kaiser kernel (`β=9.42`, 32 zero-crossings, 512 phases,
+3. **Resample quality tier** — is the fixed 80 dB Kaiser kernel (`β=9.42`, 32 zero-crossings, 512 phases,
    `src/dsp/resample.ts:31`) the only tier, or should we expose a fast/HQ/VHQ knob (soxr-style) for the
    longform path where ~270× realtime is the floor (`measured-evidence.md`)? Fixed = reproducible; a knob = better
    worst-case throughput.
 
-5. **Channel-order assumption** — `remix` hardcodes 5.1 as `L,R,C,LFE,Ls,Rs` (`src/dsp/mix.ts:53`). Do we
+4. **Channel-order assumption** — `remix` hardcodes 5.1 as `L,R,C,LFE,Ls,Rs` (`src/dsp/mix.ts:53`). Do we
    need to honor a source's declared channel-layout (WAV `dwChannelMask`, ffmpeg `SL/SR` vs `BL/BR`)
    before rematrix, or is the SMPTE/WAV default sufficient for the corpus? (Informs delta #7.)
 
-6. **Loudness normalization semantics** — is `normalizeRms` (RMS proxy) enough, or do we commit to
+5. **Loudness normalization semantics** — is `normalizeRms` (RMS proxy) enough, or do we commit to
    EBU R128 LUFS + true-peak as the public "normalize"? Affects API naming and the dynamics contract.
    (Blocks delta #9.)
 
-7. **Cross-fade / extra fade curves** — we ship only `linear` + `equal-power` (`src/dsp/fade.ts:27`);
+6. **Cross-fade / extra fade curves** — we ship only `linear` + `equal-power` (`src/dsp/fade.ts:27`);
    ffmpeg `afade` offers ~15 curves. Do any benchmark/real cells need them, or is two the SOTA-minimal
    set? (Low priority.)

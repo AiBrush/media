@@ -14,7 +14,8 @@ import type {
   PacketMetadata,
   TrackInfo,
 } from '../contracts/driver.ts';
-import { MediaError } from '../contracts/errors.ts';
+import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { normalizeClockwiseRotation } from '../util/rotation.ts';
 import {
   avcCodecStringFromDescription,
   bitDepthFromCodec,
@@ -116,12 +117,54 @@ export function requireEncoderConfig<T>(config: T | undefined, media: 'video' | 
 export interface SourceGeometry {
   width: number | undefined;
   height: number | undefined;
+  /** Source container display rotation, clockwise-positive, when known. */
+  rotation?: number;
   /** Source presentation frame rate when known; used only for rate-conversion capability planning. */
   fps?: number;
   /** Source declared duration when known; used only for runtime budget/capability planning. */
   durationSec?: number;
   /** Measured compressed video bitrate in bits/second, when a packet table proves it. */
   bitrate?: number;
+}
+
+/**
+ * Resolve the physical quarter-turn a decoded-frame pipeline must bake into pixels.
+ *
+ * An explicit `rotate` is applied after the source container's display rotation, and the composed
+ * orientation is baked into pixels with an identity output matrix. Thus `rotate: 0` is normalization and
+ * a 90° source followed by `rotate: 270` is a physical no-op. Omitting `rotate` leaves pixels alone and
+ * preserves the source display matrix at the mux boundary.
+ */
+export function videoPixelRotation(
+  target: Pick<VideoTarget, 'rotate'>,
+  src: Pick<SourceGeometry, 'rotation'>,
+): 0 | 90 | 180 | 270 {
+  if (target.rotate === undefined) return 0;
+  const sourceRotation = normalizeClockwiseRotation(src.rotation) ?? 0;
+  const composedRotation = (sourceRotation + target.rotate) % 360;
+  if (
+    composedRotation === 0 ||
+    composedRotation === 90 ||
+    composedRotation === 180 ||
+    composedRotation === 270
+  ) {
+    return composedRotation;
+  }
+  throw new CapabilityError(
+    `cannot bake composed video rotation ${composedRotation}° with the available quarter-turn filters`,
+    { op: { kind: 'route', id: 'rotate' }, tried: ['video-filter/quarter-turn'] },
+  );
+}
+
+/**
+ * Rotation metadata for an encoded output. Any explicit rotate request is normalized into pixels and
+ * therefore clears the source display matrix; an omitted request preserves it.
+ */
+export function outputVideoRotation(
+  target: Pick<VideoTarget, 'rotate'>,
+  sourceRotation: number | undefined,
+): number | undefined {
+  return target.rotate === undefined ? sourceRotation : undefined;
 }
 
 /**
@@ -185,7 +228,8 @@ export function outputDimensions(
     width = target.pad.width;
     height = target.pad.height;
   }
-  if (target.rotate === 90 || target.rotate === 270) {
+  const rotation = videoPixelRotation(target, src);
+  if (rotation === 90 || rotation === 270) {
     const w = width;
     width = height;
     height = w;

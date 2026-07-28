@@ -87,6 +87,7 @@ function syntheticAudioMovie(sampleSizes: number[], chunkOffsets: number[]): Mov
       })),
       chunkOffsets,
       syncSamples: [],
+      sampleDependencies: [],
     },
   };
   return { brand: 'isom', timescale: 1_000, durationSec: track.durationSec, tracks: [track] };
@@ -113,6 +114,7 @@ function syntheticBFrameMovie(): Movie {
       sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 3, descIndex: 1 }],
       chunkOffsets: [100],
       syncSamples: [1],
+      sampleDependencies: [],
     },
   };
   return { brand: 'isom', timescale: 1_000, durationSec: 3, tracks: [track] };

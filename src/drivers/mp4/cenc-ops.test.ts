@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { encryptCenc, encryptCens } from '../../test-support/cenc-encrypt.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
@@ -8,6 +8,7 @@ import { muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 
 const KEY = '000102030405060708090a0b0c0d0e0f';
 const KID = '00112233445566778899aabbccddeeff';
+const WRONG_KID = 'ffeeddccbbaa00998877665544332211';
 const ra = (b: Uint8Array) => ({
   read: (o: number, l: number) => Promise.resolve(b.subarray(o, o + l)),
   size: b.byteLength,
@@ -73,11 +74,31 @@ describe('media.decrypt — CENC (cenc / AES-CTR) on real MP4 (ADR-023)', () => 
     expect(await audioSamples(out)).not.toEqual(await audioSamples(clear));
   });
 
-  it('rejects a missing key for the KID with a typed CapabilityError', async () => {
+  it('rejects an empty key map with a typed CapabilityError before reading protected media', async () => {
     const enc = await encryptCenc(await loadFixture('movie_5.mp4'), { keyHex: KEY, kidHex: KID });
     await expect(
       createMedia().decrypt(encSource(enc), { scheme: 'cenc', keys: {} }),
     ).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('rejects a nonempty key map missing the referenced KID with a typed InputError', async () => {
+    const enc = await encryptCenc(await loadFixture('movie_5.mp4'), { keyHex: KEY, kidHex: KID });
+    await expect(
+      createMedia().decrypt(encSource(enc), {
+        scheme: 'cenc',
+        keys: { [WRONG_KID]: KEY },
+      }),
+    ).rejects.toMatchObject({
+      name: 'InputError',
+      code: 'unsupported-input',
+      detail: { kid: KID },
+    });
+    await expect(
+      createMedia().decrypt(encSource(enc), {
+        scheme: 'cenc',
+        keys: { [WRONG_KID]: KEY },
+      }),
+    ).rejects.toBeInstanceOf(InputError);
   });
 
   it('rejects a scheme that contradicts the container (cenc file asked as cbcs) with a MediaError', async () => {

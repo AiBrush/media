@@ -542,6 +542,18 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
     ]);
   });
 
+  it('uses nearest-even for exact positive and negative half-LSB direct s16 writes', () => {
+    const codes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+    const out = new Uint8Array(codes.length * 2);
+    writeInterleavedF32S16le(
+      new DataView(out.buffer),
+      0,
+      Float32Array.from(codes, (code) => code / 32_768),
+    );
+
+    expect(Array.from(new Int16Array(out.buffer))).toEqual([-2, -2, 0, 0, 2, 2]);
+  });
+
   it('writes direct s16 samples correctly when the destination is not Int16Array-aligned', () => {
     const out = new Uint8Array(7);
     const dv = new DataView(out.buffer);

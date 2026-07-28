@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, RawFrame } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
-import { decodeVideoWithRuntimeFallback } from './replayable-video-decoder.ts';
+import {
+  decodeVideoWithRuntimeFallback,
+  planRuntimeVideoFallback,
+} from './replayable-video-decoder.ts';
 
 interface TestChunk {
   readonly byteLength: number;
@@ -56,6 +59,33 @@ async function drain(stream: ReadableStream<VideoFrame>): Promise<TestFrame[]> {
     reader.releaseLock();
   }
 }
+
+describe('planRuntimeVideoFallback', () => {
+  it('keeps VPx on its proved WASM tail unless the selected native driver was pinned', () => {
+    expect(planRuntimeVideoFallback('webcodecs-video', 'vp09.00.31.08')).toBe('wasm-vpx');
+    expect(planRuntimeVideoFallback('webcodecs-video', 'VP8', { determinism: 'auto' })).toBe(
+      'wasm-vpx',
+    );
+    expect(
+      planRuntimeVideoFallback('webcodecs-video', 'vp09.00.31.08', {
+        pinDriver: 'webcodecs-video',
+      }),
+    ).toBe('webcodecs-software');
+    expect(planRuntimeVideoFallback('wasm-vpx', 'vp09.00.31.08')).toBeUndefined();
+  });
+
+  it('retries other native formats in software only from automatic determinism', () => {
+    for (const codec of ['avc1.640028', 'hvc1.1.6.L93.B0', 'av01.0.08M.08']) {
+      expect(planRuntimeVideoFallback('webcodecs-video', codec)).toBe('webcodecs-software');
+      expect(
+        planRuntimeVideoFallback('webcodecs-video', codec, {
+          determinism: 'force-software',
+        }),
+      ).toBeUndefined();
+    }
+    expect(planRuntimeVideoFallback('wasm-av1', 'av01.0.08M.08')).toBeUndefined();
+  });
+});
 
 describe('decodeVideoWithRuntimeFallback', () => {
   it('keeps a successful native path byte-for-byte ordered without loading the fallback', async () => {

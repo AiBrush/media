@@ -7,11 +7,11 @@
 import type {
   ContainerDriver,
   Determinism,
+  MuxOptions,
   StageOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
-import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import type { MaterializeOptions, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
 import { type MediaInput, type Source, from as normalizeInput } from '../sources/source.ts';
@@ -59,17 +59,17 @@ export function forceSoftware(o: CallOptions): CallOptions {
 }
 
 /** Re-expose a {@link StageOptions} as a {@link CallOptions.strategy} so a sub-route inherits determinism. */
-export function stageStrategy(stage: StageOptions): { determinism: Determinism; pinDriver?: string } {
+export function stageStrategy(stage: StageOptions): {
+  determinism: Determinism;
+  pinDriver?: string;
+} {
   return {
     determinism: stage.determinism ?? 'auto',
     ...(stage.pinDriver !== undefined ? { pinDriver: stage.pinDriver } : {}),
   };
 }
 
-export function isPinnedDriverMiss(
-  error: CapabilityError,
-  pinDriver: string | undefined,
-): boolean {
+export function isPinnedDriverMiss(error: CapabilityError, pinDriver: string | undefined): boolean {
   if (pinDriver === undefined || !error.message.startsWith('pinned ')) return false;
   const detail = error.detail;
   if (typeof detail !== 'object' || detail === null || !('tried' in detail)) return false;
@@ -91,32 +91,23 @@ export function isRawPcmTrack(track: TrackInfo): boolean {
 export function muxOptionsFrom(
   opts: ConvertOptions | MuxSpec | EncodeOptions | RemuxOptions,
   container?: string,
-): {
-  faststart?: boolean;
-  fragmented?: boolean;
-  container?: string;
-} {
+): MuxOptions {
   const faststart = 'faststart' in opts ? opts.faststart : undefined;
+  const maximumPacketCount = 'maximumPacketCount' in opts ? opts.maximumPacketCount : undefined;
   const fragmented = 'fragmented' in opts ? opts.fragmented : undefined;
   return {
     ...(faststart !== undefined ? { faststart } : {}),
+    ...(maximumPacketCount !== undefined ? { maximumPacketCount } : {}),
     ...(fragmented !== undefined ? { fragmented } : {}),
     ...(container !== undefined ? { container } : {}),
   };
-}
-
-export function openRenditionOptions(opts: ConvertOptions): {
-  readonly sink?: unknown;
-  readonly [key: string]: unknown;
-} {
-  const { sink, ...rest } = opts;
-  return sink === undefined ? { ...rest } : { ...rest, sink };
 }
 
 /** Source geometry (coded dims) for a video track, read from its WebCodecs decoder config. */
 export function sourceGeometryOf(track: TrackInfo): {
   width: number | undefined;
   height: number | undefined;
+  rotation?: number;
   fps?: number;
   durationSec?: number;
   bitrate?: number;
@@ -131,6 +122,7 @@ export function sourceGeometryOf(track: TrackInfo): {
     return {
       width: config.codedWidth,
       height: config.codedHeight,
+      ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
       ...(fps !== undefined ? { fps } : {}),
       ...(durationSec !== undefined ? { durationSec } : {}),
       ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
@@ -139,6 +131,7 @@ export function sourceGeometryOf(track: TrackInfo): {
   return {
     width: undefined,
     height: undefined,
+    ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(fps !== undefined ? { fps } : {}),
     ...(durationSec !== undefined ? { durationSec } : {}),
     ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
@@ -183,34 +176,6 @@ export function isFlacAuthorCodec(codec: string | undefined): boolean {
   return codec === undefined || codec === 'flac' || codec === 'pcm' || codec.startsWith('pcm-');
 }
 
-export function pcmSampleFormat(codec: string | undefined): SampleFormat | undefined {
-  if (codec === undefined || codec === 'pcm') return undefined;
-  const normalized = codec.endsWith('be') ? codec.slice(0, -2) : codec;
-  switch (normalized) {
-    case 'pcm-u8':
-      return 'u8';
-    case 'pcm-s8':
-      return 's8';
-    case 'pcm-s16':
-      return 's16';
-    case 'pcm-s24':
-      return 's24';
-    case 'pcm-s32':
-      return 's32';
-    case 'pcm-f32':
-      return 'f32';
-    case 'pcm-f64':
-      return 'f64';
-    default:
-      return undefined;
-  }
-}
-
-export function pcmEndian(codec: string | undefined): Endianness | undefined {
-  if (codec === undefined || codec === 'pcm') return undefined;
-  return codec.endsWith('be') ? 'be' : 'le';
-}
-
 export function toMediaInfo(
   container: ContainerDriver,
   tracks: readonly TrackInfo[],
@@ -233,6 +198,7 @@ function toInfoTrack(t: TrackInfo): MediaInfoTrack {
     codec: t.codec,
   };
   if (t.durationSec !== undefined) base.durationSec = t.durationSec;
+  if (t.language !== undefined) base.language = t.language;
   if (t.fps !== undefined) base.fps = t.fps;
   if (t.rotation !== undefined) base.rotation = t.rotation;
   const config = t.config;

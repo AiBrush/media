@@ -8,9 +8,10 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MediaError } from '../contracts/errors.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { cacheSource } from './cache.ts';
-import { fromBlob, fromBytes } from './source.ts';
+import { type Source, fromBlob, fromBytes } from './source.ts';
 
 /** Drain a readable fully into one contiguous array (test util — distinct from the impl's internal copy). */
 async function readAll(s: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -225,6 +226,255 @@ describe('cacheSource — preload serves the second read from cache (no duplicat
     expectBytesEqual(a, truth.subarray(0, 4096));
     expectBytesEqual(b, truth.subarray(0, 4096));
     expect(calls.filter((c) => c.range !== null).length).toBe(1); // single in-flight fetch shared
+  });
+});
+
+describe('cacheSource — bounded ranged-read retention', () => {
+  it('keeps a strict byte ceiling and evicts the least-recently-used interval', async () => {
+    const truth = Uint8Array.from({ length: 128 }, (_, index) => index);
+    const calls: Array<[number, number]> = [];
+    const source: Source = {
+      ...fromBytes(truth),
+      range(start, end): Promise<Uint8Array> {
+        calls.push([start, end]);
+        return Promise.resolve(truth.slice(start, end));
+      },
+    };
+    const src = cacheSource(source, { maxBytes: 16 });
+
+    expectBytesEqual(await src.range(0, 8), truth.subarray(0, 8));
+    expectBytesEqual(await src.range(32, 40), truth.subarray(32, 40));
+    expect(src.cachedBytes).toBe(16);
+
+    // Refresh the leading interval, then make a third disjoint window force the middle one out.
+    expectBytesEqual(await src.range(0, 4), truth.subarray(0, 4));
+    expectBytesEqual(await src.range(64, 72), truth.subarray(64, 72));
+    expect(src.cachedBytes).toBe(16);
+    expect(calls).toHaveLength(3);
+
+    expectBytesEqual(await src.range(0, 4), truth.subarray(0, 4));
+    expect(calls).toHaveLength(3);
+    expectBytesEqual(await src.range(32, 40), truth.subarray(32, 40));
+    expect(calls).toHaveLength(4);
+    expect(src.cachedBytes).toBeLessThanOrEqual(16);
+  });
+
+  it('returns an over-cap window exactly without retaining it', async () => {
+    const truth = Uint8Array.from({ length: 64 }, (_, index) => index);
+    let calls = 0;
+    const source: Source = {
+      ...fromBytes(truth),
+      range(start, end): Promise<Uint8Array> {
+        calls++;
+        return Promise.resolve(truth.slice(start, end));
+      },
+    };
+    const src = cacheSource(source, { maxBytes: 8 });
+
+    expectBytesEqual(await src.range(0, 16), truth.subarray(0, 16));
+    expect(src.cachedBytes).toBe(0);
+    expectBytesEqual(await src.range(0, 16), truth.subarray(0, 16));
+    expect(calls).toBe(2);
+    expect(src.cachedBytes).toBe(0);
+  });
+
+  it('rejects unsafe cache capacities synchronously', () => {
+    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: -1 })).toThrow(RangeError);
+    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: 1.5 })).toThrow(RangeError);
+    expect(() =>
+      cacheSource(fromBytes(new Uint8Array()), { maxBytes: Number.MAX_SAFE_INTEGER + 1 }),
+    ).toThrow(RangeError);
+  });
+});
+
+describe('cacheSource — AbortSignal forwarding and cancellation', () => {
+  it('forwards the exact signal through nested caching wrappers', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const memory = fromBytes(truth);
+    const seen: Array<AbortSignal | undefined> = [];
+    const source: Source = {
+      ...memory,
+      range(start, end, signal): Promise<Uint8Array> {
+        seen.push(signal);
+        return Promise.resolve(truth.subarray(start, end));
+      },
+    };
+    const src = cacheSource(cacheSource(source));
+    const controller = new AbortController();
+
+    expectBytesEqual(await src.range(17, 49, controller.signal), truth.subarray(17, 49));
+    expect(seen).toEqual([controller.signal]);
+  });
+
+  it('rejects an in-flight read even when the wrapped source ignores cancellation', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const memory = fromBytes(truth);
+    let seen: AbortSignal | undefined;
+    const source: Source = {
+      ...memory,
+      range(_start, _end, signal): Promise<Uint8Array> {
+        seen = signal;
+        return new Promise<Uint8Array>(() => {});
+      },
+    };
+    const src = cacheSource(source);
+    const controller = new AbortController();
+    const reason = new MediaError('aborted', 'stop cached read');
+
+    const read = src.range(0, 32, controller.signal);
+    expect(seen).toBe(controller.signal);
+    controller.abort(reason);
+
+    await expect(read).rejects.toBe(reason);
+  });
+
+  it('checks an already-aborted signal before returning a cached hit', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const memory = fromBytes(truth);
+    let calls = 0;
+    const source: Source = {
+      ...memory,
+      range(start, end): Promise<Uint8Array> {
+        calls++;
+        return Promise.resolve(truth.subarray(start, end));
+      },
+    };
+    const src = cacheSource(source);
+    await src.range(0, 32);
+    const controller = new AbortController();
+    controller.abort(new MediaError('aborted', 'pre-aborted cached read'));
+
+    await expect(src.range(0, 32, controller.signal)).rejects.toMatchObject({ code: 'aborted' });
+    expect(calls).toBe(1);
+  });
+
+  it('forwards the signal to an eager cache’s underlying full-range read', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const memory = fromBytes(truth);
+    const calls: Array<{
+      start: number;
+      end: number;
+      signal: AbortSignal | undefined;
+    }> = [];
+    const source: Source = {
+      ...memory,
+      range(start, end, signal): Promise<Uint8Array> {
+        calls.push({ start, end, signal });
+        return Promise.resolve(truth.subarray(start, end));
+      },
+    };
+    const src = cacheSource(source, { eager: true });
+    const controller = new AbortController();
+
+    expectBytesEqual(await src.range(17, 49, controller.signal), truth.subarray(17, 49));
+    expect(calls).toEqual([{ start: 0, end: truth.byteLength, signal: controller.signal }]);
+  });
+
+  it('isolates eager callers with different signals', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const memory = fromBytes(truth);
+    const requests: Array<{
+      signal: AbortSignal | undefined;
+      resolve: (bytes: Uint8Array) => void;
+    }> = [];
+    const source: Source = {
+      ...memory,
+      range(_start, _end, signal): Promise<Uint8Array> {
+        return new Promise<Uint8Array>((resolve) => requests.push({ signal, resolve }));
+      },
+    };
+    const src = cacheSource(source, { eager: true });
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+
+    const first = src.range(0, 32, firstController.signal);
+    const second = src.range(0, 32, secondController.signal);
+    expect(requests.map((request) => request.signal)).toEqual([
+      firstController.signal,
+      secondController.signal,
+    ]);
+
+    firstController.abort();
+    await expect(first).rejects.toMatchObject({ code: 'aborted' });
+    requests[1]?.resolve(truth.subarray(0, 32));
+    expectBytesEqual(await second, truth.subarray(0, 32));
+  });
+
+  it('aborts a hanging URL size probe during prime()', async () => {
+    let fetchSignal: AbortSignal | null | undefined;
+    let markFetchStarted: (() => void) | undefined;
+    const fetchStarted = new Promise<void>((resolve) => {
+      markFetchStarted = resolve;
+    });
+    vi.stubGlobal('fetch', ((_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      fetchSignal = init?.signal;
+      markFetchStarted?.();
+      return new Promise<Response>(() => {});
+    }) as typeof fetch);
+    try {
+      const src = cacheSource('https://example.test/hanging.mp4');
+      const controller = new AbortController();
+      const prime = src.prime(undefined, controller.signal);
+      await fetchStarted;
+      expect(fetchSignal).toBe(controller.signal);
+      controller.abort(new MediaError('aborted', 'stop prime'));
+      await expect(prime).rejects.toMatchObject({ code: 'aborted' });
+      expect(src.cachedBytes).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not insert a late eager full read after its caller aborts', async () => {
+    const truth = await loadFixture(FIXTURE);
+    let resolveRead: ((bytes: Uint8Array) => void) | undefined;
+    const source: Source = {
+      ...fromBytes(truth),
+      range(): Promise<Uint8Array> {
+        return new Promise<Uint8Array>((resolve) => {
+          resolveRead = resolve;
+        });
+      },
+    };
+    const src = cacheSource(source, { eager: true });
+    const controller = new AbortController();
+    const read = src.range(0, 32, controller.signal);
+    controller.abort(new MediaError('aborted', 'stop late eager read'));
+    await expect(read).rejects.toMatchObject({ code: 'aborted' });
+    resolveRead?.(truth);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(src.cachedBytes).toBe(0);
+  });
+
+  it('cancels a range-less sequential stream when its signalled materialization aborts', async () => {
+    let cancels = 0;
+    let cancelReason: unknown;
+    const source: Source = {
+      __media: 'source',
+      kind: 'stream',
+      stream(): ReadableStream<Uint8Array> {
+        return new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(Uint8Array.of(1, 2, 3));
+          },
+          cancel(reason): void {
+            cancels++;
+            cancelReason = reason;
+          },
+        });
+      },
+    };
+    const src = cacheSource(source);
+    const controller = new AbortController();
+    const reason = new MediaError('aborted', 'stop sequential cache read');
+    const read = src.range(0, 32, controller.signal);
+    await Promise.resolve();
+    controller.abort(reason);
+    await expect(read).rejects.toBe(reason);
+    expect(cancels).toBe(1);
+    expect(cancelReason).toBe(reason);
+    expect(src.cachedBytes).toBe(0);
   });
 });
 

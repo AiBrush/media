@@ -19,7 +19,12 @@
 import { describe, expect, it } from 'vitest';
 import { WorkerStreamBridge } from './worker-bridge.ts';
 import { type JobRunner, runOffloadWorker } from './worker-entry.ts';
-import type { HostMessage, MessageLike, WorkerMediaCaps, WorkerMessage } from './worker-protocol.ts';
+import type {
+  HostMessage,
+  MessageLike,
+  WorkerMediaCaps,
+  WorkerMessage,
+} from './worker-protocol.ts';
 import { adaptWorker, ensureWorkerBridge } from './worker-spawn.ts';
 
 // ── an EventTarget-backed DOM-Worker stand-in with observable listener bookkeeping ───────────────────
@@ -223,7 +228,9 @@ describe('ensureWorkerBridge over adaptWorker — per-op caps handshake', () => 
     const fake = fakeDomWorkerRunning(runner, ALL);
     const bridge = await ensureWorkerBridge(() => adaptWorker(fake), 1000);
     if (bridge === undefined) throw new Error('expected a bridge');
-    const chunks = (await drain(bridge.runStream({ op: 'convert', payload: { n: 3 } }))) as ArrayBuffer[];
+    const chunks = (await drain(
+      bridge.runStream({ op: 'convert', payload: { n: 3 } }),
+    )) as ArrayBuffer[];
     expect(chunks.map((b) => [...new Uint8Array(b)][0])).toEqual([0, 1, 2]);
     expect(fake.messageListenerCount).toBe(0);
   });

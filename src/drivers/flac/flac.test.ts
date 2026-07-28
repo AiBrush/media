@@ -11,7 +11,7 @@ import {
 import { encodeFlac, flacPcmFromDecoded } from '../../codecs/flac/encode.ts';
 import type { ByteSource, PacketInfoTable } from '../../contracts/driver.ts';
 import { InputError } from '../../contracts/errors.ts';
-import { channelAt } from '../../dsp/pcm.ts';
+import { channelAt, roundHalfToEven } from '../../dsp/pcm.ts';
 import { type Source, fromBytes } from '../../sources/source.ts';
 import {
   fixtureSource,
@@ -1263,7 +1263,10 @@ describe('media.encode — native FLAC output via pure-TS FLAC encoder + muxer',
       let o = 0;
       for (let i = 0; i < total; i++) {
         for (let ch = 0; ch < 2; ch++) {
-          const q = Math.max(-32768, Math.min(32767, Math.round((planes[ch]?.[i] ?? 0) * 32768)));
+          const q = Math.max(
+            -32768,
+            Math.min(32767, roundHalfToEven((planes[ch]?.[i] ?? 0) * 32768)),
+          );
           dv.setInt16(o, q, true);
           o += 2;
           expect(decoded.samples[ch]?.[i], `ch${ch} sample ${i}`).toBe(q);

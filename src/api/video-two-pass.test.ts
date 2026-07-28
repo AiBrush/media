@@ -71,12 +71,14 @@ describe('planH264TwoPass', () => {
       mediaType: 'video',
       codec: 'h264',
       config: { codec: 'avc1.42E01E', codedWidth: 320, codedHeight: 240 },
+      rotation: 90,
       fps: 25,
       durationSec: 1,
     };
     expect(sourceGeometryOf(known)).toEqual({
       width: 320,
       height: 240,
+      rotation: 90,
       fps: 25,
       durationSec: 1,
     });

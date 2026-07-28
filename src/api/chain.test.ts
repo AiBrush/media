@@ -111,7 +111,7 @@ describe('MediaChain', () => {
     const input = new Uint8Array([1, 2, 3]);
 
     const out = await createMediaChain(engine, input)
-      .trim({ start: 1, end: 2, mode: 'accurate' })
+      .trim({ start: 1, end: 2, mode: 'accurate', fragmented: true })
       .resize(320, 180, 'contain')
       .convert({ to: 'mp4', audio: { codec: 'aac' } })
       .blob();
@@ -123,6 +123,7 @@ describe('MediaChain', () => {
       start: 1,
       end: 2,
       mode: 'accurate',
+      fragmented: true,
       sink: { kind: 'stream' },
     });
     expect(engine.calls[1]?.input).toBeInstanceOf(ReadableStream);

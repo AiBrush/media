@@ -2,7 +2,7 @@ import type { PcmTransform } from '../../contracts/driver.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import type { SampleFormat } from '../../dsp/pcm.ts';
 import { bytesPerSample } from '../../dsp/pcm.ts';
-import { locate, writeExtendedFloat80 } from './aiff.ts';
+import { aiffPcmSampleBytes, locate, writeExtendedFloat80 } from './aiff.ts';
 
 const AIFF_HEADER_BYTES = 54;
 const AIFF_COMM_SIZE = 18;
@@ -15,6 +15,7 @@ function hasOtherPcmWork(o: PcmTransform): boolean {
   return (
     o.gainDb !== undefined ||
     o.fade !== undefined ||
+    o.mixMatrix !== undefined ||
     o.dynamics !== undefined ||
     o.biquad !== undefined
   );
@@ -112,10 +113,11 @@ export function trySliceAiffPcm(
   if (layout.channels <= 0 || sampleRate <= 0) return undefined;
   if (opts.channels !== undefined && opts.channels !== layout.channels) return undefined;
   if (opts.sampleRate !== undefined && opts.sampleRate !== sampleRate) return undefined;
+  aiffPcmSampleBytes(layout, ssndSampleOffset, ssndSampleBytes);
   if (ssndSampleOffset < 0) return undefined;
 
   const frameBytes = layout.channels * bytesPerSample(format);
-  const realFrames = Math.min(layout.frames, Math.floor(ssndSampleBytes / frameBytes));
+  const realFrames = layout.frames;
   const { startFrame, endFrame } = validateBounds(bounds, realFrames, sampleRate);
   const startByte = ssndSampleOffset + startFrame * frameBytes;
   const endByte = ssndSampleOffset + endFrame * frameBytes;

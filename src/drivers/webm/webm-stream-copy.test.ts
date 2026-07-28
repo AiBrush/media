@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
+import { toStreamTarget } from '../../sinks/stream-target.ts';
 import { fromBytes } from '../../sources/source.ts';
+import { loadFixture } from '../../test-support/corpus.ts';
 import { WebmMuxer } from './ebml-write.ts';
 import { elements, findChild } from './ebml.ts';
 import { WebmDriver, WebmModule, demuxWebm, parseWebm } from './webm-driver.ts';
@@ -562,5 +564,43 @@ describe('WebmDriver.streamCopy — Session 6 R3 keyframe trim', () => {
       (row) => row.trackIndex === firstVideoTrackIndex(output),
     );
     expect(videoRows[0]?.keyframe).toBe(true);
+  });
+
+  it('public finite WebM remux writes a definite Segment to a contiguous callback target', async () => {
+    const source = await loadFixture('movie_5.webm');
+    const writes: Array<{ readonly position: number; readonly data: Uint8Array }> = [];
+    const result = await createMedia()
+      .use(WebmModule)
+      .remux(fromBytes(source, { mime: 'video/webm' }), {
+        to: 'webm',
+        sink: toStreamTarget((data, position) => {
+          writes.push({ position, data: data.slice() });
+        }),
+      });
+    expect(result).toBeUndefined();
+    expect(writes.length).toBeGreaterThan(0);
+    let expectedPosition = 0;
+    for (const write of writes) {
+      expect(write.position).toBe(expectedPosition);
+      expectedPosition += write.data.byteLength;
+    }
+    const output = new Uint8Array(expectedPosition);
+    for (const write of writes) output.set(write.data, write.position);
+    const parsed = parseWebm(output);
+    const original = parseWebm(source);
+    expect(parsed.container).toBe('webm');
+    expect(parsed.durationSec).toBeCloseTo(original.durationSec, 3);
+    expect(parsed.tracks.map((track) => track.codec)).toEqual(
+      original.tracks.map((track) => track.codec),
+    );
+
+    const segment = [
+      ...elements(
+        new DataView(output.buffer, output.byteOffset, output.byteLength),
+        0,
+        output.byteLength,
+      ),
+    ].find((element) => element.id === 0x18538067);
+    expect(segment?.unknownSize).toBe(false);
   });
 });

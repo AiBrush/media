@@ -273,20 +273,30 @@ function sampleBilinear(
 /**
  * Resize {@link Blit} (source rect scaled into the destination rect): bilinear-resample the source sub-rect
  * into the `dst` rect of a `blit.dims` output. Pixels outside `dst` (the `contain` letterbox) stay
- * transparent black — matching the GPU's cleared background and Canvas2D's `clearRect`.
+ * transparent black. A fractional destination edge contributes its geometric coverage to the adjacent
+ * pixel, matching the antialiased Canvas2D/WebGPU substrates instead of using a fractional typed-array
+ * index.
  */
 function resizeBlitToRgba(blit: Blit, src: RgbaImage): RgbaImage {
   const out = blankRgba(blit.dims);
   const view = viewOf(src);
   const sxScale = blit.src.width / blit.dst.width;
   const syScale = blit.src.height / blit.dst.height;
-  for (let dy = 0; dy < blit.dst.height; dy++) {
+  const startX = Math.max(0, Math.floor(blit.dst.x));
+  const startY = Math.max(0, Math.floor(blit.dst.y));
+  const endX = Math.min(out.width, Math.ceil(blit.dst.x + blit.dst.width));
+  const endY = Math.min(out.height, Math.ceil(blit.dst.y + blit.dst.height));
+  const coverage = (pixel: number, start: number, end: number): number =>
+    Math.max(0, Math.min(pixel + 1, end) - Math.max(pixel, start));
+  for (let oy = startY; oy < endY; oy++) {
     // Sample at destination-pixel centres mapped back into the source rect.
-    const sy = blit.src.y + (dy + 0.5) * syScale - 0.5;
-    for (let dx = 0; dx < blit.dst.width; dx++) {
-      const sx = blit.src.x + (dx + 0.5) * sxScale - 0.5;
+    const sy = blit.src.y + (oy + 0.5 - blit.dst.y) * syScale - 0.5;
+    const coverageY = coverage(oy, blit.dst.y, blit.dst.y + blit.dst.height);
+    for (let ox = startX; ox < endX; ox++) {
+      const sx = blit.src.x + (ox + 0.5 - blit.dst.x) * sxScale - 0.5;
       const [r, g, b, a] = sampleBilinear(view, src, sx, sy);
-      setPixel(out, blit.dst.x + dx, blit.dst.y + dy, r, g, b, a);
+      const alphaCoverage = coverageY * coverage(ox, blit.dst.x, blit.dst.x + blit.dst.width);
+      setPixel(out, ox, oy, r, g, b, Math.round(a * alphaCoverage));
     }
   }
   return out;
@@ -294,7 +304,12 @@ function resizeBlitToRgba(blit: Blit, src: RgbaImage): RgbaImage {
 
 /** A {@link Blit} is an exact copy when its source and destination rects are the same size (crop / 1:1). */
 function isExactBlit(blit: Blit): boolean {
-  return blit.src.width === blit.dst.width && blit.src.height === blit.dst.height;
+  return (
+    blit.src.width === blit.dst.width &&
+    blit.src.height === blit.dst.height &&
+    Number.isSafeInteger(blit.dst.x) &&
+    Number.isSafeInteger(blit.dst.y)
+  );
 }
 
 /**

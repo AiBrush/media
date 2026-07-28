@@ -6,6 +6,7 @@
 import type {
   Determinism,
   EncodedChunk,
+  FaststartMode,
   Packet,
   PacketMetadata,
   PcmBiquad,
@@ -43,10 +44,18 @@ export type {
   Determinism,
   /** A sealed encoded unit (PTS only) — the unit of {@link PacketStreams} and {@link Packet.chunk}. */
   EncodedChunk,
+  /** MP4 fast-start layout: false, in-memory moov-first, or positioned reserved-moov streaming. */
+  FaststartMode,
   /** A demuxed packet (sealed chunk + optional DTS/packet size) — the unit of {@link Demuxed.packets}. */
   Packet,
   /** Demux packet metadata without payload bytes — the unit of {@link Demuxed.packetTable}. */
   PacketMetadata,
+  /** One lightweight packet-timeline row. */
+  PacketInfoMetadata,
+  /** Materialized packet-timeline rows plus their tracks. */
+  PacketInfoTable,
+  /** Single-use pull-driven packet batches plus their tracks. */
+  PacketInfoBatchStream,
   /** PCM-native biquad/EQ spec accepted by {@link AudioTarget.biquad}. */
   PcmBiquad,
   /** PCM-native dynamics spec accepted by {@link AudioTarget.dynamics}. */
@@ -92,6 +101,16 @@ export interface CallOptions {
   signal?: AbortSignal;
   onProgress?: (p: Progress) => void;
   strategy?: StrategyOverride;
+}
+
+/** Per-call options for {@link MediaEngine.decode}. */
+export interface DecodeOptions extends CallOptions {
+  /**
+   * Optional single-source track selectors such as `video:1` or `audio:0`. The ordinal is zero-based
+   * among tracks of that media type. Because {@link MediaStreams} exposes one stream per media type,
+   * selecting more than one distinct video or audio track raises a typed `InputError`.
+   */
+  trackSelect?: readonly string[];
 }
 
 /**
@@ -168,6 +187,13 @@ export interface AudioTarget {
   bitrate?: number;
   gainDb?: number;
   fade?: { inSec?: number; outSec?: number; curve?: 'linear' | 'equal-power' };
+  /**
+   * Optional explicit output-channel × input-channel remix matrix for PCM-native
+   * WAV/AIFF/CAF/FLAC targets.
+   * Each output row must contain one finite coefficient per input channel. When present,
+   * `channels` must equal the row count; otherwise the source/target channel-count defaults apply.
+   */
+  mixMatrix?: readonly (readonly number[])[];
   dynamics?: PcmDynamics;
   biquad?: PcmBiquad | readonly PcmBiquad[];
 }
@@ -184,14 +210,18 @@ export interface ConvertOptions {
   to?: Container;
   video?: false | VideoTarget;
   audio?: false | AudioTarget;
-  faststart?: boolean;
+  faststart?: FaststartMode;
+  /** Required per-track packet ceiling when `faststart:'reserve'` is selected. */
+  maximumPacketCount?: number;
   fragmented?: boolean;
   sink?: Sink;
 }
 
 export interface RemuxOptions {
   to: Container;
-  faststart?: boolean;
+  faststart?: FaststartMode;
+  /** Required per-track packet ceiling when `faststart:'reserve'` is selected. */
+  maximumPacketCount?: number;
   fragmented?: boolean;
   /** Same-container metadata tag rewrite. Unsupported containers raise a typed capability miss. */
   tags?: Record<string, string>;
@@ -204,6 +234,8 @@ export interface TrimOptions {
   start: number;
   end: number;
   mode?: 'keyframe' | 'accurate';
+  /** Preserve/author fragmented MP4 (CMAF-style init segment plus media fragments) output. */
+  fragmented?: boolean;
   sink?: Sink;
 }
 
@@ -225,7 +257,9 @@ export interface EncodeOptions {
 
 export interface MuxSpec {
   container: Container;
-  faststart?: boolean;
+  faststart?: FaststartMode;
+  /** Required per-track packet ceiling when `faststart:'reserve'` is selected. */
+  maximumPacketCount?: number;
   fragmented?: boolean;
   sink?: Sink;
 }
@@ -272,6 +306,7 @@ export interface MediaInfoTrack {
   fps?: number;
   sampleRate?: number;
   channels?: number;
+  /** ISO-639-2/T language declared by the container, including the explicit `und` code. */
   language?: string;
 }
 
@@ -291,7 +326,10 @@ export interface Demuxed {
   close(): Promise<void>;
 }
 
-/** Decoded frame streams (the result of `decode`). */
+/**
+ * Decoded frame streams (the result of `decode`). Video pixels have the container track's display
+ * rotation applied; callers therefore receive presentation-oriented frames rather than coded orientation.
+ */
 export interface MediaStreams {
   video?: ReadableStream<VideoFrame>;
   audio?: ReadableStream<AudioData>;

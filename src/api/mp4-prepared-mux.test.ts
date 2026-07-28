@@ -1,12 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { EncodedChunk, Packet, PacketInfoMetadata } from '../contracts/driver.ts';
+import type { EncodedChunk, Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { mp3PacketInfoFromBytes } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseFragments } from '../drivers/mp4/parse.ts';
+import { writeMp4 } from '../drivers/mp4/write.ts';
 import { toStream } from '../sinks/sink.ts';
+import { cacheSource } from '../sources/cache.ts';
 import { type Source, fromBytes } from '../sources/source.ts';
+import { loadFixture } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
 import { muxPreparedMp4PacketStreams } from './flac-mkv-mux.ts';
 import {
@@ -148,6 +151,63 @@ function packetShape(packet: PacketInfoMetadata): {
     durationUs: packet.durationUs,
     keyframe: packet.keyframe,
   };
+}
+
+function packetInfoChecksum(packets: readonly PacketInfoMetadata[]): number {
+  let checksum = 0x811c9dc5;
+  const mix = (value: number): void => {
+    checksum = Math.imul(checksum ^ (value >>> 0), 0x01000193) >>> 0;
+  };
+  for (const packet of packets) {
+    mix(packet.trackIndex);
+    mix(packet.size);
+    mix(packet.ptsUs);
+    mix(packet.dtsUs);
+    mix(packet.durationUs ?? 0);
+    mix(packet.keyframe ? 1 : 0);
+  }
+  return checksum;
+}
+
+let retainedMultiWindowAvcFixture: Uint8Array | undefined;
+
+function multiWindowAvcFixture(): Uint8Array {
+  if (retainedMultiWindowAvcFixture !== undefined) return retainedMultiWindowAvcFixture;
+  const sampleBytes = 2 * 1024 * 1024;
+  const sampleCount = 9;
+  const samples = Array.from({ length: sampleCount }, (_, index) => {
+    const data = new Uint8Array(sampleBytes);
+    const nalBytes = sampleBytes - 4;
+    data[0] = (nalBytes >>> 24) & 0xff;
+    data[1] = (nalBytes >>> 16) & 0xff;
+    data[2] = (nalBytes >>> 8) & 0xff;
+    data[3] = nalBytes & 0xff;
+    data[4] = index === 0 ? 0x65 : 0x41;
+    // first_mb_in_slice=0, then either I (2) or P (0). The payload classifier deliberately has to
+    // discover the non-IDR I pictures because only sample 1 is declared in stss.
+    data[5] = index % 2 === 1 ? 0xb0 : 0xc0;
+    return {
+      data,
+      durationTicks: 3_000,
+      cttsTicks: 0,
+      keyframe: index === 0,
+    };
+  });
+  retainedMultiWindowAvcFixture = writeMp4(
+    [
+      {
+        mediaType: 'video',
+        sampleEntryType: 'avc1',
+        timescale: 90_000,
+        width: 16,
+        height: 16,
+        description: Uint8Array.of(1, 100, 0, 31, 255, 225, 0, 1, 103, 1, 0, 1, 104),
+        samples,
+      },
+    ],
+    { faststart: true, brand: 'mp4' },
+  );
+  return retainedMultiWindowAvcFixture;
 }
 
 function topLevelBoxTypes(bytes: Uint8Array): string[] {
@@ -331,6 +391,81 @@ describe('prepared MP4 packet mux', () => {
     const reparsed = await mp4PacketInfoFromBytes(output);
     expect(reparsed.tracks.map((track) => track.mediaType)).toEqual(['video', 'audio']);
     expect(reparsed.packets.map(packetShape)).toEqual(table.packets.map(packetShape));
+  });
+
+  it('does not turn prepared Matroska AAC priming into a leading video edit', async () => {
+    const videoTrack: TrackInfo = {
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      fps: 30,
+      config: {
+        codec: 'avc1.42C01E',
+        codedWidth: 32,
+        codedHeight: 18,
+        description: Uint8Array.of(1, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0, 0),
+      },
+    };
+    const audioTrack: TrackInfo = {
+      id: 2,
+      mediaType: 'audio',
+      codec: 'aac',
+      codecDelayNs: 42_666_667,
+      config: {
+        codec: 'aac',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description: Uint8Array.of(0x11, 0x90),
+      },
+    };
+    const packet = (
+      ptsUs: number,
+      dtsUs: number,
+      durationUs: number,
+      keyframe: boolean,
+      data: Uint8Array,
+    ): Packet => {
+      const row: PacketInfoMetadata = {
+        trackIndex: 0,
+        size: data.byteLength,
+        ptsUs,
+        dtsUs,
+        durationUs,
+        keyframe,
+      };
+      return {
+        chunk: encodedChunkView(row, data),
+        data,
+        dtsUs,
+        sizeBytes: data.byteLength,
+      };
+    };
+    const videoPackets = [
+      packet(0, 0, 33_333, true, Uint8Array.of(0x12, 0x34)),
+      packet(33_333, 33_333, 33_333, false, Uint8Array.of(0x56, 0x78)),
+    ];
+    const audioPackets = Array.from({ length: 4 }, (_, index) =>
+      packet(
+        Math.round(((index * 1024 - 2048) * 1_000_000) / 48_000),
+        Math.round((index * 1024 * 1_000_000) / 48_000),
+        Math.round((1024 * 1_000_000) / 48_000),
+        true,
+        Uint8Array.of(0x21, index),
+      ),
+    );
+
+    const output = muxPreparedMp4PacketTracks({
+      tracks: [
+        { track: videoTrack, packets: videoPackets },
+        { track: audioTrack, packets: audioPackets },
+      ],
+      container: 'mp4',
+    });
+    const reparsed = await mp4PacketInfoFromBytes(output);
+    const firstVideo = reparsed.packets.find((row) => row.trackIndex === 0);
+    const reparsedAudio = reparsed.tracks.find((track) => track.mediaType === 'audio');
+    expect(firstVideo?.ptsUs).toBe(0);
+    expect(reparsedAudio?.gapless?.leadingSamples).toBe(2048);
   });
 
   it('fuses untouched first-party MP4 and ADTS packet streams byte-identically without host chunks', async () => {
@@ -988,6 +1123,19 @@ describe('prepared MP4 packet mux', () => {
     }
   });
 
+  it('keeps forced-offset byte helpers on the authoritative fragmented packet path', async () => {
+    const input = await loadFixture('bear-open-gop-frag.mp4');
+    const direct = await mp4PacketInfoFromBytes(input, { includeOffsets: true });
+    const packetInfo = Mp4Driver.packetInfo;
+    if (packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+    const authoritative = await packetInfo.call(Mp4Driver, fromBytes(input, { mime: 'video/mp4' }));
+
+    expect(direct.tracks).toEqual(authoritative.tracks);
+    expect(direct.packets).toEqual(authoritative.packets);
+    expect(direct.packets.length).toBeGreaterThan(0);
+    expect(direct.packets.every((packet) => packet.offset !== undefined)).toBe(true);
+  });
+
   it('streams prepared multi-track MP4 payloads as incremental chunks', async () => {
     const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
     const table = await mp4PacketInfoFromBytes(input);
@@ -1105,6 +1253,318 @@ describe('prepared MP4 packet mux', () => {
     );
   });
 
+  it('reuses only parsed facts for an exact finite blob URL and returns defensive snapshots', async () => {
+    const input = await mediaTestBytes('scenarios/performance/op-sweep-demux/01.mp4');
+    const expected = await mp4PacketInfoFromBytes(input);
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+    const url = 'blob:https://example.test/immutable-packet-info';
+    const opts = { mime: 'video/mp4', size: input.byteLength } as const;
+
+    const first = await mp4PacketInfoFromUrl(url, opts);
+    const firstTrack = first.tracks[0];
+    if (firstTrack === undefined) throw new Error('expected first cached track');
+    firstTrack.codec = 'poisoned';
+    (first.packets[0] as { size: number }).size = 1;
+
+    const second = await mp4PacketInfoFromUrl(url, opts);
+    expect(second.tracks).toEqual(expected.tracks);
+    expect(second.packets).toEqual(expected.packets);
+    expect(second).not.toBe(first);
+    expect(second.tracks).not.toBe(first.tracks);
+    expect(second.packets).not.toBe(first.packets);
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+    ]);
+
+    const secondTrack = second.tracks[0];
+    if (secondTrack === undefined) throw new Error('expected second cached track');
+    secondTrack.codec = 'also-poisoned';
+    (second.packets[0] as { size: number }).size = 2;
+    const third = await mp4PacketInfoFromUrl(url, opts);
+    expect(third.tracks).toEqual(expected.tracks);
+    expect(third.packets).toEqual(expected.packets);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('separates finite blob MIME and packet-info provider identities', async () => {
+    const input = await mediaTestBytes('scenarios/performance/op-sweep-demux/01.mp4');
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+    const url = 'blob:https://example.test/semantic-packet-info';
+    const originalPacketInfo = Mp4Driver.packetInfo;
+    if (originalPacketInfo === undefined) throw new Error('expected MP4 packetInfo');
+
+    await mp4PacketInfoFromUrl(url, { mime: 'video/mp4', size: input.byteLength });
+    await mp4PacketInfoFromUrl(url, { mime: 'video/quicktime', size: input.byteLength });
+    expect(calls).toHaveLength(2);
+
+    let replacementCalls = 0;
+    const replacement: NonNullable<typeof Mp4Driver.packetInfo> = async (source, options) => {
+      replacementCalls++;
+      return originalPacketInfo.call(Mp4Driver, source, options);
+    };
+    Object.defineProperty(Mp4Driver, 'packetInfo', {
+      configurable: true,
+      value: replacement,
+    });
+    try {
+      await mp4PacketInfoFromUrl(url, { mime: 'video/mp4', size: input.byteLength });
+      await mp4PacketInfoFromUrl(url, { mime: 'video/mp4', size: input.byteLength });
+      expect(replacementCalls).toBe(1);
+      expect(calls).toHaveLength(3);
+    } finally {
+      Object.defineProperty(Mp4Driver, 'packetInfo', {
+        configurable: true,
+        value: originalPacketInfo,
+      });
+    }
+  });
+
+  it('never publishes failed or aborted finite blob packet-table attempts', async () => {
+    const input = await mediaTestBytes('micro_h264_1frame.mp4');
+    const server = rangeServer(input);
+    const originalPacketInfo = Mp4Driver.packetInfo;
+    if (originalPacketInfo === undefined) throw new Error('expected MP4 packetInfo');
+    let providerCalls = 0;
+    const fallible: NonNullable<typeof Mp4Driver.packetInfo> = async (source, options) => {
+      providerCalls++;
+      if (providerCalls === 1) throw new Error('intentional packet-info failure');
+      return originalPacketInfo.call(Mp4Driver, source, options);
+    };
+    Object.defineProperty(Mp4Driver, 'packetInfo', {
+      configurable: true,
+      value: fallible,
+    });
+    globalThis.fetch = server.fetch;
+    const failedUrl = 'blob:https://example.test/fallible-packet-info';
+    try {
+      await expect(mp4PacketInfoFromUrl(failedUrl, { size: input.byteLength })).rejects.toThrow(
+        'intentional packet-info failure',
+      );
+      await mp4PacketInfoFromUrl(failedUrl, { size: input.byteLength });
+      await mp4PacketInfoFromUrl(failedUrl, { size: input.byteLength });
+      expect(providerCalls).toBe(2);
+      expect(server.calls).toHaveLength(2);
+    } finally {
+      Object.defineProperty(Mp4Driver, 'packetInfo', {
+        configurable: true,
+        value: originalPacketInfo,
+      });
+    }
+
+    const abortServer = rangeServer(input);
+    const controller = new AbortController();
+    let abortFirstRead = true;
+    globalThis.fetch = (async (request, init): Promise<Response> => {
+      const response = await abortServer.fetch(request, init);
+      if (abortFirstRead) {
+        abortFirstRead = false;
+        controller.abort(new MediaError('aborted', 'cancel packet-info miss'));
+      }
+      return response;
+    }) as typeof fetch;
+    const abortedUrl = 'blob:https://example.test/aborted-packet-info';
+    await expect(
+      mp4PacketInfoFromUrl(abortedUrl, {
+        size: input.byteLength,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    await mp4PacketInfoFromUrl(abortedUrl, { size: input.byteLength });
+    expect(abortServer.calls).toHaveLength(2);
+  });
+
+  it('bounds retained URL windows across multi-window AVC classification without changing packet truth', async () => {
+    const input = multiWindowAvcFixture();
+    const expected = await mp4PacketInfoFromBytes(input);
+    const ranges: Array<{ readonly start: number; readonly end: number }> = [];
+    const raw: Source = {
+      __media: 'source',
+      kind: 'url',
+      size: input.byteLength,
+      mimeHint: 'video/mp4',
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('multi-window AVC packet info must stay range-backed');
+      },
+      range(start, end, signal): Promise<Uint8Array> {
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        ranges.push({ start, end });
+        return Promise.resolve(input.slice(start, end));
+      },
+    };
+    const maxBytes = 8 * 1024 * 1024;
+    const cached = cacheSource(raw, { maxBytes });
+    await cached.prime([{ start: 0, end: 32 * 1024 }]);
+    const packetInfo = Mp4Driver.packetInfo;
+    if (packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+
+    const table = await packetInfo.call(Mp4Driver, cached);
+
+    expect(table.tracks).toEqual(expected.tracks);
+    expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
+    expect(packetInfoChecksum(table.packets)).toBe(packetInfoChecksum(expected.packets));
+    expect(table.packets.flatMap((packet, index) => (packet.keyframe ? [index] : []))).toEqual([
+      0, 1, 3, 5, 7,
+    ]);
+    expect(ranges.filter(({ start, end }) => end - start > 32 * 1024)).toHaveLength(2);
+    expect(ranges.every(({ start, end }) => end - start <= maxBytes)).toBe(true);
+    expect(cached.cachedBytes).toBeLessThanOrEqual(maxBytes);
+  });
+
+  it('stops multi-window URL classification after abort without retaining past the cap', async () => {
+    const input = multiWindowAvcFixture();
+    const controller = new AbortController();
+    const ranges: Array<{ readonly start: number; readonly end: number }> = [];
+    const raw: Source = {
+      __media: 'source',
+      kind: 'url',
+      size: input.byteLength,
+      mimeHint: 'video/mp4',
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('multi-window AVC packet info must stay range-backed');
+      },
+      range(start, end): Promise<Uint8Array> {
+        ranges.push({ start, end });
+        if (end - start > 32 * 1024) controller.abort(new MediaError('aborted', 'stop AVC walk'));
+        return Promise.resolve(input.slice(start, end));
+      },
+    };
+    const maxBytes = 8 * 1024 * 1024;
+    const cached = cacheSource(raw, { maxBytes });
+    await cached.prime([{ start: 0, end: 32 * 1024 }]);
+    const packetInfo = Mp4Driver.packetInfo;
+    if (packetInfo === undefined) throw new Error('expected MP4 packetInfo');
+
+    await expect(
+      packetInfo.call(Mp4Driver, cached, { signal: controller.signal }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(ranges.filter(({ start, end }) => end - start > 32 * 1024)).toHaveLength(1);
+    expect(cached.cachedBytes).toBeLessThanOrEqual(maxBytes);
+  });
+
+  it('uses complete sdtp picture dependencies without reading H.264 payload ranges', async () => {
+    const input = await mediaTestBytes('scenarios/performance/op-sweep-demux/01.mp4');
+    const expected = await mp4PacketInfoFromBytes(input);
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+
+    const table = await mp4PacketInfoFromUrl('https://example.test/sdtp-h264.mp4', {
+      mime: 'video/mp4',
+      size: input.byteLength,
+    });
+
+    expect(table.tracks).toEqual(expected.tracks);
+    expect(table.packets.map(packetShape)).toEqual(expected.packets.map(packetShape));
+    const videoPackets = table.packets.filter((packet) => packet.trackIndex === 0);
+    expect(videoPackets.flatMap((packet, index) => (packet.keyframe ? [index] : []))).toEqual([
+      0, 76, 152, 228, 304,
+    ]);
+    expect(input.byteLength).toBeGreaterThan(32 * 1024);
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+    ]);
+  });
+
+  it('uses a fresh bounded URL snapshot when rebuilding MP4 packet tables', async () => {
+    const input = await mediaTestBytes('scenarios/performance/op-sweep-demux/01.mp4');
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+    const url = 'https://example.test/repeated-sdtp-h264.mp4';
+    const opts = { mime: 'video/mp4', size: input.byteLength } as const;
+
+    const first = await mp4PacketInfoFromUrl(url, opts);
+    const second = await mp4PacketInfoFromUrl(url, opts);
+
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+    expect(second.packets).not.toBe(first.packets);
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+    ]);
+  });
+
+  it('never reuses URL packet truth across same-href same-size replacements', async () => {
+    const make = (durationTicks: number): Uint8Array =>
+      writeMp4([
+        {
+          mediaType: 'audio',
+          sampleEntryType: 'mp4a',
+          timescale: 48_000,
+          sampleRate: 48_000,
+          channels: 2,
+          description: Uint8Array.of(0x11, 0x90),
+          samples: [
+            {
+              data: Uint8Array.of(1),
+              durationTicks,
+              cttsTicks: 0,
+              keyframe: true,
+            },
+          ],
+        },
+      ]);
+    const firstBytes = make(1_024);
+    const secondBytes = make(2_048);
+    expect(secondBytes).toHaveLength(firstBytes.byteLength);
+    const firstServer = rangeServer(firstBytes);
+    globalThis.fetch = firstServer.fetch;
+    const url = 'https://example.test/replaced-in-place.mp4';
+    const first = await mp4PacketInfoFromUrl(url, { size: firstBytes.byteLength });
+    const secondServer = rangeServer(secondBytes);
+    globalThis.fetch = secondServer.fetch;
+    const second = await mp4PacketInfoFromUrl(url, { size: secondBytes.byteLength });
+
+    expect(first.packets[0]?.durationUs).toBe(21_333);
+    expect(second.packets[0]?.durationUs).toBe(42_667);
+    expect(firstServer.calls).toHaveLength(1);
+    expect(secondServer.calls).toHaveLength(1);
+  });
+
+  it('does not retain raw URL ranges for sources above the aggregate cache ceiling', async () => {
+    const input = await mediaTestBytes('scenarios/performance/op-sweep-demux/01.mp4');
+    const padded = new Uint8Array(8 * 1024 * 1024 + 1);
+    padded.set(input);
+    const { fetch, calls } = rangeServer(padded);
+    globalThis.fetch = fetch;
+    const url = 'https://example.test/oversize-sdtp-h264.mp4';
+    const opts = { mime: 'video/mp4', size: padded.byteLength } as const;
+
+    const first = await mp4PacketInfoFromUrl(url, opts);
+    const second = await mp4PacketInfoFromUrl(url, opts);
+
+    expect(second).toEqual(first);
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+      {
+        method: 'GET',
+        range: 'bytes=0-32767',
+        bytes: 32 * 1024,
+      },
+    ]);
+  });
+
   it('reads URL packet info with default MIME, discovered size, and an explicit signal', async () => {
     const input = await mediaTestBytes('micro_h264_1frame.mp4');
     const expected = await mp4PacketInfoFromBytes(input);
@@ -1136,6 +1596,19 @@ describe('prepared MP4 packet mux', () => {
     await expect(
       mp4PacketInfoFromBytes(input, { includeOffsets: true, signal: controller.signal }),
     ).rejects.toThrow(MediaError);
+
+    let fetchCalls = 0;
+    globalThis.fetch = (async (): Promise<Response> => {
+      fetchCalls++;
+      throw new Error('pre-aborted URL packet info must not fetch');
+    }) as unknown as typeof fetch;
+    await expect(
+      mp4PacketInfoFromUrl('https://example.test/pre-aborted.mp4', {
+        size: input.byteLength,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(fetchCalls).toBe(0);
   });
 
   it('reports a typed miss when MP4 packet-info is not registered', async () => {

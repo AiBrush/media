@@ -8,6 +8,7 @@
       "type": "audio",
       "codec": "fLaC",
       "durationSec": 2.7399546485260773,
+      "language": "und",
       "sampleRate": 44100,
       "channels": 2
     }

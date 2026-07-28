@@ -562,7 +562,7 @@ async function writeConsumerSources(
     typeProbe,
     [
       "import { createMedia, fromBytes, toBlob } from '@aibrush/media';",
-      "import type { ConvertOptions, MediaEngine, MediaInfo, PacketStreams } from '@aibrush/media';",
+      "import type { ConvertOptions, MediaEngine, MediaInfo, PacketInfoBatchStream, PacketInfoTable, PacketStreams } from '@aibrush/media';",
       "import { DRIVER_API_VERSION } from '@aibrush/media/core';",
       "import type { CodecDriver, ContainerDriver } from '@aibrush/media/core';",
       "import { IMAGE_FORMATS } from '@aibrush/media/image';",
@@ -575,7 +575,7 @@ async function writeConsumerSources(
       'const formats: readonly ImageFormat[] = IMAGE_FORMATS;',
       'const apiVersion: number = DRIVER_API_VERSION;',
       'const streams: PacketStreams = {};',
-      'type PublicPins = [MediaInfo, CodecDriver, ContainerDriver, ImageInfo];',
+      'type PublicPins = [MediaInfo, PacketInfoTable, PacketInfoBatchStream, CodecDriver, ContainerDriver, ImageInfo];',
       ...concreteDriverPins,
       '',
       'void engine;',

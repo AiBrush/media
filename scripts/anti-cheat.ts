@@ -444,14 +444,14 @@ async function plausibility(): Promise<void> {
     check('CENC twin produced a Blob output', false);
   }
 
-  // a missing key for a real CENC file is a typed CapabilityError (graceful, not a wrong output).
+  // An empty key map for a real CENC file is a typed capability miss (graceful, not a wrong output).
   const missing = await createMedia()
     .decrypt(fromBytes(enc, { mime: 'video/mp4' }), { scheme: 'cenc', keys: {} })
     .then(
       () => false,
       (e) => e instanceof CapabilityError,
     );
-  check('decrypt with a missing key raises a typed CapabilityError', missing);
+  check('decrypt with an empty key map raises a typed CapabilityError', missing);
 }
 
 // ── runner ──────────────────────────────────────────────────────────────────────────────────────────

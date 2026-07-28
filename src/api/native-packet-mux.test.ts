@@ -25,6 +25,7 @@ describe('transactional native packet provenance', () => {
       id: 7,
       mediaType: 'video',
       codec: 'avc1.64001f',
+      language: 'eng',
       durationSec: 2.5,
       fps: 24,
       rotation: 90,
@@ -103,6 +104,7 @@ describe('transactional native packet provenance', () => {
     expect(nativePacketSource(stream, { ...sourceTrack, rotation: 180 })).toBeUndefined();
     expect(nativePacketSource(stream, { ...sourceTrack, alpha: false })).toBeUndefined();
     expect(nativePacketSource(stream, { ...sourceTrack, fps: 25 })).toBeUndefined();
+    expect(nativePacketSource(stream, { ...sourceTrack, language: 'fra' })).toBeUndefined();
 
     const changedDimensions = structuredClone(sourceTrack);
     const dimensionsConfig = changedDimensions.config;

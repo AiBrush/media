@@ -11,6 +11,11 @@
 import { throwIfSourceAborted } from './abort.ts';
 import type { Source } from './source.ts';
 
+// The result/prefix handoff shares the same finite-probe lifecycle and is loaded through this one
+// probe-cache boundary. Keeping one browser chunk avoids charging every cold Blob probe a second
+// dynamic-module request while preserving the default entry's eager budget.
+export { ProbeContainerResultCache } from '../api/blob-probe-handoff.ts';
+
 interface ProbeRangeEntry {
   readonly start: number;
   readonly end: number;

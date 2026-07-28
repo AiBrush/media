@@ -29,38 +29,22 @@ import {
   writeWavHeader,
 } from '../drivers/wav/pcm.ts';
 import { streamWavPcmCopy } from '../drivers/wav/wav-copy-stream.ts';
-import type { Endianness, SampleFormat } from '../dsp/pcm.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { Sink } from '../sinks/sink.ts';
-import { SOURCE_CACHE_KEY, type Source } from '../sources/source.ts';
+import { type Source, fromBytes } from '../sources/source.ts';
 import { isPcmContainer } from './codec-routing.ts';
+import { pcmEndian, pcmSampleFormat } from './pcm-codec-format.ts';
 import type { AudioTarget, CallOptions, Container, ConvertOptions, Output } from './types.ts';
-
-const PCM_REWRITE_SOURCE_CACHE_TTL_MS = 60_000;
-const PCM_REWRITE_SOURCE_CACHE_MAX_ENTRIES = 32;
-const PCM_REWRITE_SOURCE_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
-const PCM_REWRITE_SOURCE_CACHE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
-
-interface PcmRewriteSourceCacheEntry {
-  readonly bytes: Uint8Array;
-  readonly expiresAtMs: number;
-}
-
-const pcmRewriteSourceCache = new Map<string, PcmRewriteSourceCacheEntry>();
-let pcmRewriteSourceCacheBytes = 0;
 
 /**
  * The engine capabilities {@link convertPcmNative} needs, threaded in so the routine never reaches into the
  * engine's private state: route the source container, build a per-call {@link StageOptions}, build the
- * materialize MIME options, and map a `pcm-*` codec token to its on-wire {@link SampleFormat}/{@link
- * Endianness} (the shared helpers the eager path also uses — kept single-sourced in the engine).
+ * materialize MIME options. Codec-token projection stays local to this lazy authoring chunk.
  */
 export interface PcmConvertDeps {
   routeContainer(src: Source, direction: 'demux'): Promise<ContainerDriver>;
   stageOptions(signal: AbortSignal, o: CallOptions): StageOptions;
   mimeOpts(signal: AbortSignal, container: string): { signal: AbortSignal; mime?: string };
-  pcmSampleFormat(codec: string | undefined): SampleFormat | undefined;
-  pcmEndian(codec: string | undefined): Endianness | undefined;
 }
 
 export interface WavPcmPacketCopyInput {
@@ -80,6 +64,7 @@ function canRewritePcmBytes(o: PcmTransform): boolean {
     o.container === 'wav' &&
     o.gainDb === undefined &&
     o.fade === undefined &&
+    o.mixMatrix === undefined &&
     o.dynamics === undefined &&
     o.biquad === undefined &&
     o.timeBounds === undefined &&
@@ -181,86 +166,14 @@ function outputWavPcmCopy(
   }
 }
 
-function pcmRewriteSourceCacheKey(src: Source): string | undefined {
-  const key = src[SOURCE_CACHE_KEY];
-  const size = src.size;
-  if (key === undefined || size === undefined || size > PCM_REWRITE_SOURCE_CACHE_MAX_ENTRY_BYTES) {
-    return undefined;
-  }
-  return `${key}#${size}`;
-}
-
-function deletePcmRewriteSourceCacheEntry(key: string): void {
-  const entry = pcmRewriteSourceCache.get(key);
-  if (entry === undefined) return;
-  pcmRewriteSourceCache.delete(key);
-  pcmRewriteSourceCacheBytes = Math.max(0, pcmRewriteSourceCacheBytes - entry.bytes.byteLength);
-}
-
-function deleteExpiredPcmRewriteSourceCacheEntries(now: number): void {
-  for (const [key, entry] of pcmRewriteSourceCache) {
-    if (entry.expiresAtMs <= now) deletePcmRewriteSourceCacheEntry(key);
-  }
-}
-
-function cachedPcmRewriteSourceBytes(src: Source): Uint8Array | undefined {
-  const key = pcmRewriteSourceCacheKey(src);
-  if (key === undefined) return undefined;
-  const entry = pcmRewriteSourceCache.get(key);
-  if (entry === undefined) return undefined;
-  if (entry.expiresAtMs <= Date.now()) {
-    deletePcmRewriteSourceCacheEntry(key);
-    return undefined;
-  }
-  pcmRewriteSourceCache.delete(key);
-  pcmRewriteSourceCache.set(key, entry);
-  return entry.bytes;
-}
-
-function rememberPcmRewriteSourceBytes(src: Source, bytes: Uint8Array): void {
-  const key = pcmRewriteSourceCacheKey(src);
-  if (key === undefined || bytes.byteLength !== src.size) return;
-  const now = Date.now();
-  deleteExpiredPcmRewriteSourceCacheEntries(now);
-  deletePcmRewriteSourceCacheEntry(key);
-  while (
-    pcmRewriteSourceCache.size >= PCM_REWRITE_SOURCE_CACHE_MAX_ENTRIES ||
-    pcmRewriteSourceCacheBytes + bytes.byteLength > PCM_REWRITE_SOURCE_CACHE_MAX_TOTAL_BYTES
-  ) {
-    const oldestKey = pcmRewriteSourceCache.keys().next().value;
-    if (oldestKey === undefined) break;
-    deletePcmRewriteSourceCacheEntry(oldestKey);
-  }
-  if (pcmRewriteSourceCacheBytes + bytes.byteLength > PCM_REWRITE_SOURCE_CACHE_MAX_TOTAL_BYTES)
-    return;
-  pcmRewriteSourceCache.set(key, {
-    bytes,
-    expiresAtMs: now + PCM_REWRITE_SOURCE_CACHE_TTL_MS,
-  });
-  pcmRewriteSourceCacheBytes += bytes.byteLength;
-}
-
-interface PcmRewriteSourceRead {
-  readonly bytes: Uint8Array;
-  readonly cached: boolean;
-}
-
-async function readPcmRewriteSourceBytes(
-  src: Source,
-  signal?: AbortSignal,
-): Promise<PcmRewriteSourceRead> {
-  const cached = cachedPcmRewriteSourceBytes(src);
-  if (cached !== undefined) return { bytes: cached, cached: true };
-  const size = src.size;
-  if (src.range === undefined || size === undefined) {
-    return { bytes: new Uint8Array(0), cached: false };
-  }
-  const bytes = await src.range(0, size);
-  throwIfAborted(signal);
-  return { bytes, cached: false };
-}
-
 type PcmCopySourceKind = 'wav' | 'aiff';
+type DirectPcmCopy = WavPcmCopyPlan | Uint8Array<ArrayBuffer>;
+
+interface DirectPcmCopyAttempt {
+  readonly copied: DirectPcmCopy | undefined;
+  readonly bytes: Uint8Array | undefined;
+  readonly sourceKind: PcmCopySourceKind | undefined;
+}
 
 function hintedPcmCopySourceKind(src: Source): PcmCopySourceKind | undefined {
   if (wavHint(src)) return 'wav';
@@ -272,28 +185,27 @@ async function tryDirectWavPcmCopy(
   src: Source,
   o: PcmTransform,
   sourceKind = hintedPcmCopySourceKind(src),
-): Promise<WavPcmCopyPlan | Uint8Array<ArrayBuffer> | undefined> {
+): Promise<DirectPcmCopyAttempt> {
   if (
     sourceKind === undefined ||
     !canRewritePcmBytes(o) ||
     src.range === undefined ||
     src.size === undefined
   ) {
-    return undefined;
+    return { copied: undefined, bytes: undefined, sourceKind };
   }
   throwIfAborted(o.signal);
-  const read = await readPcmRewriteSourceBytes(src, o.signal);
+  const sourceBytes = await src.range(0, src.size, o.signal);
   throwIfAborted(o.signal);
-  let copied: WavPcmCopyPlan | Uint8Array<ArrayBuffer> | undefined;
+  let copied: DirectPcmCopy | undefined;
   if (sourceKind === 'wav') {
-    copied = planWavPcmCopy(read.bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+    copied = planWavPcmCopy(sourceBytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
   } else {
     const { rewriteAiffPcmToWav } = await import('../drivers/aiff/aiff-wav-rewrite.ts');
-    copied = rewriteAiffPcmToWav(read.bytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
+    copied = rewriteAiffPcmToWav(sourceBytes, o.sampleFormat, o.endian, o.channels, o.sampleRate);
   }
   throwIfAborted(o.signal);
-  if (copied !== undefined && !read.cached) rememberPcmRewriteSourceBytes(src, read.bytes);
-  return copied;
+  return { copied, bytes: sourceBytes, sourceKind };
 }
 
 /**
@@ -314,11 +226,15 @@ export async function convertPcmNative(
   o: CallOptions,
 ): Promise<Output | undefined> {
   const pcmOpts = pcmTransformOptions(deps, audio, target, signal, o);
-  const direct = await tryDirectWavPcmCopy(src, pcmOpts);
-  if (direct !== undefined) {
-    return direct instanceof Uint8Array
-      ? outputBytes(opts.sink ?? toBlob(), direct, deps.mimeOpts(signal, target))
-      : outputWavPcmCopy(opts.sink ?? toBlob(), direct, deps.mimeOpts(signal, target));
+  const hintedAttempt = await tryDirectWavPcmCopy(src, pcmOpts);
+  if (hintedAttempt.copied !== undefined) {
+    return hintedAttempt.copied instanceof Uint8Array
+      ? outputBytes(opts.sink ?? toBlob(), hintedAttempt.copied, deps.mimeOpts(signal, target))
+      : outputWavPcmCopy(
+          opts.sink ?? toBlob(),
+          hintedAttempt.copied,
+          deps.mimeOpts(signal, target),
+        );
   }
   const container = await deps.routeContainer(src, 'demux');
   const routedCopyKind: PcmCopySourceKind | undefined = container.formats.includes('wav')
@@ -326,19 +242,34 @@ export async function convertPcmNative(
     : container.formats.includes('aiff')
       ? 'aiff'
       : undefined;
-  const routedDirect = await tryDirectWavPcmCopy(src, pcmOpts, routedCopyKind);
-  if (routedDirect !== undefined) {
-    return routedDirect instanceof Uint8Array
-      ? outputBytes(opts.sink ?? toBlob(), routedDirect, deps.mimeOpts(signal, target))
-      : outputWavPcmCopy(opts.sink ?? toBlob(), routedDirect, deps.mimeOpts(signal, target));
+  const routedAttempt =
+    routedCopyKind === hintedAttempt.sourceKind
+      ? hintedAttempt
+      : await tryDirectWavPcmCopy(src, pcmOpts, routedCopyKind);
+  if (routedAttempt.copied !== undefined) {
+    return routedAttempt.copied instanceof Uint8Array
+      ? outputBytes(opts.sink ?? toBlob(), routedAttempt.copied, deps.mimeOpts(signal, target))
+      : outputWavPcmCopy(
+          opts.sink ?? toBlob(),
+          routedAttempt.copied,
+          deps.mimeOpts(signal, target),
+        );
   }
+  const ownedSource =
+    routedCopyKind !== undefined &&
+    routedAttempt.sourceKind === routedCopyKind &&
+    routedAttempt.bytes !== undefined
+      ? fromBytes(routedAttempt.bytes, {
+          mime: routedCopyKind === 'wav' ? 'audio/wav' : 'audio/aiff',
+        })
+      : src;
   // Raw-PCM transform (WAV/AIFF/CAF → WAV/AIFF/CAF, ADR-022/059): the source container parses its own bytes,
   // applies sample format / channel / rate transforms, then serializes the requested raw-PCM target. A WAV
   // target may also be produced by a compressed-audio source's `decodePcm` bridge (FLAC→WAV, ADTS AAC→WAV).
   const stream = container.transformPcm
-    ? await container.transformPcm(src, pcmOpts)
+    ? await container.transformPcm(ownedSource, pcmOpts)
     : target === 'wav' && container.decodePcm
-      ? await container.decodePcm(src, pcmOpts)
+      ? await container.decodePcm(ownedSource, pcmOpts)
       : undefined;
   if (stream) return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(signal, target));
   return undefined;
@@ -355,8 +286,8 @@ function pcmTransformOptions(
   signal: AbortSignal,
   o: CallOptions,
 ): PcmTransform {
-  const sampleFormat = deps.pcmSampleFormat(audio?.codec);
-  const endian = deps.pcmEndian(audio?.codec);
+  const sampleFormat = pcmSampleFormat(audio?.codec);
+  const endian = pcmEndian(audio?.codec);
   return {
     ...deps.stageOptions(signal, o),
     container: target,
@@ -366,6 +297,7 @@ function pcmTransformOptions(
     ...(audio?.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
     ...(audio?.gainDb !== undefined ? { gainDb: audio.gainDb } : {}),
     ...(audio?.fade !== undefined ? { fade: audio.fade } : {}),
+    ...(audio?.mixMatrix !== undefined ? { mixMatrix: audio.mixMatrix } : {}),
     ...(audio?.dynamics !== undefined ? { dynamics: audio.dynamics } : {}),
     ...(audio?.biquad !== undefined ? { biquad: audio.biquad } : {}),
   };
@@ -445,12 +377,9 @@ export async function pcm(
   return materialize(opts.sink ?? toBlob(), stream, deps.mimeOpts(activeSignal, target));
 }
 
-export function wavPcmPacketCopy(
-  deps: Pick<PcmConvertDeps, 'pcmSampleFormat' | 'pcmEndian'>,
-  input: WavPcmPacketCopyInput,
-): Uint8Array<ArrayBuffer> {
-  const format = deps.pcmSampleFormat(input.codec);
-  const endian = deps.pcmEndian(input.codec) ?? 'le';
+export function wavPcmPacketCopy(input: WavPcmPacketCopyInput): Uint8Array<ArrayBuffer> {
+  const format = pcmSampleFormat(input.codec);
+  const endian = pcmEndian(input.codec) ?? 'le';
   if (format === undefined || endian !== 'le') {
     throw new CapabilityError('WAV packet copy requires little-endian PCM packets', {
       op: { kind: 'route', id: 'mux' },

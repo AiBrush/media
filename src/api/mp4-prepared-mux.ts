@@ -7,7 +7,7 @@ import type {
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { fragmentMp4 } from '../drivers/mp4/fragment.ts';
-import { Mp4Driver, mp4PacketInfoTable, readMovie } from '../drivers/mp4/mp4-driver.ts';
+import { Mp4Driver, mp4PacketInfoBatchesFromSource } from '../drivers/mp4/mp4-driver.ts';
 import type { ChunkStruct, Mp4PacketTrackInput } from '../drivers/mp4/mux.ts';
 import {
   mp4PacketMuxTracks,
@@ -15,11 +15,49 @@ import {
   writeMp4PacketTracks,
 } from '../drivers/mp4/prepared-stream.ts';
 import type { NativePacketChunk } from '../internal/packet-provenance.ts';
-import { cacheSource } from '../sources/cache.ts';
+import { type CachingSource, cacheSource } from '../sources/cache.ts';
 import { fromBytes, fromURL } from '../sources/source.ts';
 import type { Container } from './types.ts';
 
 const MP4_PACKET_INFO_URL_PRIME_BYTES = 32 * 1024;
+const MP4_PACKET_INFO_URL_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+type Mp4PacketInfoProvider = NonNullable<typeof Mp4Driver.packetInfo>;
+type Mp4PacketInfoUrlCacheModule = typeof import('./mp4-packet-info-url-cache.ts');
+let mp4PacketInfoUrlCacheModulePromise: Promise<Mp4PacketInfoUrlCacheModule> | undefined;
+
+function canUseMp4PacketInfoUrlCache(
+  url: string | URL,
+  opts: Mp4PacketInfoFromUrlOptions,
+): boolean {
+  return (
+    String(url).toLowerCase().startsWith('blob:') &&
+    typeof opts.size === 'number' &&
+    Number.isSafeInteger(opts.size) &&
+    opts.size >= 0
+  );
+}
+
+function loadMp4PacketInfoUrlCache(): Promise<Mp4PacketInfoUrlCacheModule> {
+  mp4PacketInfoUrlCacheModulePromise ??= import('./mp4-packet-info-url-cache.ts');
+  return mp4PacketInfoUrlCacheModulePromise;
+}
+
+function freshMp4PacketInfoUrlSource(
+  url: string | URL,
+  opts: Mp4PacketInfoFromUrlOptions,
+): CachingSource {
+  return cacheSource(
+    fromURL(url, {
+      mime: opts.mime ?? 'video/mp4',
+      ...(opts.size !== undefined ? { size: opts.size } : {}),
+    }),
+    {
+      // AVC key-picture classification can legitimately walk a multi-hour file in contiguous 8 MiB
+      // windows. Retain one such window for overlap/retry reuse, never the complete media payload.
+      maxBytes: MP4_PACKET_INFO_URL_SOURCE_CACHE_MAX_BYTES,
+    },
+  );
+}
 
 export interface PreparedMp4PacketMuxInput {
   readonly track: TrackInfo;
@@ -185,14 +223,18 @@ export async function mp4PacketInfoFromBytes(
   opts: Mp4PacketInfoFromBytesOptions = {},
 ): Promise<PacketInfoTable> {
   if (opts.includeOffsets === true) {
-    assertNotAborted(opts.signal);
-    const movie = await readMovie({
-      size: bytes.byteLength,
-      read: (offset, length) =>
-        Promise.resolve(bytes.subarray(offset, Math.min(bytes.byteLength, offset + length))),
+    const stream = await mp4PacketInfoBatchesFromSource(fromBytes(bytes, { mime: 'video/mp4' }), {
+      includeOffsets: true,
+      batchSize: 65_536,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     });
-    assertNotAborted(opts.signal);
-    return mp4PacketInfoTable(movie, bytes.byteLength);
+    const packets = [];
+    try {
+      for await (const batch of stream) packets.push(...batch);
+      return { tracks: stream.tracks, packets };
+    } finally {
+      await stream.cancel();
+    }
   }
   return mp4PacketInfoFromSource(fromBytes(bytes, { mime: 'video/mp4' }), opts.signal);
 }
@@ -201,28 +243,50 @@ export async function mp4PacketInfoFromUrl(
   url: string | URL,
   opts: Mp4PacketInfoFromUrlOptions = {},
 ): Promise<PacketInfoTable> {
-  const src = cacheSource(
-    fromURL(url, {
-      mime: opts.mime ?? 'video/mp4',
-      ...(opts.size !== undefined ? { size: opts.size } : {}),
-    }),
+  assertNotAborted(opts.signal);
+  const packetInfo = requireMp4PacketInfoProvider();
+  const cacheModule = canUseMp4PacketInfoUrlCache(url, opts)
+    ? await loadMp4PacketInfoUrlCache()
+    : undefined;
+  assertNotAborted(opts.signal);
+  const cacheIdentity = cacheModule?.mp4PacketInfoUrlCacheIdentity(url, opts, packetInfo);
+  if (cacheIdentity !== undefined) {
+    const cached = cacheModule?.mp4PacketInfoUrlCache.hit(cacheIdentity, opts.signal);
+    if (cached !== undefined) return cached;
+  }
+
+  // Generic URLs remain mutable resources: each miss owns a fresh bounded byte-window snapshot.
+  const src = freshMp4PacketInfoUrlSource(url, opts);
+  await src.prime(
+    [
+      {
+        start: 0,
+        end:
+          opts.size !== undefined
+            ? Math.min(opts.size, MP4_PACKET_INFO_URL_PRIME_BYTES)
+            : MP4_PACKET_INFO_URL_PRIME_BYTES,
+      },
+    ],
+    opts.signal,
   );
-  await src.prime([
-    {
-      start: 0,
-      end:
-        opts.size !== undefined
-          ? Math.min(opts.size, MP4_PACKET_INFO_URL_PRIME_BYTES)
-          : MP4_PACKET_INFO_URL_PRIME_BYTES,
-    },
-  ]);
-  return mp4PacketInfoFromSource(src, opts.signal);
+  assertNotAborted(opts.signal);
+  const table = await mp4PacketInfoFromSource(src, opts.signal, packetInfo);
+  assertNotAborted(opts.signal);
+  if (cacheIdentity !== undefined) {
+    cacheModule?.mp4PacketInfoUrlCache.store(cacheIdentity, table, opts.signal);
+  }
+  return table;
 }
 
 async function mp4PacketInfoFromSource(
   src: Parameters<NonNullable<typeof Mp4Driver.packetInfo>>[0],
   signal?: AbortSignal,
+  packetInfo: Mp4PacketInfoProvider = requireMp4PacketInfoProvider(),
 ): Promise<PacketInfoTable> {
+  return packetInfo.call(Mp4Driver, src, signal !== undefined ? { signal } : undefined);
+}
+
+function requireMp4PacketInfoProvider(): Mp4PacketInfoProvider {
   const packetInfo = Mp4Driver.packetInfo;
   if (packetInfo === undefined) {
     throw new CapabilityError('MP4 packet-info is not available', {
@@ -230,7 +294,7 @@ async function mp4PacketInfoFromSource(
       tried: ['mp4'],
     });
   }
-  return packetInfo.call(Mp4Driver, src, signal !== undefined ? { signal } : undefined);
+  return packetInfo;
 }
 
 function chunkStructFrom(value: Packet | EncodedChunk): ChunkStruct {

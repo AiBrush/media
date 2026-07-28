@@ -642,13 +642,16 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
 
   it('ts_tiny_writes / ts_continuity_many_writes / prop_ts_stream_duration use real StreamTarget packet writes', async () => {
     const source = parseTs(await bytesFromDerived(DERIVED_TS));
-    const muxer = muxerFromParsedTs(source, 1);
+    const muxer = muxerFromParsedTs(source);
     await muxer.finalize();
     const writes: { readonly position: number; readonly bytes: Uint8Array }[] = [];
     await writeToStreamTarget(
-      toStreamTarget((chunk, position) => {
-        writes.push({ position, bytes: chunk.slice() });
-      }),
+      toStreamTarget(
+        (chunk, position) => {
+          writes.push({ position, bytes: chunk.slice() });
+        },
+        { writeChunkBytes: 188 },
+      ),
       muxer.output,
     );
 

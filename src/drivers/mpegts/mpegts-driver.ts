@@ -32,6 +32,7 @@ import {
 } from '../../contracts/errors.ts';
 import { MPEG_TS_FORMATS, isMpegTsExtension, matchesMpegTs } from './mpegts-sniff.ts';
 import { type TsAccessUnit, type TsParse, type TsTrack, parseTs } from './ts-parse.ts';
+import { probeTs } from './ts-probe.ts';
 import { MpegTsMuxer } from './ts-write.ts';
 
 const MICROSECONDS_PER_SECOND = 1_000_000;
@@ -54,7 +55,7 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
 async function readAll(src: ByteSource, signal: AbortSignal | undefined): Promise<Uint8Array> {
   assertNotAborted(signal);
   if (src.range && src.size !== undefined) {
-    const bytes = await src.range(0, src.size);
+    const bytes = await src.range(0, src.size, signal);
     assertNotAborted(signal);
     return bytes;
   }
@@ -328,6 +329,10 @@ export const MpegTsDriver: ContainerDriver = {
   kind: 'container',
   formats: MPEG_TS_FORMATS,
   supports: matchesMpegTs,
+  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+    const parsed = await probeTs(src, o?.signal);
+    return parsed.tracks.map((track, index) => toTrackInfo(track, index));
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const signal = o?.signal;
     const parsed = await parse(src, signal);

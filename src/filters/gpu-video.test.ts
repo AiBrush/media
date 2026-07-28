@@ -42,13 +42,29 @@ import {
 } from './gpu-uniforms.ts';
 import {
   GpuVideoFilterModule,
+  canDeferFullFrameScale,
   canvas2dVideoFilterDriver,
   mapVideoColorSpace,
   planColor,
   planDraw,
+  rotatePackedI420By180,
   webgpuGeometryNeedsCanvasColorManagement,
   webgpuVideoFilterDriver,
 } from './gpu-video.ts';
+
+describe('rotatePackedI420By180', () => {
+  it('reverses luma and both chroma planes independently', () => {
+    // 4×2 I420: 8 Y samples, then 2 U and 2 V samples.
+    const data = Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 20, 21]);
+    rotatePackedI420By180(data, 4, 2);
+    expect([...data]).toEqual([7, 6, 5, 4, 3, 2, 1, 0, 11, 10, 21, 20]);
+  });
+
+  it('rejects invalid dimensions and non-packed buffers', () => {
+    expect(() => rotatePackedI420By180(new Uint8Array(1), 0, 2)).toThrow(InputError);
+    expect(() => rotatePackedI420By180(new Uint8Array(11), 4, 2)).toThrow(InputError);
+  });
+});
 
 type Corner = readonly [number, number];
 interface Corners {
@@ -105,6 +121,17 @@ describe('resizeBlit — fit modes', () => {
     expect(b.dst.height).toBe(56); // round(1080 * 100/1920) = round(56.25)
     expect(b.dst.x).toBe(0);
     expect(b.dst.y).toBe(22); // floor((100 - 56) / 2)
+  });
+
+  it('splits an odd contain remainder evenly instead of biasing the trailing bar', () => {
+    const b = resizeBlit(1080, 1920, {
+      mediaType: 'video',
+      type: 'resize',
+      width: 1280,
+      height: 720,
+      fit: 'contain',
+    });
+    expect(b.dst).toEqual({ x: 437.5, y: 0, width: 405, height: 720 });
   });
 
   it('cover preserves aspect and crops the centred overflow from the source (16:9 → square)', () => {
@@ -207,6 +234,103 @@ describe('resizeBlit — fit modes', () => {
     expect(() =>
       resizeBlit(0, 100, { mediaType: 'video', type: 'resize', width: 10, height: 10 }),
     ).toThrow(InputError);
+  });
+});
+
+describe('canDeferFullFrameScale — native-surface resize boundary', () => {
+  const source = { displayWidth: 1920, displayHeight: 1080 };
+
+  it('defers full-source/full-destination resize for fill and equal-aspect fit modes', () => {
+    for (const fit of [undefined, 'contain', 'cover'] as const) {
+      expect(
+        canDeferFullFrameScale(
+          source,
+          planDraw(
+            {
+              mediaType: 'video',
+              type: 'resize',
+              width: 320,
+              height: 180,
+              ...(fit === undefined ? {} : { fit }),
+            },
+            source.displayWidth,
+            source.displayHeight,
+          ),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('retains colour-managed rendering for legacy SD YUV matrices', () => {
+    const recipe = planDraw(
+      { mediaType: 'video', type: 'resize', width: 320, height: 180 },
+      source.displayWidth,
+      source.displayHeight,
+    );
+    for (const matrix of ['smpte170m', 'bt470bg'] as const) {
+      expect(canDeferFullFrameScale({ ...source, colorSpace: { matrix } }, recipe)).toBe(false);
+    }
+    for (const matrix of ['bt709', 'rgb', null] as const) {
+      expect(canDeferFullFrameScale({ ...source, colorSpace: { matrix } }, recipe)).toBe(true);
+    }
+  });
+
+  it('retains rendering when contain needs bars or cover needs a source crop', () => {
+    for (const fit of ['contain', 'cover'] as const) {
+      expect(
+        canDeferFullFrameScale(
+          source,
+          planDraw(
+            { mediaType: 'video', type: 'resize', width: 320, height: 320, fit },
+            source.displayWidth,
+            source.displayHeight,
+          ),
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it('retains rendering for a fill that changes display aspect ratio', () => {
+    expect(
+      canDeferFullFrameScale(
+        { displayWidth: 1080, displayHeight: 1920 },
+        planDraw({ mediaType: 'video', type: 'resize', width: 1280, height: 720 }, 1080, 1920),
+      ),
+    ).toBe(false);
+  });
+
+  it('retains rendering for crop, pad, rotate, flip and colour recipes', () => {
+    const recipes = [
+      planDraw(
+        { mediaType: 'video', type: 'crop', x: 10, y: 10, width: 320, height: 180 },
+        source.displayWidth,
+        source.displayHeight,
+      ),
+      planDraw(
+        { mediaType: 'video', type: 'pad', x: 64, y: 36, width: 2048, height: 1152 },
+        source.displayWidth,
+        source.displayHeight,
+      ),
+      planDraw(
+        { mediaType: 'video', type: 'rotate', degrees: 90 },
+        source.displayWidth,
+        source.displayHeight,
+      ),
+      planDraw(
+        { mediaType: 'video', type: 'flip', axis: 'h' },
+        source.displayWidth,
+        source.displayHeight,
+      ),
+      {
+        kind: 'color' as const,
+        plan: planColor(
+          { mediaType: 'video', type: 'colorspace', to: 'bt709' },
+          { primaries: 'bt709', transfer: 'bt709' },
+        ),
+        dims: { width: source.displayWidth, height: source.displayHeight },
+      },
+    ];
+    for (const recipe of recipes) expect(canDeferFullFrameScale(source, recipe)).toBe(false);
   });
 });
 

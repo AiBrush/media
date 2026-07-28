@@ -149,6 +149,20 @@ export interface Mp4ByteStreamLayout {
   totalLen: number;
 }
 
+/** A bounded positioned-write plan for MP4 `faststart:'reserve'`. */
+export interface ReservedMp4ByteStreamLayout {
+  readonly ftyp: Uint8Array;
+  /** Final `moov` followed by a valid `free` box that fills the complete reservation. */
+  readonly moovPatch: Uint8Array;
+  readonly mdatHeader: Uint8Array;
+  readonly reservationPosition: number;
+  readonly reservationBytes: number;
+  readonly mdatPosition: number;
+  readonly mdatPayloadLen: number;
+  readonly totalLen: number;
+  readonly observedPacketCount: number;
+}
+
 /**
  * Output container flavor for callers that target MP4 vs MOV. The writer emits ISO-compatible `ftyp`
  * brands for both flavors because the rest of the file is authored as ISO-BMFF; Safari/WebKit can raise a
@@ -978,6 +992,92 @@ export function planMp4ByteStreamLayout(
     mdatBeforeMoov: parts.mdatBeforeMoov,
     mdatPayloadLen: parts.mdatPayloadLen,
     totalLen: parts.totalLen,
+  };
+}
+
+const RESERVE_TRACK_OVERHEAD_BYTES = 4 * 1024;
+const RESERVE_PACKET_TABLE_BYTES = 64;
+
+/**
+ * Plan a sparse reserved-moov MP4. The estimate deliberately covers the maximum simultaneous `stts`,
+ * `ctts`, `stsz`, `stss`, `stsc`, `stco`, and 16-byte `senc` growth per packet, plus fixed track box
+ * overhead. The actual writer-owned moov remains the final authority: unusually large codec metadata
+ * expands the reservation rather than producing a truncated patch.
+ */
+export function planReservedMp4ByteStreamLayout(
+  tracks: readonly MuxTrackLayoutInput[],
+  maximumPacketCount: number,
+  opts: Omit<WriteOptions, 'faststart'> = {},
+): ReservedMp4ByteStreamLayout {
+  if (!Number.isSafeInteger(maximumPacketCount) || maximumPacketCount < 1) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 faststart reserve maximumPacketCount must be a positive integer, got ${maximumPacketCount}`,
+    );
+  }
+  if (tracks.length === 0) {
+    throw new MediaError('mux-error', 'cannot reserve an MP4 moov for zero tracks');
+  }
+
+  let observedPacketCount = 0;
+  for (let index = 0; index < tracks.length; index++) {
+    const count = tracks[index]?.samples.length ?? 0;
+    observedPacketCount = Math.max(observedPacketCount, count);
+    if (count > maximumPacketCount) {
+      throw new MediaError(
+        'mux-error',
+        `[MP4_FASTSTART_RESERVE_PACKET_OVERFLOW] track ${index + 1} has ${count} packets, exceeding maximumPacketCount ${maximumPacketCount}`,
+      );
+    }
+  }
+
+  const movieTimescale = opts.movieTimescale ?? 1000;
+  const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
+  const { layouts: trackChunks, totalPayloadBytes: mdatPayloadLen } = trackChunkLayouts(tracks);
+  const moovBytes = moov(tracks, movieTimescale, zeroChunkTables(trackChunks));
+  const estimate =
+    1024 +
+    tracks.length *
+      (RESERVE_TRACK_OVERHEAD_BYTES + maximumPacketCount * RESERVE_PACKET_TABLE_BYTES);
+  if (!Number.isSafeInteger(estimate) || estimate > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 faststart reserve estimate ${estimate} exceeds the 32-bit box limit`,
+    );
+  }
+  // Always leave at least one legal 8-byte `free` box. Besides making under-fill explicit, this avoids
+  // an invalid 1..7-byte tail when actual moov length happens to sit just below the estimate.
+  const reservationBytes = Math.max(estimate, moovBytes.length + 8);
+  if (reservationBytes > 0xffffffff) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 faststart reserve ${reservationBytes} exceeds the 32-bit box limit`,
+    );
+  }
+  const reservationPosition = ftyp.length;
+  const mdatPosition = reservationPosition + reservationBytes;
+  patchGeneratedMoovChunkOffsets(moovBytes, chunkTablesFor(trackChunks, mdatPosition));
+
+  const moovPatch = new Uint8Array(reservationBytes);
+  moovPatch.set(moovBytes);
+  const freeBytes = reservationBytes - moovBytes.length;
+  const freeOffset = moovBytes.length;
+  moovPatch.set(u32(freeBytes), freeOffset);
+  moovPatch.set(fourcc('free'), freeOffset + 4);
+
+  const mdatHeader = Uint8Array.from(cat(u32(8 + mdatPayloadLen), fourcc('mdat')));
+  const totalLen = ftyp.length + reservationBytes + mdatHeader.byteLength + mdatPayloadLen;
+  assertSingleBufferSize(totalLen);
+  return {
+    ftyp: Uint8Array.from(ftyp),
+    moovPatch,
+    mdatHeader,
+    reservationPosition,
+    reservationBytes,
+    mdatPosition,
+    mdatPayloadLen,
+    totalLen,
+    observedPacketCount,
   };
 }
 

@@ -31,7 +31,12 @@ export async function raceAbort<T>(
   signal: AbortSignal | undefined,
 ): Promise<T> {
   if (signal === undefined) return promise;
-  throwIfSourceAborted(signal);
+  if (signal.aborted) {
+    // The transport promise may itself have observed the same synchronous abort and rejected before
+    // this outer race was installed. Mute that losing rejection before surfacing the canonical error.
+    promise.catch(() => {});
+    throw sourceAbortError(signal);
+  }
   let removeListener: (() => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
     const onAbort = (): void => {

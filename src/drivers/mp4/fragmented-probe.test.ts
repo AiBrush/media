@@ -6,11 +6,14 @@
  * and the non-square-pixel file (also fragmented) probed fps 0 — so each assertion below can fail.
  */
 
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
 import type { MediaInfo } from '../../api/types.ts';
+import type { ByteSource } from '../../contracts/driver.ts';
+import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
-import { Mp4Module } from './mp4-driver.ts';
+import { Mp4Driver, Mp4Module } from './mp4-driver.ts';
 import { applyFragmentTiming, parseFragments, parseMovie } from './parse.ts';
 
 /** ffprobe 8.0 ground truth (container duration + video stream avg_frame_rate). */
@@ -33,6 +36,47 @@ async function probe(id: string): Promise<MediaInfo> {
   return createMedia()
     .use(Mp4Module)
     .probe(await fixtureSource(id));
+}
+
+type UrlMp4Source = ByteSource & {
+  readonly kind: 'url';
+  readonly mimeHint: 'video/mp4';
+};
+
+function streamBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+async function expectSparseFragmentProbe(bytes: Uint8Array): Promise<void> {
+  const reads: Array<readonly [number, number]> = [];
+  const source: UrlMp4Source = {
+    size: bytes.byteLength,
+    kind: 'url',
+    mimeHint: 'video/mp4',
+    stream: () => streamBytes(bytes),
+    range: (start, end) => {
+      reads.push([start, end]);
+      return Promise.resolve(bytes.subarray(start, end));
+    },
+  };
+
+  const tracks = await Mp4Driver.probe?.(source);
+  const demuxer = await Mp4Driver.demux(fromBytes(bytes, { mime: 'video/mp4' }));
+  try {
+    expect(tracks).toEqual(demuxer.tracks);
+  } finally {
+    await demuxer.close();
+  }
+
+  expect(reads).not.toContainEqual([0, bytes.byteLength]);
+  expect(reads.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(
+    bytes.byteLength / 2,
+  );
 }
 
 describe('fragmented/CMAF MP4 probe — duration + fps recovered from movie fragments (ffprobe truth)', () => {
@@ -68,6 +112,80 @@ describe('fragmented/CMAF MP4 probe — duration + fps recovered from movie frag
     applyFragmentTiming(movie, file);
     const after = movie.tracks.map((t) => ({ d: t.durationSec, f: t.fps }));
     expect(after).toEqual(before);
+  });
+
+  it('reads only top-level timing boxes for real fragmented and encrypted CMAF inputs', async () => {
+    for (const fixture of [
+      'bear-av-frag.mp4',
+      '../../../../media-test/fixtures/media/cenc_ctr_fragmented.mp4',
+      '../../../../media-test/fixtures/media/scenarios/probe/cenc_cbcs/01.mp4',
+      '../../../../media-test/fixtures/media/fragmented_cmaf.mp4',
+    ] as const) {
+      const bytes = fixture.startsWith('../')
+        ? new Uint8Array(await readFile(new URL(fixture, import.meta.url)))
+        : await loadFixture(fixture);
+      await expectSparseFragmentProbe(bytes);
+    }
+  });
+
+  it('propagates an abort raised during a sparse fragment timing range', async () => {
+    const bytes = new Uint8Array(
+      await readFile(
+        new URL('../../../../media-test/fixtures/media/cenc_ctr_fragmented.mp4', import.meta.url),
+      ),
+    );
+    const controller = new AbortController();
+    let reads = 0;
+    const source: UrlMp4Source = {
+      size: bytes.byteLength,
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads++;
+        if (reads === 2) controller.abort();
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+
+    await expect(Mp4Driver.probe?.(source, { signal: controller.signal })).rejects.toMatchObject({
+      code: 'aborted',
+    });
+    expect(reads).toBe(2);
+  });
+
+  it('falls back to an exact whole read when the sparse top-level walk is malformed', async () => {
+    const bytes = (await loadFixture('bear-av-frag.mp4')).slice();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let offset = 0;
+    while (offset + 8 <= bytes.byteLength) {
+      const size = view.getUint32(offset);
+      const type = new TextDecoder().decode(bytes.subarray(offset + 4, offset + 8));
+      if (type === 'mdat') {
+        // The declared end now exceeds the source. A sparse walker must decline rather than skip to
+        // an invented later fragment; the established exact-byte parser remains the fallback truth.
+        view.setUint32(offset, bytes.byteLength);
+        break;
+      }
+      if (size < 8 || offset + size > bytes.byteLength) {
+        throw new Error('unexpected malformed source fixture');
+      }
+      offset += size;
+    }
+
+    const reads: Array<readonly [number, number]> = [];
+    const source: UrlMp4Source = {
+      size: bytes.byteLength,
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    };
+    await Mp4Driver.probe?.(source);
+    expect(reads).toContainEqual([0, bytes.byteLength]);
   });
 });
 

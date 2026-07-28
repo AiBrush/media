@@ -81,7 +81,7 @@ function validateOperation(value: unknown, index: number): MediaJobOperation {
   }
   switch (discriminant) {
     case 'trim': {
-      allowedKeys(operation, ['op', 'start', 'end', 'mode'], label);
+      allowedKeys(operation, ['op', 'start', 'end', 'mode', 'fragmented'], label);
       const start = finiteNumber(operation.start, `${label}.start`);
       const end = finiteNumber(operation.end, `${label}.end`);
       if (start < 0 || end <= start) {
@@ -94,11 +94,15 @@ function validateOperation(value: unknown, index: number): MediaJobOperation {
       ) {
         throw new InputError(`${label}.mode is not supported`);
       }
+      optionalBoolean(operation.fragmented, `${label}.fragmented`);
       return {
         op: 'trim',
         start,
         end,
         ...(operation.mode !== undefined ? { mode: operation.mode } : {}),
+        ...(operation.fragmented !== undefined
+          ? { fragmented: operation.fragmented as boolean }
+          : {}),
       };
     }
     case 'convert': {

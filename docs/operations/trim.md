@@ -13,7 +13,7 @@ benchmark **`trim`** family (42 harness features; mediabunny currently wins 31/4
 concentration of "weak-gate" oracles — 31 of the 206 weak-gate cells) (measured-evidence.md). The public
 entrypoint is `Engine.trim(input, opts, o)` which lazily imports `runTrim`
 (`src/api/engine.ts:680`), and the option shape is `TrimOptions { start; end; mode?: 'keyframe' |
-'accurate'; sink? }` (`src/api/types.ts:203`).
+'accurate'; fragmented?: boolean; sink? }` (`src/api/types.ts`).
 
 Two modes, two contracts:
 
@@ -143,6 +143,12 @@ the worker round-trip is not worth it, and offload ships **input bytes, never fr
   backpressure (`src/api/codec-pipeline.ts:2526`). The window reader coalesces adjacent packet byte
   ranges into ≤8 MiB windows with ≤256 KiB gap tolerance
   (`assignTrimPacketInfoWindows`, `src/api/trim-streams.ts:632`; constants `:12`–`:13`).
+- **Fragmented MP4.** `fragmented: true` is valid only for MP4 input/output. Both keyframe-copy and
+  accurate codec paths author an `ftyp` + `moov` initialization segment followed by retained
+  `moof`/`mdat` media fragments. Fragmented input sample runs are recovered from `moof`/`traf`/`trun`
+  before selection; public second bounds are rounded to the closest native track tick so a
+  microsecond-rounded fragment boundary cannot select the preceding GOP. The trimmed track duration,
+  not the source initialization duration, is written into the new init metadata.
 
 ### What the target adds over today (see §5)
 
@@ -158,6 +164,15 @@ presentation, and only `accurate` (re-encode) achieves a frame-exact start.
 module-global **mutable** state — planners are pure and the only stateful object,
 `TrimPacketInfoWindowReader`, is per-call (`src/api/trim-streams.ts:657`). That is genuinely good.
 The smells are structural:
+
+- **Fragmented MP4 trim is implemented across all public surfaces.** `TrimOptions.fragmented` reaches
+  driver-native stream copy and the accurate-path muxer, and is preserved by fluent chains and the
+  declarative job schema. Real fragmented A/V coverage proves the output retains both tracks, contains
+  media fragments and fewer samples, and probes shorter than the source.
+- **The immutable benchmark adapter remains stale.** It rejects a fragmented trim request before the
+  framework call with `AIBRUSH_FRAGMENTED_TRIM_UNSUPPORTED` and the assertion that `TrimOptions`
+  cannot request fragmented output. The product capability therefore cannot receive an unchanged
+  matrix verdict until that benchmark-owned declaration and forwarding path change.
 
 - **`runTrim` is a branch ladder / near-god-function** (`src/api/trim-runner.ts:98`–`:193`): nine
   routes (FLAC copy, `validatesStreamCopyTrim`, PCM `transformPcm` ×2, whole-source identity,

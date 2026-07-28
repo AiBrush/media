@@ -4,7 +4,7 @@ import { type BiquadSpec, biquad } from '../dsp/biquad.ts';
 import { limit, normalizePeak, normalizeRms } from '../dsp/dynamics.ts';
 import { type FadeShape, fadeIn, fadeOut } from '../dsp/fade.ts';
 import { gain } from '../dsp/gain.ts';
-import { remix } from '../dsp/mix.ts';
+import { remix, remixMatrix } from '../dsp/mix.ts';
 import type { PcmAudio } from '../dsp/pcm.ts';
 import { resample } from '../dsp/resample.ts';
 
@@ -193,12 +193,15 @@ export function applyPcmTransform(
     if (fade.inFrames > 0) result = fadeIn(result, fade.inFrames, fade.shape);
     if (fade.outFrames > 0) result = fadeOut(result, fade.outFrames, fade.shape);
   }
-  if (o?.channels !== undefined && o.channels !== result.channels)
+  if (o?.mixMatrix !== undefined) {
+    result = remixMatrix(result, o.mixMatrix, o.channels);
+  } else if (o?.channels !== undefined && o.channels !== result.channels) {
     result = remix(result, o.channels);
+  }
   if (o?.sampleRate !== undefined && o.sampleRate !== result.sampleRate) {
     if (options.resample === 'reject') {
       throw new CapabilityError(
-        `audio resample ${result.sampleRate}→${o.sampleRate} Hz needs the WASM/WebAudio tail`,
+        `the selected PCM route disallows audio resample ${result.sampleRate}→${o.sampleRate} Hz`,
         { op: { kind: 'route', id: options.op ?? 'convert' }, tried: [...(options.tried ?? [])] },
       );
     }

@@ -576,8 +576,20 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     await muxer.finalize();
 
     const bytes = await collect(muxer.output);
+    const demuxed = demuxWebm(bytes);
+    const demuxedAudioIndex = demuxed.info.tracks.findIndex((track) => track.mediaType === 'audio');
+    const expectedCodecDelayNs = Math.round(
+      ((audioGapless?.leadingSamples ?? 0) * 1_000_000_000) / (audio.sampleRate ?? 1),
+    );
     expect(parseWebm(bytes).durationSec).toBeCloseTo(30, 6);
     expect(scanBlocks(bytes).find((block) => block.trackNumber === videoTrack)?.timeMs).toBe(0);
+    expect(demuxed.info.tracks[demuxedAudioIndex]?.codecDelayNs).toBe(expectedCodecDelayNs);
+    expect(
+      Math.abs(
+        (demuxed.framesByIndex[demuxedAudioIndex]?.[0]?.timestampUs ?? 0) -
+          (buildSamples(audio)[0]?.ptsUs ?? 0),
+      ),
+    ).toBeLessThanOrEqual(1_000);
   });
 
   it('multitrack VP9 + Opus: both re-parse; Opus CodecPrivate survives; per-track blocks correct', async () => {

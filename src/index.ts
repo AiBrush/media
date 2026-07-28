@@ -17,6 +17,8 @@ export {
   h264AbrLadder,
   load,
   mux,
+  packetInfo,
+  packetInfoBatches,
   preload,
   probe,
   remux,
@@ -27,6 +29,10 @@ export {
   trim,
 } from './api/create-media.ts';
 export type { MediaEngine } from './api/engine.ts';
+export type {
+  PacketInfoBatchCallOptions,
+  PacketInfoCallOptions,
+} from './api/packet-info-runner.ts';
 export type { MediaJob, MediaJobInput, MediaJobOperation, MediaJobOutput } from './api/job.ts';
 
 // Public option/result types
@@ -67,6 +73,7 @@ export { toStreamTarget, writeToStreamTarget } from './sinks/stream-target.ts';
 export type {
   StreamDestination,
   StreamTarget,
+  StreamTargetOptions,
   StreamTargetWriter,
 } from './sinks/stream-target.ts';
 

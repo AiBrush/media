@@ -36,8 +36,9 @@ and must never appear on the surface (ADR-003, `measured-evidence.md`).
 
 Two API styles ride the same engine (ADR-009/010):
 
-1. **Flat verbs** — `probe`, `convert`, `remux`, `trim`, `demux`, `decode`, `seek`, `encode`, `mux`,
-   `decrypt`, `h264AbrLadder`, `preload`, `load`, `run` (`src/api/create-media.ts:43-103`), each available
+1. **Flat verbs** — `probe`, `packetInfo`, `packetInfoBatches`, `convert`, `remux`, `trim`, `demux`,
+   `decode`, `seek`, `encode`, `mux`, `decrypt`, `h264AbrLadder`, `preload`, `load`, `run`
+   (`src/api/create-media.ts`), each available
    both as a method on a `createMedia()` instance (`src/api/engine.ts:145-180`) and as a bare function
    backed by a lazily-created default instance (`src/api/create-media.ts:35-41`).
 2. **Fluent chain** — `load(input).trim(...).resize(...).to('mp4').blob()` (`src/api/types.ts:239-257`),
@@ -112,7 +113,11 @@ option object ever names a backend; each names only *intent* (container, codec, 
   materialization (`types.ts:233-236`).
 - **Result records** — `MediaInfo`/`MediaInfoTrack` (probe, `types.ts:259-284`), `Demuxed`
   (live demux, `types.ts:286-292`), `MediaStreams` (decoded frame streams, `types.ts:294-298`),
-  `PacketStreams`/`PacketStream` (mux input, `types.ts:300-331`).
+  `PacketStreams`/`PacketStream` (mux input, `types.ts:300-331`), and the packet-introspection pair
+  `PacketInfoTable` (compatibility materialization) / `PacketInfoBatchStream` (single-use async batches).
+  The batched form materializes packet **row objects** only for the current caller-sized batch and
+  releases its source on EOF, early iterator return, error, or explicit `cancel()`. Parsed primitive
+  sample tables and bounded transport/cache windows remain live for the iterator session.
 - **Cancellability** — every async op returns `Cancellable<T> = Promise<T> & { cancel(): void }`
   (`types.ts:344-345`). `decode` alone returns `MediaStreams` synchronously (`engine.ts:687`) because its
   streams are the cancellation handle.
@@ -178,7 +183,9 @@ successive same-config seeks (`engine.ts:230-237`,`:848-851`).
 returned `Cancellable.cancel()` (`types.ts:344-345`). `#withCancel` bridges both onto one internal
 `AbortController`, mirrors a pre-aborted or future caller abort, and detaches its listener on settle so no
 listener leaks (`engine.ts:1729-1765`). `cancel()` aborts with a typed `MediaError('aborted', …)`
-(`engine.ts:1763`). For the synchronous `decode`, `bridgeSignal` wires the caller signal into the stream
+(`engine.ts:1763`). For operations returning a live lease, such as `packetInfoBatches`, the runner also
+retains the original caller signal for the iterator lifetime; promise settlement is setup completion, not
+source completion. For the synchronous `decode`, `bridgeSignal` wires the caller signal into the stream
 controller (`engine.ts:694`,`:1829-1833`).
 
 **Frame lifetime (`close()` exactly once).** The contract: *a frame emitted into a caller-owned stream is

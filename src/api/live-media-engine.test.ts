@@ -177,6 +177,27 @@ describe('MediaEngine live MediaStream integration', () => {
     expect(track.stopCount).toBe(0);
   });
 
+  it('rejects container track selectors on raw live streams before constructing a processor', async () => {
+    let processorConstructions = 0;
+    vi.stubGlobal(
+      'MediaStreamTrackProcessor',
+      class {
+        readonly readable = new ReadableStream();
+
+        constructor() {
+          processorConstructions++;
+        }
+      },
+    );
+    const decoded = createMedia({ worker: false }).decode(
+      mediaStream([new FakeTrack('video', { width: 320, height: 240 })]),
+      { trackSelect: ['video:0'] },
+    );
+
+    await expect(decoded.video?.getReader().read()).rejects.toBeInstanceOf(InputError);
+    expect(processorConstructions).toBe(0);
+  });
+
   it('typed-declines finite byte/replay operations before reading the live tracks', async () => {
     const media = createMedia({ worker: false });
     const stream = mediaStream([new FakeTrack('video', { width: 320, height: 240 })]);

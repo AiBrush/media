@@ -6,6 +6,7 @@
  */
 
 import { MediaError } from '../contracts/errors.ts';
+import { raceAbort, throwIfSourceAborted } from '../sources/abort.ts';
 import {
   SOURCE_CACHE_KEY,
   SOURCE_URL_KEY,
@@ -16,15 +17,30 @@ import { CONTAINER_MIME } from './container-mime.ts';
 
 export const HEAD_BYTES = 64 * 1024;
 export const HINTED_HEAD_BYTES = 4 * 1024;
-const SOURCE_PREFIX_HANDOFF_TTL_MS = 250;
 
-/** A probed source prefix handed from `probe` to the next op on the same cache-keyed source. */
-export interface SourcePrefixHandoff {
+interface SourcePrefixHandoffBase {
   readonly bytes: Uint8Array;
   /** Total learned by the range response that produced `bytes`, when the source exposed it. */
   readonly size?: number;
-  readonly token: object;
+  /** Owned expiry handle; also the entry's generation identity. */
+  readonly token: ReturnType<typeof setTimeout>;
 }
+
+/** A probed source prefix handed from `probe` to the next op on the same cache-keyed source. */
+export type SourcePrefixHandoff = SourcePrefixHandoffBase &
+  (
+    | {
+        readonly reusable?: undefined;
+        readonly expiresAtMs?: undefined;
+      }
+    | {
+        /** Finite blob-URL entry reusable by a distinct Source snapshot. */
+        readonly reusable: true;
+        /** Absolute admission deadline (never extended on a hit). */
+        readonly expiresAtMs: number;
+        /** Exactly one active expiry timer is owned by a reusable entry. */
+      }
+  );
 
 export function routeHeadBytes(src: Source): number {
   return src.mimeHint !== undefined || src.filename !== undefined ? HINTED_HEAD_BYTES : HEAD_BYTES;
@@ -44,9 +60,7 @@ export async function readAllSource(
 ): Promise<Uint8Array> {
   throwIfAborted(signal);
   if (src.range && src.size !== undefined) {
-    const bytes = await src.range(0, src.size);
-    throwIfAborted(signal);
-    return bytes;
+    return raceAbort(src.range(0, src.size, signal), signal);
   }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
@@ -54,7 +68,7 @@ export async function readAllSource(
   try {
     for (;;) {
       throwIfAborted(signal);
-      const { done, value } = await readSourceChunk(reader, signal);
+      const { done, value } = await raceAbort(reader.read(), signal);
       if (done) break;
       chunks.push(value);
       total += value.byteLength;
@@ -73,25 +87,6 @@ export async function readAllSource(
   }
   throwIfAborted(signal);
   return out;
-}
-
-async function readSourceChunk(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  signal: AbortSignal | undefined,
-): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>> {
-  throwIfAborted(signal);
-  if (signal === undefined) return reader.read();
-  let rejectAbort: (() => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAbort = () => reject(new MediaError('aborted', 'aborted'));
-  });
-  const onAbort = (): void => rejectAbort?.();
-  signal.addEventListener('abort', onAbort, { once: true });
-  try {
-    return await Promise.race([reader.read(), aborted]);
-  } finally {
-    signal.removeEventListener('abort', onAbort);
-  }
 }
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -127,6 +122,11 @@ export function sourceMayBeHlsManifest(src: Source): boolean {
     return false;
   }
   return true;
+}
+
+/** Cheap eager gate before loading the finite blob-URL handoff implementation. */
+export function sourceMayHaveBlobProbeHandoff(src: Source): boolean {
+  return !!src[SOURCE_CACHE_KEY]?.startsWith('blob:');
 }
 
 /**
@@ -168,8 +168,8 @@ export function cacheProbeRanges(
       : undefined;
   let cached = consumed?.bytes;
   let cachedSize = consumed?.size;
-  if (mode === 'consume' && cacheKey !== undefined) {
-    handoff?.delete(cacheKey);
+  if (mode === 'consume' && cacheKey !== undefined && handoff !== undefined) {
+    dropSourcePrefixHandoff(handoff, cacheKey);
   }
   const wrapped: Source = {
     ...src,
@@ -177,7 +177,8 @@ export function cacheProbeRanges(
     // snapshot/omit those late facts, so every Source wrapper must keep them live. A fresh Source that
     // consumes a probe prefix also needs the total learned by the probe: otherwise parsing wholly from
     // the cached prefix leaves the new URL unread and MP4 cannot validate its terminal boxes/mdat.
-    range: async (start, end) => {
+    range: async (start, end, signal) => {
+      throwIfSourceAborted(signal);
       const sourceSize = src.size ?? cachedSize;
       const cachedCoversEnd =
         cached !== undefined &&
@@ -186,7 +187,8 @@ export function cacheProbeRanges(
       if (cached !== undefined && start >= 0 && cachedCoversEnd) {
         return cached.subarray(start, end);
       }
-      const bytes = await range.call(src, start, end);
+      const bytes = await raceAbort(range.call(src, start, end, signal), signal);
+      throwIfSourceAborted(signal);
       cachedSize =
         src.size ??
         cachedSize ??
@@ -215,13 +217,31 @@ function storeSourcePrefixHandoff(
   cacheKey: string,
   bytes: Uint8Array,
   size: number | undefined,
-  ttlMs: number = SOURCE_PREFIX_HANDOFF_TTL_MS,
+  ttlMs = 250,
 ): void {
-  const token = {};
-  handoff.set(cacheKey, { bytes, ...(size !== undefined ? { size } : {}), token });
-  setTimeout(() => {
-    if (handoff.get(cacheKey)?.token === token) {
-      handoff.delete(cacheKey);
-    }
-  }, ttlMs);
+  dropSourcePrefixHandoff(handoff, cacheKey);
+  const token = setTimeout(() => dropSourcePrefixHandoff(handoff, cacheKey, token), ttlMs);
+  handoff.set(cacheKey, {
+    bytes,
+    ...(size !== undefined ? { size } : {}),
+    token,
+  });
+}
+
+function dropSourcePrefixHandoff(
+  handoff: Map<string, SourcePrefixHandoff>,
+  key: string,
+  expectedToken?: ReturnType<typeof setTimeout>,
+): void {
+  const entry = handoff.get(key);
+  if (entry === undefined || (expectedToken !== undefined && entry.token !== expectedToken)) {
+    return;
+  }
+  handoff.delete(key);
+  clearTimeout(entry.token);
+}
+
+export function clearSourcePrefixHandoffs(handoff: Map<string, SourcePrefixHandoff>): void {
+  for (const entry of handoff.values()) clearTimeout(entry.token);
+  handoff.clear();
 }

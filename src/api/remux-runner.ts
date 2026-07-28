@@ -1,6 +1,7 @@
 import type {
   ContainerDriver,
   ContainerQuery,
+  MuxOptions,
   StageOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
@@ -10,6 +11,7 @@ import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
 import { type MediaInput, type Source, from as normalizeInput } from '../sources/source.ts';
 import { containerHasChunkMuxer } from './codec-routing.ts';
+import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, RemuxOptions } from './types.ts';
 
 const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
@@ -55,6 +57,7 @@ export async function runRemux(
   options: CallOptions,
   signal: AbortSignal,
 ): Promise<Output> {
+  validateReservedFaststart('remux', opts.to, opts);
   // Plan and snapshot caller-owned tags before opening any source. A getter/proxy failure therefore cannot
   // leave a one-shot producer partially consumed, and later caller mutation cannot change the rewrite.
   const tags = opts.tags;
@@ -231,6 +234,9 @@ export async function runRemux(
       ...context.stage(signal, remuxCallOptions),
       container: opts.to,
       ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+      ...(opts.maximumPacketCount !== undefined
+        ? { maximumPacketCount: opts.maximumPacketCount }
+        : {}),
       ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
       ...(metadata === undefined ? streamCopySinkMode(opts.sink) : { buffered: true }),
     });
@@ -266,6 +272,16 @@ async function remuxViaSeam(
   if (opts.to === 'ts') {
     const { tryRemuxPacketInfoToMpegTs } = await import('./mpegts-packet-info-remux.ts');
     const stream = await tryRemuxPacketInfoToMpegTs(
+      container,
+      source,
+      opts,
+      context.stage(signal, options),
+    );
+    if (stream !== undefined) return stream;
+  }
+  if (opts.to === 'webm' || opts.to === 'mkv') {
+    const { tryRemuxPacketInfoToBufferedWebm } = await import('./webm-packet-info-remux.ts');
+    const stream = await tryRemuxPacketInfoToBufferedWebm(
       container,
       source,
       opts,
@@ -338,16 +354,17 @@ async function materializeOutput(
 }
 
 function streamCopySinkMode(sink: Sink | undefined): { streaming?: true; buffered?: true } {
-  return sink?.kind === 'stream-target' ? { streaming: true } : { buffered: true };
+  return sink?.kind === 'stream-target' || sink?.kind === 'opfs' || sink?.kind === 'opfs-target'
+    ? { streaming: true }
+    : { buffered: true };
 }
 
-function remuxMuxOptions(opts: RemuxOptions): {
-  faststart?: boolean;
-  fragmented?: boolean;
-  container: string;
-} {
+function remuxMuxOptions(opts: RemuxOptions): MuxOptions & { readonly container: string } {
   return {
     ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+    ...(opts.maximumPacketCount !== undefined
+      ? { maximumPacketCount: opts.maximumPacketCount }
+      : {}),
     ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
     container: opts.to,
   };

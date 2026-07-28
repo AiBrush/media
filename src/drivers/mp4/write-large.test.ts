@@ -8,7 +8,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { type MuxTrackInput, assertSingleBufferSize, writeMp4 } from './write.ts';
+import {
+  type MuxTrackInput,
+  assertSingleBufferSize,
+  planReservedMp4ByteStreamLayout,
+  writeMp4,
+} from './write.ts';
 
 function videoTrack(samples: Uint8Array[]): MuxTrackInput {
   return {
@@ -62,6 +67,27 @@ describe('writeMp4 — large-output assembly (Uint8Array, not number[])', () => 
   it('assertSingleBufferSize: accepts ≤ the 4.29 GB cap, throws above it', () => {
     expect(() => assertSingleBufferSize(0xffffffff)).not.toThrow();
     expect(() => assertSingleBufferSize(0xffffffff + 1)).toThrow(/single-buffer limit/);
+  });
+
+  it('plans a bounded moov reservation from a per-track packet ceiling', () => {
+    const track = videoTrack([new Uint8Array([1]), new Uint8Array([2])]);
+    const layout = planReservedMp4ByteStreamLayout([track], 8);
+    expect(layout.observedPacketCount).toBe(2);
+    expect(layout.reservationPosition).toBe(layout.ftyp.byteLength);
+    expect(layout.mdatPosition).toBe(layout.reservationPosition + layout.reservationBytes);
+    expect(layout.moovPatch.byteLength).toBe(layout.reservationBytes);
+    expect(String.fromCharCode(...layout.moovPatch.subarray(4, 8))).toBe('moov');
+    const moovSize = new DataView(
+      layout.moovPatch.buffer,
+      layout.moovPatch.byteOffset,
+      layout.moovPatch.byteLength,
+    ).getUint32(0);
+    expect(String.fromCharCode(...layout.moovPatch.subarray(moovSize + 4, moovSize + 8))).toBe(
+      'free',
+    );
+    expect(() => planReservedMp4ByteStreamLayout([track], 1)).toThrowError(
+      /MP4_FASTSTART_RESERVE_PACKET_OVERFLOW/,
+    );
   });
 
   it('builds a 200k-sample moov without a stack overflow (massive size-ladder rung)', () => {

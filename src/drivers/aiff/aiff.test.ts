@@ -13,6 +13,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
+import type { ByteSource } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { channelAt } from '../../dsp/pcm.ts';
 import { readCafPcm } from '../caf/caf.ts';
@@ -662,6 +663,26 @@ describe('rewriteAiffPcmToWav — no-DSP cross-wrapper fast path', () => {
     expect(wav.frames).toBe(source.frames);
   });
 
+  it('narrows exact half-LSB s24 samples with canonical nearest-even rounding', () => {
+    const s16HalfCodes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+    const file = writeAiff(
+      {
+        sampleRate: 8_000,
+        channels: 1,
+        frames: s16HalfCodes.length,
+        planar: [Float64Array.from(s16HalfCodes, (code) => code / 32_768)],
+      },
+      's24',
+    );
+    const rewritten = rewriteAiffPcmToWav(file, 's16', 'le', 1, 8_000);
+
+    expect(rewritten).toEqual(writeWav(readAiffPcm(file), 's16'));
+    if (rewritten === undefined) throw new Error('expected direct AIFF s24→WAV s16 narrowing');
+    expect(Array.from(new Int16Array(rewritten.buffer, rewritten.byteOffset + 44))).toEqual([
+      -2, -2, 0, 0, 2, 2,
+    ]);
+  });
+
   it('copies little-endian AIFF-C PCM directly into canonical WAV payload bytes', () => {
     const samples = Uint8Array.of(0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde);
     const ssnd = new Uint8Array(8 + samples.byteLength);
@@ -850,6 +871,893 @@ describe('AiffDriver.decodePcmAudio — abort handling', () => {
     };
 
     await expect(decode(source, { signal: controller.signal })).rejects.toThrow(MediaError);
+  });
+});
+
+describe('AiffDriver.decodePcmInterleavedStream — bounded fused PCM egress', () => {
+  it.each(['pcm_s16be.aiff', 'pcm_s24be.aiff'] as const)(
+    'decodes real %s range-backed PCM bit-exactly without materializing the payload',
+    async (id) => {
+      const bytes = await loadHarness(id);
+      const canonical = readAiffPcm(bytes);
+      const expected = new Float32Array(canonical.frames * canonical.channels);
+      for (let frame = 0; frame < canonical.frames; frame++) {
+        for (let channel = 0; channel < canonical.channels; channel++) {
+          expected[frame * canonical.channels + channel] = canonical.planar[channel]?.[frame] ?? 0;
+        }
+      }
+      const reads: Array<readonly [number, number]> = [];
+      const decode = AiffDriver.decodePcmInterleavedStream;
+      if (decode === undefined) {
+        throw new Error('AiffDriver must expose fused interleaved PCM decode');
+      }
+      const chunks = await decode({
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('range-backed AIFF decode must not open the full payload stream');
+        },
+      });
+
+      const actual = new Uint32Array(expected.length);
+      const reader = chunks.getReader();
+      let sample = 0;
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        expect(next.value.frames).toBeLessThanOrEqual(4096);
+        expect(next.value.sampleRate).toBe(canonical.sampleRate);
+        expect(next.value.channels).toBe(canonical.channels);
+        const bits = new Uint32Array(
+          next.value.data.buffer,
+          next.value.data.byteOffset,
+          next.value.data.length,
+        );
+        actual.set(bits, sample);
+        sample += bits.length;
+      }
+      reader.releaseLock();
+
+      expect(sample).toBe(expected.length);
+      expect(actual).toEqual(new Uint32Array(expected.buffer));
+      expect(reads[0]).toEqual([0, 65_536]);
+      expect(reads.every(([start, end]) => end - start <= 1024 * 1024)).toBe(true);
+      expect(reads.length).toBeLessThanOrEqual(id === 'pcm_s16be.aiff' ? 2 : 3);
+    },
+  );
+
+  it('uses COMM frame count and ignores legal SSND block-alignment tail bytes', async () => {
+    const samples = Uint8Array.of(0x20, 0, 0x40, 0, 0x60, 0, 0x7f, 0xff);
+    const sound = new Uint8Array(8 + samples.byteLength);
+    new DataView(sound.buffer).setUint32(4, 8);
+    sound.set(samples, 8);
+    const bytes = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 1)),
+      chunk('SSND', sound),
+    ]);
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+
+    for (const source of [bytesSource(bytes), { stream: () => streamOf(bytes) }]) {
+      const reader = (await decode(source)).getReader();
+      const first = await reader.read();
+      expect(first.value).toMatchObject({ sampleRate: 8000, channels: 1, frames: 1 });
+      expect(Array.from(first.value?.data ?? [])).toEqual([0.25]);
+      expect((await reader.read()).done).toBe(true);
+      reader.releaseLock();
+    }
+    expect(readAiffPcm(bytes).frames).toBe(1);
+    const rewritten = rewriteAiffPcmToWav(bytes);
+    expect(rewritten).toBeDefined();
+    expect(readWavPcm(rewritten ?? new Uint8Array()).frames).toBe(1);
+    expect(aiffPacketInfoFromBytes(bytes).packets).toHaveLength(1);
+    expect(aiffPacketInfoFromBytes(bytes).packets[0]?.size).toBe(2);
+  });
+
+  it('rejects missing or short SSND data whenever COMM declares required frames', async () => {
+    const oneFrameSound = new Uint8Array(10);
+    oneFrameSound.set([0x20, 0], 8);
+    const malformed = [
+      form('AIFF', [chunk('COMM', comm(1, 16, 8000, undefined, 1))]),
+      form('AIFF', [chunk('COMM', comm(1, 16, 8000, undefined, 2)), chunk('SSND', oneFrameSound)]),
+    ];
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+
+    for (const bytes of malformed) {
+      expect(() => readAiffPcm(bytes)).toThrowError(/SSND/);
+      expect(() => rewriteAiffPcmToWav(bytes)).toThrowError(/SSND/);
+      expect(() =>
+        trySliceAiffPcm(bytes, {
+          container: 'aiff',
+          timeBounds: { startSec: 0, endSec: 1 / 8000 },
+        }),
+      ).toThrowError(/SSND/);
+      expect(() => aiffPacketInfoFromBytes(bytes)).toThrowError(/SSND/);
+      await expect(decode(bytesSource(bytes))).rejects.toMatchObject({ code: 'demux-error' });
+      await expect(decode({ stream: () => streamOf(bytes) })).rejects.toMatchObject({
+        code: 'demux-error',
+      });
+    }
+  });
+
+  it('streams range-less signed-24 PCM with range-path cadence and Float32 bits', async () => {
+    const bytes = await loadDerived('sfx-s24.aiff');
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const expectedReader = (
+      await decode({
+        size: bytes.byteLength,
+        range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('range control must not stream');
+        },
+      })
+    ).getReader();
+    const expectedBits: number[] = [];
+    const expectedCadence: number[] = [];
+    for (;;) {
+      const next = await expectedReader.read();
+      if (next.done) break;
+      expectedCadence.push(next.value.frames);
+      expectedBits.push(
+        ...new Uint32Array(
+          next.value.data.buffer,
+          next.value.data.byteOffset,
+          next.value.data.length,
+        ),
+      );
+    }
+    expectedReader.releaseLock();
+
+    let streamCalls = 0;
+    let offset = 0;
+    let activePulls = 0;
+    let maximumActivePulls = 0;
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      stream(): ReadableStream<Uint8Array> {
+        streamCalls++;
+        offset = 0;
+        return new ReadableStream<Uint8Array>(
+          {
+            async pull(controller): Promise<void> {
+              activePulls++;
+              maximumActivePulls = Math.max(maximumActivePulls, activePulls);
+              await Promise.resolve();
+              const length = Math.min(97 + (offset % 131), bytes.byteLength - offset);
+              if (length > 0) {
+                controller.enqueue(bytes.slice(offset, offset + length));
+                offset += length;
+              }
+              if (offset >= bytes.byteLength) controller.close();
+              activePulls--;
+            },
+          },
+          { highWaterMark: 0 },
+        );
+      },
+    };
+
+    const actualReader = (await decode(source)).getReader();
+    const actualBits: number[] = [];
+    const actualCadence: number[] = [];
+    for (;;) {
+      const next = await actualReader.read();
+      if (next.done) break;
+      actualCadence.push(next.value.frames);
+      actualBits.push(
+        ...new Uint32Array(
+          next.value.data.buffer,
+          next.value.data.byteOffset,
+          next.value.data.length,
+        ),
+      );
+    }
+    actualReader.releaseLock();
+
+    expect(streamCalls).toBe(1);
+    expect(maximumActivePulls).toBe(1);
+    expect(actualCadence).toEqual(expectedCadence);
+    expect(actualBits).toEqual(expectedBits);
+  });
+
+  it('spools a legal SSND-before-COMM stream in bounded segments and releases its source', async () => {
+    const frames = 524_297;
+    const samples = new Uint8Array(frames * 2);
+    for (let frame = 0; frame < frames; frame++) {
+      samples[frame * 2] = frame & 0x7f;
+      samples[frame * 2 + 1] = frame & 0xff;
+    }
+    const sound = new Uint8Array(8 + samples.byteLength);
+    sound.set(samples, 8);
+    const bytes = form('AIFF', [
+      chunk('SSND', sound),
+      chunk('COMM', comm(1, 16, 8000, undefined, frames)),
+    ]);
+    let offset = 0;
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller): void {
+          const end = Math.min(bytes.byteLength, offset + 64 * 1024);
+          if (end > offset) controller.enqueue(bytes.slice(offset, end));
+          offset = end;
+          if (offset >= bytes.byteLength) controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+
+    const chunks = await decode({ stream: () => sourceStream });
+    expect(sourceStream.locked).toBe(false);
+    const reader = chunks.getReader();
+    let decodedFrames = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      expect(next.value.frames).toBeLessThanOrEqual(4096);
+      decodedFrames += next.value.frames;
+    }
+    reader.releaseLock();
+    expect(decodedFrames).toBe(frames);
+  });
+
+  it('rejects chunks outside the sequential FORM boundary and unlocks the source', async () => {
+    const bytes = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 1)),
+      chunk('SSND', Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0)),
+    ]);
+    new DataView(bytes.buffer).setUint32(4, 4);
+    const sourceStream = streamOf(bytes);
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+
+    await expect(decode({ stream: () => sourceStream })).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('COMM'),
+    });
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('aborts a pending initial range promptly through the ByteSource range signal', async () => {
+    let rangeStarted = false;
+    let rangeAborted = false;
+    const abort = new AbortController();
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const pending = decode(
+      {
+        size: 1024,
+        range(_start, _end, signal): Promise<Uint8Array> {
+          rangeStarted = true;
+          return new Promise((_resolve, reject) => {
+            signal?.addEventListener(
+              'abort',
+              () => {
+                rangeAborted = true;
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          });
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('range-backed AIFF decode must not stream');
+        },
+      },
+      { signal: abort.signal },
+    );
+    while (!rangeStarted) await Promise.resolve();
+
+    abort.abort('stop initial AIFF range');
+
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
+    expect(rangeAborted).toBe(true);
+  });
+
+  it('honors AIFF-C sowt little-endian signed-16 payloads on the bounded path', async () => {
+    const samples = Uint8Array.of(0, 0x80, 0xff, 0x7f, 0xff, 0xff, 0, 0);
+    const sound = new Uint8Array(8 + samples.byteLength);
+    sound.set(samples, 8);
+    const bytes = form('AIFC', [chunk('COMM', comm(1, 16, 8000, 'sowt', 4)), chunk('SSND', sound)]);
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const reader = (await decode(bytesSource(bytes))).getReader();
+    const first = await reader.read();
+
+    expect(first.done).toBe(false);
+    expect(first.value).toMatchObject({ sampleRate: 8000, channels: 1, frames: 4 });
+    expect(Array.from(first.value?.data ?? [])).toEqual([-1, 32_767 / 32_768, -1 / 32_768, 0]);
+    expect((await reader.read()).done).toBe(true);
+    reader.releaseLock();
+  });
+
+  it('cancels and unlocks a sequential source during a pending payload read', async () => {
+    const bytes = await loadHarness('pcm_s16be.aiff');
+    const sampleRange = ssndSampleRange(bytes);
+    const firstPayloadEnd = sampleRange.offset + 4096 * 2 * 2;
+    let pendingPull = false;
+    let cancelled = 0;
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(bytes.slice(0, firstPayloadEnd));
+        },
+        pull(): Promise<void> {
+          pendingPull = true;
+          return new Promise(() => {});
+        },
+        cancel(): void {
+          cancelled++;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const reader = (await decode({ stream: () => sourceStream })).getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    const pending = reader.read();
+    while (!pendingPull) await Promise.resolve();
+
+    await reader.cancel('consumer stopped');
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    reader.releaseLock();
+    expect(cancelled).toBe(1);
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('aborts a pending bounded range window when the consumer cancels', async () => {
+    const bytes = await loadHarness('pcm_s16be.aiff');
+    let payloadRangeStarted = false;
+    let payloadRangeAborted = false;
+    let rangeCalls = 0;
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      range(start, end, signal): Promise<Uint8Array> {
+        expect(this).toBe(source);
+        rangeCalls++;
+        if (rangeCalls === 1) return Promise.resolve(bytes.subarray(start, end));
+        payloadRangeStarted = true;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              payloadRangeAborted = true;
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        });
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('range-backed AIFF decode must remain bounded');
+      },
+    };
+    const reader = (await decode(source)).getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    expect((await reader.read()).value?.frames).toBe(4096);
+    expect((await reader.read()).value?.frames).toBe(4096);
+    const pending = reader.read();
+    while (!payloadRangeStarted) await Promise.resolve();
+
+    const cancelled = reader.cancel('consumer stopped during AIFF range read');
+
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    await expect(cancelled).resolves.toBeUndefined();
+    expect(rangeCalls).toBe(2);
+    expect(payloadRangeAborted).toBe(true);
+    reader.releaseLock();
+  });
+
+  it('preserves a sequential producer error as a typed demux failure and unlocks the source', async () => {
+    const bytes = await loadHarness('pcm_s16be.aiff');
+    const sampleRange = ssndSampleRange(bytes);
+    const firstPayloadEnd = sampleRange.offset + 4096 * 2 * 2;
+    const sourceFailure = new Error('producer failed after first AIFF PCM chunk');
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(bytes.slice(0, firstPayloadEnd));
+        },
+        pull(controller): void {
+          controller.error(sourceFailure);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const reader = (await decode({ stream: () => sourceStream })).getReader();
+    expect((await reader.read()).value?.frames).toBe(4096);
+    await expect(reader.read()).rejects.toMatchObject({
+      code: 'demux-error',
+      detail: sourceFailure,
+      message: expect.stringContaining('producer failed after first AIFF PCM chunk'),
+    });
+    reader.releaseLock();
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('rejects a range-less payload that ends before its declared final frame', async () => {
+    const bytes = await loadDerived('sfx.aiff');
+    const truncated = bytes.slice(0, -2);
+    const sourceStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller): void {
+          controller.enqueue(truncated.subarray(0, 83));
+          controller.enqueue(truncated.subarray(83));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const reader = (await decode({ stream: () => sourceStream })).getReader();
+    await expect(
+      (async () => {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) return;
+        }
+      })(),
+    ).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('ended before the declared SSND payload'),
+    });
+    reader.releaseLock();
+    expect(sourceStream.locked).toBe(false);
+  });
+
+  it('cancels and unlocks a pending sequential header read on abort', async () => {
+    const bytes = await loadDerived('sfx.aiff');
+    let releasePull: (() => void) | undefined;
+    let cancelled = false;
+    const sourceStream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(bytes.subarray(0, 12));
+      },
+      pull(controller): Promise<void> {
+        return new Promise((resolve) => {
+          releasePull = () => {
+            controller.enqueue(bytes.subarray(12));
+            controller.close();
+            resolve();
+          };
+        });
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    const decode = AiffDriver.decodePcmInterleavedStream;
+    if (decode === undefined) {
+      throw new Error('AiffDriver must expose fused interleaved PCM decode');
+    }
+    const abort = new AbortController();
+    const outcome = decode({ stream: () => sourceStream }, { signal: abort.signal }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    while (releasePull === undefined) await Promise.resolve();
+
+    abort.abort('stop');
+    await Promise.resolve();
+    await Promise.resolve();
+    const wasCancelledPromptly = cancelled;
+    if (!cancelled) releasePull();
+
+    expect(wasCancelledPromptly).toBe(true);
+    await expect(outcome).resolves.toMatchObject({ code: 'aborted' });
+    expect(sourceStream.locked).toBe(false);
+  });
+});
+
+describe('AiffDriver bounded decode — defensive container branches', () => {
+  const maybeDecode = AiffDriver.decodePcmInterleavedStream;
+  if (maybeDecode === undefined) {
+    throw new Error('AiffDriver must expose fused interleaved PCM decode');
+  }
+  const decode: NonNullable<typeof AiffDriver.decodePcmInterleavedStream> = maybeDecode;
+  const maybeProbe = AiffDriver.probe;
+  if (maybeProbe === undefined) throw new Error('AiffDriver must expose probe');
+  const probe: NonNullable<typeof AiffDriver.probe> = maybeProbe;
+  const maybeDecodeAudio = AiffDriver.decodePcmAudio;
+  if (maybeDecodeAudio === undefined) throw new Error('AiffDriver must expose decodePcmAudio');
+  const decodeAudio: NonNullable<typeof AiffDriver.decodePcmAudio> = maybeDecodeAudio;
+
+  async function consume(source: ByteSource, signal?: AbortSignal): Promise<number> {
+    const reader = (
+      await decode(source, signal === undefined ? undefined : { signal })
+    ).getReader();
+    let frames = 0;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) return frames;
+        frames += next.value.frames;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  function rangeOnly(
+    bytes: Uint8Array,
+    logicalSize: number | undefined = bytes.byteLength,
+  ): ByteSource {
+    return {
+      ...(logicalSize === undefined ? {} : { size: logicalSize }),
+      range: (start, end) => Promise.resolve(bytes.subarray(start, end)),
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('bounded AIFF decode must not materialize the source stream');
+      },
+    };
+  }
+
+  it('reports packet metadata for float64, float32, signed-8, and little-endian PCM', () => {
+    const cases = [
+      {
+        bytes: form('AIFC', [
+          chunk('COMM', comm(1, 64, 8000, 'fl64', 1)),
+          chunk('SSND', new Uint8Array(16)),
+        ]),
+        codec: 'pcm-f64',
+      },
+      {
+        bytes: form('AIFC', [
+          chunk('COMM', comm(1, 32, 8000, 'fl32', 1)),
+          chunk('SSND', new Uint8Array(12)),
+        ]),
+        codec: 'pcm-f32',
+      },
+      {
+        bytes: form('AIFF', [
+          chunk('COMM', comm(1, 8, 8000, undefined, 1)),
+          chunk('SSND', new Uint8Array(9)),
+        ]),
+        codec: 'pcm-s8',
+      },
+      {
+        bytes: form('AIFC', [
+          chunk('COMM', comm(1, 16, 8000, 'sowt', 1)),
+          chunk('SSND', new Uint8Array(10)),
+        ]),
+        codec: 'pcm-s16',
+      },
+    ] as const;
+
+    for (const { bytes, codec } of cases) {
+      const table = aiffPacketInfoFromBytes(bytes);
+      expect(table.tracks[0]?.codec).toBe(codec);
+      expect(table.packets).toHaveLength(1);
+    }
+
+    const zeroRate = form('AIFF', [chunk('COMM', comm(1, 16, 0, undefined, 0))]);
+    expect(aiffPacketInfoFromBytes(zeroRate).tracks[0]?.durationSec).toBe(0);
+  });
+
+  it('rejects malformed range-backed FORM, COMM, and SSND structures without a full read', async () => {
+    const shortFormEnd = form('AIFF', []);
+    new DataView(shortFormEnd.buffer).setUint32(4, 0);
+
+    const truncatedChunkHeader = new Uint8Array(16);
+    truncatedChunkHeader.set(new TextEncoder().encode('FORM'), 0);
+    new DataView(truncatedChunkHeader.buffer).setUint32(4, 12);
+    truncatedChunkHeader.set(new TextEncoder().encode('AIFF'), 8);
+
+    const shortSoundFull = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 1)),
+      chunk('SSND', new Uint8Array(8)),
+    ]);
+    const shortSound = shortSoundFull.subarray(0, shortSoundFull.byteLength - 4);
+
+    const invalidOffset = new Uint8Array(8);
+    new DataView(invalidOffset.buffer).setUint32(0, 1);
+
+    const cases: ReadonlyArray<readonly [string, ByteSource]> = [
+      ['bad magic', rangeOnly(new Uint8Array(12))],
+      ['short FORM extent', rangeOnly(shortFormEnd)],
+      ['short chunk header', rangeOnly(truncatedChunkHeader, 20)],
+      ['short COMM', rangeOnly(form('AIFF', [chunk('COMM', new Uint8Array(17))]))],
+      [
+        'short SSND',
+        rangeOnly(
+          form('AIFF', [
+            chunk('COMM', comm(1, 16, 8000, undefined, 1)),
+            chunk('SSND', new Uint8Array(7)),
+          ]),
+        ),
+      ],
+      ['short SSND prefix', rangeOnly(shortSound, shortSoundFull.byteLength)],
+      [
+        'invalid SSND offset',
+        rangeOnly(
+          form('AIFF', [
+            chunk('COMM', comm(1, 16, 8000, undefined, 1)),
+            chunk('SSND', invalidOffset),
+          ]),
+        ),
+      ],
+      ['missing COMM', rangeOnly(form('AIFF', [chunk('SSND', new Uint8Array(8))]))],
+    ];
+
+    for (const [label, source] of cases) {
+      await expect(consume(source), label).rejects.toBeInstanceOf(MediaError);
+    }
+  });
+
+  it('grows the bounded metadata window and closes a legal zero-frame range source', async () => {
+    const bytes = form('AIFF', [
+      chunk('JUNK', new Uint8Array(65_536)),
+      chunk('COMM', comm(1, 16, 8000, undefined, 0)),
+    ]);
+    const reads: Array<readonly [number, number]> = [];
+    const source: ByteSource = {
+      range(start, end): Promise<Uint8Array> {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('bounded AIFF decode must not stream');
+      },
+    };
+
+    await expect(consume(source)).resolves.toBe(0);
+    expect(reads.length).toBeGreaterThan(1);
+  });
+
+  it('enforces the range-backed chunk-count safety limit', async () => {
+    const emptyChunks = Array.from({ length: 8192 }, () => chunk('JUNK', new Uint8Array(0)));
+    const bytes = form('AIFF', emptyChunks);
+
+    await expect(consume(rangeOnly(bytes))).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('safety limit'),
+    });
+  });
+
+  it('rejects malformed sequential chunk ordering, sizes, padding, and truncation', async () => {
+    const invalidOffset = new Uint8Array(8);
+    new DataView(invalidOffset.buffer).setUint32(0, 1);
+
+    const oversized = new Uint8Array(28);
+    oversized.set(new TextEncoder().encode('FORM'), 0);
+    const oversizedSoundSize = 8 + 16 * 1024 * 1024 + 1;
+    new DataView(oversized.buffer).setUint32(4, 4 + 8 + oversizedSoundSize + 1);
+    oversized.set(new TextEncoder().encode('AIFF'), 8);
+    oversized.set(new TextEncoder().encode('SSND'), 12);
+    new DataView(oversized.buffer).setUint32(16, oversizedSoundSize);
+
+    const truncatedUnknownFull = form('AIFF', [chunk('JUNK', new Uint8Array(4))]);
+    const truncatedUnknown = truncatedUnknownFull.subarray(0, truncatedUnknownFull.byteLength - 2);
+
+    const shortSoundHeaderFull = form('AIFF', [chunk('SSND', new Uint8Array(8))]);
+    const shortSoundHeader = shortSoundHeaderFull.subarray(0, shortSoundHeaderFull.byteLength - 4);
+
+    const missingPadFull = form('AIFF', [chunk('SSND', new Uint8Array(9))]);
+    const missingPad = missingPadFull.subarray(0, missingPadFull.byteLength - 1);
+
+    const longCommBody = new Uint8Array(20);
+    longCommBody.set(comm(1, 16, 8000));
+    const shortCommTailFull = form('AIFF', [chunk('COMM', longCommBody)]);
+    const shortCommTail = shortCommTailFull.subarray(0, shortCommTailFull.byteLength - 2);
+
+    const duplicateSound = form('AIFF', [
+      chunk('SSND', new Uint8Array(8)),
+      chunk('SSND', new Uint8Array(8)),
+      chunk('COMM', comm(1, 16, 8000, undefined, 0)),
+    ]);
+
+    const trailingHeader = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 0)),
+      Uint8Array.of(1),
+    ]);
+
+    const shortChunkHeader = new Uint8Array(16);
+    shortChunkHeader.set(new TextEncoder().encode('FORM'), 0);
+    new DataView(shortChunkHeader.buffer).setUint32(4, 12);
+    shortChunkHeader.set(new TextEncoder().encode('AIFF'), 8);
+
+    const chunkOutsideForm = new Uint8Array(20);
+    chunkOutsideForm.set(new TextEncoder().encode('FORM'), 0);
+    new DataView(chunkOutsideForm.buffer).setUint32(4, 12);
+    chunkOutsideForm.set(new TextEncoder().encode('AIFFJUNK'), 8);
+    new DataView(chunkOutsideForm.buffer).setUint32(16, 4);
+
+    const alignmentBody = new Uint8Array(12);
+    new DataView(alignmentBody.buffer).setUint32(0, 4);
+    const missingAlignmentFull = form('AIFF', [chunk('SSND', alignmentBody)]);
+    const missingAlignment = missingAlignmentFull.subarray(0, missingAlignmentFull.byteLength - 4);
+
+    const shortSpoolBody = new Uint8Array(12);
+    const shortSpoolFull = form('AIFF', [chunk('SSND', shortSpoolBody)]);
+    const shortSpool = shortSpoolFull.subarray(0, shortSpoolFull.byteLength - 2);
+
+    const cases = [
+      form('AIFF', []),
+      trailingHeader,
+      form('AIFF', [chunk('COMM', new Uint8Array(17))]),
+      form('AIFF', [chunk('SSND', new Uint8Array(7))]),
+      form('AIFF', [chunk('SSND', invalidOffset)]),
+      duplicateSound,
+      oversized,
+      truncatedUnknown,
+      shortSoundHeader,
+      missingPad,
+      shortCommTail,
+      shortChunkHeader,
+      chunkOutsideForm,
+      missingAlignment,
+      shortSpool,
+      form(
+        'AIFF',
+        Array.from({ length: 8192 }, () => chunk('JUNK', new Uint8Array(0))),
+      ),
+    ];
+
+    for (const bytes of cases) {
+      const sourceStream = streamOf(bytes);
+      await expect(consume({ stream: () => sourceStream })).rejects.toBeInstanceOf(MediaError);
+      expect(sourceStream.locked).toBe(false);
+    }
+  });
+
+  it('handles empty sequential AIFF and AIFF-C payloads and typed producer failures', async () => {
+    for (const [kind, compression] of [
+      ['AIFF', undefined],
+      ['AIFC', 'sowt'],
+    ] as const) {
+      const bytes = form(kind, [chunk('COMM', comm(1, 16, 8000, compression, 0))]);
+      await expect(consume({ stream: () => streamOf(bytes) })).resolves.toBe(0);
+    }
+
+    const sourceError = new MediaError('demux-error', 'typed sequential source failure');
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new TextEncoder().encode('FORM'));
+        controller.error(sourceError);
+      },
+    });
+    await expect(consume({ stream: () => broken })).rejects.toBe(sourceError);
+    expect(broken.locked).toBe(false);
+  });
+
+  it('threads a live signal through bounded, sequential, head, and whole-source reads', async () => {
+    const bytes = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 2)),
+      chunk('SSND', Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0x40, 0)),
+    ]);
+    const live = new AbortController();
+
+    await expect(consume(rangeOnly(bytes), live.signal)).resolves.toBe(2);
+    await expect(consume({ stream: () => streamOf(bytes) }, live.signal)).resolves.toBe(2);
+    await expect(
+      probe({ stream: () => streamOf(bytes) }, { signal: live.signal }),
+    ).resolves.toHaveLength(1);
+    await expect(
+      decodeAudio({ stream: () => streamOf(bytes) }, { signal: live.signal }),
+    ).resolves.toMatchObject({ frames: 2, channels: 1, sampleRate: 8000 });
+  });
+
+  it('preserves empty-head, full-read, and non-Error producer failures', async () => {
+    await expect(probe({ stream: () => streamOf(new Uint8Array(0)) })).rejects.toBeInstanceOf(
+      InputError,
+    );
+
+    const fullReadFailure = new Error('whole AIFF source failed');
+    const brokenWholeRead = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.error(fullReadFailure);
+      },
+    });
+    await expect(decodeAudio({ stream: () => brokenWholeRead })).rejects.toBe(fullReadFailure);
+    expect(brokenWholeRead.locked).toBe(false);
+
+    const brokenSequential = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new TextEncoder().encode('FORM'));
+        controller.error('non-Error sequential source failure');
+      },
+    });
+    await expect(consume({ stream: () => brokenSequential })).rejects.toMatchObject({
+      code: 'demux-error',
+      message: expect.stringContaining('non-Error sequential source failure'),
+      detail: 'non-Error sequential source failure',
+    });
+    expect(brokenSequential.locked).toBe(false);
+  });
+
+  it('falls back from a COMM-only packet prefix to a signalled complete range read', async () => {
+    const bytes = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 0)),
+      chunk('JUNK', new Uint8Array(65_536)),
+      chunk('SSND', new Uint8Array(8)),
+    ]);
+    const reads: Array<readonly [number, number]> = [];
+    const live = new AbortController();
+    const packetInfo = AiffDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('AiffDriver must expose packetInfo');
+
+    const table = await packetInfo(
+      {
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('sized packet-info must use ranges');
+        },
+      },
+      { signal: live.signal },
+    );
+
+    expect(table.packets).toHaveLength(0);
+    expect(reads).toEqual([
+      [0, 65_536],
+      [0, bytes.byteLength],
+    ]);
+  });
+
+  it('accepts URL objects, default MIME, and a live signal on URL packet-info fallback', async () => {
+    const bytes = form('AIFF', [chunk('COMM', comm(1, 16, 8000, undefined, 0))]);
+    const server = rangeServer(bytes);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = server.fetch;
+    try {
+      const live = new AbortController();
+      const table = await aiffPacketInfoFromUrl(
+        new URL('https://fixtures.invalid/empty-live-signal.aiff'),
+        { size: bytes.byteLength, signal: live.signal },
+      );
+      expect(table.tracks[0]).toMatchObject({
+        codec: 'pcm-s16be',
+        config: { sampleRate: 8000, numberOfChannels: 1 },
+      });
+      expect(table.packets).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns an empty stream when COMM precedes an explicitly empty SSND', async () => {
+    const bytes = form('AIFF', [
+      chunk('COMM', comm(1, 16, 8000, undefined, 0)),
+      chunk('SSND', new Uint8Array(8)),
+    ]);
+
+    await expect(consume({ stream: () => streamOf(bytes) })).resolves.toBe(0);
   });
 });
 

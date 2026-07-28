@@ -10,7 +10,7 @@
  * {@link CapabilityError} rather than guessing.
  */
 
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { type PcmAudio, channelAt, sampleAt } from './pcm.ts';
 
 const C = Math.SQRT1_2; // 1/√2 ≈ 0.7071 — the BS.775 center/surround coefficient
@@ -106,4 +106,47 @@ export function remix(audio: PcmAudio, toChannels: number): PcmAudio {
     `unsupported channel remix ${from}→${toChannels} (supported: 1↔2, 2↔6, 6→1, N→N)`,
     { op: { kind: 'route', id: 'filter' }, tried: [] },
   );
+}
+
+/** Apply an explicit output-channel × input-channel coefficient matrix. */
+export function remixMatrix(
+  audio: PcmAudio,
+  matrix: readonly (readonly number[])[],
+  requestedChannels?: number,
+): PcmAudio {
+  const outputChannels = requestedChannels ?? matrix.length;
+  if (!Number.isInteger(outputChannels) || outputChannels <= 0) {
+    throw new CapabilityError(`invalid target channel count ${outputChannels}`, {
+      op: { kind: 'route', id: 'filter' },
+      tried: [],
+    });
+  }
+  if (matrix.length !== outputChannels) {
+    throw new InputError(
+      `audio mix matrix has ${matrix.length} output row(s), expected ${outputChannels}`,
+    );
+  }
+  const planar: Float64Array[] = [];
+  for (let output = 0; output < matrix.length; output++) {
+    const row = matrix[output];
+    if (row === undefined || row.length !== audio.channels) {
+      throw new InputError(
+        `audio mix matrix row ${output} has ${row?.length ?? 0} coefficient(s), expected ${audio.channels}`,
+      );
+    }
+    const channel = new Float64Array(audio.frames);
+    for (let input = 0; input < row.length; input++) {
+      const coefficient = row[input];
+      if (coefficient === undefined || !Number.isFinite(coefficient)) {
+        throw new InputError('audio mix matrix coefficients must be finite numbers');
+      }
+      if (coefficient === 0) continue;
+      const source = channelAt(audio.planar, input);
+      for (let frame = 0; frame < audio.frames; frame++) {
+        channel[frame] = (channel[frame] ?? 0) + sampleAt(source, frame) * coefficient;
+      }
+    }
+    planar.push(channel);
+  }
+  return build(audio, outputChannels, planar);
 }

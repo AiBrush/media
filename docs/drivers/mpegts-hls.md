@@ -2,7 +2,7 @@
 
 > Target spec for the MPEG-2 Transport Stream container driver and the HLS manifest source adapter.
 > This is the **best** design plus an honest delta against today's code — not a description of today's code.
-> Owned code: `src/drivers/mpegts/{mpegts-driver,mpegts-sniff,ts-framing,ts-parse,ts-write}.ts`
+> Owned code: `src/drivers/mpegts/{mpegts-driver,mpegts-sniff,ts-framing,ts-parse,ts-probe,ts-write}.ts`
 > (NOT `mpegts-decrypt.ts` → S19) and `src/drivers/hls/{hls-driver,hls-source,m3u8-parse}.ts`.
 
 ## 1. Purpose & scope
@@ -28,7 +28,7 @@ AC-3 / E-AC-3 / MP3 / Opus audio) multiplexed by PID, described by PSI tables (P
 (`../media-test/src/scenarios/demux/index.ts:128,178,188`). Remux drives TS→TS copy/trim and
 `ADTS→MPEG-TS` and `prop_ts_to_mp4_duration_materialized`
 (`../media-test/src/scenarios/remux/{audio.ts:76,metamorphic.ts:67}`). The driver's parsed tracks also
-back `probe` via the `demux().tracks` fallback (see §3), and its writer backs `mux` (S14) via
+back `probe` through a bounded range path (see §3), and its writer backs `mux` (S14) via
 `writeMpegTsPacketTracks` and the CMAF/HLS `streaming-output` family (S07).
 
 ## 2. Spec & references
@@ -93,11 +93,18 @@ each carrying its access units, a container `durationSec`, optional `fps`, and a
 `toTrackInfo` (`mpegts-driver.ts:76-85`), `demux()` returns a `Demuxer` whose `packets(trackId)` streams
 `Encoded*Chunk` (`mpegts-driver.ts:329-343`), and `streamCopy()`/`createMuxer()` route through the writer.
 
-**Probe seam:** the target adds `MpegTsDriver.probe()` and `MpegTsDriver.packetInfo()` (both optional on
-`ContainerDriver`, `contracts/driver.ts:416-424`). Today the driver implements **neither**
-(`mpegts-driver.ts:323-357`), so probe falls back to `demux()` + `tracks` and a packet-info probe
-reassembles full AU payloads it never needs — the demux perf deficit in §5 (`measured-evidence.md`:
-`demux/hls_vod` 63.850 ms vs mediabunny 43.345 ms).
+**Probe seam:** `MpegTsDriver.probe()` now implements the optional metadata contract directly. For a
+seekable known-size source, `ts-probe.ts` independently parses packet-aligned 128 KiB head and tail
+windows and grows either side geometrically when codec/timing evidence is incomplete. The tail receives
+only the head's PMT stream declarations for payload routing: its PES, AAC, H.264, and timestamp state
+starts empty, so payload bytes can never bridge the omitted range. Independently, the parser records
+every PMT declaration sampled in either window; any stream-set change immediately abandons sparse
+metadata for the exact full parser, which remains authoritative. Sparse results also require first/head
+codec configuration, stable matching cadence, monotonic decode epochs, non-conflicting tail
+configuration, and independently timed tail units; malformed, late-config, sampled-VFR, or discontinuous
+layouts use the exact full parser. Endpoint duration/fps remain estimates because no sparse reader can
+prove an omitted legal TS region contains no reset or VFR phase. `MpegTsDriver.packetInfo()` remains a
+target gap: packet-table requests still reassemble full AU payloads they do not need.
 
 ### Capability routing (WebCodecs → GPU → WASM, miss-only)
 
@@ -130,18 +137,19 @@ and unsupported cross-container or fragmented copy targets fail loudly
   `fps = 90000/gap`, `ts-parse.ts:708-711`). Container duration is the all-track PTS span plus one
   finest-cadence display interval (`containerDuration`, `ts-parse.ts:544-551`) — the ffprobe measure,
   correct for VFR.
-- **Seek** — no random access in-container: a TS has no front index, so both probe and demux read the
-  **whole bounded segment** (`readAll`, `mpegts-driver.ts:47-73`). Keyframe-aligned **trim** is supported
+- **Seek** — no random-access index is stored in-container. Metadata probe independently range-samples
+  aligned endpoints with strict evidence gates and exact full fallback (`ts-probe.ts`); demux still reads
+  the **whole bounded segment** (`readAll`, `mpegts-driver.ts:47-73`). Keyframe-aligned **trim** is supported
   in `streamCopy`: it snaps the start to the last IDR at/before the requested start and computes the
   window against the *earliest source PTS* (`firstPresentationUs`, `mpegts-driver.ts:131-145`;
   `selectTrimmedUnits`, 159-198) — TS often starts at a nonzero timestamp (`measured-evidence.md`). Frame-accurate
   *decode* seek runs through the demuxed packet stream via `replayable-video-decoder` (S10), not here.
-  Target improvement: a sparse PCR/IDR index so a large TS can be range-scanned instead of fully buffered.
-- **Cancel** — cooperative `AbortSignal` throughout: `assertNotAborted` guards each stage and each written
-  unit (`mpegts-driver.ts:43-45, 242-259`), `packetStream.pull` errors the stream on abort
-  (`mpegts-driver.ts:287-289`), and the HLS resolver `throwIfAborted`s between every segment/key fetch
-  (`hls-source.ts:143-149, 547-549`). Gap: `readAll`'s single `src.range(0,size)` is not interruptible
-  mid-read (only between chunked reads), §5.
+  Target improvement: a sparse PCR/IDR index so demux/seek can range-scan a large TS too.
+- **Cancel** — cooperative `AbortSignal` throughout: sparse probe passes the live signal to every range
+  and races transports that ignore it; full ranged reads now receive the signal too. `assertNotAborted`
+  guards each stage and each written unit, `packetStream.pull` errors the stream on abort, and the HLS
+  resolver checks between every segment/key fetch. The remaining gap is incremental demux cancellation
+  while its fallback stream reader is awaiting an implementation that ignores cancellation.
 - **Frame lifetime (`close()` exactly once)** — **N/A by construction**: this family creates **no**
   `VideoFrame`/`AudioData`. It only constructs `Encoded*Chunk` from copied bytes (`mpegts-driver.ts:304`)
   and `Uint8Array`, none of which own GPU/decoder resources needing `close()`. The one ownership rule:
@@ -230,13 +238,11 @@ public path is the standalone `fromURL()` manifest resolve.
    definition remains (grep); parse of every ADTS `sampling_frequency_index` 0–12 yields the identical Hz
    value as before on a table-driven unit test; index 13–15 still returns `undefined` (reserved).
 
-3. **Add `MpegTsDriver.packetInfo()` (payload-free) and `MpegTsDriver.probe()`.** Implement the optional
-   contract methods (`contracts/driver.ts:416-424`) so a metadata/packet-info request does not copy AU
-   payloads. `packetInfo` returns rows of `{ptsUs, dtsUs, sizeBytes, key}` from the parse without slicing
-   payload bytes; `probe` returns `TrackInfo[]` only. **Acceptance:** `demux/hls_vod` and `demux/h264_ts.ts`
-   packet-info paths allocate zero AU payload copies (instrument the parse), the golden packet table
-   (470-row shape, `maxPtsDrift=0`) is unchanged, and `demux/hls_vod` median beats the stored 63.850 ms
-   deficit toward mediabunny's 43.345 ms (`measured-evidence.md`).
+3. **Add `MpegTsDriver.packetInfo()` (payload-free).** Native `probe()` is complete and range-bounded;
+   the remaining optional contract should return rows of `{ptsUs, dtsUs, sizeBytes, key}` without
+   slicing payload bytes. **Acceptance:** `demux/hls_vod` and `demux/h264_ts.ts` packet-info paths
+   allocate zero AU payload copies (instrument the parse), the golden packet table (470-row shape,
+   `maxPtsDrift=0`) is unchanged, and `demux/hls_vod` closes its retained timing deficit.
 
 4. **Stream the parse instead of `readAll`.** Replace whole-source buffering (`mpegts-driver.ts:47-73`,
    `parse` 319-321) with an incremental packet-fed parser so demux emits packets as PIDs complete and peak

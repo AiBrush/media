@@ -75,3 +75,28 @@ export function selectTrackInfos<T extends Pick<TrackInfo, 'mediaType'>>(
   }
   return out;
 }
+
+/**
+ * Resolve the one track of `mediaType` exposed by `decode()`. An explicit selector list is a whitelist:
+ * omitting a media type yields no stream for that type, while selecting two distinct tracks of the same
+ * type is invalid because `MediaStreams` has only one slot for it.
+ */
+export function selectDecodeTrackInfo<T extends Pick<TrackInfo, 'mediaType'>>(
+  tracks: readonly T[],
+  mediaType: 'video' | 'audio',
+  selectors: readonly string[] | undefined,
+): T | undefined {
+  if (!hasTrackSelection(selectors)) {
+    return tracks.find((track) => track.mediaType === mediaType);
+  }
+  const selected = selectTrackInfos(tracks, selectors).filter(
+    (track) => track.mediaType === mediaType,
+  );
+  if (selected.length > 1) {
+    throw new InputError(`decode accepts at most one ${mediaType} track`, {
+      mediaType,
+      trackCount: selected.length,
+    });
+  }
+  return selected[0];
+}

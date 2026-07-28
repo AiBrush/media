@@ -10,7 +10,7 @@
  * commits the primary path without selecting WASM.
  */
 
-import type { EncodedChunk } from '../contracts/driver.ts';
+import type { Determinism, EncodedChunk } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 
 const MAX_REPLAY_PACKETS = 256;
@@ -18,6 +18,32 @@ const MAX_REPLAY_BYTES = 16 * 1024 * 1024;
 
 export interface RuntimeVideoFallbackOptions {
   readonly signal?: AbortSignal;
+}
+
+export type RuntimeVideoFallbackKind = 'wasm-vpx' | 'webcodecs-software';
+
+export interface RuntimeVideoFallbackPlanOptions {
+  readonly determinism?: Determinism;
+  readonly pinDriver?: string;
+}
+
+/**
+ * Select the bounded pre-output recovery tail without weakening an explicit routing request.
+ * VPx keeps its proved WASM decoder tail; other native WebCodecs formats retry the same driver
+ * with software acceleration after a transient hardware runtime miss.
+ */
+export function planRuntimeVideoFallback(
+  driverId: string,
+  codec: string,
+  options: RuntimeVideoFallbackPlanOptions = {},
+): RuntimeVideoFallbackKind | undefined {
+  if (/^vp(?:8|9|09)/i.test(codec) && driverId !== 'wasm-vpx' && options.pinDriver !== driverId) {
+    return 'wasm-vpx';
+  }
+  if (driverId === 'webcodecs-video' && options.determinism !== 'force-software') {
+    return 'webcodecs-software';
+  }
+  return undefined;
 }
 
 type DecoderFactory = () => TransformStream<EncodedChunk, VideoFrame>;

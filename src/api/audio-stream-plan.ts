@@ -16,7 +16,7 @@
  */
 
 import type { FilterSpec } from '../contracts/driver.ts';
-import { InputError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import type { BiquadSpec } from '../dsp/biquad.ts';
 import type { DynamicsSpec, LimitSpec, NormalizeSpec } from '../dsp/dynamics.ts';
 import type { FadeShape } from '../dsp/fade.ts';
@@ -37,6 +37,7 @@ export function audioTargetCanBypassFilterPlanner(t: AudioTarget): boolean {
   return (
     t.gainDb === undefined &&
     t.fade === undefined &&
+    t.mixMatrix === undefined &&
     t.channels === undefined &&
     t.sampleRate === undefined &&
     t.biquad === undefined &&
@@ -128,6 +129,12 @@ function resolveDynamics(dynamics: PcmDynamics): DynamicsSpec {
  * chain is Node-validated; the substrate that runs it is browser-only.
  */
 export function audioFilterSpecs(target: AudioTarget, src: SourceAudio): FilterSpec[] {
+  if (target.mixMatrix !== undefined) {
+    throw new CapabilityError(
+      'audio mixMatrix is supported only by PCM-native WAV/AIFF/CAF/FLAC targets',
+      { op: { kind: 'route', id: 'filter' }, tried: ['audio-dsp'] },
+    );
+  }
   const specs: FilterSpec[] = [];
   if (target.gainDb !== undefined) {
     if (!Number.isFinite(target.gainDb)) {

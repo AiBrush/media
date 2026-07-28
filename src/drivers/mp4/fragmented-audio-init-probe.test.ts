@@ -2,7 +2,7 @@
  * Fragmented audio metadata may be complete in the initialization `moov`: some DASH files retain an
  * authoritative positive `mvhd`/`mdhd` duration even though their sample tables are empty. Probe may
  * trust that bounded init metadata only for the narrow audio-only/no-edit shape; every shape whose
- * presentation depends on fragment timing must retain the full fragment scan.
+ * presentation depends on fragment timing must still inspect every top-level timing box.
  */
 
 import { createHash } from 'node:crypto';
@@ -35,6 +35,11 @@ interface PrefixSource {
   readonly source: ByteSource;
   readonly reads: RangeRead[];
 }
+
+type VideoHintedUrlByteSource = ByteSource & {
+  readonly kind: 'url';
+  readonly mimeHint: 'video/mp4';
+};
 
 interface LongformTruth {
   readonly file: string;
@@ -130,6 +135,30 @@ async function realPrefixSource(truth: LongformTruth): Promise<PrefixSource> {
   }
   expect(createHash('sha256').update(prefix).digest('hex')).toBe(truth.prefixSha256);
   return prefixOnlySource(prefix, fileStat.size);
+}
+
+async function realVideoHintedUrlPrefixSource(truth: LongformTruth): Promise<PrefixSource> {
+  const path = `${LONGFORM_DIR}${truth.file}`;
+  const fileStat = await stat(path);
+  expect(fileStat.size).toBe(truth.size);
+  const prefixLength = Math.min(128 * 1024, fileStat.size);
+  const prefix = new Uint8Array(prefixLength);
+  const handle = await open(path, 'r');
+  try {
+    const { bytesRead } = await handle.read(prefix, 0, prefixLength, 0);
+    expect(bytesRead).toBe(prefixLength);
+  } finally {
+    await handle.close();
+  }
+  const { source, reads } = prefixOnlySource(prefix, fileStat.size);
+  return {
+    reads,
+    source: {
+      ...source,
+      kind: 'url',
+      mimeHint: 'video/mp4',
+    } as VideoHintedUrlByteSource,
+  };
 }
 
 function memoryRandomAccess(bytes: Uint8Array): {
@@ -268,11 +297,52 @@ function realAudioFragments(): Promise<{
   return realAudioFragmentsPromise;
 }
 
-async function expectWholeFileFallback(bytes: Uint8Array): Promise<void> {
-  const prefixLength = Math.min(PROBE_PREFIX_BYTES, bytes.byteLength - 1);
-  const { source, reads } = prefixOnlySource(bytes.subarray(0, prefixLength), bytes.byteLength);
-  await expect(probeMp4(source)).rejects.toThrow(PREFIX_REQUIRED_ERROR);
-  expect(reads.at(-1)).toEqual({ start: 0, end: bytes.byteLength });
+async function expectFragmentTimingInspection(
+  bytes: Uint8Array,
+  expectedReadPolicy: 'sparse' | 'bounded-prefix' | 'exact-fallback',
+): Promise<void> {
+  const reads: RangeRead[] = [];
+  const source: ByteSource = {
+    size: bytes.byteLength,
+    range(start, end): Promise<Uint8Array> {
+      reads.push({ start, end });
+      return Promise.resolve(bytes.subarray(start, end));
+    },
+    stream(): ReadableStream<Uint8Array> {
+      return new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.error(new Error('fragment metadata probe must stay range-backed'));
+        },
+      });
+    },
+  };
+  const tracks = await probeMp4(source);
+  const demuxer = await Mp4Driver.demux(fromBytes(bytes, { mime: 'audio/mp4' }));
+  try {
+    expect(tracks).toEqual(demuxer.tracks);
+  } finally {
+    await demuxer.close();
+  }
+  expect(reads.length).toBeGreaterThan(0);
+  const wholeRead = reads.some((read) => read.start === 0 && read.end === bytes.byteLength);
+  if (expectedReadPolicy === 'sparse') {
+    expect(wholeRead).toBe(false);
+    expect(reads.reduce((total, read) => total + read.end - read.start, 0)).toBeLessThan(
+      bytes.byteLength / 2,
+    );
+  } else if (expectedReadPolicy === 'bounded-prefix') {
+    // These compact generated fixtures place every timing box in the ordinary prefix. Requiring no
+    // exact whole read still proves the historical fallback scan is gone; a half-file ratio would be
+    // meaningless because the parser's fixed 32 KiB prefetch is almost the entire 32 KiB fixture.
+    expect(wholeRead).toBe(false);
+    expect(reads.reduce((total, read) => total + read.end - read.start, 0)).toBeLessThanOrEqual(
+      PROBE_PREFIX_BYTES,
+    );
+  } else {
+    // Inputs whose timing metadata density or range count exceeds the sparse budget prove the
+    // conservative exact parser remains reachable without weakening the payload-skip proof above.
+    expect(wholeRead).toBe(true);
+  }
 }
 
 describe('fragmented audio init-duration probe — four real fair-corpus rotations', () => {
@@ -297,29 +367,50 @@ describe('fragmented audio init-duration probe — four real fair-corpus rotatio
       expect(reads.some((read) => read.end === truth.size)).toBe(false);
     });
   }
+
+  it('accepts complete audio-only init metadata on a generic .mp4 URL without reparsing its prefix', async () => {
+    // Served `.mp4` files normally carry `video/mp4` even when the canonical moov proves they contain
+    // only AAC. The video-oriented bounded parser has already parsed that complete moov, so routing the
+    // same bytes through the generic metadata parser again is redundant.
+    const truth = LONGFORM[0];
+    if (truth === undefined) throw new Error('expected a longform audio fixture');
+    const { source, reads } = await realVideoHintedUrlPrefixSource(truth);
+    const tracks = await probeMp4(source);
+
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0]).toMatchObject({
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+    });
+    expect(tracks[0]?.durationSec).toBeCloseTo(truth.durationSec, 5);
+    expect(reads).toEqual([{ start: 0, end: 128 * 1024 }]);
+  });
 });
 
-describe('fragmented audio init-duration probe — conservative fallbacks', () => {
-  it('keeps a real video-bearing fragmented MP4 on the whole-file timing path', async () => {
-    await expectWholeFileFallback(await loadFixture('bear-av-frag.mp4'));
+describe('fragmented audio init-duration probe — conservative fragment timing', () => {
+  it('keeps a real video-bearing fragmented MP4 on the fragment timing path', async () => {
+    await expectFragmentTimingInspection(await loadFixture('bear-av-frag.mp4'), 'sparse');
   });
 
-  it('keeps audio-only fragmented media with zero init duration on the whole-file timing path', async () => {
-    await expectWholeFileFallback((await realAudioFragments()).zeroDuration);
+  it('scans audio-only fragmented media with zero init duration', async () => {
+    await expectFragmentTimingInspection(
+      (await realAudioFragments()).zeroDuration,
+      'bounded-prefix',
+    );
   });
 
-  it('keeps positive-duration edited/gapless audio on the whole-file timing path', async () => {
-    await expectWholeFileFallback((await realAudioFragments()).edited);
+  it('scans positive-duration edited/gapless audio instead of trusting its init duration', async () => {
+    await expectFragmentTimingInspection((await realAudioFragments()).edited, 'bounded-prefix');
   });
 
-  it('keeps a real hybrid stbl-plus-trun AAC file on the whole-file timing path', async () => {
+  it('scans a real hybrid stbl-plus-trun AAC file', async () => {
     const path = fileURLToPath(
       new URL(
         '../../../fixtures/media-derived/mp4-hybrid-fragmented/lc48-mono-long.m4a',
         import.meta.url,
       ),
     );
-    await expectWholeFileFallback(new Uint8Array(await readFile(path)));
+    await expectFragmentTimingInspection(new Uint8Array(await readFile(path)), 'exact-fallback');
   });
 
   it('still returns complete metadata when the fallback receives the whole real source', async () => {

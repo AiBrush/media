@@ -103,6 +103,7 @@ export function sourceGeometryOf(track: TrackInfo): SourceGeometry {
     return {
       width: config.codedWidth,
       height: config.codedHeight,
+      ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
       ...(track.fps !== undefined ? { fps: track.fps } : {}),
       ...(durationSec !== undefined ? { durationSec } : {}),
       ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
@@ -111,6 +112,7 @@ export function sourceGeometryOf(track: TrackInfo): SourceGeometry {
   return {
     width: undefined,
     height: undefined,
+    ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(durationSec !== undefined ? { durationSec } : {}),
     ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
@@ -294,6 +296,7 @@ export async function encodeVideoStream(
     encodeVideoFramesWithAlpha,
     periodicVideoKeyFrameInterval,
     requireEncoderConfig,
+    outputVideoRotation,
     videoTrackInfoFromDecoderConfig,
   } = await import('./codec-pipeline.ts');
   const sourceGeometry = sourceTrack
@@ -376,7 +379,7 @@ export async function encodeVideoStream(
         requireEncoderConfig(decoderConfig, 'video'),
         target.fps,
         sourceTrack?.durationSec,
-        sourceTrack?.rotation,
+        outputVideoRotation(target, sourceTrack?.rotation),
       ),
     signal,
   );

@@ -107,7 +107,8 @@ shapes (`driver.ts:103-134`) — the Node-safe, host-object-free path that probe
   `TransformStream<RawFrame, EncodedChunk>`. Each driver carries a `tier` (`'hardware' | 'gpu' | 'native'
   | 'wasm'`, `driver.ts:26`) that the router ranks.
 - A **`ContainerDriver`** has a **synchronous** `supports(q)` (magic bytes / mime / extension,
-  `driver.ts:414`) plus a wide, mostly-**optional** method surface: `probe`, `packetInfo`, `demux`,
+  `driver.ts:414`) plus a wide, mostly-**optional** method surface: `probe`, `packetInfo`,
+  `packetInfoBatches`, `demux`,
   `createMuxer`, and lossless-path methods (`streamCopy`, `decrypt`, `transformPcm`, `decodePcm*`) each
   gated behind an optional field so a driver advertises only what it authors (`driver.ts:411-494`).
 - A **`FilterDriver`** declares its `substrate` (`'webgpu' | 'webgl' | 'canvas2d' | 'native' | 'wasm'`,
@@ -176,8 +177,9 @@ supports` first runs the string-prefix `matches(q)` and only then imports and de
   is an optional *hint* (frames ÷ duration, `driver.ts:245-247`), never authoritative for timing.
 - **Seek.** Not a contract method — seek is a *decode-path* concern (S10) built on `demux()` +
   keyframe-aligned packet ranges. The contract's contribution is the payload-free `packetInfo()` /
-  `PacketInfoTable` (`driver.ts:118-134, 425`) giving keyframe + PTS/DTS/offset rows so a seeker can find
-  the target keyframe without materializing payloads.
+  `PacketInfoTable` compatibility surface and `packetInfoBatches()` / `PacketInfoBatchStream` bounded
+  surface, giving keyframe + PTS/DTS/offset rows so a seeker can find the target keyframe without
+  materializing payloads or retaining a very large row array.
 - **Cancel.** Every stage takes `StageOptions.signal?: AbortSignal` (`driver.ts:45-46`). A coder is a
   `TransformStream`; cancellation must release the WebCodecs/WASM object and `close()` in-flight frames
   (`driver.ts:167-171`). The reference implementation of cancel-correct teardown is
@@ -304,7 +306,7 @@ Ordered; each item has a concrete acceptance test. Items 1–4 are correctness; 
    driver…” (the former `tried: []` writePcm miss).
 
 5. **Assert the lazy flag table against the real modules (kill the drift).** For every `LazyContainerSpec`
-   boolean flag (`probe`, `packetInfo`, `streamCopy`, `decrypt`, `transformPcm`, `decodePcm*`,
+   boolean flag (`probe`, `packetInfo`, `packetInfoBatches`, `streamCopy`, `decrypt`, `transformPcm`, `decodePcm*`,
    `validates*`), assert the loaded module actually exposes that method; drivers that omit a claimed method
    should fail a **build/conformance** check, not a runtime `missingLazyMethod`. Ref `defaults.ts:270-290,
    388-505, 732-737`.

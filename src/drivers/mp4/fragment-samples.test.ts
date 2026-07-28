@@ -14,9 +14,10 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { fromBytes } from '../../sources/source.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { fragmentSamplesToDemuxSamples, parseFragmentSamples } from './fragment-samples.ts';
-import { readMovie } from './mp4-driver.ts';
+import { Mp4Driver, readMovie } from './mp4-driver.ts';
 import type { Movie } from './parse.ts';
 import { buildSampleData } from './samples.ts';
 
@@ -143,5 +144,26 @@ describe('parseFragmentSamples — real CMAF corpus vs ffprobe packet golden', (
     // An edit-list offset shifts DTS/PTS back by the media-time (ticks), exactly as buildSamples does.
     const shifted = fragmentSamplesToDemuxSamples(data, 1000, 1000, undefined);
     expect(shifted[0]).toMatchObject({ dtsUs: -1_000_000, ptsUs: -500_000 });
+  });
+
+  it('exposes reconstructed fragment rows through the public packet-info capability', async () => {
+    const bytes = await loadFixture('bear-open-gop-frag.mp4');
+    const packetInfo = Mp4Driver.packetInfo;
+    if (packetInfo === undefined) throw new Error('MP4 packet-info capability is missing');
+
+    const table = await packetInfo(fromBytes(bytes, { mime: 'video/mp4' }));
+    const golden = (await loadGolden())['bear-open-gop-frag.mp4'];
+    if (golden === undefined) throw new Error('fragment packet golden is missing');
+
+    expect(table.tracks).toHaveLength(1);
+    expect(table.packets).toHaveLength(golden.videoTrackSamples.length);
+    expect(table.packets[0]).toMatchObject({
+      trackIndex: 0,
+      offset: golden.videoTrackSamples[0]?.offset,
+      size: golden.videoTrackSamples[0]?.size,
+      keyframe: golden.videoTrackSamples[0]?.keyframe,
+    });
+    expect(table.packets.every((packet) => packet.trackIndex === 0)).toBe(true);
+    expect(table.packets.every((packet) => packet.offset !== undefined)).toBe(true);
   });
 });

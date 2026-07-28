@@ -235,6 +235,21 @@ describe('FLAC encode — verbatim pure-TS authoring with STREAMINFO MD5 oracle'
     ).toThrow(/non-finite/);
   });
 
+  it('quantizes exact positive and negative half-LSB PCM values with nearest-even rounding', () => {
+    const codes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+    const pcm = flacPcmFromPcmAudio(
+      {
+        sampleRate: 48_000,
+        channels: 1,
+        frames: codes.length,
+        planar: [Float64Array.from(codes, (code) => code / 32_768)],
+      },
+      's16',
+    );
+
+    expect([...(pcm.samples[0] ?? [])]).toEqual([-2, -2, 0, 0, 2, 2]);
+  });
+
   it('emits compressed, verbatim, stereo-decorrelated, and multi-frame FLAC that decodes bit-exactly', () => {
     const monoRamp: FlacPcm = {
       sampleRate: 48_000,

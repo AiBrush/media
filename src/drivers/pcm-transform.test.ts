@@ -40,9 +40,15 @@ describe('applyPcmTransform', () => {
   });
 
   it('keeps bridges that disable resample on a typed capability miss', () => {
-    expect(() =>
-      applyPcmTransform(ones(), { sampleRate: 24_000 }, { resample: 'reject', tried: ['test'] }),
-    ).toThrow(CapabilityError);
+    let error: unknown;
+    try {
+      applyPcmTransform(ones(), { sampleRate: 24_000 }, { resample: 'reject', tried: ['test'] });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(CapabilityError);
+    expect((error as Error).message).toContain('disallows audio resample 48000→24000 Hz');
+    expect((error as Error).message).not.toMatch(/WASM|WebAudio/);
   });
 
   it('applies biquad before dynamics normalize and limiter in the PCM transform helper', () => {

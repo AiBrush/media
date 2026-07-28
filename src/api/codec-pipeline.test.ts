@@ -55,6 +55,7 @@ import {
   normalizeDecoderCodec,
   outputDimensions,
   outputGaplessForAudioEncoder,
+  outputVideoRotation,
   periodicVideoKeyFrameInterval,
   qualifiedVideoSourceCodec,
   resolveAudioEncodeTargetForRuntime,
@@ -67,6 +68,7 @@ import {
   unwrapPackets,
   videoCodecToken,
   videoLatencyMode,
+  videoPixelRotation,
   videoTrackInfoFromDecoderConfig,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
@@ -76,11 +78,14 @@ import {
   CADENCE_BASELINE_FPS,
   EVIDENCE_BITRATE_FLOOR,
   EVIDENCE_BITRATE_HEADROOM,
+  H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND,
+  HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND,
   HIGH_CADENCE_FPS_THRESHOLD,
   IMPLICIT_BITS_PER_PIXEL_PER_SECOND,
   IMPLICIT_VIDEO_BITRATE_FLOOR,
   VIDEO_CODEC_RATE_EFFICIENCY,
 } from './encoder-config.ts';
+import { selectDecodeTrackInfo } from './track-select.ts';
 import type { VideoTarget } from './types.ts';
 import {
   planCfrFrameRetiming,
@@ -961,6 +966,15 @@ describe('selectTrackInfos', () => {
       expect(() => selectTrackInfos(tracks, [selector])).toThrow(InputError);
     }
   });
+
+  it('resolves one decode track per media type and treats explicit selectors as a whitelist', () => {
+    expect(selectDecodeTrackInfo(tracks, 'video', undefined)?.label).toBe('v0');
+    expect(selectDecodeTrackInfo(tracks, 'video', ['video:1'])?.label).toBe('v1');
+    expect(selectDecodeTrackInfo(tracks, 'audio', ['video:1'])).toBeUndefined();
+    expect(() => selectDecodeTrackInfo(tracks, 'video', ['video:0', 'video:1'])).toThrowError(
+      InputError,
+    );
+  });
 });
 
 // ── codec-string mapping ─────────────────────────────────────────────────────────────────────────
@@ -1201,6 +1215,27 @@ describe('videoFilterSpecs', () => {
     ]);
   });
 
+  it('bakes a source display matrix for rotate(0) normalization', () => {
+    const rotated = { ...src, rotation: 90 };
+    expect(videoPixelRotation({ rotate: 0 }, rotated)).toBe(90);
+    expect(videoFilterSpecs({ rotate: 0 }, rotated)).toEqual<FilterSpec[]>([
+      { mediaType: 'video', type: 'rotate', degrees: 90 },
+    ]);
+    expect(outputVideoRotation({ rotate: 0 }, rotated.rotation)).toBeUndefined();
+  });
+
+  it('composes an explicit transform after the source display matrix and clears output metadata', () => {
+    const rotated = { ...src, rotation: 90 };
+    expect(videoPixelRotation({ rotate: 270 }, rotated)).toBe(0);
+    expect(videoFilterSpecs({ rotate: 270 }, rotated)).toEqual([]);
+    expect(outputVideoRotation({ rotate: 270 }, rotated.rotation)).toBeUndefined();
+    expect(outputVideoRotation({}, rotated.rotation)).toBe(90);
+  });
+
+  it('rejects rotate(0) normalization when the source matrix is not a quarter-turn', () => {
+    expect(() => videoPixelRotation({ rotate: 0 }, { rotation: 45 })).toThrow(CapabilityError);
+  });
+
   it('rejects a resize with unknown source dims and only one target dim', () => {
     expect(() => videoFilterSpecs({ width: 640 }, { width: undefined, height: undefined })).toThrow(
       InputError,
@@ -1360,6 +1395,10 @@ describe('outputDimensions', () => {
         src,
       ),
     ).toEqual({ width: 300, height: 400 });
+    expect(outputDimensions({ rotate: 0 }, { ...src, rotation: 90 })).toEqual({
+      width: 1080,
+      height: 1920,
+    });
   });
 
   it('keeps the source dimension for an omitted resize axis', () => {
@@ -1675,6 +1714,7 @@ describe('audioTargetCanBypassFilterPlanner', () => {
     expect(audioTargetCanBypassFilterPlanner({ channels: 2 })).toBe(false);
     expect(audioTargetCanBypassFilterPlanner({ sampleRate: 48000 })).toBe(false);
     expect(audioTargetCanBypassFilterPlanner({ fade: {} })).toBe(false);
+    expect(audioTargetCanBypassFilterPlanner({ mixMatrix: [[1]] })).toBe(false);
     expect(audioTargetCanBypassFilterPlanner({ biquad: [] })).toBe(false);
     expect(
       audioTargetCanBypassFilterPlanner({
@@ -1691,6 +1731,12 @@ describe('audioFilterSpecs', () => {
     expect(audioFilterSpecs({}, src)).toEqual([]);
     expect(audioFilterSpecs({ codec: 'aac', bitrate: 128_000 }, src)).toEqual([]);
     expect(audioFilterSpecs({ gainDb: 0, channels: 2, sampleRate: 48000 }, src)).toEqual([]);
+  });
+
+  it('rejects a raw-PCM-only explicit matrix on the lossy codec filter seam', () => {
+    expect(() => audioFilterSpecs({ mixMatrix: [[0.5, 0.5]], channels: 1 }, src)).toThrow(
+      CapabilityError,
+    );
   });
 
   it('emits gain before remix and resample when all three transforms are requested', () => {
@@ -1898,14 +1944,15 @@ describe('periodicVideoKeyFrameInterval — spend GOP overhead only on fragmente
 describe('buildVideoEncoderConfig', () => {
   const src = { width: 1920, height: 1080 };
 
-  it('uses realtime only for implicit H.264 and ordinary-cadence implicit AV1', () => {
+  it('uses realtime only for qualified ordinary-cadence AV1/VP9 paths', () => {
     expect(videoLatencyMode({}, 'av1', 30.0000003)).toBe('realtime');
     expect(videoLatencyMode({}, 'av1', 30.5)).toBe('realtime');
     expect(videoLatencyMode({}, 'av1', 30.500001)).toBe('quality');
     expect(videoLatencyMode({}, 'av1', undefined)).toBe('quality');
     expect(videoLatencyMode({}, 'av1', 60)).toBe('quality');
-    expect(videoLatencyMode({}, 'h264', 30)).toBe('realtime');
-    expect(videoLatencyMode({}, 'h264', undefined)).toBe('realtime');
+    expect(videoLatencyMode({}, 'h264', 30)).toBe('quality');
+    expect(videoLatencyMode({}, 'h264', undefined)).toBe('quality');
+    expect(videoLatencyMode({}, 'h264', 60)).toBe('quality');
     expect(videoLatencyMode({ bitrate: 2_000_000 }, 'h264', 30)).toBe('quality');
     expect(videoLatencyMode({ bitrateMode: 'constant' }, 'h264', 30)).toBe('quality');
     expect(videoLatencyMode({ crf: 24 }, 'h264', 30)).toBe('quality');
@@ -3022,6 +3069,7 @@ describe('isPureStreamCopy', () => {
     expect(isPureStreamCopy({ audio: { bitrate: 96_000 } })).toBe(false);
     expect(isPureStreamCopy({ audio: { gainDb: -6 } })).toBe(false);
     expect(isPureStreamCopy({ audio: { fade: { inSec: 1 } } })).toBe(false);
+    expect(isPureStreamCopy({ audio: { mixMatrix: [[0.5, 0.5]], channels: 1 } })).toBe(false);
     expect(
       isPureStreamCopy({ audio: { dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } } }),
     ).toBe(false);
@@ -3729,6 +3777,8 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
     expect(CADENCE_BASELINE_FPS).toBe(30);
     expect(EVIDENCE_BITRATE_HEADROOM).toBe(2);
     expect(EVIDENCE_BITRATE_FLOOR).toBe(3_750_000);
+    expect(H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND).toBe(10);
+    expect(HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND).toBe(20);
   });
 
   it('planned path: width × height × 20 bpp/s × efficiency (× AV1 cadence), floored and capped', () => {
@@ -3814,6 +3864,23 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
         'avc1.42E01E',
       ).bitrate,
     ).toBe(10_000_000);
+    // Ordinary-cadence H.264 is floored at 10 bpp/s when source projection is lower.
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'h264', width: 1280, height: 720 },
+        { width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
+        'avc1.42E01E',
+      ).bitrate,
+    ).toBe(9_216_000);
+    // High-cadence source evidence is also floored by output density:
+    // 1280×720×20 bpp/s = 18_432_000, above the source-rate projection.
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'h264', width: 1280, height: 720 },
+        { width: 1080, height: 1920, fps: 60, bitrate: 5_723_914 },
+        'avc1.42E02A',
+      ).bitrate,
+    ).toBe(18_432_000);
     // An explicit bitrate always wins over evidence.
     expect(
       buildVideoEncoderConfig(

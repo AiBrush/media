@@ -10,7 +10,7 @@ import type {
   StreamCopyOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
@@ -105,6 +105,10 @@ export async function runTrim(
   const source = cacheProbeRanges(normalizeByteInput(input, 'trim'));
   const container = await context.container(source, 'demux', signal, options.strategy?.pinDriver);
   const target = (container.formats[0] ?? 'mp4') as Container;
+  if (opts.fragmented === true && target !== 'mp4') {
+    throw new InputError('fragmented trim output requires an MP4 input container');
+  }
+  const fragmented = opts.fragmented === true ? { fragmented: true as const } : {};
 
   if (opts.mode !== 'accurate' && container.streamCopy !== undefined) {
     if (target === 'flac') {
@@ -118,6 +122,7 @@ export async function runTrim(
       const stream = await container.streamCopy(source, {
         ...context.stage(signal, options),
         trim: { startSec: opts.start, endSec: opts.end },
+        ...fragmented,
         ...streamCopySinkMode(opts.sink),
       });
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
@@ -141,6 +146,14 @@ export async function runTrim(
   const durationSec = await probeDurationSec(context, container, source, signal, options);
   context.assertRange(opts.start, opts.end, durationSec);
   if (opts.mode === 'accurate' && isWholeSourceTrim(source, opts, durationSec)) {
+    if (opts.fragmented === true && container.streamCopy !== undefined) {
+      const stream = await container.streamCopy(source, {
+        ...context.stage(signal, options),
+        fragmented: true,
+        ...streamCopySinkMode(opts.sink),
+      });
+      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
+    }
     return materializeOutput(opts.sink ?? toBlob(), source.stream(), mimeOptions(signal, target));
   }
   if (opts.mode === 'accurate') {
@@ -187,6 +200,7 @@ export async function runTrim(
   const stream = await streamCopyOrThrow(container, source, target, 'trim', {
     ...context.stage(signal, options),
     trim: { startSec: opts.start, endSec: opts.end },
+    ...fragmented,
     ...streamCopySinkMode(opts.sink),
   });
   return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
@@ -287,6 +301,7 @@ async function trimViaCodec(
   const demuxer = await container.demux(source, context.stage(signal, options));
   const muxer = (await context.muxer(target, options.strategy?.pinDriver)).createMuxer({
     container: target,
+    ...(opts.fragmented === true ? { fragmented: true } : {}),
   });
   const { createDrainTaskGroup, drainEncoderToMuxer } = await import('./codec-pipeline.ts');
   const group = createDrainTaskGroup(signal);

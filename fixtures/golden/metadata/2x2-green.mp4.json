@@ -8,6 +8,7 @@
       "type": "audio",
       "codec": "mp4a.6b",
       "durationSec": 0.18179138321995464,
+      "language": "und",
       "sampleRate": 44100,
       "channels": 2
     },
@@ -16,6 +17,7 @@
       "type": "video",
       "codec": "avc1.64000A",
       "durationSec": 0.04,
+      "language": "und",
       "fps": 25,
       "rotation": 0,
       "width": 2,

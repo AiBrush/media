@@ -24,7 +24,7 @@
  *   one stream, and scattered back into their positions.
  */
 
-import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import {
   AES_BLOCK,
   type PreparedAesKey,
@@ -678,7 +678,8 @@ export async function decryptSamplesCbcs(
 //         `tfhd` bases, and 64-bit `saio`;
 //   (v)   mixed clear/encrypted tracks and mixed clear/protected sample descriptions (`stsd` > 1).
 // Malformed or contradictory protection rejects with a typed {@link MediaError}; a genuinely unsupported
-// capability (unknown scheme, multi-entry `saio`, missing key) rejects with a {@link CapabilityError}.
+// capability (unknown scheme or multi-entry `saio`) rejects with a {@link CapabilityError}. An incomplete
+// caller key map is a typed {@link InputError}, because adding the missing KID is not a driver capability.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
 /** Options for {@link decryptCencFile}: the container's own scheme and the KID→key(hex) map. */
@@ -724,6 +725,12 @@ interface RawProtection {
   origFormat: string;
   schemeType: string;
   rawTenc: Uint8Array;
+  /**
+   * Length-prefix width from `avcC`/`hvcC`, when the protected entry carries an AVC/HEVC decoder
+   * configuration. Retained so flat CBCS can recognize a broken producer that added protection
+   * signalling to an already-clear video payload.
+   */
+  nalLengthSize: number | undefined;
   /** Absolute offset of the sample-entry fourcc (rewritten to `origFormat` on neutralization). */
   renameOffset: number;
   /** Absolute offset of the `sinf` box (neutralized to `free`). */
@@ -868,10 +875,26 @@ function parseEntryProtection(
   }
   const tenc = findChild(bytes, schi.payloadStart, schi.end, 'tenc');
   if (!tenc) return undefined;
+  let nalLengthSize: number | undefined;
+  if (
+    origFormat === 'avc1' ||
+    origFormat === 'avc2' ||
+    origFormat === 'avc3' ||
+    origFormat === 'avc4'
+  ) {
+    const avcC = findChild(bytes, childStart, entry.end, 'avcC');
+    if (avcC && avcC.end - avcC.payloadStart >= 5)
+      nalLengthSize = (bytes[avcC.payloadStart + 4] ?? 0) & 0x03;
+  } else if (origFormat === 'hvc1' || origFormat === 'hev1') {
+    const hvcC = findChild(bytes, childStart, entry.end, 'hvcC');
+    if (hvcC && hvcC.end - hvcC.payloadStart >= 22)
+      nalLengthSize = (bytes[hvcC.payloadStart + 21] ?? 0) & 0x03;
+  }
   return {
     origFormat,
     schemeType,
     rawTenc: bytes.subarray(tenc.payloadStart, tenc.end).slice(),
+    nalLengthSize: nalLengthSize === undefined ? undefined : nalLengthSize + 1,
     sinfOffset: sinf.start,
   };
 }
@@ -1230,6 +1253,102 @@ function assertIndependentSampleRanges(samples: readonly SampleLoc[], fileSize: 
   }
 }
 
+/** Read a 1–4-byte unsigned big-endian integer without creating a `DataView` per NAL unit. */
+function readUnsignedBe(bytes: Uint8Array, offset: number, width: number): number {
+  let value = 0;
+  for (let i = 0; i < width; i++) value = value * 256 + (bytes[offset + i] ?? 0);
+  return value;
+}
+
+/**
+ * Whether one flat AVC/HEVC sample is structurally valid clear length-prefixed video. This is stronger
+ * than checking its first four bytes: every NAL must exactly consume the sample, have a legal header,
+ * and the access unit must contain VCL data.
+ */
+function isClearLengthPrefixedVideoSample(
+  bytes: Uint8Array,
+  loc: SampleLoc,
+  raw: RawProtection,
+): boolean {
+  const width = raw.nalLengthSize;
+  if (width === undefined) return false;
+  const isAvc =
+    raw.origFormat === 'avc1' ||
+    raw.origFormat === 'avc2' ||
+    raw.origFormat === 'avc3' ||
+    raw.origFormat === 'avc4';
+  const isHevc = raw.origFormat === 'hvc1' || raw.origFormat === 'hev1';
+  if (!isAvc && !isHevc) return false;
+
+  let cursor = loc.start;
+  const end = loc.start + loc.size;
+  let nalCount = 0;
+  let sawVcl = false;
+  while (cursor + width <= end) {
+    const size = readUnsignedBe(bytes, cursor, width);
+    cursor += width;
+    if (size <= 0 || cursor + size > end) return false;
+
+    const header = bytes[cursor] ?? 0xff;
+    if ((header & 0x80) !== 0) return false; // forbidden_zero_bit
+    if (isAvc) {
+      const type = header & 0x1f;
+      if (type === 0 || type > 23) return false;
+      if (type <= 5) sawVcl = true;
+    } else {
+      if (size < 2 || ((bytes[cursor + 1] ?? 0) & 0x07) === 0) return false;
+      if (((header >> 1) & 0x3f) <= 31) sawVcl = true;
+    }
+    cursor += size;
+    nalCount += 1;
+  }
+  return cursor === end && nalCount > 0 && sawVcl;
+}
+
+/**
+ * Find flat CBCS video descriptions whose payload is demonstrably already clear.
+ *
+ * Some packagers accept a non-fragmented input for a fragmented-only CBCS operation, emit `encv` /
+ * `sinf` / `tenc`, but leave every media byte untouched. With no `senc`, `saiz`, `saio`, or sample
+ * groups, genuine CBCS encrypts the first block of each sample; consequently all samples still forming
+ * exact AVC/HEVC length-prefixed access units is contradictory proof that only the signalling was
+ * applied. Restricting this recovery to constant-IV flat video keeps legitimate constant-IV audio and
+ * auxiliary-described video on the normal crypto path.
+ */
+function alreadyClearCbcsDescriptions(
+  bytes: Uint8Array,
+  def: TrackDef,
+  samples: readonly SampleLoc[],
+): Set<number> {
+  const clear = new Set<number>();
+  if (def.handler !== 'vide') return clear;
+
+  for (const [descIndex, raw] of def.rawProtected) {
+    const tenc = def.protectedByDesc.get(descIndex);
+    if (
+      raw.schemeType !== CBCS_SCHEME ||
+      raw.nalLengthSize === undefined ||
+      !tenc?.isProtected ||
+      tenc.perSampleIvSize !== 0 ||
+      !tenc.constantIv
+    ) {
+      continue;
+    }
+    let count = 0;
+    let valid = true;
+    for (const loc of samples) {
+      if (loc.descIndex !== descIndex) continue;
+      count += 1;
+      if (!isClearLengthPrefixedVideoSample(bytes, loc, raw)) {
+        valid = false;
+        break;
+      }
+    }
+    if (count > 0 && valid) clear.add(descIndex);
+  }
+  return clear;
+}
+
 /**
  * Decrypt one run of samples (a flat `stbl` chunk sequence or one `traf`) into `ctx.out`. Each sample's
  * protection is the `tenc` default of its sample description, optionally overridden by an `sbgp`/`sgpd`
@@ -1314,7 +1433,8 @@ async function decryptSampleRun(ctx: RunContext, samples: SampleLoc[]): Promise<
  * signalling neutralized (so the output probes as a clear file). Flat (`stbl`) and fragmented (`moof`)
  * layouts, constant-IV / per-sample-IV / `saiz`-located IVs, 'seig' sample-group overrides, patterned and
  * full-sample encryption, and mixed clear/encrypted content are all handled. Corrupt or contradictory
- * protection rejects with a typed {@link MediaError}; an unsupported capability with a {@link CapabilityError}.
+ * protection rejects with a typed {@link MediaError}; an unsupported capability with a
+ * {@link CapabilityError}; and an incomplete caller key map with an {@link InputError}.
  */
 export async function decryptCencFile(
   input: Uint8Array,
@@ -1377,10 +1497,7 @@ export async function decryptCencFile(
     if (cached) return cached;
     const hex = opts.keys[id];
     if (hex === undefined) {
-      throw new CapabilityError(`no key provided for KID ${id}`, {
-        op: { kind: 'route', id: 'decrypt' },
-        tried: ['mp4'],
-      });
+      throw new InputError(`no key provided for KID ${id}`, { kid: id });
     }
     const raw = hexToBytes(hex);
     const prepared =
@@ -1427,12 +1544,23 @@ export async function decryptCencFile(
       }
       aux = parseAuxSamples(bytes, offsets[0] ?? 0, parseSaizSizes(bytes, saiz), ivSize);
     }
+    const hasSampleGroups =
+      findChild(bytes, def.stbl.payloadStart, def.stbl.end, 'sgpd') !== undefined ||
+      findChild(bytes, def.stbl.payloadStart, def.stbl.end, 'sbgp') !== undefined;
+    const alreadyClear =
+      opts.scheme === CBCS_SCHEME && !sencBox && !saiz && !saio && !hasSampleGroups
+        ? alreadyClearCbcsDescriptions(bytes, def, samples)
+        : new Set<number>();
+    const protectedByDesc =
+      alreadyClear.size === 0
+        ? def.protectedByDesc
+        : new Map([...def.protectedByDesc].filter(([descIndex]) => !alreadyClear.has(descIndex)));
     await decryptSampleRun(
       {
         bytes,
         out,
         scheme: opts.scheme,
-        protectedByDesc: def.protectedByDesc,
+        protectedByDesc,
         resolveKey,
         senc,
         aux,

@@ -18,7 +18,7 @@ export {
   sampleAt,
 } from './pcm.ts';
 export { dbToLinear, gain } from './gain.ts';
-export { remix } from './mix.ts';
+export { remix, remixMatrix } from './mix.ts';
 export { resample } from './resample.ts';
 export { type FadeShape, crossfade, fadeIn, fadeOut } from './fade.ts';
 export { type LimitMode, limit, normalizePeak, normalizeRms } from './dynamics.ts';

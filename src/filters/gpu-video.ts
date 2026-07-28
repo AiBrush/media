@@ -14,10 +14,13 @@
  *   op's transform (`setTransform`/`drawImage`).
  *
  * **Frame lifetime (doc 06 §3, the build's hardest invariant):** each input `VideoFrame` is `close()`d
- * **exactly once** — synchronously in a `finally` right after it is consumed by the draw — and a brand-new
- * output `VideoFrame` is constructed from the rendered canvas, carrying the source `timestamp`+`duration`.
- * The draw fully consumes the source pixels before the `transform` returns, so no input frame is ever
- * buffered across an `await`; on `cancel`/error any in-flight frame is closed and GPU resources released.
+ * **exactly once** — synchronously in a `finally` after the renderer consumes it — and a fresh output
+ * `VideoFrame` carries the source `timestamp`+`duration`. A colour-safe full-source/full-destination scale
+ * is deferred through standard `VideoFrame.displayWidth/displayHeight`, preserving the decoder's native
+ * YUV surface for the encoder; legacy SD colour matrices and recipes that crop, letterbox, orient, or
+ * recolour still materialize a colour-managed rendered canvas.
+ * No input frame is buffered across an `await`; on `cancel`/error any in-flight frame is closed and GPU
+ * resources are released.
  *
  * The geometry math lives in {@link ./geometry.ts} (pure, Node-unit-tested). The browser render paths
  * here cannot run under Node — every branch touching `navigator.gpu`/`GPUDevice`/`OffscreenCanvas`/
@@ -172,6 +175,67 @@ export function planDraw(spec: GeometricVideoSpec, srcW: number, srcH: number): 
   }
 }
 
+/**
+ * Whether a blit is a pure full-frame scale that can stay on the source's native pixel surface.
+ *
+ * A cloned `VideoFrame` with the requested display dimensions is the standard WebCodecs representation
+ * of this operation. The downstream encoder scales that visible picture to its configured dimensions,
+ * avoiding an otherwise redundant YUV→RGBA canvas conversion. Legacy SD YUV matrices must first pass
+ * through the browser's colour-managed renderer: preserving their native planes across a cross-codec
+ * scale is not display-equivalent in Chromium. A fill that changes aspect ratio must also materialize:
+ * changing only `displayWidth`/`displayHeight` describes non-square display pixels, while the encoder
+ * target requires a real non-uniform raster scale. Crops, letterboxes and placed/padded draws need real
+ * pixels outside or inside the source rect and therefore retain the rendered path too.
+ */
+export function canDeferFullFrameScale(
+  source: Pick<VideoFrame, 'displayWidth' | 'displayHeight'> & {
+    readonly colorSpace?: Partial<Pick<VideoColorSpace, 'matrix'>>;
+  },
+  recipe: DrawRecipe,
+): boolean {
+  if (recipe.kind !== 'blit') return false;
+  const matrix = source.colorSpace?.matrix;
+  if (matrix !== undefined && matrix !== null && matrix !== 'bt709' && matrix !== 'rgb') {
+    return false;
+  }
+  const { src, dst, dims } = recipe.blit;
+  return (
+    src.x === 0 &&
+    src.y === 0 &&
+    src.width === source.displayWidth &&
+    src.height === source.displayHeight &&
+    dst.x === 0 &&
+    dst.y === 0 &&
+    dst.width === dims.width &&
+    dst.height === dims.height &&
+    source.displayWidth * dims.height === source.displayHeight * dims.width
+  );
+}
+
+/**
+ * Rotate a tightly-packed 8-bit I420 frame by 180° in place. Reversing each plane independently is the
+ * exact sample-domain transform: it preserves the source's 4:2:0 chroma grid and avoids an unnecessary
+ * YUV→RGB→YUV round-trip before H.264 encode.
+ */
+export function rotatePackedI420By180(data: Uint8Array, width: number, height: number): void {
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+    throw new InputError(
+      `I420 rotation requires positive integer dimensions, got ${width}×${height}`,
+    );
+  }
+  const lumaBytes = width * height;
+  const chromaBytes = Math.ceil(width / 2) * Math.ceil(height / 2);
+  const requiredBytes = lumaBytes + chromaBytes * 2;
+  if (!Number.isSafeInteger(requiredBytes) || data.byteLength !== requiredBytes) {
+    throw new InputError(
+      `I420 rotation requires ${requiredBytes} packed bytes, got ${data.byteLength}`,
+    );
+  }
+  data.subarray(0, lumaBytes).reverse();
+  data.subarray(lumaBytes, lumaBytes + chromaBytes).reverse();
+  data.subarray(lumaBytes + chromaBytes).reverse();
+}
+
 /** Resolve a *colour* spec + the source colour interpretation into a {@link ColorPlan}. Pure/Node-tested. */
 export function planColor(spec: ColorVideoSpec, source: SourceColor): ColorPlan {
   if (spec.type === 'tonemap') return planTonemap(source);
@@ -271,6 +335,20 @@ class Canvas2DRenderer implements Renderer {
 
   render(source: VideoFrame, recipe: DrawRecipe): VideoFrame {
     const dims = recipeDims(recipe);
+    const visibleRect = source.visibleRect;
+    if (visibleRect !== null && canDeferFullFrameScale(source, recipe)) {
+      return new VideoFrame(source, {
+        ...framedInit(source),
+        visibleRect: {
+          x: visibleRect.x,
+          y: visibleRect.y,
+          width: visibleRect.width,
+          height: visibleRect.height,
+        },
+        displayWidth: dims.width,
+        displayHeight: dims.height,
+      });
+    }
     const { canvas, ctx } = this.acquire(dims);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     // `new VideoFrame(canvas)` copies eagerly, so a pooled canvas is reused only after its prior output was
@@ -763,6 +841,102 @@ function createFilterStream(
   });
 }
 
+/**
+ * Read a decoded frame directly as packed I420 and reverse its Y/U/V planes. This is the fidelity path
+ * for 180° H.264-family orientation: RGB rendering is visually close on average but can create isolated
+ * full-scale chroma-edge errors after the encoder converts the rendered canvas back to 4:2:0.
+ */
+/* v8 ignore start -- live VideoFrame I420 copy/construct is browser-only and benchmark-validated. */
+async function rotateFrameI420By180(frame: VideoFrame): Promise<VideoFrame | undefined> {
+  const visible = frame.visibleRect;
+  const width = frame.displayWidth;
+  const height = frame.displayHeight;
+  if (
+    frame.format !== 'I420' ||
+    visible === null ||
+    visible.x !== 0 ||
+    visible.y !== 0 ||
+    visible.width !== width ||
+    visible.height !== height
+  ) {
+    return undefined;
+  }
+  const lumaBytes = width * height;
+  const chromaWidth = Math.ceil(width / 2);
+  const chromaBytes = chromaWidth * Math.ceil(height / 2);
+  const data = new Uint8Array(lumaBytes + chromaBytes * 2);
+  const layout: PlaneLayout[] = [
+    { offset: 0, stride: width },
+    { offset: lumaBytes, stride: chromaWidth },
+    { offset: lumaBytes + chromaBytes, stride: chromaWidth },
+  ];
+  try {
+    await frame.copyTo(data, {
+      rect: { x: 0, y: 0, width, height },
+      layout,
+    });
+  } catch (error) {
+    if (
+      error instanceof TypeError ||
+      (error instanceof DOMException && error.name === 'NotSupportedError')
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+  rotatePackedI420By180(data, width, height);
+  const base: VideoFrameBufferInit = {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: frame.timestamp,
+    colorSpace: frame.colorSpace.toJSON(),
+    layout,
+  };
+  return new VideoFrame(
+    data,
+    frame.duration === null ? base : { ...base, duration: frame.duration },
+  );
+}
+
+/**
+ * Build the asynchronous plane-preserving 180° filter. Unsupported I420 copy conversion falls back to
+ * the established Canvas2D renderer; input and output frame ownership remains exactly-once in both paths.
+ */
+function createI420Rotate180Stream(
+  spec: Extract<GeometricVideoSpec, { type: 'rotate' }>,
+  opts: StageOptions | undefined,
+): TransformStream<VideoFrame, VideoFrame> {
+  const signal = opts?.signal;
+  const fallback = new Canvas2DRenderer();
+  return new TransformStream<VideoFrame, VideoFrame>({
+    async transform(frame, controller): Promise<void> {
+      if (signal?.aborted === true) {
+        frame.close();
+        throw new MediaError('aborted', 'filter cancelled');
+      }
+      try {
+        const out =
+          (await rotateFrameI420By180(frame)) ??
+          fallback.render(frame, planDraw(spec, frame.displayWidth, frame.displayHeight));
+        let handedOff = false;
+        try {
+          controller.enqueue(out);
+          handedOff = true;
+        } finally {
+          if (!handedOff) out.close();
+        }
+      } finally {
+        frame.close();
+      }
+    },
+    flush(): void {
+      fallback.dispose();
+    },
+  });
+}
+/* v8 ignore stop */
+
 // ============ drivers ============
 
 /**
@@ -804,6 +978,9 @@ export const webgpuVideoFilterDriver: FilterDriver = {
         op: { kind: 'route', id: 'filter' },
         tried: [webgpuVideoFilterDriver.id],
       });
+    }
+    if (f.type === 'rotate' && f.degrees === 180) {
+      return createI420Rotate180Stream(f, o);
     }
     return createFilterStream(
       f,

@@ -220,6 +220,7 @@ function validatePcmOptions(target: NonNullable<EncodeOptions['audio']>): MediaE
   if (
     target.gainDb !== undefined ||
     target.fade !== undefined ||
+    target.mixMatrix !== undefined ||
     target.dynamics !== undefined ||
     target.biquad !== undefined
   ) {

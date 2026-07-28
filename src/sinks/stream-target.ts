@@ -19,9 +19,10 @@
  * produced chunk arrives — never deferred to finalize — so the first callback invocation (or first
  * `WritableStream` write) IS the time-to-first-byte signal the `streaming-output` harness reads.
  *
- * **Write coalescing (doc 09 §5 item 7, mediabunny `StreamTargetOptions` parity).** `chunked` trades a
- * bounded buffer (≤ `chunkSize` + one produced chunk) for sharply fewer target writes — off by default
- * because raw per-chunk writes minimize TTFB, which is this family's headline metric.
+ * **Write shaping.** `chunked` trades a bounded buffer (≤ `chunkSize` + one produced chunk) for sharply
+ * fewer target writes. `writeChunkBytes` instead enforces an exact destination-write size (useful for
+ * packet-aligned transports such as 188-byte MPEG-TS writes). Both are off by default because raw
+ * per-chunk writes minimize TTFB, which is this family's headline metric.
  */
 
 import { InputError, MediaError } from '../contracts/errors.ts';
@@ -42,6 +43,14 @@ export interface StreamTargetOptions {
    * buffering stays ≤ `chunkSize` + one produced chunk.
    */
   readonly chunkSize?: number;
+  /**
+   * Require every destination write to contain exactly this many bytes. Arbitrarily sized producer
+   * chunks are split/coalesced while preserving byte order, positions, and one-write-at-a-time
+   * backpressure. The completed output (and each positioned run) must be an exact multiple of this
+   * size; otherwise the drain rejects instead of silently emitting a short write. Mutually exclusive
+   * with `chunked: true`.
+   */
+  readonly writeChunkBytes?: number;
 }
 
 /**
@@ -74,6 +83,7 @@ export function toStreamTarget(
 export interface StreamTargetWritePlan {
   readonly chunked: boolean;
   readonly chunkSize: number;
+  readonly writeChunkBytes?: number;
 }
 
 /** mediabunny's default `chunkSize` (16 MiB) — the exemplar value this option mirrors. */
@@ -92,7 +102,24 @@ export function planStreamTargetWrite(target: StreamTarget): StreamTargetWritePl
       `stream-target chunkSize must be a positive integer, got ${String(options.chunkSize)}`,
     );
   }
-  return { chunked: options.chunked ?? false, chunkSize };
+  const chunked = options.chunked ?? false;
+  const writeChunkBytes = options.writeChunkBytes;
+  if (
+    writeChunkBytes !== undefined &&
+    (!Number.isSafeInteger(writeChunkBytes) || writeChunkBytes < 1)
+  ) {
+    throw new InputError(
+      `stream-target writeChunkBytes must be a positive integer, got ${String(writeChunkBytes)}`,
+    );
+  }
+  if (chunked && writeChunkBytes !== undefined) {
+    throw new InputError(
+      'stream-target chunked and writeChunkBytes are mutually exclusive write-shaping modes',
+    );
+  }
+  return writeChunkBytes === undefined
+    ? { chunked, chunkSize }
+    : { chunked, chunkSize, writeChunkBytes };
 }
 
 /**

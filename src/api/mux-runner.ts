@@ -1,8 +1,9 @@
-import type { ContainerDriver, StageOptions } from '../contracts/driver.ts';
+import type { ContainerDriver, MuxOptions, StageOptions } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { containerHasChunkMuxer } from './codec-routing.ts';
+import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, MuxSpec, PacketStreams } from './types.ts';
 
 const CONTAINER_MIME: Readonly<Record<string, string>> = {
@@ -40,6 +41,7 @@ export async function runMux(
   signal: AbortSignal,
 ): Promise<Output> {
   const target = opts.container;
+  validateReservedFaststart('mux', target, opts);
   if (!containerHasChunkMuxer(target)) {
     throw new CapabilityError(`no muxer '${target}'`, {
       op: { kind: 'route', id: 'mux' },
@@ -47,6 +49,7 @@ export async function runMux(
     });
   }
   if (
+    opts.faststart !== 'reserve' &&
     opts.fragmented !== true &&
     (target === 'mp4' || target === 'mov'
       ? opts.faststart !== false
@@ -132,13 +135,12 @@ export async function runMux(
   }
 }
 
-function muxOptions(opts: MuxSpec): {
-  faststart?: boolean;
-  fragmented?: boolean;
-  container: string;
-} {
+function muxOptions(opts: MuxSpec): MuxOptions & { readonly container: string } {
   return {
     ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+    ...(opts.maximumPacketCount !== undefined
+      ? { maximumPacketCount: opts.maximumPacketCount }
+      : {}),
     ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
     container: opts.container,
   };

@@ -236,6 +236,8 @@ describe('registerDefaultDrivers', () => {
     expect(typeof adts.decodePcm).toBe('function');
     // aiff's real driver implements probe; the proxy must advertise it (R-S04.5 anti-drift).
     expect(typeof aiff.probe).toBe('function');
+    expect(typeof aiff.decodePcmInterleavedStream).toBe('function');
+    expect(typeof caf.probe).toBe('function');
     expect(caf.packetInfo).toBeUndefined();
   });
 
@@ -278,6 +280,7 @@ describe('registerDefaultDrivers', () => {
     });
     expect(typeof mp4.probe).toBe('function');
     expect(typeof mp4.packetInfo).toBe('function');
+    expect(typeof mp4.packetInfoBatches).toBe('function');
     expect(typeof mp4.streamCopy).toBe('function');
     expect(typeof mp4.decrypt).toBe('function');
     expect(mp4.supports({ direction: 'demux', mime: 'audio/x-m4a' })).toBe(true);
@@ -413,6 +416,7 @@ describe('registerDefaultDrivers', () => {
 
     const ts = findContainer(reg, 'mpegts');
     expect(ts.formats).toEqual(['ts', 'm2ts', 'mts', 'mpegts']);
+    expect(typeof ts.probe).toBe('function');
     expect(ts.supports({ direction: 'demux', mime: 'video/mp2t' })).toBe(true);
     expect(ts.supports({ direction: 'demux', mime: 'audio/mp2t' })).toBe(true);
     expect(ts.supports({ direction: 'demux', extension: 'M2TS' })).toBe(true);

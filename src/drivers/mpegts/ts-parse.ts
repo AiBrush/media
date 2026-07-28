@@ -2,9 +2,11 @@
  * MPEG-TS (ISO/IEC 13818-1) parsing core — pure TS, no browser dependency, so it parses + validates in
  * any environment (ADR-002: containers are ours). A transport stream is a flat run of fixed-size packets
  * (188 B; 192 B for m2ts/mts with a 4-byte timestamp prefix; 204 B with RS parity) with **no front index
- * or duration** — so probe reads the whole (bounded, MB-scale) segment and derives timing from the PES
- * PTS span. PSI (PAT→PMT) maps programs → elementary PIDs → `stream_type`; each PID's PES packets carry
- * the access units with 33-bit / 90 kHz PTS/DTS. All multi-byte fields are big-endian.
+ * or duration** — so exact demux reads the whole bounded segment and derives timing from the PES PTS
+ * span. The metadata-only probe may parse independent packet-aligned endpoint fragments with fresh
+ * reassembly state and an explicit PMT-derived stream seed. PSI (PAT→PMT) maps programs → elementary
+ * PIDs → `stream_type`; each PID's PES packets carry the access units with 33-bit / 90 kHz PTS/DTS. All
+ * multi-byte fields are big-endian.
  *
  * This module turns bytes into a {@link TsParse}: the track table (codec + WebCodecs config + duration)
  * and, per track PID, the reassembled access units (decode order, with PTS/DTS) — everything the
@@ -113,11 +115,37 @@ export interface TsTrack {
   fps?: number;
   /** A WebCodecs decoder config carrying the dims (video) or sampleRate/channels (audio) for probe. */
   config: VideoDecoderConfig | AudioDecoderConfig;
+  /**
+   * Exact 90 kHz timing evidence retained for metadata-window merging. Public consumers should use
+   * `durationSec`/`fps`; this avoids reconstructing ticks from rounded WebCodecs timestamps.
+   */
+  timing?: TsTrackTiming;
+}
+
+/** Exact local timestamp reduction for one parsed packet window. */
+export interface TsTrackTiming {
+  firstPtsTicks: number;
+  lastPtsTicks: number;
+  medianGapTicks: number;
+  minGapTicks: number;
+  maxGapTicks: number;
+  gapCount: number;
+  dominantGapCount: number;
 }
 
 /** The full parse: the ordered track list (one per elementary PID with timed PES). */
 export interface TsParse {
   tracks: TsTrack[];
+  /** True when a parsed packet explicitly carried the adaptation-field discontinuity indicator. */
+  observedDiscontinuity: boolean;
+  /**
+   * Decodable elementary-stream sets declared by sampled PMTs, in encounter order. Populated only when
+   * bounded probe evidence collection is requested; payload routing remains pinned to the first
+   * full-parse declaration, or to `seedStreams` for an independent endpoint parse.
+   */
+  observedPmtStreamSets: readonly (readonly TsStream[])[];
+  /** The first selected program's PMT PID, retained so an independent tail can observe PMT immediately. */
+  selectedPmtPid?: number;
 }
 
 /** A parsed transport packet header + the slice of its payload (after any adaptation field). */
@@ -125,6 +153,7 @@ interface TsPacket {
   pid: number;
   payloadUnitStart: boolean;
   scrambled: boolean;
+  discontinuity: boolean;
   /** The PCR base (90 kHz ticks) when the adaptation field carried one, else undefined. */
   pcr?: number;
   /** The payload bytes (may be empty when AF-only), or undefined when there is no payload. */
@@ -154,10 +183,12 @@ function parsePacket(bytes: Uint8Array, off: number): TsPacket | undefined {
 
   let cursor = off + 4;
   let pcr: number | undefined;
+  let discontinuity = false;
   if (hasAdaptation) {
     const afLen = bytes[cursor] as number;
     if (afLen > 0) {
       const flags = bytes[cursor + 1] as number;
+      discontinuity = (flags & 0x80) !== 0;
       if ((flags & 0x10) !== 0 && afLen >= 7) {
         // PCR present: 33-bit base in bytes [cursor+2 .. +6] high bits, then a 9-bit extension.
         const a = bytes[cursor + 2] as number;
@@ -174,12 +205,19 @@ function parsePacket(bytes: Uint8Array, off: number): TsPacket | undefined {
 
   const packetEnd = off + 188;
   if (!hasPayload || cursor >= packetEnd) {
-    return { pid, payloadUnitStart, scrambled, ...(pcr !== undefined ? { pcr } : {}) };
+    return {
+      pid,
+      payloadUnitStart,
+      scrambled,
+      discontinuity,
+      ...(pcr !== undefined ? { pcr } : {}),
+    };
   }
   return {
     pid,
     payloadUnitStart,
     scrambled,
+    discontinuity,
     ...(pcr !== undefined ? { pcr } : {}),
     payload: bytes.subarray(cursor, packetEnd),
   };
@@ -269,7 +307,9 @@ function parsePmt(section: Uint8Array): TsStream[] | undefined {
     }
     i += 5 + esInfoLength;
   }
-  return streams.length > 0 ? streams : undefined;
+  // An otherwise valid PMT with no decodable A/V entries is still an observed empty stream set. Sparse
+  // probing must be able to distinguish that declaration from a missing/incomplete PMT.
+  return streams;
 }
 
 // ── PES reassembly ──────────────────────────────────────────────────────────────────────────────
@@ -519,6 +559,10 @@ interface PtsSpan {
   last: number;
   /** Median inter-frame gap (ticks) — the track's nominal frame/sample-group duration. */
   medianGap: number;
+  minGap: number;
+  maxGap: number;
+  gapCount: number;
+  dominantGapCount: number;
 }
 
 /** Reduce a track's raw PTS list to its unwrapped span + median frame gap (`undefined` if < 2 timed AUs). */
@@ -532,7 +576,17 @@ function ptsSpan(ptsTicks: readonly number[]): PtsSpan | undefined {
   for (let i = 1; i < unwrapped.length; i++)
     gaps.push((unwrapped[i] as number) - (unwrapped[i - 1] as number));
   gaps.sort((x, y) => x - y);
-  return { first, last, medianGap: gaps[gaps.length >> 1] as number };
+  const medianGap = gaps[gaps.length >> 1] as number;
+  const dominantTolerance = Math.max(1, Math.abs(medianGap) * 0.05);
+  return {
+    first,
+    last,
+    medianGap,
+    minGap: gaps[0] as number,
+    maxGap: gaps.at(-1) as number,
+    gapCount: gaps.length,
+    dominantGapCount: gaps.filter((gap) => Math.abs(gap - medianGap) <= dominantTolerance).length,
+  };
 }
 
 /**
@@ -557,8 +611,22 @@ function containerDuration(spans: readonly PtsSpan[]): number {
  * are read from their first occurrence; thereafter PES packets are reassembled per PID (a PUSI flushes
  * the previous PES). A PES with a separate DTS keeps PTS≠DTS (B-frames survive); a PES without a PTS is
  * dropped (it cannot be timed). Corrupt/zeroed packets are skipped by resyncing to the next sync byte.
+ *
+ * A seeded parse is an independent mid-stream fragment parse for metadata probing. It pins payload
+ * routing to the supplied PMT stream declarations; all PES builders, codec de-framers, timestamps, and
+ * payload state start empty, so bytes on opposite sides of an omitted range can never be spliced
+ * together. With bounded PMT evidence collection enabled, every PMT sampled in the fragment is recorded
+ * without mutating that routing map: the exact full parse remains the fallback authority.
  */
-export function parseTs(bytes: Uint8Array): TsParse {
+export function parseTs(
+  bytes: Uint8Array,
+  options: {
+    readonly seedStreams?: readonly TsStream[];
+    readonly seedPmtPid?: number;
+    /** Collect every sampled PMT declaration for bounded sparse-probe safety checks. */
+    readonly collectPmtEvidence?: boolean;
+  } = {},
+): TsParse {
   const framing = detectFraming(bytes);
   if (!framing) {
     throw new InputError(
@@ -567,8 +635,15 @@ export function parseTs(bytes: Uint8Array): TsParse {
   }
   const { packetSize, start, tsOffset } = framing;
 
-  let pmtPid: number | undefined;
-  const streamsByPid = new Map<number, TsStream>();
+  const collectPmtEvidence = options.collectPmtEvidence === true;
+  let pmtPid = options.seedPmtPid;
+  const observedPmtPids = new Set<number>(
+    collectPmtEvidence && options.seedPmtPid !== undefined ? [options.seedPmtPid] : [],
+  );
+  const observedPmtStreamSets: TsStream[][] = [];
+  const streamsByPid = new Map<number, TsStream>(
+    options.seedStreams?.map((stream) => [stream.pid, stream]),
+  );
   const builders = new Map<number, PesBuilder>();
   // Per-PID access units (decode order, as reassembled) plus the raw PTS list for duration. ADTS AAC
   // PIDs are handled by a stateful de-framer instead (frames span PES packets), which owns their lists.
@@ -577,6 +652,7 @@ export function parseTs(bytes: Uint8Array): TsParse {
   const deframers = new Map<number, AdtsDeframer>();
   let sawScrambled = false;
   let sawSync = false;
+  let observedDiscontinuity = false;
 
   const flush = (pid: number): void => {
     const builder = builders.get(pid);
@@ -626,6 +702,7 @@ export function parseTs(bytes: Uint8Array): TsParse {
     const packet = parsePacket(bytes, syncAt);
     off += packetSize; // next packet start (prefix + 188 + any parity)
     if (!packet) continue;
+    if (packet.discontinuity) observedDiscontinuity = true;
     if (packet.scrambled) {
       sawScrambled = true;
       continue; // cannot reassemble ciphertext payloads
@@ -633,18 +710,30 @@ export function parseTs(bytes: Uint8Array): TsParse {
     const { pid, payloadUnitStart, payload } = packet;
 
     if (pid === PID_PAT) {
-      if (pmtPid === undefined && payloadUnitStart && payload) {
+      if ((pmtPid === undefined || collectPmtEvidence) && payloadUnitStart && payload) {
         const section = sectionFromPayload(payload);
         const pat = section && parsePat(section);
-        if (pat) pmtPid = [...pat.programPmtPids.values()][0];
+        const sampledPmtPid = pat && [...pat.programPmtPids.values()][0];
+        if (sampledPmtPid !== undefined) {
+          pmtPid ??= sampledPmtPid;
+          if (collectPmtEvidence) observedPmtPids.add(sampledPmtPid);
+        }
       }
       continue;
     }
-    if (pid === pmtPid) {
-      if (streamsByPid.size === 0 && payloadUnitStart && payload) {
+    const isRoutingPmt = pid === pmtPid;
+    if (isRoutingPmt || (collectPmtEvidence && observedPmtPids.has(pid))) {
+      if ((streamsByPid.size === 0 || collectPmtEvidence) && payloadUnitStart && payload) {
         const section = sectionFromPayload(payload);
         const streams = section && parsePmt(section);
-        if (streams) for (const s of streams) streamsByPid.set(s.pid, s);
+        if (streams !== undefined) {
+          if (collectPmtEvidence) observedPmtStreamSets.push(streams);
+          // Preserve exact-parser behavior: the first selected PMT (or an explicit seed) remains the
+          // routing authority. Later PMTs are recorded as sparse-probe evidence, not applied to demux.
+          if (streamsByPid.size === 0 && isRoutingPmt) {
+            for (const stream of streams) streamsByPid.set(stream.pid, stream);
+          }
+        }
       }
       continue;
     }
@@ -713,6 +802,19 @@ export function parseTs(bytes: Uint8Array): TsParse {
       durationSec,
       ...(fps !== undefined ? { fps } : {}),
       config: configForStream(stream, units, deframer?.params),
+      ...(span !== undefined
+        ? {
+            timing: {
+              firstPtsTicks: span.first,
+              lastPtsTicks: span.last,
+              medianGapTicks: span.medianGap,
+              minGapTicks: span.minGap,
+              maxGapTicks: span.maxGap,
+              gapCount: span.gapCount,
+              dominantGapCount: span.dominantGapCount,
+            },
+          }
+        : {}),
     });
   }
   // Stable order: video first then audio, each by PID — deterministic across runs (matches probe goldens).
@@ -720,7 +822,12 @@ export function parseTs(bytes: Uint8Array): TsParse {
     (a, b) =>
       mediaRank(a.stream.mediaType) - mediaRank(b.stream.mediaType) || a.stream.pid - b.stream.pid,
   );
-  return { tracks };
+  return {
+    tracks,
+    observedDiscontinuity,
+    observedPmtStreamSets,
+    ...(pmtPid !== undefined ? { selectedPmtPid: pmtPid } : {}),
+  };
 }
 
 function mediaRank(t: MediaType): number {

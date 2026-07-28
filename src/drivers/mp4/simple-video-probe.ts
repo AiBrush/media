@@ -1,6 +1,7 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
 import { avcCodecString, parseEsds } from './codec-strings.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
+import { decodeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 const SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES = 8 * 1024;
@@ -179,13 +180,21 @@ function probeMatrixRotation(a: number, b: number): number | undefined {
   return norm === 0 ? undefined : norm;
 }
 
-function probeMdhd(r: Reader, mdhd: BoxHeader): { timescale: number; durationSec: number } {
+function probeMdhd(
+  r: Reader,
+  mdhd: BoxHeader,
+): { timescale: number; durationSec: number; language?: string } {
   r.seek(mdhd.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
-  return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
+  const language = r.pos + 2 <= mdhd.end ? decodeMdhdLanguage(r.u16()) : undefined;
+  return {
+    timescale,
+    durationSec: timescale > 0 ? duration / timescale : 0,
+    ...(language !== undefined ? { language } : {}),
+  };
 }
 
 function probeHandler(r: Reader, hdlr: BoxHeader): string {
@@ -414,6 +423,7 @@ export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly Track
       mediaType: 'audio',
       codec: entry.codec,
       durationSec: timing.durationSec,
+      ...(timing.language !== undefined ? { language: timing.language } : {}),
       ...(gapless !== undefined ? { gapless } : {}),
       config: entry.config,
     });
@@ -502,6 +512,7 @@ function probeSimpleTrack(
         mediaType: 'video',
         codec: entry.codec,
         durationSec: timing.durationSec,
+        ...(timing.language !== undefined ? { language: timing.language } : {}),
         ...(fps !== undefined ? { fps } : {}),
         ...(header.rotation !== undefined ? { rotation: header.rotation } : {}),
         config: entry.config,
@@ -524,6 +535,7 @@ function probeSimpleTrack(
       mediaType: 'audio',
       codec: entry.codec,
       durationSec: timing.durationSec,
+      ...(timing.language !== undefined ? { language: timing.language } : {}),
       ...(gapless !== undefined ? { gapless } : {}),
       config: entry.config,
     },

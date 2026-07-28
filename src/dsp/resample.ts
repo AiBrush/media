@@ -21,8 +21,9 @@
  * resample→f32 path lossless in spirit.
  */
 
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { type PcmAudio, channelAt, sampleAt } from './pcm.ts';
+import { ResampleLruCache } from './resample-cache.ts';
 
 /**
  * Quality knobs of the prototype windowed-sinc filter. Fixed (not exposed) so every `convert` resample
@@ -33,6 +34,18 @@ const SAMPLES_PER_ZERO_CROSSING = 512; // table phases between adjacent sinc zer
 const KAISER_BETA = 9.42; // Kaiser β for ≈ 80 dB stopband attenuation (Kaiser/Schafer design)
 const MAX_POLYPHASE_PHASES = 4096;
 const ABORT_CHECK_INTERVAL = 4096;
+const MAX_RESAMPLE_KERNEL_TAPS = 262_144; // ≤ 2 MiB of Float64 coefficients for one phase
+const MAX_POLYPHASE_BANK_BUILD_BYTES = 16 * 1024 * 1024; // larger safe work uses dense fallback
+// Keep the complete planar result below the conservative signed-32-bit byte ceiling shared by older
+// and current JS runtimes. Bounding the aggregate (not merely each Float64Array) prevents a valid
+// per-plane shape with many channels from committing several GiB before the caller can consume it.
+const MAX_RESAMPLE_OUTPUT_BYTES = 0x7fff_fff8; // ~2 GiB, divisible by Float64Array.BYTES_PER_ELEMENT
+const POLYPHASE_CACHE_MAX_ENTRIES = 8;
+const POLYPHASE_CACHE_MAX_RETAINED_BYTES = 4 * 1024 * 1024;
+const CACHE_ACCOUNTING_ALIGNMENT = 4096;
+const POLYPHASE_BANK_METADATA_BYTES = 256;
+const POLYPHASE_KERNEL_METADATA_BYTES = 128;
+const TYPED_ARRAY_METADATA_BYTES = 64;
 
 /** Optional controls for long-running sample-rate conversion. */
 export interface ResampleOptions {
@@ -78,6 +91,11 @@ function buildFilterTable(): Float64Array {
   return table;
 }
 
+/**
+ * One fixed-size (~128 KiB), module-owned prototype table. It never escapes this module, and cached
+ * banks copy their coefficients rather than retaining it, so it has one stable owner and is not part
+ * of the variable bank-cache budget.
+ */
 let FILTER_TABLE: Float64Array | undefined;
 function filterTable(): Float64Array {
   FILTER_TABLE ??= buildFilterTable();
@@ -109,7 +127,48 @@ interface PolyphaseBank {
   readonly kernels: readonly PolyphaseKernel[];
 }
 
-const POLYPHASE_CACHE = new Map<string, PolyphaseBank>();
+const POLYPHASE_CACHE = new ResampleLruCache<PolyphaseBank>(
+  POLYPHASE_CACHE_MAX_ENTRIES,
+  POLYPHASE_CACHE_MAX_RETAINED_BYTES,
+);
+
+/**
+ * Conservative retained-size accounting: typed-array payloads plus explicit allowances for their
+ * views, kernel objects, the kernel reference array, key, Map entry, and bank object. Page rounding
+ * intentionally over-counts small banks and allocator slack.
+ */
+function polyphaseBankRetainedBytes(key: string, bank: PolyphaseBank): number {
+  let bytes =
+    POLYPHASE_BANK_METADATA_BYTES +
+    key.length * 2 +
+    bank.kernels.length * 8 +
+    bank.baseIncrements.byteLength +
+    bank.nextPhases.byteLength +
+    2 * TYPED_ARRAY_METADATA_BYTES;
+  for (const kernel of bank.kernels) {
+    bytes += POLYPHASE_KERNEL_METADATA_BYTES + kernel.coeffs.byteLength;
+  }
+  const aligned = Math.ceil(bytes / CACHE_ACCOUNTING_ALIGNMENT) * CACHE_ACCOUNTING_ALIGNMENT;
+  return Number.isSafeInteger(aligned) ? aligned : Number.MAX_SAFE_INTEGER;
+}
+
+function estimatedPolyphaseBankRetainedBytes(
+  key: string,
+  phaseCount: number,
+  maximumTapCount: number,
+): number {
+  const bytes =
+    POLYPHASE_BANK_METADATA_BYTES +
+    key.length * 2 +
+    phaseCount *
+      (8 +
+        Int32Array.BYTES_PER_ELEMENT * 2 +
+        POLYPHASE_KERNEL_METADATA_BYTES +
+        maximumTapCount * Float64Array.BYTES_PER_ELEMENT) +
+    2 * TYPED_ARRAY_METADATA_BYTES;
+  const aligned = Math.ceil(bytes / CACHE_ACCOUNTING_ALIGNMENT) * CACHE_ACCOUNTING_ALIGNMENT;
+  return Number.isSafeInteger(aligned) ? aligned : Number.MAX_SAFE_INTEGER;
+}
 
 function gcd(a: number, b: number): number {
   let x = Math.abs(a);
@@ -163,9 +222,9 @@ function polyphaseBank(
   inRate: number,
   outRate: number,
   ratio: number,
+  maximumTapCount: number,
   table: Float64Array,
 ): PolyphaseBank | undefined {
-  if (!Number.isInteger(inRate) || inRate <= 0) return undefined;
   const divisor = gcd(inRate, outRate);
   const phaseCount = outRate / divisor;
   if (phaseCount > MAX_POLYPHASE_PHASES) return undefined;
@@ -173,6 +232,12 @@ function polyphaseBank(
   const key = `${inRate}:${outRate}`;
   const cached = POLYPHASE_CACHE.get(key);
   if (cached !== undefined) return cached;
+  if (
+    estimatedPolyphaseBankRetainedBytes(key, phaseCount, maximumTapCount) >
+    MAX_POLYPHASE_BANK_BUILD_BYTES
+  ) {
+    return undefined;
+  }
 
   const cutoff = ratio < 1 ? ratio : 1;
   const halfSupport = ZERO_CROSSINGS / cutoff;
@@ -182,8 +247,142 @@ function polyphaseBank(
   }
   const { baseIncrements, nextPhases } = buildPhaseIncrements(phaseCount, step);
   const bank = { baseIncrements, nextPhases, kernels };
-  POLYPHASE_CACHE.set(key, bank);
+  POLYPHASE_CACHE.set(key, bank, polyphaseBankRetainedBytes(key, bank));
   return bank;
+}
+
+function resampleCapabilityError(
+  message: string,
+  inRate: number,
+  outRate: number,
+  facts: Readonly<Record<string, string | number | boolean | undefined>> = {},
+): CapabilityError {
+  return new CapabilityError(message, {
+    op: { kind: 'route', id: 'filter', facts: { inRate, outRate, ...facts } },
+    tried: [],
+  });
+}
+
+function maximumKernelTapCount(inRate: number, outRate: number, ratio: number): number {
+  const cutoff = Math.min(1, ratio);
+  const tapCount = Math.ceil((ZERO_CROSSINGS * 2) / cutoff) + 1;
+  if (!Number.isSafeInteger(tapCount) || tapCount > MAX_RESAMPLE_KERNEL_TAPS) {
+    throw resampleCapabilityError(
+      `resample ratio ${inRate}:${outRate} requires an unsafe filter kernel`,
+      inRate,
+      outRate,
+      { tapCount, maxTapCount: MAX_RESAMPLE_KERNEL_TAPS },
+    );
+  }
+  return tapCount;
+}
+
+interface ResampleWorkPlan {
+  readonly ratio: number;
+  readonly outFrames: number;
+  readonly maximumTapCount: number;
+}
+
+/**
+ * Numeric-only safety plan shared with adversarial tests. It is intentionally absent from the
+ * package/DSP entry points: callers use {@link resample}, while tests can cover hour-scale plans
+ * without allocating hour-scale PCM planes.
+ *
+ * @internal
+ */
+export function planResampleWork(
+  inRate: number,
+  outRate: number,
+  frames: number,
+  channelCount: number,
+): ResampleWorkPlan {
+  if (!Number.isSafeInteger(outRate) || outRate <= 0) {
+    throw resampleCapabilityError(`invalid target sample rate ${outRate}`, inRate, outRate);
+  }
+  if (!Number.isSafeInteger(inRate) || inRate <= 0) {
+    throw resampleCapabilityError(`invalid source sample rate ${inRate}`, inRate, outRate);
+  }
+  if (!Number.isSafeInteger(frames) || frames < 0) {
+    throw new InputError(`invalid source frame count ${frames}`);
+  }
+  if (!Number.isSafeInteger(channelCount) || channelCount <= 0) {
+    throw new InputError(`invalid source channel count ${channelCount}`);
+  }
+  const ratio = outRate / inRate;
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    throw resampleCapabilityError('invalid resample ratio', inRate, outRate, { ratio });
+  }
+  const scaledFrames = frames * ratio;
+  const outFrames = Math.round(scaledFrames);
+  if (!Number.isSafeInteger(outFrames) || outFrames < 0) {
+    throw resampleCapabilityError('resample output frame count is unsafe', inRate, outRate, {
+      frames,
+      scaledFrames,
+    });
+  }
+  if (outFrames === 0) return { ratio, outFrames, maximumTapCount: 0 };
+
+  const outputSamples = outFrames * channelCount;
+  if (!Number.isSafeInteger(outputSamples)) {
+    throw resampleCapabilityError(
+      'resample output sample count exceeds safe integer accounting',
+      inRate,
+      outRate,
+      { outFrames, channelCount, outputSamples },
+    );
+  }
+  const outputBytes = outputSamples * Float64Array.BYTES_PER_ELEMENT;
+  if (!Number.isSafeInteger(outputBytes) || outputBytes > MAX_RESAMPLE_OUTPUT_BYTES) {
+    throw resampleCapabilityError(
+      'resample aggregate output exceeds the safe software allocation bound',
+      inRate,
+      outRate,
+      {
+        outFrames,
+        channelCount,
+        outputSamples,
+        outputBytes,
+        maxOutputBytes: MAX_RESAMPLE_OUTPUT_BYTES,
+      },
+    );
+  }
+  if (inRate === outRate) {
+    return { ratio, outFrames, maximumTapCount: 0 };
+  }
+
+  const maximumTapCount = maximumKernelTapCount(inRate, outRate, ratio);
+  const workUnits = outputSamples * maximumTapCount;
+  if (!Number.isSafeInteger(workUnits)) {
+    throw resampleCapabilityError(
+      'resample operation exceeds safe integer work accounting',
+      inRate,
+      outRate,
+      { outFrames, channelCount, maximumTapCount, workUnits },
+    );
+  }
+  return { ratio, outFrames, maximumTapCount };
+}
+
+function validatePcmAudioShape(audio: PcmAudio): void {
+  if (!Number.isSafeInteger(audio.frames) || audio.frames < 0) {
+    throw new InputError(`invalid source frame count ${audio.frames}`);
+  }
+  if (!Number.isSafeInteger(audio.channels) || audio.channels <= 0) {
+    throw new InputError(`invalid source channel count ${audio.channels}`);
+  }
+  if (audio.planar.length !== audio.channels) {
+    throw new InputError(
+      `source channel count ${audio.channels} does not match ${audio.planar.length} PCM planes`,
+    );
+  }
+  for (let channel = 0; channel < audio.planar.length; channel++) {
+    const plane = audio.planar[channel] as Float64Array;
+    if (plane.length !== audio.frames) {
+      throw new InputError(
+        `source PCM plane ${channel} has ${plane.length} frames; expected ${audio.frames}`,
+      );
+    }
+  }
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -337,21 +536,23 @@ function resampleChannel(
  * channel is resampled independently with the same phase schedule; output length is exactly
  * `round(frames · outRate / inRate)`. Equal rates return a bit-exact identity copy (input untouched).
  *
- * @throws CapabilityError if `outRate` is not a positive integer (the resample capability cannot be met).
+ * @throws InputError for an inconsistent canonical PCM shape.
+ * @throws CapabilityError for invalid rates or a ratio/allocation that cannot be handled safely.
  */
 export function resample(
   audio: PcmAudio,
   outRate: number,
   options: ResampleOptions = {},
 ): PcmAudio {
-  if (!Number.isInteger(outRate) || outRate <= 0) {
-    throw new CapabilityError(`invalid target sample rate ${outRate}`, {
-      op: { kind: 'route', id: 'filter' },
-      tried: [],
-    });
-  }
-  throwIfAborted(options.signal);
+  validatePcmAudioShape(audio);
   const inRate = audio.sampleRate;
+  const { ratio, outFrames, maximumTapCount } = planResampleWork(
+    inRate,
+    outRate,
+    audio.frames,
+    audio.channels,
+  );
+  throwIfAborted(options.signal);
   if (outRate === inRate) {
     return {
       sampleRate: inRate,
@@ -360,10 +561,16 @@ export function resample(
       planar: audio.planar.map((ch) => ch.slice()),
     };
   }
-  const ratio = outRate / inRate;
-  const outFrames = Math.round(audio.frames * ratio);
+  if (outFrames === 0) {
+    return {
+      sampleRate: outRate,
+      channels: audio.channels,
+      frames: 0,
+      planar: audio.planar.map(() => new Float64Array(0)),
+    };
+  }
   const table = filterTable();
-  const bank = polyphaseBank(inRate, outRate, ratio, table);
+  const bank = polyphaseBank(inRate, outRate, ratio, maximumTapCount, table);
   const planar =
     bank === undefined
       ? audio.planar.map((ch) => resampleChannel(ch, outFrames, ratio, table, options.signal))

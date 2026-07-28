@@ -64,6 +64,8 @@ suite('dist smoke (built package via exports map)', () => {
       'remux',
       'trim',
       'demux',
+      'packetInfo',
+      'packetInfoBatches',
       'decode',
       'encode',
       'mux',

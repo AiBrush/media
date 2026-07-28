@@ -9,9 +9,12 @@
  *    must advertise exactly the flagged surface (an unflagged real method is a lost capability).
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OPTIONAL_CONTAINER_CAPABILITIES } from '../contracts/driver.ts';
+import { fromBytes } from '../sources/source.ts';
+import { loadFixture } from '../test-support/corpus.ts';
 import { DEFAULT_LAZY_CONTAINER_SPECS, lazyContainer } from './defaults.ts';
+import { WAV_LAZY_CONTAINER_SPEC } from './wav/wav-lazy-driver.ts';
 
 function surfaceOf(target: object): readonly string[] {
   return OPTIONAL_CONTAINER_CAPABILITIES.filter((capability) => {
@@ -43,4 +46,22 @@ describe('lazy container spec conformance', () => {
       expect(advertised).toEqual(real);
     },
   );
+
+  it('keeps WAV probe on the lightweight implementation until a full-driver flow is requested', async () => {
+    const load = vi.fn(WAV_LAZY_CONTAINER_SPEC.load);
+    const proxy = lazyContainer({ ...WAV_LAZY_CONTAINER_SPEC, load });
+    const bytes = await loadFixture('speech.wav');
+    const probe = proxy.probe;
+    if (probe === undefined) throw new Error('lazy WAV proxy must expose probe');
+
+    await expect(probe.call(proxy, fromBytes(bytes, { mime: 'audio/wav' }))).resolves.toMatchObject(
+      [{ mediaType: 'audio', codec: 'pcm-s16' }],
+    );
+    expect(load).not.toHaveBeenCalled();
+
+    await expect(proxy.demux(fromBytes(bytes, { mime: 'audio/wav' }))).resolves.toMatchObject({
+      tracks: [{ mediaType: 'audio', codec: 'pcm-s16' }],
+    });
+    expect(load).toHaveBeenCalledTimes(1);
+  });
 });

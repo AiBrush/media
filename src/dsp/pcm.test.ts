@@ -7,6 +7,7 @@ import {
   decodePcm,
   decodePcmToInterleavedF32,
   encodePcm,
+  roundHalfToEven,
   sampleAt,
 } from './pcm.ts';
 
@@ -50,6 +51,40 @@ describe('PCM codec — bit-exact round-trip (decoded-audio-pcm oracle)', () => 
 });
 
 describe('PCM codec — normalization & clamping', () => {
+  it('rounds ordinary, halfway, large, and non-finite binary64 values consistently', () => {
+    expect([-3.6, -3.5, -2.5, -1.6, -1.4, 1.4, 1.5, 2.5, 3.5, 3.6].map(roundHalfToEven)).toEqual([
+      -4, -4, -2, -2, -1, 1, 2, 2, 4, 4,
+    ]);
+    expect(roundHalfToEven(2 ** 52)).toBe(2 ** 52);
+    expect(roundHalfToEven(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
+    expect(Number.isNaN(roundHalfToEven(Number.NaN))).toBe(true);
+  });
+
+  it.each(INT_FORMATS)(
+    '%s resolves exact positive and negative half-LSB values with nearest-even rounding',
+    (format) => {
+      const scale =
+        format === 'u8' || format === 's8'
+          ? 128
+          : format === 's16'
+            ? 32_768
+            : format === 's24'
+              ? 8_388_608
+              : 2_147_483_648;
+      const halfLsbCodes = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+      const audio = {
+        sampleRate: 8_000,
+        channels: 1,
+        frames: halfLsbCodes.length,
+        planar: [Float64Array.from(halfLsbCodes, (code) => code / scale)],
+      };
+      const decoded = decodePcm(encodePcm(audio, format), format, 1, audio.sampleRate);
+      const codes = Array.from(channelAt(decoded.planar, 0), (sample) => sample * scale);
+
+      expect(codes).toEqual([-2, -2, 0, 0, 2, 2]);
+    },
+  );
+
   it('direct interleaved Float32 egress is bit-exact to canonical narrowing', () => {
     const floatingCases: ReadonlyArray<readonly [SampleFormat, Uint8Array]> = [
       ['f32', new Uint8Array(new Float32Array([0, 0.5, -0.5, 1, -1, 0.25]).buffer)],
@@ -90,6 +125,19 @@ describe('PCM codec — normalization & clamping', () => {
       8_388_607 / 8_388_608,
       -1 / 8_388_608,
     ]);
+  });
+
+  it('direct signed-16 egress preserves extrema, byte order, and unaligned views exactly', () => {
+    const littleBacking = Uint8Array.of(0xaa, 0, 0x80, 0xff, 0x7f, 0xff, 0xff, 0, 0);
+    const bigBacking = Uint8Array.of(0xaa, 0x80, 0, 0x7f, 0xff, 0xff, 0xff, 0, 0);
+    const little = littleBacking.subarray(1);
+    const big = bigBacking.subarray(1);
+    const expected = [-1, 32_767 / 32_768, -1 / 32_768, 0];
+
+    expect(Array.from(decodePcmToInterleavedF32(little, 's16', 1, 8_000).data)).toEqual(expected);
+    expect(Array.from(decodePcmToInterleavedF32(big, 's16', 1, 8_000, 'be').data)).toEqual(
+      expected,
+    );
   });
 
   it('decodes the documented normalization (full-scale → ±1)', () => {

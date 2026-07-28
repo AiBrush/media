@@ -19,6 +19,7 @@ function track(
     sampleToChunk: partial.sampleToChunk ?? [],
     chunkOffsets: partial.chunkOffsets ?? [],
     syncSamples: partial.syncSamples ?? [],
+    sampleDependencies: partial.sampleDependencies ?? [],
   };
   const parsed: ParsedTrack = {
     id: 1,

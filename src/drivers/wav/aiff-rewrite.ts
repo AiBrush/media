@@ -20,6 +20,7 @@ function hasOtherPcmWork(o: PcmTransform): boolean {
   return (
     o.gainDb !== undefined ||
     o.fade !== undefined ||
+    o.mixMatrix !== undefined ||
     o.dynamics !== undefined ||
     o.biquad !== undefined ||
     o.timeBounds !== undefined

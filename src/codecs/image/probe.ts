@@ -18,7 +18,6 @@
  */
 
 import { InputError } from '../../contracts/errors.ts';
-
 /** The still/animated image formats this module probes + decodes. */
 export type ImageFormat = 'gif' | 'png' | 'jpeg' | 'webp' | 'avif';
 

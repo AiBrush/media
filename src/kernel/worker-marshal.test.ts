@@ -158,9 +158,10 @@ describe('readSourceOwned', () => {
   });
 
   it('rejects with a typed aborted error when the signal has already fired', async () => {
-    await expect(
-      readSourceOwned(fromBytes(fixture), AbortSignal.abort()),
-    ).rejects.toMatchObject({ name: 'MediaError', code: 'aborted' });
+    await expect(readSourceOwned(fromBytes(fixture), AbortSignal.abort())).rejects.toMatchObject({
+      name: 'MediaError',
+      code: 'aborted',
+    });
   });
 });
 

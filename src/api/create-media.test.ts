@@ -12,6 +12,7 @@ import {
   type EncodedChunk,
   type FilterDriver,
   type Packet,
+  type PacketInfoMetadata,
   type RawFrame,
   type TrackInfo,
 } from '../contracts/driver.ts';
@@ -305,6 +306,88 @@ function delayedDecodeFrameModule(
   };
 }
 
+function rotatedDecodeFrameModule(
+  codedFrame: CancelRaceFrame,
+  presentedFrame: CancelRaceFrame,
+  seenDegrees: number[],
+): DriverModule {
+  const track: TrackInfo = {
+    id: 1,
+    mediaType: 'video',
+    codec: 'rotated-video',
+    rotation: 90,
+    config: { codec: 'rotated-video', codedWidth: 16, codedHeight: 32 },
+  };
+  const container: ContainerDriver = {
+    id: 'rotated-container',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (query) => query.mime === 'video/x-rotated',
+    demux: () =>
+      Promise.resolve({
+        tracks: [track],
+        packets: () =>
+          new ReadableStream<Packet>({
+            start(controller): void {
+              controller.enqueue(fakeVideoPacket());
+              controller.close();
+            },
+          }),
+        close: () => Promise.resolve(),
+      }),
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'rotated-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: (query) =>
+      Promise.resolve({
+        supported:
+          query.mediaType === 'video' &&
+          query.direction === 'decode' &&
+          query.config.codec === 'rotated-video',
+      }),
+    createDecoder: () =>
+      new TransformStream<EncodedChunk, RawFrame>({
+        transform(_chunk, controller): void {
+          controller.enqueue(codedFrame as unknown as RawFrame);
+        },
+      }),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  const filter: FilterDriver = {
+    id: 'rotated-filter',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'filter',
+    substrate: 'wasm',
+    supports: (spec) => spec.mediaType === 'video' && spec.type === 'rotate',
+    createFilter: (spec) =>
+      new TransformStream<VideoFrame, VideoFrame>({
+        transform(frame, controller): void {
+          if (spec.mediaType !== 'video' || spec.type !== 'rotate') {
+            throw new Error('unexpected filter spec');
+          }
+          seenDegrees.push(spec.degrees);
+          frame.close();
+          controller.enqueue(presentedFrame as unknown as VideoFrame);
+        },
+      }),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(reg): void {
+      reg.addContainer(container);
+      reg.addCodec(codec);
+      reg.addFilter(filter);
+    },
+  };
+}
+
 function dualTrackStreamDecodeModule(
   expectedBytes: Uint8Array,
   videoFrame: CancelRaceFrame,
@@ -383,6 +466,82 @@ function dualTrackStreamDecodeModule(
         transform(_chunk, controller): void {
           controller.enqueue(
             (config.codec === 'fake-video' ? videoFrame : audioFrame) as unknown as RawFrame,
+          );
+        },
+      }),
+    createEncoder: () => new TransformStream<RawFrame, EncodedChunk>(),
+  };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register(registry): void {
+      registry.addContainer(container);
+      registry.addCodec(codec);
+    },
+  };
+}
+
+function selectableVideoTracksDecodeModule(
+  primaryFrame: CancelRaceFrame,
+  secondaryFrame: CancelRaceFrame,
+  requestedTrackIds: number[],
+): DriverModule {
+  const tracks: readonly TrackInfo[] = [
+    {
+      id: 10,
+      mediaType: 'video',
+      codec: 'fake-video-primary',
+      config: { codec: 'fake-video-primary', codedWidth: 16, codedHeight: 16 },
+    },
+    {
+      id: 20,
+      mediaType: 'video',
+      codec: 'fake-video-secondary',
+      config: { codec: 'fake-video-secondary', codedWidth: 32, codedHeight: 18 },
+    },
+  ];
+  const container: ContainerDriver = {
+    id: 'selectable-video-tracks',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'container',
+    formats: ['mp4'],
+    supports: (query) => query.mime === 'video/x-selectable-tracks',
+    demux: () =>
+      Promise.resolve({
+        tracks,
+        packets: (trackId) => {
+          requestedTrackIds.push(trackId);
+          return new ReadableStream<Packet>({
+            start(controller): void {
+              controller.enqueue(fakeVideoPacket());
+              controller.close();
+            },
+          });
+        },
+        close: () => Promise.resolve(),
+      }),
+    createMuxer: () => {
+      throw new Error('unused');
+    },
+  };
+  const codec: CodecDriver = {
+    id: 'selectable-video-codec',
+    apiVersion: DRIVER_API_VERSION,
+    kind: 'codec',
+    tier: 'wasm',
+    supports: (query) =>
+      Promise.resolve({
+        supported:
+          query.direction === 'decode' &&
+          (query.config.codec === 'fake-video-primary' ||
+            query.config.codec === 'fake-video-secondary'),
+      }),
+    createDecoder: (config) =>
+      new TransformStream<EncodedChunk, RawFrame>({
+        transform(_chunk, controller): void {
+          controller.enqueue(
+            (config.codec === 'fake-video-secondary'
+              ? secondaryFrame
+              : primaryFrame) as unknown as RawFrame,
           );
         },
       }),
@@ -481,7 +640,25 @@ function crossTargetStreamCopyModule(calls: Array<unknown>): DriverModule {
   return { apiVersion: DRIVER_API_VERSION, register: (reg) => reg.addContainer(driver) };
 }
 
-function packetInfoModule(): DriverModule {
+function packetInfoModule(state?: { batchCancels: number }): DriverModule {
+  const rows: readonly PacketInfoMetadata[] = [
+    {
+      trackIndex: 0,
+      size: 1,
+      ptsUs: 0,
+      dtsUs: 0,
+      durationUs: 1,
+      keyframe: true,
+    },
+    {
+      trackIndex: 0,
+      size: 1,
+      ptsUs: 1,
+      dtsUs: 1,
+      durationUs: 1,
+      keyframe: true,
+    },
+  ];
   const driver: ContainerDriver = {
     id: 'packet-info-mp4',
     apiVersion: DRIVER_API_VERSION,
@@ -489,6 +666,23 @@ function packetInfoModule(): DriverModule {
     formats: ['mp4'],
     supports: (q) => q.mime === 'video/x-packet-info',
     packetInfo: () => Promise.resolve({ tracks: [], packets: [] }),
+    packetInfoBatches: (_src, options) =>
+      Promise.resolve({
+        tracks: [],
+        async cancel(): Promise<void> {
+          if (state !== undefined) state.batchCancels++;
+        },
+        async *[Symbol.asyncIterator](): AsyncGenerator<readonly PacketInfoMetadata[]> {
+          const throwIfBatchAborted = (): void => {
+            const activeSignal = options?.signal;
+            if (activeSignal?.aborted === true) throw activeSignal.reason;
+          };
+          throwIfBatchAborted();
+          yield rows.slice(0, 1);
+          throwIfBatchAborted();
+          yield rows.slice(1);
+        },
+      }),
     demux: () =>
       Promise.resolve({
         tracks: [],
@@ -524,6 +718,8 @@ describe('createMedia', () => {
       'decode',
       'encode',
       'demux',
+      'packetInfo',
+      'packetInfoBatches',
       'h264AbrLadder',
       'mux',
       'decrypt',
@@ -563,17 +759,47 @@ describe('createMedia', () => {
   });
 
   it('packetInfo routes to the fast metadata hook and rejects drivers without one', async () => {
-    const withPacketInfo = createMedia().use(packetInfoModule()) as unknown as {
-      packetInfo(input: MediaInput): Promise<{ readonly tracks: readonly TrackInfo[] }>;
-    };
+    const withPacketInfo = createMedia().use(packetInfoModule());
     await expect(
       withPacketInfo.packetInfo(fromBytes(new Uint8Array([1]), { mime: 'video/x-packet-info' })),
     ).resolves.toEqual({ tracks: [], packets: [] });
 
-    const withoutPacketInfo = createMedia().use(NoopDriverModule) as unknown as {
-      packetInfo(input: MediaInput): Promise<unknown>;
-    };
+    const withoutPacketInfo = createMedia().use(NoopDriverModule);
     await expect(withoutPacketInfo.packetInfo(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('packetInfoBatches is typed, pull-driven, and closes its driver lease on early return', async () => {
+    const state = { batchCancels: 0 };
+    const media = createMedia().use(packetInfoModule(state));
+    const batches = await media.packetInfoBatches(
+      fromBytes(new Uint8Array([1]), { mime: 'video/x-packet-info' }),
+      { batchSize: 1 },
+    );
+    const seen: PacketInfoMetadata[] = [];
+    for await (const batch of batches) {
+      seen.push(...batch);
+      break;
+    }
+    expect(seen).toHaveLength(1);
+    expect(state.batchCancels).toBe(1);
+    await batches.cancel();
+    expect(state.batchCancels).toBe(1);
+    await expect(media.packetInfoBatches(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
+  });
+
+  it('keeps the caller AbortSignal live after packetInfoBatches setup resolves', async () => {
+    const state = { batchCancels: 0 };
+    const media = createMedia().use(packetInfoModule(state));
+    const controller = new AbortController();
+    const batches = await media.packetInfoBatches(
+      fromBytes(new Uint8Array([1]), { mime: 'video/x-packet-info' }),
+      { signal: controller.signal },
+    );
+    const reason = new MediaError('aborted', 'stop live packet-info lease');
+    controller.abort(reason);
+
+    await expect(batches[Symbol.asyncIterator]().next()).rejects.toBe(reason);
+    expect(state.batchCancels).toBe(1);
   });
 
   it('probe maps demuxer tracks into MediaInfo (dims + audio params + duration)', async () => {
@@ -948,6 +1174,76 @@ describe('createMedia', () => {
     expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
+  it('probe reuses a bounded prefix across fresh finite blob source snapshots', async () => {
+    const bytes = new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]);
+    let rangeCalls = 0;
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp3',
+        durationSec: 1,
+        config: { codec: 'mp3', sampleRate: 44100, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'fresh-blob-mp3',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['mp3'],
+      supports: (q) => q.mime === 'audio/mpeg',
+      probe: async (src) => {
+        expect(await src.range?.(0, bytes.byteLength)).toEqual(bytes);
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('fresh blob probe must not demux when probe() is available');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source = (): Source => ({
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/mpeg',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'blob:https://example.test/stable-object-url',
+      range: (start, end) => {
+        rangeCalls++;
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('fresh blob probe must not stream');
+      },
+    });
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+
+    await media.probe(source());
+    await media.probe(source());
+
+    expect(rangeCalls).toBe(1);
+
+    await media.dispose();
+    expect(() => media.probe(source())).toThrow(
+      expect.objectContaining({
+        code: 'aborted',
+        message: 'engine disposed',
+      }),
+    );
+    expect(rangeCalls).toBe(1);
+
+    const sibling = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    });
+    await sibling.probe(source());
+    expect(rangeCalls).toBe(2);
+  });
+
   it('probe never reuses a URL prefix across distinct source snapshots with the same href', async () => {
     const original = new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]);
     const mutated = new Uint8Array(original.byteLength);
@@ -1128,6 +1424,62 @@ describe('createMedia', () => {
     expect(calls).toEqual([[0, bytes.byteLength]]);
   });
 
+  it('probeContainer reuses a bounded prefix across fresh finite blob source snapshots', async () => {
+    const bytes = new Uint8Array([0x66, 0x4c, 0x61, 0x43, 0, 0, 0, 0]);
+    let rangeCalls = 0;
+    const tracks: TrackInfo[] = [
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'flac',
+        durationSec: 1,
+        config: { codec: 'flac', sampleRate: 48000, numberOfChannels: 2 },
+      },
+    ];
+    const driver: ContainerDriver = {
+      id: 'fresh-blob-flac',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['flac'],
+      supports: () => true,
+      probe: async (src) => {
+        expect(await src.range?.(0, bytes.byteLength)).toEqual(bytes);
+        return tracks;
+      },
+      demux: () => {
+        throw new Error('fresh blob known-container probe must not demux');
+      },
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+    };
+    const source = (): Source => ({
+      __media: 'source',
+      kind: 'url',
+      mimeHint: 'audio/flac',
+      size: bytes.byteLength,
+      [SOURCE_CACHE_KEY]: 'blob:https://example.test/stable-flac-url',
+      range: (start, end) => {
+        rangeCalls++;
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('fresh blob known-container probe must not stream');
+      },
+    });
+    const media = createMedia().use({
+      apiVersion: DRIVER_API_VERSION,
+      register: (reg) => reg.addContainer(driver),
+    }) as unknown as {
+      probeContainer(input: MediaInput, container: 'flac'): Promise<MediaInfo>;
+    };
+
+    await media.probeContainer(source(), 'flac');
+    await media.probeContainer(source(), 'flac');
+
+    expect(rangeCalls).toBe(1);
+  });
+
   it('probeContainer reuses bounded disjoint metadata intervals on the exact source', async () => {
     const bytes = new Uint8Array(512);
     bytes.set([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]);
@@ -1269,6 +1621,15 @@ describe('createMedia', () => {
 
   it('decode exposes images as video frames, with a typed browser-only miss in Node and no audio stream', async () => {
     const streams = createMedia().decode(fromBytes(loadImage('test.png'), { mime: 'image/png' }));
+    await expect(readFirst(streams.video)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(readFirst(streams.audio)).resolves.toBeUndefined();
+  });
+
+  it('decode applies explicit image track selection as a one-track whitelist', async () => {
+    const streams = createMedia().decode(fromBytes(loadImage('test.png'), { mime: 'image/png' }), {
+      trackSelect: ['video:0'],
+    });
+
     await expect(readFirst(streams.video)).rejects.toBeInstanceOf(CapabilityError);
     await expect(readFirst(streams.audio)).resolves.toBeUndefined();
   });
@@ -1473,6 +1834,24 @@ describe('createMedia', () => {
     expect(frame.closeCount).toBe(1);
   });
 
+  it('decode applies a video track display rotation to emitted presentation pixels', async () => {
+    const codedFrame = new CancelRaceFrame();
+    const presentedFrame = new CancelRaceFrame();
+    const seenDegrees: number[] = [];
+    const media = createMedia().use(
+      rotatedDecodeFrameModule(codedFrame, presentedFrame, seenDegrees),
+    );
+
+    const got = await readFirst(
+      media.decode(fromBytes(new Uint8Array([0]), { mime: 'video/x-rotated' })).video,
+    );
+    expect(got).toBe(presentedFrame);
+    expect(seenDegrees).toEqual([90]);
+    expect(codedFrame.closeCount).toBe(1);
+    presentedFrame.close();
+    expect(presentedFrame.closeCount).toBe(1);
+  });
+
   it('materializes a one-shot input once so dual-track decode is pull-order safe', async () => {
     const bytes = Uint8Array.of(1, 2, 3, 4, 5, 6);
     let inputPulls = 0;
@@ -1509,6 +1888,45 @@ describe('createMedia', () => {
     videoFrame.close();
     expect(audioFrame.closeCount).toBe(1);
     expect(videoFrame.closeCount).toBe(1);
+  });
+
+  it('decode selects a secondary video track by per-type ordinal', async () => {
+    const primaryFrame = new CancelRaceFrame();
+    const secondaryFrame = new CancelRaceFrame();
+    const requestedTrackIds: number[] = [];
+    const media = createMedia().use(
+      selectableVideoTracksDecodeModule(primaryFrame, secondaryFrame, requestedTrackIds),
+    );
+    const decoded = media.decode(
+      fromBytes(Uint8Array.of(1), { mime: 'video/x-selectable-tracks' }),
+      { trackSelect: ['video:1'] },
+    );
+
+    const selected = await readFirst(decoded.video);
+    expect(selected).toBe(secondaryFrame);
+    expect(await readFirst(decoded.audio)).toBeUndefined();
+    expect(requestedTrackIds).toEqual([20]);
+    expect(primaryFrame.closeCount).toBe(0);
+    secondaryFrame.close();
+    expect(secondaryFrame.closeCount).toBe(1);
+  });
+
+  it('decode rejects selecting two distinct tracks for one MediaStreams slot', async () => {
+    const requestedTrackIds: number[] = [];
+    const media = createMedia().use(
+      selectableVideoTracksDecodeModule(
+        new CancelRaceFrame(),
+        new CancelRaceFrame(),
+        requestedTrackIds,
+      ),
+    );
+    const decoded = media.decode(
+      fromBytes(Uint8Array.of(1), { mime: 'video/x-selectable-tracks' }),
+      { trackSelect: ['video:0', 'video:1'] },
+    );
+
+    await expect(readFirst(decoded.video)).rejects.toBeInstanceOf(InputError);
+    expect(requestedTrackIds).toEqual([]);
   });
 
   it('codec/container-dependent ops raise a typed CapabilityError when nothing can serve them', async () => {
@@ -1903,6 +2321,8 @@ describe('bare-function sugar', () => {
     expect(sugar.transcode).toBe(sugar.convert);
     await expect(sugar.probe(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.demux(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(sugar.packetInfo(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(sugar.packetInfoBatches(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.convert(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);
     await expect(sugar.h264AbrLadder(NOOP_BYTES, [])).rejects.toBeInstanceOf(InputError);
     await expect(sugar.remux(NOOP_BYTES, { to: 'mp4' })).rejects.toBeInstanceOf(CapabilityError);

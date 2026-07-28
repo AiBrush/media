@@ -51,7 +51,7 @@ export const SELECTIVE_CONTAINERS: readonly SelectiveContainerSpec[] = [
   {
     id: 'wav',
     matches: matchesWav,
-    load: () => import('./wav/wav-driver.ts').then((module) => module.default),
+    load: () => import('./wav/wav-lazy-driver.ts').then((module) => module.default),
   },
   {
     id: 'mp3',
@@ -119,6 +119,7 @@ export async function registerDefaultContainerForQuery(
   registry: Registry,
   query: ContainerQuery,
   pinDriver?: string,
+  beforeRegister?: () => void,
 ): Promise<boolean> {
   const spec =
     pinDriver === undefined
@@ -129,7 +130,9 @@ export async function registerDefaultContainerForQuery(
             (candidate.pinnedRequiresMatch !== true || candidate.matches(query)),
         );
   if (spec === undefined) return false;
-  (await spec.load()).register(registry);
+  const module = await spec.load();
+  beforeRegister?.();
+  module.register(registry);
   return true;
 }
 
@@ -140,9 +143,10 @@ export async function pickContainerWithDefaultFallback(
   query: ContainerQuery,
   pinDriver: string | undefined,
   registerAll: () => Promise<void>,
+  beforeSelectiveRegister?: () => void,
 ): Promise<ContainerDriver> {
   const select = pinDriver === undefined ? {} : { pinDriver };
-  if (await registerDefaultContainerForQuery(registry, query, pinDriver)) {
+  if (await registerDefaultContainerForQuery(registry, query, pinDriver, beforeSelectiveRegister)) {
     router.clearCache();
     try {
       return router.pickContainer(query, select);
