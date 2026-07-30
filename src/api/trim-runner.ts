@@ -21,6 +21,7 @@ import {
   from as normalizeInput,
 } from '../sources/source.ts';
 import { containerHasChunkMuxer, isPcmContainer } from './codec-routing.ts';
+import { assertTrimRange } from './trim-range.ts';
 import type { AudioTarget, CallOptions, Container, TrimOptions, VideoTarget } from './types.ts';
 
 const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
@@ -91,7 +92,6 @@ export interface TrimRunnerContext {
     signal: AbortSignal,
     options: CallOptions,
   ) => Promise<void>;
-  readonly assertRange: (startSec: number, endSec: number, durationSec: number) => void;
 }
 
 /** Execute trim after the eager engine has established its cancellation and exact-pin domain. */
@@ -102,6 +102,9 @@ export async function runTrim(
   options: CallOptions,
   signal: AbortSignal,
 ): Promise<Output> {
+  // These guards are independent of media duration, so reject before normalizing, sniffing, routing, or
+  // reading the source. Duration-relative bounds are checked again below once probe truth is available.
+  assertTrimRange(opts.start, opts.end, 0);
   const source = cacheProbeRanges(normalizeByteInput(input, 'trim'));
   const container = await context.container(source, 'demux', signal, options.strategy?.pinDriver);
   const target = (container.formats[0] ?? 'mp4') as Container;
@@ -122,6 +125,7 @@ export async function runTrim(
       const stream = await container.streamCopy(source, {
         ...context.stage(signal, options),
         trim: { startSec: opts.start, endSec: opts.end },
+        identitySourceIfFullRange: true,
         ...fragmented,
         ...streamCopySinkMode(opts.sink),
       });
@@ -144,7 +148,7 @@ export async function runTrim(
   }
 
   const durationSec = await probeDurationSec(context, container, source, signal, options);
-  context.assertRange(opts.start, opts.end, durationSec);
+  assertTrimRange(opts.start, opts.end, durationSec);
   if (opts.mode === 'accurate' && isWholeSourceTrim(source, opts, durationSec)) {
     if (opts.fragmented === true && container.streamCopy !== undefined) {
       const stream = await container.streamCopy(source, {

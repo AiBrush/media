@@ -1487,6 +1487,17 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
       await runTrim(keyedSource('trim-cache'), 0.75);
       expect(decodeCalls).toBe(decodeBeforeBulk + 130);
       expect(supportCalls).toBe(supportBeforeBulk + 129);
+
+      const decodeBeforeOptOut = decodeCalls;
+      const supportBeforeOptOut = supportCalls;
+      const noValidation = await streamCopy(keyedSource('trim-validation-opt-out'), {
+        trim: { startSec: 0, endSec: 0.75 },
+        buffered: true,
+        validateDecode: false,
+      });
+      expect((await collectStreamBytes(noValidation)).byteLength).toBeGreaterThan(0);
+      expect(decodeCalls).toBe(decodeBeforeOptOut);
+      expect(supportCalls).toBe(supportBeforeOptOut);
     } finally {
       if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
       else

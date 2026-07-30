@@ -444,6 +444,33 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(equalBytes(fullRange, untrimmed)).toBe(true);
   });
 
+  it('returns exact source bytes when a same-container full-range trim permits identity', async () => {
+    if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
+    const input = await loadFixture('movie_5.mp4');
+    const movie = await readMovie(ra(input));
+    const reads: Array<{ offset: number; length: number }> = [];
+    const source: ByteSource = {
+      ...rangeSource(input, reads),
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(input);
+            controller.close();
+          },
+        }),
+    };
+    const fullRange = await collectBytes(
+      await Mp4Driver.streamCopy(source, {
+        trim: { startSec: 0, endSec: movie.durationSec },
+        buffered: true,
+        identitySourceIfFullRange: true,
+      }),
+    );
+
+    expect(equalBytes(fullRange, input)).toBe(true);
+    expect(reads.length).toBeGreaterThan(0);
+  });
+
   it('keyframe trim range-reads only metadata and selected sample windows', async () => {
     if (!Mp4Driver.streamCopy) throw new Error('mp4 driver has no streamCopy');
     const input = await loadFixture('movie_5.mp4');

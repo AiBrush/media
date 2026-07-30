@@ -481,7 +481,7 @@ describe('media.trim (mp4 keyframe-copy)', () => {
     }
   });
 
-  it('full-range keyframe trim reimports as an idempotent packet copy', async () => {
+  it('full-range keyframe trim returns the exact source and remains an idempotent packet copy', async () => {
     const m = media();
     const input = await loadFixture('movie_5.mp4');
     const orig = await readMovie(ra(input));
@@ -493,7 +493,7 @@ describe('media.trim (mp4 keyframe-copy)', () => {
       }),
     );
 
-    expect(equalBytes(out, input)).toBe(false);
+    expect(equalBytes(out, input)).toBe(true);
     const re = await readMovie(ra(out));
     expect(re.tracks.length).toBe(orig.tracks.length);
     for (let i = 0; i < orig.tracks.length; i++) {

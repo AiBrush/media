@@ -115,6 +115,7 @@ function delacePackets(pages: readonly ScannedPage[]): Uint8Array[] {
   return packets;
 }
 
+const HT_CONTINUED = 0x01;
 const HT_BOS = 0x02;
 const HT_EOS = 0x04;
 
@@ -240,6 +241,7 @@ describe('buildPages — lacing (pure)', () => {
     expect(pages).toHaveLength(2);
     expect(pages[0]?.lacing.length).toBe(255);
     expect(pages[1]?.lacing.length).toBe(45);
+    expect((pages[1]?.headerType ?? 0) & HT_CONTINUED).toBe(0);
     // Page 1's granule is the 255th packet's; page 2's is the 300th's.
     expect(pages[0]?.granule).toBe(255);
     expect(pages[1]?.granule).toBe(300);
@@ -444,6 +446,7 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
 
     const pages = scanPages(bytes);
     for (const p of pages) expect(p.computedCrc).toBe(p.storedCrc); // CRC holds across the split
+    expect(pages.some((page) => (page.headerType & HT_CONTINUED) !== 0)).toBe(true);
     // The audio packet is the 3rd packet (after OpusHead, OpusTags) and reassembles exactly.
     const audioPacket = delacePackets(pages)[2];
     expect(audioPacket?.byteLength).toBe(70_000);

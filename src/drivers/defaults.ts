@@ -185,6 +185,7 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     supports: matchesMpegTs,
     load: () => import('./mpegts/mpegts-driver.ts').then((m) => m.MpegTsDriver),
     probe: true,
+    packetInfo: true,
     streamCopy: true,
     decrypt: true,
   },

@@ -117,6 +117,10 @@ const SMALL_URL_TRIM_RANDOM_ACCESS_MAX_BYTES = 8 * 1024 * 1024;
 const TRIM_END_RANGE_SLACK_SEC = 1;
 const TRIM_DECODE_VALIDATION_CACHE_TTL_MS = 60_000;
 const TRIM_DECODE_VALIDATION_CACHE_MAX_ENTRIES = 128;
+// A stream-copy trim decode-validates the selected AVC window before exposing output. Retain those exact
+// range responses briefly so the subsequent payload stream does not fetch the same coded bytes twice.
+// The cap bounds operation-local memory independently of source size and covers ordinary edit windows.
+const TRIM_VALIDATION_READ_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const FNV1A_32_OFFSET_BASIS = 0x811c9dc5;
 const FNV1A_32_PRIME = 0x01000193;
 const CENC_SCHEME = 'cenc' as const;
@@ -144,6 +148,39 @@ type SizedRandomAccess = RandomAccess & { readonly size: number };
 interface RandomAccessOptions {
   readonly eagerReadMaxBytes?: number;
   readonly signal?: AbortSignal;
+}
+
+function trimValidationReadCache(ra: RandomAccess): RandomAccess {
+  if (ra.inMemory === true) return ra;
+  const exactReads = new Map<string, Uint8Array>();
+  let retainedBytes = 0;
+  return {
+    async read(offset, length, signal): Promise<Uint8Array> {
+      const key = `${offset}:${length}`;
+      const retained = exactReads.get(key);
+      if (retained !== undefined) {
+        throwIfAborted(signal);
+        return retained;
+      }
+      const bytes = await ra.read(offset, length, signal);
+      if (
+        bytes.byteLength === length &&
+        length <= TRIM_VALIDATION_READ_CACHE_MAX_BYTES - retainedBytes
+      ) {
+        exactReads.set(key, bytes);
+        retainedBytes += length;
+      }
+      return bytes;
+    },
+    get size(): number | undefined {
+      return ra.size;
+    },
+    ...(ra.metadataPrefetchBytes !== undefined
+      ? { metadataPrefetchBytes: ra.metadataPrefetchBytes }
+      : {}),
+    inMemory: false,
+    ...(ra.cachedWhole !== undefined ? { cachedWhole: () => ra.cachedWhole?.() } : {}),
+  };
 }
 
 /** Return a zero-copy view only when retained bytes cover the complete safe half-open interval. */
@@ -3014,14 +3051,22 @@ async function trimMuxTracks(
   startSec: number,
   endSec: number,
   signal: AbortSignal | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): Promise<MuxTrackInput[]> {
   const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
   const out: MuxTrackInput[] = [];
   for (const track of movie.tracks) {
     const selected = selectTrimmed(track, startSec, endSec, fragmentSamples?.get(track.id));
     const samples = await readSamples(ra, selected);
-    await verifyTrimmedAvcDecodeIfAvailable(track, selected, samples, signal, validationCacheBase);
+    if (validationCacheBase !== null) {
+      await verifyTrimmedAvcDecodeIfAvailable(
+        track,
+        selected,
+        samples,
+        signal,
+        validationCacheBase,
+      );
+    }
     const edit = trimPresentationEdit(track, selected, startSec, endSec);
     const mediaDurationTicks = selected.reduce(
       (duration, sample) => duration + sample.durationTicks,
@@ -4070,19 +4115,21 @@ async function lazyProgressiveTrimTracksFromMovie(
   startSec: number,
   endSec: number,
   signal: AbortSignal | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): Promise<LazyProgressiveTrack[]> {
   const tracks: LazyProgressiveTrack[] = [];
   for (const track of movie.tracks) {
     const samples = selectTrimmed(track, startSec, endSec);
     validateSampleRanges(samples, ra.size);
-    await verifyTrimmedAvcDecodeFromSourceIfAvailable(
-      track,
-      samples,
-      ra,
-      signal,
-      validationCacheBase,
-    );
+    if (validationCacheBase !== null) {
+      await verifyTrimmedAvcDecodeFromSourceIfAvailable(
+        track,
+        samples,
+        ra,
+        signal,
+        validationCacheBase,
+      );
+    }
     const edit = trimPresentationEdit(track, samples, startSec, endSec);
     tracks.push({
       metadata: {
@@ -4430,12 +4477,13 @@ async function* trimmedProgressiveSourceSegments(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): AsyncGenerator<Uint8Array, void, undefined> {
+  const operationRa = trimValidationReadCache(ra);
   yield* progressiveSegmentsFromTracks(
-    ra,
+    operationRa,
     await lazyProgressiveTrimTracksFromMovie(
-      ra,
+      operationRa,
       movie,
       trim.startSec,
       trim.endSec,
@@ -4477,7 +4525,7 @@ function trimmedProgressiveSourceStream(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): ReadableStream<Uint8Array> {
   const segments = trimmedProgressiveSourceSegments(ra, movie, trim, o, validationCacheBase);
   return new ReadableStream<Uint8Array>(
@@ -4518,12 +4566,13 @@ async function materializeTrimmedProgressiveSourceBytes(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): Promise<Uint8Array> {
+  const operationRa = trimValidationReadCache(ra);
   return materializeProgressiveTracksBytes(
-    ra,
+    operationRa,
     await lazyProgressiveTrimTracksFromMovie(
-      ra,
+      operationRa,
       movie,
       trim.startSec,
       trim.endSec,
@@ -4569,7 +4618,7 @@ function trimmedProgressiveSourceBufferStream(
   movie: Movie,
   trim: NonNullable<StreamCopyOptions['trim']>,
   o: StreamCopyOptions | undefined,
-  validationCacheBase: string | undefined,
+  validationCacheBase: string | null | undefined,
 ): ReadableStream<Uint8Array> {
   let emitted = false;
   return new ReadableStream<Uint8Array>(
@@ -4607,6 +4656,16 @@ function trimCoversMovie(movie: Movie, trim: NonNullable<StreamCopyOptions['trim
     trim.endSec >= movie.durationSec &&
     trackDurationSec - trim.endSec <= FULL_RANGE_EOF_SLACK_SEC
   );
+}
+
+function exactFullRangeSourceStream(src: ByteSource, ra: RandomAccess): ReadableStream<Uint8Array> {
+  const retained = ra.cachedWhole?.();
+  return retained === undefined ? src.stream() : oneShot(retained);
+}
+
+function fullRangeIdentityKeepsContainer(movie: Movie, o: StreamCopyOptions | undefined): boolean {
+  const sourceBrand: ContainerBrand = movie.brand === 'qt  ' ? 'mov' : 'mp4';
+  return brandFor(o?.container) === sourceBrand;
 }
 
 function validateStreamCopyTrimRange(
@@ -4876,8 +4935,21 @@ export const Mp4Driver: ContainerDriver = {
       requestedTrim !== undefined && !trimCoversMovie(movie, requestedTrim)
         ? requestedTrim
         : undefined;
+    if (
+      requestedTrim !== undefined &&
+      trim === undefined &&
+      o?.identitySourceIfFullRange === true &&
+      o.fragmented !== true &&
+      fullRangeIdentityKeepsContainer(movie, o)
+    ) {
+      return exactFullRangeSourceStream(src, ra);
+    }
     const validationCacheBase =
-      trim !== undefined ? trimDecodeValidationCacheBase(src, ra) : undefined;
+      trim === undefined
+        ? undefined
+        : o?.validateDecode === false
+          ? null
+          : trimDecodeValidationCacheBase(src, ra);
     if (shouldLoadCompatibleMovToMp4Rewrite(movie, o)) {
       const { materializeCompatibleMovToMp4Bytes } = await import('./compatible-mov-rewrite.ts');
       const compatibleBrandRewrite = await materializeCompatibleMovToMp4Bytes(src, ra, movie, o);

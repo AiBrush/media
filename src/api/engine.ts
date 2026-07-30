@@ -37,7 +37,7 @@ import type {
   TrackInfo,
   WasmRuntimeProfile,
 } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { type CodecRoute, Router, type StageSelectOptions } from '../kernel/router.ts';
@@ -111,7 +111,6 @@ import {
   sourceMayHaveBlobProbeHandoff,
   throwIfAborted,
 } from './source-io.ts';
-import { assertTrimRange } from './trim-range.ts';
 import type { TrimRunnerContext } from './trim-runner.ts';
 import type {
   AudioTarget,
@@ -343,6 +342,13 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#probeContainerResultCache.wrap(src);
   }
 
+  async #cacheFiniteBlobRanges(src: Source): Promise<Source> {
+    if (!sourceMayHaveBlobProbeHandoff(src)) return src;
+    const cache = await loadProbeRangeCache();
+    this.#assertNotDisposed();
+    return cache.cacheFiniteBlobProbeRanges(src, this.#sourcePrefixHandoff);
+  }
+
   from(input: MediaStream | LiveMediaSource, opts?: FromOptions): LiveMediaSource;
   from(input: HTMLMediaElement, opts: FromOptions & { readonly mode: 'capture' }): LiveMediaSource;
   from(input: HTMLMediaElement): Source;
@@ -507,9 +513,15 @@ export class MediaEngineImpl implements MediaEngine {
 
   demux(input: MediaInput, o: CallOptions = {}): Cancellable<Demuxed> {
     return this.#withCancel(o, async (signal) => {
-      const src = await this.#resolveHlsInput(input, normalizeByteInput(input, 'demux'), signal);
-      const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
+      const normalized = normalizeByteInput(input, 'demux');
+      throwIfAborted(signal);
+      if (normalized.size === 0) {
+        throw new InputError('cannot demux an empty input');
+      }
+      let src = await this.#resolveHlsInput(input, normalized, signal);
       try {
+        src = await this.#cacheFiniteBlobRanges(src);
+        const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
         return await container.demux(src, this.#stageOptions(signal, o));
       } catch (error) {
         await cancelSource(src, error);
@@ -549,6 +561,7 @@ export class MediaEngineImpl implements MediaEngine {
       return run(
         {
           resolveHls: this.#resolveHlsInput.bind(this),
+          cacheFiniteBlobRanges: this.#cacheFiniteBlobRanges.bind(this),
           routeSource: (source, activeSignal, pinDriver) =>
             this.#routeContainer(source, 'demux', activeSignal, pinDriver),
           routeToken: (container, pinDriver) =>
@@ -1175,7 +1188,6 @@ export class MediaEngineImpl implements MediaEngine {
       decodeAudio: this.#decodeAudioTrackPackets.bind(this),
       encodeVideo: this.#encodeVideoStream.bind(this),
       encodeAudio: this.#encodeAudioStream.bind(this),
-      assertRange: assertTrimRange,
     };
   }
 

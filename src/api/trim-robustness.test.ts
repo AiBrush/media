@@ -14,6 +14,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
+import type { Source } from '../sources/source.ts';
 import { fixtureSource } from '../test-support/corpus.ts';
 import { createMedia } from './create-media.ts';
 import { assertTrimRange } from './engine.ts';
@@ -109,6 +110,37 @@ describe('trim range validation (real corpus MP4s)', () => {
     for (const id of MP4_FIXTURES) {
       await expect(trimBytes(id, Number.NaN, 4)).rejects.toBeInstanceOf(InputError);
     }
+  });
+
+  it('rejects intrinsically invalid ranges before reading or routing the source', async () => {
+    let sourceTouches = 0;
+    const unreadable: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: 1,
+      mimeHint: 'video/mp4',
+      filename: 'unreadable.mp4',
+      range() {
+        sourceTouches++;
+        return Promise.reject(new Error('invalid trim must not range-read its source'));
+      },
+      stream() {
+        sourceTouches++;
+        throw new Error('invalid trim must not stream its source');
+      },
+    };
+
+    for (const [start, end] of [
+      [Number.NaN, 4],
+      [-2, 4],
+      [8, 2],
+      [5, 5],
+    ] as const) {
+      await expect(
+        media().trim(unreadable, { start, end, mode: 'keyframe' }),
+      ).rejects.toBeInstanceOf(InputError);
+    }
+    expect(sourceTouches).toBe(0);
   });
 });
 

@@ -1,6 +1,6 @@
 # Media marathon feature ledger
 
-Date: 2026-07-28
+Date: 2026-07-29
 Benchmark: sibling `../media-test` checkout, treated as immutable
 Required benchmark protocol: Chromium, exhaustive candidates, `--warmup 1 --iters 5 --no-reuse`
 
@@ -170,69 +170,149 @@ Across exhaustive input variants, aibrush passes 93/102, ahead of FFmpeg.wasm at
 Mediabunny at 63/102. The nine aibrush NAs are exactly four endian-round-trip adapter declarations,
 four universally inapplicable image-to-audio variants, and the one authored 5.1-matrix adapter gap.
 
-### Demux closure: bounded MP4 packet-fact reuse and the remaining comparison boundary
+### Demux closure: feature-by-feature 2026-07-29 pass
 
-The required six-engine demux command ran after the final product gate and vendor sync:
+All 49 current `demux/*` definitions were enumerated from the sibling acceptance harness and run
+individually against all six scored engines in fresh Chromium, with exhaustive inputs, one warmup, five
+measured iterations, and no reuse. The per-cell artifacts are listed below. The product gate then passed
+251 test files / 4,538 tests, 90.00% branch coverage, typecheck, the 782-file Biome check, production
+build, generator checks, 11 dist-smoke tests, package install/exports/TypeScript checks, and all 51
+anti-cheat checks. The eager kernel is 49.72 kB / 50.00 kB and the typical-app closure is
+67.59 kB / 256 kB.
 
-`bash scripts/run.sh --browser chromium --feature demux --pillar all --exhaustive --no-reuse
---warmup 1 --iters 5 --random-seed marathon-demux-closure-20260728-v3`
+The retained product changes are general-purpose:
 
-The terminal artifact is `chromium-2026-07-28T11-01-09-472Z.json`: 294/294 parent cells completed
-with 221 PASS, 72 NA_ENGINE, and one FFmpeg.wasm partial failure. Its raw SHA-256 is
-`36c91f33fdad1bfffdb07d8d2550b44085da9857f5ad531a29bc3f0ed8dcd313`; embedded content hash is
-`02e235a564d796a9624c76728feec88f92fb3cdc7a3663f7bb549f114cc91599`; run ID is
-`run-9cf01b334f810df4b19793906b79381d4723d7694436b28d8f70b8305a0edd00`; manifest digest is
-`4bdd20cbfe5de6edbdad034428f928697a1a5754c3a10b659a5fc8d00c8983a0`; and corpus checksum is
+- finite immutable Blob sources now share an owned, bounded start-at-zero byte handoff across `demux`,
+  `packetInfo`, and `packetInfoBatches`; every operation still reparses and receives a defensive byte
+  copy, while mutable, unknown-size, non-Blob, expired, aborted, and oversized ranges bypass retention;
+- MPEG-TS exposes an exact payload-free packet-info table, and a live demuxer exposes the same facts
+  without replaying packet streams;
+- the H.264 TS parser scans each PES once for IDR and access-unit boundaries and reuses proven
+  one-access-unit-per-PES payloads while preserving the general cross-PES fallback and DTS repair;
+- known-empty demux input throws a typed `InputError` before source I/O or driver routing, with
+  already-aborted callers retaining abort precedence;
+- focused lifecycle, cancellation, source-mutation isolation, malformed-boundary, and cache-boundary
+  regressions cover the new paths.
+
+The TS optimization moved the aibrush aggregate median for `demux/h264_ts` from 25.535 ms in
+`chromium-2026-07-29T16-07-17-025Z.json` to 6.965 ms in
+`chromium-2026-07-29T16-21-58-641Z.json`; the final closure measured 7.465 ms. It preserves exact
+packet count, byte size, PTS, DTS, keyframe classification, global decode ordering, and the
+cross-PES fallback.
+
+After the gate, `bun run sync-vendor` refreshed the generated aibrush vendor at source revision
+`6ac6ab3f82614d83ed52dd57fb5d18c8854039f5 (dirty)`. The required closure command was:
+
+`bash scripts/run.sh --browser chromium --base-url http://127.0.0.1:52009 --feature demux
+--pillar all --exhaustive --no-reuse --warmup 1 --iters 5 --random-seed 20260729`
+
+The completed artifact is `chromium-2026-07-29T17-56-19-540Z.json`. It accounts for all 294/294
+parent cells: 221 PASS, 72 NA_ENGINE, and one external FFmpeg.wasm FAIL. Its raw SHA-256 is
+`307629ced874caa2871bff3281f925668c697bcb59a61fd0455648df5b3be5bf`; embedded content hash is
+`29c2cb39deac8b9dca6714f918fd01330cc1b84237eb0f753121f2c599cd449b`; run ID is
+`run-c22aad57a5b6ade917a84d8ee0e39844c0d6a72e426ab34de797681b9d03b76e`; manifest digest is
+`6e5b246a08548e1edb5b12280c01cf781a5d06b95af1050dc7e3436ed56423`; and corpus checksum is
 `b9dbeb1115c2d5c27bcb68c641b0fcd58453376d4a889d00c0323bd7786249a9`.
 
-Per-engine parent coverage was:
+Per-engine parent coverage is unchanged in shape from the prior closure:
 
 - aibrush-media: 45 PASS, 4 NA_ENGINE;
 - Mediabunny: 47 PASS, 2 NA_ENGINE;
-- FFmpeg.wasm: 44 PASS, 4 NA_ENGINE, 1 partial failure;
+- FFmpeg.wasm: 44 PASS, 4 NA_ENGINE, 1 FAIL;
 - Remotion: 40 PASS, 9 NA_ENGINE;
 - web-demuxer: 27 PASS, 22 NA_ENGINE;
 - MP4Box: 18 PASS, 31 NA_ENGINE.
 
 Across the 150 exhaustive children per engine, aibrush records 133 PASS and 17 NA_ENGINE. Sixteen NAs
-are the immutable adapter's first-packet-boundary declaration for four scale scenarios. The seventeenth
-is hidden candidate `demux/h264_in_mkv` / `03.mkv`, which contains a non-media JSON track and MJPEG
-attachment that the adapter cannot project into the canonical audio/video representation. Aibrush has
-no demux FAIL or ERROR.
+are the declared `AIBRUSH_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE` result for the four scale scenarios:
+the product materializes a complete packet table and does not expose the first-packet boundary that the
+scale timing contract requires. The seventeenth is hidden `demux/h264_in_mkv` candidate `03.mkv`,
+whose JSON track and MJPEG attachment cannot be projected into the canonical audio/video result.
+Aibrush has zero demux FAIL or ERROR children or parents.
 
-The retained product optimization is a general, bounded cache of parsed MP4 packet facts for an exact
-finite Blob URL identity. The semantic key includes URL, asserted byte size, MIME, and provider.
-Unknown options, HTTP sources, unknown-size or mutable identities, failures, and aborted operations
-bypass or do not populate the cache. Results are cloned, payload bytes and read windows are not retained,
-the cache has a 60-second absolute lifetime, eight-entry LRU capacity, and a 262,144-row aggregate cap.
-All 22 affected exhaustive candidates are larger than the ordinary in-memory cutoff, remain below the
-row cap, and reuse the same object URL through functional, warmup, and measured calls.
+The sole closure failure is not an aibrush result. On `demux/h264_1080p_5s` candidate `01.mov`,
+FFmpeg.wasm passes all 472 exact golden packet rows, including DTS after a track-local origin shift, but
+reports the contradictory nominal CFR value 20.49 fps. The authoritative packet timeline is VFR at
+30.000589 fps with a 29.844510–30.272758 fps observed envelope, so `golden-metadata` correctly fails
+that rival output. A fresh isolated rerun reproduced the same 3/4 aggregate failure in
+`chromium-2026-07-29T18-18-34-625Z.json` (raw SHA-256
+`3654f6dc8129cda44d2e2fed92f453601373e4b31f0123df864850a382f53b9b`). The harness, competitor
+adapter, golden, oracle, and support rules are immutable for this work, and changing aibrush cannot
+alter a rival cell. This is retained as `EXTERNAL`; it is not relabelled as PASS or NA_ENGINE.
+Consequently, the immutable all-engine artifact does not satisfy a literal zero-FAIL closure.
 
-Against the pre-change full-family artifact `chromium-2026-07-28T10-25-09-250Z.json`, 21 of those
-22 exact scenario/input rows improved, one tied, and none regressed; their geometric aggregate improved
-by 1.190× in the final closure. Representative aibrush median changes were fragmented CMAF
-8.295→6.075 ms, H.264 1080p base 138.020→115.670 ms, H.264 4K base 110.095→92.200 ms,
-B-frame MP4 50.805→39.060 ms, and multitrack MP4 25.795→18.820 ms.
+The suite does not provide the cohort dimensions needed for a reporter-certified cross-engine
+leaderboard. A same-scenario, same-input-SHA diagnostic using the suite's descriptive 3% band gives:
 
-The normalized reporter rejects all 294 cohorts as `NOT_COMPARABLE` because required cohort dimensions
-are absent; its normalized report content hash is
-`099e6176e4ce003e744d88d4644eb8ffe7267199415ac93dc970afd986c303ef`. The following exact
-scenario/input-SHA median/MAD cut is therefore diagnostic, not a reporter-certified leaderboard:
-
-| Rival | Matched rankable rows | Aibrush leads | Ties | Aibrush losses | Geomean rival / aibrush |
+| Rival | Matched PASS rows | Aibrush leads | Within 3% | Aibrush losses | Geomean rival / aibrush |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| FFmpeg.wasm | 122 | 115 | 4 | 3 | 2.729× |
-| Remotion | 100 | 99 | 1 | 0 | 7.045× |
-| web-demuxer | 69 | 68 | 0 | 1 | 5.721× |
-| Mediabunny | 118 | 53 | 9 | 56 | 0.952× |
-| MP4Box | 44 | 2 | 0 | 42 | 0.505× |
-| Fastest rival per row | 123 | 49 | 7 | 67 | 0.853× |
+| FFmpeg.wasm | 132 | 129 | 2 | 1 | 3.025× |
+| Remotion | 110 | 106 | 0 | 4 | 6.856× |
+| web-demuxer | 79 | 78 | 0 | 1 | 5.883× |
+| Mediabunny | 128 | 66 | 1 | 61 | 1.068× |
+| MP4Box | 50 | 2 | 1 | 47 | 0.509× |
+| Fastest rival per row | 133 | 60 | 4 | 69 | 0.922× |
 
-The optimization therefore improves real product work and preserves the broadest practical packet
-semantics, but it does not establish a universal demux speed crown. On the remaining MP4-heavy losses,
-the immutable adapter rebuilds its rich per-packet representation and repeatedly copies decoder
-configuration evidence after the product returns. Removing configuration or metadata would weaken the
-public result and overfit the harness, so no such shortcut was retained.
+These counts are diagnostic, not statistical win claims. The remaining losses are concentrated in
+MP4Box's narrower ISO parser and Mediabunny's compact audio parsers. Aibrush returns richer public
+packet and decoder-configuration evidence, after which the immutable adapter rebuilds and copies its
+own representation. Removing packet facts, configuration, track metadata, or validation would weaken
+the product result or optimize only the harness, so those shortcuts were not retained.
+
+The final closure medians below are median-of-exhaustive-file medians. The rival column includes only
+PASS engines with the same passing input-SHA set as aibrush; it is descriptive, not a sole-winner claim.
+
+| Scenario | Cell artifact | Aibrush closure | Median | Fastest coverage-equal rival |
+| --- | --- | ---: | ---: | --- |
+| `demux/aac_adts` | `chromium-2026-07-29T16-38-03-314Z.json` | PASS 4/4 | 1.372 ms | Mediabunny 1.585 ms |
+| `demux/aac_audio_only` | `chromium-2026-07-29T16-38-39-736Z.json` | PASS 1/1 | 2.365 ms | MP4Box 1.710 ms |
+| `demux/av1_720p_5s` | `chromium-2026-07-29T16-05-54-110Z.json` | PASS 4/4 | 7.270 ms | FFmpeg.wasm 16.593 ms |
+| `demux/empty_audio_zero_packets` | `chromium-2026-07-29T17-25-49-396Z.json` | PASS 1/1 | 0.310 ms | Mediabunny 0.020 ms |
+| `demux/flac_noseektable` | `chromium-2026-07-29T16-51-54-392Z.json` | PASS 4/4 | 0.408 ms | Mediabunny 0.287 ms |
+| `demux/flac_seektable` | `chromium-2026-07-29T16-42-25-626Z.json` | PASS 4/4 | 0.410 ms | Mediabunny 0.193 ms |
+| `demux/fragmented_cmaf` | `chromium-2026-07-29T16-56-42-217Z.json` | PASS 1/1 | 6.125 ms | MP4Box 3.225 ms |
+| `demux/gapless_aac` | `chromium-2026-07-29T16-58-39-276Z.json` | PASS 1/1 | 0.370 ms | Mediabunny 0.280 ms |
+| `demux/graceful_mp4_header_destroyed` | `chromium-2026-07-29T17-30-00-806Z.json` | PASS 4/4 | 95.493 ms | MP4Box 48.477 ms |
+| `demux/graceful_truncated_h264` | `chromium-2026-07-29T17-29-45-442Z.json` | PASS 1/1 | 40.275 ms | MP4Box 8.395 ms |
+| `demux/graceful_webm_header_destroyed` | `chromium-2026-07-29T17-30-29-072Z.json` | PASS 4/4 | 66.333 ms | Mediabunny 66.592 ms |
+| `demux/graceful_zero_length` | `chromium-2026-07-29T17-29-16-612Z.json` | PASS 1/1 | 76.375 ms | Remotion 8.345 ms |
+| `demux/h264_1080p_30s` | `chromium-2026-07-29T15-55-43-426Z.json` | PASS 4/4 | 26.353 ms | Mediabunny 11.560 ms |
+| `demux/h264_1080p_5s` | `chromium-2026-07-29T16-03-09-439Z.json` | PASS 4/4 | 17.218 ms | MP4Box 9.158 ms |
+| `demux/h264_4k_10s` | `chromium-2026-07-29T16-46-36-203Z.json` | PASS 4/4 | 103.628 ms | MP4Box 46.340 ms |
+| `demux/h264_bframes_1080p` | `chromium-2026-07-29T16-00-50-464Z.json` | PASS 4/4 | 26.760 ms | MP4Box 9.790 ms |
+| `demux/h264_in_mkv` | `chromium-2026-07-29T16-06-38-536Z.json` | PASS 3/4 | 2.605 ms | Mediabunny 5.860 ms |
+| `demux/h264_multitrack` | `chromium-2026-07-29T16-02-29-238Z.json` | PASS 4/4 | 12.710 ms | MP4Box 5.700 ms |
+| `demux/h264_rotated90` | `chromium-2026-07-29T16-48-41-683Z.json` | PASS 4/4 | 12.870 ms | MP4Box 4.445 ms |
+| `demux/h264_ts` | `chromium-2026-07-29T16-21-58-641Z.json` | PASS 4/4 | 7.465 ms | Mediabunny 14.075 ms |
+| `demux/h264_vfr` | `chromium-2026-07-29T16-01-39-841Z.json` | PASS 4/4 | 36.318 ms | MP4Box 22.472 ms |
+| `demux/hevc_1080p_10s` | `chromium-2026-07-29T16-43-59-735Z.json` | PASS 1/1 | 40.910 ms | MP4Box 8.880 ms |
+| `demux/hls_aes128` | `chromium-2026-07-29T16-51-37-641Z.json` | PASS 1/1 | 14.655 ms | FFmpeg.wasm 67.610 ms |
+| `demux/hls_vod` | `chromium-2026-07-29T16-49-52-324Z.json` | PASS 1/1 | 11.960 ms | Mediabunny 40.290 ms |
+| `demux/metamorphic_flac_seektable_invariance` | `chromium-2026-07-29T17-30-54-116Z.json` | PASS 1/1 | 2.725 ms | Mediabunny 2.455 ms |
+| `demux/mislabeled_h264` | `chromium-2026-07-29T16-57-54-212Z.json` | PASS 1/1 | 0.425 ms | Mediabunny 0.990 ms |
+| `demux/mp3_cbr_notoc` | `chromium-2026-07-29T16-54-40-056Z.json` | PASS 4/4 | 2.055 ms | FFmpeg.wasm 2.658 ms |
+| `demux/mp3_xing` | `chromium-2026-07-29T16-53-49-313Z.json` | PASS 4/4 | 1.840 ms | Mediabunny 2.397 ms |
+| `demux/opus` | `chromium-2026-07-29T16-42-06-683Z.json` | PASS 4/4 | 0.307 ms | Mediabunny 0.535 ms |
+| `demux/pcm_s16_caf` | `chromium-2026-07-29T16-59-40-510Z.json` | PASS 1/1 | 0.620 ms | FFmpeg.wasm 2.410 ms |
+| `demux/pcm_s16be` | `chromium-2026-07-29T16-56-08-821Z.json` | PASS 4/4 | 0.797 ms | FFmpeg.wasm 0.987 ms |
+| `demux/realworld_mdn_flower_mp4` | `chromium-2026-07-29T16-00-11-789Z.json` | PASS 3/3 | 7.580 ms | Mediabunny 3.295 ms |
+| `demux/realworld_mdn_flower_webm` | `chromium-2026-07-29T16-04-46-102Z.json` | PASS 4/4 | 2.512 ms | FFmpeg.wasm 3.667 ms |
+| `demux/realworld_mdn_trex_mp3` | `chromium-2026-07-29T16-54-21-730Z.json` | PASS 4/4 | 1.478 ms | Mediabunny 1.798 ms |
+| `demux/size_huge_huge_h264_1080p_600s` | `chromium-2026-07-29T17-10-13-251Z.json` | NA_ENGINE 0/4 | — | — |
+| `demux/size_large_large_h264_1080p_120s` | `chromium-2026-07-29T17-01-59-633Z.json` | NA_ENGINE 0/4 | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | `chromium-2026-07-29T17-05-51-121Z.json` | NA_ENGINE 0/4 | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | `chromium-2026-07-29T17-14-36-268Z.json` | NA_ENGINE 0/4 | — | — |
+| `demux/size_micro_micro_audio_short` | `chromium-2026-07-29T17-00-23-206Z.json` | PASS 4/4 | 4.760 ms | MP4Box 3.043 ms |
+| `demux/size_micro_micro_h264_1frame` | `chromium-2026-07-29T17-00-04-176Z.json` | PASS 1/1 | 0.230 ms | Mediabunny 0.060 ms |
+| `demux/size_tiny_tiny_h264_360p_2s` | `chromium-2026-07-29T17-01-07-706Z.json` | PASS 4/4 | 2.953 ms | MP4Box 1.828 ms |
+| `demux/size_tiny_tiny_vp9_360p_2s` | `chromium-2026-07-29T17-01-25-850Z.json` | PASS 4/4 | 0.588 ms | Mediabunny 2.660 ms |
+| `demux/ts_discontinuity` | `chromium-2026-07-29T16-59-03-533Z.json` | PASS 1/1 | 1.205 ms | Mediabunny 3.540 ms |
+| `demux/vp8_720p_10s` | `chromium-2026-07-29T16-05-17-085Z.json` | PASS 4/4 | 2.240 ms | FFmpeg.wasm 3.862 ms |
+| `demux/vp9_1080p_10s` | `chromium-2026-07-29T16-03-53-300Z.json` | PASS 4/4 | 13.787 ms | Mediabunny 20.965 ms |
+| `demux/vp9_alpha` | `chromium-2026-07-29T16-49-21-376Z.json` | PASS 1/1 | 0.465 ms | Mediabunny 1.560 ms |
+| `demux/wav_f32` | `chromium-2026-07-29T16-55-36-297Z.json` | PASS 4/4 | 0.495 ms | Mediabunny 0.255 ms |
+| `demux/wav_s16` | `chromium-2026-07-29T16-55-04-756Z.json` | PASS 4/4 | 0.478 ms | Mediabunny 1.270 ms |
+| `demux/wav_s24` | `chromium-2026-07-29T16-55-19-382Z.json` | PASS 4/4 | 0.538 ms | Mediabunny 0.845 ms |
 
 ### Transcode closure: immutable result-schema validator abort
 

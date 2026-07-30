@@ -21,6 +21,7 @@ export type PacketInfoBatchCallOptions = PacketInfoCallOptions & { readonly batc
 
 export interface PacketInfoRunnerContext {
   resolveHls(input: MediaInput, source: Source, signal: AbortSignal): Promise<Source>;
+  cacheFiniteBlobRanges(source: Source): Promise<Source>;
   routeSource(
     source: Source,
     signal: AbortSignal,
@@ -36,8 +37,9 @@ export async function runPacketInfo(
   options: PacketInfoCallOptions,
   signal: AbortSignal,
 ): Promise<PacketInfoTable> {
-  const source = await context.resolveHls(input, normalizeByteInput(input, 'packetInfo'), signal);
+  let source = await context.resolveHls(input, normalizeByteInput(input, 'packetInfo'), signal);
   try {
+    source = await context.cacheFiniteBlobRanges(source);
     const container =
       options.container === undefined
         ? await context.routeSource(source, signal, options.strategy?.pinDriver)
@@ -68,12 +70,13 @@ export async function runPacketInfoBatches(
   // in the live lease as well, so a later caller abort still stops batch I/O after the stream is returned.
   const lifecycleSignal =
     options.signal === undefined ? signal : AbortSignal.any([signal, options.signal]);
-  const source = await context.resolveHls(
+  let source = await context.resolveHls(
     input,
     normalizeByteInput(input, 'packetInfoBatches'),
     lifecycleSignal,
   );
   try {
+    source = await context.cacheFiniteBlobRanges(source);
     const container =
       options.container === undefined
         ? await context.routeSource(source, lifecycleSignal, options.strategy?.pinDriver)

@@ -2108,7 +2108,25 @@ async function streamCopyWebm(
     });
   }
   assertNotAborted(options?.signal);
-  const demux = demuxWebm(await readAll(src, options?.signal));
+  const bytes = await readAll(src, options?.signal);
+  if (
+    options?.trim !== undefined &&
+    Math.abs(options.trim.startSec) <= Number.EPSILON &&
+    options.fragmented !== true
+  ) {
+    const info = parseWebm(bytes, {
+      scanClusters: false,
+      scanFirstKeyframes: false,
+      sourceSizeBytes: bytes.byteLength,
+    });
+    const requestedRange = normalizeTrimRange(options.trim, info.durationSec);
+    const sourceDocType = info.container === 'mkv' ? 'matroska' : 'webm';
+    if (requestedRange?.fullRange === true && streamCopyDocType(info, options) === sourceDocType) {
+      assertNotAborted(options.signal);
+      return streamFromBytes(bytes);
+    }
+  }
+  const demux = demuxWebm(bytes);
   assertNotAborted(options?.signal);
   const sourceDurationUs =
     demux.info.durationSec > 0 ? Math.round(demux.info.durationSec * MICROS_PER_SECOND) : undefined;
@@ -2173,6 +2191,15 @@ async function streamCopyWebm(
   }
   await muxer.finalize();
   return muxer.output;
+}
+
+function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }
 
 /**

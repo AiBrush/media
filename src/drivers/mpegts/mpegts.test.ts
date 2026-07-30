@@ -472,6 +472,56 @@ describe('golden-packets — access-unit count + per-frame size/PTS/DTS vs the h
 });
 
 describe('demux — packet seam (browser-gated like mp4)', () => {
+  it('exposes the exact payload-free packet table through packetInfo and the live demuxer', async () => {
+    const bytes = await bytesFromDerived(DERIVED_TS);
+    const parsed = parseTs(bytes);
+    const packetInfo = MpegTsDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('MpegTsDriver.packetInfo is not implemented');
+
+    const table = await packetInfo.call(MpegTsDriver, fromBytes(bytes, { mime: 'video/mp2t' }));
+    const expectedRows = parsed.tracks.reduce((count, track) => count + track.units.length, 0);
+    expect(table.tracks.map((track) => track.codec)).toEqual(['h264', 'aac']);
+    expect(table.packets).toHaveLength(expectedRows);
+    expect(table.packets.every((packet) => packet.offset === undefined)).toBe(true);
+    expect(table.packets.every((packet) => !('data' in packet) && !('payload' in packet))).toBe(
+      true,
+    );
+    for (let index = 1; index < table.packets.length; index += 1) {
+      const previous = table.packets[index - 1];
+      const current = table.packets[index];
+      if (previous === undefined || current === undefined)
+        throw new Error(`missing packet row ${index}`);
+      expect(
+        current.dtsUs > previous.dtsUs ||
+          (current.dtsUs === previous.dtsUs && current.trackIndex >= previous.trackIndex),
+      ).toBe(true);
+    }
+    for (let trackIndex = 0; trackIndex < parsed.tracks.length; trackIndex += 1) {
+      const units = parsed.tracks[trackIndex]?.units ?? [];
+      const rows = table.packets.filter((packet) => packet.trackIndex === trackIndex);
+      expect(rows).toHaveLength(units.length);
+      for (let index = 0; index < units.length; index += 1) {
+        const unit = units[index];
+        expect(rows[index]).toEqual({
+          trackIndex,
+          size: unit?.sizeBytes ?? unit?.data.byteLength,
+          ptsUs: unit?.ptsUs,
+          dtsUs: unit?.dtsUs,
+          keyframe: unit?.keyframe,
+        });
+      }
+    }
+
+    const demuxed = await MpegTsDriver.demux(fromBytes(bytes, { mime: 'video/mp2t' }));
+    const liveTable = (
+      demuxed as typeof demuxed & {
+        packetInfoTable?(): readonly (typeof table.packets)[number][];
+      }
+    ).packetInfoTable?.();
+    expect(liveTable).toEqual(table.packets);
+    await demuxed.close();
+  });
+
   it('exposes the tracks but the EncodedChunk seam is a typed capability gap in node', async () => {
     const demuxed = await MpegTsDriver.demux(
       fromBytes(await bytesFromDerived(DERIVED_TS), { mime: 'video/mp2t' }),

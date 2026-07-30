@@ -177,8 +177,9 @@ export function buildPages(
     let byteOffset = 0;
     while (segOffset < segs.length) {
       if (lacing.length === MAX_PAGE_SEGMENTS) {
+        // The preceding packet completed exactly at the page boundary. The current packet has not
+        // started yet, so the next page must not carry HT_CONTINUED.
         flush();
-        continued = true; // the remainder of this packet continues on the new page
       }
       const room = MAX_PAGE_SEGMENTS - lacing.length;
       const take = Math.min(room, segs.length - segOffset);

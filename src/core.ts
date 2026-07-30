@@ -125,6 +125,7 @@ export type {
 export {
   mp4PacketInfoFromBytes,
   mp4PacketInfoFromUrl,
+  mp4TrimFromUrl,
   muxPreparedMp4PacketTrack,
   muxPreparedMp4PacketTracks,
   muxPreparedMp4PacketTracksStream,
@@ -132,6 +133,7 @@ export {
 export { muxPreparedMpegTsPacketTracks } from './api/mpegts-prepared-mux.ts';
 export type {
   Mp4PacketInfoFromUrlOptions,
+  Mp4TrimFromUrlOptions,
   PreparedMp4PacketMuxInput,
   PreparedMp4PacketTrackMuxInput,
   PreparedMp4PacketTracksMuxInput,

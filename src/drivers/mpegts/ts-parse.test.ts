@@ -8,7 +8,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { detectFraming, parseTs } from './ts-parse.ts';
+import { deframeH264PesUnits, detectFraming, parseTs } from './ts-parse.ts';
 
 const DERIVED = new URL('../../../fixtures/media-derived/', import.meta.url).pathname;
 const PACKET = 188;
@@ -344,6 +344,73 @@ describe('parseTs H.264 access units spanning PES boundaries', () => {
     readonly dtsUs: number;
     readonly keyframe: boolean;
   }
+
+  it('reuses PES payloads when AUD boundaries prove one complete access unit per PES', () => {
+    const first = Uint8Array.of(
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x09,
+      0xf0,
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x65,
+      0xaa,
+    );
+    const second = Uint8Array.of(
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x09,
+      0xf0,
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x41,
+      0xbb,
+    );
+    const units = deframeH264PesUnits([
+      { data: first, ptsUs: 1_000, dtsUs: 1_000, keyframe: true },
+      { data: second, ptsUs: 2_000, dtsUs: 2_000, keyframe: false },
+    ]);
+    expect(units).toHaveLength(2);
+    expect(units[0]?.data).toBe(first);
+    expect(units[1]?.data).toBe(second);
+    expect(units.map(({ ptsUs, dtsUs, keyframe }) => ({ ptsUs, dtsUs, keyframe }))).toEqual([
+      { ptsUs: 1_000, dtsUs: 1_000, keyframe: true },
+      { ptsUs: 2_000, dtsUs: 2_000, keyframe: false },
+    ]);
+  });
+
+  it('keeps the cross-PES fallback when a PES does not begin at an AUD boundary', () => {
+    const first = Uint8Array.of(
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x09,
+      0xf0,
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x65,
+      0xaa,
+    );
+    const continuation = Uint8Array.of(0xbb, 0xcc);
+    const units = deframeH264PesUnits([
+      { data: first, ptsUs: 1_000, dtsUs: 1_000, keyframe: true },
+      { data: continuation, ptsUs: 2_000, dtsUs: 2_000, keyframe: false },
+    ]);
+    expect(units).toHaveLength(1);
+    expect(units[0]?.data).not.toBe(first);
+    expect(units[0]?.data).toEqual(concatBytes(first, continuation));
+  });
 
   it('matches every ffprobe packet on the rotated cross-PES Annex-B fixture', async () => {
     const mediaPath = new URL(

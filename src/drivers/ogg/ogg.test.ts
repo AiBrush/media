@@ -52,6 +52,20 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return out;
 }
 
+function byteSource(bytes: Uint8Array): ByteSource {
+  return {
+    size: bytes.byteLength,
+    range: (start, end) => Promise.resolve(bytes.slice(start, end)),
+    stream: () =>
+      new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(bytes.slice());
+          controller.close();
+        },
+      }),
+  };
+}
+
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 const MICROS_PER_SECOND = 1_000_000;
 const u16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
@@ -296,21 +310,208 @@ describe('OggDriver — demux seam + muxer', () => {
     }
   });
 
-  it('streamCopy trims Opus packets through the prepared Ogg writer without WebCodecs chunks', async () => {
+  it('streamCopy authors exact Opus pre-skip/end-granule trims while preserving coded packets', async () => {
     const streamCopy = OggDriver.streamCopy;
     if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
     expect(OggDriver.validatesStreamCopyTrim).toBe(true);
 
+    const seed = await loadFixture('sfx-opus.ogg');
+    const seedTable = oggPacketInfoFromBytes(seed);
+    const seedTrack = seedTable.tracks[0];
+    if (seedTrack === undefined || seedTable.packets.length === 0) {
+      throw new Error('Opus seed fixture is missing track or packet facts');
+    }
+    const packetCount = 180;
+    const sourceMuxer = new OggMuxer();
+    const sourceTrackId = sourceMuxer.addTrack({
+      ...seedTrack,
+      durationSec: packetCount * 0.02,
+    });
+    for (let index = 0; index < packetCount; index++) {
+      const packet = seedTable.packets[index % seedTable.packets.length];
+      if (packet === undefined) throw new Error(`missing Opus seed packet ${index}`);
+      sourceMuxer.addChunkStruct(sourceTrackId, {
+        timestampUs: index * 20_000,
+        durationUs: 20_000,
+        key: true,
+        data: oggPacketBytes(seed, packet),
+      });
+    }
+    await sourceMuxer.finalize();
+    const source = await collect(sourceMuxer.output);
+    const sourceTable = oggPacketInfoFromBytes(source);
+    const sourceDescription = sourceTable.tracks[0]?.config?.description;
+    if (!(sourceDescription instanceof Uint8Array)) {
+      throw new Error('authored Opus source is missing OpusHead');
+    }
+    const sourcePreSkip = new DataView(
+      sourceDescription.buffer,
+      sourceDescription.byteOffset,
+      sourceDescription.byteLength,
+    ).getUint16(10, true);
+    const sampleRate = 48_000;
+    const trim = { startSec: 2, endSec: 3 } as const;
+    const startFrame = trim.startSec * sampleRate;
+    const endFrame = trim.endSec * sampleRate;
+    const packetFrames = sourceTable.packets.map((packet) => {
+      if (packet.durationUs === undefined) throw new Error('Opus packet duration missing');
+      return Math.round((packet.durationUs * sampleRate) / MICROS_PER_SECOND);
+    });
+    const codedStarts: number[] = [];
+    let codedFrames = 0;
+    for (const frames of packetFrames) {
+      codedStarts.push(codedFrames);
+      codedFrames += frames;
+    }
+    const firstIndex = codedStarts.findIndex((codedStart) => {
+      const preSkip = startFrame - (codedStart - sourcePreSkip);
+      return preSkip >= 0 && preSkip <= 0xffff;
+    });
+    let lastIndex = -1;
+    for (let index = firstIndex; index < codedStarts.length; index++) {
+      const codedStart = codedStarts[index];
+      if (codedStart === undefined || codedStart - sourcePreSkip >= endFrame) break;
+      lastIndex = index;
+    }
+    if (firstIndex <= 0 || lastIndex < firstIndex) {
+      throw new Error('long Opus source did not produce a bounded pre-roll selection');
+    }
+    const selectedCodedStart = codedStarts[firstIndex];
+    const priorCodedStart = codedStarts[firstIndex - 1];
+    const finalPacketFrames = packetFrames[lastIndex];
+    if (
+      selectedCodedStart === undefined ||
+      priorCodedStart === undefined ||
+      finalPacketFrames === undefined
+    ) {
+      throw new Error('long Opus source selection indexes are out of bounds');
+    }
+    const expectedPreSkip = startFrame - (selectedCodedStart - sourcePreSkip);
+    const priorPreSkip = startFrame - (priorCodedStart - sourcePreSkip);
+    expect(expectedPreSkip).toBeLessThanOrEqual(0xffff);
+    expect(priorPreSkip).toBeGreaterThan(0xffff);
+
     const out = await collect(
-      await streamCopy(await fixtureSource('sfx-opus.ogg'), {
+      await streamCopy(byteSource(source), {
         container: 'ogg',
-        trim: { startSec: 0.04, endSec: 0.16 },
+        trim,
       }),
     );
 
-    const info = parseOgg(out, out);
-    expect(info.codec).toBe('opus');
-    expect(info.durationSec).toBeCloseTo(0.12, 1);
+    const outputTable = oggPacketInfoFromBytes(out);
+    const outputTrack = outputTable.tracks[0];
+    const outputDescription = outputTrack?.config?.description;
+    if (outputTrack === undefined || !(outputDescription instanceof Uint8Array)) {
+      throw new Error('trimmed Opus output is missing track or OpusHead facts');
+    }
+    const outputPreSkip = new DataView(
+      outputDescription.buffer,
+      outputDescription.byteOffset,
+      outputDescription.byteLength,
+    ).getUint16(10, true);
+    const finalGranule = Math.round((outputTrack.durationSec ?? 0) * sampleRate);
+    const expectedFinalGranule = expectedPreSkip + endFrame - startFrame;
+    const expectedPackets = sourceTable.packets.slice(firstIndex, lastIndex + 1);
+    const selectedCodedFrames = packetFrames
+      .slice(firstIndex, lastIndex + 1)
+      .reduce((sum, frames) => sum + frames, 0);
+
+    expect(outputPreSkip).toBe(expectedPreSkip);
+    expect(finalGranule).toBe(expectedFinalGranule);
+    expect(finalGranule - outputPreSkip).toBe(endFrame - startFrame);
+    expect(selectedCodedFrames - finalGranule).toBeGreaterThanOrEqual(0);
+    expect(selectedCodedFrames - finalGranule).toBeLessThan(finalPacketFrames);
+    expect(outputTable.packets.map((packet) => oggPacketBytes(out, packet))).toEqual(
+      expectedPackets.map((packet) => oggPacketBytes(source, packet)),
+    );
+  });
+
+  it('streamCopy rejects invalid and unrepresentable exact Opus trim ranges with typed errors', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const source = await loadFixture('sfx-opus.ogg');
+    const durationSec = oggPacketInfoFromBytes(source).tracks[0]?.durationSec;
+    if (durationSec === undefined) throw new Error('Opus fixture is missing duration');
+
+    const invalidRanges = [
+      {
+        trim: { startSec: Number.NaN, endSec: 0.1 },
+        message: 'bad trim',
+      },
+      {
+        trim: { startSec: -0.01, endSec: 0.1 },
+        message: 'trim start < 0',
+      },
+      {
+        trim: { startSec: 0.05, endSec: 0.05 },
+        message: 'empty trim range',
+      },
+      {
+        trim: { startSec: 0.1, endSec: 0.05 },
+        message: 'bad trim range',
+      },
+      {
+        trim: { startSec: durationSec, endSec: durationSec + 0.0005 },
+        message: 'trim start >= duration',
+      },
+      {
+        trim: { startSec: 0, endSec: durationSec + 0.01 },
+        message: 'trim end > duration',
+      },
+    ] as const;
+    for (const { trim, message } of invalidRanges) {
+      await expect(
+        streamCopy(byteSource(source), { container: 'ogg', trim }),
+      ).rejects.toMatchObject({
+        code: 'unsupported-input',
+        message,
+      });
+    }
+
+    const zeroDurationSource = new Uint8Array([
+      ...page({ bos: true, data: opusId(2) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 0, data: [0] }),
+    ]);
+    await expect(
+      streamCopy(byteSource(zeroDurationSource), {
+        container: 'ogg',
+        trim: { startSec: 0, endSec: Number.EPSILON },
+      }),
+    ).rejects.toMatchObject({
+      code: 'demux-error',
+      message: 'Ogg trim needs a finite source duration',
+    });
+
+    await expect(
+      streamCopy(byteSource(source), {
+        container: 'ogg',
+        trim: { startSec: 0, endSec: Number.EPSILON },
+      }),
+    ).rejects.toMatchObject({
+      code: 'capability-miss',
+      message: 'Ogg Opus cannot represent the requested trim as a positive 48 kHz sample interval',
+    });
+  });
+
+  it('streamCopy rejects an Opus packet whose code-3 TOC declares zero frames', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const source = new Uint8Array([
+      ...page({ bos: true, data: opusId(2) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 312, data: [3, 0] }),
+    ]);
+
+    await expect(
+      streamCopy(byteSource(source), {
+        container: 'ogg',
+        trim: { startSec: 0, endSec: 0.001 },
+      }),
+    ).rejects.toMatchObject({
+      code: 'demux-error',
+      message: 'Ogg Opus trim encountered a packet with an invalid coded duration',
+    });
   });
 
   it('streamCopy rejects an unsupported target before acquiring source bytes', async () => {

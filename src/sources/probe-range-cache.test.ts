@@ -200,6 +200,22 @@ describe('repeated probe interval cache', () => {
     }
   });
 
+  it('can disable interval retention without changing range results', async () => {
+    const bytes = Uint8Array.from({ length: 16 }, (_value, index) => index);
+    const { source, calls } = sourceWithCalls(bytes);
+    const cache = new WeakMap<Source, ProbeRangeCacheState>();
+    const options: ProbeRangeCacheOptions = { ...OPTIONS, maxIntervals: 0 };
+    const wrapped = cacheRepeatedProbeRanges(source, cache, options);
+
+    expect(await rangeOf(wrapped, 0, 8)).toEqual(bytes.subarray(0, 8));
+    expect(await rangeOf(wrapped, 0, 8)).toEqual(bytes.subarray(0, 8));
+    expect(calls).toEqual([
+      [0, 8],
+      [0, 8],
+    ]);
+    expect(cache.get(source)).toMatchObject({ entries: [], totalBytes: 0 });
+  });
+
   it('owns exact-sized bytes and isolates cache hits from consumer mutation', async () => {
     const backing = Uint8Array.from({ length: 8 * 1024 * 1024 }, (_value, index) => index);
     let calls = 0;

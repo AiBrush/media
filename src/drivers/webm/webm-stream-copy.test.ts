@@ -394,10 +394,11 @@ describe('WebmDriver.streamCopy — Session 6 R3 keyframe trim', () => {
     },
   );
 
-  it('trim/vp9_noop_full_range_idempotent reimports against the golden packet table without passthrough', async () => {
+  it('trim/vp9_noop_full_range_idempotent returns exact source bytes and reimports against the golden packet table', async () => {
     const source = await mediaFixture('vp9_1080p_10s.webm');
     const output = await streamCopyTrim(source, { startUs: 0, endUs: 10_000_000 }, 'webm');
-    expect(digest(output)).not.toBe(digest(source));
+    expect(output.byteLength).toBe(source.byteLength);
+    expect(digest(output)).toBe(digest(source));
     expectDurationWithin(output, 10_000_000, 0.05);
 
     const outputRows = packetRows(output);

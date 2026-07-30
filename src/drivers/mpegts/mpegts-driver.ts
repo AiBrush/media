@@ -17,6 +17,8 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketInfoMetadata,
+  PacketInfoTable,
   Registry,
   StageOptions,
   StreamCopyOptions,
@@ -89,6 +91,28 @@ function toTrackInfo(track: TsTrack, id: number): TrackInfo {
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     config: track.config,
   };
+}
+
+/**
+ * Project the already-parsed access-unit inventory into the fact-only packet surface. MPEG-TS packet
+ * payloads are split across transport packets, so no single source offset can honestly name an AU; the
+ * structural table therefore keeps exact size/timeline/keyframe facts and leaves payload delivery to
+ * {@link packetStream}. Match the generic demux adapter's global decode-order sort so taking this fast
+ * path cannot change packet ordering.
+ */
+function packetInfoFromParsed(parsed: TsParse): PacketInfoTable {
+  const tracks = parsed.tracks.map((track, index) => toTrackInfo(track, index));
+  const packets: PacketInfoMetadata[] = parsed.tracks.flatMap((track, trackIndex) =>
+    track.units.map((unit) => ({
+      trackIndex,
+      size: unit.sizeBytes ?? unit.data.byteLength,
+      ptsUs: unit.ptsUs,
+      dtsUs: unit.dtsUs,
+      keyframe: unit.keyframe,
+    })),
+  );
+  packets.sort((left, right) => left.dtsUs - right.dtsUs || left.trackIndex - right.trackIndex);
+  return { tracks, packets };
 }
 
 function capabilityDetail(facts: OperationFacts): CapabilityErrorDetail {
@@ -333,13 +357,21 @@ export const MpegTsDriver: ContainerDriver = {
     const parsed = await probeTs(src, o?.signal);
     return parsed.tracks.map((track, index) => toTrackInfo(track, index));
   },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    const parsed = await parse(src, o?.signal);
+    assertNotAborted(o?.signal);
+    return packetInfoFromParsed(parsed);
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const signal = o?.signal;
     const parsed = await parse(src, signal);
+    const table = packetInfoFromParsed(parsed);
     // The public track id is the array index (stable: video-first, then by PID — see parseTs sort).
-    const tracks = parsed.tracks.map((t, i) => toTrackInfo(t, i));
-    return {
-      tracks,
+    const demuxer: Demuxer & {
+      packetInfoTable(): readonly PacketInfoMetadata[];
+    } = {
+      tracks: table.tracks,
+      packetInfoTable: () => table.packets,
       packets(trackId: number): ReadableStream<Packet> {
         const track = parsed.tracks[trackId];
         if (!track) throw new MediaError('demux-error', `no track ${trackId}`);
@@ -347,6 +379,7 @@ export const MpegTsDriver: ContainerDriver = {
       },
       close: () => Promise.resolve(),
     };
+    return demuxer;
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     assertStreamCopyOptions(o);

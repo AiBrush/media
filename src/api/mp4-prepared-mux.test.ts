@@ -15,6 +15,7 @@ import { muxPreparedMp4PacketStreams } from './flac-mkv-mux.ts';
 import {
   mp4PacketInfoFromBytes,
   mp4PacketInfoFromUrl,
+  mp4TrimFromUrl,
   muxPreparedMp4PacketTrack,
   muxPreparedMp4PacketTracks,
   muxPreparedMp4PacketTracksStream,
@@ -1250,6 +1251,34 @@ describe('prepared MP4 packet mux', () => {
     expect(calls[1]?.range?.endsWith(`-${input.byteLength - 1}`)).toBe(true);
     expect(calls.reduce((sum, call) => sum + call.bytes, 0)).toBeLessThanOrEqual(
       input.byteLength + 32 * 1024,
+    );
+  });
+
+  it('copy-trims a same-family MP4 directly from bounded URL ranges', async () => {
+    const input = await mediaTestBytes('h264_vfr.mp4');
+    const { fetch, calls } = rangeServer(input);
+    globalThis.fetch = fetch;
+
+    const output = await mp4TrimFromUrl('https://example.test/h264_vfr.mp4', {
+      mime: 'video/mp4',
+      size: input.byteLength,
+      startSec: 0,
+      endSec: 1,
+      container: 'mp4',
+    });
+    const source = await mp4PacketInfoFromBytes(input);
+    const trimmed = await mp4PacketInfoFromBytes(output);
+
+    expect(output.byteLength).toBeGreaterThan(0);
+    expect(trimmed.tracks.map((track) => track.mediaType)).toEqual(
+      source.tracks.map((track) => track.mediaType),
+    );
+    expect(trimmed.packets.length).toBeGreaterThan(0);
+    expect(trimmed.packets.length).toBeLessThan(source.packets.length);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.range !== null)).toBe(true);
+    expect(calls.reduce((total, call) => total + call.bytes, 0)).toBeLessThanOrEqual(
+      input.byteLength,
     );
   });
 

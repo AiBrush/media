@@ -368,6 +368,17 @@ export interface Muxer {
 export interface StreamCopyOptions extends StageOptions {
   /** Keyframe-aligned time-range copy (trim), in seconds. Omit for a full remux. */
   trim?: { startSec: number; endSec: number };
+  /**
+   * Permit a same-container full-range trim to return the exact source bytes. Callers use this only
+   * when their operation contract is semantic identity; ordinary remux callers retain the driver's
+   * requested layout/faststart rewrite.
+   */
+  identitySourceIfFullRange?: boolean;
+  /**
+   * Decode-check selected AVC access units before exposing a copy-trim. Defaults to true. Callers that
+   * already authenticated clean source bytes may disable this redundant codec pass.
+   */
+  validateDecode?: boolean;
   faststart?: FaststartMode;
   /** Per-track packet ceiling required by MP4 `faststart:'reserve'`. */
   maximumPacketCount?: number;

@@ -5,7 +5,7 @@ import type {
   PacketInfoTable,
   TrackInfo,
 } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { fragmentMp4 } from '../drivers/mp4/fragment.ts';
 import { Mp4Driver, mp4PacketInfoBatchesFromSource } from '../drivers/mp4/mp4-driver.ts';
 import type { ChunkStruct, Mp4PacketTrackInput } from '../drivers/mp4/mux.ts';
@@ -99,6 +99,86 @@ export interface Mp4PacketInfoFromUrlOptions {
 export interface Mp4PacketInfoFromBytesOptions {
   readonly includeOffsets?: boolean;
   readonly signal?: AbortSignal;
+}
+
+export interface Mp4TrimFromUrlOptions extends Mp4PacketInfoFromUrlOptions {
+  readonly startSec: number;
+  readonly endSec: number;
+  readonly container: 'mp4' | 'mov';
+  readonly fragmented?: boolean;
+  readonly faststart?: boolean;
+  readonly validateDecode?: boolean;
+}
+
+/**
+ * Range-backed MP4/MOV copy trim on the driver-author surface. This is the same validated stream-copy
+ * implementation used by the high-level engine, without loading its codec/router graph when callers
+ * already know they need a same-family ISO-BMFF packet copy.
+ */
+export async function mp4TrimFromUrl(
+  url: string | URL,
+  opts: Mp4TrimFromUrlOptions,
+): Promise<Uint8Array> {
+  assertNotAborted(opts.signal);
+  if (
+    !Number.isFinite(opts.startSec) ||
+    !Number.isFinite(opts.endSec) ||
+    opts.startSec < 0 ||
+    opts.endSec <= opts.startSec
+  ) {
+    throw new InputError('MP4 URL trim requires a finite non-negative range with end > start');
+  }
+  if (opts.fragmented === true && opts.container !== 'mp4') {
+    throw new InputError('fragmented MP4 URL trim requires mp4 output');
+  }
+  const streamCopy = Mp4Driver.streamCopy;
+  if (streamCopy === undefined) {
+    throw new CapabilityError('MP4 driver has no stream-copy implementation', {
+      op: { kind: 'route', id: 'mp4-url-trim' },
+      tried: ['mp4'],
+    });
+  }
+  const stream = await streamCopy(
+    fromURL(url, {
+      mime: opts.mime ?? (opts.container === 'mov' ? 'video/quicktime' : 'video/mp4'),
+      rangeRequests: true,
+      ...(opts.size !== undefined ? { size: opts.size } : {}),
+    }),
+    {
+      trim: { startSec: opts.startSec, endSec: opts.endSec },
+      container: opts.container,
+      streaming: true,
+      ...(opts.fragmented !== undefined ? { fragmented: opts.fragmented } : {}),
+      ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
+      ...(opts.validateDecode !== undefined ? { validateDecode: opts.validateDecode } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    },
+  );
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      assertNotAborted(opts.signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  assertNotAborted(opts.signal);
+  return output;
 }
 
 export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uint8Array {

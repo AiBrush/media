@@ -93,6 +93,8 @@ export interface TsAccessUnit {
   dtsUs: number;
   /** Internal provenance used by the H.264 PES→access-unit de-framer; omitted from public packets. */
   pesHadExplicitDts?: boolean;
+  /** Internal one-pass H.264 scan fact; omitted from public packets after PES de-framing. */
+  pesIsAccessUnit?: boolean;
   keyframe: boolean;
   /**
    * The container packet's on-disk byte size — what a packet-size oracle (`ffprobe -show_packets` size,
@@ -395,17 +397,58 @@ function splitPes(pes: Uint8Array): PesUnit | undefined {
   };
 }
 
+interface H264PesScan {
+  readonly hasIdr: boolean;
+  readonly isAccessUnit: boolean;
+}
+
+/**
+ * Scan one H.264 PES once for both packet facts needed later: IDR/keyframe presence and whether this PES
+ * is already exactly one AUD-delimited access unit. Requiring the AUD at byte zero preserves the general
+ * de-framer's treatment of leading bytes, and rejecting an AUD after VCL proves that no second access
+ * unit begins in this PES. Consecutive field AUDs before VCL remain valid.
+ */
+function scanH264Pes(bytes: Uint8Array): H264PesScan {
+  let hasIdr = false;
+  let boundaryValid = true;
+  let sawNal = false;
+  let sawAud = false;
+  let sawVcl = false;
+  for (let offset = 0; offset + 3 < bytes.byteLength; offset++) {
+    let prefixLength = 0;
+    if (
+      bytes[offset] === 0 &&
+      bytes[offset + 1] === 0 &&
+      bytes[offset + 2] === 0 &&
+      bytes[offset + 3] === 1
+    ) {
+      prefixLength = 4;
+    } else if (bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) {
+      prefixLength = 3;
+    }
+    if (prefixLength === 0) continue;
+    const header = bytes[offset + prefixLength];
+    if (header === undefined) break;
+    const nalType = header & 0x1f;
+    if (!sawNal) {
+      if (offset !== 0 || nalType !== 9) boundaryValid = false;
+      sawNal = true;
+    }
+    if (nalType === 9) {
+      if (sawVcl) boundaryValid = false;
+      sawAud = true;
+    } else if (nalType === 1 || nalType === 5) {
+      sawVcl = true;
+      if (nalType === 5) hasIdr = true;
+    }
+    offset += prefixLength - 1;
+  }
+  return { hasIdr, isAccessUnit: boundaryValid && sawAud && sawVcl };
+}
+
 /** True when an H.264 Annex-B access unit contains an IDR (NAL type 5) — a clean keyframe. */
 function h264HasIdr(au: Uint8Array): boolean {
-  // Scan for 00 00 01 / 00 00 00 01 start codes and inspect the NAL unit type (low 5 bits of the byte).
-  for (let i = 0; i + 3 < au.byteLength; i++) {
-    if (au[i] === 0x00 && au[i + 1] === 0x00 && au[i + 2] === 0x01) {
-      const nalType = (au[i + 3] as number) & 0x1f;
-      if (nalType === 5) return true; // IDR slice
-      i += 2;
-    }
-  }
-  return false;
+  return scanH264Pes(au).hasIdr;
 }
 
 interface AnnexBNalStart {
@@ -445,6 +488,36 @@ function h264AnnexBNalStarts(bytes: Uint8Array): AnnexBNalStart[] {
  */
 export function deframeH264PesUnits(units: readonly TsAccessUnit[]): TsAccessUnit[] {
   if (units.length === 0) return [];
+  const hasIndependentDts = units.some(
+    (unit) => unit.pesHadExplicitDts === true && unit.dtsUs !== unit.ptsUs,
+  );
+
+  // Common muxer fast path: FFmpeg writes one complete AUD-delimited AU per PES. The general path's
+  // output then has identical boundaries and anchors, so reuse the PES buffers and only apply its DTS
+  // normalization. This avoids joining and rescanning the full video payload solely to rediscover the
+  // boundaries the muxer already made explicit.
+  if (units.every((unit) => unit.pesIsAccessUnit ?? scanH264Pes(unit.data).isAccessUnit)) {
+    let dtsCursor: number | undefined;
+    return units.map((unit) => {
+      let dtsUs: number;
+      if (unit.pesHadExplicitDts === true && unit.dtsUs !== unit.ptsUs) {
+        dtsUs = unit.dtsUs;
+        dtsCursor = dtsUs;
+      } else if (!hasIndependentDts) {
+        dtsUs = unit.ptsUs;
+      } else {
+        dtsUs = dtsCursor ?? unit.dtsUs;
+        dtsCursor = unit.ptsUs;
+      }
+      return {
+        data: unit.data,
+        ptsUs: unit.ptsUs,
+        dtsUs,
+        keyframe: unit.keyframe,
+      };
+    });
+  }
+
   const totalBytes = units.reduce((sum, unit) => sum + unit.data.byteLength, 0);
   const joined = new Uint8Array(totalBytes);
   const anchors: { readonly offset: number; readonly unit: TsAccessUnit }[] = [];
@@ -476,9 +549,6 @@ export function deframeH264PesUnits(units: readonly TsAccessUnit[]): TsAccessUni
   if (sawVcl) ranges.push({ start: accessUnitStart, end: joined.byteLength });
   if (!sawAud || ranges.length === 0) return [...units];
 
-  const hasIndependentDts = units.some(
-    (unit) => unit.pesHadExplicitDts === true && unit.dtsUs !== unit.ptsUs,
-  );
   const out: TsAccessUnit[] = [];
   let anchorIndex = 0;
   let dtsCursor: number | undefined;
@@ -675,13 +745,15 @@ export function parseTs(
     if (split.pts === undefined) return; // no PTS → cannot place on the timeline; drop
     // Everything else (H.264/HEVC video, LATM/AC-3/… audio): the whole PES payload is ONE access unit
     // with the PES's own PTS/DTS (a separate DTS keeps B-frame decode order intact).
+    const h264Scan = stream.codec === 'h264' ? scanH264Pes(split.payload) : undefined;
     const list = unitsByPid.get(pid) ?? [];
     list.push({
       data: split.payload,
       ptsUs: ticksToUs(split.pts),
       dtsUs: ticksToUs(split.dts ?? split.pts),
       ...(split.dts !== undefined ? { pesHadExplicitDts: true } : {}),
-      keyframe: isKeyframe(stream.codec, stream.mediaType, split.payload),
+      ...(h264Scan !== undefined ? { pesIsAccessUnit: h264Scan.isAccessUnit } : {}),
+      keyframe: h264Scan?.hasIdr ?? isKeyframe(stream.codec, stream.mediaType, split.payload),
     });
     unitsByPid.set(pid, list);
     const ptsList = ptsByPid.get(pid) ?? [];

@@ -167,6 +167,8 @@ function maxGranule(dv: DataView, serial: number): number {
 // ============ packet de-lacing + per-packet timing (pure, Node-validated) ============
 
 const MICROS_PER_SECOND = 1_000_000;
+const OPUS_GRANULE_RATE = 48_000;
+const MAX_OPUS_PRE_SKIP_FRAMES = 0xffff;
 
 /** One contiguous payload span inside an Ogg page body (never includes page headers or lacing bytes). */
 export interface OggPacketSpan {
@@ -299,6 +301,19 @@ function opusPacketSamples(dv: DataView, packet: RawPacket): number {
   if (code === 1 || code === 2) frames = 2;
   else if (code === 3) frames = packet.size >= 2 ? (packetByte(dv, packet, 1) ?? 1) & 0x3f : 1;
   return frameSamples * (frames > 0 ? frames : 1);
+}
+
+/** Strict Opus packet duration for exact granule authoring (RFC 6716 §3.1). */
+function exactOpusPacketSamples(data: Uint8Array): number | undefined {
+  const toc = data[0];
+  if (toc === undefined) return undefined;
+  const frameSamples = OPUS_FRAME_SAMPLES[toc >> 3];
+  if (frameSamples === undefined) return undefined;
+  const code = toc & 0x03;
+  const frames =
+    code === 0 ? 1 : code === 1 || code === 2 ? 2 : data[1] === undefined ? 0 : data[1] & 0x3f;
+  const samples = frameSamples * frames;
+  return frames > 0 && samples <= 5_760 ? samples : undefined;
 }
 
 /** A framed audio packet ready for the browser block: payload spans + presentation/duration in µs. */
@@ -729,11 +744,11 @@ function selectOggTrimPackets(
   return { firstIndex, lastIndex, firstPtsUs, endUs: selectedEndUs };
 }
 
-function resetOpusPreSkip(track: TrackInfo): TrackInfo {
+function opusHeadDescription(track: TrackInfo): Uint8Array | undefined {
   const config = track.config;
-  if (track.codec !== 'opus' || config === undefined || !('sampleRate' in config)) return track;
+  if (track.codec !== 'opus' || config === undefined || !('sampleRate' in config)) return undefined;
   const source = config.description;
-  if (source === undefined) return track;
+  if (source === undefined) return undefined;
   const description = ArrayBuffer.isView(source)
     ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice()
     : new Uint8Array(source).slice();
@@ -741,13 +756,31 @@ function resetOpusPreSkip(track: TrackInfo): TrackInfo {
     description.byteLength < 12 ||
     asciiAt(new DataView(description.buffer), 0, 8) !== 'OpusHead'
   ) {
-    return track;
+    return undefined;
   }
-  new DataView(description.buffer).setUint16(10, 0, true);
+  return description;
+}
+
+function opusTrackWithPreSkip(track: TrackInfo, preSkipFrames: number): TrackInfo | undefined {
+  if (
+    !Number.isSafeInteger(preSkipFrames) ||
+    preSkipFrames < 0 ||
+    preSkipFrames > MAX_OPUS_PRE_SKIP_FRAMES
+  ) {
+    return undefined;
+  }
+  const config = track.config;
+  const description = opusHeadDescription(track);
+  if (config === undefined || description === undefined) return undefined;
+  new DataView(description.buffer).setUint16(10, preSkipFrames, true);
   const output: TrackInfo = { ...track, config: { ...config, description } };
   Reflect.deleteProperty(output, 'codecDelayNs');
   Reflect.deleteProperty(output, 'gapless');
   return output;
+}
+
+function resetOpusPreSkip(track: TrackInfo): TrackInfo {
+  return opusTrackWithPreSkip(track, 0) ?? track;
 }
 
 async function writeOggWebmPacketCopy(
@@ -840,6 +873,172 @@ function validateOggTrimRange(
   }
 }
 
+interface ExactOggOpusPacket {
+  readonly packet: OggPacketInfoMetadata;
+  readonly data: Uint8Array;
+  readonly samples: number;
+  readonly codedStartFrame: number;
+  readonly presentationStartFrame: number;
+}
+
+function oggOpusTrimCapability(message: string): CapabilityError {
+  return new CapabilityError(message, {
+    op: {
+      kind: 'route',
+      id: 'trim',
+      facts: { container: 'ogg', codec: 'opus', mode: 'packet-copy' },
+    },
+    tried: ['ogg', 'opus-pre-skip'],
+  });
+}
+
+/**
+ * Author an exact decoded Opus presentation interval without changing coded packets.
+ *
+ * Ogg exposes two sample-accurate controls: OpusHead pre-skip trims the beginning and the EOS
+ * granule trims the end. Retain the earliest packet history whose start remains representable by
+ * the unsigned 16-bit pre-skip field, then express the requested half-open interval through those
+ * two controls. This also gives the decoder substantially more state than selecting only the packet
+ * that overlaps the requested start.
+ */
+function writeExactOggOpusPacketCopyTrim(
+  bytes: Uint8Array,
+  table: OggPacketInfoTable,
+  track: TrackInfo,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+): Uint8Array {
+  const description = opusHeadDescription(track);
+  if (description === undefined || description.byteLength < 19) {
+    throw new MediaError('demux-error', 'Ogg Opus trim needs a complete OpusHead packet');
+  }
+  const sourcePreSkipFrames = new DataView(
+    description.buffer,
+    description.byteOffset,
+    description.byteLength,
+  ).getUint16(10, true);
+
+  const packets: ExactOggOpusPacket[] = [];
+  let codedFrames = 0;
+  for (const packet of table.packets) {
+    const data = oggPacketBytes(bytes, packet);
+    const samples = exactOpusPacketSamples(data);
+    if (samples === undefined) {
+      throw new MediaError(
+        'demux-error',
+        'Ogg Opus trim encountered a packet with an invalid coded duration',
+      );
+    }
+    packets.push({
+      packet,
+      data,
+      samples,
+      codedStartFrame: codedFrames,
+      presentationStartFrame: codedFrames - sourcePreSkipFrames,
+    });
+    codedFrames += samples;
+    if (!Number.isSafeInteger(codedFrames)) {
+      throw new MediaError('demux-error', 'Ogg Opus coded duration exceeds safe integer range');
+    }
+  }
+  if (packets.length === 0) {
+    throw new MediaError('mux-error', 'Ogg Opus trim selected no audio packets');
+  }
+
+  const sourceFinalGranule = Math.round((track.durationSec ?? 0) * OPUS_GRANULE_RATE);
+  const sourcePresentationFrames = sourceFinalGranule - sourcePreSkipFrames;
+  if (
+    !Number.isSafeInteger(sourceFinalGranule) ||
+    sourceFinalGranule < sourcePreSkipFrames ||
+    sourceFinalGranule > codedFrames
+  ) {
+    throw new MediaError('demux-error', 'Ogg Opus source granule is inconsistent with its packets');
+  }
+
+  const requestedStartFrame = Math.round(trim.startSec * OPUS_GRANULE_RATE);
+  const requestedEndFrame = Math.round(trim.endSec * OPUS_GRANULE_RATE);
+  if (
+    !Number.isSafeInteger(requestedStartFrame) ||
+    !Number.isSafeInteger(requestedEndFrame) ||
+    requestedEndFrame <= requestedStartFrame
+  ) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot represent the requested trim as a positive 48 kHz sample interval',
+    );
+  }
+  if (requestedEndFrame > sourcePresentationFrames) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot author a trim beyond the source presentation granule',
+    );
+  }
+
+  let firstIndex = -1;
+  let outputPreSkipFrames = -1;
+  for (let index = 0; index < packets.length; index++) {
+    const packet = packets[index];
+    if (packet === undefined || packet.presentationStartFrame > requestedStartFrame) break;
+    const candidatePreSkip = requestedStartFrame - packet.presentationStartFrame;
+    if (candidatePreSkip <= MAX_OPUS_PRE_SKIP_FRAMES) {
+      firstIndex = index;
+      outputPreSkipFrames = candidatePreSkip;
+      break;
+    }
+  }
+  if (firstIndex < 0 || outputPreSkipFrames < 0) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot retain enough packet history within its 16-bit pre-skip field',
+    );
+  }
+
+  let lastIndex = -1;
+  for (let index = firstIndex; index < packets.length; index++) {
+    const packet = packets[index];
+    if (packet === undefined || packet.presentationStartFrame >= requestedEndFrame) break;
+    lastIndex = index;
+  }
+  if (lastIndex < firstIndex) {
+    throw oggOpusTrimCapability('Ogg Opus trim selected no packet spanning the requested interval');
+  }
+
+  const presentationFrames = requestedEndFrame - requestedStartFrame;
+  let selectedCodedFrames = 0;
+  for (let index = firstIndex; index <= lastIndex; index++) {
+    selectedCodedFrames += packets[index]?.samples ?? 0;
+  }
+  const lastPacketFrames = packets[lastIndex]?.samples ?? 0;
+  const finalGranule = outputPreSkipFrames + presentationFrames;
+  if (
+    !Number.isSafeInteger(finalGranule) ||
+    finalGranule <= selectedCodedFrames - lastPacketFrames ||
+    finalGranule > selectedCodedFrames
+  ) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot express the requested end within the selected final packet',
+    );
+  }
+
+  const outputTrack = opusTrackWithPreSkip(track, outputPreSkipFrames);
+  if (outputTrack === undefined) {
+    throw new MediaError('demux-error', 'Ogg Opus trim could not rewrite OpusHead pre-skip');
+  }
+  const state = trackStateFrom({
+    ...outputTrack,
+    durationSec: finalGranule / OPUS_GRANULE_RATE,
+  });
+  let rebasedFrames = 0;
+  for (let index = firstIndex; index <= lastIndex; index++) {
+    const packet = packets[index];
+    if (packet === undefined) continue;
+    state.chunks.push({
+      timestampUs: Math.round((rebasedFrames * MICROS_PER_SECOND) / OPUS_GRANULE_RATE),
+      durationUs: Math.round((packet.samples * MICROS_PER_SECOND) / OPUS_GRANULE_RATE),
+      key: packet.packet.keyframe,
+      data: packet.data,
+    });
+    rebasedFrames += packet.samples;
+  }
+  return writeOgg(state);
+}
+
 function writeOggPacketCopyTrim(
   bytes: Uint8Array,
   trim: NonNullable<StreamCopyOptions['trim']>,
@@ -853,6 +1052,9 @@ function writeOggPacketCopyTrim(
     });
   }
   validateOggTrimRange(track.durationSec, trim);
+  if (track.codec.toLowerCase() === 'opus') {
+    return writeExactOggOpusPacketCopyTrim(bytes, table, track, trim);
+  }
 
   const startUs = Math.round(trim.startSec * MICROS_PER_SECOND);
   const endUs = Math.round(trim.endSec * MICROS_PER_SECOND);
