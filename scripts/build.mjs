@@ -103,6 +103,26 @@ async function bundleJavaScript() {
     entryNames: '[name]',
     logLevel: 'info',
   });
+
+  // MP4/MOV packet-table consumers are also startup-sensitive. Keep this narrow public surface in
+  // one request so they do not evaluate the complete multi-container/core graph just to inspect
+  // packet metadata. It reuses the canonical implementation and only duplicates the reachable code.
+  await build({
+    absWorkingDir: ROOT,
+    entryPoints: { 'mp4-packet-info': 'src/mp4-packet-info.ts' },
+    outdir: DIST,
+    bundle: true,
+    format: 'esm',
+    target: 'es2022',
+    platform: 'browser',
+    external: EXTERNAL_NODE_MODULES,
+    splitting: false,
+    treeShaking: true,
+    minify: true,
+    sourcemap: 'external',
+    entryNames: '[name]',
+    logLevel: 'info',
+  });
 }
 
 async function emitDeclarations() {

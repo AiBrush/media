@@ -83,6 +83,11 @@ export interface Source {
    * `MediaError('aborted')` once `signal` aborts. Absent for pure streams.
    */
   range?(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
+  /**
+   * Release an exact ephemeral view returned by {@link range} after the caller has permanently
+   * consumed it. Borrowed/cache-backed sources omit this hook.
+   */
+  releaseRange?(bytes: Uint8Array): void;
   /** Owned one-buffer full read, when the backing source can avoid generic stream concatenation. */
   readAll?(signal?: AbortSignal): Promise<Uint8Array>;
   /** A MIME hint from the origin (Blob type, element, etc.), if any. */

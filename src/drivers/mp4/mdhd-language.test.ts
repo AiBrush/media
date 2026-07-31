@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodeMdhdLanguage } from './mdhd-language.ts';
+import { decodeMdhdLanguage, decodeQuickTimeMdhdLanguage } from './mdhd-language.ts';
 
 function pack(language: string): number {
   const [first = 0, second = 0, third = 0] = [...language].map(
@@ -22,5 +22,17 @@ describe('decodeMdhdLanguage', () => {
     ['non-integer value', pack('eng') + 0.5],
   ])('leaves an invalid %s absent', (_case, packed) => {
     expect(decodeMdhdLanguage(packed)).toBeUndefined();
+  });
+
+  it('maps the general legacy QuickTime language table without changing ISO-only decoding', () => {
+    expect(decodeQuickTimeMdhdLanguage(0)).toBe('eng');
+    expect(decodeQuickTimeMdhdLanguage(2)).toBe('deu');
+    expect(decodeQuickTimeMdhdLanguage(34)).toBe('nld');
+    expect(decodeQuickTimeMdhdLanguage(86)).toBe('tir');
+    expect(decodeQuickTimeMdhdLanguage(128)).toBe('cym');
+    expect(decodeQuickTimeMdhdLanguage(pack('jpn'))).toBe('jpn');
+    expect(decodeQuickTimeMdhdLanguage(0x7fff)).toBeUndefined();
+    expect(decodeQuickTimeMdhdLanguage(127)).toBeUndefined();
+    expect(decodeMdhdLanguage(0)).toBeUndefined();
   });
 });

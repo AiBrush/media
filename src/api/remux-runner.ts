@@ -15,6 +15,10 @@ import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, RemuxOptions } from './types.ts';
 
 const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
+// The prepared MP4→WebM-family writer deliberately snapshots at most 64 MiB. Route every larger
+// source directly to the incremental packet-info writer instead of leaving 64 MiB–1 GiB on the
+// generic EncodedChunk + buffered-muxer path, where source, mux state, and output coexist.
+const WEBM_STREAMING_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
 
 const CONTAINER_MIME: Readonly<Record<string, string>> = {
   mp4: 'video/mp4',
@@ -264,7 +268,7 @@ async function remuxViaSeam(
   if (
     (opts.to === 'webm' || opts.to === 'mkv') &&
     (opts.fragmented === true ||
-      (source.size !== undefined && source.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES))
+      (source.size !== undefined && source.size > WEBM_STREAMING_MIN_SOURCE_BYTES))
   ) {
     const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
     return remuxViaStreamingWebm(container, source, opts, context.stage(signal, options));

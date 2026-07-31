@@ -134,6 +134,8 @@ function brandFor(container: string | undefined): ContainerBrand {
 /** A random-access view over a source: range reads when available, else a one-time buffer. */
 interface RandomAccess {
   read(offset: number, length: number, signal?: AbortSignal): Promise<Uint8Array>;
+  /** Return an ephemeral range view after its final synchronous consumer has finished. */
+  release?(bytes: Uint8Array): void;
   size?: number | undefined;
   /** Source-aware first-window policy for metadata-only reads. */
   readonly metadataPrefetchBytes?: number;
@@ -283,6 +285,7 @@ async function randomAccess(
       };
     }
     let cachedWhole: Uint8Array | undefined;
+    const releasable = src.releaseRange === undefined ? undefined : new WeakSet<Uint8Array>();
     return {
       async read(offset, length, signal): Promise<Uint8Array> {
         const activeSignal = signal ?? defaultSignal;
@@ -301,9 +304,18 @@ async function randomAccess(
           bytes.byteLength >= learnedSize
         ) {
           cachedWhole = bytes.subarray(0, learnedSize);
+        } else {
+          releasable?.add(bytes);
         }
         return bytes;
       },
+      ...(src.releaseRange !== undefined
+        ? {
+            release(bytes: Uint8Array): void {
+              if (releasable?.delete(bytes) === true) src.releaseRange?.(bytes);
+            },
+          }
+        : {}),
       // URL/element sources learn their length from the first range response. Keep the random-access
       // view live so a later full-container validation sees that learned size instead of the undefined
       // snapshot that existed before the request completed.
@@ -2530,24 +2542,28 @@ async function classifyAvcPacketInfoBatch(
     throwIfAborted(signal);
     const expected = window.end - window.start;
     const bytes = await ra.read(window.start, expected, signal);
-    if (bytes.byteLength !== expected) {
-      throw new MediaError(
-        'demux-error',
-        `sample window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes (truncated MP4)`,
-      );
-    }
-    for (const item of window.items) {
-      const sample = item.sample;
-      if (
-        h264AccessUnitRangeIsKeyPicture(
-          bytes,
-          sample.offset - window.start,
-          sample.size,
-          sample.lengthSize,
-        ) === true
-      ) {
-        sample.row.keyframe = true;
+    try {
+      if (bytes.byteLength !== expected) {
+        throw new MediaError(
+          'demux-error',
+          `sample window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes (truncated MP4)`,
+        );
       }
+      for (const item of window.items) {
+        const sample = item.sample;
+        if (
+          h264AccessUnitRangeIsKeyPicture(
+            bytes,
+            sample.offset - window.start,
+            sample.size,
+            sample.lengthSize,
+          ) === true
+        ) {
+          sample.row.keyframe = true;
+        }
+      }
+    } finally {
+      ra.release?.(bytes);
     }
   }
   throwIfAborted(signal);
@@ -3100,6 +3116,7 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
     id: t.id,
     mediaType: t.mediaType,
     codec: t.codec,
+    defaultDisposition: t.defaultDisposition,
     durationSec: presentationDurationSec(t),
     ...(t.language !== undefined ? { language: t.language } : {}),
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
@@ -3162,6 +3179,9 @@ function toOtherProbeTrackInfo(track: OtherTrack): TrackInfo {
     mediaType: 'video',
     nonMedia: true,
     codec: '',
+    ...(track.defaultDisposition !== undefined
+      ? { defaultDisposition: track.defaultDisposition }
+      : {}),
     ...(track.durationSec > 0 ? { durationSec: track.durationSec } : {}),
     ...(track.language !== undefined ? { language: track.language } : {}),
   };

@@ -29,6 +29,10 @@
       "types": "./dist/core.d.ts",
       "import": "./dist/core.js"
     },
+    "./mp4-packet-info": {
+      "types": "./dist/mp4-packet-info.d.ts",
+      "import": "./dist/mp4-packet-info.js"
+    },
     "./image": {
       "types": "./dist/image.d.ts",
       "import": "./dist/image.js"

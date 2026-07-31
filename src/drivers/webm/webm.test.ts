@@ -125,6 +125,7 @@ const E = {
   TrackType: [0x83],
   TrackNumber: [0xd7],
   CodecID: [0x86],
+  Language: [0x22, 0xb5, 0x9c],
   Video: [0xe0],
   PixelWidth: [0xb0],
   PixelHeight: [0xba],
@@ -889,6 +890,27 @@ describe('parseWebm — EBML parsing', () => {
       width: 640,
       height: 480,
     });
+  });
+
+  it('projects an explicit ISO-639-2 Matroska track language through the public seam', async () => {
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackType, [1]),
+      ...el(E.TrackNumber, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Language, str('ENG')),
+      ...el(E.Video, [...el(E.PixelWidth, [2]), ...el(E.PixelHeight, [2])]),
+    ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4))),
+        ...el(E.Tracks, track),
+      ]),
+    ]);
+
+    expect(parseWebm(bytes).tracks[0]?.language).toBe('eng');
+    const tracks = await probeWithWebmDriver(fromBytes(bytes, { mime: 'video/webm' }));
+    expect(tracks[0]?.language).toBe('eng');
   });
 
   it('derives duration from clusters when Duration is absent (audio track)', () => {

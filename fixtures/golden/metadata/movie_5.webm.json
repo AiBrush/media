@@ -8,6 +8,7 @@
       "type": "video",
       "codec": "vp9",
       "durationSec": 5.008,
+      "language": "und",
       "fps": 24.000000384000007,
       "width": 320,
       "height": 240
@@ -17,6 +18,7 @@
       "type": "audio",
       "codec": "opus",
       "durationSec": 5.008,
+      "language": "und",
       "sampleRate": 24000,
       "channels": 1
     }

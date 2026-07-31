@@ -24,6 +24,7 @@ function track(
   const parsed: ParsedTrack = {
     id: 1,
     mediaType: 'video',
+    defaultDisposition: true,
     timescale,
     durationSec: 1,
     codec: 'avc1',

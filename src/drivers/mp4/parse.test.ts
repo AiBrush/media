@@ -40,6 +40,7 @@ describe('parseMovie — format variants', () => {
     expect(movie.otherTracks).toEqual([
       {
         id: 3,
+        defaultDisposition: false,
         handler: 'text',
         codec: 'tx3g',
         timescale: 1000,
@@ -153,8 +154,8 @@ describe('parseMovie — error handling', () => {
 
 const mvhd600 = full('mvhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4)));
 
-function tkhd0(trackId: number): number[] {
-  return full(
+function tkhd0(trackId: number, defaultDisposition = false): number[] {
+  const out = full(
     'tkhd',
     0,
     cat(
@@ -172,6 +173,8 @@ function tkhd0(trackId: number): number[] {
       zeros(8),
     ),
   );
+  if (defaultDisposition) out[11] = 1;
+  return out;
 }
 
 function mdiaFor(handler: string, stblChildren: number[], language = 0): number[] {
@@ -186,7 +189,7 @@ function mdiaFor(handler: string, stblChildren: number[], language = 0): number[
 }
 
 /** A minimal avc1 video trak whose sample entry carries the given extension boxes. */
-function videoTrakWith(extensions: number[], language = 0): number[] {
+function videoTrakWith(extensions: number[], language = 0, defaultDisposition = false): number[] {
   const avcC = box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
   const entry = box(
     'avc1',
@@ -195,7 +198,7 @@ function videoTrakWith(extensions: number[], language = 0): number[] {
   return box(
     'trak',
     cat(
-      tkhd0(1),
+      tkhd0(1, defaultDisposition),
       mdiaFor(
         'vide',
         cat(
@@ -292,6 +295,18 @@ describe('parseMovie — colr/pasp/clap sample-entry extensions', () => {
 });
 
 describe('parseMovie — non-media traks are never dropped, however malformed', () => {
+  it('projects the tkhd Track_enabled flag as the public default disposition', () => {
+    expect(movieWith([videoTrakWith([], 0, true)]).tracks[0]?.defaultDisposition).toBe(true);
+    expect(movieWith([videoTrakWith([], 0, false)]).tracks[0]?.defaultDisposition).toBe(false);
+  });
+
+  it('interprets legacy Macintosh mdhd language codes only for a QuickTime major brand', () => {
+    const payload = bytes(box('moov', cat(mvhd600, videoTrakWith([], 0))).slice(8));
+
+    expect(parseMovie('qt  ', payload).tracks[0]?.language).toBe('eng');
+    expect(parseMovie('isom', payload).tracks[0]?.language).toBeUndefined();
+  });
+
   it('decodes mdhd language for both AV and non-media tracks, retaining explicit undetermined', () => {
     const dataTrak = box(
       'trak',
@@ -331,10 +346,12 @@ describe('parseMovie — non-media traks are never dropped, however malformed', 
     expect(movie.otherTracks).toEqual([
       {
         id: 7,
+        defaultDisposition: false,
         handler: 'meta',
         codec: '',
         timescale: 1000,
         durationSec: 0.5,
+        language: 'eng',
         sampleCount: 0,
         trakIndex: 1,
       },
@@ -345,7 +362,16 @@ describe('parseMovie — non-media traks are never dropped, however malformed', 
     const bareTrak = box('trak', tkhd0(9));
     const movie = movieWith([videoTrakWith([]), bareTrak]);
     expect(movie.otherTracks).toEqual([
-      { id: 9, handler: '', codec: '', timescale: 0, durationSec: 0, sampleCount: 0, trakIndex: 1 },
+      {
+        id: 9,
+        defaultDisposition: false,
+        handler: '',
+        codec: '',
+        timescale: 0,
+        durationSec: 0,
+        sampleCount: 0,
+        trakIndex: 1,
+      },
     ]);
   });
 

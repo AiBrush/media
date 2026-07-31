@@ -79,6 +79,37 @@ function rangeSource(
 }
 
 describe('MP4 packet-info batches', () => {
+  it('releases explicitly-owned AVC classification windows after their final consumer', async () => {
+    const bytes = avcMp4(257);
+    const released: Uint8Array[] = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('packet-info batches must stay range-backed');
+      },
+      range(start, end): Promise<Uint8Array> {
+        return Promise.resolve(bytes.slice(start, Math.min(end, bytes.byteLength)));
+      },
+      releaseRange(view): void {
+        released.push(view);
+        const buffer = view.buffer as ArrayBuffer & {
+          transfer?: (newByteLength?: number) => ArrayBuffer;
+        };
+        buffer.transfer?.(0);
+      },
+    };
+    const packetInfoBatches = Mp4Driver.packetInfoBatches;
+    if (packetInfoBatches === undefined) throw new Error('MP4 packet-info batches unavailable');
+    const stream = await packetInfoBatches.call(Mp4Driver, source, { batchSize: 17 });
+    const rows: PacketInfoMetadata[] = [];
+    for await (const batch of stream) rows.push(...batch);
+
+    expect(rows).toHaveLength(257);
+    expect(rows.filter((row) => row.keyframe)).toHaveLength(129);
+    expect(released.length).toBeGreaterThan(0);
+    expect(released.every((view) => view.byteLength === 0)).toBe(true);
+  });
+
   it('concatenates to exact compatibility rows while respecting the requested batch ceiling', async () => {
     const bytes = avcMp4(257);
     const packetInfo = Mp4Driver.packetInfo;
@@ -90,6 +121,8 @@ describe('MP4 packet-info batches', () => {
     const stream = await packetInfoBatches.call(Mp4Driver, rangeSource(bytes, []), {
       batchSize: 17,
     });
+    expect(expected.tracks[0]?.defaultDisposition).toBe(true);
+    expect(stream.tracks[0]?.defaultDisposition).toBe(true);
     const batches: Array<readonly PacketInfoMetadata[]> = [];
     for await (const batch of stream) batches.push(batch);
     expect(batches.every((batch) => batch.length > 0 && batch.length <= 17)).toBe(true);

@@ -49,16 +49,29 @@ const distBuilt =
   existsSync(fileURLToPath(new URL('../dist/index.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/core.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/image.js', import.meta.url))) &&
+  existsSync(fileURLToPath(new URL('../dist/mp4-packet-info.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/wav.js', import.meta.url)));
 const suite = distBuilt ? describe : describe.skip;
 const packageSubpath = (subpath: string): string => `@aibrush/media/${subpath}`;
 type ImageEntry = typeof import('./image.ts');
+type Mp4PacketInfoEntry = typeof import('./mp4-packet-info.ts');
 type WavEntry = typeof import('./wav.ts');
 type CoreEntryWithWavPcmToAiff = typeof core & {
   readonly wavPcmToAiffFromBytes?: unknown;
 };
 
 suite('dist smoke (built package via exports map)', () => {
+  it('MP4 packet-info subpath exposes only the focused parser and typed errors', async () => {
+    const packetInfo = (await import(packageSubpath('mp4-packet-info'))) as Mp4PacketInfoEntry;
+    expect(typeof packetInfo.mp4PacketInfoFromBytes).toBe('function');
+    expect(typeof packetInfo.mp4PacketInfoFromUrl).toBe('function');
+    expect(typeof packetInfo.MediaError).toBe('function');
+    expect('createMedia' in packetInfo).toBe(false);
+    await expect(packetInfo.mp4PacketInfoFromBytes(Uint8Array.of(0))).rejects.toBeInstanceOf(
+      packetInfo.MediaError,
+    );
+  });
+
   it('wav subpath re-authors a valid empty PCM WAV without loading the engine surface', async () => {
     const wav = (await import(packageSubpath('wav'))) as WavEntry;
     expect(typeof wav.decodeWavPcmInterleavedPrefix).toBe('function');

@@ -40,6 +40,7 @@ interface ProbeVideoEntry {
 
 interface ProbeTrackHeader {
   readonly id: number;
+  readonly defaultDisposition: boolean;
   readonly rotation?: number;
 }
 
@@ -152,16 +153,10 @@ function probeMovieTimescale(r: Reader, mvhd: BoxHeader): number {
   return r.u32();
 }
 
-function probeTrackId(r: Reader, tkhd: BoxHeader): number {
-  r.seek(tkhd.payloadStart);
-  const { version } = readFullBoxHeader(r);
-  r.skip(version === 1 ? 16 : 8);
-  return r.u32();
-}
-
 function probeTrackHeader(r: Reader, tkhd: BoxHeader): ProbeTrackHeader {
   r.seek(tkhd.payloadStart);
-  const { version } = readFullBoxHeader(r);
+  const { version, flags } = readFullBoxHeader(r);
+  const defaultDisposition = (flags & 0x000001) !== 0;
   r.skip(version === 1 ? 16 : 8);
   const id = r.u32();
   r.skip(4);
@@ -170,7 +165,7 @@ function probeTrackHeader(r: Reader, tkhd: BoxHeader): ProbeTrackHeader {
   const a = r.fixed16();
   const b = r.fixed16();
   const rotation = probeMatrixRotation(a, b);
-  return rotation === undefined ? { id } : { id, rotation };
+  return rotation === undefined ? { id, defaultDisposition } : { id, defaultDisposition, rotation };
 }
 
 function probeMatrixRotation(a: number, b: number): number | undefined {
@@ -407,7 +402,7 @@ export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly Track
     const stbl = minf === undefined ? undefined : probeChild(r, minf, 'stbl');
     const stsd = stbl === undefined ? undefined : probeChild(r, stbl, 'stsd');
     if (stbl === undefined || stsd === undefined) return undefined;
-    const id = probeTrackId(r, tkhd);
+    const header = probeTrackHeader(r, tkhd);
     const timing = probeMdhd(r, mdhd);
     const entry = probeAudioEntry(r, stsd);
     if (entry === undefined || entry.type !== 'mp4a') return undefined;
@@ -419,9 +414,10 @@ export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly Track
       probeSttsDurationTicks(r, stbl),
     );
     tracks.push({
-      id,
+      id: header.id,
       mediaType: 'audio',
       codec: entry.codec,
+      defaultDisposition: header.defaultDisposition,
       durationSec: timing.durationSec,
       ...(timing.language !== undefined ? { language: timing.language } : {}),
       ...(gapless !== undefined ? { gapless } : {}),
@@ -511,6 +507,7 @@ function probeSimpleTrack(
         id: header.id,
         mediaType: 'video',
         codec: entry.codec,
+        defaultDisposition: header.defaultDisposition,
         durationSec: timing.durationSec,
         ...(timing.language !== undefined ? { language: timing.language } : {}),
         ...(fps !== undefined ? { fps } : {}),
@@ -534,6 +531,7 @@ function probeSimpleTrack(
       id: header.id,
       mediaType: 'audio',
       codec: entry.codec,
+      defaultDisposition: header.defaultDisposition,
       durationSec: timing.durationSec,
       ...(timing.language !== undefined ? { language: timing.language } : {}),
       ...(gapless !== undefined ? { gapless } : {}),

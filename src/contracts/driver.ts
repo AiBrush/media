@@ -213,6 +213,12 @@ export interface ByteSource {
   size?: number;
   /** Half-open random-access read. Implementations must reject promptly when `signal` aborts. */
   range?(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
+  /**
+   * Optional ownership handshake for ephemeral range buffers. A consumer calls this only after it is
+   * permanently done with an exact view returned by {@link range}; the source may then detach or
+   * recycle that backing store. Sources that return borrowed/cache-backed views omit this hook.
+   */
+  releaseRange?(bytes: Uint8Array): void;
   /** Optional owned one-buffer materialization for consumers that have already proved they need all bytes. */
   readAll?(signal?: AbortSignal): Promise<Uint8Array>;
 }
@@ -260,6 +266,11 @@ export interface TrackInfo {
   id: number;
   mediaType: MediaType;
   codec: string;
+  /**
+   * Whether the container marks this track enabled by default. For ISO BMFF this is the `tkhd`
+   * Track_enabled flag; it is distinct from application-level track selection.
+   */
+  defaultDisposition?: boolean;
   /** Measured compressed elementary-stream bitrate in bits/second when a packet table proves it. */
   bitrate?: number;
   /**

@@ -68,6 +68,7 @@ const ID = {
   TrackType: 0x83,
   CodecID: 0x86,
   TrackNumber: 0xd7,
+  Language: 0x22b59c,
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
@@ -188,6 +189,8 @@ function mapCodec(codecId: string, bitDepth?: number): string {
 export interface WebmTrack {
   mediaType: MediaType;
   codec: string;
+  /** Explicit Matroska `Language` value (ISO-639-2); the implicit spec default is not invented. */
+  language?: string;
   /** Declared stream that is enumerable but not decodable (for example a JSON attachment). */
   nonMedia?: true;
   /** Matroska TrackNumber — the value carried by each (Simple)Block, used to attribute block timing. */
@@ -294,6 +297,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   let type = 0;
   let codecId = '';
   let trackNumber: number | undefined;
+  let language: string | undefined;
   let width: number | undefined;
   let height: number | undefined;
   let alphaModeDeclarations = 0;
@@ -312,7 +316,12 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     if (c.id === ID.TrackType) type = readUint(dv, c);
     else if (c.id === ID.TrackNumber) trackNumber = readUint(dv, c);
     else if (c.id === ID.CodecID) codecId = readAscii(dv, c);
-    else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
+    else if (c.id === ID.Language) {
+      const declared = readAscii(dv, c).toLowerCase();
+      // TrackInfo's public language vocabulary is ISO-639-2/T. LanguageIETF is deliberately not
+      // projected here because an arbitrary BCP-47 tag cannot be losslessly represented by that seam.
+      if (/^[a-z]{3}$/.test(declared)) language = declared;
+    } else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
     else if (c.id === ID.DefaultDuration) defaultDuration = readUint(dv, c);
     else if (c.id === ID.CodecDelay) codecDelayNs = readUint(dv, c);
     else if (c.id === ID.SeekPreRoll) seekPreRollNs = readUint(dv, c);
@@ -380,6 +389,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     mediaType,
     codec,
     ...(trackNumber !== undefined ? { trackNumber } : {}),
+    ...(language !== undefined ? { language } : {}),
     ...(codecDelayNs > 0 ? { codecDelayNs } : {}),
     ...(seekPreRollNs > 0 ? { seekPreRollNs } : {}),
     ...(reorderDepth !== undefined ? { reorderDepth } : {}),
@@ -1620,6 +1630,7 @@ function toTrackInfo(
     mediaType: track.mediaType,
     codec: track.codec,
     ...(durationSec !== undefined ? { durationSec } : {}),
+    ...(track.language !== undefined ? { language: track.language } : {}),
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(track.alpha === true || observedAlpha === true ? { alpha: true } : {}),

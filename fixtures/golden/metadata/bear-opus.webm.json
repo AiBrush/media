@@ -9,7 +9,8 @@
       "codec": "opus",
       "durationSec": 2.741,
       "sampleRate": 48000,
-      "channels": 2
+      "channels": 2,
+      "language": "und"
     }
   ]
 }

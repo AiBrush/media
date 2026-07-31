@@ -69,6 +69,7 @@ function syntheticAudioMovie(sampleSizes: number[], chunkOffsets: number[]): Mov
   const track: ParsedTrack = {
     id: 1,
     mediaType: 'audio',
+    defaultDisposition: true,
     timescale: 48_000,
     durationSec: sampleSizes.length / 48_000,
     codec: 'mp4a.40.2',
@@ -97,6 +98,7 @@ function syntheticBFrameMovie(): Movie {
   const track: ParsedTrack = {
     id: 7,
     mediaType: 'video',
+    defaultDisposition: true,
     timescale: 1_000,
     durationSec: 3,
     codec: 'avc1.64001f',

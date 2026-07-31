@@ -35,8 +35,32 @@ async function mp4Bytes(): Promise<Uint8Array> {
 }
 
 const GIB = 1024 * 1024 * 1024;
+const MIB = 1024 * 1024;
 
 describe('remux scale — oversize mp4→mkv uses the streaming WebM/MKV route', () => {
+  it('closes the 64 MiB–1 GiB buffering gap at the prepared-writer boundary', async () => {
+    const src = mp4SourceWithSize(await mp4Bytes(), 64 * MIB + 1);
+    const media = createMedia().use(Mp4Module).use(WebmModule);
+    const err = await media.remux(src, { to: 'mkv' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(CapabilityError);
+    expect((err as CapabilityError).message).toMatch(/EncodedChunk constructors/i);
+  });
+
+  it('keeps the exact 64 MiB boundary on the prepared buffered route', async () => {
+    const src = mp4SourceWithSize(await mp4Bytes(), 64 * MIB);
+    const media = createMedia().use(Mp4Module).use(WebmModule);
+    const err = await media.remux(src, { to: 'mkv' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/short source read/i);
+    expect((err as Error).message).not.toMatch(/EncodedChunk constructors/i);
+  });
+
   it('a >1 GiB mp4→mkv remux no longer raises the buffer-all memory gate', async () => {
     const src = mp4SourceWithSize(await mp4Bytes(), 2 * GIB); // a "2-hour 1080p"-scale source
     const media = createMedia().use(Mp4Module).use(WebmModule);

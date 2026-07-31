@@ -117,11 +117,11 @@ function mvhdV1(timescale = 1000, duration = 2000): Uint8Array {
   return fullBox('mvhd', 1, 0, zeros(16), u32(timescale), u64(duration));
 }
 
-function tkhdV1(id: number, a = 1, b = 0): Uint8Array {
+function tkhdV1(id: number, a = 1, b = 0, enabled = true): Uint8Array {
   return fullBox(
     'tkhd',
     1,
-    0x000007,
+    enabled ? 0x000007 : 0x000006,
     zeros(16),
     u32(id),
     zeros(4),
@@ -137,11 +137,11 @@ function tkhdV1(id: number, a = 1, b = 0): Uint8Array {
   );
 }
 
-function tkhdV0(id: number): Uint8Array {
+function tkhdV0(id: number, enabled = true): Uint8Array {
   return fullBox(
     'tkhd',
     0,
-    0x000007,
+    enabled ? 0x000007 : 0x000006,
     zeros(8),
     u32(id),
     zeros(4),
@@ -465,6 +465,29 @@ describe('simple MP4 faststart probes', () => {
       ),
     );
     expect(tinyAudio?.[0]?.language).toBe('eng');
+  });
+
+  it('projects the tkhd enabled flag as the default disposition in both bounded probe paths', async () => {
+    const audioTable = joinBytes([stsd(box('mp4a', mp4aV0Payload())), stts(2, 1024), stsz([1, 1])]);
+    const simple = await readSimpleVideoFaststartProbe(
+      ra(
+        simpleMovie(
+          simpleAudioTrack(audioTable, mdhdV0(44100, 2048), tkhdV0(2, false)),
+          simpleVideoTrack(undefined, mdhdV0(600, 1200), tkhdV0(1)),
+        ),
+      ),
+    );
+    expect(
+      simple?.tracks.map(({ id, defaultDisposition }) => ({ id, defaultDisposition })),
+    ).toEqual([
+      { id: 2, defaultDisposition: false },
+      { id: 1, defaultDisposition: true },
+    ]);
+
+    const tinyAudio = await readTinyAudioFaststartProbe(
+      ra(simpleMovie(simpleAudioTrack(audioTable, mdhdV0(44100, 2048), tkhdV0(2, false)))),
+    );
+    expect(tinyAudio?.[0]?.defaultDisposition).toBe(false);
   });
 
   it('covers direct version-0 AAC, HE-AAC SBR, zero timing, and absent timing tables', async () => {

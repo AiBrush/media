@@ -20,7 +20,7 @@ import {
   type Mp4DisplayTransform,
   clockwiseRotationFromMp4Matrix,
 } from './display-transform.ts';
-import { decodeMdhdLanguage } from './mdhd-language.ts';
+import { decodeMdhdLanguage, decodeQuickTimeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 export type { ColrInfo } from './codec-strings.ts';
@@ -100,6 +100,8 @@ export interface ClapInfo {
  */
 export interface OtherTrack {
   id: number;
+  /** Whether the `tkhd` Track_enabled flag is set. */
+  defaultDisposition?: boolean;
   /** `hdlr` component subtype, e.g. 'tmcd' (timecode), 'text', 'sbtl', 'meta'; '' when unreadable. */
   handler: string;
   /** The stsd sample-entry fourcc (== ffprobe `codec_tag_string`), e.g. 'tmcd'; '' when unreadable. */
@@ -136,6 +138,8 @@ export interface TrackEdit {
 export interface ParsedTrack {
   id: number;
   mediaType: MediaType;
+  /** Whether the `tkhd` Track_enabled flag is set. */
+  defaultDisposition: boolean;
   /** mdhd timescale (ticks per second). */
   timescale: number;
   durationSec: number;
@@ -286,7 +290,7 @@ function parseMovieInternal(brand: string, moov: Uint8Array, mode: ParseMode): M
   let needsFragmentTiming = false;
   let trakIndex = 0;
   for (const trak of children(r, root, 'trak')) {
-    const parsed = parseTrak(r, trak, movie.timescale, mode, trakIndex);
+    const parsed = parseTrak(r, trak, movie.timescale, mode, trakIndex, brand === 'qt  ');
     trakIndex++;
     if (parsed.kind === 'other') {
       otherTracks.push(parsed.track);
@@ -616,15 +620,16 @@ function parseOtherTrak(
   movieTimescale: number,
   mode: ParseMode,
   trakIndex: number,
+  legacyQuickTimeLanguage: boolean,
 ): OtherTrack {
-  const id = attempt(() => {
+  const trackHeader = attempt(() => {
     const tkhd = child(r, trak, 'tkhd');
-    return tkhd ? parseTkhd(r, tkhd).trackId : undefined;
+    return tkhd ? parseTkhd(r, tkhd) : undefined;
   });
   const timing = attempt(() => {
     const mdia = child(r, trak, 'mdia');
     const mdhd = mdia ? child(r, mdia, 'mdhd') : undefined;
-    return mdhd ? parseMdhd(r, mdhd) : undefined;
+    return mdhd ? parseMdhd(r, mdhd, legacyQuickTimeLanguage) : undefined;
   });
   const stbl = attempt(() => {
     const mdia = child(r, trak, 'mdia');
@@ -655,7 +660,8 @@ function parseOtherTrak(
     : undefined;
   const edit = attempt(() => parseTrackEdit(r, trak, movieTimescale));
   return {
-    id: id ?? 0,
+    id: trackHeader?.trackId ?? 0,
+    ...(trackHeader !== undefined ? { defaultDisposition: trackHeader.defaultDisposition } : {}),
     handler,
     codec: codec ?? '',
     timescale: timing?.timescale ?? 0,
@@ -676,6 +682,7 @@ function parseTrak(
   movieTimescale: number,
   mode: ParseMode,
   trakIndex: number,
+  legacyQuickTimeLanguage: boolean,
 ): ParsedTrakResult {
   // The handler decides the path: `vide`/`soun` keep the strict decode-grade parse below; any other
   // (or unreadable) handler surfaces as a lenient OtherTrack — a declared trak is NEVER dropped.
@@ -685,12 +692,20 @@ function parseTrak(
   if (mediaType === undefined) {
     return {
       kind: 'other',
-      track: parseOtherTrak(r, trak, handler ?? '', movieTimescale, mode, trakIndex),
+      track: parseOtherTrak(
+        r,
+        trak,
+        handler ?? '',
+        movieTimescale,
+        mode,
+        trakIndex,
+        legacyQuickTimeLanguage,
+      ),
     };
   }
 
   const tkhd = child(r, trak, 'tkhd') ?? fail('trak has no tkhd');
-  const { trackId, rotation, displayTransform } = parseTkhd(r, tkhd);
+  const { trackId, defaultDisposition, rotation, displayTransform } = parseTkhd(r, tkhd);
 
   const mdia = child(r, trak, 'mdia') ?? fail('trak has no mdia');
   const mdhd = child(r, mdia, 'mdhd') ?? fail('mdia has no mdhd');
@@ -699,7 +714,7 @@ function parseTrak(
     durationSec,
     durationTicks: mediaDurationTicks,
     language,
-  } = parseMdhd(r, mdhd);
+  } = parseMdhd(r, mdhd, legacyQuickTimeLanguage);
 
   const minf = child(r, mdia, 'minf') ?? fail('mdia has no minf');
   const stbl = child(r, minf, 'stbl') ?? fail('minf has no stbl');
@@ -723,6 +738,7 @@ function parseTrak(
   const base = {
     id: trackId,
     mediaType,
+    defaultDisposition,
     timescale,
     durationSec,
     ...(language !== undefined ? { language } : {}),
@@ -811,9 +827,15 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
 function parseTkhd(
   r: Reader,
   box: BoxHeader,
-): { trackId: number; rotation?: number; displayTransform: Mp4DisplayTransform } {
+): {
+  trackId: number;
+  defaultDisposition: boolean;
+  rotation?: number;
+  displayTransform: Mp4DisplayTransform;
+} {
   r.seek(box.payloadStart);
-  const { version } = readFullBoxHeader(r);
+  const { version, flags } = readFullBoxHeader(r);
+  const defaultDisposition = (flags & 0x000001) !== 0;
   r.skip(version === 1 ? 16 : 8); // creation + modification
   const trackId = r.u32();
   r.skip(4); // reserved
@@ -837,20 +859,26 @@ function parseTkhd(
   };
   const rotation = clockwiseRotationFromMp4Matrix(matrix);
   return rotation === undefined
-    ? { trackId, displayTransform }
-    : { trackId, rotation, displayTransform };
+    ? { trackId, defaultDisposition, displayTransform }
+    : { trackId, defaultDisposition, rotation, displayTransform };
 }
 
 function parseMdhd(
   r: Reader,
   box: BoxHeader,
+  legacyQuickTimeLanguage = false,
 ): { timescale: number; durationSec: number; durationTicks: number; language?: string } {
   r.seek(box.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
   const duration = version === 1 ? r.u64() : r.u32();
-  const language = r.pos + 2 <= box.end ? decodeMdhdLanguage(r.u16()) : undefined;
+  const language =
+    r.pos + 2 <= box.end
+      ? legacyQuickTimeLanguage
+        ? decodeQuickTimeMdhdLanguage(r.u16())
+        : decodeMdhdLanguage(r.u16())
+      : undefined;
   return {
     timescale,
     durationSec: timescale > 0 ? duration / timescale : 0,
