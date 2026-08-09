@@ -5,7 +5,7 @@ compiled to WebAssembly — no C toolchain — loaded same-origin through `new U
 import.meta.url)` (BUILD §7: no CDN, no COOP/COEP, lazy + miss-only). The `.wasm` + JS glue are **vendored
 into this directory** and committed; this file is the reproducible recipe that produced them.
 
-Like wasm-vorbis (ADR-036) and unlike libopus (ADR-031), Symphonia is pure Rust, so it builds with the
+Like wasm-vorbis and unlike libopus, Symphonia is pure Rust, so it builds with the
 toolchain present in this environment. **This recipe was run here and succeeded.**
 
 ---
@@ -87,8 +87,8 @@ A `#[wasm_bindgen]` `AacWasm` matching `aac-core.d.ts`: `new AacWasm(extra_data,
   correctly in plain Node and Bun (verified), so the decode is validated there on real bytes — not stubbed.
 
 The browser-only part — the `createDecoder` `TransformStream` wrapping the core's output in WebCodecs
-`AudioData`, and the driver's `import.meta.url` fetch path — is validated in the Playwright harness
-(ADR-025), with `force-software` / AAC-WebCodecs-absent forcing this tier, decode SNR vs a reference, and a
+`AudioData`, and the driver's `import.meta.url` fetch path — is validated in the Playwright harness,
+with `force-software` / AAC-WebCodecs-absent forcing this tier, decode SNR vs a reference, and a
 fresh multi-sample throughput benchmark.
 
 ## Scope + rebuilding

@@ -11,10 +11,7 @@ import type { MaterializeOptions } from '../sinks/sink.ts';
 import type { MediaInput } from '../sources/source.ts';
 import { materializeOutput, normalizeByteInput } from './op-support.ts';
 import { readAllSource, throwIfAborted } from './source-io.ts';
-import {
-  H264_ABR_MAX_RETAINED_OUTPUT_BYTES,
-  H264_ABR_MAX_SOURCE_BYTES,
-} from './types.ts';
+import { H264_ABR_MAX_RETAINED_OUTPUT_BYTES, H264_ABR_MAX_SOURCE_BYTES } from './types.ts';
 import type { CallOptions, ConvertOptions, H264AbrRung, Output } from './types.ts';
 
 export interface AbrLadderRunnerContext {
@@ -48,12 +45,10 @@ export async function runH264AbrLadder(
       const operation = new AbortController();
       const unlinkCaller = linkAbrSignal(signal, operation);
       try {
-        const streams = await offloadAbrLadder(
-          pool,
-          source,
-          renditions,
-          { ...context.stage, signal: operation.signal },
-        );
+        const streams = await offloadAbrLadder(pool, source, renditions, {
+          ...context.stage,
+          signal: operation.signal,
+        });
         const budget = abrRetainedOutputBudget();
         const materializations = streams.map((stream) =>
           materializeOutput(
@@ -131,12 +126,14 @@ export function boundAbrOutputStream(
   stream: ReadableStream<Uint8Array>,
   budget: AbrRetainedOutputBudget,
 ): ReadableStream<Uint8Array> {
-  return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller): void {
-      budget.charge(chunk.byteLength);
-      controller.enqueue(chunk);
-    },
-  }));
+  return stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller): void {
+        budget.charge(chunk.byteLength);
+        controller.enqueue(chunk);
+      },
+    }),
+  );
 }
 
 function assertAbrPublishedOutputBudget(outputs: readonly Output[]): void {

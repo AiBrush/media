@@ -1,6 +1,6 @@
 # Test media corpus
 
-Real, internet-sourced media for validation and benchmarking (`BUILD_INSTRUCTIONS.md` §6.1). **No
+Real, internet-sourced media for validation and benchmarking. **No
 synthetic/mock subject media, ever.**
 
 ## Layout

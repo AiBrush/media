@@ -1,7 +1,7 @@
 # Building the `wasm-vpx` core (self-hosted, vendored, miss-only)
 
 This driver (`src/codecs/wasm-vpx/wasm-vpx-driver.ts`) **decodes** VP8/VP9 via **libvpx compiled to
-WebAssembly**, loaded same-origin through `new URL('./vpx.wasm', import.meta.url)` (BUILD §7 — no CDN, no
+WebAssembly**, loaded same-origin through `new URL('./vpx.wasm', import.meta.url)` (no CDN, no
 COOP/COEP, lazy + miss-only). The `.wasm` + its JS glue are a **vendored build artifact**: this file is the
 recipe that produces them. Until they are vendored, the driver is honest — `supports()` returns `false` and
 a (mis)routed decoder raises a typed `CapabilityError` (`capability-miss`).
@@ -14,14 +14,13 @@ lossy transform / loop-filter / entropy decode.
 **Scope: decode only.** This fallback exists to fill the WebCodecs **VP9 decode** gap (some Safari/WebKit
 builds ship no VP9 `VideoDecoder`); VP8 rides along on the same libvpx core. VP9 *encode* is out of scope —
 a pure-software VP9 encoder is far too slow to be a credible browser path, so `createEncoder` raises a
-typed `CapabilityError` rather than faking one (ADR-017, directive 6).
+typed `CapabilityError`.
 
 ---
 
-## Status in this environment (why it is not vendored here) — measured, not assumed
+## Vendored cores
 
-**VENDORED (prebuilt permissive cores, ADR-094).** A from-source libvpx build is heavy/slow, and there is no
-pure-Rust VP8/VP9 decoder; so per **ADR-085** the cores are committed **prebuilts**: **ogv.js v1.9.0**'s
+The committed cores are **ogv.js v1.9.0**'s
 standalone single-threaded per-codec decoders (libvpx **BSD-3**/WebM Project, ogv.js wrappers **MIT**).
 Vendored files (committed):
 
@@ -41,7 +40,7 @@ ogv-vp8-wasm.js `e88760eaed22be03e2efc3a8ada0e9ec2faa274eda6a2e539580f18a1ef02b0
 **Shape:** ogv.js's `OGVDecoderVideoVPxW({...})` is an Emscripten MODULARIZE factory that runs in Node; the
 glue feeds each module its base64-embedded wasm via `instantiateWasm` (no separate `.wasm`), so the tail is
 **self-contained** — esbuild bundles it into the lazy `vpx-core.js` chunk and `vendor-wasm.ts` skips it (the
-`selfContained` branch, ADR-090). The driver's `new URL('./vpx.wasm', import.meta.url)` is vestigial (the
+`selfContained` branch). The driver's `new URL('./vpx.wasm', import.meta.url)` is vestigial (the
 glue's `init` ignores it). ogv returns **stride-aligned** planes; the glue **de-strides** to packed I420.
 
 **Capability boundary (NEVER-FAKE):** **8-bit 4:2:0 only**. A 4:4:4 stream (`bear-vp9-alpha.webm`) is detected
@@ -58,37 +57,13 @@ D=src/codecs/wasm-vpx
 cp /tmp/ogv/package/dist/ogv-decoder-video-vp8-wasm.js "$D/ogv-vp8-wasm.js"
 cp /tmp/ogv/package/dist/ogv-decoder-video-vp9-wasm.js "$D/ogv-vp9-wasm.js"
 cp /tmp/ogv/package/COPYING "$D/LICENSE.ogv"
-# regenerate the base64 *-data-wasm.js modules (see the snippet in this repo's history) + update provenance.json
+# regenerate the base64 *-data-wasm.js modules and update provenance.json
 bunx vitest run src/codecs/wasm-vpx   # must stay green
 ```
 
 ---
 
-## (historical) Why not from-source in this sandbox — measured
-
-This build sandbox has `rustc` 1.94, `cargo`, `wasm-pack` 0.14, the `wasm32-unknown-unknown` target,
-`clang`, and `cmake` — but **no Emscripten (`emcc`)** and no C/wasm sysroot. Three facts were measured (cf.
-the Opus sibling's ADR-026, which reached the identical conclusion for libopus):
-
-1. **Pure Rust → wasm works end-to-end.** A `wasm-bindgen` crate built with `wasm-pack build --target web`
-   emitted exactly `*_bg.wasm` + `*.js` glue + `.d.ts` — the shape this driver's loader expects — and the
-   same crate builds clean for `wasm32-unknown-unknown`. The glue path is proven.
-2. **There is no pure-Rust VP8/VP9 decoder.** The registry has no `vp8` / `vp9` / `vpx-decode` / `vp9-dec`
-   crate (all resolve to "could not be found"); `dav1d`/`rav1d` are **AV1**, not VPX. So a zero-C
-   `wasm-bindgen` build (which *would* work, per fact 1) has nothing to wrap.
-3. **libvpx (the C bindings) cannot be built here.** `cargo build --target wasm32-unknown-unknown` with
-   `vpx-sys` (the libvpx binding) fails in its build script (exit 101): it demands a
-   `PKG_CONFIG_SYSROOT_DIR` / cross-compile sysroot for the C library — which requires Emscripten (absent).
-   `libvpx-sys` is the same C dependency.
-
-Per the task's hard bound, the toolchain chase was stopped at this measured wall; the recipe below is the
-deliverable, verified to the point `wasm-pack` runs and the pure-Rust wasm build succeeds. Vendor the
-artifact on a machine that has **Emscripten** (the libvpx path) and commit the two files into this
-directory.
-
----
-
-## Recipe A — libvpx via Emscripten (recommended: reference-quality VP8 **and** VP9 decode)
+## From-source recipe — libvpx via Emscripten
 
 Requires `emcc` (Emscripten ≥ 3.1) + `make`/`cmake`/`yasm`/`nasm` (libvpx's asm; or `--disable-runtime-cpu-detect`
 + generic C).
@@ -170,7 +145,7 @@ packet-in / planar-frame-out — no JS framing or timing logic.
 
 ---
 
-## After vendoring — validation (on a browser machine, ADR-025)
+## Validation on a browser machine
 
 1. Place `vpx.wasm` + `vpx-core.js` in this directory; `loadVpxCore()` then resolves non-null and
    `supports({codec:'vp09.00.10.08', direction:'decode'})` returns `true`.

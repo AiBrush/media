@@ -2,12 +2,11 @@
 
 Checksum-pinned, committed oracle references baked from the verified real-media corpus
 (`scripts/bake-goldens.ts`, `bun run bake-goldens`). The large media stays git-ignored under
-`fixtures/media/`; **only these small goldens + `fixtures/manifest.json` are committed**
-(BUILD_INSTRUCTIONS §6.1, docs/architecture/11). Every per-op golden is gated by a test that re-runs the
-engine and asserts an exact match, and — where the unit admits — is **independently corroborated** by a
-tool we did not write (so a golden can never be a self-confirming round-trip; doc 11 §5, ADR-085).
+`fixtures/media/`; **only these small goldens + `fixtures/manifest.json` are committed**. Every per-op
+golden is gated by a test that re-runs the engine and asserts an exact match. Where possible, an independent
+tool also corroborates the result so a golden cannot be a self-confirming round-trip.
 
-| Family | Path | Oracle (doc 11 §1) | Baked from | Independent corroboration | Gated by |
+| Family | Path | Oracle | Baked from | Independent corroboration | Gated by |
 |---|---|---|---|---|---|
 | corpus index | `corpus-index.json` | structural | manifest + sha256 re-verify | — | `src/test-support/corpus.test.ts` |
 | golden-metadata | `metadata/<id>.json` | structural / metadata-exact | engine `probe` | ffprobe truth informs which fields are deferred | `src/drivers/mp4/golden-metadata.test.ts`, `corpus.test.ts` |
@@ -40,11 +39,11 @@ ffmpeg -hide_banner -loglevel error -y -i fixtures/media/movie_5.mp4 -c copy \
   -encryption_kid 00112233445566778899aabbccddeeff decrypt/movie_5.mp4.cenc.mp4
 ```
 
-## Deferred (documented honestly, not faked)
+## Verification boundaries
 
 - **12-bit FLAC** decode: ffmpeg scales the 12-bit sample to s16 full-scale while we keep the literal
   value (a representation choice). Its golden is self-validated by FLAC's STREAMINFO MD5 (checked inside
   the decoder) and flagged `ffmpegCrossChecked:false`.
 - **CENC *video* subsample twin** from ffmpeg: ffmpeg keeps the IDR keyframe's parameter-set NALs clear
   with a sample-0 boundary our decryptor splits differently; 119/120 video samples already match. The
-  **audio** CENC twin (whole-sample AES-CTR) is committed and byte-exact. (Reported for follow-up.)
+  **audio** CENC twin (whole-sample AES-CTR) is committed and byte-exact.

@@ -83,7 +83,8 @@ export interface LogEvent {
 export interface CreateMediaOptions {
   determinism?: Determinism; // default 'auto'                 (ADR-007)
   enableThreads?: boolean; // default = crossOriginIsolated    (ADR-006)
-  worker?: boolean | { pool?: number }; // default true (heavy) (ADR-019)
+  /** Opt into worker offload; omitted/false runs inline, true uses one worker, and a pool enables fanout. */
+  worker?: boolean | { pool?: number };
   /** Optional same-origin asset directory; normalized once, default keeps literal import.meta URLs. */
   assetBaseUrl?: string; // default = import.meta.url-resolved  (ADR-005/237)
   onLog?: (e: LogEvent) => void;
@@ -235,7 +236,7 @@ export const H264_ABR_MAX_SOURCE_BYTES = 128 * 1024 * 1024;
 export const H264_ABR_MAX_RETAINED_OUTPUT_BYTES = 512 * 1024 * 1024;
 
 /** Maximum simultaneous bitrate-only ABR worker jobs/source copies; quality ladders always use one. */
-export const H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS = 4;
+export const H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS = 4;
 
 export interface ConvertOptions {
   to?: Container;

@@ -13,7 +13,7 @@ browser. The wasm core supplies the lossy Layer-III decode (Huffman / IMDCT / sy
 
 **Scope: decode only.** This fallback fills the WebCodecs **MP3 decode** gap (some WebKit/Firefox builds
 ship no MP3 `AudioDecoder`). MP3 *encode* is out of scope — Symphonia is decode-only and libmp3lame is C —
-so `createEncoder` raises a typed `CapabilityError` rather than faking one (ADR-017, directive 6).
+so `createEncoder` raises a typed `CapabilityError`.
 
 ---
 
@@ -76,7 +76,7 @@ output-rate samples, and constructs/closes every `AudioData`. The wasm side is p
    frame decodes to exactly its header sample count (1152 MPEG-1, 576 MPEG-2/2.5), the channel count/rate
    match, and the PCM is finite, in-range, non-silent. Cross-check total decoded samples against
    (frames walked × samplesPerFrame).
-2. **Browser (Playwright, ADR-025):** with WebCodecs MP3 disabled / `force-software`, decode the same
+2. **Browser (Playwright):** with WebCodecs MP3 disabled / `force-software`, decode the same
    corpus to `AudioData` and compare against a WebCodecs MP3 reference where available (SNR / near-bit-exact
    after the LAME encoder-delay trim); assert each emitted `AudioData` is `close()`d exactly once and an
    abort mid-stream frees the decoder (no leak).

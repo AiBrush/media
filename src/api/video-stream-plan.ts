@@ -1003,10 +1003,10 @@ export function planH264AbrLadder(
     throw new InputError('H.264 ABR ladder must contain at least one rung');
   }
   if (ladder.length > H264_ABR_MAX_RUNGS) {
-    throw new InputError(
-      `H.264 ABR ladder may contain at most ${H264_ABR_MAX_RUNGS} rungs`,
-      { rungCount: ladder.length, maximumRungs: H264_ABR_MAX_RUNGS },
-    );
+    throw new InputError(`H.264 ABR ladder may contain at most ${H264_ABR_MAX_RUNGS} rungs`, {
+      rungCount: ladder.length,
+      maximumRungs: H264_ABR_MAX_RUNGS,
+    });
   }
   return ladder.map((rung, index): PlannedH264AbrRung => {
     assertPositiveInteger('ABR rung width', rung.width);

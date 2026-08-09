@@ -1,9 +1,7 @@
 # The `wasm-opus` core (vendored prebuilt libopus-wasm, self-hosted, miss-only)
 
 This driver (`wasm-opus-driver.ts`) decodes/encodes Opus via **libopus** (xiph/opus, **BSD-3**), compiled
-to WebAssembly. libopus is C and this build sandbox has no usable wasm C toolchain to build it from source
-(see "Status" below), so per **ADR-085** (vendor a prebuilt **permissive** core) + **ADR-088** the core is a
-committed prebuilt: **`libopus-wasm@0.2.0`** (npm; **MIT** wrapper + **BSD** libopus), self-hosted in this
+to WebAssembly. The committed core is **`libopus-wasm@0.2.0`** (npm; **MIT** wrapper + **BSD** libopus), self-hosted in this
 directory (we commit it and serve it same-origin — NOT a runtime CDN dependency). It is loaded lazily,
 miss-only, behind WebCodecs.
 
@@ -73,19 +71,15 @@ changes; if it does, re-reconcile `opus-core.js` + `opus-core.d.ts` to the new s
 - **multi-rate** {8,12,16,24,48} kHz decodability; **decode** (§3.C.10): our decode of real `sfx-opus.ogg` /
   `bear-opus.webm` vs `ffmpeg` (≫ 60 dB — both are libopus); an encode→decode round-trip.
 
-Browser (Playwright, ADR-025) additionally validates the live `AudioData`/`EncodedChunk` stream path.
+Browser tests additionally validate the live `AudioData`/`EncodedChunk` stream path.
 Throughput: `bun run scripts/bench-opus.ts`. Budget: a probe-only app pulls **zero** Opus chunk; an Opus
 convert on a WebCodecs miss pulls **only** the lazy `opus-core.js` chunk (the inlined `.mjs` rides inside it).
 
 ---
 
-## Status: why prebuilt (not from-source) in this sandbox
+## From-source alternative
 
-emsdk/emcc 6.0.1 IS present (`source ~/emsdk/emsdk_env.sh`), so a from-source libopus build via Emscripten
-is *possible* in principle (recipe in `docs/notes/wasm-codec-cores.md` §1: `emconfigure ./configure
---disable-shared --disable-intrinsics` on `xiph/opus` v1.5.2, then a tiny C shim + `emcc -sMODULARIZE
--sEXPORT_ES6 --no-entry`). The **prebuilt** was chosen (ADR-088) because it is **proven** — a 50.3 dB Node
-round-trip + the full ffmpeg oracle pass against it — whereas an unproven heavy from-source build starves
-the active swarm and adds no validated capability. The from-source Emscripten path remains the documented
-alternative for cleaner BSD-only provenance if wanted later; the `OpusWasmCore` contract + the Node oracle
-are unchanged by such a swap.
+A source build requires Emscripten. Configure pinned libopus sources with `emconfigure ./configure
+--disable-shared --disable-intrinsics`, build the static library, and link a small C shim with
+`emcc -sMODULARIZE -sEXPORT_ES6 --no-entry`. Any replacement must satisfy the existing `OpusWasmCore`
+contract and pass the Node and ffmpeg validation described above.

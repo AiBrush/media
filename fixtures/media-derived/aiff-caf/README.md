@@ -1,7 +1,7 @@
 # AIFF / AIFF-C / CAF derived fixtures (committed)
 
 Small, **real Apple-native** audio files for the AIFF (`src/drivers/aiff`) and CAF (`src/drivers/caf`)
-container drivers (`BUILD_INSTRUCTIONS.md` §6.1). They are produced by macOS **CoreAudio `afconvert`**
+container drivers. They are produced by macOS **CoreAudio `afconvert`**
 from committed corpus WAVs — genuine AIFF/AIFF-C/CAF bitstreams, not hand-crafted bytes — and kept tiny
 while still covering every byte-order / sample-format variant the drivers must parse.
 

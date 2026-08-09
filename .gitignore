@@ -18,5 +18,6 @@ coverage
 fixtures/media
 
 # OS / editor
+.claude/
 .DS_Store
 *.log

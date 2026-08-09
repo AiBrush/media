@@ -16,11 +16,10 @@ Until both files are present, the driver is deliberately honest: `supports()` re
 is not auto-registered in `src/drivers/defaults.ts`, and a misrouted decoder raises a typed
 `CapabilityError`.
 
-## Status in this environment
+## Vendored core
 
-**VENDORED (prebuilt permissive core, ADR-093).** A from-source dav1d build here needs **Meson** (absent —
-`docs/notes/wasm-codec-cores.md`), so per **ADR-085** the core is a committed **prebuilt**: **`dav1d.js`
-v0.1.1** (npm) — dav1d itself **BSD-3** (VideoLAN), the dav1d.js wrapper **CC0** (public domain). It ships a
+The core is a committed prebuilt from **`dav1d.js` v0.1.1** (npm) — dav1d itself **BSD-3** (VideoLAN),
+the dav1d.js wrapper **CC0** (public domain). It ships a
 **separate 376 kB `.wasm`** (the standard pair, not inlined) with named C exports (`djs_decode_obu` …) and
 **stubbed pthreads** (single-thread, no COOP/COEP). Vendored files (committed):
 

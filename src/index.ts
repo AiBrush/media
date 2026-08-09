@@ -38,7 +38,7 @@ export type { MediaJob, MediaJobInput, MediaJobOperation, MediaJobOutput } from 
 // Public option/result types
 export type * from './api/types.ts';
 export {
-  H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS,
+  H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS,
   H264_ABR_MAX_RETAINED_OUTPUT_BYTES,
   H264_ABR_MAX_RUNGS,
   H264_ABR_MAX_SOURCE_BYTES,

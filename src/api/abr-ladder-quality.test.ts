@@ -3,8 +3,8 @@ import { ConstraintUnsatisfiedError, InputError, MediaError } from '../contracts
 import type { JobStreamRunner } from '../kernel/worker-host.ts';
 import type { WorkerMediaCaps } from '../kernel/worker-protocol.ts';
 import {
-  abrRetainedOutputBudget,
   type AbrLadderRunnerContext,
+  abrRetainedOutputBudget,
   runH264AbrLadder,
 } from './abr-ladder-runner.ts';
 import {
@@ -65,9 +65,9 @@ function offloadContext(
 }
 
 describe('H.264 ABR quality-constrained rungs', () => {
-  it('preserves legacy bitrate-only convert options byte-for-byte', () => {
+  it('preserves bitrate-only convert options byte-for-byte', () => {
     const planned = planH264AbrLadder(
-      [{ name: 'legacy', width: 640, height: 360, bitrate: 800_000 }],
+      [{ name: 'bitrate-only', width: 640, height: 360, bitrate: 800_000 }],
       SOURCE,
     );
 
@@ -202,7 +202,7 @@ describe('H.264 ABR quality-constrained rungs', () => {
     expect(H264_ABR_MAX_RETAINED_OUTPUT_BYTES).toBe(512 * 1024 * 1024);
   });
 
-  it('passes exact quality tuples into convert while leaving legacy rungs unchanged', async () => {
+  it('passes exact quality tuples into convert while leaving bitrate-only rungs unchanged', async () => {
     const seen: ConvertOptions[] = [];
     await runH264AbrLadder(
       inlineContext((_input, opts) => {
@@ -210,7 +210,7 @@ describe('H.264 ABR quality-constrained rungs', () => {
         return Promise.resolve(undefined);
       }),
       new Uint8Array([1, 2, 3]),
-      [qualityRung(), { name: 'legacy', width: 640, height: 360, bitrate: 800_000 }],
+      [qualityRung(), { name: 'bitrate-only', width: 640, height: 360, bitrate: 800_000 }],
       {},
       SIGNAL,
     );

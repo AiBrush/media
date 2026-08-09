@@ -15,8 +15,8 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
+import { H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS } from '../api/types.ts';
 import { type Source, fromBytes, fromStream } from '../sources/source.ts';
-import { H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS } from '../api/types.ts';
 import { readSourceOwned, transferableInput } from './worker-input.ts';
 import {
   type JobStreamRunner,
@@ -169,15 +169,17 @@ describe('readSourceOwned', () => {
 
   it('cancels an unknown-length worker source as soon as its explicit byte ceiling is crossed', async () => {
     let cancelled = false;
-    const src = fromStream(new ReadableStream<Uint8Array>({
-      start(controller): void {
-        controller.enqueue(Uint8Array.of(1, 2, 3));
-        controller.enqueue(Uint8Array.of(4, 5, 6));
-      },
-      cancel(): void {
-        cancelled = true;
-      },
-    }));
+    const src = fromStream(
+      new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(Uint8Array.of(1, 2, 3));
+          controller.enqueue(Uint8Array.of(4, 5, 6));
+        },
+        cancel(): void {
+          cancelled = true;
+        },
+      }),
+    );
     await expect(readSourceOwned(src, undefined, 5)).rejects.toMatchObject({
       code: 'unsupported-input',
       detail: { observedBytes: 6, maximumBytes: 5 },
@@ -326,8 +328,9 @@ describe('offloadAbrLadder bounded scheduling', () => {
         runStream: (job): ReadableStream<Transferable> => {
           active += 1;
           peak = Math.max(peak, active);
-          const opts = (job.payload as { readonly opts?: { readonly video?: { readonly width?: number } } })
-            .opts;
+          const opts = (
+            job.payload as { readonly opts?: { readonly video?: { readonly width?: number } } }
+          ).opts;
           const marker = opts?.video?.width ?? 0;
           let emitted = false;
           return new ReadableStream<Transferable>({
@@ -369,31 +372,27 @@ describe('offloadAbrLadder bounded scheduling', () => {
       })),
     );
     await Promise.all(streams.map(drainBytes));
-    expect(tracked.peak()).toBe(H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS);
+    expect(tracked.peak()).toBe(H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS);
   });
 
   it('serializes the full ladder when any rung carries an objective-quality constraint', async () => {
     const tracked = trackingRunner(4);
-    const streams = await offloadAbrLadder(
-      tracked.runner,
-      fromBytes(Uint8Array.of(1, 2, 3)),
-      [
-        {
-          opts: {
-            to: 'mp4',
-            video: {
-              codec: 'h264',
-              width: 1_920,
-              bitrate: 4_000_000,
-              maxAverageBitrate: 5_200_000,
-              quality: { metric: 'ssim-luma-v1', minimumMean: 0.95 },
-            },
+    const streams = await offloadAbrLadder(tracked.runner, fromBytes(Uint8Array.of(1, 2, 3)), [
+      {
+        opts: {
+          to: 'mp4',
+          video: {
+            codec: 'h264',
+            width: 1_920,
+            bitrate: 4_000_000,
+            maxAverageBitrate: 5_200_000,
+            quality: { metric: 'ssim-luma-v1', minimumMean: 0.95 },
           },
         },
-        { opts: { to: 'mp4', video: { codec: 'h264', width: 1_280, bitrate: 2_000_000 } } },
-        { opts: { to: 'mp4', video: { codec: 'h264', width: 854, bitrate: 1_000_000 } } },
-      ],
-    );
+      },
+      { opts: { to: 'mp4', video: { codec: 'h264', width: 1_280, bitrate: 2_000_000 } } },
+      { opts: { to: 'mp4', video: { codec: 'h264', width: 854, bitrate: 1_000_000 } } },
+    ]);
     await Promise.all(streams.map(drainBytes));
     expect(tracked.peak()).toBe(1);
   });

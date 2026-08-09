@@ -34,8 +34,8 @@ function packetStreams(tracks: readonly TrackInfo[]): PacketStreams {
     streams.audio = { track: audio, packets: demuxed.packets(audio.id) };
   }
   if (streams.video === undefined && streams.audio === undefined) {
-    throw new CapabilityError('capability-miss', 'input has no muxable audio or video tracks', {
-      op: 'mux',
+    throw new CapabilityError('input has no muxable audio or video tracks', {
+      op: { kind: 'route', id: 'mux' },
       tried: [],
     });
   }

@@ -7,12 +7,9 @@
  * inner engine). Also owns the per-op caps policy: which media kinds a job needs (punch-list 6).
  */
 
+import { H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS, H264_ABR_MAX_SOURCE_BYTES } from '../api/types.ts';
 import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
-import {
-  H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS,
-  H264_ABR_MAX_SOURCE_BYTES,
-} from '../api/types.ts';
 import type { Source } from '../sources/source.ts';
 import type { RunStreamOptions } from './worker-bridge.ts';
 import { readSourceOwned, transferableInput } from './worker-input.ts';
@@ -166,7 +163,7 @@ export function abrLadderCapsSatisfy(
  * ladder retains at most `min(N,K)` transferable copies instead of eagerly retaining K. A ladder containing
  * an objective-quality rung is deliberately serialized in full: the bounded quality runner already owns
  * sizeable candidate + RGBA/luma audit buffers, and overlapping it with another rung would defeat its
- * per-operation memory ceiling. Legacy bitrate-only ladders retain pool fan-out.
+ * per-operation memory ceiling. Bitrate-only ladders retain pool fan-out.
  */
 export async function offloadAbrLadder(
   pool: JobStreamRunner,
@@ -184,7 +181,7 @@ export async function offloadAbrLadder(
   const permits = abrPermits(
     containsQualityConstraint
       ? 1
-      : Math.min(declaredConcurrency, ladder.length, H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS),
+      : Math.min(declaredConcurrency, ladder.length, H264_ABR_MAX_CONCURRENT_BITRATE_RUNGS),
   );
 
   return ladder.map((rung) =>
@@ -210,7 +207,7 @@ export async function offloadAbrLadder(
 }
 
 function isQualityConstrainedRendition(rung: AbrRendition): boolean {
-  const video = rung.opts['video'];
+  const { video } = rung.opts;
   return (
     typeof video === 'object' &&
     video !== null &&
@@ -321,9 +318,7 @@ function scheduledAbrStream(
       throw abrAbortError();
     }
     try {
-      const stream = asBytes(
-        pool.runStream(buildJob(), { ...opts, signal: operation.signal }),
-      );
+      const stream = asBytes(pool.runStream(buildJob(), { ...opts, signal: operation.signal }));
       reader = stream.getReader();
       return reader;
     } catch (error) {

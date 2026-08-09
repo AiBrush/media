@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Real-media corpus (BUILD_INSTRUCTIONS §6.1) — real downloaded media only, never synthetic. Each entry is pinned by sha256 (a mismatch fails setup loudly) and records its `source`, `license`, and `attribution`. Run `bun run fetch-fixtures` to cache under fixtures/media/ (git-ignored; never committed). Sources: web-platform-tests (W3C 3-Clause BSD test license), ietf-wg-cellar/flac-test-files (CC0-1.0), and chromium/chromium media/test/data (BSD-3-Clause, © The Chromium Authors). The corpus only grows; new codecs/containers/traits get real files before their feature is done.",
+  "note": "Real downloaded media only, never synthetic. Each entry is pinned by sha256 (a mismatch fails setup loudly) and records its `source`, `license`, and `attribution`. Run `bun run fetch-fixtures` to cache under fixtures/media/ (git-ignored; never committed). Sources: web-platform-tests (W3C 3-Clause BSD test license), ietf-wg-cellar/flac-test-files (CC0-1.0), and chromium/chromium media/test/data (BSD-3-Clause, © The Chromium Authors). Add real files for new codecs, containers, and traits before shipping their support.",
   "files": [
     {
       "id": "2x2-green.mp4",

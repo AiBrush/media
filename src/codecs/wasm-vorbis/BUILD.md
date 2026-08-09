@@ -5,7 +5,7 @@ compiled to WebAssembly** — no C toolchain — loaded same-origin through `new
 import.meta.url)` (BUILD §7: no CDN, no COOP/COEP, lazy + miss-only). The `.wasm` + JS glue are **vendored
 into this directory** and committed; this file is the reproducible recipe that produced them.
 
-Unlike libopus (which needs Emscripten/autotools — see `../wasm-opus/BUILD.md`, ADR-031), Symphonia is
+Unlike libopus (which needs Emscripten/autotools — see `../wasm-opus/BUILD.md`), Symphonia is
 pure Rust, so it builds with the toolchain present in this environment. **This recipe was run here and
 succeeded.**
 
@@ -79,8 +79,8 @@ RFC 5215 §1.3.3). Landing within one block of the exact granulepos is impossibl
 codec — a strong, un-fakeable check.
 
 The browser-only part — the `createDecoder` `TransformStream` wrapping the core's output in WebCodecs
-`AudioData`, and the driver's `import.meta.url` fetch path — is validated in the Playwright harness
-(ADR-025), with `force-software` / Vorbis-WebCodecs-absent forcing this tier, decode SNR vs a reference,
+`AudioData`, and the driver's `import.meta.url` fetch path — is validated in the Playwright harness,
+with `force-software` / Vorbis-WebCodecs-absent forcing this tier, decode SNR vs a reference,
 and a fresh multi-sample throughput benchmark.
 
 ## Rebuilding from scratch

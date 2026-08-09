@@ -102,19 +102,16 @@ export async function readAllSource(
 }
 
 function assertMaximumReadBytes(maximumBytes: number | undefined): void {
-  if (
-    maximumBytes !== undefined &&
-    (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)
-  ) {
+  if (maximumBytes !== undefined && (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)) {
     throw new InputError('maximum source byte limit must be a positive safe integer');
   }
 }
 
 function sourceTooLarge(observedBytes: number, maximumBytes: number): InputError {
-  return new InputError(
-    `source exceeds the ${maximumBytes}-byte operation limit`,
-    { observedBytes, maximumBytes },
-  );
+  return new InputError(`source exceeds the ${maximumBytes}-byte operation limit`, {
+    observedBytes,
+    maximumBytes,
+  });
 }
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {

@@ -53,7 +53,7 @@ const CONTAINER_BY_EXTENSION = new Map<string, Container>([
 export function arg(args: readonly string[], index: number, label: string): string {
   const value = args[index];
   if (value === undefined || value.length === 0) {
-    throw new InputError('unsupported-input', `missing ${label}`);
+    throw new InputError(`missing ${label}`);
   }
   return value;
 }
@@ -62,7 +62,7 @@ export function numberArg(args: readonly string[], index: number, label: string)
   const raw = arg(args, index, label);
   const value = Number(raw);
   if (!Number.isFinite(value)) {
-    throw new InputError('unsupported-input', `${label} must be a finite number, got '${raw}'`);
+    throw new InputError(`${label} must be a finite number, got '${raw}'`);
   }
   return value;
 }
@@ -71,7 +71,7 @@ export function containerFromPath(path: string): Container {
   const ext = extname(path).toLowerCase();
   const container = CONTAINER_BY_EXTENSION.get(ext);
   if (container === undefined) {
-    throw new InputError('unsupported-input', `cannot infer output container from '${path}'`);
+    throw new InputError(`cannot infer output container from '${path}'`);
   }
   return container;
 }
@@ -95,7 +95,7 @@ async function outputToBytes(output: Output): Promise<Uint8Array> {
   if (output instanceof ReadableStream) {
     return readAll(output);
   }
-  throw new InputError('unsupported-input', 'operation produced no byte output for this example');
+  throw new InputError('operation produced no byte output for this example');
 }
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {

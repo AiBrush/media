@@ -1,9 +1,20 @@
 {
   "name": "@aibrush/media",
   "version": "0.0.0",
-  "description": "A unified, capability-routed, in-browser media engine — routes each operation to the best available substrate (WebCodecs → GPU → WASM → TS) behind a flat, intent-only API.",
+  "description": "A browser-first media engine for inspecting, decoding, encoding, converting, muxing, remuxing, and trimming media.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AiBrush/media.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AiBrush/media/issues"
+  },
+  "homepage": "https://github.com/AiBrush/media#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "sideEffects": false,
   "keywords": [
     "media",
@@ -61,9 +72,10 @@
     "url": false,
     "worker_threads": false
   },
-  "files": ["dist"],
+  "files": ["dist", "docs", "examples"],
   "scripts": {
     "typecheck": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node ./node_modules/typescript/bin/tsc -p tsconfig.test.json",
+    "docs:check": "node ./node_modules/typescript/bin/tsc -p tsconfig.examples.json && bun run scripts/check-docs.ts",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "format:check": "biome format .",
@@ -72,8 +84,6 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:dist": "vitest run src/dist-smoke.test.ts",
-    "test:deficit-generator": "node --test docs/perf/gen-deficits.test.mjs",
-    "test:session13-ledger-generator": "node --test docs/perf/gen-session13-speed-ledger.test.mjs",
     "build": "bun ./scripts/build.mjs",
     "vendor-wasm": "bun run scripts/vendor-wasm.ts",
     "vendor-wasm:check": "bun run scripts/vendor-wasm.ts --check",
@@ -81,7 +91,7 @@
     "check-budgets": "bun run scripts/check-budgets.ts",
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
-    "gate": "bun run typecheck && biome check . && bun run test:deficit-generator && bun run test:session13-ledger-generator && vitest run --coverage && bun run build && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
+    "gate": "bun run typecheck && bun run docs:check && biome check . && vitest run --coverage && bun run build && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
