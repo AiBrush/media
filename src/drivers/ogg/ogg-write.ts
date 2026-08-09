@@ -24,6 +24,11 @@ import {
 
 const MAX_SEGMENT = 255; // a lacing value is one byte; 255 means "continues in the next segment"
 const MAX_PAGE_SEGMENTS = 255; // a page's segment table holds at most 255 lacing values
+// Keep completed packets on bounded-size pages. Besides limiting muxer/demuxer latency, Vorbis needs
+// intermediate page granules to anchor overlap/preroll; putting an entire short program on one audio
+// page can make standards-compliant decoders discard the first overlap window even when the final
+// granule is exact. Oversized individual packets remain intact and may exceed this soft target.
+const TARGET_PAGE_BODY_BYTES = 8 * 1024;
 const OPUS_GRANULE_RATE = 48_000; // Opus always granule-clocks at 48 kHz, whatever the input rate
 const MICROS_PER_SECOND = 1_000_000;
 const DEFAULT_SERIAL = 0x00000001;
@@ -139,6 +144,13 @@ export interface OggPacket {
   granule: number;
 }
 
+export interface OggPageBuildOptions {
+  /** Soft bound between completed-packet granules on adjacent pages. */
+  maxGranuleSpan?: number;
+  /** End the first completed packet on its own page (Vorbis overlap/preroll anchor). */
+  flushAfterFirstPacket?: boolean;
+}
+
 /**
  * Lace packets into pages. Packets are accumulated onto a page until adding the next packet's segments
  * would exceed the 255-entry segment table, then the page is flushed; a packet larger than a page's
@@ -151,11 +163,13 @@ export function buildPages(
   packets: readonly OggPacket[],
   firstHeaderType: number,
   lastHeaderType: number,
+  options: OggPageBuildOptions = {},
 ): PageDraft[] {
   const pages: PageDraft[] = [];
   let lacing: number[] = [];
   let body: number[] = [];
   let pageGranule = -1; // -1 until a packet *completes* on this page
+  let previousPageGranule = 0;
   let continued = false; // does this page begin with a continued packet?
 
   const flush = (): void => {
@@ -165,14 +179,29 @@ export function buildPages(
       lacing,
       body: Uint8Array.from(body),
     });
+    if (pageGranule >= 0) previousPageGranule = pageGranule;
     lacing = [];
     body = [];
     pageGranule = -1;
     continued = false;
   };
 
-  for (const packet of packets) {
+  for (let packetIndex = 0; packetIndex < packets.length; packetIndex++) {
+    const packet = packets[packetIndex] as OggPacket;
     const segs = lacingForLength(packet.data.byteLength);
+    // Flush only at a packet boundary. Never split a packet merely to hit the soft body target; the
+    // 255-entry segment-table limit below remains the sole continuation-page mechanism.
+    if (
+      lacing.length > 0 &&
+      body.length > 0 &&
+      ((options.flushAfterFirstPacket === true && packetIndex === 1) ||
+        body.length + packet.data.byteLength > TARGET_PAGE_BODY_BYTES ||
+        (options.maxGranuleSpan !== undefined &&
+          pageGranule >= 0 &&
+          packet.granule - previousPageGranule > options.maxGranuleSpan))
+    ) {
+      flush();
+    }
     let segOffset = 0; // which lacing/segment of this packet we're placing next
     let byteOffset = 0;
     while (segOffset < segs.length) {
@@ -385,6 +414,7 @@ export interface TrackState {
   readonly sampleRate: number;
   readonly granuleRate: number;
   readonly durationSec: number | undefined;
+  readonly gapless: TrackInfo['gapless'] | undefined;
   readonly description: Uint8Array | undefined;
   readonly chunks: ChunkStruct[];
 }
@@ -406,6 +436,7 @@ export function trackStateFrom(info: TrackInfo): TrackState {
     sampleRate,
     granuleRate: codec === 'opus' ? OPUS_GRANULE_RATE : sampleRate,
     durationSec: finitePositiveDurationSec(info.durationSec),
+    gapless: info.gapless,
     description: ac?.description !== undefined ? toBytes(ac.description) : undefined,
     chunks: [],
   };
@@ -434,10 +465,39 @@ function samplesFor(chunk: ChunkStruct, fallbackUs: number, track: TrackState): 
   return Math.max(0, Math.round((durUs * track.granuleRate) / MICROS_PER_SECOND));
 }
 
-function declaredFinalGranule(track: TrackState): number | undefined {
-  return track.durationSec === undefined
-    ? undefined
-    : Math.max(0, Math.round(track.durationSec * track.granuleRate));
+function opusPreSkip(description: Uint8Array): number {
+  if (
+    description.byteLength < 12 ||
+    String.fromCharCode(...description.subarray(0, 8)) !== 'OpusHead'
+  ) {
+    return 0;
+  }
+  return new DataView(description.buffer, description.byteOffset, description.byteLength).getUint16(
+    10,
+    true,
+  );
+}
+
+/**
+ * Resolve the EOS granule for a declared presentation duration. Ogg Opus granules count decoded PCM
+ * before OpusHead pre-skip is removed, so an encoder destination whose public duration is the program
+ * window must add pre-skip. A demuxed Ogg source's exact `ogg-opus-granule` tuple is authoritative even
+ * when a separate metadata probe exposed a raw absolute granule duration (including a positive origin).
+ */
+function declaredFinalGranule(track: TrackState, idHeader: Uint8Array): number | undefined {
+  if (track.durationSec === undefined) return undefined;
+  const declaredSamples = Math.max(0, Math.round(track.durationSec * track.granuleRate));
+  if (track.codec !== 'opus') return declaredSamples;
+
+  const preSkip = opusPreSkip(idHeader);
+  const gapless = track.gapless;
+  const sourceProgramSamples = gapless?.totalSamples;
+  const hasExactOggProgram =
+    gapless?.basis === 'ogg-opus-granule' &&
+    Number.isSafeInteger(sourceProgramSamples) &&
+    (sourceProgramSamples ?? -1) >= 0;
+  const programSamples = hasExactOggProgram ? (sourceProgramSamples ?? 0) : declaredSamples;
+  return preSkip + programSamples;
 }
 
 /** The median inter-chunk PTS gap (µs), a per-chunk duration estimate when the encoder omitted it. */
@@ -482,7 +542,7 @@ export function writeOgg(track: TrackState, serial = DEFAULT_SERIAL): Uint8Array
   // Audio packets in presentation order with cumulative granule positions.
   const ordered = [...track.chunks].sort((a, b) => a.timestampUs - b.timestampUs);
   const fallbackUs = fallbackGapUs(ordered);
-  const targetFinalGranule = declaredFinalGranule(track);
+  const targetFinalGranule = declaredFinalGranule(track, idHeader);
   const audio: OggPacket[] = [];
   const weightedVorbis =
     track.codec === 'vorbis' && targetFinalGranule !== undefined && ordered.length > 0;
@@ -533,7 +593,13 @@ export function writeOgg(track: TrackState, serial = DEFAULT_SERIAL): Uint8Array
     0,
     0,
   );
-  const audioPages = buildPages(audio, 0, HT_EOS);
+  // A duration bound matters independently of byte size: a low-bitrate or short Vorbis program can
+  // fit below 8 KiB yet still needs an intermediate granule anchor for decoder overlap/preroll. Half a
+  // second keeps latency bounded and guarantees a useful pre-EOS anchor for one-second programs.
+  const audioPages = buildPages(audio, 0, HT_EOS, {
+    maxGranuleSpan: Math.max(1, Math.round(track.granuleRate / 2)),
+    flushAfterFirstPacket: track.codec === 'vorbis',
+  });
 
   const all = [...idPages, ...setupPages, ...audioPages];
   let seq = 0;

@@ -121,6 +121,7 @@ describe('Matroska Opus gapless preservation (ADR-196)', () => {
         numberOfChannels: golden.channels,
       });
       expect(audio?.gapless, expected.name).toEqual({
+        basis: 'webm-opus-codec-delay',
         leadingSamples: expected.leadingSamples,
         trailingSamples: expected.trailingSamples,
         totalSamples: expected.totalSamples,
@@ -156,6 +157,7 @@ describe('Matroska Opus gapless preservation (ADR-196)', () => {
         const audio = reparsed.tracks.find((track) => track.mediaType === 'audio');
         await reparsed.close();
         expect(audio?.gapless, expected.name).toEqual({
+          basis: 'webm-opus-codec-delay',
           leadingSamples: expected.leadingSamples,
           trailingSamples: expected.trailingSamples,
           totalSamples: expected.totalSamples,

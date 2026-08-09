@@ -9,7 +9,7 @@
  * sufficient — a whole-buffer borrowed view is shape-exact and still must not be adopted.
  */
 
-import { MediaError } from '../contracts/errors.ts';
+import { InputError, MediaError } from '../contracts/errors.ts';
 import type { Source } from '../sources/source.ts';
 
 /** One exact-length read of a whole source, tagged with whether this module owns the backing buffer. */
@@ -29,11 +29,19 @@ export interface OwnedSourceBytes {
 export async function readSourceOwned(
   src: Source,
   signal: AbortSignal | undefined,
+  maximumBytes?: number,
 ): Promise<OwnedSourceBytes> {
   throwIfAborted(signal);
+  assertMaximumReadBytes(maximumBytes);
+  if (maximumBytes !== undefined && src.size !== undefined && src.size > maximumBytes) {
+    throw sourceTooLarge(src.size, maximumBytes);
+  }
   if (src.range && src.size !== undefined) {
-    const bytes = await src.range(0, src.size);
+    const bytes = await src.range(0, src.size, signal);
     throwIfAborted(signal);
+    if (maximumBytes !== undefined && bytes.byteLength > maximumBytes) {
+      throw sourceTooLarge(bytes.byteLength, maximumBytes);
+    }
     return { bytes, owned: false };
   }
   const reader = src.stream().getReader();
@@ -44,6 +52,12 @@ export async function readSourceOwned(
       throwIfAborted(signal);
       const { done, value } = await reader.read();
       if (done) break;
+      if (
+        maximumBytes !== undefined &&
+        (value.byteLength > maximumBytes - total)
+      ) {
+        throw sourceTooLarge(total + value.byteLength, maximumBytes);
+      }
       chunks.push(value);
       total += value.byteLength;
     }
@@ -61,6 +75,22 @@ export async function readSourceOwned(
   }
   throwIfAborted(signal);
   return { bytes: out, owned: true };
+}
+
+function assertMaximumReadBytes(maximumBytes: number | undefined): void {
+  if (
+    maximumBytes !== undefined &&
+    (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)
+  ) {
+    throw new InputError('maximum source byte limit must be a positive safe integer');
+  }
+}
+
+function sourceTooLarge(observedBytes: number, maximumBytes: number): InputError {
+  return new InputError(
+    `source exceeds the ${maximumBytes}-byte operation limit`,
+    { observedBytes, maximumBytes },
+  );
 }
 
 /**

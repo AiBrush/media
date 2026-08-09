@@ -310,11 +310,18 @@ export interface TrackInfo {
   gapless?: {
     /**
      * Provenance for gapless facts whose native decoder treatment is substrate-dependent. MP4 edit
-     * lists rebase encoded packet timestamps before decode; some browsers also consume that priming
-     * natively, while others expose it for the engine to trim. An absent basis keeps the historical
-     * count-only contract used by codec-delay metadata such as Matroska Opus.
+     * lists rebase encoded packet timestamps before decode; Ogg Opus carries pre-skip in OpusHead and
+     * the exact presented tail in its EOS granule; Matroska Opus uses CodecDelay plus terminal
+     * DiscardPadding; Xing/LAME stores MP3 delay/padding that must be translated across Layer III's
+     * synthesis delay. Some container-aware decoders consume leading trim natively, while raw-frame
+     * decoders expose it for the engine to trim. An absent basis keeps the historical count-only contract.
      */
-    basis?: 'mp4-edit-list';
+    basis?: 'mp4-edit-list' | 'ogg-opus-granule' | 'webm-opus-codec-delay' | 'mp3-xing-lame';
+    /** Raw reversible Xing/LAME fields retained when `basis` is `mp3-xing-lame`. */
+    mp3Lame?: {
+      readonly encoderDelaySamples: number;
+      readonly encoderPaddingSamples: number;
+    };
     /** Leading decoder/encoder-delay samples to discard before exposing program audio. */
     leadingSamples?: number;
     /** Trailing encoder-padding samples to discard after program audio. */
@@ -322,6 +329,22 @@ export interface TrackInfo {
     /** Exact program-audio sample count after leading/trailing removal. */
     totalSamples?: number;
   };
+}
+
+/**
+ * Exact presentation-timing facts published by an audio encoder after its input and output have
+ * drained. Counts are per-channel PCM samples at {@link sampleRate}; they describe the newly encoded
+ * destination stream, never the source track's codec delay or padding.
+ */
+export interface AudioEncoderOutputTiming {
+  /** Destination PCM clock used by the encoded access units. */
+  readonly sampleRate: number;
+  /** Exact program samples submitted to the encoder after decode/filter/resample/downmix. */
+  readonly submittedSamples: number;
+  /** Total PCM capacity of the emitted access units, when the codec framing proves it. */
+  readonly codedSamples?: number;
+  /** Destination encoder priming before the first submitted program sample, when implementation-proven. */
+  readonly leadingSamples?: number;
 }
 
 export interface VideoColorMetadata {
@@ -365,11 +388,27 @@ export interface MuxOptions {
   container?: string;
 }
 
+/** Exact prepared-sample accounting from the selected mux route, before any candidate is published. */
+export interface MuxedTrackAudit {
+  /** Sum of elementary sample payload bytes after the muxer's framing normalization. */
+  readonly elementaryPayloadBytes: number;
+  /** Prepared payload byte lengths in packet arrival order, for rate-model recalibration. */
+  readonly preparedSampleByteLengths: readonly number[];
+  /** `max(PTS + duration) - min(PTS)` in the same rounded units a neutral demuxer will expose. */
+  readonly presentationSpanUs: number;
+  readonly sampleCount: number;
+}
+
 /** A live mux session: add tracks, write packets (preserving PTS/DTS/duration), finalize. */
 export interface Muxer {
   readonly output: ReadableStream<Uint8Array>;
   addTrack(info: TrackInfo): number;
   write(trackId: number, packet: Packet): Promise<void>;
+  /**
+   * Optional buffered-muxer seam for destination encoder timing learned only after its stream drains.
+   * Must be called before {@link finalize}; the tuple is in decoded samples at the output track rate.
+   */
+  setTrackGapless?(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void;
   /** Optional raw-PCM frame seam; bytes must match the added track's declared PCM wire layout. */
   writePcm?(trackId: number, data: Uint8Array): Promise<void>;
   finalize(): Promise<void>;
@@ -491,6 +530,19 @@ export interface ContainerDriver extends DriverBase {
   packetInfoBatches?(src: ByteSource, o?: PacketInfoBatchOptions): Promise<PacketInfoBatchStream>;
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
   createMuxer(o?: MuxOptions): Muxer;
+  /**
+   * Optional exact pre-publication accounting for one encoded track. The iterable is single-use and may
+   * copy one packet payload at a time; implementations must apply the same framing/timescale rules as the
+   * eventual {@link createMuxer} call with the same options. Implementations must observe `signal` while
+   * consuming bounded packet evidence. Absence means the route cannot prove a hard elementary-rate
+   * constraint before publication.
+   */
+  auditMuxedTrack?(
+    track: TrackInfo,
+    packets: Iterable<Packet>,
+    o?: MuxOptions,
+    signal?: AbortSignal,
+  ): Promise<MuxedTrackAudit>;
   /**
    * Optional lossless driver-native stream-copy targets outside {@link formats}. A driver lists only
    * target containers it can author itself while preserving coded packets and the target's strict layout
@@ -617,6 +669,7 @@ export const OPTIONAL_CONTAINER_CAPABILITIES = [
   'probe',
   'packetInfo',
   'packetInfoBatches',
+  'auditMuxedTrack',
   'streamCopy',
   'validatesStreamCopyTrim',
   'transformPcm',

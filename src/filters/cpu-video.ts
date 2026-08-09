@@ -1,8 +1,7 @@
 /**
  * CPU video filter driver (doc 09 §filters; ladder doc 04: WebGPU → Canvas2D → native CPU → WASM).
- * The cross-browser fallback that runs **every** video `FilterSpec` — resize, crop, pad, rotate, flip, colorspace,
- * tonemap — without WebGPU or Canvas2D colour management, for engines (Firefox/Safari often lack WebGPU)
- * where the GPU drivers' `supports()` is false. It reads a frame's pixels with `VideoFrame.copyTo` into a
+ * The cross-browser fallback for resize, crop, pad, rotate, flip, and colorspace when WebGPU or Canvas2D
+ * colour management is unavailable. It reads a frame's pixels with `VideoFrame.copyTo` into a
  * tightly-packed RGBA buffer, applies the **same pure math** the GPU path uses — the geometry from
  * {@link ./geometry.ts} and the colour science (gamut matrices, transfer curves, Reinhard/Hable tonemap)
  * from {@link ./gpu-uniforms.ts} — per pixel on the CPU, and emits a new RGBA `VideoFrame`.
@@ -14,12 +13,12 @@
  *   rungs and above the WASM tail. It is **pure TS**, not WASM: the byte-for-byte colour/geometry math is
  *   plain TypeScript, so it ships zero binary and is Node-validated.
  *
- * **Why the CPU path is *more* capable than Canvas2D for colour (ADR-038):** `copyTo` to `'RGBA'` yields
- * the frame's pixels in the frame's **own** colour space (the UA does only the YUV→RGB matrix, not display
- * tone-management), which is exactly the input the {@link ColorPlan} expects (decode the source transfer →
- * linear → gamut → tonemap → encode the target transfer). So the CPU driver can do a *genuine* colorspace
- * conversion to **any** target (including wide gamut) and a *genuine* HDR→SDR tonemap — unlike the Canvas2D
- * fallback, which can only passthrough-to-display. `supports()` is therefore honest about **all six** ops.
+ * **Colour boundary (ADR-038):** `copyTo({ format:'RGBA', colorSpace:'srgb' })` yields normalized sRGB
+ * pixels. That is a sound input for conversion from sRGB to any requested output gamut, but it has already
+ * discarded the source's native PQ/HLG representation. Applying a source-aware HDR transfer afterwards
+ * would double-convert those display-space samples, so this driver deliberately declines `tonemap` until a
+ * native HDR pixel representation is available. Chromium's colour-managed Canvas2D path remains the honest
+ * HDR→SDR rung; elsewhere the router returns a typed capability miss instead of wrong pixels.
  *
  * **Frame lifetime (doc 06 §3):** each input `VideoFrame` is `close()`d **exactly once** — in a `finally`
  * after `copyTo` has fully read its pixels into our buffer (the output frame is built from that buffer, never
@@ -358,11 +357,14 @@ type GeometricVideoSpec = Extract<
   { mediaType: 'video'; type: 'resize' | 'crop' | 'pad' | 'rotate' | 'flip' }
 >;
 
-/** The colour video specs this driver handles (colorspace/tonemap). */
+/** All colour specs understood by the pure planning helpers. */
 type ColorVideoSpec = Extract<FilterSpec, { mediaType: 'video'; type: 'colorspace' | 'tonemap' }>;
 
-/** Any video spec the CPU driver handles (all six). */
-type CpuVideoSpec = GeometricVideoSpec | ColorVideoSpec;
+/** The one colour spec whose normalized-sRGB input contract the CPU renderer can satisfy. */
+type CpuColorVideoSpec = Extract<FilterSpec, { mediaType: 'video'; type: 'colorspace' }>;
+
+/** Any video spec the CPU driver can honestly render. */
+type CpuVideoSpec = GeometricVideoSpec | CpuColorVideoSpec;
 
 /** True for the five geometric video specs. */
 function isGeometricVideoSpec(f: FilterSpec): f is GeometricVideoSpec {
@@ -376,14 +378,14 @@ function isGeometricVideoSpec(f: FilterSpec): f is GeometricVideoSpec {
   );
 }
 
-/** True for the two colour video specs. */
-function isColorVideoSpec(f: FilterSpec): f is ColorVideoSpec {
-  return f.mediaType === 'video' && (f.type === 'colorspace' || f.type === 'tonemap');
+/** True for the normalized-sRGB colour conversion the CPU renderer can perform. */
+function isCpuColorVideoSpec(f: FilterSpec): f is CpuColorVideoSpec {
+  return f.mediaType === 'video' && f.type === 'colorspace';
 }
 
-/** Any video spec the CPU driver handles (all six geometric + colour ops). */
+/** True for every video spec the CPU driver can honestly render. */
 function isCpuVideoSpec(f: FilterSpec): f is CpuVideoSpec {
-  return isGeometricVideoSpec(f) || isColorVideoSpec(f);
+  return isGeometricVideoSpec(f) || isCpuColorVideoSpec(f);
 }
 
 /** Resolve a geometric spec + concrete source dims into a CPU geometry recipe (may throw `InputError`). */
@@ -405,14 +407,19 @@ export function planCpuGeometry(spec: GeometricVideoSpec, srcW: number, srcH: nu
   }
 }
 
-/** Resolve a colour spec + the source colour interpretation into a {@link ColorPlan}. Pure/Node-tested. */
+/**
+ * Resolve a colour spec for the packed-RGBA representation consumed below. `VideoFrame.copyTo(RGBA)` is
+ * explicitly requested in sRGB, so colorspace conversion starts from sRGB instead of re-applying the
+ * decoded frame's original primaries/transfer. The tone-map branch remains a pure planning primitive for
+ * parity tests, but the CPU driver does not route it because this representation is no longer native HDR.
+ */
 export function planCpuColor(spec: ColorVideoSpec, source: SourceColor): ColorPlan {
   if (spec.type === 'tonemap') return planTonemap(source);
   const dst = parseColorSpace(spec.to);
   if (dst === null) {
     throw new InputError(`unknown colorspace target '${spec.to}'`);
   }
-  return planColorspace(source, dst);
+  return planColorspace({ primaries: 'srgb', transfer: 'srgb' }, dst);
 }
 
 // ---- VideoColorSpace ↔ SourceColor / target tagging (pure plan side; render side is browser-only) ----
@@ -434,25 +441,9 @@ function videoFrameRgbaAvailable(): boolean {
   return typeof VideoFrame !== 'undefined';
 }
 
-/**
- * Chromium's HDR decoder can expose an opaque/null-format `VideoFrame` that cannot be read with `copyTo`.
- * When the browser's Canvas2D path is available, it is the honest HDR→SDR substrate for those frames;
- * other browsers retain the pure CPU path.
- */
-function chromiumCanvasTonemapAvailable(): boolean {
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  return (
-    typeof OffscreenCanvas !== 'undefined' &&
-    videoFrameRgbaAvailable() &&
-    /\b(?:Chrome|Chromium|CriOS|Edg)\//.test(ua) &&
-    !/\bFirefox\//.test(ua)
-  );
-}
-
 /** True when the CPU filter can read the source frames for a spec in this environment. */
 export function cpuVideoFilterSupports(f: FilterSpec): boolean {
-  if (!isCpuVideoSpec(f) || !videoFrameRgbaAvailable()) return false;
-  return !(f.type === 'tonemap' && chromiumCanvasTonemapAvailable());
+  return isCpuVideoSpec(f) && videoFrameRgbaAvailable();
 }
 
 /** Cast through the lib.dom lag for BT.2020/PQ/HLG tokens; the runtime accepts the spec-defined values. */
@@ -466,7 +457,12 @@ async function frameToRgba(frame: VideoFrame): Promise<RgbaImage> {
   const height = frame.displayHeight;
   const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA }];
   const data = new Uint8ClampedArray(rgbaCopyBufferSize(width, height));
-  await frame.copyTo(data, { format: 'RGBA', rect: { x: 0, y: 0, width, height }, layout });
+  await frame.copyTo(data, {
+    format: 'RGBA',
+    colorSpace: 'srgb',
+    rect: { x: 0, y: 0, width, height },
+    layout,
+  });
   return { data, width, height };
 }
 
@@ -494,7 +490,7 @@ async function filterFrameCpu(spec: CpuVideoSpec, frame: VideoFrame): Promise<Vi
   const src = await frameToRgba(frame);
   const timestamp = frame.timestamp;
   const duration = frame.duration;
-  if (isColorVideoSpec(spec)) {
+  if (isCpuColorVideoSpec(spec)) {
     const plan = planCpuColor(spec, mapVideoColorSpace(frame.colorSpace));
     const out = applyColorPlanToRgba(plan, src);
     const target = colorSpecTargetGamut(spec);
@@ -573,11 +569,11 @@ function exhaustive(value: never): never {
 const CPU_SUBSTRATE: FilterSubstrate = 'native';
 
 /**
- * The CPU video filter driver (`substrate:'native'`, ranked **below** WebGPU + Canvas2D). Handles **all six**
- * video ops on the CPU via `VideoFrame.copyTo` + the shared pure math, so filters work even without WebGPU
- * or Canvas2D colour management (the cross-browser fallback). `supports()` is honest: true for every video
- * geometric/colour spec when `VideoFrame` is present, false otherwise (e.g. Node) and for audio specs. The
- * router only reaches it on a GPU miss (substrate ranking), so it never steals work from the GPU drivers.
+ * The CPU video filter driver (`substrate:'native'`, ranked **below** WebGPU + Canvas2D). Handles geometry
+ * and colorspace conversion via normalized-sRGB `VideoFrame.copyTo` plus shared pure math. It intentionally
+ * declines HDR tone-map because that read boundary cannot expose the native PQ/HLG samples its plan needs.
+ * The router only reaches this driver on a GPU miss, and receives a typed capability miss if no honest HDR
+ * substrate exists.
  */
 export const cpuVideoFilterDriver: FilterDriver = {
   id: 'cpu-video-filter',

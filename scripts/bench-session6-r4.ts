@@ -104,6 +104,9 @@ function benchRatePlans(): number {
     if (plan.mode === 'default') return sum + 1;
     if (plan.mode === 'bitrate') return sum + plan.bitrate;
     if (plan.mode === 'two-pass-bitrate') return sum + plan.bitrate + plan.passes;
+    if (plan.mode === 'quality-constrained-bitrate') {
+      return sum + plan.preferredAverageBitrate + plan.maxAverageBitrate;
+    }
     return sum + plan.crf + (plan.webCodecsConfigurable ? 17 : 3);
   }, 0);
 }

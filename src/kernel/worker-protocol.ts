@@ -16,6 +16,7 @@
 import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import {
   CapabilityError,
+  ConstraintUnsatisfiedError,
   InputError,
   MediaError,
   type MediaErrorCode,
@@ -170,7 +171,7 @@ export type WorkerMessage =
  * subclasses; a non-`MediaError` throw is carried with `kind:'generic'` so the host can wrap it.
  */
 export interface SerializedError {
-  readonly kind: 'media' | 'capability' | 'input' | 'generic';
+  readonly kind: 'media' | 'capability' | 'constraint' | 'input' | 'generic';
   readonly code?: MediaErrorCode;
   readonly message: string;
   readonly detail?: unknown;
@@ -179,15 +180,41 @@ export interface SerializedError {
 /** Serialize a thrown value for the wire, preserving a {@link MediaError}'s code/subclass + `detail`. */
 export function serializeError(e: unknown): SerializedError {
   if (e instanceof CapabilityError) {
-    return { kind: 'capability', code: e.code, message: e.message, detail: safeDetail(e.detail) };
+    return {
+      kind: 'capability',
+      code: e.code,
+      message: e.message,
+      detail: safeDetail(e.detail),
+    };
   }
   if (e instanceof InputError) {
-    return { kind: 'input', code: e.code, message: e.message, detail: safeDetail(e.detail) };
+    return {
+      kind: 'input',
+      code: e.code,
+      message: e.message,
+      detail: safeDetail(e.detail),
+    };
+  }
+  if (e instanceof ConstraintUnsatisfiedError) {
+    return {
+      kind: 'constraint',
+      code: e.code,
+      message: e.message,
+      detail: safeDetail(e.detail),
+    };
   }
   if (e instanceof MediaError) {
-    return { kind: 'media', code: e.code, message: e.message, detail: safeDetail(e.detail) };
+    return {
+      kind: 'media',
+      code: e.code,
+      message: e.message,
+      detail: safeDetail(e.detail),
+    };
   }
-  return { kind: 'generic', message: e instanceof Error ? e.message : String(e) };
+  return {
+    kind: 'generic',
+    message: e instanceof Error ? e.message : String(e),
+  };
 }
 
 /**
@@ -205,6 +232,10 @@ export function deserializeError(s: SerializedError, fallbackCode?: MediaErrorCo
       );
     case 'input':
       return new InputError(s.message, s.detail);
+    case 'constraint':
+      return isConstraintUnsatisfiedDetail(s.detail)
+        ? new ConstraintUnsatisfiedError(s.message, s.detail)
+        : new MediaError('constraint-unsatisfied', s.message, s.detail);
     case 'media':
       return new MediaError(s.code ?? 'decode-error', s.message, s.detail);
     case 'generic':
@@ -214,6 +245,28 @@ export function deserializeError(s: SerializedError, fallbackCode?: MediaErrorCo
     default:
       return assertNever(s.kind);
   }
+}
+
+function isConstraintUnsatisfiedDetail(
+  value: unknown,
+): value is ConstructorParameters<typeof ConstraintUnsatisfiedError>[1] {
+  if (typeof value !== 'object' || value === null) return false;
+  const detail = value as {
+    constraint?: unknown;
+    preferredAverageBitrate?: unknown;
+    maxAverageBitrate?: unknown;
+    minimumQualityMean?: unknown;
+    metric?: unknown;
+    attempts?: unknown;
+  };
+  return (
+    detail.constraint === 'h264-quality-rate' &&
+    typeof detail.preferredAverageBitrate === 'number' &&
+    typeof detail.maxAverageBitrate === 'number' &&
+    typeof detail.minimumQualityMean === 'number' &&
+    detail.metric === 'ssim-luma-v1' &&
+    Array.isArray(detail.attempts)
+  );
 }
 
 /** `detail` may itself be unserializable (e.g. a live object); keep only clone-safe shapes, else drop. */

@@ -24,6 +24,7 @@ import { describe, expect, it } from 'vitest';
 import type { Packet, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { writeToStreamTarget } from '../../sinks/stream-target.ts';
+import { fromBytes } from '../../sources/source.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { readMovie } from '../mp4/mp4-driver.ts';
 import type { ParsedTrack } from '../mp4/parse.ts';
@@ -124,6 +125,23 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
     off += p.byteLength;
   }
   return out;
+}
+
+async function withinMs<T>(promise: Promise<T>, label: string, timeoutMs = 500): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${label} did not settle promptly`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 function gaplessFromMp4Track(track: ParsedTrack): TrackInfo['gapless'] | undefined {
@@ -634,8 +652,66 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     const a2 = blocks.filter((b) => b.trackNumber === 2);
     expect(v1.map((b) => b.timeMs)).toEqual([0, 40]);
     expect(v1.map((b) => b.size)).toEqual([80, 30]);
-    expect(a2.map((b) => b.timeMs)).toEqual([0, 20, 40]);
+    // Stored Blocks sit one rounded TimecodeScale tick after the 6.5 ms CodecDelay. Demux subtracts
+    // the exact delay and therefore preserves the incoming presentation clock (within the 1 ms tick).
+    expect(a2.map((b) => b.timeMs)).toEqual([7, 27, 47]);
     expect(a2.map((b) => b.key)).toEqual([true, true, true]);
+    const demuxed = demuxWebm(bytes);
+    const demuxedAudioIndex = demuxed.info.tracks.findIndex((track) => track.codec === 'opus');
+    const demuxedAudio = demuxed.framesByIndex[demuxedAudioIndex] ?? [];
+    for (let index = 0; index < demuxedAudio.length; index++) {
+      expect(
+        Math.abs((demuxedAudio[index]?.timestampUs ?? 0) - index * 20_000),
+      ).toBeLessThanOrEqual(1_000);
+    }
+  });
+
+  it('authors destination Opus CodecDelay, terminal DiscardPadding, and exact program length', async () => {
+    const muxer = new WebmMuxer();
+    const programSamples = 2500;
+    const preSkipSamples = 312;
+    const codedSamples = 3 * 960;
+    const trailingSamples = codedSamples - preSkipSamples - programSamples;
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'opus',
+      durationSec: programSamples / 48_000,
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2, description: OPUS_HEAD },
+    });
+    for (let index = 0; index < 3; index++) {
+      // TOC config 1, code 0 = one 20 ms / 960-sample frame.
+      muxer.addChunkStruct(aud, {
+        timestampUs: index * 20_000,
+        durationUs: 20_000,
+        key: true,
+        data: Uint8Array.of(1 << 3, 0x40 + index),
+      });
+    }
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    const parsed = demuxWebm(bytes);
+    const trackIndex = parsed.info.tracks.findIndex((track) => track.codec === 'opus');
+    const opus = parsed.info.tracks[trackIndex];
+    const frames = parsed.framesByIndex[trackIndex] ?? [];
+    expect(opus?.codecDelayNs).toBe(Math.round((preSkipSamples * 1_000_000_000) / 48_000));
+    expect(frames.at(-1)?.discardPaddingNs).toBe(
+      Math.round((trailingSamples * 1_000_000_000) / 48_000),
+    );
+    expect(parseWebm(bytes).durationSec).toBeCloseTo(programSamples / 48_000, 6);
+
+    const publicDemuxer = await WebmDriver.demux(fromBytes(bytes));
+    try {
+      expect(publicDemuxer.tracks.find((track) => track.codec === 'opus')?.gapless).toEqual({
+        basis: 'webm-opus-codec-delay',
+        leadingSamples: preSkipSamples,
+        trailingSamples,
+        totalSamples: programSamples,
+      });
+    } finally {
+      await publicDemuxer.close();
+    }
   });
 
   it('B-frame reorder (decode-order PTS [0,3,1,2]): blocks carry presentation times (sorted)', async () => {
@@ -1271,6 +1347,48 @@ describe('WebmStreamingMuxer — true Cluster-on-write streaming output', () => 
     expect(parseWebm(bytes).tracks[0]?.codec).toBe('vp9');
   });
 
+  it('rejects a backpressured keyframe flush promptly when the output reader cancels', async () => {
+    const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      fps: 30,
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    const reader = muxer.output.getReader();
+
+    // The unread init segment consumes the stream's one-chunk queue. The next keyframe must flush the
+    // pending GOP, so this write remains suspended in the muxer's demand waiter until cancellation.
+    await muxer.addChunkStruct(vid, chunk(0, 33_333, true, 20));
+    await muxer.addChunkStruct(vid, chunk(33_333, 33_333, false, 21));
+    let settled = false;
+    const pendingWrite = muxer.addChunkStruct(vid, chunk(66_666, 33_333, true, 22)).finally(() => {
+      settled = true;
+    });
+    const writeOutcome = pendingWrite.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    const cancelReason = new Error('consumer stopped before the next WebM Cluster');
+    await withinMs(reader.cancel(cancelReason), 'output cancellation');
+    const outcome = await withinMs(writeOutcome, 'backpressured keyframe write');
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error).toBe(cancelReason);
+
+    // Cancellation is terminal and idempotent: no buffered GOP can be resumed by a later write/finalize.
+    await expect(muxer.addChunkStruct(vid, chunk(99_999, 33_333, false, 23))).rejects.toBe(
+      cancelReason,
+    );
+    await expect(muxer.finalize()).rejects.toBe(cancelReason);
+    await expect(reader.cancel(new Error('duplicate cancellation'))).resolves.toBeUndefined();
+    reader.releaseLock();
+  });
+
   it('uses packet.data directly and does not copy bytes back out of the EncodedChunk', async () => {
     const muxer = new WebmStreamingMuxer({ timelineBaseUs: 0 });
     const vid = muxer.addTrack({
@@ -1328,6 +1446,48 @@ describe('WebmStreamingMuxer — true Cluster-on-write streaming output', () => 
     expect(topLevelClusterCount(bytes)).toBe(3);
     expect(scanBlocks(bytes).map((block) => block.size)).toEqual([10, 11, 12, 13, 14, 15, 16, 17]);
     expect(parseWebm(bytes).tracks[0]?.codec).toBe('opus');
+  });
+
+  it('derives destination Opus tail padding cumulatively on the declared final streaming block', async () => {
+    const muxer = new WebmStreamingMuxer({ maxBlocksPerFragment: 2, timelineBaseUs: 0 });
+    const programSamples = 2500;
+    const preSkipSamples = 312;
+    const trailingSamples = 3 * 960 - preSkipSamples - programSamples;
+    const aud = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'opus',
+      durationSec: programSamples / 48_000,
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2, description: OPUS_HEAD },
+    });
+    const partsPromise = collectChunks(muxer.output);
+
+    for (let index = 0; index < 3; index++) {
+      await muxer.addChunkStruct(
+        aud,
+        {
+          timestampUs: index * 20_000,
+          durationUs: 20_000,
+          key: true,
+          data: Uint8Array.of(1 << 3, 0x50 + index),
+        },
+        index === 2,
+      );
+    }
+    await muxer.finalize();
+    const bytes = concatBytes(await partsPromise);
+
+    const demuxer = await WebmDriver.demux(fromBytes(bytes));
+    try {
+      expect(demuxer.tracks.find((track) => track.codec === 'opus')?.gapless).toEqual({
+        basis: 'webm-opus-codec-delay',
+        leadingSamples: preSkipSamples,
+        trailingSamples,
+        totalSamples: programSamples,
+      });
+    } finally {
+      await demuxer.close();
+    }
   });
 
   it('splits an audio Cluster when the timestamp span exceeds the WebM int16 relative limit', async () => {
@@ -1455,7 +1615,7 @@ describe('WebmMuxer — fragmented/CMAF streaming output (synthesized)', () => {
     expect(topLevelClusterCount(bytes)).toBeGreaterThanOrEqual(2);
     const blocks = scanBlocks(bytes);
     expect(blocks).toHaveLength(N);
-    expect(blocks.map((b) => b.timeMs)).toEqual(Array.from({ length: N }, (_, i) => i * 20));
+    expect(blocks.map((b) => b.timeMs)).toEqual(Array.from({ length: N }, (_, i) => i * 20 + 7));
   });
 
   it('a single short fragment still yields a valid stream (init + exactly one Cluster)', async () => {

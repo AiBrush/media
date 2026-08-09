@@ -144,6 +144,23 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return out;
 }
 
+async function withinMs<T>(promise: Promise<T>, label: string, timeoutMs = 500): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${label} did not settle promptly`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 function containerWith(demuxer: Demuxer): ContainerDriver {
   return {
     id: 'fake-mp4',
@@ -303,6 +320,78 @@ describe('remuxViaStreamingWebm', () => {
       expect(parsed.tracks[0]?.width).toBe(2);
       expect(parsed.tracks[0]?.height).toBe(2);
       expect(demuxer.close).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('unwinds packet readers and closes the demuxer when downstream cancels a backpressured keyframe flush', async () => {
+    const restore = installChunkConstructors();
+    const track: TrackInfo = {
+      id: 8,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      durationSec: 0.099,
+      config: { codec: 'vp09.00.10.08', codedWidth: 2, codedHeight: 2 },
+    };
+    const packets = [
+      packet('key', 0, [1, 2, 3]),
+      packet('delta', 33_000, [4, 5]),
+      packet('key', 66_000, [6, 7, 8]),
+    ];
+    let packetIndex = 0;
+    let markPacketsExhausted: (() => void) | undefined;
+    const packetsExhausted = new Promise<void>((resolve) => {
+      markPacketsExhausted = resolve;
+    });
+    let markClosed: (() => void) | undefined;
+    const closed = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
+    const packetReader = {
+      read: vi.fn(async (): Promise<ReadableStreamReadResult<Packet>> => {
+        const value = packets[packetIndex++];
+        if (value !== undefined) return { done: false, value };
+        markPacketsExhausted?.();
+        return { done: true, value: undefined };
+      }),
+      cancel: vi.fn(async () => undefined),
+      releaseLock: vi.fn(),
+    };
+    const demuxer: Demuxer & { close: ReturnType<typeof vi.fn> } = {
+      tracks: [track],
+      packets: vi.fn(
+        () =>
+          ({
+            getReader: () => packetReader as unknown as ReadableStreamDefaultReader<Packet>,
+          }) as unknown as ReadableStream<Packet>,
+      ),
+      close: vi.fn(async () => {
+        markClosed?.();
+      }),
+    };
+
+    try {
+      const stream = await remuxViaStreamingWebm(
+        containerWith(demuxer),
+        source as Source,
+        { to: 'mkv' },
+        {},
+      );
+      const reader = stream.getReader();
+      await packetsExhausted;
+      // Let the pump continue from its final input read into the third packet's keyframe-triggered flush.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(demuxer.close).not.toHaveBeenCalled();
+      expect(packetReader.cancel).not.toHaveBeenCalled();
+
+      const cancelReason = new Error('downstream abandoned WebM output');
+      await withinMs(Promise.all([reader.cancel(cancelReason), closed]), 'streaming remux cleanup');
+      expect(packetReader.cancel).toHaveBeenCalledWith(cancelReason);
+      expect(packetReader.releaseLock).toHaveBeenCalledTimes(1);
+      expect(demuxer.close).toHaveBeenCalledTimes(1);
+      await expect(reader.cancel(new Error('duplicate cancellation'))).resolves.toBeUndefined();
+      reader.releaseLock();
     } finally {
       restore();
     }

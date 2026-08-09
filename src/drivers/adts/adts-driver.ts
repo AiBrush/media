@@ -4,12 +4,12 @@
  * sampling-frequency index, and channel configuration. Duration comes from walking the frames (each is
  * `frame_length` bytes and 1024 samples per raw block). Probe and framing are pure TS; AAC packet decode
  * is capability-routed through native WebCodecs first and the vendored `wasm-aac` tail second, except for
- * Firefox/force-software PCM extraction and small no-DSP WAV-s16 extraction where the wasm tail owns the
- * route up front. The
+ * Firefox/force-software PCM extraction where the wasm tail owns the route up front. The
  * `decodePcm` bridge exposes ADTS → WAV extraction without pretending WAV is an `EncodedChunk` muxer.
  */
 
 import { loadAacCore } from '../../codecs/wasm-aac/wasm-aac-driver.ts';
+import { awaitAudioCodecQueueDrain } from '../../codecs/webcodecs-audio.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -52,7 +52,6 @@ const ADTS_TRIM_END_SLACK_SEC = 1;
 const ADTS_TRIM_URL_CACHE_TTL_MS = 60_000;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRIES = 16;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRY_BYTES = 1 * 1024 * 1024;
-const ADTS_DIRECT_WASM_S16_MAX_BYTES = 256 * 1024;
 
 export type AdtsAacPcmDecodeRung = (typeof AAC_PCM_NATIVE_FIRST_PLAN)[number];
 
@@ -374,11 +373,7 @@ function mayUseAdtsDirectWasmS16Wav(
   wasmOnlyRuntime: boolean,
 ): boolean {
   if (!Number.isFinite(byteLength) || byteLength < 0) return false;
-  return (
-    wasmOnlyRuntime ||
-    o?.determinism === 'force-software' ||
-    byteLength <= ADTS_DIRECT_WASM_S16_MAX_BYTES
-  );
+  return wasmOnlyRuntime || o?.determinism === 'force-software';
 }
 
 function payload(bytes: Uint8Array, frame: AdtsPacket): Uint8Array {
@@ -579,7 +574,7 @@ async function decodeNativeAacToPcm(
           data: payload(bytes, frame),
         }),
       );
-      if (decoder.decodeQueueSize >= 8) await decoder.flush();
+      await awaitAudioCodecQueueDrain(decoder, () => decoder.decodeQueueSize, signal, 8);
     }
     await decoder.flush();
     if (callbackError !== undefined) throw callbackError;

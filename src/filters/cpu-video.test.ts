@@ -1,7 +1,7 @@
 /**
  * Node-side validation for the CPU video filter driver (the cross-browser, no-GPU fallback). The live
  * `VideoFrame`/`copyTo` render runs only in the browser harness, so here we test the **pure per-pixel
- * transforms** — colorspace/tonemap and the geometry — exhaustively, with the key oracle being **parity
+ * transforms** — colorspace/tonemap math and the routed geometry — exhaustively, with the key oracle being **parity
  * with the GPU math**: the CPU colour apply must equal an independent recomputation from the *same* pure
  * primitives the GPU shader mirrors (`eotf`/`oetf`/`applyMat3`/tonemap from gpu-uniforms.ts), plus a few
  * hand-computed ground truths. We also cover geometry (crop exact, flip/rotate lossless, resize bilinear),
@@ -432,10 +432,17 @@ describe('geometryToRgba — resize (bilinear)', () => {
 describe('planCpuColor / planCpuGeometry — dispatch', () => {
   const src709 = { primaries: 'bt709', transfer: 'bt709' } as const;
 
-  it('colorspace → a no-tonemap plan with the right gamut matrix', () => {
+  it("colorspace starts from copyTo(RGBA)'s normalized sRGB representation", () => {
     const p = planCpuColor({ mediaType: 'video', type: 'colorspace', to: 'bt2020' }, src709);
     expect(p.tonemap).toBeNull();
-    expect(p.gamut).toEqual(gamutMatrix('bt709', 'bt2020'));
+    expect(p.decode).toBe('srgb');
+    expect(p.gamut).toEqual(gamutMatrix('srgb', 'bt2020'));
+    expect(
+      planCpuColor(
+        { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
+        { primaries: 'bt601', transfer: 'bt709' },
+      ),
+    ).toEqual(p);
   });
 
   it('tonemap → a Reinhard plan that converts the source gamut to 709', () => {
@@ -557,6 +564,9 @@ const ALL_VIDEO: readonly FilterSpec[] = [
   { mediaType: 'video', type: 'tonemap', to: 'sdr' },
 ];
 
+const CPU_HANDLED_VIDEO = ALL_VIDEO.filter((spec) => spec.type !== 'tonemap');
+const TONEMAP_SPEC: FilterSpec = { mediaType: 'video', type: 'tonemap', to: 'sdr' };
+
 const AUDIO: readonly FilterSpec[] = [
   { mediaType: 'audio', type: 'gain', db: 3 },
   { mediaType: 'audio', type: 'resample', sampleRate: 48000 },
@@ -577,42 +587,37 @@ describe('cpuVideoFilterDriver — identity & honest supports()', () => {
     for (const spec of AUDIO) expect(cpuVideoFilterDriver.supports(spec)).toBe(false);
   });
 
-  it('declines Chromium tonemap when Canvas2D can consume opaque HDR frames', () => {
-    vi.stubGlobal('navigator', { userAgent: 'Chrome/149' });
-    vi.stubGlobal('OffscreenCanvas', class FakeOffscreenCanvas {});
-    vi.stubGlobal('VideoFrame', class FakeVideoFrame {});
-    try {
-      expect(cpuVideoFilterSupports({ mediaType: 'video', type: 'tonemap', to: 'sdr' })).toBe(
-        false,
-      );
-      expect(
-        cpuVideoFilterSupports({ mediaType: 'video', type: 'resize', width: 8, height: 8 }),
-      ).toBe(true);
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it('retains CPU tonemap support on Firefox where Canvas2D does not claim HDR tonemap', () => {
-    vi.stubGlobal('navigator', { userAgent: 'Firefox/149' });
-    vi.stubGlobal('OffscreenCanvas', class FakeOffscreenCanvas {});
-    vi.stubGlobal('VideoFrame', class FakeVideoFrame {});
-    try {
-      expect(cpuVideoFilterSupports({ mediaType: 'video', type: 'tonemap', to: 'sdr' })).toBe(true);
-    } finally {
-      vi.unstubAllGlobals();
+  it('declines tonemap on every engine because copyTo exposes normalized sRGB, not native HDR', () => {
+    for (const userAgent of ['Chrome/149', 'Firefox/149', 'Version/18.0 Safari/605.1.15']) {
+      vi.stubGlobal('navigator', { userAgent });
+      vi.stubGlobal('VideoFrame', class FakeVideoFrame {});
+      try {
+        expect(cpuVideoFilterSupports(TONEMAP_SPEC)).toBe(false);
+        expect(
+          cpuVideoFilterSupports({ mediaType: 'video', type: 'colorspace', to: 'bt2020' }),
+        ).toBe(true);
+        expect(
+          cpuVideoFilterSupports({ mediaType: 'video', type: 'resize', width: 8, height: 8 }),
+        ).toBe(true);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     }
   });
 });
 
 describe('cpuVideoFilterDriver.createFilter — handler gating', () => {
-  it('builds a TransformStream for every video op (handler-gated, not env-gated)', () => {
-    for (const spec of ALL_VIDEO) {
+  it('builds a TransformStream for every honestly handled video op (handler-gated, not env-gated)', () => {
+    for (const spec of CPU_HANDLED_VIDEO) {
       const stream = cpuVideoFilterDriver.createFilter(spec);
       expect(stream).toBeInstanceOf(TransformStream);
       expect(stream.readable).toBeInstanceOf(ReadableStream);
       expect(stream.writable).toBeInstanceOf(WritableStream);
     }
+  });
+
+  it('rejects CPU tonemap synchronously with a typed CapabilityError', () => {
+    expect(() => cpuVideoFilterDriver.createFilter(TONEMAP_SPEC)).toThrow(CapabilityError);
   });
 
   it('throws CapabilityError for every audio spec', () => {

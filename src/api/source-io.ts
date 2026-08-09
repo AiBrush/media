@@ -5,7 +5,7 @@
  * the probed head bytes, and the cheap HLS-manifest plausibility gate.
  */
 
-import { MediaError } from '../contracts/errors.ts';
+import { InputError, MediaError } from '../contracts/errors.ts';
 import { raceAbort, throwIfSourceAborted } from '../sources/abort.ts';
 import {
   SOURCE_CACHE_KEY,
@@ -57,10 +57,19 @@ export async function readHead(
 export async function readAllSource(
   src: Source,
   signal: AbortSignal | undefined,
+  maximumBytes?: number,
 ): Promise<Uint8Array> {
   throwIfAborted(signal);
+  assertMaximumReadBytes(maximumBytes);
+  if (maximumBytes !== undefined && src.size !== undefined && src.size > maximumBytes) {
+    throw sourceTooLarge(src.size, maximumBytes);
+  }
   if (src.range && src.size !== undefined) {
-    return raceAbort(src.range(0, src.size, signal), signal);
+    const bytes = await raceAbort(src.range(0, src.size, signal), signal);
+    if (maximumBytes !== undefined && bytes.byteLength > maximumBytes) {
+      throw sourceTooLarge(bytes.byteLength, maximumBytes);
+    }
+    return bytes;
   }
   const reader = src.stream().getReader();
   const chunks: Uint8Array[] = [];
@@ -70,6 +79,9 @@ export async function readAllSource(
       throwIfAborted(signal);
       const { done, value } = await raceAbort(reader.read(), signal);
       if (done) break;
+      if (maximumBytes !== undefined && value.byteLength > maximumBytes - total) {
+        throw sourceTooLarge(total + value.byteLength, maximumBytes);
+      }
       chunks.push(value);
       total += value.byteLength;
     }
@@ -87,6 +99,22 @@ export async function readAllSource(
   }
   throwIfAborted(signal);
   return out;
+}
+
+function assertMaximumReadBytes(maximumBytes: number | undefined): void {
+  if (
+    maximumBytes !== undefined &&
+    (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)
+  ) {
+    throw new InputError('maximum source byte limit must be a positive safe integer');
+  }
+}
+
+function sourceTooLarge(observedBytes: number, maximumBytes: number): InputError {
+  return new InputError(
+    `source exceeds the ${maximumBytes}-byte operation limit`,
+    { observedBytes, maximumBytes },
+  );
 }
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {

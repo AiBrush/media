@@ -42,6 +42,8 @@ function videoTargetRequestsReencode(target: VideoTarget): boolean {
     target.fit !== undefined ||
     target.fps !== undefined ||
     target.bitrate !== undefined ||
+    target.maxAverageBitrate !== undefined ||
+    target.quality !== undefined ||
     target.bitrateMode !== undefined ||
     target.crf !== undefined ||
     target.twoPass === true ||
@@ -85,6 +87,8 @@ export function mayBeSemanticStreamCopy(opts: ConvertOptions): boolean {
     if (
       video.fps !== undefined ||
       video.bitrate !== undefined ||
+      video.maxAverageBitrate !== undefined ||
+      video.quality !== undefined ||
       video.bitrateMode !== undefined ||
       video.crf !== undefined ||
       video.twoPass === true ||

@@ -131,6 +131,8 @@ export interface MuxTrackInput {
     durationMovieTicks?: number;
     leadingEmptyDurationMovieTicks?: number;
   };
+  /** ISO BMFF `roll` sample-group distance; AAC normally uses -1 (one access unit of decoder preroll). */
+  rollDistance?: number;
   /** Optional explicit `mdat` chunk layout; omitted means one contiguous chunk per track. */
   sampleChunks?: readonly MuxSampleChunkLayoutInput[];
   samples: MuxSampleInput[];
@@ -435,6 +437,42 @@ function sampleToChunkEntries(chunks: readonly NormalizedTrackChunk[]): number[]
   return out;
 }
 
+/**
+ * Explicit AAC priming marker (ISO sample groups / QuickTime AAC priming appendix). `elst` carries the
+ * source waveform window; `sgpd` + `sbgp` declare that the offset is explicit and describe one access
+ * unit of decoder roll. Without these boxes Apple readers apply the historical implicit 2,112 rule.
+ */
+function rollSampleGroups(track: MuxTrackLayoutInput): number[] {
+  const distance = track.rollDistance;
+  if (distance === undefined) return [];
+  if (!Number.isInteger(distance) || distance < -0x8000 || distance > 0x7fff) {
+    throw new MediaError('mux-error', `roll distance ${distance} is outside signed 16-bit range`);
+  }
+  const sgpd = full(
+    'sgpd',
+    1,
+    0,
+    cat(
+      fourcc('roll'),
+      u32(2), // default_length: one signed i16 roll_distance
+      u32(1), // entry_count
+      u16(distance),
+    ),
+  );
+  const sbgp = full(
+    'sbgp',
+    0,
+    0,
+    cat(
+      fourcc('roll'),
+      u32(1), // entry_count
+      u32(track.samples.length),
+      u32(1), // group_description_index
+    ),
+  );
+  return cat(sgpd, sbgp);
+}
+
 function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): number[] {
   const entry = track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
   const sizes = track.samples.map(sampleByteLength);
@@ -455,6 +493,7 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
     full('stsc', 0, 0, cat(u32(sampleToChunk.length / 12), sampleToChunk)),
     full('stco', 0, 0, cat(u32(chunkTable.chunkOffsets.length), u32Table(chunkTable.chunkOffsets))),
     allSync ? [] : full('stss', 0, 0, cat(u32(sync.length), u32Table(sync))),
+    rollSampleGroups(track),
     sencBox(track),
   );
   return box('stbl', children);

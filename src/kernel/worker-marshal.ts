@@ -9,6 +9,10 @@
 
 import type { WasmRuntimeProfile } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
+import {
+  H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS,
+  H264_ABR_MAX_SOURCE_BYTES,
+} from '../api/types.ts';
 import type { Source } from '../sources/source.ts';
 import type { RunStreamOptions } from './worker-bridge.ts';
 import { readSourceOwned, transferableInput } from './worker-input.ts';
@@ -21,6 +25,8 @@ import type { OffloadJob, WorkerMediaCaps } from './worker-protocol.ts';
  * through a pool of N for `{pool:N}` or a single bridge without naming which.
  */
 export interface JobStreamRunner {
+  /** Maximum jobs the runner can execute concurrently. A single bridge may omit this (treated as one). */
+  readonly size?: number;
   runStream(job: OffloadJob, opts: RunStreamOptions): ReadableStream<Transferable>;
 }
 
@@ -140,10 +146,27 @@ export interface AbrRendition {
 }
 
 /**
- * Encode an **ABR ladder** from one source across a pool: fan the K renditions out as K independent
- * `convert` jobs (concurrency `min(N,K)`), returning a byte stream per rendition **in input order**.
- * Because a transfer detaches the input buffer, each rendition gets its **own copy** of the source bytes
- * (a worker must own a transferable buffer) — unavoidable and explicit.
+ * ABR offload is allowed only with an affirmative worker handshake that covers every rendition. Unlike
+ * the generic single-job helper, missing caps are not treated as unrestricted: a ladder would otherwise
+ * start several expensive jobs before discovering that the worker cannot execute one of their media paths.
+ */
+export function abrLadderCapsSatisfy(
+  caps: WorkerMediaCaps | undefined,
+  ladder: readonly AbrRendition[],
+): boolean {
+  return (
+    caps !== undefined &&
+    ladder.every((rendition) => capsSatisfy(caps, offloadCapsNeed(rendition.opts)))
+  );
+}
+
+/**
+ * Encode an **ABR ladder** from one source across a pool, returning a byte stream per rendition **in input
+ * order**. Source copies are allocated only when a bounded scheduler dispatches a rendition, so a K-rung
+ * ladder retains at most `min(N,K)` transferable copies instead of eagerly retaining K. A ladder containing
+ * an objective-quality rung is deliberately serialized in full: the bounded quality runner already owns
+ * sizeable candidate + RGBA/luma audit buffers, and overlapping it with another rung would defeat its
+ * per-operation memory ceiling. Legacy bitrate-only ladders retain pool fan-out.
  */
 export async function offloadAbrLadder(
   pool: JobStreamRunner,
@@ -151,23 +174,204 @@ export async function offloadAbrLadder(
   ladder: readonly AbrRendition[],
   opts: OffloadStreamOptions = {},
 ): Promise<ReadableStream<Uint8Array>[]> {
-  const { bytes } = await readSourceOwned(src, opts.signal);
+  const { bytes } = await readSourceOwned(src, opts.signal, H264_ABR_MAX_SOURCE_BYTES);
   const { determinism, pinDriver, wasmRuntime, wasmAssetBaseUrl } = opts;
-  const jobs: OffloadJob[] = ladder.map((rung) => ({
-    op: 'convert' as const,
-    // Per-rendition copy: each job transfers (detaches) its own input buffer, so they cannot share one.
-    // `TypedArray.slice` always allocates a fresh plain ArrayBuffer (never an SAB), so the cast is sound.
-    payload: {
-      ...buildOffloadPayload('convert', src, rung.opts),
-      input: bytes.slice().buffer as ArrayBuffer,
-    },
-    ...(determinism !== undefined ? { determinism } : {}),
-    ...(pinDriver !== undefined ? { pinDriver } : {}),
-    ...(wasmRuntime !== undefined ? { wasmRuntime } : {}),
-    ...(wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl } : {}),
-  }));
   const runOpts = runOptionsOf(opts);
-  return jobs.map((job) => asBytes(pool.runStream(job, runOpts)));
+  const containsQualityConstraint = ladder.some((rung) => isQualityConstrainedRendition(rung));
+  const declaredConcurrency = Number.isFinite(pool.size)
+    ? Math.max(1, Math.floor(pool.size as number))
+    : 1;
+  const permits = abrPermits(
+    containsQualityConstraint
+      ? 1
+      : Math.min(declaredConcurrency, ladder.length, H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS),
+  );
+
+  return ladder.map((rung) =>
+    scheduledAbrStream(
+      pool,
+      permits,
+      () => ({
+        op: 'convert' as const,
+        // A worker must exclusively own its transferred input. Allocate this copy only after the scheduler
+        // grants a slot; `TypedArray.slice` always returns a fresh plain ArrayBuffer-backed typed array.
+        payload: {
+          ...buildOffloadPayload('convert', src, rung.opts),
+          input: bytes.slice().buffer as ArrayBuffer,
+        },
+        ...(determinism !== undefined ? { determinism } : {}),
+        ...(pinDriver !== undefined ? { pinDriver } : {}),
+        ...(wasmRuntime !== undefined ? { wasmRuntime } : {}),
+        ...(wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl } : {}),
+      }),
+      runOpts,
+    ),
+  );
+}
+
+function isQualityConstrainedRendition(rung: AbrRendition): boolean {
+  const video = rung.opts['video'];
+  return (
+    typeof video === 'object' &&
+    video !== null &&
+    'quality' in video &&
+    (video as { readonly quality?: unknown }).quality !== undefined
+  );
+}
+
+interface AbrPermits {
+  acquire(signal: AbortSignal): Promise<() => void>;
+  fail(error: unknown): void;
+}
+
+/** Small abort-aware semaphore used only for ABR job/source-copy lifetime. */
+function abrPermits(limit: number): AbrPermits {
+  let active = 0;
+  let failure: { readonly error: unknown } | undefined;
+  const waiting: Array<{
+    readonly signal: AbortSignal;
+    readonly resolve: (release: () => void) => void;
+    readonly reject: (error: unknown) => void;
+    readonly onAbort: () => void;
+  }> = [];
+
+  const grant = (resolve: (release: () => void) => void): void => {
+    active += 1;
+    let released = false;
+    resolve(() => {
+      if (released) return;
+      released = true;
+      active -= 1;
+      while (waiting.length > 0) {
+        const next = waiting.shift();
+        if (next === undefined) break;
+        next.signal.removeEventListener('abort', next.onAbort);
+        if (next.signal.aborted) {
+          next.reject(abrAbortError());
+          continue;
+        }
+        grant(next.resolve);
+        break;
+      }
+    });
+  };
+
+  return {
+    acquire(signal): Promise<() => void> {
+      if (failure !== undefined) return Promise.reject(failure.error);
+      if (signal.aborted) return Promise.reject(abrAbortError());
+      if (active < limit) {
+        return new Promise((resolve) => grant(resolve));
+      }
+      return new Promise<() => void>((resolve, reject) => {
+        const entry = {
+          signal,
+          resolve,
+          reject,
+          onAbort: (): void => {
+            const index = waiting.indexOf(entry);
+            if (index >= 0) waiting.splice(index, 1);
+            reject(abrAbortError());
+          },
+        };
+        waiting.push(entry);
+        signal.addEventListener('abort', entry.onAbort, { once: true });
+      });
+    },
+    fail(error): void {
+      if (failure !== undefined) return;
+      failure = { error };
+      for (const pending of waiting.splice(0)) {
+        pending.signal.removeEventListener('abort', pending.onAbort);
+        pending.reject(error);
+      }
+    },
+  };
+}
+
+/** Lazily allocate + dispatch one rendition after the bounded scheduler grants it a slot. */
+function scheduledAbrStream(
+  pool: JobStreamRunner,
+  permits: AbrPermits,
+  buildJob: () => OffloadJob,
+  opts: RunStreamOptions,
+): ReadableStream<Uint8Array> {
+  const operation = new AbortController();
+  const parentSignal = opts.signal;
+  const onParentAbort = (): void => operation.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) operation.abort(parentSignal.reason);
+  else parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let opening: Promise<ReadableStreamDefaultReader<Uint8Array>> | undefined;
+  let releasePermit: (() => void) | undefined;
+  let settled = false;
+
+  const settle = (): void => {
+    if (settled) return;
+    settled = true;
+    parentSignal?.removeEventListener('abort', onParentAbort);
+    releasePermit?.();
+    releasePermit = undefined;
+  };
+  const open = async (): Promise<ReadableStreamDefaultReader<Uint8Array>> => {
+    releasePermit = await permits.acquire(operation.signal);
+    if (operation.signal.aborted) {
+      settle();
+      throw abrAbortError();
+    }
+    try {
+      const stream = asBytes(
+        pool.runStream(buildJob(), { ...opts, signal: operation.signal }),
+      );
+      reader = stream.getReader();
+      return reader;
+    } catch (error) {
+      settle();
+      throw error;
+    }
+  };
+
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        try {
+          opening ??= open();
+          const active = await opening;
+          const { done, value } = await active.read();
+          if (done) {
+            active.releaseLock();
+            reader = undefined;
+            settle();
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (error) {
+          permits.fail(error);
+          reader?.releaseLock();
+          reader = undefined;
+          settle();
+          controller.error(error);
+        }
+      },
+      async cancel(reason): Promise<void> {
+        operation.abort(reason);
+        const active = reader ?? (await opening?.catch(() => undefined));
+        if (active !== undefined) {
+          await active.cancel(reason).catch(() => {});
+          active.releaseLock();
+        }
+        reader = undefined;
+        settle();
+      },
+    },
+    new CountQueuingStrategy({ highWaterMark: 0 }),
+  );
+}
+
+function abrAbortError(): MediaError {
+  return new MediaError('aborted', 'ABR rendition cancelled');
 }
 
 /** Strip the job-level fields, keeping only the per-call stream options the bridge consumes. */

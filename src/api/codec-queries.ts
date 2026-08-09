@@ -152,7 +152,10 @@ export function videoPixelRotation(
   }
   throw new CapabilityError(
     `cannot bake composed video rotation ${composedRotation}° with the available quarter-turn filters`,
-    { op: { kind: 'route', id: 'rotate' }, tried: ['video-filter/quarter-turn'] },
+    {
+      op: { kind: 'route', id: 'rotate' },
+      tried: ['video-filter/quarter-turn'],
+    },
   );
 }
 
@@ -321,13 +324,18 @@ function vpxAlphaProfile(codec: string): string | undefined {
  * so they keep the dual-encode path.
  */
 export function canCopyVpxAlphaSideData(
-  target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
+  target: Pick<
+    VideoTarget,
+    'bitrate' | 'maxAverageBitrate' | 'quality' | 'bitrateMode' | 'crf' | 'twoPass'
+  >,
   sourceCodec: string,
   targetCodec: string,
 ): boolean {
   const sourceProfile = vpxAlphaProfile(sourceCodec);
   return (
     target.bitrate === undefined &&
+    target.maxAverageBitrate === undefined &&
+    target.quality === undefined &&
     target.bitrateMode === undefined &&
     target.crf === undefined &&
     target.twoPass !== true &&

@@ -380,6 +380,43 @@ describe('WorkerPool per-call signal + cancel', () => {
       await pool.terminate();
     }
   });
+
+  it('removes a cancelled queued job before dispatch and leaves the pool reusable', async () => {
+    const started: number[] = [];
+    const runJob: JobRunner = (job) => {
+      const { id, finite } = job.payload as { id: number; finite: boolean };
+      started.push(id);
+      let emitted = false;
+      return new ReadableStream<Transferable>({
+        pull(controller): void {
+          if (!finite) {
+            controller.enqueue(Uint8Array.of(id).buffer);
+            return;
+          }
+          if (emitted) controller.close();
+          else {
+            emitted = true;
+            controller.enqueue(Uint8Array.of(id).buffer);
+          }
+        },
+      });
+    };
+    const pool = new WorkerPool({ size: 1, transport: channelTransport(runJob) });
+    try {
+      const active = pool.run(convertJob({ id: 0, finite: false }));
+      const queued = pool.run(convertJob({ id: 1, finite: true }));
+      const activeReader = active.getReader();
+      await activeReader.read();
+      await queued.cancel(new Error('ladder sibling failed'));
+      await activeReader.cancel();
+
+      const replacement = pool.run(convertJob({ id: 2, finite: true }));
+      await drain(replacement);
+      expect(started).toEqual([0, 2]);
+    } finally {
+      await pool.terminate();
+    }
+  });
 });
 
 // ── failure isolation + terminated guard ─────────────────────────────────────────────────────────────

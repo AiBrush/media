@@ -189,10 +189,13 @@ export function validateLiveConvertOptions(input: LiveInput, options: ConvertOpt
     }
     requirePositiveInteger(target.width, 'live video target width');
     requirePositiveInteger(target.height, 'live video target height');
-    if (target.twoPass === true) {
+    if (target.twoPass === true || target.quality !== undefined) {
       throw new CapabilityError(
-        'two-pass video encode requires a finite replayable source, not a live MediaStream',
-        { op: { kind: 'route', id: 'convert' }, tried: ['media-stream', 'two-pass'] },
+        'replay-backed video rate control requires a finite source, not a live MediaStream',
+        {
+          op: { kind: 'route', id: 'convert' },
+          tried: ['media-stream', 'replay-rate-control'],
+        },
       );
     }
   }

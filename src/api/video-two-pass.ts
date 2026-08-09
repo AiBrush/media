@@ -4,18 +4,34 @@
  * retaining frames or payload bytes.
  */
 
-import { InputError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 
 export const H264_FIRST_PASS_QUANTIZER = 28 as const;
+/**
+ * Operational ceiling for the in-memory per-picture analysis schedule. The limit is independent of
+ * fixture identity and keeps every analysis/candidate array bounded before a replay can allocate it.
+ */
+export const H264_TWO_PASS_MAX_PICTURE_EVIDENCE = 262_144;
 
 const H264_MIN_QUANTIZER = 0;
 const H264_MAX_QUANTIZER = 51;
 const H264_QP_PER_SIZE_DOUBLING = 6;
-const COMPLEXITY_BLUR = 0.6;
+/**
+ * Allocate mildly superlinearly with fixed-QP bytes per presentation-time unit. For
+ *
+ *   weight = duration * (bytes / duration)^a
+ *
+ * the QP model below reduces to `q = constant + 6 * (1 - a) * log2(bytes / duration)` before
+ * key-picture credit, smoothing, and global calibration. `a = 1.15` therefore gives a difficult
+ * picture 0.9 lower (better) QP per complexity doubling. A sublinear exponent instead gives harder
+ * pictures worse QP, the opposite of the intended complexity-aware allocation.
+ */
+const COMPLEXITY_EXPONENT = 1.15;
 const KEYFRAME_WEIGHT = 1.15;
 const MAX_ADJACENT_QP_DELTA = 4;
 const MICROS_PER_SECOND = 1_000_000;
 const BITS_PER_BYTE = 8;
+const DECLARED_DURATION_ROUNDING_TOLERANCE_US = 1;
 
 export interface H264FirstPassSample {
   readonly timestampUs: number;
@@ -34,11 +50,23 @@ export interface H264TwoPassPlan {
   /** Packed PTS evidence: eight timestamp bytes plus one QP byte per analyzed picture. */
   readonly evidenceBytes: number;
   readonly timestampsUs: Readonly<Float64Array>;
+  /** Packed per-picture QPs, aligned one-to-one with {@link timestampsUs}. */
+  readonly quantizers: Readonly<Uint8Array>;
   quantizerForTimestamp(timestampUs: number): number;
+  /** Validate an encoded candidate's exact PTS/duration set and return its measured presentation span. */
+  validateCandidateTimeline(actualSamples: readonly H264FirstPassSample[]): number;
+  /**
+   * Return a fresh replay cursor with the same complexity shape globally recalibrated from one exact
+   * candidate encode. Candidate samples must cover the analyzed PTS set one-to-one.
+   */
+  recalibrate(actualSamples: readonly H264FirstPassSample[], targetBytes: number): H264TwoPassPlan;
 }
 
 interface TimedSample extends H264FirstPassSample {
+  /** Duration that the eventual buffered mux path assigns to this presentation sample. */
   readonly durationUs: number;
+  /** Verbatim nullable WebCodecs chunk duration retained for candidate-equivalence checks. */
+  readonly chunkDurationUs: number | undefined;
 }
 
 function finiteNonNegativeInteger(value: number, label: string): void {
@@ -53,6 +81,33 @@ function positiveFinite(value: number, label: string): void {
   }
 }
 
+function positiveSafeInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new InputError(`${label} must be a positive safe integer`);
+  }
+}
+
+/** Reject a replay schedule before retaining more than the operation's fixed picture-evidence bound. */
+export function assertH264TwoPassPictureEvidenceCapacity(pictureCount: number): void {
+  if (!Number.isSafeInteger(pictureCount) || pictureCount < 0) {
+    throw new InputError('H.264 two-pass picture count must be a non-negative safe integer');
+  }
+  if (pictureCount <= H264_TWO_PASS_MAX_PICTURE_EVIDENCE) return;
+  throw new CapabilityError('H.264 two-pass picture evidence exceeds the in-memory limit', {
+    op: {
+      kind: 'route',
+      id: 'h264-two-pass-picture-evidence',
+      facts: {
+        pictureCount,
+        maximumPictureCount: H264_TWO_PASS_MAX_PICTURE_EVIDENCE,
+      },
+    },
+    tried: ['in-memory-picture-evidence'],
+    suggestion:
+      'use a shorter/lower-frame-rate source or an encode mode that does not require replay',
+  });
+}
+
 function clampQuantizer(value: number): number {
   return Math.min(H264_MAX_QUANTIZER, Math.max(H264_MIN_QUANTIZER, Math.round(value)));
 }
@@ -61,15 +116,20 @@ function normalizeTimeline(
   samples: readonly H264FirstPassSample[],
   declaredDurationSec: number | undefined,
 ): { readonly samples: readonly TimedSample[]; readonly durationUs: number } {
+  assertH264TwoPassPictureEvidenceCapacity(samples.length);
   if (samples.length === 0) {
     throw new InputError('H.264 two-pass first pass produced no pictures');
   }
+  const presentationOrderIsEncodeOrder = samples.every(
+    (sample, index) => index === 0 || sample.timestampUs >= (samples[index - 1]?.timestampUs ?? 0),
+  );
   const sorted = [...samples].sort((a, b) => a.timestampUs - b.timestampUs);
   const declaredDurationUs =
     declaredDurationSec === undefined
       ? undefined
       : Math.round(declaredDurationSec * MICROS_PER_SECOND);
-  if (declaredDurationUs !== undefined) positiveFinite(declaredDurationUs, 'declared duration');
+  if (declaredDurationUs !== undefined)
+    positiveSafeInteger(declaredDurationUs, 'declared duration');
 
   for (let index = 0; index < sorted.length; index++) {
     const current = sorted[index];
@@ -79,7 +139,9 @@ function normalizeTimeline(
     if (current.byteLength === 0) {
       throw new InputError('H.264 two-pass first pass emitted an empty picture');
     }
-    if (current.durationUs !== undefined) positiveFinite(current.durationUs, 'picture duration');
+    if (current.durationUs !== undefined) {
+      positiveSafeInteger(current.durationUs, 'picture duration');
+    }
     const previous = sorted[index - 1];
     if (previous?.timestampUs === current.timestampUs) {
       throw new InputError(`H.264 two-pass first pass duplicated PTS ${current.timestampUs}`);
@@ -91,29 +153,54 @@ function normalizeTimeline(
   if (last === undefined) {
     throw new InputError('H.264 two-pass first pass produced no pictures');
   }
-  const declaredEndUs =
-    declaredDurationUs === undefined ? undefined : firstTimestamp + declaredDurationUs;
-  const fallbackLastDuration =
-    last.durationUs ??
-    (declaredEndUs !== undefined ? declaredEndUs - last.timestampUs : undefined) ??
-    (sorted.length > 1
-      ? last.timestampUs - (sorted.at(-2)?.timestampUs ?? last.timestampUs)
-      : undefined);
-  if (fallbackLastDuration === undefined || fallbackLastDuration <= 0) {
-    throw new InputError('H.264 two-pass needs a duration for its final picture');
-  }
+  const hasAllChunkDurations = sorted.every((sample) => sample.durationUs !== undefined);
 
   const timed = sorted.map((current, index): TimedSample => {
     const next = sorted[index + 1];
-    const durationUs =
-      current.durationUs ??
-      (next === undefined ? fallbackLastDuration : next.timestampUs - current.timestampUs);
-    positiveFinite(durationUs, 'picture duration');
-    return { ...current, durationUs };
+    const nextPtsDuration = next === undefined ? undefined : next.timestampUs - current.timestampUs;
+    let durationUs = current.durationUs;
+    if (presentationOrderIsEncodeOrder && nextPtsDuration !== undefined) {
+      positiveSafeInteger(nextPtsDuration, 'picture PTS interval');
+      durationUs = nextPtsDuration;
+    } else if (presentationOrderIsEncodeOrder && durationUs === undefined) {
+      durationUs =
+        index === 0
+          ? 0
+          : current.timestampUs - (sorted[index - 1]?.timestampUs ?? current.timestampUs);
+    } else if (!presentationOrderIsEncodeOrder && !hasAllChunkDurations) {
+      // This is the same presentation-order recovery used by the buffered MP4 muxer when a reordered
+      // encoder omits at least one duration: every declared duration is ignored, adjacent PTS gaps are
+      // authoritative, and the final picture reuses the preceding presentation gap.
+      durationUs =
+        nextPtsDuration ??
+        (index === 0
+          ? 0
+          : current.timestampUs - (sorted[index - 1]?.timestampUs ?? current.timestampUs));
+    }
+    if (durationUs === undefined) {
+      throw new InputError('H.264 two-pass needs a duration for its final picture');
+    }
+    positiveSafeInteger(durationUs, 'picture duration');
+    return { ...current, chunkDurationUs: current.durationUs, durationUs };
   });
-  const derivedEnd = Math.max(...timed.map((sample) => sample.timestampUs + sample.durationUs));
-  const durationUs = declaredDurationUs ?? derivedEnd - firstTimestamp;
-  positiveFinite(durationUs, 'two-pass timeline duration');
+  let derivedEnd = firstTimestamp;
+  for (const sample of timed) {
+    const sampleEnd = sample.timestampUs + sample.durationUs;
+    if (!Number.isSafeInteger(sampleEnd)) {
+      throw new InputError('H.264 picture presentation end exceeds safe integer accounting');
+    }
+    if (sampleEnd > derivedEnd) derivedEnd = sampleEnd;
+  }
+  const durationUs = derivedEnd - firstTimestamp;
+  positiveSafeInteger(durationUs, 'two-pass timeline duration');
+  if (
+    declaredDurationUs !== undefined &&
+    Math.abs(declaredDurationUs - durationUs) > DECLARED_DURATION_ROUNDING_TOLERANCE_US
+  ) {
+    throw new InputError(
+      `H.264 declared duration ${declaredDurationUs}us does not match measured presentation span ${durationUs}us`,
+    );
+  }
   return { samples: timed, durationUs };
 }
 
@@ -188,51 +275,20 @@ function calibrateQuantizers(
   return best;
 }
 
-/** Build the timestamp-exact second-pass H.264 quantizer schedule from a real fixed-QP first pass. */
-export function planH264TwoPass(
-  firstPass: readonly H264FirstPassSample[],
-  targetBitrate: number,
-  declaredDurationSec?: number,
+function createPlan(
+  timeline: {
+    readonly samples: readonly TimedSample[];
+    readonly durationUs: number;
+  },
+  firstPassBytes: number,
+  targetBytes: number,
+  predictedBytes: number,
+  quantizerValues: readonly number[],
 ): H264TwoPassPlan {
-  if (!Number.isSafeInteger(targetBitrate) || targetBitrate <= 0) {
-    throw new InputError('H.264 two-pass bitrate must be a positive safe integer');
-  }
-  const timeline = normalizeTimeline(firstPass, declaredDurationSec);
-  const targetBytes = Math.round(
-    (targetBitrate * timeline.durationUs) / (BITS_PER_BYTE * MICROS_PER_SECOND),
-  );
-  if (!Number.isSafeInteger(targetBytes) || targetBytes <= 0) {
-    throw new InputError('H.264 two-pass target byte budget is not representable');
-  }
-  const firstPassBytes = timeline.samples.reduce((total, sample) => total + sample.byteLength, 0);
-  if (!Number.isSafeInteger(firstPassBytes) || firstPassBytes <= 0) {
-    throw new InputError('H.264 two-pass first-pass size is not representable');
-  }
-
-  const weights = timeline.samples.map((sample) => {
-    const durationWeight = sample.durationUs ** (1 - COMPLEXITY_BLUR);
-    const complexityWeight = sample.byteLength ** COMPLEXITY_BLUR;
-    return durationWeight * complexityWeight * (sample.keyFrame ? KEYFRAME_WEIGHT : 1);
-  });
-  const totalWeight = weights.reduce((total, value) => total + value, 0);
-  positiveFinite(totalWeight, 'H.264 two-pass complexity weight');
-  const rawQuantizers = timeline.samples.map((sample, index) => {
-    const weight = weights[index];
-    if (weight === undefined || weight <= 0) {
-      throw new InputError('H.264 two-pass picture has no complexity weight');
-    }
-    const allocatedBytes = (targetBytes * weight) / totalWeight;
-    const sizeRatio = sample.byteLength / allocatedBytes;
-    return clampQuantizer(
-      H264_FIRST_PASS_QUANTIZER + H264_QP_PER_SIZE_DOUBLING * Math.log2(sizeRatio),
-    );
-  });
-  const quantizers = calibrateQuantizers(timeline.samples, rawQuantizers, targetBytes);
-  const predictedBytes = Math.round(predictedBytesForQuantizers(timeline.samples, quantizers));
   const timestampsUs = new Float64Array(timeline.samples.length);
   const packedQuantizers = new Uint8Array(timeline.samples.length);
   timeline.samples.forEach((sample, index) => {
-    const quantizer = quantizers[index];
+    const quantizer = quantizerValues[index];
     if (quantizer === undefined) {
       throw new InputError('H.264 two-pass quantizer schedule is incomplete');
     }
@@ -262,6 +318,39 @@ export function planH264TwoPass(
     return -1;
   };
 
+  const validateCandidate = (
+    actualSamples: readonly H264FirstPassSample[],
+  ): { readonly samples: readonly TimedSample[]; readonly durationUs: number } => {
+    if (actualSamples.length !== timeline.samples.length) {
+      throw new InputError(
+        `H.264 candidate emitted ${actualSamples.length}/${timeline.samples.length} analyzed pictures`,
+      );
+    }
+    const actualTimeline = normalizeTimeline(actualSamples, undefined);
+    for (let index = 0; index < actualTimeline.samples.length; index++) {
+      const expected = timeline.samples[index];
+      const actual = actualTimeline.samples[index];
+      if (
+        expected === undefined ||
+        actual === undefined ||
+        actual.timestampUs !== expected.timestampUs
+      ) {
+        throw new InputError('H.264 candidate changed the analyzed presentation timeline');
+      }
+      if (actual.chunkDurationUs !== expected.chunkDurationUs) {
+        throw new InputError(
+          `H.264 candidate changed picture duration at PTS ${actual.timestampUs}`,
+        );
+      }
+    }
+    if (actualTimeline.durationUs !== timeline.durationUs) {
+      throw new InputError(
+        `H.264 candidate presentation span ${actualTimeline.durationUs}us does not match the analyzed mux span ${timeline.durationUs}us`,
+      );
+    }
+    return actualTimeline;
+  };
+
   return {
     sampleCount: timeline.samples.length,
     durationUs: timeline.durationUs,
@@ -270,6 +359,7 @@ export function planH264TwoPass(
     predictedBytes,
     evidenceBytes: timestampsUs.byteLength + packedQuantizers.byteLength,
     timestampsUs,
+    quantizers: packedQuantizers,
     quantizerForTimestamp(timestampUs): number {
       finiteNonNegativeInteger(timestampUs, 'second-pass timestamp');
       // Normal decoder output is in presentation order, so replay is one array read per picture. The
@@ -285,5 +375,123 @@ export function planH264TwoPass(
       }
       return quantizerAtIndex(index);
     },
+    validateCandidateTimeline(actualSamples): number {
+      return validateCandidate(actualSamples).durationUs;
+    },
+    recalibrate(actualSamples, nextTargetBytes): H264TwoPassPlan {
+      if (!Number.isSafeInteger(nextTargetBytes) || nextTargetBytes <= 0) {
+        throw new InputError('H.264 candidate target byte budget must be a positive safe integer');
+      }
+      const presentationSamples = validateCandidate(actualSamples).samples;
+      const actualBytes: number[] = [];
+      let totalActualBytes = 0;
+      for (let index = 0; index < presentationSamples.length; index++) {
+        const sample = presentationSamples[index];
+        if (sample === undefined) throw new InputError('H.264 candidate evidence is incomplete');
+        finiteNonNegativeInteger(sample.byteLength, 'candidate byte length');
+        if (sample.byteLength === 0) {
+          throw new InputError('H.264 candidate emitted an empty picture');
+        }
+        actualBytes.push(sample.byteLength);
+        totalActualBytes += sample.byteLength;
+      }
+      if (!Number.isSafeInteger(totalActualBytes) || totalActualBytes <= 0) {
+        throw new InputError('H.264 candidate size is not representable');
+      }
+
+      // H.264's local rate response is approximately one size doubling per six QPs. Use the exact
+      // candidate access-unit sizes to score the globally shifted schedule, including per-picture QP
+      // clamping, and inspect the ideal integer shift plus its neighbors. No fixture/QP outcome is baked
+      // in: every correction derives from the declared byte budget and the preceding candidate itself.
+      const idealOffset = Math.round(
+        H264_QP_PER_SIZE_DOUBLING * Math.log2(totalActualBytes / nextTargetBytes),
+      );
+      let bestQuantizers: readonly number[] | undefined;
+      let bestPrediction = 0;
+      let fallbackQuantizers: readonly number[] = [...packedQuantizers];
+      let fallbackPrediction = totalActualBytes;
+      let fallbackError = Math.abs(Math.log(totalActualBytes / nextTargetBytes));
+      for (const offset of new Set([0, idealOffset - 1, idealOffset, idealOffset + 1])) {
+        const candidateQuantizers = Array.from(packedQuantizers, (value) =>
+          clampQuantizer(value + offset),
+        );
+        const candidatePrediction = actualBytes.reduce((total, bytes, index) => {
+          const before = packedQuantizers[index];
+          const after = candidateQuantizers[index];
+          if (before === undefined || after === undefined) {
+            throw new InputError('H.264 candidate quantizer schedule is incomplete');
+          }
+          return total + bytes * 2 ** ((before - after) / H264_QP_PER_SIZE_DOUBLING);
+        }, 0);
+        const error = Math.abs(Math.log(candidatePrediction / nextTargetBytes));
+        if (error < fallbackError) {
+          fallbackQuantizers = candidateQuantizers;
+          fallbackPrediction = candidatePrediction;
+          fallbackError = error;
+        }
+        // The next target is a hard candidate-spool ceiling. Prefer the closest model prediction that
+        // stays at or below it; this makes a small measured overshoot advance at least one QP instead of
+        // repeating the same invalid schedule. The fallback exists only for QP-clamped schedules where
+        // no inspected offset can mathematically fit.
+        if (candidatePrediction <= nextTargetBytes && candidatePrediction > bestPrediction) {
+          bestQuantizers = candidateQuantizers;
+          bestPrediction = candidatePrediction;
+        }
+      }
+      bestQuantizers ??= fallbackQuantizers;
+      if (bestPrediction === 0) bestPrediction = fallbackPrediction;
+      return createPlan(
+        timeline,
+        firstPassBytes,
+        nextTargetBytes,
+        Math.round(bestPrediction),
+        bestQuantizers,
+      );
+    },
   };
+}
+
+/** Build the timestamp-exact second-pass H.264 quantizer schedule from a real fixed-QP first pass. */
+export function planH264TwoPass(
+  firstPass: readonly H264FirstPassSample[],
+  targetBitrate: number,
+  declaredDurationSec?: number,
+): H264TwoPassPlan {
+  if (!Number.isSafeInteger(targetBitrate) || targetBitrate <= 0) {
+    throw new InputError('H.264 two-pass bitrate must be a positive safe integer');
+  }
+  const timeline = normalizeTimeline(firstPass, declaredDurationSec);
+  const targetBytes = Math.floor(
+    (targetBitrate * timeline.durationUs) / (BITS_PER_BYTE * MICROS_PER_SECOND),
+  );
+  if (!Number.isSafeInteger(targetBytes) || targetBytes <= 0) {
+    throw new InputError('H.264 two-pass target byte budget is not representable');
+  }
+  const firstPassBytes = timeline.samples.reduce((total, sample) => total + sample.byteLength, 0);
+  if (!Number.isSafeInteger(firstPassBytes) || firstPassBytes <= 0) {
+    throw new InputError('H.264 two-pass first-pass size is not representable');
+  }
+
+  const weights = timeline.samples.map(
+    (sample) =>
+      sample.durationUs *
+      (sample.byteLength / sample.durationUs) ** COMPLEXITY_EXPONENT *
+      (sample.keyFrame ? KEYFRAME_WEIGHT : 1),
+  );
+  const totalWeight = weights.reduce((total, value) => total + value, 0);
+  positiveFinite(totalWeight, 'H.264 two-pass complexity weight');
+  const rawQuantizers = timeline.samples.map((sample, index) => {
+    const weight = weights[index];
+    if (weight === undefined || weight <= 0) {
+      throw new InputError('H.264 two-pass picture has no complexity weight');
+    }
+    const allocatedBytes = (targetBytes * weight) / totalWeight;
+    const sizeRatio = sample.byteLength / allocatedBytes;
+    return clampQuantizer(
+      H264_FIRST_PASS_QUANTIZER + H264_QP_PER_SIZE_DOUBLING * Math.log2(sizeRatio),
+    );
+  });
+  const quantizers = calibrateQuantizers(timeline.samples, rawQuantizers, targetBytes);
+  const predictedBytes = Math.round(predictedBytesForQuantizers(timeline.samples, quantizers));
+  return createPlan(timeline, firstPassBytes, targetBytes, predictedBytes, quantizers);
 }

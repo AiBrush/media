@@ -36,6 +36,7 @@
  */
 
 import type {
+  AudioEncoderOutputTiming,
   CodecDriver,
   CodecQuery,
   CodecSupport,
@@ -182,6 +183,45 @@ export function decoderErrorToCapabilityMiss(
  */
 export const AUDIO_CODEC_PREFIXES = ['mp4a', 'opus', 'mp3', 'flac', 'vorbis'] as const;
 
+/** One decoded PCM frame per channel represented by an AAC-LC access unit. */
+export const AAC_LC_ACCESS_UNIT_SAMPLES = 1024 as const;
+
+/**
+ * The encoder priming emitted by Chromium's macOS AudioToolbox AAC-LC route.
+ *
+ * This is intentionally not a codec-family default. WebCodecs does not expose encoder delay, and
+ * Chromium selects different native AAC implementations on macOS, Windows, and Android. Chromium's
+ * own cross-platform encoder test declares 2,112 leading samples only for its macOS AAC implementation;
+ * the same value is the conventional AudioToolbox/QuickTime AAC delay documented by Apple. Keep the
+ * fact confined to the positively identified Chromium-on-Mac route so a different backend cannot inherit
+ * an unproven edit-list offset.
+ *
+ * @see https://chromium.googlesource.com/chromium/src/+/HEAD/media/audio/audio_encoders_unittest.cc
+ * @see https://developer.apple.com/documentation/quicktime-file-format/historical_solution_implicit_encoder_delay
+ */
+export const CHROMIUM_MAC_AAC_LC_LEADING_SAMPLES = 2112 as const;
+
+/** True only for the AAC-LC object type whose access units represent 1,024 decoded samples. */
+export function isAacLcCodecString(codec: string): boolean {
+  return /^mp4a\.40\.0?2$/i.test(codec);
+}
+
+/**
+ * Resolve an implementation-owned AAC priming fact for the native WebCodecs route. Unknown runtimes
+ * deliberately return `undefined`; callers that require sample-accurate MP4 presentation must surface an
+ * honest capability miss instead of guessing.
+ */
+export function webCodecsAacLcLeadingSamples(
+  codec: string,
+  platform: string | undefined,
+  userAgent: string | undefined,
+): number | undefined {
+  if (!isAacLcCodecString(codec)) return undefined;
+  const mac = platform !== undefined && /^Mac/.test(platform);
+  const chromium = userAgent !== undefined && /(?:Chrome|Chromium)\//.test(userAgent);
+  return mac && chromium ? CHROMIUM_MAC_AAC_LC_LEADING_SAMPLES : undefined;
+}
+
 /** True when a codec string names a WebCodecs **audio** codec this driver routes (by RFC-6381 prefix). */
 export function isAudioCodecString(codec: string): boolean {
   return AUDIO_CODEC_PREFIXES.some((p) => codec === p || codec.startsWith(`${p}.`));
@@ -273,6 +313,8 @@ export function unsupported(reason: string): CodecSupport {
  */
 export interface AudioEncoderStageOptions extends StageOptions {
   onConfig?(config: AudioDecoderConfig): void;
+  /** Called once after flush with exact facts owned by this destination encoder invocation. */
+  onTiming?(timing: AudioEncoderOutputTiming): void;
 }
 
 /** Read the optional {@link AudioEncoderStageOptions.onConfig} sink off a `StageOptions` object. */
@@ -280,6 +322,14 @@ function configSink(
   o: StageOptions | undefined,
 ): ((config: AudioDecoderConfig) => void) | undefined {
   const sink = (o as AudioEncoderStageOptions | undefined)?.onConfig;
+  return typeof sink === 'function' ? sink : undefined;
+}
+
+/** Read the optional destination-timing sink off the driver-local stage options. */
+function timingSink(
+  o: StageOptions | undefined,
+): ((timing: AudioEncoderOutputTiming) => void) | undefined {
+  const sink = (o as AudioEncoderStageOptions | undefined)?.onTiming;
   return typeof sink === 'function' ? sink : undefined;
 }
 
@@ -546,6 +596,9 @@ function createEncoder(
   const signal = o?.signal;
   const determinism = o?.determinism;
   const onConfig = configSink(o);
+  const onTiming = timingSink(o);
+  const audioConfig = config as AudioEncoderConfig;
+  const aacLc = isAacLcCodecString(audioConfig.codec);
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted before encode');
   if (typeof AudioEncoder === 'undefined') {
     throw new CapabilityError('WebCodecs AudioEncoder is unavailable', {
@@ -558,6 +611,8 @@ function createEncoder(
   let encoder: AudioEncoder | undefined;
   let onAbort: (() => void) | undefined;
   let configSent = false;
+  let submittedSamples: number | undefined = 0;
+  let encodedAacAccessUnits = 0;
   // The readable (consumed by the muxer) is dead: once set, the async `output` callback must NOT enqueue
   // — it drops the chunk instead. Prevents the "enqueue into a closed readable" throw when the muxer
   // closes/cancels early (mux error, early-stop trim, abort) while the encoder is still draining.
@@ -574,6 +629,7 @@ function createEncoder(
     start(controller): void {
       const enc = new AudioEncoder({
         output: (chunk, meta) => {
+          if (aacLc) encodedAacAccessUnits++;
           if (!configSent && onConfig) {
             const decoderConfig = decoderConfigFromEncoderMeta(meta);
             if (decoderConfig) {
@@ -605,6 +661,8 @@ function createEncoder(
         data.close(); // never leak the input even on a misuse path
         throw new MediaError('encode-error', 'encoder not configured');
       }
+      const frameSamples = data.numberOfFrames;
+      const frameSampleRate = data.sampleRate;
       return submitClosableAudioCodecInput(
         enc,
         () => enc.encodeQueueSize,
@@ -612,14 +670,44 @@ function createEncoder(
         data,
         () => {
           enc.encode(data); // copies the planes it needs synchronously
+          if (submittedSamples !== undefined) {
+            if (
+              frameSampleRate !== audioConfig.sampleRate ||
+              !Number.isSafeInteger(frameSamples) ||
+              frameSamples < 0 ||
+              !Number.isSafeInteger(submittedSamples + frameSamples)
+            ) {
+              // A native resample (or an impossible counter overflow) makes the exact destination-rate
+              // program count unknowable at this seam. Do not publish a guessed timing tuple.
+              submittedSamples = undefined;
+            } else {
+              submittedSamples += frameSamples;
+            }
+          }
         },
       );
     },
     async flush(): Promise<void> {
       const enc = encoder;
       if (!enc) return;
-      await enc.flush();
-      teardown();
+      try {
+        await enc.flush();
+        if (onTiming && submittedSamples !== undefined) {
+          const platform = typeof navigator === 'undefined' ? undefined : navigator.platform;
+          const userAgent = typeof navigator === 'undefined' ? undefined : navigator.userAgent;
+          const leadingSamples = aacLc
+            ? webCodecsAacLcLeadingSamples(audioConfig.codec, platform, userAgent)
+            : undefined;
+          onTiming({
+            sampleRate: audioConfig.sampleRate,
+            submittedSamples,
+            ...(aacLc ? { codedSamples: encodedAacAccessUnits * AAC_LC_ACCESS_UNIT_SAMPLES } : {}),
+            ...(leadingSamples !== undefined ? { leadingSamples } : {}),
+          });
+        }
+      } finally {
+        teardown();
+      }
     },
     // The muxer closed/cancelled the readable while the encoder may still be draining: mark closed and
     // dispose the encoder so it stops emitting — no late enqueue. (Chunks are byte buffers; nothing leaks.)

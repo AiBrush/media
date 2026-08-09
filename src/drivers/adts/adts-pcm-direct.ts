@@ -6,7 +6,6 @@ import { writeWavHeader } from '../wav/pcm.ts';
 import type { AdtsLayout, AdtsPacket } from './adts-driver.ts';
 
 const PCM_OUTPUT_FORMAT = 's16' as const;
-const ADTS_DIRECT_WASM_S16_MAX_BYTES = 256 * 1024;
 const ADTS_DIRECT_DECODE_BATCH_FRAMES = 32;
 const WAV_HEADER_BYTES = 44;
 const S16_BYTES_PER_SAMPLE = 2;
@@ -37,11 +36,7 @@ export function canUseAdtsWasmDirectS16Wav(
   if (o?.channels !== undefined && o.channels !== sourceChannels) return false;
   if (o?.sampleRate !== undefined && o.sampleRate !== sourceSampleRate) return false;
   if (hasPcmDomainWork(o)) return false;
-  return (
-    wasmOnlyRuntime ||
-    o?.determinism === 'force-software' ||
-    byteLength <= ADTS_DIRECT_WASM_S16_MAX_BYTES
-  );
+  return wasmOnlyRuntime || o?.determinism === 'force-software';
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

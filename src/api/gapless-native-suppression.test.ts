@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
+import type { EncodedChunk, Packet, RawFrame, TrackInfo } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
+import { decodedAudioStreamWithGapless } from './codec-live.ts';
 import {
   MP4_GAPLESS_PREFLIGHT_MAX_PACKETS,
+  nativeSuppressedGaplessSamples,
   nativeSuppressedMp4EditSamples,
 } from './gapless-native-suppression.ts';
 
@@ -67,6 +69,56 @@ function fakeDecoder(
 }
 
 describe('MP4 native gapless suppression preflight', () => {
+  it('detects an Ogg-mode Opus decoder consuming the 312-sample OpusHead pre-skip', async () => {
+    const packets = fakePackets([fakeChunk(0, 60000), fakeChunk(60000, 60000)]);
+    const frames: FakeAudioFrame[] = [];
+
+    const suppressed = await nativeSuppressedGaplessSamples(
+      {
+        packets: packets.stream,
+        createDecoder: () => fakeDecoder([2568], frames),
+      },
+      312,
+      48000,
+      { probeFromFirstPacket: true },
+    );
+
+    expect(suppressed).toBe(312);
+    expect(packets.pulls()).toBe(1);
+    expect(packets.canceled()).toBe(true);
+    expect(frames[0]?.closeCount).toBe(1);
+  });
+
+  it('runs the same first-packet native pre-skip probe for WebM CodecDelay tracks', async () => {
+    const packets = fakePackets([fakeChunk(0, 60_000), fakeChunk(60_000, 60_000)]);
+    const track: TrackInfo = {
+      id: 0,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+      gapless: {
+        basis: 'webm-opus-codec-delay',
+        leadingSamples: 312,
+      },
+    };
+    const decoded = await decodedAudioStreamWithGapless(
+      new ReadableStream<AudioData>({
+        start(controller): void {
+          controller.close();
+        },
+      }),
+      track,
+      {
+        packets: packets.stream,
+        createDecoder: () => fakeDecoder([2568], []),
+      },
+    );
+
+    expect((await decoded.getReader().read()).done).toBe(true);
+    expect(packets.pulls()).toBe(1);
+    expect(packets.canceled()).toBe(true);
+  });
+
   it('detects a native decoder that consumes the negative priming packet', async () => {
     const packets = fakePackets([fakeChunk(-23220, 23220), fakeChunk(0, 23220)]);
 

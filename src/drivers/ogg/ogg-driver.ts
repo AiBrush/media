@@ -164,6 +164,24 @@ function maxGranule(dv: DataView, serial: number): number {
   return best;
 }
 
+/** The granule carried by the logical stream's terminal EOS page, if that page is complete and timed. */
+function eosGranule(dv: DataView, serial: number): number | undefined {
+  let terminal: number | undefined;
+  let at = 0;
+  while (at + 27 <= dv.byteLength) {
+    const page = parsePage(dv, at);
+    if (!page) {
+      at++;
+      continue;
+    }
+    if (page.serial === serial && (page.headerType & 0x04) !== 0 && page.granule >= 0) {
+      terminal = page.granule;
+    }
+    at = page.pageEnd > at ? page.pageEnd : at + 1;
+  }
+  return terminal;
+}
+
 // ============ packet de-lacing + per-packet timing (pure, Node-validated) ============
 
 const MICROS_PER_SECOND = 1_000_000;
@@ -187,6 +205,9 @@ interface RawPacket {
   readonly size: number;
   /** The page granule_position carried on the page where this packet *completed* (-1 ⇒ none). */
   pageGranule: number;
+  /** Byte offset and flags identify the exact completion page even when adjacent granules are equal. */
+  completionPageOffset: number;
+  completionPageHeaderType: number;
   complete: boolean;
 }
 
@@ -211,6 +232,7 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
     const segCount = dv.getUint8(at + 26);
     if (at + 27 + segCount > dv.byteLength) break; // truncated header → stop cleanly
     const granule = readGranule(dv, at + 6);
+    const headerType = dv.getUint8(at + 5);
     const pageSerial = dv.getUint32(at + 14, true);
     const body = at + 27 + segCount; // first body byte (after header + segment table)
     let bodyLen = 0;
@@ -234,7 +256,14 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
       runSize += lace;
       segOffset += lace;
       if (lace < 255) {
-        packets.push({ spans: runSpans, size: runSize, pageGranule: granule, complete: true });
+        packets.push({
+          spans: runSpans,
+          size: runSize,
+          pageGranule: granule,
+          completionPageOffset: at,
+          completionPageHeaderType: headerType,
+          complete: true,
+        });
         runSpans = [];
         runSize = 0;
       }
@@ -248,7 +277,14 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
   }
   // A still-open run at EOF is a truncated trailing packet — record it as incomplete so it is dropped.
   if (pendingSpans.length > 0) {
-    packets.push({ spans: pendingSpans, size: pendingSize, pageGranule: -1, complete: false });
+    packets.push({
+      spans: pendingSpans,
+      size: pendingSize,
+      pageGranule: -1,
+      completionPageOffset: -1,
+      completionPageHeaderType: 0,
+      complete: false,
+    });
   }
   return packets;
 }
@@ -314,6 +350,35 @@ function exactOpusPacketSamples(data: Uint8Array): number | undefined {
     code === 0 ? 1 : code === 1 || code === 2 ? 2 : data[1] === undefined ? 0 : data[1] & 0x3f;
   const samples = frameSamples * frames;
   return frames > 0 && samples <= 5_760 ? samples : undefined;
+}
+
+/**
+ * Absolute Ogg granules may start above the coded packet clock (RFC 7845 §4.5). Recover that
+ * offset from the first audio page so both packet PTS and the EOS trim use the same coded-sample
+ * coordinate. A single-page EOS stream may instead end before its decoded packet boundary; that is
+ * terminal trimming, not a negative origin.
+ */
+function opusInitialGranuleOffset(
+  data: Uint8Array,
+  audio: readonly RawPacket[],
+): number | undefined {
+  const first = audio[0];
+  if (first === undefined || first.pageGranule < 0 || first.completionPageOffset < 0) {
+    return undefined;
+  }
+  let samplesThroughFirstPage = 0;
+  for (const packet of audio) {
+    if (packet.completionPageOffset !== first.completionPageOffset) break;
+    const samples = exactOpusPacketSamples(oggPacketBytes(data, packet));
+    if (samples === undefined) return undefined;
+    samplesThroughFirstPage += samples;
+  }
+  const offset = first.pageGranule - samplesThroughFirstPage;
+  if (offset >= 0) return offset;
+  // In a one-audio-page stream the first completion page is also EOS, whose granule may trim inside
+  // its final packet. That is terminal padding, not a negative initial offset. Before EOS, G1 < S1 is
+  // inconsistent and must not be silently normalized.
+  return (first.completionPageHeaderType & 0x04) !== 0 ? 0 : undefined;
 }
 
 /** A framed audio packet ready for the browser block: payload spans + presentation/duration in µs. */
@@ -512,8 +577,9 @@ export function oggAudioPackets(data: Uint8Array): OggPacket[] {
   const rate = stream.granuleRate;
   const out: OggPacket[] = [];
   if (stream.codec === 'opus') {
-    // Opus: exact per-packet samples from the TOC; PTS = running start granule − pre_skip.
-    let startGranule = -preSkip;
+    // Opus: exact per-packet samples from the TOC. An allowed positive initial granule offset rebases
+    // the coded packet clock (cropped/joined streams); pre-skip still selects the first valid sample.
+    let startGranule = (opusInitialGranuleOffset(data, audio) ?? 0) - preSkip;
     for (const p of audio) {
       const samples = opusPacketSamples(dv, p);
       out.push({
@@ -594,18 +660,73 @@ export interface OggInfo {
   durationSec: number;
 }
 
-function trackFromInfo(info: OggInfo, description?: Uint8Array): TrackInfo {
+/**
+ * Recover the exact Ogg Opus program window from OpusHead, packet TOCs, and the EOS granule (RFC 7845):
+ * coded = sum(packet durations), leading = pre-skip, and presented end = final granule minus the allowed
+ * initial granule offset. The tuple remains container-true; the decode pipeline separately measures whether
+ * its selected decoder already consumed the OpusHead pre-skip before applying it again.
+ */
+export function oggOpusGapless(data: Uint8Array): NonNullable<TrackInfo['gapless']> | undefined {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const stream = firstRecognizedStream(dv);
+  if (stream?.codec !== 'opus') return undefined;
+  const raw = delacePackets(dv, stream.serial);
+  const audio = raw
+    .slice(headerPacketCount(stream.codec, dv, raw))
+    .filter((packet) => packet.complete);
+  if (audio.length === 0) return undefined;
+
+  let codedSamples = 0;
+  for (const packet of audio) {
+    const samples = exactOpusPacketSamples(oggPacketBytes(data, packet));
+    if (samples === undefined || !Number.isSafeInteger(codedSamples + samples)) return undefined;
+    codedSamples += samples;
+  }
+  const leadingSamples = readOpusPreSkip(dv, stream.serial);
+  const finalGranule = eosGranule(dv, stream.serial);
+  const initialGranuleOffset = opusInitialGranuleOffset(data, audio);
+  if (
+    finalGranule === undefined ||
+    initialGranuleOffset === undefined ||
+    !Number.isSafeInteger(finalGranule) ||
+    !Number.isSafeInteger(finalGranule - initialGranuleOffset)
+  ) {
+    return undefined;
+  }
+  const presentedEndSamples = finalGranule - initialGranuleOffset;
+  if (presentedEndSamples < leadingSamples || presentedEndSamples > codedSamples) return undefined;
+  return {
+    basis: 'ogg-opus-granule',
+    leadingSamples,
+    trailingSamples: codedSamples - presentedEndSamples,
+    totalSamples: presentedEndSamples - leadingSamples,
+  };
+}
+
+function trackFromInfo(
+  info: OggInfo,
+  description?: Uint8Array,
+  gapless?: TrackInfo['gapless'],
+): TrackInfo {
+  const durationSec =
+    gapless?.basis === 'ogg-opus-granule' &&
+    gapless.totalSamples !== undefined &&
+    Number.isSafeInteger(gapless.totalSamples) &&
+    gapless.totalSamples >= 0
+      ? gapless.totalSamples / OPUS_GRANULE_RATE
+      : info.durationSec;
   return {
     id: 0,
     mediaType: info.mediaType,
     codec: info.codec,
-    durationSec: info.durationSec,
+    durationSec,
     config: {
       codec: info.codec,
       sampleRate: info.sampleRate,
       numberOfChannels: info.channels,
       ...(description !== undefined ? { description } : {}),
     },
+    ...(gapless !== undefined ? { gapless } : {}),
   };
 }
 
@@ -655,7 +776,7 @@ export function oggPacketInfoTable(data: Uint8Array): OggPacketInfoTable {
     };
   });
   return {
-    tracks: [trackFromInfo(info, codecPrivateDescription(data))],
+    tracks: [trackFromInfo(info, codecPrivateDescription(data), oggOpusGapless(data))],
     packets,
   };
 }
@@ -779,8 +900,112 @@ function opusTrackWithPreSkip(track: TrackInfo, preSkipFrames: number): TrackInf
   return output;
 }
 
-function resetOpusPreSkip(track: TrackInfo): TrackInfo {
-  return opusTrackWithPreSkip(track, 0) ?? track;
+interface OggOpusWebmTrimSelection {
+  readonly firstIndex: number;
+  readonly lastIndex: number;
+  readonly preSkipFrames: number;
+  readonly totalSamples: number;
+  readonly trailingSamples: number;
+  readonly selectedPacketSamples: readonly number[];
+  readonly outputTrack: TrackInfo;
+}
+
+/** Select an exact Ogg Opus program interval and translate it to Matroska P/Q/T coordinates. */
+function selectOggOpusWebmTrim(
+  bytes: Uint8Array,
+  table: OggPacketInfoTable,
+  track: TrackInfo,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+  signal: AbortSignal | undefined,
+): OggOpusWebmTrimSelection {
+  const description = opusHeadDescription(track);
+  if (description === undefined) {
+    throw new MediaError('demux-error', 'Ogg Opus remux trim needs a complete OpusHead packet');
+  }
+  const sourcePreSkip = new DataView(
+    description.buffer,
+    description.byteOffset,
+    description.byteLength,
+  ).getUint16(10, true);
+  const startFrame = Math.round(trim.startSec * OPUS_GRANULE_RATE);
+  const endFrame = Math.round(trim.endSec * OPUS_GRANULE_RATE);
+  const totalSamples = endFrame - startFrame;
+  if (totalSamples <= 0) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot represent the requested trim as a positive 48 kHz sample interval',
+    );
+  }
+
+  const packetSamples: number[] = [];
+  const codedStarts: number[] = [];
+  let codedFrames = 0;
+  let firstIndex = -1;
+  let lastIndex = -1;
+  for (let index = 0; index < table.packets.length; index++) {
+    if (signal?.aborted) throw abortedOggRead();
+    const packet = table.packets[index];
+    if (packet === undefined) continue;
+    const samples = exactOpusPacketSamples(oggPacketBytes(bytes, packet));
+    if (samples === undefined) {
+      throw new MediaError('demux-error', 'Ogg Opus remux trim found an invalid packet duration');
+    }
+    codedStarts.push(codedFrames);
+    packetSamples.push(samples);
+    const presentationStart = codedFrames - sourcePreSkip;
+    const presentationEnd = presentationStart + samples;
+    if (presentationEnd > startFrame && presentationStart < endFrame) {
+      if (firstIndex < 0) firstIndex = index;
+      lastIndex = index;
+    }
+    codedFrames += samples;
+  }
+  if (firstIndex < 0 || lastIndex < firstIndex) {
+    throw new MediaError('mux-error', 'Ogg Opus remux trim selected no audio packets');
+  }
+
+  const selectedCodedStart = codedStarts[firstIndex];
+  if (selectedCodedStart === undefined) {
+    throw new MediaError('demux-error', 'Ogg Opus remux trim lost its coded start coordinate');
+  }
+  const preSkipFrames = startFrame - (selectedCodedStart - sourcePreSkip);
+  const selectedPacketSamples = packetSamples.slice(firstIndex, lastIndex + 1);
+  const selectedCodedFrames = selectedPacketSamples.reduce((sum, samples) => sum + samples, 0);
+  const trailingSamples = selectedCodedFrames - preSkipFrames - totalSamples;
+  const finalPacketSamples = selectedPacketSamples.at(-1) ?? 0;
+  if (
+    !Number.isSafeInteger(preSkipFrames) ||
+    preSkipFrames < 0 ||
+    preSkipFrames > MAX_OPUS_PRE_SKIP_FRAMES ||
+    !Number.isSafeInteger(trailingSamples) ||
+    trailingSamples < 0 ||
+    trailingSamples >= finalPacketSamples
+  ) {
+    throw oggOpusTrimCapability(
+      'Ogg Opus cannot express the requested trim through Matroska CodecDelay/DiscardPadding',
+    );
+  }
+  const rewritten = opusTrackWithPreSkip(track, preSkipFrames);
+  if (rewritten === undefined) {
+    throw new MediaError('demux-error', 'Ogg Opus remux trim could not rewrite OpusHead pre-skip');
+  }
+  return {
+    firstIndex,
+    lastIndex,
+    preSkipFrames,
+    totalSamples,
+    trailingSamples,
+    selectedPacketSamples,
+    outputTrack: {
+      ...rewritten,
+      durationSec: totalSamples / OPUS_GRANULE_RATE,
+      gapless: {
+        basis: 'webm-opus-codec-delay',
+        leadingSamples: preSkipFrames,
+        trailingSamples,
+        totalSamples,
+      },
+    },
+  };
 }
 
 async function writeOggWebmPacketCopy(
@@ -804,26 +1029,32 @@ async function writeOggWebmPacketCopy(
     });
   }
   if (trim !== undefined) validateOggTrimRange(track.durationSec, trim);
+  const opusSelection =
+    trim !== undefined && track.codec.toLowerCase() === 'opus'
+      ? selectOggOpusWebmTrim(bytes, table, track, trim, signal)
+      : undefined;
   const startUs = trim === undefined ? undefined : Math.round(trim.startSec * MICROS_PER_SECOND);
   const endUs = trim === undefined ? undefined : Math.round(trim.endSec * MICROS_PER_SECOND);
   const selection =
-    startUs === undefined || endUs === undefined
-      ? undefined
-      : selectOggTrimPackets(table.packets, startUs, endUs, signal);
+    opusSelection === undefined && startUs !== undefined && endUs !== undefined
+      ? selectOggTrimPackets(table.packets, startUs, endUs, signal)
+      : undefined;
   const { WebmMuxer } = await import('../webm/ebml-write.ts');
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
   const outputTrack =
-    selection === undefined
+    opusSelection?.outputTrack ??
+    (selection === undefined
       ? track
       : {
-          ...(selection.firstIndex === 0 ? track : resetOpusPreSkip(track)),
+          ...track,
           durationSec: (selection.endUs - selection.firstPtsUs) / MICROS_PER_SECOND,
-        };
+        });
   const muxer = new WebmMuxer({ container }, container === 'mkv' ? 'matroska' : 'webm');
   const trackId = muxer.addTrack(outputTrack);
   let selected = 0;
-  const firstIndex = selection?.firstIndex ?? 0;
-  const lastIndex = selection?.lastIndex ?? table.packets.length - 1;
+  const firstIndex = opusSelection?.firstIndex ?? selection?.firstIndex ?? 0;
+  const lastIndex = opusSelection?.lastIndex ?? selection?.lastIndex ?? table.packets.length - 1;
+  let selectedCodedFrames = 0;
   for (let index = firstIndex; index <= lastIndex; index++) {
     if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     const packet = table.packets[index];
@@ -834,14 +1065,26 @@ async function writeOggWebmPacketCopy(
     }
     const packetStartUs = Math.round(packet.ptsUs);
     const packetDurationUs = Math.round(durationUs);
+    const opusPacketSamples = opusSelection?.selectedPacketSamples[index - firstIndex];
     const timestampUs =
-      selection === undefined ? packetStartUs : Math.max(0, packetStartUs - selection.firstPtsUs);
+      opusSelection !== undefined
+        ? Math.round(
+            ((selectedCodedFrames - opusSelection.preSkipFrames) * MICROS_PER_SECOND) /
+              OPUS_GRANULE_RATE,
+          )
+        : selection === undefined
+          ? packetStartUs
+          : Math.max(0, packetStartUs - selection.firstPtsUs);
     muxer.addChunkStruct(trackId, {
       timestampUs,
-      durationUs: packetDurationUs,
+      durationUs:
+        opusPacketSamples === undefined
+          ? packetDurationUs
+          : Math.round((opusPacketSamples * MICROS_PER_SECOND) / OPUS_GRANULE_RATE),
       key: packet.keyframe,
       data: oggPacketBytes(bytes, packet),
     });
+    selectedCodedFrames += opusPacketSamples ?? 0;
     selected++;
   }
   if (selected === 0) throw new MediaError('mux-error', 'Ogg remux selected no audio packets');
@@ -868,7 +1111,7 @@ function validateOggTrimRange(
   if (trim.startSec >= durationSec) {
     throw new InputError('trim start >= duration');
   }
-  if (trim.endSec > durationSec + 1e-3) {
+  if (trim.endSec > durationSec) {
     throw new InputError('trim end > duration');
   }
 }
@@ -944,14 +1187,18 @@ function writeExactOggOpusPacketCopyTrim(
     throw new MediaError('mux-error', 'Ogg Opus trim selected no audio packets');
   }
 
-  const sourceFinalGranule = Math.round((track.durationSec ?? 0) * OPUS_GRANULE_RATE);
-  const sourcePresentationFrames = sourceFinalGranule - sourcePreSkipFrames;
+  const sourcePresentationFrames =
+    track.gapless?.basis === 'ogg-opus-granule' ? track.gapless.totalSamples : undefined;
   if (
-    !Number.isSafeInteger(sourceFinalGranule) ||
-    sourceFinalGranule < sourcePreSkipFrames ||
-    sourceFinalGranule > codedFrames
+    sourcePresentationFrames === undefined ||
+    !Number.isSafeInteger(sourcePresentationFrames) ||
+    sourcePresentationFrames <= 0 ||
+    sourcePreSkipFrames + sourcePresentationFrames > codedFrames
   ) {
-    throw new MediaError('demux-error', 'Ogg Opus source granule is inconsistent with its packets');
+    throw new MediaError(
+      'demux-error',
+      'Ogg Opus source presentation window is inconsistent with its packets',
+    );
   }
 
   const requestedStartFrame = Math.round(trim.startSec * OPUS_GRANULE_RATE);
@@ -1022,7 +1269,9 @@ function writeExactOggOpusPacketCopyTrim(
   }
   const state = trackStateFrom({
     ...outputTrack,
-    durationSec: finalGranule / OPUS_GRANULE_RATE,
+    // OggMuxer accepts a presentation duration and adds the rewritten OpusHead pre-skip when authoring
+    // the EOS granule. Passing the raw granule here would count outputPreSkipFrames twice.
+    durationSec: presentationFrames / OPUS_GRANULE_RATE,
   });
   let rebasedFrames = 0;
   for (let index = firstIndex; index <= lastIndex; index++) {

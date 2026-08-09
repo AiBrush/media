@@ -9,6 +9,7 @@ import {
   OggDriver,
   OggModule,
   oggAudioPackets,
+  oggOpusGapless,
   oggPacketBytes,
   oggPacketInfoFromBytes,
   parseOgg,
@@ -68,6 +69,7 @@ function byteSource(bytes: Uint8Array): ByteSource {
 
 const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 const MICROS_PER_SECOND = 1_000_000;
+const OPUS_GRANULE_RATE = 48_000;
 const u16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
 const u32 = (n: number): number[] => [
   n & 0xff,
@@ -79,6 +81,7 @@ const u64 = (n: number): number[] => [...u32(n >>> 0), ...u32(Math.floor(n / 2 *
 
 function page(opts: {
   bos?: boolean;
+  eos?: boolean;
   granule?: number;
   serial?: number;
   version?: number;
@@ -97,7 +100,7 @@ function page(opts: {
   return [
     ...str('OggS'),
     opts.version ?? 0,
-    opts.bos ? 0x02 : 0x00,
+    (opts.bos ? 0x02 : 0x00) | (opts.eos ? 0x04 : 0x00),
     ...granule,
     ...u32(opts.serial ?? 1),
     ...u32(0),
@@ -122,15 +125,70 @@ const vorbisId = (ch: number, sr: number): number[] => [
   0xb8,
   0x01,
 ];
-const opusId = (ch: number): number[] => [
+const opusId = (ch: number, preSkip = 312): number[] => [
   ...str('OpusHead'),
   1,
   ch,
-  ...u16(312),
+  ...u16(preSkip),
   ...u32(48000),
   ...u16(0),
   0,
 ];
+
+/** Add an allowed absolute offset to every timed audio-page granule in a real Opus fixture. */
+function withOpusGranuleOffset(source: Uint8Array, offsetSamples: number): Uint8Array {
+  const out = source.slice();
+  const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  let opusSerial: number | undefined;
+  let at = 0;
+  while (at + 27 <= out.byteLength) {
+    if (String.fromCharCode(...out.subarray(at, at + 4)) !== 'OggS') {
+      at++;
+      continue;
+    }
+    const segmentCount = dv.getUint8(at + 26);
+    if (at + 27 + segmentCount > out.byteLength) break;
+    let bodyLength = 0;
+    for (let index = 0; index < segmentCount; index++) {
+      bodyLength += dv.getUint8(at + 27 + index);
+    }
+    const bodyStart = at + 27 + segmentCount;
+    const pageEnd = bodyStart + bodyLength;
+    if (pageEnd > out.byteLength) break;
+    if (String.fromCharCode(...out.subarray(bodyStart, bodyStart + 8)) === 'OpusHead') {
+      opusSerial = dv.getUint32(at + 14, true);
+      break;
+    }
+    at = pageEnd;
+  }
+  if (opusSerial === undefined) throw new Error('fixture has no Opus logical stream');
+
+  at = 0;
+  while (at + 27 <= out.byteLength) {
+    if (String.fromCharCode(...out.subarray(at, at + 4)) !== 'OggS') {
+      at++;
+      continue;
+    }
+    const segmentCount = dv.getUint8(at + 26);
+    if (at + 27 + segmentCount > out.byteLength) break;
+    let bodyLength = 0;
+    for (let index = 0; index < segmentCount; index++) {
+      bodyLength += dv.getUint8(at + 27 + index);
+    }
+    const pageEnd = at + 27 + segmentCount + bodyLength;
+    if (pageEnd > out.byteLength) break;
+    const low = dv.getUint32(at + 6, true);
+    const high = dv.getUint32(at + 10, true);
+    const granule = high === 0xffffffff && low === 0xffffffff ? -1 : high * 2 ** 32 + low;
+    if (dv.getUint32(at + 14, true) === opusSerial && granule > 0) {
+      const shifted = granule + offsetSamples;
+      dv.setUint32(at + 6, shifted >>> 0, true);
+      dv.setUint32(at + 10, Math.floor(shifted / 2 ** 32), true);
+    }
+    at = pageEnd;
+  }
+  return out;
+}
 
 describe('OggDriver.supports', () => {
   it('recognizes OggS magic, mime, and extension; rejects others', async () => {
@@ -228,6 +286,177 @@ describe('parseOgg — page + codec parsing', () => {
   });
 });
 
+describe('Ogg Opus gapless program window', () => {
+  it('derives pre-skip, terminal padding, and exact program samples from the EOS granule', () => {
+    const bytes = new Uint8Array([
+      ...page({ bos: true, data: opusId(2) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 480, data: [0] }),
+      ...page({ granule: 960, data: [0] }),
+      ...page({ eos: true, granule: 1312, data: [0] }),
+    ]);
+
+    const expected = {
+      basis: 'ogg-opus-granule',
+      leadingSamples: 312,
+      trailingSamples: 128,
+      totalSamples: 1000,
+    } as const;
+    expect(oggOpusGapless(bytes)).toEqual(expected);
+    expect(oggPacketInfoFromBytes(bytes).tracks[0]?.gapless).toEqual(expected);
+  });
+
+  it('subtracts an allowed positive initial granule offset before deriving EOS padding', () => {
+    const bytes = new Uint8Array([
+      ...page({ bos: true, data: opusId(1, 104) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 584, data: [0] }),
+      ...page({ granule: 1064, data: [0] }),
+      ...page({ eos: true, granule: 1416, data: [0] }),
+    ]);
+
+    expect(oggAudioPackets(bytes)[0]?.ptsUs).toBe(0);
+    expect(oggOpusGapless(bytes)).toEqual({
+      basis: 'ogg-opus-granule',
+      leadingSamples: 104,
+      trailingSamples: 128,
+      totalSamples: 1208,
+    });
+  });
+
+  it('keys the initial offset to the exact first completion page when adjacent granules match', () => {
+    const bytes = new Uint8Array([
+      ...page({ bos: true, data: opusId(1) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 960, data: [0] }),
+      ...page({ granule: 960, data: [0] }),
+      ...page({ eos: true, granule: 1792, data: [0] }),
+    ]);
+
+    expect(oggOpusGapless(bytes)).toEqual({
+      basis: 'ogg-opus-granule',
+      leadingSamples: 312,
+      trailingSamples: 128,
+      totalSamples: 1000,
+    });
+  });
+
+  it('treats an in-packet granule on a one-audio-page EOS stream as tail trim, not negative I', () => {
+    const bytes = new Uint8Array([
+      ...page({ bos: true, data: opusId(1, 104) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ eos: true, granule: 404, data: [0] }),
+    ]);
+
+    expect(oggOpusGapless(bytes)).toEqual({
+      basis: 'ogg-opus-granule',
+      leadingSamples: 104,
+      trailingSamples: 76,
+      totalSamples: 300,
+    });
+  });
+
+  it('uses the EOS page as the terminal coordinate instead of an unrelated maximum granule', () => {
+    const bytes = new Uint8Array([
+      ...page({ bos: true, data: opusId(1) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 480, data: [0] }),
+      ...page({ granule: 2_000, data: [0] }),
+      ...page({ eos: true, granule: 1_312, data: [0] }),
+    ]);
+
+    expect(oggOpusGapless(bytes)).toEqual({
+      basis: 'ogg-opus-granule',
+      leadingSamples: 312,
+      trailingSamples: 128,
+      totalSamples: 1_000,
+    });
+  });
+
+  it('declines malformed granule windows instead of inventing terminal padding', () => {
+    const beforePreSkip = new Uint8Array([
+      ...page({ bos: true, data: opusId(2) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ eos: true, granule: 300, data: [0] }),
+    ]);
+    const beyondCodedAudio = new Uint8Array([
+      ...page({ bos: true, data: opusId(2) }),
+      ...page({ data: str('OpusTags') }),
+      ...page({ granule: 480, data: [0] }),
+      ...page({ eos: true, granule: 961, data: [0] }),
+    ]);
+
+    expect(oggOpusGapless(beforePreSkip)).toBeUndefined();
+    expect(oggOpusGapless(beyondCodedAudio)).toBeUndefined();
+  });
+
+  it('keeps exact trim bounds across normal, +480, and +960 real-fixture granule origins', async () => {
+    const streamCopy = OggDriver.streamCopy;
+    if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
+    const fixture = await loadFixture('sfx-opus.ogg');
+    const baseline = oggOpusGapless(fixture);
+    const totalSamples = baseline?.totalSamples;
+    if (baseline === undefined || totalSamples === undefined || totalSamples <= 200) {
+      throw new Error('real Opus fixture has no exact program window');
+    }
+
+    for (const offsetSamples of [0, 480, 960]) {
+      const source = withOpusGranuleOffset(fixture, offsetSamples);
+      const table = oggPacketInfoFromBytes(source);
+      expect(table.tracks[0]?.gapless, `offset=${offsetSamples}`).toEqual(baseline);
+      expect(table.tracks[0]?.durationSec, `offset=${offsetSamples}`).toBe(
+        totalSamples / OPUS_GRANULE_RATE,
+      );
+
+      for (const [startFrame, endFrame] of [
+        [0, totalSamples],
+        [123, totalSamples - 77],
+      ] as const) {
+        const output = await collect(
+          await streamCopy(byteSource(source), {
+            container: 'ogg',
+            trim: {
+              startSec: startFrame / OPUS_GRANULE_RATE,
+              endSec: endFrame / OPUS_GRANULE_RATE,
+            },
+          }),
+        );
+        expect(
+          oggPacketInfoFromBytes(output).tracks[0]?.gapless?.totalSamples,
+          `offset=${offsetSamples}, range=${startFrame}..${endFrame}`,
+        ).toBe(endFrame - startFrame);
+
+        const webm = await collect(
+          await streamCopy(byteSource(source), {
+            container: 'mkv',
+            trim: {
+              startSec: startFrame / OPUS_GRANULE_RATE,
+              endSec: endFrame / OPUS_GRANULE_RATE,
+            },
+          }),
+        );
+        const webmTrack = webmPacketPayloadInfoFromBytes(webm).tracks[0];
+        expect(webmTrack?.gapless?.basis).toBe('webm-opus-codec-delay');
+        expect(
+          webmTrack?.gapless?.totalSamples,
+          `WebM offset=${offsetSamples}, range=${startFrame}..${endFrame}`,
+        ).toBe(endFrame - startFrame);
+      }
+
+      await expect(
+        streamCopy(byteSource(source), {
+          container: 'ogg',
+          trim: {
+            startSec: 0,
+            endSec: (totalSamples + 1) / OPUS_GRANULE_RATE,
+          },
+        }),
+        `offset=${offsetSamples}`,
+      ).rejects.toMatchObject({ code: 'unsupported-input', message: 'trim end > duration' });
+    }
+  });
+});
+
 describe('OggDriver — demux seam + muxer', () => {
   it('demuxes a stream source; the packet seam is a typed gap in node', async () => {
     const bytes = await loadFixture('sound_5.oga');
@@ -294,6 +523,12 @@ describe('OggDriver — demux seam + muxer', () => {
     const packets = oggAudioPackets(bytes);
     expect(table.tracks[0]?.codec).toBe('opus');
     expect(table.tracks[0]?.config?.description).toBeInstanceOf(Uint8Array);
+    expect(table.tracks[0]?.gapless).toEqual({
+      basis: 'ogg-opus-granule',
+      leadingSamples: 312,
+      trailingSamples: 0,
+      totalSamples: 9288,
+    });
     expect(table.packets.length).toBe(packets.length);
     for (let i = 0; i < packets.length; i++) {
       const packet = packets[i];
@@ -323,8 +558,10 @@ describe('OggDriver — demux seam + muxer', () => {
     }
     const packetCount = 180;
     const sourceMuxer = new OggMuxer();
+    const seedTrackWithoutGapless = { ...seedTrack };
+    Reflect.deleteProperty(seedTrackWithoutGapless, 'gapless');
     const sourceTrackId = sourceMuxer.addTrack({
-      ...seedTrack,
+      ...seedTrackWithoutGapless,
       durationSec: packetCount * 0.02,
     });
     for (let index = 0; index < packetCount; index++) {
@@ -409,7 +646,7 @@ describe('OggDriver — demux seam + muxer', () => {
       outputDescription.byteOffset,
       outputDescription.byteLength,
     ).getUint16(10, true);
-    const finalGranule = Math.round((outputTrack.durationSec ?? 0) * sampleRate);
+    const finalGranule = Math.round(parseOgg(out).durationSec * sampleRate);
     const expectedFinalGranule = expectedPreSkip + endFrame - startFrame;
     const expectedPackets = sourceTable.packets.slice(firstIndex, lastIndex + 1);
     const selectedCodedFrames = packetFrames
@@ -418,6 +655,7 @@ describe('OggDriver — demux seam + muxer', () => {
 
     expect(outputPreSkip).toBe(expectedPreSkip);
     expect(finalGranule).toBe(expectedFinalGranule);
+    expect(outputTrack.durationSec).toBe((endFrame - startFrame) / sampleRate);
     expect(finalGranule - outputPreSkip).toBe(endFrame - startFrame);
     expect(selectedCodedFrames - finalGranule).toBeGreaterThanOrEqual(0);
     expect(selectedCodedFrames - finalGranule).toBeLessThan(finalPacketFrames);
@@ -471,7 +709,7 @@ describe('OggDriver — demux seam + muxer', () => {
     const zeroDurationSource = new Uint8Array([
       ...page({ bos: true, data: opusId(2) }),
       ...page({ data: str('OpusTags') }),
-      ...page({ granule: 0, data: [0] }),
+      ...page({ eos: true, granule: 0, data: [0] }),
     ]);
     await expect(
       streamCopy(byteSource(zeroDurationSource), {
@@ -500,7 +738,7 @@ describe('OggDriver — demux seam + muxer', () => {
     const source = new Uint8Array([
       ...page({ bos: true, data: opusId(2) }),
       ...page({ data: str('OpusTags') }),
-      ...page({ granule: 312, data: [3, 0] }),
+      ...page({ eos: true, granule: 312, data: [3, 0] }),
     ]);
 
     await expect(
@@ -547,21 +785,6 @@ describe('OggDriver — demux seam + muxer', () => {
         const reparsed = demuxWebm(output);
         expect(reparsed.info.container).toBe(container);
         expect(reparsed.info.tracks[0]?.codec).toBe(sourceTable.tracks[0]?.codec);
-        const description = sourceTable.tracks[0]?.config?.description;
-        const codecDelayUs =
-          sourceTable.tracks[0]?.codec === 'opus' &&
-          description instanceof Uint8Array &&
-          description.byteLength >= 12
-            ? Math.round(
-                (new DataView(
-                  description.buffer,
-                  description.byteOffset,
-                  description.byteLength,
-                ).getUint16(10, true) /
-                  48_000) *
-                  MICROS_PER_SECOND,
-              )
-            : 0;
         const outputFrames = reparsed.framesByIndex[0] ?? [];
         expect(outputFrames).toHaveLength(sourceTable.packets.length);
         for (let index = 0; index < sourceTable.packets.length; index++) {
@@ -579,9 +802,7 @@ describe('OggDriver — demux seam + muxer', () => {
                   ),
                 ),
           );
-          expect(
-            Math.abs(outputFrame.timestampUs - (sourcePacket.ptsUs - codecDelayUs)),
-          ).toBeLessThanOrEqual(1_000);
+          expect(Math.abs(outputFrame.timestampUs - sourcePacket.ptsUs)).toBeLessThanOrEqual(1_000);
         }
       }
     }
@@ -626,7 +847,7 @@ describe('OggDriver — demux seam + muxer', () => {
     );
   });
 
-  it('cross-container Opus trim resets pre-skip after the original leading packet', async () => {
+  it('cross-container Opus trim re-authors exact CodecDelay/DiscardPadding/program coordinates', async () => {
     const streamCopy = OggDriver.streamCopy;
     if (streamCopy === undefined) throw new Error('OggDriver.streamCopy must be implemented');
     const source = await loadFixture('sfx-opus.ogg');
@@ -641,16 +862,42 @@ describe('OggDriver — demux seam + muxer', () => {
       );
     });
     const expectedFirst = expected[0];
-    if (expectedFirst === undefined) throw new Error('Opus trim selected no packets');
+    const expectedLast = expected.at(-1);
+    if (expectedFirst === undefined || expectedLast === undefined) {
+      throw new Error('Opus trim selected no packets');
+    }
     expect(sourceTable.packets.indexOf(expectedFirst)).toBeGreaterThan(0);
+    const sourceDescription = sourceTable.tracks[0]?.config?.description;
+    if (!(sourceDescription instanceof Uint8Array)) {
+      throw new Error('Opus source is missing OpusHead');
+    }
+    const sourcePreSkip = new DataView(
+      sourceDescription.buffer,
+      sourceDescription.byteOffset,
+      sourceDescription.byteLength,
+    ).getUint16(10, true);
+    const firstIndex = sourceTable.packets.indexOf(expectedFirst);
+    const lastIndex = sourceTable.packets.indexOf(expectedLast);
+    const packetSamples = sourceTable.packets.map((packet) =>
+      Math.round(((packet.durationUs ?? 0) * OPUS_GRANULE_RATE) / MICROS_PER_SECOND),
+    );
+    const selectedCodedStart = packetSamples
+      .slice(0, firstIndex)
+      .reduce((sum, samples) => sum + samples, 0);
+    const selectedCodedSamples = packetSamples
+      .slice(firstIndex, lastIndex + 1)
+      .reduce((sum, samples) => sum + samples, 0);
+    const startFrame = Math.round(trim.startSec * OPUS_GRANULE_RATE);
+    const endFrame = Math.round(trim.endSec * OPUS_GRANULE_RATE);
+    const expectedPreSkip = startFrame - (selectedCodedStart - sourcePreSkip);
+    const expectedTotal = endFrame - startFrame;
+    const expectedTrailing = selectedCodedSamples - expectedPreSkip - expectedTotal;
     const output = await collect(
       await streamCopy(await fixtureSource('sfx-opus.ogg'), { container: 'mkv', trim }),
     );
     const outputTable = webmPacketPayloadInfoFromBytes(output);
     const outputTrack = outputTable.tracks[0];
-    const firstPtsUs = expected[0]?.ptsUs;
-    const last = expected.at(-1);
-    if (outputTrack === undefined || firstPtsUs === undefined || last?.durationUs === undefined) {
+    if (outputTrack === undefined) {
       throw new Error('trimmed Opus output is missing track or packet facts');
     }
     const description = outputTrack.config?.description;
@@ -658,13 +905,23 @@ describe('OggDriver — demux seam + muxer', () => {
     const opusHead = description as Uint8Array;
     expect(
       new DataView(opusHead.buffer, opusHead.byteOffset, opusHead.byteLength).getUint16(10, true),
-    ).toBe(0);
-    expect(outputTrack.codecDelayNs).toBeUndefined();
-    expect(outputTrack.gapless).toBeUndefined();
-    expect(outputTrack.durationSec).toBeCloseTo(
-      (last.ptsUs + last.durationUs - firstPtsUs) / MICROS_PER_SECOND,
-      6,
+    ).toBe(expectedPreSkip);
+    expect(outputTrack.codecDelayNs).toBe(
+      Math.round((expectedPreSkip * 1_000_000_000) / OPUS_GRANULE_RATE),
     );
+    expect(outputTrack.gapless).toEqual({
+      basis: 'webm-opus-codec-delay',
+      leadingSamples: expectedPreSkip,
+      trailingSamples: expectedTrailing,
+      totalSamples: expectedTotal,
+    });
+    expect(outputTrack.durationSec).toBeCloseTo(expectedTotal / OPUS_GRANULE_RATE, 6);
+    expect(
+      Math.abs(
+        (outputTable.packets[0]?.ptsUs ?? 0) +
+          (expectedPreSkip * MICROS_PER_SECOND) / OPUS_GRANULE_RATE,
+      ),
+    ).toBeLessThanOrEqual(1_000);
     expect(outputTable.packets.map((packet) => packet.data)).toEqual(
       expected.map((packet) => oggPacketBytes(source, packet)),
     );
@@ -688,8 +945,12 @@ describe('OggDriver — demux seam + muxer', () => {
       throw new Error('leading Opus trim is missing track truth');
     }
     expect(outputTrack.codecDelayNs).toBe(6_500_000);
-    expect(outputTrack.gapless?.leadingSamples).toBe(312);
-    expect(outputTrack.gapless?.trailingSamples).toBeUndefined();
+    expect(outputTrack.gapless).toEqual({
+      basis: 'webm-opus-codec-delay',
+      leadingSamples: 312,
+      trailingSamples: 648,
+      totalSamples: 1_920,
+    });
     expect(outputTable.packets[0]?.data).toEqual(oggPacketBytes(source, first));
   });
 

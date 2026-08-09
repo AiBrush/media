@@ -6,6 +6,7 @@
  */
 
 import { InputError } from '../contracts/errors.ts';
+import { validateVideoQualityConstraint } from './job-schema-quality.ts';
 import {
   allowedKeys,
   clonePlainData,
@@ -33,6 +34,8 @@ const VIDEO_TARGET_KEYS = [
   'fit',
   'fps',
   'bitrate',
+  'maxAverageBitrate',
+  'quality',
   'bitrateMode',
   'crf',
   'twoPass',
@@ -66,7 +69,24 @@ export function validateVideoTarget(value: unknown, label: string): VideoTarget 
   optionalPositiveInteger(target.height, `${label}.height`);
   optionalEnum(target.fit, ['contain', 'cover', 'fill'], `${label}.fit`);
   optionalPositiveNumber(target.fps, `${label}.fps`);
-  optionalPositiveInteger(target.bitrate, `${label}.bitrate`);
+  const bitrate =
+    target.bitrate === undefined ? undefined : positiveInteger(target.bitrate, `${label}.bitrate`);
+  const maxAverageBitrate =
+    target.maxAverageBitrate === undefined
+      ? undefined
+      : positiveInteger(target.maxAverageBitrate, `${label}.maxAverageBitrate`);
+  if (maxAverageBitrate !== undefined && bitrate === undefined) {
+    throw new InputError(`${label}.maxAverageBitrate requires bitrate`);
+  }
+  if (maxAverageBitrate !== undefined && bitrate !== undefined && maxAverageBitrate < bitrate) {
+    throw new InputError(`${label}.maxAverageBitrate must be greater than or equal to bitrate`);
+  }
+  if (target.quality !== undefined) {
+    validateVideoQualityConstraint(target.quality, `${label}.quality`);
+  }
+  if (maxAverageBitrate !== undefined && target.quality === undefined) {
+    throw new InputError(`${label}.maxAverageBitrate requires quality`);
+  }
   optionalEnum(target.bitrateMode, ['constant', 'variable', 'quantizer'], `${label}.bitrateMode`);
   if (target.crf !== undefined) {
     const crf = finiteNumber(target.crf, `${label}.crf`);
@@ -76,6 +96,20 @@ export function validateVideoTarget(value: unknown, label: string): VideoTarget 
     }
   }
   optionalBoolean(target.twoPass, `${label}.twoPass`);
+  if (target.quality !== undefined) {
+    if (bitrate === undefined || maxAverageBitrate === undefined) {
+      throw new InputError(`${label}.quality requires bitrate and maxAverageBitrate`);
+    }
+    if (Object.hasOwn(target, 'crf')) {
+      throw new InputError(`${label}.quality cannot combine with crf`);
+    }
+    if (Object.hasOwn(target, 'bitrateMode')) {
+      throw new InputError(`${label}.quality cannot combine with bitrateMode`);
+    }
+    if (Object.hasOwn(target, 'twoPass')) {
+      throw new InputError(`${label}.quality cannot combine with twoPass`);
+    }
+  }
   if (target.bitrate !== undefined && target.crf !== undefined) {
     throw new InputError(`${label} cannot combine bitrate and crf`);
   }

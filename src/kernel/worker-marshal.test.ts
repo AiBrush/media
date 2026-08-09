@@ -16,11 +16,14 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { type Source, fromBytes, fromStream } from '../sources/source.ts';
+import { H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS } from '../api/types.ts';
 import { readSourceOwned, transferableInput } from './worker-input.ts';
 import {
   type JobStreamRunner,
+  abrLadderCapsSatisfy,
   buildOffloadPayload,
   capsSatisfy,
+  offloadAbrLadder,
   offloadCapsNeed,
   runOffloadStream,
 } from './worker-marshal.ts';
@@ -163,6 +166,24 @@ describe('readSourceOwned', () => {
       code: 'aborted',
     });
   });
+
+  it('cancels an unknown-length worker source as soon as its explicit byte ceiling is crossed', async () => {
+    let cancelled = false;
+    const src = fromStream(new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(Uint8Array.of(1, 2, 3));
+        controller.enqueue(Uint8Array.of(4, 5, 6));
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    }));
+    await expect(readSourceOwned(src, undefined, 5)).rejects.toMatchObject({
+      code: 'unsupported-input',
+      detail: { observedBytes: 6, maximumBytes: 5 },
+    });
+    expect(cancelled).toBe(true);
+  });
 });
 
 // ── runOffloadStream: zero-copy adopt on the stream path, exact copy on the range path ────────────────
@@ -268,5 +289,112 @@ describe('offloadCapsNeed / capsSatisfy', () => {
     expect(capsSatisfy(audioOnly, { video: true, audio: true })).toBe(false); // av needs both
     expect(capsSatisfy({ video: true, audio: true }, { video: true, audio: true })).toBe(true);
     expect(capsSatisfy(undefined, { video: true, audio: true })).toBe(true); // no handshake ⇒ open
+  });
+
+  it('requires affirmative caps for every ABR rendition', () => {
+    const ladder = [
+      { opts: { to: 'mp4', video: { codec: 'h264' } } },
+      { opts: { to: 'mp4', video: { codec: 'h264' }, audio: false } },
+    ];
+    expect(abrLadderCapsSatisfy(undefined, ladder)).toBe(false);
+    expect(abrLadderCapsSatisfy({ video: true, audio: false }, ladder)).toBe(false);
+    expect(abrLadderCapsSatisfy({ video: false, audio: true }, ladder)).toBe(false);
+    expect(abrLadderCapsSatisfy({ video: true, audio: true }, ladder)).toBe(true);
+  });
+});
+
+describe('offloadAbrLadder bounded scheduling', () => {
+  async function drainBytes(stream: ReadableStream<Uint8Array>): Promise<number[]> {
+    const out: number[] = [];
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return out;
+      out.push(...value);
+    }
+  }
+
+  function trackingRunner(size: number): {
+    readonly runner: JobStreamRunner;
+    readonly peak: () => number;
+  } {
+    let active = 0;
+    let peak = 0;
+    return {
+      runner: {
+        size,
+        runStream: (job): ReadableStream<Transferable> => {
+          active += 1;
+          peak = Math.max(peak, active);
+          const opts = (job.payload as { readonly opts?: { readonly video?: { readonly width?: number } } })
+            .opts;
+          const marker = opts?.video?.width ?? 0;
+          let emitted = false;
+          return new ReadableStream<Transferable>({
+            async pull(controller): Promise<void> {
+              if (emitted) return;
+              emitted = true;
+              await new Promise<void>((resolve) => setTimeout(resolve, 1));
+              controller.enqueue(Uint8Array.of(marker & 0xff).buffer);
+              active -= 1;
+              controller.close();
+            },
+          });
+        },
+      },
+      peak: () => peak,
+    };
+  }
+
+  it('keeps legacy source copies/jobs bounded to the runner size', async () => {
+    const tracked = trackingRunner(2);
+    const streams = await offloadAbrLadder(
+      tracked.runner,
+      fromBytes(Uint8Array.of(1, 2, 3)),
+      Array.from({ length: 7 }, (_, index) => ({
+        opts: { to: 'mp4', video: { codec: 'h264', width: 320 + index } },
+      })),
+    );
+    await Promise.all(streams.map(drainBytes));
+    expect(tracked.peak()).toBe(2);
+  });
+
+  it('caps legacy fanout even when a caller configures a much larger worker pool', async () => {
+    const tracked = trackingRunner(99);
+    const streams = await offloadAbrLadder(
+      tracked.runner,
+      fromBytes(Uint8Array.of(1, 2, 3)),
+      Array.from({ length: 7 }, (_, index) => ({
+        opts: { to: 'mp4', video: { codec: 'h264', width: 320 + index } },
+      })),
+    );
+    await Promise.all(streams.map(drainBytes));
+    expect(tracked.peak()).toBe(H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS);
+  });
+
+  it('serializes the full ladder when any rung carries an objective-quality constraint', async () => {
+    const tracked = trackingRunner(4);
+    const streams = await offloadAbrLadder(
+      tracked.runner,
+      fromBytes(Uint8Array.of(1, 2, 3)),
+      [
+        {
+          opts: {
+            to: 'mp4',
+            video: {
+              codec: 'h264',
+              width: 1_920,
+              bitrate: 4_000_000,
+              maxAverageBitrate: 5_200_000,
+              quality: { metric: 'ssim-luma-v1', minimumMean: 0.95 },
+            },
+          },
+        },
+        { opts: { to: 'mp4', video: { codec: 'h264', width: 1_280, bitrate: 2_000_000 } } },
+        { opts: { to: 'mp4', video: { codec: 'h264', width: 854, bitrate: 1_000_000 } } },
+      ],
+    );
+    await Promise.all(streams.map(drainBytes));
+    expect(tracked.peak()).toBe(1);
   });
 });

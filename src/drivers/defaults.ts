@@ -105,9 +105,11 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     probe: true,
     packetInfo: true,
     packetInfoBatches: true,
+    auditMuxedTrack: true,
     streamCopy: true,
     decrypt: true,
     validatesStreamCopyTrim: true,
+    gaplessSeam: true,
   },
   {
     id: 'webm',
@@ -335,10 +337,7 @@ function canvas2dFilterSupports(spec: FilterSpec): boolean {
 }
 
 function cpuVideoFilterSupports(spec: FilterSpec): boolean {
-  if (spec.mediaType !== 'video' || typeof VideoFrame === 'undefined') return false;
-  const chromiumCanvasTonemap =
-    typeof OffscreenCanvas !== 'undefined' && chromiumCanvasTonemapAvailable();
-  return !(spec.type === 'tonemap' && chromiumCanvasTonemap);
+  return spec.mediaType === 'video' && spec.type !== 'tonemap' && typeof VideoFrame !== 'undefined';
 }
 
 function isGeometricVideoFilterSpec(spec: FilterSpec): boolean {

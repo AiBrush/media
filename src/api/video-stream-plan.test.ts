@@ -18,7 +18,9 @@ import {
   planCfrFrameRetiming,
   planVideoBitDepthConversion,
   retimeTimedFrameStream,
+  videoColorMuxIntent,
   videoFilterRouteCost,
+  videoFilterSpecs,
   videoTargetPixelBoundaryBitDepth,
 } from './video-stream-plan.ts';
 
@@ -172,6 +174,46 @@ describe('video route-cost saturation', () => {
       mediaSeconds: 1e308,
     });
     expect(videoFilterRouteCost({}, { width: Number.MAX_VALUE, height: 2 })).toEqual({});
+  });
+});
+
+describe('video colour-transform compatibility', () => {
+  const combinedTarget = {
+    colorspace: { to: 'bt2020' },
+    tonemap: { to: 'sdr' as const },
+  };
+
+  it('rejects a combined colorspace and tonemap target before source geometry is touched', () => {
+    const untouchedSource = new Proxy(
+      { width: undefined, height: undefined },
+      {
+        get(): never {
+          throw new Error('source geometry was touched');
+        },
+      },
+    );
+    let error: unknown;
+    try {
+      videoFilterSpecs(combinedTarget, untouchedSource);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(CapabilityError);
+    expect(error).toMatchObject({
+      code: 'capability-miss',
+      detail: {
+        op: {
+          kind: 'route',
+          id: 'convert',
+          facts: { colorspace: 'bt2020', tonemap: 'sdr' },
+        },
+        tried: [],
+      },
+    });
+  });
+
+  it('rejects the same unsupported combination while planning mux colour metadata', () => {
+    expect(() => videoColorMuxIntent(combinedTarget)).toThrow(CapabilityError);
   });
 });
 

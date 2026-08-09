@@ -19,6 +19,7 @@ import type {
   WarmVideoDecoderPool,
 } from '../codecs/webcodecs-video.ts';
 import type {
+  AudioEncoderOutputTiming,
   CodecDriver,
   CodecQuery,
   ContainerDriver,
@@ -150,6 +151,10 @@ export interface MediaEngine {
     o?: PacketInfoBatchCallOptions,
   ): Cancellable<PacketInfoBatchStream>;
   convert(input: MediaInput, opts: ConvertOptions, o?: CallOptions): Cancellable<Output>;
+  /**
+   * Atomically author up to eight H.264 renditions as retained Blob outputs. The operation rejects
+   * sources/output aggregates beyond the public ABR memory policy before publishing any rung.
+   */
   h264AbrLadder(
     input: MediaInput,
     ladder: readonly H264AbrRung[],
@@ -324,7 +329,9 @@ export class MediaEngineImpl implements MediaEngine {
 
   #assertNotDisposed(): void {
     if (this.#disposed) {
-      throw new MediaError('aborted', 'engine disposed', { reason: 'disposed' });
+      throw new MediaError('aborted', 'engine disposed', {
+        reason: 'disposed',
+      });
     }
   }
 
@@ -578,7 +585,11 @@ export class MediaEngineImpl implements MediaEngine {
   pcm(
     src: Source | Uint8Array,
     sourceContainer: string,
-    opts: { readonly to: Container; readonly audio?: AudioTarget | false; readonly sink?: Sink },
+    opts: {
+      readonly to: Container;
+      readonly audio?: AudioTarget | false;
+      readonly sink?: Sink;
+    },
     o: CallOptions = {},
   ): Cancellable<Output | Uint8Array> {
     this.#assertNotDisposed();
@@ -677,6 +688,18 @@ export class MediaEngineImpl implements MediaEngine {
               }),
           },
           signal,
+        );
+      }
+      // A quality-constrained request owns multiple finite replays. Validate its complete public tuple
+      // and replay proof before HLS resolution, probing, routing, or any source byte read.
+      const finiteVideoTarget = opts.video === false ? undefined : opts.video;
+      if (
+        finiteVideoTarget?.quality !== undefined ||
+        finiteVideoTarget?.maxAverageBitrate !== undefined
+      ) {
+        (await import('./video-quality-constraint.ts')).assertH264QualityConstraintPreflight(
+          finiteVideoTarget,
+          normalized,
         );
       }
       const src = await this.#resolveHlsInput(input, normalized, signal);
@@ -862,7 +885,9 @@ export class MediaEngineImpl implements MediaEngine {
           await this.#probeCodec(q, {});
         },
         pickFilter: (filter) => {
-          this.#router.pickFilter(filter, { determinism: this.#opts.determinism ?? 'auto' });
+          this.#router.pickFilter(filter, {
+            determinism: this.#opts.determinism ?? 'auto',
+          });
         },
         ...(this.#opts.onLog !== undefined ? { onLog: this.#opts.onLog } : {}),
       },
@@ -1280,7 +1305,10 @@ export class MediaEngineImpl implements MediaEngine {
       sourceGeometryOf(sourceTrack),
       sourceTrack.codec,
     );
-    const encoderConfig: VideoEncoderConfig = { ...encodeConfig, alpha: 'discard' };
+    const encoderConfig: VideoEncoderConfig = {
+      ...encodeConfig,
+      alpha: 'discard',
+    };
     const decodeStage: VideoDecoderStageOptions = {
       ...this.#stageOptions(signal, o),
       alpha: 'discard',
@@ -1454,7 +1482,10 @@ export class MediaEngineImpl implements MediaEngine {
       sourceGeometryOf(sourceTrack),
       sourceTrack.codec,
     );
-    const encoderConfig: VideoEncoderConfig = { ...encodeConfig, alpha: 'discard' };
+    const encoderConfig: VideoEncoderConfig = {
+      ...encodeConfig,
+      alpha: 'discard',
+    };
     const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
     /* v8 ignore start -- requires live WebCodecs decoders/encoders; browser-harness validated. */
     let decoderConfig: VideoDecoderConfig | undefined;
@@ -1534,6 +1565,7 @@ export class MediaEngineImpl implements MediaEngine {
   ): Promise<void> {
     const {
       audioEncodeNeedsSoftwareRuntime,
+      audioCodecToken,
       audioTrackInfoFromDecoderConfig,
       buildAudioEncoderConfig,
       drainEncoderToMuxer,
@@ -1551,24 +1583,59 @@ export class MediaEngineImpl implements MediaEngine {
     // Past here is the live WebCodecs path — unreachable in Node (the route above throws first).
     /* v8 ignore start -- requires a real AudioEncoder; validated in the browser harness (BUILD §6.1). */
     let decoderConfig: AudioDecoderConfig | undefined;
+    let encoderTiming: AudioEncoderOutputTiming | undefined;
     const stage: AudioEncoderStageOptions = {
       ...this.#stageOptions(signal, encodeOptions),
       onConfig: (c) => {
         decoderConfig = c;
       },
+      onTiming: (timing) => {
+        encoderTiming = timing;
+      },
     };
     const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
+    let outputTrackId: number | undefined;
     await drainEncoderToMuxer(
       chunks,
-      muxer,
+      {
+        addTrack: (info) => {
+          const id = muxer.addTrack(info);
+          outputTrackId = id;
+          return id;
+        },
+        write: (trackId, packet) => muxer.write(trackId, packet),
+      },
       () =>
         audioTrackInfoFromDecoderConfig(
           requireEncoderConfig(decoderConfig, 'audio'),
           sourceTrack?.durationSec,
-          outputGaplessForAudioEncoder(requireEncoderConfig(decoderConfig, 'audio'), sourceTrack),
         ),
       signal,
     );
+    const publishedConfig = requireEncoderConfig(decoderConfig, 'audio') as AudioDecoderConfig;
+    if (
+      outputTrackId !== undefined &&
+      muxer.setTrackGapless !== undefined &&
+      audioCodecToken(publishedConfig.codec) === 'aac'
+    ) {
+      const gapless = outputGaplessForAudioEncoder(publishedConfig, encoderTiming);
+      if (gapless === undefined) {
+        throw new CapabilityError(
+          `sample-accurate AAC MP4 muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
+          {
+            op: {
+              kind: 'route',
+              id: 'mux',
+              facts: { mediaType: 'audio', codec: publishedConfig.codec },
+            },
+            tried: [codec.id],
+            suggestion:
+              'use a runtime with a proven AAC encoder-delay fact or an encoder that publishes one',
+          },
+        );
+      }
+      muxer.setTrackGapless(outputTrackId, gapless);
+    }
     /* v8 ignore stop */
   }
 

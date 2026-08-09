@@ -108,6 +108,14 @@ describe('MP3 output / Mp3Muxer — the engine produces a valid, decodable .mp3 
     const fixture = 'bear-vbr-toc.mp3';
     const golden = (await loadGoldenMetadata(fixture)) as MediaInfo;
     const sourceBytes = await loadFixture(fixture);
+    const sourceInfo = parseMp3(sourceBytes, sourceBytes.byteLength);
+    expect(sourceInfo.gapless, 'legacy Lavc raw tuple and physical decoder window').toEqual({
+      basis: 'mp3-xing-lame',
+      leadingSamples: 1_105,
+      trailingSamples: 0,
+      totalSamples: 441_263,
+      mp3Lame: { encoderDelaySamples: 576, encoderPaddingSamples: 0 },
+    });
     const sourcePackets = enumerateMp3Packets(sourceBytes);
     const sourceAudioBytes = sourcePackets.reduce((sum, packet) => sum + packet.size, 0);
     const outBytes = await remuxToMp3({ bytes: sourceBytes, packets: sourcePackets });
@@ -124,6 +132,9 @@ describe('MP3 output / Mp3Muxer — the engine produces a valid, decodable .mp3 
     expect(reparsed.durationSec, 'VBR remux duration').toBeCloseTo(golden.durationSec, 6);
     expect(reparsed.sampleRate).toBe(golden.tracks[0]?.sampleRate);
     expect(reparsed.channels).toBe(golden.tracks[0]?.channels);
+    expect(reparsed.gapless, 'decoded window and raw LAME tuple round-trip').toEqual(
+      sourceInfo.gapless,
+    );
   }, 30_000);
 
   it('authors ≥2 real MP3 sources to a valid .mp3 (re-parses + ffmpeg-decodes)', async () => {

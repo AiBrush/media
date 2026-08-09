@@ -195,6 +195,24 @@ describe('probe WebM across the real corpus', () => {
     expect(info.durationSec).toBeGreaterThan(0);
   });
 
+  it('recorder_headerless.webm — consecutive unknown-size Clusters retain the complete timeline', async () => {
+    const bytes = await bytesFromMediaTest('recorder_headerless.webm');
+    const info = parseWebm(bytes);
+    const demuxed = demuxWebm(bytes);
+    const videoIndex = demuxed.info.tracks.findIndex((track) => track.mediaType === 'video');
+    const frames = demuxed.framesByIndex[videoIndex] ?? [];
+
+    // This MediaRecorder stream starts a second unknown-size Cluster at 1.680 s. Treating the first
+    // Cluster as the Segment remainder truncates exactly 79 frames and the entire second GOP.
+    expect(info.durationSec).toBe(2.98);
+    expect(frames).toHaveLength(180);
+    expect(frames[0]?.timestampUs).toBe(0);
+    expect(frames.at(-1)?.timestampUs).toBe(2_980_000);
+    expect(frames.filter((frame) => frame.keyframe).map((frame) => frame.timestampUs)).toEqual([
+      0, 1_680_000,
+    ]);
+  });
+
   it.each(['movie_5.webm', '2x2-green.webm', 'white.webm'])(
     '%s probe matches its committed golden',
     async (id) => {

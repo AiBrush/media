@@ -10,7 +10,14 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { OPTIONAL_CONTAINER_CAPABILITIES } from '../contracts/driver.ts';
+import {
+  type ContainerDriver,
+  DRIVER_API_VERSION,
+  type MuxOptions,
+  OPTIONAL_CONTAINER_CAPABILITIES,
+  type Packet,
+  type TrackInfo,
+} from '../contracts/driver.ts';
 import { fromBytes } from '../sources/source.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { DEFAULT_LAZY_CONTAINER_SPECS, lazyContainer } from './defaults.ts';
@@ -62,6 +69,44 @@ describe('lazy container spec conformance', () => {
     await expect(proxy.demux(fromBytes(bytes, { mime: 'audio/wav' }))).resolves.toMatchObject({
       tracks: [{ mediaType: 'audio', codec: 'pcm-s16' }],
     });
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads once and forwards the exact track, packet iterable, and mux options for auditMuxedTrack', async () => {
+    const expected = {
+      elementaryPayloadBytes: 7,
+      preparedSampleByteLengths: [7],
+      presentationSpanUs: 40_000,
+      sampleCount: 1,
+    } as const;
+    const auditMuxedTrack = vi.fn(async () => expected);
+    const loaded: ContainerDriver = {
+      id: 'audit-container',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'container',
+      formats: ['audit'],
+      supports: () => true,
+      demux: () => Promise.reject(new Error('unused')),
+      createMuxer: () => {
+        throw new Error('unused');
+      },
+      auditMuxedTrack,
+    };
+    const load = vi.fn(async () => loaded);
+    const proxy = lazyContainer({
+      id: loaded.id,
+      formats: loaded.formats,
+      supports: loaded.supports,
+      load,
+      auditMuxedTrack: true,
+    });
+    const track: TrackInfo = { id: 1, mediaType: 'video', codec: 'avc1.42E01E' };
+    const packets: Packet[] = [];
+    const options: MuxOptions = { fragmented: true, container: 'audit' };
+    const signal = new AbortController().signal;
+
+    await expect(proxy.auditMuxedTrack?.(track, packets, options, signal)).resolves.toBe(expected);
+    expect(auditMuxedTrack).toHaveBeenCalledWith(track, packets, options, signal);
     expect(load).toHaveBeenCalledTimes(1);
   });
 });

@@ -100,7 +100,13 @@ describe('semantic stream-copy eligibility', () => {
   it('accepts only an exactly proved codec, coded geometry, rotation, precision, and audio layout', () => {
     const exact: ConvertOptions = {
       to: 'mp4',
-      video: { codec: 'h264', width: 720, height: 1280, rotate: 0, bitDepth: 8 },
+      video: {
+        codec: 'h264',
+        width: 720,
+        height: 1280,
+        rotate: 0,
+        bitDepth: 8,
+      },
       audio: { codec: 'aac', sampleRate: 48_000, channels: 2 },
     };
     expect(mayBeSemanticStreamCopy(exact)).toBe(true);
@@ -215,7 +221,10 @@ describe('semantic stream-copy eligibility', () => {
     for (const [codec, family] of cases) {
       expect(
         isSemanticStreamCopy(
-          { to: 'mkv', audio: { codec: family, sampleRate: 48_000, channels: 2 } },
+          {
+            to: 'mkv',
+            audio: { codec: family, sampleRate: 48_000, channels: 2 },
+          },
           [
             {
               id: 1,
@@ -233,7 +242,11 @@ describe('semantic stream-copy eligibility', () => {
           id: 1,
           mediaType: 'audio',
           codec: 'unknown-audio',
-          config: { codec: 'unknown-audio', sampleRate: 48_000, numberOfChannels: 2 },
+          config: {
+            codec: 'unknown-audio',
+            sampleRate: 48_000,
+            numberOfChannels: 2,
+          },
         },
       ]),
     ).toBe(false);
@@ -258,7 +271,11 @@ describe('semantic stream-copy eligibility', () => {
       isSemanticStreamCopy({ to: 'mp4', video: { codec: 'h264' } }, [
         {
           ...H264_VIDEO,
-          config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+          config: {
+            codec: 'mp4a.40.2',
+            sampleRate: 48_000,
+            numberOfChannels: 2,
+          },
         },
       ]),
     ).toBe(false);
@@ -338,7 +355,11 @@ describe('semantic stream-copy eligibility', () => {
           ...H264_VIDEO,
           codec: 'vp09.00.10.08',
           alpha: true,
-          config: { codec: 'vp09.00.10.08', codedWidth: 720, codedHeight: 1280 },
+          config: {
+            codec: 'vp09.00.10.08',
+            codedWidth: 720,
+            codedHeight: 1280,
+          },
         },
       ]),
     ).toBe(true);
@@ -347,6 +368,11 @@ describe('semantic stream-copy eligibility', () => {
       { bitrateMode: 'constant' as const },
       { crf: 20 },
       { twoPass: true },
+      {
+        bitrate: 2_000_000,
+        maxAverageBitrate: 2_600_000,
+        quality: { metric: 'ssim-luma-v1' as const, minimumMean: 0.93 },
+      },
       { fit: 'contain' as const },
       { flip: 'h' as const },
       { crop: { x: 0, y: 0, width: 720, height: 1280 } },
@@ -481,7 +507,10 @@ function sourceAwareCopyModule(
       throw new Error('eligible semantic copy must not create a codec muxer');
     },
   };
-  return { apiVersion: DRIVER_API_VERSION, register: (registry) => registry.addContainer(driver) };
+  return {
+    apiVersion: DRIVER_API_VERSION,
+    register: (registry) => registry.addContainer(driver),
+  };
 }
 
 describe('public convert semantic stream-copy route', () => {
@@ -503,7 +532,13 @@ describe('public convert semantic stream-copy route', () => {
     expect(calls).toEqual({
       probe: 1,
       demux: 0,
-      copy: [expect.objectContaining({ container: 'mp4', faststart: true, fragmented: false })],
+      copy: [
+        expect.objectContaining({
+          container: 'mp4',
+          faststart: true,
+          fragmented: false,
+        }),
+      ],
     });
     expect(calls.copy[0]?.signal).toBeInstanceOf(AbortSignal);
   });
@@ -605,7 +640,11 @@ describe('public convert semantic stream-copy route', () => {
       { mime: 'video/x-semantic-copy' },
     );
     await expect(
-      media.convert(input, { to: 'mp4', video: { codec: 'h264' }, audio: false }),
+      media.convert(input, {
+        to: 'mp4',
+        video: { codec: 'h264' },
+        audio: false,
+      }),
     ).rejects.toThrow();
     expect(calls).toEqual({ probe: 0, demux: 1, copy: [] });
   });
@@ -622,7 +661,12 @@ describe('public convert semantic stream-copy route', () => {
       }
       const output = await media.convert(input, {
         to: 'mp4',
-        video: { codec: 'h264', width: video.width, height: video.height, rotate: 0 },
+        video: {
+          codec: 'h264',
+          width: video.width,
+          height: video.height,
+          rotate: 0,
+        },
       });
       expect(output).toBeInstanceOf(Blob);
       if (!(output instanceof Blob)) throw new Error('expected a Blob output');
@@ -664,7 +708,12 @@ describe('public convert semantic stream-copy route', () => {
       }
       const output = await media.convert(blob, {
         to: 'mp4',
-        video: { codec: 'h264', width: video.width, height: video.height, rotate: 0 },
+        video: {
+          codec: 'h264',
+          width: video.width,
+          height: video.height,
+          rotate: 0,
+        },
       });
 
       expect(output).toBeInstanceOf(Blob);
@@ -672,7 +721,10 @@ describe('public convert semantic stream-copy route', () => {
       expect(output).not.toBe(blob);
       expect(output.type).toBe('video/mp4');
       expect(new Uint8Array(await output.arrayBuffer())).toEqual(input);
-      expect(blob.reads).not.toContainEqual({ start: 0, end: input.byteLength });
+      expect(blob.reads).not.toContainEqual({
+        start: 0,
+        end: input.byteLength,
+      });
       expect(blob.reads.reduce((sum, read) => sum + read.end - read.start, 0)).toBeLessThan(
         input.byteLength,
       );
@@ -721,14 +773,18 @@ describe('public convert semantic stream-copy route', () => {
     expect(normalized).not.toEqual(input);
     expect(explicitLayout).not.toEqual(input);
 
-    const unsafe = new ObservedBlob([input, emptyTopLevelBox('uuid')], { type: 'video/mp4' });
+    const unsafe = new ObservedBlob([input, emptyTopLevelBox('uuid')], {
+      type: 'video/mp4',
+    });
     expect(await tryReuseMp4SemanticBlobDirectly(unsafe, 'mp4')).toBeUndefined();
     expect(
       await tryReuseMp4SemanticBlobDirectly(new Blob([input], { type: 'video/mp4' }), 'mov'),
     ).toBeUndefined();
     expect(
       await tryReuseMp4SemanticBlobDirectly(
-        new Blob([input.subarray(0, input.byteLength - 1)], { type: 'video/mp4' }),
+        new Blob([input.subarray(0, input.byteLength - 1)], {
+          type: 'video/mp4',
+        }),
         'mp4',
       ),
     ).toBeUndefined();
@@ -754,7 +810,12 @@ describe('public convert semantic stream-copy route', () => {
     }
     const output = await media.convert(new File([input], 'renamed-by-caller.mp4'), {
       to: 'mp4',
-      video: { codec: 'h264', width: video.width, height: video.height, rotate: 0 },
+      video: {
+        codec: 'h264',
+        width: video.width,
+        height: video.height,
+        rotate: 0,
+      },
     });
     expect(output).toBeInstanceOf(Blob);
     if (!(output instanceof Blob)) throw new Error('expected Blob output');
@@ -937,7 +998,12 @@ describe('public convert semantic stream-copy route', () => {
     await expect(
       media.convert(input, {
         to: 'mp4',
-        video: { codec: 'h264', width: video.width, height: video.height, rotate: 0 },
+        video: {
+          codec: 'h264',
+          width: video.width,
+          height: video.height,
+          rotate: 0,
+        },
       }),
     ).rejects.toThrow();
   });

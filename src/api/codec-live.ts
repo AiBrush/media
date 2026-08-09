@@ -82,7 +82,6 @@ export interface VpxAlphaFrameTranscodeOptions {
 export function frameSatisfiesSeek(timestampUs: number, targetUs: number): boolean {
   return timestampUs >= targetUs;
 }
-
 /** Apply parsed encoder-delay/padding facts to a decoded audio stream, or preserve identity when absent. */
 export async function decodedAudioStreamWithGapless(
   frames: ReadableStream<AudioData>,
@@ -95,16 +94,19 @@ export async function decodedAudioStreamWithGapless(
   const config = track.config;
   if (
     suppressionProbe !== undefined &&
-    gapless.basis === 'mp4-edit-list' &&
+    (gapless.basis === 'mp4-edit-list' ||
+      gapless.basis === 'ogg-opus-granule' ||
+      gapless.basis === 'webm-opus-codec-delay') &&
     leadingSamples !== undefined &&
     config !== undefined &&
     'sampleRate' in config
   ) {
-    const { nativeSuppressedMp4EditSamples } = await import('./gapless-native-suppression.ts');
-    const nativeSuppressed = await nativeSuppressedMp4EditSamples(
+    const { nativeSuppressedGaplessSamples } = await import('./gapless-native-suppression.ts');
+    const nativeSuppressed = await nativeSuppressedGaplessSamples(
       suppressionProbe,
       leadingSamples,
       config.sampleRate,
+      { probeFromFirstPacket: gapless.basis !== 'mp4-edit-list' },
     );
     if (nativeSuppressed > 0) {
       gapless = { ...gapless, leadingSamples: Math.max(0, leadingSamples - nativeSuppressed) };

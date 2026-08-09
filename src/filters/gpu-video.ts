@@ -236,14 +236,20 @@ export function rotatePackedI420By180(data: Uint8Array, width: number, height: n
   data.subarray(lumaBytes + chromaBytes).reverse();
 }
 
-/** Resolve a *colour* spec + the source colour interpretation into a {@link ColorPlan}. Pure/Node-tested. */
+/**
+ * Resolve a *colour* spec into the plan consumed by the WebGPU shader. `importExternalTexture()` converts
+ * its source to sRGB unless another `PredefinedColorSpace` is requested, so a colorspace recipe must start
+ * from that normalized representation rather than re-applying the decoded frame's original primaries and
+ * transfer. Tone-map retains its existing source-aware plan until its HDR import representation is handled
+ * independently.
+ */
 export function planColor(spec: ColorVideoSpec, source: SourceColor): ColorPlan {
   if (spec.type === 'tonemap') return planTonemap(source);
   const dst = parseColorSpace(spec.to);
   if (dst === null) {
     throw new InputError(`unknown colorspace target '${spec.to}'`);
   }
-  return planColorspace(source, dst);
+  return planColorspace({ primaries: 'srgb', transfer: 'srgb' }, dst);
 }
 
 /* v8 ignore start -- render-path helpers: only the browser-only renderers call these (they touch
@@ -399,12 +405,34 @@ class Canvas2DRenderer implements Renderer {
 // ---- WebGPU ----
 
 /**
+ * Convert normalized straight-alpha RGBA to the representation required by a WebGPU canvas configured
+ * with `alphaMode:'premultiplied'`. The shader-side helper below mirrors this pure function; keeping the
+ * arithmetic visible here lets Node tests pin the translucent-pixel contract without faking WebGPU.
+ */
+export function premultiplyWebGpuCanvasRgba(
+  rgba: readonly [number, number, number, number],
+): [number, number, number, number] {
+  const [r, g, b, a] = rgba;
+  return [r * a, g * a, b * a, a];
+}
+
+/** The canvas alpha representation both WebGPU fragment pipelines write. */
+export const WEBGPU_CANVAS_ALPHA_MODE = 'premultiplied' as const;
+
+/** Shared WGSL mirror of {@link premultiplyWebGpuCanvasRgba}. */
+const PREMULTIPLY_CANVAS_WGSL = /* wgsl */ `
+fn premultiply_for_canvas(c : vec4<f32>) -> vec4<f32> {
+  return vec4<f32>(c.rgb * c.a, c.a);
+}
+`;
+
+/**
  * WGSL for a textured full-screen quad. The vertex stage emits a triangle-strip quad in clip space and a
  * source-space position; the fragment stage samples the external texture at the recipe-derived UV. Geometry
  * (which source texels land where) is encoded entirely in the per-frame `Uniforms`, so one pipeline serves
  * every op: `uvScale`/`uvOffset` select the source sub-rect (resize-cover/crop), and `rot`+`flip` re-orient.
  */
-const WGSL = /* wgsl */ `
+export const WEBGPU_GEOMETRY_SHADER_SOURCE = /* wgsl */ `
 struct Uniforms {
   // Destination placement in the output, top-left/[0,1] convention: the unit quad maps to
   // [posOffset, posOffset + posScale]. A full-output op uses scale (1,1) offset (0,0); resize-'contain'
@@ -421,6 +449,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var samp : sampler;
 @group(0) @binding(2) var tex : texture_external;
+
+${PREMULTIPLY_CANVAS_WGSL}
 
 struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
 
@@ -446,7 +476,8 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
     u.rot0.x * centred.x + u.rot1.x * centred.y,
     u.rot0.y * centred.x + u.rot1.y * centred.y) + vec2<f32>(0.5, 0.5);
   let srcUv = oriented * u.uvScale + u.uvOffset;
-  return textureSampleBaseClampToEdge(tex, samp, srcUv);
+  let c = textureSampleBaseClampToEdge(tex, samp, srcUv);
+  return premultiply_for_canvas(c);
 }
 `;
 
@@ -454,14 +485,15 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
  * WGSL for the **colour** pipeline (ADR-032): a full-frame quad that samples the external texture and
  * applies, per pixel, *decode-transfer (EOTF → linear) → 3×3 gamut matrix → optional tonemap → encode-
  * transfer (OETF)*. The transfer curves and gamut matrix mirror the pure TS math in {@link ./gpu-uniforms.ts}
- * exactly (same constants), so the Node-validated plan and the GPU render agree. Alpha is passed through.
+ * exactly (same constants), so the Node-validated plan and the GPU render agree. Alpha is preserved while
+ * RGB is premultiplied at the final canvas boundary, matching the configured canvas alpha mode.
  *
  * `params = vec4(decodeTag, encodeTag, tonemapTag, peak)` and `gamut` is a column-major `mat3x3`, matching
  * {@link packColorUniforms}. Transfer tags: 0 linear · 1 sRGB · 2 BT.709/2020 · 3 PQ · 4 HLG. HDR EOTFs
  * return SDR-white-relative linear light (PQ peak 100, HLG peak 12), so the tonemap operator's `peak`
  * parameter maps the real source peak to 1.0 (black stays at 0).
  */
-const COLOR_WGSL = /* wgsl */ `
+export const WEBGPU_COLOR_SHADER_SOURCE = /* wgsl */ `
 struct ColorUniforms {
   gamut : mat3x3<f32>,
   params : vec4<f32>,   // (decodeTag, encodeTag, tonemapTag, peak)
@@ -469,6 +501,8 @@ struct ColorUniforms {
 @group(0) @binding(0) var<uniform> u : ColorUniforms;
 @group(0) @binding(1) var samp : sampler;
 @group(0) @binding(2) var tex : texture_external;
+
+${PREMULTIPLY_CANVAS_WGSL}
 
 struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
 
@@ -569,7 +603,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   lin = u.gamut * lin;                          // gamut convert (linear RGB)
   lin = tonemap3(u.params.z, u.params.w, lin);  // HDR -> SDR (no-op when tag 0)
   let outRgb = oetf3(u.params.y, clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)));
-  return vec4<f32>(outRgb, c.a);
+  return premultiply_for_canvas(vec4<f32>(outRgb, c.a));
 }
 `;
 
@@ -625,7 +659,7 @@ class WebGPURenderer implements Renderer {
     if (signal?.aborted === true) throw new MediaError('aborted', 'filter cancelled during setup');
     const device = await adapter.requestDevice();
     const format = gpuApi.getPreferredCanvasFormat();
-    const module = device.createShaderModule({ code: WGSL });
+    const module = device.createShaderModule({ code: WEBGPU_GEOMETRY_SHADER_SOURCE });
     const pipeline = device.createRenderPipeline({
       layout: 'auto',
       vertex: { module, entryPoint: 'vs' },
@@ -643,7 +677,7 @@ class WebGPURenderer implements Renderer {
   /** Lazily build (once) the second colour pipeline + its uniform buffer; reused for every colour frame. */
   private colorBundle(gpu: GpuContext): { pipeline: GPURenderPipeline; uniformBuffer: GPUBuffer } {
     if (gpu.color !== null) return gpu.color;
-    const module = gpu.device.createShaderModule({ code: COLOR_WGSL });
+    const module = gpu.device.createShaderModule({ code: WEBGPU_COLOR_SHADER_SOURCE });
     const pipeline = gpu.device.createRenderPipeline({
       layout: 'auto',
       vertex: { module, entryPoint: 'vs' },
@@ -675,7 +709,7 @@ class WebGPURenderer implements Renderer {
     if (context === null) {
       throw new MediaError('encode-error', 'OffscreenCanvas WebGPU context unavailable');
     }
-    context.configure({ device, format: this.format, alphaMode: 'premultiplied' });
+    context.configure({ device, format: this.format, alphaMode: WEBGPU_CANVAS_ALPHA_MODE });
     const slot: PooledWebGpuCanvas = { canvas, context };
     this.canvasPool[index] = slot;
     return slot;
@@ -703,7 +737,9 @@ class WebGPURenderer implements Renderer {
         : packUniforms(uniformsForRecipe(recipe, source.displayWidth, source.displayHeight)),
     );
 
-    const external = gpu.device.importExternalTexture({ source });
+    // Pin the representation assumed by `planColor`: WebGPU otherwise defaults this field to sRGB, but
+    // spelling it out prevents the shader's input contract from depending on an implicit API default.
+    const external = gpu.device.importExternalTexture({ source, colorSpace: 'srgb' });
     const bindGroup = gpu.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -941,17 +977,19 @@ function createI420Rotate180Stream(
 
 /**
  * A spec the WebGPU driver can handle: every geometric op + colorspace. Tonemap intentionally falls
- * through to the CPU colour path because Chromium WebGPU external-texture tonemap has proven unstable on
- * the tiny HDR10 benchmark path, while the CPU path uses the same validated colour science.
+ * through to Chromium's colour-managed Canvas2D path because WebGPU external-texture tonemap has proven
+ * unstable on the tiny HDR10 benchmark path. Engines without that honest HDR substrate receive a typed
+ * capability miss; normalized-sRGB CPU readback cannot safely recover the source PQ/HLG representation.
  */
 function webgpuHandles(f: FilterSpec): f is VideoFilterSpec {
   return isGeometricVideoSpec(f) || (isColorVideoSpec(f) && f.type === 'colorspace');
 }
 
 /**
- * A spec the Canvas2D driver can *honestly* handle: every geometric op, plus a `colorspace` op only when
- * its target resolves to the display gamut (a UA-colour-managed passthrough). Tonemap and wide-gamut
- * colorspace are declined so the router falls through rather than emitting wrong pixels (ADR-032).
+ * A spec the Canvas2D driver can *honestly* handle: every geometric op, a `colorspace` op when its target
+ * resolves to the display gamut (a UA-colour-managed passthrough), and Chromium HDR tone-map where that
+ * browser supplies colour-managed `drawImage(VideoFrame)`. Other tone-map and wide-gamut colorspace cases
+ * are declined rather than emitting wrong pixels (ADR-032).
  */
 function canvas2dHandles(f: FilterSpec): f is VideoFilterSpec {
   if (isGeometricVideoSpec(f)) return true;

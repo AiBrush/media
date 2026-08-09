@@ -139,6 +139,7 @@ describe('decoderErrorToCapabilityMiss — native-decoder failure → cross-brow
       op: { kind: 'route', id: 'decode' },
       tried: ['webcodecs-video'],
     });
+    expect(err.cause).toBe(dom);
   });
   it('names the driver and degrades gracefully when the codec is unknown', () => {
     const err = decoderErrorToCapabilityMiss(new Error('boom'), 'webcodecs-video', undefined);

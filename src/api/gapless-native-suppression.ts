@@ -10,6 +10,14 @@ export interface GaplessNativeSuppressionProbe {
   readonly signal?: AbortSignal | undefined;
 }
 
+export interface GaplessNativeSuppressionOptions {
+  /**
+   * Probe the first coded packets even when their container timestamps are non-negative. Ogg Opus
+   * permits a positive initial granule offset while OpusHead pre-skip still consumes decoder output.
+   */
+  readonly probeFromFirstPacket?: boolean;
+}
+
 interface GaplessPrefix {
   readonly chunks: readonly EncodedChunk[];
   readonly expectedSamples: number;
@@ -50,11 +58,12 @@ async function readWithAbort<T>(
   });
 }
 
-async function collectNegativeTimestampPrefix(
+async function collectPrimingPrefix(
   packets: ReadableStream<Packet>,
   leadingSamples: number,
   sampleRate: number,
   signal: AbortSignal | undefined,
+  probeFromFirstPacket: boolean,
 ): Promise<GaplessPrefix> {
   const reader = packets.getReader();
   const chunks: EncodedChunk[] = [];
@@ -67,7 +76,7 @@ async function collectNegativeTimestampPrefix(
         exhausted = true;
         break;
       }
-      if (next.value.chunk.timestamp >= 0) break;
+      if (!probeFromFirstPacket && next.value.chunk.timestamp >= 0) break;
       chunks.push(next.value.chunk);
       expectedSamples += durationSamples(next.value.chunk, sampleRate);
     }
@@ -124,17 +133,19 @@ async function decodedPrefixSamples(
 }
 
 /**
- * Measure how many edit-list priming samples the selected native decoder already consumed. MP4 packet
- * timestamps alone cannot answer this: Chromium emits the negative packet for ordinary AAC, but silently
- * consumes the same packet for some standards-valid encoder-delay streams. Decode only the negative
- * prefix through an independent decoder instance, close every probe frame, and compare its exact decoded
- * sample count with the packet-duration expectation. If a prefix-only decode is unsupported, preserve the
- * conservative historical behavior (zero native suppression) and let the full decoder remain authoritative.
+ * Measure how many container-declared priming samples the selected decoder already consumed. Packet
+ * timestamps alone cannot answer this: Chromium may consume MP4 edit-list AAC priming, and an Ogg-mode
+ * Opus decoder consumes OpusHead pre-skip, while a raw/WASM decoder can expose those samples. Decode only
+ * a bounded priming prefix through an independent decoder instance, close every probe frame, and compare
+ * its exact decoded sample count with the packet-duration expectation. If a prefix-only decode is
+ * unsupported, preserve the conservative historical behavior (zero native suppression) and let the full
+ * decoder remain authoritative.
  */
-export async function nativeSuppressedMp4EditSamples(
+export async function nativeSuppressedGaplessSamples(
   probe: GaplessNativeSuppressionProbe,
   leadingSamples: number,
   sampleRate: number,
+  options: GaplessNativeSuppressionOptions = {},
 ): Promise<number> {
   if (
     !Number.isSafeInteger(leadingSamples) ||
@@ -145,11 +156,12 @@ export async function nativeSuppressedMp4EditSamples(
     return 0;
   }
   throwIfAborted(probe.signal);
-  const prefix = await collectNegativeTimestampPrefix(
+  const prefix = await collectPrimingPrefix(
     probe.packets,
     leadingSamples,
     sampleRate,
     probe.signal,
+    options.probeFromFirstPacket === true,
   );
   if (prefix.chunks.length === 0 || prefix.expectedSamples === 0) return 0;
   let observedSamples: number;
@@ -166,3 +178,6 @@ export async function nativeSuppressedMp4EditSamples(
   if (missingSamples <= prefix.chunks.length) return 0;
   return Math.min(leadingSamples, missingSamples);
 }
+
+/** Backward-compatible name for the original MP4-only caller/tests. */
+export const nativeSuppressedMp4EditSamples = nativeSuppressedGaplessSamples;

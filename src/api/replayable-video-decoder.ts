@@ -18,6 +18,13 @@ const MAX_REPLAY_BYTES = 16 * 1024 * 1024;
 
 export interface RuntimeVideoFallbackOptions {
   readonly signal?: AbortSignal;
+  /** Add caller-owned stage evidence without weakening the fallback eligibility decision. */
+  readonly mapTerminalError?: (error: unknown, context: RuntimeVideoTerminalContext) => unknown;
+}
+
+export interface RuntimeVideoTerminalContext {
+  readonly attempt: 'primary' | 'fallback';
+  readonly primaryFrameEmitted: boolean;
 }
 
 export type RuntimeVideoFallbackKind = 'wasm-vpx' | 'webcodecs-software';
@@ -71,7 +78,7 @@ function isCapabilityError(error: unknown): error is CapabilityError {
 export function decodeVideoWithRuntimeFallback(
   source: ReadableStream<EncodedChunk>,
   createPrimary: DecoderFactory,
-  createFallback: AsyncDecoderFactory,
+  createFallback: AsyncDecoderFactory | undefined,
   options: RuntimeVideoFallbackOptions = {},
 ): ReadableStream<VideoFrame> {
   const signal = options.signal;
@@ -253,13 +260,15 @@ export function decodeVideoWithRuntimeFallback(
   const switchToFallback = async (
     primaryError: CapabilityError,
   ): Promise<ReadableStreamDefaultReader<VideoFrame>> => {
+    const fallbackFactory = createFallback;
+    if (fallbackFactory === undefined) throw primaryError;
     await activeReader?.cancel(primaryError).catch(() => {});
     await primaryInputStopped;
     if (signal?.aborted) {
       throw new MediaError('aborted', 'operation aborted', signal.reason);
     }
-    const decoder = await createFallback();
     mode = 'fallback';
+    const decoder = await fallbackFactory();
     activeReader = fallbackInput().pipeThrough(decoder).getReader();
     return activeReader;
   };
@@ -273,6 +282,7 @@ export function decodeVideoWithRuntimeFallback(
         mode !== 'primary' ||
         primaryFrameEmitted ||
         !fallbackEligible ||
+        createFallback === undefined ||
         !isCapabilityError(error) ||
         signal?.aborted
       ) {
@@ -301,8 +311,13 @@ export function decodeVideoWithRuntimeFallback(
         try {
           result = await readOutput();
         } catch (error) {
-          await teardown(error);
-          throw error;
+          const terminalError =
+            options.mapTerminalError?.(error, {
+              attempt: mode === 'fallback' ? 'fallback' : 'primary',
+              primaryFrameEmitted,
+            }) ?? error;
+          await teardown(terminalError);
+          throw terminalError;
         }
         if (mode === 'terminal') {
           if (!result.done) result.value.close();

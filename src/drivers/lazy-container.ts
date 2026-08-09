@@ -12,7 +12,9 @@ import type {
   DecryptParams,
   Demuxer,
   MuxOptions,
+  MuxedTrackAudit,
   Muxer,
+  Packet,
   PacketInfoBatchOptions,
   PacketInfoBatchStream,
   PacketInfoTable,
@@ -50,6 +52,7 @@ export interface LazyContainerSpec {
   readonly probeImpl?: NonNullable<ContainerDriver['probe']>;
   readonly packetInfo?: true;
   readonly packetInfoBatches?: true;
+  readonly auditMuxedTrack?: true;
   readonly streamCopy?: true;
   readonly decrypt?: true;
   readonly transformPcm?: true;
@@ -59,6 +62,8 @@ export interface LazyContainerSpec {
   readonly decodePcmInterleavedStream?: true;
   readonly validatesStreamCopyTrim?: true;
   readonly validatesPcmTrim?: true;
+  /** The loaded muxer's late-bound per-track gapless timing seam is safe to expose. */
+  readonly gaplessSeam?: true;
   readonly muxKind?: LazyAudioMuxKind;
   readonly rejectChunkMux?: 'aiff' | 'caf';
   readonly validateTrack?: (track: TrackInfo, trackCount: number) => void;
@@ -130,8 +135,26 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
         muxOptions: o,
         validateTrack: spec.validateTrack,
         pcmSeam: true,
+        gaplessSeam: spec.gaplessSeam === true,
       });
     },
+    ...(spec.auditMuxedTrack === true
+      ? {
+          async auditMuxedTrack(
+            track: TrackInfo,
+            packets: Iterable<Packet>,
+            o?: MuxOptions,
+            signal?: AbortSignal,
+          ): Promise<MuxedTrackAudit> {
+            const loaded = await load();
+            const auditMuxedTrack = loaded.auditMuxedTrack;
+            if (auditMuxedTrack === undefined) {
+              throw missingLazyMethod(spec.id, 'auditMuxedTrack');
+            }
+            return auditMuxedTrack.call(loaded, track, packets, o, signal);
+          },
+        }
+      : {}),
     ...(spec.streamCopy === true
       ? {
           async streamCopy(

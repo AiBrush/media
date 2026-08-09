@@ -163,27 +163,60 @@ export class WorkerPool {
     if (this.#terminated) {
       return errorStream(new MediaError('aborted', 'worker pool terminated'));
     }
+    if (opts.signal?.aborted) {
+      return errorStream(new MediaError('aborted', 'worker pool job aborted before dispatch'));
+    }
     let dispatched:
       | { reader: ReadableStreamDefaultReader<Transferable>; ctrl: AbortController }
       | undefined;
     let dispatchError: Error | undefined;
+    let cancelled = false;
+    let queued = true;
     let resolveDispatch: (() => void) | undefined;
     const dispatchReady = new Promise<void>((resolve) => {
       resolveDispatch = resolve;
     });
+    let onQueuedAbort: (() => void) | undefined;
+    const unlinkQueuedAbort = (): void => {
+      if (onQueuedAbort !== undefined && opts.signal !== undefined) {
+        opts.signal.removeEventListener('abort', onQueuedAbort);
+        onQueuedAbort = undefined;
+      }
+    };
     const pending: PendingJob = {
       job,
       opts,
       attach: (reader, ctrl) => {
+        queued = false;
+        unlinkQueuedAbort();
         dispatched = { reader, ctrl };
         resolveDispatch?.();
       },
       fail: (e) => {
+        queued = false;
+        unlinkQueuedAbort();
         dispatchError = e;
         resolveDispatch?.();
       },
     };
+    const removeQueued = (): boolean => {
+      if (!queued) return false;
+      const index = this.#queue.indexOf(pending);
+      if (index < 0) return false;
+      this.#queue.splice(index, 1);
+      queued = false;
+      unlinkQueuedAbort();
+      return true;
+    };
     this.#queue.push(pending);
+    if (opts.signal !== undefined) {
+      onQueuedAbort = (): void => {
+        if (!removeQueued()) return;
+        dispatchError = new MediaError('aborted', 'worker pool job aborted before dispatch');
+        resolveDispatch?.();
+      };
+      opts.signal.addEventListener('abort', onQueuedAbort, { once: true });
+    }
     // Schedule on a microtask so the caller holds the stream before the (synchronous) bridge starts.
     queueMicrotask(() => this.#pump());
 
@@ -191,6 +224,7 @@ export class WorkerPool {
       {
         async pull(controller): Promise<void> {
           if (dispatched === undefined && dispatchError === undefined) await dispatchReady;
+          if (cancelled) return;
           if (dispatchError !== undefined) {
             controller.error(dispatchError);
             return;
@@ -205,10 +239,14 @@ export class WorkerPool {
           controller.enqueue(value);
         },
         async cancel(reason): Promise<void> {
+          cancelled = true;
           if (dispatched !== undefined) {
             dispatched.ctrl.abort(reason);
             await dispatched.reader.cancel(reason).catch(() => {});
+            return;
           }
+          removeQueued();
+          resolveDispatch?.();
         },
       },
       new CountQueuingStrategy({ highWaterMark: 0 }),

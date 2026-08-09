@@ -99,6 +99,11 @@ const MICROS_PER_MS = 1_000;
 const NANOS_PER_SECOND = 1_000_000_000;
 const OPUS_SAMPLE_RATE = 48_000;
 const OPUS_SEEK_PREROLL_NS = 80_000_000;
+/** Opus TOC config → one frame's duration on the codec's fixed 48 kHz clock (RFC 6716 §3.1). */
+const OPUS_FRAME_SAMPLES: readonly number[] = [
+  480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960, 120, 240,
+  480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+];
 /**
  * A new Cluster is started before a block's timecode relative to the cluster would overflow the signed
  * int16 `SimpleBlock` field. The hard limit is 32767 ms; 30000 leaves margin (and bounds cluster size).
@@ -583,6 +588,30 @@ function opusDelayNanoseconds(preSkip: number): number {
   return Math.round((preSkip * NANOS_PER_SECOND) / OPUS_SAMPLE_RATE);
 }
 
+/** Exact decoded sample count of one valid RFC 6716 packet, or undefined for malformed framing. */
+function opusPacketSamples(packet: Uint8Array): number | undefined {
+  const toc = packet[0];
+  if (toc === undefined) return undefined;
+  const frameSamples = OPUS_FRAME_SAMPLES[toc >> 3];
+  if (frameSamples === undefined) return undefined;
+  const code = toc & 0x03;
+  const frameCount =
+    code === 0 ? 1 : code === 1 || code === 2 ? 2 : packet[1] === undefined ? 0 : packet[1] & 0x3f;
+  const samples = frameSamples * frameCount;
+  return frameCount > 0 && samples <= 5760 ? samples : undefined;
+}
+
+function codedOpusSamples(chunks: readonly ChunkStruct[]): number | undefined {
+  let total = 0;
+  for (const chunk of chunks) {
+    const samples = opusPacketSamples(chunk.data);
+    if (samples === undefined) return undefined;
+    total += samples;
+    if (!Number.isSafeInteger(total)) return undefined;
+  }
+  return total;
+}
+
 /**
  * Translate MP4/AAC priming samples into Matroska's codec-neutral `CodecDelay`.
  *
@@ -771,7 +800,10 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
   const aacGaplessDelayNs = matroskaAacCodecDelayNs(info);
   const codecDelayNs = info.codecDelayNs ?? aacGaplessDelayNs ?? opus.codecDelayNs;
   const seekPreRollNs = info.seekPreRollNs ?? opus.seekPreRollNs;
-  const timestampAdjustmentNs = info.codecDelayNs ?? aacGaplessDelayNs;
+  // Matroska readers subtract CodecDelay from every stored Block timestamp. Always add the authored
+  // delay back here, including source Ogg/WebM remux tracks, so a demux→mux round trip preserves the
+  // packet presentation clock instead of shifting every Opus PTS earlier by pre-skip.
+  const timestampAdjustmentNs = info.codecDelayNs ?? aacGaplessDelayNs ?? opus.codecDelayNs;
   return {
     trackNumber,
     mediaType: 'audio',
@@ -794,7 +826,8 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
 
 function timelineTrack(t: TrackState): TrackChunks {
   const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
-  const trailingDiscardPaddingNs = trackTrailingDiscardPaddingNs(t);
+  const gapless = destinationOpusGapless(t);
+  const trailingDiscardPaddingNs = trackTrailingDiscardPaddingNs(t, gapless);
   const base = {
     trackNumber: t.trackNumber,
     mediaType: t.mediaType,
@@ -807,7 +840,7 @@ function timelineTrack(t: TrackState): TrackChunks {
       : t.sampleRate !== undefined
         ? { sampleRate: t.sampleRate }
         : {}),
-    ...(t.gapless !== undefined ? { gapless: t.gapless } : {}),
+    ...(gapless !== undefined ? { gapless } : {}),
     ...(t.timestampAdjustmentNs !== undefined
       ? { timestampAdjustmentNs: t.timestampAdjustmentNs }
       : {}),
@@ -816,8 +849,42 @@ function timelineTrack(t: TrackState): TrackChunks {
   return durationSec !== undefined ? { ...base, durationSec } : base;
 }
 
-function trackTrailingDiscardPaddingNs(track: TrackState): number | undefined {
-  const trailingSamples = track.gapless?.trailingSamples;
+/**
+ * Derive destination Opus presentation facts from its codec-private pre-skip, exact packet TOCs, and
+ * declared program duration. Source remux tracks already carry an explicit gapless tuple and keep it
+ * verbatim. Returning undefined on any inconsistent fact is deliberate: the muxer never invents a trim.
+ */
+function destinationOpusGapless(
+  track: TrackState,
+  codedSamplesOverride?: number,
+): TrackInfo['gapless'] | undefined {
+  if (track.codecId !== 'A_OPUS' || track.gapless !== undefined) return track.gapless;
+  if (track.durationSec === undefined) return undefined;
+  const totalSamples = Math.round(track.durationSec * OPUS_SAMPLE_RATE);
+  const leadingSamples = Math.round(
+    ((track.codecDelayNs ?? 0) * OPUS_SAMPLE_RATE) / NANOS_PER_SECOND,
+  );
+  const codedSamples = codedSamplesOverride ?? codedOpusSamples(track.chunks);
+  if (
+    !Number.isSafeInteger(totalSamples) ||
+    totalSamples <= 0 ||
+    !Number.isSafeInteger(leadingSamples) ||
+    leadingSamples < 0 ||
+    codedSamples === undefined ||
+    !Number.isSafeInteger(codedSamples)
+  ) {
+    return undefined;
+  }
+  const trailingSamples = codedSamples - leadingSamples - totalSamples;
+  if (!Number.isSafeInteger(trailingSamples) || trailingSamples < 0) return undefined;
+  return { leadingSamples, trailingSamples, totalSamples };
+}
+
+function trackTrailingDiscardPaddingNs(
+  track: TrackState,
+  gapless: TrackInfo['gapless'] | undefined = track.gapless,
+): number | undefined {
+  const trailingSamples = gapless?.trailingSamples;
   if (
     track.codecId !== 'A_OPUS' ||
     trailingSamples === undefined ||
@@ -1449,6 +1516,11 @@ export interface WebmStreamingMuxerOptions extends WebmFragmentOptions {
   timelineBaseUs?: number;
 }
 
+interface WebmDemandWaiter {
+  readonly resolve: () => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
 /**
  * A bounded Cluster-on-write muxer: unlike {@link WebmMuxer}, this never stores the full packet timeline.
  * Callers add all tracks up front, then feed packets in decode order. The muxer emits the streaming init
@@ -1459,11 +1531,14 @@ export class WebmStreamingMuxer {
   readonly output: ReadableStream<Uint8Array>;
 
   readonly #tracks = new Map<number, TrackState>();
+  readonly #opusCodedSamples = new Map<number, number | null>();
   readonly #docType: string;
-  readonly #containerSideData: WebmContainerSideData;
+  #containerSideData: WebmContainerSideData;
   readonly #maxBlocksPerFragment: number;
   #nextTrackNumber = 1;
   #finalized = false;
+  #hasTerminalError = false;
+  #terminalError: unknown;
   #started = false;
   #timelineBaseUs: number | undefined;
   #currentBlocks: TimelineBlock[] = [];
@@ -1471,7 +1546,7 @@ export class WebmStreamingMuxer {
   #currentMaxPtsMs = 0;
   readonly #writtenTrackNumbers = new Set<number>();
   readonly #attachmentProjectionTrackNumbers = new Set<number>();
-  readonly #pullWaiters: Array<() => void> = [];
+  readonly #pullWaiters: WebmDemandWaiter[] = [];
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   readonly #ready: Promise<void>;
   #resolveReady: (() => void) | undefined;
@@ -1493,6 +1568,7 @@ export class WebmStreamingMuxer {
         this.#resolveReady?.();
       },
       pull: (): void => this.#resolvePullWaiters(),
+      cancel: (reason): void => this.#cancelOutput(reason),
     });
   }
 
@@ -1509,7 +1585,11 @@ export class WebmStreamingMuxer {
       this.#attachmentProjectionTrackNumbers.add(trackNumber);
       return trackNumber;
     }
-    this.#tracks.set(trackNumber, trackStateFrom(info, trackNumber));
+    const track = trackStateFrom(info, trackNumber);
+    this.#tracks.set(trackNumber, track);
+    if (track.codecId === 'A_OPUS' && track.gapless === undefined) {
+      this.#opusCodedSamples.set(trackNumber, 0);
+    }
     return trackNumber;
   }
 
@@ -1589,8 +1669,7 @@ export class WebmStreamingMuxer {
   }
 
   fail(error: unknown): void {
-    this.#finalized = true;
-    this.#resolveAllPullWaiters();
+    if (!this.#terminateWithError(error)) return;
     void this.#ready.then(() => this.#controller?.error(error));
   }
 
@@ -1614,8 +1693,14 @@ export class WebmStreamingMuxer {
   #blockFromChunk(track: TrackState, chunk: ChunkStruct, lastInTrack: boolean): TimelineBlock {
     const baseUs = this.#timelineBaseUs ?? chunk.timestampUs;
     this.#timelineBaseUs = baseUs;
+    const codedSamples = this.#accumulateOpusCodedSamples(track, chunk);
+    const terminalGapless =
+      lastInTrack && codedSamples !== undefined
+        ? destinationOpusGapless(track, codedSamples)
+        : track.gapless;
     const discardPaddingNs =
-      chunk.discardPaddingNs ?? (lastInTrack ? trackTrailingDiscardPaddingNs(track) : undefined);
+      chunk.discardPaddingNs ??
+      (lastInTrack ? trackTrailingDiscardPaddingNs(track, terminalGapless) : undefined);
     return {
       trackNumber: track.trackNumber,
       timeMs: usToMs(chunk.timestampUs - baseUs + (track.timestampAdjustmentNs ?? 0) / 1000),
@@ -1625,6 +1710,20 @@ export class WebmStreamingMuxer {
       ...(chunk.alpha !== undefined ? { alpha: chunk.alpha } : {}),
       ...(discardPaddingNs !== undefined && discardPaddingNs !== 0 ? { discardPaddingNs } : {}),
     };
+  }
+
+  #accumulateOpusCodedSamples(track: TrackState, chunk: ChunkStruct): number | undefined {
+    if (!this.#opusCodedSamples.has(track.trackNumber)) return undefined;
+    const previous = this.#opusCodedSamples.get(track.trackNumber);
+    if (previous === null || previous === undefined) return undefined;
+    const samples = opusPacketSamples(chunk.data);
+    if (samples === undefined || !Number.isSafeInteger(previous + samples)) {
+      this.#opusCodedSamples.set(track.trackNumber, null);
+      return undefined;
+    }
+    const total = previous + samples;
+    this.#opusCodedSamples.set(track.trackNumber, total);
+    return total;
   }
 
   #shouldFlushBefore(block: TimelineBlock): boolean {
@@ -1662,35 +1761,68 @@ export class WebmStreamingMuxer {
 
   async #enqueue(chunk: Uint8Array): Promise<void> {
     await this.#waitForDemand();
+    this.#throwIfTerminated();
     this.#controller?.enqueue(chunk);
   }
 
   async #waitForDemand(): Promise<void> {
     await this.#ready;
+    this.#throwIfTerminated();
     const desiredSize = this.#controller?.desiredSize;
     if (desiredSize === undefined || desiredSize === null || desiredSize > 0) return;
-    await new Promise<void>((resolve) => {
-      this.#pullWaiters.push(resolve);
+    await new Promise<void>((resolve, reject) => {
+      this.#pullWaiters.push({ resolve, reject });
     });
+    this.#throwIfTerminated();
   }
 
   #resolvePullWaiters(): void {
     while ((this.#controller?.desiredSize ?? 0) > 0) {
       const waiter = this.#pullWaiters.shift();
       if (waiter === undefined) return;
-      waiter();
+      waiter.resolve();
     }
   }
 
-  #resolveAllPullWaiters(): void {
+  #rejectAllPullWaiters(reason: unknown): void {
     for (;;) {
       const waiter = this.#pullWaiters.shift();
       if (waiter === undefined) return;
-      waiter();
+      waiter.reject(reason);
     }
   }
 
+  #cancelOutput(reason: unknown): void {
+    this.#terminateWithError(
+      reason === undefined
+        ? new MediaError('mux-error', 'streaming muxer output was cancelled')
+        : reason,
+    );
+  }
+
+  #terminateWithError(error: unknown): boolean {
+    if (this.#hasTerminalError) return false;
+    this.#hasTerminalError = true;
+    this.#terminalError = error;
+    this.#finalized = true;
+    this.#currentBlocks = [];
+    this.#currentMinPtsMs = 0;
+    this.#currentMaxPtsMs = 0;
+    this.#writtenTrackNumbers.clear();
+    this.#tracks.clear();
+    this.#opusCodedSamples.clear();
+    this.#attachmentProjectionTrackNumbers.clear();
+    this.#containerSideData = new WebmContainerSideData(this.#docType);
+    this.#rejectAllPullWaiters(error);
+    return true;
+  }
+
+  #throwIfTerminated(): void {
+    if (this.#hasTerminalError) throw this.#terminalError;
+  }
+
   #assertOpen(): void {
+    this.#throwIfTerminated();
     if (this.#finalized) {
       throw new MediaError('mux-error', 'muxer already finalized');
     }

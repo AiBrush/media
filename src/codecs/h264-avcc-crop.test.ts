@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { parseH264SpsDimensions } from '../drivers/mpegts/ts-parse.ts';
-import { addH264AvcCVisibleRightCrop } from './h264-avcc-crop.ts';
+import {
+  addH264AvcCVisibleRightCrop,
+  h264AvcCColors,
+  rewriteH264AvcCColor,
+} from './h264-avcc-crop.ts';
 
 /** Real libx264 High-profile avcC records, generated from 856×480 and 864×480 one-frame streams. */
 const AVCC_856 = fromHex(
@@ -58,5 +62,87 @@ describe('addH264AvcCVisibleRightCrop — standards-valid aligned coded surface'
     expect(() => addH264AvcCVisibleRightCrop(AVCC_856.subarray(0, 12), 2)).toThrow(
       /truncated avcC SPS payload/,
     );
+  });
+});
+
+describe('rewriteH264AvcCColor — elementary/container colour agreement', () => {
+  const bt2020 = {
+    primaries: 9,
+    transferCharacteristics: 14,
+    matrixCoefficients: 9,
+    fullRange: false,
+  } as const;
+  const bt709 = {
+    primaries: 1,
+    transferCharacteristics: 1,
+    matrixCoefficients: 1,
+    fullRange: false,
+  } as const;
+
+  it('adds a complete colour declaration to a real SPS whose VUI omitted it', () => {
+    expect(h264AvcCColors(AVCC_856)).toEqual([undefined]);
+    const rewritten = rewriteH264AvcCColor(AVCC_856, bt2020);
+    expect(h264AvcCColors(rewritten)).toEqual([bt2020]);
+    expect(AVCC_856).toEqual(
+      fromHex(
+        '0164001fffe1001a6764001facd940d83de5f0110000030001000003003c0f18319601000668ebe3cb22c0fdf8f800',
+      ),
+    );
+  });
+
+  it('replaces a conflicting declaration and remains composable with the visible-crop rewrite', () => {
+    const conflicting = rewriteH264AvcCColor(AVCC_856, bt709);
+    expect(h264AvcCColors(conflicting)).toEqual([bt709]);
+    const rewritten = rewriteH264AvcCColor(conflicting, bt2020);
+    expect(h264AvcCColors(rewritten)).toEqual([bt2020]);
+
+    const croppedAfterColor = addH264AvcCVisibleRightCrop(rewritten, 2);
+    expect(h264AvcCColors(croppedAfterColor)).toEqual([bt2020]);
+    expect(parseH264SpsDimensions(firstSps(croppedAfterColor))).toEqual({
+      width: 854,
+      height: 480,
+    });
+
+    const colorAfterCrop = rewriteH264AvcCColor(addH264AvcCVisibleRightCrop(AVCC_856, 2), bt2020);
+    expect(h264AvcCColors(colorAfterCrop)).toEqual([bt2020]);
+    expect(parseH264SpsDimensions(firstSps(colorAfterCrop))).toEqual({ width: 854, height: 480 });
+  });
+
+  it('rewrites every declared SPS and preserves the PPS/extension suffix', () => {
+    const sps = firstSps(AVCC_856);
+    const suffixOffset = 8 + sps.byteLength;
+    const suffix = AVCC_856.subarray(suffixOffset);
+    const twoSps = Uint8Array.of(
+      ...(AVCC_856.subarray(0, 5) as Uint8Array),
+      ((AVCC_856[5] as number) & 0xe0) | 2,
+      (sps.byteLength >>> 8) & 0xff,
+      sps.byteLength & 0xff,
+      ...sps,
+      (sps.byteLength >>> 8) & 0xff,
+      sps.byteLength & 0xff,
+      ...sps,
+      ...suffix,
+    );
+    const rewritten = rewriteH264AvcCColor(twoSps, bt2020);
+    expect(h264AvcCColors(rewritten)).toEqual([bt2020, bt2020]);
+    const rewrittenFirstLength = ((rewritten[6] as number) << 8) | (rewritten[7] as number);
+    const rewrittenSecondLengthOffset = 8 + rewrittenFirstLength;
+    const rewrittenSecondLength =
+      ((rewritten[rewrittenSecondLengthOffset] as number) << 8) |
+      (rewritten[rewrittenSecondLengthOffset + 1] as number);
+    const rewrittenSuffixOffset = rewrittenSecondLengthOffset + 2 + rewrittenSecondLength;
+    expect(rewritten.subarray(rewrittenSuffixOffset)).toEqual(suffix);
+  });
+
+  it('rejects malformed avcC and invalid H.273 code points rather than emitting partial VUI', () => {
+    expect(() => rewriteH264AvcCColor(Uint8Array.of(1, 2, 3), bt2020)).toThrow(
+      /invalid AVCDecoderConfigurationRecord/,
+    );
+    expect(() => rewriteH264AvcCColor(AVCC_856.subarray(0, 12), bt2020)).toThrow(
+      /truncated avcC SPS payload/,
+    );
+    expect(() =>
+      rewriteH264AvcCColor(AVCC_856, { ...bt2020, transferCharacteristics: 256 }),
+    ).toThrow(RangeError);
   });
 });

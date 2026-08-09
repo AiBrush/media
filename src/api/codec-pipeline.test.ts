@@ -79,8 +79,6 @@ import {
   CADENCE_BASELINE_FPS,
   EVIDENCE_BITRATE_FLOOR,
   EVIDENCE_BITRATE_HEADROOM,
-  H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND,
-  HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND,
   HIGH_CADENCE_FPS_THRESHOLD,
   IMPLICIT_BITS_PER_PIXEL_PER_SECOND,
   IMPLICIT_VIDEO_BITRATE_FLOOR,
@@ -120,7 +118,10 @@ async function withVideoFrameConstructor<T>(
   fn: () => T | Promise<T>,
 ): Promise<T> {
   const original = Object.getOwnPropertyDescriptor(globalThis, 'VideoFrame');
-  Object.defineProperty(globalThis, 'VideoFrame', { configurable: true, value });
+  Object.defineProperty(globalThis, 'VideoFrame', {
+    configurable: true,
+    value,
+  });
   try {
     return await fn();
   } finally {
@@ -480,7 +481,10 @@ describe('decodeVideoPacketsWithAlpha frame ownership', () => {
 
   it('closes cached alpha frames and cancels the alpha sibling when color decode fails', async () => {
     const color = new AlphaLifecycleFrame({ timestamp: 100, format: 'RGBA' });
-    const futureAlpha = new AlphaLifecycleFrame({ timestamp: 200, format: 'RGBA' });
+    const futureAlpha = new AlphaLifecycleFrame({
+      timestamp: 200,
+      format: 'RGBA',
+    });
     let decoderCount = 0;
     let alphaCancelCount = 0;
     const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
@@ -522,7 +526,10 @@ describe('decodeVideoPacketsWithAlpha frame ownership', () => {
 
   it('closes cached alpha frames exactly once on downstream cancellation', async () => {
     const color = new AlphaLifecycleFrame({ timestamp: 100, format: 'RGBA' });
-    const futureAlpha = new AlphaLifecycleFrame({ timestamp: 200, format: 'RGBA' });
+    const futureAlpha = new AlphaLifecycleFrame({
+      timestamp: 200,
+      format: 'RGBA',
+    });
     let decoderCount = 0;
     let alphaCancelCount = 0;
     const createDecoder = (): TransformStream<EncodedChunk, RawFrame> => {
@@ -579,7 +586,11 @@ describe('canUseVpxAlphaPacketTranscode', () => {
     expect(canUse({ codec: 'vp9', alpha: 'keep', rotate: 90 })).toBe(false);
     expect(canUse({ codec: 'vp9', alpha: 'keep', height: 180 })).toBe(false);
     expect(
-      canUse({ codec: 'vp9', alpha: 'keep', crop: { x: 0, y: 0, width: 16, height: 16 } }),
+      canUse({
+        codec: 'vp9',
+        alpha: 'keep',
+        crop: { x: 0, y: 0, width: 16, height: 16 },
+      }),
     ).toBe(false);
     expect(canUse({ codec: 'vp9', alpha: 'keep', pad: { width: 640, height: 480 } })).toBe(false);
     expect(canUse({ codec: 'vp9', alpha: 'keep', flip: 'h' })).toBe(false);
@@ -617,7 +628,12 @@ describe('canCopyAudioTrackToContainer', () => {
         codec: 'opus',
       }),
     ).toBe(false);
-    expect(canCopyAudioTrackToContainer('webm', { ...track('opus'), encrypted: true })).toBe(false);
+    expect(
+      canCopyAudioTrackToContainer('webm', {
+        ...track('opus'),
+        encrypted: true,
+      }),
+    ).toBe(false);
     expect(canCopyAudioTrackToContainer('wav', track('opus'))).toBe(false);
   });
 });
@@ -639,7 +655,12 @@ describe('canUseVpxAlphaGeometryPacketTranscode', () => {
     ).toBe(false);
     expect(
       canUseVpxAlphaGeometryPacketTranscode(
-        { codec: 'vp9', width: 320, alpha: 'keep', crop: { x: 0, y: 0, width: 320, height: 240 } },
+        {
+          codec: 'vp9',
+          width: 320,
+          alpha: 'keep',
+          crop: { x: 0, y: 0, width: 320, height: 240 },
+        },
         true,
         source,
         source,
@@ -647,7 +668,13 @@ describe('canUseVpxAlphaGeometryPacketTranscode', () => {
     ).toBe(false);
     expect(
       canUseVpxAlphaGeometryPacketTranscode(
-        { codec: 'vp9', width: 320, height: 240, alpha: 'keep', colorspace: { to: 'bt709' } },
+        {
+          codec: 'vp9',
+          width: 320,
+          height: 240,
+          alpha: 'keep',
+          colorspace: { to: 'bt709' },
+        },
         true,
         source,
         source,
@@ -755,9 +782,15 @@ describe('transcodeVpxAlphaPackets', () => {
     const out = await collectPackets(
       transcodeVpxAlphaPackets(
         streamOf<Packet>([
-          { chunk: chunk('c100', 100), alpha: chunk('a50', 50) as EncodedVideoChunk },
+          {
+            chunk: chunk('c100', 100),
+            alpha: chunk('a50', 50) as EncodedVideoChunk,
+          },
           { chunk: chunk('c200', 200) },
-          { chunk: chunk('c300', 300), alpha: chunk('a300', 300) as EncodedVideoChunk },
+          {
+            chunk: chunk('c300', 300),
+            alpha: chunk('a300', 300) as EncodedVideoChunk,
+          },
         ]),
         packetTranscodeOptions,
       ),
@@ -824,7 +857,10 @@ describe('transcodeVpxAlphaPackets', () => {
     const out = await collectPackets(
       transcodeVpxAlphaPackets(
         streamOf<Packet>([
-          { chunk: chunk('c100', 100), alpha: chunk('a200', 200) as EncodedVideoChunk },
+          {
+            chunk: chunk('c100', 100),
+            alpha: chunk('a200', 200) as EncodedVideoChunk,
+          },
           { chunk: chunk('c300', 300) },
         ]),
         packetTranscodeOptions,
@@ -852,7 +888,10 @@ describe('transcodeVpxAlphaPackets', () => {
       collectPackets(
         transcodeVpxAlphaPackets(
           streamOf<Packet>([
-            { chunk: chunk('c100', 100), alpha: chunk('a100', 100) as EncodedVideoChunk },
+            {
+              chunk: chunk('c100', 100),
+              alpha: chunk('a100', 100) as EncodedVideoChunk,
+            },
           ]),
           { ...packetTranscodeOptions, createDecoder: failingDecoder },
         ),
@@ -863,7 +902,10 @@ describe('transcodeVpxAlphaPackets', () => {
   it('allows downstream cancellation after yielding a packet', async () => {
     const reader = transcodeVpxAlphaPackets(
       streamOf<Packet>([
-        { chunk: chunk('c100', 100), alpha: chunk('a200', 200) as EncodedVideoChunk },
+        {
+          chunk: chunk('c100', 100),
+          alpha: chunk('a200', 200) as EncodedVideoChunk,
+        },
         { chunk: chunk('c300', 300) },
       ]),
       packetTranscodeOptions,
@@ -1038,8 +1080,9 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
   const src = { width: 1920, height: 1080 };
 
   it('is the only exported target/source resolver; the legacy doors are private helpers of it', async () => {
-    const surface: Record<string, unknown> & { resolveVideoEncoderCodecString?: unknown } =
-      await import('./codec-pipeline.ts');
+    const surface: Record<string, unknown> & {
+      resolveVideoEncoderCodecString?: unknown;
+    } = await import('./codec-pipeline.ts');
     expect(typeof surface.resolveVideoEncoderCodecString).toBe('function');
     // The two former public doors (videoEncoderCodecString, h264CodecStringForSourceProfile) and the
     // internal plan projection must not be exported: one room, one door.
@@ -1115,7 +1158,13 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
     // An explicit bitrate promotes the level exactly as the config builder does.
     expect(
       resolveVideoEncoderCodecString(
-        { codec: 'av1', width: 1280, height: 720, fps: 30, bitrate: 50_000_000 },
+        {
+          codec: 'av1',
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate: 50_000_000,
+        },
         src,
         undefined,
       ),
@@ -1175,7 +1224,7 @@ describe('videoFilterSpecs', () => {
     expect(videoFilterSpecs({ codec: 'h264', bitrate: 1_000_000 }, src)).toEqual([]);
   });
 
-  it('emits crop → resize → pad → rotate → flip → colorspace → tonemap in order', () => {
+  it('emits crop → resize → pad → rotate → flip → colorspace in order', () => {
     const specs = videoFilterSpecs(
       {
         crop: { x: 10, y: 20, width: 640, height: 480 },
@@ -1186,19 +1235,43 @@ describe('videoFilterSpecs', () => {
         rotate: 90,
         flip: 'h',
         colorspace: { to: 'bt2020' },
-        tonemap: { to: 'sdr' },
       },
       src,
     );
     expect(specs).toEqual<FilterSpec[]>([
-      { mediaType: 'video', type: 'crop', x: 10, y: 20, width: 640, height: 480 },
-      { mediaType: 'video', type: 'resize', width: 320, height: 240, fit: 'cover' },
-      { mediaType: 'video', type: 'pad', x: 40, y: 30, width: 400, height: 300 },
+      {
+        mediaType: 'video',
+        type: 'crop',
+        x: 10,
+        y: 20,
+        width: 640,
+        height: 480,
+      },
+      {
+        mediaType: 'video',
+        type: 'resize',
+        width: 320,
+        height: 240,
+        fit: 'cover',
+      },
+      {
+        mediaType: 'video',
+        type: 'pad',
+        x: 40,
+        y: 30,
+        width: 400,
+        height: 300,
+      },
       { mediaType: 'video', type: 'rotate', degrees: 90 },
       { mediaType: 'video', type: 'flip', axis: 'h' },
       { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
-      { mediaType: 'video', type: 'tonemap', to: 'sdr' },
     ]);
+  });
+
+  it('rejects simultaneous colorspace conversion and tonemapping', () => {
+    expect(() =>
+      videoFilterSpecs({ colorspace: { to: 'bt2020' }, tonemap: { to: 'sdr' } }, src),
+    ).toThrow(CapabilityError);
   });
 
   it('fills a missing resize dimension from the known source dims', () => {
@@ -1223,7 +1296,14 @@ describe('videoFilterSpecs', () => {
         src,
       ),
     ).toEqual<FilterSpec[]>([
-      { mediaType: 'video', type: 'crop', x: 100, y: 50, width: 1280, height: 720 },
+      {
+        mediaType: 'video',
+        type: 'crop',
+        x: 100,
+        y: 50,
+        width: 1280,
+        height: 720,
+      },
     ]);
   });
 
@@ -1232,11 +1312,27 @@ describe('videoFilterSpecs', () => {
       videoFilterSpecs({ width: 320, height: 240, pad: { width: 401, height: 301 } }, src),
     ).toEqual<FilterSpec[]>([
       { mediaType: 'video', type: 'resize', width: 320, height: 240 },
-      { mediaType: 'video', type: 'pad', width: 401, height: 301, x: 40, y: 30 },
+      {
+        mediaType: 'video',
+        type: 'pad',
+        width: 401,
+        height: 301,
+        x: 40,
+        y: 30,
+      },
     ]);
     expect(videoFilterSpecs({ pad: { width: 2048, height: 1200, x: 128, y: 100 } }, src)).toEqual<
       FilterSpec[]
-    >([{ mediaType: 'video', type: 'pad', width: 2048, height: 1200, x: 128, y: 100 }]);
+    >([
+      {
+        mediaType: 'video',
+        type: 'pad',
+        width: 2048,
+        height: 1200,
+        x: 128,
+        y: 100,
+      },
+    ]);
     expect(videoFilterSpecs({ pad: { width: 1920, height: 1080 } }, src)).toEqual([]);
   });
 
@@ -1415,15 +1511,26 @@ describe('outputDimensions', () => {
       width: 800,
       height: 600,
     });
-    expect(outputDimensions({ width: 320, height: 240 }, src)).toEqual({ width: 320, height: 240 });
+    expect(outputDimensions({ width: 320, height: 240 }, src)).toEqual({
+      width: 320,
+      height: 240,
+    });
     expect(outputDimensions({ width: 320, height: 240, rotate: 90 }, src)).toEqual({
       width: 240,
       height: 320,
     });
-    expect(outputDimensions({ rotate: 270 }, src)).toEqual({ width: 1080, height: 1920 });
+    expect(outputDimensions({ rotate: 270 }, src)).toEqual({
+      width: 1080,
+      height: 1920,
+    });
     expect(
       outputDimensions(
-        { width: 320, height: 240, pad: { width: 400, height: 300 }, rotate: 90 },
+        {
+          width: 320,
+          height: 240,
+          pad: { width: 400, height: 300 },
+          rotate: 90,
+        },
         src,
       ),
     ).toEqual({ width: 300, height: 400 });
@@ -1434,12 +1541,21 @@ describe('outputDimensions', () => {
   });
 
   it('keeps the source dimension for an omitted resize axis', () => {
-    expect(outputDimensions({ width: 320 }, src)).toEqual({ width: 320, height: 1080 });
-    expect(outputDimensions({ height: 240 }, src)).toEqual({ width: 1920, height: 240 });
+    expect(outputDimensions({ width: 320 }, src)).toEqual({
+      width: 320,
+      height: 1080,
+    });
+    expect(outputDimensions({ height: 240 }, src)).toEqual({
+      width: 1920,
+      height: 240,
+    });
   });
 
   it('flip is dimension-preserving', () => {
-    expect(outputDimensions({ flip: 'v' }, src)).toEqual({ width: 1920, height: 1080 });
+    expect(outputDimensions({ flip: 'v' }, src)).toEqual({
+      width: 1920,
+      height: 1080,
+    });
   });
 });
 
@@ -1511,7 +1627,9 @@ describe('planCfrFrameRetiming', () => {
   it('rejects invalid fps or non-monotonic source timestamps with typed errors', () => {
     expect(() => planCfrFrameRetiming(cfrTimings(30, 2), { fps: 0 })).toThrow(InputError);
     expect(() =>
-      planCfrFrameRetiming([{ timestamp: 10_000 }, { timestamp: 5_000 }], { fps: 30 }),
+      planCfrFrameRetiming([{ timestamp: 10_000 }, { timestamp: 5_000 }], {
+        fps: 30,
+      }),
     ).toThrow(InputError);
   });
 
@@ -1523,30 +1641,33 @@ describe('planCfrFrameRetiming', () => {
       outputs: [],
       droppedSourceIndexes: [],
     });
-    expect(planCfrFrameRetiming([{ timestamp: 10_000 }], { fps: 10, durationUs: 200_000 })).toEqual(
-      {
+    expect(
+      planCfrFrameRetiming([{ timestamp: 10_000 }], {
         fps: 10,
-        startsAtUs: 10_000,
-        endsAtUs: 210_000,
-        outputs: [
-          {
-            outputIndex: 0,
-            sourceIndex: 0,
-            timestamp: 10_000,
-            duration: 100_000,
-            duplicate: false,
-          },
-          {
-            outputIndex: 1,
-            sourceIndex: 0,
-            timestamp: 110_000,
-            duration: 100_000,
-            duplicate: true,
-          },
-        ],
-        droppedSourceIndexes: [],
-      },
-    );
+        durationUs: 200_000,
+      }),
+    ).toEqual({
+      fps: 10,
+      startsAtUs: 10_000,
+      endsAtUs: 210_000,
+      outputs: [
+        {
+          outputIndex: 0,
+          sourceIndex: 0,
+          timestamp: 10_000,
+          duration: 100_000,
+          duplicate: false,
+        },
+        {
+          outputIndex: 1,
+          sourceIndex: 0,
+          timestamp: 110_000,
+          duration: 100_000,
+          duplicate: true,
+        },
+      ],
+      droppedSourceIndexes: [],
+    });
     expect(() => planCfrFrameRetiming([{ timestamp: 0 }], { fps: 30, durationUs: 0 })).toThrow(
       InputError,
     );
@@ -1819,14 +1940,26 @@ describe('audioFilterSpecs', () => {
   it('emits a stream-stateful fade with frame counts resolved against the SOURCE rate (before resample)', () => {
     // 0.5 s in / 0.25 s out @ the 48 kHz source rate → 24000 / 12000 frames; default curve 'linear'.
     expect(audioFilterSpecs({ fade: { inSec: 0.5, outSec: 0.25 } }, src)).toEqual<FilterSpec[]>([
-      { mediaType: 'audio', type: 'fade', curve: 'linear', inFrames: 24000, outFrames: 12000 },
+      {
+        mediaType: 'audio',
+        type: 'fade',
+        curve: 'linear',
+        inFrames: 24000,
+        outFrames: 12000,
+      },
     ]);
     // Fade frames are resolved at the source rate even when a resample follows (fade precedes resample),
     // and the resample is emitted after the fade.
     expect(
       audioFilterSpecs({ fade: { outSec: 1, curve: 'equal-power' }, sampleRate: 22050 }, src),
     ).toEqual<FilterSpec[]>([
-      { mediaType: 'audio', type: 'fade', curve: 'equal-power', inFrames: 0, outFrames: 48000 },
+      {
+        mediaType: 'audio',
+        type: 'fade',
+        curve: 'equal-power',
+        inFrames: 0,
+        outFrames: 48000,
+      },
       { mediaType: 'audio', type: 'resample', sampleRate: 22050 },
     ]);
   });
@@ -1848,7 +1981,11 @@ describe('audioFilterSpecs', () => {
         src,
       ),
     ).toEqual<FilterSpec[]>([
-      { mediaType: 'audio', type: 'biquad', spec: { type: 'highpass', frequency: 80, q: 0.7 } },
+      {
+        mediaType: 'audio',
+        type: 'biquad',
+        spec: { type: 'highpass', frequency: 80, q: 0.7 },
+      },
       {
         mediaType: 'audio',
         type: 'biquad',
@@ -1860,7 +1997,9 @@ describe('audioFilterSpecs', () => {
   it('emits a stream-stateful dynamics spec, filling the limiter defaults (ceiling 0 dBFS, hard)', () => {
     expect(
       audioFilterSpecs(
-        { dynamics: { normalize: { mode: 'rms', targetDbfs: -14 }, limit: {} } },
+        {
+          dynamics: { normalize: { mode: 'rms', targetDbfs: -14 }, limit: {} },
+        },
         src,
       ),
     ).toEqual<FilterSpec[]>([
@@ -1890,7 +2029,13 @@ describe('audioFilterSpecs', () => {
       ),
     ).toEqual<FilterSpec[]>([
       { mediaType: 'audio', type: 'gain', db: -3 },
-      { mediaType: 'audio', type: 'fade', curve: 'equal-power', inFrames: 4800, outFrames: 0 },
+      {
+        mediaType: 'audio',
+        type: 'fade',
+        curve: 'equal-power',
+        inFrames: 4800,
+        outFrames: 0,
+      },
       { mediaType: 'audio', type: 'remix', channels: 1 },
       { mediaType: 'audio', type: 'resample', sampleRate: 24000 },
       {
@@ -1915,7 +2060,11 @@ describe('audioFilterSpecs', () => {
     ).toThrow(InputError);
     expect(() =>
       audioFilterSpecs(
-        { dynamics: { normalize: { mode: 'lufs' as unknown as 'peak', targetDbfs: -14 } } },
+        {
+          dynamics: {
+            normalize: { mode: 'lufs' as unknown as 'peak', targetDbfs: -14 },
+          },
+        },
         src,
       ),
     ).toThrow(InputError);
@@ -2036,7 +2185,11 @@ describe('buildVideoEncoderConfig', () => {
         { width: 1080, height: 1920, fps: 60 },
         'avc1.64002A',
       ),
-    ).toMatchObject({ codec: 'avc1.64002A', framerate: 60, bitrate: 2_000_000 });
+    ).toMatchObject({
+      codec: 'avc1.64002A',
+      framerate: 60,
+      bitrate: 2_000_000,
+    });
   });
 
   it('uses a resolution-aware default bitrate for offline video encodes', () => {
@@ -2084,7 +2237,7 @@ describe('buildVideoEncoderConfig', () => {
         { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
         'av01.0.05M.08',
       ),
-    ).toMatchObject({ bitrate: 3_750_000, bitrateMode: 'variable' });
+    ).toMatchObject({ bitrate: 33_177_600, bitrateMode: 'variable' });
     expect(
       buildVideoEncoderConfig(
         { codec: 'vp9', bitrate: 4_000_000 },
@@ -2104,6 +2257,21 @@ describe('buildVideoEncoderConfig', () => {
     });
     expect(
       buildVideoEncoderConfig({ codec: 'h264', bitrate: 2_000_000, twoPass: true }, src, undefined),
+    ).toMatchObject({
+      codec: 'avc1.42E028',
+      bitrateMode: 'quantizer',
+    });
+    expect(
+      buildVideoEncoderConfig(
+        {
+          codec: 'h264',
+          bitrate: 2_000_000,
+          maxAverageBitrate: 2_600_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+        },
+        src,
+        undefined,
+      ),
     ).toMatchObject({
       codec: 'avc1.42E028',
       bitrateMode: 'quantizer',
@@ -2193,27 +2361,49 @@ describe('buildVideoEncoderConfig', () => {
       { width: 3840, height: 2160, fps: 60 },
       undefined,
     );
-    expect(av1).toMatchObject({ codec: 'av01.0.13M.08', width: 1080, height: 1920, framerate: 60 });
+    expect(av1).toMatchObject({
+      codec: 'av01.0.13M.08',
+      width: 1080,
+      height: 1920,
+      framerate: 60,
+    });
 
     const vp9 = buildVideoEncoderConfig(
       { codec: 'vp9', width: 3840, height: 2160, rotate: 270 },
       { width: 7680, height: 4320, fps: 30 },
       undefined,
     );
-    expect(vp9).toMatchObject({ codec: 'vp09.00.52.08', width: 2160, height: 3840, framerate: 30 });
+    expect(vp9).toMatchObject({
+      codec: 'vp09.00.52.08',
+      width: 2160,
+      height: 3840,
+      framerate: 30,
+    });
   });
 
   it('promotes VP9/AV1 levels when an explicit bitrate exceeds a lower level', () => {
     expect(
       buildVideoEncoderConfig(
-        { codec: 'vp9', width: 1280, height: 720, fps: 30, bitrate: 50_000_000 },
+        {
+          codec: 'vp9',
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate: 50_000_000,
+        },
         src,
         undefined,
       ).codec,
     ).toBe('vp09.00.50.08');
     expect(
       buildVideoEncoderConfig(
-        { codec: 'av1', width: 1280, height: 720, fps: 30, bitrate: 50_000_000 },
+        {
+          codec: 'av1',
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate: 50_000_000,
+        },
         src,
         undefined,
       ).codec,
@@ -2325,14 +2515,28 @@ describe('buildVideoEncoderConfig', () => {
   it('keeps VP9 alpha on a high-depth profile and rejects AV1 alpha as a disjoint capability', () => {
     expect(
       buildVideoEncoderConfig(
-        { codec: 'vp9', width: 1280, height: 720, fps: 30, bitDepth: 12, alpha: 'keep' },
+        {
+          codec: 'vp9',
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitDepth: 12,
+          alpha: 'keep',
+        },
         src,
         undefined,
       ),
     ).toMatchObject({ codec: 'vp09.02.40.12', alpha: 'keep' });
     expect(() =>
       buildVideoEncoderConfig(
-        { codec: 'av1', width: 1280, height: 720, fps: 30, bitDepth: 12, alpha: 'keep' },
+        {
+          codec: 'av1',
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitDepth: 12,
+          alpha: 'keep',
+        },
         src,
         undefined,
       ),
@@ -2576,6 +2780,28 @@ describe('planVideoRateControl', () => {
       requiresReplay: true,
       firstPassQuantizer: 28,
     });
+    expect(
+      planVideoRateControl(
+        {
+          bitrate: 2_000_000,
+          maxAverageBitrate: 2_600_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+        },
+        'avc1.42E01E',
+      ),
+    ).toEqual({
+      mode: 'quality-constrained-bitrate',
+      preferredAverageBitrate: 2_000_000,
+      maxAverageBitrate: 2_600_000,
+      metric: 'ssim-luma-v1',
+      minimumMean: 0.93,
+      samples: 8,
+      webCodecsConfigurable: true,
+      requiresReplay: true,
+      requiresFiniteSource: true,
+      firstPassQuantizer: 28,
+      maximumCandidatePasses: 3,
+    });
   });
 
   it('rejects malformed or conflicting rate-control requests with typed errors', () => {
@@ -2586,6 +2812,27 @@ describe('planVideoRateControl', () => {
       InputError,
     );
     expect(() => planVideoRateControl({ twoPass: true }, 'avc1.42E01E')).toThrow(InputError);
+    expect(() =>
+      planVideoRateControl(
+        {
+          bitrate: 2_000_000,
+          maxAverageBitrate: 2_600_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.93 },
+        },
+        'vp09.00.10.08',
+      ),
+    ).toThrow(CapabilityError);
+    expect(() =>
+      planVideoRateControl(
+        {
+          bitrate: 2_000_000,
+          maxAverageBitrate: 2_600_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.93 },
+          twoPass: false,
+        },
+        'avc1.42E01E',
+      ),
+    ).toThrow(InputError);
   });
 });
 
@@ -2647,7 +2894,12 @@ describe('planVideoBitDepthConversion', () => {
       targetBitDepth: 8,
       requiresPixelPath: true,
     });
-    expect(planVideoBitDepthConversion({ sourceCodec: 'vp8', targetCodec: 'unknown' })).toEqual({
+    expect(
+      planVideoBitDepthConversion({
+        sourceCodec: 'vp8',
+        targetCodec: 'unknown',
+      }),
+    ).toEqual({
       kind: 'none',
       sourceBitDepth: 8,
       targetBitDepth: undefined,
@@ -2678,9 +2930,24 @@ describe('planH264AbrLadder', () => {
     expect(ladder.map((rung) => rung.options)).toEqual([
       {
         to: 'mp4',
-        video: { codec: 'h264', width: 1280, height: 720, bitrate: 3_000_000, fps: 30 },
+        video: {
+          codec: 'h264',
+          width: 1280,
+          height: 720,
+          bitrate: 3_000_000,
+          fps: 30,
+        },
       },
-      { to: 'mp4', video: { codec: 'h264', width: 640, height: 360, bitrate: 800_000, fps: 30 } },
+      {
+        to: 'mp4',
+        video: {
+          codec: 'h264',
+          width: 640,
+          height: 360,
+          bitrate: 800_000,
+          fps: 30,
+        },
+      },
     ]);
     expect(ladder.map((rung) => rung.config.codec)).toEqual(['avc1.42E01F', 'avc1.42E01E']);
   });
@@ -2838,10 +3105,16 @@ describe('normalizeDecoderCodec', () => {
     expect(normalizeDecoderCodec({ codec: 'hevc' })).toBe('hevc');
     // too-short avcC/hvcC → cannot parse → unchanged
     expect(
-      normalizeDecoderCodec({ codec: 'h264', description: new Uint8Array([0x01, 0x64]) }),
+      normalizeDecoderCodec({
+        codec: 'h264',
+        description: new Uint8Array([0x01, 0x64]),
+      }),
     ).toBe('h264');
     expect(
-      normalizeDecoderCodec({ codec: 'hevc', description: new Uint8Array([0x01, 0x02, 0x20]) }),
+      normalizeDecoderCodec({
+        codec: 'hevc',
+        description: new Uint8Array([0x01, 0x02, 0x20]),
+      }),
     ).toBe('hevc');
   });
 });
@@ -2899,7 +3172,9 @@ describe('firefoxOpusAudioEncodeTarget / firefoxOpusEncodeUsesWasm', () => {
   });
 
   it('normalizes preserve-source Opus targets and leaves non-Opus targets untouched', () => {
-    expect(firefoxOpusAudioEncodeTarget({}, 'opus')).toEqual({ sampleRate: 48000 });
+    expect(firefoxOpusAudioEncodeTarget({}, 'opus')).toEqual({
+      sampleRate: 48000,
+    });
     const aac = { codec: 'aac', bitrate: 192_000 } as const;
     expect(firefoxOpusAudioEncodeTarget(aac, 'mp3')).toBe(aac);
   });
@@ -2921,13 +3196,25 @@ describe('firefoxOpusAudioEncodeTarget / firefoxOpusEncodeUsesWasm', () => {
       }),
     ).toBe(true);
     expect(
-      firefoxOpusEncodeUsesWasm({ codec: 'opus', sampleRate: 44100, numberOfChannels: 2 }),
+      firefoxOpusEncodeUsesWasm({
+        codec: 'opus',
+        sampleRate: 44100,
+        numberOfChannels: 2,
+      }),
     ).toBe(false);
     expect(
-      firefoxOpusEncodeUsesWasm({ codec: 'opus', sampleRate: 48000, numberOfChannels: 6 }),
+      firefoxOpusEncodeUsesWasm({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 6,
+      }),
     ).toBe(false);
     expect(
-      firefoxOpusEncodeUsesWasm({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 }),
+      firefoxOpusEncodeUsesWasm({
+        codec: 'mp4a.40.2',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+      }),
     ).toBe(false);
   });
 });
@@ -3020,7 +3307,12 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
       id: 0,
       mediaType: 'video',
       codec: 'avc1.42E01E',
-      config: { codec: 'avc1.42E01E', codedWidth: 640, codedHeight: 480, description },
+      config: {
+        codec: 'avc1.42E01E',
+        codedWidth: 640,
+        codedHeight: 480,
+        description,
+      },
       fps: 30,
       durationSec: 12.5,
     });
@@ -3048,7 +3340,12 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
       id: 0,
       mediaType: 'audio',
       codec: 'mp4a.40.2',
-      config: { codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, description },
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        description,
+      },
       durationSec: 9.75,
     });
   });
@@ -3058,14 +3355,21 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
     const { loadFixture } = await import('../test-support/corpus.ts');
     const source = parseMp3(await loadFixture('sound_5.mp3'));
     expect(source.gapless).toEqual({
-      leadingSamples: 576,
-      trailingSamples: 913,
+      basis: 'mp3-xing-lame',
+      leadingSamples: 1_105,
+      trailingSamples: 384,
       totalSamples: 110_255,
+      mp3Lame: { encoderDelaySamples: 576, encoderPaddingSamples: 913 },
     });
     if (source.gapless === undefined) throw new Error('expected the real MP3 gapless tuple');
     const output = outputGaplessForAudioEncoder(
       { codec: 'opus', sampleRate: 48_000, numberOfChannels: 1 },
-      { gapless: source.gapless },
+      {
+        sampleRate: 48_000,
+        submittedSamples: source.gapless.totalSamples ?? 0,
+        codedSamples: 111_360,
+        leadingSamples: 312,
+      },
     );
     expect(output).toBeUndefined();
   });
@@ -3090,9 +3394,11 @@ describe('isPureStreamCopy', () => {
     expect(isPureStreamCopy({ video: { twoPass: true } })).toBe(false);
     expect(isPureStreamCopy({ video: { alpha: 'discard' } })).toBe(false);
     expect(isPureStreamCopy({ video: { rotate: 90 } })).toBe(false);
-    expect(isPureStreamCopy({ video: { crop: { x: 0, y: 0, width: 10, height: 10 } } })).toBe(
-      false,
-    );
+    expect(
+      isPureStreamCopy({
+        video: { crop: { x: 0, y: 0, width: 10, height: 10 } },
+      }),
+    ).toBe(false);
     expect(isPureStreamCopy({ video: { pad: { width: 1920, height: 1080 } } })).toBe(false);
     expect(isPureStreamCopy({ video: { colorspace: { to: 'bt2020' } } })).toBe(false);
     expect(isPureStreamCopy({ video: { tonemap: { to: 'sdr' } } })).toBe(false);
@@ -3103,10 +3409,14 @@ describe('isPureStreamCopy', () => {
     expect(isPureStreamCopy({ audio: { fade: { inSec: 1 } } })).toBe(false);
     expect(isPureStreamCopy({ audio: { mixMatrix: [[0.5, 0.5]], channels: 1 } })).toBe(false);
     expect(
-      isPureStreamCopy({ audio: { dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } } }),
+      isPureStreamCopy({
+        audio: { dynamics: { normalize: { mode: 'peak', targetDbfs: -3 } } },
+      }),
     ).toBe(false);
     expect(
-      isPureStreamCopy({ audio: { biquad: { type: 'lowpass', frequency: 1000, q: 1 } } }),
+      isPureStreamCopy({
+        audio: { biquad: { type: 'lowpass', frequency: 1000, q: 1 } },
+      }),
     ).toBe(false);
   });
 
@@ -3726,7 +4036,11 @@ describe('vpx-alpha RGBA sidecar is a WeakMap, never a frame expando (item 5)', 
     const colorRgba = Uint8ClampedArray.from([10, 20, 30, 255, 40, 50, 60, 255]);
     const alphaRgba = Uint8ClampedArray.from([7, 7, 7, 255, 200, 200, 200, 255]);
     const expectedMerged = Uint8ClampedArray.from([10, 20, 30, 7, 40, 50, 60, 200]);
-    const expectedSplit = splitRgbaForVpxAlpha({ data: expectedMerged, width: 2, height: 1 });
+    const expectedSplit = splitRgbaForVpxAlpha({
+      data: expectedMerged,
+      width: 2,
+      height: 1,
+    });
 
     const constructed: { frame: SidecarPixelFrame; data: Uint8ClampedArray }[] = [];
     await withVideoFrameConstructor(sidecarFrameConstructor(constructed), async () => {
@@ -3809,8 +4123,6 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
     expect(CADENCE_BASELINE_FPS).toBe(30);
     expect(EVIDENCE_BITRATE_HEADROOM).toBe(2);
     expect(EVIDENCE_BITRATE_FLOOR).toBe(3_750_000);
-    expect(H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND).toBe(10);
-    expect(HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND).toBe(20);
   });
 
   it('planned path: width × height × 20 bpp/s × efficiency (× AV1 cadence), floored and capped', () => {
@@ -3869,25 +4181,55 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
     );
     expect(preserved.codec).toBe('vp09.00.21.08');
     expect(preserved.bitrate).toBe(3_600_000);
+
+    const preservedWithEvidence = buildVideoEncoderConfig(
+      {},
+      { width: 640, height: 360, fps: 30, bitrate: 271_201 },
+      'vp09.00.21.08',
+    );
+    expect(preservedWithEvidence.codec).toBe('vp09.00.21.08');
+    expect(preservedWithEvidence.bitrate).toBe(3_600_000);
   });
 
-  it('evidence path: source bitrate × spatial × temporal × codec-scale × headroom, floored (av1→vp9 row)', () => {
-    // 271_201 × 1 × 1 × (0.8/0.6) × 2 = 723_203 → floored at 3_750_000 (the harvested av1→vp9 row)
+  it('uses the codec-aware planned pixel density as the evidence floor at 960×540', () => {
+    const cases = [
+      { codec: 'h264', sourceCodec: 'avc1.42E01E', expected: 10_368_000 },
+      { codec: 'vp9', sourceCodec: 'vp09.00.31.08', expected: 8_294_400 },
+      { codec: 'av1', sourceCodec: 'av01.0.05M.08', expected: 6_220_800 },
+    ] as const;
+
+    for (const { codec, sourceCodec, expected } of cases) {
+      const target = { codec, width: 960, height: 540, fps: 30 } as const;
+      expect(
+        buildVideoEncoderConfig(target, { width: 960, height: 540 }, sourceCodec).bitrate,
+      ).toBe(expected);
+      expect(
+        buildVideoEncoderConfig(
+          target,
+          { width: 960, height: 540, fps: 30, bitrate: 271_201 },
+          sourceCodec,
+        ).bitrate,
+      ).toBe(expected);
+    }
+
+    expect(
+      buildVideoEncoderConfig(
+        { codec: 'av1', width: 1280, height: 720, fps: 60 },
+        { width: 1280, height: 720, fps: 60, bitrate: 271_201 },
+        'av01.0.08M.08',
+      ).bitrate,
+    ).toBe(15_640_071);
+  });
+
+  it('keeps source-rate projection authoritative above the codec-aware evidence floor', () => {
+    // 16_000_000 × (0.8/0.6) × 2 = 42_666_666.67 → 42_666_667, above the VP9 pixel floor.
     expect(
       buildVideoEncoderConfig(
         { codec: 'vp9' },
-        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
+        { width: 1920, height: 1080, fps: 24, bitrate: 16_000_000 },
         'av01.0.05M.08',
       ).bitrate,
-    ).toBe(3_750_000);
-    // 4_000_000 × (0.8/0.6) × 2 = 10_666_666.67 → 10_666_667 (above the floor, below the VP9 cap)
-    expect(
-      buildVideoEncoderConfig(
-        { codec: 'vp9' },
-        { width: 1920, height: 1080, fps: 24, bitrate: 4_000_000 },
-        'av01.0.05M.08',
-      ).bitrate,
-    ).toBe(10_666_667);
+    ).toBe(42_666_667);
     // Spatial ¼ × temporal 2 × same-codec 1 × headroom 2: 10_000_000 × 0.25 × 2 × 2 = 10_000_000
     expect(
       buildVideoEncoderConfig(
@@ -3896,14 +4238,14 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
         'avc1.42E01E',
       ).bitrate,
     ).toBe(10_000_000);
-    // Ordinary-cadence H.264 is floored at 10 bpp/s when source projection is lower.
+    // Ordinary-cadence H.264 uses the same 20 bpp/s floor as the no-evidence quality budget.
     expect(
       buildVideoEncoderConfig(
         { codec: 'h264', width: 1280, height: 720 },
         { width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
         'avc1.42E01E',
       ).bitrate,
-    ).toBe(9_216_000);
+    ).toBe(18_432_000);
     // High-cadence source evidence is also floored by output density:
     // 1280×720×20 bpp/s = 18_432_000, above the source-rate projection.
     expect(
@@ -3913,14 +4255,39 @@ describe('defaultVideoBitrate golden table (item 6 — named constants, hand-der
         'avc1.42E02A',
       ).bitrate,
     ).toBe(18_432_000);
-    // An explicit bitrate always wins over evidence.
+  });
+
+  it('keeps every explicit rate or quality authority out of the implicit evidence model', () => {
+    const evidenceSource = { width: 960, height: 540, fps: 30, bitrate: 271_201 };
+
     expect(
-      buildVideoEncoderConfig(
-        { codec: 'vp9', bitrate: 4_000_000 },
-        { width: 1920, height: 1080, fps: 24, bitrate: 271_201 },
-        'av01.0.05M.08',
-      ).bitrate,
+      buildVideoEncoderConfig({ codec: 'vp9', bitrate: 4_000_000 }, evidenceSource, 'vp09.00.31.08')
+        .bitrate,
     ).toBe(4_000_000);
+    const crf = buildVideoEncoderConfig({ codec: 'h264', crf: 23 }, evidenceSource, 'avc1.42E01E');
+    expect(crf).toMatchObject({ bitrateMode: 'quantizer' });
+    expect(crf).not.toHaveProperty('bitrate');
+
+    const twoPass = buildVideoEncoderConfig(
+      { codec: 'h264', bitrate: 2_000_000, twoPass: true },
+      evidenceSource,
+      'avc1.42E01E',
+    );
+    expect(twoPass).toMatchObject({ bitrateMode: 'quantizer' });
+    expect(twoPass).not.toHaveProperty('bitrate');
+
+    const quality = buildVideoEncoderConfig(
+      {
+        codec: 'h264',
+        bitrate: 2_000_000,
+        maxAverageBitrate: 2_600_000,
+        quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+      },
+      evidenceSource,
+      'avc1.42E01E',
+    );
+    expect(quality).toMatchObject({ bitrateMode: 'quantizer' });
+    expect(quality).not.toHaveProperty('bitrate');
   });
 });
 
@@ -4010,7 +4377,10 @@ describe('frame-lifetime oracle: closeCount === createCount on every path (item 
   it('encodeVideoFramesWithAlpha split failure: cancels upstream so undelivered frames still close', async () => {
     const derived: AlphaLifecycleFrame[] = [];
     const good = new AlphaLifecycleFrame({ timestamp: 100, clones: derived });
-    const poisoned = new AlphaLifecycleFrame({ timestamp: 200, clones: derived });
+    const poisoned = new AlphaLifecycleFrame({
+      timestamp: 200,
+      clones: derived,
+    });
     poisoned.copyTo = (): Promise<readonly PlaneLayout[]> =>
       Promise.reject(new Error('GPU readback failed'));
     const never = new AlphaLifecycleFrame({ timestamp: 300, clones: derived });
@@ -4144,10 +4514,9 @@ describe('frame-lifetime oracle: closeCount === createCount on every path (item 
 // ── item 8: alpha pairing is bounded by the reorder distance and pinned at highWaterMark 0 ───────
 
 describe('alpha pairing bound + backpressure (item 8)', () => {
-  function countingEncoder(counter: { runs: number }): () => TransformStream<
-    RawFrame,
-    EncodedChunk
-  > {
+  function countingEncoder(counter: {
+    runs: number;
+  }): () => TransformStream<RawFrame, EncodedChunk> {
     return () =>
       new TransformStream<RawFrame, EncodedChunk>({
         transform(frame, controller): void {
@@ -4374,7 +4743,14 @@ describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () 
     // bytes = 1500+500+2000 = 4000; span = (50_000+50_000) − 0 = 100_000 µs
     // → 4000×8×1e6 / 100_000 = 320_000 b/s exactly.
     const vfr = [
-      { trackId: 1, sizeBytes: 1500, ptsUs: 0, dtsUs: 0, durationUs: 33_333, keyframe: true },
+      {
+        trackId: 1,
+        sizeBytes: 1500,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 33_333,
+        keyframe: true,
+      },
       {
         trackId: 1,
         sizeBytes: 500,
@@ -4398,7 +4774,14 @@ describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () 
   it('B-frames: reordered DTS rows with adversarial PTS give the identical hand-derived rate', () => {
     // bytes = 6000; span = (120_000+40_000) − 0 = 160_000 µs → 6000×8×1e6/160_000 = 300_000 b/s.
     const presentationOrder = [
-      { trackId: 2, sizeBytes: 1000, ptsUs: 40_000, dtsUs: 0, durationUs: 40_000, keyframe: true },
+      {
+        trackId: 2,
+        sizeBytes: 1000,
+        ptsUs: 40_000,
+        dtsUs: 0,
+        durationUs: 40_000,
+        keyframe: true,
+      },
       {
         trackId: 2,
         sizeBytes: 1500,
@@ -4438,9 +4821,30 @@ describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () 
 
   it('ignores other tracks and invalid rows rather than polluting the evidence', () => {
     const table = [
-      { trackId: 1, sizeBytes: 4000, ptsUs: 0, dtsUs: 0, durationUs: 100_000, keyframe: true },
-      { trackId: 9, sizeBytes: 999_999, ptsUs: 0, dtsUs: 0, durationUs: 1, keyframe: true },
-      { trackId: 1, sizeBytes: -5, ptsUs: 0, dtsUs: 0, durationUs: 100_000, keyframe: false },
+      {
+        trackId: 1,
+        sizeBytes: 4000,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 100_000,
+        keyframe: true,
+      },
+      {
+        trackId: 9,
+        sizeBytes: 999_999,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 1,
+        keyframe: true,
+      },
+      {
+        trackId: 1,
+        sizeBytes: -5,
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 100_000,
+        keyframe: false,
+      },
       {
         trackId: 1,
         sizeBytes: 4000,
@@ -4449,7 +4853,14 @@ describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () 
         durationUs: 100_000,
         keyframe: false,
       },
-      { trackId: 1, sizeBytes: 4000, ptsUs: 0, dtsUs: 100_000, durationUs: 0, keyframe: false },
+      {
+        trackId: 1,
+        sizeBytes: 4000,
+        ptsUs: 0,
+        dtsUs: 100_000,
+        durationUs: 0,
+        keyframe: false,
+      },
     ];
     expect(sourceVideoBitrateFromPacketTable(table, 1)).toBe(320_000);
     expect(sourceVideoBitrateFromPacketTable([], 1)).toBeUndefined();

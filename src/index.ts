@@ -37,6 +37,12 @@ export type { MediaJob, MediaJobInput, MediaJobOperation, MediaJobOutput } from 
 
 // Public option/result types
 export type * from './api/types.ts';
+export {
+  H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS,
+  H264_ABR_MAX_RETAINED_OUTPUT_BYTES,
+  H264_ABR_MAX_RUNGS,
+  H264_ABR_MAX_SOURCE_BYTES,
+} from './api/types.ts';
 
 // Sources (ADR-013). `cacheSource` wraps any source in an opt-in in-memory range cache (the backing for
 // source-level `preload`, doc 07 §5); `probeUrlSize` learns a URL's length body-free for tail-seeking probes.
@@ -88,7 +94,17 @@ export type {
 // surface (or a lazy subpath), reached by apps through `convert(..., { fragmented: true })`. See report.
 
 // Typed error model (ADR-017)
-export { CapabilityError, InputError, MediaError } from './contracts/errors.ts';
-export type { CapabilityErrorDetail, MediaErrorCode } from './contracts/errors.ts';
+export {
+  CapabilityError,
+  ConstraintUnsatisfiedError,
+  InputError,
+  MediaError,
+} from './contracts/errors.ts';
+export type {
+  CapabilityErrorDetail,
+  ConstraintAttemptDetail,
+  ConstraintUnsatisfiedDetail,
+  MediaErrorCode,
+} from './contracts/errors.ts';
 
 export { VERSION } from './version.ts';

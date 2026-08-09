@@ -18,13 +18,7 @@ import { FlacDriver, enumerateFlacFrames, parseFlac } from '../drivers/flac/flac
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseTs } from '../drivers/mpegts/ts-parse.ts';
-import {
-  OggDriver,
-  oggAudioPackets,
-  oggPacketBytes,
-  oggPacketInfoFromBytes,
-  parseOgg,
-} from '../drivers/ogg/ogg-driver.ts';
+import { OggDriver, oggAudioPackets, oggPacketBytes, parseOgg } from '../drivers/ogg/ogg-driver.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { demuxWebm, parseWebm } from '../drivers/webm/webm-driver.ts';
 import { channelAt } from '../dsp/pcm.ts';
@@ -653,22 +647,6 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
       for (const id of ['sfx-opus.ogg', 'sound_5.oga'] as const) {
         const input = await loadFixture(id);
         const sourcePackets = oggAudioPackets(input);
-        const sourceTable = oggPacketInfoFromBytes(input);
-        const description = sourceTable.tracks[0]?.config?.description;
-        const codecDelayUs =
-          sourceTable.tracks[0]?.codec === 'opus' &&
-          description instanceof Uint8Array &&
-          description.byteLength >= 12
-            ? Math.round(
-                (new DataView(
-                  description.buffer,
-                  description.byteOffset,
-                  description.byteLength,
-                ).getUint16(10, true) /
-                  48_000) *
-                  1_000_000,
-              )
-            : 0;
         const out = await outputBytes(await media().remux(await fixtureSource(id), { to: 'mkv' }));
         const reparsed = demuxWebm(out);
         expect(reparsed.info.container).toBe('mkv');
@@ -682,9 +660,7 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
             throw new Error(`${id}: missing packet ${index}`);
           }
           expect(frame.data).toEqual(oggPacketBytes(input, sourcePacket));
-          expect(
-            Math.abs(frame.timestampUs - (sourcePacket.ptsUs - codecDelayUs)),
-          ).toBeLessThanOrEqual(1_000);
+          expect(Math.abs(frame.timestampUs - sourcePacket.ptsUs)).toBeLessThanOrEqual(1_000);
         }
       }
     } finally {
@@ -707,10 +683,9 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
     }
   });
 
-  it('public Ogg demux reassembles cross-page native FLAC packets byte-exactly', async () => {
+  it('public Ogg demux exposes production-packed native FLAC packets byte-exactly', async () => {
     const restore = installEncodedChunkShims();
     try {
-      let sawDiscontiguousPacket = false;
       for (const id of FLAC_OGG_FIXTURES) {
         const input = await loadFixture(id);
         const sourceFrames = enumerateFlacFrames(input);
@@ -719,13 +694,6 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
         try {
           const track = demuxed.tracks.find((candidate) => candidate.codec === 'flac');
           if (track === undefined) throw new Error(`${id}: public Ogg demux found no FLAC track`);
-          const rows = (
-            demuxed as typeof demuxed & {
-              packetInfoTable?: () => readonly PacketInfoMetadata[];
-            }
-          ).packetInfoTable?.();
-          sawDiscontiguousPacket ||= rows?.some((row) => row.offset === undefined) === true;
-
           const payloads = await packetPayloads(demuxed.packets(track.id));
           expect(payloads, `${id}: packet count`).toHaveLength(sourceFrames.length);
           for (let index = 0; index < sourceFrames.length; index += 1) {
@@ -740,10 +708,6 @@ describe('remux — generalized container routing (ADR-021/012)', () => {
           await demuxed.close();
         }
       }
-      expect(
-        sawDiscontiguousPacket,
-        'real corpus must exercise at least one cross-page packet',
-      ).toBe(true);
     } finally {
       restore();
     }

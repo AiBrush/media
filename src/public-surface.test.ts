@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { destinationColorI420FrameStream as directDestinationColorI420FrameStream } from './api/video-frame-convert.ts';
 import * as core from './core.ts';
 import * as image from './image.ts';
 import * as index from './index.ts';
@@ -19,6 +20,7 @@ describe('public surface', () => {
     expect(core.VERSION).toBe('0.0.0');
     expect(new core.MediaError('demux-error', 'x').code).toBe('demux-error');
     expect(typeof core.wavPcmToAiffFromBytes).toBe('function');
+    expect(core.destinationColorI420FrameStream).toBe(directDestinationColorI420FrameStream);
   });
 
   it('image subpath exposes standalone helpers without joining the default entry', () => {

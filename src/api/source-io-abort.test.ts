@@ -47,4 +47,33 @@ describe('readAllSource cancellation', () => {
     await expectPromptAbort(pending);
     expect(observedSignal).toBe(controller.signal);
   });
+
+  it('stops an unknown-length stream at the caller-provided whole-source byte bound', async () => {
+    let cancelled = false;
+    const source: Source = {
+      __media: 'source',
+      kind: 'stream',
+      stream(): ReadableStream<Uint8Array> {
+        let index = 0;
+        return new ReadableStream<Uint8Array>(
+          {
+            pull(controller): void {
+              if (index++ < 2) controller.enqueue(Uint8Array.of(1, 2, 3));
+              else controller.close();
+            },
+            cancel(): void {
+              cancelled = true;
+            },
+          },
+          { highWaterMark: 0 },
+        );
+      },
+    };
+
+    await expect(readAllSource(source, undefined, 5)).rejects.toMatchObject({
+      code: 'unsupported-input',
+      detail: { observedBytes: 6, maximumBytes: 5 },
+    });
+    expect(cancelled).toBe(true);
+  });
 });

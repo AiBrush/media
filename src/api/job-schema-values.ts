@@ -36,6 +36,11 @@ export interface PlainRecord extends Record<string, unknown> {
   readonly codec?: unknown;
   readonly fps?: unknown;
   readonly bitrate?: unknown;
+  readonly maxAverageBitrate?: unknown;
+  readonly quality?: unknown;
+  readonly metric?: unknown;
+  readonly minimumMean?: unknown;
+  readonly samples?: unknown;
   readonly bitrateMode?: unknown;
   readonly crf?: unknown;
   readonly twoPass?: unknown;

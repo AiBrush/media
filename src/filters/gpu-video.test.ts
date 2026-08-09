@@ -42,15 +42,39 @@ import {
 } from './gpu-uniforms.ts';
 import {
   GpuVideoFilterModule,
+  WEBGPU_CANVAS_ALPHA_MODE,
+  WEBGPU_COLOR_SHADER_SOURCE,
+  WEBGPU_GEOMETRY_SHADER_SOURCE,
   canDeferFullFrameScale,
   canvas2dVideoFilterDriver,
   mapVideoColorSpace,
   planColor,
   planDraw,
+  premultiplyWebGpuCanvasRgba,
   rotatePackedI420By180,
   webgpuGeometryNeedsCanvasColorManagement,
   webgpuVideoFilterDriver,
 } from './gpu-video.ts';
+
+describe('WebGPU premultiplied canvas boundary', () => {
+  it('premultiplies translucent straight-alpha RGBA while preserving alpha', () => {
+    expect(premultiplyWebGpuCanvasRgba([0.8, 0.4, 0.2, 0.5])).toEqual([0.4, 0.2, 0.1, 0.5]);
+    expect(premultiplyWebGpuCanvasRgba([0.25, 0.5, 0.75, 0])).toEqual([0, 0, 0, 0]);
+    expect(premultiplyWebGpuCanvasRgba([0.25, 0.5, 0.75, 1])).toEqual([0.25, 0.5, 0.75, 1]);
+  });
+
+  it('pins the premultiplied canvas mode and both fragment shaders to the same conversion', () => {
+    expect(WEBGPU_CANVAS_ALPHA_MODE).toBe('premultiplied');
+    for (const source of [WEBGPU_GEOMETRY_SHADER_SOURCE, WEBGPU_COLOR_SHADER_SOURCE]) {
+      expect(source).toContain('return vec4<f32>(c.rgb * c.a, c.a);');
+      expect(source).toContain('return premultiply_for_canvas(');
+    }
+    expect(WEBGPU_GEOMETRY_SHADER_SOURCE).toContain('return premultiply_for_canvas(c);');
+    expect(WEBGPU_COLOR_SHADER_SOURCE).toContain(
+      'return premultiply_for_canvas(vec4<f32>(outRgb, c.a));',
+    );
+  });
+});
 
 describe('rotatePackedI420By180', () => {
   it('reverses luma and both chroma planes independently', () => {
@@ -784,7 +808,7 @@ describe('createFilter() — typed rejection of specs the driver does not handle
     }
   });
 
-  it('webgpu declines tonemap so the router can fall through to the CPU colour path', () => {
+  it('webgpu declines tonemap so the router can try an honest HDR-capable fallback', () => {
     expect(() => webgpuVideoFilterDriver.createFilter(TONEMAP_SPEC)).toThrow(CapabilityError);
   });
 });
@@ -1122,11 +1146,24 @@ describe('planColorspace / planTonemap — pipeline selection', () => {
     expect(p.encode).toBe('bt709');
   });
 
-  it('planColor dispatches colorspace vs tonemap and rejects an unknown colorspace target', () => {
+  it("planColor starts colorspace math from WebGPU's normalized sRGB import representation", () => {
     const cs = planColor({ mediaType: 'video', type: 'colorspace', to: 'bt2020' }, src709);
-    expect(cs.tonemap).toBeNull();
+    expect(cs).toEqual(planColorspace({ primaries: 'srgb', transfer: 'srgb' }, 'bt2020'));
+    expect(cs.decode).toBe('srgb');
+
+    // `importExternalTexture` has already converted both sources to sRGB. Reusing the original 601/709
+    // tags here would apply their gamut/transfer a second time and make identical imported pixels diverge.
+    const from601 = planColor(
+      { mediaType: 'video', type: 'colorspace', to: 'bt2020' },
+      { primaries: 'bt601', transfer: 'bt709' },
+    );
+    expect(from601).toEqual(cs);
+  });
+
+  it('planColor retains source metadata for tone-map and rejects an unknown colorspace target', () => {
     const tm = planColor({ mediaType: 'video', type: 'tonemap', to: 'sdr' }, srcPQ2020);
     expect(tm.tonemap).not.toBeNull();
+    expect(tm.decode).toBe('pq');
     expect(() =>
       planColor({ mediaType: 'video', type: 'colorspace', to: 'not-a-space' }, src709),
     ).toThrow(InputError);

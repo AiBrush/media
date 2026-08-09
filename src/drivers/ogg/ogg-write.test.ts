@@ -246,6 +246,54 @@ describe('buildPages — lacing (pure)', () => {
     expect(pages[0]?.granule).toBe(255);
     expect(pages[1]?.granule).toBe(300);
   });
+
+  it('flushes completed packets near 8 KiB without inventing continuation pages', () => {
+    const packets = Array.from({ length: 20 }, (_, i) => ({
+      data: new Uint8Array(600).fill(i),
+      granule: (i + 1) * 1024,
+    }));
+    const pages = buildPages(packets, 0, 0);
+
+    expect(pages).toHaveLength(2);
+    expect(pages.map((page) => page.body.byteLength)).toEqual([7_800, 4_200]);
+    expect(pages.map((page) => page.granule)).toEqual([13 * 1024, 20 * 1024]);
+    expect(pages.every((page) => (page.headerType & HT_CONTINUED) === 0)).toBe(true);
+    expect(
+      delacePackets(
+        pages.map((page, seq) => ({
+          ...page,
+          serial: 1,
+          seq,
+          storedCrc: 0,
+          computedCrc: 0,
+        })),
+      ),
+    ).toEqual(packets.map((packet) => packet.data));
+  });
+
+  it('can bound page duration independently of encoded byte size', () => {
+    const packets = Array.from({ length: 10 }, (_, i) => ({
+      data: new Uint8Array([i]),
+      granule: (i + 1) * 100,
+    }));
+    const pages = buildPages(packets, 0, 0, { maxGranuleSpan: 500 });
+
+    expect(pages).toHaveLength(2);
+    expect(pages.map((page) => page.granule)).toEqual([500, 1_000]);
+    expect(pages.every((page) => (page.headerType & HT_CONTINUED) === 0)).toBe(true);
+  });
+
+  it('can anchor a short Vorbis-style program after its first packet', () => {
+    const packets = Array.from({ length: 4 }, (_, i) => ({
+      data: new Uint8Array(16).fill(i),
+      granule: i === 0 ? 0 : i * 1024,
+    }));
+    const pages = buildPages(packets, 0, 0, { flushAfterFirstPacket: true });
+
+    expect(pages).toHaveLength(2);
+    expect(pages.map((page) => page.granule)).toEqual([0, 3_072]);
+    expect(pages.every((page) => (page.headerType & HT_CONTINUED) === 0)).toBe(true);
+  });
 });
 
 describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', () => {
@@ -361,20 +409,49 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     expect(audioPackets.map((p) => [...p])).toEqual(inputs.map((c) => [...c.data]));
   });
 
-  it('uses declared Opus duration as a final in-packet granule trim', async () => {
+  it('adds OpusHead pre-skip to a declared program duration when authoring the EOS granule', async () => {
     const muxer = new OggMuxer();
-    const declaredFinalGranule = 1500; // between packet 1 (960) and packet 2 (1920)
-    const t = muxer.addTrack({ ...opusTrack, durationSec: declaredFinalGranule / 48_000 });
+    const programSamples = 1500;
+    const preSkip = 312;
+    const expectedFinalGranule = preSkip + programSamples; // inside packet 2 (coded end 1920)
+    const t = muxer.addTrack({ ...opusTrack, durationSec: programSamples / 48_000 });
     muxer.addChunkStruct(t, audio(0, 80, 0x11));
     muxer.addChunkStruct(t, audio(20_000, 120, 0x22));
     await muxer.finalize();
     const bytes = await collect(muxer.output);
 
-    expect(parseOgg(bytes).durationSec).toBeCloseTo(declaredFinalGranule / 48_000, 5);
+    expect(parseOgg(bytes).durationSec).toBeCloseTo(expectedFinalGranule / 48_000, 5);
     const granules = scanPages(bytes)
       .map((p) => p.granule)
       .filter((g) => g >= 0);
-    expect(Math.max(...granules)).toBe(declaredFinalGranule);
+    expect(Math.max(...granules)).toBe(expectedFinalGranule);
+    expect(Math.max(...granules) - preSkip).toBe(programSamples);
+  });
+
+  it('does not count pre-skip twice when remuxing a raw Ogg-granule duration', async () => {
+    const muxer = new OggMuxer();
+    const initialGranuleOffset = 480;
+    const preSkip = 312;
+    const programSamples = 1500;
+    const finalGranule = preSkip + programSamples;
+    const t = muxer.addTrack({
+      ...opusTrack,
+      durationSec: (initialGranuleOffset + finalGranule) / 48_000,
+      gapless: {
+        basis: 'ogg-opus-granule',
+        leadingSamples: preSkip,
+        trailingSamples: 108,
+        totalSamples: programSamples,
+      },
+    });
+    muxer.addChunkStruct(t, audio(0, 80, 0x11));
+    muxer.addChunkStruct(t, audio(20_000, 120, 0x22));
+    await muxer.finalize();
+
+    const granules = scanPages(await collect(muxer.output))
+      .map((page) => page.granule)
+      .filter((granule) => granule >= 0);
+    expect(Math.max(...granules)).toBe(finalGranule);
   });
 
   it('derives Opus granule duration from the packet TOC instead of a misleading chunk duration', async () => {
@@ -398,10 +475,11 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     expect(Math.max(...granules)).toBe(expectedGranule);
   });
 
-  it('applies a declared final Opus trim against the TOC-derived packet span', async () => {
+  it('applies a declared Opus program trim against the TOC-derived packet span', async () => {
     const muxer = new OggMuxer();
-    const declaredFinalGranule = 2400; // 50 ms, inside one 60 ms Opus packet.
-    const t = muxer.addTrack({ ...opusTrack, durationSec: declaredFinalGranule / 48_000 });
+    const programSamples = 2400; // 50 ms of program inside one 60 ms Opus packet after pre-skip.
+    const expectedFinalGranule = 312 + programSamples;
+    const t = muxer.addTrack({ ...opusTrack, durationSec: programSamples / 48_000 });
     muxer.addChunkStruct(t, {
       timestampUs: 0,
       durationUs: 20_000,
@@ -411,11 +489,11 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     await muxer.finalize();
     const bytes = await collect(muxer.output);
 
-    expect(parseOgg(bytes).durationSec).toBeCloseTo(declaredFinalGranule / 48_000, 5);
+    expect(parseOgg(bytes).durationSec).toBeCloseTo(expectedFinalGranule / 48_000, 5);
     const granules = scanPages(bytes)
       .map((p) => p.granule)
       .filter((g) => g >= 0);
-    expect(Math.max(...granules)).toBe(declaredFinalGranule);
+    expect(Math.max(...granules)).toBe(expectedFinalGranule);
   });
 
   it('synthesizes an OpusHead when no description is supplied (parses with the right channels)', async () => {

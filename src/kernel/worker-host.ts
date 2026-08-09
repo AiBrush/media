@@ -51,6 +51,7 @@ export {
   type OffloadStreamOptions,
   type WithOptionalSink,
   buildOffloadPayload,
+  abrLadderCapsSatisfy,
   capsSatisfy,
   offloadAbrLadder,
   offloadCapsNeed,

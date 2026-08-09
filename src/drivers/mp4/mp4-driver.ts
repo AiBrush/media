@@ -52,7 +52,7 @@ import {
 import { gaplessFromMp4Edit } from './gapless.ts';
 import { h264AccessUnitRangeIsKeyPicture } from './h264-access-unit.ts';
 import { matchesMp4 } from './mp4-sniff.ts';
-import { Mp4Muxer } from './mux.ts';
+import { Mp4Muxer, auditMp4H264MuxedPackets } from './mux.ts';
 import {
   type Movie,
   type MovieMetadata,
@@ -5135,7 +5135,15 @@ export const Mp4Driver: ContainerDriver = {
   createMuxer(o?: MuxOptions): Muxer {
     // The EncodedChunk-seam adapter over writeMp4 ({@link Mp4Muxer}): its packet→sample timing
     // (DTS/ctts, B-frames) is pure + Node-validated; only the per-chunk `copyTo` is browser-only.
-    return new Mp4Muxer(o);
+    return new Mp4Muxer(o, 'mp4');
+  },
+  async auditMuxedTrack(
+    track: TrackInfo,
+    packets: Iterable<Packet>,
+    options?: MuxOptions,
+    signal?: AbortSignal,
+  ) {
+    return auditMp4H264MuxedPackets(track, packets, options, signal);
   },
 };
 

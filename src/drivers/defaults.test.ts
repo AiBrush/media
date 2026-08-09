@@ -283,6 +283,7 @@ describe('registerDefaultDrivers', () => {
     expect(typeof mp4.packetInfoBatches).toBe('function');
     expect(typeof mp4.streamCopy).toBe('function');
     expect(typeof mp4.decrypt).toBe('function');
+    expect(typeof mp4.createMuxer().setTrackGapless).toBe('function');
     expect(mp4.supports({ direction: 'demux', mime: 'audio/x-m4a' })).toBe(true);
     expect(mp4.supports({ direction: 'demux', extension: 'MOV' })).toBe(true);
     expect(mp4.supports({ direction: 'demux', head: mp4Head })).toBe(true);
@@ -291,6 +292,7 @@ describe('registerDefaultDrivers', () => {
     expect(webm).toMatchObject({ formats: ['webm', 'mkv'] });
     expect(typeof webm.probe).toBe('function');
     expect(typeof webm.streamCopy).toBe('function');
+    expect(webm.createMuxer().setTrackGapless).toBeUndefined();
     expect(webm.supports({ direction: 'demux', mime: 'video/x-matroska' })).toBe(true);
     expect(webm.supports({ direction: 'demux', extension: 'mkv' })).toBe(true);
     expect(webm.supports({ direction: 'demux', head: webmHead })).toBe(true);
@@ -606,7 +608,7 @@ describe('registerDefaultDrivers', () => {
       expect(findFilter(reg, 'webgpu-video-filter').supports(resize)).toBe(false);
       expect(findFilter(reg, 'canvas2d-video-filter').supports(resize)).toBe(true);
       expect(findFilter(reg, 'canvas2d-video-filter').supports(tonemap)).toBe(false);
-      expect(findFilter(reg, 'cpu-video-filter').supports(tonemap)).toBe(true);
+      expect(findFilter(reg, 'cpu-video-filter').supports(tonemap)).toBe(false);
     } finally {
       restoreFrame();
       restoreCanvas();

@@ -12,7 +12,9 @@ import { describe, expect, it } from 'vitest';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import WebCodecsAudioModule, {
   AUDIO_CODEC_PREFIXES,
+  AAC_LC_ACCESS_UNIT_SAMPLES,
   BACKPRESSURE_THRESHOLD,
+  CHROMIUM_MAC_AAC_LC_LEADING_SAMPLES,
   awaitAudioCodecQueueDrain,
   type EnqueueSink,
   decoderConfigFromEncoderMeta,
@@ -20,6 +22,7 @@ import WebCodecsAudioModule, {
   enqueueOrClose,
   enqueueOrDrop,
   hardwareAccelerationFor,
+  isAacLcCodecString,
   isAudioCodecString,
   normalizeAudioDecoderConfig,
   normalizeAudioEncoderConfig,
@@ -27,6 +30,7 @@ import WebCodecsAudioModule, {
   submitClosableAudioCodecInput,
   shouldApplyBackpressure,
   unsupported,
+  webCodecsAacLcLeadingSamples,
   WebCodecsAudioDriver,
 } from './webcodecs-audio.ts';
 
@@ -147,6 +151,33 @@ describe('isAudioCodecString — the audio codec families this driver routes (RF
   it('exposes every prefix exactly once', () => {
     expect(new Set(AUDIO_CODEC_PREFIXES).size).toBe(AUDIO_CODEC_PREFIXES.length);
     expect([...AUDIO_CODEC_PREFIXES]).toEqual(['mp4a', 'opus', 'mp3', 'flac', 'vorbis']);
+  });
+});
+
+describe('webCodecsAacLcLeadingSamples — implementation-owned native AAC timing', () => {
+  const CHROMIUM_MAC_UA =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
+
+  it('publishes 2112 only for AAC-LC on the proven Chromium macOS route', () => {
+    expect(AAC_LC_ACCESS_UNIT_SAMPLES).toBe(1024);
+    expect(CHROMIUM_MAC_AAC_LC_LEADING_SAMPLES).toBe(2112);
+    expect(isAacLcCodecString('mp4a.40.2')).toBe(true);
+    expect(isAacLcCodecString('mp4a.40.02')).toBe(true);
+    expect(webCodecsAacLcLeadingSamples('mp4a.40.2', 'MacIntel', CHROMIUM_MAC_UA)).toBe(2112);
+  });
+
+  it('does not launder the macOS AAC fact into other codecs, platforms, or browser engines', () => {
+    expect(webCodecsAacLcLeadingSamples('mp4a.40.5', 'MacIntel', CHROMIUM_MAC_UA)).toBeUndefined();
+    expect(webCodecsAacLcLeadingSamples('mp4a.40.2', 'Win32', CHROMIUM_MAC_UA)).toBeUndefined();
+    expect(
+      webCodecsAacLcLeadingSamples(
+        'mp4a.40.2',
+        'MacIntel',
+        'Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15',
+      ),
+    ).toBeUndefined();
+    expect(webCodecsAacLcLeadingSamples('mp4a.40.2', undefined, undefined)).toBeUndefined();
   });
 });
 

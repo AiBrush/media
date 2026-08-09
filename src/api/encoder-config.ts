@@ -21,9 +21,9 @@ import {
   videoCodecToken,
 } from './codec-strings.ts';
 import type { AudioCodec, AudioTarget, PcmCodec, VideoCodec, VideoTarget } from './types.ts';
+import { qualityConstrainedEncoderRateConfig } from './video-quality-rate-config.ts';
 
 // ============ target validation against the resolved codec string ============
-
 /** VPx-alpha capability of the resolved encode codec string, or a typed miss for `alpha:'keep'`. */
 export function videoAlphaOption(
   target: VideoTarget,
@@ -62,7 +62,10 @@ export function assertTargetBitDepth(
 
 // ============ rate model (named constants + selection, §5 item 6) ============
 
-type EagerVideoRateTarget = Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>;
+type EagerVideoRateTarget = Pick<
+  VideoTarget,
+  'bitrate' | 'maxAverageBitrate' | 'quality' | 'bitrateMode' | 'crf' | 'twoPass'
+>;
 
 function assertPositiveFinite(name: string, value: number): void {
   if (!Number.isFinite(value) || value <= 0) {
@@ -76,7 +79,10 @@ function assertValidVideoBitrate(bitrate: number): void {
   }
 }
 
-function crfBounds(codec: VideoCodec | 'unknown'): { readonly min: number; readonly max: number } {
+function crfBounds(codec: VideoCodec | 'unknown'): {
+  readonly min: number;
+  readonly max: number;
+} {
   switch (codec) {
     case 'h264':
     case 'hevc':
@@ -152,21 +158,6 @@ export const EVIDENCE_BITRATE_HEADROOM = 2;
 export const EVIDENCE_BITRATE_FLOOR = 3_750_000;
 
 /**
- * Ordinary-cadence H.264 evidence floor in bits per output pixel per second. Chromium's realtime
- * encoder needs this density to keep a second-generation 720p scale above the independent SSIM gate;
- * source-rate projection remains authoritative whenever it is already higher.
- */
-export const H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND = 10;
-
-/**
- * High-cadence H.264 evidence floor in bits per output pixel per second. A source-rate projection
- * alone underbudgets 50/60 fps spatial transforms after generation loss; 20 bpp/s is the first shared
- * budget that keeps the independently decoded 60 fps corpus above the visual quality gate while
- * matching the 20 bpp/s no-evidence budget.
- */
-export const HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND = 20;
-
-/**
  * Cadence scale for high-fps AV1 output: temporal prediction makes bitrate sublinear in cadence, but a
  * 60 fps stream still needs more rate than the 30 fps-shaped default. `sqrt(fps/30)`, scale-up only,
  * capped at H.264's common budget (1/efficiency) rather than erasing AV1's efficiency advantage
@@ -179,6 +170,22 @@ function av1CadenceScale(codec: VideoCodec | 'unknown', frameRate: number | unde
   return Math.min(1 / VIDEO_CODEC_RATE_EFFICIENCY.av1, Math.sqrt(frameRate / CADENCE_BASELINE_FPS));
 }
 
+/** Codec-aware implicit quality budget for the output pixels, optionally shaped for cadence. */
+function implicitPixelBitrate(
+  codec: VideoCodec | 'unknown',
+  width: number,
+  height: number,
+  cadenceScale = 1,
+): number {
+  return Math.round(
+    width *
+      height *
+      IMPLICIT_BITS_PER_PIXEL_PER_SECOND *
+      VIDEO_CODEC_RATE_EFFICIENCY[codec] *
+      cadenceScale,
+  );
+}
+
 /**
  * Native realtime mode materially reduces ordinary-cadence AV1 and the measured ordinary-cadence
  * AV1→VP9 VOD path while retaining their generous implicit quality budgets. H.264 and every explicit
@@ -186,7 +193,10 @@ function av1CadenceScale(codec: VideoCodec | 'unknown', frameRate: number | unde
  * mode.
  */
 export function videoLatencyMode(
-  target: Pick<VideoTarget, 'bitrate' | 'bitrateMode' | 'crf' | 'twoPass'>,
+  target: Pick<
+    VideoTarget,
+    'bitrate' | 'maxAverageBitrate' | 'quality' | 'bitrateMode' | 'crf' | 'twoPass'
+  >,
   codec: VideoCodec | 'unknown',
   frameRate: number | undefined,
   sourceCodecString?: string,
@@ -216,7 +226,8 @@ export function videoLatencyMode(
  * The implicit output bitrate. Two paths, both golden-tested against hand-derived values:
  *   - **evidence-based** (source bitrate measured from the packet table + known source dims): scale the
  *     measured rate by spatial/temporal/codec-efficiency ratios, apply
- *     {@link EVIDENCE_BITRATE_HEADROOM}, floor at {@link EVIDENCE_BITRATE_FLOOR}, cap at `maximum`;
+ *     {@link EVIDENCE_BITRATE_HEADROOM}, floor at both {@link EVIDENCE_BITRATE_FLOOR} and the same
+ *     codec-aware output-pixel quality density as the planned path, cap at `maximum`;
  *   - **planned** (no evidence): {@link IMPLICIT_BITS_PER_PIXEL_PER_SECOND} bits/pixel/s scaled by
  *     {@link VIDEO_CODEC_RATE_EFFICIENCY} and the AV1 cadence scale, floored at
  *     {@link IMPLICIT_VIDEO_BITRATE_FLOOR}, capped at `maximum` (the level-table ceiling).
@@ -259,13 +270,12 @@ function defaultVideoBitrate(
     const evidenceBased = Math.round(
       sourceBitrate * spatialScale * temporalScale * codecScale * EVIDENCE_BITRATE_HEADROOM,
     );
-    const h264EvidenceDensity =
-      codec === 'h264'
-        ? frameRate !== undefined && frameRate > HIGH_CADENCE_FPS_THRESHOLD
-          ? HIGH_CADENCE_EVIDENCE_BITS_PER_PIXEL_PER_SECOND
-          : H264_EVIDENCE_BITS_PER_PIXEL_PER_SECOND
-        : 0;
-    const evidencePixelFloor = Math.round(width * height * h264EvidenceDensity);
+    const evidencePixelFloor = implicitPixelBitrate(
+      codec,
+      width,
+      height,
+      av1CadenceScale(codec, frameRate),
+    );
     return Math.min(
       maximum ?? Number.MAX_SAFE_INTEGER,
       Math.max(EVIDENCE_BITRATE_FLOOR, evidencePixelFloor, evidenceBased),
@@ -273,13 +283,7 @@ function defaultVideoBitrate(
   }
   const planned = Math.max(
     IMPLICIT_VIDEO_BITRATE_FLOOR,
-    Math.round(
-      width *
-        height *
-        IMPLICIT_BITS_PER_PIXEL_PER_SECOND *
-        VIDEO_CODEC_RATE_EFFICIENCY[codec] *
-        av1CadenceScale(codec, frameRate),
-    ),
+    implicitPixelBitrate(codec, width, height, av1CadenceScale(codec, frameRate)),
   );
   return maximum === undefined ? planned : Math.min(planned, maximum);
 }
@@ -302,6 +306,8 @@ function eagerVideoRateConfig(
   if (target.bitrate !== undefined && target.crf !== undefined) {
     throw new InputError('bitrate/CRF conflict');
   }
+  const qualityRateConfig = qualityConstrainedEncoderRateConfig(target, codec);
+  if (qualityRateConfig !== undefined) return qualityRateConfig;
   if (target.twoPass === true && target.bitrate === undefined) {
     throw new InputError('two-pass needs bitrate');
   }
@@ -451,7 +457,7 @@ function videoEncodePlan(
     height,
     frameRate,
     sourceCodecString,
-    rateControl.bitrate,
+    rateControl.bitrate ?? target.maxAverageBitrate,
     preserveSourceQualification,
   );
   assertSupportedVideoEncodeProfile(codec);

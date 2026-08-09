@@ -17,9 +17,17 @@
 import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
 import { parseAv1Codec } from '../../codecs/wasm-av1/av1.ts';
 import { parseVpxCodec } from '../../codecs/wasm-vpx/vpx.ts';
-import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
+import type {
+  MuxOptions,
+  MuxedTrackAudit,
+  Muxer,
+  Packet,
+  TrackInfo,
+} from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
+import { BUFFER_ALL_MAX_RETAINED_BYTES } from '../../internal/buffer-policy.ts';
 import { positionedChunk } from '../../sinks/stream-target.ts';
+import { throwIfSourceAborted } from '../../sources/abort.ts';
 import { parseEsds } from './codec-strings.ts';
 import { fragmentMp4 } from './fragment.ts';
 import type { MuxSampleInput, MuxTrackInput } from './write.ts';
@@ -28,6 +36,9 @@ import { type ContainerBrand, planReservedMp4ByteStreamLayout, writeMp4 } from '
 /** The MPEG 90 kHz media clock — the default video timescale (divides 24/25/30/50/60 fps exactly). */
 const DEFAULT_VIDEO_TIMESCALE = 90_000;
 const MICROS_PER_SECOND = 1_000_000;
+
+/** Every current MP4/MOV mux layout retains encoded payloads until `finalize()`. */
+export const MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES = BUFFER_ALL_MAX_RETAINED_BYTES;
 
 /**
  * A decoded view of one `EncodedChunk` in container-neutral terms — the pure input to the timing model.
@@ -132,6 +143,11 @@ const H264_NAL_TYPE_SPS = 7;
 const H264_NAL_TYPE_PPS = 8;
 const AVC_MAX_SPS_COUNT = 31;
 const AVC_MAX_PPS_COUNT = 255;
+/** Operational ceiling for per-access-unit framing evidence; independent of candidate byte length. */
+export const MP4_H264_MAX_NAL_UNITS_PER_ACCESS_UNIT = 65_536;
+/** Total SPS/PPS bytes inspected while synthesizing one avcC record. */
+export const MP4_H264_MAX_PARAMETER_SET_EVIDENCE_BYTES = 1024 * 1024;
+const H264_ABORT_SCAN_INTERVAL_BYTES = 64 * 1024;
 
 interface AvcPreparedSamples {
   readonly chunks: ChunkStruct[];
@@ -146,6 +162,9 @@ interface AacPreparedSamples {
 interface H264ParameterSets {
   readonly sps: Uint8Array[];
   readonly pps: Uint8Array[];
+  readonly spsByFingerprint: Map<string, Uint8Array[]>;
+  readonly ppsByFingerprint: Map<string, Uint8Array[]>;
+  evidenceBytes: number;
 }
 
 interface AacAdtsAccessUnit {
@@ -167,27 +186,62 @@ function startCodeLengthAt(data: Uint8Array, offset: number): 3 | 4 | undefined 
 function findStartCode(
   data: Uint8Array,
   from: number,
+  signal?: AbortSignal,
 ): { offset: number; length: 3 | 4 } | undefined {
-  for (let i = Math.max(0, from); i + 3 <= data.byteLength; i++) {
+  const start = Math.max(0, from);
+  let nextAbortCheck = start;
+  for (let i = start; i + 3 <= data.byteLength; i++) {
+    if (i >= nextAbortCheck) {
+      throwIfSourceAborted(signal);
+      nextAbortCheck = i + H264_ABORT_SCAN_INTERVAL_BYTES;
+    }
     const length = startCodeLengthAt(data, i);
     if (length !== undefined) return { offset: i, length };
   }
   return undefined;
 }
 
+function assertH264NalUnitEvidenceCapacity(count: number): void {
+  if (count <= MP4_H264_MAX_NAL_UNITS_PER_ACCESS_UNIT) return;
+  throw new CapabilityError('H.264 access unit exceeds the in-memory NAL-evidence limit', {
+    op: {
+      kind: 'route',
+      id: 'mp4-h264-access-unit-evidence',
+      facts: {
+        nalUnitCount: count,
+        maximumNalUnitsPerAccessUnit: MP4_H264_MAX_NAL_UNITS_PER_ACCESS_UNIT,
+      },
+    },
+    tried: ['mp4', 'mov'],
+    suggestion: 'use conventionally framed H.264 access units with fewer NAL units',
+  });
+}
+
 /** Split one Annex-B access unit into NAL unit payloads (start codes removed). */
-function annexBNalUnits(data: Uint8Array): Uint8Array[] | undefined {
-  const first = findStartCode(data, 0);
+function annexBNalUnits(data: Uint8Array, signal?: AbortSignal): Uint8Array[] | undefined {
+  const first = findStartCode(data, 0, signal);
   if (first === undefined) return undefined;
   const out: Uint8Array[] = [];
+  let startCodeCount = 1;
+  assertH264NalUnitEvidenceCapacity(startCodeCount);
   let payloadOffset = first.offset + first.length;
   for (;;) {
-    const next = findStartCode(data, payloadOffset);
+    throwIfSourceAborted(signal);
+    const next = findStartCode(data, payloadOffset, signal);
     let payloadEnd = next?.offset ?? data.byteLength;
     // Annex-B permits zero_byte/trailing_zero_8bits before the next start code; those are not NAL payload.
-    while (payloadEnd > payloadOffset && data[payloadEnd - 1] === 0) payloadEnd--;
+    let nextAbortCheck = payloadEnd;
+    while (payloadEnd > payloadOffset && data[payloadEnd - 1] === 0) {
+      if (payloadEnd <= nextAbortCheck) {
+        throwIfSourceAborted(signal);
+        nextAbortCheck = payloadEnd - H264_ABORT_SCAN_INTERVAL_BYTES;
+      }
+      payloadEnd--;
+    }
     if (payloadEnd > payloadOffset) out.push(data.subarray(payloadOffset, payloadEnd));
     if (next === undefined) break;
+    startCodeCount++;
+    assertH264NalUnitEvidenceCapacity(startCodeCount);
     payloadOffset = next.offset + next.length;
   }
   return out.length > 0 ? out : undefined;
@@ -204,17 +258,79 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-function pushUniqueParameterSet(out: Uint8Array[], nal: Uint8Array): void {
-  if (out.some((item) => equalBytes(item, nal))) return;
-  out.push(nal.slice());
+function parameterSetFingerprint(nal: Uint8Array): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (const byte of nal) {
+    first = Math.imul(first ^ byte, 0x01000193) >>> 0;
+    second = Math.imul(second ^ byte, 0x85ebca6b) >>> 0;
+  }
+  return `${nal.byteLength}:${first}:${second}`;
+}
+
+function pushUniqueParameterSet(
+  out: Uint8Array[],
+  byFingerprint: Map<string, Uint8Array[]>,
+  nal: Uint8Array,
+  kind: 'SPS' | 'PPS',
+  maximumCount: number,
+  sets: H264ParameterSets,
+): void {
+  assertParameterSetLength(kind, nal);
+  const fingerprint = parameterSetFingerprint(nal);
+  const matches = byFingerprint.get(fingerprint);
+  if (matches?.some((item) => equalBytes(item, nal)) === true) return;
+  if (out.length >= maximumCount) {
+    throw new MediaError(
+      'mux-error',
+      `too many H.264 ${kind} parameter sets for avcC (maximum ${maximumCount})`,
+    );
+  }
+  const evidenceBytes = sets.evidenceBytes + nal.byteLength;
+  if (
+    !Number.isSafeInteger(evidenceBytes) ||
+    evidenceBytes > MP4_H264_MAX_PARAMETER_SET_EVIDENCE_BYTES
+  ) {
+    throw new CapabilityError('H.264 parameter sets exceed the in-memory avcC-evidence limit', {
+      op: {
+        kind: 'route',
+        id: 'mp4-h264-access-unit-evidence',
+        facts: {
+          parameterSetEvidenceBytes: evidenceBytes,
+          maximumParameterSetEvidenceBytes: MP4_H264_MAX_PARAMETER_SET_EVIDENCE_BYTES,
+        },
+      },
+      tried: ['mp4', 'mov'],
+      suggestion: 'provide an avcC description or smaller H.264 parameter-set evidence',
+    });
+  }
+  const copy = nal.slice();
+  sets.evidenceBytes = evidenceBytes;
+  out.push(copy);
+  if (matches === undefined) byFingerprint.set(fingerprint, [copy]);
+  else matches.push(copy);
 }
 
 function collectParameterSets(nalus: readonly Uint8Array[], sets: H264ParameterSets): void {
   for (const nal of nalus) {
     const type = h264NalType(nal);
-    if (type === H264_NAL_TYPE_SPS) pushUniqueParameterSet(sets.sps, nal);
-    else if (type === H264_NAL_TYPE_PPS) pushUniqueParameterSet(sets.pps, nal);
+    if (type !== H264_NAL_TYPE_SPS && type !== H264_NAL_TYPE_PPS) continue;
+    if (type === H264_NAL_TYPE_SPS) {
+      pushUniqueParameterSet(sets.sps, sets.spsByFingerprint, nal, 'SPS', AVC_MAX_SPS_COUNT, sets);
+    } else {
+      pushUniqueParameterSet(sets.pps, sets.ppsByFingerprint, nal, 'PPS', AVC_MAX_PPS_COUNT, sets);
+    }
   }
+}
+
+function emptyH264ParameterSets(): H264ParameterSets {
+  return {
+    sps: [],
+    pps: [],
+    spsByFingerprint: new Map(),
+    ppsByFingerprint: new Map(),
+    evidenceBytes: 0,
+  };
 }
 
 function writeU16(out: number[], value: number): void {
@@ -475,13 +591,17 @@ function synthesizeRawBoxDescription(t: TrackState): Uint8Array | undefined {
  * the `avcC` `description`, the chunks are by definition length-prefixed; we verify that structurally here
  * and pass them through verbatim, only treating a chunk as Annex-B if it does NOT parse as length-prefixed.
  */
-function isLengthPrefixedAvc(data: Uint8Array, lengthSize: number): boolean {
+function isLengthPrefixedAvc(data: Uint8Array, lengthSize: number, signal?: AbortSignal): boolean {
   let pos = 0;
   let sawNal = false;
+  let nalUnitCount = 0;
   while (pos + lengthSize <= data.byteLength) {
+    throwIfSourceAborted(signal);
     let len = 0;
     for (let i = 0; i < lengthSize; i++) len = len * 256 + (data[pos + i] as number);
     if (len === 0) return false; // a zero-length NAL never occurs in a valid avcC AU
+    nalUnitCount++;
+    assertH264NalUnitEvidenceCapacity(nalUnitCount);
     pos += lengthSize + len;
     sawNal = true;
     if (pos > data.byteLength) return false; // a length overran the buffer ⇒ not length-prefixed
@@ -489,28 +609,44 @@ function isLengthPrefixedAvc(data: Uint8Array, lengthSize: number): boolean {
   return sawNal && pos === data.byteLength; // consumed the buffer exactly ⇒ well-formed avcC AU
 }
 
-function prepareAvcSamples(
-  chunks: readonly ChunkStruct[],
+type AvcAccessUnitClassification =
+  | { readonly kind: 'passthrough' }
+  | { readonly kind: 'annex-b'; readonly nalus: readonly Uint8Array[] };
+
+/** One source of truth for the AVC framing decision used by both final muxing and pre-publication audit. */
+function classifyAvcAccessUnit(
+  data: Uint8Array,
   description: Uint8Array | undefined,
-): AvcPreparedSamples {
-  const sets: H264ParameterSets = { sps: [], pps: [] };
-  let sawAnnexB = false;
-  // With an `avcC` description, NAL length size = (lengthSizeMinusOne & 3) + 1 (byte 4 of avcC); default 4.
-  const lengthSize =
-    description !== undefined && description.byteLength > 4
-      ? ((description[4] as number) & 0x03) + 1
-      : AVC_NAL_LENGTH_SIZE;
-  const normalized = chunks.map((chunk): ChunkStruct => {
-    // An `avcC`-described chunk that already parses as length-prefixed is passed through verbatim — never
-    // run through the Annex-B start-code scan, which would mis-split a length prefix containing `00 00 01`.
-    if (description !== undefined && isLengthPrefixedAvc(chunk.data, lengthSize)) return chunk;
-    const nalus = annexBNalUnits(chunk.data);
-    if (nalus === undefined) return chunk;
-    sawAnnexB = true;
-    collectParameterSets(nalus, sets);
-    return copyChunkWithData(chunk, lengthPrefixedAvcAccessUnit(nalus));
-  });
-  if (description !== undefined) return { chunks: normalized, description };
+  lengthSize: number,
+  signal?: AbortSignal,
+): AvcAccessUnitClassification {
+  if (description !== undefined && isLengthPrefixedAvc(data, lengthSize, signal)) {
+    return { kind: 'passthrough' };
+  }
+  const nalus = annexBNalUnits(data, signal);
+  return nalus === undefined ? { kind: 'passthrough' } : { kind: 'annex-b', nalus };
+}
+
+function lengthPrefixedAvcAccessUnitByteLength(nalus: readonly Uint8Array[]): number {
+  let byteLength = 0;
+  for (const nal of nalus) {
+    if (nal.byteLength === 0) {
+      throw new MediaError('mux-error', 'empty H.264 NAL in Annex-B access unit');
+    }
+    byteLength += AVC_NAL_LENGTH_SIZE + nal.byteLength;
+    if (!Number.isSafeInteger(byteLength)) {
+      throw new MediaError('mux-error', 'H.264 access-unit size exceeds safe integer accounting');
+    }
+  }
+  return byteLength;
+}
+
+function resolvedAvcDescription(
+  description: Uint8Array | undefined,
+  sawAnnexB: boolean,
+  sets: H264ParameterSets,
+): Uint8Array {
+  if (description !== undefined) return description;
   if (!sawAnnexB) {
     throw new CapabilityError(
       'H.264 MP4 muxing requires avcC description or Annex-B access units with SPS/PPS',
@@ -520,7 +656,28 @@ function prepareAvcSamples(
       },
     );
   }
-  return { chunks: normalized, description: avcCFromParameterSets(sets) };
+  return avcCFromParameterSets(sets);
+}
+
+function prepareAvcSamples(
+  chunks: readonly ChunkStruct[],
+  description: Uint8Array | undefined,
+): AvcPreparedSamples {
+  const sets = emptyH264ParameterSets();
+  let sawAnnexB = false;
+  // With an `avcC` description, NAL length size = (lengthSizeMinusOne & 3) + 1 (byte 4 of avcC); default 4.
+  const lengthSize =
+    description !== undefined && description.byteLength > 4
+      ? ((description[4] as number) & 0x03) + 1
+      : AVC_NAL_LENGTH_SIZE;
+  const normalized = chunks.map((chunk): ChunkStruct => {
+    const classification = classifyAvcAccessUnit(chunk.data, description, lengthSize);
+    if (classification.kind === 'passthrough') return chunk;
+    sawAnnexB = true;
+    if (description === undefined) collectParameterSets(classification.nalus, sets);
+    return copyChunkWithData(chunk, lengthPrefixedAvcAccessUnit(classification.nalus));
+  });
+  return { chunks: normalized, description: resolvedAvcDescription(description, sawAnnexB, sets) };
 }
 
 function parseAdtsAccessUnit(data: Uint8Array): AacAdtsAccessUnit | undefined {
@@ -900,7 +1057,7 @@ export interface TrackState {
   readonly colr: MuxTrackInput['colr'];
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
-  readonly gapless: TrackInfo['gapless'];
+  gapless: TrackInfo['gapless'];
   readonly chunks: ChunkStruct[];
 }
 
@@ -1037,6 +1194,143 @@ export function trackStateFrom(info: TrackInfo): TrackState {
   };
 }
 
+/**
+ * Project one H.264 candidate through the exact buffered MP4/MOV sample preparation used at finalize.
+ * The iterable lets browser callers copy/inspect one sealed EncodedVideoChunk at a time rather than
+ * materializing a second whole-candidate byte array. Payload framing shares {@link classifyAvcAccessUnit};
+ * timing shares {@link buildMuxSamples} and the exact fps-derived track timescale from {@link trackStateFrom}.
+ */
+export function auditMp4H264MuxedTrack(
+  info: TrackInfo,
+  chunks: Iterable<ChunkStruct>,
+  options?: MuxOptions,
+  signal?: AbortSignal,
+): MuxedTrackAudit {
+  throwIfSourceAborted(signal);
+  const state = trackStateFrom(info);
+  if (state.mediaType !== 'video' || state.sampleEntryType !== 'avc1') {
+    throw new CapabilityError('MP4 H.264 candidate audit requires one AVC video track', {
+      op: {
+        kind: 'route',
+        id: 'h264-quality-output-audit',
+        facts: { mediaType: state.mediaType, sampleEntryType: state.sampleEntryType },
+      },
+      tried: ['mp4', 'mov'],
+    });
+  }
+
+  const sets = emptyH264ParameterSets();
+  let sawAnnexB = false;
+  let elementaryPayloadBytes = 0;
+  const preparedSampleByteLengths: number[] = [];
+  const timingChunks: ChunkStruct[] = [];
+  const emptySampleData = new Uint8Array(0);
+  const description = state.description;
+  const lengthSize =
+    description !== undefined && description.byteLength > 4
+      ? ((description[4] as number) & 0x03) + 1
+      : AVC_NAL_LENGTH_SIZE;
+
+  for (const chunk of chunks) {
+    throwIfSourceAborted(signal);
+    const classification = classifyAvcAccessUnit(chunk.data, description, lengthSize, signal);
+    let preparedByteLength = chunk.data.byteLength;
+    if (classification.kind === 'annex-b') {
+      sawAnnexB = true;
+      if (description === undefined) collectParameterSets(classification.nalus, sets);
+      preparedByteLength = lengthPrefixedAvcAccessUnitByteLength(classification.nalus);
+    }
+    elementaryPayloadBytes += preparedByteLength;
+    if (!Number.isSafeInteger(elementaryPayloadBytes)) {
+      throw new MediaError('mux-error', 'H.264 candidate payload exceeds safe integer accounting');
+    }
+    preparedSampleByteLengths.push(preparedByteLength);
+    timingChunks.push({
+      timestampUs: chunk.timestampUs,
+      durationUs: chunk.durationUs,
+      key: chunk.key,
+      data: emptySampleData,
+      ...(chunk.dtsUs !== undefined ? { dtsUs: chunk.dtsUs } : {}),
+    });
+  }
+  throwIfSourceAborted(signal);
+
+  const sampleCount = timingChunks.length;
+  if (sampleCount === 0 || elementaryPayloadBytes <= 0) {
+    throw new MediaError('mux-error', 'H.264 candidate audit requires positive sample evidence');
+  }
+  // Perform the same final framing validation as prepareAvcSamples even though the audit needs only sizes.
+  resolvedAvcDescription(description, sawAnnexB, sets);
+  const samples = buildMuxSamples(timingChunks, state.timescale);
+  if (samples.length !== sampleCount) {
+    throw new MediaError('mux-error', 'H.264 candidate audit lost MP4 sample evidence');
+  }
+
+  let dtsTicks = 0;
+  let minimumPtsTicks = Number.POSITIVE_INFINITY;
+  for (const sample of samples) {
+    const ptsTicks = dtsTicks + sample.cttsTicks;
+    if (ptsTicks < minimumPtsTicks) minimumPtsTicks = ptsTicks;
+    dtsTicks += sample.durationTicks;
+  }
+  if (!Number.isFinite(minimumPtsTicks)) {
+    throw new MediaError('mux-error', 'H.264 candidate audit has no presentation origin');
+  }
+  const ticksToUs = (value: number): number =>
+    Math.round((value * MICROS_PER_SECOND) / state.timescale);
+  let minimumPtsUs = Number.POSITIVE_INFINITY;
+  let maximumEndUs = Number.NEGATIVE_INFINITY;
+  dtsTicks = 0;
+  for (const sample of samples) {
+    // Progressive MP4 neutral demux rebases the complete sample table in ticks. Fragmented neutral demux
+    // reads each trun/tfdt PTS first and the rate oracle subtracts the rounded-µs minimum afterward.
+    const ptsTicks = dtsTicks + sample.cttsTicks;
+    const ptsUs = ticksToUs(options?.fragmented === true ? ptsTicks : ptsTicks - minimumPtsTicks);
+    const durationUs = ticksToUs(sample.durationTicks);
+    if (durationUs <= 0) {
+      throw new MediaError('mux-error', 'H.264 candidate duration vanishes at the MP4 timescale');
+    }
+    if (ptsUs < minimumPtsUs) minimumPtsUs = ptsUs;
+    const endUs = ptsUs + durationUs;
+    if (endUs > maximumEndUs) maximumEndUs = endUs;
+    dtsTicks += sample.durationTicks;
+  }
+  const presentationSpanUs = maximumEndUs - minimumPtsUs;
+  if (!Number.isSafeInteger(presentationSpanUs) || presentationSpanUs <= 0) {
+    throw new MediaError('mux-error', 'H.264 candidate MP4 presentation span is not representable');
+  }
+  return Object.freeze({
+    elementaryPayloadBytes,
+    preparedSampleByteLengths: Object.freeze(preparedSampleByteLengths),
+    presentationSpanUs,
+    sampleCount,
+  });
+}
+
+/** ContainerDriver capability implementation over the same sealed-packet seam as {@link Mp4Muxer.write}. */
+export function auditMp4H264MuxedPackets(
+  info: TrackInfo,
+  packets: Iterable<Packet>,
+  options?: MuxOptions,
+  signal?: AbortSignal,
+): MuxedTrackAudit {
+  const chunks: Iterable<ChunkStruct> = {
+    *[Symbol.iterator](): Iterator<ChunkStruct> {
+      for (const packet of packets) {
+        const chunk = packet.chunk;
+        yield {
+          timestampUs: chunk.timestamp,
+          durationUs: chunk.duration ?? undefined,
+          key: chunk.type === 'key',
+          data: packetBytes(packet),
+          ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
+        };
+      }
+    },
+  };
+  return auditMp4H264MuxedTrack(info, chunks, options, signal);
+}
+
 interface GaplessMuxLayout {
   samples: MuxSampleInput[];
   edit?: MuxTrackInput['edit'];
@@ -1076,13 +1370,13 @@ function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): Ga
   const leadingSamples =
     t.gapless.leadingSamples !== undefined &&
     Number.isFinite(t.gapless.leadingSamples) &&
-    t.gapless.leadingSamples > 0
+    t.gapless.leadingSamples >= 0
       ? t.gapless.leadingSamples
       : undefined;
   const trailingSamples =
     t.gapless.trailingSamples !== undefined &&
     Number.isFinite(t.gapless.trailingSamples) &&
-    t.gapless.trailingSamples > 0
+    t.gapless.trailingSamples >= 0
       ? t.gapless.trailingSamples
       : undefined;
   const declaredTotalSamples =
@@ -1113,7 +1407,15 @@ function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): Ga
   const mediaTimeTicks = Math.min(Math.max(0, requestedMediaTime), maxMediaTime);
   const targetDurationTicks = mediaTimeTicks + durationTicks;
   return {
-    samples: clampSamplesToDuration(samples, targetDurationTicks),
+    // Source-proven gapless facts describe a presentation window over an already-authored coded
+    // timeline. Preserve every coded access unit and express its leading/trailing trim exclusively
+    // through `elst`; shortening the last sample here mutates packet-copy timing. Destination
+    // encoder timing has no basis and may still need its excess coded tail bounded to the declared
+    // submitted program window.
+    samples:
+      t.gapless.basis === undefined
+        ? clampSamplesToDuration(samples, targetDurationTicks)
+        : [...samples],
     edit: { mediaTimeTicks, durationTicks },
   };
 }
@@ -1151,6 +1453,15 @@ export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
     ...(muxEdit !== undefined ? { edit: muxEdit } : {}),
+    // A newly encoded AAC stream has destination priming that must be declared explicitly; `elst`
+    // selects its program window and `roll` prevents readers from applying a historical implicit delay.
+    // A packet-copied MP4 edit list is source metadata, not proof that we may invent a new roll group.
+    ...(gaplessLayout.edit !== undefined &&
+    t.config.kind === 'esds-from-description' &&
+    t.gapless?.basis !== 'mp4-edit-list' &&
+    (t.gapless?.leadingSamples ?? 0) > 0
+      ? { rollDistance: -1 }
+      : {}),
   };
   if (t.config.kind === 'raw-box') {
     const description = prepared.description ?? synthesizeRawBoxDescription(t);
@@ -1188,13 +1499,15 @@ export class Mp4Muxer implements Muxer {
   readonly #maximumPacketCount: number | undefined;
   readonly #fragmented: boolean;
   readonly #brand: ContainerBrand;
+  readonly #driverId: 'mp4' | 'mp4-mux';
   #nextId = 1;
+  #bufferedPayloadBytes = 0;
   #finalized = false;
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   readonly #ready: Promise<void>;
   #resolveReady: (() => void) | undefined;
 
-  constructor(options?: MuxOptions) {
+  constructor(options?: MuxOptions, driverId: 'mp4' | 'mp4-mux' = 'mp4') {
     // Fragmented/CMAF output (ADR-034): finalize emits an init segment + one media segment per fragment
     // via {@link fragmentMp4}, instead of the single faststart `moov`+`mdat` from {@link writeMp4}.
     this.#fragmented = options?.fragmented === true;
@@ -1220,6 +1533,7 @@ export class Mp4Muxer implements Muxer {
       );
     }
     this.#brand = options?.container === 'mov' || options?.container === 'qt' ? 'mov' : 'mp4';
+    this.#driverId = driverId;
     this.#ready = new Promise<void>((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -1238,6 +1552,19 @@ export class Mp4Muxer implements Muxer {
     return id;
   }
 
+  /** Attach destination encoder timing learned after the encoded stream drained, before finalization. */
+  setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+    this.#assertOpen();
+    const track = this.#tracks.get(trackId);
+    if (track === undefined) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    if (track.mediaType !== 'audio') {
+      throw new MediaError('mux-error', `set gapless timing on non-audio track ${trackId}`);
+    }
+    track.gapless = { ...gapless };
+  }
+
   /**
    * Buffer one encoded packet on its track (decode = arrival order). Extracting the bytes/timing from a
    * real `EncodedVideoChunk`/`EncodedAudioChunk` (`copyTo`) is the only browser-only step (guarded); the
@@ -1246,6 +1573,9 @@ export class Mp4Muxer implements Muxer {
   write(trackId: number, packet: Packet): Promise<void> {
     /* v8 ignore start -- requires a real WebCodecs Encoded*Chunk; validated under browser-mode (Phase 1) */
     const chunk = packet.chunk;
+    // Check the logical encoded size before `packetBytes` allocates and calls `copyTo`. The shared
+    // addChunkStruct path repeats this admission check immediately before committing the retained view.
+    this.#assertChunkAdmission(trackId, chunk.byteLength);
     const data = packetBytes(packet);
     this.addChunkStruct(trackId, {
       timestampUs: chunk.timestamp,
@@ -1264,6 +1594,18 @@ export class Mp4Muxer implements Muxer {
    * timing + serialization are fully validated without WebCodecs.
    */
   addChunkStruct(trackId: number, chunk: ChunkStruct): void {
+    const { track, nextBufferedPayloadBytes } = this.#assertChunkAdmission(
+      trackId,
+      chunk.data.byteLength,
+    );
+    track.chunks.push(chunk);
+    this.#bufferedPayloadBytes = nextBufferedPayloadBytes;
+  }
+
+  #assertChunkAdmission(
+    trackId: number,
+    incomingPayloadBytes: number,
+  ): { readonly track: TrackState; readonly nextBufferedPayloadBytes: number } {
     this.#assertOpen();
     const track = this.#tracks.get(trackId);
     if (track === undefined) {
@@ -1278,7 +1620,26 @@ export class Mp4Muxer implements Muxer {
         `[MP4_FASTSTART_RESERVE_PACKET_OVERFLOW] track ${trackId} exceeds maximumPacketCount ${this.#maximumPacketCount}`,
       );
     }
-    track.chunks.push(chunk);
+    const nextBufferedPayloadBytes = this.#bufferedPayloadBytes + incomingPayloadBytes;
+    if (
+      !Number.isSafeInteger(nextBufferedPayloadBytes) ||
+      nextBufferedPayloadBytes > MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES
+    ) {
+      throw new CapabilityError('MP4 buffered mux payload exceeds the in-memory buffer-all limit', {
+        op: {
+          kind: 'route',
+          id: 'mp4-buffer-all-payload',
+          facts: {
+            bufferedPayloadBytes: this.#bufferedPayloadBytes,
+            incomingPayloadBytes,
+            maximumBufferedPayloadBytes: MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES,
+          },
+        },
+        tried: [this.#driverId],
+        suggestion: 'lower the duration or bitrate, or route to an incremental MP4 muxer',
+      });
+    }
+    return { track, nextBufferedPayloadBytes };
   }
 
   async finalize(): Promise<void> {

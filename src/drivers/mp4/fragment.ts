@@ -171,6 +171,26 @@ function sampleEntry(track: FragmentInitTrackInput): number[] {
   return track.mediaType === 'video' ? videoSampleEntry(track) : audioSampleEntry(track);
 }
 
+function assertRollDistance(distance: number): void {
+  if (!Number.isInteger(distance) || distance < -0x8000 || distance > 0x7fff) {
+    throw new MediaError('mux-error', `roll distance ${distance} is outside signed 16-bit range`);
+  }
+}
+
+/** Track-level `roll` description; fragment-local `sbgp` boxes below map each run to this entry. */
+function rollSampleGroupDescription(track: FragmentInitTrackInput): number[] {
+  const distance = track.rollDistance;
+  if (distance === undefined) return [];
+  assertRollDistance(distance);
+  return full('sgpd', 1, 0, cat(fourcc('roll'), u32(2), u32(1), u16(distance)));
+}
+
+function rollSampleToGroup(distance: number | undefined, sampleCount: number): number[] {
+  if (distance === undefined) return [];
+  assertRollDistance(distance);
+  return full('sbgp', 0, 0, cat(fourcc('roll'), u32(1), u32(sampleCount), u32(1)));
+}
+
 function tkhdDisplayFields(track: FragmentInitTrackInput): number[] {
   const raw = track.displayTransform;
   const matrix =
@@ -198,6 +218,7 @@ function emptyStbl(track: FragmentInitTrackInput): number[] {
     'stbl',
     cat(
       full('stsd', 0, 0, cat(u32(1), sampleEntry(track))),
+      rollSampleGroupDescription(track),
       full('stts', 0, 0, u32(0)),
       full('stsc', 0, 0, u32(0)),
       full('stsz', 0, 0, cat(u32(0), u32(0))),
@@ -388,6 +409,7 @@ function buildTraf(
   trackId: number,
   samples: readonly MuxSampleInput[],
   baseDecodeTime: number,
+  rollDistance?: number,
 ): TrafResult {
   const tfhd = full(
     'tfhd',
@@ -415,13 +437,14 @@ function buildTraf(
     if (useCto) pushS32(payload, s.cttsTicks);
   }
   const trun = full('trun', version, flags, payload);
+  const rollGroup = rollSampleToGroup(rollDistance, samples.length);
 
-  const trafChildren = cat(tfhd, tfdt, trun);
+  const trafChildren = cat(tfhd, tfdt, rollGroup, trun);
   const traf = box('traf', trafChildren);
 
   // data_offset position inside `traf`: 8 (traf hdr) + tfhd.len + tfdt.len + [8 trun hdr + 4 ver/flags]
   // + 4 (sample_count) → then the placeholder. Compute from the actual emitted lengths.
-  const trunStart = 8 + tfhd.length + tfdt.length;
+  const trunStart = 8 + tfhd.length + tfdt.length + rollGroup.length;
   const dataOffsetPos = trunStart + 12 + dataOffsetPayloadPos;
   return { bytes: traf, dataOffsetPos };
 }
@@ -431,6 +454,8 @@ export interface SegmentTrackRun {
   trackId: number;
   samples: readonly MuxSampleInput[];
   baseDecodeTime: number;
+  /** Maps this fragment run to the track-level `roll` group description. */
+  rollDistance?: number;
 }
 
 /** Patch a fixed-width s32 in-place inside a byte array (big-endian). */
@@ -454,7 +479,9 @@ export function buildMediaSegment(
   const mfhd = full('mfhd', 0, 0, u32(sequenceNumber));
 
   // Build each traf; its `data_offset` placeholder is patched once the moof + mdat layout is known.
-  const trafs = runs.map((run) => buildTraf(run.trackId, run.samples, run.baseDecodeTime));
+  const trafs = runs.map((run) =>
+    buildTraf(run.trackId, run.samples, run.baseDecodeTime, run.rollDistance),
+  );
 
   const moofPayloadLen = mfhd.length + trafs.reduce((a, t) => a + t.bytes.length, 0);
   const moofLen = 8 + moofPayloadLen; // + box header
@@ -589,7 +616,13 @@ export function* fragmentMp4(
       if (run === undefined || run.length === 0) continue;
       cursors[ti] = (cursors[ti] ?? 0) + 1;
       const base = baseDts[ti] ?? 0;
-      runs.push({ trackId: ti + 1, samples: run, baseDecodeTime: base });
+      const rollDistance = tracks[ti]?.rollDistance;
+      runs.push({
+        trackId: ti + 1,
+        samples: run,
+        baseDecodeTime: base,
+        ...(rollDistance !== undefined ? { rollDistance } : {}),
+      });
       // Advance this track's DTS by the run's total duration (decode-order, contiguous).
       let dur = 0;
       for (const s of run) dur += s.durationTicks;

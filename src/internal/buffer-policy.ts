@@ -1,0 +1,20 @@
+/**
+ * Shared operational ceiling for product paths that retain a complete media payload in memory.
+ *
+ * One GiB is deliberately below any structural `Uint8Array` limit: buffer-all paths keep source,
+ * packet metadata, mux state, and publication buffers live at the same time. Callers that can prove an
+ * incremental representation may bypass this policy; callers that retain every payload byte may not.
+ */
+export const BUFFER_ALL_MAX_RETAINED_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Portable planning ceiling for a single output `ArrayBuffer`.
+ *
+ * ISO BMFF can describe almost 4 GiB with version-0 box sizes, but browser allocators do not promise
+ * that a contiguous allocation near that structural maximum is available. Keep projections within a
+ * signed 31-bit byte index and reserve separate headroom for MP4 sample tables and box framing.
+ */
+export const SAFE_SINGLE_ARRAY_BUFFER_BYTES = 0x7fffffff;
+
+/** Conservative non-payload allowance used by the finite MP4/MOV convert projection. */
+export const MP4_PROJECTED_CONTAINER_HEADROOM_BYTES = 64 * 1024 * 1024;

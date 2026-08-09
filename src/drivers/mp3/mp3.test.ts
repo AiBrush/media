@@ -145,11 +145,44 @@ describe('probe MP3 on the real corpus', () => {
     const tracks = await Mp3Driver.probe?.(await fixtureSource('sound_5.mp3'));
     expect(tracks?.[0]?.durationSec).toBeCloseTo(110_255 / 22_050, 12);
     expect(tracks?.[0]?.gapless).toEqual({
-      leadingSamples: 576,
-      trailingSamples: 913,
+      basis: 'mp3-xing-lame',
+      leadingSamples: 1_105,
+      trailingSamples: 384,
       totalSamples: 110_255,
+      mp3Lame: { encoderDelaySamples: 576, encoderPaddingSamples: 913 },
     });
   });
+
+  it.each([
+    ['mp3_xing.mp3', 1_105, 263, 441_000],
+    ['01.mp3', 1_105, 687, 101_888],
+    ['02.mp3', 1_105, 687, 622_592],
+    ['03.mp3', 1_105, 831, 606_320],
+  ] as const)(
+    '%s exposes the decoded program window after Layer III synthesis delay',
+    async (file, leadingSamples, trailingSamples, totalSamples) => {
+      const bytes = new Uint8Array(
+        await readFile(
+          new URL(
+            `../../../../media-test/fixtures/media/scenarios/transcode/mp3_to_aac_mp4/${file}`,
+            import.meta.url,
+          ),
+        ),
+      );
+      const info = parseMp3(bytes, bytes.byteLength);
+      expect(info.gapless).toEqual({
+        basis: 'mp3-xing-lame',
+        leadingSamples,
+        trailingSamples,
+        totalSamples,
+        mp3Lame: {
+          encoderDelaySamples: 576,
+          encoderPaddingSamples: trailingSamples + 529,
+        },
+      });
+      expect(info.durationSec).toBeCloseTo(totalSamples / info.sampleRate, 12);
+    },
+  );
 
   it('metadata-only probe range-reads one bounded head for known-size sources', async () => {
     const bytes = await loadFixture('sound_5.mp3');

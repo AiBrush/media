@@ -60,6 +60,7 @@ const ID = {
   CRC32: 0xbf,
   Void: 0xec,
   Segment: 0x18538067,
+  SeekHead: 0x114d9b74,
   Info: 0x1549a966,
   TimecodeScale: 0x2ad7b1,
   Duration: 0x4489,
@@ -98,6 +99,9 @@ const ID = {
   CodecDelay: 0x56aa,
   SeekPreRoll: 0x56bb,
   Attachments: 0x1941a469,
+  Chapters: 0x1043a770,
+  Tags: 0x1254c367,
+  Cues: 0x1c53bb6b,
   AttachedFile: 0x61a7,
   FileName: 0x466e,
   FileMimeType: 0x4660,
@@ -1080,7 +1084,7 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
   const blockTimes = new Map<number, BlockTiming>(); // TrackNumber → block-timing, for fps fallback
   const firstKeyframes = new Map<number, Uint8Array>();
   let keyframeTrackNumbers: readonly number[] = [];
-  for (const el of elements(dv, segment.dataStart, segment.dataEnd)) {
+  for (const el of segmentElements(dv, segment, false)) {
     if (el.id === ID.Info) {
       for (const c of elements(dv, el.dataStart, el.dataEnd)) {
         if (c.id === ID.TimecodeScale) timecodeScale = readUint(dv, c);
@@ -1201,29 +1205,82 @@ export interface WebmPacketPayloadInfoTable {
  * Yield the complete top-level Segment walk while validating each finite element. `elements()`
  * intentionally stops at an invalid vint so bounded metadata probes can retry with a larger prefix; a
  * full-file demux cannot treat that stop as EOF because doing so accepts a destroyed late element header
- * after otherwise usable Clusters. Unknown-size Clusters remain legal and consume the enclosing remainder.
+ * after otherwise usable Clusters. Unknown-size Clusters remain legal and end at the next Segment-level
+ * sibling when a streaming author writes consecutive clusters.
  */
-function* completeSegmentElements(dv: DataView, segment: EbmlElement): Generator<EbmlElement> {
+const SEGMENT_LEVEL_IDS = new Set<number>([
+  ID.SeekHead,
+  ID.Info,
+  ID.Tracks,
+  ID.Cluster,
+  ID.Cues,
+  ID.Attachments,
+  ID.Chapters,
+  ID.Tags,
+]);
+
+/**
+ * Resolve an unknown-size Cluster's end at the next element that is valid only at Segment level.
+ * MediaRecorder commonly writes several consecutive unknown-size Clusters. EBML's generic iterator
+ * cannot infer element levels, so treating the first Cluster as the Segment remainder silently drops
+ * every later GOP. Walking complete child headers keeps payload bytes opaque and makes the boundary
+ * standards-derived rather than a byte-pattern scan.
+ */
+function unknownClusterEnd(dv: DataView, start: number, limit: number): number {
+  let offset = start;
+  while (offset < limit) {
+    const id = readVint(dv, offset, true);
+    if (id === undefined) return limit;
+    if (SEGMENT_LEVEL_IDS.has(id.value)) return offset;
+    const size = readVint(dv, offset + id.length, false);
+    if (size === undefined) return limit;
+    const dataStart = offset + id.length + size.length;
+    if (size.value < 0 || dataStart > limit) return limit;
+    const dataEnd = dataStart + size.value;
+    if (!Number.isSafeInteger(dataEnd) || dataEnd <= offset || dataEnd > limit) return limit;
+    offset = dataEnd;
+  }
+  return limit;
+}
+
+/** Iterate Segment-level elements, including consecutive unknown-size MediaRecorder Clusters. */
+function* segmentElements(
+  dv: DataView,
+  segment: EbmlElement,
+  strict: boolean,
+): Generator<EbmlElement> {
   if (!segment.complete && !segment.unknownSize) {
-    throw new MediaError('demux-error', 'WebM Segment is truncated');
+    if (strict) throw new MediaError('demux-error', 'WebM Segment is truncated');
   }
 
   let offset = segment.dataStart;
   while (offset < segment.dataEnd) {
     const id = readVint(dv, offset, true);
     if (id === undefined) {
-      throw new MediaError('demux-error', `invalid EBML element id at Segment offset ${offset}`);
+      if (strict) {
+        throw new MediaError('demux-error', `invalid EBML element id at Segment offset ${offset}`);
+      }
+      return;
     }
     const size = readVint(dv, offset + id.length, false);
     if (size === undefined) {
-      throw new MediaError('demux-error', `invalid EBML element size at Segment offset ${offset}`);
+      if (strict) {
+        throw new MediaError(
+          'demux-error',
+          `invalid EBML element size at Segment offset ${offset}`,
+        );
+      }
+      return;
     }
     const dataStart = offset + id.length + size.length;
     if (dataStart > segment.dataEnd) {
-      throw new MediaError(
-        'demux-error',
-        `truncated EBML element header at Segment offset ${offset}`,
-      );
+      if (strict) {
+        throw new MediaError(
+          'demux-error',
+          `truncated EBML element header at Segment offset ${offset}`,
+        );
+      }
+      return;
     }
     if (size.value < 0) {
       if (id.value !== ID.Cluster) {
@@ -1232,17 +1289,30 @@ function* completeSegmentElements(dv: DataView, segment: EbmlElement): Generator
           `unknown-sized non-Cluster element 0x${id.value.toString(16)} in WebM Segment`,
         );
       }
+      const dataEnd = unknownClusterEnd(dv, dataStart, segment.dataEnd);
       yield {
         id: id.value,
         dataStart,
-        dataEnd: segment.dataEnd,
+        dataEnd,
         complete: false,
         unknownSize: true,
       };
-      return;
+      if (dataEnd >= segment.dataEnd) return;
+      offset = dataEnd;
+      continue;
     }
     const dataEnd = dataStart + size.value;
     if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > segment.dataEnd) {
+      if (!strict && Number.isSafeInteger(dataEnd) && dataEnd >= dataStart) {
+        yield {
+          id: id.value,
+          dataStart,
+          dataEnd: segment.dataEnd,
+          complete: false,
+          unknownSize: false,
+        };
+        return;
+      }
       throw new MediaError(
         'demux-error',
         `EBML element 0x${id.value.toString(16)} escapes the WebM Segment`,
@@ -1258,8 +1328,12 @@ function* completeSegmentElements(dv: DataView, segment: EbmlElement): Generator
     offset = dataEnd;
   }
   if (offset !== segment.dataEnd) {
-    throw new MediaError('demux-error', 'WebM Segment has malformed trailing bytes');
+    if (strict) throw new MediaError('demux-error', 'WebM Segment has malformed trailing bytes');
   }
+}
+
+function* completeSegmentElements(dv: DataView, segment: EbmlElement): Generator<EbmlElement> {
+  yield* segmentElements(dv, segment, true);
 }
 
 /**
@@ -1545,6 +1619,7 @@ function opusGapless(
   }
   const totalSamples = codedSamples - effectiveLeadingSamples - trailingSamples;
   return {
+    basis: 'webm-opus-codec-delay',
     ...(effectiveLeadingSamples > 0 || !includeLeadingDelay
       ? { leadingSamples: effectiveLeadingSamples }
       : {}),

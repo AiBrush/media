@@ -11,7 +11,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import type { TrackInfo } from '../../contracts/driver.ts';
+import type { MuxOptions, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
 import { toStreamTarget, writeToStreamTarget } from '../../sinks/stream-target.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
@@ -19,7 +19,12 @@ import { enumerateMp3Packets, parseMp3 } from '../mp3/mp3-driver.ts';
 import { parseTs } from '../mpegts/ts-parse.ts';
 import { demuxWebm } from '../webm/webm-driver.ts';
 import { Mp4Driver, readMovie } from './mp4-driver.ts';
-import { type ChunkStruct, Mp4Muxer, buildMuxSamples } from './mux.ts';
+import {
+  type ChunkStruct,
+  MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES,
+  Mp4Muxer,
+  buildMuxSamples,
+} from './mux.ts';
 import { buildSampleData } from './samples.ts';
 
 const ra = (b: Uint8Array) => ({
@@ -163,6 +168,14 @@ function topLevelBoxes(bytes: Uint8Array): string[] {
     off += size;
   }
   return out;
+}
+
+function findFourccOffset(bytes: Uint8Array, type: string): number {
+  const code = [...type].map((char) => char.charCodeAt(0));
+  for (let i = 4; i + 4 <= bytes.byteLength; i++) {
+    if (code.every((value, index) => bytes[i + index] === value)) return i;
+  }
+  return -1;
 }
 
 describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
@@ -613,6 +626,131 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     const durations = audio ? buildSampleData(audio).map((s) => s.durationTicks) : [];
     expect(durations).toHaveLength(45);
     expect(durations.at(-1)).toBe(641);
+  });
+
+  it('keeps source-proven AAC access-unit durations outside the edit-list program window', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      gapless: {
+        basis: 'mp4-edit-list',
+        leadingSamples: 0,
+        trailingSamples: 48,
+        totalSamples: 2_000,
+      },
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description: ASC,
+      },
+    });
+    for (let i = 0; i < 2; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 1024 * 1_000_000) / 48_000),
+        durationUs: Math.round((1024 * 1_000_000) / 48_000),
+        key: true,
+        data: new Uint8Array([0x21, i]),
+      });
+    }
+    await muxer.finalize();
+
+    const audio = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(audio?.edit).toEqual({
+      mediaTimeTicks: 0,
+      durationSec: 0.042,
+      durationMovieTicks: 42,
+      movieTimescale: 1_000,
+    });
+    expect(audio ? buildSampleData(audio).map((sample) => sample.durationTicks) : []).toEqual([
+      1024, 1024,
+    ]);
+  });
+
+  it('applies drained destination AAC timing and writes explicit roll sample groups', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description: ASC,
+      },
+    });
+    // Chromium/macOS emits 191 AAC-LC AUs for 192,000 submitted frames. The explicit program window
+    // needs only 190 AUs after its 2,112-frame priming, so the muxer drops the fully trailing last AU.
+    for (let i = 0; i < 191; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 1024 * 1_000_000) / 48_000),
+        durationUs: Math.round((1024 * 1_000_000) / 48_000),
+        key: true,
+        data: new Uint8Array([0x21, i & 0xff]),
+      });
+    }
+    muxer.setTrackGapless(aud, {
+      leadingSamples: 2_112,
+      trailingSamples: 1_472,
+      totalSamples: 192_000,
+    });
+    await muxer.finalize();
+
+    const bytes = await collect(muxer.output);
+    const audio = (await readMovie(ra(bytes))).tracks[0];
+    expect(audio?.edit).toEqual({
+      mediaTimeTicks: 2_112,
+      durationSec: 4,
+      durationMovieTicks: 4_000,
+      movieTimescale: 1_000,
+    });
+    expect(audio ? buildSampleData(audio) : []).toHaveLength(190);
+
+    const sgpdType = findFourccOffset(bytes, 'sgpd');
+    const sbgpType = findFourccOffset(bytes, 'sbgp');
+    expect(sgpdType).toBeGreaterThan(0);
+    expect(sbgpType).toBeGreaterThan(0);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    expect(String.fromCharCode(...bytes.subarray(sgpdType + 8, sgpdType + 12))).toBe('roll');
+    expect(view.getUint32(sgpdType + 12)).toBe(2); // default_length
+    expect(view.getUint32(sgpdType + 16)).toBe(1); // entry_count
+    expect(view.getInt16(sgpdType + 20)).toBe(-1);
+    expect(String.fromCharCode(...bytes.subarray(sbgpType + 8, sbgpType + 12))).toBe('roll');
+    expect(view.getUint32(sbgpType + 12)).toBe(1); // entry_count
+    expect(view.getUint32(sbgpType + 16)).toBe(190); // every retained AAC AU
+    expect(view.getUint32(sbgpType + 20)).toBe(1); // group_description_index
+  });
+
+  it('honors an explicitly proven zero leading delay instead of inferring priming from padding', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      gapless: { leadingSamples: 0, trailingSamples: 880, totalSamples: 12_432 },
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 1,
+        description: ASC,
+      },
+    });
+    for (let i = 0; i < 13; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 1024 * 1_000_000) / 48_000),
+        durationUs: Math.round((1024 * 1_000_000) / 48_000),
+        key: true,
+        data: new Uint8Array([0x21, i]),
+      });
+    }
+    await muxer.finalize();
+
+    const audio = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    expect(audio?.edit?.mediaTimeTicks).toBe(0);
+    expect(audio?.edit?.durationMovieTicks).toBe(259);
   });
 
   it('muxes synthesized raw-box codec records when AV1/VP9/Opus descriptions are absent', async () => {
@@ -1152,6 +1290,135 @@ describe('Mp4Muxer — typed misuse + capability misses', () => {
     expect(() =>
       muxer.addTrack({ id: 1, mediaType: 'video', codec: 'theora', config: { codec: 'theora' } }),
     ).toThrowError(/cannot write video codec 'theora'/);
+  });
+
+  it.each<[string, MuxOptions]>([
+    ['ordinary', {}],
+    ['fragmented', { fragmented: true }],
+    ['reserve', { faststart: 'reserve', maximumPacketCount: 2048 }],
+  ])('%s mode rejects the crossing payload before retaining it', (_name, options) => {
+    const muxer = new Mp4Muxer(options);
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 4, codedHeight: 4, description: AVCC },
+    });
+    const oneMiB = new Uint8Array(1024 * 1024);
+    const retainedChunkCount = MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES / oneMiB.byteLength;
+    for (let index = 0; index < retainedChunkCount; index++) {
+      muxer.addChunkStruct(vid, {
+        timestampUs: index * 1000,
+        durationUs: 1000,
+        key: index === 0,
+        data: oneMiB,
+      });
+    }
+
+    const crossingChunk: ChunkStruct = {
+      timestampUs: retainedChunkCount * 1000,
+      durationUs: 1000,
+      key: false,
+      data: new Uint8Array(1),
+    };
+    const captureFailure = (): unknown => {
+      try {
+        muxer.addChunkStruct(vid, crossingChunk);
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    };
+    const firstFailure = captureFailure();
+    const secondFailure = captureFailure();
+
+    for (const failure of [firstFailure, secondFailure]) {
+      expect(failure).toBeInstanceOf(CapabilityError);
+      expect(failure).toMatchObject({
+        code: 'capability-miss',
+        detail: {
+          op: {
+            kind: 'route',
+            id: 'mp4-buffer-all-payload',
+            facts: {
+              bufferedPayloadBytes: MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES,
+              incomingPayloadBytes: 1,
+              maximumBufferedPayloadBytes: MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES,
+            },
+          },
+        },
+      });
+    }
+  });
+
+  it('rejects an oversized encoded chunk before allocating or calling copyTo', () => {
+    const muxer = new Mp4Muxer(undefined, 'mp4-mux');
+    const audio = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    let copied = false;
+    const chunk = {
+      byteLength: MP4_BUFFER_ALL_MAX_PAYLOAD_BYTES + 1,
+      timestamp: 0,
+      duration: 20_000,
+      type: 'key',
+      copyTo: (): void => {
+        copied = true;
+      },
+    } as EncodedAudioChunk;
+
+    let failure: unknown;
+    try {
+      muxer.write(audio, { chunk });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(CapabilityError);
+    expect(failure).toMatchObject({ detail: { tried: ['mp4-mux'] } });
+    expect(copied).toBe(false);
+  });
+
+  it('accounts retained payload cumulatively across video and audio tracks', () => {
+    const muxer = new Mp4Muxer();
+    const video = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'avc1.42C01E',
+      config: { codec: 'avc1.42C01E', codedWidth: 4, codedHeight: 4, description: AVCC },
+    });
+    const audio = muxer.addTrack({
+      id: 2,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    const oneMiB = new Uint8Array(1024 * 1024);
+    for (let index = 0; index < 512; index++) {
+      muxer.addChunkStruct(video, {
+        timestampUs: index * 1000,
+        durationUs: 1000,
+        key: index === 0,
+        data: oneMiB,
+      });
+      muxer.addChunkStruct(audio, {
+        timestampUs: index * 1000,
+        durationUs: 1000,
+        key: true,
+        data: oneMiB,
+      });
+    }
+
+    expect(() =>
+      muxer.addChunkStruct(audio, {
+        timestampUs: 512_000,
+        durationUs: 1000,
+        key: true,
+        data: new Uint8Array(1),
+      }),
+    ).toThrowError(CapabilityError);
   });
 
   it('maps legal raw-box codec families without rewriting their codec-private bytes', async () => {

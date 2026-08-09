@@ -111,6 +111,17 @@ function topLevelBoxes(file: Uint8Array): { type: string; start: number; end: nu
   return out;
 }
 
+function childBox(
+  file: Uint8Array,
+  start: number,
+  end: number,
+  type: string,
+): { type: string; start: number; payloadStart: number; end: number } | undefined {
+  const reader = new Reader(file);
+  reader.seek(start);
+  return [...boxes(reader, end)].find((box) => box.type === type);
+}
+
 /** A non-sync `trun` sample-flags word? (bit `sample_is_non_sync_sample` = 0x00010000). */
 function isNonSync(flags: number): boolean {
   return (flags & 0x00010000) !== 0;
@@ -386,6 +397,55 @@ describe('fragmentMp4 — audio segment planning', () => {
 
     expect(segments).toHaveLength(3);
     expect(segments.map((segment) => samplesForTrack([segment], 1).length)).toEqual([90, 90, 20]);
+  });
+
+  it('carries explicit AAC roll description in stbl and maps each fragment run with sbgp', () => {
+    const sourceSamples = Array.from({ length: 5 }, (_, i) => sample(1024, 0, true, 4, i + 1));
+    const audio: FragmentTrackInput = {
+      ...audioTrack(sourceSamples),
+      edit: { mediaTimeTicks: 2_112, durationTicks: 3_008 },
+      rollDistance: -1,
+    };
+    const file = concat([...fragmentMp4([audio], { maxSamplesPerFragment: 3 })]);
+    const top = topLevelBoxes(file);
+    const moov = top.find((box) => box.type === 'moov');
+    expect(moov).toBeDefined();
+    if (!moov) return;
+    const trak = childBox(file, moov.start + 8, moov.end, 'trak');
+    const mdia = trak && childBox(file, trak.payloadStart, trak.end, 'mdia');
+    const minf = mdia && childBox(file, mdia.payloadStart, mdia.end, 'minf');
+    const stbl = minf && childBox(file, minf.payloadStart, minf.end, 'stbl');
+    const sgpd = stbl && childBox(file, stbl.payloadStart, stbl.end, 'sgpd');
+    expect(sgpd).toBeDefined();
+    if (!sgpd) return;
+    const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+    expect(
+      String.fromCharCode(...file.subarray(sgpd.payloadStart + 4, sgpd.payloadStart + 8)),
+    ).toBe('roll');
+    expect(view.getInt16(sgpd.payloadStart + 16)).toBe(-1);
+
+    const moofs = top.filter((box) => box.type === 'moof');
+    expect(moofs).toHaveLength(2);
+    expect(
+      moofs.map((moofBox) => {
+        const traf = childBox(file, moofBox.start + 8, moofBox.end, 'traf');
+        const sbgp = traf && childBox(file, traf.payloadStart, traf.end, 'sbgp');
+        if (!sbgp) return undefined;
+        return {
+          grouping: String.fromCharCode(
+            ...file.subarray(sbgp.payloadStart + 4, sbgp.payloadStart + 8),
+          ),
+          sampleCount: view.getUint32(sbgp.payloadStart + 12),
+          index: view.getUint32(sbgp.payloadStart + 16),
+        };
+      }),
+    ).toEqual([
+      { grouping: 'roll', sampleCount: 3, index: 1 },
+      { grouping: 'roll', sampleCount: 2, index: 1 },
+    ]);
+    expect(samplesForTrack(scanSegments(file), 1).map((entry) => entry.data)).toEqual(
+      sourceSamples.map((entry) => entry.data),
+    );
   });
 });
 

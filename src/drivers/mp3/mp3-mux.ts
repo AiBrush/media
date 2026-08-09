@@ -19,6 +19,7 @@ import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/drive
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { assertAudioMuxOptions, validateMp3MuxTrack } from '../audio-container-mux-validation.ts';
 import type { ChunkStruct } from '../ogg/ogg-write.ts';
+import { MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES } from './mp3-gapless.ts';
 
 const SAMPLE_RATES: Record<number, readonly number[]> = {
   3: [44100, 48000, 32000],
@@ -311,8 +312,8 @@ function writeU32BE(out: Uint8Array, at: number, value: number): void {
 }
 
 interface Mp3GaplessMetadata {
-  readonly leadingSamples: number;
-  readonly trailingSamples: number;
+  readonly encoderDelay: number;
+  readonly encoderPadding: number;
 }
 
 function gaplessMetadataFor(track: Mp3MuxTrack): Mp3GaplessMetadata | undefined {
@@ -324,22 +325,27 @@ function gaplessMetadataFor(track: Mp3MuxTrack): Mp3GaplessMetadata | undefined 
   if (leadingSamples === undefined || trailingSamples === undefined || totalSamples === undefined) {
     return undefined;
   }
+  const encoderDelay =
+    gapless.mp3Lame?.encoderDelaySamples ?? leadingSamples - MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES;
+  const encoderPadding =
+    gapless.mp3Lame?.encoderPaddingSamples ??
+    trailingSamples + MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES;
   if (
     !Number.isSafeInteger(leadingSamples) ||
     !Number.isSafeInteger(trailingSamples) ||
     !Number.isSafeInteger(totalSamples) ||
-    leadingSamples < 0 ||
-    trailingSamples < 0 ||
+    encoderDelay < 0 ||
+    encoderPadding < 0 ||
     totalSamples <= 0 ||
-    leadingSamples > 0xfff ||
-    trailingSamples > 0xfff
+    encoderDelay > 0xfff ||
+    encoderPadding > 0xfff
   ) {
     throw new MediaError(
       'mux-error',
       'MP3 mux: gapless delay/padding is outside the LAME field range',
     );
   }
-  return { leadingSamples, trailingSamples };
+  return { encoderDelay, encoderPadding };
 }
 
 function buildXingFrame(track: Mp3MuxTrack): Uint8Array {
@@ -363,7 +369,7 @@ function buildXingFrame(track: Mp3MuxTrack): Uint8Array {
   if (gapless !== undefined) {
     const lameAt = tagAt + 16;
     writeAscii(out, lameAt, 'LAME3.99r');
-    const packed = (gapless.leadingSamples << 12) | gapless.trailingSamples;
+    const packed = (gapless.encoderDelay << 12) | gapless.encoderPadding;
     out[lameAt + 21] = (packed >>> 16) & 0xff;
     out[lameAt + 22] = (packed >>> 8) & 0xff;
     out[lameAt + 23] = packed & 0xff;

@@ -490,7 +490,7 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
     expect(adtsAacPcmDecodePlan(true, 'force-software')).toEqual(['wasm-aac']);
   });
 
-  it('uses the direct wasm-s16 WAV route only for no-DSP same-layout extraction', () => {
+  it('uses the direct wasm-s16 WAV route only on wasm-only or force-software runtimes', () => {
     expect(
       canUseAdtsWasmDirectS16Wav(
         163_811,
@@ -499,7 +499,7 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
         { container: 'wav', sampleFormat: 's16' },
         false,
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       canUseAdtsWasmDirectS16Wav(
         300_000,
@@ -516,6 +516,15 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
         2,
         { container: 'wav', sampleFormat: 's16' },
         true,
+      ),
+    ).toBe(true);
+    expect(
+      canUseAdtsWasmDirectS16Wav(
+        163_811,
+        48_000,
+        2,
+        { container: 'wav', sampleFormat: 's16', determinism: 'force-software' },
+        false,
       ),
     ).toBe(true);
     expect(canUseAdtsWasmDirectS16Wav(163_811, 48_000, 2, { sampleRate: 44_100 }, false)).toBe(

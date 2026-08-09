@@ -6,6 +6,7 @@ import type {
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { BUFFER_ALL_MAX_RETAINED_BYTES } from '../internal/buffer-policy.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
@@ -14,7 +15,6 @@ import { containerHasChunkMuxer } from './codec-routing.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, RemuxOptions } from './types.ts';
 
-const REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
 // The prepared MP4→WebM-family writer deliberately snapshots at most 64 MiB. Route every larger
 // source directly to the incremental packet-info writer instead of leaving 64 MiB–1 GiB on the
 // generic EncodedChunk + buffered-muxer path, where source, mux state, and output coexist.
@@ -293,7 +293,7 @@ async function remuxViaSeam(
     );
     if (stream !== undefined) return stream;
   }
-  if (source.size !== undefined && source.size > REMUX_BUFFER_ALL_MAX_OUTPUT_BYTES) {
+  if (source.size !== undefined && source.size > BUFFER_ALL_MAX_RETAINED_BYTES) {
     throw new CapabilityError(`remux '${opts.to}' over buffer limit`, {
       op: { kind: 'route', id: 'remux' },
       tried: [container.id, opts.to],

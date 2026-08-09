@@ -30,18 +30,24 @@ function stubDriver(muxer: Muxer): ContainerDriver {
   };
 }
 
-function recordingMuxer(withPcm: boolean): Muxer & {
+function recordingMuxer(
+  withPcm: boolean,
+  withGapless = false,
+): Muxer & {
   added: TrackInfo[];
   writes: Array<readonly [number, Packet]>;
   pcmWrites: Array<readonly [number, Uint8Array]>;
+  gaplessWrites: Array<readonly [number, NonNullable<TrackInfo['gapless']>]>;
 } {
   const added: TrackInfo[] = [];
   const writes: Array<readonly [number, Packet]> = [];
   const pcmWrites: Array<readonly [number, Uint8Array]> = [];
+  const gaplessWrites: Array<readonly [number, NonNullable<TrackInfo['gapless']>]> = [];
   return {
     added,
     writes,
     pcmWrites,
+    gaplessWrites,
     output: new ReadableStream<Uint8Array>({
       start(controller): void {
         controller.close();
@@ -60,6 +66,13 @@ function recordingMuxer(withPcm: boolean): Muxer & {
           writePcm(trackId: number, data: Uint8Array): Promise<void> {
             pcmWrites.push([trackId, data]);
             return Promise.resolve();
+          },
+        }
+      : {}),
+    ...(withGapless
+      ? {
+          setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+            gaplessWrites.push([trackId, gapless]);
           },
         }
       : {}),
@@ -133,6 +146,54 @@ describe('LazyMuxer', () => {
       facts: { mediaType: 'audio', codec: 'pcm' },
     });
     expect(miss?.detail?.tried).toEqual(['stub']);
+  });
+
+  it('exposes only a configured gapless seam and replays timing with mapped ids', async () => {
+    const real = recordingMuxer(false, true);
+    const load = vi.fn(() => Promise.resolve(stubDriver(real)));
+    const lazy = new LazyMuxer({
+      driverId: 'stub',
+      load,
+      muxOptions: undefined,
+      gaplessSeam: true,
+    });
+    const initial = { leadingSamples: 2_112, trailingSamples: 960, totalSamples: 48_000 };
+    const corrected = { leadingSamples: 2_112, trailingSamples: 448, totalSamples: 48_512 };
+    lazy.addTrack(track(1));
+
+    lazy.setTrackGapless?.(0, initial);
+    expect(load).not.toHaveBeenCalled();
+    await lazy.write(0, packet());
+    expect(real.gaplessWrites).toEqual([[100, initial]]);
+
+    lazy.setTrackGapless?.(0, corrected);
+    expect(real.gaplessWrites).toEqual([
+      [100, initial],
+      [100, corrected],
+    ]);
+    expect(() => lazy.setTrackGapless?.(9, initial)).toThrowError(MediaError);
+
+    const noSeam = new LazyMuxer({
+      driverId: 'stub',
+      load: () => Promise.resolve(stubDriver(recordingMuxer(false, true))),
+      muxOptions: undefined,
+    });
+    expect(noSeam.setTrackGapless).toBeUndefined();
+  });
+
+  it('raises a typed miss when an advertised gapless seam is absent after loading', async () => {
+    const lazy = new LazyMuxer({
+      driverId: 'stub',
+      load: () => Promise.resolve(stubDriver(recordingMuxer(false))),
+      muxOptions: undefined,
+      gaplessSeam: true,
+    });
+    lazy.addTrack(track(1));
+    await lazy.write(0, packet());
+
+    expect(() =>
+      lazy.setTrackGapless?.(0, { leadingSamples: 2_112, totalSamples: 48_000 }),
+    ).toThrowError(/lazy stub driver lacks setTrackGapless/);
   });
 
   it('missingLazyMethod names the method and driver in the typed descriptor', () => {

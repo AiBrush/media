@@ -1,7 +1,7 @@
 /**
  * Video filter-chain PLANNING (docs/architecture/09) — the pure builder that turns a public
  * {@link VideoTarget} into the ordered GPU {@link FilterSpec} chain the engine composes on a decoded video
- * stream before the encoder (**crop → resize → pad → rotate → flip → colorspace → tonemap**).
+ * stream before the encoder (**crop → resize → pad → rotate → flip → colour transform**).
  *
  * Why a SEPARATE module (split out of `codec-pipeline.ts`): `videoFilterSpecs` is reached ONLY on the
  * convert-with-video-filter path (a live, browser-only decode→filter→encode). Keeping it here, behind the
@@ -14,6 +14,7 @@
 
 import type { FilterSpec } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
+import { parseColorSpace } from '../filters/gpu-uniforms.ts';
 import { closeFrame } from '../kernel/frames.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
 import {
@@ -23,11 +24,50 @@ import {
   videoCodecToken,
   videoPixelRotation,
 } from './codec-pipeline.ts';
-import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
+import type { VideoColorMuxIntent } from './mux-trackinfo.ts';
+import { H264_ABR_MAX_RUNGS } from './types.ts';
+import type { H264AbrRung, VideoCodec, VideoQualityConstraint, VideoTarget } from './types.ts';
+
+function assertCompatibleVideoColorTransforms(target: VideoTarget): void {
+  if (target.colorspace === undefined || target.tonemap === undefined) return;
+  throw new CapabilityError(
+    'video colorspace conversion and tonemapping cannot be combined in one target',
+    {
+      op: {
+        kind: 'route',
+        id: 'convert',
+        facts: {
+          colorspace: target.colorspace.to,
+          tonemap: target.tonemap.to,
+        },
+      },
+      tried: [],
+      suggestion: 'request either colorspace conversion or tonemapping, not both',
+    },
+  );
+}
+
+/**
+ * Preserve an applied colour transform's standard identity until muxing. The live frame boundary can
+ * express the pixel math (`bt2020` primaries with the BT.709-equivalent display curve), but WebCodecs has
+ * no BT.2020-10/12 transfer token. A target may request colorspace conversion or tonemapping; composing
+ * both is rejected because the intermediate colour standard is not represented by the public target.
+ */
+export function videoColorMuxIntent(target: VideoTarget): VideoColorMuxIntent | undefined {
+  assertCompatibleVideoColorTransforms(target);
+  if (target.tonemap !== undefined) {
+    if (target.tonemap.to !== 'sdr') return undefined;
+    return { kind: 'bt709-sdr', transform: 'tonemap' };
+  }
+  if (target.colorspace === undefined) return undefined;
+  const destination = parseColorSpace(target.colorspace.to);
+  if (destination === 'bt2020') return { kind: 'bt2020-sdr', transform: 'colorspace' };
+  return undefined;
+}
 
 /**
  * Build the ordered GPU {@link FilterSpec} chain for a {@link VideoTarget}: **crop → resize → pad → rotate
- * → flip → colorspace → tonemap**, each emitted only when the target requests it. Order matters — crop
+ * → flip → colour transform**, each emitted only when the target requests it. Order matters — crop
  * selects a source sub-rect first, resize scales it, pad places it without resampling, then orientation and
  * full-frame colour conversion. A `resize` is emitted when width/height are given and differ from the
  * post-crop geometry; a geometry-identical resize is omitted so a no-op request does not introduce an
@@ -36,6 +76,7 @@ import type { H264AbrRung, VideoCodec, VideoTarget } from './types.ts';
  * Empty array ⇒ no filters (the decode→encode is direct).
  */
 export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): FilterSpec[] {
+  assertCompatibleVideoColorTransforms(target);
   const specs: FilterSpec[] = [];
   if (target.crop) {
     const { x, y, width, height } = target.crop;
@@ -569,7 +610,8 @@ export function retimeVideoFrameStream(
 
 // ============ video rate-control planning ============
 
-interface VideoRateControlTarget extends Pick<VideoTarget, 'bitrate' | 'crf'> {
+interface VideoRateControlTarget
+  extends Pick<VideoTarget, 'bitrate' | 'maxAverageBitrate' | 'quality' | 'crf'> {
   readonly bitrateMode?: VideoEncoderBitrateMode;
   readonly twoPass?: boolean;
 }
@@ -603,9 +645,25 @@ export type VideoRateControlPlan =
       readonly webCodecsConfigurable: true;
       readonly requiresReplay: true;
       readonly firstPassQuantizer: 28;
+    }
+  | {
+      readonly mode: 'quality-constrained-bitrate';
+      readonly preferredAverageBitrate: number;
+      readonly maxAverageBitrate: number;
+      readonly metric: 'ssim-luma-v1';
+      readonly minimumMean: number;
+      readonly samples: number;
+      readonly webCodecsConfigurable: true;
+      readonly requiresReplay: true;
+      readonly requiresFiniteSource: true;
+      readonly firstPassQuantizer: 28;
+      readonly maximumCandidatePasses: 3;
     };
 
-function crfBounds(codec: VideoCodec | 'unknown'): { min: number; max: number } {
+function crfBounds(codec: VideoCodec | 'unknown'): {
+  min: number;
+  max: number;
+} {
   switch (codec) {
     case 'h264':
     case 'hevc':
@@ -640,10 +698,66 @@ export function planVideoRateControl(
   const hasBitrate = bitrate !== undefined;
   const hasCrf = crf !== undefined;
   const twoPass = target.twoPass === true;
+  const hasQualityContract = target.quality !== undefined || target.maxAverageBitrate !== undefined;
   if (bitrate !== undefined) assertValidBitrate(bitrate);
   if (crf !== undefined) assertValidCrf(crf, codec);
   if (hasBitrate && hasCrf) {
     throw new InputError('video bitrate and CRF are mutually exclusive');
+  }
+  if (hasQualityContract) {
+    if (
+      bitrate === undefined ||
+      target.maxAverageBitrate === undefined ||
+      target.quality === undefined
+    ) {
+      throw new InputError(
+        'quality-constrained video encode requires bitrate, maxAverageBitrate, and quality',
+      );
+    }
+    assertValidBitrate(target.maxAverageBitrate);
+    if (target.maxAverageBitrate < bitrate) {
+      throw new InputError('maxAverageBitrate must be greater than or equal to bitrate');
+    }
+    if (
+      target.quality.metric !== 'ssim-luma-v1' ||
+      !Number.isFinite(target.quality.minimumMean) ||
+      target.quality.minimumMean < 0 ||
+      target.quality.minimumMean > 1
+    ) {
+      throw new InputError('invalid ssim-luma-v1 quality constraint');
+    }
+    const samples = target.quality.samples ?? 8;
+    if (!Number.isSafeInteger(samples) || samples < 1 || samples > 256) {
+      throw new InputError('quality sample count must be a safe integer in [1, 256]');
+    }
+    if (
+      target.crf !== undefined ||
+      target.bitrateMode !== undefined ||
+      target.twoPass !== undefined
+    ) {
+      throw new InputError(
+        'quality-constrained bitrate cannot combine with CRF, bitrateMode, or twoPass',
+      );
+    }
+    if (codec !== 'h264') {
+      throw new CapabilityError(
+        `quality-constrained bitrate is currently available only for H.264, not ${codec}`,
+        { op: { kind: 'route', id: 'encode' }, tried: ['webcodecs-video'] },
+      );
+    }
+    return {
+      mode: 'quality-constrained-bitrate',
+      preferredAverageBitrate: bitrate,
+      maxAverageBitrate: target.maxAverageBitrate,
+      metric: target.quality.metric,
+      minimumMean: target.quality.minimumMean,
+      samples,
+      webCodecsConfigurable: true,
+      requiresReplay: true,
+      requiresFiniteSource: true,
+      firstPassQuantizer: 28,
+      maximumCandidatePasses: 3,
+    };
   }
   if (twoPass && !hasBitrate) {
     throw new InputError('two-pass video encode requires a target bitrate');
@@ -686,7 +800,11 @@ export function planVideoRateControl(
     if (bitrate === undefined) {
       throw new InputError('video bitrate is missing');
     }
-    return { mode: 'bitrate', bitrate, bitrateMode: target.bitrateMode ?? 'variable' };
+    return {
+      mode: 'bitrate',
+      bitrate,
+      bitrateMode: target.bitrateMode ?? 'variable',
+    };
   }
   return { mode: 'default' };
 }
@@ -809,7 +927,12 @@ export function planVideoBitDepthConversion(
     targetBitDepth === undefined ||
     sourceBitDepth === targetBitDepth
   ) {
-    return { kind: 'none', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
+    return {
+      kind: 'none',
+      sourceBitDepth,
+      targetBitDepth,
+      requiresPixelPath: false,
+    };
   }
   if (sourceBitDepth > targetBitDepth && targetBitDepth === 8) {
     return {
@@ -820,10 +943,20 @@ export function planVideoBitDepthConversion(
     };
   }
   if (sourceBitDepth === 8 && (targetBitDepth === 10 || targetBitDepth === 12)) {
-    return { kind: 'encoder-widen', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
+    return {
+      kind: 'encoder-widen',
+      sourceBitDepth,
+      targetBitDepth,
+      requiresPixelPath: false,
+    };
   }
   if (sourceBitDepth === 10 && targetBitDepth === 12) {
-    return { kind: 'encoder-widen', sourceBitDepth, targetBitDepth, requiresPixelPath: false };
+    return {
+      kind: 'encoder-widen',
+      sourceBitDepth,
+      targetBitDepth,
+      requiresPixelPath: false,
+    };
   }
   throw new CapabilityError(
     `video bit-depth conversion ${sourceBitDepth}-bit → ${targetBitDepth}-bit is not available in the current codec pipeline`,
@@ -847,6 +980,8 @@ export interface PlannedH264AbrRung {
       readonly width: number;
       readonly height: number;
       readonly bitrate: number;
+      readonly maxAverageBitrate?: number;
+      readonly quality?: VideoQualityConstraint;
       readonly fps?: number;
     };
   };
@@ -867,26 +1002,38 @@ export function planH264AbrLadder(
   if (ladder.length === 0) {
     throw new InputError('H.264 ABR ladder must contain at least one rung');
   }
+  if (ladder.length > H264_ABR_MAX_RUNGS) {
+    throw new InputError(
+      `H.264 ABR ladder may contain at most ${H264_ABR_MAX_RUNGS} rungs`,
+      { rungCount: ladder.length, maximumRungs: H264_ABR_MAX_RUNGS },
+    );
+  }
   return ladder.map((rung, index): PlannedH264AbrRung => {
     assertPositiveInteger('ABR rung width', rung.width);
     assertPositiveInteger('ABR rung height', rung.height);
     assertValidBitrate(rung.bitrate);
     if (rung.fps !== undefined) assertPositiveFinite('ABR rung fps', rung.fps);
-    const video =
-      rung.fps === undefined
+    const hasMaximum = rung.maxAverageBitrate !== undefined;
+    const hasQuality = rung.quality !== undefined;
+    if (hasMaximum !== hasQuality) {
+      throw new InputError(
+        'quality-constrained ABR rung requires bitrate, maxAverageBitrate, and quality together',
+      );
+    }
+    const video = {
+      codec: 'h264' as const,
+      width: rung.width,
+      height: rung.height,
+      bitrate: rung.bitrate,
+      ...(rung.maxAverageBitrate !== undefined && rung.quality !== undefined
         ? {
-            codec: 'h264' as const,
-            width: rung.width,
-            height: rung.height,
-            bitrate: rung.bitrate,
+            maxAverageBitrate: rung.maxAverageBitrate,
+            quality: { ...rung.quality },
           }
-        : {
-            codec: 'h264' as const,
-            width: rung.width,
-            height: rung.height,
-            bitrate: rung.bitrate,
-            fps: rung.fps,
-          };
+        : {}),
+      ...(rung.fps !== undefined ? { fps: rung.fps } : {}),
+    };
+    if (hasMaximum && hasQuality) planVideoRateControl(video, 'h264');
     const options = { to: 'mp4' as const, video };
     return {
       name: rung.name ?? `${rung.height}p-${index}`,

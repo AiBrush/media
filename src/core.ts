@@ -100,6 +100,11 @@ export type { PlannedStage, Planner, StageGraph, StageKind } from './kernel/plan
 // Engine
 export { createMedia } from './api/create-media.ts';
 export { type MediaEngine, MediaEngineImpl } from './api/engine.ts';
+export {
+  type VideoColorMuxIntent,
+  videoTrackInfoFromDecoderConfig,
+} from './api/mux-trackinfo.ts';
+export { destinationColorI420FrameStream } from './api/video-frame-convert.ts';
 
 // Advanced container writers (escape hatch, doc 09 streaming-output). The fragmented-MP4/CMAF generator
 // lives on this driver-author surface — NOT the eager default entry — because it is heavy MP4 box-writer

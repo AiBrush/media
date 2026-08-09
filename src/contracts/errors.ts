@@ -18,6 +18,7 @@ export type MediaErrorCode =
   | 'encode-error'
   | 'demux-error'
   | 'mux-error'
+  | 'constraint-unsatisfied' // a valid request whose declared output constraints cannot all be met
   | 'aborted' // signal aborted
   | 'driver-incompatible'; // apiVersion mismatch at registration
 
@@ -51,7 +52,11 @@ export type OperationDescriptor =
   | { readonly kind: 'codec'; readonly query: CodecQuery }
   | { readonly kind: 'container'; readonly query: ContainerQuery }
   | { readonly kind: 'filter'; readonly spec: FilterSpec }
-  | { readonly kind: 'route'; readonly id: string; readonly facts?: OperationFacts };
+  | {
+      readonly kind: 'route';
+      readonly id: string;
+      readonly facts?: OperationFacts;
+    };
 
 /** Structured payload attached to a {@link CapabilityError} (`detail`). */
 export interface CapabilityErrorDetail {
@@ -70,13 +75,22 @@ export interface CapabilityErrorDetail {
  */
 export function isCapabilityErrorDetail(value: unknown): value is CapabilityErrorDetail {
   if (typeof value !== 'object' || value === null) return false;
-  const detail = value as { op?: unknown; tried?: unknown; suggestion?: unknown };
+  const detail = value as {
+    op?: unknown;
+    tried?: unknown;
+    suggestion?: unknown;
+  };
   if (!Array.isArray(detail.tried) || !detail.tried.every((id) => typeof id === 'string')) {
     return false;
   }
   if (detail.suggestion !== undefined && typeof detail.suggestion !== 'string') return false;
   if (typeof detail.op !== 'object' || detail.op === null) return false;
-  const op = detail.op as { kind?: unknown; query?: unknown; spec?: unknown; id?: unknown };
+  const op = detail.op as {
+    kind?: unknown;
+    query?: unknown;
+    spec?: unknown;
+    id?: unknown;
+  };
   switch (op.kind) {
     case 'codec':
     case 'container':
@@ -113,5 +127,39 @@ export class InputError extends MediaError {
   constructor(message: string, detail?: unknown, options?: ErrorOptions) {
     super('unsupported-input', message, detail, options);
     this.name = 'InputError';
+  }
+}
+
+/** One bounded candidate considered while satisfying an objective output constraint. */
+export interface ConstraintAttemptDetail {
+  readonly attempt: number;
+  readonly targetBytes: number;
+  readonly actualBytes: number;
+  readonly averageBitrate: number;
+  readonly qualityMean?: number;
+  readonly qualitySamples?: number;
+}
+
+/** Structured evidence carried when no bounded candidate satisfies every declared constraint. */
+export interface ConstraintUnsatisfiedDetail {
+  readonly constraint: 'h264-quality-rate';
+  readonly preferredAverageBitrate: number;
+  readonly maxAverageBitrate: number;
+  readonly minimumQualityMean: number;
+  readonly metric: 'ssim-luma-v1';
+  readonly attempts: readonly ConstraintAttemptDetail[];
+}
+
+/**
+ * The engine understood and attempted a constraint-bearing request, but no candidate met all hard
+ * bounds. This is distinct from bad input and from a missing codec capability: callers may inspect the
+ * bounded attempt evidence and choose a different declared rate/quality contract.
+ */
+export class ConstraintUnsatisfiedError extends MediaError {
+  declare readonly detail: ConstraintUnsatisfiedDetail;
+
+  constructor(message: string, detail: ConstraintUnsatisfiedDetail, options?: ErrorOptions) {
+    super('constraint-unsatisfied', message, detail, options);
+    this.name = 'ConstraintUnsatisfiedError';
   }
 }

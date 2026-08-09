@@ -26,6 +26,10 @@ import { toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions } from '../sinks/sink.ts';
 import type { MediaInput, Source } from '../sources/source.ts';
 import {
+  assertBufferedMp4ConvertProjection,
+  isBuiltInBufferedMp4MuxDriverId,
+} from './buffered-mp4-convert.ts';
+import {
   type SourceGeometry,
   buildVideoEncoderConfigForRuntime,
   canCopyAudioTrackToContainer,
@@ -140,6 +144,13 @@ export async function runCodecConvert(
   input: MediaInput,
   context: CodecConvertRunnerContext,
 ): Promise<Output> {
+  const qualityRequest =
+    opts.video === false
+      ? undefined
+      : (await import('./video-quality-constraint.ts')).assertH264QualityConstraintPreflight(
+          opts.video ?? {},
+          src,
+        );
   const container = await context.routeContainer(
     src,
     'demux',
@@ -182,25 +193,14 @@ export async function runCodecConvert(
     );
   }
 
-  const twoPassPlan =
-    opts.video !== false && opts.video?.twoPass === true
-      ? await (await import('./video-two-pass-runner.ts')).analyzeH264TwoPass(
-          src,
-          container,
-          opts.video,
-          signal,
-          callOptions,
-          opts.fragmented === true,
-          context.videoRunnerContext(),
-        )
-      : undefined;
   const demuxer = await container.demux(src, context.stageOptions(signal, callOptions));
-  const muxer = (await context.routeMuxer(target, callOptions.strategy?.pinDriver)).createMuxer(
-    context.muxOptions(opts, target),
-  );
-  const tasks: Promise<void>[] = [];
-  const openStreams: ReadableStream<unknown>[] = [];
   try {
+    // Route once and retain the exact output driver so projection, quality audit, and final mux cannot
+    // diverge under a pinned/custom route.
+    const outputContainer = await context.routeMuxer(target, callOptions.strategy?.pinDriver);
+    const outputMuxOptions = context.muxOptions(opts, target);
+    const qualityVideoTarget = opts.video === false ? undefined : opts.video;
+    const usesQualityCandidate = qualityRequest !== undefined && qualityVideoTarget !== undefined;
     const selectedVideoTrack =
       opts.video === false
         ? undefined
@@ -214,137 +214,232 @@ export async function runCodecConvert(
       opts.audio === undefined &&
       canCopyAudioTrackToContainer(target, audioTrack);
 
-    if (selectedVideoTrack !== undefined) {
+    let videoTrack: TrackInfo | undefined;
+    let videoTarget: VideoTarget | undefined;
+    let videoEncoderConfig: VideoEncoderConfig | undefined;
+    if (selectedVideoTrack !== undefined && !usesQualityCandidate) {
       const measuredBitrate = sourceVideoBitrateFromPacketTable(
         demuxer.packetTable?.(),
         selectedVideoTrack.id,
       );
-      const videoTrack: TrackInfo =
+      videoTrack =
         measuredBitrate === undefined
           ? selectedVideoTrack
           : { ...selectedVideoTrack, bitrate: measuredBitrate };
-      const videoTarget = opts.video || {};
-      const sourceGeometry = context.sourceGeometry(videoTrack);
-      const videoEncoderConfig = await buildVideoEncoderConfigForRuntime(
+      videoTarget = opts.video || {};
+      videoEncoderConfig = await buildVideoEncoderConfigForRuntime(
         videoTarget,
-        sourceGeometry,
+        context.sourceGeometry(videoTrack),
         videoTrack.codec,
       );
-      const sourceVideoCodec = qualifiedVideoSourceCodec(videoTrack);
-      if (
-        canUseVpxAlphaGeometryPacketTranscode(
-          videoTarget,
-          videoTrack.alpha === true,
-          sourceVideoCodec,
-          videoEncoderConfig.codec,
-        )
-      ) {
-        const packets = demuxer.packets(videoTrack.id);
-        openStreams.push(packets);
-        tasks.push(
-          context.transcodeVpxAlphaGeometry(
-            packets,
-            videoTarget,
-            videoTrack,
-            muxer,
-            signal,
-            callOptions,
-          ),
-        );
-      } else if (
-        canUseVpxAlphaPacketTranscode(
-          videoTarget,
-          videoTrack.alpha === true,
-          sourceVideoCodec,
-          videoEncoderConfig.codec,
-        )
-      ) {
-        const packets = demuxer.packets(videoTrack.id);
-        openStreams.push(packets);
-        tasks.push(
-          context.transcodeVpxAlpha(packets, videoTarget, videoTrack, muxer, signal, callOptions),
-        );
-      } else {
-        const decodeQuery = await decodeQueryFor(videoTrack);
-        const videoCodec = await context.routeCodec(decodeQuery, callOptions);
-        const config = decodeQuery.config;
-        const decodeStage = context.stageOptions(signal, callOptions);
-        const runtimeFallback =
-          videoTrack.alpha === true ? undefined : await import('./replayable-video-decoder.ts');
-        const fallbackKind = runtimeFallback?.planRuntimeVideoFallback(
-          videoCodec.id,
-          config.codec,
-          callOptions.strategy,
-        );
-        /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
-        const decoded =
-          videoTrack.alpha === true
-            ? decodeVideoPacketsWithAlpha(demuxer.packets(videoTrack.id), () =>
-                videoCodec.createDecoder(config, decodeStage),
-              )
-            : runtimeFallback !== undefined && fallbackKind !== undefined
-              ? runtimeFallback.decodeVideoWithRuntimeFallback(
-                  unwrapPackets(demuxer.packets(videoTrack.id)),
-                  () =>
-                    videoCodec.createDecoder(config, decodeStage) as TransformStream<
-                      EncodedChunk,
-                      VideoFrame
-                    >,
-                  async () => {
-                    if (fallbackKind === 'wasm-vpx') {
-                      const fallback = await context.routeCodec(decodeQuery, {
-                        ...callOptions,
-                        strategy: { ...callOptions.strategy, pinDriver: 'wasm-vpx' },
-                      });
-                      return fallback.createDecoder(config, decodeStage) as TransformStream<
-                        EncodedChunk,
-                        VideoFrame
-                      >;
-                    }
-                    const softwareOptions: CallOptions = {
-                      ...callOptions,
-                      strategy: {
-                        ...callOptions.strategy,
-                        determinism: 'force-software',
-                      },
-                    };
-                    return videoCodec.createDecoder(
-                      config,
-                      context.stageOptions(signal, softwareOptions),
-                    ) as TransformStream<EncodedChunk, VideoFrame>;
-                  },
-                  { signal },
-                )
-              : lazyPipeThrough<EncodedChunk, VideoFrame>(
-                  unwrapPackets(demuxer.packets(videoTrack.id)),
-                  () =>
-                    videoCodec.createDecoder(config, decodeStage) as TransformStream<
-                      EncodedChunk,
-                      VideoFrame
-                    >,
-                  { closeValue: context.closeIfClosable },
-                );
-        const filtered = await context.applyVideoFilters(
-          decoded as ReadableStream<VideoFrame>,
-          videoTarget,
-          videoTrack,
-          signal,
-          callOptions,
-        );
-        openStreams.push(filtered);
-        tasks.push(
-          context.encodeVideoStream(
-            filtered,
-            videoTarget,
-            videoTrack,
-            muxer,
+    }
+    const audioTarget =
+      audioTrack === undefined || copyAudioPackets
+        ? undefined
+        : await resolveAudioEncodeTargetForRuntime(opts.audio || {}, audioTrack.codec);
+
+    // The built-in MP4/MOV chunk muxer retains every encoded payload until finalize and its ordinary
+    // publication path ultimately needs one ArrayBuffer. Reject only projections beyond the portable
+    // 31-bit allocation ceiling (with 64 MiB of box/table headroom): this catches the 3.67 GiB long-form
+    // plan without pre-rejecting the ~1.4 GiB plan whose VBR encoder has already proven it can underspend.
+    // The muxer's independent 1 GiB actual-retention cap remains authoritative when rate evidence is
+    // absent or an encoder overshoots/underspends its plan.
+    if (
+      (target === 'mp4' || target === 'mov') &&
+      isBuiltInBufferedMp4MuxDriverId(outputContainer.id) &&
+      outputMuxOptions.fragmented !== true &&
+      outputMuxOptions.faststart !== 'reserve'
+    ) {
+      const plannedVideoBitrate =
+        selectedVideoTrack === undefined
+          ? undefined
+          : (videoEncoderConfig?.bitrate ??
+            (opts.video === false
+              ? undefined
+              : (opts.video?.maxAverageBitrate ?? opts.video?.bitrate)));
+      const plannedAudioBitrate = copyAudioPackets ? audioTrack?.bitrate : audioTarget?.bitrate;
+      assertBufferedMp4ConvertProjection(
+        target,
+        outputContainer.id,
+        maximumTrackDurationSec(selectedVideoTrack, audioTrack),
+        [plannedVideoBitrate, plannedAudioBitrate].filter(isPositiveFiniteNumber),
+      );
+    }
+
+    // These finite replay passes may pull decoder/encoder streams, so they deliberately occur only after
+    // the buffer-all projection has accepted the resolved source duration and actual planned rate.
+    const twoPassPlan =
+      opts.video !== false && opts.video?.twoPass === true
+        ? await (await import('./video-two-pass-runner.ts')).analyzeH264TwoPass(
+            src,
+            container,
+            opts.video,
             signal,
             callOptions,
             opts.fragmented === true,
-            twoPassPlan,
-          ),
-        );
-        /* v8 ignore stop */
+            context.videoRunnerContext(),
+          )
+        : undefined;
+    const qualityCandidate =
+      !usesQualityCandidate || qualityVideoTarget === undefined
+        ? undefined
+        : await (await import('./video-quality-runner.ts')).analyzeH264QualityConstrained(
+            src,
+            container,
+            qualityVideoTarget,
+            qualityRequest,
+            signal,
+            callOptions,
+            opts.fragmented === true,
+            {
+              driver: outputContainer,
+              format: target,
+              muxOptions: outputMuxOptions as MuxOptions,
+            },
+            context.videoRunnerContext(),
+          );
+
+    const muxer = outputContainer.createMuxer(outputMuxOptions);
+    const tasks: Promise<void>[] = [];
+    const openStreams: ReadableStream<unknown>[] = [];
+
+    if (selectedVideoTrack !== undefined) {
+      if (qualityCandidate !== undefined) {
+        const chunks = streamOf(qualityCandidate.chunks);
+        openStreams.push(chunks);
+        tasks.push(drainEncoderToMuxer(chunks, muxer, qualityCandidate.track, signal));
+      } else {
+        const plannedVideoTrack = videoTrack as TrackInfo;
+        const plannedVideoTarget = videoTarget as VideoTarget;
+        const plannedVideoEncoderConfig = videoEncoderConfig as VideoEncoderConfig;
+        const sourceVideoCodec = qualifiedVideoSourceCodec(plannedVideoTrack);
+        if (
+          canUseVpxAlphaGeometryPacketTranscode(
+            plannedVideoTarget,
+            plannedVideoTrack.alpha === true,
+            sourceVideoCodec,
+            plannedVideoEncoderConfig.codec,
+          )
+        ) {
+          const packets = demuxer.packets(plannedVideoTrack.id);
+          openStreams.push(packets);
+          tasks.push(
+            context.transcodeVpxAlphaGeometry(
+              packets,
+              plannedVideoTarget,
+              plannedVideoTrack,
+              muxer,
+              signal,
+              callOptions,
+            ),
+          );
+        } else if (
+          canUseVpxAlphaPacketTranscode(
+            plannedVideoTarget,
+            plannedVideoTrack.alpha === true,
+            sourceVideoCodec,
+            plannedVideoEncoderConfig.codec,
+          )
+        ) {
+          const packets = demuxer.packets(plannedVideoTrack.id);
+          openStreams.push(packets);
+          tasks.push(
+            context.transcodeVpxAlpha(
+              packets,
+              plannedVideoTarget,
+              plannedVideoTrack,
+              muxer,
+              signal,
+              callOptions,
+            ),
+          );
+        } else {
+          const decodeQuery = await decodeQueryFor(plannedVideoTrack);
+          const videoCodec = await context.routeCodec(decodeQuery, callOptions);
+          const config = decodeQuery.config;
+          const decodeStage = context.stageOptions(signal, callOptions);
+          const runtimeFallback =
+            plannedVideoTrack.alpha === true
+              ? undefined
+              : await import('./replayable-video-decoder.ts');
+          const fallbackKind = runtimeFallback?.planRuntimeVideoFallback(
+            videoCodec.id,
+            config.codec,
+            callOptions.strategy,
+          );
+          /* v8 ignore start -- live decode→filter→encode requires WebCodecs; browser-harness validated. */
+          const decoded =
+            plannedVideoTrack.alpha === true
+              ? decodeVideoPacketsWithAlpha(demuxer.packets(plannedVideoTrack.id), () =>
+                  videoCodec.createDecoder(config, decodeStage),
+                )
+              : runtimeFallback !== undefined && fallbackKind !== undefined
+                ? runtimeFallback.decodeVideoWithRuntimeFallback(
+                    unwrapPackets(demuxer.packets(plannedVideoTrack.id)),
+                    () =>
+                      videoCodec.createDecoder(config, decodeStage) as TransformStream<
+                        EncodedChunk,
+                        VideoFrame
+                      >,
+                    async () => {
+                      if (fallbackKind === 'wasm-vpx') {
+                        const fallback = await context.routeCodec(decodeQuery, {
+                          ...callOptions,
+                          strategy: {
+                            ...callOptions.strategy,
+                            pinDriver: 'wasm-vpx',
+                          },
+                        });
+                        return fallback.createDecoder(config, decodeStage) as TransformStream<
+                          EncodedChunk,
+                          VideoFrame
+                        >;
+                      }
+                      const softwareOptions: CallOptions = {
+                        ...callOptions,
+                        strategy: {
+                          ...callOptions.strategy,
+                          determinism: 'force-software',
+                        },
+                      };
+                      return videoCodec.createDecoder(
+                        config,
+                        context.stageOptions(signal, softwareOptions),
+                      ) as TransformStream<EncodedChunk, VideoFrame>;
+                    },
+                    { signal },
+                  )
+                : lazyPipeThrough<EncodedChunk, VideoFrame>(
+                    unwrapPackets(demuxer.packets(plannedVideoTrack.id)),
+                    () =>
+                      videoCodec.createDecoder(config, decodeStage) as TransformStream<
+                        EncodedChunk,
+                        VideoFrame
+                      >,
+                    { closeValue: context.closeIfClosable },
+                  );
+          const filtered = await context.applyVideoFilters(
+            decoded as ReadableStream<VideoFrame>,
+            plannedVideoTarget,
+            plannedVideoTrack,
+            signal,
+            callOptions,
+          );
+          openStreams.push(filtered);
+          tasks.push(
+            context.encodeVideoStream(
+              filtered,
+              plannedVideoTarget,
+              plannedVideoTrack,
+              muxer,
+              signal,
+              callOptions,
+              opts.fragmented === true,
+              twoPassPlan,
+            ),
+          );
+          /* v8 ignore stop */
+        }
       }
     }
 
@@ -354,10 +449,7 @@ export async function runCodecConvert(
         openStreams.push(packets);
         tasks.push(drainEncoderToMuxer(packets, muxer, audioTrack, signal));
       } else {
-        const audioTarget = await resolveAudioEncodeTargetForRuntime(
-          opts.audio || {},
-          audioTrack.codec,
-        );
+        const plannedAudioTarget = audioTarget as AudioTarget;
         const stage = context.stageOptions(signal, callOptions);
         let decoded: ReadableStream<AudioData>;
         if (
@@ -397,14 +489,21 @@ export async function runCodecConvert(
         /* v8 ignore start -- live decode→filter→encode requires AudioData/WebCodecs; browser-validated. */
         const shaped = await context.applyAudioFilters(
           decoded,
-          audioTarget,
+          plannedAudioTarget,
           audioTrack,
           signal,
           callOptions,
         );
         openStreams.push(shaped);
         tasks.push(
-          context.encodeAudioStream(shaped, audioTarget, audioTrack, muxer, signal, callOptions),
+          context.encodeAudioStream(
+            shaped,
+            plannedAudioTarget,
+            audioTrack,
+            muxer,
+            signal,
+            callOptions,
+          ),
         );
         /* v8 ignore stop */
       }
@@ -428,6 +527,29 @@ export async function runCodecConvert(
   } finally {
     await demuxer.close();
   }
+}
+
+function maximumTrackDurationSec(...tracks: Array<TrackInfo | undefined>): number | undefined {
+  const durations = tracks.map((track) => track?.durationSec).filter(isPositiveFiniteNumber);
+  return durations.length === 0 ? undefined : Math.max(...durations);
+}
+
+function isPositiveFiniteNumber(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function streamOf<T>(values: readonly T[]): ReadableStream<T> {
+  let index = 0;
+  return new ReadableStream<T>(
+    {
+      pull(controller): void {
+        const value = values[index++];
+        if (value === undefined) controller.close();
+        else controller.enqueue(value);
+      },
+    },
+    { highWaterMark: 0 },
+  );
 }
 
 async function cancelStream(stream: ReadableStream<unknown>): Promise<void> {

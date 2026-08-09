@@ -277,7 +277,7 @@ describe('Vorbis authoring - vendored libvorbisenc core, Ogg mux, ffmpeg oracle'
     const ogg = await encodeToOggVorbis(core, pcm, 'auto');
     expect(ogg[0], 'OggS magic').toBe(0x4f);
     const decoded = ffmpegDecode(ogg, pcm.channels, pcm.sampleRate);
-    expect(decoded.length / pcm.channels).toBeGreaterThan(pcm.frames * 0.9);
+    expect(decoded.length / pcm.channels, 'decoded presentation frames').toBe(pcm.frames);
     expect(snrDb(pcm.interleaved, decoded, pcm.channels), 'tonal SNR').toBeGreaterThan(
       SNR_FLOOR_DB,
     );
@@ -297,6 +297,7 @@ describe('Vorbis authoring - vendored libvorbisenc core, Ogg mux, ffmpeg oracle'
       const pcm = await wavPcm(id);
       const ogg = await encodeToOggVorbis(core, pcm, 112_000);
       const decoded = ffmpegDecode(ogg, pcm.channels, pcm.sampleRate);
+      expect(decoded.length / pcm.channels, `${id} decoded presentation frames`).toBe(pcm.frames);
       const snr = snrDb(pcm.interleaved, decoded, pcm.channels);
       expect(snr, `${id} SNR`).toBeGreaterThan(SNR_FLOOR_DB);
     }

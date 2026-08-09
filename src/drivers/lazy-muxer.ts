@@ -32,15 +32,23 @@ export interface LazyMuxerConfig {
    * advertise it — a consumer probes `writePcm` presence to choose between the PCM and encode paths.
    */
   readonly pcmSeam?: boolean;
+  /**
+   * Expose the late-bound gapless-timing seam. Only buffered muxers that can update track metadata
+   * after encoded packets drain may advertise it; callers use method presence as that capability
+   * check.
+   */
+  readonly gaplessSeam?: boolean;
 }
 
 export class LazyMuxer implements Muxer {
   readonly output: ReadableStream<Uint8Array>;
+  readonly setTrackGapless?: (trackId: number, gapless: NonNullable<TrackInfo['gapless']>) => void;
   readonly writePcm?: (trackId: number, data: Uint8Array) => Promise<void>;
   readonly #config: LazyMuxerConfig;
   readonly #ready: Promise<void>;
   readonly #tracks: TrackInfo[] = [];
   readonly #targetTrackIds: number[] = [];
+  readonly #pendingGapless = new Map<number, NonNullable<TrackInfo['gapless']>>();
   #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   #resolveReady: (() => void) | undefined;
   #muxer: Muxer | undefined;
@@ -59,6 +67,9 @@ export class LazyMuxer implements Muxer {
     });
     if (config.pcmSeam === true) {
       this.writePcm = (trackId, data): Promise<void> => this.#writePcm(trackId, data);
+    }
+    if (config.gaplessSeam === true) {
+      this.setTrackGapless = (trackId, gapless): void => this.#setTrackGapless(trackId, gapless);
     }
   }
 
@@ -83,6 +94,25 @@ export class LazyMuxer implements Muxer {
   async finalize(): Promise<void> {
     const muxer = await this.#ensureMuxer();
     await muxer.finalize();
+  }
+
+  #setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+    if (this.#tracks[trackId] === undefined) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    const muxer = this.#muxer;
+    if (muxer === undefined) {
+      this.#pendingGapless.set(trackId, { ...gapless });
+      return;
+    }
+    const targetTrackId = this.#targetTrackIds[trackId];
+    if (targetTrackId === undefined) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    if (muxer.setTrackGapless === undefined) {
+      throw missingLazyMethod(this.#config.driverId, 'setTrackGapless');
+    }
+    muxer.setTrackGapless(targetTrackId, gapless);
   }
 
   async #writePcm(trackId: number, data: Uint8Array): Promise<void> {
@@ -112,6 +142,19 @@ export class LazyMuxer implements Muxer {
       this.#muxer = muxer;
       this.#pumpOutput(muxer.output);
       for (const track of this.#tracks) this.#targetTrackIds.push(muxer.addTrack(track));
+      if (this.#pendingGapless.size > 0) {
+        if (muxer.setTrackGapless === undefined) {
+          throw missingLazyMethod(this.#config.driverId, 'setTrackGapless');
+        }
+        for (const [trackId, gapless] of this.#pendingGapless) {
+          const targetTrackId = this.#targetTrackIds[trackId];
+          if (targetTrackId === undefined) {
+            throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+          }
+          muxer.setTrackGapless(targetTrackId, gapless);
+        }
+        this.#pendingGapless.clear();
+      }
       return muxer;
     } catch (error) {
       await this.#errorOutput(error);

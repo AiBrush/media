@@ -6,6 +6,7 @@ import type { CodecQuery, ContainerQuery, FilterSpec } from './driver.ts';
 import {
   CapabilityError,
   type CapabilityErrorDetail,
+  ConstraintUnsatisfiedError,
   InputError,
   MediaError,
   type OperationDescriptor,
@@ -60,13 +61,20 @@ describe('CapabilityError', () => {
       direction: 'decode',
       config: { codec: 'flac', sampleRate: 48_000, numberOfChannels: 2 },
     };
-    const containerQuery: ContainerQuery = { direction: 'mux', extension: 'mp4' };
+    const containerQuery: ContainerQuery = {
+      direction: 'mux',
+      extension: 'mp4',
+    };
     const filterSpec: FilterSpec = { mediaType: 'audio', type: 'gain', db: -3 };
     const ops: readonly OperationDescriptor[] = [
       { kind: 'codec', query: codecQuery },
       { kind: 'container', query: containerQuery },
       { kind: 'filter', spec: filterSpec },
-      { kind: 'route', id: 'remux', facts: { container: 'mp4', fragmented: true } },
+      {
+        kind: 'route',
+        id: 'remux',
+        facts: { container: 'mp4', fragmented: true },
+      },
     ];
     for (const op of ops) {
       const err = new CapabilityError('miss', { op, tried: ['x'] });
@@ -76,10 +84,18 @@ describe('CapabilityError', () => {
   });
 
   it('guards a wire-shaped detail without accepting malformed payloads', () => {
-    expect(isCapabilityErrorDetail({ op: { kind: 'route', id: 'demux' }, tried: [] })).toBe(true);
-    expect(isCapabilityErrorDetail({ op: { kind: 'route', id: 'demux' }, tried: ['mp4'] })).toBe(
-      true,
-    );
+    expect(
+      isCapabilityErrorDetail({
+        op: { kind: 'route', id: 'demux' },
+        tried: [],
+      }),
+    ).toBe(true);
+    expect(
+      isCapabilityErrorDetail({
+        op: { kind: 'route', id: 'demux' },
+        tried: ['mp4'],
+      }),
+    ).toBe(true);
     expect(isCapabilityErrorDetail(undefined)).toBe(false);
     expect(isCapabilityErrorDetail(null)).toBe(false);
     expect(isCapabilityErrorDetail('demux')).toBe(false);
@@ -102,6 +118,35 @@ describe('InputError', () => {
 
   it('is distinguishable from a sibling subclass', () => {
     expect(new InputError('x')).not.toBeInstanceOf(CapabilityError);
+  });
+});
+
+describe('ConstraintUnsatisfiedError', () => {
+  it('intrinsically carries the constraint code and bounded attempt evidence', () => {
+    const detail = {
+      constraint: 'h264-quality-rate',
+      preferredAverageBitrate: 2_000_000,
+      maxAverageBitrate: 2_600_000,
+      minimumQualityMean: 0.93,
+      metric: 'ssim-luma-v1',
+      attempts: [
+        {
+          attempt: 1,
+          targetBytes: 250_000,
+          actualBytes: 240_000,
+          averageBitrate: 1_920_000,
+          qualityMean: 0.91,
+          qualitySamples: 8,
+        },
+      ],
+    } as const;
+    const error = new ConstraintUnsatisfiedError('no candidate', detail);
+    expect(error).toBeInstanceOf(MediaError);
+    expect(error).toMatchObject({
+      name: 'ConstraintUnsatisfiedError',
+      code: 'constraint-unsatisfied',
+      detail,
+    });
   });
 });
 

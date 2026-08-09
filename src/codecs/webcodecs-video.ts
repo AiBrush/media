@@ -330,6 +330,7 @@ export function decoderErrorToCapabilityMiss(
       tried: [driverId],
       suggestion: 'try another browser or a WASM decode tail',
     },
+    { cause: e },
   );
 }
 

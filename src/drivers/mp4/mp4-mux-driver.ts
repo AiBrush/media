@@ -8,11 +8,13 @@ import type {
   DriverModule,
   MuxOptions,
   Muxer,
+  Packet,
   Registry,
+  TrackInfo,
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError } from '../../contracts/errors.ts';
-import { Mp4Muxer } from './mux.ts';
+import { Mp4Muxer, auditMp4H264MuxedPackets } from './mux.ts';
 
 function supportsMux(query: ContainerQuery): boolean {
   if (query.direction !== 'mux') return false;
@@ -43,7 +45,15 @@ export const Mp4MuxOnlyDriver: ContainerDriver = {
     );
   },
   createMuxer(options?: MuxOptions): Muxer {
-    return new Mp4Muxer(options);
+    return new Mp4Muxer(options, 'mp4-mux');
+  },
+  async auditMuxedTrack(
+    track: TrackInfo,
+    packets: Iterable<Packet>,
+    options?: MuxOptions,
+    signal?: AbortSignal,
+  ) {
+    return auditMp4H264MuxedPackets(track, packets, options, signal);
   },
 };
 

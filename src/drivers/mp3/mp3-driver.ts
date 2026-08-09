@@ -22,6 +22,7 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { matchesMp3 } from '../audio-container-sniff.ts';
+import { mp3PresentationGaplessFromLame } from './mp3-gapless.ts';
 import { Mp3Muxer, muxPreparedMp3PacketTrack } from './mp3-mux.ts';
 export { muxPreparedMp3PacketTrack };
 export type { PreparedMp3Packet, PreparedMp3PacketMuxInput } from './mp3-mux.ts';
@@ -172,30 +173,28 @@ function isInfoFrame(dv: DataView, offset: number, header: FrameHeader): boolean
 function gaplessFromXingLame(
   bytes: Uint8Array,
   first: { offset: number; header: FrameHeader },
-): TrackInfo['gapless'] | undefined {
+):
+  | {
+      readonly gapless: NonNullable<TrackInfo['gapless']>;
+      readonly declaredTotalSamples: number;
+    }
+  | undefined {
   const frameEnd = first.offset + first.header.frameLength;
   if (frameEnd > bytes.byteLength) return undefined;
   const parsedHeader = parseMp3FrameHeader(bytes, first.offset);
   const vbr = parseVbrHeader(bytes.subarray(first.offset, frameEnd), parsedHeader);
   const frameCount = vbr?.frameCount;
-  const leadingSamples = vbr?.encoderDelay;
-  const trailingSamples = vbr?.encoderPadding;
-  if (
-    frameCount === undefined ||
-    leadingSamples === undefined ||
-    trailingSamples === undefined ||
-    !Number.isSafeInteger(frameCount) ||
-    !Number.isSafeInteger(leadingSamples) ||
-    !Number.isSafeInteger(trailingSamples) ||
-    frameCount <= 0 ||
-    leadingSamples < 0 ||
-    trailingSamples < 0
-  ) {
+  const encoderDelay = vbr?.encoderDelay;
+  const encoderPadding = vbr?.encoderPadding;
+  if (frameCount === undefined || encoderDelay === undefined || encoderPadding === undefined) {
     return undefined;
   }
-  const totalSamples = frameCount * parsedHeader.samplesPerFrame - leadingSamples - trailingSamples;
-  if (!Number.isSafeInteger(totalSamples) || totalSamples <= 0) return undefined;
-  return { leadingSamples, trailingSamples, totalSamples };
+  return mp3PresentationGaplessFromLame(
+    frameCount,
+    parsedHeader.samplesPerFrame,
+    encoderDelay,
+    encoderPadding,
+  );
 }
 
 /** Exact audio duration from every complete MPEG frame present in `dv`, skipping a leading Xing/Info frame. */
@@ -262,10 +261,11 @@ export function parseMp3(bytes: Uint8Array, totalSize?: number, sourceOffset = 0
   const { offset, header } = first;
 
   const frames = xingFrameCount(dv, offset, header);
-  const gapless = gaplessFromXingLame(bytes, first);
+  const xingLame = gaplessFromXingLame(bytes, first);
+  const gapless = xingLame?.gapless;
   let durationSec: number;
-  if (gapless !== undefined && gapless.totalSamples !== undefined) {
-    durationSec = gapless.totalSamples / header.sampleRate;
+  if (xingLame !== undefined) {
+    durationSec = xingLame.declaredTotalSamples / header.sampleRate;
   } else if (frames !== undefined) {
     durationSec = (frames * header.samplesPerFrame) / header.sampleRate;
   } else if (totalSize === undefined || totalSize <= sourceOffset + dv.byteLength) {

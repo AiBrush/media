@@ -158,13 +158,27 @@ export type PcmCodec =
   | 'pcm-f64be';
 export type AudioCodec = 'aac' | 'opus' | 'mp3' | 'flac' | 'vorbis' | PcmCodec;
 
+export interface VideoQualityConstraint {
+  /** Versioned objective-quality metric evaluated over presentation-aligned decoded frames. */
+  metric: 'ssim-luma-v1';
+  /** Required mean metric score, inclusive, in the range [0, 1]. */
+  minimumMean: number;
+  /** Number of deterministic, uniformly distributed presentation-time samples to evaluate. */
+  samples?: number;
+}
+
 export interface VideoTarget {
   codec?: VideoCodec;
   width?: number;
   height?: number;
   fit?: 'contain' | 'cover' | 'fill';
   fps?: number;
+  /** Preferred whole-program elementary-stream average bitrate in bits per second. */
   bitrate?: number;
+  /** Hard whole-program elementary-stream average bitrate ceiling; requires `bitrate` and `quality`. */
+  maxAverageBitrate?: number;
+  /** Hard objective-quality constraint; requires `bitrate` and `maxAverageBitrate`. */
+  quality?: VideoQualityConstraint;
   bitrateMode?: VideoEncoderBitrateMode;
   crf?: number;
   twoPass?: boolean;
@@ -202,9 +216,26 @@ export interface H264AbrRung {
   readonly name?: string;
   readonly width: number;
   readonly height: number;
+  /** Preferred whole-program elementary-stream average bitrate in bits per second. */
   readonly bitrate: number;
+  /** Hard average bitrate ceiling; requires `quality` and is never inferred from `bitrate`. */
+  readonly maxAverageBitrate?: number;
+  /** Hard objective-quality constraint; requires `maxAverageBitrate`. */
+  readonly quality?: VideoQualityConstraint;
   readonly fps?: number;
 }
+
+/** Maximum public H.264 ABR fanout width; bounds retained outputs and per-rung orchestration state. */
+export const H264_ABR_MAX_RUNGS = 8;
+
+/** Maximum source bytes accepted by the Blob-returning H.264 ABR convenience operation. */
+export const H264_ABR_MAX_SOURCE_BYTES = 128 * 1024 * 1024;
+
+/** Maximum cumulative encoded bytes retained across one atomically published H.264 ABR ladder. */
+export const H264_ABR_MAX_RETAINED_OUTPUT_BYTES = 512 * 1024 * 1024;
+
+/** Maximum simultaneous bitrate-only ABR worker jobs/source copies; quality ladders always use one. */
+export const H264_ABR_MAX_CONCURRENT_LEGACY_RUNGS = 4;
 
 export interface ConvertOptions {
   to?: Container;

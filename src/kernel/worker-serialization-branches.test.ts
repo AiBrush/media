@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import {
+  CapabilityError,
+  ConstraintUnsatisfiedError,
+  InputError,
+  MediaError,
+} from '../contracts/errors.ts';
 import {
   type SerializedError,
   collectTransferables,
@@ -72,12 +77,18 @@ describe('worker protocol serialization boundaries', () => {
       detail: cloneSafe,
     });
     expect(serializeError(new InputError('input', null)).detail).toBeNull();
-    const capDetail = { op: { kind: 'route', id: 'probe' }, tried: [] } as const;
+    const capDetail = {
+      op: { kind: 'route', id: 'probe' },
+      tried: [],
+    } as const;
     expect(serializeError(new CapabilityError('cap', capDetail)).detail).toEqual(capDetail);
   });
 
   it('serializes generic Error and non-Error throws without fabricating a media code', () => {
-    expect(serializeError(new Error('plain'))).toEqual({ kind: 'generic', message: 'plain' });
+    expect(serializeError(new Error('plain'))).toEqual({
+      kind: 'generic',
+      message: 'plain',
+    });
     expect(serializeError('string failure')).toEqual({
       kind: 'generic',
       message: 'string failure',
@@ -90,13 +101,45 @@ describe('worker protocol serialization boundaries', () => {
     const input = deserializeError({ kind: 'input', message: 'input' });
     const media = deserializeError({ kind: 'media', message: 'media' });
 
-    expect(capability).toMatchObject({ name: 'CapabilityError', code: 'capability-miss' });
-    expect(input).toMatchObject({ name: 'InputError', code: 'unsupported-input' });
+    expect(capability).toMatchObject({
+      name: 'CapabilityError',
+      code: 'capability-miss',
+    });
+    expect(input).toMatchObject({
+      name: 'InputError',
+      code: 'unsupported-input',
+    });
     expect(media).toMatchObject({ name: 'MediaError', code: 'decode-error' });
   });
 
+  it('round-trips the objective-constraint subclass and safely degrades malformed detail', () => {
+    const detail = {
+      constraint: 'h264-quality-rate',
+      preferredAverageBitrate: 2_000_000,
+      maxAverageBitrate: 2_600_000,
+      minimumQualityMean: 0.93,
+      metric: 'ssim-luma-v1',
+      attempts: [],
+    } as const;
+    const back = deserializeError(
+      serializeError(new ConstraintUnsatisfiedError('no candidate', detail)),
+    );
+    expect(back).toBeInstanceOf(ConstraintUnsatisfiedError);
+    expect(back).toMatchObject({ code: 'constraint-unsatisfied', detail });
+    expect(
+      deserializeError({
+        kind: 'constraint',
+        message: 'old worker',
+        detail: null,
+      }),
+    ).toMatchObject({ name: 'MediaError', code: 'constraint-unsatisfied' });
+  });
+
   it('rebuilds generic failures either faithfully or under the caller operation code', () => {
-    const wire: SerializedError = { kind: 'generic', message: 'worker exploded' };
+    const wire: SerializedError = {
+      kind: 'generic',
+      message: 'worker exploded',
+    };
     const plain = deserializeError(wire);
     const typed = deserializeError(wire, 'encode-error');
 
