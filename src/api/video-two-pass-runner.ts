@@ -353,16 +353,25 @@ export async function analyzeH264TwoPass(
       quantizer: H264_FIRST_PASS_QUANTIZER,
       ...(keyFrameInterval === undefined ? {} : { keyFrameInterval }),
     };
-    let firstPassInput = bitDepthPlan.requiresPixelPath
-      ? filteredFrames.pipeThrough(
-          (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
-        )
-      : filteredFrames;
+    let firstPassInput = filteredFrames;
+    if (bitDepthPlan.kind === 'downconvert' && bitDepthPlan.requiresPixelPath) {
+      firstPassInput = firstPassInput.pipeThrough(
+        (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
+      );
+    }
     if (colorIntent !== undefined) {
       firstPassInput = firstPassInput.pipeThrough(
         (await import('./video-frame-convert.ts')).destinationColorI420FrameStream(
           colorIntent,
           target.alpha === 'keep',
+        ),
+      );
+    }
+    if (bitDepthPlan.kind === 'encoder-widen') {
+      firstPassInput = firstPassInput.pipeThrough(
+        (await import('./video-frame-convert.ts')).widenedI420VideoFrameStream(
+          bitDepthPlan.sourceBitDepth,
+          bitDepthPlan.targetBitDepth,
         ),
       );
     }
@@ -419,6 +428,7 @@ export async function encodeVideoStream(
 ): Promise<void> {
   const {
     buildVideoEncoderConfig,
+    assertVideoEncoderOutputBitDepth,
     drainEncoderToMuxer,
     encodeQueryFor,
     encodeVideoFramesWithAlpha,
@@ -499,14 +509,32 @@ export async function encodeVideoStream(
     ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
     ...(rateControlWarmupFrames !== undefined ? { rateControlWarmupFrames } : {}),
   };
-  let encodeInput = bitDepthPlan.requiresPixelPath
-    ? frames.pipeThrough((await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream())
-    : frames;
+  if (bitDepthPlan.kind === 'encoder-widen' && target.alpha === 'keep') {
+    throw new CapabilityError('high-bit-depth alpha widening is not available', {
+      op: { kind: 'route', id: 'convert-video-bit-depth' },
+      tried: ['videoframe-planar-alpha'],
+      suggestion: 'discard alpha or target 8-bit output',
+    });
+  }
+  let encodeInput = frames;
+  if (bitDepthPlan.kind === 'downconvert' && bitDepthPlan.requiresPixelPath) {
+    encodeInput = encodeInput.pipeThrough(
+      (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
+    );
+  }
   if (colorIntent !== undefined) {
     encodeInput = encodeInput.pipeThrough(
       (await import('./video-frame-convert.ts')).destinationColorI420FrameStream(
         colorIntent,
         target.alpha === 'keep',
+      ),
+    );
+  }
+  if (bitDepthPlan.kind === 'encoder-widen') {
+    encodeInput = encodeInput.pipeThrough(
+      (await import('./video-frame-convert.ts')).widenedI420VideoFrameStream(
+        bitDepthPlan.sourceBitDepth,
+        bitDepthPlan.targetBitDepth,
       ),
     );
   }
@@ -523,14 +551,17 @@ export async function encodeVideoStream(
   await drainEncoderToMuxer(
     chunks,
     muxer,
-    () =>
-      videoTrackInfoFromDecoderConfig(
-        requireEncoderConfig(decoderConfig, 'video'),
+    () => {
+      const publishedConfig = requireEncoderConfig(decoderConfig, 'video');
+      assertVideoEncoderOutputBitDepth(publishedConfig, target.bitDepth);
+      return videoTrackInfoFromDecoderConfig(
+        publishedConfig,
         target.fps,
         sourceTrack?.durationSec,
         outputVideoRotation(target, sourceTrack?.rotation),
         colorIntent,
-      ),
+      );
+    },
     signal,
   );
   assertTwoPassComplete?.();

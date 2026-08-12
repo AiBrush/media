@@ -1,15 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Progress } from '../contracts/driver.ts';
 import { InputError, MediaError } from '../contracts/errors.ts';
-import {
-  type CancellableTask,
-  batchPackets,
-  collect,
-  composeChain,
-  lazyPipeThrough,
-  runCancellable,
-  runToSink,
-} from './executor.ts';
+import { type CancellableTask, lazyPipeThrough, runCancellable } from './executor-cancellable.ts';
+import { batchPackets, collect, composeChain, runToSink } from './executor.ts';
 
 function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -153,6 +146,96 @@ describe('lazyPipeThrough', () => {
     } finally {
       reader.releaseLock();
     }
+  });
+
+  it('cancels the source exactly once before the first pull without creating the stage', async () => {
+    const reason = new Error('stop before pull');
+    const reasons: unknown[] = [];
+    let created = 0;
+    const source = new ReadableStream<Uint8Array>(
+      {
+        cancel(value): void {
+          reasons.push(value);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const stream = lazyPipeThrough(source, () => {
+      created++;
+      return inc();
+    });
+
+    await stream.cancel(reason);
+    await stream.cancel(new Error('duplicate cancel'));
+
+    expect(created).toBe(0);
+    expect(reasons).toEqual([reason]);
+    expect(source.locked).toBe(false);
+  });
+
+  it('hands cancellation ownership to the pipe exactly once when cancel races a pending pull', async () => {
+    const reason = new Error('stop pending pull');
+    const reasons: unknown[] = [];
+    let created = 0;
+    const source = new ReadableStream<Uint8Array>(
+      {
+        pull(): Promise<void> {
+          return new Promise(() => {});
+        },
+        cancel(value): void {
+          reasons.push(value);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const reader = lazyPipeThrough(source, () => {
+      created++;
+      return inc();
+    }).getReader();
+    try {
+      const pendingRead = reader.read();
+      await Promise.resolve();
+      await Promise.all([reader.cancel(reason), reader.cancel(new Error('duplicate cancel'))]);
+
+      await expect(pendingRead).resolves.toEqual({ done: true, value: undefined });
+      expect(created).toBe(1);
+      expect(reasons).toEqual([reason]);
+    } finally {
+      reader.releaseLock();
+    }
+  });
+
+  it('closes an owned value when a non-cooperative stage resolves after consumer cancellation', async () => {
+    const closeValue = vi.fn();
+    const value = { id: 1 };
+    let resolveRead: ((result: ReadableStreamReadResult<typeof value>) => void) | undefined;
+    const stageReader = {
+      read: vi.fn(
+        () =>
+          new Promise<ReadableStreamReadResult<typeof value>>((resolve) => {
+            resolveRead = resolve;
+          }),
+      ),
+      cancel: vi.fn(() => Promise.resolve()),
+    };
+    const source = {
+      pipeThrough: vi.fn(() => ({ getReader: () => stageReader })),
+      cancel: vi.fn(() => Promise.resolve()),
+    } as unknown as ReadableStream<number>;
+    const reader = lazyPipeThrough(source, () => new TransformStream<number, typeof value>(), {
+      closeValue,
+    }).getReader();
+
+    const pending = reader.read();
+    await Promise.resolve();
+    const cancelled = reader.cancel('consumer stopped');
+    resolveRead?.({ done: false, value });
+    await cancelled;
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    await Promise.resolve();
+
+    expect(stageReader.cancel).toHaveBeenCalledWith('consumer stopped');
+    expect(closeValue).toHaveBeenCalledWith(value);
   });
 });
 
@@ -461,6 +544,23 @@ describe('runCancellable', () => {
     parent.abort();
     await expect(task).rejects.toMatchObject({ code: 'aborted' });
     task.cancel();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps linked abort authoritative when an inner cancel hook throws', async () => {
+    const cancel = vi.fn(() => {
+      throw new Error('broken cancel hook');
+    });
+    const task = runCancellable([], async (scope) => {
+      void scope.dispatch(cancellable(Promise.resolve('ignored'), cancel));
+      await new Promise<void>((resolve) => {
+        scope.signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return scope.signal.aborted;
+    });
+
+    task.cancel();
+    await expect(task).resolves.toBe(true);
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 });

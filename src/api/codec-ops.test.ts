@@ -13,7 +13,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { parseAdts } from '../drivers/adts/adts-driver.ts';
+import { enumerateAdtsFrames, parseAdts } from '../drivers/adts/adts-driver.ts';
 import { FlacDriver, enumerateFlacFrames, parseFlac } from '../drivers/flac/flac-driver.ts';
 import { parseMp3 } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
@@ -514,6 +514,42 @@ describe('trim — compressed audio packet-copy path', () => {
     } finally {
       restore();
     }
+  });
+
+  it('rejects an accurate ADTS sub-range that the carrier cannot present sample-exactly', async () => {
+    const restore = installEncodedChunkShims();
+    try {
+      await expect(
+        media().trim(await fixtureSource('sfx.adts'), {
+          start: 0.04,
+          end: 0.16,
+          mode: 'accurate',
+        }),
+      ).rejects.toMatchObject({
+        code: 'capability-miss',
+        message: expect.stringMatching(/ADTS.*whole AAC access units.*discard metadata/i),
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it('accurately copy-trims an ADTS prefix that ends on a proven access-unit boundary', async () => {
+    const source = await loadFixture('sfx.adts');
+    const sourceFrames = enumerateAdtsFrames(source);
+    const firstExcluded = sourceFrames[5];
+    if (firstExcluded === undefined) throw new Error('ADTS fixture needs at least six frames');
+
+    const out = await outputBytes(
+      await media().trim(fromBytes(source, { mime: 'audio/aac' }), {
+        start: 0,
+        end: firstExcluded.ptsUs / 1_000_000,
+        mode: 'accurate',
+      }),
+    );
+
+    expect(out).toEqual(source.subarray(sourceFrames[0]?.offset ?? 0, firstExcluded.offset));
+    expect(enumerateAdtsFrames(out)).toHaveLength(5);
   });
 });
 

@@ -24,6 +24,7 @@ import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/index.ts';
 import { readByteStream } from '../../util/byte-stream.ts';
 import { type LazyContainerLoader, LazyMuxer, missingLazyMethod } from '../lazy-muxer.ts';
+import { validateFlacMuxTrack } from './flac-match.ts';
 import {
   type FastFlacFrameSpan,
   fastFlacFrames,
@@ -112,22 +113,6 @@ export function lazyFlacContainerDriver(): ContainerDriver {
       return transformPcm(src, o);
     },
   };
-}
-
-/** FLAC writes exactly one FLAC audio stream — enforced synchronously, before the chunk loads. */
-function validateFlacMuxTrack(info: TrackInfo, trackCount: number): void {
-  if (trackCount > 0) {
-    throw new CapabilityError('the FLAC muxer writes a single audio stream', {
-      op: { kind: 'route', id: 'mux' },
-      tried: ['flac'],
-    });
-  }
-  if (info.mediaType !== 'audio' || info.codec !== 'flac') {
-    throw new CapabilityError(
-      `FLAC container carries a single FLAC audio track, not ${info.mediaType}/${info.codec}`,
-      { op: { kind: 'route', id: 'mux' }, tried: ['flac'] },
-    );
-  }
 }
 
 async function readFlacBytes(src: ByteSource): Promise<Uint8Array> {

@@ -13,7 +13,8 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createMedia } from '../src/api/create-media.ts';
-import { batchPackets, runCancellable } from '../src/kernel/executor.ts';
+import { runCancellable } from '../src/kernel/executor-cancellable.ts';
+import { batchPackets } from '../src/kernel/executor.ts';
 import { plan } from '../src/kernel/planner.ts';
 import { toBlob } from '../src/sinks/sink.ts';
 

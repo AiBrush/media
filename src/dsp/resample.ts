@@ -24,6 +24,7 @@
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { type PcmAudio, channelAt, sampleAt } from './pcm.ts';
 import { ResampleLruCache } from './resample-cache.ts';
+import type { StatefulAudioStage } from './stream.ts';
 
 /**
  * Quality knobs of the prototype windowed-sinc filter. Fixed (not exposed) so every `convert` resample
@@ -584,4 +585,216 @@ export function resample(
           )
         : audio.planar.map((ch) => resampleChannelPolyphase(ch, outFrames, bank, options.signal));
   return { sampleRate: outRate, channels: audio.channels, frames: outFrames, planar };
+}
+
+/**
+ * Build a bounded, continuous-phase streaming resampler. Unlike applying {@link resample} to every
+ * decoder chunk independently, this stage retains only the filter's short history/look-ahead window,
+ * carries the exact polyphase cursor across chunks, and rounds the output length once for the complete
+ * signal. Concatenating all `push()`/`flush()` output is floating-point equivalent to one whole-signal
+ * `resample(input, outRate)` call (within summation epsilon), independent of input chunk boundaries.
+ */
+export function resampleStage(outRate: number, options: ResampleOptions = {}): StatefulAudioStage {
+  let inRate: number | undefined;
+  let channels: number | undefined;
+  let ratio = 0;
+  let inverseRatio = 0;
+  let halfSupport = 0;
+  let bank: PolyphaseBank | undefined;
+  let base = 0;
+  let phase = 0;
+  let totalInputFrames = 0;
+  let totalOutputFrames = 0;
+  let bufferStartFrame = 0;
+  let buffer: Float64Array[] = [];
+  let flushed = false;
+
+  const initialize = (chunk: PcmAudio): void => {
+    validatePcmAudioShape(chunk);
+    const plan = planResampleWork(chunk.sampleRate, outRate, 1, chunk.channels);
+    inRate = chunk.sampleRate;
+    channels = chunk.channels;
+    ratio = plan.ratio;
+    inverseRatio = 1 / ratio;
+    if (inRate !== outRate) {
+      halfSupport = ZERO_CROSSINGS / Math.min(1, ratio);
+      bank = polyphaseBank(inRate, outRate, ratio, plan.maximumTapCount, filterTable());
+    }
+    buffer = Array.from({ length: channels }, () => new Float64Array(0));
+  };
+
+  const validateChunk = (chunk: PcmAudio): void => {
+    validatePcmAudioShape(chunk);
+    if (chunk.sampleRate !== inRate || chunk.channels !== channels) {
+      throw new InputError(
+        `streaming resample layout changed from ${inRate} Hz/${channels} channel(s) to ` +
+          `${chunk.sampleRate} Hz/${chunk.channels} channel(s)`,
+      );
+    }
+  };
+
+  const append = (chunk: PcmAudio): void => {
+    const retainedFrames = totalInputFrames - bufferStartFrame;
+    if (retainedFrames < 0 || buffer.some((plane) => plane.length !== retainedFrames)) {
+      throw new MediaError('encode-error', 'streaming resample history accounting is inconsistent');
+    }
+    buffer = buffer.map((plane, channel) => {
+      const combined = new Float64Array(retainedFrames + chunk.frames);
+      combined.set(plane);
+      combined.set(channelAt(chunk.planar, channel), retainedFrames);
+      return combined;
+    });
+    totalInputFrames += chunk.frames;
+  };
+
+  const nextInputBounds = (
+    candidateBase: number,
+    candidatePhase: number,
+    outputFrame: number,
+  ): { first: number; last: number } => {
+    if (bank !== undefined) {
+      const kernel = bank.kernels[candidatePhase] as PolyphaseKernel;
+      const first = candidateBase + kernel.firstOffset;
+      return { first, last: first + kernel.coeffs.length - 1 };
+    }
+    const center = outputFrame * inverseRatio;
+    return {
+      first: Math.ceil(center - halfSupport),
+      last: Math.floor(center + halfSupport),
+    };
+  };
+
+  const availableOutputFrames = (final: boolean): number => {
+    const finalTarget = final ? Math.round(totalInputFrames * ratio) : Number.POSITIVE_INFINITY;
+    let candidateBase = base;
+    let candidatePhase = phase;
+    let outputFrame = totalOutputFrames;
+    let count = 0;
+    while (outputFrame < finalTarget) {
+      const bounds = nextInputBounds(candidateBase, candidatePhase, outputFrame);
+      if (!final && bounds.last >= totalInputFrames) break;
+      count++;
+      outputFrame++;
+      if (bank !== undefined) {
+        candidateBase += bank.baseIncrements[candidatePhase] as number;
+        candidatePhase = bank.nextPhases[candidatePhase] as number;
+      }
+    }
+    return count;
+  };
+
+  const bufferedSample = (plane: Float64Array, inputFrame: number): number => {
+    if (inputFrame < 0 || inputFrame >= totalInputFrames) return 0;
+    const localFrame = inputFrame - bufferStartFrame;
+    if (localFrame < 0 || localFrame >= plane.length) {
+      throw new MediaError(
+        'encode-error',
+        'streaming resample discarded input history before its final filter use',
+      );
+    }
+    return plane[localFrame] as number;
+  };
+
+  const produce = (final: boolean): readonly PcmAudio[] => {
+    throwIfAborted(options.signal);
+    if (inRate === undefined || channels === undefined) return [];
+    if (inRate === outRate) return [];
+    const frames = availableOutputFrames(final);
+    if (frames === 0) return [];
+    const planar = Array.from({ length: channels }, () => new Float64Array(frames));
+    const table = bank === undefined ? filterTable() : undefined;
+    const cutoff = Math.min(1, ratio);
+
+    for (let localOutput = 0; localOutput < frames; localOutput++) {
+      if ((localOutput & (ABORT_CHECK_INTERVAL - 1)) === 0) throwIfAborted(options.signal);
+      if (bank !== undefined) {
+        const kernel = bank.kernels[phase] as PolyphaseKernel;
+        const first = base + kernel.firstOffset;
+        const localFirst = first - bufferStartFrame;
+        const tapCount = kernel.coeffs.length;
+        const firstBuffer = buffer[0] as Float64Array;
+        const direct = localFirst >= 0 && localFirst + tapCount <= firstBuffer.length;
+        for (let channel = 0; channel < channels; channel++) {
+          const input = buffer[channel] as Float64Array;
+          let value = 0;
+          if (direct) {
+            let tap = 0;
+            let inputFrame = localFirst;
+            const unrolled = tapCount - (tapCount & 3);
+            for (; tap < unrolled; tap += 4, inputFrame += 4) {
+              value +=
+                (input[inputFrame] as number) * (kernel.coeffs[tap] as number) +
+                (input[inputFrame + 1] as number) * (kernel.coeffs[tap + 1] as number) +
+                (input[inputFrame + 2] as number) * (kernel.coeffs[tap + 2] as number) +
+                (input[inputFrame + 3] as number) * (kernel.coeffs[tap + 3] as number);
+            }
+            for (; tap < tapCount; tap++, inputFrame++) {
+              value += (input[inputFrame] as number) * (kernel.coeffs[tap] as number);
+            }
+          } else {
+            for (let tap = 0; tap < tapCount; tap++) {
+              value += bufferedSample(input, first + tap) * (kernel.coeffs[tap] as number);
+            }
+          }
+          (planar[channel] as Float64Array)[localOutput] = value;
+        }
+        base += bank.baseIncrements[phase] as number;
+        phase = bank.nextPhases[phase] as number;
+      } else {
+        const center = totalOutputFrames * inverseRatio;
+        const first = Math.ceil(center - halfSupport);
+        const last = Math.floor(center + halfSupport);
+        for (let channel = 0; channel < channels; channel++) {
+          const input = buffer[channel] as Float64Array;
+          let value = 0;
+          for (let inputFrame = first; inputFrame <= last; inputFrame++) {
+            value +=
+              bufferedSample(input, inputFrame) *
+              tapAt(table as Float64Array, Math.abs((center - inputFrame) * cutoff));
+          }
+          (planar[channel] as Float64Array)[localOutput] = value * cutoff;
+        }
+      }
+      totalOutputFrames++;
+    }
+
+    const nextFirst = nextInputBounds(base, phase, totalOutputFrames).first;
+    const discardBefore = Math.max(bufferStartFrame, Math.min(totalInputFrames, nextFirst));
+    const discardFrames = discardBefore - bufferStartFrame;
+    if (discardFrames > 0) {
+      buffer = buffer.map((plane) => plane.slice(discardFrames));
+      bufferStartFrame = discardBefore;
+    }
+    return [{ sampleRate: outRate, channels, frames, planar }];
+  };
+
+  return {
+    push(chunk: PcmAudio): readonly PcmAudio[] {
+      if (flushed)
+        throw new MediaError('encode-error', 'streaming resample received input after flush');
+      if (inRate === undefined) initialize(chunk);
+      else validateChunk(chunk);
+      if (inRate === outRate) {
+        totalInputFrames += chunk.frames;
+        totalOutputFrames += chunk.frames;
+        return [
+          {
+            sampleRate: outRate,
+            channels: chunk.channels,
+            frames: chunk.frames,
+            planar: chunk.planar.map((plane) => plane.slice()),
+          },
+        ];
+      }
+      append(chunk);
+      return produce(false);
+    },
+    flush(): readonly PcmAudio[] {
+      if (flushed) return [];
+      flushed = true;
+      const output = produce(true);
+      buffer = [];
+      return output;
+    },
+  };
 }

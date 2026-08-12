@@ -18,6 +18,7 @@ import {
   implicitRateControlWarmupFrames,
   installH264TwoPassQuantizer,
   sourceGeometryOf,
+  tagH264ReplayDecodeError,
 } from './video-two-pass-runner.ts';
 import {
   type H264FirstPassSample,
@@ -311,11 +312,22 @@ describe('planH264TwoPass', () => {
     expect(implicitRateControlWarmupFrames({}, 'AVC3.64001F', undefined)).toBe(3);
     expect(implicitRateControlWarmupFrames({}, 'vp09.00.31.08', 60)).toBeUndefined();
     expect(implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'avc1.64001F', 30)).toBe(3);
+    expect(implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'avc3.64001F', 60)).toBe(8);
+    expect(
+      implicitRateControlWarmupFrames({ bitrate: 2_000_000 }, 'vp09.00.31.08', 60),
+    ).toBeUndefined();
     expect(
       implicitRateControlWarmupFrames({ bitrateMode: 'constant' }, 'avc1.64001F', 30),
     ).toBeUndefined();
     expect(implicitRateControlWarmupFrames({ crf: 22 }, 'av01.0.12M.08', 60)).toBeUndefined();
     expect(implicitRateControlWarmupFrames({ twoPass: true }, 'avc1.64001F', 30)).toBeUndefined();
+    expect(
+      implicitRateControlWarmupFrames(
+        { quality: { metric: 'ssim-luma-v1', minimumMean: 0.95 } },
+        'avc1.64001F',
+        30,
+      ),
+    ).toBeUndefined();
   });
 
   it('primes the real portrait 60-fps ABR corpus geometry used by the strict golden gate', async () => {
@@ -363,6 +375,74 @@ describe('planH264TwoPass', () => {
     ).toEqual({
       width: undefined,
       height: undefined,
+    });
+    expect(
+      sourceGeometryOf({
+        id: 2,
+        mediaType: 'video',
+        codec: 'h264',
+        rotation: 180,
+        fps: 60,
+        durationSec: 2,
+        bitrate: 3_000_000,
+      }),
+    ).toEqual({
+      width: undefined,
+      height: undefined,
+      rotation: 180,
+      fps: 60,
+      durationSec: 2,
+      bitrate: 3_000_000,
+    });
+    expect(
+      sourceGeometryOf({
+        id: 3,
+        mediaType: 'video',
+        codec: 'h264',
+        config: { codec: 'avc1.42E01E', codedWidth: 640, codedHeight: 360 },
+        durationSec: Number.NaN,
+        bitrate: 1_000_000,
+      }),
+    ).toEqual({ width: 640, height: 360, bitrate: 1_000_000 });
+  });
+
+  it('tags only genuine capability misses and retains exact terminal attempt facts', () => {
+    const ordinary = new Error('ordinary decode fault');
+    expect(
+      tagH264ReplayDecodeError(
+        ordinary,
+        'source-replay',
+        'avc1.64001F',
+        'webcodecs-video',
+        undefined,
+        { attempt: 'primary', primaryFrameEmitted: false },
+      ),
+    ).toBe(ordinary);
+
+    const crossRealm = Object.assign(new Error('cross-realm miss'), {
+      name: 'CapabilityError',
+      code: 'capability-miss',
+    });
+    const tagged = tagH264ReplayDecodeError(
+      crossRealm,
+      'source-replay',
+      'avc1.64001F',
+      'webcodecs-video',
+      'webcodecs-software',
+      { attempt: 'fallback', primaryFrameEmitted: true },
+    );
+    expect(tagged).toBeInstanceOf(CapabilityError);
+    expect(tagged).toMatchObject({
+      detail: {
+        tried: ['webcodecs-video', 'webcodecs-software'],
+        op: {
+          facts: {
+            fallback: 'webcodecs-software',
+            attempt: 'fallback',
+            primaryFrameEmitted: true,
+          },
+        },
+      },
     });
   });
 
@@ -697,6 +777,24 @@ describe('planH264TwoPass', () => {
     expect(
       Array.from(next.quantizers).some((value, index) => value > (plan.quantizers[index] ?? 0)),
     ).toBe(true);
+  });
+
+  it('fills sub-QP headroom with a mixed measured-complexity schedule below the byte bound', () => {
+    const count = 120;
+    const first = Array.from({ length: count }, (_, index) =>
+      sample(index * 40_000, 1_000 + (index % 7) * 100, 40_000, index === 0),
+    );
+    const plan = planH264TwoPass(first, 300_000, 4.8);
+    const actual = first.map((picture) => ({ ...picture, byteLength: picture.byteLength * 2 }));
+    const actualBytes = actual.reduce((sum, picture) => sum + picture.byteLength, 0);
+    const targetBytes = Math.floor(actualBytes / 1.02);
+    const next = plan.recalibrate(actual, targetBytes);
+    const uniqueQuantizers = new Set(next.quantizers);
+
+    expect(next.predictedBytes).toBeLessThanOrEqual(targetBytes);
+    expect(next.predictedBytes / targetBytes).toBeGreaterThan(0.99);
+    expect(uniqueQuantizers.size).toBeGreaterThan(1);
+    expect(Array.from(next.quantizers)).not.toEqual(Array.from(plan.quantizers));
   });
 
   it('installs a timestamp-checked replay quantizer and detects lifecycle mismatches', () => {

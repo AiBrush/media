@@ -16,11 +16,12 @@ import type {
   MuxOptions,
   Muxer,
   Packet,
+  PacketMetadataStats,
   StageOptions,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
-import { lazyPipeThrough } from '../kernel/executor.ts';
+import { lazyPipeThrough } from '../kernel/executor-cancellable.ts';
 import type { Sink } from '../sinks/sink.ts';
 import { toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions } from '../sinks/sink.ts';
@@ -28,6 +29,7 @@ import type { MediaInput, Source } from '../sources/source.ts';
 import {
   assertBufferedMp4ConvertProjection,
   isBuiltInBufferedMp4MuxDriverId,
+  packetStatsPresentationSpanSec,
 } from './buffered-mp4-convert.ts';
 import {
   type SourceGeometry,
@@ -40,7 +42,7 @@ import {
   drainEncoderToMuxer,
   qualifiedVideoSourceCodec,
   resolveAudioEncodeTargetForRuntime,
-  sourceVideoBitrateFromPacketTable,
+  sourceVideoBitrateFromPacketStats,
   unwrapPackets,
 } from './codec-pipeline.ts';
 import { chooseOutputContainer, containerHasChunkMuxer } from './codec-routing.ts';
@@ -213,15 +215,21 @@ export async function runCodecConvert(
       audioTrack !== undefined &&
       opts.audio === undefined &&
       canCopyAudioTrackToContainer(target, audioTrack);
+    const packetStatsCache = new Map<number, PacketMetadataStats | undefined>();
+    const packetStatsFor = (trackId: number): PacketMetadataStats | undefined => {
+      if (packetStatsCache.has(trackId)) return packetStatsCache.get(trackId);
+      const stats = demuxer.packetStats?.(trackId);
+      packetStatsCache.set(trackId, stats);
+      return stats;
+    };
 
     let videoTrack: TrackInfo | undefined;
     let videoTarget: VideoTarget | undefined;
     let videoEncoderConfig: VideoEncoderConfig | undefined;
     if (selectedVideoTrack !== undefined && !usesQualityCandidate) {
-      const measuredBitrate = sourceVideoBitrateFromPacketTable(
-        demuxer.packetTable?.(),
-        selectedVideoTrack.id,
-      );
+      const measuredBitrate =
+        selectedVideoTrack.bitrate ??
+        sourceVideoBitrateFromPacketStats(packetStatsFor(selectedVideoTrack.id));
       videoTrack =
         measuredBitrate === undefined
           ? selectedVideoTrack
@@ -258,10 +266,21 @@ export async function runCodecConvert(
               ? undefined
               : (opts.video?.maxAverageBitrate ?? opts.video?.bitrate)));
       const plannedAudioBitrate = copyAudioPackets ? audioTrack?.bitrate : audioTarget?.bitrate;
+      const selectedTrackIds = [selectedVideoTrack?.id, audioTrack?.id].filter(isDefinedNumber);
+      const selectedPacketStats = selectedTrackIds.map((trackId) => packetStatsFor(trackId));
+      const packetStatsSpanSec = packetStatsPresentationSpanSec(selectedPacketStats);
+      // Legacy third-party demuxers may expose only a row-materializing packetTable. Never call it for
+      // planning: if bounded stats are absent, also avoid treating an absolute container endpoint as
+      // elapsed work. The muxer's retained-byte cap remains the correctness authority.
+      const projectedDurationSec =
+        packetStatsSpanSec ??
+        (demuxer.packetTable === undefined
+          ? maximumTrackDurationSec(selectedVideoTrack, audioTrack)
+          : undefined);
       assertBufferedMp4ConvertProjection(
         target,
         outputContainer.id,
-        maximumTrackDurationSec(selectedVideoTrack, audioTrack),
+        projectedDurationSec,
         [plannedVideoBitrate, plannedAudioBitrate].filter(isPositiveFiniteNumber),
       );
     }
@@ -536,6 +555,10 @@ function maximumTrackDurationSec(...tracks: Array<TrackInfo | undefined>): numbe
 
 function isPositiveFiniteNumber(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function isDefinedNumber(value: number | undefined): value is number {
+  return value !== undefined;
 }
 
 function streamOf<T>(values: readonly T[]): ReadableStream<T> {

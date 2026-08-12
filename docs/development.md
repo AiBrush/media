@@ -18,14 +18,15 @@ bun install
 | `bun run test` | Run the Vitest suite |
 | `bun run test:watch` | Run Vitest in watch mode |
 | `bun run test:cov` | Run tests with coverage |
+| `bun run fetch-fixtures` | Fetch and hash-verify the reproducible media corpus |
 | `bun run build` | Build ESM bundles, source maps, and declarations into `dist/` |
 | `bun run vendor-wasm` | Copy selected codec WASM assets into the package output |
 | `bun run vendor-wasm:check` | Verify vendored asset contents |
 | `bun run test:dist` | Smoke-test the built distribution |
-| `bun run check-budgets` | Enforce package and eager-bundle size limits |
-| `bun run verify:package` | Install the packed package and verify runtime imports and types |
+| `bun run check-budgets` | Enforce dist-graph eager and concrete MP4 route limits |
+| `bun run verify:package` | Install the packed package and enforce clean-consumer imports, types, and route budgets |
 | `bun run verify:integrity` | Run repository integrity checks |
-| `bun run gate` | Run the complete local release gate |
+| `bun run gate` | Run the complete local package-quality gate |
 
 ## Runnable examples
 
@@ -70,6 +71,7 @@ Run the complete gate from a clean dependency install:
 
 ```sh
 bun install
+bun run fetch-fixtures
 bun run gate
 npm pack --dry-run
 ```
@@ -87,3 +89,20 @@ Before publishing, confirm:
 
 The package is ESM-only and declares Node.js 18 or newer. Keep those constraints synchronized with the
 actual build target and verification environment.
+
+Cross-browser/device, performance, memory, and soak certification is maintained by the separate
+`media-test` matrix. Passing this repository's package-quality gate is necessary release evidence, but
+does not by itself certify the full cross-browser performance claim.
+
+The clean installed-consumer graph produced by `verify:package` is the authoritative ≤50 KiB eager and
+≤250 KiB typical MP4 probe/remux evidence. `check-budgets` independently inspects `dist/` as a split and
+source-leak oracle; both checks must pass.
+
+The concrete probe route is a finite fast-start MP4 `Blob` with a concrete `video/mp4` MIME. The concrete
+remux route is the ordinary default call `remux(blob, { to: 'mp4' })`, including full default-`Blob`
+materialization. The clean-consumer verifier removes every JavaScript file outside each modeled static
+union and executes the representative `movie_5.mp4` operation; this makes an omitted awaited chunk or an
+unexpected full-probe fallback fail rather than merely undercount. Reports include per-route minified raw,
+gzip, and Brotli byte totals and the exact seed/file sets. The public ceiling is the raw 250 KiB limit; an
+additional 512-byte architecture headroom warning is reported separately and does not redefine or fail
+the exact `≤ 250 KiB` limit.

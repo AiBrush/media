@@ -25,6 +25,7 @@ import type {
 } from '../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import type { InterleavedPcmF32, PcmAudio } from '../dsp/index.ts';
+import { sourceAbortError } from '../sources/abort.ts';
 import {
   type LazyAudioMuxKind,
   assertAudioMuxOptions,
@@ -49,7 +50,10 @@ export interface LazyContainerSpec {
    * An optional lightweight implementation for the advertised probe seam. Other operations still
    * resolve through `load()`, preserving one canonical full-driver capability surface.
    */
-  readonly probeImpl?: NonNullable<ContainerDriver['probe']>;
+  readonly probeImpl?: (
+    src: ByteSource,
+    o?: StageOptions,
+  ) => Promise<readonly TrackInfo[] | undefined>;
   readonly packetInfo?: true;
   readonly packetInfoBatches?: true;
   readonly auditMuxedTrack?: true;
@@ -65,6 +69,8 @@ export interface LazyContainerSpec {
   /** The loaded muxer's late-bound per-track gapless timing seam is safe to expose. */
   readonly gaplessSeam?: true;
   readonly muxKind?: LazyAudioMuxKind;
+  /** Omit the generic raw-PCM mux seam for encoded-only families such as native FLAC. */
+  readonly pcmMuxSeam?: false;
   readonly rejectChunkMux?: 'aiff' | 'caf';
   readonly validateTrack?: (track: TrackInfo, trackCount: number) => void;
 }
@@ -75,11 +81,19 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
   let loadPromise: Promise<ContainerDriver> | undefined;
   const load = async (): Promise<ContainerDriver> => {
     if (driver !== undefined) return driver;
-    loadPromise ??= spec.load();
-    driver = await loadPromise;
-    return driver;
+    const pending = loadPromise ?? spec.load();
+    loadPromise = pending;
+    try {
+      driver = await pending;
+      return driver;
+    } catch (error) {
+      // Preload is best-effort. A transient warmup failure must not poison the proxy forever: all
+      // concurrent callers still share this attempt, while the next real operation may retry.
+      if (loadPromise === pending) loadPromise = undefined;
+      throw error;
+    }
   };
-  return {
+  const proxy: ContainerDriver = {
     id: spec.id,
     apiVersion: DRIVER_API_VERSION,
     kind: 'container',
@@ -89,7 +103,11 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
     ...(spec.probe === true
       ? {
           async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
-            if (spec.probeImpl !== undefined) return spec.probeImpl(src, o);
+            if (spec.probeImpl !== undefined) {
+              const tracks = await spec.probeImpl(src, o);
+              if (tracks !== undefined) return tracks;
+              if (o?.signal?.aborted === true) throw sourceAbortError(o.signal);
+            }
             const loaded = await load();
             const probe = loaded.probe;
             if (probe === undefined) throw missingLazyMethod(spec.id, 'probe');
@@ -134,7 +152,7 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
         load,
         muxOptions: o,
         validateTrack: spec.validateTrack,
-        pcmSeam: true,
+        pcmSeam: spec.pcmMuxSeam !== false,
         gaplessSeam: spec.gaplessSeam === true,
       });
     },
@@ -244,4 +262,8 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
     ...(spec.validatesStreamCopyTrim === true ? { validatesStreamCopyTrim: true } : {}),
     ...(spec.validatesPcmTrim === true ? { validatesPcmTrim: true } : {}),
   };
+  (proxy as ContainerDriver & { ensureLoaded(): Promise<void> }).ensureLoaded = async () => {
+    await load();
+  };
+  return proxy;
 }

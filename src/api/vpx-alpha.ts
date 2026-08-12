@@ -71,7 +71,7 @@ function frameDimension(frame: VideoFrame, axis: 'width' | 'height'): number {
   return value;
 }
 
-async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFramePixels> {
+export async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFramePixels> {
   const width = frameDimension(frame, 'width');
   const height = frameDimension(frame, 'height');
   const sidecar = rgbaPixelSidecars.get(frame);
@@ -118,7 +118,7 @@ function rgbaPixelsToFrame(
   return frame;
 }
 
-function bufferInitFromSourceFrame(
+export function bufferInitFromSourceFrame(
   frame: VideoFrame,
   format: VideoPixelFormat,
   width: number,

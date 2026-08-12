@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { EncodedChunk, Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { mp3PacketInfoFromBytes } from '../drivers/mp3/mp3-driver.ts';
 import { Mp4Driver } from '../drivers/mp4/mp4-driver.ts';
 import { parseFragments } from '../drivers/mp4/parse.ts';
@@ -19,6 +19,7 @@ import {
   muxPreparedMp4PacketTrack,
   muxPreparedMp4PacketTracks,
   muxPreparedMp4PacketTracksStream,
+  muxPreparedSparseMp4PacketTrack,
 } from './mp4-prepared-mux.ts';
 
 const MEDIA_TEST = new URL('../../../media-test/fixtures/media/', import.meta.url).pathname;
@@ -108,6 +109,30 @@ function expectBytesEqual(actual: Uint8Array, expected: Uint8Array, label: strin
       throw new Error(`${label}: byte ${index} got ${actual[index]} expected ${expected[index]}`);
     }
   }
+}
+
+class ObservedSparseTarget {
+  size: bigint | undefined;
+  readonly writes: Array<{ position: bigint; bytes: Uint8Array }> = [];
+
+  setSize(size: bigint | string): void {
+    this.size = typeof size === 'bigint' ? size : BigInt(size);
+  }
+
+  write(position: bigint | string, bytes: Uint8Array): void {
+    this.writes.push({
+      position: typeof position === 'bigint' ? position : BigInt(position),
+      bytes: bytes.slice(),
+    });
+  }
+}
+
+function fourccOffset(bytes: Uint8Array, value: string): number {
+  const expected = [...value].map((char) => char.charCodeAt(0));
+  for (let offset = 0; offset <= bytes.byteLength - expected.length; offset++) {
+    if (expected.every((byte, index) => bytes[offset + index] === byte)) return offset;
+  }
+  return -1;
 }
 
 async function collectChunks(stream: ReadableStream<Uint8Array>): Promise<{
@@ -255,6 +280,151 @@ async function expectFragmentedMp4MatchesPacketInfo(
 }
 
 describe('prepared MP4 packet mux', () => {
+  it('authors source packets across 0xffffffff through co64 without allocating the virtual extent', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input, { includeOffsets: true });
+    const trackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
+    const track = table.tracks[trackIndex];
+    const packets = table.packets
+      .filter((row) => row.trackIndex === trackIndex)
+      .slice(0, 2)
+      .map((row) => packetFromRow(row, input))
+      .filter(isPacket);
+    if (track === undefined || packets.length !== 2) throw new Error('expected two video packets');
+
+    const target = new ObservedSparseTarget();
+    const fileSize = 4_294_975_488n;
+    const sampleOffsets = [4_096n, 4_294_967_552n];
+    const prefix = muxPreparedSparseMp4PacketTrack({
+      track,
+      packets,
+      container: 'mp4',
+      target,
+      fileSize,
+      sampleOffsets,
+    });
+
+    expect(target.size).toBe(fileSize);
+    expect(prefix.byteLength).toBeLessThan(4_096);
+    expect(target.writes.map((write) => write.position)).toEqual([0n, ...sampleOffsets]);
+    const firstWrite = target.writes[1];
+    const secondWrite = target.writes[2];
+    const firstData = packets[0]?.data;
+    const secondData = packets[1]?.data;
+    if (
+      firstWrite === undefined ||
+      secondWrite === undefined ||
+      firstData === undefined ||
+      secondData === undefined
+    ) {
+      throw new Error('expected two sparse packet writes with retained packet bytes');
+    }
+    expectBytesEqual(firstWrite.bytes, firstData, 'first sparse sample');
+    expectBytesEqual(secondWrite.bytes, secondData, 'second sparse sample');
+
+    const co64 = fourccOffset(prefix, 'co64');
+    expect(co64).toBeGreaterThan(3);
+    const co64View = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+    expect(co64View.getUint32(co64 + 8)).toBe(2);
+    expect(co64View.getBigUint64(co64 + 12)).toBe(sampleOffsets[0]);
+    expect(co64View.getBigUint64(co64 + 20)).toBe(sampleOffsets[1]);
+    expect(fourccOffset(prefix, 'stco')).toBe(-1);
+
+    const mdat = fourccOffset(prefix, 'mdat');
+    expect(mdat).toBeGreaterThan(3);
+    expect(co64View.getUint32(mdat - 4)).toBe(1);
+    expect(co64View.getBigUint64(mdat + 4)).toBe(fileSize - BigInt(mdat - 4));
+  });
+
+  it('rejects malformed sparse extents, offset cardinality, overlap, and decimal input', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input, { includeOffsets: true });
+    const trackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
+    const track = table.tracks[trackIndex];
+    const packets = table.packets
+      .filter((row) => row.trackIndex === trackIndex)
+      .slice(0, 2)
+      .map((row) => packetFromRow(row, input))
+      .filter(isPacket);
+    if (track === undefined || packets.length !== 2) throw new Error('expected two video packets');
+    const base = {
+      track,
+      packets,
+      container: 'mp4',
+      target: new ObservedSparseTarget(),
+      fileSize: 4_294_975_488n,
+      sampleOffsets: [4_096n, 4_294_967_552n],
+    } as const;
+
+    expect(() => muxPreparedSparseMp4PacketTrack({ ...base, fileSize: 0xffff_ffffn })).toThrow(
+      MediaError,
+    );
+    expect(() => muxPreparedSparseMp4PacketTrack({ ...base, sampleOffsets: [4_096n] })).toThrow(
+      InputError,
+    );
+    expect(() =>
+      muxPreparedSparseMp4PacketTrack({ ...base, sampleOffsets: [4_096n, 4_097n] }),
+    ).toThrow(MediaError);
+    expect(() => muxPreparedSparseMp4PacketTrack({ ...base, fileSize: '4GiB' })).toThrow(
+      InputError,
+    );
+    expect(() => muxPreparedSparseMp4PacketTrack({ ...base, fileSize: -1n })).toThrow(InputError);
+    expect(() =>
+      muxPreparedSparseMp4PacketTrack({ ...base, sampleOffsets: [-1n, 4_294_967_552n] }),
+    ).toThrow(InputError);
+
+    const oversizedTarget = new ObservedSparseTarget();
+    const uint64Overflow = 0x1_0000_0000_0000_0000n;
+    expect(() =>
+      muxPreparedSparseMp4PacketTrack({
+        ...base,
+        target: oversizedTarget,
+        fileSize: uint64Overflow,
+      }),
+    ).toThrow(InputError);
+    expect(() =>
+      muxPreparedSparseMp4PacketTrack({
+        ...base,
+        target: oversizedTarget,
+        fileSize: uint64Overflow.toString(),
+      }),
+    ).toThrow(InputError);
+    expect(() =>
+      muxPreparedSparseMp4PacketTrack({
+        ...base,
+        target: oversizedTarget,
+        sampleOffsets: [4_096n, uint64Overflow],
+      }),
+    ).toThrow(InputError);
+    expect(oversizedTarget.size).toBeUndefined();
+    expect(oversizedTarget.writes).toEqual([]);
+  });
+
+  it('accepts decimal-string sparse extents and offsets without losing 64-bit precision', async () => {
+    const input = await mediaTestBytes('tiny_h264_360p_2s.mp4');
+    const table = await mp4PacketInfoFromBytes(input, { includeOffsets: true });
+    const trackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
+    const track = table.tracks[trackIndex];
+    const packet = table.packets
+      .filter((row) => row.trackIndex === trackIndex)
+      .map((row) => packetFromRow(row, input))
+      .find(isPacket);
+    if (track === undefined || packet === undefined) throw new Error('expected one video packet');
+    const target = new ObservedSparseTarget();
+
+    muxPreparedSparseMp4PacketTrack({
+      track,
+      packets: [packet],
+      container: 'mov',
+      target,
+      fileSize: '4294975488',
+      sampleOffsets: ['4294967552'],
+    });
+
+    expect(target.size).toBe(4_294_975_488n);
+    expect(target.writes.map((write) => write.position)).toEqual([0n, 4_294_967_552n]);
+  });
+
   const originalFetch = globalThis.fetch;
 
   afterEach(() => {

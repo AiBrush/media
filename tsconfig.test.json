@@ -5,6 +5,6 @@
     "types": ["@webgpu/types", "bun-types"],
     "rootDir": "."
   },
-  "include": ["src/**/*.test.ts", "src/test-support", "scripts"],
+  "include": ["src/**/*.test.ts", "src/test-support", "scripts", "test/**/*.test.ts"],
   "exclude": []
 }

@@ -1,10 +1,12 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
 import { avcCodecString, parseEsds } from './codec-strings.ts';
+import { clockwiseRotationFromMp4MatrixFirstRow } from './display-transform.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
 import { decodeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 const SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES = 8 * 1024;
+const SIMPLE_VIDEO_FASTSTART_PROBE_MAX_PREFETCH_BYTES = 128 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 
 interface SimpleRandomAccess {
@@ -41,6 +43,7 @@ interface ProbeVideoEntry {
 interface ProbeTrackHeader {
   readonly id: number;
   readonly defaultDisposition: boolean;
+  readonly canonicalRotationMatrix: boolean;
   readonly rotation?: number;
 }
 
@@ -78,9 +81,15 @@ function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefin
 
 export async function readSimpleVideoFaststartProbe(
   ra: SimpleRandomAccess,
+  prefetchBytes = SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES,
+  requireEveryTrack = false,
 ): Promise<SimpleVideoFaststartProbe | undefined> {
   if (ra.size === undefined) return undefined;
-  const head = await ra.read(0, Math.min(ra.size, SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES));
+  const boundedPrefetchBytes =
+    Number.isSafeInteger(prefetchBytes) && prefetchBytes > 0
+      ? Math.min(prefetchBytes, SIMPLE_VIDEO_FASTSTART_PROBE_MAX_PREFETCH_BYTES)
+      : SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES;
+  const head = await ra.read(0, Math.min(ra.size, boundedPrefetchBytes));
   let offset = 0;
   let brand = 'mp42';
   for (;;) {
@@ -93,7 +102,7 @@ export async function readSimpleVideoFaststartProbe(
       if (offset + header.size > head.byteLength) return undefined;
       try {
         const moov = head.subarray(offset + header.headerSize, offset + header.size);
-        const tracks = parseSimpleVideoFaststartProbeTracks(moov);
+        const tracks = parseSimpleVideoFaststartProbeTracks(moov, requireEveryTrack);
         return tracks === undefined ? undefined : { tracks, brand, moov };
       } catch {
         return undefined;
@@ -119,6 +128,12 @@ function probeBoxAt(r: Reader): BoxHeader | undefined {
   }
   if (size < headerSize || start + size > r.length) return undefined;
   return { type, size, headerSize, start, payloadStart: start + headerSize, end: start + size };
+}
+
+function declaredBoxSize(r: Reader, start: number): number | undefined {
+  if (start < 0 || start + 4 > r.length) return undefined;
+  const bytes = r.bytesAt(start, start + 4);
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
 }
 
 function probeChild(r: Reader, parent: BoxHeader, type: string): BoxHeader | undefined {
@@ -162,17 +177,41 @@ function probeTrackHeader(r: Reader, tkhd: BoxHeader): ProbeTrackHeader {
   r.skip(4);
   r.skip(version === 1 ? 8 : 4);
   r.skip(8 + 2 + 2 + 2 + 2);
-  const a = r.fixed16();
-  const b = r.fixed16();
+  const matrix = Array.from({ length: 9 }, () => r.u32());
+  const a = ((matrix[0] ?? 0) | 0) / 65536;
+  const b = ((matrix[1] ?? 0) | 0) / 65536;
   const rotation = probeMatrixRotation(a, b);
-  return rotation === undefined ? { id, defaultDisposition } : { id, defaultDisposition, rotation };
+  const canonicalRotationMatrix = isCanonicalRotationMatrix(matrix);
+  return rotation === undefined
+    ? { id, defaultDisposition, canonicalRotationMatrix }
+    : { id, defaultDisposition, canonicalRotationMatrix, rotation };
+}
+
+function isCanonicalRotationMatrix(matrix: readonly number[]): boolean {
+  const a = matrix[0] ?? 0;
+  const b = matrix[1] ?? 0;
+  const perspectiveX = matrix[2] ?? 0;
+  const c = matrix[3] ?? 0;
+  const d = matrix[4] ?? 0;
+  const perspectiveY = matrix[5] ?? 0;
+  const perspectiveScale = matrix[8] ?? 0;
+  return (
+    perspectiveX === 0 &&
+    perspectiveY === 0 &&
+    perspectiveScale === 0x40000000 &&
+    ((a === 0x00010000 && b === 0 && c === 0 && d === 0x00010000) ||
+      (a === 0 && b === 0x00010000 && c === 0xffff0000 && d === 0) ||
+      (a === 0xffff0000 && b === 0 && c === 0 && d === 0xffff0000) ||
+      (a === 0 && b === 0xffff0000 && c === 0x00010000 && d === 0))
+  );
 }
 
 function probeMatrixRotation(a: number, b: number): number | undefined {
   if (a === 1 && b === 0) return 0;
-  const deg = Math.round((Math.atan2(b, a) * 180) / Math.PI);
-  const norm = ((deg % 360) + 360) % 360;
-  return norm === 0 ? undefined : norm;
+  const rotation = clockwiseRotationFromMp4MatrixFirstRow(a, b);
+  // Match the canonical complete-matrix projection: a scaled or near-identity matrix whose rounded
+  // angle is zero is not the exact identity and therefore has no public scalar rotation.
+  return rotation === 0 ? undefined : rotation;
 }
 
 function probeMdhd(
@@ -229,12 +268,20 @@ function readSigned64(r: Reader): number {
   return hi * 2 ** 32 + lo;
 }
 
-function probeAudioEntry(r: Reader, stsd: BoxHeader): ProbeAudioEntry | undefined {
+function probeAudioEntry(
+  r: Reader,
+  stsd: BoxHeader,
+  requireCanonicalSubset = false,
+): ProbeAudioEntry | undefined {
   r.seek(stsd.payloadStart);
   readFullBoxHeader(r);
   if (r.u32() !== 1) return undefined;
+  const entryStart = r.pos;
   const entry = probeBoxAt(r);
   if (entry === undefined || entry.type !== 'mp4a') return undefined;
+  if (requireCanonicalSubset && (entry.headerSize !== 8 || declaredBoxSize(r, entryStart) === 0)) {
+    return undefined;
+  }
   const { channels, sampleRate, childStart } = probeAudioGeometry(r, entry);
   const esds = probeAudioConfigBox(r, childStart, entry.end, 'esds');
   if (esds === undefined) return undefined;
@@ -256,18 +303,35 @@ function probeAudioEntry(r: Reader, stsd: BoxHeader): ProbeAudioEntry | undefine
   };
 }
 
-function probeVideoEntry(r: Reader, stsd: BoxHeader): ProbeVideoEntry | undefined {
+function probeVideoEntry(
+  r: Reader,
+  stsd: BoxHeader,
+  requireCanonicalSubset = false,
+): ProbeVideoEntry | undefined {
   r.seek(stsd.payloadStart);
   readFullBoxHeader(r);
   if (r.u32() !== 1) return undefined;
+  const entryStart = r.pos;
   const entry = probeBoxAt(r);
   if (entry === undefined || (entry.type !== 'avc1' && entry.type !== 'avc3')) return undefined;
+  if (requireCanonicalSubset && (entry.headerSize !== 8 || declaredBoxSize(r, entryStart) === 0)) {
+    return undefined;
+  }
   r.seek(entry.payloadStart);
   r.skip(6 + 2 + 2 + 2 + 12);
   const width = r.u16();
   const height = r.u16();
   r.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
-  const avcC = probeBoxFrom(r, r.pos, entry.end, 'avcC');
+  const childStart = r.pos;
+  if (
+    requireCanonicalSubset &&
+    ['colr', 'pasp', 'clap'].some(
+      (type) => probeBoxFrom(r, childStart, entry.end, type) !== undefined,
+    )
+  ) {
+    return undefined;
+  }
+  const avcC = probeBoxFrom(r, childStart, entry.end, 'avcC');
   if (avcC === undefined) return undefined;
   const description = r.bytesAt(avcC.payloadStart, avcC.end).slice();
   const codec = avcCodecString(description);
@@ -446,7 +510,10 @@ export async function readTinyAudioFaststartProbe(
   }
 }
 
-function parseSimpleVideoFaststartProbeTracks(moov: Uint8Array): readonly TrackInfo[] | undefined {
+function parseSimpleVideoFaststartProbeTracks(
+  moov: Uint8Array,
+  requireEveryTrack: boolean,
+): readonly TrackInfo[] | undefined {
   const r = new Reader(moov);
   const root: BoxHeader = {
     type: 'moov',
@@ -458,13 +525,23 @@ function parseSimpleVideoFaststartProbeTracks(moov: Uint8Array): readonly TrackI
   };
   const mvhd = probeChild(r, root, 'mvhd');
   if (mvhd === undefined) return undefined;
+  // Fragment timing can extend or replace the initial stbl duration/fps. The lightweight route does
+  // not scan moof/traf runs, so a strict public probe must delegate every mvex movie to canonical.
+  if (requireEveryTrack && probeChild(r, root, 'mvex') !== undefined) return undefined;
   const movieTimescale = probeMovieTimescale(r, mvhd);
   const tracks: TrackInfo[] = [];
   let sawVideo = false;
   for (const trak of probeChildren(r, root, 'trak')) {
-    const parsed = probeSimpleTrack(r, trak, movieTimescale);
+    // The compact fast path intentionally does not publish every edit-derived TrackInfo fact. In
+    // strict mode, decline using the parsed box hierarchy (including extended-size headers) rather
+    // than accepting a result that can differ from the canonical metadata parser.
+    if (requireEveryTrack && probeChild(r, trak, 'edts') !== undefined) return undefined;
+    const parsed = probeSimpleTrack(r, trak, movieTimescale, requireEveryTrack);
     if (parsed === undefined) return undefined;
-    if (parsed.kind === 'skip') continue;
+    if (parsed.kind === 'skip') {
+      if (requireEveryTrack) return undefined;
+      continue;
+    }
     sawVideo ||= parsed.track.mediaType === 'video';
     tracks.push(parsed.track);
   }
@@ -475,6 +552,7 @@ function probeSimpleTrack(
   r: Reader,
   trak: BoxHeader,
   movieTimescale: number,
+  requireCanonicalSubset = false,
 ): SimpleProbeTrack | undefined {
   const tkhd = probeChild(r, trak, 'tkhd');
   const mdia = probeChild(r, trak, 'mdia');
@@ -490,12 +568,13 @@ function probeSimpleTrack(
   if (stbl === undefined || stsd === undefined) return undefined;
 
   const header = probeTrackHeader(r, tkhd);
+  if (requireCanonicalSubset && !header.canonicalRotationMatrix) return undefined;
   const timing = probeMdhd(r, mdhd);
   const sampleTiming = probeSampleTiming(r, stbl);
   if (sampleTiming.sampleCount === 0) return undefined;
   const edit = probeTrackEdit(r, trak, movieTimescale);
   if (handler === 'vide') {
-    const entry = probeVideoEntry(r, stsd);
+    const entry = probeVideoEntry(r, stsd, requireCanonicalSubset);
     if (entry === undefined) return undefined;
     const fps =
       timing.durationSec > 0 && sampleTiming.sampleCount > 0
@@ -517,7 +596,7 @@ function probeSimpleTrack(
     };
   }
 
-  const entry = probeAudioEntry(r, stsd);
+  const entry = probeAudioEntry(r, stsd, requireCanonicalSubset);
   if (entry === undefined) return undefined;
   const gapless = probeGapless(
     edit,

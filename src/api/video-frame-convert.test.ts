@@ -5,6 +5,8 @@ import {
   destinationColorI420FrameStream,
   limitedI420FromPackedRgba,
   srgbToBt709TransferInPlace,
+  widenI420Samples,
+  widenedI420VideoFrameStream,
 } from './video-frame-convert.ts';
 
 function solidRgba(width: number, height: number, r: number, g: number, b: number): Uint8Array {
@@ -62,6 +64,317 @@ describe('limitedI420FromPackedRgba', () => {
     srgbToBt709TransferInPlace(rgba);
     expect(rgba).toEqual(Uint8Array.of(0, 115, 255, 17));
     expect(() => srgbToBt709TransferInPlace(new Uint8Array(3))).toThrow(InputError);
+  });
+});
+
+describe('high-bit-depth planar widening', () => {
+  it('left-shifts every luma and chroma sample into little-endian 10/12-bit storage', () => {
+    const widened10 = widenI420Samples(Uint8Array.of(0, 1, 16, 255, 128, 64), 2, 2, 8, 10);
+    expect([...new Uint16Array(widened10.data.buffer)]).toEqual([0, 4, 64, 1020, 512, 256]);
+    expect(widened10.layout).toEqual([
+      { offset: 0, stride: 4 },
+      { offset: 8, stride: 2 },
+      { offset: 10, stride: 2 },
+    ]);
+
+    const source10 = new Uint16Array([0, 1, 64, 1023, 512, 256]);
+    const widened12 = widenI420Samples(new Uint8Array(source10.buffer), 2, 2, 10, 12);
+    expect([...new Uint16Array(widened12.data.buffer)]).toEqual([0, 4, 256, 4092, 2048, 1024]);
+    expect(() => widenI420Samples(new Uint8Array(5), 2, 2, 8, 10)).toThrow(InputError);
+    expect(() => widenI420Samples(new Uint8Array(12), 2, 2, 10, 10)).toThrow(InputError);
+    expect(() => widenI420Samples(new Uint8Array(), 0, 2, 8, 10)).toThrow(InputError);
+    const outOfRange10 = new Uint16Array([0, 1, 2, 3, 4, 1024]);
+    expect(() => widenI420Samples(new Uint8Array(outOfRange10.buffer), 2, 2, 10, 12)).toThrow(
+      /sample 1024 exceeds 1023/,
+    );
+  });
+
+  it('preserves crop/display geometry in I420P10 and maps a missing pixel format to CapabilityError', async () => {
+    type PlanarCopyOptions = Omit<VideoFrameCopyToOptions, 'format'> & {
+      readonly format?: VideoPixelFormat | 'I420P10';
+    };
+    const planarLayout = (width: number, height: number, bytesPerSample: 1 | 2): PlaneLayout[] => {
+      const luma = width * height;
+      const chromaWidth = Math.ceil(width / 2);
+      const chroma = chromaWidth * Math.ceil(height / 2);
+      return [
+        { offset: 0, stride: width * bytesPerSample },
+        { offset: luma * bytesPerSample, stride: chromaWidth * bytesPerSample },
+        { offset: (luma + chroma) * bytesPerSample, stride: chromaWidth * bytesPerSample },
+      ];
+    };
+
+    const copyPlanarRect = (
+      source: Uint8Array,
+      sourceLayout: readonly PlaneLayout[],
+      sourceOrigin: { readonly x: number; readonly y: number },
+      destination: Uint8Array,
+      destinationLayout: readonly PlaneLayout[],
+      rect: {
+        readonly x: number;
+        readonly y: number;
+        readonly width: number;
+        readonly height: number;
+      },
+      bytesPerSample: 1 | 2,
+    ): void => {
+      for (let plane = 0; plane < 3; plane++) {
+        const subsampling = plane === 0 ? 1 : 2;
+        const sourcePlane = sourceLayout[plane];
+        const destinationPlane = destinationLayout[plane];
+        if (sourcePlane === undefined || destinationPlane === undefined) {
+          throw new Error(`missing planar layout ${plane}`);
+        }
+        const sourceX = (rect.x - sourceOrigin.x) / subsampling;
+        const sourceY = (rect.y - sourceOrigin.y) / subsampling;
+        const rowBytes = Math.ceil(rect.width / subsampling) * bytesPerSample;
+        const rows = Math.ceil(rect.height / subsampling);
+        for (let row = 0; row < rows; row++) {
+          const sourceOffset =
+            sourcePlane.offset + (sourceY + row) * sourcePlane.stride + sourceX * bytesPerSample;
+          const destinationOffset = destinationPlane.offset + row * destinationPlane.stride;
+          destination.set(
+            source.subarray(sourceOffset, sourceOffset + rowBytes),
+            destinationOffset,
+          );
+        }
+      }
+    };
+
+    class FakePlanarVideoFrame {
+      static rejectHighDepth = false;
+      readonly codedWidth: number;
+      readonly codedHeight: number;
+      readonly displayWidth: number;
+      readonly displayHeight: number;
+      readonly visibleRect: DOMRectReadOnly | null;
+      readonly timestamp: number;
+      readonly duration: number | null;
+      readonly colorSpace = {
+        primaries: 'bt709' as VideoColorPrimaries,
+        transfer: 'bt709' as VideoTransferCharacteristics,
+        matrix: 'bt709' as VideoMatrixCoefficients,
+        fullRange: false,
+      };
+      readonly source: Uint8Array | undefined;
+      readonly output: Uint8Array | undefined;
+      readonly init: VideoFrameBufferInit | undefined;
+      closeCount = 0;
+
+      constructor(
+        value:
+          | {
+              readonly source: Uint8Array;
+              readonly width: number;
+              readonly height: number;
+              readonly visibleRect?: DOMRectInit;
+              readonly displayWidth?: number;
+              readonly displayHeight?: number;
+              readonly timestamp: number;
+              readonly duration: number;
+            }
+          | Uint8Array,
+        init?: VideoFrameBufferInit,
+      ) {
+        if (value instanceof Uint8Array) {
+          if (FakePlanarVideoFrame.rejectHighDepth) throw new TypeError('I420P10 unavailable');
+          if (init === undefined) throw new Error('missing planar output init');
+          const minimumLumaStride = init.codedWidth * 2;
+          const minimumChromaStride = Math.ceil(init.codedWidth / 2) * 2;
+          if (
+            init.layout?.[0] === undefined ||
+            init.layout[1] === undefined ||
+            init.layout[2] === undefined ||
+            init.layout[0].stride < minimumLumaStride ||
+            init.layout[1].stride < minimumChromaStride ||
+            init.layout[2].stride < minimumChromaStride
+          ) {
+            throw new TypeError('invalid coded-plane layout');
+          }
+          this.codedWidth = init.codedWidth;
+          this.codedHeight = init.codedHeight;
+          this.displayWidth = init.displayWidth ?? init.codedWidth;
+          this.displayHeight = init.displayHeight ?? init.codedHeight;
+          this.visibleRect = (init.visibleRect ?? {
+            x: 0,
+            y: 0,
+            width: init.codedWidth,
+            height: init.codedHeight,
+          }) as DOMRectReadOnly;
+          this.timestamp = init.timestamp;
+          this.duration = init.duration ?? null;
+          this.source = undefined;
+          this.output = value.slice();
+          this.init = init;
+          return;
+        }
+        this.codedWidth = value.width;
+        this.codedHeight = value.height;
+        this.displayWidth = value.displayWidth ?? value.width;
+        this.displayHeight = value.displayHeight ?? value.height;
+        this.visibleRect = (value.visibleRect ?? {
+          x: 0,
+          y: 0,
+          width: value.width,
+          height: value.height,
+        }) as DOMRectReadOnly;
+        this.timestamp = value.timestamp;
+        this.duration = value.duration;
+        this.source = value.source;
+        this.output = undefined;
+        this.init = undefined;
+      }
+
+      copyTo(
+        destination: AllowSharedBufferSource,
+        options?: PlanarCopyOptions,
+      ): Promise<PlaneLayout[]> {
+        if (options?.format !== 'I420' && options?.format !== 'I420P10') {
+          throw new Error(`unexpected planar copy format ${options?.format}`);
+        }
+        const bytesPerSample = options.format === 'I420' ? 1 : 2;
+        const rect = {
+          x: options.rect?.x ?? this.visibleRect?.x ?? 0,
+          y: options.rect?.y ?? this.visibleRect?.y ?? 0,
+          width: options.rect?.width ?? this.visibleRect?.width ?? this.codedWidth,
+          height: options.rect?.height ?? this.visibleRect?.height ?? this.codedHeight,
+        };
+        const destinationLayout =
+          options.layout ?? planarLayout(rect.width, rect.height, bytesPerSample);
+        const bytes = ArrayBuffer.isView(destination)
+          ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+          : new Uint8Array(destination);
+        if (this.source !== undefined) {
+          copyPlanarRect(
+            this.source,
+            planarLayout(this.codedWidth, this.codedHeight, bytesPerSample),
+            { x: 0, y: 0 },
+            bytes,
+            destinationLayout,
+            rect,
+            bytesPerSample,
+          );
+        } else {
+          if (this.output === undefined || this.init?.layout === undefined) {
+            throw new Error('missing constructed planar data');
+          }
+          copyPlanarRect(
+            this.output,
+            this.init.layout,
+            { x: 0, y: 0 },
+            bytes,
+            destinationLayout,
+            rect,
+            bytesPerSample,
+          );
+        }
+        return Promise.resolve(destinationLayout);
+      }
+
+      close(): void {
+        this.closeCount++;
+      }
+    }
+
+    const restoreVideoFrame = replaceGlobal(
+      'VideoFrame',
+      FakePlanarVideoFrame as unknown as typeof VideoFrame,
+    );
+    try {
+      const input = new FakePlanarVideoFrame({
+        source: Uint8Array.of(
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          100,
+          101,
+          102,
+          103,
+          200,
+          201,
+          202,
+          203,
+        ),
+        width: 4,
+        height: 4,
+        visibleRect: { x: 2, y: 2, width: 2, height: 2 },
+        displayWidth: 8,
+        displayHeight: 5,
+        timestamp: 12,
+        duration: 34,
+      });
+      const stream = widenedI420VideoFrameStream(8, 10);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const read = reader.read();
+      await writer.write(input as unknown as VideoFrame);
+      const result = await read;
+      const output = result.value as unknown as FakePlanarVideoFrame;
+      expect(input.closeCount).toBe(1);
+      expect(output.init).toMatchObject({
+        format: 'I420P10',
+        codedWidth: 4,
+        codedHeight: 4,
+        visibleRect: { x: 2, y: 2, width: 2, height: 2 },
+        displayWidth: 8,
+        displayHeight: 5,
+        timestamp: 12,
+        duration: 34,
+      });
+      if (output.output === undefined) throw new Error('missing widened output bytes');
+      expect([...new Uint16Array(output.output.buffer)]).toEqual([
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 400, 404, 408, 412, 800, 804,
+        808, 812,
+      ]);
+      const visibleCopy = new Uint8Array(12);
+      await output.copyTo(visibleCopy, {
+        format: 'I420P10',
+        rect: { x: 2, y: 2, width: 2, height: 2 },
+        layout: planarLayout(2, 2, 2),
+      });
+      expect([...new Uint16Array(visibleCopy.buffer)]).toEqual([40, 44, 56, 60, 412, 812]);
+      output.close();
+      await writer.close();
+      reader.releaseLock();
+      writer.releaseLock();
+
+      FakePlanarVideoFrame.rejectHighDepth = true;
+      const rejectedInput = new FakePlanarVideoFrame({
+        source: Uint8Array.of(16, 17, 18, 19, 128, 129),
+        width: 2,
+        height: 2,
+        timestamp: 56,
+        duration: 78,
+      });
+      const rejected = widenedI420VideoFrameStream(8, 10);
+      const rejectedWriter = rejected.writable.getWriter();
+      const rejectedReader = rejected.readable.getReader();
+      const [write, failedRead] = await Promise.allSettled([
+        rejectedWriter.write(rejectedInput as unknown as VideoFrame),
+        rejectedReader.read(),
+      ]);
+      expect(write.status).toBe('rejected');
+      expect(failedRead.status).toBe('rejected');
+      if (write.status === 'rejected') expect(write.reason).toBeInstanceOf(CapabilityError);
+      expect(rejectedInput.closeCount).toBe(1);
+      rejectedReader.releaseLock();
+      rejectedWriter.releaseLock();
+    } finally {
+      restoreVideoFrame();
+    }
   });
 });
 

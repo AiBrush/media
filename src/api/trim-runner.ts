@@ -161,6 +161,38 @@ export async function runTrim(
     return materializeOutput(opts.sink ?? toBlob(), source.stream(), mimeOptions(signal, target));
   }
   if (opts.mode === 'accurate') {
+    if (target === 'adts' || target === 'aac') {
+      const exactPrefix = await tryAccurateAdtsPrefixCopy(
+        context,
+        container,
+        source,
+        target,
+        opts,
+        signal,
+        options,
+      );
+      if (exactPrefix !== undefined) {
+        return materializeOutput(opts.sink ?? toBlob(), exactPrefix, mimeOptions(signal, target));
+      }
+      // AAC ADTS can carry only complete access units. Unlike MP4 edit lists or Ogg Opus
+      // pre-skip/EOS granules, the elementary stream has no standardized leading- or trailing-discard
+      // field. Re-encoding therefore still adds/rounds priming and padding; a hybrid that retains a
+      // history access unit cannot hide its decoded samples. Never publish that rounded file for an
+      // operation that promises accuracy.
+      throw new CapabilityError(
+        'accurate ADTS trim can carry only whole AAC access units and has no presentation discard metadata',
+        {
+          op: {
+            kind: 'route',
+            id: 'trim',
+            facts: { container: target, codec: 'aac', mode: 'accurate' },
+          },
+          tried: ['adts-access-unit-copy', 'aac-full-reencode'],
+          suggestion:
+            "use mode:'keyframe' and accept whole-access-unit alignment, or author AAC in a container with explicit presentation timing",
+        },
+      );
+    }
     if (target === 'flac' && container.transformPcm !== undefined) {
       const stream = await container.transformPcm(source, {
         ...context.stage(signal, options),
@@ -208,6 +240,55 @@ export async function runTrim(
     ...streamCopySinkMode(opts.sink),
   });
   return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
+}
+
+/**
+ * Losslessly satisfy the one non-identity ADTS shape that needs no discard signalling: keep the original
+ * decoder origin and end exactly before a proved access unit. A non-zero start is intentionally excluded.
+ * Although WebCodecs labels every AAC chunk `key`, the AAC registration warns that decoding an arbitrary
+ * packet may not reproduce the expected audio; its transform overlap needs earlier decoder state. ADTS
+ * cannot retain that history and then suppress its presentation, so only a start-at-zero prefix is exact.
+ * Packet-info PTS is derived from each ADTS header's raw-data-block count, rather than assuming 1,024
+ * samples for every physical frame.
+ */
+async function tryAccurateAdtsPrefixCopy(
+  context: TrimRunnerContext,
+  container: ContainerDriver,
+  source: Source,
+  target: Container,
+  opts: TrimOptions,
+  signal: AbortSignal,
+  options: CallOptions,
+): Promise<ReadableStream<Uint8Array> | undefined> {
+  if (
+    container.id !== 'adts' ||
+    container.packetInfo === undefined ||
+    container.streamCopy === undefined ||
+    Math.round(opts.start * 1_000_000) !== 0
+  ) {
+    return undefined;
+  }
+  const table = await container.packetInfo(source, context.stage(signal, options));
+  const audioTrackIndex = table.tracks.findIndex(
+    (track) => track.mediaType === 'audio' && /^mp4a\./i.test(track.codec),
+  );
+  if (audioTrackIndex < 0 || table.tracks.some((_, index) => index !== audioTrackIndex)) {
+    return undefined;
+  }
+  const endUs = Math.round(opts.end * 1_000_000);
+  const packets = table.packets.filter((packet) => packet.trackIndex === audioTrackIndex);
+  if (
+    packets[0]?.ptsUs !== 0 ||
+    !packets.some((packet, index) => index > 0 && Math.round(packet.ptsUs) === endUs)
+  ) {
+    return undefined;
+  }
+  return container.streamCopy(source, {
+    ...context.stage(signal, options),
+    container: target,
+    trim: { startSec: opts.start, endSec: opts.end },
+    ...streamCopySinkMode(opts.sink),
+  });
 }
 
 async function trimAudioPacketsViaSeam(
@@ -287,6 +368,7 @@ async function trimViaCodec(
   if (offloaded !== undefined) return offloaded;
 
   const {
+    canUseMp4AacPacketInfoTrim,
     estimateTrackBitrateFromPacketInfo,
     restampAudioData,
     restampVideoFrame,
@@ -370,20 +452,21 @@ async function trimViaCodec(
       const plannedAudioRows =
         typeof EncodedAudioChunk === 'undefined' ||
         source.range === undefined ||
-        audioTrackIndex < 0
+        audioTrackIndex < 0 ||
+        !canUseMp4AacPacketInfoTrim(audioTrack, target)
           ? undefined
           : planTrimAudioPacketInfoRows(packetInfoRows ?? [], audioTrackIndex, bounds);
-      if (plannedAudioRows !== undefined) {
+      const packetInfoAudioTrack =
+        plannedAudioRows === undefined
+          ? undefined
+          : trimAudioPacketInfoTrack(audioTrack, bounds, plannedAudioRows, target);
+      if (
+        plannedAudioRows !== undefined &&
+        packetInfoAudioTrack?.gapless?.basis === 'mp4-edit-list'
+      ) {
         const packets = trimAudioPacketInfoStream(source, plannedAudioRows, taskSignal);
         openStreams.push(packets);
-        tasks.push(
-          drainEncoderToMuxer(
-            packets,
-            muxer,
-            trimAudioPacketInfoTrack(audioTrack, bounds),
-            taskSignal,
-          ),
-        );
+        tasks.push(drainEncoderToMuxer(packets, muxer, packetInfoAudioTrack, taskSignal));
       } else {
         /* v8 ignore start -- live decode/encode requires browser WebCodecs; lifecycle is browser-gated. */
         const programAudio = await context.decodeAudio(

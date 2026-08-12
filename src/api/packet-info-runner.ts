@@ -17,7 +17,10 @@ import { normalizeByteInput } from './op-support.ts';
 import type { CallOptions, Container } from './types.ts';
 
 export type PacketInfoCallOptions = CallOptions & { readonly container?: Container };
-export type PacketInfoBatchCallOptions = PacketInfoCallOptions & { readonly batchSize?: number };
+export type PacketInfoBatchCallOptions = PacketInfoCallOptions & {
+  readonly batchSize?: number;
+  readonly includePayloadDigests?: boolean;
+};
 
 export interface PacketInfoRunnerContext {
   resolveHls(input: MediaInput, source: Source, signal: AbortSignal): Promise<Source>;
@@ -90,6 +93,9 @@ export async function runPacketInfoBatches(
     const stage: PacketInfoBatchOptions = {
       ...context.stage(lifecycleSignal, options),
       ...(options.batchSize !== undefined ? { batchSize: options.batchSize } : {}),
+      ...(options.includePayloadDigests !== undefined
+        ? { includePayloadDigests: options.includePayloadDigests }
+        : {}),
     };
     const inner = await container.packetInfoBatches(source, stage);
     return ownPacketInfoBatchSource(inner, source, lifecycleSignal);

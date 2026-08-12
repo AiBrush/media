@@ -134,6 +134,7 @@ export {
   muxPreparedMp4PacketTrack,
   muxPreparedMp4PacketTracks,
   muxPreparedMp4PacketTracksStream,
+  muxPreparedSparseMp4PacketTrack,
 } from './api/mp4-prepared-mux.ts';
 export { muxPreparedMpegTsPacketTracks } from './api/mpegts-prepared-mux.ts';
 export type {
@@ -142,7 +143,9 @@ export type {
   PreparedMp4PacketMuxInput,
   PreparedMp4PacketTrackMuxInput,
   PreparedMp4PacketTracksMuxInput,
+  PreparedSparseMp4PacketTrackMuxInput,
 } from './api/mp4-prepared-mux.ts';
+export type { SparseMp4WriteTarget } from './drivers/mp4/write.ts';
 export {
   type Mp4PacketInfoBatchSourceOptions,
   mp4PacketInfoBatchesFromSource,

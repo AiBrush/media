@@ -14,9 +14,9 @@
  * WebCodecs (see mux.test.ts).
  */
 
-import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
-import { parseAv1Codec } from '../../codecs/wasm-av1/av1.ts';
-import { parseVpxCodec } from '../../codecs/wasm-vpx/vpx.ts';
+import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/aac-config.ts';
+import { parseAv1Codec } from '../../codecs/av1-codec-string.ts';
+import { parseVpxCodec } from '../../codecs/vpx-codec-string.ts';
 import type {
   MuxOptions,
   MuxedTrackAudit,
@@ -968,11 +968,12 @@ function sourceTimedDurationsUs(
 /**
  * Convert buffered chunk-structs (decode order) into {@link MuxSampleInput}s with correct B-frame timing.
  *
- * The DTS timeline is the cumulative sum of durations in decode order. For monotonic encoder output,
+ * The DTS timeline is the cumulative sum of durations in decode order. For monotonic video output,
  * adjacent PTS gaps are authoritative: WebCodecs may retain a stale nominal `duration` across a VFR gap,
  * and putting that discrepancy in `ctts` would fabricate picture reorder (eventually even DTS > PTS).
- * Only the final sample has no following PTS and therefore uses its declared duration. True reordered
- * output retains its decode-order duration path. Composition offset is computed in microseconds first —
+ * Audio instead preserves every declared coded-sample duration so authored gaps/overlaps remain
+ * composition offsets rather than being silently stretched/shrunk. True reordered output retains its
+ * decode-order duration path. Composition offset is computed in microseconds first —
  * `ctts = (PTS−base) − DTS` — so a non-reordered stream yields exactly zero at any timescale, while a
  * reordered (B-frame) stream carries the true offset (negative offsets are fine — {@link writeMp4} emits
  * a version-1 `ctts`). PTS is rebased to the minimum so a standalone file starts at t=0. Decode order is
@@ -981,6 +982,7 @@ function sourceTimedDurationsUs(
 export function buildMuxSamples(
   chunks: readonly ChunkStruct[],
   timescale: number,
+  mediaType: 'video' | 'audio' = 'video',
 ): MuxSampleInput[] {
   const n = chunks.length;
   if (n === 0) return [];
@@ -993,6 +995,21 @@ export function buildMuxSamples(
   const durationsUs = presentationOrderIsDecodeOrder
     ? chunks.map((chunk, index) => {
         const next = chunks[index + 1];
+        if (mediaType === 'audio' && chunk.durationUs !== undefined) {
+          const adjacentClockGap =
+            next === undefined
+              ? undefined
+              : chunk.dtsUs !== undefined && next.dtsUs !== undefined
+                ? next.dtsUs - chunk.dtsUs
+                : next.timestampUs - chunk.timestampUs;
+          // Independently rounded microsecond timestamps and durations may differ by one microsecond.
+          // Keep the adjacent clock delta in that case so long audio runs do not accumulate ctts drift;
+          // a larger mismatch is an authored discontinuity and the declared sample duration must win.
+          if (adjacentClockGap === undefined || Math.abs(adjacentClockGap - chunk.durationUs) > 1) {
+            return chunk.durationUs;
+          }
+          return adjacentClockGap;
+        }
         if (next !== undefined) return next.timestampUs - chunk.timestampUs;
         if (chunk.durationUs !== undefined) return chunk.durationUs;
         return index === 0 ? 0 : chunk.timestampUs - (chunks[index - 1] as ChunkStruct).timestampUs;
@@ -1001,24 +1018,35 @@ export function buildMuxSamples(
       ? chunks.map((c) => c.durationUs as number)
       : recoverDurationsUs(chunks);
 
-  // Verbatim-remux fast path: every packet carries the source's true decode timestamp (the demuxer read
+  // Verbatim-video/remux fast path: every packet carries the source's true decode timestamp (the demuxer read
   // it from `stts`). Lay the composition offset down as the exact (PTS − DTS), and derive each sample's
   // duration from the gap to the next DTS so writeMp4's cumulative-sum `stts` reconstructs the source
   // decode timeline 1:1 — preserving the original B-frame/open-GOP structure losslessly (ADR-045). The
   // chunks arrive in decode order, so DTS is monotonic and every gap is ≥ 0.
-  if (chunks.every((c) => c.dtsUs !== undefined)) {
+  // Audio has no inter-frame decode dependency. When it supplies explicit durations, preserve its
+  // authored PTS/duration discontinuities on a contiguous MP4 decode clock instead of stretching stts
+  // deltas merely to reproduce redundant source DTS values.
+  if (chunks.every((c) => c.dtsUs !== undefined) && !(mediaType === 'audio' && hasAllDurations)) {
     const sourceDurationsUs = sourceTimedDurationsUs(chunks, durationsUs);
     const out: MuxSampleInput[] = [];
+    let durationBoundaryUs = 0;
+    let durationBoundaryTicks = 0;
     for (let i = 0; i < n; i++) {
       const c = chunks[i] as ChunkStruct;
       const dts = c.dtsUs as number;
       const durUs = sourceDurationsUs[i] as number;
+      durationBoundaryUs += durUs;
+      const nextDurationBoundaryTicks = ticks(durationBoundaryUs, timescale);
       out.push({
         data: c.data,
-        durationTicks: ticks(durUs, timescale),
+        // Quantize source-timed boundaries, not every interval independently. At clocks such as
+        // 44.1 kHz, independently rounding Matroska's alternating 23/24 ms AAC gaps loses a fraction
+        // of a tick on nearly every packet and turns harmless local quantization into cumulative drift.
+        durationTicks: nextDurationBoundaryTicks - durationBoundaryTicks,
         cttsTicks: ticks(c.timestampUs - dts, timescale),
         keyframe: c.key,
       });
+      durationBoundaryTicks = nextDurationBoundaryTicks;
     }
     return out;
   }
@@ -1428,7 +1456,10 @@ export function toMuxTrack(t: TrackState, leadingEmptyUs = 0): MuxTrackInput {
       : t.mediaType === 'audio' && t.config.kind === 'esds-from-description'
         ? prepareAacSamples(t.chunks, t.description)
         : { chunks: t.chunks, description: t.description };
-  const gaplessLayout = gaplessLayoutFor(t, buildMuxSamples(prepared.chunks, t.timescale));
+  const gaplessLayout = gaplessLayoutFor(
+    t,
+    buildMuxSamples(prepared.chunks, t.timescale, t.mediaType),
+  );
   const { samples, edit } = gaplessLayout;
   const leadingEmptyDurationTicks = ticks(Math.max(0, leadingEmptyUs), t.timescale);
   const muxEdit =

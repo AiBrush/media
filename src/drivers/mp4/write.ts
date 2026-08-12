@@ -21,6 +21,17 @@ const u32 = (n: number): number[] => [
   (n >>> 8) & 0xff,
   n & 0xff,
 ];
+const u64 = (n: bigint): number[] => [
+  Number((n >> 56n) & 0xffn),
+  Number((n >> 48n) & 0xffn),
+  Number((n >> 40n) & 0xffn),
+  Number((n >> 32n) & 0xffn),
+  Number((n >> 24n) & 0xffn),
+  Number((n >> 16n) & 0xffn),
+  Number((n >> 8n) & 0xffn),
+  Number(n & 0xffn),
+];
+const UINT64_MAX = 0xffff_ffff_ffff_ffffn;
 const fourcc = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 const zeros = (n: number): number[] => new Array<number>(n).fill(0);
 const cat = (...parts: number[][]): number[] => parts.flat();
@@ -179,6 +190,19 @@ export interface WriteOptions {
   brand?: ContainerBrand;
 }
 
+/** Positioned output used when a valid MP4 address space is larger than one JavaScript buffer. */
+export interface SparseMp4WriteTarget {
+  setSize(size: bigint | string): void;
+  write(position: bigint | string, bytes: Uint8Array): void;
+}
+
+export interface SparseMp4WriteOptions extends Omit<WriteOptions, 'faststart'> {
+  /** Complete virtual file extent. Sparse holes are part of the large `mdat` box. */
+  fileSize: bigint;
+  /** One absolute file offset per sample, in the same per-track order as `tracks`. */
+  sampleOffsets: readonly (readonly bigint[])[];
+}
+
 interface RunLength {
   count: number;
   value: number;
@@ -197,7 +221,7 @@ interface TrackChunkLayout {
 
 interface TrackChunkTable {
   chunks: readonly NormalizedTrackChunk[];
-  chunkOffsets: readonly number[];
+  chunkOffsets: readonly (number | bigint)[];
 }
 
 function runLength(values: readonly number[]): RunLength[] {
@@ -220,6 +244,11 @@ function pushU32(out: number[], n: number): void {
 function u32Table(values: readonly number[]): number[] {
   const out: number[] = [];
   for (const v of values) pushU32(out, v);
+  return out;
+}
+function u64Table(values: readonly (number | bigint)[]): number[] {
+  const out: number[] = [];
+  for (const value of values) out.push(...u64(typeof value === 'bigint' ? value : BigInt(value)));
   return out;
 }
 function runLengthTable(runs: readonly RunLength[]): number[] {
@@ -484,6 +513,12 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
   const sync = track.samples.flatMap((s, i) => (s.keyframe ? [i + 1] : []));
   const allSync = sync.length === track.samples.length;
   const sampleToChunk = sampleToChunkEntries(chunkTable.chunks);
+  const useCo64 = chunkTable.chunkOffsets.some(
+    (offset) => typeof offset === 'bigint' || offset > 0xffffffff,
+  );
+  const chunkOffsetPayload = useCo64
+    ? u64Table(chunkTable.chunkOffsets)
+    : u32Table(chunkTable.chunkOffsets as readonly number[]);
 
   const children = cat(
     full('stsd', 0, 0, cat(u32(1), entry)),
@@ -491,7 +526,12 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
     hasCtts ? full('ctts', cttsVersion, 0, cat(u32(ctts.length), runLengthTable(ctts))) : [],
     full('stsz', 0, 0, cat(u32(0), u32(sizes.length), u32Table(sizes))),
     full('stsc', 0, 0, cat(u32(sampleToChunk.length / 12), sampleToChunk)),
-    full('stco', 0, 0, cat(u32(chunkTable.chunkOffsets.length), u32Table(chunkTable.chunkOffsets))),
+    full(
+      useCo64 ? 'co64' : 'stco',
+      0,
+      0,
+      cat(u32(chunkTable.chunkOffsets.length), chunkOffsetPayload),
+    ),
     allSync ? [] : full('stss', 0, 0, cat(u32(sync.length), u32Table(sync))),
     rollSampleGroups(track),
     sencBox(track),
@@ -931,6 +971,9 @@ function patchGeneratedMoovChunkOffsets(
       if (chunkOffset === undefined) {
         throw new MediaError('mux-error', 'internal MP4 moov patch lost a planned chunk offset');
       }
+      if (typeof chunkOffset === 'bigint') {
+        throw new MediaError('mux-error', 'internal MP4 stco patch received a 64-bit chunk offset');
+      }
       patchGeneratedU32(moovBytes, stco.start + 16 + index * 4, chunkOffset);
       patchedOffsets++;
     }
@@ -1118,6 +1161,91 @@ export function planReservedMp4ByteStreamLayout(
     totalLen,
     observedPacketCount,
   };
+}
+
+/**
+ * Author a progressive MP4 into a positioned sparse target without materializing its virtual `mdat`.
+ * Every sample is an independent chunk, so absolute offsets can straddle the 32-bit boundary while the
+ * metadata stays bounded. The resulting `co64` table and 64-bit `mdat` extent are ordinary ISO-BMFF;
+ * holes are supplied by the target rather than represented by an in-memory allocation.
+ */
+export function writeSparseMp4(
+  tracks: readonly MuxTrackInput[],
+  target: SparseMp4WriteTarget,
+  opts: SparseMp4WriteOptions,
+): Uint8Array {
+  if (tracks.length === 0) throw new MediaError('mux-error', 'sparse MP4 mux received no tracks');
+  if (opts.fileSize <= 0xffff_ffffn) {
+    throw new MediaError('mux-error', 'sparse MP4 extent must cross the 32-bit address boundary');
+  }
+  if (opts.fileSize > UINT64_MAX) {
+    throw new MediaError('mux-error', 'sparse MP4 extent exceeds the unsigned 64-bit box limit');
+  }
+  if (opts.sampleOffsets.length !== tracks.length) {
+    throw new MediaError('mux-error', 'sparse MP4 sample-offset track count does not match input');
+  }
+
+  const chunkLayouts: TrackChunkLayout[] = [];
+  const chunkTables: TrackChunkTable[] = [];
+  const sampleRegions: Array<{ start: bigint; end: bigint; data: Uint8Array }> = [];
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex];
+    const offsets = opts.sampleOffsets[trackIndex];
+    if (track === undefined || offsets === undefined || offsets.length !== track.samples.length) {
+      throw new MediaError(
+        'mux-error',
+        `sparse MP4 track ${trackIndex + 1} needs one offset per sample`,
+      );
+    }
+    const chunks = track.samples.map((sample, sampleIndex) => {
+      const start = offsets[sampleIndex];
+      if (start === undefined || start < 0n || start > UINT64_MAX) {
+        throw new MediaError(
+          'mux-error',
+          'sparse MP4 sample offset must be an unsigned 64-bit bigint',
+        );
+      }
+      const end = start + BigInt(sample.data.byteLength);
+      sampleRegions.push({ start, end, data: sample.data });
+      return {
+        firstSample: sampleIndex,
+        sampleCount: 1,
+        payloadOffset: 0,
+        byteLength: sample.data.byteLength,
+      };
+    });
+    chunkLayouts.push({ chunks });
+    chunkTables.push({ chunks, chunkOffsets: offsets });
+  }
+
+  const movieTimescale = opts.movieTimescale ?? 1000;
+  const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
+  const moovBytes = moov(tracks, movieTimescale, chunkTables);
+  const mdatStart = BigInt(ftyp.length + moovBytes.length);
+  const mdatSize = opts.fileSize - mdatStart;
+  if (mdatSize <= 0xffff_ffffn) {
+    throw new MediaError('mux-error', 'sparse MP4 mdat must require its 64-bit large-size header');
+  }
+  const mdatHeader = cat(u32(1), fourcc('mdat'), u64(mdatSize));
+  const mdatBodyStart = mdatStart + BigInt(mdatHeader.length);
+
+  sampleRegions.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  let previousEnd = mdatBodyStart;
+  for (const region of sampleRegions) {
+    if (region.start < mdatBodyStart || region.end > opts.fileSize || region.start < previousEnd) {
+      throw new MediaError(
+        'mux-error',
+        'sparse MP4 sample regions overlap or escape the mdat payload',
+      );
+    }
+    previousEnd = region.end;
+  }
+
+  const prefix = Uint8Array.from(cat(ftyp, moovBytes, mdatHeader));
+  target.setSize(opts.fileSize);
+  target.write(0n, prefix);
+  for (const region of sampleRegions) target.write(region.start, region.data);
+  return prefix;
 }
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readMovie } from './mp4-driver.ts';
 import { buildSampleData } from './samples.ts';
-import { type MuxTrackInput, writeMp4 } from './write.ts';
+import { type MuxTrackInput, writeMp4, writeSparseMp4 } from './write.ts';
 
 const ra = (b: Uint8Array) => ({
   read: (o: number, l: number) => Promise.resolve(b.subarray(o, o + l)),
@@ -44,6 +44,33 @@ const audio: MuxTrackInput = {
 };
 
 describe('writeMp4 — encode path (synthesizes avcC/esds from description)', () => {
+  it('rejects sparse extents and offsets outside uint64 before touching the target', () => {
+    let targetCalls = 0;
+    const target = {
+      setSize(): void {
+        targetCalls++;
+      },
+      write(): void {
+        targetCalls++;
+      },
+    };
+    const uint64Overflow = 0x1_0000_0000_0000_0000n;
+
+    expect(() =>
+      writeSparseMp4([video], target, {
+        fileSize: uint64Overflow,
+        sampleOffsets: [[4_096n, 8_192n]],
+      }),
+    ).toThrow(/unsigned 64-bit box limit/);
+    expect(() =>
+      writeSparseMp4([video], target, {
+        fileSize: 0xffff_ffff_ffff_ffffn,
+        sampleOffsets: [[4_096n, uint64Overflow]],
+      }),
+    ).toThrow(/unsigned 64-bit bigint/);
+    expect(targetCalls).toBe(0);
+  });
+
   it('faststart muxes video+audio that re-parse to the right codecs, with ctts + stss', async () => {
     const movie = await readMovie(ra(writeMp4([video, audio])));
     expect(movie.tracks).toHaveLength(2);

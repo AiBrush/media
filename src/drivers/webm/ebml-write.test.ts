@@ -49,9 +49,14 @@ const ID = {
   TrackNumber: 0xd7,
   CodecID: 0x86,
   CodecPrivate: 0x63a2,
+  CodecDelay: 0x56aa,
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
   SimpleBlock: 0xa3,
+  BlockGroup: 0xa0,
+  Block: 0xa1,
+  BlockDuration: 0x9b,
+  ReferenceBlock: 0xfb,
 } as const;
 
 interface ScannedBlock {
@@ -59,9 +64,10 @@ interface ScannedBlock {
   timeMs: number;
   key: boolean;
   size: number;
+  durationMs?: number;
 }
 
-/** Independently scan every Cluster's SimpleBlocks (low-level EBML only — not the writer under test). */
+/** Independently scan every Cluster's Blocks (low-level EBML only — not the writer under test). */
 function scanBlocks(bytes: Uint8Array): ScannedBlock[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
@@ -73,17 +79,27 @@ function scanBlocks(bytes: Uint8Array): ScannedBlock[] {
     for (const c of elements(dv, el.dataStart, el.dataEnd)) {
       if (c.id === ID.Timecode) {
         clusterTime = readUint(dv, c);
-      } else if (c.id === ID.SimpleBlock) {
-        const tn = readVint(dv, c.dataStart, false);
+      } else if (c.id === ID.SimpleBlock || c.id === ID.BlockGroup) {
+        const block = c.id === ID.SimpleBlock ? c : findChild(dv, c.dataStart, c.dataEnd, ID.Block);
+        if (block === undefined) continue;
+        const tn = readVint(dv, block.dataStart, false);
         if (!tn) continue;
-        const rel = dv.getInt16(c.dataStart + tn.length, false);
-        const flags = dv.getUint8(c.dataStart + tn.length + 2);
-        const dataStart = c.dataStart + tn.length + 3;
+        const rel = dv.getInt16(block.dataStart + tn.length, false);
+        const flags = dv.getUint8(block.dataStart + tn.length + 2);
+        const dataStart = block.dataStart + tn.length + 3;
+        const duration =
+          c.id === ID.BlockGroup
+            ? findChild(dv, c.dataStart, c.dataEnd, ID.BlockDuration)
+            : undefined;
         out.push({
           trackNumber: tn.value,
           timeMs: clusterTime + rel,
-          key: (flags & 0x80) !== 0,
-          size: c.dataEnd - dataStart,
+          key:
+            c.id === ID.SimpleBlock
+              ? (flags & 0x80) !== 0
+              : findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined,
+          size: block.dataEnd - dataStart,
+          ...(duration !== undefined ? { durationMs: readUint(dv, duration) } : {}),
         });
       }
     }
@@ -104,6 +120,22 @@ function codecPrivateOf(bytes: Uint8Array, trackNumber: number): Uint8Array | un
     if (!num || readUint(dv, num) !== trackNumber) continue;
     const cp: EbmlElement | undefined = findChild(dv, te.dataStart, te.dataEnd, ID.CodecPrivate);
     return cp ? bytes.slice(cp.dataStart, cp.dataEnd) : undefined;
+  }
+  return undefined;
+}
+
+function trackUintOf(bytes: Uint8Array, trackNumber: number, id: number): number | undefined {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const segment = findChild(dv, 0, dv.byteLength, ID.Segment);
+  if (!segment) return undefined;
+  const tracks = findChild(dv, segment.dataStart, segment.dataEnd, ID.Tracks);
+  if (!tracks) return undefined;
+  for (const entry of elements(dv, tracks.dataStart, tracks.dataEnd)) {
+    if (entry.id !== ID.TrackEntry) continue;
+    const number = findChild(dv, entry.dataStart, entry.dataEnd, ID.TrackNumber);
+    if (!number || readUint(dv, number) !== trackNumber) continue;
+    const value = findChild(dv, entry.dataStart, entry.dataEnd, id);
+    return value ? readUint(dv, value) : undefined;
   }
   return undefined;
 }
@@ -278,6 +310,64 @@ describe('buildBlockTimeline — presentation-time ordering (pure)', () => {
     expect(blocks.map((b) => b.timeMs)).toEqual([0, 300, 100, 200]);
     expect(blocks.map((b) => b.dtsMs)).toEqual([0, 100, 200, 300]);
     expect(blocks.map((b) => b.key)).toEqual([true, false, false, false]);
+    expect(blocks.map((b) => b.durationMs)).toEqual([100, 100, 100, 100]);
+  });
+
+  it('retains nonuniform packet durations as explicit Matroska BlockDuration ticks', () => {
+    const { blocks } = buildBlockTimeline([
+      {
+        trackNumber: 1,
+        chunks: [chunk(0, 33_333, true, 1), chunk(33_333, 66_667, false, 1)],
+      },
+    ]);
+
+    expect(blocks.map((block) => block.durationMs)).toEqual([undefined, 67]);
+  });
+
+  it('quantizes prepared video durations between rounded DTS boundaries without cumulative drift', () => {
+    const decodeTable = (ptsUs: number, dtsUs: number, key: boolean): ChunkStruct => ({
+      timestampUs: ptsUs,
+      dtsUs,
+      durationUs: 33_333,
+      key,
+      data: new Uint8Array([1]),
+    });
+    const { blocks } = buildBlockTimeline([
+      {
+        trackNumber: 1,
+        mediaType: 'video',
+        chunks: [
+          decodeTable(0, -66_667, true),
+          decodeTable(100_000, -33_334, false),
+          decodeTable(33_333, 0, false),
+          decodeTable(66_667, 33_333, false),
+        ],
+      },
+    ]);
+
+    expect(blocks.map((block) => block.dtsMs)).toEqual([-67, -33, 0, 33]);
+    expect(blocks.map((block) => block.durationMs)).toEqual([34, 33, 33, 33]);
+  });
+
+  it('preserves a supplied packet duration across a genuine DTS discontinuity', () => {
+    const decodeTable = (ptsUs: number, dtsUs: number, key: boolean): ChunkStruct => ({
+      timestampUs: ptsUs,
+      dtsUs,
+      durationUs: 33_000,
+      key,
+      data: new Uint8Array([1]),
+    });
+    const { blocks } = buildBlockTimeline([
+      {
+        trackNumber: 1,
+        mediaType: 'video',
+        chunks: [decodeTable(0, 0, true), decodeTable(100_000, 100_000, false)],
+      },
+    ]);
+
+    // The 67 ms hole is a timeline gap. It must not stretch the first packet's BlockDuration to 100 ms.
+    expect(blocks.map((block) => block.dtsMs)).toEqual([0, 100]);
+    expect(blocks.map((block) => block.durationMs)).toEqual([33, 33]);
   });
 
   it('uses edit-list-adjusted packet timestamps for a real B-frame MP4 fallback end', async () => {
@@ -469,6 +559,57 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     expect(blocks.every((b) => b.timeMs >= 0)).toBe(true);
     // It re-demuxes as a valid WebM whose duration spans the full presentation timeline (300ms + 100ms).
     expect(parseWebm(bytes).durationSec).toBeCloseTo(0.4, 3);
+  });
+
+  it('authors and re-demuxes variable BlockDuration values without flattening cadence', async () => {
+    const muxer = new WebmMuxer({}, 'matroska');
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    muxer.addChunkStruct(vid, chunk(0, 33_333, true, 4));
+    muxer.addChunkStruct(vid, chunk(33_333, 66_667, false, 4));
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    expect(scanBlocks(bytes).map((block) => block.durationMs)).toEqual([undefined, 67]);
+    const frames = demuxWebm(bytes).framesByIndex[0];
+    expect(frames?.map((frame) => frame.durationUs)).toEqual([undefined, 67_000]);
+  });
+
+  it('signals a negative initial video DTS as CodecDelay and preserves B-frame composition offsets', async () => {
+    const muxer = new WebmMuxer({}, 'matroska');
+    const vid = muxer.addTrack({
+      id: 1,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      config: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 48 },
+    });
+    const reordered = [
+      { ptsUs: 0, dtsUs: -67_000, key: true },
+      { ptsUs: 99_000, dtsUs: -34_000, key: false },
+      { ptsUs: 33_000, dtsUs: -1_000, key: false },
+      { ptsUs: 66_000, dtsUs: 32_000, key: false },
+    ];
+    for (const [index, sample] of reordered.entries()) {
+      muxer.addChunkStruct(vid, {
+        timestampUs: sample.ptsUs,
+        dtsUs: sample.dtsUs,
+        durationUs: 33_000,
+        key: sample.key,
+        data: new Uint8Array([index + 1]),
+      });
+    }
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    expect(trackUintOf(bytes, 1, ID.CodecDelay)).toBe(67_000_000);
+    expect(scanBlocks(bytes).map((block) => block.timeMs)).toEqual([67, 166, 100, 133]);
+    expect(demuxWebm(bytes).framesByIndex[0]?.map((frame) => frame.timestampUs)).toEqual([
+      0, 99_000, 33_000, 66_000,
+    ]);
   });
 
   it('writes a declared remux duration into the Segment Info Duration', async () => {

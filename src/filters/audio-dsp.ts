@@ -30,12 +30,12 @@ import {
   type Registry,
   type StageOptions,
 } from '../contracts/driver.ts';
-import { CapabilityError, MediaError } from '../contracts/errors.ts';
+import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { audioDataToPcm, pcmToPlanarInit } from '../dsp/audio-data.ts';
 import { gain } from '../dsp/gain.ts';
 import { remix } from '../dsp/mix.ts';
 import type { PcmAudio } from '../dsp/pcm.ts';
-import { resample } from '../dsp/resample.ts';
+import { resample, resampleStage } from '../dsp/resample.ts';
 import { type StatefulAudioStage, biquadStage, dynamicsStage, fadeStage } from '../dsp/stream.ts';
 
 export { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/audio-data.ts';
@@ -44,8 +44,8 @@ export { audioDataToPcm, pcmRangeToPlanarInit, pcmToPlanarInit } from '../dsp/au
 export type AudioDspSpec = Extract<FilterSpec, { mediaType: 'audio' }>;
 
 /**
- * The **stateless** audio specs — pure per-chunk transforms with no cross-chunk state: `resample`,
- * `remix`, `gain`. Each maps one input `AudioData` to one output `AudioData` independently.
+ * Audio specs with a pure whole-buffer transform. `remix` and `gain` are also stream-stateless;
+ * `resample` is deliberately dispatched through a continuous-phase stage at the live stream seam.
  */
 export type StatelessAudioSpec = Extract<AudioDspSpec, { type: 'resample' | 'remix' | 'gain' }>;
 
@@ -61,7 +61,7 @@ export function isAudioDspSpec(f: FilterSpec): f is AudioDspSpec {
   return f.mediaType === 'audio';
 }
 
-/** True for a stateful audio spec (`fade`/`biquad`/`dynamics`) — driven via a {@link StatefulAudioStage}. */
+/** True for a stateful effect spec (`fade`/`biquad`/`dynamics`) — driven via a {@link StatefulAudioStage}. */
 export function isStatefulAudioSpec(f: AudioDspSpec): f is StatefulAudioSpec {
   return f.type === 'fade' || f.type === 'biquad' || f.type === 'dynamics';
 }
@@ -145,7 +145,7 @@ function emitPcm(
  * a new `AudioData` carrying the source `timestamp`, and close the input exactly once in a `finally`.
  */
 function createStatelessFilterStream(
-  spec: StatelessAudioSpec,
+  spec: Exclude<StatelessAudioSpec, { type: 'resample' }>,
   opts: StageOptions | undefined,
 ): TransformStream<AudioData, AudioData> {
   const signal = opts?.signal;
@@ -173,6 +173,97 @@ function createStatelessFilterStream(
     },
     flush(): void {
       if (signal !== undefined) signal.removeEventListener('abort', onAbort);
+    },
+  });
+}
+
+/**
+ * Build the continuous-phase resample stream. Adjacent decoder chunks are transport framing, not signal
+ * boundaries: the stage carries its polyphase cursor and bounded sinc history across them. Authored gaps or
+ * overlaps start a new segment, each with its own output-rate clock and one final output-length rounding.
+ */
+function createResampleFilterStream(
+  spec: Extract<AudioDspSpec, { type: 'resample' }>,
+  opts: StageOptions | undefined,
+): TransformStream<AudioData, AudioData> {
+  const signal = opts?.signal;
+  let stage = resampleStage(spec.sampleRate, { signal });
+  let originTimestamp: number | undefined;
+  let inputSampleRate: number | undefined;
+  let inputChannels: number | undefined;
+  let consumedFrames = 0;
+  let emittedFrames = 0;
+
+  const drain = (
+    controller: TransformStreamDefaultController<AudioData>,
+    chunks: readonly PcmAudio[],
+  ): void => {
+    for (const chunk of chunks) {
+      if (originTimestamp === undefined) {
+        throw new MediaError(
+          'encode-error',
+          'streaming resample emitted before receiving a timestamp',
+        );
+      }
+      const timestamp = Math.round(originTimestamp + (emittedFrames * 1_000_000) / spec.sampleRate);
+      emitPcm(controller, chunk, timestamp);
+      emittedFrames += chunk.frames;
+    }
+  };
+
+  const beginSegment = (timestamp: number): void => {
+    stage = resampleStage(spec.sampleRate, { signal });
+    originTimestamp = timestamp;
+    consumedFrames = 0;
+    emittedFrames = 0;
+  };
+
+  return new TransformStream<AudioData, AudioData>({
+    start(): void {
+      if (signal?.aborted === true)
+        throw new MediaError('aborted', 'audio filter cancelled before start');
+    },
+    transform(frame: AudioData, controller): void {
+      const data = asAudioData(frame);
+      let pcm: PcmAudio;
+      const timestamp = data.timestamp;
+      try {
+        if (signal?.aborted === true) throw new MediaError('aborted', 'audio filter cancelled');
+        pcm = audioDataToPcm(data);
+      } finally {
+        data.close();
+      }
+
+      if (inputSampleRate === undefined || inputChannels === undefined) {
+        inputSampleRate = pcm.sampleRate;
+        inputChannels = pcm.channels;
+      } else if (pcm.sampleRate !== inputSampleRate || pcm.channels !== inputChannels) {
+        throw new InputError(
+          `streaming resample layout changed from ${inputSampleRate} Hz/${inputChannels} channel(s) to ` +
+            `${pcm.sampleRate} Hz/${pcm.channels} channel(s)`,
+        );
+      }
+
+      if (originTimestamp === undefined) {
+        beginSegment(timestamp);
+      } else {
+        const expectedTimestamp = Math.round(
+          originTimestamp + (consumedFrames * 1_000_000) / pcm.sampleRate,
+        );
+        // WebCodecs timestamps are integer microseconds, so independently rounded adjacent boundaries
+        // can differ by one microsecond without representing a signal discontinuity. A larger delta is a
+        // real gap/overlap: finish the old filter tail and start a new clock segment at the authored PTS.
+        if (Math.abs(timestamp - expectedTimestamp) > 1) {
+          drain(controller, stage.flush());
+          beginSegment(timestamp);
+        }
+      }
+      consumedFrames += pcm.frames;
+      drain(controller, stage.push(pcm));
+    },
+    flush(controller): void {
+      if (signal?.aborted === true) throw new MediaError('aborted', 'audio filter cancelled');
+      drain(controller, stage.flush());
     },
   });
 }
@@ -253,9 +344,11 @@ function createAudioFilterStream(
   spec: AudioDspSpec,
   opts: StageOptions | undefined,
 ): TransformStream<AudioData, AudioData> {
-  return isStatefulAudioSpec(spec)
-    ? createStatefulFilterStream(spec, opts)
-    : createStatelessFilterStream(spec, opts);
+  return spec.type === 'resample'
+    ? createResampleFilterStream(spec, opts)
+    : isStatefulAudioSpec(spec)
+      ? createStatefulFilterStream(spec, opts)
+      : createStatelessFilterStream(spec, opts);
 }
 
 /* v8 ignore stop */

@@ -12,7 +12,13 @@ import { fromBytes } from '../../sources/source.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
 import { WebmMuxer } from './ebml-write.ts';
 import { elements, findChild } from './ebml.ts';
-import { WebmDriver, WebmModule, demuxWebm, parseWebm } from './webm-driver.ts';
+import {
+  WebmDriver,
+  WebmModule,
+  demuxWebm,
+  parseWebm,
+  webmPacketPayloadInfoFromBytes,
+} from './webm-driver.ts';
 
 const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
@@ -391,6 +397,40 @@ describe('WebmDriver.streamCopy — Session 6 R3 keyframe trim', () => {
         expect(alphaFrames.length).toBeGreaterThan(0);
         expect(alphaFrames.every((frame) => frame.alpha !== undefined)).toBe(true);
       }
+    },
+  );
+
+  it.each(['01.mkv', '02.mkv', '03.mkv'] as const)(
+    'trim/mkv_keyframe_aligned/%s keeps H.264 blocks in source decode order',
+    async (asset) => {
+      const source = await mediaFixture(`scenarios/trim/mkv_keyframe_aligned/${asset}`);
+      const output = await streamCopyTrim(source, { startUs: 0, endUs: 5_000_000 }, 'mkv');
+      const sourceTable = webmPacketPayloadInfoFromBytes(source);
+      const outputTable = webmPacketPayloadInfoFromBytes(output);
+      const sourceVideo = sourceTable.tracks.findIndex((track) => track.codec === 'h264');
+      const outputVideo = outputTable.tracks.findIndex((track) => track.codec === 'h264');
+      expect(sourceVideo).toBeGreaterThanOrEqual(0);
+      expect(outputVideo).toBeGreaterThanOrEqual(0);
+      const selected = sourceTable.packets.filter(
+        (packet) =>
+          packet.trackIndex === sourceVideo && packet.ptsUs >= 0 && packet.ptsUs < 5_000_000,
+      );
+      const actual = outputTable.packets.filter((packet) => packet.trackIndex === outputVideo);
+
+      // FFmpeg's SPS-delay projection has an unresolved leading prefix for this rotation. Its reported
+      // DTS regresses even though Matroska's Block/file order is already the authoritative decode order.
+      if (asset === '02.mkv') {
+        expect(
+          selected.some(
+            (packet, index) => index > 0 && packet.dtsUs < (selected[index - 1]?.dtsUs ?? 0),
+          ),
+        ).toBe(true);
+      }
+
+      expect(actual).toHaveLength(selected.length);
+      expect(actual.map((packet) => [packet.ptsUs, digest(packet.data)])).toEqual(
+        selected.map((packet) => [packet.ptsUs, digest(packet.data)]),
+      );
     },
   );
 

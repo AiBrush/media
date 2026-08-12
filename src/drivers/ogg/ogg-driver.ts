@@ -25,6 +25,7 @@ import {
   type TrackInfo,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { packetStatsFromRows } from '../../internal/packet-stats.ts';
 import { matchesOgg } from '../audio-container-sniff.ts';
 import { type ChunkStruct, OggMuxer, trackStateFrom, writeOgg } from './ogg-write.ts';
 
@@ -1496,12 +1497,17 @@ export const OggDriver: ContainerDriver = {
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     const all = await readAll(src, o?.signal);
     const table = oggPacketInfoTable(all);
-    const packetTable = oggPacketMetadata(table);
+    let packetTable: readonly PacketMetadata[] | undefined;
     const signal = o?.signal;
     if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
     return {
       tracks: table.tracks,
-      packetTable: () => packetTable,
+      packetStats: (trackId) =>
+        trackId === table.tracks[0]?.id ? packetStatsFromRows(table.packets) : undefined,
+      packetTable(): readonly PacketMetadata[] {
+        packetTable ??= oggPacketMetadata(table);
+        return packetTable;
+      },
       ...({ packetInfoTable: () => table.packets } as {
         packetInfoTable: () => readonly PacketInfoMetadata[];
       }),

@@ -1,5 +1,5 @@
 {
-  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment with no Info/Duration, an exact VP9 profile/level/depth/chroma CodecPrivate feature list, and one Cluster per fragment. A byte change in the EBML header, Tracks, Segment unknown-size encoding, live Info layout, cluster boundary rule, or SimpleBlock layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (ADR-242).",
+  "note": "Canonical fragmented/CMAF WebM bytes for a fixed synthesized VP9 input (8 frames, 2 GOPs with keyframes at frame 0 and 4; frame i has timestamp i*33333us, duration 33333us, and size 20+i bytes filled with 0x6b for keyframes / 0x42 for deltas). Produced by `new WebmMuxer({ fragmented: true })` writing an unknown-size Segment init segment with no Info/Duration, an exact VP9 profile/level/depth/chroma CodecPrivate feature list, and one Cluster per fragment. Constant cadence is represented by adjacent timestamps and DefaultDuration; only each live track's terminal packet carries BlockDuration, avoiding cumulative millisecond rounding. A byte change in the EBML header, Tracks, Segment unknown-size encoding, live Info layout, cluster boundary rule, or terminal BlockGroup layout breaks `sha256`. Regenerate intentionally only when the on-disk format changes (ADR-242).",
   "input": {
     "codec": "vp09.00.10.08",
     "codedWidth": 64,
@@ -12,12 +12,12 @@
   "docType": "webm",
   "fragmented": true,
   "chunkCount": 3,
-  "chunkSizes": [150, 118, 135],
-  "totalBytes": 403,
-  "sha256": "f4db1b2e28376d5e87ecc14eabdacd9b148e242836b9461e102496f6cb6a7227",
+  "chunkSizes": [150, 118, 143],
+  "totalBytes": 411,
+  "sha256": "8b77f8c3efda4fe273921d14aad052130f63655d64172de1f14f956ad3b1036d",
   "chunkSha256": [
     "692674d7f4a1bf2ccb8afa5b7be13d6d7c192b5b8a89b27abef193d0e30d031d",
     "073752a9ecdc79e2f0f8b18cb4015659d0fed5880fa082d667344ff13a6dc345",
-    "717d2286d5f307825af3b1a2ec52d3319750351d22d59fbd50e3d4a377432f8f"
+    "bcbab975b66010a09424b9b52bb05e9f70a63bf0ac5bdeda797bec7c373f4a2f"
   ]
 }

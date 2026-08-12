@@ -254,6 +254,31 @@ describe('buildMuxSamples — DTS/ctts timing (pure)', () => {
     expect(samples.map((sample) => sample.cttsTicks)).toEqual([0, 0, 0, 0]);
   });
 
+  it('quantizes true-DTS boundaries without cumulative 44.1 kHz drift', () => {
+    const packetCount = 570;
+    const chunks: ChunkStruct[] = Array.from({ length: packetCount }, (_, index) => {
+      const timestampUs = Math.round((index * 1024) / 44.1) * 1_000;
+      const nextTimestampUs = Math.round(((index + 1) * 1024) / 44.1) * 1_000;
+      return {
+        timestampUs,
+        dtsUs: timestampUs,
+        durationUs: nextTimestampUs - timestampUs,
+        key: true,
+        data: new Uint8Array([index & 0xff]),
+      };
+    });
+
+    const samples = buildMuxSamples(chunks, 44_100);
+    const cumulativeTicks = (throughIndex: number): number =>
+      samples.slice(0, throughIndex).reduce((total, sample) => total + sample.durationTicks, 0);
+    const expectedTicks = (throughIndex: number): number =>
+      Math.round(((chunks[throughIndex]?.dtsUs ?? 0) * 44_100) / 1_000_000);
+
+    expect(cumulativeTicks(275)).toBe(expectedTicks(275));
+    expect(cumulativeTicks(packetCount - 1)).toBe(expectedTicks(packetCount - 1));
+    expect(samples.every((sample) => sample.durationTicks > 0)).toBe(true);
+  });
+
   it('VFR: durations vary; DTS stays contiguous so ctts stays 0 when not reordered', () => {
     const ts = 90_000;
     const chunks: ChunkStruct[] = [
@@ -483,6 +508,32 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(track?.channels).toBe(2);
     expect(track?.config?.description).toEqual(ASC);
     expect(track ? buildSampleData(track).map((s) => s.size) : []).toEqual([5, 6]);
+  });
+
+  it('preserves declared audio durations across authored timestamp gaps and overlaps', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'aac',
+      config: { codec: 'aac', sampleRate: 48_000, numberOfChannels: 1, description: ASC },
+    });
+    for (const [index, timestampUs] of [0, 20_000, 25_000].entries()) {
+      muxer.addChunkStruct(aud, {
+        timestampUs,
+        dtsUs: timestampUs,
+        durationUs: 10_000,
+        key: true,
+        data: new Uint8Array([0x21, index]),
+      });
+    }
+    await muxer.finalize();
+
+    const track = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    const samples = track === undefined ? [] : buildSampleData(track);
+    expect(samples.map((sample) => sample.durationTicks)).toEqual([480, 480, 480]);
+    expect(samples.map((sample) => sample.cttsTicks)).toEqual([0, 480, 240]);
+    expect(samples.map((sample) => sample.dtsTicks + sample.cttsTicks)).toEqual([0, 960, 1_200]);
   });
 
   it('uses the documented 48 kHz audio clock fallback when config omits sampleRate', async () => {

@@ -99,10 +99,40 @@ export function vpxAlphaI420FromPackedRgba(
   sourcePlane: PlaneLayout,
   format: VpxAlphaPackedSourceFormat,
 ): VpxAlphaI420Plane {
+  return vpxAlphaI420FromPackedChannel(source, width, height, sourcePlane, format, 3);
+}
+
+/**
+ * Pack the red channel of a grayscale RGBA/BGRA raster as direct full-swing VPx alpha luma. Geometry
+ * filters materialize their result as display RGB; feeding that RGB frame straight to VideoEncoder
+ * makes the browser apply studio-swing RGB→YUV conversion (0 becomes 16), which is wrong for an alpha
+ * payload whose samples are the channel values themselves.
+ */
+export function vpxAlphaI420FromPackedGrayscale(
+  source: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  sourcePlane: PlaneLayout,
+  format: VpxAlphaPackedSourceFormat,
+): VpxAlphaI420Plane {
+  const redByteOffset = format === 'RGBA' ? 0 : format === 'BGRA' ? 2 : undefined;
+  if (redByteOffset === undefined) {
+    throw new MediaError('encode-error', `Unsupported VPx alpha packed source format ${format}`);
+  }
+  return vpxAlphaI420FromPackedChannel(source, width, height, sourcePlane, format, redByteOffset);
+}
+
+function vpxAlphaI420FromPackedChannel(
+  source: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  sourcePlane: PlaneLayout,
+  format: VpxAlphaPackedSourceFormat,
+  channelByteOffset: number,
+): VpxAlphaI420Plane {
   assertVpxAlphaDimensions(width, height);
   assertPlaneContainsRows(source, sourcePlane, width * RGBA_BYTES_PER_PIXEL, height);
-  const alphaByteOffset = format === 'RGBA' || format === 'BGRA' ? 3 : undefined;
-  if (alphaByteOffset === undefined) {
+  if (format !== 'RGBA' && format !== 'BGRA') {
     throw new MediaError('encode-error', `Unsupported VPx alpha packed source format ${format}`);
   }
   const layout = vpxAlphaI420Layout(width, height);
@@ -112,7 +142,7 @@ export function vpxAlphaI420FromPackedRgba(
     const targetRow = y * width;
     for (let x = 0; x < width; x++) {
       data[targetRow + x] = source[
-        sourceRow + x * RGBA_BYTES_PER_PIXEL + alphaByteOffset
+        sourceRow + x * RGBA_BYTES_PER_PIXEL + channelByteOffset
       ] as number;
     }
   }

@@ -317,7 +317,9 @@ describe('WebCodecs decoder startup — configuration is proven before packet su
     let hardwareSupported = true;
     let probeCalls = 0;
 
-    class TestEncodedVideoChunk {}
+    class TestEncodedVideoChunk {
+      constructor(readonly type: EncodedVideoChunkType = 'key') {}
+    }
     class BarrierVideoDecoder extends EventTarget {
       static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
         probeCalls++;
@@ -384,6 +386,7 @@ describe('WebCodecs decoder startup — configuration is proven before packet su
 
       const stream = WebcodecsVideoDriver.createDecoder(config);
       const writer = stream.writable.getWriter();
+      await writer.write(new TestEncodedVideoChunk('delta') as unknown as EncodedVideoChunk);
       await writer.write(new TestEncodedVideoChunk() as unknown as EncodedVideoChunk);
       await writer.close();
       await expect(stream.readable.getReader().read()).resolves.toEqual({
@@ -418,7 +421,9 @@ async function expectPromptStartupCancellation(mode: StartupCancellationMode): P
     markProbeStarted = resolve;
   });
 
-  class TestEncodedVideoChunk {}
+  class TestEncodedVideoChunk {
+    readonly type: EncodedVideoChunkType = 'key';
+  }
   class PendingProbeVideoDecoder extends EventTarget {
     static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
       markProbeStarted();

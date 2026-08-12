@@ -10,9 +10,9 @@ import { createMedia } from '../../api/create-media.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { Mp4Module } from '../../drivers/mp4/mp4-driver.ts';
 import { fixtureSource } from '../../test-support/corpus.ts';
+import { parseAv1Codec } from '../av1-codec-string.ts';
 import {
   normalizeAv1DecoderConfig,
-  parseAv1Codec,
   pixelFormatForAv1BitDepth,
   planeLayoutI420,
   pushDisplayTimestamp,
@@ -85,6 +85,23 @@ describe('parseAv1Codec — AV1 codec strings', () => {
     expect(() => parseAv1Codec('av01.0.04M.09')).toThrow(/bit depth/);
     expect(() => parseAv1Codec('av01.0.04M.08.2')).toThrow(/monochrome/);
     expect(() => parseAv1Codec('av01.0.04M.08.0.010')).toThrow(/chroma/);
+  });
+
+  it('rejects missing numeric fields and malformed chroma codes', () => {
+    expect(() => parseAv1Codec('av01..04M.08')).toThrow(/profile.*not numeric/);
+    expect(() => parseAv1Codec('av01.0.04M.')).toThrow(/bitDepth.*not numeric/);
+    expect(() => parseAv1Codec('av01.0.04M.08.0.12x')).toThrow(/chroma-subsampling/);
+  });
+
+  it('distinguishes the remaining legal chroma-subsampling layouts', () => {
+    expect(parseAv1Codec('av01.1.04M.08.0.100')).toMatchObject({
+      profile: 1,
+      chromaSubsampling: '422',
+    });
+    expect(parseAv1Codec('av01.2.04M.12.0.001')).toMatchObject({
+      profile: 2,
+      chromaSubsampling: '444',
+    });
   });
 });
 

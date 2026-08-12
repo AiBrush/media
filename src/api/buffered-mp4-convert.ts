@@ -1,3 +1,4 @@
+import type { PacketMetadata, PacketMetadataStats } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import {
   MP4_PROJECTED_CONTAINER_HEADROOM_BYTES,
@@ -36,6 +37,65 @@ export function projectedBufferedMp4OutputBytes(
   return Number.isSafeInteger(projectedOutputBytes)
     ? projectedOutputBytes
     : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Derive the selected program's presentation span from complete packet metadata. Container duration can
+ * be an absolute timeline endpoint (notably Matroska with a large non-zero timestamp origin); using it as
+ * elapsed work can reject a few seconds of real media as a multi-day buffered output. Require at least one
+ * valid packet for every selected track, then measure the global `[minimum PTS, maximum PTS+duration)` span
+ * so genuine inter-track offsets are retained while a common origin shift cancels out.
+ */
+export function packetTablePresentationSpanSec(
+  table: readonly PacketMetadata[] | undefined,
+  selectedTrackIds: readonly number[],
+): number | undefined {
+  if (table === undefined || selectedTrackIds.length === 0) return undefined;
+  const selected = new Set(selectedTrackIds);
+  const seen = new Set<number>();
+  let firstPtsUs = Number.POSITIVE_INFINITY;
+  let lastEndUs = Number.NEGATIVE_INFINITY;
+  for (const packet of table) {
+    if (
+      !selected.has(packet.trackId) ||
+      !Number.isFinite(packet.ptsUs) ||
+      !Number.isFinite(packet.durationUs) ||
+      packet.durationUs <= 0
+    ) {
+      continue;
+    }
+    const endUs = packet.ptsUs + packet.durationUs;
+    if (!Number.isFinite(endUs)) continue;
+    seen.add(packet.trackId);
+    firstPtsUs = Math.min(firstPtsUs, packet.ptsUs);
+    lastEndUs = Math.max(lastEndUs, endUs);
+  }
+  if (seen.size !== selected.size) return undefined;
+  const spanSec = (lastEndUs - firstPtsUs) / 1_000_000;
+  return Number.isFinite(spanSec) && spanSec > 0 ? spanSec : undefined;
+}
+
+/** Combine constant-sized per-track summaries into the selected program's presentation span. */
+export function packetStatsPresentationSpanSec(
+  stats: readonly (PacketMetadataStats | undefined)[],
+): number | undefined {
+  if (stats.length === 0 || stats.some((entry) => entry === undefined)) return undefined;
+  let firstPtsUs = Number.POSITIVE_INFINITY;
+  let lastEndUs = Number.NEGATIVE_INFINITY;
+  for (const entry of stats) {
+    if (
+      entry === undefined ||
+      entry.packetCount <= 0 ||
+      !Number.isFinite(entry.presentationStartUs) ||
+      !Number.isFinite(entry.presentationEndUs)
+    ) {
+      return undefined;
+    }
+    firstPtsUs = Math.min(firstPtsUs, entry.presentationStartUs);
+    lastEndUs = Math.max(lastEndUs, entry.presentationEndUs);
+  }
+  const spanSec = (lastEndUs - firstPtsUs) / 1_000_000;
+  return Number.isFinite(spanSec) && spanSec > 0 ? spanSec : undefined;
 }
 
 /**

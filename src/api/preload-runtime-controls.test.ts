@@ -28,6 +28,7 @@ describe('preload runtime controls', () => {
       wasmRuntime,
       wasmAssetBaseUrl: 'https://app.example/media/cores/',
       ensureDefaultDrivers: () => Promise.resolve(),
+      warmOperationChunks: () => Promise.resolve(),
       pickContainer: (_query: ContainerQuery) => {},
       pickCodec: (_query: CodecQuery) => Promise.resolve(),
       pickFilter: (_spec: FilterSpec) => {},

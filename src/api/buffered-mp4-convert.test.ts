@@ -5,6 +5,7 @@ import {
   BUFFERED_MP4_CONVERT_MAX_PROJECTED_PAYLOAD_BYTES,
   assertBufferedMp4ConvertProjection,
   isBuiltInBufferedMp4MuxDriverId,
+  packetTablePresentationSpanSec,
   projectedBufferedMp4OutputBytes,
 } from './buffered-mp4-convert.ts';
 
@@ -87,5 +88,75 @@ describe('buffer-all MP4/MOV convert projection', () => {
     expect(() =>
       assertBufferedMp4ConvertProjection('mp4', 'mp4-mux', 1, [Number.MAX_VALUE, Number.MAX_VALUE]),
     ).toThrowError(CapabilityError);
+  });
+
+  it('uses selected packet presentation span independently of a huge common timestamp origin', () => {
+    const packets = [
+      {
+        trackId: 3,
+        sizeBytes: 100,
+        ptsUs: 2_243_657_254_000,
+        dtsUs: 2_243_657_254_000,
+        durationUs: 33_000,
+        keyframe: true,
+      },
+      {
+        trackId: 4,
+        sizeBytes: 20,
+        ptsUs: 2_243_657_244_000,
+        dtsUs: 2_243_657_244_000,
+        durationUs: 23_000,
+        keyframe: true,
+      },
+      {
+        trackId: 3,
+        sizeBytes: 100,
+        ptsUs: 2_243_664_987_000,
+        dtsUs: 2_243_664_987_000,
+        durationUs: 33_000,
+        keyframe: false,
+      },
+      {
+        trackId: 4,
+        sizeBytes: 20,
+        ptsUs: 2_243_664_849_000,
+        dtsUs: 2_243_664_849_000,
+        durationUs: 23_000,
+        keyframe: false,
+      },
+    ];
+    expect(packetTablePresentationSpanSec(packets, [3, 4])).toBe(7.776);
+
+    const shifted = packets.map((packet) => ({
+      ...packet,
+      ptsUs: packet.ptsUs - 2_243_657_244_000,
+      dtsUs: packet.dtsUs - 2_243_657_244_000,
+    }));
+    expect(packetTablePresentationSpanSec(shifted, [3, 4])).toBe(7.776);
+  });
+
+  it('retains real inter-track offsets and falls back when one selected track has no valid packet', () => {
+    const packets = [
+      {
+        trackId: 1,
+        sizeBytes: 10,
+        ptsUs: 10_000_000,
+        dtsUs: 10_000_000,
+        durationUs: 1_000_000,
+        keyframe: true,
+      },
+      {
+        trackId: 2,
+        sizeBytes: 10,
+        ptsUs: 12_000_000,
+        dtsUs: 12_000_000,
+        durationUs: 2_000_000,
+        keyframe: true,
+      },
+    ];
+    expect(packetTablePresentationSpanSec(packets, [1, 2])).toBe(4);
+    expect(packetTablePresentationSpanSec(packets, [1, 3])).toBeUndefined();
+    expect(packetTablePresentationSpanSec(undefined, [1])).toBeUndefined();
+    expect(packetTablePresentationSpanSec(packets, [])).toBeUndefined();
   });
 });

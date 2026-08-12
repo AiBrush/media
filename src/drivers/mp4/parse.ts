@@ -4,6 +4,7 @@
  * with correct PTS/DTS and keyframe flags (docs/architecture/09 demux). Pure TS; no browser APIs.
  */
 
+import { h264AvcCSampleAspectRatios } from '../../codecs/h264-avcc-crop.ts';
 import type { MediaType } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
 import {
@@ -1064,6 +1065,91 @@ function parsePasp(r: Reader, childStart: number, end: number): PaspInfo | undef
   return { hSpacing: r.u32(), vSpacing: r.u32() };
 }
 
+const MAX_WEBCODECS_DIMENSION = 0xffff_ffff;
+
+function greatestCommonDivisor(a: number, b: number): number {
+  let left = a;
+  let right = b;
+  while (right !== 0) {
+    const remainder = left % right;
+    left = right;
+    right = remainder;
+  }
+  return left;
+}
+
+/**
+ * Project ISO-BMFF sample aspect ratio into the display aspect WebCodecs applies to decoded frames.
+ * Keep the exact reduced display ratio: DAR = coded width:height * pasp hSpacing:vSpacing. Malformed or
+ * unrepresentable values stay available as raw `pasp` side data but must not make decoder.configure throw.
+ * An explicit square-pixel container override must still be emitted when it supersedes non-square
+ * in-band codec metadata; otherwise an omitted WebCodecs aspect lets the decoder reuse that metadata.
+ */
+function decoderDisplayAspect(
+  width: number,
+  height: number,
+  pasp: PaspInfo | undefined,
+  preserveSquarePixelOverride = false,
+): Pick<VideoDecoderConfig, 'displayAspectWidth' | 'displayAspectHeight'> {
+  if (
+    pasp === undefined ||
+    pasp.hSpacing === 0 ||
+    pasp.vSpacing === 0 ||
+    (pasp.hSpacing === pasp.vSpacing && !preserveSquarePixelOverride)
+  ) {
+    return {};
+  }
+  // Visual-sample-entry dimensions are u16 and pasp components are u32, so both products remain exact
+  // JS safe integers. Reduce before enforcing WebCodecs' unsigned-long range.
+  const horizontal = width * pasp.hSpacing;
+  const vertical = height * pasp.vSpacing;
+  const divisor = greatestCommonDivisor(horizontal, vertical);
+  const displayAspectWidth = horizontal / divisor;
+  const displayAspectHeight = vertical / divisor;
+  if (
+    displayAspectWidth <= 0 ||
+    displayAspectHeight <= 0 ||
+    displayAspectWidth > MAX_WEBCODECS_DIMENSION ||
+    displayAspectHeight > MAX_WEBCODECS_DIMENSION
+  ) {
+    return {};
+  }
+  return { displayAspectWidth, displayAspectHeight };
+}
+
+/**
+ * A container pasp is authoritative. Otherwise, use a global SPS ratio only when every declared SPS
+ * agrees; conflicting parameter sets cannot be represented by one VideoDecoderConfig display aspect.
+ */
+function decoderSampleAspect(
+  containerPasp: PaspInfo | undefined,
+  sampleEntryType: string,
+  codecRecord: Uint8Array,
+): PaspInfo | undefined {
+  if (containerPasp !== undefined) return containerPasp;
+  if (sampleEntryType !== 'avc1' && sampleEntryType !== 'avc3') return undefined;
+  try {
+    const ratios = h264AvcCSampleAspectRatios(codecRecord);
+    const first = ratios[0];
+    if (
+      first === undefined ||
+      ratios.some(
+        (candidate) =>
+          candidate === undefined ||
+          // extended_SAR pairs need not be reduced; compare their exact rational values.
+          candidate.width * first.height !== first.width * candidate.height,
+      )
+    ) {
+      return undefined;
+    }
+    return { hSpacing: first.width, vSpacing: first.height };
+  } catch {
+    // Preserve malformed/unsupported SPS bytes as description; do not turn optional display metadata
+    // extraction into a structural MP4 parse failure.
+    return undefined;
+  }
+}
+
 /** The `clap` clean-aperture box: width/height numerators are unsigned; the centre offsets are signed. */
 function parseClap(r: Reader, childStart: number, end: number): ClapInfo | undefined {
   r.seek(childStart);
@@ -1103,9 +1189,10 @@ function parseVisualEntry(r: Reader, entry: BoxHeader): SampleEntry {
     ...(pasp !== undefined ? { pasp } : {}),
     ...(clap !== undefined ? { clap } : {}),
   };
-  // The colour hint rides on the WebCodecs config so the decoder applies it when the bitstream lacks
-  // colour info — the decode-seam fix for the wrong-colours defect (ADR-185).
+  // Container display metadata rides on the WebCodecs config: colour overrides missing bitstream facts,
+  // while pasp sets the presentation ratio of the decoded VideoFrame rather than changing coded geometry.
   const colorInit = colorSpace !== undefined ? { colorSpace } : {};
+  const containerDisplayAspectInit = decoderDisplayAspect(width, height, pasp, true);
 
   const spec = VIDEO_CONFIG[entry.type];
   if (spec) {
@@ -1114,6 +1201,12 @@ function parseVisualEntry(r: Reader, entry: BoxHeader): SampleEntry {
     if (cfg) {
       const record = r.bytesAt(cfg.payloadStart, cfg.end).slice();
       const codec = spec.codec(entry.type, record);
+      const displayAspectInit = decoderDisplayAspect(
+        width,
+        height,
+        decoderSampleAspect(pasp, entry.type, record),
+        pasp !== undefined,
+      );
       return {
         type: entry.type,
         codec,
@@ -1123,6 +1216,7 @@ function parseVisualEntry(r: Reader, entry: BoxHeader): SampleEntry {
           codedHeight: height,
           description: record,
           ...colorInit,
+          ...displayAspectInit,
         },
         width,
         height,
@@ -1135,7 +1229,13 @@ function parseVisualEntry(r: Reader, entry: BoxHeader): SampleEntry {
   return {
     type: entry.type,
     codec,
-    config: { codec, codedWidth: width, codedHeight: height, ...colorInit },
+    config: {
+      codec,
+      codedWidth: width,
+      codedHeight: height,
+      ...colorInit,
+      ...containerDisplayAspectInit,
+    },
     width,
     height,
     ...extras,

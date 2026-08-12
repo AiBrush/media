@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'vitest';
+import type { ContainerDriver, TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { toOpfsTarget } from '../sinks/opfs-target.ts';
 import { toBlob, toOPFS } from '../sinks/sink.ts';
 import { toStreamTarget } from '../sinks/stream-target.ts';
-import { muxOptionsFrom } from './op-support.ts';
+import type { Source } from '../sources/source.ts';
+import {
+  isFlacAuthorCodec,
+  isPinnedDriverMiss,
+  isRawPcmTrack,
+  muxOptionsFrom,
+  sourceGeometryOf,
+  stageStrategy,
+  toMediaInfo,
+} from './op-support.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { MuxSpec, RemuxOptions } from './types.ts';
 
@@ -149,5 +159,103 @@ describe('reserved faststart public preflight', () => {
       sink: toStreamTarget(destination as never),
     });
     expect(() => validateReservedFaststart('mux', 'mp4', options)).toThrowError(CapabilityError);
+  });
+});
+
+describe('operation support projections', () => {
+  it('preserves only explicit stage routing choices', () => {
+    expect(stageStrategy({})).toEqual({ determinism: 'auto' });
+    expect(stageStrategy({ determinism: 'force-software', pinDriver: 'wasm-vpx' })).toEqual({
+      determinism: 'force-software',
+      pinDriver: 'wasm-vpx',
+    });
+  });
+
+  it('recognizes only an exact single-driver pinned miss', () => {
+    const miss = (message: string, detail: unknown) =>
+      new CapabilityError(message, detail as ConstructorParameters<typeof CapabilityError>[1]);
+    expect(isPinnedDriverMiss(miss('pinned route missed', { tried: ['native'] }), 'native')).toBe(
+      true,
+    );
+    expect(isPinnedDriverMiss(miss('ordinary route missed', { tried: ['native'] }), 'native')).toBe(
+      false,
+    );
+    expect(isPinnedDriverMiss(miss('pinned route missed', null), 'native')).toBe(false);
+    expect(isPinnedDriverMiss(miss('pinned route missed', {}), 'native')).toBe(false);
+    expect(isPinnedDriverMiss(miss('pinned route missed', { tried: 'native' }), 'native')).toBe(
+      false,
+    );
+    expect(isPinnedDriverMiss(miss('pinned route missed', { tried: [] }), 'native')).toBe(false);
+    expect(isPinnedDriverMiss(miss('pinned route missed', { tried: ['other'] }), 'native')).toBe(
+      false,
+    );
+    expect(isPinnedDriverMiss(miss('pinned route missed', { tried: ['native'] }), undefined)).toBe(
+      false,
+    );
+  });
+
+  it('classifies raw PCM and every lossless FLAC authoring token without accepting lossy codecs', () => {
+    const track = (codec: string): TrackInfo => ({ id: 1, mediaType: 'audio', codec });
+    expect(isRawPcmTrack(track('pcm'))).toBe(true);
+    expect(isRawPcmTrack(track('pcm-s24'))).toBe(true);
+    expect(isRawPcmTrack(track('aac'))).toBe(false);
+    expect([undefined, 'flac', 'pcm', 'pcm-s16'].map(isFlacAuthorCodec)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(isFlacAuthorCodec('opus')).toBe(false);
+  });
+
+  it('keeps sparse video geometry sparse even when a decoder config object exists', () => {
+    expect(
+      sourceGeometryOf({
+        id: 1,
+        mediaType: 'video',
+        codec: 'h264',
+        config: { codec: 'avc1.42E01E', codedWidth: undefined, codedHeight: undefined },
+      } as unknown as TrackInfo),
+    ).toEqual({ width: undefined, height: undefined });
+  });
+
+  it('materializes unknown, non-media, sparse-video, and audio track facts exactly', () => {
+    const container = { formats: [] } as unknown as ContainerDriver;
+    const source = {
+      __media: 'source',
+      kind: 'bytes',
+      stream: () => new ReadableStream<Uint8Array>(),
+    } as Source;
+    const info = toMediaInfo(
+      container,
+      [
+        { id: 1, mediaType: 'audio', codec: 'json', nonMedia: true },
+        {
+          id: 2,
+          mediaType: 'video',
+          codec: 'h264',
+          config: { codec: 'avc1.42E01E', codedWidth: undefined, codedHeight: undefined },
+          durationSec: 2,
+          fps: 24,
+          rotation: 270,
+        } as unknown as TrackInfo,
+        {
+          id: 3,
+          mediaType: 'audio',
+          codec: 'opus',
+          config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+        },
+      ],
+      source,
+    );
+    expect(info).toEqual({
+      container: 'unknown',
+      durationSec: 2,
+      tracks: [
+        { id: 1, type: 'other', codec: 'json' },
+        { id: 2, type: 'video', codec: 'h264', durationSec: 2, fps: 24, rotation: 270 },
+        { id: 3, type: 'audio', codec: 'opus', sampleRate: 48_000, channels: 2 },
+      ],
+    });
   });
 });

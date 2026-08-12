@@ -49,6 +49,7 @@ export interface TrimAudioPacketInfoRow {
   readonly offset: number;
   readonly size: number;
   readonly sourceTimestampUs: number;
+  readonly sourceDtsUs: number;
   readonly timestampUs: number;
   readonly dtsUs: number;
   readonly durationUs: number;
@@ -93,11 +94,78 @@ export function trimPacketCopyTrack(track: TrackInfo, bounds: TrimBoundsUs): Tra
   };
 }
 
-export function trimAudioPacketInfoTrack(track: TrackInfo, bounds: TrimBoundsUs): TrackInfo {
+/** Whether compressed audio can carry an exact sub-packet trim through the destination container. */
+export function canUseMp4AacPacketInfoTrim(track: TrackInfo, outputContainer: string): boolean {
+  const config = track.config;
+  const sampleRate =
+    config !== undefined && 'sampleRate' in config && positiveFinite(config.sampleRate)
+      ? config.sampleRate
+      : undefined;
+  const container = outputContainer.toLowerCase();
+  return (
+    (container === 'mp4' || container === 'mov') &&
+    track.mediaType === 'audio' &&
+    /^(?:aac|mp4a(?:\.|$))/i.test(track.codec) &&
+    sampleRate !== undefined
+  );
+}
+
+export function trimAudioPacketInfoTrack(
+  track: TrackInfo,
+  bounds: TrimBoundsUs,
+  rows: readonly TrimAudioPacketInfoRow[] = [],
+  outputContainer?: string,
+): TrackInfo {
   const { gapless: _gapless, ...trackWithoutGapless } = track;
-  return {
+  const trimmedTrack: TrackInfo = {
     ...trackWithoutGapless,
     durationSec: Math.max(0, bounds.endUs - bounds.startUs) / MICROS_PER_SECOND,
+  };
+  const config = track.config;
+  const sampleRate =
+    config !== undefined && 'sampleRate' in config && positiveFinite(config.sampleRate)
+      ? config.sampleRate
+      : undefined;
+  if (
+    outputContainer === undefined ||
+    !canUseMp4AacPacketInfoTrim(track, outputContainer) ||
+    sampleRate === undefined ||
+    rows.length === 0
+  ) {
+    return trimmedTrack;
+  }
+
+  const first = rows[0];
+  if (first === undefined) return trimmedTrack;
+  const leadingSamples = microsecondsToSamples(
+    Math.max(0, bounds.startUs - first.sourceDtsUs),
+    sampleRate,
+  );
+  const totalSamples = microsecondsToSamples(
+    Math.max(0, bounds.endUs - bounds.startUs),
+    sampleRate,
+  );
+  const codedSamples = rows.reduce(
+    (total, row) => total + microsecondsToSamples(row.durationUs, sampleRate),
+    0,
+  );
+  if (
+    !Number.isSafeInteger(leadingSamples) ||
+    !Number.isSafeInteger(totalSamples) ||
+    !Number.isSafeInteger(codedSamples) ||
+    totalSamples <= 0 ||
+    leadingSamples + totalSamples > codedSamples
+  ) {
+    return trimmedTrack;
+  }
+  return {
+    ...trimmedTrack,
+    gapless: {
+      basis: 'mp4-edit-list',
+      leadingSamples,
+      trailingSamples: codedSamples - leadingSamples - totalSamples,
+      totalSamples,
+    },
   };
 }
 
@@ -135,22 +203,21 @@ export function planTrimAudioPacketInfoRows(
     if (row === false) return undefined;
     rows.push(row);
   }
-
-  // A range shorter than one compressed access unit cannot own a packet by its end timestamp. Keep
-  // the single covering unit in that exact shape instead of falling through to a fresh encoder whose
-  // codec priming would move a sub-frame trim away from origin zero.
-  if (rows.length === 0) {
-    for (const packet of packets) {
-      if (packet.trackIndex !== trackIndex) continue;
-      const row = trimAudioPacketInfoRow(packet, bounds, true);
-      if (row === undefined) continue;
-      if (row === false) return undefined;
-      rows.push(row);
-    }
-  }
   if (rows.length === 0) return undefined;
-  assignTrimPacketInfoWindows(rows);
-  return rows;
+  // Keep the compressed access units on one contiguous coded clock. A cut inside the first unit is
+  // represented later by an MP4 edit (`leadingSamples`), not by clamping that packet to PTS zero while
+  // leaving the following packet at its cut-relative PTS. The latter creates an artificial AAC overlap.
+  const codedOriginUs = rows[0]?.sourceDtsUs;
+  if (codedOriginUs === undefined) return undefined;
+  const normalized = rows.map(
+    (row): TrimAudioPacketInfoRow => ({
+      ...row,
+      timestampUs: row.sourceTimestampUs - codedOriginUs,
+      dtsUs: row.sourceDtsUs - codedOriginUs,
+    }),
+  );
+  assignTrimPacketInfoWindows(normalized);
+  return normalized;
 }
 
 export function planTrimVideoPacketInfoRows(
@@ -617,7 +684,6 @@ function trimVideoPacketInfoRow(packet: PacketInfoMetadata): TrimVideoPacketInfo
 function trimAudioPacketInfoRow(
   packet: PacketInfoMetadata,
   bounds: TrimBoundsUs,
-  allowEndOverlap = false,
 ): TrimAudioPacketInfoRow | undefined | false {
   const offset = packet.offset;
   if (
@@ -633,23 +699,22 @@ function trimAudioPacketInfoRow(
     return false;
   }
   const timestampUs = Math.round(packet.ptsUs);
+  const sourceDtsUs = Math.round(packet.dtsUs);
   const durationUs = Math.round(packet.durationUs);
   const endUs = timestampUs + durationUs;
-  // Assign a packet that crosses an adjacent-cut boundary to the range on the right. Overlap-based
-  // selection would emit that encoded access unit from both ranges, so trim(a..b) + trim(b..c) would
-  // contain one more audio packet than trim(a..c).
-  if (
-    endUs <= bounds.startUs ||
-    (allowEndOverlap ? timestampUs >= bounds.endUs : endUs > bounds.endUs)
-  ) {
+  // An encoded access unit cannot be split at a sample-accurate boundary. Keep every overlapping unit;
+  // the derived MP4 edit discards the leading/trailing fractions. Adjacent independent cuts therefore
+  // share their boundary unit by design, allowing a concat implementation to collapse it by identity.
+  if (endUs <= bounds.startUs || timestampUs >= bounds.endUs) {
     return undefined;
   }
   return {
     offset: Math.round(offset),
     size: Math.round(packet.size),
     sourceTimestampUs: timestampUs,
-    timestampUs: Math.max(0, timestampUs - bounds.startUs),
-    dtsUs: Math.max(0, Math.round(packet.dtsUs) - bounds.startUs),
+    sourceDtsUs,
+    timestampUs,
+    dtsUs: sourceDtsUs,
     durationUs,
     window: undefined,
   };
@@ -745,6 +810,10 @@ function clampInt(value: number, min: number, max: number): number {
 
 function positiveFinite(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function microsecondsToSamples(microseconds: number, sampleRate: number): number {
+  return Math.round((microseconds * sampleRate) / MICROS_PER_SECOND);
 }
 
 function sampleCountOrZero(value: number | undefined, label: string): number {

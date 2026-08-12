@@ -12,6 +12,7 @@ import type {
   DecoderConfig,
   EncoderConfig,
   PacketMetadata,
+  PacketMetadataStats,
   TrackInfo,
 } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
@@ -203,6 +204,32 @@ export function sourceVideoBitrateFromPacketTable(
   const spanUs = lastEndUs - firstDtsUs;
   if (bytes <= 0 || !Number.isFinite(spanUs) || spanUs <= 0) return undefined;
   const bitrate = Math.round((bytes * 8 * 1_000_000) / spanUs);
+  return Number.isSafeInteger(bitrate) && bitrate > 0 ? bitrate : undefined;
+}
+
+/** Derive the same compressed-rate evidence from a constant-sized demux summary. */
+export function sourceVideoBitrateFromPacketStats(
+  stats: PacketMetadataStats | undefined,
+): number | undefined {
+  const hasDecodeSpan =
+    stats !== undefined &&
+    Number.isFinite(stats.decodeStartUs) &&
+    Number.isFinite(stats.decodeEndUs);
+  const startUs = hasDecodeSpan ? stats.decodeStartUs : stats?.presentationStartUs;
+  const endUs = hasDecodeSpan ? stats.decodeEndUs : stats?.presentationEndUs;
+  if (
+    stats === undefined ||
+    stats.packetCount <= 0 ||
+    !Number.isSafeInteger(stats.totalSizeBytes) ||
+    stats.totalSizeBytes <= 0 ||
+    !Number.isFinite(startUs) ||
+    !Number.isFinite(endUs)
+  ) {
+    return undefined;
+  }
+  const spanUs = (endUs as number) - (startUs as number);
+  if (!Number.isFinite(spanUs) || spanUs <= 0) return undefined;
+  const bitrate = Math.round((stats.totalSizeBytes * 8 * 1_000_000) / spanUs);
   return Number.isSafeInteger(bitrate) && bitrate > 0 ? bitrate : undefined;
 }
 

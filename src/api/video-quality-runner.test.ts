@@ -29,6 +29,7 @@ import {
   type H264QualityOutputRoute,
   analyzeH264QualityConstrained,
   copyDisplayedRgbaForQuality,
+  nextNativeRateRequest,
 } from './video-quality-runner.ts';
 
 const WIDTH = 8;
@@ -157,6 +158,8 @@ interface FakeRuntimeState {
   auditMuxOptions: H264QualityOutputRoute['muxOptions'] | undefined;
   candidateEncodedBytes: number[];
   candidateQuantizers: number[][];
+  candidateBitrates: Array<number | undefined>;
+  candidateRateControlWarmupFrames: Array<number | undefined>;
 }
 
 function fakeRuntime(
@@ -190,6 +193,8 @@ function fakeRuntime(
     auditMuxOptions: undefined,
     candidateEncodedBytes: [],
     candidateQuantizers: [],
+    candidateBitrates: [],
+    candidateRateControlWarmupFrames: [],
   };
   const source: Source = {
     __media: 'source',
@@ -238,6 +243,8 @@ function fakeRuntime(
       if (candidateIndex >= 0) {
         state.candidateEncodedBytes[candidateIndex] = 0;
         state.candidateQuantizers[candidateIndex] = [];
+        state.candidateBitrates[candidateIndex] = 'bitrate' in config ? config.bitrate : undefined;
+        state.candidateRateControlWarmupFrames[candidateIndex] = stage?.rateControlWarmupFrames;
       }
       let index = 0;
       let published = false;
@@ -362,6 +369,19 @@ function target(minimumMean: number): VideoTarget {
     quality: { metric: 'ssim-luma-v1', minimumMean, samples: 4 },
   };
 }
+
+describe('native H.264 request calibration', () => {
+  it('uses byte correction for over-cap or unmeasured candidates', () => {
+    expect(nextNativeRateRequest(1_000_000, 200, 100, 0.99, 0.95)).toBe(500_000);
+    expect(nextNativeRateRequest(1_000_000, 80, 100, undefined, 0.95)).toBe(1_250_000);
+  });
+
+  it('uses the larger of rate headroom and measured SSIM distortion when quality is available', () => {
+    expect(nextNativeRateRequest(1_000_000, 100, 100, 0.9, 0.95)).toBe(2_000_000);
+    expect(nextNativeRateRequest(1_000_000, 80, 100, 0.96, 0.95)).toBe(1_250_000);
+    expect(nextNativeRateRequest(1, 1, 1, 0.99, 1)).toBeGreaterThan(1);
+  });
+});
 
 const AVC_DESCRIPTION = new Uint8Array([1, 0x42, 0xe0, 0x1e, 0xff]);
 
@@ -945,6 +965,95 @@ describe('replay-backed H.264 quality candidate runner', () => {
     expect(attempts[1]?.qualityMean).toBeLessThan(request.quality.minimumMean);
   });
 
+  it('falls back to an audited native-rate candidate when scheduled QPs cannot meet quality', async () => {
+    const runtime = fakeRuntime(undefined, {
+      candidateQualityQuantizers: [51, 51, 51, 0],
+    });
+    const videoTarget = target(0.99);
+    const request = assertH264QualityConstraintPreflight(videoTarget, runtime.source);
+    if (request === undefined) throw new Error('expected quality request');
+
+    const candidate = await analyzeH264QualityConstrained(
+      runtime.source,
+      runtime.container,
+      videoTarget,
+      request,
+      new AbortController().signal,
+      {},
+      false,
+      runtime.outputRoute,
+      runtime.context,
+    );
+
+    expect(candidate.attempts).toHaveLength(4);
+    expect(candidate.qualityMean).toBeGreaterThanOrEqual(request.quality.minimumMean);
+    expect(candidate.averageBitrate).toBeLessThanOrEqual(request.maxAverageBitrate);
+    expect(runtime.state.candidateQuantizers[3]).toEqual([28, 28, 28, 28]);
+    expect(runtime.state.candidateBitrates.slice(0, 2)).toEqual([undefined, undefined]);
+    expect(runtime.state.candidateBitrates[2]).toBe(request.maxAverageBitrate);
+    expect(runtime.state.candidateBitrates[3]).toBe(request.maxAverageBitrate * 4);
+    expect(runtime.state.candidateRateControlWarmupFrames).toEqual([undefined, undefined, 3, 3]);
+  });
+
+  it('rejects an over-cap native candidate and corrects its controller request downward', async () => {
+    const runtime = fakeRuntime(undefined, {
+      candidateByteLengthFactors: [1, 1, 2, 1],
+      candidateQualityQuantizers: [51, 51, 0, 0],
+    });
+    const videoTarget = target(0.99);
+    const request = assertH264QualityConstraintPreflight(videoTarget, runtime.source);
+    if (request === undefined) throw new Error('expected quality request');
+
+    const candidate = await analyzeH264QualityConstrained(
+      runtime.source,
+      runtime.container,
+      videoTarget,
+      request,
+      new AbortController().signal,
+      {},
+      false,
+      runtime.outputRoute,
+      runtime.context,
+    );
+
+    expect(candidate.attempts).toHaveLength(4);
+    expect(candidate.attempts[2]?.averageBitrate).toBeGreaterThan(request.maxAverageBitrate);
+    expect(candidate.attempts[2]?.qualityMean).toBeUndefined();
+    expect(candidate.qualityMean).toBeGreaterThanOrEqual(request.quality.minimumMean);
+    expect(runtime.state.candidateBitrates[2]).toBe(request.maxAverageBitrate);
+    expect(runtime.state.candidateBitrates[3]).toBeLessThan(request.maxAverageBitrate);
+  });
+
+  it('retains no over-spool native bytes before a later bounded candidate succeeds', async () => {
+    const runtime = fakeRuntime(undefined, {
+      candidateByteLengthFactors: [1, 1, 50_000, 1],
+      candidateQualityQuantizers: [51, 51, 0, 0],
+    });
+    const videoTarget = target(0.99);
+    const request = assertH264QualityConstraintPreflight(videoTarget, runtime.source);
+    if (request === undefined) throw new Error('expected quality request');
+
+    const candidate = await analyzeH264QualityConstrained(
+      runtime.source,
+      runtime.container,
+      videoTarget,
+      request,
+      new AbortController().signal,
+      {},
+      false,
+      runtime.outputRoute,
+      runtime.context,
+    );
+
+    expect(candidate.attempts).toHaveLength(4);
+    expect(candidate.attempts[2]?.actualBytes).toBeGreaterThan(
+      H264_QUALITY_MAX_IN_MEMORY_CANDIDATE_BYTES,
+    );
+    expect(candidate.attempts[2]?.qualityMean).toBeUndefined();
+    expect(candidate.qualityMean).toBeGreaterThanOrEqual(request.quality.minimumMean);
+    expect(runtime.state.muxersCreated).toBe(0);
+  });
+
   it('returns typed bounded evidence and no muxed output when the declared floor is impossible', async () => {
     const runtime = fakeRuntime();
     const videoTarget = target(1);
@@ -973,7 +1082,7 @@ describe('replay-backed H.264 quality candidate runner', () => {
       },
     });
     expect((error as ConstraintUnsatisfiedError).detail.attempts.length).toBeGreaterThan(0);
-    expect((error as ConstraintUnsatisfiedError).detail.attempts.length).toBeLessThanOrEqual(3);
+    expect((error as ConstraintUnsatisfiedError).detail.attempts.length).toBeLessThanOrEqual(6);
     expect(runtime.state.muxersCreated).toBe(0);
     expect(runtime.state.demuxClosed).toBe(runtime.state.demuxOpened);
     expect(runtime.state.framesClosed).toBe(runtime.state.framesCreated);

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   gate:
-    name: typecheck · lint · test · build · budgets
+    name: full package gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +39,9 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Documentation checks
+        run: bun run docs:check
+
       - name: Lint + format
         run: bunx biome ci .
 
@@ -48,8 +51,20 @@ jobs:
       - name: Build (ESM + .d.ts)
         run: bun run build
 
+      - name: Vendor WASM artifacts
+        run: bun run vendor-wasm
+
+      - name: Test published artifacts
+        run: bun run test:dist
+
       - name: Bundle budgets
         run: bun run check-budgets
 
-  # Cross-browser correctness (Chromium/WebKit/Firefox via Playwright) lands with the Phase 1 MVP,
-  # when WebCodecs/GPU paths exist to exercise. Added as a separate matrix job at that point.
+      - name: Verify clean package consumer
+        run: bun run verify:package
+
+      - name: Verify integrity
+        run: bun run verify:integrity
+
+  # Cross-browser/device, performance, memory, and soak evidence lives in the media-test matrix; this
+  # package-quality job does not by itself certify the repository's full SOTA release claims.

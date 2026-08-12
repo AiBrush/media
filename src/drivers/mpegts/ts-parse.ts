@@ -908,10 +908,31 @@ function mediaRank(t: MediaType): number {
 
 // ── codec config (dims / sample params) for probe ─────────────────────────────────────────────────
 
-/** Parse H.264 SPS coded dimensions from the first SPS NAL in an access unit (Annex-B). */
-function h264Dimensions(au: Uint8Array): { width: number; height: number } | undefined {
+interface H264SpsConfig {
+  readonly codec: string;
+  readonly dimensions: { readonly width: number; readonly height: number } | undefined;
+}
+
+/** Derive the RFC 6381 AVC codec string from an Annex-B SPS's profile/compatibility/level bytes. */
+export function h264CodecStringFromAnnexB(au: Uint8Array): string | undefined {
+  return h264SpsConfig(au)?.codec;
+}
+
+/** Read the WebCodecs-facing facts carried in the first H.264 SPS NAL in an Annex-B access unit. */
+function h264SpsConfig(au: Uint8Array): H264SpsConfig | undefined {
   const sps = findNal(au, (nal) => (nal[0] as number) & 0x1f, 7);
-  return sps ? parseH264SpsDimensions(sps) : undefined;
+  if (sps === undefined || sps.byteLength < 4) return undefined;
+  const profileIdc = sps[1];
+  const profileCompatibility = sps[2];
+  const levelIdc = sps[3];
+  if (profileIdc === undefined || profileCompatibility === undefined || levelIdc === undefined) {
+    return undefined;
+  }
+  const hexByte = (value: number): string => value.toString(16).padStart(2, '0').toUpperCase();
+  return {
+    codec: `avc1.${hexByte(profileIdc)}${hexByte(profileCompatibility)}${hexByte(levelIdc)}`,
+    dimensions: parseH264SpsDimensions(sps),
+  };
 }
 
 /** Find the first Annex-B NAL whose `typeOf(nalBody)` equals `want`; returns the NAL body (sans header byte offset 0). */
@@ -1291,15 +1312,21 @@ function configForStream(
 ): VideoDecoderConfig | AudioDecoderConfig {
   if (stream.mediaType === 'video') {
     let dims: { width: number; height: number } | undefined;
+    let codec = stream.codec;
     if (stream.codec === 'h264') {
       // A TS range can begin mid-GOP. The first complete AU then legitimately has no SPS; keep scanning
-      // decode order until the next parameter-set repetition instead of publishing a false 0×0 config.
+      // decode order until the next parameter-set repetition instead of publishing a false 0×0 config
+      // or a generic `h264` string that WebCodecs cannot use. No `description` is attached: TS access
+      // units stay Annex-B, which is precisely the no-description form expected by VideoDecoder.
       for (const unit of units) {
-        dims = h264Dimensions(unit.data);
+        const sps = h264SpsConfig(unit.data);
+        if (sps === undefined) continue;
+        codec = sps.codec;
+        dims = sps.dimensions;
         if (dims !== undefined) break;
       }
     }
-    return { codec: stream.codec, codedWidth: dims?.width ?? 0, codedHeight: dims?.height ?? 0 };
+    return { codec, codedWidth: dims?.width ?? 0, codedHeight: dims?.height ?? 0 };
   }
   if (adtsParams !== undefined) {
     // A `channel_configuration` of 0 means the layout rides in an in-band PCE: there is no honest

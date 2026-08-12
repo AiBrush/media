@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { fromBytes } from '../../sources/source.ts';
+import { Mp4Driver } from './mp4-driver.ts';
+import { probeMp4Faststart } from './mp4-lazy-probe.ts';
 import {
   readSimpleVideoFaststartProbe,
   readTinyAudioFaststartProbe,
@@ -399,6 +402,57 @@ describe('simple MP4 faststart probes', () => {
       codedWidth: 64,
       codedHeight: 36,
     });
+  });
+
+  it('strict wrapper declines an extended-size sample entry that canonical probe interprets differently', async () => {
+    const bytes = simpleMovie(
+      simpleVideoTrack(joinBytes([stsd(box64('avc1', avc1Payload())), stts(2, 600), stsz([1, 1])])),
+    );
+    const canonical = await Mp4Driver.probe?.(fromBytes(bytes, { mime: 'video/mp4' }));
+    const compact = await readSimpleVideoFaststartProbe(ra(bytes));
+    const strict = await probeMp4Faststart({
+      size: bytes.byteLength,
+      stream: () => new ReadableStream(),
+      range: (start, end) => Promise.resolve(bytes.slice(start, end)),
+    });
+
+    expect(compact?.tracks[0]).toMatchObject({ codec: 'avc1.42C01E' });
+    expect(canonical?.[0]).toMatchObject({ codec: 'avc1' });
+    expect(strict).toBeUndefined();
+  });
+
+  it('strict wrapper also declines an extended-size mp4a entry nested beside accepted AVC', async () => {
+    const bytes = simpleMovie(
+      simpleVideoTrack(),
+      simpleAudioTrack(
+        joinBytes([stsd(box64('mp4a', mp4aV0Payload())), stts(2, 1_024), stsz([1, 1])]),
+      ),
+    );
+    const compact = await readSimpleVideoFaststartProbe(ra(bytes));
+    const strict = await probeMp4Faststart({
+      size: bytes.byteLength,
+      stream: () => new ReadableStream(),
+      range: (start, end) => Promise.resolve(bytes.slice(start, end)),
+    });
+
+    expect(compact?.tracks.map((track) => track.codec)).toEqual(['avc1.42C01E', 'mp4a.40.2']);
+    expect(strict).toBeUndefined();
+  });
+
+  it('strict wrapper declines mvex movies whose fragment timing is outside the compact parser', async () => {
+    const bytes = joinBytes([
+      ftyp(),
+      box('moov', mvhdV1(), box('mvex', box('trex', zeros(24))), simpleVideoTrack()),
+    ]);
+    const compact = await readSimpleVideoFaststartProbe(ra(bytes));
+    const strict = await probeMp4Faststart({
+      size: bytes.byteLength,
+      stream: () => new ReadableStream(),
+      range: (start, end) => Promise.resolve(bytes.slice(start, end)),
+    });
+
+    expect(compact?.tracks).toHaveLength(1);
+    expect(strict).toBeUndefined();
   });
 
   it('accepts an internal size-zero sample entry as bounded-to-parent data', async () => {

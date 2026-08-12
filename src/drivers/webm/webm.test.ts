@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import { parseAsc } from '../../codecs/wasm-aac/aac.ts';
+import { parseAsc } from '../../codecs/aac-config.ts';
 import type { ByteSource, TrackInfo } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
@@ -93,7 +93,18 @@ const str = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
 function sizeVint(n: number): number[] {
   if (n < 0x7f) return [0x80 | n];
   if (n < 0x3fff) return [0x40 | (n >> 8), n & 0xff];
-  return [0x20 | (n >> 16), (n >> 8) & 0xff, n & 0xff];
+  if (n < 0x1fffff) return [0x20 | (n >> 16), (n >> 8) & 0xff, n & 0xff];
+  return [0x10 | (n >> 24), (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+function leb128(n: number): number[] {
+  const out: number[] = [];
+  let remaining = n;
+  do {
+    const low = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    out.push(low | (remaining > 0 ? 0x80 : 0));
+  } while (remaining > 0);
+  return out;
 }
 function uintN(value: number, len: number): number[] {
   const out: number[] = [];
@@ -125,6 +136,8 @@ const E = {
   TrackType: [0x83],
   TrackNumber: [0xd7],
   CodecID: [0x86],
+  CodecPrivate: [0x63, 0xa2],
+  DefaultDuration: [0x23, 0xe3, 0x83],
   Language: [0x22, 0xb5, 0x9c],
   Video: [0xe0],
   PixelWidth: [0xb0],
@@ -138,11 +151,13 @@ const E = {
   SimpleBlock: [0xa3],
   BlockGroup: [0xa0],
   Block: [0xa1],
+  BlockDuration: [0x9b],
   BlockAdditions: [0x75, 0xa1],
   BlockMore: [0xa6],
   BlockAdditional: [0xa5],
   BlockAddID: [0xee],
   ReferenceBlock: [0xfb],
+  Void: [0xec],
 };
 
 describe('WebmDriver.supports', () => {
@@ -644,6 +659,1062 @@ describe('probe WebM across the real corpus', () => {
     expect(alphaPackets[0]?.data.byteLength).toBeGreaterThan(0);
   });
 
+  it('packetInfo range-scans diverse WebM clusters without retaining packet payloads', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    for (const { name, load } of [
+      { name: 'movie_5.webm', load: () => loadFixture('movie_5.webm') },
+      { name: 'bear-multitrack.webm', load: () => loadFixture('bear-multitrack.webm') },
+      { name: 'bear-opus.webm', load: () => loadFixture('bear-opus.webm') },
+      { name: 'bear-vp9-alpha.webm', load: () => loadFixture('bear-vp9-alpha.webm') },
+      { name: 'recorder_headerless.webm', load: () => loadFixture('recorder_headerless.webm') },
+      { name: 'h264_in_mkv.mkv', load: () => bytesFromMediaTest('h264_in_mkv.mkv') },
+      { name: 'av1_720p_5s.webm', load: () => bytesFromMediaTest('av1_720p_5s.webm') },
+      { name: 'vp8_720p_10s.webm', load: () => bytesFromMediaTest('vp8_720p_10s.webm') },
+    ]) {
+      const bytes = await load();
+      const ranges: Array<readonly [number, number]> = [];
+      let releases = 0;
+      let streamCalls = 0;
+      const actual = await packetInfo.call(WebmDriver, {
+        size: bytes.byteLength,
+        async range(start, end): Promise<Uint8Array> {
+          ranges.push([start, end]);
+          return bytes.slice(start, end);
+        },
+        releaseRange(): void {
+          releases++;
+        },
+        stream(): ReadableStream<Uint8Array> {
+          streamCalls++;
+          throw new Error('finite WebM packet-info must stay range-backed');
+        },
+      });
+      const payloadTable = webmPacketPayloadInfoFromBytes(bytes);
+      const expectedPackets = payloadTable.packets.map((packet) => ({
+        trackIndex: packet.trackIndex,
+        ...(packet.offset !== undefined ? { offset: packet.offset } : {}),
+        size: packet.size,
+        ptsUs: packet.ptsUs,
+        dtsUs: packet.dtsUs,
+        ...(packet.durationUs !== undefined ? { durationUs: packet.durationUs } : {}),
+        keyframe: packet.keyframe,
+      }));
+      expect(actual.tracks, name).toEqual(payloadTable.tracks);
+      expect(actual.packets, name).toEqual(expectedPackets);
+      expect(streamCalls, name).toBe(0);
+      expect(ranges.length, name).toBeGreaterThan(1);
+      expect(releases, `${name} released ranges`).toBe(ranges.length);
+      if (bytes.byteLength > 256 * 1024) {
+        expect(
+          Math.max(...ranges.map(([start, end]) => end - start)),
+          `${name} maximum physical range`,
+        ).toBeLessThan(bytes.byteLength);
+      }
+    }
+  });
+
+  it('packetInfo never allocates a complete large finite Cluster', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const clusterPayload = [...el(E.Timecode, [0])];
+    for (let timestamp = 0; timestamp < 96; timestamp++) {
+      clusterPayload.push(
+        ...el(E.SimpleBlock, [
+          0x81,
+          (timestamp >> 8) & 0xff,
+          timestamp & 0xff,
+          0x80,
+          ...new Array(4096).fill(timestamp & 0xff),
+        ]),
+      );
+    }
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [...el(E.Tracks, track), ...el(E.Cluster, clusterPayload)]),
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('large finite Cluster packet-info must remain range-backed');
+      },
+    });
+
+    expect(actual.tracks).toEqual(expected.tracks);
+    expect(actual.packets).toEqual(
+      expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    );
+    expect(actual.packets).toHaveLength(96);
+    expect(clusterPayload.length).toBeGreaterThan(256 * 1024);
+    expect(Math.max(...ranges.map(([start, end]) => end - start))).toBeLessThan(
+      clusterPayload.length,
+    );
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+  });
+
+  it('packetInfo skips one file-sized Block payload with constant post-prefix ranges', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, uintN(320, 2)), ...el(E.PixelHeight, [240])]),
+    ]);
+    const payloadSize = 512 * 1024;
+    const payload = new Array(payloadSize).fill(0);
+    // Valid 320x240 profile-0 VP9 keyframe header; the remaining half-megabyte is deliberately opaque.
+    payload.splice(0, 16, 130, 73, 131, 66, 32, 19, 240, 14, 246, 0, 56, 36, 28, 24, 2, 0);
+    const block = el(E.SimpleBlock, [0x81, 0, 0, 0x80, ...payload]);
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Tracks, track),
+        ...el(E.Info, el(E.Duration, f64(1000))),
+        ...el(E.Cluster, [...el(E.Timecode, [0]), ...block]),
+      ]),
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(response): void {
+        releases++;
+        const buffer = response.buffer as ArrayBuffer;
+        structuredClone(buffer, { transfer: [buffer] });
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('a huge finite Block must remain on bounded ranges');
+      },
+    });
+
+    expect(actual).toEqual({
+      tracks: expected.tracks,
+      packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    });
+    expect(actual.packets).toHaveLength(1);
+    expect(actual.packets[0]?.size).toBe(payloadSize);
+    expect((actual.tracks[0]?.config as VideoDecoderConfig | undefined)?.codec).toMatch(
+      /^vp09\.00\./,
+    );
+    expect(ranges[0]).toEqual([0, 256 * 1024]);
+    expect(Math.max(...ranges.slice(1).map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      64 * 1024,
+    );
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(releases).toBe(ranges.length);
+  });
+
+  it('packetInfo bounds Xiph lace-header work and releases every range on overflow', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.Duration, f64(20))),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [
+          ...el(E.Timecode, [0]),
+          ...el(E.SimpleBlock, [0x81, 0, 0, 0x82, 1, ...new Array(2 * 1024 * 1024).fill(0xff)]),
+        ]),
+      ]),
+    ]);
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    await expect(
+      packetInfo.call(WebmDriver, {
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          ranges.push([start, end]);
+          return Promise.resolve(bytes.slice(start, end));
+        },
+        releaseRange(response): void {
+          releases++;
+          const buffer = response.buffer as ArrayBuffer;
+          structuredClone(buffer, { transfer: [buffer] });
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('oversized Xiph lace header must remain range-backed');
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'constraint-unsatisfied',
+      detail: {
+        constraint: 'webm-packet-info-xiph-lace-header-bytes',
+        maxBytes: 1024 * 1024,
+      },
+    });
+    expect(ranges[0]).toEqual([0, 256 * 1024]);
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(Math.max(...ranges.slice(1).map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      64 * 1024,
+    );
+    expect(releases).toBe(ranges.length);
+  });
+
+  it('packetInfo pre-scans late Info beyond a large Void before interpreting Cluster clocks', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP9')),
+      ...el(E.Video, [...el(E.PixelWidth, uintN(320, 2)), ...el(E.PixelHeight, [240])]),
+    ]);
+    const keyframe = [130, 73, 131, 66, 32, 19, 240, 14, 246, 0, 56, 36, 28, 24, 2, 0];
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [
+          ...el(E.Timecode, [0]),
+          ...el(E.SimpleBlock, [0x81, 0, 0, 0x80, ...keyframe]),
+          ...el(E.SimpleBlock, [0x81, 0, 10, 0x80, ...keyframe]),
+        ]),
+        ...el(E.Void, new Array(270 * 1024).fill(0)),
+        ...el(E.Info, [...el(E.TimecodeScale, uintN(2_000_000, 4)), ...el(E.Duration, f64(20))]),
+      ]),
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('late finite Info must remain range-backed');
+      },
+    });
+
+    expect(actual).toEqual({
+      tracks: expected.tracks,
+      packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    });
+    expect(actual.tracks[0]?.durationSec).toBe(0.04);
+    expect((actual.tracks[0]?.config as VideoDecoderConfig | undefined)?.codec).toMatch(
+      /^vp09\.00\./,
+    );
+    expect(actual.packets.map(({ ptsUs, durationUs }) => [ptsUs, durationUs])).toEqual([
+      [0, 20_000],
+      [20_000, 20_000],
+    ]);
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+  });
+
+  it('packetInfo discovers Tracks after a prefix-sized Void without materializing the source', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.Duration, f64(20))),
+        ...el(E.Void, new Array(270 * 1024).fill(0)),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [
+          ...el(E.Timecode, [0]),
+          ...el(E.SimpleBlock, [0x81, 0, 0, 0x80, 0x11]),
+          ...el(E.SimpleBlock, [0x81, 0, 10, 0x80, 0x22]),
+        ]),
+      ]),
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(): void {
+        releases++;
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('late finite Tracks must remain range-backed');
+      },
+    });
+
+    expect(actual).toEqual({
+      tracks: expected.tracks,
+      packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    });
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(Math.max(...ranges.map(([start, end]) => end - start))).toBeLessThanOrEqual(256 * 1024);
+    expect(releases).toBe(ranges.length);
+  });
+
+  it('packetInfo accepts a padded EBML Header beyond its prefix and types the bounded header cap', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const segment = el(E.Segment, [
+      ...el(E.Info, el(E.Duration, f64(20))),
+      ...el(E.Tracks, track),
+      ...el(E.Cluster, [
+        ...el(E.Timecode, [0]),
+        ...el(E.SimpleBlock, [0x81, 0, 0, 0x80, 0x11]),
+        ...el(E.SimpleBlock, [0x81, 0, 10, 0x80, 0x22]),
+      ]),
+    ]);
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, [...el(E.DocType, str('webm')), ...el(E.Void, new Array(270 * 1024).fill(0))]),
+      ...segment,
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(): void {
+        releases++;
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('padded EBML Header packetInfo must remain range-backed');
+      },
+    });
+    expect(actual).toEqual({
+      tracks: expected.tracks,
+      packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    });
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(Math.max(...ranges.map(([start, end]) => end - start))).toBeLessThan(bytes.byteLength);
+    expect(releases).toBe(ranges.length);
+
+    const capped = Uint8Array.from([
+      ...el(E.EBML, [...el(E.DocType, str('webm')), ...el(E.Void, new Array(1024 * 1024).fill(0))]),
+      ...segment,
+    ]);
+    const cappedRanges: Array<readonly [number, number]> = [];
+    await expect(
+      packetInfo.call(WebmDriver, {
+        size: capped.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          cappedRanges.push([start, end]);
+          return Promise.resolve(capped.slice(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('oversized EBML Header must fail before stream materialization');
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'constraint-unsatisfied',
+      detail: {
+        constraint: 'webm-packet-info-metadata-bytes',
+        kind: 'EBML Header',
+        maxBytes: 1024 * 1024,
+      },
+    });
+    expect(cappedRanges).toEqual([[0, 256 * 1024]]);
+    expect(cappedRanges).not.toContainEqual([0, capped.byteLength]);
+  });
+
+  it('packetInfo skips large AV1 Padding OBUs and bounds pathological qualification walks', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const source = await bytesFromMediaTest('av1_720p_5s.webm');
+    const payloadTable = webmPacketPayloadInfoFromBytes(source);
+    const videoIndex = payloadTable.tracks.findIndex((trackInfo) => trackInfo.codec === 'av1');
+    const realKeyframe = payloadTable.packets.find(
+      (packet) => packet.trackIndex === videoIndex && packet.keyframe,
+    )?.data;
+    if (realKeyframe === undefined) throw new Error('expected a real AV1 keyframe');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_AV1')),
+      ...el(E.Video, [...el(E.PixelWidth, uintN(1280, 2)), ...el(E.PixelHeight, uintN(720, 2))]),
+    ]);
+    const build = (paddingSize: number): Uint8Array => {
+      const accessUnit = [
+        0x7a,
+        ...leb128(paddingSize),
+        ...new Array(paddingSize).fill(0),
+        ...realKeyframe,
+      ];
+      return Uint8Array.from([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [
+          ...el(E.Info, el(E.Duration, f64(20))),
+          ...el(E.Tracks, track),
+          ...el(E.Void, new Array(270 * 1024).fill(0)),
+          ...el(E.Cluster, [
+            ...el(E.Timecode, [0]),
+            ...el(E.SimpleBlock, [0x81, 0, 0, 0x80, ...accessUnit]),
+          ]),
+        ]),
+      ]);
+    };
+
+    const bytes = build(70_000);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(response): void {
+        releases++;
+        const buffer = response.buffer as ArrayBuffer;
+        structuredClone(buffer, { transfer: [buffer] });
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('AV1 OBU qualification must remain range-backed');
+      },
+    });
+    expect(actual).toEqual({
+      tracks: expected.tracks,
+      packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    });
+    expect((actual.tracks[0]?.config as VideoDecoderConfig | undefined)?.codec).toBe(
+      'av01.0.05M.08',
+    );
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(Math.max(...ranges.slice(1).map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      64 * 1024,
+    );
+    expect(releases).toBe(ranges.length);
+
+    const capped = build(4 * 1024 * 1024 + 1);
+    const cappedRanges: Array<readonly [number, number]> = [];
+    const cappedActual = await packetInfo.call(WebmDriver, {
+      size: capped.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        cappedRanges.push([start, end]);
+        return Promise.resolve(capped.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('capped AV1 OBU qualification must remain range-backed');
+      },
+    });
+    expect((cappedActual.tracks[0]?.config as VideoDecoderConfig | undefined)?.codec).toBe('av01');
+    expect(cappedRanges).not.toContainEqual([0, capped.byteLength]);
+    expect(Math.max(...cappedRanges.map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      256 * 1024,
+    );
+  });
+
+  it('packetInfo caps aggregate retained codec qualification prefixes across many tracks', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const trackEntries: number[] = [];
+    const clusterPayload = el(E.Timecode, [0]);
+    const codedFrame = new Array(64 * 1024).fill(0);
+    codedFrame.splice(0, 16, 130, 73, 131, 66, 32, 19, 240, 14, 246, 0, 56, 36, 28, 24, 2, 0);
+    for (let trackNumber = 1; trackNumber <= 17; trackNumber++) {
+      trackEntries.push(
+        ...el(E.TrackEntry, [
+          ...el(E.TrackNumber, [trackNumber]),
+          ...el(E.TrackType, [1]),
+          ...el(E.CodecID, str('V_VP9')),
+          ...el(E.Video, [...el(E.PixelWidth, uintN(320, 2)), ...el(E.PixelHeight, [240])]),
+        ]),
+      );
+      clusterPayload.push(...el(E.SimpleBlock, [0x80 | trackNumber, 0, 0, 0x80, ...codedFrame]));
+    }
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.Duration, f64(1000))),
+        ...el(E.Tracks, trackEntries),
+        ...el(E.Cluster, clusterPayload),
+      ]),
+    ]);
+    const expectedPackets = webmPacketPayloadInfoFromBytes(bytes).packets.map(
+      ({ data: _data, alpha: _alpha, ...packet }) => packet,
+    );
+    const ranges: Array<readonly [number, number]> = [];
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        ranges.push([start, end]);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(): void {
+        releases++;
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('multitrack qualification must remain range-backed');
+      },
+    });
+
+    expect(actual.packets).toEqual(expectedPackets);
+    expect(actual.tracks).toHaveLength(17);
+    expect(
+      actual.tracks.filter((trackInfo) =>
+        (trackInfo.config as VideoDecoderConfig | undefined)?.codec.startsWith('vp09.'),
+      ),
+    ).toHaveLength(16);
+    expect((actual.tracks[16]?.config as VideoDecoderConfig | undefined)?.codec).toBe('vp09');
+    expect(ranges).not.toContainEqual([0, bytes.byteLength]);
+    expect(Math.max(...ranges.slice(1).map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      64 * 1024,
+    );
+    expect(releases).toBe(ranges.length);
+  });
+
+  it('packetInfo range-walk preserves lacing and late BlockGroup metadata before releasing windows', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP8')),
+      ...el(E.Video, [...el(E.PixelWidth, [2]), ...el(E.PixelHeight, [2])]),
+    ]);
+    const xiphLaced = el(
+      E.SimpleBlock,
+      [0x81, 0, 0, 0x82, 2, 2, 3, 0x11, 0x12, 0x21, 0x22, 0x23, 0x31, 0x32, 0x33, 0x34],
+    );
+    const blockGroup = el(E.BlockGroup, [
+      ...el(E.Block, [0x81, 0, 10, 0, 0x41, 0x42, 0x43, 0x44, 0x45]),
+      ...el(E.ReferenceBlock, [0xff]),
+      ...el(E.BlockDuration, [6]),
+      ...el(
+        E.BlockAdditions,
+        el(E.BlockMore, [...el(E.BlockAdditional, [0xaa]), ...el(E.BlockAddID, [1])]),
+      ),
+    ]);
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.Duration, f64(20))),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [...el(E.Timecode, [0]), ...xiphLaced, ...blockGroup]),
+      ]),
+    ]);
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    let reads = 0;
+    let releases = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        reads++;
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      releaseRange(response): void {
+        releases++;
+        const buffer = response.buffer as ArrayBuffer;
+        structuredClone(buffer, { transfer: [buffer] });
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('finite laced packet-info must remain range-backed');
+      },
+    });
+
+    expect(actual.tracks).toEqual(expected.tracks);
+    expect(actual.tracks[0]).toMatchObject({ alpha: true });
+    expect(actual.packets).toEqual(
+      expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    );
+    expect(actual.packets.map(({ size }) => size)).toEqual([2, 3, 4, 5]);
+    expect(actual.packets.map(({ keyframe }) => keyframe)).toEqual([true, true, true, false]);
+    expect(actual.packets[3]?.durationUs).toBe(6000);
+    expect(releases).toBe(reads);
+  });
+
+  it('packetInfo preserves exact whole-source semantics across finite-source fallback shapes', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const bytes = await loadFixture('white.webm');
+    const expected = await packetInfo.call(WebmDriver, fromBytes(bytes));
+    const stream = (): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+
+    for (const source of [
+      { stream },
+      { size: bytes.byteLength, stream },
+      { size: 0, range: async () => new Uint8Array(0), stream },
+    ]) {
+      expect(await packetInfo.call(WebmDriver, source)).toEqual(expected);
+    }
+  });
+
+  it('packetInfo range-walks unknown-size Clusters and bounded attachment metadata', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const recorder = await bytesFromMediaTest('recorder_headerless.webm');
+    const trailingVoid = Uint8Array.from(el(E.Void, new Array(320 * 1024).fill(0)));
+    const paddedRecorder = new Uint8Array(recorder.byteLength + trailingVoid.byteLength);
+    paddedRecorder.set(recorder);
+    paddedRecorder.set(trailingVoid, recorder.byteLength);
+    const recorderRanges: Array<readonly [number, number]> = [];
+    const recorderExpected = webmPacketPayloadInfoFromBytes(paddedRecorder);
+    const recorderActual = await packetInfo.call(WebmDriver, {
+      size: paddedRecorder.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        recorderRanges.push([start, end]);
+        return Promise.resolve(paddedRecorder.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('unknown-size Clusters must remain on the finite range walk');
+      },
+    });
+    expect(recorderActual.tracks).toEqual(recorderExpected.tracks);
+    expect(recorderActual.packets).toEqual(
+      recorderExpected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    );
+    expect(recorderRanges).not.toContainEqual([0, paddedRecorder.byteLength]);
+    expect(Math.max(...recorderRanges.map(([start, end]) => end - start))).toBeLessThanOrEqual(
+      256 * 1024,
+    );
+
+    const attachmentBytes = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/03.mkv');
+    const attachmentRanges: Array<readonly [number, number]> = [];
+    const attachmentExpected = webmPacketPayloadInfoFromBytes(attachmentBytes);
+    const attachmentActual = await packetInfo.call(WebmDriver, {
+      size: attachmentBytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        attachmentRanges.push([start, end]);
+        return Promise.resolve(attachmentBytes.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('finite attachment metadata must stay range-backed');
+      },
+    });
+    expect(attachmentActual.tracks).toEqual(attachmentExpected.tracks);
+    expect(attachmentActual.packets).toEqual(
+      attachmentExpected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    );
+    expect(attachmentRanges).not.toContainEqual([0, attachmentBytes.byteLength]);
+    expect(Math.max(...attachmentRanges.map(([start, end]) => end - start))).toBeLessThan(
+      attachmentBytes.byteLength,
+    );
+
+    const ordinary = await loadFixture('movie_5.webm');
+    let reads = 0;
+    await expect(
+      packetInfo.call(WebmDriver, {
+        size: ordinary.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          reads++;
+          const prefix = new Uint8Array(end - start);
+          prefix.set(ordinary.subarray(0, Math.min(16, prefix.byteLength)));
+          return Promise.resolve(prefix);
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('invalid finite metadata must not open the source stream');
+        },
+      }),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/unsupported-input|demux-error/) });
+    expect(reads).toBe(1);
+  });
+
+  it('packetInfo rejects short finite ranges and observes cancellation after an awaited read', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const bytes = await loadFixture('movie_5.webm');
+    await expect(
+      packetInfo.call(WebmDriver, {
+        size: bytes.byteLength,
+        range(start, end): Promise<Uint8Array> {
+          return Promise.resolve(bytes.slice(start, end - 1));
+        },
+        stream: () => new ReadableStream<Uint8Array>(),
+      }),
+    ).rejects.toThrowError(/returned .* bytes for range/);
+
+    const controller = new AbortController();
+    await expect(
+      packetInfo.call(
+        WebmDriver,
+        {
+          size: bytes.byteLength,
+          range(start, end): Promise<Uint8Array> {
+            controller.abort('packet-info range completed after cancellation');
+            return Promise.resolve(bytes.slice(start, end));
+          },
+          stream: () => new ReadableStream<Uint8Array>(),
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: 'aborted' });
+  });
+
+  it('packetInfo derives undeclared clocks while ignoring non-media and malformed block children', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const emptyVideoTrack = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [2]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_VP8')),
+    ]);
+    const cluster = el(E.Cluster, [
+      ...el(E.Timecode, [0]),
+      ...el(E.SimpleBlock, [0]),
+      ...el(E.BlockGroup, []),
+      ...el(E.SimpleBlock, [0x81, 0x00, 0x00, 0x80, 0x11]),
+      ...el(E.SimpleBlock, [0x81, 0x00, 0x0a, 0x80, 0x22]),
+    ]);
+    for (const info of [[], el(E.Info, [])]) {
+      const bytes = new Uint8Array([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [...info, ...el(E.Tracks, [...track, ...emptyVideoTrack]), ...cluster]),
+      ]);
+      const table = await packetInfo.call(WebmDriver, fromBytes(bytes));
+      expect(table.packets).toEqual([
+        expect.objectContaining({ ptsUs: 0, dtsUs: 0, durationUs: 10_000, keyframe: true }),
+        expect.objectContaining({
+          ptsUs: 10_000,
+          dtsUs: 10_000,
+          durationUs: 10_000,
+          keyframe: true,
+        }),
+      ]);
+      expect(table.tracks[0]).toMatchObject({ codec: 'mp3' });
+    }
+  });
+
+  it('packetInfo rejects finite Segment walks with no exact packet timeline', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, el(E.Channels, [1])),
+    ]);
+    const wrap = (tail: number[]): Uint8Array =>
+      new Uint8Array([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [...el(E.Tracks, track), ...tail]),
+      ]);
+
+    await expect(packetInfo.call(WebmDriver, fromBytes(wrap([])))).rejects.toThrowError(
+      /contains no media blocks/,
+    );
+    await expect(
+      packetInfo.call(
+        WebmDriver,
+        fromBytes(
+          wrap(
+            el(E.Cluster, [
+              ...el(E.Timecode, [0]),
+              ...el(E.SimpleBlock, [0x81, 0x00, 0x00, 0x80, 0x11]),
+            ]),
+          ),
+        ),
+      ),
+    ).rejects.toThrowError(/has no exact duration/);
+  });
+
+  it('packetInfo rejects malformed or escaping finite Segment element headers', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+    ]);
+    const metadata = el(E.Tracks, track);
+    const wrap = (tail: number[]): Uint8Array =>
+      new Uint8Array([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [...metadata, ...tail]),
+      ]);
+    for (const { tail, message } of [
+      { tail: [0], message: /invalid EBML element header/ },
+      { tail: E.Cluster, message: /invalid EBML element header/ },
+      { tail: [...E.Cluster, 0x8a], message: /escapes the WebM Segment/ },
+    ]) {
+      await expect(packetInfo.call(WebmDriver, fromBytes(wrap(tail)))).rejects.toThrowError(
+        message,
+      );
+    }
+
+    const declaredPayload = [...metadata];
+    const truncatedSegment = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...E.Segment,
+      ...sizeVint(declaredPayload.length + 1),
+      ...declaredPayload,
+    ]);
+    await expect(packetInfo.call(WebmDriver, fromBytes(truncatedSegment))).rejects.toThrowError(
+      /truncated|escapes/,
+    );
+  });
+
+  it('packetInfo qualifies VP9 and AV1 from a later keyframe, with capability-safe fallback', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const padding = el(E.Void, new Array(256 * 1024).fill(0));
+    for (const { codec, codecId, source } of [
+      { codec: 'vp9', codecId: 'V_VP9', source: await loadFixture('movie_5.webm') },
+      { codec: 'av1', codecId: 'V_AV1', source: await bytesFromMediaTest('av1_720p_5s.webm') },
+    ]) {
+      const payloadTable = webmPacketPayloadInfoFromBytes(source);
+      const trackIndex = payloadTable.tracks.findIndex((trackInfo) => trackInfo.codec === codec);
+      const payload = payloadTable.packets.find(
+        (packet) => packet.trackIndex === trackIndex && packet.keyframe,
+      )?.data;
+      const nonKeyPayload = payloadTable.packets.find(
+        (packet) => packet.trackIndex === trackIndex && !packet.keyframe,
+      )?.data;
+      if (payload === undefined) throw new Error(`expected a ${codec} keyframe`);
+      if (nonKeyPayload === undefined) throw new Error(`expected a ${codec} inter frame`);
+
+      for (const variant of [
+        { packetData: payload, keyframe: true, trackFacts: false, declaredDuration: true },
+        { packetData: nonKeyPayload, keyframe: true, trackFacts: false, declaredDuration: true },
+        { packetData: nonKeyPayload, keyframe: false, trackFacts: true, declaredDuration: false },
+      ]) {
+        const track = el(E.TrackEntry, [
+          ...el(E.TrackNumber, [1]),
+          ...el(E.TrackType, [1]),
+          ...el(E.CodecID, str(codecId)),
+          ...(variant.trackFacts
+            ? [
+                ...el(E.DefaultDuration, uintN(10_000_000, 4)),
+                ...el(E.Video, [...el(E.PixelWidth, [1]), ...el(E.PixelHeight, [1])]),
+              ]
+            : []),
+        ]);
+        const block = variant.keyframe
+          ? el(E.SimpleBlock, [0x81, 0x00, 0x00, 0x80, ...variant.packetData])
+          : el(E.BlockGroup, [
+              ...el(E.Block, [0x81, 0x00, 0x00, 0x00, ...variant.packetData]),
+              ...el(E.ReferenceBlock, [0]),
+              ...el(E.BlockDuration, [10]),
+            ]);
+        const bytes = new Uint8Array([
+          ...el(E.EBML, el(E.DocType, str('webm'))),
+          ...el(E.Segment, [
+            ...el(
+              E.Info,
+              variant.declaredDuration
+                ? [...el(E.TimecodeScale, uintN(1_000_000, 4)), ...el(E.Duration, f64(10))]
+                : el(E.TimecodeScale, uintN(1_000_000, 4)),
+            ),
+            ...el(E.Tracks, track),
+            ...padding,
+            ...el(E.Cluster, [...el(E.Timecode, [0]), ...block]),
+          ]),
+        ]);
+        const actual = await packetInfo.call(WebmDriver, fromBytes(bytes));
+        const expected = webmPacketPayloadInfoFromBytes(bytes);
+        expect(actual.tracks, codec).toEqual(expected.tracks);
+        expect(actual.packets, codec).toEqual(
+          expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+        );
+      }
+
+      const malformedTrack = el(E.TrackEntry, [
+        ...el(E.TrackNumber, [1]),
+        ...el(E.TrackType, [1]),
+        ...el(E.CodecID, str(codecId)),
+      ]);
+      const malformed = new Uint8Array([
+        ...el(E.EBML, el(E.DocType, str('webm'))),
+        ...el(E.Segment, [
+          ...el(E.Info, el(E.Duration, f64(10))),
+          ...el(E.Tracks, malformedTrack),
+          ...padding,
+          ...el(E.Cluster, [
+            ...el(E.Timecode, [0]),
+            ...el(E.SimpleBlock, [0x81, 0x00, 0x00, 0x80, 0]),
+          ]),
+        ]),
+      ]);
+      if (codec === 'vp9') {
+        await expect(packetInfo.call(WebmDriver, fromBytes(malformed))).rejects.toMatchObject({
+          code: 'demux-error',
+        });
+      } else {
+        expect(await packetInfo.call(WebmDriver, fromBytes(malformed))).toMatchObject({
+          tracks: [expect.objectContaining({ codec: 'av1' })],
+          packets: [expect.objectContaining({ size: 1, durationUs: 10_000 })],
+        });
+      }
+    }
+  });
+
+  it('packetInfo reconstructs H.264 decode order from codec-private reorder depth', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const source = await bytesFromMediaTest('scenarios/demux/h264_in_mkv/01.mkv');
+    const sourceTable = webmPacketPayloadInfoFromBytes(source);
+    const videoIndex = sourceTable.tracks.findIndex((track) => track.codec === 'h264');
+    const config = sourceTable.tracks[videoIndex]?.config;
+    const rawDescription = config && 'description' in config ? config.description : undefined;
+    if (rawDescription === undefined) throw new Error('expected H.264 codec private data');
+    const description = ArrayBuffer.isView(rawDescription)
+      ? new Uint8Array(rawDescription.buffer, rawDescription.byteOffset, rawDescription.byteLength)
+      : new Uint8Array(rawDescription);
+    const packets = sourceTable.packets
+      .filter((packet) => packet.trackIndex === videoIndex)
+      .slice(0, 8);
+    expect(packets.some((packet) => packet.dtsUs !== packet.ptsUs)).toBe(true);
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [1]),
+      ...el(E.CodecID, str('V_MPEG4/ISO/AVC')),
+      ...el(E.CodecPrivate, [...description]),
+    ]);
+    const blocks = packets.flatMap((packet) => {
+      const ticks = Math.round(packet.ptsUs / 1000);
+      return el(E.SimpleBlock, [
+        0x81,
+        (ticks >> 8) & 0xff,
+        ticks & 0xff,
+        packet.keyframe ? 0x80 : 0,
+        ...packet.data,
+      ]);
+    });
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('matroska'))),
+      ...el(E.Segment, [
+        ...el(E.Info, [...el(E.TimecodeScale, uintN(1_000_000, 4)), ...el(E.Duration, f64(1_000))]),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [...el(E.Timecode, [0]), ...blocks]),
+      ]),
+    ]);
+    const actual = await packetInfo.call(WebmDriver, fromBytes(bytes));
+    const expected = webmPacketPayloadInfoFromBytes(bytes);
+    expect(actual.tracks).toEqual(expected.tracks);
+    expect(actual.packets).toEqual(
+      expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
+    );
+    expect(actual.packets.some((packet) => packet.dtsUs !== packet.ptsUs)).toBe(true);
+    // File order starts I,P,B..., so adjacent Block PTS would falsely make the first packets 167 ms.
+    // Public packetInfo instead derives durations from adjacent presentation timestamps.
+    expect(actual.packets.slice(0, 6).map((packet) => packet.durationUs)).toEqual([
+      33_000, 33_000, 34_000, 33_000, 33_000, 34_000,
+    ]);
+  });
+
+  it('packetInfo keeps explicit BlockDuration exact on a stream-only source without Duration', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+    ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.TimecodeScale, uintN(1_000_000, 4))),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [
+          ...el(E.Timecode, [0]),
+          ...el(E.BlockGroup, [
+            ...el(E.Block, [0x81, 0x00, 0x00, 0x00, 0x11]),
+            ...el(E.BlockDuration, [10]),
+          ]),
+        ]),
+      ]),
+    ]);
+    const table = await packetInfo.call(WebmDriver, {
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+    });
+    expect(table.packets).toEqual([
+      expect.objectContaining({ ptsUs: 0, dtsUs: 0, durationUs: 10_000, keyframe: true }),
+    ]);
+  });
+
+  it('packetStats matches packetTable across a timestamp gap and exact terminal BlockDuration', async () => {
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+    ]);
+    const block = (relativeTicks: number, durationTicks: number, payload: number): number[] =>
+      el(E.BlockGroup, [
+        ...el(E.Block, [0x81, (relativeTicks >> 8) & 0xff, relativeTicks & 0xff, 0x00, payload]),
+        ...el(E.BlockDuration, uintN(durationTicks, 2)),
+      ]);
+    const bytes = new Uint8Array([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, [...el(E.TimecodeScale, uintN(1_000_000, 4)), ...el(E.Duration, f64(2_000))]),
+        ...el(E.Tracks, track),
+        ...el(E.Cluster, [
+          ...el(E.Timecode, [0]),
+          ...block(0, 100, 0x11),
+          ...block(1_000, 10, 0x22),
+        ]),
+      ]),
+    ]);
+
+    const demuxer = await WebmDriver.demux(fromBytes(bytes, { mime: 'video/webm' }));
+    try {
+      expect(demuxer.packetTable?.()).toEqual([
+        expect.objectContaining({ ptsUs: 0, durationUs: 100_000 }),
+        expect.objectContaining({ ptsUs: 1_000_000, durationUs: 10_000 }),
+      ]);
+      expect(demuxer.packetStats?.(0)).toEqual({
+        packetCount: 2,
+        totalSizeBytes: 2,
+        decodeStartUs: 0,
+        decodeEndUs: 1_010_000,
+        presentationStartUs: 0,
+        presentationEndUs: 1_010_000,
+      });
+    } finally {
+      await demuxer.close();
+    }
+  });
+
   it('demux packet streams expose the parsed payload view as Packet.data', async () => {
     await withEncodedChunkConstructors(async () => {
       const bytes = await loadFixture('movie_5.webm');
@@ -737,10 +1808,13 @@ describe('probe WebM across the real corpus', () => {
         try {
           const first = await reader.read();
           const second = await reader.read();
+          const third = await reader.read();
           expect(first.value?.chunk.timestamp).toBe(0);
           expect(first.value?.dtsUs).toBeUndefined();
           expect(second.value?.chunk.timestamp).toBe(167_000);
-          expect(second.value?.dtsUs).toBe(0);
+          expect(second.value?.dtsUs).toBe(33_000);
+          expect(third.value?.chunk.timestamp).toBe(33_000);
+          expect(third.value?.dtsUs).toBe(67_000);
         } finally {
           await reader.cancel();
           reader.releaseLock();

@@ -1,4 +1,4 @@
-import { runCancellable } from '../kernel/executor.ts';
+import { runCancellable } from '../kernel/executor-cancellable.ts';
 import type { MediaInput } from '../sources/source.ts';
 import type {
   CallOptions,

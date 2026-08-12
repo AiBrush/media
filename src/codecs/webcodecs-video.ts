@@ -1042,6 +1042,11 @@ function createVideoDecoder(
   // explicit frame queue drains so already-decoded B-frame tail output is still consumed or closed.
   let closed = false;
   let decoderDone = false;
+  // WebCodecs starts every newly configured decoder in "key chunk required" state. Some Chromium
+  // decoders accept a leading delta chunk without throwing but then retain it forever waiting for
+  // references, so neither dequeue nor flush can make progress. Container slices can legitimately
+  // begin mid-GOP; preserve those packets at the demux seam, but do not submit the undecodable prefix.
+  let needsKeyChunk = true;
   let pullWaiting = false;
   let terminalError: Error | undefined;
   let rejectStartupCancellation: ((error: Error) => void) | undefined;
@@ -1315,6 +1320,10 @@ function createVideoDecoder(
         if (!decoder) throw new MediaError('decode-error', 'decoder not configured');
         if (!(chunk instanceof EncodedVideoChunk)) {
           throw new MediaError('decode-error', 'webcodecs-video decoder expects EncodedVideoChunk');
+        }
+        if (needsKeyChunk) {
+          if (chunk.type !== 'key') return;
+          needsKeyChunk = false;
         }
         await waitForOutputRoom();
         await drainBelowHighWater(decoder, signal);
@@ -1833,6 +1842,9 @@ function createWarmBorrowStream(
   const queueWaiters = new Set<{ resolve(): void; reject(error: Error): void }>();
   let closed = false; // the readable is dead: `onFrame` closes frames instead of enqueuing them
   let decoderDone = false; // EOF flush finished; the readable closes once the frame queue drains
+  // Each borrow is a new coded sequence even when the configured native decoder stays warm. A clean
+  // prior flush leaves no reference pictures this sequence can use, so gate its mid-GOP prefix too.
+  let needsKeyChunk = true;
   let pullWaiting = false;
   let settled = false;
   let writeInFlight = false;
@@ -2028,6 +2040,10 @@ function createWarmBorrowStream(
               'decode-error',
               'webcodecs-video decoder expects EncodedVideoChunk',
             );
+          }
+          if (needsKeyChunk) {
+            if (chunk.type !== 'key') return;
+            needsKeyChunk = false;
           }
           await waitForOutputRoom();
           while (!closed && queueIsBackpressured(decoder.decodeQueueSize, HIGH_WATER_MARK)) {

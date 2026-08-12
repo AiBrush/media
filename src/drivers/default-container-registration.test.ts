@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createMedia } from '../api/create-media.ts';
+import { toMediaInfo } from '../api/op-support.ts';
 import { Registry } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
 import { fromBytes } from '../sources/source.ts';
@@ -7,6 +9,8 @@ import {
   SELECTIVE_CONTAINERS,
   registerDefaultContainerForQuery,
 } from './default-container-registration.ts';
+import { Mp4Driver } from './mp4/mp4-driver.ts';
+import { MP4_LAZY_CONTAINER_SPEC } from './mp4/mp4-lazy-driver.ts';
 import { WAV_LAZY_CONTAINER_SPEC } from './wav/wav-lazy-driver.ts';
 
 describe('query-selective default container registration', () => {
@@ -194,6 +198,29 @@ describe('query-selective default container registration', () => {
       expect(fullLoad).not.toHaveBeenCalled();
     } finally {
       fullLoad.mockRestore();
+    }
+  });
+
+  it('keeps public typed-Blob MP4 probe on the selective light path and loads once on decline', async () => {
+    const fullLoad = vi.spyOn(MP4_LAZY_CONTAINER_SPEC, 'load');
+    const media = createMedia();
+    try {
+      const bytes = await loadFixture('movie_5.mp4');
+      const source = fromBytes(bytes, { mime: 'video/mp4' });
+      const expectedTracks = await Mp4Driver.probe?.(source);
+      const expected = toMediaInfo(Mp4Driver, expectedTracks ?? [], source);
+      const actual = await media.probe(new Blob([bytes.slice().buffer], { type: 'video/mp4' }));
+      expect(actual).toEqual(expected);
+      expect(fullLoad).not.toHaveBeenCalled();
+
+      const quickTime = await loadFixture('bear-rotate-90.mp4');
+      await expect(
+        media.probe(new Blob([quickTime.slice().buffer], { type: 'video/quicktime' })),
+      ).resolves.toMatchObject({ container: 'mp4' });
+      expect(fullLoad).toHaveBeenCalledTimes(1);
+    } finally {
+      fullLoad.mockRestore();
+      await media.dispose();
     }
   });
 });

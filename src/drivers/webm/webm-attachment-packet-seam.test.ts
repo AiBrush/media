@@ -277,6 +277,41 @@ describe('Matroska attachments — public demux to packet mux seam', () => {
     });
   });
 
+  it('cross-container remux excludes attachment projections from timed MP4 tracks', async () => {
+    await withEncodedChunkConstructors(async () => {
+      const input = new Uint8Array(await readFile(SUBJECT));
+      const media = createMedia().use(WebmModule);
+      const output = await bytesFromOutput(
+        await media.remux(fromBytes(input, { mime: 'video/x-matroska' }), { to: 'mp4' }),
+      );
+      const info = await media.probe(fromBytes(output, { mime: 'video/mp4' }));
+
+      expect(info.tracks.map((track) => track.type)).toEqual(['video', 'audio']);
+      expect(info.tracks[0]?.codec).toMatch(/^avc1\./);
+      expect(info.tracks[1]?.codec).toBe('mp4a.40.2');
+    });
+  });
+
+  it('marks presentation-ordered Matroska audio packets with source-proven DTS', async () => {
+    await withEncodedChunkConstructors(async () => {
+      const input = new Uint8Array(await readFile(SUBJECT));
+      const demuxed = await createMedia()
+        .use(WebmModule)
+        .demux(fromBytes(input, { mime: 'video/x-matroska' }));
+      try {
+        const audio = demuxed.tracks.find(
+          (track) => track.mediaType === 'audio' && !track.nonMedia,
+        );
+        if (audio === undefined) throw new Error('expected timed audio track');
+        const packets = await collectPackets(demuxed.packets(audio.id));
+        expect(packets.length).toBeGreaterThan(1);
+        expect(packets.every((packet) => packet.dtsUs === packet.chunk.timestamp)).toBe(true);
+      } finally {
+        await demuxed.close();
+      }
+    });
+  });
+
   it('retains both attachments when ordinary selection keeps only H.264 or only AAC', async () => {
     await withEncodedChunkConstructors(async () => {
       const input = new Uint8Array(await readFile(SUBJECT));

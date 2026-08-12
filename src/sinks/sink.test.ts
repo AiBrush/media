@@ -1,5 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { Progress } from '../contracts/driver.ts';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { toOpfsTarget } from './opfs-target.ts';
@@ -15,7 +16,29 @@ function bytesStream(...arrays: number[][]): ReadableStream<Uint8Array> {
   });
 }
 
-/** Stream `bytes` in several chunks so the sink's collect/concat path is exercised (not one buffer). */
+/** A pull-driven producer that deliberately recycles one backing store between delivered chunks. */
+function reusedChunkStream(...arrays: number[][]): ReadableStream<Uint8Array> {
+  const storage = new Uint8Array(Math.max(0, ...arrays.map((array) => array.length)));
+  let index = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller): void {
+        const array = arrays[index];
+        if (array === undefined) {
+          controller.close();
+          return;
+        }
+        index++;
+        storage.fill(0);
+        storage.set(array);
+        controller.enqueue(storage.subarray(0, array.length));
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+/** Stream `bytes` in several chunks so whole-output sinks are exercised with distinct parts. */
 function chunkedStream(bytes: Uint8Array, chunk = 4096): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(c): void {
@@ -67,7 +90,7 @@ describe('sink descriptors', () => {
 });
 
 describe('materialize', () => {
-  it('collects into a Blob with the given mime', async () => {
+  it('materializes a multi-chunk Blob with the given mime and exact bytes', async () => {
     const out = await materialize(toBlob(), bytesStream([1, 2], [3]), { mime: 'video/mp4' });
     expect(out).toBeInstanceOf(Blob);
     const blob = out as Blob;
@@ -75,7 +98,7 @@ describe('materialize', () => {
     expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([1, 2, 3]);
   });
 
-  it('collects into a Blob without forcing an empty mime option', async () => {
+  it('materializes a Blob without forcing an empty mime option', async () => {
     const out = await materialize(toBlob(), bytesStream([7, 8]));
     expect(out).toBeInstanceOf(Blob);
     const blob = out as Blob;
@@ -83,16 +106,72 @@ describe('materialize', () => {
     expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([7, 8]);
   });
 
-  it('collects into a named File', async () => {
-    const out = await materialize(toFile('clip.mp4'), bytesStream([9]));
+  it('materializes a multi-chunk named File with exact bytes', async () => {
+    const out = await materialize(toFile('clip.mp4'), bytesStream([9], [8, 7]));
     expect(out).toBeInstanceOf(File);
     expect((out as File).name).toBe('clip.mp4');
+    expect([...new Uint8Array(await (out as File).arrayBuffer())]).toEqual([9, 8, 7]);
   });
 
-  it('collects into a named File with an explicit MIME type', async () => {
+  it('materializes a named File with an explicit MIME type', async () => {
     const out = await materialize(toFile('clip.mp4'), bytesStream([9]), { mime: 'video/mp4' });
     expect(out).toBeInstanceOf(File);
     expect((out as File).type).toBe('video/mp4');
+  });
+
+  it('reports cumulative collect progress for every retained Blob part', async () => {
+    const seen: Progress[] = [];
+    const out = await materialize(toBlob(), bytesStream([1, 2], [3], [4, 5, 6]), {
+      onProgress: (progress) => seen.push(progress),
+    });
+
+    expect(out).toBeInstanceOf(Blob);
+    expect(seen).toEqual([
+      { done: 2, stage: 'collect' },
+      { done: 3, stage: 'collect' },
+      { done: 6, stage: 'collect' },
+    ]);
+  });
+
+  it('aborts in-flight Blob part collection and cancels the source', async () => {
+    let cancelled = false;
+    const source = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new Uint8Array([1, 2]));
+      },
+      cancel(): void {
+        cancelled = true;
+      },
+    });
+    const controller = new AbortController();
+    const seen: Progress[] = [];
+    const pending = materialize(toBlob(), source, {
+      signal: controller.signal,
+      onProgress: (progress) => {
+        seen.push(progress);
+        controller.abort();
+      },
+    });
+
+    await expect(pending).rejects.toMatchObject({ name: 'MediaError', code: 'aborted' });
+    expect(cancelled).toBe(true);
+    expect(seen).toEqual([{ done: 2, stage: 'collect' }]);
+  });
+
+  it('maps a File source failure with the supplied error code', async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.error(new Error('broken output'));
+      },
+    });
+
+    await expect(
+      materialize(toFile('clip.mp4'), source, { errorCode: 'mux-error' }),
+    ).rejects.toMatchObject({
+      name: 'MediaError',
+      code: 'mux-error',
+      message: 'broken output',
+    });
   });
 
   it('returns a stream sink lazily (the same stream)', async () => {
@@ -117,6 +196,61 @@ describe('materialize', () => {
     expect(out).toBeUndefined();
     expect(writes.map((w) => w.bytes)).toEqual([[1, 2], [3], [4, 5, 6]]);
     expect(writes.map((w) => w.position)).toEqual([0, 2, 3]); // contiguous, starting at 0
+  });
+});
+
+describe('materialize — Blob/File part construction', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('passes independent reusable-source chunks directly to the Blob constructor without joining', async () => {
+    const calls: { parts: BlobPart[]; options: BlobPropertyBag | undefined }[] = [];
+    class RecordingBlob {
+      constructor(parts: BlobPart[] = [], options?: BlobPropertyBag) {
+        calls.push({ parts: [...parts], options });
+      }
+    }
+    vi.stubGlobal('Blob', RecordingBlob);
+
+    const out = await materialize(toBlob(), reusedChunkStream([1, 2], [3], [4, 5, 6]), {
+      mime: 'video/mp4',
+    });
+
+    expect(out).toBeInstanceOf(RecordingBlob);
+    expect(calls).toHaveLength(1);
+    const parts = calls[0]?.parts;
+    expect(parts?.every((part) => part instanceof Uint8Array)).toBe(true);
+    expect(parts?.map((part) => [...(part as Uint8Array)])).toEqual([[1, 2], [3], [4, 5, 6]]);
+    expect(parts?.map((part) => (part as Uint8Array).byteLength)).toEqual([2, 1, 3]);
+    expect(new Set(parts?.map((part) => (part as Uint8Array).buffer)).size).toBe(3);
+    expect(calls[0]?.options).toEqual({ type: 'video/mp4' });
+  });
+
+  it('passes every emitted part and metadata directly to the File constructor without joining', async () => {
+    const calls: { parts: BlobPart[]; name: string; options: FilePropertyBag | undefined }[] = [];
+    class RecordingFile {
+      constructor(parts: BlobPart[], name: string, options?: FilePropertyBag) {
+        calls.push({ parts: [...parts], name, options });
+      }
+    }
+    vi.stubGlobal('File', RecordingFile);
+
+    const out = await materialize(toFile('clip.mp4'), bytesStream([9, 8], [7], [6, 5, 4]), {
+      mime: 'video/mp4',
+    });
+
+    expect(out).toBeInstanceOf(RecordingFile);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.parts.map((part) => [...(part as Uint8Array)])).toEqual([
+      [9, 8],
+      [7],
+      [6, 5, 4],
+    ]);
+    expect(calls[0]?.parts.map((part) => (part as Uint8Array).byteLength)).toEqual([2, 1, 3]);
+    expect(calls[0]?.name).toBe('clip.mp4');
+    expect(calls[0]?.options).toEqual({ type: 'video/mp4' });
   });
 });
 

@@ -56,6 +56,16 @@ Container drivers also declare `formats`, synchronously answer `supports(query)`
 and provide `createMuxer()`. Focused drivers can add efficient `probe`, packet metadata, stream-copy,
 PCM, or decrypt capabilities.
 
+A demuxer can implement `packetStats(trackId): PacketMetadataStats | undefined` so conversion planning
+can measure coded bitrate and presentation span without calling the legacy row-materializing
+`packetTable()`. The result must be computed with constant-sized auxiliary state: publish packet count,
+total coded bytes, and exact presentation start/end; publish `decodeStartUs` and `decodeEndUs` together
+only when both are exact. Return `undefined` when the driver cannot produce a valid bounded summary.
+Long inputs must never allocate one object per packet merely to implement this seam.
+Without `packetStats`, conversion still proceeds and the muxer's authoritative byte cap remains active,
+but measured-bitrate and shifted-origin early planning evidence is unavailable; the engine does not call
+`packetTable()` as a fallback.
+
 Codec drivers declare an execution `tier`, asynchronously probe exact decoder/encoder configurations,
 and build transform streams for the directions they support. `supports()` must be cheap and must return an
 honest unsupported verdict instead of deferring an expected miss to execution.

@@ -11,7 +11,7 @@
  */
 
 import { InputError, MediaError } from '../contracts/errors.ts';
-import { runCancellable } from '../kernel/executor.ts';
+import { runCancellable } from '../kernel/executor-cancellable.ts';
 import { toBlob, toStream } from '../sinks/sink.ts';
 import type { MediaInput } from '../sources/source.ts';
 import { type JobStage, compileMediaJobSafely } from './job-compile.ts';

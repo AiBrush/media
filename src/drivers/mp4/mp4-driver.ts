@@ -19,6 +19,7 @@ import type {
   PacketInfoBatchStream,
   PacketInfoTable,
   PacketMetadata,
+  PacketMetadataStats,
   Registry,
   StageOptions,
   StreamCopyOptions,
@@ -32,9 +33,10 @@ import {
   registerNativePacketSource,
 } from '../../internal/packet-provenance.ts';
 import { positionedChunk } from '../../sinks/stream-target.ts';
-import { raceAbort } from '../../sources/abort.ts';
+import { raceAbort, sourceAbortError } from '../../sources/abort.ts';
 import { drainStream } from '../../sources/read-all.ts';
 import { SOURCE_CACHE_KEY } from '../../sources/source.ts';
+import { sha256Hex } from '../../util/digest.ts';
 // Type-only: erased at compile time, so it does not create a runtime import of the lazily-loaded CENC
 // module (the `import.meta`-gated `loadCencModule` remains the only value-level entry point to `cenc.ts`).
 import type { SampleDecryptedCallback } from './cenc.ts';
@@ -105,6 +107,7 @@ const FASTSTART_PREFIX_CACHE_READ_MAX_BYTES = 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 const AUDIO_FASTSTART_TRACK_PREFIX_MAX_BYTES = 128 * 1024;
 const AUDIO_FASTSTART_SCALAR_BOX_MAX_BYTES = 128 * 1024;
+const SPARSE_FASTSTART_MAX_CHILD_BOXES = 256;
 const FRAGMENT_PROBE_SCAN_WINDOW_BYTES = 32 * 1024;
 const FRAGMENT_PROBE_MAX_RANGE_READS = 64;
 const FRAGMENT_PROBE_MAX_METADATA_BYTES = 8 * 1024 * 1024;
@@ -136,6 +139,8 @@ interface RandomAccess {
   read(offset: number, length: number, signal?: AbortSignal): Promise<Uint8Array>;
   /** Return an ephemeral range view after its final synchronous consumer has finished. */
   release?(bytes: Uint8Array): void;
+  /** Release every still-owned exact range response when a finite metadata session ends. */
+  dispose?(): void;
   size?: number | undefined;
   /** Source-aware first-window policy for metadata-only reads. */
   readonly metadataPrefetchBytes?: number;
@@ -149,7 +154,15 @@ type SizedRandomAccess = RandomAccess & { readonly size: number };
 
 interface RandomAccessOptions {
   readonly eagerReadMaxBytes?: number;
+  /** Retain exact range-response identities so a finite operation can release all of them in `dispose`. */
+  readonly releaseRangesOnDispose?: boolean;
   readonly signal?: AbortSignal;
+}
+
+function randomAccessDisposedError(signal: AbortSignal | undefined): MediaError {
+  return signal?.aborted === true
+    ? sourceAbortError(signal)
+    : new MediaError('aborted', 'random-access session disposed');
 }
 
 function trimValidationReadCache(ra: RandomAccess): RandomAccess {
@@ -272,30 +285,67 @@ async function randomAccess(
   if (range) {
     const metadataPrefetchBytes = metadataProbePrefetchBytes(src);
     if (shouldEagerReadRandomAccess(src, opts.eagerReadMaxBytes)) {
-      const buffered = await raceAbort(range.call(src, 0, src.size, defaultSignal), defaultSignal);
+      const requested = range.call(src, 0, src.size, defaultSignal);
+      const guarded =
+        opts.releaseRangesOnDispose === true && src.releaseRange !== undefined
+          ? requested.then((bytes) => {
+              if (defaultSignal?.aborted !== true) return bytes;
+              src.releaseRange?.(bytes);
+              throw sourceAbortError(defaultSignal);
+            })
+          : requested;
+      const buffered = await raceAbort(guarded, defaultSignal);
+      let disposed = false;
       return {
         read: (offset, length, signal) => {
-          throwIfAborted(signal ?? defaultSignal);
+          const activeSignal = signal ?? defaultSignal;
+          if (disposed) throw randomAccessDisposedError(activeSignal);
+          throwIfAborted(activeSignal);
           return Promise.resolve(buffered.subarray(offset, offset + length));
         },
         size: buffered.byteLength,
         metadataPrefetchBytes,
         inMemory: true,
         cachedWhole: () => buffered,
+        ...(opts.releaseRangesOnDispose === true && src.releaseRange !== undefined
+          ? {
+              dispose(): void {
+                if (disposed) return;
+                disposed = true;
+                src.releaseRange?.(buffered);
+              },
+            }
+          : {}),
       };
     }
     let cachedWhole: Uint8Array | undefined;
+    let cachedWholeOwner: Uint8Array | undefined;
+    let disposed = false;
     const releasable = src.releaseRange === undefined ? undefined : new WeakSet<Uint8Array>();
+    const ownedRanges =
+      opts.releaseRangesOnDispose === true && src.releaseRange !== undefined
+        ? new Set<Uint8Array>()
+        : undefined;
     return {
       async read(offset, length, signal): Promise<Uint8Array> {
         const activeSignal = signal ?? defaultSignal;
+        if (disposed) throw randomAccessDisposedError(activeSignal);
         throwIfAborted(activeSignal);
         const retained = coveredByteView(cachedWhole, offset, length);
         if (retained !== undefined) return retained;
-        const bytes = await raceAbort(
-          range.call(src, offset, offset + length, activeSignal),
-          activeSignal,
-        );
+        const requested = range.call(src, offset, offset + length, activeSignal);
+        // A non-cooperative transport may fulfill after abort has already won `raceAbort`. Operation-
+        // scoped sessions still own that exact late response, so release it at fulfillment rather than
+        // letting it escape the disposed session. Ordinary random-access consumers keep the prior path.
+        const guarded =
+          ownedRanges === undefined
+            ? requested
+            : requested.then((bytes) => {
+                if (!disposed) return bytes;
+                src.releaseRange?.(bytes);
+                throw randomAccessDisposedError(activeSignal);
+              });
+        const bytes = await raceAbort(guarded, activeSignal);
         const learnedSize = src.size;
         if (
           offset === 0 &&
@@ -304,16 +354,37 @@ async function randomAccess(
           bytes.byteLength >= learnedSize
         ) {
           cachedWhole = bytes.subarray(0, learnedSize);
+          if (ownedRanges !== undefined) cachedWholeOwner = bytes;
         } else {
           releasable?.add(bytes);
+          ownedRanges?.add(bytes);
         }
         return bytes;
       },
       ...(src.releaseRange !== undefined
         ? {
             release(bytes: Uint8Array): void {
-              if (releasable?.delete(bytes) === true) src.releaseRange?.(bytes);
+              if (releasable?.delete(bytes) !== true) return;
+              ownedRanges?.delete(bytes);
+              src.releaseRange?.(bytes);
             },
+            ...(ownedRanges === undefined
+              ? {}
+              : {
+                  dispose(): void {
+                    if (disposed) return;
+                    disposed = true;
+                    for (const bytes of ownedRanges) {
+                      ownedRanges.delete(bytes);
+                      releasable?.delete(bytes);
+                      src.releaseRange?.(bytes);
+                    }
+                    const whole = cachedWholeOwner;
+                    cachedWholeOwner = undefined;
+                    cachedWhole = undefined;
+                    if (whole !== undefined) src.releaseRange?.(whole);
+                  },
+                }),
           }
         : {}),
       // URL/element sources learn their length from the first range response. Keep the random-access
@@ -995,6 +1066,150 @@ export function compactAudioProbeTrack(prefix: Uint8Array): Uint8Array | undefin
   return compact;
 }
 
+interface AbsoluteProbeBox extends TopBoxHeader {
+  readonly start: number;
+  readonly end: number;
+  readonly payloadStart: number;
+}
+
+function makeCompactProbeBox(type: string, parts: readonly Uint8Array[]): Uint8Array {
+  const payloadSize = parts.reduce((total, part) => total + part.byteLength, 0);
+  const size = 8 + payloadSize;
+  if (type.length !== 4 || size > 0xffff_ffff) {
+    throw new MediaError('demux-error', 'sparse MP4 metadata box exceeds compact box limits');
+  }
+  const out = new Uint8Array(size);
+  new DataView(out.buffer).setUint32(0, size, false);
+  for (let index = 0; index < 4; index++) out[4 + index] = type.charCodeAt(index);
+  let offset = 8;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+async function sparseProbeBoxAt(
+  ra: SizedRandomAccess,
+  start: number,
+  parentEnd: number,
+  signal: AbortSignal | undefined,
+): Promise<AbsoluteProbeBox | undefined> {
+  if (!Number.isSafeInteger(start) || start < 0 || start + 8 > parentEnd) return undefined;
+  const head = await ra.read(start, Math.min(16, parentEnd - start), signal);
+  throwIfAborted(signal);
+  const relative = declaredProbeBoxAt(head, 0);
+  if (relative === undefined) return undefined;
+  const end = start + relative.size;
+  if (!Number.isSafeInteger(end) || end <= start || end > parentEnd) return undefined;
+  return {
+    size: relative.size,
+    type: relative.type,
+    headerSize: relative.headerSize,
+    start,
+    end,
+    payloadStart: start + relative.headerSize,
+  };
+}
+
+async function sparseProbeChildren(
+  ra: SizedRandomAccess,
+  parent: AbsoluteProbeBox,
+  signal: AbortSignal | undefined,
+): Promise<AbsoluteProbeBox[] | undefined> {
+  const out: AbsoluteProbeBox[] = [];
+  let offset = parent.payloadStart;
+  while (offset < parent.end) {
+    if (out.length >= SPARSE_FASTSTART_MAX_CHILD_BOXES) return undefined;
+    const box = await sparseProbeBoxAt(ra, offset, parent.end, signal);
+    if (box === undefined) return undefined;
+    out.push(box);
+    offset = box.end;
+  }
+  return offset === parent.end ? out : undefined;
+}
+
+async function sparseProbeWholeBox(
+  ra: SizedRandomAccess,
+  box: AbsoluteProbeBox,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array | undefined> {
+  if (box.size > AUDIO_FASTSTART_SCALAR_BOX_MAX_BYTES) return undefined;
+  const bytes = await ra.read(box.start, box.size, signal);
+  throwIfAborted(signal);
+  return bytes.byteLength === box.size ? bytes : undefined;
+}
+
+async function rebuildSparseProbeTrack(
+  ra: SizedRandomAccess,
+  trak: AbsoluteProbeBox,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array | undefined> {
+  const trakChildren = await sparseProbeChildren(ra, trak, signal);
+  if (trakChildren === undefined) return undefined;
+  const tkhd = trakChildren.find((box) => box.type === 'tkhd');
+  const edts = trakChildren.find((box) => box.type === 'edts');
+  const mdia = trakChildren.find((box) => box.type === 'mdia');
+  if (tkhd === undefined || mdia === undefined) return undefined;
+
+  const mdiaChildren = await sparseProbeChildren(ra, mdia, signal);
+  if (mdiaChildren === undefined) return undefined;
+  const mdhd = mdiaChildren.find((box) => box.type === 'mdhd');
+  const hdlr = mdiaChildren.find((box) => box.type === 'hdlr');
+  const minf = mdiaChildren.find((box) => box.type === 'minf');
+  if (mdhd === undefined || hdlr === undefined || minf === undefined) return undefined;
+
+  const minfChildren = await sparseProbeChildren(ra, minf, signal);
+  const stbl = minfChildren?.find((box) => box.type === 'stbl');
+  if (stbl === undefined) return undefined;
+  const stblChildren = await sparseProbeChildren(ra, stbl, signal);
+  if (stblChildren === undefined) return undefined;
+  const stsd = stblChildren.find((box) => box.type === 'stsd');
+  const stts = stblChildren.find((box) => box.type === 'stts');
+  const stsz = stblChildren.find((box) => box.type === 'stsz');
+  if (stsd === undefined || stts === undefined) return undefined;
+
+  const [tkhdBytes, edtsBytes, mdhdBytes, hdlrBytes, stsdBytes, sttsBytes] = await Promise.all([
+    sparseProbeWholeBox(ra, tkhd, signal),
+    edts === undefined ? Promise.resolve(undefined) : sparseProbeWholeBox(ra, edts, signal),
+    sparseProbeWholeBox(ra, mdhd, signal),
+    sparseProbeWholeBox(ra, hdlr, signal),
+    sparseProbeWholeBox(ra, stsd, signal),
+    sparseProbeWholeBox(ra, stts, signal),
+  ]);
+  if (
+    tkhdBytes === undefined ||
+    (edts !== undefined && edtsBytes === undefined) ||
+    mdhdBytes === undefined ||
+    hdlrBytes === undefined ||
+    stsdBytes === undefined ||
+    sttsBytes === undefined
+  ) {
+    return undefined;
+  }
+
+  let compactStsz: Uint8Array | undefined;
+  if (stsz !== undefined) {
+    if (stsz.size < stsz.headerSize + 12) return undefined;
+    const scalar = await ra.read(stsz.payloadStart, 12, signal);
+    throwIfAborted(signal);
+    if (scalar.byteLength !== 12) return undefined;
+    compactStsz = makeCompactProbeBox('stsz', [scalar]);
+  }
+  const compactStbl = makeCompactProbeBox('stbl', [
+    stsdBytes,
+    sttsBytes,
+    ...(compactStsz === undefined ? [] : [compactStsz]),
+  ]);
+  const compactMinf = makeCompactProbeBox('minf', [compactStbl]);
+  const compactMdia = makeCompactProbeBox('mdia', [mdhdBytes, hdlrBytes, compactMinf]);
+  return makeCompactProbeBox('trak', [
+    tkhdBytes,
+    ...(edtsBytes === undefined ? [] : [edtsBytes]),
+    compactMdia,
+  ]);
+}
+
 function joinProbeBoxes(parts: readonly Uint8Array[]): Uint8Array {
   let size = 0;
   for (const part of parts) size += part.byteLength;
@@ -1008,12 +1223,13 @@ function joinProbeBoxes(parts: readonly Uint8Array[]): Uint8Array {
 }
 
 /**
- * Read an audio-only faststart movie without materializing variable-width `stsz` bodies. Declared
- * top-level/trak sizes locate every sibling track, so a large first table can never hide a later
- * track. Any fragmented, reordered, encrypted, non-AAC, or incomplete layout returns `undefined` and
- * is reparsed by the established full metadata path.
+ * Read a progressive faststart movie without materializing placement or per-sample tables. Declared
+ * box sizes locate every sibling track, while a compact canonical `moov` preserves only probe facts:
+ * movie/track headers, edit lists, sample descriptions, timing summaries, and scalar sample counts.
+ * Fragmented, oversized-scalar, unsupported-codec, or malformed layouts decline to the established
+ * exact metadata path.
  */
-async function readSparseAudioFaststartProbeTracks(
+async function readSparseFaststartProbeTracks(
   ra: SizedRandomAccess,
   signal: AbortSignal | undefined,
 ): Promise<readonly TrackInfo[] | undefined> {
@@ -1026,9 +1242,13 @@ async function readSparseAudioFaststartProbeTracks(
   throwIfAborted(signal);
   let topOffset = 0;
   let moov: DeclaredProbeBox | undefined;
+  let brand = 'mp42';
   while (topOffset + 8 <= window.byteLength) {
     const box = declaredProbeBoxAt(window, topOffset);
     if (box === undefined || box.end > ra.size) return undefined;
+    if (box.type === 'ftyp' && box.payloadStart + 4 <= window.byteLength) {
+      brand = new Reader(window.subarray(box.payloadStart, box.payloadStart + 4)).fourcc();
+    }
     if (box.type === 'moov') {
       moov = box;
       break;
@@ -1082,6 +1302,20 @@ async function readSparseAudioFaststartProbeTracks(
         throwIfAborted(signal);
         compact = compactAudioProbeTrack(prefix);
       }
+      if (compact === undefined) {
+        compact = await rebuildSparseProbeTrack(
+          ra,
+          {
+            size: relativeBox.size,
+            type: relativeBox.type,
+            headerSize: relativeBox.headerSize,
+            start: offset,
+            end,
+            payloadStart: offset + relativeBox.headerSize,
+          },
+          signal,
+        );
+      }
       if (compact === undefined) return undefined;
       parts.push(compact);
       trackCount++;
@@ -1089,8 +1323,19 @@ async function readSparseAudioFaststartProbeTracks(
     offset = end;
   }
   if (offset !== moovEnd || !movieHeaderFound || trackCount === 0) return undefined;
-  const { parseAudioFaststartProbeTracks } = await loadFaststartProbeModule();
-  return parseAudioFaststartProbeTracks(joinProbeBoxes(parts));
+  try {
+    const movie = parseMovieMetadata(brand, joinProbeBoxes(parts));
+    if (
+      movie.needsFragmentTiming ||
+      movie.tracks.length === 0 ||
+      !movie.tracks.every((track) => isBoundedVideoMetadataTrack(track))
+    ) {
+      return undefined;
+    }
+    return toProbeTracks(movie);
+  } catch {
+    return undefined;
+  }
 }
 
 /** A fragmented track whose initialization `stbl` declares no progressive samples at all. */
@@ -1887,6 +2132,7 @@ export interface Mp4PacketInfoMetadata {
   dtsUs: number;
   durationUs?: number;
   keyframe: boolean;
+  payloadDigest?: string;
 }
 
 function appendFragmentTrackPacketInfo(
@@ -2141,6 +2387,116 @@ export function mp4PacketMetadata(movie: Movie, sourceSize?: number): readonly P
   return packets;
 }
 
+/** Summarize one progressive MP4 track directly from its run tables without allocating packet rows. */
+function progressiveTrackPacketStats(track: ParsedTrack): PacketMetadataStats | undefined {
+  const sizes = track.samples.sampleSizes;
+  if (sizes.length === 0 || track.timescale <= 0) return undefined;
+  const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
+  const hasCtts = track.samples.compositionOffsets.length > 0;
+  const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  let dtsTicks = 0;
+  let packetCount = 0;
+  let totalSizeBytes = 0;
+  let decodeStartUs = Number.POSITIVE_INFINITY;
+  let decodeEndUs = Number.NEGATIVE_INFINITY;
+  let presentationStartUs = Number.POSITIVE_INFINITY;
+  let presentationEndUs = Number.NEGATIVE_INFINITY;
+  for (let sampleIndex = 0; sampleIndex < sizes.length; sampleIndex++) {
+    const size = sizes[sampleIndex];
+    const durationTicks = nextPacketTimeDelta(track.samples.timeToSample, deltaCursor);
+    const cttsTicks = hasCtts
+      ? nextPacketCompositionOffset(track.samples.compositionOffsets, cttsCursor)
+      : 0;
+    if (size === undefined || size <= 0 || durationTicks <= 0) return undefined;
+    if (sampleStartsBeforeActiveEditEnd(track, dtsTicks)) {
+      const dtsUs = ticksToUs(dtsTicks - editOffsetTicks, track.timescale);
+      const ptsUs = ticksToUs(dtsTicks + cttsTicks - editOffsetTicks, track.timescale);
+      const durationUs = ticksToUs(durationTicks, track.timescale);
+      if (
+        !Number.isFinite(dtsUs) ||
+        !Number.isFinite(ptsUs) ||
+        !Number.isFinite(durationUs) ||
+        durationUs <= 0
+      ) {
+        return undefined;
+      }
+      packetCount++;
+      totalSizeBytes += size;
+      if (!Number.isSafeInteger(totalSizeBytes)) return undefined;
+      decodeStartUs = Math.min(decodeStartUs, dtsUs);
+      decodeEndUs = Math.max(decodeEndUs, dtsUs + durationUs);
+      presentationStartUs = Math.min(presentationStartUs, ptsUs);
+      presentationEndUs = Math.max(presentationEndUs, ptsUs + durationUs);
+    }
+    dtsTicks += durationTicks;
+  }
+  return packetCount === 0
+    ? undefined
+    : {
+        packetCount,
+        totalSizeBytes,
+        decodeStartUs,
+        decodeEndUs,
+        presentationStartUs,
+        presentationEndUs,
+      };
+}
+
+/** Summarize the already-required fragmented sample list without creating a second row array. */
+function fragmentTrackPacketStats(
+  track: ParsedTrack,
+  samples: readonly Sample[],
+): PacketMetadataStats | undefined {
+  if (samples.length === 0) return undefined;
+  const editEndUs =
+    track.edit !== undefined && track.edit.durationSec > 0
+      ? Math.round(track.edit.durationSec * 1_000_000)
+      : undefined;
+  // Match `samplesWithinActiveEdit` exactly while avoiding its O(packet-count) `slice`: an edit only
+  // removes the trailing suffix beyond its end, preserving an earlier discontinuity/reset verbatim.
+  let end = samples.length;
+  if (editEndUs !== undefined) {
+    while (end > 0 && (samples[end - 1]?.dtsUs ?? Number.NEGATIVE_INFINITY) >= editEndUs) {
+      end--;
+    }
+  }
+  let totalSizeBytes = 0;
+  let packetCount = 0;
+  let decodeStartUs = Number.POSITIVE_INFINITY;
+  let decodeEndUs = Number.NEGATIVE_INFINITY;
+  let presentationStartUs = Number.POSITIVE_INFINITY;
+  let presentationEndUs = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < end; index++) {
+    const sample = samples[index];
+    if (sample === undefined) continue;
+    if (sample.size <= 0 || sample.durationUs <= 0) return undefined;
+    packetCount++;
+    totalSizeBytes += sample.size;
+    if (!Number.isSafeInteger(totalSizeBytes)) return undefined;
+    decodeStartUs = Math.min(decodeStartUs, sample.dtsUs);
+    decodeEndUs = Math.max(decodeEndUs, sample.dtsUs + sample.durationUs);
+    presentationStartUs = Math.min(presentationStartUs, sample.ptsUs);
+    presentationEndUs = Math.max(presentationEndUs, sample.ptsUs + sample.durationUs);
+  }
+  if (
+    !Number.isFinite(decodeStartUs) ||
+    !Number.isFinite(decodeEndUs) ||
+    !Number.isFinite(presentationStartUs) ||
+    !Number.isFinite(presentationEndUs)
+  ) {
+    return undefined;
+  }
+  return {
+    packetCount,
+    totalSizeBytes,
+    decodeStartUs,
+    decodeEndUs,
+    presentationStartUs,
+    presentationEndUs,
+  };
+}
+
 function appendTrackPacketInfoBySampleOrder(
   packets: Mp4PacketInfoMetadata[],
   packetIndex: number,
@@ -2273,17 +2629,17 @@ function appendTrackPacketInfoMetadata(
   return writeIndex;
 }
 
-interface PendingAvcPacketInfo {
+interface PendingPacketInfoPayload {
   readonly row: Mp4PacketInfoMetadata;
   readonly index: number;
   readonly offset: number;
   readonly size: number;
-  readonly lengthSize: 1 | 2 | 4;
+  readonly lengthSize?: 1 | 2 | 4;
 }
 
 interface PendingPacketInfoRow {
   readonly row: Mp4PacketInfoMetadata;
-  readonly avc?: PendingAvcPacketInfo;
+  readonly payload?: PendingPacketInfoPayload;
 }
 
 function packetInfoBatchSize(value: number | undefined): number {
@@ -2347,18 +2703,18 @@ function packetInfoRow(
           durationUs: ticksToUs(durationTicks, track.timescale),
           keyframe: decision.keyframe,
         };
-  return decision.lengthSize !== undefined && offset !== undefined
-    ? {
+  return offset === undefined
+    ? { row }
+    : {
         row,
-        avc: {
+        payload: {
           row,
           index: sampleIndex,
           offset,
           size,
-          lengthSize: decision.lengthSize,
+          ...(decision.lengthSize === undefined ? {} : { lengthSize: decision.lengthSize }),
         },
-      }
-    : { row };
+      };
 }
 
 /** Pull rows directly from one progressive track's run tables without a flat sample/row array. */
@@ -2484,8 +2840,15 @@ function* fragmentTrackPacketInfoRows(
       durationUs: ticksToUs(sample.durationTicks, track.timescale),
       keyframe: sample.keyframe,
     };
+    const row: Mp4PacketInfoMetadata = includeOffsets ? { ...base, offset: sample.offset } : base;
     yield {
-      row: includeOffsets ? { ...base, offset: sample.offset } : base,
+      row,
+      payload: {
+        row,
+        index: sample.index,
+        offset: sample.offset,
+        size: sample.size,
+      },
     };
   }
 }
@@ -2531,10 +2894,11 @@ function* moviePacketInfoRows(
   }
 }
 
-async function classifyAvcPacketInfoBatch(
-  rows: readonly PendingAvcPacketInfo[],
+async function inspectPacketInfoBatch(
+  rows: readonly PendingPacketInfoPayload[],
   ra: RandomAccess,
   signal: AbortSignal,
+  includePayloadDigests: boolean,
 ): Promise<void> {
   if (rows.length === 0) return;
   for (const row of rows) validateSampleRange(row.index, row.offset, row.size, ra.size);
@@ -2549,19 +2913,30 @@ async function classifyAvcPacketInfoBatch(
           `sample window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes (truncated MP4)`,
         );
       }
+      const digestPromises: Promise<void>[] = [];
       for (const item of window.items) {
         const sample = item.sample;
+        const start = sample.offset - window.start;
+        const payload = bytes.subarray(start, start + sample.size);
         if (
-          h264AccessUnitRangeIsKeyPicture(
-            bytes,
-            sample.offset - window.start,
-            sample.size,
-            sample.lengthSize,
-          ) === true
+          sample.lengthSize !== undefined &&
+          h264AccessUnitRangeIsKeyPicture(bytes, start, sample.size, sample.lengthSize) === true
         ) {
           sample.row.keyframe = true;
         }
+        if (includePayloadDigests) {
+          const digestPayload: Uint8Array<ArrayBuffer> =
+            payload.buffer instanceof ArrayBuffer
+              ? new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
+              : Uint8Array.from(payload);
+          digestPromises.push(
+            sha256Hex(digestPayload).then((digest) => {
+              sample.row.payloadDigest = digest;
+            }),
+          );
+        }
       }
+      await Promise.all(digestPromises);
     } finally {
       ra.release?.(bytes);
     }
@@ -2580,13 +2955,11 @@ function createMp4PacketInfoBatchStream(
   ra: RandomAccess,
   batchSize: number,
   includeOffsets: boolean,
+  includePayloadDigests: boolean,
   externalSignal: AbortSignal | undefined,
   fragmentSamples?: ReadonlyMap<number, readonly SampleData[]>,
 ): PacketInfoBatchStream {
   const controller = new AbortController();
-  const onAbort = (): void => controller.abort(externalSignal?.reason);
-  if (externalSignal?.aborted === true) onAbort();
-  else externalSignal?.addEventListener('abort', onAbort, { once: true });
   let claimed = false;
   let closed = false;
   const close = (reason?: unknown): Promise<void> => {
@@ -2594,9 +2967,15 @@ function createMp4PacketInfoBatchStream(
       closed = true;
       externalSignal?.removeEventListener('abort', onAbort);
       if (!controller.signal.aborted) controller.abort(reason);
+      ra.dispose?.();
     }
     return Promise.resolve();
   };
+  const onAbort = (): void => {
+    void close(externalSignal?.reason);
+  };
+  if (externalSignal?.aborted === true) onAbort();
+  else externalSignal?.addEventListener('abort', onAbort, { once: true });
   return {
     tracks: packetInfoTracks(movie),
     cancel: close,
@@ -2613,20 +2992,29 @@ function createMp4PacketInfoBatchStream(
             fragmentSamples,
           );
           let batch: Mp4PacketInfoMetadata[] = [];
-          let avc: PendingAvcPacketInfo[] = [];
+          let inspected: PendingPacketInfoPayload[] = [];
           for (const pending of pendingRows) {
             throwIfAborted(controller.signal);
             batch.push(pending.row);
-            if (pending.avc !== undefined) avc.push(pending.avc);
+            if (pending.payload !== undefined) {
+              if (pending.payload.lengthSize !== undefined || includePayloadDigests) {
+                inspected.push(pending.payload);
+              }
+            } else if (includePayloadDigests && pending.row.size > 0) {
+              throw new MediaError(
+                'demux-error',
+                'packet payload digest requested but the MP4 sample has no physical byte offset',
+              );
+            }
             if (batch.length < batchSize) continue;
-            await classifyAvcPacketInfoBatch(avc, ra, controller.signal);
+            await inspectPacketInfoBatch(inspected, ra, controller.signal, includePayloadDigests);
             const ready = batch;
             batch = [];
-            avc = [];
+            inspected = [];
             yield ready;
           }
           if (batch.length > 0) {
-            await classifyAvcPacketInfoBatch(avc, ra, controller.signal);
+            await inspectPacketInfoBatch(inspected, ra, controller.signal, includePayloadDigests);
             yield batch;
           }
         } finally {
@@ -3521,6 +3909,14 @@ function createMp4Demuxer(
   const publicById = new Map(publicTracks.map((track) => [track.id, track] as const));
   return {
     tracks: publicTracks,
+    packetStats(trackId: number): PacketMetadataStats | undefined {
+      const track = byId.get(trackId);
+      if (track === undefined) return undefined;
+      const fragments = fragmentSamples?.get(trackId);
+      return fragments === undefined
+        ? progressiveTrackPacketStats(track)
+        : fragmentTrackPacketStats(track, fragments);
+    },
     ...(supportsPacketTable
       ? {
           packetTable: () => mp4PacketMetadata(movie, sourceSize),
@@ -4825,26 +5221,44 @@ export async function mp4PacketInfoBatchesFromSource(
   const batchSize = packetInfoBatchSize(options?.batchSize);
   const signal = options?.signal;
   throwIfAborted(signal);
-  const ra = await randomAccess(src, signal === undefined ? {} : { signal });
-  throwIfAborted(signal);
-  const includeOffsets =
-    options?.includeOffsets ??
-    (ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES);
-  let movie = includeOffsets ? await readMovie(ra) : await readMoviePacketInfo(ra);
-  // Only unknown AVC picture status needs physical sample placement. Other large sources retain the
-  // prior offset-free/header-only parse while their row objects are still produced pull-by-pull.
-  if (!includeOffsets && packetInfoMovieNeedsPhysicalAvc(movie)) movie = await readMovie(ra);
-  throwIfAborted(signal);
-  const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
-  throwIfAborted(signal);
-  return createMp4PacketInfoBatchStream(
-    movie,
-    ra,
-    batchSize,
-    includeOffsets,
-    signal,
-    fragmentSamples,
-  );
+  const ra = await randomAccess(src, {
+    releaseRangesOnDispose: true,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  let ownsRandomAccess = true;
+  try {
+    throwIfAborted(signal);
+    const includePayloadDigests = options?.includePayloadDigests === true;
+    const includeOffsets =
+      options?.includeOffsets ??
+      (ra.size !== undefined && ra.size <= PACKET_INFO_OFFSET_MAX_SOURCE_BYTES);
+    const needsPhysicalSamplePlacement = includeOffsets || includePayloadDigests;
+    // Digest rows may deliberately omit their public offsets for a large source, but hashing still
+    // needs the private stsc/stco/co64 placement tables. Keep that placement internal and let the
+    // pull-driven batch inspector issue only its bounded sample windows.
+    let movie = needsPhysicalSamplePlacement ? await readMovie(ra) : await readMoviePacketInfo(ra);
+    // Only unknown AVC picture status needs physical sample placement. Other large sources retain the
+    // prior offset-free/header-only parse while their row objects are still produced pull-by-pull.
+    if (!needsPhysicalSamplePlacement && packetInfoMovieNeedsPhysicalAvc(movie)) {
+      movie = await readMovie(ra);
+    }
+    throwIfAborted(signal);
+    const fragmentSamples = await buildFragmentSampleDataMap(movie, ra);
+    throwIfAborted(signal);
+    const stream = createMp4PacketInfoBatchStream(
+      movie,
+      ra,
+      batchSize,
+      includeOffsets,
+      includePayloadDigests,
+      signal,
+      fragmentSamples,
+    );
+    ownsRandomAccess = false;
+    return stream;
+  } finally {
+    if (ownsRandomAccess) ra.dispose?.();
+  }
 }
 
 async function collectPacketInfoBatches(stream: PacketInfoBatchStream): Promise<PacketInfoTable> {
@@ -4866,32 +5280,45 @@ export const Mp4Driver: ContainerDriver = {
   supports: matchesMp4,
   async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
     const signal = o?.signal;
-    const ra = await randomAccess(src, signal === undefined ? {} : { signal });
-    throwIfAborted(signal);
-    if (shouldTrySimpleVideoFaststartProbe(src, ra)) {
-      const metadataTracks = await readBoundedVideoMetadataProbeTracks(src, ra, signal);
-      if (metadataTracks !== false) {
+    const ra = await randomAccess(src, {
+      releaseRangesOnDispose: true,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    try {
+      throwIfAborted(signal);
+      if (shouldTrySimpleVideoFaststartProbe(src, ra)) {
+        const kind = sourceKind(src);
+        if ((kind === 'url' || kind === 'element') && ra.size > PROGRESSIVE_SINGLE_READ_MAX_BYTES) {
+          const sparseTracks = await readSparseFaststartProbeTracks(ra, signal);
+          throwIfAborted(signal);
+          if (sparseTracks !== undefined) return sparseTracks;
+        }
+        const metadataTracks = await readBoundedVideoMetadataProbeTracks(src, ra, signal);
+        if (metadataTracks !== false) {
+          throwIfAborted(signal);
+          if (metadataTracks !== undefined) return metadataTracks;
+        }
+        const tracks =
+          metadataTracks === false ? undefined : await readSimpleVideoFaststartProbeTracks(src, ra);
         throwIfAborted(signal);
-        if (metadataTracks !== undefined) return metadataTracks;
+        if (tracks !== undefined) return tracks;
       }
-      const tracks =
-        metadataTracks === false ? undefined : await readSimpleVideoFaststartProbeTracks(src, ra);
+      if (shouldTryTinyAudioFaststartProbe(src, ra)) {
+        const tracks = await readTinyAudioFaststartProbeTracks(ra);
+        throwIfAborted(signal);
+        if (tracks !== undefined) return tracks;
+      }
+      if (shouldTrySparseAudioFaststartProbe(src, ra)) {
+        const tracks = await readSparseFaststartProbeTracks(ra, signal);
+        throwIfAborted(signal);
+        if (tracks !== undefined) return tracks;
+      }
+      const movie = await readMovieForProbe(src, ra);
       throwIfAborted(signal);
-      if (tracks !== undefined) return tracks;
+      return toProbeTracks(movie);
+    } finally {
+      ra.dispose?.();
     }
-    if (shouldTryTinyAudioFaststartProbe(src, ra)) {
-      const tracks = await readTinyAudioFaststartProbeTracks(ra);
-      throwIfAborted(signal);
-      if (tracks !== undefined) return tracks;
-    }
-    if (shouldTrySparseAudioFaststartProbe(src, ra)) {
-      const tracks = await readSparseAudioFaststartProbeTracks(ra, signal);
-      throwIfAborted(signal);
-      if (tracks !== undefined) return tracks;
-    }
-    const movie = await readMovieForProbe(src, ra);
-    throwIfAborted(signal);
-    return toProbeTracks(movie);
   },
   async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
     // This compatibility result retains every row by definition. Use a wide producer batch so AVC

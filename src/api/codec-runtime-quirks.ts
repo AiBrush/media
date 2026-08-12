@@ -11,6 +11,7 @@
  */
 
 import { CapabilityError } from '../contracts/errors.ts';
+import { defaultOpusAudioEncodeTarget } from './audio-target-defaults.ts';
 import { type SourceGeometry, outputDimensions } from './codec-queries.ts';
 import { videoCodecToken } from './codec-strings.ts';
 import {
@@ -167,8 +168,9 @@ export async function resolveAudioEncodeTargetForRuntime(
   sourceCodecString: string | undefined,
 ): Promise<AudioTarget> {
   const runtime = await import('./runtime-detect.ts');
-  if (!runtime.isFirefoxRuntime()) return target;
-  const audioTarget = firefoxOpusAudioEncodeTarget(target, sourceCodecString);
+  const portableTarget = defaultOpusAudioEncodeTarget(target, sourceCodecString);
+  if (!runtime.isFirefoxRuntime()) return portableTarget;
+  const audioTarget = firefoxOpusAudioEncodeTarget(portableTarget, sourceCodecString);
   const decline = firefoxAudioTranscodeDeclineReason(audioTarget, sourceCodecString);
   if (decline !== undefined) {
     throw new CapabilityError(decline, {

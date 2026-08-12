@@ -11,6 +11,99 @@ import type { AudioEncoderOutputTiming, TrackInfo } from '../contracts/driver.ts
 import { CapabilityError } from '../contracts/errors.ts';
 import { audioCodecToken } from './encoder-config.ts';
 
+function bytesFromDescription(description: AllowSharedBufferSource): Uint8Array {
+  return ArrayBuffer.isView(description)
+    ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+    : new Uint8Array(description);
+}
+
+function isCompleteHvcC(hvcC: Uint8Array): boolean {
+  if (
+    hvcC.byteLength < 23 ||
+    hvcC[0] !== 1 ||
+    ((hvcC[13] as number) & 0xf0) !== 0xf0 ||
+    ((hvcC[15] as number) & 0xfc) !== 0xfc ||
+    ((hvcC[16] as number) & 0xfc) !== 0xfc ||
+    ((hvcC[17] as number) & 0xf8) !== 0xf8 ||
+    ((hvcC[18] as number) & 0xf8) !== 0xf8
+  ) {
+    return false;
+  }
+  let offset = 23;
+  const arrayCount = hvcC[22] as number;
+  const parameterSetTypes = new Set<number>();
+  for (let array = 0; array < arrayCount; array++) {
+    if (offset + 3 > hvcC.byteLength) return false;
+    const arrayHeader = hvcC[offset] as number;
+    if ((arrayHeader & 0x40) !== 0) return false;
+    const nalType = arrayHeader & 0x3f;
+    const nalCount = ((hvcC[offset + 1] as number) << 8) | (hvcC[offset + 2] as number);
+    if (nalCount === 0) return false;
+    offset += 3;
+    for (let nal = 0; nal < nalCount; nal++) {
+      if (offset + 2 > hvcC.byteLength) return false;
+      const nalLength = ((hvcC[offset] as number) << 8) | (hvcC[offset + 1] as number);
+      offset += 2;
+      if (
+        nalLength < 2 ||
+        offset + nalLength > hvcC.byteLength ||
+        (((hvcC[offset] as number) >> 1) & 0x3f) !== nalType
+      ) {
+        return false;
+      }
+      offset += nalLength;
+    }
+    if (nalType === 32 || nalType === 33 || nalType === 34) parameterSetTypes.add(nalType);
+  }
+  return (
+    offset === hvcC.byteLength &&
+    parameterSetTypes.has(32) &&
+    parameterSetTypes.has(33) &&
+    parameterSetTypes.has(34)
+  );
+}
+
+function invalidHvcC(expectedBitDepth: 8 | 10 | 12, detail: 'missing' | 'malformed'): never {
+  throw new CapabilityError(
+    `HEVC encoder accepted ${expectedBitDepth}-bit output but published ${detail} hvcC`,
+    {
+      op: { kind: 'route', id: 'encode-video-bit-depth', facts: { expectedBitDepth } },
+      tried: ['webcodecs-video'],
+      suggestion: `use 8-bit HEVC or a runtime that emits a complete ${expectedBitDepth}-bit HEVC configuration`,
+    },
+  );
+}
+
+/** Verify the actual HEVC configuration record instead of trusting an encoder-echoed codec string. */
+export function assertVideoEncoderOutputBitDepth(
+  config: VideoDecoderConfig,
+  expectedBitDepth: 8 | 10 | 12 | undefined,
+): void {
+  if (expectedBitDepth === undefined || !/^(?:hev1|hvc1)\./i.test(config.codec)) return;
+  const description = config.description;
+  if (description === undefined) invalidHvcC(expectedBitDepth, 'missing');
+  const hvcC = bytesFromDescription(description);
+  if (!isCompleteHvcC(hvcC)) invalidHvcC(expectedBitDepth, 'malformed');
+  const profileIdc = (hvcC[1] as number) & 0x1f;
+  const profileDepth = profileIdc === 1 ? 8 : profileIdc === 2 ? 10 : undefined;
+  const lumaDepth = 8 + ((hvcC[17] as number) & 0x07);
+  const chromaDepth = 8 + ((hvcC[18] as number) & 0x07);
+  const actualBitDepth = lumaDepth === chromaDepth ? (lumaDepth ?? profileDepth) : undefined;
+  if (actualBitDepth === expectedBitDepth && (expectedBitDepth !== 10 || profileIdc === 2)) return;
+  throw new CapabilityError(
+    `HEVC encoder accepted ${expectedBitDepth}-bit output but published ${actualBitDepth ?? 'inconsistent'}-bit hvcC`,
+    {
+      op: {
+        kind: 'route',
+        id: 'encode-video-bit-depth',
+        facts: { expectedBitDepth, ...(actualBitDepth === undefined ? {} : { actualBitDepth }) },
+      },
+      tried: ['webcodecs-video'],
+      suggestion: `use 8-bit HEVC or a runtime that emits a genuine ${expectedBitDepth}-bit HEVC configuration`,
+    },
+  );
+}
+
 /**
  * Lossless colour intent carried from an applied pixel transform to the encoder→mux bridge. WebCodecs'
  * string enum collapses BT.2020-10/12 into `bt709`, so the transform plan must retain that standard

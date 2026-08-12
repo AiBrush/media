@@ -246,6 +246,62 @@ function predictedBytesForQuantizers(
   }, 0);
 }
 
+interface PredictedQuantizerSchedule {
+  readonly quantizers: readonly number[];
+  readonly predictedBytes: number;
+}
+
+/**
+ * Spend the byte headroom between two integer-QP schedules without requiring a fractional H.264 QP.
+ * The lower-rate schedule is the safe base. Pictures are promoted to the higher-rate schedule in
+ * descending measured-complexity order while their modeled increment still fits. This preserves the
+ * hard bound, improves the most expensive pictures first, and avoids the coarse ~12% whole-stream rate
+ * jump of changing every picture by one QP.
+ */
+function interpolateQuantizerSchedules(
+  actualBytes: readonly number[],
+  currentQuantizers: ArrayLike<number>,
+  targetBytes: number,
+  under: PredictedQuantizerSchedule,
+  over: PredictedQuantizerSchedule,
+): PredictedQuantizerSchedule {
+  if (under.predictedBytes > targetBytes || over.predictedBytes <= targetBytes) return under;
+
+  const quantizers = [...under.quantizers];
+  const upgrades = actualBytes.flatMap((bytes, index) => {
+    const current = currentQuantizers[index];
+    const lowerRateQp = under.quantizers[index];
+    const higherRateQp = over.quantizers[index];
+    if (
+      current === undefined ||
+      lowerRateQp === undefined ||
+      higherRateQp === undefined ||
+      higherRateQp >= lowerRateQp
+    ) {
+      return [];
+    }
+    const lowerRateBytes = bytes * 2 ** ((current - lowerRateQp) / H264_QP_PER_SIZE_DOUBLING);
+    const higherRateBytes = bytes * 2 ** ((current - higherRateQp) / H264_QP_PER_SIZE_DOUBLING);
+    return [
+      {
+        index,
+        quantizer: higherRateQp,
+        increment: higherRateBytes - lowerRateBytes,
+        complexity: bytes,
+      },
+    ];
+  });
+  upgrades.sort((a, b) => b.complexity - a.complexity || a.index - b.index);
+
+  let predictedBytes = under.predictedBytes;
+  for (const upgrade of upgrades) {
+    if (!(upgrade.increment > 0) || predictedBytes + upgrade.increment > targetBytes) continue;
+    quantizers[upgrade.index] = upgrade.quantizer;
+    predictedBytes += upgrade.increment;
+  }
+  return { quantizers, predictedBytes };
+}
+
 function calibrateQuantizers(
   samples: readonly TimedSample[],
   values: readonly number[],
@@ -401,15 +457,19 @@ function createPlan(
 
       // H.264's local rate response is approximately one size doubling per six QPs. Use the exact
       // candidate access-unit sizes to score the globally shifted schedule, including per-picture QP
-      // clamping, and inspect the ideal integer shift plus its neighbors. No fixture/QP outcome is baked
-      // in: every correction derives from the declared byte budget and the preceding candidate itself.
+      // clamping, and inspect the ideal integer shift plus its neighbors. When the byte bound falls
+      // between two integer global shifts, interpolate them across the measured picture population so a
+      // one-QP step does not strand substantial usable headroom. No fixture/QP outcome is baked in:
+      // every correction derives from the declared byte budget and the preceding candidate itself.
       const idealOffset = Math.round(
         H264_QP_PER_SIZE_DOUBLING * Math.log2(totalActualBytes / nextTargetBytes),
       );
-      let bestQuantizers: readonly number[] | undefined;
-      let bestPrediction = 0;
-      let fallbackQuantizers: readonly number[] = [...packedQuantizers];
-      let fallbackPrediction = totalActualBytes;
+      let bestUnder: PredictedQuantizerSchedule | undefined;
+      let bestOver: PredictedQuantizerSchedule | undefined;
+      let fallback: PredictedQuantizerSchedule = {
+        quantizers: [...packedQuantizers],
+        predictedBytes: totalActualBytes,
+      };
       let fallbackError = Math.abs(Math.log(totalActualBytes / nextTargetBytes));
       for (const offset of new Set([0, idealOffset - 1, idealOffset, idealOffset + 1])) {
         const candidateQuantizers = Array.from(packedQuantizers, (value) =>
@@ -425,27 +485,43 @@ function createPlan(
         }, 0);
         const error = Math.abs(Math.log(candidatePrediction / nextTargetBytes));
         if (error < fallbackError) {
-          fallbackQuantizers = candidateQuantizers;
-          fallbackPrediction = candidatePrediction;
+          fallback = { quantizers: candidateQuantizers, predictedBytes: candidatePrediction };
           fallbackError = error;
         }
-        // The next target is a hard candidate-spool ceiling. Prefer the closest model prediction that
-        // stays at or below it; this makes a small measured overshoot advance at least one QP instead of
-        // repeating the same invalid schedule. The fallback exists only for QP-clamped schedules where
-        // no inspected offset can mathematically fit.
-        if (candidatePrediction <= nextTargetBytes && candidatePrediction > bestPrediction) {
-          bestQuantizers = candidateQuantizers;
-          bestPrediction = candidatePrediction;
+        const schedule = { quantizers: candidateQuantizers, predictedBytes: candidatePrediction };
+        if (
+          candidatePrediction <= nextTargetBytes &&
+          (bestUnder === undefined || candidatePrediction > bestUnder.predictedBytes)
+        ) {
+          bestUnder = schedule;
+        } else if (
+          candidatePrediction > nextTargetBytes &&
+          (bestOver === undefined || candidatePrediction < bestOver.predictedBytes)
+        ) {
+          bestOver = schedule;
         }
       }
-      bestQuantizers ??= fallbackQuantizers;
-      if (bestPrediction === 0) bestPrediction = fallbackPrediction;
+      // The next target is a hard candidate-spool ceiling. Prefer the closest modeled schedule that
+      // stays at or below it; the fallback exists only for QP-clamped schedules where no inspected
+      // offset can mathematically fit.
+      const selected =
+        bestUnder === undefined
+          ? fallback
+          : bestOver === undefined
+            ? bestUnder
+            : interpolateQuantizerSchedules(
+                actualBytes,
+                packedQuantizers,
+                nextTargetBytes,
+                bestUnder,
+                bestOver,
+              );
       return createPlan(
         timeline,
         firstPassBytes,
         nextTargetBytes,
-        Math.round(bestPrediction),
-        bestQuantizers,
+        Math.round(selected.predictedBytes),
+        selected.quantizers,
       );
     },
   };

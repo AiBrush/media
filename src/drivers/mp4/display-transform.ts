@@ -30,13 +30,25 @@ function signedFixed16(word: number): number {
   return (word | 0) / 65536;
 }
 
-/** Derive the public clockwise scalar from the first row of a raw `tkhd` matrix. */
+/**
+ * Derive the public clockwise scalar from the first row of a raw `tkhd` matrix.
+ *
+ * FFmpeg exposes the inverse angle as a counter-clockwise display rotation; the stored first row
+ * itself maps `[0,1;-1,0]` to the public 90-degree clockwise presentation. Keep this small form
+ * shared with the bounded fast probe so the two MP4 metadata paths cannot disagree about the sign.
+ */
+export function clockwiseRotationFromMp4MatrixFirstRow(a: number, b: number): number {
+  if (a === 1 && b === 0) return 0;
+  const degrees = Math.round((Math.atan2(b, a) * 180) / Math.PI);
+  return normalizeClockwiseRotation(degrees) ?? 0;
+}
+
+/** Derive the public clockwise scalar from a complete raw `tkhd` matrix. */
 export function clockwiseRotationFromMp4Matrix(matrix: Mp4DisplayMatrix): number | undefined {
   const a = signedFixed16(matrix[0]);
   const b = signedFixed16(matrix[1]);
   if (a === 1 && b === 0) return 0;
-  const degrees = Math.round((Math.atan2(b, a) * 180) / Math.PI);
-  const normalized = normalizeClockwiseRotation(degrees);
+  const normalized = clockwiseRotationFromMp4MatrixFirstRow(a, b);
   return normalized === 0 ? undefined : normalized;
 }
 

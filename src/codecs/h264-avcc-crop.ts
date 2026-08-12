@@ -20,6 +20,32 @@ export interface H264VuiColor {
   readonly fullRange: boolean;
 }
 
+/** H.264 VUI sample aspect ratio (`sar_width:sar_height` or a standard aspect_ratio_idc mapping). */
+export interface H264SampleAspectRatio {
+  readonly width: number;
+  readonly height: number;
+}
+
+// ITU-T H.264 Table E-1. Values 17..254 are reserved; 255 carries an explicit u16 pair.
+const H264_SAMPLE_ASPECT_RATIOS: Readonly<Record<number, readonly [number, number]>> = {
+  1: [1, 1],
+  2: [12, 11],
+  3: [10, 11],
+  4: [16, 11],
+  5: [40, 33],
+  6: [24, 11],
+  7: [20, 11],
+  8: [32, 11],
+  9: [80, 33],
+  10: [18, 11],
+  11: [15, 11],
+  12: [64, 33],
+  13: [160, 99],
+  14: [4, 3],
+  15: [3, 2],
+  16: [2, 1],
+};
+
 interface ParsedSpsPrefix {
   readonly rbsp: Uint8Array;
   readonly semanticEnd: number;
@@ -66,6 +92,13 @@ function avcCDescription(avcC: Uint8Array): {
 /** Read the complete colour declaration from every SPS in an AVCDecoderConfigurationRecord. */
 export function h264AvcCColors(avcC: Uint8Array): readonly (H264VuiColor | undefined)[] {
   return avcCDescription(avcC).sps.map(readSpsColor);
+}
+
+/** Read each SPS's VUI sample aspect ratio from an AVCDecoderConfigurationRecord. */
+export function h264AvcCSampleAspectRatios(
+  avcC: Uint8Array,
+): readonly (H264SampleAspectRatio | undefined)[] {
+  return avcCDescription(avcC).sps.map(readSpsSampleAspectRatio);
 }
 
 /**
@@ -279,15 +312,27 @@ function parseSpsPrefixToVui(nal: Uint8Array): ParsedSpsPrefix {
   return { rbsp, semanticEnd, reader };
 }
 
-function skipVuiPrefixToVideoSignal(reader: BitReader): void {
-  if (reader.bit() === 1) {
-    const aspectRatioIdc = reader.bits(8);
-    if (aspectRatioIdc === 255) {
-      reader.bits(16); // sar_width
-      reader.bits(16); // sar_height
-    }
+function readVuiSampleAspectRatio(reader: BitReader): H264SampleAspectRatio | undefined {
+  if (reader.bit() === 0) return undefined; // aspect_ratio_info_present_flag
+  const aspectRatioIdc = reader.bits(8);
+  if (aspectRatioIdc === 255) {
+    const width = reader.bits(16);
+    const height = reader.bits(16);
+    return width > 0 && height > 0 ? { width, height } : undefined;
   }
+  const ratio = H264_SAMPLE_ASPECT_RATIOS[aspectRatioIdc];
+  return ratio === undefined ? undefined : { width: ratio[0], height: ratio[1] };
+}
+
+function skipVuiPrefixToVideoSignal(reader: BitReader): void {
+  readVuiSampleAspectRatio(reader);
   if (reader.bit() === 1) reader.bit(); // overscan_info_present_flag / overscan_appropriate_flag
+}
+
+function readSpsSampleAspectRatio(nal: Uint8Array): H264SampleAspectRatio | undefined {
+  const { reader } = parseSpsPrefixToVui(nal);
+  if (reader.bit() === 0) return undefined; // vui_parameters_present_flag
+  return readVuiSampleAspectRatio(reader);
 }
 
 function readSpsColor(nal: Uint8Array): H264VuiColor | undefined {

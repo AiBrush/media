@@ -4,7 +4,10 @@ import type { TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import { readMovie } from '../drivers/mp4/mp4-driver.ts';
 import { Mp4Muxer } from '../drivers/mp4/mux.ts';
-import { videoTrackInfoFromDecoderConfig } from './mux-trackinfo.ts';
+import {
+  assertVideoEncoderOutputBitDepth,
+  videoTrackInfoFromDecoderConfig,
+} from './mux-trackinfo.ts';
 import { videoColorMuxIntent } from './video-stream-plan.ts';
 
 function fromHex(hex: string): Uint8Array {
@@ -26,6 +29,112 @@ function descriptionBytes(value: AllowSharedBufferSource | undefined): Uint8Arra
     ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
     : new Uint8Array(value);
 }
+
+function hvcC(profileIdc: number, bitDepth: number): Uint8Array {
+  const parameterSetTypes = [32, 33, 34] as const;
+  const description = new Uint8Array(23 + parameterSetTypes.length * 7);
+  description[0] = 1;
+  description[1] = profileIdc;
+  description[13] = 0xf0;
+  description[15] = 0xfc;
+  description[16] = 0xfc;
+  description[17] = 0xf8 | (bitDepth - 8);
+  description[18] = 0xf8 | (bitDepth - 8);
+  description[22] = parameterSetTypes.length;
+  let offset = 23;
+  for (const nalType of parameterSetTypes) {
+    description.set([0x80 | nalType, 0, 1, 0, 2, nalType << 1, 1], offset);
+    offset += 7;
+  }
+  return description;
+}
+
+describe('assertVideoEncoderOutputBitDepth', () => {
+  it('accepts genuine Main/Main10 records and rejects echoed Main10 labels over 8-bit hvcC', () => {
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.2.4.L120.B0', description: hvcC(2, 10) }, 10),
+    ).not.toThrow();
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.1.6.L93.B0', description: hvcC(1, 8) }, 8),
+    ).not.toThrow();
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.2.4.L120.B0', description: hvcC(1, 8) }, 10),
+    ).toThrow(/published 8-bit hvcC/);
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.2.4.L120.B0', description: hvcC(2, 8) }, 10),
+    ).toThrow(CapabilityError);
+  });
+
+  it('ignores inapplicable requests and rejects missing, malformed, or inconsistent HEVC facts', () => {
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: hvcC(1, 8) },
+        undefined,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'avc1.42E01E', description: Uint8Array.of(1, 2) },
+        10,
+      ),
+    ).not.toThrow();
+    expect(() => assertVideoEncoderOutputBitDepth({ codec: 'hev1.2.4.L120.B0' }, 10)).toThrow(
+      /missing hvcC/,
+    );
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: Uint8Array.of(0) },
+        10,
+      ),
+    ).toThrow(/malformed hvcC/);
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: Uint8Array.of(2, 2) },
+        10,
+      ),
+    ).toThrow(/malformed hvcC/);
+
+    const shortMain10 = hvcC(2, 10).subarray(0, 13);
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: shortMain10.buffer.slice(0, 13) },
+        10,
+      ),
+    ).toThrow(/malformed hvcC/);
+    const truncatedArray = hvcC(2, 10);
+    truncatedArray[22] = 1;
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: truncatedArray },
+        10,
+      ),
+    ).toThrow(/malformed hvcC/);
+    const missingPps = hvcC(2, 10).subarray(0, 37);
+    missingPps[22] = 2;
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.2.4.L120.B0', description: missingPps }, 10),
+    ).toThrow(/malformed hvcC/);
+    const reservedArrayBit = hvcC(2, 10);
+    reservedArrayBit[23] = (reservedArrayBit[23] as number) | 0x40;
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: reservedArrayBit },
+        10,
+      ),
+    ).toThrow(/malformed hvcC/);
+    const inconsistent = hvcC(2, 10);
+    inconsistent[18] = 0xf8;
+    expect(() =>
+      assertVideoEncoderOutputBitDepth(
+        { codec: 'hev1.2.4.L120.B0', description: inconsistent },
+        10,
+      ),
+    ).toThrow(/inconsistent-bit hvcC/);
+    expect(() =>
+      assertVideoEncoderOutputBitDepth({ codec: 'hev1.3.4.L120.B0', description: hvcC(3, 10) }, 10),
+    ).toThrow(CapabilityError);
+  });
+});
 
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();

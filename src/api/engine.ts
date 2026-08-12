@@ -39,7 +39,6 @@ import type {
   WasmRuntimeProfile,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
-import { composeChain } from '../kernel/executor.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { type CodecRoute, Router, type StageSelectOptions } from '../kernel/router.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
@@ -79,7 +78,6 @@ import { bridgeSignal, closeIfClosable, deferredStream, memoizeAsync } from './f
 import type { MediaJob } from './job.ts';
 import type { MuxRunnerContext } from './mux-runner.ts';
 import {
-  MICROS_PER_SECOND,
   audioGeometryOf,
   forceSoftware,
   isFlacAuthorCodec,
@@ -90,7 +88,6 @@ import {
   muxOptionsFrom,
   normalizeByteInput,
   sourceGeometryOf,
-  toMediaInfo,
 } from './op-support.ts';
 import type { PacketInfoBatchCallOptions, PacketInfoCallOptions } from './packet-info-runner.ts';
 // Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
@@ -98,6 +95,7 @@ import type { PacketInfoBatchCallOptions, PacketInfoCallOptions } from './packet
 // engine's `#authoringDeps()` returns the `PcmConvertDeps` superset, which also satisfies the FLAC route's
 // (narrower) deps at its call site, so only this one type is referenced here.
 import type { PcmConvertDeps } from './pcm-convert-plan.ts';
+import type { ProbeRunnerContext } from './probe-runner.ts';
 import type { RemuxRunnerContext } from './remux-runner.ts';
 import {
   HINTED_HEAD_BYTES,
@@ -105,7 +103,6 @@ import {
   cacheProbeRanges,
   clearSourcePrefixHandoffs,
   extensionOf,
-  readAllSource,
   readHead,
   routeHeadBytes,
   sourceMayBeHlsManifest,
@@ -356,6 +353,22 @@ export class MediaEngineImpl implements MediaEngine {
     return cache.cacheFiniteBlobProbeRanges(src, this.#sourcePrefixHandoff);
   }
 
+  #probeRunnerContext(): ProbeRunnerContext {
+    return {
+      cacheOwner: this,
+      sourcePrefixHandoff: this.#sourcePrefixHandoff,
+      loadRangeCache: loadProbeRangeCache,
+      resolveHls: this.#resolveHlsInput.bind(this),
+      blobProbe: this.#blobProbe.bind(this),
+      routeSource: (source, signal, pinDriver) =>
+        this.#routeContainer(source, 'demux', signal, pinDriver),
+      routeToken: (container, pinDriver) =>
+        this.#routeContainerToken(container, 'demux', pinDriver),
+      stage: this.#stageOptions.bind(this),
+      imageOps: this.#imageOpsForSource.bind(this),
+    };
+  }
+
   from(input: MediaStream | LiveMediaSource, opts?: FromOptions): LiveMediaSource;
   from(input: HTMLMediaElement, opts: FromOptions & { readonly mode: 'capture' }): LiveMediaSource;
   from(input: HTMLMediaElement): Source;
@@ -401,74 +414,10 @@ export class MediaEngineImpl implements MediaEngine {
           throwIfAborted(signal);
           return probeLiveMediaStream(normalized);
         }
-        // Resolve an HLS `.m3u8` to its (decrypted, concatenated) media source BEFORE the probe-prefix cache
-        // wrappers — exactly as demux/decode do (they pass a fresh `normalizeInput(input)` to the resolver).
-        // Wrapping first put the eager range-cache in front of an *unresolved* manifest, so the HLS content
-        // sniff saw cached/segment bytes, declined to resolve, and probe then mis-read the raw encrypted TS
-        // segment as "not an MPEG-TS stream". For non-HLS inputs the resolver is a cheap no-op (same source).
-        const resolved = await this.#resolveHlsInput(input, normalized, signal);
-        let src = resolved;
-        let probeRangeCache: Awaited<ReturnType<typeof loadProbeRangeCache>> | undefined;
-        let operationResultCache: ProbeContainerResultCache | undefined;
-        let info: MediaInfo;
-        try {
-          if (
-            resolved.range !== undefined &&
-            (resolved.kind !== 'bytes' || resolved.mimeHint !== undefined)
-          ) {
-            probeRangeCache = await loadProbeRangeCache();
-            src = probeRangeCache.cacheRepeatedProbeRangesFor(this, resolved);
-          }
-          if (sourceMayHaveBlobProbeHandoff(resolved)) {
-            [src, operationResultCache] = await this.#blobProbe(src);
-          } else {
-            src = cacheProbeRanges(src, this.#sourcePrefixHandoff, 'store');
-          }
-          // A concrete audio/video MIME already identifies the container family cheaply. On a seekable
-          // source, try that container before spending a separate range read on image magic. This is safe
-          // even before the URL size is known: range reads are replayable, the first 206 learns the size, and
-          // the exact-source prefix cache preserves bytes for the typed-rejection image fallback. MIME remains
-          // only a hint, so a JPEG mislabeled `video/mp4` still resolves as JPEG. One-shot streams stay
-          // image-first because a rejected container probe may consume bytes irreversibly.
-          if (src.range !== undefined && probeRangeCache?.hasConcreteAudioVideoMime(src.mimeHint)) {
-            try {
-              info = await this.#probeContainerInfo(src, signal, o);
-            } catch (error) {
-              throwIfAborted(signal);
-              if (!(error instanceof MediaError) || error.code === 'aborted') throw error;
-              const imageInfo = await this.#probeImageInfo(src, signal);
-              if (imageInfo !== undefined) info = imageInfo;
-              else throw error;
-            }
-          } else {
-            const imageInfo = await this.#probeImageInfo(src, signal);
-            info = imageInfo ?? (await this.#probeContainerInfo(src, signal, o));
-          }
-        } finally {
-          await cancelSource(src, signal.reason);
-        }
-        // A third-party driver or one-shot cleanup is allowed to settle after its StageOptions signal
-        // aborts. Recheck after the final awaited boundary so such a stale success neither resolves the
-        // cancelled public operation nor becomes an engine-owned fact for a later caller.
-        throwIfAborted(signal);
-        operationResultCache?.store(normalized, o, info);
-        return info;
+        const { runProbe } = await import('./probe-runner.ts');
+        return runProbe(this.#probeRunnerContext(), input, normalized, o, signal);
       })
     );
-  }
-
-  async #probeContainerInfo(src: Source, signal: AbortSignal, o: CallOptions): Promise<MediaInfo> {
-    const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
-    const stage = this.#stageOptions(signal, o);
-    if (container.probe !== undefined) {
-      return toMediaInfo(container, await container.probe(src, stage), src);
-    }
-    const demuxer = await container.demux(src, stage);
-    try {
-      return toMediaInfo(container, demuxer.tracks, src);
-    } finally {
-      await demuxer.close();
-    }
   }
 
   probeContainer(
@@ -479,41 +428,16 @@ export class MediaEngineImpl implements MediaEngine {
     return (
       this.#probeContainerResultCache?.hit(input, o, container) ??
       this.#withCancel(o, async (signal) => {
-        // Resolve an HLS `.m3u8` to its decrypted media source first (as `demux`/`probe` do) — a container-
-        // targeted probe of an HLS manifest (e.g. an AES-128 `mpeg-ts` playlist) must sniff the resolved TS,
-        // not the raw encrypted segment (which reads as "not an MPEG-TS stream"). No-op for non-HLS inputs.
         const normalized = normalizeByteInput(input, 'probeContainer');
-        const resolved = await this.#resolveHlsInput(input, normalized, signal);
-        let src = resolved;
-        let operationResultCache: ProbeContainerResultCache | undefined;
-        let info: MediaInfo;
-        try {
-          if (resolved.range !== undefined && resolved.kind !== 'bytes') {
-            src = (await loadProbeRangeCache()).cacheRepeatedProbeRangesFor(this, resolved);
-          }
-          if (sourceMayHaveBlobProbeHandoff(resolved)) {
-            [src, operationResultCache] = await this.#blobProbe(src);
-          }
-          const driver = await this.#routeContainerToken(container, 'demux', o.strategy?.pinDriver);
-          const stage = this.#stageOptions(signal, o);
-          if (driver.probe) {
-            info = toMediaInfo(driver, await driver.probe(src, stage), src);
-          } else {
-            const demuxer = await driver.demux(src, stage);
-            try {
-              info = toMediaInfo(driver, demuxer.tracks, src);
-            } finally {
-              await demuxer.close();
-            }
-          }
-        } finally {
-          await cancelSource(src, signal.reason);
-        }
-        // No await is permitted after this check and before the store: cancellation during a delayed
-        // one-shot cleanup must win just as cancellation during a non-cooperative driver does.
-        throwIfAborted(signal);
-        operationResultCache?.store(normalized, o, info, container);
-        return info;
+        const { runProbeContainer } = await import('./probe-runner.ts');
+        return runProbeContainer(
+          this.#probeRunnerContext(),
+          input,
+          normalized,
+          container,
+          o,
+          signal,
+        );
       })
     );
   }
@@ -876,8 +800,14 @@ export class MediaEngineImpl implements MediaEngine {
           ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl }
           : {}),
         ensureDefaultDrivers: () => this.#ensureDefaultDrivers(),
-        pickContainer: (q) => {
-          this.#router.pickContainer(q);
+        warmOperationChunks: async (op) => {
+          if (op === 'probe') {
+            await Promise.all([loadProbeRangeCache(), import('./probe-runner.ts')]);
+          }
+        },
+        pickContainer: async (q) => {
+          const driver = this.#router.pickContainer(q);
+          await (driver as ContainerDriver & LazyChunkDriver).ensureLoaded?.();
         },
         pickCodec: async (q) => {
           // Warm through the verdict-carrying route (ADR-203): the cached CodecRoute the first real
@@ -1167,15 +1097,6 @@ export class MediaEngineImpl implements MediaEngine {
     return ops?.sniff(head) === undefined ? undefined : ops;
   }
 
-  /** Probe image bytes through the standalone image parser when the source magic matches an image. */
-  async #probeImageInfo(src: Source, signal: AbortSignal): Promise<MediaInfo | undefined> {
-    const ops = await this.#imageOpsForSource(src, signal);
-    if (ops === undefined) return undefined;
-    const bytes = await readAllSource(src, signal);
-    const { imageInfoToMediaMetadata } = await import('../codecs/image/probe.ts');
-    return imageInfoToMediaMetadata(await ops.probe(bytes), src.size);
-  }
-
   async #decodeAudioTrackPackets(
     demuxer: Demuxer,
     track: TrackInfo,
@@ -1290,6 +1211,7 @@ export class MediaEngineImpl implements MediaEngine {
       drainEncoderToMuxer,
       encodeVpxAlphaFrameStreams,
       encodeQueryFor,
+      prepareVpxAlphaFramesForEncode,
       requireEncoderConfig,
       videoTrackInfoFromDecoderConfig,
     } = await loadCodecPipeline();
@@ -1317,7 +1239,14 @@ export class MediaEngineImpl implements MediaEngine {
       decodeCodec.createDecoder(decodeConfig, decodeStage),
     );
     const colorFrames = await this.#applyVideoFilters(planes.color, target, sourceTrack, signal, o);
-    const alphaFrames = await this.#applyVideoFilters(planes.alpha, target, sourceTrack, signal, o);
+    const filteredAlphaFrames = await this.#applyVideoFilters(
+      planes.alpha,
+      target,
+      sourceTrack,
+      signal,
+      o,
+    );
+    const alphaFrames = prepareVpxAlphaFramesForEncode(filteredAlphaFrames);
     /* v8 ignore start -- requires live WebCodecs decode/filter/encode; browser-harness validated. */
     let decoderConfig: VideoDecoderConfig | undefined;
     const colorStage: VideoEncoderStageOptions = {
@@ -1368,40 +1297,11 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<VideoFrame>> {
-    // The video filter-spec PLANNER lives in a lazily-imported chunk (`video-stream-plan.ts`), so the eager
-    // kernel never statically pulls the video-spec code (doc 08 §7). Reached only here, on the live convert
-    // video re-encode — already a browser-only, async path.
-    const { retimeVideoFrameStream, videoFilterRouteCost, videoFilterSpecs } = await import(
-      './video-stream-plan.ts'
-    );
-    const sourceGeometry = sourceGeometryOf(track);
-    const specs = videoFilterSpecs(target, sourceGeometry);
-    const routeCost = videoFilterRouteCost(target, sourceGeometry);
-    let out = frames;
-    const stages: TransformStream<VideoFrame, VideoFrame>[] = [];
-    for (const spec of specs) {
-      const driver = await this.#routeFilter(spec, o, routeCost);
-      stages.push(
-        driver.createFilter(spec, this.#stageOptions(signal, o)) as TransformStream<
-          VideoFrame,
-          VideoFrame
-        >,
-      );
-    }
-    if (stages.length > 0) out = composeChain(out, stages);
-    if (target.fps !== undefined) {
-      const durationUs =
-        track.durationSec !== undefined &&
-        Number.isFinite(track.durationSec) &&
-        track.durationSec > 0
-          ? Math.round(track.durationSec * MICROS_PER_SECOND)
-          : undefined;
-      out = retimeVideoFrameStream(
-        out,
-        durationUs === undefined ? { fps: target.fps } : { fps: target.fps, durationUs },
-      );
-    }
-    return out;
+    const { applyVideoFrameFilters } = await import('./media-filter-runner.ts');
+    return applyVideoFrameFilters(frames, target, track, signal, o, {
+      routeFilter: this.#routeFilter.bind(this),
+      stageOptions: this.#stageOptions.bind(this),
+    });
   }
   /* v8 ignore stop */
 
@@ -1421,26 +1321,11 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<AudioData>> {
-    const { audioFilterSpecs, audioTargetCanBypassFilterPlanner } = await import(
-      './audio-stream-plan.ts'
-    );
-    if (audioTargetCanBypassFilterPlanner(target)) return frames;
-    // The lossy-seam audio-filter PLANNER lives in a lazily-imported chunk (`audio-stream-plan.ts`), so the
-    // eager kernel never statically pulls the audio-spec code + its audio-dsp type imports (doc 08 §7).
-    // Reached only here, on the live convert audio re-encode — already a browser-only, async path.
-    const specs = audioFilterSpecs(target, audioGeometryOf(track));
-    if (specs.length === 0) return frames;
-    const stages: TransformStream<AudioData, AudioData>[] = [];
-    for (const spec of specs) {
-      const driver = await this.#routeFilter(spec, o);
-      stages.push(
-        driver.createFilter(spec, this.#stageOptions(signal, o)) as TransformStream<
-          AudioData,
-          AudioData
-        >,
-      );
-    }
-    return composeChain(frames, stages);
+    const { applyAudioFrameFilters } = await import('./media-filter-runner.ts');
+    return applyAudioFrameFilters(frames, target, track, signal, o, {
+      routeFilter: this.#routeFilter.bind(this),
+      stageOptions: this.#stageOptions.bind(this),
+    });
   }
   /* v8 ignore stop */
 

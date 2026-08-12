@@ -82,7 +82,7 @@ export interface MoovOptions {
   videoType?: string;
   /** Audio sample-entry fourcc (default 'mp4a'; '.mp3' exercises QuickTime MP3-in-MOV). */
   audioType?: string;
-  /** tkhd matrix (a, b) in 16.16 (default [0, 1] = 90°). */
+  /** tkhd matrix first row (a, b) in 16.16 (default [0, 1] = 90° clockwise). */
   rotationAB?: [number, number];
 }
 
@@ -90,7 +90,7 @@ export interface MoovOptions {
 export function moovBox(opts: MoovOptions = {}): number[] {
   const videoType = opts.videoType ?? 'avc1';
   const audioType = opts.audioType ?? 'mp4a';
-  const [a, b] = opts.rotationAB ?? [0, ID]; // 90° default
+  const [a, b] = opts.rotationAB ?? [0, ID]; // 90° clockwise default
   const video = box(
     'trak',
     cat(

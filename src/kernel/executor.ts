@@ -33,55 +33,6 @@ export function composeChain<T>(
   return out;
 }
 
-export interface LazyPipeThroughOptions<U> {
-  /** Called if a downstream enqueue loses a cancellation/error race and the produced value owns resources. */
-  closeValue?: (value: U) => void;
-}
-
-/**
- * Defer a `source.pipeThrough(createStage())` link until a downstream reader actually pulls. Native
- * `pipeThrough()` starts piping immediately; that is ideal for steady-state chains, but a live media graph
- * may need to finish composing downstream filters/encoders before an upstream decoder stage starts
- * draining packets. This wrapper preserves backpressure by reading at most one output item per downstream
- * pull.
- */
-export function lazyPipeThrough<T, U>(
-  source: ReadableStream<T>,
-  createStage: () => TransformStream<T, U>,
-  opts: LazyPipeThroughOptions<U> = {},
-): ReadableStream<U> {
-  let reader: ReadableStreamDefaultReader<U> | undefined;
-
-  const ensureReader = (): ReadableStreamDefaultReader<U> => {
-    if (reader !== undefined) return reader;
-    reader = source.pipeThrough(createStage()).getReader();
-    return reader;
-  };
-
-  return new ReadableStream<U>(
-    {
-      async pull(controller): Promise<void> {
-        const active = ensureReader();
-        const { done, value } = await active.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        try {
-          controller.enqueue(value);
-        } catch (e) {
-          opts.closeValue?.(value);
-          throw e;
-        }
-      },
-      async cancel(reason): Promise<void> {
-        await reader?.cancel(reason).catch(() => {});
-      },
-    },
-    { highWaterMark: 0 },
-  );
-}
-
 // ── Batched packet drain (ADR-278) ──────────────────────────────────────────────────────────────
 
 export interface PacketBatchOptions<T> {
@@ -173,86 +124,7 @@ export function batchPackets<T>(
   );
 }
 
-// ── Cancellable op plumbing (shared by the chain/job orchestrators) ─────────────────────────────
-
-/** A promise that also exposes cooperative `.cancel()` — the runtime's op-handle shape (ADR-012). */
-export type CancellableTask<T> = Promise<T> & { cancel(): void };
-
-export interface CancellableScope {
-  /** The one linked signal every inner operation must receive. */
-  readonly signal: AbortSignal;
-  /**
-   * Run one inner cancellable op: it is tracked so a linked abort re-cancels it (at most once per
-   * dispatch), and the synchronous cancel-during-dispatch race — a hook aborting while the handle is
-   * still being returned, before the abort listener can observe it — is closed explicitly.
-   */
-  dispatch<U>(op: CancellableTask<U>): Promise<U>;
-}
-
-/**
- * The one implementation of "a promise with `.cancel()` linked to parent signals plus an internal
- * `AbortController`, tracking the active inner op" (docs/architecture/execution-runtime §5 item 8).
- * Parent aborts mirror into the internal controller with their reason; `.cancel()` aborts it directly.
- * Every listener is removed once the run settles; `.cancel()` after settlement still re-cancels the last
- * tracked handle so a lazily-started inner runner is reached even post-resolution.
- */
-export function runCancellable<T>(
-  parents: readonly (AbortSignal | undefined)[],
-  run: (scope: CancellableScope) => Promise<T>,
-): CancellableTask<T> {
-  const controller = new AbortController();
-  const links: { readonly signal: AbortSignal; readonly onAbort: () => void }[] = [];
-  let active: { cancel(): void } | undefined;
-  let cancelled: { cancel(): void } | undefined;
-  const cancelActive = (): void => {
-    const current = active;
-    if (current === undefined || current === cancelled) return;
-    cancelled = current;
-    try {
-      current.cancel();
-    } catch {
-      // The linked abort remains the primary cancellation fact; a throwing cancel hook cannot mask it.
-    }
-  };
-  const abortWith = (reason: unknown): void => {
-    if (!controller.signal.aborted) controller.abort(reason);
-  };
-  for (const parent of parents) {
-    if (parent === undefined) continue;
-    if (parent.aborted) {
-      abortWith(parent.reason);
-      break;
-    }
-    const onAbort = (): void => abortWith(parent.reason);
-    parent.addEventListener('abort', onAbort, { once: true });
-    links.push({ signal: parent, onAbort });
-  }
-  controller.signal.addEventListener('abort', cancelActive);
-  const scope: CancellableScope = {
-    signal: controller.signal,
-    dispatch<U>(op: CancellableTask<U>): Promise<U> {
-      cancelled = undefined;
-      active = op;
-      if (controller.signal.aborted) cancelActive();
-      return Promise.resolve(op);
-    },
-  };
-  const promise = (async (): Promise<T> => {
-    try {
-      return await run(scope);
-    } finally {
-      controller.signal.removeEventListener('abort', cancelActive);
-      for (const link of links) link.signal.removeEventListener('abort', link.onAbort);
-    }
-  })() as CancellableTask<T>;
-  promise.cancel = (): void => {
-    abortWith(undefined);
-    cancelActive();
-  };
-  return promise;
-}
-
-/** Collect a byte stream into one `Uint8Array` (the Blob/File sink path), honoring abort + progress. */
+/** Collect a byte stream into one contiguous `Uint8Array`, honoring abort + progress. */
 export async function collect(
   readable: ReadableStream<Uint8Array>,
   opts: ExecuteOptions = {},

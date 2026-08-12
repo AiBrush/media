@@ -346,7 +346,7 @@ describe('planVideoBitDepthConversion — partial codec metadata', () => {
       kind: 'encoder-widen',
       sourceBitDepth: 8,
       targetBitDepth: 10,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     });
     expect(
       planVideoBitDepthConversion({ sourceCodec: 'vp09.00.10', targetCodec: 'hvc1.3.4.L120.B0' }),
@@ -358,18 +358,18 @@ describe('planVideoBitDepthConversion — partial codec metadata', () => {
     });
   });
 
-  it('classifies 8/10-bit exact widening to 12-bit without a pixel copy', () => {
+  it('classifies 8/10-bit exact widening to 12-bit through an explicit planar copy', () => {
     expect(planVideoBitDepthConversion({ sourceBitDepth: 8, targetBitDepth: 12 })).toEqual({
       kind: 'encoder-widen',
       sourceBitDepth: 8,
       targetBitDepth: 12,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     });
     expect(planVideoBitDepthConversion({ sourceBitDepth: 10, targetBitDepth: 12 })).toEqual({
       kind: 'encoder-widen',
       sourceBitDepth: 10,
       targetBitDepth: 12,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     });
   });
 
@@ -423,7 +423,7 @@ describe('planVideoBitDepthConversion — partial codec metadata', () => {
     );
   });
 
-  it('allows an 8-bit source to filter then widen and validates pixel-boundary depth', () => {
+  it('allows an 8-bit source to filter then explicitly widen and validates pixel-boundary depth', () => {
     expect(
       planVideoBitDepthConversion({
         sourceBitDepth: 8,
@@ -434,7 +434,7 @@ describe('planVideoBitDepthConversion — partial codec metadata', () => {
       kind: 'encoder-widen',
       sourceBitDepth: 8,
       targetBitDepth: 12,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     });
     expect(() =>
       planVideoBitDepthConversion({

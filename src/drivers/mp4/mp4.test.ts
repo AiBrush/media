@@ -732,6 +732,37 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
     expect(tracks).toEqual(expected);
   });
 
+  it('metadata-only long-form video probe skips sample tables that push stsz beyond the prefix', async () => {
+    const samples = Array.from({ length: 40_000 }, (_, index) => ({
+      data: new Uint8Array([index & 0xff]),
+      durationTicks: 1,
+      cttsTicks: index & 1,
+      keyframe: index % 60 === 0,
+    }));
+    const bytes = writeMp4([smallH264Track({ timescale: 30, samples })], { faststart: true });
+    const [, moovEnd] = topLevelBoxRange(bytes, 'moov');
+    expect(moovEnd).toBeGreaterThan(128 * 1024);
+    const expected = await Mp4Driver.probe?.(byteSource(bytes));
+    const reads: Array<readonly [number, number]> = [];
+    const tracks = await Mp4Driver.probe?.({
+      // The metadata layout is complete; the declared long-form tail is never part of a probe read.
+      size: 65 * 1024 * 1024,
+      kind: 'url',
+      mimeHint: 'video/mp4',
+      stream: () => streamBytes(bytes),
+      range: (start, end) => {
+        reads.push([start, end]);
+        return Promise.resolve(bytes.subarray(start, end));
+      },
+    } as UrlByteSource & MimeHintedByteSource);
+
+    expect(tracks).toEqual(expected);
+    expect(reads[0]).toEqual([0, 128 * 1024]);
+    expect(reads.some(([start]) => start > 128 * 1024)).toBe(true);
+    expect(reads.every(([start, end]) => end - start <= 128 * 1024)).toBe(true);
+    expect(reads.reduce((total, [start, end]) => total + end - start, 0)).toBeLessThan(moovEnd);
+  });
+
   it('metadata-only probe uses the tiny M4A audio fast path only when the source is known audio', async () => {
     const bytes = writeMp4(
       [

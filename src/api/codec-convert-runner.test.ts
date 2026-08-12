@@ -240,6 +240,144 @@ describe('runCodecConvert setup ownership', () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  it('uses bounded WebM packet stats for a 50-million-row shifted timeline without materializing its table', async () => {
+    const constructionFailure = new Error('packet-span mux construction reached');
+    const close = vi.fn(() => Promise.resolve());
+    const packets = vi.fn(() => {
+      throw new Error('packets must not be opened before mux construction');
+    });
+    const packetTable = vi.fn(() => {
+      throw new Error('a 50-million-row packet table must not be materialized');
+    });
+    const packetStats = vi.fn(() => ({
+      packetCount: 50_000_000,
+      totalSizeBytes: 25_000_000_000,
+      decodeStartUs: 2_243_657_254_000,
+      decodeEndUs: 2_243_665_020_000,
+      presentationStartUs: 2_243_657_254_000,
+      presentationEndUs: 2_243_665_020_000,
+    }));
+    const videoTrack: TrackInfo = {
+      id: 3,
+      mediaType: 'video',
+      codec: 'vp8',
+      durationSec: 2_243_665.02,
+      fps: 30,
+      config: { codec: 'vp8', codedWidth: 1920, codedHeight: 1080 },
+    };
+    const demuxer: Demuxer = {
+      tracks: [videoTrack],
+      packets,
+      packetTable,
+      packetStats,
+      close,
+    };
+    const createMuxer = vi.fn(() => {
+      throw constructionFailure;
+    });
+    const inputContainer = {
+      ...containerDriver(demuxer, () => unused('input createMuxer')),
+      id: 'webm',
+    };
+    const outputContainer: ContainerDriver = {
+      ...containerDriver(demuxer, createMuxer),
+      id: 'mp4-mux',
+      formats: ['mp4', 'mov'],
+    };
+    const context: CodecConvertRunnerContext = {
+      ...runnerContext(
+        inputContainer,
+        () => Promise.resolve(outputContainer),
+        () => Promise.reject(unused('materializeOutput')),
+      ),
+      sourceGeometry: () => ({
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        durationSec: 2_243_665.02,
+      }),
+    };
+
+    await expect(
+      runCodecConvert(
+        source,
+        { to: 'mp4', video: { codec: 'h264', bitrate: 18_432_000 }, audio: false },
+        new AbortController().signal,
+        {},
+        source,
+        context,
+      ),
+    ).rejects.toBe(constructionFailure);
+
+    expect(packetStats).toHaveBeenCalledTimes(1);
+    expect(packetStats).toHaveBeenCalledWith(3);
+    expect(packetTable).not.toHaveBeenCalled();
+    expect(createMuxer).toHaveBeenCalledTimes(1);
+    expect(packets).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not materialize a legacy third-party packet table or false-reject its shifted origin', async () => {
+    const constructionFailure = new Error('legacy table mux construction reached');
+    const close = vi.fn(() => Promise.resolve());
+    const packets = vi.fn(() => {
+      throw new Error('packets must not be opened before mux construction');
+    });
+    const packetTable = vi.fn(() => {
+      throw new Error('legacy packet rows must not be materialized for planning');
+    });
+    const videoTrack: TrackInfo = {
+      id: 3,
+      mediaType: 'video',
+      codec: 'vp8',
+      durationSec: 2_243_665.02,
+      fps: 30,
+      config: { codec: 'vp8', codedWidth: 1920, codedHeight: 1080 },
+    };
+    const demuxer: Demuxer = { tracks: [videoTrack], packets, packetTable, close };
+    const createMuxer = vi.fn(() => {
+      throw constructionFailure;
+    });
+    const inputContainer = {
+      ...containerDriver(demuxer, () => unused('input createMuxer')),
+      id: 'third-party-webm',
+    };
+    const outputContainer: ContainerDriver = {
+      ...containerDriver(demuxer, createMuxer),
+      id: 'mp4-mux',
+      formats: ['mp4', 'mov'],
+    };
+    const context: CodecConvertRunnerContext = {
+      ...runnerContext(
+        inputContainer,
+        () => Promise.resolve(outputContainer),
+        () => Promise.reject(unused('materializeOutput')),
+      ),
+      sourceGeometry: () => ({
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        durationSec: 2_243_665.02,
+      }),
+    };
+
+    await expect(
+      runCodecConvert(
+        source,
+        { to: 'mp4', video: { codec: 'h264', bitrate: 18_432_000 }, audio: false },
+        new AbortController().signal,
+        {},
+        source,
+        context,
+      ),
+    ).rejects.toBe(constructionFailure);
+
+    expect(packetTable).not.toHaveBeenCalled();
+    expect(createMuxer).toHaveBeenCalledTimes(1);
+    expect(packets).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('does not apply the single-array projection to fragmented MP4 output', async () => {
     const constructionFailure = new Error('fragmented mux construction reached');
     const close = vi.fn(() => Promise.resolve());

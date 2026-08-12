@@ -306,7 +306,9 @@ async function remuxViaSeam(
   );
   const { selectTrackInfos } = await import('./track-select.ts');
   const tracks = selectTrackInfos(
-    demuxer.tracks.filter((track) => track.config !== undefined),
+    demuxer.tracks.filter(
+      (track) => track.config !== undefined && track.containerProjection === undefined,
+    ),
     opts.trackSelect,
   );
   if (tracks.length === 0) {

@@ -837,11 +837,11 @@ export type VideoBitDepthConversionPlan =
       readonly requiresPixelPath: boolean;
     }
   | {
-      /** Lower-depth integer samples are exactly representable at the target; no precision is invented. */
+      /** Lower-depth integer samples are left-shifted into an explicit high-depth planar frame. */
       readonly kind: 'encoder-widen';
       readonly sourceBitDepth: 8 | 10;
       readonly targetBitDepth: 10 | 12;
-      readonly requiresPixelPath: false;
+      readonly requiresPixelPath: true;
     };
 
 function normalizeBitDepth(depth: number | undefined): VideoBitDepth | undefined {
@@ -947,7 +947,7 @@ export function planVideoBitDepthConversion(
       kind: 'encoder-widen',
       sourceBitDepth,
       targetBitDepth,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     };
   }
   if (sourceBitDepth === 10 && targetBitDepth === 12) {
@@ -955,7 +955,7 @@ export function planVideoBitDepthConversion(
       kind: 'encoder-widen',
       sourceBitDepth,
       targetBitDepth,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     };
   }
   throw new CapabilityError(

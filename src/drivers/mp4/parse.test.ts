@@ -189,8 +189,13 @@ function mdiaFor(handler: string, stblChildren: number[], language = 0): number[
 }
 
 /** A minimal avc1 video trak whose sample entry carries the given extension boxes. */
-function videoTrakWith(extensions: number[], language = 0, defaultDisposition = false): number[] {
-  const avcC = box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
+function videoTrakWith(
+  extensions: number[],
+  language = 0,
+  defaultDisposition = false,
+  avcCRecord: number[] = [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00],
+): number[] {
+  const avcC = box('avcC', avcCRecord);
   const entry = box(
     'avc1',
     cat(zeros(6), be16(1), zeros(16), be16(4), be16(4), zeros(50), avcC, extensions),
@@ -267,6 +272,75 @@ describe('parseMovie — colr/pasp/clap sample-entry extensions', () => {
       matrix: 'bt709',
     });
     expect(v?.pasp).toEqual({ hSpacing: 4, vSpacing: 3 });
+    expect(v?.config).toMatchObject({ displayAspectWidth: 4, displayAspectHeight: 3 });
+  });
+
+  it.each([
+    { hSpacing: 3, vSpacing: 4, expectedWidth: 3, expectedHeight: 4 },
+    { hSpacing: 224, vSpacing: 225, expectedWidth: 224, expectedHeight: 225 },
+  ])(
+    'projects a $hSpacing:$vSpacing pasp into the decoder display aspect without changing coded geometry',
+    ({ hSpacing, vSpacing, expectedWidth, expectedHeight }) => {
+      const pasp = box('pasp', cat(be32(hSpacing), be32(vSpacing)));
+      const video = movieWith([videoTrakWith(pasp)]).tracks[0];
+      expect(video?.config).toMatchObject({
+        codedWidth: 4,
+        codedHeight: 4,
+        displayAspectWidth: expectedWidth,
+        displayAspectHeight: expectedHeight,
+      });
+    },
+  );
+
+  it.each([
+    [0, 1],
+    [1, 0],
+  ] as const)('keeps malformed %i:%i pasp out of VideoDecoderConfig', (h, v) => {
+    const pasp = box('pasp', cat(be32(h), be32(v)));
+    const config = movieWith([videoTrakWith(pasp)]).tracks[0]?.config as VideoDecoderConfig;
+    expect(config.displayAspectWidth).toBeUndefined();
+    expect(config.displayAspectHeight).toBeUndefined();
+  });
+
+  it('falls back to H.264 SPS extended_SAR and lets a container pasp override it', () => {
+    const avcCWithSar224x225 = Array.from(
+      Uint8Array.fromHex(
+        '01640015ffe1001d67640015acb404c1cf2fff80700070880000030008000003018478b17501000568cf32c8b0',
+      ),
+    );
+    const fromSps = movieWith([videoTrakWith([], 0, false, avcCWithSar224x225)]).tracks[0]
+      ?.config as VideoDecoderConfig;
+    expect(fromSps).toMatchObject({
+      codedWidth: 4,
+      codedHeight: 4,
+      displayAspectWidth: 224,
+      displayAspectHeight: 225,
+    });
+
+    const pasp = box('pasp', cat(be32(4), be32(3)));
+    const fromContainer = movieWith([videoTrakWith(pasp, 0, false, avcCWithSar224x225)]).tracks[0]
+      ?.config as VideoDecoderConfig;
+    expect(fromContainer).toMatchObject({ displayAspectWidth: 4, displayAspectHeight: 3 });
+
+    const squarePasp = box('pasp', cat(be32(1), be32(1)));
+    const squareContainerOverride = movieWith([
+      videoTrakWith(squarePasp, 0, false, avcCWithSar224x225),
+    ]).tracks[0]?.config as VideoDecoderConfig;
+    expect(squareContainerOverride).toMatchObject({
+      displayAspectWidth: 1,
+      displayAspectHeight: 1,
+    });
+  });
+
+  it('accepts equivalent reduced ratios across multiple H.264 SPS parameter sets', () => {
+    // Synthetic Baseline avcC with two otherwise-identical SPS entries signaling extended_SAR 4:3
+    // and 8:6. A single VideoDecoderConfig can represent their common display aspect.
+    const equivalentSpsRatios = Array.from(
+      Uint8Array.fromHex('0142001fffe2000c6742001ff4f7fe0008000601000c6742001ff4f7fe0010000c0100'),
+    );
+    const config = movieWith([videoTrakWith([], 0, false, equivalentSpsRatios)]).tracks[0]
+      ?.config as VideoDecoderConfig;
+    expect(config).toMatchObject({ displayAspectWidth: 4, displayAspectHeight: 3 });
   });
 
   it('nclx full_range bit maps to colorSpace.fullRange (set and unset)', () => {

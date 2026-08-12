@@ -126,6 +126,8 @@ export interface PacketInfoMetadata {
   /** Packet duration in microseconds when known without payload materialization. */
   readonly durationUs?: number;
   readonly keyframe: boolean;
+  /** Optional SHA-256 of the exact coded packet payload, produced only when explicitly requested. */
+  readonly payloadDigest?: string;
 }
 
 /** Tracks plus a lightweight packet table, without constructing payload streams. */
@@ -141,6 +143,11 @@ export interface PacketInfoBatchOptions extends StageOptions {
    * them; callers therefore control row-object memory through consumption/backpressure.
    */
   readonly batchSize?: number;
+  /**
+   * Hash each exact coded payload while its bounded source range is owned. This adds a full payload
+   * scan but retains only one digest per row; it is intended for integrity/oracle workflows.
+   */
+  readonly includePayloadDigests?: boolean;
 }
 
 /**
@@ -332,6 +339,20 @@ export interface TrackInfo {
 }
 
 /**
+ * Constant-sized timing/size evidence for one demuxed track. Unlike {@link PacketMetadata}, this
+ * summary must be computed without allocating one object per packet.
+ */
+export interface PacketMetadataStats {
+  readonly packetCount: number;
+  readonly totalSizeBytes: number;
+  /** Exact decode span when derivable with bounded memory; publish both decode fields or neither. */
+  readonly decodeStartUs?: number;
+  readonly decodeEndUs?: number;
+  readonly presentationStartUs: number;
+  readonly presentationEndUs: number;
+}
+
+/**
  * Exact presentation-timing facts published by an audio encoder after its input and output have
  * drained. Counts are per-channel PCM samples at {@link sampleRate}; they describe the newly encoded
  * destination stream, never the source track's codec delay or padding.
@@ -369,6 +390,8 @@ export interface Demuxer {
   readonly tracks: readonly TrackInfo[];
   /** Optional packet-table fast path: no encoded payload bytes are read or materialized. */
   packetTable?(): readonly PacketMetadata[];
+  /** Optional constant-sized per-track evidence; implementations must not materialize packet rows. */
+  packetStats?(trackId: number): PacketMetadataStats | undefined;
   packets(trackId: number): ReadableStream<Packet>;
   close(): Promise<void>;
 }

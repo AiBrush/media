@@ -337,6 +337,110 @@ describe('audio-dsp filter — driver surface', () => {
       audioDspFilterDriver.createFilter({ mediaType: 'video', type: 'flip', axis: 'h' }),
     ).toThrow(CapabilityError);
   });
+
+  it('resample preserves real timestamp gaps and overlaps instead of synthesizing one clock', async () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioData');
+
+    class StubAudioData {
+      readonly format = 'f32-planar' as const;
+      readonly sampleRate: number;
+      readonly numberOfChannels: number;
+      readonly numberOfFrames: number;
+      readonly timestamp: number;
+      readonly duration: number;
+      readonly #planar: Float32Array[];
+      closedFlag = false;
+
+      constructor(init: AudioDataInit) {
+        this.sampleRate = init.sampleRate;
+        this.numberOfChannels = init.numberOfChannels;
+        this.numberOfFrames = init.numberOfFrames;
+        this.timestamp = init.timestamp;
+        this.duration = (init.numberOfFrames / init.sampleRate) * 1_000_000;
+        const bytes = ArrayBuffer.isView(init.data)
+          ? new Float32Array(init.data.buffer, init.data.byteOffset, init.data.byteLength / 4)
+          : new Float32Array(init.data);
+        this.#planar = Array.from({ length: init.numberOfChannels }, (_, channel) =>
+          bytes.slice(channel * init.numberOfFrames, (channel + 1) * init.numberOfFrames),
+        );
+      }
+
+      allocationSize(): number {
+        return this.numberOfFrames * Float32Array.BYTES_PER_ELEMENT;
+      }
+
+      copyTo(destination: AllowSharedBufferSource, options: AudioDataCopyToOptions): void {
+        const output = new Float32Array(
+          (destination as ArrayBufferView).buffer,
+          (destination as ArrayBufferView).byteOffset,
+          this.numberOfFrames,
+        );
+        output.set(this.#planar[options.planeIndex] ?? new Float32Array(0));
+      }
+
+      close(): void {
+        this.closedFlag = true;
+      }
+    }
+
+    Object.defineProperty(globalThis, 'AudioData', {
+      configurable: true,
+      writable: true,
+      value: StubAudioData,
+    });
+    try {
+      const input = (timestamp: number): StubAudioData =>
+        new StubAudioData({
+          format: 'f32-planar',
+          sampleRate: 44_100,
+          numberOfChannels: 1,
+          numberOfFrames: 441,
+          timestamp,
+          data: new Float32Array(441).buffer,
+        });
+      const segmentStarts = [1_000_000, 1_020_000, 1_025_000];
+      const frames = segmentStarts.map(input);
+      const filter = audioDspFilterDriver.createFilter(RESAMPLE_48K) as TransformStream<
+        AudioData,
+        AudioData
+      >;
+      const reader = filter.readable.getReader();
+      const reading = (async (): Promise<AudioData[]> => {
+        const output: AudioData[] = [];
+        for (;;) {
+          const result = await reader.read();
+          if (result.done) return output;
+          output.push(result.value);
+        }
+      })();
+      const writer = filter.writable.getWriter();
+      for (const frame of frames) await writer.write(frame as unknown as AudioData);
+      await writer.close();
+      const output = await reading;
+
+      const outputStarts = segmentStarts.map((timestamp) =>
+        output.findIndex((frame) => frame.timestamp === timestamp),
+      );
+      expect(outputStarts[0]).toBe(0);
+      expect(outputStarts[1]).toBeGreaterThan(outputStarts[0] as number);
+      expect(outputStarts[2]).toBeGreaterThan(outputStarts[1] as number);
+      for (let segment = 0; segment < segmentStarts.length; segment++) {
+        const start = outputStarts[segment] as number;
+        const end = outputStarts[segment + 1] ?? output.length;
+        expect(start, `missing output clock for segment ${segment}`).toBeGreaterThanOrEqual(0);
+        expect(
+          output.slice(start, end).reduce((frames, chunk) => frames + chunk.numberOfFrames, 0),
+          `rounded output length for segment ${segment}`,
+        ).toBe(480);
+      }
+      expect(output.every((frame) => frame.sampleRate === 48_000)).toBe(true);
+      expect(frames.every((frame) => frame.closedFlag)).toBe(true);
+      for (const frame of output) frame.close();
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
+      else Object.defineProperty(globalThis, 'AudioData', previous);
+    }
+  });
 });
 
 describe('AudioDspFilterModule — registration', () => {

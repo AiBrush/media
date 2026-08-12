@@ -13,6 +13,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
+import { parseVpxCodec } from '../vpx-codec-string.ts';
 import {
   type VpxPixelFormat,
   iterateIvfFrames,
@@ -21,7 +22,6 @@ import {
   parseSuperframeIndex,
   parseVp8FrameInfo,
   parseVp9FrameInfo,
-  parseVpxCodec,
   pixelFormatForBitDepth,
   planeLayoutI420,
 } from './vpx.ts';

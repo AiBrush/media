@@ -9,11 +9,16 @@
 import { access, mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { brotliCompressSync, gzipSync } from 'node:zlib';
+import { resolveLocalJsImport, staticLocalJsImports } from './bundle-graph.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const BUN = process.execPath;
 const TSC = join(ROOT, 'node_modules/typescript/bin/tsc');
 const EAGER_KERNEL_BUDGET = 50 * 1024;
+const TYPICAL_APP_BUDGET = 250 * 1024;
+const MIN_BUDGET_MARGIN = 512;
 const KEEP_TEMP = process.argv.includes('--keep-temp');
 const REPORT_PATH = optionValue('--report');
 const INSTALL_SPEC = optionValue('--install-spec') ?? optionValue('--package');
@@ -46,7 +51,12 @@ interface BundleReport {
   readonly entryFile: string;
   readonly eagerBudgetBytes: number;
   readonly eagerJsBytes: number;
+  readonly eagerGzipBytes: number;
+  readonly eagerBrotliBytes: number;
   readonly eagerMarginBytes: number;
+  readonly eagerWorkerJsBytes: 0;
+  readonly eagerWasmBytes: 0;
+  readonly eagerCodecDataBytes: 0;
   readonly emittedJsBytes: number;
   readonly lazyJsBytes: number;
   readonly eagerJsFiles: readonly SizedFileReport[];
@@ -54,6 +64,35 @@ interface BundleReport {
   readonly emittedJsFileDetails: readonly SizedFileReport[];
   readonly emittedWasmFiles: readonly string[];
   readonly emittedAssetFiles: readonly string[];
+  readonly typicalMp4Probe: RouteBundleReport;
+  readonly typicalMp4Remux: RouteBundleReport;
+}
+
+interface RouteBundleReport {
+  readonly entryFile: string;
+  readonly route: 'finite-faststart-mp4-probe' | 'default-blob-mp4-remux';
+  readonly budgetBytes: number;
+  readonly rawBytes: number;
+  readonly gzipBytes: number;
+  readonly brotliBytes: number;
+  readonly marginBytes: number;
+  readonly workerJsBytes: 0;
+  readonly wasmBytes: 0;
+  readonly codecDataBytes: 0;
+  readonly seedFiles: readonly string[];
+  readonly jsFiles: readonly SizedFileReport[];
+  readonly runtimeCompletenessChecked: true;
+}
+
+interface ConsumerBundleGraph {
+  readonly outDir: string;
+  readonly entryFile: string;
+  readonly jsFiles: readonly string[];
+  readonly wasmFiles: readonly string[];
+  readonly assetFiles: readonly string[];
+  readonly jsText: ReadonlyMap<string, string>;
+  readonly jsSizes: ReadonlyMap<string, number>;
+  readonly metafile: Bun.BuildMetafile;
 }
 
 interface PackageSourceReport {
@@ -489,10 +528,12 @@ async function writeConsumerSources(
   concreteDriverSubpath: string | undefined,
 ): Promise<{
   readonly probeEntry: string;
+  readonly remuxEntry: string;
   readonly typecheckConfig: string;
   readonly runtimeProbe: string;
 }> {
   const probeEntry = join(appDir, 'probe-only.ts');
+  const remuxEntry = join(appDir, 'remux-only.ts');
   const typeProbe = join(appDir, 'types-probe.ts');
   const typecheckConfig = join(appDir, 'tsconfig.json');
   const runtimeProbe = join(appDir, 'runtime-probe.mjs');
@@ -500,13 +541,30 @@ async function writeConsumerSources(
   await writeFile(
     probeEntry,
     [
-      "import { MediaError, probe } from '@aibrush/media';",
+      "import { probe } from '@aibrush/media';",
       '',
-      'try {',
-      '  await probe(new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));',
-      '} catch (error) {',
-      '  if (!(error instanceof MediaError)) throw error;',
-      '  console.info(error.code);',
+      'export async function run(bytes: Uint8Array): Promise<number> {',
+      '  const input = new Blob([bytes.slice().buffer], { type: "video/mp4" });',
+      '  const info = await probe(input);',
+      '  if (info.tracks.length === 0) throw new Error("MP4 probe returned no tracks");',
+      '  return info.tracks.length;',
+      '}',
+      '',
+    ].join('\n'),
+  );
+
+  await writeFile(
+    remuxEntry,
+    [
+      "import { remux } from '@aibrush/media';",
+      '',
+      'export async function run(bytes: Uint8Array): Promise<number> {',
+      '  const input = new Blob([bytes.slice().buffer], { type: "video/mp4" });',
+      '  const output = await remux(input, { to: "mp4" });',
+      '  if (!(output instanceof Blob)) throw new Error("default MP4 remux did not return a Blob");',
+      '  const result = await output.arrayBuffer();',
+      '  if (result.byteLength === 0) throw new Error("default MP4 remux returned an empty Blob");',
+      '  return result.byteLength;',
       '}',
       '',
     ].join('\n'),
@@ -612,7 +670,7 @@ async function writeConsumerSources(
     )}\n`,
   );
 
-  return { probeEntry, typecheckConfig, runtimeProbe };
+  return { probeEntry, remuxEntry, typecheckConfig, runtimeProbe };
 }
 
 function runTypecheck(typecheckConfig: string, appDir: string): void {
@@ -623,44 +681,47 @@ function runRuntimeImport(runtimeProbe: string, appDir: string): void {
   runCommand(BUN, [runtimeProbe], appDir);
 }
 
-async function measureProbeBundle(probeEntry: string, outDir: string): Promise<BundleReport> {
+async function buildConsumerBundle(entry: string, outDir: string): Promise<ConsumerBundleGraph> {
   await rm(outDir, { recursive: true, force: true });
   await mkdir(outDir, { recursive: true });
   const result = await Bun.build({
-    entrypoints: [probeEntry],
+    entrypoints: [entry],
     outdir: outDir,
     target: 'browser',
     format: 'esm',
     splitting: true,
     minify: true,
     sourcemap: 'none',
+    metafile: true,
   });
   assertCondition(
     result.success,
     'bundle',
-    'probe-only consumer browser bundle failed',
+    `${basename(entry)} consumer browser bundle failed`,
     result.logs.map((log) => String(log)),
   );
+  assertCondition(result.metafile !== undefined, 'bundle', 'consumer build emitted no metafile');
 
   const files = await collectFiles(outDir);
   const jsFiles = files.filter((file) => file.endsWith('.js')).sort();
   const wasmFiles = files.filter((file) => file.endsWith('.wasm')).sort();
   const assetFiles = files.filter((file) => !file.endsWith('.js')).sort();
-  assertCondition(jsFiles.length > 0, 'bundle', 'probe-only bundle emitted no JavaScript');
+  assertCondition(jsFiles.length > 0, 'bundle', `${basename(entry)} emitted no JavaScript`);
   assertCondition(
     wasmFiles.length === 0,
     'bundle',
-    `probe-only installed bundle emitted WASM assets: ${wasmFiles.join(', ')}`,
+    `${basename(entry)} installed bundle emitted WASM assets: ${wasmFiles.join(', ')}`,
     wasmFiles,
   );
-
-  const entryFile = 'probe-only.js';
   assertCondition(
-    jsFiles.includes(entryFile),
+    assetFiles.length === 0,
     'bundle',
-    'probe-only entry file was not emitted',
-    jsFiles,
+    `${basename(entry)} native route bundle emitted non-JS assets: ${assetFiles.join(', ')}`,
+    assetFiles,
   );
+
+  const entryFile = `${basename(entry, '.ts')}.js`;
+  assertCondition(jsFiles.includes(entryFile), 'bundle', `${entryFile} was not emitted`, jsFiles);
   const jsText = new Map<string, string>();
   const jsSizes = new Map<string, number>();
   for (const file of jsFiles) {
@@ -668,30 +729,338 @@ async function measureProbeBundle(probeEntry: string, outDir: string): Promise<B
     jsText.set(file, await Bun.file(path).text());
     jsSizes.set(file, (await stat(path)).size);
   }
-  const eagerClosure = staticClosure(entryFile, jsText, jsSizes);
+  return {
+    outDir,
+    entryFile,
+    jsFiles,
+    wasmFiles,
+    assetFiles,
+    jsText,
+    jsSizes,
+    metafile: result.metafile,
+  };
+}
+
+function outputRelativeFile(graph: ConsumerBundleGraph, outputPath: string): string | undefined {
+  const candidate = relative(graph.outDir, resolve(outputPath)).replaceAll('\\', '/');
+  if (graph.jsFiles.includes(candidate)) return candidate;
+  const normalized = outputPath.replaceAll('\\', '/');
+  return graph.jsFiles.find((file) => normalized === file || normalized.endsWith(`/${file}`));
+}
+
+function requireEntryOutput(
+  graph: ConsumerBundleGraph,
+  label: string,
+  entryPointPattern: RegExp,
+): string {
+  const matches: string[] = [];
+  for (const [outputPath, output] of Object.entries(graph.metafile.outputs)) {
+    const entryPoint = output.entryPoint?.replaceAll('\\', '/');
+    if (entryPoint === undefined || !entryPointPattern.test(entryPoint)) continue;
+    const file = outputRelativeFile(graph, outputPath);
+    if (file !== undefined) matches.push(file);
+  }
+  const uniqueMatches = [...new Set(matches)].sort();
+  assertCondition(
+    uniqueMatches.length === 1,
+    'bundle',
+    `${label} expected one emitted entry chunk, found ${uniqueMatches.length}`,
+    { pattern: String(entryPointPattern), matches: uniqueMatches },
+  );
+  const match = uniqueMatches[0];
+  assertCondition(match !== undefined, 'bundle', `${label} emitted entry chunk disappeared`);
+  return match;
+}
+
+function unionStaticClosures(
+  seedFiles: readonly string[],
+  graph: ConsumerBundleGraph,
+): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const seed of seedFiles) {
+    for (const [file, size] of staticClosure(seed, graph.jsText, graph.jsSizes)) {
+      result.set(file, size);
+    }
+  }
+  return result;
+}
+
+function outputMetadata(
+  graph: ConsumerBundleGraph,
+  file: string,
+): Bun.BuildMetafile['outputs'][string] | undefined {
+  for (const [outputPath, output] of Object.entries(graph.metafile.outputs)) {
+    if (outputRelativeFile(graph, outputPath) === file) return output;
+  }
+  return undefined;
+}
+
+function assertNoRouteInputLeaks(
+  label: string,
+  files: ReadonlyMap<string, number>,
+  graph: ConsumerBundleGraph,
+  forbidden: RegExp,
+): void {
+  const leaks: string[] = [];
+  for (const file of files.keys()) {
+    const output = outputMetadata(graph, file);
+    assertCondition(output !== undefined, 'bundle', `metafile output is missing for ${file}`);
+    const sources = [output.entryPoint, ...Object.keys(output.inputs)].filter(
+      (source): source is string => source !== undefined,
+    );
+    for (const source of sources) {
+      const normalized = source.replaceAll('\\', '/');
+      if (forbidden.test(normalized)) leaks.push(`${normalized} via ${file}`);
+    }
+    const code = graph.jsText.get(file);
+    assertCondition(code !== undefined, 'bundle', `missing JS text for ${file}`);
+    if (/['"][^'"]+\.(?:wasm|bin|data|model|weights)(?:\?[^'"]*)?['"]/.test(code)) {
+      leaks.push(`codec asset reference via ${file}`);
+    }
+  }
+  assertCondition(
+    leaks.length === 0,
+    'bundle',
+    `${label} contains heavy route leaks`,
+    leaks.sort(),
+  );
+}
+
+function compressedRouteSizes(
+  files: ReadonlyMap<string, number>,
+  graph: ConsumerBundleGraph,
+): { readonly raw: number; readonly gzip: number; readonly brotli: number } {
+  let raw = 0;
+  let gzip = 0;
+  let brotli = 0;
+  for (const [file, size] of files) {
+    const code = graph.jsText.get(file);
+    assertCondition(code !== undefined, 'bundle', `missing JS text for ${file}`);
+    const bytes = new TextEncoder().encode(code);
+    raw += size;
+    gzip += gzipSync(bytes).byteLength;
+    brotli += brotliCompressSync(bytes).byteLength;
+  }
+  return { raw, gzip, brotli };
+}
+
+function assertTypicalRouteBudget(
+  label: string,
+  bytes: number,
+  files: ReadonlyMap<string, number>,
+) {
+  assertCondition(
+    bytes <= TYPICAL_APP_BUDGET,
+    'bundle',
+    `${label} ${fmt(bytes)} exceeds ${fmt(TYPICAL_APP_BUDGET)}`,
+    fileDetails(files),
+  );
+  const margin = TYPICAL_APP_BUDGET - bytes;
+  if (margin < MIN_BUDGET_MARGIN) {
+    console.warn(
+      `verify-package-install: ${label} has only ${fmt(
+        margin,
+      )} architecture headroom (recommended ${fmt(MIN_BUDGET_MARGIN)})`,
+    );
+  }
+}
+
+async function executePrunedRoute(
+  graph: ConsumerBundleGraph,
+  routeFiles: ReadonlyMap<string, number>,
+  fixturePath: string,
+): Promise<void> {
+  for (const file of graph.jsFiles) {
+    if (!routeFiles.has(file)) await rm(join(graph.outDir, file), { force: true });
+  }
+  for (const file of graph.assetFiles) await rm(join(graph.outDir, file), { force: true });
+  const runner = join(graph.outDir, 'verify-route.mjs');
+  const entryUrl = pathToFileURL(join(graph.outDir, graph.entryFile)).href;
+  await writeFile(
+    runner,
+    [
+      `import { run } from ${JSON.stringify(entryUrl)};`,
+      `const bytes = new Uint8Array(await Bun.file(${JSON.stringify(fixturePath)}).arrayBuffer());`,
+      'const result = await run(bytes);',
+      'if (!Number.isSafeInteger(result) || result <= 0) throw new Error(`invalid route result ${result}`);',
+      '',
+    ].join('\n'),
+  );
+  runCommand(BUN, [runner], graph.outDir);
+}
+
+function routeReport(
+  route: RouteBundleReport['route'],
+  seedFiles: readonly string[],
+  files: ReadonlyMap<string, number>,
+  graph: ConsumerBundleGraph,
+): RouteBundleReport {
+  const compressed = compressedRouteSizes(files, graph);
+  const workerFiles = [...files.keys()].filter((file) =>
+    /(?:^|\/)worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*\.js$/.test(file),
+  );
+  assertCondition(
+    workerFiles.length === 0,
+    'bundle',
+    `${route} contains worker JavaScript`,
+    workerFiles,
+  );
+  assertTypicalRouteBudget(route, compressed.raw, files);
+  return {
+    entryFile: graph.entryFile,
+    route,
+    budgetBytes: TYPICAL_APP_BUDGET,
+    rawBytes: compressed.raw,
+    gzipBytes: compressed.gzip,
+    brotliBytes: compressed.brotli,
+    marginBytes: TYPICAL_APP_BUDGET - compressed.raw,
+    workerJsBytes: 0,
+    wasmBytes: 0,
+    codecDataBytes: 0,
+    seedFiles,
+    jsFiles: fileDetails(files),
+    runtimeCompletenessChecked: true,
+  };
+}
+
+async function measureConsumerBundles(
+  probeEntry: string,
+  remuxEntry: string,
+  outRoot: string,
+): Promise<BundleReport> {
+  const probeGraph = await buildConsumerBundle(probeEntry, join(outRoot, 'probe'));
+  const remuxGraph = await buildConsumerBundle(remuxEntry, join(outRoot, 'remux'));
+
+  const probeSeeds = [
+    probeGraph.entryFile,
+    requireEntryOutput(probeGraph, 'probe runner', /\/dist\/probe-runner(?:-[^/]+)?\.js$/),
+    requireEntryOutput(
+      probeGraph,
+      'probe range cache',
+      /\/dist\/probe-range-cache(?:-[^/]+)?\.js$/,
+    ),
+    requireEntryOutput(
+      probeGraph,
+      'query-selective container registration',
+      /\/dist\/default-container-registration(?:-[^/]+)?\.js$/,
+    ),
+    requireEntryOutput(
+      probeGraph,
+      'query-selective MP4 lazy driver',
+      /\/dist\/mp4-lazy-driver(?:-[^/]+)?\.js$/,
+    ),
+    requireEntryOutput(
+      probeGraph,
+      'lightweight MP4 probe',
+      /\/dist\/mp4-lazy-probe(?:-[^/]+)?\.js$/,
+    ),
+  ];
+  const fullProbeFallback = requireEntryOutput(
+    probeGraph,
+    'full MP4 fallback',
+    /\/dist\/drivers\/mp4\.js$/,
+  );
+  const typicalMp4ProbeFiles = unionStaticClosures(probeSeeds, probeGraph);
+  assertCondition(
+    !typicalMp4ProbeFiles.has(fullProbeFallback),
+    'bundle',
+    'finite faststart MP4 probe route includes the full MP4 fallback',
+    fileDetails(typicalMp4ProbeFiles),
+  );
+  assertNoRouteInputLeaks(
+    'finite faststart MP4 probe route',
+    typicalMp4ProbeFiles,
+    probeGraph,
+    /\/dist\/(?:defaults|drivers\/mp4|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|materialize|mux-packet-streams|mux-runner|preload|remux-runner|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
+  );
+
+  const remuxSeeds = [
+    remuxGraph.entryFile,
+    requireEntryOutput(remuxGraph, 'remux runner', /\/dist\/remux-runner(?:-[^/]+)?\.js$/),
+    requireEntryOutput(
+      remuxGraph,
+      'query-selective container registration',
+      /\/dist\/default-container-registration(?:-[^/]+)?\.js$/,
+    ),
+    requireEntryOutput(
+      remuxGraph,
+      'query-selective MP4 lazy driver',
+      /\/dist\/mp4-lazy-driver(?:-[^/]+)?\.js$/,
+    ),
+    requireEntryOutput(remuxGraph, 'MP4 driver', /\/dist\/drivers\/mp4\.js$/),
+    requireEntryOutput(
+      remuxGraph,
+      'default Blob materializer',
+      /\/dist\/materialize(?:-[^/]+)?\.js$/,
+    ),
+  ];
+  const typicalMp4RemuxFiles = unionStaticClosures(remuxSeeds, remuxGraph);
+  assertNoRouteInputLeaks(
+    'default Blob MP4 remux route',
+    typicalMp4RemuxFiles,
+    remuxGraph,
+    /\/dist\/(?:defaults|drivers\/(?:webm|wav|mp3|ogg|adts|aiff|caf|mpegts|avi|flac)|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|mux-packet-streams|mux-runner|preload|probe-runner|remux-metadata|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
+  );
+
+  const typicalMp4Probe = routeReport(
+    'finite-faststart-mp4-probe',
+    probeSeeds,
+    typicalMp4ProbeFiles,
+    probeGraph,
+  );
+  const typicalMp4Remux = routeReport(
+    'default-blob-mp4-remux',
+    remuxSeeds,
+    typicalMp4RemuxFiles,
+    remuxGraph,
+  );
+
+  const fixturePath = join(ROOT, 'fixtures/media/movie_5.mp4');
+  await assertFile(fixturePath, 'representative faststart MP4 fixture is missing');
+  await executePrunedRoute(probeGraph, typicalMp4ProbeFiles, fixturePath);
+  await executePrunedRoute(remuxGraph, typicalMp4RemuxFiles, fixturePath);
+
+  const eagerClosure = staticClosure(probeGraph.entryFile, probeGraph.jsText, probeGraph.jsSizes);
+  const eagerCompressed = compressedRouteSizes(eagerClosure, probeGraph);
+  const eagerWorkerFiles = [...eagerClosure.keys()].filter((file) =>
+    /(?:^|\/)worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*\.js$/.test(file),
+  );
+  assertCondition(
+    eagerWorkerFiles.length === 0,
+    'bundle',
+    'probe-only eager closure contains worker JavaScript',
+    eagerWorkerFiles,
+  );
   const eagerJsBytes = [...eagerClosure.values()].reduce((sum, size) => sum + size, 0);
-  const emittedJsBytes = [...jsSizes.values()].reduce((sum, size) => sum + size, 0);
+  const emittedJsBytes = [...probeGraph.jsSizes.values()].reduce((sum, size) => sum + size, 0);
   const eagerJsFiles = fileDetails(eagerClosure);
-  const emittedJsFileDetails = fileDetails(jsSizes);
+  const emittedJsFileDetails = fileDetails(probeGraph.jsSizes);
   assertCondition(
     eagerJsBytes <= EAGER_KERNEL_BUDGET,
     'bundle',
-    `probe-only eager JS closure ${(eagerJsBytes / 1024).toFixed(2)} kB exceeds 50.00 kB`,
-    [...eagerClosure.keys()].sort(),
+    `probe-only eager JS closure ${fmt(eagerJsBytes)} exceeds ${fmt(EAGER_KERNEL_BUDGET)}`,
+    eagerJsFiles,
   );
 
   return {
-    entryFile,
+    entryFile: probeGraph.entryFile,
     eagerBudgetBytes: EAGER_KERNEL_BUDGET,
     eagerJsBytes,
+    eagerGzipBytes: eagerCompressed.gzip,
+    eagerBrotliBytes: eagerCompressed.brotli,
     eagerMarginBytes: EAGER_KERNEL_BUDGET - eagerJsBytes,
+    eagerWorkerJsBytes: 0,
+    eagerWasmBytes: 0,
+    eagerCodecDataBytes: 0,
     emittedJsBytes,
     lazyJsBytes: emittedJsBytes - eagerJsBytes,
     eagerJsFiles,
-    emittedJsFiles: jsFiles,
+    emittedJsFiles: probeGraph.jsFiles,
     emittedJsFileDetails,
-    emittedWasmFiles: wasmFiles,
-    emittedAssetFiles: assetFiles,
+    emittedWasmFiles: probeGraph.wasmFiles,
+    emittedAssetFiles: probeGraph.assetFiles,
+    typicalMp4Probe,
+    typicalMp4Remux,
   };
 }
 
@@ -728,28 +1097,21 @@ function staticClosure(
     const size = jsSizes.get(file);
     assertCondition(code !== undefined && size !== undefined, 'bundle', `missing JS chunk ${file}`);
     closure.set(file, size);
-    for (const spec of staticLocalJsImports(code)) queue.push(spec);
+    for (const spec of staticLocalJsImports(code)) {
+      const target = resolveLocalJsImport(file, spec);
+      assertCondition(
+        !target.startsWith('../'),
+        'bundle',
+        `${file} imports outside bundle: ${spec}`,
+      );
+      queue.push(target);
+    }
   }
   return closure;
 }
 
-function staticLocalJsImports(code: string): string[] {
-  const specs: string[] = [];
-  const fromRe = /(?:^|[\s;])(?:import|export)\b[^'"]*?\bfrom\s*['"](\.\/[^'"]+\.js)['"]/g;
-  for (const match of code.matchAll(fromRe)) {
-    const spec = match[1];
-    if (spec !== undefined) specs.push(spec.replace(/^\.\//, ''));
-  }
-  const bareRe = /(?:^|[\s;])import\s*['"](\.\/[^'"]+\.js)['"]/g;
-  for (const match of code.matchAll(bareRe)) {
-    const spec = match[1];
-    if (spec !== undefined) specs.push(spec.replace(/^\.\//, ''));
-  }
-  return [...new Set(specs)].sort();
-}
-
 function fmt(bytes: number): string {
-  return `${(bytes / 1024).toFixed(2)} kB`;
+  return `${(bytes / 1024).toFixed(2)} KiB`;
 }
 
 function errorMessage(error: unknown): string {
@@ -776,7 +1138,7 @@ async function main(): Promise<void> {
     const packDir = join(tmpRoot, 'pack');
     const appDir = join(tmpRoot, 'app');
     const cacheDir = join(tmpRoot, 'npm-cache');
-    const bundleDir = join(tmpRoot, 'probe-bundle');
+    const bundleDir = join(tmpRoot, 'consumer-bundles');
     await mkdir(packDir, { recursive: true });
     await mkdir(appDir, { recursive: true });
     await mkdir(cacheDir, { recursive: true });
@@ -796,7 +1158,7 @@ async function main(): Promise<void> {
     const sources = await writeConsumerSources(appDir, pkg.concreteDriverSubpath);
     runTypecheck(sources.typecheckConfig, appDir);
     runRuntimeImport(sources.runtimeProbe, appDir);
-    const bundle = await measureProbeBundle(sources.probeEntry, bundleDir);
+    const bundle = await measureConsumerBundles(sources.probeEntry, sources.remuxEntry, bundleDir);
 
     const report: VerificationReport = {
       packageName: pkg.name,
@@ -845,10 +1207,27 @@ async function main(): Promise<void> {
     console.info(
       `verify-package-install: probe-only eager JS ${fmt(bundle.eagerJsBytes)} / ${fmt(
         bundle.eagerBudgetBytes,
-      )} (margin ${fmt(bundle.eagerMarginBytes)}); emitted JS ${fmt(
+      )} (margin ${fmt(bundle.eagerMarginBytes)}); gzip ${fmt(
+        bundle.eagerGzipBytes,
+      )}; Brotli ${fmt(bundle.eagerBrotliBytes)}; emitted JS ${fmt(
         bundle.emittedJsBytes,
-      )} including lazy ${fmt(bundle.lazyJsBytes)}; emitted WASM ${bundle.emittedWasmFiles.length}`,
+      )} including lazy ${fmt(bundle.lazyJsBytes)}; eager worker/WASM/codec data 0/0/0 bytes`,
     );
+    for (const route of [bundle.typicalMp4Probe, bundle.typicalMp4Remux]) {
+      console.info(
+        `verify-package-install: ${route.route} JS raw ${fmt(route.rawBytes)} / ${fmt(
+          route.budgetBytes,
+        )} (margin ${fmt(route.marginBytes)}); gzip ${fmt(route.gzipBytes)}; Brotli ${fmt(
+          route.brotliBytes,
+        )}; worker/WASM/codec data ${route.workerJsBytes}/${route.wasmBytes}/${
+          route.codecDataBytes
+        } bytes`,
+      );
+      console.info(`verify-package-install: ${route.route} seeds ${route.seedFiles.join(', ')}`);
+      for (const file of route.jsFiles.slice(0, 12)) {
+        console.info(`  ${fmt(file.size).padStart(10)}  ${file.file}`);
+      }
+    }
     for (const warning of report.warnings)
       console.warn(`verify-package-install: warning: ${warning}`);
     console.info(

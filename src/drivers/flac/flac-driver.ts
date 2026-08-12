@@ -40,6 +40,7 @@ import {
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio, SampleFormat } from '../../dsp/index.ts';
+import { packetStatsFromRows } from '../../internal/packet-stats.ts';
 import { OggMuxer } from '../ogg/ogg-write.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
 import { writeWav } from '../wav/pcm.ts';
@@ -714,6 +715,7 @@ export const FlacDriver: ContainerDriver = {
     const signal = o?.signal;
     return {
       tracks: [track],
+      packetStats: (trackId) => (trackId === 0 ? packetStatsFromRows(frames) : undefined),
       packets(trackId: number): ReadableStream<Packet> {
         if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(frames, signal);

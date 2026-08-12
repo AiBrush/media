@@ -31,6 +31,7 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import type { PcmAudio } from '../../dsp/index.ts';
 import { audioDataToPcm } from '../../filters/audio-dsp.ts';
 import { registerNativePacketSource } from '../../internal/packet-provenance.ts';
+import { packetStatsFromRows } from '../../internal/packet-stats.ts';
 import { fromURL } from '../../sources/source.ts';
 import { matchesAdts } from '../audio-container-sniff.ts';
 import { applyPcmTransform } from '../pcm-transform.ts';
@@ -803,6 +804,7 @@ export const AdtsDriver = {
     const track = trackInfoFromLayout(layout);
     return {
       tracks: [track],
+      packetStats: (trackId) => (trackId === 0 ? packetStatsFromRows(layout.frames) : undefined),
       packets(trackId: number): ReadableStream<Packet> {
         if (trackId !== 0) throw new MediaError('demux-error', `no track ${trackId}`);
         return packetStream(bytes, layout.frames, track, signal);

@@ -162,7 +162,9 @@ interface DecryptOptions {
 `DecodeOptions` extends `CallOptions` with `trackSelect?: readonly string[]`.
 
 `PacketInfoCallOptions` extends `CallOptions` with `container?: Container`.
-`PacketInfoBatchCallOptions` also accepts `batchSize?: number`.
+`PacketInfoBatchCallOptions` also accepts `batchSize?: number` and
+`includePayloadDigests?: boolean`. Digest-enabled rows carry `payloadDigest`, the SHA-256 of the exact
+coded packet payload; range-backed drivers retain bounded read windows while performing the full scan.
 
 ## Containers and codecs
 
@@ -237,6 +239,11 @@ interface MediaInfo {
 `MediaStreams` has optional `video: ReadableStream<VideoFrame>` and
 `audio: ReadableStream<AudioData>` members.
 
+The core driver `Demuxer` can additionally expose `packetStats(trackId)`. Its
+`PacketMetadataStats` result is constant-sized: packet count and total coded bytes plus exact
+presentation bounds. Exact decode bounds are optional and must be supplied as a pair. Drivers must
+compute this summary without materializing one packet-row object per packet.
+
 `PacketInfoTable` contains `tracks` and materialized `packets`. Each packet row reports a track index,
 size, PTS, DTS, keyframe flag, and optional offset/duration. `PacketInfoBatchStream` exposes the same
 tracks, an async iterator of packet-row batches, and `cancel()`.
@@ -251,6 +258,18 @@ tracks, an async iterator of packet-row batches, and `cancel()`.
 - terminals: `run`, `blob`, `file`, `stream`.
 
 No work starts before a terminal method.
+
+## Prepared MP4 packet authoring
+
+The root and core entries export `muxPreparedMp4PacketTrack`, `muxPreparedMp4PacketTracks`, and
+`muxPreparedMp4PacketTracksStream` for callers that already own validated encoded packets and track
+descriptors. `muxPreparedSparseMp4PacketTrack` authors a progressive MP4 whose virtual extent is larger
+than one JavaScript buffer. Its `SparseMp4WriteTarget` receives `setSize()` followed by positioned
+`write()` calls, so holes are never allocated in memory.
+
+Sparse `fileSize` and `sampleOffsets` accept `bigint` or unsigned decimal strings. Every value must fit
+an unsigned 64-bit integer, every sample must lie inside the declared file extent, and the target is not
+mutated when validation fails.
 
 ## Public constants and errors
 

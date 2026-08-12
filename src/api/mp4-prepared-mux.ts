@@ -14,6 +14,7 @@ import {
   streamMp4PacketTracks,
   writeMp4PacketTracks,
 } from '../drivers/mp4/prepared-stream.ts';
+import { type SparseMp4WriteTarget, writeSparseMp4 } from '../drivers/mp4/write.ts';
 import type { NativePacketChunk } from '../internal/packet-provenance.ts';
 import { type CachingSource, cacheSource } from '../sources/cache.ts';
 import { fromBytes, fromURL } from '../sources/source.ts';
@@ -21,6 +22,7 @@ import type { Container } from './types.ts';
 
 const MP4_PACKET_INFO_URL_PRIME_BYTES = 32 * 1024;
 const MP4_PACKET_INFO_URL_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const UINT64_MAX = 0xffff_ffff_ffff_ffffn;
 type Mp4PacketInfoProvider = NonNullable<typeof Mp4Driver.packetInfo>;
 type Mp4PacketInfoUrlCacheModule = typeof import('./mp4-packet-info-url-cache.ts');
 let mp4PacketInfoUrlCacheModulePromise: Promise<Mp4PacketInfoUrlCacheModule> | undefined;
@@ -77,6 +79,17 @@ export interface PreparedMp4PacketTracksMuxInput {
   readonly container: Container | string;
   readonly faststart?: boolean;
   readonly fragmented?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface PreparedSparseMp4PacketTrackMuxInput {
+  readonly track: TrackInfo;
+  readonly packets: readonly (EncodedChunk | Packet)[];
+  readonly container: Container | string;
+  readonly target: SparseMp4WriteTarget;
+  readonly fileSize: bigint | string;
+  /** Absolute file offsets, one for each packet in `packets`. */
+  readonly sampleOffsets: readonly (bigint | string)[];
   readonly signal?: AbortSignal;
 }
 
@@ -185,6 +198,38 @@ export function muxPreparedMp4PacketTrack(input: PreparedMp4PacketMuxInput): Uin
   return muxPreparedMp4PacketTracks({
     ...input,
     tracks: [{ track: input.track, packets: input.packets }],
+  });
+}
+
+/**
+ * Author caller-supplied packets into a virtual >4 GiB progressive MP4. This driver-author seam is
+ * intentionally positioned: it emits bounded metadata and real sample bytes to an abstract sparse
+ * target, leaving holes unallocated while exercising the same packet-to-sample-table conversion as
+ * the ordinary prepared mux.
+ */
+export function muxPreparedSparseMp4PacketTrack(
+  input: PreparedSparseMp4PacketTrackMuxInput,
+): Uint8Array {
+  assertPreparedMp4MuxInput(
+    { tracks: [{ track: input.track, packets: input.packets }], container: input.container },
+    'mux',
+  );
+  assertNotAborted(input.signal);
+  if (input.sampleOffsets.length !== input.packets.length) {
+    throw new InputError('sparse MP4 mux requires one absolute offset per packet');
+  }
+  const fileSize = unsignedDecimalBigInt(input.fileSize, 'fileSize');
+  const sampleOffsets = input.sampleOffsets.map((value, index) =>
+    unsignedDecimalBigInt(value, `sampleOffsets[${index}]`),
+  );
+  const packetTracks = packetTrackInputsFrom(
+    [{ track: input.track, packets: input.packets }],
+    input.signal,
+  );
+  return writeSparseMp4(mp4PacketMuxTracks(packetTracks), input.target, {
+    fileSize,
+    sampleOffsets: [sampleOffsets],
+    brand: input.container === 'mov' ? 'mov' : 'mp4',
   });
 }
 
@@ -430,4 +475,16 @@ function encodedChunkBytes(chunk: EncodedChunk): Uint8Array {
 
 function assertNotAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+}
+
+function unsignedDecimalBigInt(value: bigint | string, label: string): bigint {
+  if (typeof value === 'string' && !/^\d+$/.test(value)) {
+    throw new InputError(`sparse MP4 ${label} must be an unsigned decimal integer`);
+  }
+  const parsed = typeof value === 'bigint' ? value : BigInt(value);
+  if (parsed < 0n) throw new InputError(`sparse MP4 ${label} must be non-negative`);
+  if (parsed > UINT64_MAX) {
+    throw new InputError(`sparse MP4 ${label} must fit an unsigned 64-bit integer`);
+  }
+  return parsed;
 }

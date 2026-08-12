@@ -336,7 +336,7 @@ describe('parseTs — PAT/PMT/PES structural oracle on the committed slice', () 
     const parsed = parseTs(await bytesFromDerived(DERIVED_TS));
     const v = parsed.tracks[0]?.config as VideoDecoderConfig;
     const a = parsed.tracks[1]?.config as AudioDecoderConfig;
-    expect(v).toMatchObject({ codec: 'h264', codedWidth: 1280, codedHeight: 720 });
+    expect(v).toMatchObject({ codec: 'avc1.64001F', codedWidth: 1280, codedHeight: 720 });
     expect(a).toMatchObject({ codec: 'aac', sampleRate: 48000, numberOfChannels: 2 });
   });
 
@@ -625,6 +625,45 @@ describe('mux — H.264/AAC access units into MPEG-TS', () => {
     expect([...(audio?.units[0]?.data ?? new Uint8Array())]).toEqual([
       0x21, 0x10, 0x56, 0xe5, 0x00, 0x40,
     ]);
+  });
+
+  it('establishes the declared PCR clock before an earlier non-PCR media stream', async () => {
+    const muxer = new MpegTsMuxer({ writeChunkPackets: 1 });
+    const videoTrackId = muxer.addTrack(h264Track());
+    const audioTrackId = muxer.addTrack(aacTrack());
+    muxer.addChunkStruct(videoTrackId, {
+      data: Uint8Array.of(0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84),
+      timestampUs: 21_333,
+      dtsUs: 21_333,
+      durationUs: 33_333,
+      key: true,
+    });
+    muxer.addChunkStruct(audioTrackId, {
+      data: Uint8Array.of(0x21, 0x10, 0x56, 0xe5, 0x00, 0x40),
+      timestampUs: 0,
+      dtsUs: 0,
+      durationUs: 21_333,
+      key: true,
+    });
+
+    await muxer.finalize();
+    const bytes = await collectBytes(muxer.output);
+    const packet = (index: number): Uint8Array => bytes.subarray(index * 188, (index + 1) * 188);
+    const pid = (value: Uint8Array): number => (((value[1] ?? 0) & 0x1f) << 8) | (value[2] ?? 0);
+    const adaptationControl = (value: Uint8Array): number => ((value[3] ?? 0) >> 4) & 0x03;
+
+    expect(pid(packet(0))).toBe(0x0000);
+    expect(pid(packet(1))).toBe(0x0100);
+    expect(pid(packet(2))).toBe(0x0101);
+    expect(adaptationControl(packet(2))).toBe(0x02);
+    expect((packet(2)[5] ?? 0) & 0x10).toBe(0x10);
+    expect(pid(packet(3))).toBe(0x0102);
+    expect(adaptationControl(packet(3))).not.toBe(0x02);
+
+    const parsed = parseTs(bytes);
+    expect(parsed.tracks.map((track) => track.stream.codec)).toEqual(['h264', 'aac']);
+    expect(parsed.tracks[0]?.units).toHaveLength(1);
+    expect(parsed.tracks[1]?.units).toHaveLength(1);
   });
 
   it('streams the transport stream as packet-aligned incremental writes (target:writes), bytes identical', async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Packet, PacketInfoMetadata, TrackInfo } from '../contracts/driver.ts';
 import {
   type TimedFrameForTrim,
+  canUseMp4AacPacketInfoTrim,
   estimateTrackBitrateFromPacketInfo,
   planSeekVideoPacketInfoRows,
   planTrimAudioPacketInfoRows,
@@ -337,8 +338,8 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     const rows = planTrimAudioPacketInfoRows(packets, 1, { startUs: 15, endUs: 30 });
 
     expect(rows?.map((row) => [row.offset, row.size, row.timestampUs, row.dtsUs])).toEqual([
-      [2_020, 20, 0, 0],
-      [2_040, 20, 5, 4],
+      [2_020, 20, 1, 0],
+      [2_040, 20, 11, 10],
     ]);
     expect(rows?.map((row) => row.window)).toEqual([
       { start: 2_020, end: 2_060 },
@@ -346,7 +347,7 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     ]);
   });
 
-  it('assigns boundary-crossing packet-info audio rows to exactly one adjacent range', () => {
+  it('retains one shared boundary access unit for complementary adjacent MP4 edits', () => {
     const packets: PacketInfoMetadata[] = Array.from({ length: 5 }, (_value, index) => ({
       trackIndex: 0,
       offset: 100 + index * 10,
@@ -360,17 +361,12 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     const left = planTrimAudioPacketInfoRows(packets, 0, { startUs: 5, endUs: 25 });
     const right = planTrimAudioPacketInfoRows(packets, 0, { startUs: 25, endUs: 45 });
 
-    expect(direct?.map((row) => row.offset)).toEqual([100, 110, 120, 130]);
-    expect(left?.map((row) => row.offset)).toEqual([100, 110]);
-    expect(right?.map((row) => row.offset)).toEqual([120, 130]);
-    expect([...(left ?? []), ...(right ?? [])].map((row) => row.offset)).toEqual(
-      direct?.map((row) => row.offset),
-    );
-    expect(
-      [...(left ?? []), ...(right ?? [])].every(
-        (row, index) => row.timestampUs + row.durationUs <= (index < 2 ? 20 : 20),
-      ),
-    ).toBe(true);
+    expect(direct?.map((row) => row.offset)).toEqual([100, 110, 120, 130, 140]);
+    expect(left?.map((row) => row.offset)).toEqual([100, 110, 120]);
+    expect(right?.map((row) => row.offset)).toEqual([120, 130, 140]);
+    expect(left?.at(-1)?.offset).toBe(right?.[0]?.offset);
+    expect(left?.map((row) => row.timestampUs)).toEqual([0, 10, 20]);
+    expect(right?.map((row) => row.timestampUs)).toEqual([0, 10, 20]);
   });
 
   it('keeps the covering audio access unit when the trim is shorter than one packet', () => {
@@ -758,7 +754,7 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
     }
   });
 
-  it('strips source gapless metadata from packet-info audio subclips', () => {
+  it('replaces source gapless metadata with the exact MP4 AAC subclip edit window', () => {
     const sourceTrack: TrackInfo = {
       id: 1,
       mediaType: 'audio',
@@ -768,15 +764,57 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
       gapless: { leadingSamples: 1024, trailingSamples: 0, totalSamples: 5_760_000 },
     };
 
+    const rows = Array.from({ length: 142 }, (_value, index) => {
+      const sourceTimestampUs = 1_984_000 + Math.round((index * 1024 * 1_000_000) / 48_000);
+      return {
+        offset: 1_000 + index,
+        size: 1,
+        sourceTimestampUs,
+        sourceDtsUs: sourceTimestampUs,
+        timestampUs: Math.round((index * 1024 * 1_000_000) / 48_000),
+        dtsUs: Math.round((index * 1024 * 1_000_000) / 48_000),
+        durationUs: 21_333,
+        window: undefined,
+      };
+    });
+
+    expect(trimAudioPacketInfoTrack(sourceTrack, { startUs: 2_000_000, endUs: 5_000_000 })).toEqual(
+      {
+        id: 1,
+        mediaType: 'audio',
+        codec: 'mp4a.40.2',
+        durationSec: 3,
+        config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+      },
+    );
     expect(
-      trimAudioPacketInfoTrack(sourceTrack, { startUs: 60_000_000, endUs: 66_000_000 }),
+      trimAudioPacketInfoTrack(sourceTrack, { startUs: 2_000_000, endUs: 5_000_000 }, rows, 'mp4'),
     ).toEqual({
       id: 1,
       mediaType: 'audio',
       codec: 'mp4a.40.2',
-      durationSec: 6,
+      durationSec: 3,
       config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+      gapless: {
+        basis: 'mp4-edit-list',
+        leadingSamples: 768,
+        trailingSamples: 640,
+        totalSamples: 144_000,
+      },
     });
+    expect(canUseMp4AacPacketInfoTrim(sourceTrack, 'mov')).toBe(true);
+    expect(canUseMp4AacPacketInfoTrim(sourceTrack, 'webm')).toBe(false);
+
+    const opusTrack: TrackInfo = {
+      ...sourceTrack,
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    };
+    expect(canUseMp4AacPacketInfoTrim(opusTrack, 'mp4')).toBe(false);
+    expect(
+      trimAudioPacketInfoTrack(opusTrack, { startUs: 2_000_000, endUs: 5_000_000 }, rows, 'mp4')
+        .gapless,
+    ).toBeUndefined();
   });
 
   it('closes preroll/end-boundary source frames, stops at end, and rebases kept frames', async () => {

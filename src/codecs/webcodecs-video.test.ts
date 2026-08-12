@@ -716,6 +716,29 @@ async function runFakeSeek(
 const POOL_H264: VideoDecoderConfig = { codec: 'avc1.640028', codedWidth: 64, codedHeight: 64 };
 
 describe('createWarmVideoDecoderPool — reuse a configured decoder across sequential same-config seeks', () => {
+  it('drops a mid-GOP delta prefix and begins decoding at the first key chunk on every borrow', async () => {
+    const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
+    const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));
+    const chunks = [
+      new PoolFakeChunk(0, 'delta'),
+      new PoolFakeChunk(1_000, 'delta'),
+      new PoolFakeChunk(2_000, 'key'),
+      new PoolFakeChunk(3_000, 'delta'),
+    ];
+
+    const first = await runFakeSeek(pool.borrow(POOL_H264, undefined), chunks, 9_999);
+    expect(first.timestamp).toBe(3_000);
+    first.close();
+    expect(state.frames.map((frame) => frame.timestamp)).toEqual([2_000, 3_000]);
+
+    const second = await runFakeSeek(pool.borrow(POOL_H264, undefined), chunks, 9_999);
+    expect(second.timestamp).toBe(3_000);
+    second.close();
+    expect(state.frames.map((frame) => frame.timestamp)).toEqual([2_000, 3_000, 2_000, 3_000]);
+    expect(state.builds).toBe(1);
+    for (const frame of state.frames) expect(frame.closeCount).toBe(1);
+  });
+
   it('builds ONE decoder and reuses it across many same-config seeks (warm, never closed between them)', async () => {
     const state: FakePoolState = { builds: 0, closes: 0, frames: [], failAt: undefined };
     const pool = createWarmVideoDecoderPool(fakeWarmFactory(state));

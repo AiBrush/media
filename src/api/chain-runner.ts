@@ -1,5 +1,5 @@
 import { InputError } from '../contracts/errors.ts';
-import { runCancellable } from '../kernel/executor.ts';
+import { runCancellable } from '../kernel/executor-cancellable.ts';
 import type { Sink } from '../sinks/sink.ts';
 import { toBlob, toFile, toStream } from '../sinks/sink.ts';
 import type { MediaInput } from '../sources/source.ts';

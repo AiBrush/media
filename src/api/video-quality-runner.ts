@@ -1,10 +1,11 @@
 /**
  * Replay-backed H.264 preferred-rate / hard-rate / objective-quality orchestration.
  *
- * A fixed-QP analysis pass supplies the ordinary complexity schedule. Up to three private candidates
- * are then encoded and measured. Candidate access units remain in a compressed, hard-ceiling-bounded
- * spool; neither a muxer nor a caller sink sees bytes until both the exact elementary-stream byte check
- * and the decoded `ssim-luma-v1` check pass.
+ * A fixed-QP analysis pass supplies the ordinary complexity schedule. Up to three scheduled candidates
+ * are encoded first; when integer-QP allocation cannot meet the quality floor, up to three native
+ * variable-rate candidates are calibrated from exact measured payload. Candidate access units remain in
+ * a compressed, hard-ceiling-bounded spool; neither a muxer nor a caller sink sees bytes until both the
+ * exact elementary-stream byte check and the decoded `ssim-luma-v1` check pass.
  */
 
 import type { VideoEncoderStageOptions } from '../codecs/webcodecs-video.ts';
@@ -43,6 +44,7 @@ import {
   type H264TwoPassRunnerContext,
   analyzeH264TwoPass,
   decodeH264ReplayVideo,
+  implicitRateControlWarmupFrames,
   installH264TwoPassQuantizer,
   sourceGeometryOf,
 } from './video-two-pass-runner.ts';
@@ -53,8 +55,32 @@ import {
 } from './video-two-pass.ts';
 
 const MAXIMUM_CANDIDATE_PASSES = 3;
+const MAXIMUM_NATIVE_RATE_PASSES = 3;
+/** Bound a malfunctioning native controller request independently of the exact audited output cap. */
+const MAXIMUM_NATIVE_RATE_REQUEST_MULTIPLIER = 4;
 const MICROS_PER_SECOND = 1_000_000;
 const BITS_PER_BYTE = 8;
+
+export function nextNativeRateRequest(
+  currentRequest: number,
+  actualBytes: number,
+  maximumBytes: number,
+  qualityMean: number | undefined,
+  minimumQualityMean: number,
+): number {
+  const rateScale = maximumBytes / actualBytes;
+  if (actualBytes > maximumBytes || qualityMean === undefined) {
+    return Math.round(currentRequest * rateScale);
+  }
+  // Near one, `1 - SSIM` is a useful bounded distortion proxy. If the candidate uses the byte budget
+  // but misses quality, grow the controller request by the measured/allowed distortion ratio instead
+  // of making a negligible payload-only adjustment. The mux audit, not this input hint, remains the
+  // output-rate authority.
+  const allowedDistortion = Math.max(Number.EPSILON, 1 - minimumQualityMean);
+  const measuredDistortion = Math.max(0, 1 - qualityMean);
+  const qualityScale = measuredDistortion / allowedDistortion;
+  return Math.round(currentRequest * Math.max(rateScale, qualityScale));
+}
 
 export interface H264QualityOutputRoute {
   /** The exact already-routed driver object that will instantiate the eventual public muxer. */
@@ -194,16 +220,25 @@ async function openPreparedReplay(
       ...(target.bitDepth !== undefined ? { targetBitDepth: target.bitDepth } : {}),
       ...(pixelPathBitDepth !== undefined ? { pixelPathBitDepth } : {}),
     });
-    prepared = bitDepthPlan.requiresPixelPath
-      ? filtered.pipeThrough(
-          (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
-        )
-      : filtered;
+    prepared = filtered;
+    if (bitDepthPlan.kind === 'downconvert' && bitDepthPlan.requiresPixelPath) {
+      prepared = prepared.pipeThrough(
+        (await import('./video-frame-convert.ts')).canvasBackedVideoFrameStream(),
+      );
+    }
     if (colorIntent !== undefined) {
       prepared = prepared.pipeThrough(
         (await import('./video-frame-convert.ts')).destinationColorI420FrameStream(
           colorIntent,
           false,
+        ),
+      );
+    }
+    if (bitDepthPlan.kind === 'encoder-widen') {
+      prepared = prepared.pipeThrough(
+        (await import('./video-frame-convert.ts')).widenedI420VideoFrameStream(
+          bitDepthPlan.sourceBitDepth,
+          bitDepthPlan.targetBitDepth,
         ),
       );
     }
@@ -257,6 +292,7 @@ async function encodeCandidate(
   options: CallOptions,
   fragmented: boolean,
   context: H264TwoPassRunnerContext,
+  nativeBitrate?: number,
 ): Promise<EncodedCandidate> {
   const replay = await openPreparedReplay(src, container, target, signal, options, context);
   let encoded: ReadableStream<EncodedChunk> | undefined;
@@ -264,28 +300,37 @@ async function encodeCandidate(
     const { encodeQueryFor, periodicVideoKeyFrameInterval, requireEncoderConfig } = await import(
       './codec-pipeline.ts'
     );
-    const encoder: CodecDriver = await context.routeCodec(
-      encodeQueryFor(replay.encoderConfig),
-      options,
-    );
+    const encoderConfig: VideoEncoderConfig =
+      nativeBitrate === undefined
+        ? replay.encoderConfig
+        : { ...replay.encoderConfig, bitrate: nativeBitrate, bitrateMode: 'variable' };
+    const encoder: CodecDriver = await context.routeCodec(encodeQueryFor(encoderConfig), options);
     let decoderConfig: VideoDecoderConfig | undefined;
     const keyFrameInterval = periodicVideoKeyFrameInterval(target.fps, fragmented);
-    const installation = installH264TwoPassQuantizer(
-      {
-        ...context.stageOptions(signal, options),
-        onDecoderConfig: (value) => {
-          decoderConfig = value;
-        },
-        ...(keyFrameInterval === undefined ? {} : { keyFrameInterval }),
-      } satisfies VideoEncoderStageOptions,
-      plan,
-    );
+    const rateControlWarmupFrames =
+      nativeBitrate === undefined
+        ? undefined
+        : implicitRateControlWarmupFrames(
+            { bitrate: nativeBitrate },
+            encoderConfig.codec,
+            encoderConfig.framerate,
+          );
+    const baseStage = {
+      ...context.stageOptions(signal, options),
+      onDecoderConfig: (value) => {
+        decoderConfig = value;
+      },
+      ...(keyFrameInterval === undefined ? {} : { keyFrameInterval }),
+      ...(rateControlWarmupFrames === undefined ? {} : { rateControlWarmupFrames }),
+    } satisfies VideoEncoderStageOptions;
+    const installation =
+      nativeBitrate === undefined ? installH264TwoPassQuantizer(baseStage, plan) : undefined;
     const samples: H264FirstPassSample[] = [];
     encoded = replay.frames
-      .pipeThrough(encoder.createEncoder(replay.encoderConfig, installation.stage))
+      .pipeThrough(encoder.createEncoder(encoderConfig, installation?.stage ?? baseStage))
       .pipeThrough(tapCandidateSamples(samples));
     const spool = await collectBoundedCandidateChunks(encoded, maximumBytes, signal);
-    installation.assertComplete();
+    installation?.assertComplete();
     if (spool.chunks !== undefined) {
       requireEncoderConfig(decoderConfig, 'video');
     }
@@ -785,6 +830,95 @@ export async function analyzeH264QualityConstrained(
 
   if (bestFeasible !== undefined) {
     return materializeFeasibleCandidate(bestFeasible, attempts);
+  }
+
+  // Per-picture integer QPs have a coarse whole-stream rate step and may be less efficient than the
+  // browser's native lookahead/controller on a particular device. Keep that hardware route behind the
+  // same private spool, mux audit, timeline validation, and decoded-quality gate. The controller request
+  // may exceed the authored output ceiling because it is only an input hint; exact output payload never
+  // may. Each retry derives solely from the previous measured response.
+  const maximumNativeRequest = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    request.maxAverageBitrate * MAXIMUM_NATIVE_RATE_REQUEST_MULTIPLIER,
+  );
+  let nativeBitrate = request.maxAverageBitrate;
+  for (let nativePass = 1; nativePass <= MAXIMUM_NATIVE_RATE_PASSES; nativePass++) {
+    const candidate = await encodeCandidate(
+      src,
+      container,
+      target,
+      plan,
+      H264_QUALITY_MAX_IN_MEMORY_CANDIDATE_BYTES,
+      signal,
+      options,
+      fragmented,
+      context,
+      nativeBitrate,
+    );
+    const candidateDurationUs = plan.validateCandidateTimeline(candidate.samples);
+    const outputAudit =
+      candidate.chunks === undefined || candidate.decoderConfig === undefined
+        ? undefined
+        : await auditCandidateOutput(candidate, target, outputRoute, signal);
+    const auditedDurationUs = outputAudit?.presentationSpanUs ?? candidateDurationUs;
+    const auditedPayloadBytes = outputAudit?.elementaryPayloadBytes ?? candidate.byteLength;
+    const candidateMaximumBytes = averageBitrateByteBudget(
+      request.maxAverageBitrate,
+      auditedDurationUs,
+    );
+    assertH264QualityCandidateMemoryLimit(candidateMaximumBytes);
+    const averageBitrate =
+      (auditedPayloadBytes * BITS_PER_BYTE * MICROS_PER_SECOND) / auditedDurationUs;
+    const quality =
+      auditedPayloadBytes <= candidateMaximumBytes && outputAudit !== undefined
+        ? await measureCandidateQuality(
+            src,
+            container,
+            target,
+            plan,
+            candidate,
+            request,
+            signal,
+            options,
+            context,
+          )
+        : undefined;
+    attempts.push({
+      attempt: attempts.length + 1,
+      targetBytes: candidateMaximumBytes,
+      actualBytes: auditedPayloadBytes,
+      averageBitrate,
+      ...(quality === undefined
+        ? {}
+        : { qualityMean: quality.mean, qualitySamples: quality.samples }),
+    });
+    if (
+      candidate.chunks !== undefined &&
+      outputAudit !== undefined &&
+      quality !== undefined &&
+      quality.mean >= request.quality.minimumMean
+    ) {
+      return {
+        chunks: candidate.chunks,
+        track: outputAudit.track,
+        byteLength: auditedPayloadBytes,
+        averageBitrate,
+        qualityMean: quality.mean,
+        qualitySamples: quality.samples,
+        attempts,
+      };
+    }
+    if (nativePass === MAXIMUM_NATIVE_RATE_PASSES || auditedPayloadBytes <= 0) break;
+    const calibrated = nextNativeRateRequest(
+      nativeBitrate,
+      auditedPayloadBytes,
+      candidateMaximumBytes,
+      quality?.mean,
+      request.quality.minimumMean,
+    );
+    const nextNativeBitrate = Math.max(1, Math.min(maximumNativeRequest, calibrated));
+    if (nextNativeBitrate === nativeBitrate) break;
+    nativeBitrate = nextNativeBitrate;
   }
 
   throw new ConstraintUnsatisfiedError(

@@ -91,7 +91,7 @@
     "check-budgets": "bun run scripts/check-budgets.ts",
     "fetch-fixtures": "bun run scripts/fetch-fixtures.ts",
     "verify:integrity": "bun run scripts/anti-cheat.ts",
-    "gate": "bun run typecheck && bun run docs:check && biome check . && vitest run --coverage && bun run build && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
+    "gate": "bun run fetch-fixtures && bun run typecheck && bun run docs:check && biome check . && vitest run --coverage && bun run build && bun run vendor-wasm && bun run test:dist && bun run check-budgets && bun run verify:package && bun run verify:integrity"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

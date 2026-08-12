@@ -15,93 +15,10 @@
  */
 
 import { InputError, MediaError } from '../../contracts/errors.ts';
+import { type VpxCodec, parseVpxCodec } from '../vpx-codec-string.ts';
 
-// ============ codecs this driver bridges ============
-
-/** The two VPX video codecs this fallback serves (the WebCodecs gap is VP9; VP8 rides along). */
-export type VpxCodec = 'vp8' | 'vp9';
-
-/** Maximum VP9 profile (0–3); profile selects bit depth and chroma subsampling (VP9 spec §7.2.2). */
-export const VP9_MAX_PROFILE = 3 as const;
-
-// ============ codec-string parsing (RFC 6381 / VP9 ISO-BMFF binding) ============
-
-/**
- * What a VP8/VP9 codec string tells the driver about the *output* frame layout. VP8 is always profile-0
- * 8-bit 4:2:0. VP9's `vp09.PP.LL.DD[.CC…]` carries profile (PP), level (LL), bit depth (DD), and an
- * optional chroma-subsampling code (CC). The wasm core re-derives all of this from the bitstream, but we
- * parse the string to (a) route to the right driver and (b) pre-size buffers / validate before any decode.
- */
-export interface VpxCodecInfo {
-  codec: VpxCodec;
-  /** VP9 profile 0–3 (always 0 for VP8). */
-  profile: number;
-  /** Luma/chroma bit depth: 8 for VP8 and VP9 profiles 0/1; 8/10/12 for VP9 (from the `DD` field). */
-  bitDepth: 8 | 10 | 12;
-  /**
-   * Chroma subsampling code (ISO VP-codec binding, same numbering as VP9's `subsampling_x/y`):
-   * 0 → 4:2:0 colocated, 1 → 4:2:0, 2 → 4:2:2, 3 → 4:4:4. VP8 is always 4:2:0 (1). When the codec string
-   * omits it (the common `vp09.PP.LL.DD` form), it defaults to 1 (4:2:0), the VP9 binding's default.
-   */
-  subsampling: 0 | 1 | 2 | 3;
-}
-
-/** Narrow an arbitrary number to a supported VPX bit depth, or `undefined`. */
-function asBitDepth(n: number): 8 | 10 | 12 | undefined {
-  return n === 8 || n === 10 || n === 12 ? n : undefined;
-}
-
-/** Narrow an arbitrary number to a chroma-subsampling code (0–3), or `undefined`. */
-function asSubsampling(n: number): 0 | 1 | 2 | 3 | undefined {
-  return n === 0 || n === 1 || n === 2 || n === 3 ? n : undefined;
-}
-
-/**
- * Parse a WebCodecs/RFC-6381 VP8 or VP9 codec string into {@link VpxCodecInfo}. Accepts:
- *  - `vp8` → profile 0, 8-bit, 4:2:0.
- *  - `vp9` (bare, legacy) → profile 0, 8-bit, 4:2:0.
- *  - `vp09.PP.LL.DD` and `vp09.PP.LL.DD.CC.…` → fields parsed per the VP9 ISO-BMFF binding; only the
- *    leading PP/LL/DD/CC fields are significant to us (the rest — colour primaries/transfer/matrix/range —
- *    do not change the plane geometry the driver allocates).
- * A malformed string is a typed {@link MediaError} (`decode-error`) — never a silently-wrong layout.
- */
-export function parseVpxCodec(codecRaw: string): VpxCodecInfo {
-  const codec = codecRaw.trim().toLowerCase();
-  if (codec === 'vp8') return { codec: 'vp8', profile: 0, bitDepth: 8, subsampling: 1 };
-  if (codec === 'vp9') return { codec: 'vp9', profile: 0, bitDepth: 8, subsampling: 1 };
-  if (!codec.startsWith('vp09.')) {
-    throw new MediaError('decode-error', `vpx: not a VP8/VP9 codec string: '${codecRaw}'`);
-  }
-  const fields = codec.slice('vp09.'.length).split('.');
-  const profile = parseDecimalField(fields[0], 'profile');
-  if (profile < 0 || profile > VP9_MAX_PROFILE) {
-    throw new MediaError('decode-error', `vpx: VP9 profile ${profile} out of range (0–3)`);
-  }
-  // Level (fields[1]) does not affect plane geometry; we validate it is present and numeric but ignore it.
-  parseDecimalField(fields[1], 'level');
-  const bitDepth = asBitDepth(parseDecimalField(fields[2], 'bitDepth'));
-  if (bitDepth === undefined) {
-    throw new MediaError('decode-error', `vpx: VP9 bit depth '${fields[2]}' must be 8, 10, or 12`);
-  }
-  // Profile 0 & 2 are 4:2:0 only; the binding still lets CC be stated. Default to 4:2:0 when omitted.
-  const subsampling =
-    fields[3] === undefined ? 1 : asSubsampling(parseDecimalField(fields[3], 'subsampling'));
-  if (subsampling === undefined) {
-    throw new MediaError('decode-error', `vpx: VP9 chroma subsampling '${fields[3]}' must be 0–3`);
-  }
-  return { codec: 'vp9', profile, bitDepth, subsampling };
-}
-
-/** Parse a zero-padded decimal codec-string field (e.g. `'02'`), rejecting non-numeric/empty input. */
-function parseDecimalField(field: string | undefined, name: string): number {
-  if (field === undefined || field === '' || !/^\d+$/.test(field)) {
-    throw new MediaError(
-      'decode-error',
-      `vpx: codec-string ${name} field '${field}' is not numeric`,
-    );
-  }
-  return Number.parseInt(field, 10);
-}
+export { VP9_MAX_PROFILE, parseVpxCodec } from '../vpx-codec-string.ts';
+export type { VpxCodec, VpxCodecInfo } from '../vpx-codec-string.ts';
 
 // ============ VP8 frame tag (RFC 6386 §9.1) ============
 

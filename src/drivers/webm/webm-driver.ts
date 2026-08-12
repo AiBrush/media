@@ -19,7 +19,9 @@ import {
   type Muxer,
   type Packet,
   type PacketInfoMetadata,
+  type PacketInfoTable,
   type PacketMetadata,
+  type PacketMetadataStats,
   type Registry,
   type StageOptions,
   type StreamCopyOptions,
@@ -111,6 +113,7 @@ const ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  BlockDuration: 0x9b,
   BlockAdditions: 0x75a1,
   BlockMore: 0xa6,
   BlockAdditional: 0xa5,
@@ -142,6 +145,33 @@ const WEBM_UNKNOWN_REMOTE_METADATA_PREFIX_BYTES = [
   1024 * 1024,
   4 * 1024 * 1024,
 ] as const;
+/** Ordinary EBML bootstrap read; late declarations are discovered by the bounded Segment walk. */
+const WEBM_PACKET_INFO_PREFIX_BYTES = 256 * 1024;
+/** A valid but unusually padded EBML Header may exceed the ordinary prefix; keep that retry bounded. */
+const WEBM_PACKET_INFO_EBML_HEADER_MAX_BYTES = 1024 * 1024;
+/** Four-byte EBML id plus eight-byte size: the largest legal element header. */
+const EBML_ELEMENT_HEADER_MAX_BYTES = 12;
+/** Reuse one modest sequential window while walking EBML headers and bounded packet prefixes. */
+const WEBM_PACKET_INFO_RANGE_WINDOW_BYTES = 64 * 1024;
+/** Codec qualification may inspect a prefix, but must never retain an arbitrarily large keyframe. */
+const WEBM_PACKET_INFO_CODEC_PREFIX_BYTES = 64 * 1024;
+/** Bound aggregate retained VP9/AV1 qualification bytes across an adversarial multitrack table. */
+const WEBM_PACKET_INFO_CODEC_PREFIX_TOTAL_BYTES = 1024 * 1024;
+/** Bound how far an AV1 access unit may be header-walked while skipping sized non-sequence OBUs. */
+const WEBM_PACKET_INFO_AV1_OBU_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+/** Bound CPU work independently of byte span for adversarial chains of empty AV1 OBUs. */
+const WEBM_PACKET_INFO_AV1_OBU_SCAN_MAX_COUNT = 1024;
+/** Bound range/CPU work for adversarial Xiph size tables made of long 0xff chains. */
+const WEBM_PACKET_INFO_XIPH_LACE_HEADER_MAX_BYTES = 1024 * 1024;
+/** Track declarations are metadata, but an adversarial CodecPrivate must still have a fixed ceiling. */
+const WEBM_PACKET_INFO_TRACKS_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Exact attachment side data is public packet-info output. Keep the complete declaration below a
+ * ceiling that remains under the 64 MiB heap gate even while the response and detached copies overlap.
+ */
+const WEBM_PACKET_INFO_ATTACHMENTS_MAX_BYTES = 16 * 1024 * 1024;
+/** Keep object/array overhead bounded even when metadata is packed with tiny declarations. */
+const WEBM_PACKET_INFO_TRACK_DECLARATION_MAX_COUNT = 4096;
 
 /**
  * Matroska CodecID → the engine's canonical codec token (the short vocabulary the harness goldens and
@@ -420,14 +450,20 @@ function parseAttachments(
   bytes: Uint8Array,
   dv: DataView,
   attachmentsElement: EbmlElement,
+  maxAttachedFiles = Number.POSITIVE_INFINITY,
 ): WebmTrack[] {
   const tracks: WebmTrack[] = [];
+  let attachedFileCount = 0;
   for (const attachedFile of elements(
     dv,
     attachmentsElement.dataStart,
     attachmentsElement.dataEnd,
   )) {
     if (attachedFile.id !== ID.AttachedFile) continue;
+    attachedFileCount++;
+    if (attachedFileCount > maxAttachedFiles) {
+      throw packetInfoMetadataCountLimit('AttachedFile', attachedFileCount, maxAttachedFiles);
+    }
     if (!attachedFile.complete || attachedFile.unknownSize) {
       throw new MediaError('demux-error', 'Matroska AttachedFile is truncated or unknown-sized');
     }
@@ -608,6 +644,8 @@ export interface WebmFrame {
   alpha?: Uint8Array;
   /** Signed Matroska BlockGroup DiscardPadding, in nanoseconds. */
   discardPaddingNs?: number;
+  /** Explicit BlockDuration projected to microseconds, when authored by the container. */
+  durationUs?: number;
   timestampUs: number;
   keyframe: boolean;
 }
@@ -705,6 +743,7 @@ function blockFrames(
   keyframeOverride: boolean | undefined,
   alpha: Uint8Array | undefined,
   discardPaddingNs: number | undefined,
+  blockDurationTicks?: number,
 ): { trackNumber: number; frames: WebmFrame[] } | undefined {
   const tn = readVint(dv, block.dataStart, false);
   if (!tn || tn.value < 0) return undefined;
@@ -722,6 +761,10 @@ function blockFrames(
     ? Math.round(presentationNs / 1000)
     : Math.round((Math.round(presentationNs / timecodeScale) * timecodeScale) / 1000);
   const timestampUs = Object.is(roundedTimestampUs, -0) ? 0 : roundedTimestampUs;
+  const blockDurationUs =
+    blockDurationTicks !== undefined
+      ? Math.round((blockDurationTicks * timecodeScale) / 1000)
+      : undefined;
   const lacing = lacingOf(flags);
   const headerStart = flagsOff + 1;
 
@@ -730,6 +773,9 @@ function blockFrames(
       data: bytes.subarray(headerStart, block.dataEnd),
       timestampUs,
       keyframe,
+      ...(blockDurationUs !== undefined && blockDurationUs > 0
+        ? { durationUs: blockDurationUs }
+        : {}),
       ...(alpha !== undefined ? { alpha } : {}),
       ...(discardPaddingNs !== undefined && discardPaddingNs !== 0 ? { discardPaddingNs } : {}),
     };
@@ -748,6 +794,9 @@ function blockFrames(
           data: bytes.subarray(headerStart, block.dataEnd),
           timestampUs,
           keyframe,
+          ...(blockDurationUs !== undefined && blockDurationUs > 0
+            ? { durationUs: blockDurationUs }
+            : {}),
           ...(alpha !== undefined ? { alpha } : {}),
           ...(discardPaddingNs !== undefined && discardPaddingNs !== 0 ? { discardPaddingNs } : {}),
         },
@@ -755,6 +804,10 @@ function blockFrames(
     };
   }
   const frames: WebmFrame[] = [];
+  const frameDurationUs =
+    blockDurationUs !== undefined && blockDurationUs > 0
+      ? Math.round(blockDurationUs / laced.sizes.length)
+      : undefined;
   let p = laced.dataStart;
   for (let index = 0; index < laced.sizes.length; index++) {
     const size = laced.sizes[index] as number;
@@ -769,6 +822,9 @@ function blockFrames(
       data: bytes.subarray(p, end),
       timestampUs,
       keyframe,
+      ...(frameDurationUs !== undefined && frameDurationUs > 0
+        ? { durationUs: frameDurationUs }
+        : {}),
       ...(carriesDiscardPadding ? { discardPaddingNs } : {}),
     });
     p = end;
@@ -851,6 +907,7 @@ function collectFrames(
           // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
           const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
           const discardPadding = findChild(dv, c.dataStart, c.dataEnd, ID.DiscardPadding);
+          const blockDuration = findChild(dv, c.dataStart, c.dataEnd, ID.BlockDuration);
           const delay = codecDelayForBlock(block);
           push(
             blockFrames(
@@ -864,6 +921,7 @@ function collectFrames(
               isKeyframe,
               readMainBlockAdditional(bytes, dv, c.dataStart, c.dataEnd),
               discardPadding === undefined ? undefined : readInt(dv, discardPadding),
+              blockDuration === undefined ? undefined : readUint(dv, blockDuration),
             ),
           );
         }
@@ -1385,7 +1443,7 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
     if (
       track.mediaType !== 'video' ||
       (track.codec !== 'vp9' && track.codec !== 'av1') ||
-      track.decoderCodecSource !== 'unknown' ||
+      track.decoderCodecSource === 'codec-private' ||
       track.trackNumber === undefined
     ) {
       continue;
@@ -1407,6 +1465,8 @@ export function demuxWebm(bytes: Uint8Array): WebmDemux {
       if (qualification.description !== undefined) track.description = qualification.description;
     } catch (error) {
       if (!(error instanceof CapabilityError)) throw error;
+      track.decoderCodec = track.codec === 'vp9' ? 'vp09' : 'av01';
+      track.decoderCodecSource = 'unknown';
     }
   }
   // Remap TrackNumber → public index. A track without a TrackNumber (or with no blocks) gets an empty
@@ -1446,6 +1506,74 @@ interface WebmPacketMetadataRow extends PacketMetadata {
   readonly offset?: number;
 }
 
+/** Reduce retained WebM frames to constant-sized evidence without constructing packet rows. */
+function webmTrackPacketStats(
+  frames: readonly WebmFrame[],
+  sourceDurationUs: number | undefined,
+  reorderDepth: number,
+): PacketMetadataStats | undefined {
+  if (frames.length === 0) return undefined;
+  let totalSizeBytes = 0;
+  let presentationStartUs = Number.POSITIVE_INFINITY;
+  let largestPtsUs = Number.NEGATIVE_INFINITY;
+  let secondLargestPtsUs = Number.NEGATIVE_INFINITY;
+  let terminalFrameNeedsInferredDuration = false;
+  let explicitPresentationEndUs = Number.NEGATIVE_INFINITY;
+  for (const frame of frames) {
+    if (!Number.isFinite(frame.timestampUs) || frame.data.byteLength <= 0) return undefined;
+    totalSizeBytes += frame.data.byteLength;
+    if (!Number.isSafeInteger(totalSizeBytes)) return undefined;
+    presentationStartUs = Math.min(presentationStartUs, frame.timestampUs);
+    if (frame.timestampUs > largestPtsUs) {
+      secondLargestPtsUs = largestPtsUs;
+      largestPtsUs = frame.timestampUs;
+      terminalFrameNeedsInferredDuration = !(
+        frame.durationUs !== undefined && frame.durationUs > 0
+      );
+    } else if (frame.timestampUs === largestPtsUs) {
+      terminalFrameNeedsInferredDuration ||= !(
+        frame.durationUs !== undefined && frame.durationUs > 0
+      );
+    } else if (frame.timestampUs < largestPtsUs && frame.timestampUs > secondLargestPtsUs) {
+      secondLargestPtsUs = frame.timestampUs;
+    }
+    if (frame.durationUs !== undefined && frame.durationUs > 0) {
+      explicitPresentationEndUs = Math.max(
+        explicitPresentationEndUs,
+        frame.timestampUs + frame.durationUs,
+      );
+    }
+  }
+  const inferredTerminalDurationUs = terminalFrameNeedsInferredDuration
+    ? Number.isFinite(secondLargestPtsUs)
+      ? largestPtsUs - secondLargestPtsUs
+      : sourceDurationUs !== undefined && sourceDurationUs > largestPtsUs
+        ? sourceDurationUs - largestPtsUs
+        : undefined
+    : undefined;
+  const presentationEndUs = Math.max(
+    explicitPresentationEndUs,
+    inferredTerminalDurationUs === undefined
+      ? Number.NEGATIVE_INFINITY
+      : largestPtsUs + inferredTerminalDurationUs,
+  );
+  if (!Number.isFinite(presentationEndUs) || presentationEndUs <= presentationStartUs) {
+    return undefined;
+  }
+  // Matroska Block order is decode order. The legacy packet table's DTS reconstruction sorts every PTS,
+  // so a reordered track cannot publish exact decode bounds without packet-count auxiliary storage.
+  // Omit those optional fields; rate planning deliberately falls back to this exact presentation span.
+  return {
+    packetCount: frames.length,
+    totalSizeBytes,
+    ...(reorderDepth > 0
+      ? {}
+      : { decodeStartUs: presentationStartUs, decodeEndUs: presentationEndUs }),
+    presentationStartUs,
+    presentationEndUs,
+  };
+}
+
 function packetMetadataRows(
   bytes: Uint8Array,
   tracks: readonly WebmTrack[],
@@ -1461,10 +1589,11 @@ function packetMetadataRows(
     const reorderDepth = track.reorderDepth ?? 0;
     const presentationTimeline =
       reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
+    const durationsUs = frameDurationsUs(frames, sourceDurationUs);
     for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
       const frame = frames[frameIndex];
       if (frame === undefined) continue;
-      const durationUs = frameDurationUs(frames, frameIndex, sourceDurationUs);
+      const durationUs = durationsUs[frameIndex];
       if (durationUs === undefined) {
         throw new MediaError(
           'demux-error',
@@ -1508,11 +1637,12 @@ function packetPayloadRows(
     const reorderDepth = track?.reorderDepth ?? 0;
     const presentationTimeline =
       reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
+    const durationsUs = frameDurationsUs(frames, sourceDurationUs);
     for (let i = 0; i < frames.length; i++) {
       const frame = frames[i];
       if (frame === undefined) continue;
       const offset = sourceViewOffset(bytes, frame.data);
-      const durationUs = frameDurationUs(frames, i, sourceDurationUs);
+      const durationUs = durationsUs[i];
       const dtsUs =
         presentationTimeline !== undefined && i >= reorderDepth
           ? (presentationTimeline[i - reorderDepth] ?? frame.timestampUs)
@@ -1546,6 +1676,1280 @@ export function webmPacketPayloadInfoFromBytes(bytes: Uint8Array): WebmPacketPay
   return {
     tracks: toTrackInfos(info, framesByIndex),
     packets: packetPayloadRows(bytes, info.tracks, framesByIndex, sourceDurationUs),
+  };
+}
+
+interface WebmSegmentRange {
+  readonly dataStart: number;
+  readonly dataEnd: number;
+}
+
+interface WebmPacketInfoBootstrap {
+  readonly container: 'webm' | 'mkv';
+  readonly segment: WebmSegmentRange;
+}
+
+interface WebmElementRange extends WebmSegmentRange {
+  readonly id: number;
+  readonly unknownSize: boolean;
+}
+
+interface ScannedWebmFrame extends WebmFrame {
+  readonly offset: number;
+  readonly size: number;
+}
+
+const EMPTY_PACKET_DATA = new Uint8Array(0);
+
+type FiniteRangeByteSource = ByteSource & {
+  readonly size: number;
+  readonly range: NonNullable<ByteSource['range']>;
+};
+
+function copyWebmTrack(track: WebmTrack): WebmTrack {
+  return {
+    ...track,
+    ...(track.color !== undefined ? { color: { ...track.color } } : {}),
+    ...(track.description !== undefined ? { description: track.description.slice() } : {}),
+    ...(track.attachmentData !== undefined ? { attachmentData: track.attachmentData.slice() } : {}),
+    ...(track.attachedFilePayload !== undefined
+      ? { attachedFilePayload: track.attachedFilePayload.slice() }
+      : {}),
+  };
+}
+
+async function readPacketInfoRange(
+  src: ByteSource & { readonly range: NonNullable<ByteSource['range']> },
+  start: number,
+  end: number,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  assertNotAborted(signal);
+  const bytes = await src.range(start, end, signal);
+  try {
+    assertNotAborted(signal);
+    const expected = end - start;
+    if (bytes.byteLength !== expected) {
+      throw new InputError(
+        `WebM source returned ${bytes.byteLength} bytes for range [${start}, ${end}), expected ${expected}`,
+      );
+    }
+    return bytes;
+  } catch (error) {
+    // The awaited request did return an owned view, but validation prevented ownership from reaching
+    // the caller's `finally`. Return that exact response here, including the post-read abort race.
+    src.releaseRange?.(bytes);
+    throw error;
+  }
+}
+
+/**
+ * One-response read-ahead cursor for the packet-info EBML walk. Returned views are valid only until the
+ * next cache miss or {@link close}; callers consume them synchronously and copy the few bytes that escape.
+ */
+class WebmPacketInfoRangeReader {
+  #response: Uint8Array | undefined;
+  #responseStart = 0;
+
+  constructor(
+    private readonly src: FiniteRangeByteSource,
+    private readonly signal: AbortSignal | undefined,
+  ) {}
+
+  async read(start: number, end: number, readAheadLimit: number): Promise<Uint8Array> {
+    assertNotAborted(this.signal);
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      !Number.isSafeInteger(readAheadLimit) ||
+      start < 0 ||
+      end < start ||
+      end > readAheadLimit ||
+      readAheadLimit > this.src.size
+    ) {
+      throw new MediaError(
+        'demux-error',
+        `invalid WebM packet-info range [${start}, ${end}) within ${readAheadLimit}`,
+      );
+    }
+    if (start === end) return EMPTY_PACKET_DATA;
+
+    const response = this.#response;
+    const responseEnd = this.#responseStart + (response?.byteLength ?? 0);
+    if (response !== undefined && start >= this.#responseStart && end <= responseEnd) {
+      return response.subarray(start - this.#responseStart, end - this.#responseStart);
+    }
+
+    this.#release();
+    const requestedLength = end - start;
+    const physicalEnd =
+      requestedLength >= WEBM_PACKET_INFO_RANGE_WINDOW_BYTES
+        ? end
+        : Math.min(readAheadLimit, start + WEBM_PACKET_INFO_RANGE_WINDOW_BYTES);
+    const loaded = await readPacketInfoRange(this.src, start, physicalEnd, this.signal);
+    this.#response = loaded;
+    this.#responseStart = start;
+    return loaded.subarray(0, requestedLength);
+  }
+
+  close(): void {
+    this.#release();
+  }
+
+  #release(): void {
+    const response = this.#response;
+    this.#response = undefined;
+    this.#responseStart = 0;
+    if (response !== undefined) this.src.releaseRange?.(response);
+  }
+}
+
+function packetInfoBootstrapFromBytes(
+  bytes: Uint8Array,
+  sourceSize: number,
+): WebmPacketInfoBootstrap {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const first = elements(dv, 0, dv.byteLength).next().value;
+  if (first === undefined || first.id !== ID.EBML || !first.complete) {
+    throw new InputError('not a WebM/Matroska file (missing complete leading EBML header)');
+  }
+  const header = parseEbmlHeader(dv, first);
+  const id = readVint(dv, first.dataEnd, true);
+  const size = id === undefined ? undefined : readVint(dv, first.dataEnd + id.length, false);
+  if (
+    id === undefined ||
+    size === undefined ||
+    id.value !== ID.Segment ||
+    id.length > header.maxIdLength ||
+    size.length > header.maxSizeLength
+  ) {
+    throw ebmlHeaderError('the Segment does not immediately follow the EBML header');
+  }
+  const dataStart = first.dataEnd + id.length + size.length;
+  const dataEnd = size.value < 0 ? sourceSize : dataStart + size.value;
+  if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > sourceSize) {
+    throw new MediaError('demux-error', 'WebM Segment escapes the declared source size');
+  }
+  return {
+    container: header.docType === 'matroska' ? 'mkv' : 'webm',
+    segment: { dataStart, dataEnd },
+  };
+}
+
+async function packetInfoBootstrapFromPrefix(
+  src: FiniteRangeByteSource,
+  prefix: Uint8Array,
+  signal: AbortSignal | undefined,
+): Promise<WebmPacketInfoBootstrap> {
+  const dv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+  const id = readVint(dv, 0, true);
+  const size = id === undefined ? undefined : readVint(dv, id.length, false);
+  if (id === undefined || size === undefined || id.value !== ID.EBML || size.value < 0) {
+    throw new InputError('not a WebM/Matroska file (missing complete leading EBML header)');
+  }
+  const headerEnd = id.length + size.length + size.value;
+  if (!Number.isSafeInteger(headerEnd) || headerEnd > src.size) {
+    throw new InputError('not a WebM/Matroska file (the leading EBML header is truncated)');
+  }
+  if (headerEnd > WEBM_PACKET_INFO_EBML_HEADER_MAX_BYTES) {
+    throw packetInfoMetadataLimit('EBML Header', headerEnd, WEBM_PACKET_INFO_EBML_HEADER_MAX_BYTES);
+  }
+  const neededEnd = Math.min(src.size, headerEnd + EBML_ELEMENT_HEADER_MAX_BYTES);
+  if (neededEnd <= prefix.byteLength) {
+    return packetInfoBootstrapFromBytes(prefix, src.size);
+  }
+  const headerAndSegment = await readPacketInfoRange(src, 0, neededEnd, signal);
+  try {
+    return packetInfoBootstrapFromBytes(headerAndSegment, src.size);
+  } finally {
+    src.releaseRange?.(headerAndSegment);
+  }
+}
+
+async function readWebmElementRange(
+  reader: WebmPacketInfoRangeReader,
+  offset: number,
+  limit: number,
+): Promise<WebmElementRange> {
+  const headerEnd = Math.min(limit, offset + EBML_ELEMENT_HEADER_MAX_BYTES);
+  const bytes = await reader.read(offset, headerEnd, limit);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const id = readVint(dv, 0, true);
+  const size = id === undefined ? undefined : readVint(dv, id.length, false);
+  if (id === undefined || size === undefined) {
+    throw new MediaError('demux-error', `invalid EBML element header at Segment offset ${offset}`);
+  }
+  const dataStart = offset + id.length + size.length;
+  const dataEnd = size.value < 0 ? limit : dataStart + size.value;
+  if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > limit) {
+    throw new MediaError(
+      'demux-error',
+      `EBML element 0x${id.value.toString(16)} escapes the WebM Segment`,
+    );
+  }
+  return { id: id.value, dataStart, dataEnd, unknownSize: size.value < 0 };
+}
+
+async function readPacketInfoInteger(
+  reader: WebmPacketInfoRangeReader,
+  element: WebmElementRange,
+  limit: number,
+  signed: boolean,
+): Promise<number> {
+  const length = element.dataEnd - element.dataStart;
+  if (element.unknownSize || length > 8) {
+    throw new MediaError(
+      'demux-error',
+      `WebM integer element 0x${element.id.toString(16)} has an invalid size`,
+    );
+  }
+  const bytes = await reader.read(element.dataStart, element.dataEnd, limit);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const local: EbmlElement = {
+    id: element.id,
+    dataStart: 0,
+    dataEnd: bytes.byteLength,
+    complete: true,
+    unknownSize: false,
+  };
+  return signed ? readInt(dv, local) : readUint(dv, local);
+}
+
+async function readPacketInfoFloat(
+  reader: WebmPacketInfoRangeReader,
+  element: WebmElementRange,
+  limit: number,
+): Promise<number> {
+  const length = element.dataEnd - element.dataStart;
+  if (element.unknownSize || (length !== 4 && length !== 8)) return 0;
+  const bytes = await reader.read(element.dataStart, element.dataEnd, limit);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return length === 4 ? dv.getFloat32(0, false) : dv.getFloat64(0, false);
+}
+
+function codecDelayMap(
+  info: WebmInfo,
+): ReadonlyMap<number, { readonly nanoseconds: number; readonly preserveSubTick: boolean }> {
+  const result = new Map<
+    number,
+    { readonly nanoseconds: number; readonly preserveSubTick: boolean }
+  >();
+  for (const track of info.tracks) {
+    if (track.trackNumber === undefined || track.codecDelayNs === undefined) continue;
+    result.set(track.trackNumber, {
+      nanoseconds: track.codecDelayNs,
+      preserveSubTick: track.codec === 'opus',
+    });
+  }
+  return result;
+}
+
+function scannedPacketRows(
+  tracks: readonly WebmTrack[],
+  framesByIndex: readonly (readonly ScannedWebmFrame[])[],
+  sourceDurationUs: number | undefined,
+): readonly PacketInfoMetadata[] {
+  const rows: PacketInfoMetadata[] = [];
+  for (let trackIndex = 0; trackIndex < framesByIndex.length; trackIndex++) {
+    // Both arrays are projected from the same parsed track list and are therefore dense and aligned.
+    const frames = framesByIndex[trackIndex] as readonly ScannedWebmFrame[];
+    const track = tracks[trackIndex] as WebmTrack;
+    const codecDefinesAudioSync = track.codec === 'opus' || track.codec === 'vorbis';
+    const reorderDepth = track.reorderDepth ?? 0;
+    const presentationTimeline =
+      reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
+    const durationsUs = frameDurationsUs(frames, sourceDurationUs);
+    for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+      const frame = frames[frameIndex] as ScannedWebmFrame;
+      const durationUs = durationsUs[frameIndex];
+      if (durationUs === undefined) {
+        throw new MediaError(
+          'demux-error',
+          `WebM packet ${frameIndex} on track ${trackIndex} has no exact duration`,
+        );
+      }
+      const dtsUs =
+        presentationTimeline !== undefined && frameIndex >= reorderDepth
+          ? (presentationTimeline[frameIndex - reorderDepth] as number)
+          : frame.timestampUs;
+      rows.push({
+        trackIndex,
+        offset: frame.offset,
+        size: frame.size,
+        ptsUs: frame.timestampUs,
+        dtsUs,
+        durationUs,
+        keyframe: codecDefinesAudioSync || frame.keyframe,
+      });
+    }
+  }
+  return rows.sort((left, right) => (left.offset as number) - (right.offset as number));
+}
+
+interface WebmQualificationPrefix {
+  readonly bytes: Uint8Array;
+  /** False means the access unit exceeded the bounded qualification budget. */
+  readonly complete: boolean;
+}
+
+function qualifyScannedWebmTracks(
+  info: WebmInfo,
+  firstKeyframes: ReadonlyMap<number, WebmQualificationPrefix>,
+  sourceSizeBytes: number,
+): void {
+  for (const track of info.tracks) {
+    if (
+      track.mediaType !== 'video' ||
+      (track.codec !== 'vp9' && track.codec !== 'av1') ||
+      track.decoderCodecSource !== 'unknown' ||
+      track.trackNumber === undefined
+    ) {
+      continue;
+    }
+    const candidate = firstKeyframes.get(track.trackNumber);
+    try {
+      const qualification = qualifyWebmVideoCodec({
+        codec: track.codec,
+        ...(candidate === undefined ? {} : { firstKeyframe: candidate.bytes }),
+        ...(track.width === undefined ? {} : { width: track.width }),
+        ...(track.height === undefined ? {} : { height: track.height }),
+        ...(track.fps === undefined ? {} : { fps: track.fps }),
+        sourceSizeBytes,
+        ...(info.durationSec > 0 ? { durationSec: info.durationSec } : {}),
+      });
+      track.decoderCodec = qualification.codec;
+      track.decoderCodecSource = qualification.source;
+    } catch (error) {
+      // A complete access unit retains the whole-parser's strict malformed-bitstream behavior. A
+      // deliberately truncated qualification prefix can only prove a capability miss, never corruption
+      // beyond the inspected boundary, so leave that track honestly unqualified.
+      const boundedPrefixMiss =
+        candidate?.complete === false &&
+        error instanceof MediaError &&
+        error.code === 'demux-error';
+      if (!(error instanceof CapabilityError) && !boundedPrefixMiss) throw error;
+    }
+  }
+}
+
+interface WebmPacketInfoScanState {
+  readonly info: WebmInfo;
+  readonly trackIndexByNumber: ReadonlyMap<number, number>;
+  readonly delays: ReadonlyMap<
+    number,
+    { readonly nanoseconds: number; readonly preserveSubTick: boolean }
+  >;
+  readonly framesByIndex: ScannedWebmFrame[][];
+  readonly blockTimes: Map<number, BlockTiming>;
+  readonly firstKeyframes: Map<number, WebmQualificationPrefix>;
+  qualificationBytesRemaining: number;
+  timecodeScale: number;
+  lastEndTicks: number;
+}
+
+interface ScannedBlockGroupRange {
+  readonly block?: WebmElementRange;
+  readonly keyframe: boolean;
+  readonly hasAlpha: boolean;
+  readonly discardPaddingNs?: number;
+  readonly blockDurationTicks?: number;
+}
+
+function unknownPacketInfoChild(element: WebmElementRange, context: string): never {
+  throw new MediaError(
+    'demux-error',
+    `unknown-sized ${context} element 0x${element.id.toString(16)} in WebM`,
+  );
+}
+
+interface PacketInfoInfoFields {
+  readonly timecodeScale?: number;
+  readonly durationTicks?: number;
+}
+
+interface PacketInfoTrackDeclaration {
+  readonly track: WebmTrack;
+  /** Synthetic packet metadata for a JPEG attachment, whose bytes never need to escape packetInfo. */
+  readonly attachmentFrame?: ScannedWebmFrame;
+}
+
+function packetInfoMetadataLimit(
+  kind: 'EBML Header' | 'Tracks' | 'Attachments',
+  byteLength: number,
+  maxBytes: number,
+): MediaError {
+  return new MediaError(
+    'constraint-unsatisfied',
+    `WebM ${kind} metadata is ${byteLength} bytes; bounded packetInfo supports at most ${maxBytes}`,
+    {
+      constraint: 'webm-packet-info-metadata-bytes',
+      kind,
+      byteLength,
+      maxBytes,
+    },
+  );
+}
+
+function packetInfoMetadataCountLimit(
+  kind: 'TrackEntry' | 'AttachedFile',
+  count: number,
+  maxCount: number,
+): MediaError {
+  return new MediaError(
+    'constraint-unsatisfied',
+    `WebM ${kind} count is ${count}; bounded packetInfo supports at most ${maxCount}`,
+    {
+      constraint: 'webm-packet-info-metadata-count',
+      kind,
+      count,
+      maxCount,
+    },
+  );
+}
+
+function packetInfoXiphLaceLimit(scannedBytes: number): MediaError {
+  return new MediaError(
+    'constraint-unsatisfied',
+    `WebM Xiph lace header exceeds the bounded packetInfo limit of ${WEBM_PACKET_INFO_XIPH_LACE_HEADER_MAX_BYTES} bytes`,
+    {
+      constraint: 'webm-packet-info-xiph-lace-header-bytes',
+      scannedBytes,
+      maxBytes: WEBM_PACKET_INFO_XIPH_LACE_HEADER_MAX_BYTES,
+    },
+  );
+}
+
+async function scanPacketInfoTracks(
+  reader: WebmPacketInfoRangeReader,
+  tracksElement: WebmElementRange,
+): Promise<readonly PacketInfoTrackDeclaration[]> {
+  const byteLength = tracksElement.dataEnd - tracksElement.dataStart;
+  if (byteLength > WEBM_PACKET_INFO_TRACKS_MAX_BYTES) {
+    throw packetInfoMetadataLimit('Tracks', byteLength, WEBM_PACKET_INFO_TRACKS_MAX_BYTES);
+  }
+  const bytes = await reader.read(
+    tracksElement.dataStart,
+    tracksElement.dataEnd,
+    tracksElement.dataEnd,
+  );
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const declarations: PacketInfoTrackDeclaration[] = [];
+  let trackEntryCount = 0;
+  let parsedEnd = 0;
+  for (const entry of elements(dv, 0, dv.byteLength)) {
+    parsedEnd = entry.dataEnd;
+    if (!entry.complete || entry.unknownSize) {
+      throw new MediaError('demux-error', 'WebM Tracks contains a truncated TrackEntry');
+    }
+    if (entry.id !== ID.TrackEntry) continue;
+    trackEntryCount++;
+    if (trackEntryCount > WEBM_PACKET_INFO_TRACK_DECLARATION_MAX_COUNT) {
+      throw packetInfoMetadataCountLimit(
+        'TrackEntry',
+        trackEntryCount,
+        WEBM_PACKET_INFO_TRACK_DECLARATION_MAX_COUNT,
+      );
+    }
+    const track = parseTrackEntry(bytes, dv, entry);
+    if (track !== undefined) {
+      const detached = copyWebmTrack(track);
+      if (
+        (detached.codec === 'vp9' || detached.codec === 'av1') &&
+        detached.decoderCodecSource === undefined
+      ) {
+        detached.decoderCodec = detached.codec === 'vp9' ? 'vp09' : 'av01';
+        detached.decoderCodecSource = 'unknown';
+      }
+      declarations.push({ track: detached });
+    }
+  }
+  if (parsedEnd !== dv.byteLength) {
+    throw new MediaError('demux-error', 'WebM Tracks contains malformed trailing bytes');
+  }
+  return declarations;
+}
+
+async function scanPacketInfoAttachments(
+  reader: WebmPacketInfoRangeReader,
+  attachmentsElement: WebmElementRange,
+): Promise<readonly PacketInfoTrackDeclaration[]> {
+  const byteLength = attachmentsElement.dataEnd - attachmentsElement.dataStart;
+  if (byteLength > WEBM_PACKET_INFO_ATTACHMENTS_MAX_BYTES) {
+    throw packetInfoMetadataLimit(
+      'Attachments',
+      byteLength,
+      WEBM_PACKET_INFO_ATTACHMENTS_MAX_BYTES,
+    );
+  }
+  const bytes = await reader.read(
+    attachmentsElement.dataStart,
+    attachmentsElement.dataEnd,
+    attachmentsElement.dataEnd,
+  );
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const localElement: EbmlElement = {
+    id: ID.Attachments,
+    dataStart: 0,
+    dataEnd: bytes.byteLength,
+    complete: true,
+    unknownSize: false,
+  };
+  return parseAttachments(
+    bytes,
+    dv,
+    localElement,
+    WEBM_PACKET_INFO_TRACK_DECLARATION_MAX_COUNT,
+  ).map((track): PacketInfoTrackDeclaration => {
+    const { attachmentData, ...detachedBase } = track;
+    const localOffset =
+      attachmentData === undefined ? undefined : sourceViewOffset(bytes, attachmentData);
+    // Only attachment packet metadata escapes this path. Retain the exact AttachedFile side data, but
+    // do not duplicate the image payload once more solely to discard it from PacketInfoTable.
+    const detached: WebmTrack = {
+      ...detachedBase,
+      ...(track.color === undefined ? {} : { color: { ...track.color } }),
+      ...(track.description === undefined ? {} : { description: track.description.slice() }),
+      ...(track.attachedFilePayload === undefined
+        ? {}
+        : { attachedFilePayload: track.attachedFilePayload.slice() }),
+    };
+    return {
+      track: detached,
+      ...(attachmentData === undefined || localOffset === undefined
+        ? {}
+        : {
+            attachmentFrame: {
+              data: EMPTY_PACKET_DATA,
+              timestampUs: 0,
+              keyframe: true,
+              offset: attachmentsElement.dataStart + localOffset,
+              size: attachmentData.byteLength,
+            },
+          }),
+    };
+  });
+}
+
+async function scanPacketInfoInfo(
+  reader: WebmPacketInfoRangeReader,
+  info: WebmElementRange,
+): Promise<PacketInfoInfoFields> {
+  let timecodeScale: number | undefined;
+  let durationTicks: number | undefined;
+  let cursor = info.dataStart;
+  while (cursor < info.dataEnd) {
+    const child = await readWebmElementRange(reader, cursor, info.dataEnd);
+    if (child.unknownSize) unknownPacketInfoChild(child, 'Info child');
+    cursor = child.dataEnd;
+    if (child.id === ID.TimecodeScale) {
+      timecodeScale = await readPacketInfoInteger(reader, child, info.dataEnd, false);
+    } else if (child.id === ID.Duration) {
+      durationTicks = await readPacketInfoFloat(reader, child, info.dataEnd);
+    }
+  }
+  return {
+    ...(timecodeScale === undefined ? {} : { timecodeScale }),
+    ...(durationTicks === undefined ? {} : { durationTicks }),
+  };
+}
+
+/** Skip an unknown Cluster by direct-child sizes until the next parsed Segment-level sibling. */
+async function skipPacketInfoCluster(
+  reader: WebmPacketInfoRangeReader,
+  cluster: WebmElementRange,
+): Promise<number> {
+  if (!cluster.unknownSize) return cluster.dataEnd;
+  let cursor = cluster.dataStart;
+  while (cursor < cluster.dataEnd) {
+    const child = await readWebmElementRange(reader, cursor, cluster.dataEnd);
+    if (SEGMENT_LEVEL_IDS.has(child.id)) return cursor;
+    if (child.unknownSize) unknownPacketInfoChild(child, 'Cluster child');
+    cursor = child.dataEnd;
+  }
+  return cursor;
+}
+
+/** Detect VPx alpha side data without reading the (potentially frame-sized) BlockAdditional payload. */
+async function packetInfoBlockAdditionsHaveAlpha(
+  reader: WebmPacketInfoRangeReader,
+  additions: WebmElementRange,
+): Promise<boolean> {
+  let cursor = additions.dataStart;
+  while (cursor < additions.dataEnd) {
+    const blockMore = await readWebmElementRange(reader, cursor, additions.dataEnd);
+    if (blockMore.unknownSize) unknownPacketInfoChild(blockMore, 'BlockAdditions child');
+    cursor = blockMore.dataEnd;
+    if (blockMore.id !== ID.BlockMore) continue;
+
+    let addId = 1;
+    let hasAdditional = false;
+    let childCursor = blockMore.dataStart;
+    while (childCursor < blockMore.dataEnd) {
+      const child = await readWebmElementRange(reader, childCursor, blockMore.dataEnd);
+      if (child.unknownSize) unknownPacketInfoChild(child, 'BlockMore child');
+      childCursor = child.dataEnd;
+      if (child.id === ID.BlockAddID) {
+        addId = await readPacketInfoInteger(reader, child, blockMore.dataEnd, false);
+      } else if (child.id === ID.BlockAdditional) {
+        hasAdditional = true;
+      }
+    }
+    if (hasAdditional && addId === 1) return true;
+  }
+  return false;
+}
+
+/** Walk BlockGroup metadata before decoding its Block, since ReferenceBlock may follow the payload. */
+async function scanPacketInfoBlockGroup(
+  reader: WebmPacketInfoRangeReader,
+  group: WebmElementRange,
+): Promise<ScannedBlockGroupRange> {
+  let block: WebmElementRange | undefined;
+  let hasReference = false;
+  let hasAlpha = false;
+  let discardPaddingNs: number | undefined;
+  let blockDurationTicks: number | undefined;
+  let sawDiscardPadding = false;
+  let sawBlockDuration = false;
+  let cursor = group.dataStart;
+
+  while (cursor < group.dataEnd) {
+    const child = await readWebmElementRange(reader, cursor, group.dataEnd);
+    if (child.unknownSize) unknownPacketInfoChild(child, 'BlockGroup child');
+    cursor = child.dataEnd;
+    if (child.id === ID.Block && block === undefined) {
+      block = child;
+    } else if (child.id === ID.ReferenceBlock) {
+      hasReference = true;
+    } else if (child.id === ID.DiscardPadding && !sawDiscardPadding) {
+      discardPaddingNs = await readPacketInfoInteger(reader, child, group.dataEnd, true);
+      sawDiscardPadding = true;
+    } else if (child.id === ID.BlockDuration && !sawBlockDuration) {
+      blockDurationTicks = await readPacketInfoInteger(reader, child, group.dataEnd, false);
+      sawBlockDuration = true;
+    } else if (child.id === ID.BlockAdditions) {
+      if (await packetInfoBlockAdditionsHaveAlpha(reader, child)) hasAlpha = true;
+    }
+  }
+
+  return {
+    ...(block === undefined ? {} : { block }),
+    keyframe: !hasReference,
+    hasAlpha,
+    ...(sawDiscardPadding ? { discardPaddingNs: discardPaddingNs as number } : {}),
+    ...(sawBlockDuration ? { blockDurationTicks: blockDurationTicks as number } : {}),
+  };
+}
+
+interface PacketInfoFrameRange {
+  readonly offset: number;
+  readonly size: number;
+}
+
+interface PacketInfoBlockLayout {
+  readonly frames: readonly PacketInfoFrameRange[];
+  /** True only when a declared lace table parsed successfully. */
+  readonly laced: boolean;
+}
+
+async function readPacketInfoVint(
+  reader: WebmPacketInfoRangeReader,
+  offset: number,
+  limit: number,
+  keepMarker: boolean,
+): Promise<{ readonly value: number; readonly length: number } | undefined> {
+  if (offset >= limit) return undefined;
+  const bytes = await reader.read(offset, Math.min(limit, offset + 8), limit);
+  return readVint(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), 0, keepMarker);
+}
+
+function unparsedLaceLayout(headerStart: number, blockEnd: number): PacketInfoBlockLayout {
+  return {
+    frames: [{ offset: headerStart, size: Math.max(0, blockEnd - headerStart) }],
+    laced: false,
+  };
+}
+
+async function packetInfoBlockLayout(
+  reader: WebmPacketInfoRangeReader,
+  headerStart: number,
+  blockEnd: number,
+  lacing: Lacing,
+): Promise<PacketInfoBlockLayout> {
+  if (lacing === 'none') return unparsedLaceLayout(headerStart, blockEnd);
+  if (headerStart >= blockEnd) return unparsedLaceLayout(headerStart, blockEnd);
+  const count = await reader.read(headerStart, headerStart + 1, blockEnd);
+  const frameCount = (count[0] ?? 0) + 1;
+  let cursor = headerStart + 1;
+  const sizes: number[] = [];
+
+  if (lacing === 'fixed') {
+    const total = blockEnd - cursor;
+    if (total < 0 || total % frameCount !== 0) {
+      return unparsedLaceLayout(headerStart, blockEnd);
+    }
+    for (let index = 0; index < frameCount; index++) sizes.push(total / frameCount);
+  } else if (lacing === 'xiph') {
+    let remaining = frameCount - 1;
+    let currentSize = 0;
+    let headerBytes = 1; // Lace-count byte.
+    while (remaining > 0) {
+      if (cursor >= blockEnd) return unparsedLaceLayout(headerStart, blockEnd);
+      if (headerBytes >= WEBM_PACKET_INFO_XIPH_LACE_HEADER_MAX_BYTES) {
+        throw packetInfoXiphLaceLimit(headerBytes);
+      }
+      const chunkEnd = Math.min(
+        blockEnd,
+        cursor + WEBM_PACKET_INFO_RANGE_WINDOW_BYTES,
+        cursor + WEBM_PACKET_INFO_XIPH_LACE_HEADER_MAX_BYTES - headerBytes,
+      );
+      const chunk = await reader.read(cursor, chunkEnd, blockEnd);
+      let consumed = 0;
+      for (const byte of chunk) {
+        consumed++;
+        headerBytes++;
+        currentSize += byte;
+        if (!Number.isSafeInteger(currentSize)) {
+          return unparsedLaceLayout(headerStart, blockEnd);
+        }
+        if (byte !== 0xff) {
+          sizes.push(currentSize);
+          currentSize = 0;
+          remaining--;
+          if (remaining === 0) break;
+        }
+      }
+      cursor += consumed;
+    }
+  } else {
+    const first = await readPacketInfoVint(reader, cursor, blockEnd, false);
+    if (first === undefined || first.value < 0 || !Number.isSafeInteger(first.value)) {
+      return unparsedLaceLayout(headerStart, blockEnd);
+    }
+    cursor += first.length;
+    sizes.push(first.value);
+    for (let index = 1; index < frameCount - 1; index++) {
+      const raw = await readPacketInfoVint(reader, cursor, blockEnd, false);
+      if (raw === undefined || raw.value < 0 || !Number.isSafeInteger(raw.value)) {
+        return unparsedLaceLayout(headerStart, blockEnd);
+      }
+      const previous = sizes[sizes.length - 1] as number;
+      const bias = 2 ** (7 * raw.length - 1) - 1;
+      const size = previous + (raw.value - bias);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        return unparsedLaceLayout(headerStart, blockEnd);
+      }
+      sizes.push(size);
+      cursor += raw.length;
+    }
+  }
+
+  let used = 0;
+  for (const size of sizes) {
+    used += size;
+    if (!Number.isSafeInteger(used) || size < 0) {
+      return unparsedLaceLayout(headerStart, blockEnd);
+    }
+  }
+  const finalSize = blockEnd - cursor - used;
+  if (!Number.isSafeInteger(finalSize) || finalSize < 0) {
+    return unparsedLaceLayout(headerStart, blockEnd);
+  }
+  sizes.push(finalSize);
+
+  const frames: PacketInfoFrameRange[] = [];
+  let frameOffset = cursor;
+  for (const size of sizes) {
+    const frameEnd = frameOffset + size;
+    if (!Number.isSafeInteger(frameEnd) || frameEnd > blockEnd) {
+      return unparsedLaceLayout(headerStart, blockEnd);
+    }
+    frames.push({ offset: frameOffset, size });
+    frameOffset = frameEnd;
+  }
+  if (frameOffset !== blockEnd) return unparsedLaceLayout(headerStart, blockEnd);
+  return { frames, laced: true };
+}
+
+function encodePacketInfoLeb128(value: number): Uint8Array {
+  const bytes: number[] = [];
+  let remaining = value;
+  do {
+    const low = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    bytes.push(low | (remaining > 0 ? 0x80 : 0));
+  } while (remaining > 0);
+  return Uint8Array.from(bytes);
+}
+
+async function readPacketInfoAv1Leb128(
+  reader: WebmPacketInfoRangeReader,
+  offset: number,
+  limit: number,
+): Promise<{ readonly value: number; readonly length: number }> {
+  const bytes = await reader.read(offset, Math.min(limit, offset + 8), limit);
+  let value = 0;
+  let multiplier = 1;
+  for (let index = 0; index < 8; index++) {
+    const byte = bytes[index];
+    if (byte === undefined) {
+      throw new MediaError('demux-error', 'AV1 OBU LEB128 size is truncated');
+    }
+    value += (byte & 0x7f) * multiplier;
+    if (!Number.isSafeInteger(value)) {
+      throw new MediaError('demux-error', 'AV1 OBU LEB128 size exceeds safe integer');
+    }
+    if ((byte & 0x80) === 0) return { value, length: index + 1 };
+    multiplier *= 128;
+  }
+  throw new MediaError('demux-error', 'AV1 OBU LEB128 size exceeds eight bytes');
+}
+
+/**
+ * Find the first AV1 Sequence Header OBU without retaining preceding Padding/Metadata payloads. The
+ * returned synthetic one-OBU access unit carries only a bounded sequence payload prefix; the ordinary
+ * qualifier remains the single parser for AV1 sequence syntax and codec-string construction.
+ */
+async function scanPacketInfoAv1SequenceHeader(
+  reader: WebmPacketInfoRangeReader,
+  frame: PacketInfoFrameRange,
+  blockEnd: number,
+  retainedByteBudget: number,
+): Promise<WebmQualificationPrefix> {
+  if (retainedByteBudget < 2) return { bytes: EMPTY_PACKET_DATA, complete: false };
+  const frameEnd = frame.offset + frame.size;
+  let offset = frame.offset;
+  let obuCount = 0;
+  while (offset < frameEnd) {
+    if (
+      offset - frame.offset > WEBM_PACKET_INFO_AV1_OBU_SCAN_MAX_BYTES ||
+      obuCount >= WEBM_PACKET_INFO_AV1_OBU_SCAN_MAX_COUNT
+    ) {
+      return { bytes: EMPTY_PACKET_DATA, complete: false };
+    }
+    obuCount++;
+    const headerBytes = await reader.read(offset, offset + 1, blockEnd);
+    const header = headerBytes[0] as number;
+    if ((header & 0x80) !== 0 || (header & 1) !== 0) {
+      throw new MediaError('demux-error', 'AV1 OBU header has a forbidden or reserved bit set');
+    }
+    const type = (header >> 3) & 0x0f;
+    const extension = (header & 0x04) !== 0;
+    const hasSize = (header & 0x02) !== 0;
+    let payloadStart = offset + 1;
+    if (extension) {
+      if (payloadStart >= frameEnd) {
+        throw new MediaError('demux-error', 'AV1 OBU extension is truncated');
+      }
+      const extensionBytes = await reader.read(payloadStart, payloadStart + 1, blockEnd);
+      if (((extensionBytes[0] as number) & 0x07) !== 0) {
+        throw new MediaError('demux-error', 'AV1 OBU extension reserved bits are set');
+      }
+      payloadStart++;
+    }
+    let payloadEnd = frameEnd;
+    if (hasSize) {
+      const size = await readPacketInfoAv1Leb128(reader, payloadStart, frameEnd);
+      payloadStart += size.length;
+      payloadEnd = payloadStart + size.value;
+      if (!Number.isSafeInteger(payloadEnd) || payloadEnd > frameEnd) {
+        throw new MediaError('demux-error', 'AV1 OBU payload is truncated');
+      }
+    }
+    if (type === 1) {
+      const declaredSize = payloadEnd - payloadStart;
+      let prefixSize = Math.min(
+        declaredSize,
+        WEBM_PACKET_INFO_CODEC_PREFIX_BYTES,
+        Math.max(0, retainedByteBudget - 4),
+      );
+      let sizeBytes = encodePacketInfoLeb128(prefixSize);
+      while (1 + sizeBytes.byteLength + prefixSize > retainedByteBudget) {
+        prefixSize--;
+        sizeBytes = encodePacketInfoLeb128(prefixSize);
+      }
+      const payload =
+        prefixSize === 0
+          ? EMPTY_PACKET_DATA
+          : (await reader.read(payloadStart, payloadStart + prefixSize, blockEnd)).slice();
+      const synthetic = new Uint8Array(1 + sizeBytes.byteLength + payload.byteLength);
+      synthetic[0] = 0x0a; // Sequence Header, no extension, explicit payload size.
+      synthetic.set(sizeBytes, 1);
+      synthetic.set(payload, 1 + sizeBytes.byteLength);
+      return { bytes: synthetic, complete: prefixSize === declaredSize };
+    }
+    if (!hasSize) return { bytes: EMPTY_PACKET_DATA, complete: true };
+    offset = payloadEnd;
+  }
+  return { bytes: EMPTY_PACKET_DATA, complete: true };
+}
+
+/** Parse one Block from bounded headers/prefixes; coded payload bytes are skipped by declared size. */
+async function scanPacketInfoBlock(
+  reader: WebmPacketInfoRangeReader,
+  block: WebmElementRange,
+  _readAheadLimit: number,
+  clusterTimecode: number,
+  state: WebmPacketInfoScanState,
+  keyframeOverride: boolean | undefined,
+  hasAlpha: boolean,
+  discardPaddingNs: number | undefined,
+  blockDurationTicks: number | undefined,
+): Promise<void> {
+  if (block.unknownSize) unknownPacketInfoChild(block, 'Block');
+  const track = await readPacketInfoVint(reader, block.dataStart, block.dataEnd, false);
+  if (track === undefined || track.value < 0) return;
+  const timecodeOffset = block.dataStart + track.length;
+  const flagsOffset = timecodeOffset + 2;
+  if (flagsOffset >= block.dataEnd) return;
+  const fixedHeader = await reader.read(timecodeOffset, flagsOffset + 1, block.dataEnd);
+  const headerView = new DataView(
+    fixedHeader.buffer,
+    fixedHeader.byteOffset,
+    fixedHeader.byteLength,
+  );
+  const relativeTimecode = headerView.getInt16(0, false);
+  const flags = fixedHeader[2] as number;
+  const blockTime = clusterTimecode + relativeTimecode;
+  state.lastEndTicks = Math.max(state.lastEndTicks, blockTime);
+
+  const trackIndex = state.trackIndexByNumber.get(track.value);
+  if (trackIndex === undefined) return;
+  recordBlockTime(state.blockTimes, track.value, blockTime);
+  const trackInfo = state.info.tracks[trackIndex] as WebmTrack;
+  const target = state.framesByIndex[trackIndex] as ScannedWebmFrame[];
+  const delay = state.delays.get(track.value) ?? {
+    nanoseconds: 0,
+    preserveSubTick: false,
+  };
+  const presentationNs = blockTime * state.timecodeScale - delay.nanoseconds;
+  const roundedTimestampUs = delay.preserveSubTick
+    ? Math.round(presentationNs / 1000)
+    : Math.round((Math.round(presentationNs / state.timecodeScale) * state.timecodeScale) / 1000);
+  const timestampUs = Object.is(roundedTimestampUs, -0) ? 0 : roundedTimestampUs;
+  const keyframe = keyframeOverride ?? (flags & 0x80) !== 0;
+  const blockDurationUs =
+    blockDurationTicks === undefined
+      ? undefined
+      : Math.round((blockDurationTicks * state.timecodeScale) / 1000);
+  const layout = await packetInfoBlockLayout(
+    reader,
+    flagsOffset + 1,
+    block.dataEnd,
+    lacingOf(flags),
+  );
+  const frameDurationUs =
+    blockDurationUs !== undefined && blockDurationUs > 0
+      ? layout.laced
+        ? Math.round(blockDurationUs / layout.frames.length)
+        : blockDurationUs
+      : undefined;
+
+  for (let index = 0; index < layout.frames.length; index++) {
+    const frame = layout.frames[index] as PacketInfoFrameRange;
+    let data = EMPTY_PACKET_DATA;
+    if (trackInfo.codec === 'opus' && frame.size > 0) {
+      const prefixEnd = frame.offset + Math.min(2, frame.size);
+      data = (await reader.read(frame.offset, prefixEnd, block.dataEnd)).slice();
+    }
+    if (
+      keyframe &&
+      trackInfo.mediaType === 'video' &&
+      (trackInfo.codec === 'vp9' || trackInfo.codec === 'av1') &&
+      trackInfo.decoderCodecSource === 'unknown' &&
+      !state.firstKeyframes.has(track.value)
+    ) {
+      const retainedByteBudget = state.qualificationBytesRemaining;
+      let candidate: WebmQualificationPrefix;
+      if (trackInfo.codec === 'av1') {
+        candidate = await scanPacketInfoAv1SequenceHeader(
+          reader,
+          frame,
+          block.dataEnd,
+          retainedByteBudget,
+        );
+      } else {
+        const prefixSize = Math.min(
+          frame.size,
+          WEBM_PACKET_INFO_CODEC_PREFIX_BYTES,
+          retainedByteBudget,
+        );
+        const bytes =
+          prefixSize === 0
+            ? EMPTY_PACKET_DATA
+            : (await reader.read(frame.offset, frame.offset + prefixSize, block.dataEnd)).slice();
+        candidate = { bytes, complete: prefixSize === frame.size };
+      }
+      state.qualificationBytesRemaining -= candidate.bytes.byteLength;
+      state.firstKeyframes.set(track.value, candidate);
+    }
+    const carriesDiscardPadding =
+      discardPaddingNs !== undefined &&
+      discardPaddingNs !== 0 &&
+      (discardPaddingNs < 0 ? index === 0 : index === layout.frames.length - 1);
+    target.push({
+      data,
+      timestampUs,
+      keyframe,
+      ...(frameDurationUs !== undefined && frameDurationUs > 0
+        ? { durationUs: frameDurationUs }
+        : {}),
+      ...(hasAlpha && !layout.laced ? { alpha: EMPTY_PACKET_DATA } : {}),
+      ...(carriesDiscardPadding ? { discardPaddingNs } : {}),
+      offset: frame.offset,
+      size: frame.size,
+    });
+  }
+}
+
+/**
+ * Walk one Cluster by declared child sizes. For an unknown-size Cluster, a parsed direct-child header
+ * carrying a Segment-level id is its standards-derived boundary; payload bytes are never pattern-scanned.
+ */
+async function scanPacketInfoCluster(
+  reader: WebmPacketInfoRangeReader,
+  cluster: WebmElementRange,
+  state: WebmPacketInfoScanState,
+): Promise<number> {
+  let clusterTimecode = 0;
+  let cursor = cluster.dataStart;
+  while (cursor < cluster.dataEnd) {
+    const child = await readWebmElementRange(reader, cursor, cluster.dataEnd);
+    if (cluster.unknownSize && SEGMENT_LEVEL_IDS.has(child.id)) return cursor;
+    if (child.unknownSize) unknownPacketInfoChild(child, 'Cluster child');
+    cursor = child.dataEnd;
+
+    if (child.id === ID.Timecode) {
+      clusterTimecode = await readPacketInfoInteger(reader, child, cluster.dataEnd, false);
+    } else if (child.id === ID.SimpleBlock) {
+      await scanPacketInfoBlock(
+        reader,
+        child,
+        cluster.dataEnd,
+        clusterTimecode,
+        state,
+        undefined,
+        false,
+        undefined,
+        undefined,
+      );
+    } else if (child.id === ID.BlockGroup) {
+      const group = await scanPacketInfoBlockGroup(reader, child);
+      if (group.block !== undefined) {
+        await scanPacketInfoBlock(
+          reader,
+          group.block,
+          child.dataEnd,
+          clusterTimecode,
+          state,
+          group.keyframe,
+          group.hasAlpha,
+          group.discardPaddingNs,
+          group.blockDurationTicks,
+        );
+      }
+    }
+  }
+  return cursor;
+}
+
+async function webmPacketInfoFromWholeSource(
+  src: ByteSource,
+  signal: AbortSignal | undefined,
+): Promise<PacketInfoTable> {
+  const ranged =
+    src.range !== undefined && src.size !== undefined && src.size > 0
+      ? (src as ByteSource & {
+          readonly size: number;
+          readonly range: NonNullable<ByteSource['range']>;
+        })
+      : undefined;
+  const bytes =
+    ranged === undefined
+      ? await readAll(src, signal)
+      : await readPacketInfoRange(ranged, 0, ranged.size, signal);
+  try {
+    const { info, framesByIndex } = demuxWebm(bytes);
+    const sourceDurationUs =
+      info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
+    // `CodecPrivate`, image attachments, and AttachedFile payloads are source-buffer views. Packet-info
+    // strips timed payloads, but its TrackInfo still escapes, so clone every track-backed byte field
+    // before an owned whole-range response can be detached or recycled by `releaseRange`.
+    const detachedInfo = { ...info, tracks: info.tracks.map(copyWebmTrack) };
+    return {
+      tracks: toTrackInfos(detachedInfo, framesByIndex),
+      packets: packetPayloadRows(bytes, info.tracks, framesByIndex, sourceDurationUs).map(
+        ({ data: _data, alpha: _alpha, ...row }) => row,
+      ),
+    };
+  } finally {
+    if (ranged !== undefined) ranged.releaseRange?.(bytes);
+  }
+}
+
+/**
+ * Metadata-only WebM scan over finite range sources. It retains one bounded prefix, one read-ahead
+ * window, bounded declarations/codec prefixes, and lightweight packet rows — never a complete Block,
+ * Cluster, or media body. The prefix validates only EBML + Segment; schema-order-independent metadata
+ * discovery happens in the bounded top-level walk so late Info/Tracks/Attachments remain exact.
+ */
+async function webmPacketInfoFromSource(
+  src: ByteSource,
+  signal: AbortSignal | undefined,
+): Promise<PacketInfoTable> {
+  if (src.range === undefined || src.size === undefined || src.size <= 0) {
+    return webmPacketInfoFromWholeSource(src, signal);
+  }
+  const ranged = src as FiniteRangeByteSource;
+  const prefixEnd = Math.min(ranged.size, WEBM_PACKET_INFO_PREFIX_BYTES);
+  const prefix = await readPacketInfoRange(ranged, 0, prefixEnd, signal);
+  let bootstrap: WebmPacketInfoBootstrap;
+  try {
+    // Deliberately do not call parseWebm here: even with scanClusters:false, keyframe qualification in
+    // an incomplete leading Cluster can couple codec facts to missing late Info. Qualification belongs
+    // exclusively to the second bounded pass after all Segment metadata is known.
+    bootstrap = await packetInfoBootstrapFromPrefix(ranged, prefix, signal);
+  } finally {
+    ranged.releaseRange?.(prefix);
+  }
+  const segment = bootstrap.segment;
+  let timecodeScale = 1_000_000;
+  let durationTicks = 0;
+
+  // Segment metadata peers have no useful ordering guarantee. Discover and detach them before reading
+  // any packet clock. A second Tracks is schema-invalid and rejected rather than ambiguously merged.
+  let metadataCursor = segment.dataStart;
+  let tracksSeen = 0;
+  let attachmentsSeen = 0;
+  const declarations: PacketInfoTrackDeclaration[] = [];
+  const metadataReader = new WebmPacketInfoRangeReader(ranged, signal);
+  try {
+    while (metadataCursor < segment.dataEnd) {
+      assertNotAborted(signal);
+      const element = await readWebmElementRange(metadataReader, metadataCursor, segment.dataEnd);
+      if (element.unknownSize && element.id !== ID.Cluster) {
+        throw new MediaError(
+          'demux-error',
+          `unknown-sized non-Cluster element 0x${element.id.toString(16)} in WebM Segment`,
+        );
+      }
+      if (element.id === ID.Info) {
+        const fields = await scanPacketInfoInfo(metadataReader, element);
+        timecodeScale = fields.timecodeScale ?? timecodeScale;
+        durationTicks = fields.durationTicks ?? durationTicks;
+        metadataCursor = element.dataEnd;
+      } else if (element.id === ID.Tracks) {
+        tracksSeen++;
+        if (tracksSeen > 1) {
+          throw new MediaError('demux-error', 'WebM Segment contains duplicate Tracks elements');
+        }
+        declarations.push(...(await scanPacketInfoTracks(metadataReader, element)));
+        metadataCursor = element.dataEnd;
+      } else if (element.id === ID.Attachments) {
+        attachmentsSeen++;
+        if (attachmentsSeen > 1) {
+          throw new MediaError(
+            'demux-error',
+            'WebM Segment contains duplicate Attachments elements',
+          );
+        }
+        declarations.push(...(await scanPacketInfoAttachments(metadataReader, element)));
+        metadataCursor = element.dataEnd;
+      } else {
+        metadataCursor =
+          element.id === ID.Cluster
+            ? await skipPacketInfoCluster(metadataReader, element)
+            : element.dataEnd;
+      }
+    }
+  } finally {
+    metadataReader.close();
+  }
+  if (declarations.length === 0) {
+    throw new MediaError('demux-error', 'WebM segment has no decodable tracks');
+  }
+  const info: WebmInfo = {
+    container: bootstrap.container,
+    durationSec: durationTicks > 0 ? (durationTicks * timecodeScale) / NANOS_PER_SECOND : 0,
+    tracks: declarations.map(({ track }) => track),
+  };
+
+  const trackIndexByNumber = new Map<number, number>();
+  for (let index = 0; index < info.tracks.length; index++) {
+    const trackNumber = info.tracks[index]?.trackNumber;
+    if (trackNumber !== undefined) trackIndexByNumber.set(trackNumber, index);
+  }
+  const delays = codecDelayMap(info);
+  const framesByIndex: ScannedWebmFrame[][] = declarations.map(({ attachmentFrame }) =>
+    attachmentFrame === undefined ? [] : [attachmentFrame],
+  );
+  const blockTimes = new Map<number, BlockTiming>();
+  const firstKeyframes = new Map<number, WebmQualificationPrefix>();
+  const state: WebmPacketInfoScanState = {
+    info,
+    trackIndexByNumber,
+    delays,
+    framesByIndex,
+    blockTimes,
+    firstKeyframes,
+    qualificationBytesRemaining: WEBM_PACKET_INFO_CODEC_PREFIX_TOTAL_BYTES,
+    timecodeScale,
+    lastEndTicks: 0,
+  };
+  let cursor = segment.dataStart;
+  const reader = new WebmPacketInfoRangeReader(ranged, signal);
+  try {
+    while (cursor < segment.dataEnd) {
+      assertNotAborted(signal);
+      const element = await readWebmElementRange(reader, cursor, segment.dataEnd);
+      if (element.unknownSize && element.id !== ID.Cluster) {
+        throw new MediaError(
+          'demux-error',
+          `unknown-sized non-Cluster element 0x${element.id.toString(16)} in WebM Segment`,
+        );
+      }
+      cursor =
+        element.id === ID.Cluster
+          ? await scanPacketInfoCluster(reader, element, state)
+          : element.dataEnd;
+    }
+  } finally {
+    reader.close();
+  }
+
+  const declaredMediaIndexes = info.tracks.flatMap((track, index) =>
+    track.trackNumber === undefined ? [] : [index],
+  );
+  const hasDeclaredMediaBlock = declaredMediaIndexes.some(
+    (trackIndex) => (framesByIndex[trackIndex]?.length ?? 0) > 0,
+  );
+  if (
+    cursor !== segment.dataEnd ||
+    (declaredMediaIndexes.length > 0 && !hasDeclaredMediaBlock) ||
+    framesByIndex.every((frames) => frames.length === 0)
+  ) {
+    throw new MediaError(
+      'demux-error',
+      'WebM segment declares media tracks but contains no media blocks',
+    );
+  }
+  if (info.durationSec <= 0) {
+    info.durationSec = (state.lastEndTicks * state.timecodeScale) / NANOS_PER_SECOND;
+  }
+  for (const track of info.tracks) {
+    if (track.mediaType !== 'video' || track.fps !== undefined || track.trackNumber === undefined) {
+      continue;
+    }
+    const timing = blockTimes.get(track.trackNumber);
+    const fps = timing === undefined ? undefined : fpsFromBlockTiming(timing, state.timecodeScale);
+    if (fps !== undefined) track.fps = fps;
+  }
+  qualifyScannedWebmTracks(info, firstKeyframes, ranged.size);
+  const sourceDurationUs =
+    info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
+  return {
+    tracks: toTrackInfos(info, framesByIndex),
+    packets: scannedPacketRows(info.tracks, framesByIndex, sourceDurationUs),
   };
 }
 
@@ -1761,8 +3165,8 @@ function toTrackInfos(
 /** Read the entire source into one buffer — demux walks every Cluster, which spans the whole file. */
 async function readAll(src: ByteSource, signal?: AbortSignal): Promise<Uint8Array> {
   assertNotAborted(signal);
-  if (src.range && src.size !== undefined) {
-    const bytes = await src.range(0, src.size);
+  if (src.range && src.size !== undefined && src.size > 0) {
+    const bytes = await src.range(0, src.size, signal);
     assertNotAborted(signal);
     return bytes;
   }
@@ -2050,29 +3454,52 @@ function videoDecodeStartUs(
   return Number.isFinite(candidate) ? candidate : startUs;
 }
 
-function frameDurationUs(
+function frameDurationsUs(
   frames: readonly WebmFrame[],
-  index: number,
   sourceDurationUs: number | undefined,
-): number | undefined {
-  const current = frames[index];
-  if (current === undefined) return undefined;
-  for (let i = index + 1; i < frames.length; i++) {
-    const next = frames[i];
-    if (next !== undefined && next.timestampUs > current.timestampUs) {
-      return next.timestampUs - current.timestampUs;
+): readonly (number | undefined)[] {
+  // `frames` is Block/file order, which is decode order for reordered video. Its adjacent PTS can
+  // therefore belong to a distant future/past presentation sample (I,P,B,B is the canonical case).
+  // Find the actual neighbours on the presentation timeline instead of deriving a false long packet
+  // duration from whichever access unit happens to sit next in the Cluster.
+  const presentationTimestampsUs = [...new Set(frames.map((frame) => frame.timestampUs))].sort(
+    (left, right) => left - right,
+  );
+  const inferredByTimestampUs = new Map<number, number>();
+  for (let index = 0; index < presentationTimestampsUs.length; index++) {
+    const timestampUs = presentationTimestampsUs[index] as number;
+    const previousTimestampUs = presentationTimestampsUs[index - 1];
+    const nextTimestampUs = presentationTimestampsUs[index + 1];
+    if (nextTimestampUs !== undefined) {
+      inferredByTimestampUs.set(timestampUs, nextTimestampUs - timestampUs);
+    } else if (previousTimestampUs !== undefined) {
+      inferredByTimestampUs.set(timestampUs, timestampUs - previousTimestampUs);
+    } else if (sourceDurationUs !== undefined && sourceDurationUs > timestampUs) {
+      inferredByTimestampUs.set(timestampUs, sourceDurationUs - timestampUs);
     }
   }
-  for (let i = index - 1; i >= 0; i--) {
-    const prev = frames[i];
-    if (prev !== undefined && current.timestampUs > prev.timestampUs) {
-      return current.timestampUs - prev.timestampUs;
-    }
-  }
-  if (sourceDurationUs !== undefined && sourceDurationUs > current.timestampUs) {
-    return sourceDurationUs - current.timestampUs;
-  }
-  return undefined;
+  return frames.map((frame) =>
+    frame.durationUs !== undefined && frame.durationUs > 0
+      ? frame.durationUs
+      : inferredByTimestampUs.get(frame.timestampUs),
+  );
+}
+
+/**
+ * Project Matroska's authoritative Block/file decode order onto a monotone decode clock.
+ *
+ * ffprobe-compatible packet reporting below intentionally exposes its SPS-delay projection, whose
+ * leading entries have no preceding presentation timestamps and are consequently PTS-prefixed. That
+ * hybrid is useful as reported metadata but is not a safe mux scheduling key: sorting by it can move a
+ * P/B access unit ahead of the I/P unit that decodes it. For an actual remux, the source order is the
+ * authority; assigning its access units the sorted presentation ticks preserves that order and cadence.
+ */
+function muxDecodeTimelineUs(
+  frames: readonly WebmFrame[],
+  reorderDepth: number,
+): readonly number[] | undefined {
+  if (!Number.isSafeInteger(reorderDepth) || reorderDepth <= 0) return undefined;
+  return frames.map((frame) => frame.timestampUs).sort((left, right) => left - right);
 }
 
 function firstKeyframeIndex(frames: readonly WebmFrame[], start: number): number {
@@ -2153,16 +3580,17 @@ function chunkFromFrame(
   frames: readonly WebmFrame[],
   index: number,
   timestampOffsetUs: number,
-  sourceDurationUs: number | undefined,
+  durationUs: number | undefined,
+  dtsUs?: number,
 ): ChunkStruct | undefined {
   const frame = frames[index];
   if (frame === undefined) return undefined;
-  const durationUs = frameDurationUs(frames, index, sourceDurationUs);
   return {
     timestampUs: frame.timestampUs - timestampOffsetUs,
     durationUs,
     key: frame.keyframe,
     data: frame.data,
+    ...(dtsUs !== undefined ? { dtsUs: dtsUs - timestampOffsetUs } : {}),
     ...(frame.alpha !== undefined ? { alpha: frame.alpha } : {}),
     ...(frame.discardPaddingNs !== undefined ? { discardPaddingNs: frame.discardPaddingNs } : {}),
   };
@@ -2252,6 +3680,11 @@ async function streamCopyWebm(
       const frame = frames[index];
       return frame === undefined ? [] : [frame];
     });
+    const decodeTimeline =
+      track.mediaType === 'video'
+        ? muxDecodeTimelineUs(frames, track.reorderDepth ?? 0)
+        : undefined;
+    const durationsUs = frameDurationsUs(frames, sourceDurationUs);
     const muxTrackId = muxer.addTrack(
       toTrackInfo(
         track,
@@ -2264,7 +3697,11 @@ async function streamCopyWebm(
     );
     for (const index of indexes) {
       assertNotAborted(options?.signal);
-      const chunk = chunkFromFrame(frames, index, timestampOffsetUs, sourceDurationUs);
+      // Matroska blocks carry PTS but their file order is decode order. Use a complete monotone decode
+      // clock for every selected access unit; the packet-info reporting projection has a PTS-prefixed
+      // lead-in and must never become a writer sort key. Indexing the full clock keeps trim gaps intact.
+      const dtsUs = decodeTimeline?.[index];
+      const chunk = chunkFromFrame(frames, index, timestampOffsetUs, durationsUs[index], dtsUs);
       if (chunk === undefined) continue;
       muxer.addChunkStruct(muxTrackId, chunk);
       selectedPackets++;
@@ -2311,8 +3748,7 @@ function packetStream(
   const reorderDepth = track.reorderDepth ?? 0;
   const batchPacketLimit = 32;
   const batchByteLimit = 128 * 1024;
-  const presentationTimeline =
-    reorderDepth > 0 ? frames.map((frame) => frame.timestampUs).sort((a, b) => a - b) : undefined;
+  const decodeTimeline = isVideo ? muxDecodeTimelineUs(frames, reorderDepth) : undefined;
   let i = 0;
   return new ReadableStream<Packet>(
     {
@@ -2335,11 +3771,19 @@ function packetStream(
           i++;
           const keyframe = codecDefinesAudioSync || frame.keyframe;
           const type = (keyframe ? 'key' : 'delta') as EncodedVideoChunkType;
-          if (presentationTimeline === undefined && frame.alpha === undefined) {
+          if (decodeTimeline === undefined && frame.alpha === undefined) {
             const chunk = isVideo
               ? new EncodedVideoChunk({ type, timestamp: frame.timestampUs, data: frame.data })
               : new EncodedAudioChunk({ type, timestamp: frame.timestampUs, data: frame.data });
-            controller.enqueue({ chunk, data: frame.data, sizeBytes: frame.data.byteLength });
+            controller.enqueue({
+              chunk,
+              data: frame.data,
+              sizeBytes: frame.data.byteLength,
+              // Audio blocks are presentation-order packets, so their PTS is also source-proven DTS.
+              // Keep it explicit: packet-copy muxers can then quantize the authored source timeline as
+              // cumulative boundaries instead of mistaking it for encoder-produced PTS-only timing.
+              ...(!isVideo ? { dtsUs: frame.timestampUs } : {}),
+            });
             emittedPackets++;
             emittedBytes += frame.data.byteLength;
             continue;
@@ -2351,17 +3795,14 @@ function packetStream(
             timestamp: frame.timestampUs,
             data: frame.data,
           };
-          // Matroska blocks carry PTS in decode order. H.264's SPS reorder restriction reconstructs DTS;
-          // non-reordered frames keep it implicit under the `undefined => DTS equals PTS` Packet contract.
+          // Matroska blocks carry PTS in decode order. For H.264, project that authoritative file order
+          // onto a monotone DTS clock; non-reordered frames keep DTS implicit under the Packet contract.
           const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
           const alpha =
             isVideo && frame.alpha !== undefined
               ? new EncodedVideoChunk({ ...init, data: frame.alpha })
               : undefined;
-          const dtsUs =
-            presentationTimeline !== undefined && i - 1 >= reorderDepth
-              ? (presentationTimeline[i - 1 - reorderDepth] ?? frame.timestampUs)
-              : frame.timestampUs;
+          const dtsUs = decodeTimeline?.[i - 1] ?? frame.timestampUs;
           controller.enqueue({
             chunk,
             data: frame.data,
@@ -2392,6 +3833,9 @@ export const WebmDriver: ContainerDriver = {
     assertNotAborted(signal);
     return toTrackInfos(info);
   },
+  async packetInfo(src: ByteSource, o?: StageOptions): Promise<PacketInfoTable> {
+    return webmPacketInfoFromSource(src, o?.signal);
+  },
   async demux(src: ByteSource, o?: StageOptions): Promise<Demuxer> {
     // Demux reads the whole file (Clusters span the body) and decodes every (Simple)Block into per-track
     // frames; `packets()` then wraps each frame as a WebCodecs EncodedChunk (browser-gated). The metadata
@@ -2401,8 +3845,17 @@ export const WebmDriver: ContainerDriver = {
     const { info, framesByIndex } = demuxWebm(bytes);
     assertNotAborted(signal);
     const tracks = toTrackInfos(info, framesByIndex);
+    const sourceDurationUs =
+      info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
     return {
       tracks,
+      packetStats(trackId: number): PacketMetadataStats | undefined {
+        const frames = framesByIndex[trackId];
+        const track = info.tracks[trackId];
+        return frames === undefined || track === undefined
+          ? undefined
+          : webmTrackPacketStats(frames, sourceDurationUs, track.reorderDepth ?? 0);
+      },
       packets(trackId: number): ReadableStream<Packet> {
         const track = info.tracks[trackId];
         const frames = framesByIndex[trackId];
@@ -2410,8 +3863,6 @@ export const WebmDriver: ContainerDriver = {
         return packetStream(frames, track, signal);
       },
       packetTable(): readonly PacketMetadata[] {
-        const sourceDurationUs =
-          info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
         return packetMetadataRows(bytes, info.tracks, framesByIndex, sourceDurationUs);
       },
       close: () => Promise.resolve(),

@@ -86,6 +86,168 @@ export interface LimitedI420Frame {
   readonly layout: readonly PlaneLayout[];
 }
 
+export interface PlanarI420Frame {
+  readonly data: Uint8Array;
+  readonly layout: readonly PlaneLayout[];
+}
+
+function i420SampleCount(
+  width: number,
+  height: number,
+): {
+  readonly luma: number;
+  readonly chroma: number;
+  readonly total: number;
+} {
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+    throw new InputError(
+      `planar video conversion needs positive integer dimensions, got ${width}x${height}`,
+    );
+  }
+  const luma = width * height;
+  const chroma = Math.ceil(width / 2) * Math.ceil(height / 2);
+  const total = luma + chroma * 2;
+  if (!Number.isSafeInteger(total))
+    throw new InputError('planar video conversion frame is too large');
+  return { luma, chroma, total };
+}
+
+function i420Layout(width: number, height: number, bytesPerSample: 1 | 2): PlaneLayout[] {
+  const { luma, chroma } = i420SampleCount(width, height);
+  const chromaWidth = Math.ceil(width / 2);
+  return [
+    { offset: 0, stride: width * bytesPerSample },
+    { offset: luma * bytesPerSample, stride: chromaWidth * bytesPerSample },
+    { offset: (luma + chroma) * bytesPerSample, stride: chromaWidth * bytesPerSample },
+  ];
+}
+
+/** Left-shift planar 4:2:0 integer samples into a 10/12-bit little-endian representation. */
+export function widenI420Samples(
+  source: Uint8Array,
+  width: number,
+  height: number,
+  sourceBitDepth: 8 | 10,
+  targetBitDepth: 10 | 12,
+): PlanarI420Frame {
+  if (targetBitDepth <= sourceBitDepth) {
+    throw new InputError(
+      `video sample widening needs an increasing depth, got ${sourceBitDepth}→${targetBitDepth}`,
+    );
+  }
+  const { total } = i420SampleCount(width, height);
+  const sourceBytesPerSample = sourceBitDepth === 8 ? 1 : 2;
+  const expectedBytes = total * sourceBytesPerSample;
+  if (!Number.isSafeInteger(expectedBytes) || source.byteLength !== expectedBytes) {
+    throw new InputError(
+      `planar ${sourceBitDepth}-bit frame needs ${expectedBytes} bytes, got ${source.byteLength}`,
+    );
+  }
+  const data = new Uint8Array(total * 2);
+  const sourceView = new DataView(source.buffer, source.byteOffset, source.byteLength);
+  const outputView = new DataView(data.buffer);
+  const shift = targetBitDepth - sourceBitDepth;
+  const sourceMaximum = (1 << sourceBitDepth) - 1;
+  for (let sample = 0; sample < total; sample++) {
+    const value =
+      sourceBitDepth === 8 ? (source[sample] as number) : sourceView.getUint16(sample * 2, true);
+    if (value > sourceMaximum) {
+      throw new InputError(`${sourceBitDepth}-bit planar sample ${value} exceeds ${sourceMaximum}`);
+    }
+    outputView.setUint16(sample * 2, value << shift, true);
+  }
+  return { data, layout: i420Layout(width, height, 2) };
+}
+
+function frameColorSpace(frame: VideoFrame): VideoColorSpaceInit {
+  const colorSpace: VideoColorSpaceInit = {};
+  if (frame.colorSpace.primaries !== null) colorSpace.primaries = frame.colorSpace.primaries;
+  if (frame.colorSpace.transfer !== null) colorSpace.transfer = frame.colorSpace.transfer;
+  if (frame.colorSpace.matrix !== null) colorSpace.matrix = frame.colorSpace.matrix;
+  if (frame.colorSpace.fullRange !== null) colorSpace.fullRange = frame.colorSpace.fullRange;
+  return colorSpace;
+}
+
+function highDepthFormat(bitDepth: 10 | 12): VideoPixelFormat {
+  return `I420P${bitDepth}` as VideoPixelFormat;
+}
+
+/**
+ * Materialize a lower-depth frame as the standards-defined I420P10/I420P12 input an encoder needs.
+ * Browsers that expose the codec profile but cannot construct the matching pixel format fail as a typed
+ * capability miss instead of silently encoding an 8-bit stream under a high-depth codec request.
+ */
+export function widenedI420VideoFrameStream(
+  sourceBitDepth: 8 | 10,
+  targetBitDepth: 10 | 12,
+): TransformStream<VideoFrame, VideoFrame> {
+  return new TransformStream<VideoFrame, VideoFrame>({
+    async transform(frame, controller): Promise<void> {
+      try {
+        const width = frame.codedWidth;
+        const height = frame.codedHeight;
+        const visibleRect = frame.visibleRect;
+        const { total } = i420SampleCount(width, height);
+        const sourceBytesPerSample = sourceBitDepth === 8 ? 1 : 2;
+        const source = new Uint8Array(total * sourceBytesPerSample);
+        const sourceFormat = sourceBitDepth === 8 ? 'I420' : highDepthFormat(sourceBitDepth);
+        try {
+          await frame.copyTo(source, {
+            format: sourceFormat,
+            rect: { x: 0, y: 0, width, height },
+            layout: i420Layout(width, height, sourceBytesPerSample),
+          });
+          const widened = widenI420Samples(source, width, height, sourceBitDepth, targetBitDepth);
+          const base: VideoFrameBufferInit = {
+            format: highDepthFormat(targetBitDepth),
+            codedWidth: width,
+            codedHeight: height,
+            ...(visibleRect === null
+              ? {}
+              : {
+                  visibleRect: {
+                    x: visibleRect.x,
+                    y: visibleRect.y,
+                    width: visibleRect.width,
+                    height: visibleRect.height,
+                  },
+                }),
+            displayWidth: frame.displayWidth,
+            displayHeight: frame.displayHeight,
+            timestamp: frame.timestamp,
+            colorSpace: frameColorSpace(frame),
+            layout: [...widened.layout],
+          };
+          const output = new VideoFrame(
+            widened.data,
+            frame.duration === null ? base : { ...base, duration: frame.duration },
+          );
+          let handedOff = false;
+          try {
+            controller.enqueue(output);
+            handedOff = true;
+          } finally {
+            if (!handedOff) output.close();
+          }
+        } catch (error) {
+          if (error instanceof InputError || error instanceof CapabilityError) throw error;
+          throw new CapabilityError(
+            `this runtime cannot materialize ${sourceBitDepth}-bit video as I420P${targetBitDepth}`,
+            {
+              op: { kind: 'route', id: 'convert-video-bit-depth' },
+              tried: [`videoframe-i420p${targetBitDepth}`],
+              suggestion: `use ${sourceBitDepth}-bit output or a runtime with I420P${targetBitDepth} VideoFrame support`,
+            },
+            { cause: error },
+          );
+        }
+      } finally {
+        frame.close();
+      }
+    },
+  });
+}
+
 interface YuvMatrixCoefficients {
   readonly kr: number;
   readonly kb: number;

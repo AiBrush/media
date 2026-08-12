@@ -59,6 +59,12 @@ try {
 The batch stream is single-use. Breaking a `for await` loop releases it automatically; explicit
 `cancel()` is safe when ownership leaves the loop. An optional `container` hint can skip format routing.
 
+Set `includePayloadDigests: true` when an integrity workflow also needs SHA-256 for each exact coded
+payload. Each returned row then carries `payloadDigest`. This performs a full payload scan, but
+range-capable sources are still read in bounded windows and batches retain only row metadata. Large-file
+policies may omit the public `offset` even though the driver uses private sample placement to hash the
+payload; do not treat a missing offset as a missing digest.
+
 ### `demux`
 
 `demux()` exposes track descriptors and one packet stream per track:

@@ -17,9 +17,9 @@
 import { describe, expect, it } from 'vitest';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
+import { MPEG4_SAMPLE_RATES, parseAsc, sampleRateForIndex } from '../aac-config.ts';
 import {
   AAC_LC_FRAME_SAMPLES,
-  MPEG4_SAMPLE_RATES,
   aacObjectTypeFromCodecString,
   deinterleaveF32,
   descriptionBytes,
@@ -27,9 +27,7 @@ import {
   isAacCodec,
   normalizeAacDecoderConfig,
   parseAdtsFrame,
-  parseAsc,
   readAdtsFrames,
-  sampleRateForIndex,
   skipId3,
 } from './aac.ts';
 import WasmAacModule, {

@@ -88,6 +88,34 @@ describe('H.264 AVC access-unit picture classification', () => {
       h264AccessUnitIsKeyPicture(accessUnit(4, new Uint8Array([0x67, 0x64, 0, 0x28])), 4),
     ).toBeUndefined();
     expect(h264AccessUnitIsKeyPicture(accessUnit(4, sliceNal(1, 2)), 3)).toBeUndefined();
+    expect(h264AccessUnitIsKeyPicture(new Uint8Array([0]), 1)).toBeUndefined();
+    expect(h264AccessUnitIsKeyPicture(new Uint8Array([0]), 2)).toBeUndefined();
+    expect(h264AccessUnitIsKeyPicture(new Uint8Array([1, 0x80]), 1)).toBeUndefined();
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 3])), 1),
+    ).toBeUndefined();
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 3, 4])), 1),
+    ).toBeUndefined();
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 0, 0, 0])), 1),
+    ).toBeUndefined();
+    expect(h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 1])), 1)).toBeUndefined();
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 1, 0, 0, 3])), 1),
+    ).toBeUndefined();
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 1, 0, 0, 3, 4])), 1),
+    ).toBeUndefined();
+  });
+
+  it('accepts valid emulation-prevention bytes in both Exp-Golomb scan phases', () => {
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 3, 1, 0, 0, 0x81])), 1),
+    ).toBe(false);
+    expect(
+      h264AccessUnitIsKeyPicture(accessUnit(1, new Uint8Array([0x41, 0, 0, 1, 0, 0, 3, 1])), 1),
+    ).toBe(false);
   });
 
   it('classifies an exact byte range without treating adjacent storage as access-unit data', () => {
@@ -99,6 +127,8 @@ describe('H.264 AVC access-unit picture classification', () => {
     expect(h264AccessUnitRangeIsKeyPicture(storage, 3, picture.byteLength, 4)).toBe(true);
     expect(h264AccessUnitRangeIsKeyPicture(storage, 3, picture.byteLength - 1, 4)).toBeUndefined();
     expect(h264AccessUnitRangeIsKeyPicture(storage, -1, picture.byteLength, 4)).toBeUndefined();
+    expect(h264AccessUnitRangeIsKeyPicture(storage, 0.5, picture.byteLength, 4)).toBeUndefined();
+    expect(h264AccessUnitRangeIsKeyPicture(storage, 3, -1, 4)).toBeUndefined();
     expect(h264AccessUnitRangeIsKeyPicture(storage, 3, Number.MAX_SAFE_INTEGER, 4)).toBeUndefined();
   });
 });

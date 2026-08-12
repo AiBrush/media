@@ -898,9 +898,9 @@ describe('public convert semantic stream-copy route', () => {
     expect(output).toBeInstanceOf(Blob);
     if (!(output instanceof Blob)) throw new Error('expected a Blob output');
     const outputBytes = new Uint8Array(await output.arrayBuffer());
-    expect(outputBytes).toHaveLength(3862);
+    expect(outputBytes).toHaveLength(3865);
     expect(createHash('sha256').update(outputBytes).digest('hex')).toBe(
-      '25dd20c3ed93ef38f371036c8b41b7f53523ca472658af59493d613f1dda9152',
+      '088e211bc76139768fba142085863e64927fef11f6dce3d46b5e901f7f7a9d07',
     );
     const after = webmPacketPayloadInfoFromBytes(outputBytes);
     const trackTruth = (track: TrackInfo): unknown => ({

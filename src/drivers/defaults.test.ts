@@ -1,18 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   CodecDriver,
   ContainerDriver,
+  EncodedChunk,
   FilterDriver,
   FilterSpec,
+  RawFrame,
   TrackInfo,
 } from '../contracts/driver.ts';
+import { DRIVER_API_VERSION } from '../contracts/driver.ts';
 import { CapabilityError, MediaError, isCapabilityErrorDetail } from '../contracts/errors.ts';
 import { Registry } from '../kernel/registry.ts';
 import { fromBytes } from '../sources/source.ts';
 import { fixtureSource, loadFixture } from '../test-support/corpus.ts';
-import { registerDefaultDrivers } from './defaults.ts';
+import { lazyCodec, registerDefaultDrivers } from './defaults.ts';
 import { FlacDriver } from './flac/flac-driver.ts';
 import { OggDriver } from './ogg/ogg-driver.ts';
 
@@ -106,6 +109,102 @@ async function derivedBytes(name: string): Promise<Uint8Array> {
 }
 
 describe('registerDefaultDrivers', () => {
+  it('orders native codecs first and retries a transient lazy support load', async () => {
+    const reg = new Registry();
+    registerDefaultDrivers(reg);
+    expect(
+      reg
+        .codecs()
+        .slice(0, 2)
+        .map((driver) => driver.id),
+    ).toEqual(['webcodecs-video', 'webcodecs-audio']);
+
+    const loaded: CodecDriver = {
+      id: 'test-native-video',
+      apiVersion: DRIVER_API_VERSION,
+      kind: 'codec',
+      tier: 'hardware',
+      supports: vi.fn(async () => ({ supported: true })),
+      createDecoder: vi.fn(() => new TransformStream<EncodedChunk, RawFrame>()),
+      createEncoder: vi.fn(() => new TransformStream<RawFrame, EncodedChunk>()),
+    };
+    const load = vi
+      .fn<() => Promise<CodecDriver>>()
+      .mockRejectedValueOnce(new Error('transient native chunk failure'))
+      .mockResolvedValue(loaded);
+    const proxy = lazyCodec({
+      id: loaded.id,
+      tier: loaded.tier,
+      matches: (query) => query.mediaType === 'video',
+      load,
+    });
+    const audioQuery = {
+      mediaType: 'audio',
+      direction: 'decode',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
+    } as const;
+    const videoQuery = {
+      mediaType: 'video',
+      direction: 'decode',
+      config: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+    } as const;
+
+    await expect(proxy.supports(audioQuery)).resolves.toMatchObject({ supported: false });
+    expect(load).not.toHaveBeenCalled();
+    await expect(proxy.supports(videoQuery)).resolves.toMatchObject({
+      supported: false,
+      reason: 'transient native chunk failure',
+    });
+    const supportOptions = { determinism: 'force-software' } as const;
+    await expect(proxy.supports(videoQuery, supportOptions)).resolves.toEqual({ supported: true });
+    expect(() =>
+      proxy.createDecoder({ codec: 'vp8', codedWidth: 16, codedHeight: 16 }),
+    ).not.toThrow();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(loaded.supports).toHaveBeenCalledTimes(1);
+    expect(loaded.supports).toHaveBeenCalledWith(videoQuery, supportOptions);
+    expect(loaded.createDecoder).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a non-Error lazy codec rejection without leaking the rejected value', async () => {
+    const proxy = lazyCodec({
+      id: 'non-error-codec',
+      tier: 'native',
+      matches: () => true,
+      load: () => Promise.reject('chunk unavailable'),
+    });
+
+    await expect(
+      proxy.supports({
+        mediaType: 'video',
+        direction: 'decode',
+        config: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+      }),
+    ).resolves.toEqual({ supported: false, reason: 'non-error-codec unavailable' });
+  });
+
+  it('keeps both lazy image decode surfaces honest when ImageDecoder is absent', async () => {
+    const restore = defineGlobal('ImageDecoder', undefined);
+    try {
+      const reg = new Registry();
+      registerDefaultDrivers(reg);
+      const images = reg.imageOps();
+      if (images === undefined) throw new Error('default image ops are missing');
+
+      const reader = images.decode(new Uint8Array()).getReader();
+      try {
+        await expect(reader.read()).rejects.toBeInstanceOf(CapabilityError);
+      } finally {
+        reader.releaseLock();
+      }
+      await expect(images.decodeFrames(new Uint8Array()).next()).rejects.toBeInstanceOf(
+        CapabilityError,
+      );
+    } finally {
+      restore();
+    }
+  });
+
   it('registers image support on the default registry host', async () => {
     const reg = new Registry();
     registerDefaultDrivers(reg);
@@ -401,6 +500,11 @@ describe('registerDefaultDrivers', () => {
     expect(flac.supports({ direction: 'demux', mime: 'audio/flac' })).toBe(true);
     expect(flac.supports({ direction: 'demux', extension: 'flac' })).toBe(true);
     expect(flac.supports({ direction: 'demux', extension: 'mp3' })).toBe(false);
+    const muxer = flac.createMuxer();
+    expect(muxer.writePcm).toBeUndefined();
+    expect(() => muxer.addTrack({ id: 1, mediaType: 'video', codec: 'vp9' })).toThrowError(
+      CapabilityError,
+    );
   });
 
   it('registers Ogg cross-container packet-copy targets on its lazy proxy', () => {

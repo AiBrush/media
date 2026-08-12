@@ -32,12 +32,14 @@ import {
   buildVideoEncoderConfigForRuntime,
   canCopyAudioTrackToContainer,
   canCopyVpxAlphaSideData,
+  canDeferVpxAlphaFrameRepack,
   canUseVpxAlphaGeometryPacketTranscode,
   canUseVpxAlphaPacketTranscode,
   chooseOutputContainer,
   containerHasChunkMuxer,
   createDrainTaskGroup,
   decodeVideoPacketsWithAlpha,
+  defaultOpusAudioEncodeTarget,
   drainEncoderToMuxer,
   encodeVideoFramesWithAlpha,
   encodeVpxAlphaFrameStreams,
@@ -63,6 +65,7 @@ import {
   resolveVideoEncoderCodecString,
   seekFrame,
   selectTrackInfos,
+  sourceVideoBitrateFromPacketStats,
   sourceVideoBitrateFromPacketTable,
   splitRgbaForVpxAlpha,
   transcodeVpxAlphaPackets,
@@ -71,6 +74,7 @@ import {
   videoLatencyMode,
   videoPixelRotation,
   videoTrackInfoFromDecoderConfig,
+  vpxAlphaI420FromPackedGrayscale,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
   webkitVideoTranscodeDeclineReason,
@@ -294,6 +298,40 @@ describe('vpxAlphaI420FromPackedRgba', () => {
     expect(() =>
       vpxAlphaI420FromPackedRgba(bgra, 1, 1, { offset: 0, stride: 4 }, 'ARGB' as never),
     ).toThrow(MediaError);
+  });
+});
+
+describe('vpxAlphaI420FromPackedGrayscale', () => {
+  it('keeps full-swing grayscale endpoints instead of introducing studio-range 16/235 offsets', () => {
+    const rgba = Uint8Array.from([0, 7, 8, 255, 127, 1, 2, 255, 255, 3, 4, 255]);
+    const bgra = Uint8Array.from([8, 7, 0, 255, 2, 1, 127, 255, 4, 3, 255, 255]);
+
+    expect([
+      ...vpxAlphaI420FromPackedGrayscale(rgba, 3, 1, { offset: 0, stride: 12 }, 'RGBA').data,
+    ]).toEqual([0, 127, 255, 128, 128, 128, 128]);
+    expect([
+      ...vpxAlphaI420FromPackedGrayscale(bgra, 3, 1, { offset: 0, stride: 12 }, 'BGRA').data,
+    ]).toEqual([0, 127, 255, 128, 128, 128, 128]);
+  });
+});
+
+describe('canDeferVpxAlphaFrameRepack', () => {
+  it('recognizes deferred display-size scales that need coded-raster repacking', () => {
+    const frame = {
+      format: 'I420' as const,
+      codedWidth: 640,
+      codedHeight: 480,
+      displayWidth: 320,
+      displayHeight: 240,
+    };
+    expect(canDeferVpxAlphaFrameRepack(frame)).toBe(true);
+    expect(
+      canDeferVpxAlphaFrameRepack({
+        ...frame,
+        codedWidth: 320,
+        codedHeight: 240,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -2851,7 +2889,7 @@ describe('planVideoBitDepthConversion', () => {
     });
   });
 
-  it('keeps same-depth transcodes as no-op and widens exact 8-bit samples at the Main10 encoder', () => {
+  it('keeps same-depth transcodes as no-op and plans an explicit Main10 sample-widening path', () => {
     expect(
       planVideoBitDepthConversion({
         sourceCodec: 'avc1.42E01E',
@@ -2872,7 +2910,7 @@ describe('planVideoBitDepthConversion', () => {
       kind: 'encoder-widen',
       sourceBitDepth: 8,
       targetBitDepth: 10,
-      requiresPixelPath: false,
+      requiresPixelPath: true,
     });
   });
 
@@ -3158,7 +3196,21 @@ describe('buildAudioEncoderConfig', () => {
   });
 });
 
-describe('firefoxOpusAudioEncodeTarget / firefoxOpusEncodeUsesWasm', () => {
+describe('Opus audio target normalization / Firefox wasm routing', () => {
+  it('defaults every implicit Opus output to its fixed 48 kHz presentation rate', () => {
+    expect(defaultOpusAudioEncodeTarget({ codec: 'opus', bitrate: 128_000 }, 'mp4a.40.2')).toEqual({
+      codec: 'opus',
+      bitrate: 128_000,
+      sampleRate: 48000,
+    });
+    expect(defaultOpusAudioEncodeTarget({}, 'opus')).toEqual({ sampleRate: 48000 });
+
+    const explicit = { codec: 'opus', sampleRate: 24_000 } as const;
+    expect(defaultOpusAudioEncodeTarget(explicit, 'flac')).toBe(explicit);
+    const aac = { codec: 'aac', bitrate: 192_000 } as const;
+    expect(defaultOpusAudioEncodeTarget(aac, 'mp3')).toBe(aac);
+  });
+
   it('normalizes explicit Firefox Opus audio targets to the wasm-supported 48 kHz rate', () => {
     expect(firefoxOpusAudioEncodeTarget({ codec: 'opus', bitrate: 128_000 }, 'mp3')).toEqual({
       codec: 'opus',
@@ -3238,10 +3290,17 @@ describe('runtime-aware transcode preflight helpers', () => {
     vendor: 'Google Inc.',
   };
 
-  it('keeps non-Firefox audio targets untouched and uses the normal encoder config path', async () => {
+  it('applies portable Opus defaults on Chromium and uses the normal encoder config path', async () => {
     await withNavigator(chromeNavigator, async () => {
       const aac = { codec: 'aac', bitrate: 192_000 } as const;
       expect(await resolveAudioEncodeTargetForRuntime(aac, 'mp3')).toBe(aac);
+      await expect(
+        resolveAudioEncodeTargetForRuntime({ codec: 'opus', bitrate: 128_000 }, 'mp4a.40.2'),
+      ).resolves.toEqual({ codec: 'opus', bitrate: 128_000, sampleRate: 48000 });
+      const explicitOpus = { codec: 'opus', sampleRate: 24_000 } as const;
+      await expect(resolveAudioEncodeTargetForRuntime(explicitOpus, 'flac')).resolves.toBe(
+        explicitOpus,
+      );
       await expect(
         buildVideoEncoderConfigForRuntime({ codec: 'vp8' }, { width: 320, height: 240 }, 'vp8'),
       ).resolves.toMatchObject({ codec: 'vp8' });
@@ -3886,6 +3945,7 @@ const s13ModuleSource = (name: string): string =>
 
 describe('S13 layering: the pure config modules are frame-free and runtime-free (items 2/3)', () => {
   const pureModules = [
+    'audio-target-defaults.ts',
     'codec-strings.ts',
     'codec-queries.ts',
     'encoder-config.ts',
@@ -3934,12 +3994,14 @@ describe('S13 layering: the pure config modules are frame-free and runtime-free 
 
   it('every S13 module respects the < 600-line budget (item 1)', () => {
     const modules = [
+      'audio-target-defaults.ts',
       'codec-pipeline.ts',
       'codec-strings.ts',
       'codec-queries.ts',
       'encoder-config.ts',
       'mux-trackinfo.ts',
       'vpx-alpha.ts',
+      'vpx-alpha-geometry.ts',
       'codec-live.ts',
       'codec-runtime-quirks.ts',
       'codec-routing.ts',
@@ -4865,5 +4927,25 @@ describe('sourceVideoBitrateFromPacketTable VFR + B-frame golden (item 10)', () 
     expect(sourceVideoBitrateFromPacketTable(table, 1)).toBe(320_000);
     expect(sourceVideoBitrateFromPacketTable([], 1)).toBeUndefined();
     expect(sourceVideoBitrateFromPacketTable(undefined, 1)).toBeUndefined();
+  });
+});
+
+describe('sourceVideoBitrateFromPacketStats', () => {
+  it('uses an exact decode pair and otherwise falls back wholly to presentation bounds', () => {
+    const base = {
+      packetCount: 4,
+      totalSizeBytes: 4_000,
+      presentationStartUs: 1_000_000,
+      presentationEndUs: 1_200_000,
+    };
+    expect(
+      sourceVideoBitrateFromPacketStats({
+        ...base,
+        decodeStartUs: 900_000,
+        decodeEndUs: 1_000_000,
+      }),
+    ).toBe(320_000);
+    expect(sourceVideoBitrateFromPacketStats(base)).toBe(160_000);
+    expect(sourceVideoBitrateFromPacketStats({ ...base, decodeStartUs: 900_000 })).toBe(160_000);
   });
 });

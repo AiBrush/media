@@ -8,7 +8,12 @@
 
 import { readFile } from 'node:fs/promises';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { deframeH264PesUnits, detectFraming, parseTs } from './ts-parse.ts';
+import {
+  deframeH264PesUnits,
+  detectFraming,
+  h264CodecStringFromAnnexB,
+  parseTs,
+} from './ts-parse.ts';
 
 const DERIVED = new URL('../../../fixtures/media-derived/', import.meta.url).pathname;
 const PACKET = 188;
@@ -56,6 +61,26 @@ function asciiBytes(s: string): Uint8Array<ArrayBuffer> {
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;
 }
+
+describe('H.264 Annex-B decoder config', () => {
+  it('derives profile/compatibility/level from SPS after either start-code width', () => {
+    expect(h264CodecStringFromAnnexB(Uint8Array.of(0, 0, 1, 0x67, 0x64, 0, 0x28))).toBe(
+      'avc1.640028',
+    );
+    expect(h264CodecStringFromAnnexB(Uint8Array.of(0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1e))).toBe(
+      'avc1.42E01E',
+    );
+  });
+
+  it('skips non-SPS NALs and rejects an SPS missing any codec-parameter byte', () => {
+    expect(
+      h264CodecStringFromAnnexB(
+        Uint8Array.of(0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x1f),
+      ),
+    ).toBe('avc1.4D401F');
+    expect(h264CodecStringFromAnnexB(Uint8Array.of(0, 0, 1, 0x67, 0x64, 0))).toBeUndefined();
+  });
+});
 
 function tsPacket(
   pid: number,
@@ -326,7 +351,7 @@ describe('parseTs on the m2ts (192-byte) and offset variants of the real slice',
       }));
     expect(summarize(m2ts)).toEqual(summarize(plain));
     const v = m2ts.tracks[0]?.config as VideoDecoderConfig;
-    expect(v).toMatchObject({ codec: 'h264', codedWidth: 1280, codedHeight: 720 });
+    expect(v).toMatchObject({ codec: 'avc1.64001F', codedWidth: 1280, codedHeight: 720 });
   });
 
   it('parses the offset-shifted (junk-prefixed) 188 stream identically', () => {
@@ -444,6 +469,10 @@ describe('parseTs H.264 access units spanning PES boundaries', () => {
     ).pathname;
     const parsed = parseTs(new Uint8Array(await readFile(mediaPath)));
     const video = parsed.tracks.find((track) => track.stream.mediaType === 'video');
-    expect(video?.config).toMatchObject({ codec: 'h264', codedWidth: 960, codedHeight: 720 });
+    expect(video?.config).toMatchObject({
+      codec: 'avc1.4D401F',
+      codedWidth: 960,
+      codedHeight: 720,
+    });
   });
 });

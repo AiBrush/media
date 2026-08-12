@@ -6,6 +6,7 @@ import type { LogEvent, PreloadSpec } from './types.ts';
 interface PreloadRecorder {
   readonly tasks: Map<string, Promise<void>>;
   ensures: number;
+  readonly warmedOperations: string[];
   readonly containers: ContainerQuery[];
   readonly codecs: CodecQuery[];
   readonly filters: FilterSpec[];
@@ -32,6 +33,7 @@ function recordingHost(options: RecordingHostOptions = {}): {
   const recorder: PreloadRecorder = {
     tasks,
     ensures: 0,
+    warmedOperations: [],
     containers: [],
     codecs: [],
     filters: [],
@@ -42,6 +44,9 @@ function recordingHost(options: RecordingHostOptions = {}): {
     async ensureDefaultDrivers(): Promise<void> {
       recorder.ensures++;
       if ('failEnsure' in options) throw options.failEnsure;
+    },
+    async warmOperationChunks(op: string): Promise<void> {
+      recorder.warmedOperations.push(op);
     },
     pickContainer(q: ContainerQuery): void {
       recorder.containers.push(q);
@@ -97,6 +102,7 @@ describe('runPreload', () => {
     await expect(runPreload(host, [])).resolves.toBeUndefined();
 
     expect(recorder.ensures).toBe(1);
+    expect(recorder.warmedOperations).toEqual(['probe']);
     expect(recorder.containers).toHaveLength(13);
     expect(recorder.containers.every((q) => q.direction === 'demux')).toBe(true);
     expect(recorder.containers.find((q) => q.extension === 'mp4')?.mime).toBe('video/mp4');
@@ -159,6 +165,23 @@ describe('runPreload', () => {
       fit: 'contain',
     });
     expect(recorder.filters).toContainEqual({ mediaType: 'audio', type: 'gain', db: 0 });
+  });
+
+  it('compiles each requested lazy WASM family at compile level', async () => {
+    const { host, recorder } = recordingHost();
+
+    await expect(
+      runPreload(host, [
+        { op: 'decode', audio: 'mp3', level: 'compile' },
+        { op: 'decode', audio: 'vorbis', level: 'compile' },
+        { op: 'decode', audio: 'opus', level: 'compile' },
+        { op: 'decode', video: 'av1', level: 'compile' },
+        { op: 'decode', video: 'vp9', level: 'compile' },
+      ]),
+    ).resolves.toBeUndefined();
+
+    expect(recorder.ensures).toBe(5);
+    expect(recorder.warmedOperations).toEqual(['decode', 'decode', 'decode', 'decode', 'decode']);
   });
 
   it('continues after individual probe failures without surfacing warmup errors', async () => {

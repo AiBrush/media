@@ -366,6 +366,23 @@ describe('QTFF/.mov ffprobe-truth oracle (task #11 / ADR-185)', () => {
         // the parser must not invent one — but any non-square truth requires the atom to be read.
         if (track.pasp) {
           expect(`${track.pasp.hSpacing}:${track.pasp.vSpacing}`).toBe(truth.sampleAspectRatio);
+          if (track.pasp.hSpacing !== track.pasp.vSpacing) {
+            const displayWidth = config.displayAspectWidth;
+            const displayHeight = config.displayAspectHeight;
+            expect(displayWidth, `${file} decoder displayAspectWidth`).toBeDefined();
+            expect(displayHeight, `${file} decoder displayAspectHeight`).toBeDefined();
+            if (
+              displayWidth !== undefined &&
+              displayHeight !== undefined &&
+              truth.width !== null &&
+              truth.height !== null
+            ) {
+              // Independent ffprobe oracle: decoder DAR must equal coded width:height multiplied by SAR.
+              expect(displayWidth * truth.height * track.pasp.vSpacing).toBe(
+                displayHeight * truth.width * track.pasp.hSpacing,
+              );
+            }
+          }
         } else {
           expect(
             truth.sampleAspectRatio === null || truth.sampleAspectRatio === '1:1',

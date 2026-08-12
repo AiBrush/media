@@ -7,12 +7,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { MediaError } from '../contracts/errors.ts';
 import { readWavPcm } from '../drivers/wav/pcm.ts';
 import { loadFixture } from '../test-support/corpus.ts';
 import { type BiquadSpec, biquad } from './biquad.ts';
 import { limit, normalizePeak, normalizeRms } from './dynamics.ts';
 import { fadeIn, fadeOut } from './fade.ts';
 import type { PcmAudio } from './pcm.ts';
+import { resample, resampleStage } from './resample.ts';
 import { biquadStage, dynamicsStage, fadeStage } from './stream.ts';
 import type { StatefulAudioStage } from './stream.ts';
 
@@ -186,6 +188,73 @@ describe('streaming stages — chunked == whole-signal across the diverse real W
 });
 
 // ============ biquad — chunked == single-call ============
+
+describe('continuous-phase streaming resample', () => {
+  it('matches whole-signal 44.1 -> 48 kHz to float epsilon across arbitrary decoder chunking', () => {
+    const source = stereoTone(44_100, 12_347);
+    const expected = resample(source, 48_000);
+    for (const schedule of SCHEDULES) {
+      const actual = runStage(resampleStage(48_000), splitInto(source, schedule));
+      expect(actual.frames, `schedule ${schedule.join(',')}`).toBe(expected.frames);
+      expect(maxAbsDiff(actual, expected), `schedule ${schedule.join(',')}`).toBeLessThan(2e-15);
+    }
+  });
+
+  it('rounds the complete program once instead of accumulating per-AAC-chunk frame error', () => {
+    const source = stereoTone(44_100, 44_100);
+    const chunkSizes = Array.from({ length: Math.ceil(source.frames / 1024) }, () => 1024);
+    const chunks = splitInto(source, chunkSizes);
+    const actual = runStage(resampleStage(48_000), chunks);
+    const resetAtEveryChunk = concat(chunks.map((chunk) => resample(chunk, 48_000)));
+    const expected = resample(source, 48_000);
+
+    expect(actual.frames).toBe(48_000);
+    expect(actual.frames).toBe(expected.frames);
+    expect(maxAbsDiff(actual, expected)).toBeLessThan(2e-15);
+    expect(resetAtEveryChunk.frames).not.toBe(expected.frames);
+    expect(maxAbsDiff(resetAtEveryChunk, expected)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('preserves exact offline output when downsampling and rejects a mid-stream layout mutation', () => {
+    const source = stereoTone(48_000, 5_003);
+    const expected = resample(source, 16_000);
+    const actual = runStage(resampleStage(16_000), splitInto(source, [511, 1, 1024, 3]));
+    expect(actual.frames).toBe(expected.frames);
+    expect(maxAbsDiff(actual, expected)).toBeLessThan(2e-15);
+
+    const stage = resampleStage(48_000);
+    stage.push(tone(440, 44_100, 1_024));
+    expect(() => stage.push(tone(440, 48_000, 1_024))).toThrow(/layout changed/);
+  });
+
+  it('covers equal-rate identity, dense irrational ratios, empty flush, and lifecycle guards', () => {
+    const identitySource = stereoTone(48_000, 257);
+    const identityStage = resampleStage(48_000);
+    const identityChunks = identityStage.push(identitySource);
+    expect(identityChunks).toHaveLength(1);
+    expect(identityChunks[0]).toEqual(identitySource);
+    expect(identityChunks[0]?.planar[0]).not.toBe(identitySource.planar[0]);
+    expect(identityStage.flush()).toEqual([]);
+    expect(identityStage.flush()).toEqual([]);
+    expect(() => identityStage.push(identitySource)).toThrow(/after flush/);
+
+    const irrationalSource = tone(997, 44_100, 509);
+    const irrationalExpected = resample(irrationalSource, 44_101);
+    const irrationalActual = runStage(
+      resampleStage(44_101),
+      splitInto(irrationalSource, [1, 31, 2, 127]),
+    );
+    expect(irrationalActual.frames).toBe(irrationalExpected.frames);
+    expect(maxAbsDiff(irrationalActual, irrationalExpected)).toBeLessThan(2e-15);
+
+    const empty = resampleStage(48_000);
+    expect(empty.flush()).toEqual([]);
+    const abort = new AbortController();
+    const aborted = resampleStage(48_000, { signal: abort.signal });
+    abort.abort();
+    expect(() => aborted.push(tone(440, 44_100, 64))).toThrow(MediaError);
+  });
+});
 
 describe('biquadStage — chunked equals the whole-signal biquad (state persists across chunks)', () => {
   const specs: readonly BiquadSpec[] = [

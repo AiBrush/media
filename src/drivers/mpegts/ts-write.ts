@@ -1,4 +1,4 @@
-import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/wasm-aac/aac.ts';
+import { MPEG4_SAMPLE_RATES, parseAsc } from '../../codecs/aac-config.ts';
 import type { MediaType, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import {
   CapabilityError,
@@ -344,6 +344,17 @@ function* mpegTsChunks(
     psiPayload(pmtSection(serialization.packetizedTracks, serialization.pcrTrack.pid)),
   );
 
+  // Decode-time interleaving can legitimately put an audio PES before the first video PES, while the
+  // PMT still names the preferred video PID as the program clock reference. Publish an adaptation-only
+  // PCR packet immediately after the PMT so every elementary stream begins behind an established program
+  // clock. This preserves access-unit ordering and does not consume the PCR PID's payload continuity
+  // counter (ISO/IEC 13818-1 increments it only for packets carrying payload).
+  const firstUnit = serialization.units[0];
+  if (firstUnit === undefined) {
+    throw new MediaError('mux-error', 'MPEG-TS muxing requires a timed access unit.');
+  }
+  yield* pcrOnlyPacket(serialization.pcrTrack.pid, firstUnit.dtsTicks, continuity, writer);
+
   for (const unit of serialization.units) {
     const payload = accessUnitPayload(unit.track, unit.chunk);
     const pes = pesPacket(unit.track.streamId, payload, unit.ptsTicks, unit.dtsTicks);
@@ -353,6 +364,27 @@ function* mpegTsChunks(
 
   const finalChunk = writer.flush();
   if (finalChunk !== undefined) yield finalChunk;
+}
+
+function* pcrOnlyPacket(
+  pid: number,
+  pcrTicks: number,
+  continuity: ReadonlyMap<number, number>,
+  writer: TsPacketChunkWriter,
+): Generator<Uint8Array> {
+  const packet = writer.buffer;
+  const base = writer.packetOffset();
+  packet.fill(0xff, base, base + TS_PACKET_SIZE);
+  const continuityCounter = continuity.get(pid) ?? 0;
+  packet[base] = 0x47;
+  packet[base + 1] = (pid >> 8) & 0x1f;
+  packet[base + 2] = pid & 0xff;
+  packet[base + 3] = 0x20 | continuityCounter;
+  packet[base + 4] = TS_PACKET_SIZE - 5;
+  packet[base + 5] = 0x10;
+  writePcr(packet, base + 6, pcrTicks);
+  const chunk = writer.commitPacket();
+  if (chunk !== undefined) yield chunk;
 }
 
 class TsPacketChunkWriter {

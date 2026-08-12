@@ -84,6 +84,104 @@ async function videoSamples(mp4: Uint8Array): Promise<Uint8Array[]> {
   return (tracks[idx]?.samples ?? []).map((s) => s.data);
 }
 
+/**
+ * Run one decrypt behind a strict browser-decoder double whose independent oracle is the clear track's
+ * exact access-unit sequence. A mismatching unit is deliberately dropped rather than reported through
+ * the decoder error callback, exercising the production frame-count guard as well as its error channel.
+ */
+async function withStrictVideoSampleOracle<T>(
+  expectedSamples: readonly Uint8Array[],
+  run: () => Promise<T>,
+): Promise<{ result: T; decodedSamples: number }> {
+  let decodedSamples = 0;
+  class FakeCencEncodedVideoChunk {
+    readonly data: Uint8Array;
+
+    constructor(init: EncodedVideoChunkInit) {
+      const data = init.data;
+      this.data = ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data);
+    }
+  }
+  class StrictCencVideoDecoder {
+    static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+      return Promise.resolve({ config, supported: true });
+    }
+
+    readonly decodeQueueSize = 0;
+    state: CodecState = 'unconfigured';
+    readonly #output: (frame: VideoFrame) => void;
+
+    constructor(init: VideoDecoderInit) {
+      this.#output = init.output;
+    }
+
+    configure(_config: VideoDecoderConfig): void {
+      this.state = 'configured';
+    }
+
+    decode(chunk: EncodedVideoChunk): void {
+      const actual = (chunk as unknown as FakeCencEncodedVideoChunk).data;
+      const expected = expectedSamples[decodedSamples];
+      decodedSamples++;
+      if (
+        expected === undefined ||
+        actual.byteLength !== expected.byteLength ||
+        actual.some((byte, index) => byte !== expected[index])
+      ) {
+        return;
+      }
+      this.#output({ close: (): void => undefined } as VideoFrame);
+    }
+
+    flush(): Promise<void> {
+      return Promise.resolve();
+    }
+
+    reset(): void {
+      this.state = 'unconfigured';
+    }
+
+    close(): void {
+      this.state = 'closed';
+    }
+
+    addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+
+    removeEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+  }
+
+  const originalVideoDecoder = globalThis.VideoDecoder;
+  const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
+  Object.defineProperty(globalThis, 'VideoDecoder', {
+    configurable: true,
+    value: StrictCencVideoDecoder as unknown as typeof VideoDecoder,
+  });
+  Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+    configurable: true,
+    value: FakeCencEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
+  });
+
+  try {
+    return { result: await run(), decodedSamples };
+  } finally {
+    if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
+    else
+      Object.defineProperty(globalThis, 'VideoDecoder', {
+        configurable: true,
+        value: originalVideoDecoder,
+      });
+    if (originalEncodedVideoChunk === undefined)
+      Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
+    else
+      Object.defineProperty(globalThis, 'EncodedVideoChunk', {
+        configurable: true,
+        value: originalEncodedVideoChunk,
+      });
+  }
+}
+
 async function decryptBytes(mp4: Uint8Array): Promise<Uint8Array> {
   const out = await createMedia().decrypt(encSource(mp4), { scheme: 'cenc', keys: { [KID]: KEY } });
   if (!(out instanceof Blob)) throw new Error('expected a Blob output');
@@ -183,10 +281,15 @@ describeHarness(
       await expect(readMovie(ra(out))).resolves.toBeDefined();
     });
 
-    // Every baked mutation must reject at the decrypt seam with a typed MediaError. The bit-flip fixture
-    // changes one `senc` IV inside an otherwise consecutive producer run; the clean neighbours expose that
-    // metadata corruption without assuming that all valid CENC IVs are sequential.
-    const HARNESS_REJECT: ReadonlyArray<{ name: string; path: string }> = [
+    // Every baked mutation must reject at the browser decrypt seam with a typed MediaError. The bit-flip
+    // fixture changes only encrypted `mdat` payload bytes; because AES-CTR is unauthenticated, that case
+    // requires the production AVC decode-validation boundary. Structural metadata/truncation cases reject
+    // before a decoder is needed.
+    const HARNESS_REJECT: ReadonlyArray<{
+      name: string;
+      path: string;
+      validateRecoveredVideo?: true;
+    }> = [
       {
         name: 'cenc_ctr_protection_zeroed.mp4',
         path: 'scenarios/encryption/cenc_ctr_protection_zeroed_graceful/cenc_ctr_protection_zeroed.mp4',
@@ -194,20 +297,37 @@ describeHarness(
       {
         name: 'cenc_ctr_senc_bitflip.mp4',
         path: 'scenarios/encryption/cenc_ctr_senc_bitflip_graceful/cenc_ctr_senc_bitflip.mp4',
+        validateRecoveredVideo: true,
       },
       {
         name: 'cenc_ctr_truncated_mdat.mp4',
         path: 'scenarios/encryption/cenc_ctr_truncated_mdat_graceful/cenc_ctr_truncated_mdat.mp4',
       },
     ];
-    for (const { name, path } of HARNESS_REJECT) {
+    for (const { name, path, validateRecoveredVideo } of HARNESS_REJECT) {
       it(`rejects ${name} with a typed MediaError`, async () => {
         const bytes = harnessFixture(path);
         if (!bytes) return;
-        const err = await decryptHarness(bytes).then(
-          () => undefined,
-          (e: unknown) => e,
-        );
+        let err: unknown;
+        if (validateRecoveredVideo) {
+          const clean = harnessFixture('cenc_ctr.mp4');
+          if (!clean) throw new Error('clean CENC harness fixture is missing');
+          const expectedVideo = await videoSamples(await decryptHarness(clean));
+          expect(expectedVideo.length).toBeGreaterThan(0);
+          const checked = await withStrictVideoSampleOracle(expectedVideo, () =>
+            decryptHarness(bytes).then(
+              () => undefined,
+              (e: unknown) => e,
+            ),
+          );
+          err = checked.result;
+          expect(checked.decodedSamples).toBe(expectedVideo.length);
+        } else {
+          err = await decryptHarness(bytes).then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+        }
         expect(err).toBeInstanceOf(MediaError);
         expect(err).not.toBeInstanceOf(CapabilityError);
       });
@@ -288,106 +408,18 @@ describe('media.decrypt — CENC robustness: malformed protection rejects cleanl
       throw new Error('mutation offset is outside the encrypted fixture');
     corrupted[mutationOffset] = originalByte ^ 0x01;
 
-    let decodedSamples = 0;
-    class FakeCencEncodedVideoChunk {
-      readonly data: Uint8Array;
+    const recovered = await withStrictVideoSampleOracle(clearVideo, () => decryptBytes(encrypted));
+    expect(recovered.decodedSamples).toBe(clearVideo.length);
+    expect(await videoSamples(recovered.result)).toEqual(clearVideo);
 
-      constructor(init: EncodedVideoChunkInit) {
-        const data = init.data;
-        this.data = ArrayBuffer.isView(data)
-          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-          : new Uint8Array(data);
-      }
-    }
-    class StrictCencVideoDecoder {
-      static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
-        return Promise.resolve({ config, supported: true });
-      }
-
-      readonly decodeQueueSize = 0;
-      state: CodecState = 'unconfigured';
-      readonly #output: (frame: VideoFrame) => void;
-
-      constructor(init: VideoDecoderInit) {
-        this.#output = init.output;
-      }
-
-      configure(_config: VideoDecoderConfig): void {
-        this.state = 'configured';
-      }
-
-      decode(chunk: EncodedVideoChunk): void {
-        const actual = (chunk as unknown as FakeCencEncodedVideoChunk).data;
-        const expected = clearVideo[decodedSamples];
-        decodedSamples++;
-        if (
-          expected === undefined ||
-          actual.byteLength !== expected.byteLength ||
-          actual.some((byte, index) => byte !== expected[index])
-        ) {
-          // Model a real decoder's error-concealment path: it may accept the chunk but drop the damaged
-          // access unit without firing the error callback. Full-track validation must still reject because
-          // one MP4 AVC sample is one access unit and therefore owes exactly one output frame.
-          return;
-        }
-        this.#output({ close: (): void => undefined } as VideoFrame);
-      }
-
-      flush(): Promise<void> {
-        return Promise.resolve();
-      }
-
-      reset(): void {
-        this.state = 'unconfigured';
-      }
-
-      close(): void {
-        this.state = 'closed';
-      }
-
-      addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
-
-      removeEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
-    }
-
-    const originalVideoDecoder = globalThis.VideoDecoder;
-    const originalEncodedVideoChunk = globalThis.EncodedVideoChunk;
-    Object.defineProperty(globalThis, 'VideoDecoder', {
-      configurable: true,
-      value: StrictCencVideoDecoder as unknown as typeof VideoDecoder,
-    });
-    Object.defineProperty(globalThis, 'EncodedVideoChunk', {
-      configurable: true,
-      value: FakeCencEncodedVideoChunk as unknown as typeof EncodedVideoChunk,
-    });
-
-    try {
-      const recovered = await decryptBytes(encrypted);
-      expect(decodedSamples).toBe(clearVideo.length);
-      expect(await videoSamples(recovered)).toEqual(clearVideo);
-
-      decodedSamples = 0;
-      const error = await decryptBytes(corrupted).then(
+    const corruptedResult = await withStrictVideoSampleOracle(clearVideo, () =>
+      decryptBytes(corrupted).then(
         () => undefined,
         (reason: unknown) => reason,
-      );
-      expect(error).toBeInstanceOf(MediaError);
-      expect(error).not.toBeInstanceOf(CapabilityError);
-    } finally {
-      if (originalVideoDecoder === undefined) Reflect.deleteProperty(globalThis, 'VideoDecoder');
-      else
-        Object.defineProperty(globalThis, 'VideoDecoder', {
-          configurable: true,
-          value: originalVideoDecoder,
-        });
-      if (originalEncodedVideoChunk === undefined)
-        Reflect.deleteProperty(globalThis, 'EncodedVideoChunk');
-      else
-        Object.defineProperty(globalThis, 'EncodedVideoChunk', {
-          configurable: true,
-          value: originalEncodedVideoChunk,
-        });
-    }
+      ),
+    );
+    expect(corruptedResult.result).toBeInstanceOf(MediaError);
+    expect(corruptedResult.result).not.toBeInstanceOf(CapabilityError);
   });
 });
 

@@ -3,8 +3,8 @@
  * zero-config (doc 07) while the eager kernel stays tiny (ADR-004). The engine `import()`s this module
  * only on a capability miss, so it (and the container parsers it pulls in) is a lazy code-split chunk,
  * never part of the eager bundle. This file holds only registration wiring plus the lazy proxy
- * factories; real parsing lives in the per-family driver modules (`./flac/flac-lazy-driver.ts` for
- * the FLAC fast paths), byte IO in `../util/byte-stream.ts`, image sniffing in the image codec module,
+ * factories; real parsing lives in per-family driver modules, byte IO in `../util/byte-stream.ts`,
+ * image sniffing in the image codec module,
  * and runtime capability detection in `../kernel/runtime-capabilities.ts`.
  */
 
@@ -15,14 +15,12 @@ import type {
   ImageOps,
 } from '../codecs/image/index.ts';
 import { sniffImageFormat } from '../codecs/image/probe.ts';
-import { WebCodecsAudioModule } from '../codecs/webcodecs-audio.ts';
-import { WebcodecsVideoModule } from '../codecs/webcodecs-video.ts';
 import type {
   CodecDriver,
   CodecQuery,
   CodecSupport,
+  CodecSupportOptions,
   DecoderConfig,
-  DriverModule,
   EncodedChunk,
   EncoderConfig,
   FilterDriver,
@@ -43,6 +41,7 @@ import {
   adtsMuxTrackConfig,
   validateMp3MuxTrack,
   validateOggMuxTrack,
+  wavMuxTrackConfig,
 } from './audio-container-mux-validation.ts';
 import {
   matchesAdts,
@@ -50,14 +49,14 @@ import {
   matchesCaf,
   matchesMp3,
   matchesOgg,
+  matchesWav,
 } from './audio-container-sniff.ts';
 import { matchesAvi } from './avi/avi-sniff.ts';
-import { lazyFlacContainerDriver } from './flac/flac-lazy-driver.ts';
+import { matchesFlac, validateFlacMuxTrack } from './flac/flac-match.ts';
 import { type LazyContainerSpec, lazyContainer } from './lazy-container.ts';
 import { createLazyFilterStream } from './lazy-filter-stream.ts';
-import { matchesMp4 } from './mp4/mp4-sniff.ts';
+import { MP4_LAZY_CONTAINER_SPEC } from './mp4/mp4-lazy-driver.ts';
 import { MPEG_TS_FORMATS, matchesMpegTs } from './mpegts/mpegts-sniff.ts';
-import { WAV_LAZY_CONTAINER_SPEC } from './wav/wav-lazy-driver.ts';
 import { matchesWebm } from './webm/webm-sniff.ts';
 
 export { lazyContainer } from './lazy-container.ts';
@@ -70,16 +69,7 @@ export type { LazyContainerSpec } from './lazy-container.ts';
  * registering them everywhere is safe — the router simply skips them and falls through to a typed miss.
  */
 export function registerDefaultDrivers(reg: Registry): void {
-  const modules: DriverModule[] = [
-    WebcodecsVideoModule,
-    WebCodecsAudioModule,
-    // All software codec tails now co-vendor their wasm via scripts/vendor-wasm.ts (rust both-files pairs:
-    // Vorbis/AAC/MP3 + dav1d AV1; self-contained inlined tails: Opus/VPx) for the lazy import.meta.url load
-    // on a WebCodecs miss (ADR-042/086/090/093/094). supports()→false in Node (no VideoFrame/WebCodecs seam).
-  ];
-  for (const mod of modules) mod.register(reg);
   for (const spec of DEFAULT_LAZY_CONTAINER_SPECS) reg.addContainer(lazyContainer(spec));
-  reg.addContainer(lazyFlacContainerDriver());
   for (const driver of lazyFilterDrivers()) reg.addFilter(driver);
   reg.addImageOps?.(lazyImageOps());
   for (const driver of lazyCodecDrivers()) reg.addCodec(driver);
@@ -88,7 +78,7 @@ export function registerDefaultDrivers(reg: Registry): void {
 type LazyCodecLoader = () => Promise<CodecDriver>;
 type LazyFilterLoader = () => Promise<FilterDriver>;
 
-interface LazyCodecSpec {
+export interface LazyCodecSpec {
   readonly id: string;
   readonly tier: CodecDriver['tier'];
   readonly matches: (q: CodecQuery) => boolean;
@@ -97,29 +87,36 @@ interface LazyCodecSpec {
 
 /** Every spec-registered first-party container, in registration (routing ladder) order. */
 export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
-  {
-    id: 'mp4',
-    formats: ['mp4', 'mov'],
-    supports: matchesMp4,
-    load: () => import('./mp4/mp4-driver.ts').then((module) => module.Mp4Driver),
-    probe: true,
-    packetInfo: true,
-    packetInfoBatches: true,
-    auditMuxedTrack: true,
-    streamCopy: true,
-    decrypt: true,
-    validatesStreamCopyTrim: true,
-    gaplessSeam: true,
-  },
+  MP4_LAZY_CONTAINER_SPEC,
   {
     id: 'webm',
     formats: ['webm', 'mkv'],
     supports: matchesWebm,
     load: () => import('./webm/webm-driver.ts').then((module) => module.WebmDriver),
     probe: true,
+    packetInfo: true,
     streamCopy: true,
   },
-  WAV_LAZY_CONTAINER_SPEC,
+  {
+    id: 'wav',
+    formats: ['wav'],
+    supports: matchesWav,
+    load: () =>
+      import('./wav/wav-lazy-driver.ts').then((module) =>
+        lazyContainer(module.WAV_LAZY_CONTAINER_SPEC),
+      ),
+    probe: true,
+    packetInfo: true,
+    transformPcm: true,
+    decodePcmAudio: true,
+    decodePcmAudioStream: true,
+    decodePcmInterleavedStream: true,
+    validatesPcmTrim: true,
+    muxKind: 'wav',
+    validateTrack: (track, trackCount) => {
+      wavMuxTrackConfig(track, trackCount);
+    },
+  },
   {
     id: 'mp3',
     formats: ['mp3'],
@@ -196,6 +193,22 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     formats: ['avi'],
     supports: matchesAvi,
     load: () => import('./avi/avi-driver.ts').then((m) => m.AviDriver),
+  },
+  {
+    id: 'flac',
+    formats: ['flac'],
+    streamCopyTargets: ['ogg'],
+    supports: matchesFlac,
+    load: () =>
+      import('./flac/flac-lazy-driver.ts').then((module) => module.lazyFlacContainerDriver()),
+    probe: true,
+    packetInfo: true,
+    streamCopy: true,
+    transformPcm: true,
+    decodePcm: true,
+    decodePcmAudio: true,
+    pcmMuxSeam: false,
+    validateTrack: validateFlacMuxTrack,
   },
 ];
 
@@ -372,6 +385,21 @@ function videoDecode(q: CodecQuery): boolean {
 function lazyCodecDrivers(): readonly CodecDriver[] {
   return [
     lazyCodec({
+      id: 'webcodecs-video',
+      tier: 'hardware',
+      matches: (q) => q.mediaType === 'video',
+      load: () =>
+        import('../codecs/webcodecs-video.ts').then((module) => module.WebcodecsVideoDriver),
+    }),
+    lazyCodec({
+      id: 'webcodecs-audio',
+      tier: 'hardware',
+      matches: (q) => q.mediaType === 'audio',
+      load: () =>
+        import('../codecs/webcodecs-audio.ts').then((module) => module.WebCodecsAudioDriver),
+    }),
+    // Software codec tails co-vendor their WASM and remain lazy until a native WebCodecs miss.
+    lazyCodec({
       id: 'flac-encode',
       tier: 'native',
       matches: (q) =>
@@ -433,14 +461,20 @@ function lazyCodecDrivers(): readonly CodecDriver[] {
   ];
 }
 
-function lazyCodec(spec: LazyCodecSpec): CodecDriver {
+export function lazyCodec(spec: LazyCodecSpec): CodecDriver {
   let driver: CodecDriver | undefined;
   let loadPromise: Promise<CodecDriver> | undefined;
   const load = async (): Promise<CodecDriver> => {
     if (driver !== undefined) return driver;
-    loadPromise ??= spec.load();
-    driver = await loadPromise;
-    return driver;
+    const pending = loadPromise ?? spec.load();
+    loadPromise = pending;
+    try {
+      driver = await pending;
+      return driver;
+    } catch (error) {
+      if (loadPromise === pending) loadPromise = undefined;
+      throw error;
+    }
   };
   const unavailable = (): CapabilityError =>
     new CapabilityError(`${spec.id} was not loaded`, {
@@ -452,10 +486,10 @@ function lazyCodec(spec: LazyCodecSpec): CodecDriver {
     apiVersion: DRIVER_API_VERSION,
     kind: 'codec',
     tier: spec.tier,
-    async supports(q: CodecQuery): Promise<CodecSupport> {
+    async supports(q: CodecQuery, o?: CodecSupportOptions): Promise<CodecSupport> {
       if (!spec.matches(q)) return { supported: false, reason: `${spec.id} does not match` };
       try {
-        return await (await load()).supports(q);
+        return await (await load()).supports(q, o);
       } catch (error) {
         return {
           supported: false,

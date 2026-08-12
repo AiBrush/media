@@ -3,7 +3,8 @@
  * plus the {@link WebmMuxer} adapter over it, mirroring the MP4 muxer's "Muxer-over-writer" shape
  * ({@link Mp4Muxer}). It writes an **EBML Header** + a **Segment** (`Info` with TimecodeScale/Duration,
  * `Tracks` with one `TrackEntry` per track carrying CodecID + CodecPrivate + geometry, and `Cluster`s of
- * `SimpleBlock`s — one per encoded packet, with presentation timecodes derived from each chunk's PTS).
+ * Blocks — one per encoded packet, with presentation timecodes derived from each chunk's PTS and
+ * `BlockDuration` carried by a `BlockGroup` for variable-cadence tracks and terminal live packets).
  *
  * EBML element = `ID(vint, marker kept) · size(vint, marker stripped) · data`. This writer always emits
  * **definite** sizes (every element's payload is built first, then length-prefixed), so the output is
@@ -11,8 +12,8 @@
  *
  * The packet→block timing (the only non-trivial logic) is a pure, Node-testable helper
  * ({@link buildBlockTimeline}); only the `write()` extraction of a real `EncodedChunk` (`copyTo`) is
- * browser-only and guarded. WebM `SimpleBlock`s carry **presentation** time + a keyframe flag (no
- * separate DTS/ctts as in MP4), so reordered (B-frame) input simply yields blocks timestamped by PTS.
+ * browser-only and guarded. Matroska Blocks carry **presentation** time while their file order carries
+ * decode order, so reordered (B-frame) input is stored by DTS and timestamped by PTS.
  */
 
 import type {
@@ -84,6 +85,7 @@ const EBML_ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  BlockDuration: 0x9b,
   BlockAdditions: 0x75a1,
   BlockMore: 0xa6,
   BlockAdditional: 0xa5,
@@ -378,6 +380,8 @@ export interface TimelineBlock {
   timeMs: number;
   /** Decode time (ms ticks) — the storage/decode order key; equals `timeMs` for a non-reordered stream. */
   dtsMs: number;
+  /** Explicit duration in Segment ticks, when it is needed to materialize variable/terminal cadence. */
+  durationMs?: number;
   key: boolean;
   data: Uint8Array;
   /** VPx alpha side-data bytes to write as BlockAdditions (BlockAddID=1), when present. */
@@ -406,6 +410,57 @@ interface TrackChunks {
 
 interface DeclaredTrackDuration {
   endMs: number;
+}
+
+function durationBearingChunks(track: TrackChunks): ReadonlySet<ChunkStruct> {
+  const explicit = new Set<ChunkStruct>();
+  const carriesDecodeTable =
+    track.mediaType === 'video' && track.chunks.some((chunk) => chunk.dtsUs !== undefined);
+  const reordered = track.chunks.some((chunk, index) => {
+    const previous = track.chunks[index - 1];
+    return previous !== undefined && chunk.timestampUs < previous.timestampUs;
+  });
+  if (carriesDecodeTable || reordered) {
+    // Prepared video sample durations belong to decode-table access units. Even before a visible PTS
+    // regression, the next presentation timestamp can belong to a different access unit, so a Matroska
+    // remux keeps every independently supplied duration explicit.
+    for (const chunk of track.chunks) {
+      if (
+        chunk.durationUs !== undefined &&
+        Number.isFinite(chunk.durationUs) &&
+        chunk.durationUs > 0
+      ) {
+        explicit.add(chunk);
+      }
+    }
+    return explicit;
+  }
+  const presented = [...track.chunks].sort((left, right) => left.timestampUs - right.timestampUs);
+  for (let index = 0; index < presented.length; index++) {
+    const chunk = presented[index];
+    if (
+      chunk?.durationUs === undefined ||
+      !Number.isFinite(chunk.durationUs) ||
+      chunk.durationUs <= 0
+    ) {
+      continue;
+    }
+    let next = index + 1;
+    while (next < presented.length && presented[next]?.timestampUs === chunk.timestampUs) {
+      next++;
+    }
+    const nextTimestampUs = presented[next]?.timestampUs;
+    // Adjacent PTS values represent ordinary CFR/VFR cadence without accumulating one rounded duration
+    // per packet. A terminal packet has no following timestamp; a genuine overlap/gap whose duration is
+    // different at Segment precision also needs an explicit BlockDuration.
+    if (
+      nextTimestampUs === undefined ||
+      Math.abs(chunk.durationUs - (nextTimestampUs - chunk.timestampUs)) > MICROS_PER_MS
+    ) {
+      explicit.add(chunk);
+    }
+  }
+  return explicit;
 }
 
 /**
@@ -443,17 +498,48 @@ export function buildBlockTimeline(tracks: readonly TrackChunks[]): {
   let fallbackEndMs = 0;
   for (const t of tracks) {
     const codecDelayUs = (t.timestampAdjustmentNs ?? 0) / 1000;
+    // Adjacent Block timestamps represent ordinary CFR/VFR cadence more accurately than summing rounded
+    // millisecond durations. Materialize only a terminal duration or a real duration-vs-next-PTS gap.
+    const explicitDurations = durationBearingChunks(t);
     for (let chunkIndex = 0; chunkIndex < t.chunks.length; chunkIndex++) {
       const c = t.chunks[chunkIndex] as ChunkStruct;
       const isTerminal = chunkIndex === t.chunks.length - 1;
+      const nextChunk = t.chunks[chunkIndex + 1];
       const discardPaddingNs =
         c.discardPaddingNs ?? (isTerminal ? t.trailingDiscardPaddingNs : undefined);
+      const currentDtsUs = c.dtsUs ?? c.timestampUs;
+      const nextDtsUs = nextChunk?.dtsUs ?? nextChunk?.timestampUs;
+      const decodeSpanUs =
+        nextDtsUs !== undefined && Number.isFinite(nextDtsUs)
+          ? nextDtsUs - currentDtsUs
+          : undefined;
+      const decodeSpanMs =
+        decodeSpanUs !== undefined
+          ? usToMs(currentDtsUs + decodeSpanUs - baseUs) - usToMs(currentDtsUs - baseUs)
+          : undefined;
       blocks.push({
         trackNumber: t.trackNumber,
         // CodecDelay is subtracted by readers, so add it back to the raw Block timestamp here. Sorting
         // remains on the actual decode clock below, keeping cross-track/B-frame ordering independent.
         timeMs: usToMs(c.timestampUs - baseUs + codecDelayUs),
         dtsMs: usToMs((c.dtsUs ?? c.timestampUs) - baseUs),
+        ...(explicitDurations.has(c) &&
+        c.durationUs !== undefined &&
+        Number.isFinite(c.durationUs) &&
+        c.durationUs > 0
+          ? {
+              // Adjacent rounded DTS boundaries remove quantization drift only when they describe this
+              // packet's supplied duration. A larger DTS discontinuity is a real decode gap, not license
+              // to stretch BlockDuration across it; preserve the independently authored duration there.
+              durationMs:
+                decodeSpanUs !== undefined &&
+                decodeSpanMs !== undefined &&
+                decodeSpanMs > 0 &&
+                Math.abs(decodeSpanUs - c.durationUs) <= MICROS_PER_MS
+                  ? decodeSpanMs
+                  : Math.max(1, usToMs(c.durationUs)),
+            }
+          : {}),
         key: c.key,
         data: c.data,
         ...(c.alpha !== undefined ? { alpha: c.alpha } : {}),
@@ -824,10 +910,39 @@ function trackStateFrom(info: TrackInfo, trackNumber: number): TrackState {
   };
 }
 
+/**
+ * Materialize an initial video composition offset as Matroska CodecDelay. MP4 can carry a negative
+ * first DTS independently from PTS; Matroska instead stores Blocks in decode order and signals the
+ * corresponding presentation shift on the TrackEntry. Quantize the delay to the authored Segment
+ * clock so stored Block timestamps subtract back to exact integer ticks.
+ */
+function derivedVideoReorderDelayNs(track: TrackState): number | undefined {
+  if (track.mediaType !== 'video') return undefined;
+  let first: ChunkStruct | undefined;
+  for (const chunk of track.chunks) {
+    if (chunk.dtsUs === undefined || !Number.isFinite(chunk.dtsUs)) continue;
+    if (first === undefined || chunk.dtsUs < (first.dtsUs ?? first.timestampUs)) first = chunk;
+  }
+  if (first?.dtsUs === undefined) return undefined;
+  const delayMs = usToMs(first.timestampUs - first.dtsUs);
+  if (!Number.isSafeInteger(delayMs) || delayMs <= 0) return undefined;
+  const delayNs = delayMs * NS_PER_MS;
+  return Number.isSafeInteger(delayNs) ? delayNs : undefined;
+}
+
+function authoredCodecDelayNs(track: TrackState): number | undefined {
+  return track.codecDelayNs ?? derivedVideoReorderDelayNs(track);
+}
+
+function authoredTimestampAdjustmentNs(track: TrackState): number | undefined {
+  return track.timestampAdjustmentNs ?? derivedVideoReorderDelayNs(track);
+}
+
 function timelineTrack(t: TrackState): TrackChunks {
   const durationSec = durationSecToMs(t.durationSec) !== undefined ? t.durationSec : undefined;
   const gapless = destinationOpusGapless(t);
   const trailingDiscardPaddingNs = trackTrailingDiscardPaddingNs(t, gapless);
+  const timestampAdjustmentNs = authoredTimestampAdjustmentNs(t);
   const base = {
     trackNumber: t.trackNumber,
     mediaType: t.mediaType,
@@ -841,9 +956,7 @@ function timelineTrack(t: TrackState): TrackChunks {
         ? { sampleRate: t.sampleRate }
         : {}),
     ...(gapless !== undefined ? { gapless } : {}),
-    ...(t.timestampAdjustmentNs !== undefined
-      ? { timestampAdjustmentNs: t.timestampAdjustmentNs }
-      : {}),
+    ...(timestampAdjustmentNs !== undefined ? { timestampAdjustmentNs } : {}),
     ...(trailingDiscardPaddingNs !== undefined ? { trailingDiscardPaddingNs } : {}),
   };
   return durationSec !== undefined ? { ...base, durationSec } : base;
@@ -956,6 +1069,7 @@ function colorElement(color: VideoColorMetadata): Uint8Array | undefined {
 
 /** One `TrackEntry`: number/UID/type + CodecID(+private) + Video/Audio geometry. */
 function trackEntryElement(t: TrackState): Uint8Array {
+  const codecDelayNs = authoredCodecDelayNs(t);
   const parts: Uint8Array[] = [
     uintEl(EBML_ID.TrackNumber, t.trackNumber),
     uintEl(EBML_ID.TrackUID, t.trackNumber),
@@ -966,7 +1080,7 @@ function trackEntryElement(t: TrackState): Uint8Array {
   if (t.codecPrivate !== undefined && t.codecPrivate.byteLength > 0) {
     parts.push(element(EBML_ID.CodecPrivate, t.codecPrivate));
   }
-  if (t.codecDelayNs !== undefined) parts.push(uintEl(EBML_ID.CodecDelay, t.codecDelayNs));
+  if (codecDelayNs !== undefined) parts.push(uintEl(EBML_ID.CodecDelay, codecDelayNs));
   if (t.seekPreRollNs !== undefined) parts.push(uintEl(EBML_ID.SeekPreRoll, t.seekPreRollNs));
   if (t.mediaType === 'video') {
     if (t.fps !== undefined && t.fps > 0) {
@@ -1177,7 +1291,11 @@ function blockAdditionsElement(alpha: Uint8Array): Uint8Array {
 
 function blockElementLength(block: TimelineBlock): number {
   const rawBlockPayloadLength = blockPayloadLength(block);
-  if (block.alpha === undefined && block.discardPaddingNs === undefined) {
+  if (
+    block.alpha === undefined &&
+    block.discardPaddingNs === undefined &&
+    block.durationMs === undefined
+  ) {
     return (
       idByteLength(EBML_ID.SimpleBlock) +
       vintByteLength(rawBlockPayloadLength) +
@@ -1195,8 +1313,14 @@ function blockElementLength(block: TimelineBlock): number {
     block.discardPaddingNs === undefined
       ? 0
       : intEl(EBML_ID.DiscardPadding, block.discardPaddingNs).byteLength;
+  const blockDurationLength =
+    block.durationMs === undefined ? 0 : uintEl(EBML_ID.BlockDuration, block.durationMs).byteLength;
   const blockGroupPayloadLength =
-    blockElementLength + referenceElementLength + blockAdditionsLength + discardPaddingLength;
+    blockElementLength +
+    referenceElementLength +
+    blockDurationLength +
+    blockAdditionsLength +
+    discardPaddingLength;
   return (
     idByteLength(EBML_ID.BlockGroup) +
     vintByteLength(blockGroupPayloadLength) +
@@ -1205,7 +1329,11 @@ function blockElementLength(block: TimelineBlock): number {
 }
 
 function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTimeMs: number): void {
-  if (block.alpha === undefined && block.discardPaddingNs === undefined) {
+  if (
+    block.alpha === undefined &&
+    block.discardPaddingNs === undefined &&
+    block.durationMs === undefined
+  ) {
     const rel = block.timeMs - clusterTimeMs;
     const flags = block.key ? 0x80 : 0x00;
     const payloadLength = vintByteLength(block.trackNumber) + 2 + 1 + block.data.byteLength;
@@ -1222,6 +1350,9 @@ function writeBlockElement(writer: ByteWriter, block: TimelineBlock, clusterTime
     element(EBML_ID.Block, blockPayloadBytes(block, clusterTimeMs, false)),
   ];
   if (!block.key) parts.push(element(EBML_ID.ReferenceBlock, [0x01]));
+  if (block.durationMs !== undefined) {
+    parts.push(uintEl(EBML_ID.BlockDuration, block.durationMs));
+  }
   if (block.alpha !== undefined) parts.push(blockAdditionsElement(block.alpha));
   if (block.discardPaddingNs !== undefined) {
     parts.push(intEl(EBML_ID.DiscardPadding, block.discardPaddingNs));
@@ -1705,6 +1836,12 @@ export class WebmStreamingMuxer {
       trackNumber: track.trackNumber,
       timeMs: usToMs(chunk.timestampUs - baseUs + (track.timestampAdjustmentNs ?? 0) / 1000),
       dtsMs: usToMs((chunk.dtsUs ?? chunk.timestampUs) - baseUs),
+      ...(lastInTrack &&
+      chunk.durationUs !== undefined &&
+      Number.isFinite(chunk.durationUs) &&
+      chunk.durationUs > 0
+        ? { durationMs: Math.max(1, usToMs(chunk.durationUs)) }
+        : {}),
       key: chunk.key,
       data: chunk.data,
       ...(chunk.alpha !== undefined ? { alpha: chunk.alpha } : {}),
