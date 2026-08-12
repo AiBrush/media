@@ -23,6 +23,7 @@
  */
 
 import type {
+  AudioEncoderOutputTiming,
   CodecDriver,
   CodecQuery,
   CodecSupport,
@@ -52,6 +53,7 @@ import {
   interleaveF32,
   normalizeOpusDecoderConfig,
   normalizeOpusEncoderConfig,
+  opusDrainFrameCount,
   packetDurationSamples,
 } from './opus.ts';
 
@@ -63,6 +65,8 @@ import {
  */
 export interface OpusEncoderStageOptions extends StageOptions {
   onConfig?(config: AudioDecoderConfig): void;
+  /** Called once after flush with exact destination-owned sample accounting. */
+  onTiming?(timing: AudioEncoderOutputTiming): void;
 }
 
 /** Read the optional {@link OpusEncoderStageOptions.onConfig} sink off a `StageOptions` object. */
@@ -70,6 +74,14 @@ function opusConfigSink(
   o: StageOptions | undefined,
 ): ((config: AudioDecoderConfig) => void) | undefined {
   const sink = (o as OpusEncoderStageOptions | undefined)?.onConfig;
+  return typeof sink === 'function' ? sink : undefined;
+}
+
+/** Read the optional destination-timing sink off the driver-local stage options. */
+function opusTimingSink(
+  o: StageOptions | undefined,
+): ((timing: AudioEncoderOutputTiming) => void) | undefined {
+  const sink = (o as OpusEncoderStageOptions | undefined)?.onTiming;
   return typeof sink === 'function' ? sink : undefined;
 }
 
@@ -362,12 +374,16 @@ function createEncoder(
   if (signal?.aborted) throw new MediaError('aborted', 'operation aborted before encode');
   const init: OpusEncoderInit = normalizeOpusEncoderConfig(config as AudioEncoderConfig);
   const onConfig = opusConfigSink(o);
+  const onTiming = opusTimingSink(o);
 
   /* v8 ignore start -- requires WebCodecs AudioData + the vendored wasm core; validated in-browser. */
   let encoder: OpusWasmEncoder | undefined;
   let onAbort: (() => void) | undefined;
   const acc = new FrameAccumulator(init.channels, init.frameSamples);
   let encodedFrames = 0; // running PTS in input-rate samples
+  let submittedSamples = 0;
+  let codedSamples = 0;
+  let leadingSamples = 0;
 
   const teardown = (): void => {
     if (onAbort && signal) signal.removeEventListener('abort', onAbort);
@@ -376,20 +392,31 @@ function createEncoder(
     encoder = undefined;
   };
 
-  const drainTo = (controller: TransformStreamDefaultController<EncodedChunk>): void => {
+  const emitFrame = (
+    frame: Float32Array,
+    controller: TransformStreamDefaultController<EncodedChunk>,
+  ): void => {
     const enc = encoder;
     if (!enc) return;
+    const bytes = enc.encode(frame);
+    controller.enqueue(
+      new EncodedAudioChunk({
+        type: 'key', // every Opus packet is independently decodable
+        timestamp: samplesToMicros(encodedFrames, init.sampleRate),
+        // The encoded packet always contains one complete Opus frame. Program-tail padding belongs in
+        // the container's gapless metadata; shortening the packet duration as well makes Matroska
+        // decoders apply two independent end trims.
+        duration: samplesToMicros(init.frameSamples, init.sampleRate),
+        data: bytes,
+      }),
+    );
+    encodedFrames += init.frameSamples;
+    codedSamples += init.frameSamples;
+  };
+
+  const drainTo = (controller: TransformStreamDefaultController<EncodedChunk>): void => {
     for (let frame = acc.pull(); frame !== undefined; frame = acc.pull()) {
-      const bytes = enc.encode(frame);
-      controller.enqueue(
-        new EncodedAudioChunk({
-          type: 'key', // every Opus packet is independently decodable
-          timestamp: samplesToMicros(encodedFrames, init.sampleRate),
-          duration: samplesToMicros(init.frameSamples, init.sampleRate),
-          data: bytes,
-        }),
-      );
-      encodedFrames += init.frameSamples;
+      emitFrame(frame, controller);
     }
   };
 
@@ -401,6 +428,14 @@ function createEncoder(
         return;
       }
       encoder = await core.createEncoder(init);
+      const preSkipAtInputRate = (encoder.preSkip() * init.sampleRate) / OPUS_RATE;
+      if (!Number.isSafeInteger(preSkipAtInputRate) || preSkipAtInputRate < 0) {
+        throw new MediaError(
+          'encode-error',
+          `opus: encoder pre-skip cannot be represented at ${init.sampleRate}Hz`,
+        );
+      }
+      leadingSamples = preSkipAtInputRate;
       // Publish the OpusHead (RFC 7845) so the muxer's track carries the channel count, the real encoder
       // pre-skip (OPUS_GET_LOOKAHEAD), and the input sample rate — the Ogg/WebM Opus codec-private.
       onConfig?.({
@@ -420,30 +455,43 @@ function createEncoder(
       try {
         if (!encoder) throw new MediaError('encode-error', 'wasm-opus encoder not configured');
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
+        if (data.sampleRate !== init.sampleRate || data.numberOfChannels !== init.channels) {
+          throw new MediaError(
+            'encode-error',
+            `wasm-opus expected ${init.channels}ch at ${init.sampleRate}Hz, got ${data.numberOfChannels}ch at ${data.sampleRate}Hz`,
+          );
+        }
+        if (!Number.isSafeInteger(submittedSamples + data.numberOfFrames)) {
+          throw new MediaError('encode-error', 'opus: submitted sample count overflow');
+        }
         acc.push(audioDataToInterleaved(data));
+        submittedSamples += data.numberOfFrames;
         drainTo(controller);
       } finally {
         data.close(); // close-exactly-once: the encoder owns each input AudioData
       }
     },
     flush(controller): void {
-      const enc = encoder;
-      if (enc) {
+      try {
+        if (!encoder) return;
         drainTo(controller); // any whole frames still buffered
         const tail = acc.drainFinal(); // zero-padded final frame, if a partial remains
         if (tail) {
-          const bytes = enc.encode(tail.frame);
-          controller.enqueue(
-            new EncodedAudioChunk({
-              type: 'key',
-              timestamp: samplesToMicros(encodedFrames, init.sampleRate),
-              duration: samplesToMicros(init.frameSamples - tail.padSamples, init.sampleRate),
-              data: bytes,
-            }),
-          );
+          emitFrame(tail.frame, controller);
         }
+        const drainFrames = opusDrainFrameCount(
+          submittedSamples,
+          codedSamples,
+          leadingSamples,
+          init.frameSamples,
+        );
+        for (let i = 0; i < drainFrames; i++) {
+          emitFrame(new Float32Array(init.frameSamples * init.channels), controller);
+        }
+        onTiming?.({ sampleRate: init.sampleRate, submittedSamples, codedSamples, leadingSamples });
+      } finally {
+        teardown();
       }
-      teardown();
     },
   });
   /* v8 ignore stop */

@@ -9,7 +9,7 @@ const AAC_CONFIG: AudioDecoderConfig = {
   description: new Uint8Array([0x11, 0x90]),
 };
 
-describe('outputGaplessForAudioEncoder — destination-owned AAC timing', () => {
+describe('outputGaplessForAudioEncoder — destination-owned audio timing', () => {
   it('derives priming, remainder, and exact program count from the drained destination encoder', () => {
     const timing: AudioEncoderOutputTiming = {
       sampleRate: 48_000,
@@ -68,7 +68,7 @@ describe('outputGaplessForAudioEncoder — destination-owned AAC timing', () => 
     ).toBeUndefined();
   });
 
-  it('leaves Opus timing to OpusHead/CodecDelay rather than applying the AAC contract', () => {
+  it('combines Opus pre-skip with coded capacity to derive exact terminal padding', () => {
     expect(
       outputGaplessForAudioEncoder(
         { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 },
@@ -79,6 +79,6 @@ describe('outputGaplessForAudioEncoder — destination-owned AAC timing', () => 
           leadingSamples: 312,
         },
       ),
-    ).toBeUndefined();
+    ).toEqual({ leadingSamples: 312, trailingSamples: 648, totalSamples: 48_000 });
   });
 });

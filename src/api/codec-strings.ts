@@ -23,14 +23,14 @@ import type { VideoCodec, VideoTarget } from './types.ts';
  */
 const VIDEO_CODEC_STRING: Record<VideoCodec, string> = {
   h264: 'avc1.42E01E',
-  hevc: 'hev1.1.6.L93.B0',
+  hevc: 'hvc1.1.6.L93.B0',
   vp8: 'vp8',
   vp9: 'vp09.00.10.08',
   av1: 'av01.0.04M.08',
 };
 
 /** HEVC Main10, Main tier, Level 4.0 — the explicit WebCodecs target for requested 10-bit output. */
-const HEVC_MAIN10_CODEC_STRING = 'hev1.2.4.L120.B0';
+const HEVC_MAIN10_CODEC_STRING = 'hvc1.2.4.L120.B0';
 
 /** Video encode bit depths this pipeline can author codec strings for. */
 export type VideoBitDepth = 8 | 10 | 12;
@@ -548,6 +548,9 @@ export function resolvedVideoEncoderCodecString(
       if (bitDepth !== 8) return unsupportedVideoBitDepth(codec, bitDepth);
       return h264CodecStringForSourceProfile(width, height, fps, sourceCodecString);
     case 'hevc':
+      // Encoders surface the parameter sets in `description`; advertise the matching hvc1 sample-entry
+      // promise. It is the interoperable MP4 form for this out-of-band stream; labeling it hev1 can
+      // make an otherwise valid output undecodable by strict players.
       if (bitDepth === 8) return VIDEO_CODEC_STRING.hevc;
       if (bitDepth === 10) return HEVC_MAIN10_CODEC_STRING;
       return unsupportedVideoBitDepth(codec, bitDepth);

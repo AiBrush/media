@@ -14,6 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
+import type { AudioEncoderOutputTiming } from '../../contracts/driver.ts';
 import { oggAudioPackets, oggPacketBytes } from '../../drivers/ogg/ogg-driver.ts';
 import { OggMuxer } from '../../drivers/ogg/ogg-write.ts';
 import { readWavPcm } from '../../drivers/wav/pcm.ts';
@@ -28,6 +29,7 @@ import {
   packetDurationSamples,
   preSkipFromDescription,
 } from './opus.ts';
+import { WasmOpusDriver } from './wasm-opus-driver.ts';
 
 /** Load the vendored libopus-wasm glue facade once (it runs in Node — the whole reason this is here). */
 async function loadCore(): Promise<OpusWasmCore> {
@@ -133,7 +135,9 @@ async function encodeToOggOpus(core: OpusWasmCore, pcm: Pcm, bitrate: number): P
     if (tail) {
       muxer.addChunkStruct(trackId, {
         timestampUs: micros(pts),
-        durationUs: micros(frameSamples - tail.padSamples),
+        // A padded tail remains a complete coded Opus frame. Exact program length is represented by
+        // granule/discard metadata, never by shortening the coded packet duration.
+        durationUs: micros(frameSamples),
         key: true,
         data: encoder.encode(tail.frame),
       });
@@ -296,6 +300,92 @@ function snrDb(source: Float32Array, decoded: Float32Array, channels: number): n
 const SNR_FLOOR_DB = 12;
 
 describe('Opus authoring — vendored libopus core, Ogg-mux, ffmpeg-decodable (ADR-088)', () => {
+  it('labels a zero-padded program tail with the full coded Opus packet duration', async () => {
+    class TestAudioData {
+      readonly sampleRate = 48_000;
+      readonly numberOfChannels = 2;
+      readonly numberOfFrames = 256;
+      closeCount = 0;
+
+      copyTo(destination: AllowSharedBufferSource): void {
+        (destination as Float32Array).fill(0);
+      }
+
+      close(): void {
+        this.closeCount++;
+      }
+    }
+    class TestEncodedAudioChunk {
+      readonly type: EncodedAudioChunkType;
+      readonly timestamp: number;
+      readonly duration: number | null;
+      readonly #data: Uint8Array;
+
+      constructor(init: EncodedAudioChunkInit) {
+        this.type = init.type;
+        this.timestamp = init.timestamp;
+        this.duration = init.duration ?? null;
+        const data = init.data;
+        this.#data = ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice()
+          : new Uint8Array(data).slice();
+      }
+
+      get byteLength(): number {
+        return this.#data.byteLength;
+      }
+
+      copyTo(destination: AllowSharedBufferSource): void {
+        new Uint8Array(destination as ArrayBuffer).set(this.#data);
+      }
+    }
+
+    const originalAudioData = Object.getOwnPropertyDescriptor(globalThis, 'AudioData');
+    const originalEncodedChunk = Object.getOwnPropertyDescriptor(globalThis, 'EncodedAudioChunk');
+    Object.defineProperty(globalThis, 'AudioData', {
+      configurable: true,
+      value: TestAudioData as unknown as typeof AudioData,
+    });
+    Object.defineProperty(globalThis, 'EncodedAudioChunk', {
+      configurable: true,
+      value: TestEncodedAudioChunk as unknown as typeof EncodedAudioChunk,
+    });
+    try {
+      const timing: AudioEncoderOutputTiming[] = [];
+      const stream = WasmOpusDriver.createEncoder(
+        { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2, bitrate: 96_000 },
+        { onTiming: (value: AudioEncoderOutputTiming) => timing.push(value) } as Parameters<
+          typeof WasmOpusDriver.createEncoder
+        >[1],
+      );
+      const chunks: TestEncodedAudioChunk[] = [];
+      const consume = (async () => {
+        for await (const chunk of stream.readable) {
+          chunks.push(chunk as unknown as TestEncodedAudioChunk);
+        }
+      })();
+      const input = new TestAudioData();
+      const writer = stream.writable.getWriter();
+      await writer.write(input as unknown as AudioData);
+      await writer.close();
+      await consume;
+
+      expect(input.closeCount).toBe(1);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]?.timestamp).toBe(0);
+      expect(chunks[0]?.duration).toBe(20_000);
+      expect(timing).toEqual([
+        { sampleRate: 48_000, submittedSamples: 256, codedSamples: 960, leadingSamples: 312 },
+      ]);
+    } finally {
+      if (originalAudioData === undefined) Reflect.deleteProperty(globalThis, 'AudioData');
+      else Object.defineProperty(globalThis, 'AudioData', originalAudioData);
+      if (originalEncodedChunk === undefined)
+        Reflect.deleteProperty(globalThis, 'EncodedAudioChunk');
+      else Object.defineProperty(globalThis, 'EncodedAudioChunk', originalEncodedChunk);
+    }
+  });
+
   it('builds a spec-correct OpusHead (RFC 7845) and reads its pre-skip back', () => {
     const head = buildOpusHead(2, 312, 48_000);
     expect(head.byteLength).toBe(19);

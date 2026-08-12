@@ -232,6 +232,7 @@ export async function runRemux(
   if (
     !wantsTrackSelection &&
     container.streamCopy !== undefined &&
+    !requiresStreamingWebmRemux(source, opts) &&
     (container.formats.includes(opts.to) || container.streamCopyTargets?.includes(opts.to) === true)
   ) {
     const stream = await container.streamCopy(source, {
@@ -249,6 +250,23 @@ export async function runRemux(
 
   const stream = await remuxViaSeam(context, container, source, opts, signal, remuxCallOptions);
   return finish(stream);
+}
+
+/**
+ * Large and explicitly fragmented WebM-family outputs belong to the packet-info streaming writer.
+ * Keep this check ahead of a source driver's generic `streamCopy`: the WebM driver's legacy copy
+ * implementation materializes the complete source before serializing, which defeats a stream sink and
+ * can exhaust a browser process on otherwise ordinary large files.
+ */
+export function requiresStreamingWebmRemux(
+  source: Pick<Source, 'size'>,
+  opts: RemuxOptions,
+): boolean {
+  return (
+    (opts.to === 'webm' || opts.to === 'mkv') &&
+    (opts.fragmented === true ||
+      (source.size !== undefined && source.size > WEBM_STREAMING_MIN_SOURCE_BYTES))
+  );
 }
 
 async function remuxViaSeam(
@@ -360,7 +378,10 @@ async function materializeOutput(
 }
 
 function streamCopySinkMode(sink: Sink | undefined): { streaming?: true; buffered?: true } {
-  return sink?.kind === 'stream-target' || sink?.kind === 'opfs' || sink?.kind === 'opfs-target'
+  return sink?.kind === 'stream' ||
+    sink?.kind === 'stream-target' ||
+    sink?.kind === 'opfs' ||
+    sink?.kind === 'opfs-target'
     ? { streaming: true }
     : { buffered: true };
 }

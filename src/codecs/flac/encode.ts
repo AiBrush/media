@@ -765,19 +765,72 @@ function frameHeader(
   const tableCode = BLOCK_SIZE_CODE.get(samples);
   const explicitBits = tableCode !== undefined ? 0 : samples <= 256 ? 8 : 16;
   const blockSizeCode = tableCode ?? (explicitBits === 8 ? 6 : 7);
+  const sampleRate = sampleRateHeaderField(config.sampleRate);
 
   bits.writeBits(0x3ffe, 14); // sync
   bits.writeBit(0); // reserved
   bits.writeBit(0); // fixed-blocksize stream; frame number follows
   bits.writeBits(blockSizeCode, 4);
-  bits.writeBits(0, 4); // sample rate from STREAMINFO
+  bits.writeBits(sampleRate.code, 4);
   bits.writeBits(channelAssignmentCode(config.channels, assignment), 4);
-  bits.writeBits(0, 3); // sample size from STREAMINFO
+  bits.writeBits(sampleSizeHeaderCode(config.bitsPerSample), 3);
   bits.writeBit(0); // reserved
   bits.writeBytes(utf8Uint(frameIndex));
   if (explicitBits > 0) bits.writeBits(samples - 1, explicitBits);
+  if (sampleRate.bits > 0) bits.writeBits(sampleRate.value, sampleRate.bits);
   const withoutCrc = bits.toUint8Array();
   return concatBytes([withoutCrc, Uint8Array.from([crc8(withoutCrc)])]);
+}
+
+interface FlacSampleRateHeaderField {
+  readonly code: number;
+  readonly value: number;
+  readonly bits: number;
+}
+
+const SAMPLE_RATE_CODE: ReadonlyMap<number, number> = new Map([
+  [88_200, 1],
+  [176_400, 2],
+  [192_000, 3],
+  [8_000, 4],
+  [16_000, 5],
+  [22_050, 6],
+  [24_000, 7],
+  [32_000, 8],
+  [44_100, 9],
+  [48_000, 10],
+  [96_000, 11],
+]);
+
+/** Prefer explicit frame-header geometry for strict platform decoders; STREAMINFO remains authoritative. */
+function sampleRateHeaderField(sampleRate: number): FlacSampleRateHeaderField {
+  const standard = SAMPLE_RATE_CODE.get(sampleRate);
+  if (standard !== undefined) return { code: standard, value: 0, bits: 0 };
+  if (sampleRate % 1000 === 0 && sampleRate / 1000 <= 0xff) {
+    return { code: 12, value: sampleRate / 1000, bits: 8 };
+  }
+  if (sampleRate <= 0xffff) return { code: 13, value: sampleRate, bits: 16 };
+  if (sampleRate % 10 === 0 && sampleRate / 10 <= 0xffff) {
+    return { code: 14, value: sampleRate / 10, bits: 16 };
+  }
+  return { code: 0, value: 0, bits: 0 };
+}
+
+function sampleSizeHeaderCode(bitsPerSample: number): number {
+  switch (bitsPerSample) {
+    case 8:
+      return 1;
+    case 12:
+      return 2;
+    case 16:
+      return 4;
+    case 20:
+      return 5;
+    case 24:
+      return 6;
+    default:
+      return 0;
+  }
 }
 
 /** The 4-bit channel assignment nibble: independent channels are `count-1`; stereo modes are 8/9/10. */

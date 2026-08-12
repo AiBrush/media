@@ -55,6 +55,13 @@ import { CapabilityError, MediaError } from '../contracts/errors.ts';
 // ============ pure, Node-testable helpers ============
 
 /**
+ * WebKit's raw AAC `AudioDecoder` exposes the AudioToolbox AAC-LC presentation lead-in that its
+ * container-aware decoders suppress. ADTS has no edit list or other gapless field to carry this fact,
+ * so the two native ADTS decode bridges share this measured runtime correction.
+ */
+export const WEBKIT_ADTS_AAC_LEADING_SAMPLES = 2112 as const;
+
+/**
  * Above this many packets queued inside the WebCodecs coder we stop feeding and let it drain, so an
  * unbounded source can't balloon WebCodecs' internal buffer (and thus decoded-frame memory). WebCodecs
  * exposes `decodeQueueSize`/`encodeQueueSize` precisely so a producer can pace itself; this is the

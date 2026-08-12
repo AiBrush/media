@@ -274,25 +274,9 @@ function configForMuxIntent(
   intent: VideoColorMuxIntent | undefined,
   color: TrackInfo['color'] | undefined,
 ): VideoDecoderConfig {
-  if (intent === undefined) return config;
   const codec = config.codec.toLowerCase();
   const isH264 = codec === 'h264' || codec.startsWith('avc1') || codec.startsWith('avc3');
   if (!isH264) return config;
-  if (!(codec === 'avc1' || codec.startsWith('avc1.'))) {
-    throw h264ColorCapabilityMiss(
-      config,
-      intent,
-      'the encoder did not publish an avc1 contract that excludes in-band SPS replacement',
-    );
-  }
-  const description = descriptionBytes(config.description);
-  if (description === undefined || description.byteLength === 0) {
-    throw h264ColorCapabilityMiss(
-      config,
-      intent,
-      'the encoder published no AVCDecoderConfigurationRecord',
-    );
-  }
   const primaries = color?.primaries;
   const transferCharacteristics = color?.transferCharacteristics;
   const matrixCoefficients = color?.matrixCoefficients;
@@ -303,7 +287,25 @@ function configForMuxIntent(
     matrixCoefficients === undefined ||
     (range !== 1 && range !== 2)
   ) {
+    if (intent === undefined) return config;
     throw h264ColorCapabilityMiss(config, intent, 'the destination H.273 tuple is incomplete');
+  }
+  if (!(codec === 'avc1' || codec.startsWith('avc1.'))) {
+    if (intent === undefined) return config;
+    throw h264ColorCapabilityMiss(
+      config,
+      intent,
+      'the encoder did not publish an avc1 contract that excludes in-band SPS replacement',
+    );
+  }
+  const description = descriptionBytes(config.description);
+  if (description === undefined || description.byteLength === 0) {
+    if (intent === undefined) return config;
+    throw h264ColorCapabilityMiss(
+      config,
+      intent,
+      'the encoder published no AVCDecoderConfigurationRecord',
+    );
   }
   try {
     const rewritten = rewriteH264AvcCColor(description, {
@@ -314,6 +316,7 @@ function configForMuxIntent(
     });
     return { ...config, description: rewritten };
   } catch (error) {
+    if (intent === undefined) return config;
     throw h264ColorCapabilityMiss(
       config,
       intent,
@@ -366,16 +369,17 @@ export function audioTrackInfoFromDecoderConfig(
 }
 
 /**
- * Build AAC gapless facts from the destination encoder's own drained timing. Source delay/padding was
- * already consumed while decoding and is never valid for a new elementary stream (even when both codecs
- * use the same sample rate). Other output codecs keep their implementation-specific signaling paths —
- * e.g. Opus publishes pre-skip in OpusHead/CodecDelay.
+ * Build destination gapless facts from an AAC or Opus encoder's own drained timing. Source
+ * delay/padding was already consumed while decoding and is never valid for a new elementary stream
+ * (even when both codecs use the same sample rate). Opus still publishes pre-skip in
+ * OpusHead/CodecDelay; this tuple adds the exact terminal padding/program window.
  */
 export function outputGaplessForAudioEncoder(
   config: AudioDecoderConfig,
   timing: AudioEncoderOutputTiming | undefined,
 ): TrackInfo['gapless'] | undefined {
-  if (audioCodecToken(config.codec) !== 'aac' || timing === undefined) return undefined;
+  const codec = audioCodecToken(config.codec);
+  if ((codec !== 'aac' && codec !== 'opus') || timing === undefined) return undefined;
   const { sampleRate, submittedSamples, codedSamples, leadingSamples } = timing;
   if (
     sampleRate !== config.sampleRate ||

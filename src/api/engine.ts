@@ -1102,9 +1102,19 @@ export class MediaEngineImpl implements MediaEngine {
     track: TrackInfo,
     stage: StageOptions,
     o: CallOptions,
-  ): Promise<ReadableStream<AudioData>> {
-    const { decodeQueryFor, decodedAudioStreamWithGapless, unwrapPackets } =
-      await loadCodecPipeline();
+    sourceContainerId?: string,
+  ): Promise<{
+    readonly frames: ReadableStream<AudioData>;
+    readonly leadingSamplesRemoved: number;
+  }> {
+    const {
+      audioDecodeLeadingSamplesForRuntime,
+      audioDecodeNativeGaplessSuppressionForRuntime,
+      audioTrackAfterNativeGaplessSuppression,
+      decodeQueryFor,
+      decodedAudioStreamWithGapless,
+      unwrapPackets,
+    } = await loadCodecPipeline();
     const decodeQuery = await decodeQueryFor(track);
     const route = await this.#probeCodec(decodeQuery, o);
     const codec = route.driver;
@@ -1112,11 +1122,30 @@ export class MediaEngineImpl implements MediaEngine {
     const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(
       codec.createDecoder(config, stage),
     ) as ReadableStream<AudioData>;
-    return decodedAudioStreamWithGapless(decoded, track, {
+    const nativeGaplessSuppression = await audioDecodeNativeGaplessSuppressionForRuntime(
+      sourceContainerId,
+      track,
+      codec.id,
+    );
+    const presentedTrack = audioTrackAfterNativeGaplessSuppression(track, nativeGaplessSuppression);
+    const presented = await decodedAudioStreamWithGapless(decoded, presentedTrack, {
       packets: demuxer.packets(track.id),
       createDecoder: () => codec.createDecoder(config, stage),
       signal: stage.signal,
     });
+    const leadingSamples = await audioDecodeLeadingSamplesForRuntime(
+      sourceContainerId,
+      track.codec,
+      codec.id,
+    );
+    if (leadingSamples === 0) return { frames: presented, leadingSamplesRemoved: 0 };
+    const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import(
+      './trim-streams.ts'
+    );
+    return {
+      frames: trimAudioGaplessFrameStream(presented, { leadingSamples }, restampAudioDataRange),
+      leadingSamplesRemoved: leadingSamples,
+    };
   }
 
   /** Bind only engine-private routing/codec seams; complete remux/trim orchestration stays lazy. */
@@ -1132,7 +1161,18 @@ export class MediaEngineImpl implements MediaEngine {
       offload: this.#offloadStream.bind(this),
       codec: this.#routeCodec.bind(this),
       decodeAudio: this.#decodeAudioTrackPackets.bind(this),
-      encodeVideo: this.#encodeVideoStream.bind(this),
+      encodeVideo: (frames, target, source, muxer, signal, options, capabilityFallbackTarget) =>
+        this.#encodeVideoStream(
+          frames,
+          target,
+          source,
+          muxer,
+          signal,
+          options,
+          false,
+          undefined,
+          capabilityFallbackTarget,
+        ),
       encodeAudio: this.#encodeAudioStream.bind(this),
     };
   }
@@ -1424,6 +1464,7 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
     fragmented = false,
     twoPassPlan?: H264TwoPassPlan,
+    capabilityFallbackTarget?: VideoTarget,
   ): Promise<void> {
     const { encodeVideoStream } = await import('./video-two-pass-runner.ts');
     await encodeVideoStream(
@@ -1436,6 +1477,7 @@ export class MediaEngineImpl implements MediaEngine {
       fragmented,
       twoPassPlan,
       this.#videoRunnerContext(),
+      capabilityFallbackTarget,
     );
   }
 
@@ -1449,7 +1491,7 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
   ): Promise<void> {
     const {
-      audioEncodeNeedsSoftwareRuntime,
+      audioEncodeSoftwareDriverForRuntime,
       audioCodecToken,
       audioTrackInfoFromDecoderConfig,
       buildAudioEncoderConfig,
@@ -1463,7 +1505,18 @@ export class MediaEngineImpl implements MediaEngine {
       audioGeometryOf(sourceTrack),
       sourceTrack?.codec,
     );
-    const encodeOptions = (await audioEncodeNeedsSoftwareRuntime(config)) ? forceSoftware(o) : o;
+    const softwareDriver = await audioEncodeSoftwareDriverForRuntime(config);
+    let encodeOptions = o;
+    if (softwareDriver !== undefined) {
+      const softwareOptions = forceSoftware(o);
+      encodeOptions =
+        o.strategy?.pinDriver === undefined
+          ? {
+              ...softwareOptions,
+              strategy: { ...softwareOptions.strategy, pinDriver: softwareDriver },
+            }
+          : softwareOptions;
+    }
     const codec = await this.#routeCodec(encodeQueryFor(config), encodeOptions);
     // Past here is the live WebCodecs path — unreachable in Node (the route above throws first).
     /* v8 ignore start -- requires a real AudioEncoder; validated in the browser harness (BUILD §6.1). */
@@ -1498,28 +1551,32 @@ export class MediaEngineImpl implements MediaEngine {
       signal,
     );
     const publishedConfig = requireEncoderConfig(decoderConfig, 'audio') as AudioDecoderConfig;
+    const outputCodec = audioCodecToken(publishedConfig.codec);
     if (
       outputTrackId !== undefined &&
       muxer.setTrackGapless !== undefined &&
-      audioCodecToken(publishedConfig.codec) === 'aac'
+      (outputCodec === 'aac' || outputCodec === 'opus')
     ) {
       const gapless = outputGaplessForAudioEncoder(publishedConfig, encoderTiming);
       if (gapless === undefined) {
-        throw new CapabilityError(
-          `sample-accurate AAC MP4 muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
-          {
-            op: {
-              kind: 'route',
-              id: 'mux',
-              facts: { mediaType: 'audio', codec: publishedConfig.codec },
+        if (outputCodec === 'aac') {
+          throw new CapabilityError(
+            `sample-accurate AAC MP4 muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
+            {
+              op: {
+                kind: 'route',
+                id: 'mux',
+                facts: { mediaType: 'audio', codec: publishedConfig.codec },
+              },
+              tried: [codec.id],
+              suggestion:
+                'use a runtime with a proven AAC encoder-delay fact or an encoder that publishes one',
             },
-            tried: [codec.id],
-            suggestion:
-              'use a runtime with a proven AAC encoder-delay fact or an encoder that publishes one',
-          },
-        );
+          );
+        }
+      } else {
+        muxer.setTrackGapless(outputTrackId, gapless);
       }
-      muxer.setTrackGapless(outputTrackId, gapless);
     }
     /* v8 ignore stop */
   }

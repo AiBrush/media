@@ -855,6 +855,51 @@ describe('WebmMuxer — round-trip on synthesized packets (parseWebm + independe
     }
   });
 
+  it('accepts destination Opus timing after packet drain when no source duration was known', async () => {
+    const muxer = new WebmMuxer();
+    const preSkipSamples = 312;
+    const programSamples = 2500;
+    const trailingSamples = 3 * 960 - preSkipSamples - programSamples;
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'opus',
+      config: { codec: 'opus', sampleRate: 48_000, numberOfChannels: 2, description: OPUS_HEAD },
+    });
+    for (let index = 0; index < 3; index++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: index * 20_000,
+        durationUs: 20_000,
+        key: true,
+        data: Uint8Array.of(1 << 3, 0x50 + index),
+      });
+    }
+    muxer.setTrackGapless(aud, {
+      leadingSamples: preSkipSamples,
+      trailingSamples,
+      totalSamples: programSamples,
+    });
+    await muxer.finalize();
+    const bytes = await collect(muxer.output);
+
+    const parsed = demuxWebm(bytes);
+    const trackIndex = parsed.info.tracks.findIndex((track) => track.codec === 'opus');
+    expect(parsed.framesByIndex[trackIndex]?.at(-1)?.discardPaddingNs).toBe(
+      Math.round((trailingSamples * 1_000_000_000) / 48_000),
+    );
+    const publicDemuxer = await WebmDriver.demux(fromBytes(bytes));
+    try {
+      expect(publicDemuxer.tracks.find((track) => track.codec === 'opus')?.gapless).toEqual({
+        basis: 'webm-opus-codec-delay',
+        leadingSamples: preSkipSamples,
+        trailingSamples,
+        totalSamples: programSamples,
+      });
+    } finally {
+      await publicDemuxer.close();
+    }
+  });
+
   it('B-frame reorder (decode-order PTS [0,3,1,2]): blocks carry presentation times (sorted)', async () => {
     const muxer = new WebmMuxer();
     const frame = 40_000;

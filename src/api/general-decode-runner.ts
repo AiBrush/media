@@ -253,6 +253,7 @@ async function decodeTrack<M extends 'video' | 'audio'>(
     decodeVideoPacketsWithAlpha,
     decodedAudioStreamWithGapless,
     unwrapPackets,
+    vpxAlphaDecodeSoftwareDriverForRuntime,
   } = await import('./codec-pipeline.ts');
   const decodeQuery = await decodeQueryFor(track);
   const route = await context.probeCodec(decodeQuery, {
@@ -262,8 +263,24 @@ async function decodeTrack<M extends 'video' | 'audio'>(
   const config = decoderConfigWithRoutedAcceleration(decodeQuery.config, route.support);
   /* v8 ignore start -- requires a real VideoDecoder/AudioDecoder; browser-harness validated. */
   if (mediaType === 'video' && track.alpha === true) {
-    const decodedWithAlpha = decodeVideoPacketsWithAlpha(demuxer.packets(track.id), () =>
-      codec.createDecoder(config, stage),
+    const alphaSoftwareDriver =
+      stage.pinDriver === undefined
+        ? await vpxAlphaDecodeSoftwareDriverForRuntime(codec.id)
+        : undefined;
+    const alphaRoute =
+      alphaSoftwareDriver === undefined
+        ? route
+        : await context.probeCodec(decodeQuery, {
+            strategy: { ...stageStrategy(stage), pinDriver: alphaSoftwareDriver },
+          });
+    const alphaCodec = alphaRoute.driver;
+    const alphaConfig = decoderConfigWithRoutedAcceleration(decodeQuery.config, alphaRoute.support);
+    const alphaStage: StageOptions =
+      alphaSoftwareDriver === undefined ? stage : { ...stage, pinDriver: alphaSoftwareDriver };
+    const decodedWithAlpha = decodeVideoPacketsWithAlpha(
+      demuxer.packets(track.id),
+      () => codec.createDecoder(config, stage),
+      () => alphaCodec.createDecoder(alphaConfig, alphaStage),
     );
     return (await applyDisplayRotation(
       context,

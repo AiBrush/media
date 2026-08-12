@@ -61,7 +61,7 @@ export function tryAuthorWavS16Flac(bytes: Uint8Array): Uint8Array<ArrayBuffer> 
   let maxFrameBytes = 0;
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
     const samples = frameSamples(totalSamples, frameIndex);
-    const frameBytes = flacFrameBytes(fmt.channels, samples, frameIndex);
+    const frameBytes = flacFrameBytes(fmt.channels, samples, frameIndex, fmt.sampleRate);
     minFrameBytes = Math.min(minFrameBytes, frameBytes);
     maxFrameBytes = Math.max(maxFrameBytes, frameBytes);
     totalBytes += frameBytes;
@@ -89,6 +89,7 @@ export function tryAuthorWavS16Flac(bytes: Uint8Array): Uint8Array<ArrayBuffer> 
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
     offset = writeVerbatimFrame(out, offset, data, {
       channels: fmt.channels,
+      sampleRate: fmt.sampleRate,
       totalSamples,
       frameIndex,
     });
@@ -167,6 +168,7 @@ function writeStreamInfo(out: Uint8Array, offset: number, info: StreamInfoInput)
 
 interface FrameWriteInput {
   readonly channels: number;
+  readonly sampleRate: number;
   readonly totalSamples: number;
   readonly frameIndex: number;
 }
@@ -183,7 +185,14 @@ function writeVerbatimFrame(
   const samples = frameSamples(input.totalSamples, input.frameIndex);
   const blockAlign = input.channels * S16_BYTES;
 
-  cursor = writeFrameHeader(out, cursor, input.channels, samples, input.frameIndex);
+  cursor = writeFrameHeader(
+    out,
+    cursor,
+    input.channels,
+    input.sampleRate,
+    samples,
+    input.frameIndex,
+  );
   const blockByte = startSample * blockAlign;
   for (let channel = 0; channel < input.channels; channel++) {
     out[cursor++] = 0x02; // zero pad bit + VERBATIM subframe type + no wasted-bits flag.
@@ -206,12 +215,27 @@ function frameSamples(totalSamples: number, frameIndex: number): number {
   return Math.min(DEFAULT_BLOCK_SIZE, totalSamples - frameIndex * DEFAULT_BLOCK_SIZE);
 }
 
-function flacFrameBytes(channels: number, samples: number, frameIndex: number): number {
-  return frameHeaderBytes(samples, frameIndex) + channels * (1 + samples * S16_BYTES) + S16_BYTES;
+function flacFrameBytes(
+  channels: number,
+  samples: number,
+  frameIndex: number,
+  sampleRate: number,
+): number {
+  return (
+    frameHeaderBytes(samples, frameIndex, sampleRate) +
+    channels * (1 + samples * S16_BYTES) +
+    S16_BYTES
+  );
 }
 
-function frameHeaderBytes(samples: number, frameIndex: number): number {
-  return 4 + utf8UintBytes(frameIndex) + explicitBlockSizeBytes(samples) + 1;
+function frameHeaderBytes(samples: number, frameIndex: number, sampleRate: number): number {
+  return (
+    4 +
+    utf8UintBytes(frameIndex) +
+    explicitBlockSizeBytes(samples) +
+    sampleRateHeaderField(sampleRate).bytes +
+    1
+  );
 }
 
 function explicitBlockSizeBytes(samples: number): 0 | 1 | 2 {
@@ -223,6 +247,7 @@ function writeFrameHeader(
   out: Uint8Array,
   offset: number,
   channels: number,
+  sampleRate: number,
   samples: number,
   frameIndex: number,
 ): number {
@@ -231,11 +256,12 @@ function writeFrameHeader(
   const standardCode = standardBlockSizeCode(samples);
   const explicitBytes = explicitBlockSizeBytes(samples);
   const blockSizeCode = standardCode ?? (explicitBytes === 1 ? 6 : 7);
+  const sampleRateField = sampleRateHeaderField(sampleRate);
 
   out[cursor++] = 0xff;
   out[cursor++] = 0xf8; // 14-bit sync + fixed-blocksize stream.
-  out[cursor++] = blockSizeCode << 4; // sample-rate code 0 means STREAMINFO.
-  out[cursor++] = (channels - 1) << 4; // independent channels; sample-size code 0 means STREAMINFO.
+  out[cursor++] = (blockSizeCode << 4) | sampleRateField.code;
+  out[cursor++] = ((channels - 1) << 4) | (4 << 1); // independent channels + explicit 16-bit samples.
   cursor = writeUtf8Uint(out, cursor, frameIndex);
   if (explicitBytes === 1) {
     out[cursor++] = samples - 1;
@@ -243,9 +269,56 @@ function writeFrameHeader(
     out[cursor++] = ((samples - 1) >>> 8) & 0xff;
     out[cursor++] = (samples - 1) & 0xff;
   }
+  if (sampleRateField.bytes === 1) {
+    out[cursor++] = sampleRateField.value;
+  } else if (sampleRateField.bytes === 2) {
+    out[cursor++] = (sampleRateField.value >>> 8) & 0xff;
+    out[cursor++] = sampleRateField.value & 0xff;
+  }
   const headerCrc = crc8(out, start, cursor);
   out[cursor++] = headerCrc;
   return cursor;
+}
+
+interface SampleRateHeaderField {
+  readonly code: number;
+  readonly value: number;
+  readonly bytes: 0 | 1 | 2;
+}
+
+function sampleRateHeaderField(sampleRate: number): SampleRateHeaderField {
+  switch (sampleRate) {
+    case 88_200:
+      return { code: 1, value: 0, bytes: 0 };
+    case 176_400:
+      return { code: 2, value: 0, bytes: 0 };
+    case 192_000:
+      return { code: 3, value: 0, bytes: 0 };
+    case 8_000:
+      return { code: 4, value: 0, bytes: 0 };
+    case 16_000:
+      return { code: 5, value: 0, bytes: 0 };
+    case 22_050:
+      return { code: 6, value: 0, bytes: 0 };
+    case 24_000:
+      return { code: 7, value: 0, bytes: 0 };
+    case 32_000:
+      return { code: 8, value: 0, bytes: 0 };
+    case 44_100:
+      return { code: 9, value: 0, bytes: 0 };
+    case 48_000:
+      return { code: 10, value: 0, bytes: 0 };
+    case 96_000:
+      return { code: 11, value: 0, bytes: 0 };
+  }
+  if (sampleRate % 1000 === 0 && sampleRate / 1000 <= 0xff) {
+    return { code: 12, value: sampleRate / 1000, bytes: 1 };
+  }
+  if (sampleRate <= 0xffff) return { code: 13, value: sampleRate, bytes: 2 };
+  if (sampleRate % 10 === 0 && sampleRate / 10 <= 0xffff) {
+    return { code: 14, value: sampleRate / 10, bytes: 2 };
+  }
+  return { code: 0, value: 0, bytes: 0 };
 }
 
 function standardBlockSizeCode(samples: number): number | undefined {

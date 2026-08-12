@@ -618,7 +618,7 @@ interface TrackState {
   readonly color?: VideoColorMetadata;
   readonly fps: number | undefined;
   readonly durationSec: number | undefined;
-  readonly gapless?: TrackInfo['gapless'];
+  gapless?: TrackInfo['gapless'];
   readonly sampleRate: number | undefined;
   readonly channels: number | undefined;
   readonly chunks: ChunkStruct[];
@@ -2021,6 +2021,19 @@ export class WebmMuxer implements Muxer {
     }
     this.#tracks.set(trackNumber, trackStateFrom(info, trackNumber));
     return trackNumber;
+  }
+
+  /** Attach destination encoder timing learned after the encoded stream drained, before finalization. */
+  setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+    this.#assertOpen();
+    const track = this.#tracks.get(trackId);
+    if (track === undefined) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    if (track.mediaType !== 'audio') {
+      throw new MediaError('mux-error', `set gapless timing on non-audio track ${trackId}`);
+    }
+    track.gapless = { ...gapless };
   }
 
   /**

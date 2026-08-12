@@ -33,6 +33,7 @@ import {
 } from './buffered-mp4-convert.ts';
 import {
   type SourceGeometry,
+  audioTrackAfterLeadingSampleTrim,
   buildVideoEncoderConfigForRuntime,
   canCopyAudioTrackToContainer,
   canUseVpxAlphaGeometryPacketTranscode,
@@ -119,7 +120,11 @@ export interface CodecConvertRunnerContext {
     track: TrackInfo,
     stage: StageOptions,
     options: CallOptions,
-  ) => Promise<ReadableStream<AudioData>>;
+    sourceContainerId: string,
+  ) => Promise<{
+    readonly frames: ReadableStream<AudioData>;
+    readonly leadingSamplesRemoved: number;
+  }>;
   readonly applyAudioFilters: (
     frames: ReadableStream<AudioData>,
     target: AudioTarget,
@@ -471,6 +476,7 @@ export async function runCodecConvert(
         const plannedAudioTarget = audioTarget as AudioTarget;
         const stage = context.stageOptions(signal, callOptions);
         let decoded: ReadableStream<AudioData>;
+        let decodedSourceTrack = audioTrack;
         if (
           (context.isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac') &&
           container.decodePcmInterleavedStream !== undefined
@@ -503,13 +509,24 @@ export async function runCodecConvert(
             'f32',
           );
         } else {
-          decoded = await context.decodeAudioTrackPackets(demuxer, audioTrack, stage, callOptions);
+          const decodedPackets = await context.decodeAudioTrackPackets(
+            demuxer,
+            audioTrack,
+            stage,
+            callOptions,
+            container.id,
+          );
+          decoded = decodedPackets.frames;
+          decodedSourceTrack = audioTrackAfterLeadingSampleTrim(
+            audioTrack,
+            decodedPackets.leadingSamplesRemoved,
+          );
         }
         /* v8 ignore start -- live decode→filter→encode requires AudioData/WebCodecs; browser-validated. */
         const shaped = await context.applyAudioFilters(
           decoded,
           plannedAudioTarget,
-          audioTrack,
+          decodedSourceTrack,
           signal,
           callOptions,
         );
@@ -518,7 +535,7 @@ export async function runCodecConvert(
           context.encodeAudioStream(
             shaped,
             plannedAudioTarget,
-            audioTrack,
+            decodedSourceTrack,
             muxer,
             signal,
             callOptions,

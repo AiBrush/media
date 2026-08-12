@@ -9,7 +9,10 @@
  */
 
 import { loadAacCore } from '../../codecs/wasm-aac/wasm-aac-driver.ts';
-import { awaitAudioCodecQueueDrain } from '../../codecs/webcodecs-audio.ts';
+import {
+  WEBKIT_ADTS_AAC_LEADING_SAMPLES,
+  awaitAudioCodecQueueDrain,
+} from '../../codecs/webcodecs-audio.ts';
 import {
   type ByteSource,
   type ContainerDriver,
@@ -53,6 +56,7 @@ const ADTS_TRIM_END_SLACK_SEC = 1;
 const ADTS_TRIM_URL_CACHE_TTL_MS = 60_000;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRIES = 16;
 const ADTS_TRIM_URL_CACHE_MAX_ENTRY_BYTES = 1 * 1024 * 1024;
+export { WEBKIT_ADTS_AAC_LEADING_SAMPLES };
 
 export type AdtsAacPcmDecodeRung = (typeof AAC_PCM_NATIVE_FIRST_PLAN)[number];
 
@@ -368,6 +372,21 @@ export function concatPcmChunks(
   return { sampleRate, channels, frames, planar };
 }
 
+/** Remove a decoder-owned leading interval without mutating shared PCM planes. */
+export function dropLeadingPcmFrames(audio: PcmAudio, count: number): PcmAudio {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new MediaError('decode-error', `aac: invalid leading sample count ${count}`);
+  }
+  if (count === 0) return audio;
+  const start = Math.min(count, audio.frames);
+  return {
+    sampleRate: audio.sampleRate,
+    channels: audio.channels,
+    frames: audio.frames - start,
+    planar: audio.planar.map((plane) => plane.slice(start)),
+  };
+}
+
 function mayUseAdtsDirectWasmS16Wav(
   byteLength: number,
   o: PcmTransform | undefined,
@@ -641,25 +660,43 @@ function aacPcmPlanMiss(
   });
 }
 
-async function firefoxRuntimeForAdtsPcm(): Promise<boolean> {
+interface AdtsAacPcmRuntimePolicy {
+  readonly wasmOnly: boolean;
+  readonly nativeLeadingSamples: number;
+}
+
+export function adtsAacPcmRuntimePolicy(
+  firefoxRuntime: boolean,
+  webKitRuntime: boolean,
+): AdtsAacPcmRuntimePolicy {
+  return {
+    wasmOnly: firefoxRuntime,
+    nativeLeadingSamples: webKitRuntime ? WEBKIT_ADTS_AAC_LEADING_SAMPLES : 0,
+  };
+}
+
+async function runtimePolicyForAdtsPcm(): Promise<AdtsAacPcmRuntimePolicy> {
   const runtime = await import('../../api/runtime-detect.ts');
-  return runtime.isFirefoxRuntime();
+  return adtsAacPcmRuntimePolicy(runtime.isFirefoxRuntime(), runtime.isWebKitRuntime());
 }
 
 async function decodeAacToPcmWithLayout(
   bytes: Uint8Array,
   layout: AdtsLayout,
-  firefoxRuntime: boolean,
+  runtimePolicy: AdtsAacPcmRuntimePolicy,
   o: PcmTransform | undefined,
 ): Promise<PcmAudio> {
   throwIfAborted(o?.signal);
-  const plan = adtsAacPcmDecodePlan(firefoxRuntime, o?.determinism);
+  const plan = adtsAacPcmDecodePlan(runtimePolicy.wasmOnly, o?.determinism);
   let nativeMiss: CapabilityError | undefined;
   let wasmMiss: CapabilityError | undefined;
   for (const rung of plan) {
     if (rung === 'webcodecs-audio') {
       try {
-        return await decodeNativeAacToPcm(bytes, layout, o?.signal);
+        return dropLeadingPcmFrames(
+          await decodeNativeAacToPcm(bytes, layout, o?.signal),
+          runtimePolicy.nativeLeadingSamples,
+        );
       } catch (e) {
         if (!(e instanceof CapabilityError)) throw e;
         nativeMiss = e;
@@ -852,16 +889,16 @@ export const AdtsDriver = {
     const bytes = await readAll(src);
     throwIfAborted(o?.signal);
     const layout = readLayout(bytes);
-    const firefoxRuntime = await firefoxRuntimeForAdtsPcm();
+    const runtimePolicy = await runtimePolicyForAdtsPcm();
     let directWav: Uint8Array<ArrayBuffer> | undefined;
-    if (mayUseAdtsDirectWasmS16Wav(bytes.byteLength, o, firefoxRuntime)) {
+    if (mayUseAdtsDirectWasmS16Wav(bytes.byteLength, o, runtimePolicy.wasmOnly)) {
       const direct = adtsPcmDirectModule ?? (await loadAdtsPcmDirectModule());
       directWav = direct.canUseAdtsWasmDirectS16Wav(
         bytes.byteLength,
         layout.info.sampleRate,
         layout.info.channels,
         o,
-        firefoxRuntime,
+        runtimePolicy.wasmOnly,
       )
         ? await direct.tryDecodeWasmAacToS16Wav(bytes, layout, o)
         : undefined;
@@ -869,7 +906,7 @@ export const AdtsDriver = {
     const out =
       directWav ??
       writeWav(
-        applyPcmTransform(await decodeAacToPcmWithLayout(bytes, layout, firefoxRuntime, o), o),
+        applyPcmTransform(await decodeAacToPcmWithLayout(bytes, layout, runtimePolicy, o), o),
         PCM_OUTPUT_FORMAT,
       );
     return new ReadableStream<Uint8Array>({

@@ -37,6 +37,18 @@ function resizeCanvas(canvas: VideoCanvas, width: number, height: number): Video
   return canvas;
 }
 
+/** Presentation-raster fallback for runtimes that cannot copy a planar frame directly to packed RGBA. */
+export function rgbaPixelsViaCanvas(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+): Uint8ClampedArray {
+  const canvas = createVideoCanvas(width, height);
+  const context = canvas2d(canvas);
+  context.drawImage(frame as unknown as CanvasImageSource, 0, 0, width, height);
+  return context.getImageData(0, 0, width, height).data.slice();
+}
+
 export function canvasBackedVideoFrameStream(): TransformStream<VideoFrame, VideoFrame> {
   let canvas: VideoCanvas | undefined;
   let ctx: VideoCanvasContext | undefined;

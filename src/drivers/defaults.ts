@@ -96,6 +96,7 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     probe: true,
     packetInfo: true,
     streamCopy: true,
+    gaplessSeam: true,
   },
   {
     id: 'wav',
@@ -137,6 +138,7 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     packetInfo: true,
     streamCopy: true,
     validatesStreamCopyTrim: true,
+    gaplessSeam: true,
     muxKind: 'ogg',
     validateTrack: validateOggMuxTrack,
   },

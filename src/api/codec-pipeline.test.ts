@@ -22,10 +22,16 @@ import type {
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { audioFilterSpecs } from './audio-stream-plan.ts';
 import {
+  FIREFOX_ADTS_AAC_LEADING_SAMPLES,
   audioCodecToken,
+  audioDecodeLeadingSamplesForRuntime,
+  audioDecodeNativeGaplessSuppressionForRuntime,
   audioEncodeNeedsSoftwareRuntime,
+  audioEncodeSoftwareDriverForRuntime,
   audioEncoderCodecString,
   audioTargetCanBypassFilterPlanner,
+  audioTrackAfterLeadingSampleTrim,
+  audioTrackAfterNativeGaplessSuppression,
   audioTrackInfoFromDecoderConfig,
   buildAudioEncoderConfig,
   buildVideoEncoderConfig,
@@ -43,10 +49,12 @@ import {
   drainEncoderToMuxer,
   encodeVideoFramesWithAlpha,
   encodeVpxAlphaFrameStreams,
+  firefoxAdtsAacLeadingSamples,
   firefoxAudioTranscodeDeclineReason,
   firefoxOpusAudioEncodeTarget,
   firefoxOpusEncodeUsesWasm,
   firefoxVideoTranscodeDeclineReason,
+  firefoxVorbisEncodeUsesWasm,
   frameSatisfiesSeek,
   h264CodecStringForDimensions,
   h264LevelIdcForDimensions,
@@ -54,6 +62,7 @@ import {
   isPcmContainer,
   isPureStreamCopy,
   isUnsupportedHevcEncodeProfile,
+  mergeVpxAlphaLuma,
   mergeVpxAlphaRgba,
   normalizeDecoderCodec,
   outputDimensions,
@@ -74,9 +83,12 @@ import {
   videoLatencyMode,
   videoPixelRotation,
   videoTrackInfoFromDecoderConfig,
+  vpxAlphaDecodeSoftwareDriverForRuntime,
   vpxAlphaI420FromPackedGrayscale,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
+  webkitAdtsAacLeadingSamples,
+  webkitCrossCodecH264Config,
   webkitVideoTranscodeDeclineReason,
 } from './codec-pipeline.ts';
 import {
@@ -263,6 +275,24 @@ describe('mergeVpxAlphaRgba', () => {
     mergeVpxAlphaRgba(color, alpha);
 
     expect([...colorBacking]).toEqual([99, 10, 20, 30, 1, 50, 60, 70, 5, 88]);
+  });
+});
+
+describe('mergeVpxAlphaLuma', () => {
+  it('takes one full-swing luma byte per pixel without video-range conversion', () => {
+    const color = Uint8ClampedArray.from([
+      10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+    ]);
+
+    mergeVpxAlphaLuma(color, Uint8Array.from([0, 15, 16, 254]));
+
+    expect([...color]).toEqual([10, 20, 30, 0, 40, 50, 60, 15, 70, 80, 90, 16, 100, 110, 120, 254]);
+  });
+
+  it('rejects a truncated alpha plane', () => {
+    expect(() => mergeVpxAlphaLuma(new Uint8ClampedArray(8), new Uint8Array(1))).toThrow(
+      'VPx alpha luma has 1 bytes for 8 RGBA bytes',
+    );
   });
 });
 
@@ -1134,7 +1164,7 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
     const rows: readonly [Parameters<typeof resolveVideoEncoderCodecString>, string][] = [
       [[{ codec: 'h264' }, src, undefined], 'avc1.42E028'], // 1080p → L4.0
       [[{ codec: 'h264', width: 320, height: 180 }, src, undefined], 'avc1.42E01E'], // L3.0 floor
-      [[{ codec: 'hevc' }, src, undefined], 'hev1.1.6.L93.B0'],
+      [[{ codec: 'hevc' }, src, undefined], 'hvc1.1.6.L93.B0'],
       [[{ codec: 'vp8' }, src, undefined], 'vp8'],
       [[{ codec: 'vp9', width: 1280, height: 720, fps: 30 }, src, undefined], 'vp09.00.40.08'],
       [[{ codec: 'av1', width: 1280, height: 720, fps: 30 }, src, undefined], 'av01.0.08M.08'],
@@ -1149,6 +1179,19 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
     expect(resolveVideoEncoderCodecString({}, src, 'avc1.640028')).toBe('avc1.640028');
     expect(resolveVideoEncoderCodecString({}, src, 'hvc1.1.6.L150.90')).toBe('hvc1.1.6.L150.90');
     expect(resolveVideoEncoderCodecString({}, src, 'vp09.02.50.10')).toBe('vp09.02.50.10');
+  });
+
+  it('uses the out-of-band hvc1 sample-entry promise for HEVC re-encoding', () => {
+    const hvc1Source = 'hvc1.1.6.L120.90';
+    expect(resolveVideoEncoderCodecString({ bitrate: 8_000_000 }, src, hvc1Source)).toBe(
+      'hvc1.1.6.L93.B0',
+    );
+    expect(buildVideoEncoderConfig({ bitrate: 8_000_000 }, src, hvc1Source).codec).toBe(
+      'hvc1.1.6.L93.B0',
+    );
+    expect(
+      resolveVideoEncoderCodecString({ codec: 'hevc', bitrate: 8_000_000 }, src, hvc1Source),
+    ).toBe('hvc1.1.6.L93.B0');
   });
 
   it('retains a source H.264 Main/High profile for an explicit h264 token (private helper path)', () => {
@@ -1170,7 +1213,7 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
 
   it('authors HEVC Main10 for a 10-bit request and sizes VP9/AV1 level boundaries', () => {
     expect(resolveVideoEncoderCodecString({ codec: 'hevc', bitDepth: 10 }, src, undefined)).toBe(
-      'hev1.2.4.L120.B0',
+      'hvc1.2.4.L120.B0',
     );
     expect(
       resolveVideoEncoderCodecString(
@@ -2358,7 +2401,7 @@ describe('buildVideoEncoderConfig', () => {
         .codec,
     ).toBe('vp09.00.50.08');
     expect(buildVideoEncoderConfig({ codec: 'hevc' }, src, undefined).codec).toBe(
-      'hev1.1.6.L93.B0',
+      'hvc1.1.6.L93.B0',
     );
   });
 
@@ -2654,7 +2697,7 @@ describe('buildVideoEncoderConfig', () => {
       'avc1.42E028',
     );
     expect(buildVideoEncoderConfig({ codec: 'hevc', bitDepth: 10 }, src, undefined)).toMatchObject({
-      codec: 'hev1.2.4.L120.B0',
+      codec: 'hvc1.2.4.L120.B0',
       width: 1920,
       height: 1080,
       latencyMode: 'quality',
@@ -2705,6 +2748,85 @@ describe('webkitVideoTranscodeDeclineReason', () => {
       ),
     ).toBeUndefined();
     expect(webkitVideoTranscodeDeclineReason({}, src)).toBeUndefined();
+  });
+});
+
+describe('webkitCrossCodecH264Config', () => {
+  const baseline = {
+    codec: 'avc1.42E028',
+    width: 1920,
+    height: 1080,
+  } satisfies VideoEncoderConfig;
+
+  it('uses level-equivalent High profile for known cross-codec input', () => {
+    expect(webkitCrossCodecH264Config(baseline, 'hvc1.1.6.L93.B0')).toMatchObject({
+      codec: 'avc1.640028',
+    });
+    expect(webkitCrossCodecH264Config(baseline, 'vp09.00.31.08')).toMatchObject({
+      codec: 'avc1.640028',
+    });
+  });
+
+  it('retains AVC, unrelated targets, and unknown-source configurations', () => {
+    expect(webkitCrossCodecH264Config(baseline, 'avc1.42E028')).toBe(baseline);
+    expect(webkitCrossCodecH264Config(baseline, undefined)).toBe(baseline);
+    const hevc = { ...baseline, codec: 'hvc1.1.6.L93.B0' };
+    expect(webkitCrossCodecH264Config(hevc, 'vp09.00.31.08')).toBe(hevc);
+  });
+});
+
+describe('webkitAdtsAacLeadingSamples', () => {
+  it('matches only first-party raw ADTS AAC decode', () => {
+    expect(webkitAdtsAacLeadingSamples('adts', 'mp4a.40.2')).toBe(2112);
+    expect(webkitAdtsAacLeadingSamples('adts', 'aac')).toBe(2112);
+    expect(webkitAdtsAacLeadingSamples('mp4', 'mp4a.40.2')).toBe(0);
+    expect(webkitAdtsAacLeadingSamples('adts', 'opus')).toBe(0);
+    expect(webkitAdtsAacLeadingSamples(undefined, 'mp4a.40.2')).toBe(0);
+  });
+
+  it('subtracts the source-clock lead-in from duration without mutating the track', () => {
+    const track: TrackInfo = {
+      id: 0,
+      mediaType: 'audio',
+      codec: 'mp4a.40.2',
+      durationSec: (861 * 1024) / 44_100,
+      config: { codec: 'mp4a.40.2', sampleRate: 44_100, numberOfChannels: 2 },
+    };
+    const adjusted = audioTrackAfterLeadingSampleTrim(track, 2112);
+    expect(adjusted).not.toBe(track);
+    expect(adjusted.durationSec).toBeCloseTo((861 * 1024 - 2112) / 44_100, 12);
+    expect(track.durationSec).toBe((861 * 1024) / 44_100);
+    expect(audioTrackAfterLeadingSampleTrim(track, 0)).toBe(track);
+  });
+
+  it('subtracts only decoder-proven MP3 gapless suppression without mutating the source', () => {
+    const track: TrackInfo = {
+      id: 0,
+      mediaType: 'audio',
+      codec: 'mp3',
+      gapless: {
+        basis: 'mp3-xing-lame',
+        leadingSamples: 1105,
+        trailingSamples: 687,
+        totalSamples: 101888,
+      },
+    };
+    const adjusted = audioTrackAfterNativeGaplessSuppression(track, 529);
+    expect(adjusted).not.toBe(track);
+    expect(adjusted.gapless?.leadingSamples).toBe(576);
+    expect(track.gapless?.leadingSamples).toBe(1105);
+    expect(audioTrackAfterNativeGaplessSuppression(track, 0)).toBe(track);
+    expect(audioTrackAfterNativeGaplessSuppression(track, 1106)).toBe(track);
+  });
+});
+
+describe('firefoxAdtsAacLeadingSamples', () => {
+  it('matches one AAC-LC access unit only for first-party raw ADTS AAC decode', () => {
+    expect(FIREFOX_ADTS_AAC_LEADING_SAMPLES).toBe(1024);
+    expect(firefoxAdtsAacLeadingSamples('adts', 'mp4a.40.2')).toBe(1024);
+    expect(firefoxAdtsAacLeadingSamples('adts', 'aac')).toBe(1024);
+    expect(firefoxAdtsAacLeadingSamples('mp4', 'mp4a.40.2')).toBe(0);
+    expect(firefoxAdtsAacLeadingSamples('adts', 'opus')).toBe(0);
   });
 });
 
@@ -3269,6 +3391,24 @@ describe('Opus audio target normalization / Firefox wasm routing', () => {
       }),
     ).toBe(false);
   });
+
+  it('routes Firefox Vorbis configs through the libvorbisenc wasm tail', () => {
+    expect(
+      firefoxVorbisEncodeUsesWasm({
+        codec: 'vorbis',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        bitrate: 128_000,
+      }),
+    ).toBe(true);
+    expect(
+      firefoxVorbisEncodeUsesWasm({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe('runtime-aware transcode preflight helpers', () => {
@@ -3304,6 +3444,13 @@ describe('runtime-aware transcode preflight helpers', () => {
       await expect(
         buildVideoEncoderConfigForRuntime({ codec: 'vp8' }, { width: 320, height: 240 }, 'vp8'),
       ).resolves.toMatchObject({ codec: 'vp8' });
+      await expect(
+        buildVideoEncoderConfigForRuntime(
+          { codec: 'h264' },
+          { width: 1920, height: 1080, fps: 30 },
+          'hvc1.1.6.L93.B0',
+        ),
+      ).resolves.toMatchObject({ codec: 'avc1.42E028' });
       expect(
         await audioEncodeNeedsSoftwareRuntime({
           codec: 'opus',
@@ -3311,22 +3458,91 @@ describe('runtime-aware transcode preflight helpers', () => {
           numberOfChannels: 2,
         }),
       ).toBe(false);
+      await expect(
+        audioEncodeSoftwareDriverForRuntime({
+          codec: 'vorbis',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).resolves.toBeUndefined();
+      await expect(
+        vpxAlphaDecodeSoftwareDriverForRuntime('webcodecs-video'),
+      ).resolves.toBeUndefined();
     });
   });
 
   it('keeps WebKit video declines typed and scoped to unstable filtered paths', async () => {
     await withNavigator(safariNavigator, async () => {
       await expect(
+        audioDecodeLeadingSamplesForRuntime('adts', 'mp4a.40.2', 'webcodecs-audio'),
+      ).resolves.toBe(2112);
+      await expect(
+        audioDecodeLeadingSamplesForRuntime('adts', 'mp4a.40.2', 'wasm-aac'),
+      ).resolves.toBe(0);
+      const mp3Track: TrackInfo = {
+        id: 0,
+        mediaType: 'audio',
+        codec: 'mp3',
+        gapless: { basis: 'mp3-xing-lame', leadingSamples: 1105 },
+      };
+      await expect(
+        audioDecodeNativeGaplessSuppressionForRuntime('mp3', mp3Track, 'webcodecs-audio'),
+      ).resolves.toBe(529);
+      await expect(
+        audioDecodeNativeGaplessSuppressionForRuntime('mp3', mp3Track, 'wasm-mp3'),
+      ).resolves.toBe(0);
+      await expect(
         buildVideoEncoderConfigForRuntime({ alpha: 'keep' }, { width: 320, height: 240 }, 'vp9'),
       ).rejects.toThrow(CapabilityError);
       await expect(
         buildVideoEncoderConfigForRuntime({ codec: 'vp8' }, { width: 320, height: 240 }, 'vp9'),
       ).resolves.toMatchObject({ codec: 'vp8' });
+      await expect(
+        buildVideoEncoderConfigForRuntime(
+          { codec: 'h264' },
+          { width: 1920, height: 1080, fps: 30 },
+          'hvc1.1.6.L93.B0',
+        ),
+      ).resolves.toMatchObject({ codec: 'avc1.640028' });
+      expect(
+        await audioEncodeNeedsSoftwareRuntime({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+          bitrate: 128_000,
+        }),
+      ).toBe(true);
+      expect(
+        await audioEncodeNeedsSoftwareRuntime({
+          codec: 'mp4a.40.2',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).toBe(false);
+      await expect(
+        audioEncodeSoftwareDriverForRuntime({
+          codec: 'vorbis',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).resolves.toBeUndefined();
+      await expect(
+        vpxAlphaDecodeSoftwareDriverForRuntime('webcodecs-video'),
+      ).resolves.toBeUndefined();
     });
   });
 
-  it('applies Firefox-specific video and Opus audio routing evidence', async () => {
+  it('applies Firefox-specific video, Opus, and Vorbis routing evidence', async () => {
     await withNavigator(firefoxNavigator, async () => {
+      await expect(
+        audioDecodeLeadingSamplesForRuntime('adts', 'mp4a.40.2', 'webcodecs-audio'),
+      ).resolves.toBe(1024);
+      await expect(
+        audioDecodeLeadingSamplesForRuntime('mp4', 'mp4a.40.2', 'webcodecs-audio'),
+      ).resolves.toBe(0);
+      await expect(
+        audioDecodeLeadingSamplesForRuntime('adts', 'mp4a.40.2', 'wasm-aac'),
+      ).resolves.toBe(0);
       await expect(
         buildVideoEncoderConfigForRuntime(
           { codec: 'vp9' },
@@ -3348,6 +3564,32 @@ describe('runtime-aware transcode preflight helpers', () => {
           numberOfChannels: 2,
         }),
       ).toBe(true);
+      await expect(
+        audioEncodeSoftwareDriverForRuntime({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).resolves.toBe('wasm-opus');
+      await expect(
+        audioEncodeSoftwareDriverForRuntime({
+          codec: 'vorbis',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+          bitrate: 128_000,
+        }),
+      ).resolves.toBe('wasm-vorbis-enc');
+      expect(
+        await audioEncodeNeedsSoftwareRuntime({
+          codec: 'vorbis',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        }),
+      ).toBe(true);
+      await expect(vpxAlphaDecodeSoftwareDriverForRuntime('webcodecs-video')).resolves.toBe(
+        'wasm-vpx',
+      );
+      await expect(vpxAlphaDecodeSoftwareDriverForRuntime('wasm-vpx')).resolves.toBeUndefined();
     });
   });
 });
@@ -3409,7 +3651,7 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
     });
   });
 
-  it('does not copy real MP3 sample-unit gapless facts into a 48 kHz Opus output track', async () => {
+  it('replaces real MP3 gapless facts with destination-owned 48 kHz Opus timing', async () => {
     const { parseMp3 } = await import('../drivers/mp3/mp3-driver.ts');
     const { loadFixture } = await import('../test-support/corpus.ts');
     const source = parseMp3(await loadFixture('sound_5.mp3'));
@@ -3430,7 +3672,13 @@ describe('videoTrackInfoFromDecoderConfig / audioTrackInfoFromDecoderConfig', ()
         leadingSamples: 312,
       },
     );
-    expect(output).toBeUndefined();
+    expect(output).toEqual({
+      leadingSamples: 312,
+      trailingSamples: 793,
+      totalSamples: 110_255,
+    });
+    expect(output?.leadingSamples).not.toBe(source.gapless.leadingSamples);
+    expect(output?.trailingSamples).not.toBe(source.gapless.trailingSamples);
   });
 });
 

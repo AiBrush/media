@@ -123,7 +123,26 @@ function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promis
  * (the offset a plain append would land at); `position === appendPosition` is the contiguous common
  * case, letting writer arms keep plain cursor writes and name the real cursor in a typed miss.
  */
-type EmitWrite = (data: Uint8Array, position: number, appendPosition: number) => Promise<void>;
+type EmitWrite = (
+  data: Uint8Array,
+  position: number,
+  appendPosition: number,
+) => void | Promise<void>;
+
+type DeliverWrite = (data: Uint8Array, position: number) => void | Promise<void>;
+
+const EXACT_WRITE_YIELD_CHECK_INTERVAL = 64;
+const EXACT_WRITE_TASK_BUDGET_MS = 8;
+
+function monotonicNow(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now();
+}
+
+function yieldToHostTask(): Promise<void> {
+  const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (typeof scheduler?.yield === 'function') return scheduler.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 /**
  * Coalesce contiguous writes into ≥`chunkSize` runs (doc 09 §5 item 7, mediabunny `chunked` parity).
@@ -133,12 +152,12 @@ type EmitWrite = (data: Uint8Array, position: number, appendPosition: number) =>
  */
 class RunCoalescer {
   readonly #chunkSize: number;
-  readonly #deliver: (data: Uint8Array, position: number) => Promise<void>;
+  readonly #deliver: DeliverWrite;
   #buffer: Uint8Array | undefined;
   #filled = 0;
   #runStart = 0;
 
-  constructor(chunkSize: number, deliver: (data: Uint8Array, position: number) => Promise<void>) {
+  constructor(chunkSize: number, deliver: DeliverWrite) {
     this.#chunkSize = chunkSize;
     this.#deliver = deliver;
   }
@@ -159,7 +178,8 @@ class RunCoalescer {
         const remaining = data.byteLength - offset;
         if (remaining >= this.#chunkSize) {
           // Nothing pending and at least one whole run in hand: ship it without re-buffering.
-          await this.#deliver(offset === 0 ? data : data.subarray(offset), position);
+          const pending = this.#deliver(offset === 0 ? data : data.subarray(offset), position);
+          if (pending !== undefined) await pending;
           return;
         }
         this.#buffer = new Uint8Array(this.#chunkSize);
@@ -184,7 +204,8 @@ class RunCoalescer {
     const start = this.#runStart;
     this.#buffer = undefined; // downstream owns the emitted view; a new run allocates fresh
     this.#filled = 0;
-    await this.#deliver(run, start);
+    const pending = this.#deliver(run, start);
+    if (pending !== undefined) await pending;
   }
 
   finish(): Promise<void> {
@@ -207,12 +228,14 @@ interface WriteShaper {
  */
 class ExactWriteShaper implements WriteShaper {
   readonly #writeBytes: number;
-  readonly #deliver: (data: Uint8Array, position: number) => Promise<void>;
+  readonly #deliver: DeliverWrite;
   #buffer: Uint8Array | undefined;
   #filled = 0;
   #runStart = 0;
+  #writesSinceYieldCheck = 0;
+  #taskStartedAt = monotonicNow();
 
-  constructor(writeBytes: number, deliver: (data: Uint8Array, position: number) => Promise<void>) {
+  constructor(writeBytes: number, deliver: DeliverWrite) {
     this.#writeBytes = writeBytes;
     this.#deliver = deliver;
   }
@@ -233,7 +256,14 @@ class ExactWriteShaper implements WriteShaper {
         const remaining = data.byteLength - offset;
         if (remaining >= this.#writeBytes) {
           const exact = data.subarray(offset, offset + this.#writeBytes);
-          await this.#deliver(exact, position);
+          // A synchronous callback is genuine immediate acceptance, not missing backpressure. Avoid
+          // manufacturing one promise/microtask per exact write: a 30 MiB transport stream contains
+          // roughly 170,000 188-byte packets, which can otherwise starve Firefox for minutes. Async
+          // callbacks still stop the pump at every returned promise.
+          const pending = this.#deliver(exact, position);
+          if (pending !== undefined) await pending;
+          const taskYield = this.#yieldIfTaskBudgetSpent();
+          if (taskYield !== undefined) await taskYield;
           offset += this.#writeBytes;
           position += this.#writeBytes;
           continue;
@@ -248,7 +278,10 @@ class ExactWriteShaper implements WriteShaper {
       this.#filled += take;
       offset += take;
       position += take;
-      if (this.#filled === this.#writeBytes) await this.#flushExact();
+      if (this.#filled === this.#writeBytes) {
+        const pending = this.#flushExact();
+        if (pending !== undefined) await pending;
+      }
     }
   }
 
@@ -256,13 +289,13 @@ class ExactWriteShaper implements WriteShaper {
     if (this.#buffer !== undefined) throw this.#partialRunError('at end of output');
   }
 
-  async #flushExact(): Promise<void> {
+  #flushExact(): void | Promise<void> {
     const buffer = this.#buffer;
     if (buffer === undefined || this.#filled !== this.#writeBytes) return;
     const start = this.#runStart;
     this.#buffer = undefined;
     this.#filled = 0;
-    await this.#deliver(buffer, start);
+    return this.#deliver(buffer, start);
   }
 
   #partialRunError(where: string): CapabilityError {
@@ -277,6 +310,16 @@ class ExactWriteShaper implements WriteShaper {
         tried: [],
       },
     );
+  }
+
+  #yieldIfTaskBudgetSpent(): void | Promise<void> {
+    this.#writesSinceYieldCheck++;
+    if (this.#writesSinceYieldCheck < EXACT_WRITE_YIELD_CHECK_INTERVAL) return;
+    this.#writesSinceYieldCheck = 0;
+    if (monotonicNow() - this.#taskStartedAt < EXACT_WRITE_TASK_BUDGET_MS) return;
+    return yieldToHostTask().then(() => {
+      this.#taskStartedAt = monotonicNow();
+    });
   }
 }
 
@@ -298,9 +341,15 @@ async function drainPositioned(
 
   const reader = readable.getReader();
   let cursor = basePosition;
-  const deliver = async (data: Uint8Array, position: number): Promise<void> => {
-    await emit(data, position, cursor);
-    cursor = position + data.byteLength;
+  const deliver: DeliverWrite = (data, position) => {
+    const pending = emit(data, position, cursor);
+    if (pending === undefined) {
+      cursor = position + data.byteLength;
+      return;
+    }
+    return pending.then(() => {
+      cursor = position + data.byteLength;
+    });
   };
   const shaper: WriteShaper | undefined =
     plan.writeChunkBytes !== undefined
@@ -340,8 +389,13 @@ async function drainPositioned(
 
 /** The callback arm's emitter: hand the chunk + intended position to the writer and await it. */
 function emitToCallback(write: StreamTargetWriter, signal: AbortSignal | undefined): EmitWrite {
-  return async (data, position) => {
-    await raceAbort(Promise.resolve(write(data, position)), signal);
+  return (data, position) => {
+    const pending = write(data, position);
+    if (pending === undefined) {
+      if (signal?.aborted) throw abortedError();
+      return;
+    }
+    return raceAbort(Promise.resolve(pending), signal);
   };
 }
 

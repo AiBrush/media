@@ -391,7 +391,7 @@ describe('registerDefaultDrivers', () => {
     expect(webm).toMatchObject({ formats: ['webm', 'mkv'] });
     expect(typeof webm.probe).toBe('function');
     expect(typeof webm.streamCopy).toBe('function');
-    expect(webm.createMuxer().setTrackGapless).toBeUndefined();
+    expect(typeof webm.createMuxer().setTrackGapless).toBe('function');
     expect(webm.supports({ direction: 'demux', mime: 'video/x-matroska' })).toBe(true);
     expect(webm.supports({ direction: 'demux', extension: 'mkv' })).toBe(true);
     expect(webm.supports({ direction: 'demux', head: webmHead })).toBe(true);

@@ -29,6 +29,7 @@ import {
   modeForConfig,
   normalizeOpusDecoderConfig,
   normalizeOpusEncoderConfig,
+  opusDrainFrameCount,
   packetDurationSamples,
   packetFrameCount,
   parseToc,
@@ -211,6 +212,25 @@ describe('FrameAccumulator — re-chunk arbitrary input into fixed Opus frames',
   it('rejects nonsensical construction', () => {
     expect(() => new FrameAccumulator(0, 4)).toThrow(MediaError);
     expect(() => new FrameAccumulator(2, 0)).toThrow(MediaError);
+  });
+});
+
+describe('opusDrainFrameCount — flush encoder lookahead', () => {
+  it('adds one drain packet for an exactly frame-aligned program', () => {
+    expect(opusDrainFrameCount(480_000, 480_000, 312, 960)).toBe(1);
+  });
+
+  it('does not add a packet when an ordinary partial tail already covers pre-skip', () => {
+    expect(opusDrainFrameCount(480_100, 480_960, 312, 960)).toBe(0);
+  });
+
+  it('adds a packet when a nearly-full partial tail leaves less padding than pre-skip', () => {
+    expect(opusDrainFrameCount(480_700, 480_960, 312, 960)).toBe(1);
+  });
+
+  it('rejects unsafe or negative accounting instead of guessing', () => {
+    expect(() => opusDrainFrameCount(-1, 0, 312, 960)).toThrow(MediaError);
+    expect(() => opusDrainFrameCount(Number.MAX_SAFE_INTEGER, 0, 1, 960)).toThrow(MediaError);
   });
 });
 

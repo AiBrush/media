@@ -764,6 +764,90 @@ describe('probe WebM across the real corpus', () => {
     expect(ranges).not.toContainEqual([0, bytes.byteLength]);
   });
 
+  it('does not replay finite Clusters through direct or bounded block-backed range sources', async () => {
+    const packetInfo = WebmDriver.packetInfo;
+    if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');
+    const track = el(E.TrackEntry, [
+      ...el(E.TrackNumber, [1]),
+      ...el(E.TrackType, [2]),
+      ...el(E.CodecID, str('A_MPEG/L3')),
+      ...el(E.Audio, [...el(E.SamplingFrequency, f64(48_000)), ...el(E.Channels, [2])]),
+    ]);
+    const clusters: number[] = [];
+    for (let timestamp = 0; timestamp < 64; timestamp++) {
+      clusters.push(
+        ...el(E.Cluster, [
+          ...el(E.Timecode, uintN(timestamp, 2)),
+          ...el(E.SimpleBlock, [0x81, 0, 0, 0x80, ...new Array(32 * 1024).fill(timestamp & 0xff)]),
+        ]),
+      );
+    }
+    const bytes = Uint8Array.from([
+      ...el(E.EBML, el(E.DocType, str('webm'))),
+      ...el(E.Segment, [
+        ...el(E.Info, el(E.Duration, f64(64))),
+        ...el(E.Tracks, track),
+        ...clusters,
+      ]),
+    ]);
+    let bytesRead = 0;
+    const actual = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        bytesRead += end - start;
+        return Promise.resolve(bytes.slice(start, end));
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('finite WebM packet-info must remain range-backed');
+      },
+    });
+
+    expect(actual.packets).toHaveLength(64);
+    expect(bytes.byteLength).toBeGreaterThan(1024 * 1024);
+    expect(bytesRead / bytes.byteLength).toBeLessThan(0.75);
+
+    const blockSize = 64 * 1024;
+    const cachedBlocks = new Map<number, Uint8Array>();
+    let physicalBytesRead = 0;
+    const blockBacked = await packetInfo.call(WebmDriver, {
+      size: bytes.byteLength,
+      range(start, end): Promise<Uint8Array> {
+        const output = new Uint8Array(end - start);
+        const firstBlock = Math.floor(start / blockSize);
+        const lastBlock = Math.floor((end - 1) / blockSize);
+        for (let blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++) {
+          let block = cachedBlocks.get(blockIndex);
+          if (block === undefined) {
+            const blockStart = blockIndex * blockSize;
+            block = bytes.slice(blockStart, Math.min(bytes.byteLength, blockStart + blockSize));
+            physicalBytesRead += block.byteLength;
+          } else {
+            cachedBlocks.delete(blockIndex);
+          }
+          cachedBlocks.set(blockIndex, block);
+          while (cachedBlocks.size > 4) {
+            const oldest = cachedBlocks.keys().next().value;
+            if (oldest === undefined) break;
+            cachedBlocks.delete(oldest);
+          }
+          const blockStart = blockIndex * blockSize;
+          const copyStart = Math.max(start, blockStart);
+          const copyEnd = Math.min(end, blockStart + block.byteLength);
+          output.set(
+            block.subarray(copyStart - blockStart, copyEnd - blockStart),
+            copyStart - start,
+          );
+        }
+        return Promise.resolve(output);
+      },
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('block-backed finite WebM packet-info must remain range-backed');
+      },
+    });
+    expect(blockBacked.packets).toHaveLength(64);
+    expect(physicalBytesRead / bytes.byteLength).toBeLessThan(1.25);
+  });
+
   it('packetInfo skips one file-sized Block payload with constant post-prefix ranges', async () => {
     const packetInfo = WebmDriver.packetInfo;
     if (packetInfo === undefined) throw new Error('WebmDriver.packetInfo is not registered');

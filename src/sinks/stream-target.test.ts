@@ -576,6 +576,58 @@ describe('planStreamTargetWrite — write-shaping options', () => {
 });
 
 describe('writeChunkBytes StreamTarget — exact destination writes', () => {
+  it('does not synthesize per-write microtask backpressure for a synchronous callback', async () => {
+    const writeChunkBytes = 188;
+    const writeCount = 4_096;
+    let writes = 0;
+    let writesSeenByFirstMicrotask = 0;
+
+    await writeToStreamTarget(
+      toStreamTarget(
+        () => {
+          writes++;
+          if (writes === 1) {
+            queueMicrotask(() => {
+              writesSeenByFirstMicrotask = writes;
+            });
+          }
+        },
+        { writeChunkBytes },
+      ),
+      chunkStream(new Uint8Array(writeChunkBytes * writeCount)),
+    );
+
+    expect(writes).toBe(writeCount);
+    expect(writesSeenByFirstMicrotask).toBeGreaterThanOrEqual(64);
+  });
+
+  it('cooperatively yields exact synchronous writes before one host task grows unbounded', async () => {
+    const writeChunkBytes = 188;
+    const writeCount = 512;
+    let hostTimerFired = false;
+    let observedTimerDuringWrite = false;
+    const timer = setTimeout(() => {
+      hostTimerFired = true;
+    }, 0);
+
+    await writeToStreamTarget(
+      toStreamTarget(
+        () => {
+          const started = performance.now();
+          while (performance.now() - started < 0.15) {
+            // Model non-trivial caller telemetry without making the test itself slow.
+          }
+          observedTimerDuringWrite ||= hostTimerFired;
+        },
+        { writeChunkBytes },
+      ),
+      chunkStream(new Uint8Array(writeChunkBytes * writeCount)),
+    );
+    clearTimeout(timer);
+
+    expect(observedTimerDuringWrite).toBe(true);
+  });
+
   it('splits and coalesces arbitrary producer chunks into exact 188-byte awaited writes', async () => {
     const writeChunkBytes = 188;
     const truth = new Uint8Array(writeChunkBytes * 7);

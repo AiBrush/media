@@ -272,6 +272,9 @@ describe('FLAC encode — verbatim pure-TS authoring with STREAMINFO MD5 oracle'
       samples: [new Int32Array(64).fill(23)],
     };
     const compressedConstant = assertRoundTrip(constant);
+    const constantFrame = enumerateFlacFrameSpans(compressedConstant)[0]?.data;
+    expect((constantFrame?.[2] ?? 0) & 0x0f).toBe(9); // explicit 44.1 kHz frame-header code
+    expect(((constantFrame?.[3] ?? 0) >>> 1) & 0x07).toBe(4); // explicit 16-bit code
     const verbatimConstant = encodeFlacVerbatim(constant, { blockSize: 64 });
     expect(compressedConstant.byteLength).toBeLessThan(verbatimConstant.byteLength);
     assertSampleExact(decodeFlac(verbatimConstant).samples, constant.samples);

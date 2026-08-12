@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodeFlac, interleavedPcmBytes } from '../codecs/flac/decode.ts';
+import { decodeFlac, enumerateFlacFrameSpans, interleavedPcmBytes } from '../codecs/flac/decode.ts';
 import type { ContainerDriver, Demuxer, Muxer, PcmTransform } from '../contracts/driver.ts';
 import { InputError } from '../contracts/errors.ts';
 import { tryAuthorWavS16Flac } from '../drivers/wav/flac-s16.ts';
@@ -348,6 +348,9 @@ describe('convertToFlac — lazy FLAC authoring route planner', () => {
       expect(decoded.totalSamples).toBe(frames);
       expect(decoded.bitsPerSample).toBe(16);
       expect(decoded.sampleRate).toBe(48_000);
+      const firstFrame = enumerateFlacFrameSpans(flac)[0]?.data;
+      expect((firstFrame?.[2] ?? 0) & 0x0f).toBe(10); // explicit 48 kHz header code
+      expect(((firstFrame?.[3] ?? 0) >>> 1) & 0x07).toBe(4); // explicit 16-bit header code
     }
   });
 

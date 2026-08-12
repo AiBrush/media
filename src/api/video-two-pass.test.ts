@@ -17,6 +17,7 @@ import {
   decodeH264ReplayVideo,
   implicitRateControlWarmupFrames,
   installH264TwoPassQuantizer,
+  routeVideoEncoderWithImplicitH264Fallback,
   sourceGeometryOf,
   tagH264ReplayDecodeError,
 } from './video-two-pass-runner.ts';
@@ -144,6 +145,120 @@ function runtimeMiss(message: string, cause: Error): CapabilityError {
     { cause },
   );
 }
+
+describe('H.264 encoder profile route fallback', () => {
+  const preferred: VideoEncoderConfig = {
+    codec: 'avc1.64002A',
+    width: 1080,
+    height: 1920,
+    framerate: 60,
+    bitrateMode: 'quantizer',
+  };
+  const driver = replayDecoder(() => {
+    throw new Error('encoder profile route test must not decode');
+  });
+
+  it('retries an implicitly inherited High profile as sized Constrained Baseline on a typed miss', async () => {
+    const queries: string[] = [];
+    const result = await routeVideoEncoderWithImplicitH264Fallback(
+      preferred,
+      {},
+      'avc1.64002A',
+      {},
+      async (query) => {
+        queries.push(query.config.codec);
+        if (queries.length === 1) {
+          throw new CapabilityError('High profile encoder unavailable', {
+            op: { kind: 'codec', query },
+            tried: ['webcodecs-video'],
+          });
+        }
+        return driver;
+      },
+    );
+
+    expect(queries).toEqual(['avc1.64002A', 'avc1.42E02A']);
+    expect(result.codec).toBe(driver);
+    expect(result.config).toEqual({ ...preferred, codec: 'avc1.42E02A' });
+  });
+
+  it('tries the portable rate contract before weakening an inherited profile', async () => {
+    const alternate: VideoEncoderConfig = {
+      ...preferred,
+      bitrate: 62_500_000,
+      bitrateMode: 'variable',
+    };
+    const queries: VideoEncoderConfig[] = [];
+    const result = await routeVideoEncoderWithImplicitH264Fallback(
+      preferred,
+      {},
+      'avc1.64002A',
+      {},
+      async (query) => {
+        const config = query.config as VideoEncoderConfig;
+        queries.push(config);
+        if (queries.length === 1) {
+          throw new CapabilityError('quantizer mode unavailable', {
+            op: { kind: 'codec', query },
+            tried: ['webcodecs-video'],
+          });
+        }
+        return driver;
+      },
+      alternate,
+    );
+
+    expect(queries).toEqual([preferred, alternate]);
+    expect(result).toEqual({ codec: driver, config: alternate, usedAlternateConfig: true });
+  });
+
+  it('does not weaken a successful preferred route or an explicit codec target', async () => {
+    const successfulQueries: string[] = [];
+    const successful = await routeVideoEncoderWithImplicitH264Fallback(
+      preferred,
+      {},
+      'avc1.64002A',
+      {},
+      async (query) => {
+        successfulQueries.push(query.config.codec);
+        return driver;
+      },
+    );
+    expect(successfulQueries).toEqual(['avc1.64002A']);
+    expect(successful.config).toBe(preferred);
+
+    const explicitQueries: string[] = [];
+    const miss = new CapabilityError('explicit route miss', {
+      op: { kind: 'route', id: 'encode' },
+      tried: ['webcodecs-video'],
+    });
+    await expect(
+      routeVideoEncoderWithImplicitH264Fallback(
+        preferred,
+        { codec: 'h264' },
+        'avc1.64002A',
+        {},
+        async (query) => {
+          explicitQueries.push(query.config.codec);
+          throw miss;
+        },
+      ),
+    ).rejects.toBe(miss);
+    expect(explicitQueries).toEqual(['avc1.64002A']);
+  });
+
+  it('does not retry non-capability failures', async () => {
+    const failure = new MediaError('encode-error', 'encoder crashed');
+    let routes = 0;
+    await expect(
+      routeVideoEncoderWithImplicitH264Fallback(preferred, {}, 'avc1.64002A', {}, async () => {
+        routes++;
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+    expect(routes).toBe(1);
+  });
+});
 
 describe('H.264 replay decoder runtime fallback', () => {
   const config: VideoDecoderConfig = {

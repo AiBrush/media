@@ -8,10 +8,12 @@ import { Mp3Driver } from '../mp3/mp3-driver.ts';
 import {
   AdtsDriver,
   adtsAacPcmDecodePlan,
+  adtsAacPcmRuntimePolicy,
   adtsPacketInfoFromBytes,
   adtsTrimFromBytes,
   adtsTrimFromUrl,
   concatPcmChunks,
+  dropLeadingPcmFrames,
   enumerateAdtsFrames,
   parseAdts,
   pcmFromInterleavedF32,
@@ -488,6 +490,39 @@ describe('AdtsDriver.decodePcm — ADTS AAC to WAV PCM bridge', () => {
     expect(adtsAacPcmDecodePlan(true)).toEqual(['wasm-aac']);
     expect(adtsAacPcmDecodePlan(false, 'force-software')).toEqual(['wasm-aac']);
     expect(adtsAacPcmDecodePlan(true, 'force-software')).toEqual(['wasm-aac']);
+  });
+
+  it('suppresses WebKit native ADTS AAC presentation lead-in without changing codec routing', () => {
+    expect(adtsAacPcmRuntimePolicy(false, false)).toEqual({
+      wasmOnly: false,
+      nativeLeadingSamples: 0,
+    });
+    expect(adtsAacPcmRuntimePolicy(true, false)).toEqual({
+      wasmOnly: true,
+      nativeLeadingSamples: 0,
+    });
+    expect(adtsAacPcmRuntimePolicy(false, true)).toEqual({
+      wasmOnly: false,
+      nativeLeadingSamples: 2112,
+    });
+  });
+
+  it('drops a native decoder lead-in from every PCM plane without mutating the source', () => {
+    const source = {
+      sampleRate: 48_000,
+      channels: 2,
+      frames: 4,
+      planar: [new Float64Array([1, 2, 3, 4]), new Float64Array([5, 6, 7, 8])],
+    };
+    expect(dropLeadingPcmFrames(source, 2)).toEqual({
+      sampleRate: 48_000,
+      channels: 2,
+      frames: 2,
+      planar: [new Float64Array([3, 4]), new Float64Array([7, 8])],
+    });
+    expect(Array.from(source.planar[0] ?? [])).toEqual([1, 2, 3, 4]);
+    expect(dropLeadingPcmFrames(source, 9).frames).toBe(0);
+    expect(() => dropLeadingPcmFrames(source, -1)).toThrowError(MediaError);
   });
 
   it('uses the direct wasm-s16 WAV route only on wasm-only or force-software runtimes', () => {

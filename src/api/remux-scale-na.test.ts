@@ -15,6 +15,7 @@ import { Mp4Module } from '../drivers/mp4/mp4-driver.ts';
 import { WebmModule } from '../drivers/webm/webm-driver.ts';
 import { type Source, fromBytes } from '../sources/source.ts';
 import { createMedia } from './create-media.ts';
+import { requiresStreamingWebmRemux } from './remux-runner.ts';
 
 const ROOT = new URL('../../', import.meta.url).pathname;
 
@@ -102,5 +103,23 @@ describe('remux scale — oversize mp4→mkv uses the streaming WebM/MKV route',
         /buffer.*memory|memory.*buffer|exceeding the in-browser buffer-all/i,
       );
     }
+  });
+});
+
+describe('remux scale — same-container WebM bypasses whole-file streamCopy at scale', () => {
+  it('routes every byte above the prepared-writer boundary to the streaming writer', () => {
+    expect(requiresStreamingWebmRemux({ size: 64 * MIB }, { to: 'webm' })).toBe(false);
+    expect(requiresStreamingWebmRemux({ size: 64 * MIB + 1 }, { to: 'webm' })).toBe(true);
+    expect(requiresStreamingWebmRemux({ size: 64 * MIB + 1 }, { to: 'mkv' })).toBe(true);
+  });
+
+  it('routes explicit fragmented WebM even when source size is unknown or tiny', () => {
+    expect(requiresStreamingWebmRemux({}, { to: 'webm', fragmented: true })).toBe(true);
+    expect(requiresStreamingWebmRemux({ size: 1 }, { to: 'mkv', fragmented: true })).toBe(true);
+  });
+
+  it('does not divert other targets or small ordinary WebM copies', () => {
+    expect(requiresStreamingWebmRemux({ size: 4 * GIB }, { to: 'mp4' })).toBe(false);
+    expect(requiresStreamingWebmRemux({ size: 1024 }, { to: 'webm' })).toBe(false);
   });
 });

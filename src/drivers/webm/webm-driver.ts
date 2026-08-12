@@ -151,8 +151,8 @@ const WEBM_PACKET_INFO_PREFIX_BYTES = 256 * 1024;
 const WEBM_PACKET_INFO_EBML_HEADER_MAX_BYTES = 1024 * 1024;
 /** Four-byte EBML id plus eight-byte size: the largest legal element header. */
 const EBML_ELEMENT_HEADER_MAX_BYTES = 12;
-/** Reuse one modest sequential window while walking EBML headers and bounded packet prefixes. */
-const WEBM_PACKET_INFO_RANGE_WINDOW_BYTES = 64 * 1024;
+/** Reuse one packet-scale sequential window without pulling large video payload tails into metadata I/O. */
+const WEBM_PACKET_INFO_RANGE_WINDOW_BYTES = 16 * 1024;
 /** Codec qualification may inspect a prefix, but must never retain an arbitrarily large keyframe. */
 const WEBM_PACKET_INFO_CODEC_PREFIX_BYTES = 64 * 1024;
 /** Bound aggregate retained VP9/AV1 qualification bytes across an adversarial multitrack table. */
@@ -1870,9 +1870,10 @@ async function readWebmElementRange(
   reader: WebmPacketInfoRangeReader,
   offset: number,
   limit: number,
+  readAhead = true,
 ): Promise<WebmElementRange> {
   const headerEnd = Math.min(limit, offset + EBML_ELEMENT_HEADER_MAX_BYTES);
-  const bytes = await reader.read(offset, headerEnd, limit);
+  const bytes = await reader.read(offset, headerEnd, readAhead ? limit : headerEnd);
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const id = readVint(dv, 0, true);
   const size = id === undefined ? undefined : readVint(dv, id.length, false);
@@ -2819,6 +2820,9 @@ async function webmPacketInfoFromSource(
   // Segment metadata peers have no useful ordering guarantee. Discover and detach them before reading
   // any packet clock. A second Tracks is schema-invalid and rejected rather than ambiguously merged.
   let metadataCursor = segment.dataStart;
+  let packetCursorStart = segment.dataStart;
+  let singlePassClusters = false;
+  let infoSeen = 0;
   let tracksSeen = 0;
   let attachmentsSeen = 0;
   const declarations: PacketInfoTrackDeclaration[] = [];
@@ -2826,7 +2830,15 @@ async function webmPacketInfoFromSource(
   try {
     while (metadataCursor < segment.dataEnd) {
       assertNotAborted(signal);
-      const element = await readWebmElementRange(metadataReader, metadataCursor, segment.dataEnd);
+      const elementStart = metadataCursor;
+      // The first pass skips complete Clusters and reads only Segment metadata. Do not prefetch 64 KiB
+      // at every Cluster boundary: the packet pass below will consume those same sequential windows.
+      const element = await readWebmElementRange(
+        metadataReader,
+        metadataCursor,
+        segment.dataEnd,
+        false,
+      );
       if (element.unknownSize && element.id !== ID.Cluster) {
         throw new MediaError(
           'demux-error',
@@ -2834,6 +2846,7 @@ async function webmPacketInfoFromSource(
         );
       }
       if (element.id === ID.Info) {
+        infoSeen++;
         const fields = await scanPacketInfoInfo(metadataReader, element);
         timecodeScale = fields.timecodeScale ?? timecodeScale;
         durationTicks = fields.durationTicks ?? durationTicks;
@@ -2856,6 +2869,14 @@ async function webmPacketInfoFromSource(
         declarations.push(...(await scanPacketInfoAttachments(metadataReader, element)));
         metadataCursor = element.dataEnd;
       } else {
+        if (element.id === ID.Cluster && infoSeen === 1 && tracksSeen === 1) {
+          // Info and the sole Tracks declaration precede the first Cluster in ordinary WebM. Walk
+          // those clusters only once; late optional Attachments are still discovered by that walk.
+          // Files with late required metadata retain the fully order-independent two-pass fallback.
+          packetCursorStart = elementStart;
+          singlePassClusters = true;
+          break;
+        }
         metadataCursor =
           element.id === ID.Cluster
             ? await skipPacketInfoCluster(metadataReader, element)
@@ -2896,7 +2917,7 @@ async function webmPacketInfoFromSource(
     timecodeScale,
     lastEndTicks: 0,
   };
-  let cursor = segment.dataStart;
+  let cursor = packetCursorStart;
   const reader = new WebmPacketInfoRangeReader(ranged, signal);
   try {
     while (cursor < segment.dataEnd) {
@@ -2908,10 +2929,35 @@ async function webmPacketInfoFromSource(
           `unknown-sized non-Cluster element 0x${element.id.toString(16)} in WebM Segment`,
         );
       }
-      cursor =
-        element.id === ID.Cluster
-          ? await scanPacketInfoCluster(reader, element, state)
-          : element.dataEnd;
+      if (element.id === ID.Cluster) {
+        cursor = await scanPacketInfoCluster(reader, element, state);
+      } else {
+        cursor = element.dataEnd;
+        if (!singlePassClusters) continue;
+        if (element.id === ID.Info) {
+          throw new MediaError('demux-error', 'WebM Segment contains duplicate Info elements');
+        }
+        if (element.id === ID.Tracks) {
+          throw new MediaError('demux-error', 'WebM Segment contains duplicate Tracks elements');
+        }
+        if (element.id === ID.Attachments) {
+          attachmentsSeen++;
+          if (attachmentsSeen > 1) {
+            throw new MediaError(
+              'demux-error',
+              'WebM Segment contains duplicate Attachments elements',
+            );
+          }
+          const lateDeclarations = await scanPacketInfoAttachments(reader, element);
+          for (const declaration of lateDeclarations) {
+            declarations.push(declaration);
+            info.tracks.push(declaration.track);
+            framesByIndex.push(
+              declaration.attachmentFrame === undefined ? [] : [declaration.attachmentFrame],
+            );
+          }
+        }
+      }
     }
   } finally {
     reader.close();

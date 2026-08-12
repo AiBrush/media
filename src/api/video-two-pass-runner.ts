@@ -48,6 +48,70 @@ export interface H264TwoPassQuantizerInstallation {
   readonly assertComplete: () => void;
 }
 
+export interface RoutedVideoEncoder {
+  readonly codec: CodecDriver;
+  readonly config: VideoEncoderConfig;
+  readonly usedAlternateConfig: boolean;
+}
+
+/**
+ * Route the preferred encoder config, then try a caller-provided portable rate contract and finally an
+ * implicitly inherited H.264 Main/High profile as Constrained Baseline. Every retry happens before frame
+ * consumption and only after a typed capability miss; successful preferred routes, explicit codec targets,
+ * non-H.264 sources, and non-capability failures are left untouched.
+ */
+export async function routeVideoEncoderWithImplicitH264Fallback(
+  config: VideoEncoderConfig,
+  target: Pick<VideoTarget, 'codec'>,
+  sourceCodecString: string | undefined,
+  options: CallOptions,
+  routeCodec: H264TwoPassRunnerContext['routeCodec'],
+  alternateConfig?: VideoEncoderConfig,
+): Promise<RoutedVideoEncoder> {
+  const { encodeQueryFor, h264CodecStringForDimensions } = await import('./codec-pipeline.ts');
+  try {
+    return {
+      codec: await routeCodec(encodeQueryFor(config), options),
+      config,
+      usedAlternateConfig: false,
+    };
+  } catch (error: unknown) {
+    if (!isTypedCapabilityError(error)) throw error;
+    let terminalError = error;
+    if (alternateConfig !== undefined) {
+      try {
+        return {
+          codec: await routeCodec(encodeQueryFor(alternateConfig), options),
+          config: alternateConfig,
+          usedAlternateConfig: true,
+        };
+      } catch (alternateError: unknown) {
+        if (!isTypedCapabilityError(alternateError)) throw alternateError;
+        terminalError = alternateError;
+      }
+    }
+    const inheritedH264Profile =
+      target.codec === undefined &&
+      /^(?:avc1|avc3)\.(?:4d|64)/i.test(sourceCodecString ?? '') &&
+      /^(?:avc1|avc3)\.(?:4d|64)/i.test(config.codec);
+    if (!inheritedH264Profile) throw terminalError;
+    const profileBase = alternateConfig ?? config;
+    const fallbackConfig: VideoEncoderConfig = {
+      ...profileBase,
+      codec: h264CodecStringForDimensions(
+        profileBase.width,
+        profileBase.height,
+        profileBase.framerate,
+      ),
+    };
+    return {
+      codec: await routeCodec(encodeQueryFor(fallbackConfig), options),
+      config: fallbackConfig,
+      usedAlternateConfig: alternateConfig !== undefined,
+    };
+  }
+}
+
 /**
  * Native ABR encoders under-allocate their first few pictures before their rate model has observations.
  * Prime H.264 targets with disposable pictures. Explicit H.264 average bitrate still keeps its
@@ -425,12 +489,12 @@ export async function encodeVideoStream(
   fragmented: boolean,
   twoPassPlan: H264TwoPassPlan | undefined,
   context: H264TwoPassRunnerContext,
+  capabilityFallbackTarget?: VideoTarget,
 ): Promise<void> {
   const {
     buildVideoEncoderConfig,
     assertVideoEncoderOutputBitDepth,
     drainEncoderToMuxer,
-    encodeQueryFor,
     encodeVideoFramesWithAlpha,
     periodicVideoKeyFrameInterval,
     requireEncoderConfig,
@@ -440,7 +504,9 @@ export async function encodeVideoStream(
   const sourceGeometry = sourceTrack
     ? sourceGeometryOf(sourceTrack)
     : { width: target.width, height: target.height };
-  const config = buildVideoEncoderConfig(target, sourceGeometry, sourceTrack?.codec);
+  const config = await (
+    await import('./codec-runtime-quirks.ts')
+  ).buildVideoEncoderConfigForRuntime(target, sourceGeometry, sourceTrack?.codec);
   const { planVideoBitDepthConversion, videoColorMuxIntent, videoTargetPixelBoundaryBitDepth } =
     await import('./video-stream-plan.ts');
   const pixelPathBitDepth =
@@ -457,8 +523,12 @@ export async function encodeVideoStream(
     ...(target.bitDepth !== undefined ? { targetBitDepth: target.bitDepth } : {}),
     ...(pixelPathBitDepth !== undefined ? { pixelPathBitDepth } : {}),
   });
-  const encoderConfig: VideoEncoderConfig =
+  const preferredEncoderConfig: VideoEncoderConfig =
     target.alpha === 'keep' ? { ...config, alpha: 'discard' } : config;
+  const alternateEncoderConfig =
+    capabilityFallbackTarget === undefined
+      ? undefined
+      : buildVideoEncoderConfig(capabilityFallbackTarget, sourceGeometry, sourceTrack?.codec);
   if (target.twoPass === true && twoPassPlan === undefined) {
     throw new CapabilityError(
       'H.264 two-pass encode needs a replayable convert source and cannot consume a one-shot frame stream',
@@ -479,10 +549,22 @@ export async function encodeVideoStream(
       },
     );
   }
-  const codec = await context.routeCodec(encodeQueryFor(encoderConfig), options);
+  const routed = await routeVideoEncoderWithImplicitH264Fallback(
+    preferredEncoderConfig,
+    target,
+    sourceTrack?.codec,
+    options,
+    context.routeCodec,
+    alternateEncoderConfig,
+  );
+  const { codec, config: encoderConfig } = routed;
+  const effectiveTarget =
+    routed.usedAlternateConfig && capabilityFallbackTarget !== undefined
+      ? capabilityFallbackTarget
+      : target;
   const keyFrameInterval = periodicVideoKeyFrameInterval(target.fps, fragmented);
   const rateControlWarmupFrames = implicitRateControlWarmupFrames(
-    target,
+    effectiveTarget,
     encoderConfig.codec,
     encoderConfig.framerate,
   );
@@ -493,7 +575,7 @@ export async function encodeVideoStream(
     onDecoderConfig: (configValue) => {
       decoderConfig = configValue;
     },
-    ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    ...(effectiveTarget.crf !== undefined ? { quantizer: effectiveTarget.crf } : {}),
     ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
     ...(rateControlWarmupFrames !== undefined ? { rateControlWarmupFrames } : {}),
   };
@@ -505,7 +587,7 @@ export async function encodeVideoStream(
   }
   const alphaStage: VideoEncoderStageOptions = {
     ...context.stageOptions(signal, options),
-    ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
+    ...(effectiveTarget.crf !== undefined ? { quantizer: effectiveTarget.crf } : {}),
     ...(keyFrameInterval !== undefined ? { keyFrameInterval } : {}),
     ...(rateControlWarmupFrames !== undefined ? { rateControlWarmupFrames } : {}),
   };

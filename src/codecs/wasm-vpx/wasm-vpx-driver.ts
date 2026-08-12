@@ -248,6 +248,12 @@ function buildVideoFrame(
   durationUs: number | null,
 ): VideoFrame {
   const layout = planeLayoutI420(decoded.width, decoded.height, decoded.bitDepth);
+  if (decoded.data.byteLength !== layout.byteLength) {
+    throw new MediaError(
+      'decode-error',
+      `vpx: decoded plane buffer is ${decoded.data.byteLength}B, expected ${layout.byteLength}B`,
+    );
+  }
   const base: VideoFrameBufferInit = {
     format: asVideoPixelFormat(layout.format),
     codedWidth: layout.codedWidth,
@@ -256,7 +262,15 @@ function buildVideoFrame(
     layout: [...layout.planes],
   };
   const init: VideoFrameBufferInit = durationUs === null ? base : { ...base, duration: durationUs };
-  return new VideoFrame(decoded.data, init);
+  try {
+    return new VideoFrame(decoded.data, init);
+  } catch (error) {
+    throw new MediaError(
+      'decode-error',
+      `vpx: VideoFrame rejected ${layout.format} ${layout.codedWidth}x${layout.codedHeight} ${decoded.data.byteLength}B buffer: ${error instanceof Error ? error.message : String(error)}`,
+      error,
+    );
+  }
 }
 
 /* v8 ignore stop */

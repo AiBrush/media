@@ -428,6 +428,26 @@ describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', 
     expect(Math.max(...granules) - preSkip).toBe(programSamples);
   });
 
+  it('uses late destination Opus timing when no source duration was known', async () => {
+    const muxer = new OggMuxer();
+    const preSkip = 312;
+    const programSamples = 1500;
+    const t = muxer.addTrack(opusTrack);
+    muxer.addChunkStruct(t, audio(0, 80, 0x11));
+    muxer.addChunkStruct(t, audio(20_000, 120, 0x22));
+    muxer.setTrackGapless(t, {
+      leadingSamples: preSkip,
+      trailingSamples: 1920 - preSkip - programSamples,
+      totalSamples: programSamples,
+    });
+    await muxer.finalize();
+
+    const granules = scanPages(await collect(muxer.output))
+      .map((page) => page.granule)
+      .filter((granule) => granule >= 0);
+    expect(Math.max(...granules)).toBe(preSkip + programSamples);
+  });
+
   it('does not count pre-skip twice when remuxing a raw Ogg-granule duration', async () => {
     const muxer = new OggMuxer();
     const initialGranuleOffset = 480;

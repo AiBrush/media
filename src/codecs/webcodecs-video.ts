@@ -1417,13 +1417,13 @@ function createVideoEncoder(
 
   let encoder: VideoEncoder | undefined;
   let frameIndex = 0;
+  let submittedEncodeCount = 0;
+  let lastSubmittedTimestamp: number | undefined;
   const rateControlWarmupTimestampsPending = new Set<number>();
   const outputBackpressure = new PendingOutputBackpressure(ENCODER_OUTPUT_HIGH_WATER_MARK);
   let alignmentCanvas: OffscreenCanvas | undefined;
-  const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(
-    config,
-    typeof navigator === 'undefined' ? undefined : navigator.platform,
-  );
+  const platform = typeof navigator === 'undefined' ? undefined : navigator.platform;
+  const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(config, platform);
   const wireConfig: VideoEncoderConfig = alignHorizontalPhase
     ? { ...config, width: config.width + 2 }
     : config;
@@ -1448,9 +1448,15 @@ function createVideoEncoder(
     outputBackpressure.submitted();
     try {
       encoder.encode(frame, options);
+      submittedEncodeCount++;
+      lastSubmittedTimestamp = frame.timestamp;
     } catch (error) {
       outputBackpressure.completed();
-      throw error;
+      throw new MediaError(
+        'encode-error',
+        `${config.codec} ${config.width}x${config.height} encoder rejected submitted frame ${submittedEncodeCount + 1} at ${frame.timestamp}us: ${describeError(error)}`,
+        error,
+      );
     }
   };
 
@@ -1500,7 +1506,12 @@ function createVideoEncoder(
           enqueueOrDrop(controller, chunk, () => closed);
         },
         error: (e: DOMException): void => {
-          const error = new MediaError('encode-error', e.message, e);
+          const error = new MediaError(
+            'encode-error',
+            `${config.codec} ${config.width}x${config.height} encoder failed after ${submittedEncodeCount} submitted frame(s)` +
+              `${lastSubmittedTimestamp === undefined ? '' : ` at ${lastSubmittedTimestamp}us`}: ${e.message}`,
+            e,
+          );
           dispose(error);
           controller.error(error);
         },

@@ -414,7 +414,7 @@ export interface TrackState {
   readonly sampleRate: number;
   readonly granuleRate: number;
   readonly durationSec: number | undefined;
-  readonly gapless: TrackInfo['gapless'] | undefined;
+  gapless: TrackInfo['gapless'] | undefined;
   readonly description: Uint8Array | undefined;
   readonly chunks: ChunkStruct[];
 }
@@ -485,18 +485,22 @@ function opusPreSkip(description: Uint8Array): number {
  * when a separate metadata probe exposed a raw absolute granule duration (including a positive origin).
  */
 function declaredFinalGranule(track: TrackState, idHeader: Uint8Array): number | undefined {
-  if (track.durationSec === undefined) return undefined;
-  const declaredSamples = Math.max(0, Math.round(track.durationSec * track.granuleRate));
+  const declaredSamples =
+    track.durationSec === undefined
+      ? undefined
+      : Math.max(0, Math.round(track.durationSec * track.granuleRate));
   if (track.codec !== 'opus') return declaredSamples;
 
   const preSkip = opusPreSkip(idHeader);
   const gapless = track.gapless;
   const sourceProgramSamples = gapless?.totalSamples;
-  const hasExactOggProgram =
-    gapless?.basis === 'ogg-opus-granule' &&
-    Number.isSafeInteger(sourceProgramSamples) &&
-    (sourceProgramSamples ?? -1) >= 0;
-  const programSamples = hasExactOggProgram ? (sourceProgramSamples ?? 0) : declaredSamples;
+  const hasExactProgram =
+    Number.isSafeInteger(sourceProgramSamples) && (sourceProgramSamples ?? -1) >= 0;
+  const exactProgramSamples = hasExactProgram
+    ? Math.round(((sourceProgramSamples ?? 0) * track.granuleRate) / track.sampleRate)
+    : undefined;
+  const programSamples = exactProgramSamples ?? declaredSamples;
+  if (programSamples === undefined) return undefined;
   return preSkip + programSamples;
 }
 
@@ -643,6 +647,15 @@ export class OggMuxer implements Muxer {
     validateOggMuxTrack(info, this.#track === undefined ? 0 : 1);
     this.#track = { id: 0, state: trackStateFrom(info) };
     return 0;
+  }
+
+  /** Attach destination encoder timing learned after the encoded stream drained, before finalization. */
+  setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+    this.#assertOpen();
+    if (this.#track === undefined || this.#track.id !== trackId) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    this.#track.state.gapless = { ...gapless };
   }
 
   /**

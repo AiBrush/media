@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { vpxAlphaFrameForEncode } from './vpx-alpha-geometry.ts';
+import { rgbaPixelsFromFrame } from './vpx-alpha.ts';
 
 interface GeometryFrameSeed {
   readonly rgba: Uint8Array;
@@ -184,6 +185,44 @@ async function withVideoFrameConstructor<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 describe('vpxAlphaFrameForEncode', () => {
+  it('falls back to presentation raster when direct planar-to-RGBA copy is rejected', async () => {
+    const prior = globalThis.OffscreenCanvas;
+    const expected = Uint8ClampedArray.from([1, 2, 3, 255, 4, 5, 6, 255]);
+    class FallbackCanvas {
+      width: number;
+      height: number;
+      constructor(width: number, height: number) {
+        this.width = width;
+        this.height = height;
+      }
+      getContext(): object {
+        return {
+          drawImage: (): void => undefined,
+          getImageData: (): { data: Uint8ClampedArray } => ({ data: expected }),
+        };
+      }
+    }
+    Object.defineProperty(globalThis, 'OffscreenCanvas', {
+      configurable: true,
+      writable: true,
+      value: FallbackCanvas,
+    });
+    try {
+      const pixels = await rgbaPixelsFromFrame({
+        displayWidth: 2,
+        displayHeight: 1,
+        codedWidth: 2,
+        codedHeight: 1,
+        format: 'NV12',
+        copyTo: (): Promise<never> => Promise.reject(new TypeError('layout size is invalid')),
+      } as unknown as VideoFrame);
+      expect(pixels).toEqual({ data: expected, width: 2, height: 1 });
+    } finally {
+      if (prior === undefined) Reflect.deleteProperty(globalThis, 'OffscreenCanvas');
+      else globalThis.OffscreenCanvas = prior;
+    }
+  });
+
   it('repacks coded pixels at full swing and round-trips the preserved visible crop', async () => {
     await withVideoFrameConstructor(async () => {
       const red = Array.from({ length: 16 }, (_, index) => index);
@@ -264,7 +303,7 @@ describe('vpxAlphaFrameForEncode', () => {
 
       expect(output.packed).toEqual(Uint8Array.from([0, 64, 128, 255, 128, 128]));
       expect(output.init).not.toHaveProperty('duration');
-      expect(frame.copyOptions).toHaveLength(2);
+      expect(frame.copyOptions).toHaveLength(1);
     });
   });
 

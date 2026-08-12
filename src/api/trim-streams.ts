@@ -386,6 +386,26 @@ export function trimEncodeTrack(track: TrackInfo): TrackInfo {
  * when concatenated and compared against one direct trim.
  */
 export function trimVideoEncodeTarget(track: TrackInfo, sourceBitrate?: number): VideoTarget {
+  const isH264 = /^(?:avc[13](?:\.|$)|h264$)/i.test(track.codec);
+  const fps = positiveFinite(track.fps) ? track.fps : 30;
+  // High-cadence H.264 needs a picture-quality contract rather than another level-bound ABR increase:
+  // fixed QP 8 keeps later open-GOP anchors transparent without inflating ordinary-cadence trims.
+  if (isH264 && fps > 30.5) return { crf: 8 };
+  return trimVideoVariableRateTarget(track, sourceBitrate);
+}
+
+/** Portable high-rate fallback for runtimes whose H.264 encoder rejects quantizer mode. */
+export function trimVideoEncodeFallbackTarget(
+  track: TrackInfo,
+  sourceBitrate?: number,
+): VideoTarget | undefined {
+  const fps = positiveFinite(track.fps) ? track.fps : 30;
+  return /^(?:avc[13](?:\.|$)|h264$)/i.test(track.codec) && fps > 30.5
+    ? trimVideoVariableRateTarget(track, sourceBitrate)
+    : undefined;
+}
+
+function trimVideoVariableRateTarget(track: TrackInfo, sourceBitrate?: number): VideoTarget {
   const width = track.config && 'codedWidth' in track.config ? track.config.codedWidth : undefined;
   const height =
     track.config && 'codedHeight' in track.config ? track.config.codedHeight : undefined;
@@ -395,9 +415,6 @@ export function trimVideoEncodeTarget(track: TrackInfo, sourceBitrate?: number):
     return { bitrate: TRIM_VIDEO_DEFAULT_BITRATE, bitrateMode: 'variable' };
   }
   const fps = positiveFinite(track.fps) ? track.fps : 30;
-  // High-cadence H.264 needs a picture-quality contract rather than another level-bound ABR increase:
-  // fixed QP 8 keeps later open-GOP anchors transparent without inflating ordinary-cadence trims.
-  if (isH264 && fps > 30.5) return { crf: 8 };
   const geometryBitrate = clampInt(
     width * height * fps * (isH264 ? TRIM_H264_BITS_PER_PIXEL : TRIM_VIDEO_BITS_PER_PIXEL),
     TRIM_VIDEO_MIN_BITRATE,

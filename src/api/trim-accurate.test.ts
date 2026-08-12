@@ -11,6 +11,7 @@ import {
   trimAudioPacketInfoTrack,
   trimAudioPacketStream,
   trimTimedFrameStream,
+  trimVideoEncodeFallbackTarget,
   trimVideoEncodeTarget,
   trimVideoPacketInfoChunkStream,
 } from './trim-streams.ts';
@@ -243,6 +244,15 @@ describe('trimTimedFrameStream — accurate trim frame-window core', () => {
         config: { codec: 'avc1.640028', codedWidth: 8192, codedHeight: 4320 },
       }),
     ).toEqual({ crf: 8 });
+    expect(
+      trimVideoEncodeFallbackTarget({
+        id: 3,
+        mediaType: 'video',
+        codec: 'avc1.640028',
+        fps: 120,
+        config: { codec: 'avc1.640028', codedWidth: 8192, codedHeight: 4320 },
+      }),
+    ).toEqual({ bitrate: 62_500_000, bitrateMode: 'variable' });
   });
 
   it('packet-copy trims audio packets by overlap and preserves packet metadata', async () => {

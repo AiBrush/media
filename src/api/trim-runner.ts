@@ -75,7 +75,11 @@ export interface TrimRunnerContext {
     track: TrackInfo,
     stage: StageOptions,
     options: CallOptions,
-  ) => Promise<ReadableStream<AudioData>>;
+    sourceContainerId: string,
+  ) => Promise<{
+    readonly frames: ReadableStream<AudioData>;
+    readonly leadingSamplesRemoved: number;
+  }>;
   readonly encodeVideo: (
     frames: ReadableStream<VideoFrame>,
     target: VideoTarget,
@@ -83,6 +87,7 @@ export interface TrimRunnerContext {
     muxer: Muxer,
     signal: AbortSignal,
     options: CallOptions,
+    capabilityFallbackTarget?: VideoTarget,
   ) => Promise<void>;
   readonly encodeAudio: (
     frames: ReadableStream<AudioData>,
@@ -379,6 +384,7 @@ async function trimViaCodec(
     trimBoundsUs,
     trimEncodeTrack,
     trimTimedFrameStream,
+    trimVideoEncodeFallbackTarget,
     trimVideoEncodeTarget,
     trimVideoPacketInfoChunkStream,
   } = await import('./trim-streams.ts');
@@ -441,6 +447,7 @@ async function trimViaCodec(
           muxer,
           taskSignal,
           options,
+          trimVideoEncodeFallbackTarget(videoTrack, sourceBitrate),
         ),
       );
       /* v8 ignore stop */
@@ -469,12 +476,14 @@ async function trimViaCodec(
         tasks.push(drainEncoderToMuxer(packets, muxer, packetInfoAudioTrack, taskSignal));
       } else {
         /* v8 ignore start -- live decode/encode requires browser WebCodecs; lifecycle is browser-gated. */
-        const programAudio = await context.decodeAudio(
+        const decodedAudio = await context.decodeAudio(
           demuxer,
           audioTrack,
           context.stage(taskSignal, options),
           options,
+          container.id,
         );
+        const programAudio = decodedAudio.frames;
         const trimmed = trimTimedFrameStream(programAudio, bounds, restampAudioData);
         openStreams.push(trimmed);
         tasks.push(

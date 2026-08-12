@@ -16,9 +16,12 @@
 import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
+import { rgbaPixelsViaCanvas } from './video-frame-convert.ts';
+import { decodedVpxAlphaLuma } from './vpx-alpha-frame-pixels.ts';
 import {
   RGBA_BYTES_PER_PIXEL,
   type VpxAlphaPackedSourceFormat,
+  mergeVpxAlphaLuma,
   mergeVpxAlphaRgba,
   vpxAlphaI420FromPackedRgba,
   vpxAlphaI420FromPlane,
@@ -85,11 +88,23 @@ export async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFrameP
   const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA_BYTES_PER_PIXEL }];
   const rect: DOMRectInit = { x: 0, y: 0, width, height };
   const minimumSize = width * height * RGBA_BYTES_PER_PIXEL;
-  const allocationSize = frame.allocationSize({ format: 'RGBA', rect, layout });
-  const data = new Uint8ClampedArray(Math.max(allocationSize, minimumSize));
-  await frame.copyTo(data, { format: 'RGBA', rect, layout });
+  const data = new Uint8ClampedArray(minimumSize);
+  try {
+    await frame.copyTo(data, { format: 'RGBA', rect, layout });
+  } catch (error) {
+    if (typeof OffscreenCanvas === 'undefined' && typeof document === 'undefined') throw error;
+    try {
+      return { data: rgbaPixelsViaCanvas(frame, width, height), width, height };
+    } catch (fallbackError) {
+      throw new MediaError(
+        'decode-error',
+        `VPx alpha RGBA copy and canvas fallback failed for ${String(frame.format)} ${width}x${height}`,
+        { cause: new AggregateError([error, fallbackError]) },
+      );
+    }
+  }
   return {
-    data: data.length === minimumSize ? data : data.slice(0, minimumSize),
+    data,
     width,
     height,
   };
@@ -279,11 +294,15 @@ export async function mergeAlphaFrames(color: VideoFrame, alpha: VideoFrame): Pr
     );
   }
 
-  const [colorPixels, alphaPixels] = await Promise.all([
+  const [colorPixels, alphaLuma] = await Promise.all([
     rgbaPixelsFromFrame(color),
-    rgbaPixelsFromFrame(alpha),
+    decodedVpxAlphaLuma(alpha, width, height),
   ]);
-  mergeVpxAlphaRgba(colorPixels.data, alphaPixels.data);
+  if (alphaLuma === undefined) {
+    mergeVpxAlphaRgba(colorPixels.data, (await rgbaPixelsFromFrame(alpha)).data);
+  } else {
+    mergeVpxAlphaLuma(colorPixels.data, alphaLuma);
+  }
   return rgbaPixelsToFrame(colorPixels, color, 'adopt');
 }
 
@@ -478,13 +497,14 @@ export function unwrapPackets(packets: ReadableStream<Packet>): ReadableStream<E
 export function decodeVpxAlphaPacketStreams(
   packets: ReadableStream<Packet>,
   createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+  createAlphaDecoder: () => TransformStream<EncodedChunk, RawFrame> = createDecoder,
 ): { readonly color: ReadableStream<VideoFrame>; readonly alpha: ReadableStream<VideoFrame> } {
   const [colorPackets, alphaPackets] = packets.tee();
   const color = unwrapPackets(colorPackets).pipeThrough(
     createDecoder(),
   ) as ReadableStream<VideoFrame>;
   const alpha = alphaChunkStream(alphaPackets).pipeThrough(
-    createDecoder(),
+    createAlphaDecoder(),
   ) as ReadableStream<VideoFrame>;
   return { color, alpha };
 }
@@ -500,10 +520,12 @@ export function decodeVpxAlphaPacketStreams(
 export function decodeVideoPacketsWithAlpha(
   packets: ReadableStream<Packet>,
   createDecoder: () => TransformStream<EncodedChunk, RawFrame>,
+  createAlphaDecoder?: () => TransformStream<EncodedChunk, RawFrame>,
 ): ReadableStream<VideoFrame> {
   const { color: colorFrames, alpha: alphaFrames } = decodeVpxAlphaPacketStreams(
     packets,
     createDecoder,
+    createAlphaDecoder,
   );
   const colorReader = colorFrames.getReader();
   const alphaReader = alphaFrames.getReader();

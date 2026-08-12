@@ -18,6 +18,7 @@ import {
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { WebmModule } from '../drivers/webm/webm-driver.ts';
+import { toStream } from '../sinks/sink.ts';
 import { toStreamTarget } from '../sinks/stream-target.ts';
 import {
   type MediaInput,
@@ -1491,7 +1492,7 @@ describe('createMedia', () => {
         mediaType: 'video',
         codec: 'hevc',
         durationSec: 1,
-        config: { codec: 'hev1.1.6.L93.B0', codedWidth: 1920, codedHeight: 1080 },
+        config: { codec: 'hvc1.1.6.L93.B0', codedWidth: 1920, codedHeight: 1080 },
       },
     ];
     const driver: ContainerDriver = {
@@ -1950,7 +1951,7 @@ describe('createMedia', () => {
     await expect(readFirst(media.decode(NOOP_BYTES).video)).rejects.toBeInstanceOf(CapabilityError);
   });
 
-  it('same-container remux and trim pass streaming options to stream-target sinks', async () => {
+  it('same-container remux and trim pass streaming options to pull and callback stream sinks', async () => {
     const calls: Array<unknown> = [];
     const chunks: Array<readonly [number, Uint8Array]> = [];
     const media = createMedia().use(streamCopyModule(calls));
@@ -1961,12 +1962,15 @@ describe('createMedia', () => {
 
     await expect(media.remux(input, { to: 'mp4', sink })).resolves.toBeUndefined();
     await expect(media.trim(input, { start: 0, end: 2, sink })).resolves.toBeUndefined();
+    await expect(media.remux(input, { to: 'mp4', sink: toStream() })).resolves.toBeInstanceOf(
+      ReadableStream,
+    );
 
     expect(chunks).toEqual([
       [0, new Uint8Array([7, 8, 9])],
       [0, new Uint8Array([7, 8, 9])],
     ]);
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
     for (const call of calls) {
       expect(call).toMatchObject({ streaming: true });
       expect(call).not.toMatchObject({ buffered: true });

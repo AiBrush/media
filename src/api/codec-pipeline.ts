@@ -61,13 +61,24 @@ export {
   isPcmContainer,
 } from './codec-routing.ts';
 export {
+  audioDecodeLeadingSamplesForRuntime,
+  audioDecodeNativeGaplessSuppressionForRuntime,
   audioEncodeNeedsSoftwareRuntime,
+  audioEncodeSoftwareDriverForRuntime,
+  audioTrackAfterLeadingSampleTrim,
+  audioTrackAfterNativeGaplessSuppression,
   buildVideoEncoderConfigForRuntime,
+  FIREFOX_ADTS_AAC_LEADING_SAMPLES,
+  firefoxAdtsAacLeadingSamples,
   firefoxAudioTranscodeDeclineReason,
   firefoxOpusAudioEncodeTarget,
   firefoxOpusEncodeUsesWasm,
+  firefoxVorbisEncodeUsesWasm,
   firefoxVideoTranscodeDeclineReason,
   resolveAudioEncodeTargetForRuntime,
+  vpxAlphaDecodeSoftwareDriverForRuntime,
+  webkitCrossCodecH264Config,
+  webkitAdtsAacLeadingSamples,
   webkitVideoTranscodeDeclineReason,
 } from './codec-runtime-quirks.ts';
 export {
@@ -111,6 +122,7 @@ export {
   type VpxAlphaSplitPixels,
 } from './vpx-alpha.ts';
 export {
+  mergeVpxAlphaLuma,
   mergeVpxAlphaRgba,
   type VpxAlphaI420Plane,
   type VpxAlphaPackedSourceFormat,

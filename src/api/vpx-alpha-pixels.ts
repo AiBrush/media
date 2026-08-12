@@ -183,3 +183,17 @@ export function mergeVpxAlphaRgba(color: Uint8ClampedArray, alpha: Uint8ClampedA
     color[index + 3] = alpha[index] as number;
   }
 }
+
+/** Replace packed RGBA alpha with one tightly-packed, full-swing VPx luma sample per pixel. */
+export function mergeVpxAlphaLuma(color: Uint8ClampedArray, alpha: Uint8Array): void {
+  const pixelCount = color.byteLength / RGBA_BYTES_PER_PIXEL;
+  if (!Number.isInteger(pixelCount) || alpha.byteLength < pixelCount) {
+    throw new MediaError(
+      'decode-error',
+      `VPx alpha luma has ${alpha.byteLength} bytes for ${color.byteLength} RGBA bytes`,
+    );
+  }
+  for (let pixel = 0; pixel < pixelCount; pixel++) {
+    color[pixel * RGBA_BYTES_PER_PIXEL + 3] = alpha[pixel] as number;
+  }
+}

@@ -175,6 +175,35 @@ export function isValidFrameMs(ms: number): ms is OpusFrameMs {
 }
 
 /**
+ * Number of silent Opus frames still needed to flush the encoder's lookahead after all program PCM
+ * has been framed. A merely frame-aligned input is not necessarily drain-complete: its final
+ * `leadingSamples` are still resident in libopus unless the emitted packet capacity covers both the
+ * submitted program and that leading delay.
+ */
+export function opusDrainFrameCount(
+  submittedSamples: number,
+  codedSamples: number,
+  leadingSamples: number,
+  frameSamples: number,
+): number {
+  if (
+    !Number.isSafeInteger(submittedSamples) ||
+    submittedSamples < 0 ||
+    !Number.isSafeInteger(codedSamples) ||
+    codedSamples < 0 ||
+    !Number.isSafeInteger(leadingSamples) ||
+    leadingSamples < 0 ||
+    !Number.isSafeInteger(frameSamples) ||
+    frameSamples <= 0 ||
+    !Number.isSafeInteger(submittedSamples + leadingSamples)
+  ) {
+    throw new MediaError('encode-error', 'opus: invalid encoder drain sample accounting');
+  }
+  const missingSamples = submittedSamples + leadingSamples - codedSamples;
+  return missingSamples > 0 ? Math.ceil(missingSamples / frameSamples) : 0;
+}
+
+/**
  * A bounded queue of interleaved f32 PCM that hands out exactly-`frameSamples`-per-channel frames to the
  * encoder. An `AudioData` carries an arbitrary number of samples, but Opus encodes only fixed frames, so
  * input is appended here and drained one full frame at a time; the remainder waits for more input. On end

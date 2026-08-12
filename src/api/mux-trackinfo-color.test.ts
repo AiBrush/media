@@ -272,6 +272,37 @@ describe('encoder colour metadata -> mux TrackInfo -> MP4 colr', () => {
     expect(videoColorMuxIntent({ colorspace: { to: 'bt709' } })).toBeUndefined();
   });
 
+  it('keeps ordinary H.264 encoder nclx and SPS VUI declarations identical', () => {
+    const publishedColor = {
+      primaries: 'bt709',
+      transfer: 'bt709',
+      matrix: 'bt709',
+      fullRange: false,
+    } as const;
+    const info = videoTrackInfoFromDecoderConfig(
+      {
+        codec: 'avc1.64001F',
+        description: AVCC,
+        colorSpace: publishedColor,
+      },
+      30,
+    );
+    expect(info.color).toEqual({
+      primaries: 1,
+      transferCharacteristics: 1,
+      matrixCoefficients: 1,
+      range: 1,
+    });
+    expect(h264AvcCColors(descriptionBytes(info.config?.description))).toEqual([
+      {
+        primaries: 1,
+        transferCharacteristics: 1,
+        matrixCoefficients: 1,
+        fullRange: false,
+      },
+    ]);
+  });
+
   it('rejects incomplete or conflicting coded-output facts instead of stamping transform intent', () => {
     const bt2020Intent = videoColorMuxIntent({ colorspace: { to: 'bt2020' } });
     const build = (colorSpace: VideoColorSpaceInit): TrackInfo =>
