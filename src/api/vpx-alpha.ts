@@ -16,7 +16,7 @@
 import type { EncodedChunk, Packet, RawFrame } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
-import { rgbaPixelsViaCanvas } from './video-frame-convert.ts';
+import { readFrameRgba } from '../util/frame-rgba.ts';
 import { decodedVpxAlphaLuma } from './vpx-alpha-frame-pixels.ts';
 import {
   RGBA_BYTES_PER_PIXEL,
@@ -85,29 +85,7 @@ export async function rgbaPixelsFromFrame(frame: VideoFrame): Promise<RgbaFrameP
       height,
     };
   }
-  const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA_BYTES_PER_PIXEL }];
-  const rect: DOMRectInit = { x: 0, y: 0, width, height };
-  const minimumSize = width * height * RGBA_BYTES_PER_PIXEL;
-  const data = new Uint8ClampedArray(minimumSize);
-  try {
-    await frame.copyTo(data, { format: 'RGBA', rect, layout });
-  } catch (error) {
-    if (typeof OffscreenCanvas === 'undefined' && typeof document === 'undefined') throw error;
-    try {
-      return { data: rgbaPixelsViaCanvas(frame, width, height), width, height };
-    } catch (fallbackError) {
-      throw new MediaError(
-        'decode-error',
-        `VPx alpha RGBA copy and canvas fallback failed for ${String(frame.format)} ${width}x${height}`,
-        { cause: new AggregateError([error, fallbackError]) },
-      );
-    }
-  }
-  return {
-    data,
-    width,
-    height,
-  };
+  return readFrameRgba(frame, { rect: { x: 0, y: 0, width, height } });
 }
 
 function rgbaPixelsToFrame(

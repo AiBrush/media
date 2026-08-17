@@ -23,7 +23,6 @@ import {
   mapVideoColorSpace,
   planCpuColor,
   planCpuGeometry,
-  rgbaCopyBufferSize,
 } from './cpu-video.ts';
 import {
   type ColorPlan,
@@ -141,19 +140,6 @@ describe('applyColorPlanToRgba — parity with the GPU colour math', () => {
     expect(or).toBe(Math.round(c[0] * 255));
     expect(og).toBe(Math.round(c[1] * 255));
     expect(ob).toBe(Math.round(c[2] * 255));
-  });
-});
-
-describe('rgbaCopyBufferSize — explicit copyTo layout sizing', () => {
-  it('returns the exact tight RGBA byte count without querying a source frame format', () => {
-    expect(rgbaCopyBufferSize(128, 72)).toBe(128 * 72 * 4);
-    expect(rgbaCopyBufferSize(1, 1)).toBe(4);
-  });
-
-  it('rejects invalid or unsafe dimensions', () => {
-    expect(() => rgbaCopyBufferSize(0, 1)).toThrow(InputError);
-    expect(() => rgbaCopyBufferSize(1, -1)).toThrow(InputError);
-    expect(() => rgbaCopyBufferSize(Number.MAX_SAFE_INTEGER, 2)).toThrow(InputError);
   });
 });
 

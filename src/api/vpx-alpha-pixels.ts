@@ -1,6 +1,7 @@
 import { MediaError } from '../contracts/errors.ts';
+import { RGBA_BYTES_PER_PIXEL } from '../util/frame-rgba.ts';
 
-export const RGBA_BYTES_PER_PIXEL = 4;
+export { RGBA_BYTES_PER_PIXEL };
 
 export type VpxAlphaPackedSourceFormat = 'RGBA' | 'BGRA';
 

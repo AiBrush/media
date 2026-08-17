@@ -1,6 +1,7 @@
 /** Full-swing sample boundary between display-RGB geometry filters and VPx alpha encoders. */
 
 import { closeFrame } from '../kernel/frames.ts';
+import { readFrameRgba } from '../util/frame-rgba.ts';
 import { RGBA_BYTES_PER_PIXEL, vpxAlphaI420FromPackedGrayscale } from './vpx-alpha-pixels.ts';
 import { bufferInitFromSourceFrame, rgbaPixelsFromFrame } from './vpx-alpha.ts';
 
@@ -18,17 +19,7 @@ async function codedRgbaPixelsFromFrame(frame: VideoFrame): Promise<{
 }> {
   const width = frame.codedWidth;
   const height = frame.codedHeight;
-  const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA_BYTES_PER_PIXEL }];
-  const rect: DOMRectInit = { x: 0, y: 0, width, height };
-  const minimumSize = width * height * RGBA_BYTES_PER_PIXEL;
-  const allocationSize = frame.allocationSize({ format: 'RGBA', rect, layout });
-  const data = new Uint8ClampedArray(Math.max(allocationSize, minimumSize));
-  await frame.copyTo(data, { format: 'RGBA', rect, layout });
-  return {
-    data: data.length === minimumSize ? data : data.slice(0, minimumSize),
-    width,
-    height,
-  };
+  return readFrameRgba(frame, { rect: { x: 0, y: 0, width, height } });
 }
 
 function sourceGeometryInit(

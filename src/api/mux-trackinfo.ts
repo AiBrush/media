@@ -125,8 +125,22 @@ function h273ColorCode(
  * mapping is deliberately field-wise: an unknown future token omits only that field, and an absent range
  * stays absent rather than being guessed. This is destination metadata — source HDR mastering facts must
  * not leak across a colour transform or a fresh encode.
+ *
+ * `encoderInputWasRgb` refuses one unsubstantiated claim. When the frames handed to the encoder were
+ * packed RGB, the encoder — not this engine — performed the RGB→YUV conversion, and every codec here
+ * defaults that conversion to studio swing (H.264 §E.2.1 `video_full_range_flag` defaults to 0; the VP9
+ * and AV1 range defaults match). A runtime exists whose encoder nonetheless publishes a full-range
+ * declaration for exactly that input while emitting studio-swing samples, and since such outputs carry no
+ * in-band VUI, the `colr` written here becomes the only signal a decoder has: it passes studio samples
+ * through unexpanded and the picture decodes compressed by 219/255 (measured luma [18.2, 245.8] for a
+ * source spanning [3, 255]). Authoring the codec default instead of the contradicted claim restores the
+ * expansion. A runtime that reports the range honestly is unaffected — the override is reachable only for
+ * a `fullRange: true` claim over RGB input.
  */
-function videoColorFromDecoderConfig(config: VideoDecoderConfig): TrackInfo['color'] | undefined {
+function videoColorFromDecoderConfig(
+  config: VideoDecoderConfig,
+  encoderInputWasRgb = false,
+): TrackInfo['color'] | undefined {
   const colorSpace = config.colorSpace;
   if (colorSpace === undefined) return undefined;
   const primaries = h273ColorCode(colorSpace.primaries, {
@@ -151,7 +165,14 @@ function videoColorFromDecoderConfig(config: VideoDecoderConfig): TrackInfo['col
     smpte170m: 6,
     'bt2020-ncl': 9,
   });
-  const range = colorSpace.fullRange === true ? 2 : colorSpace.fullRange === false ? 1 : undefined;
+  const range =
+    colorSpace.fullRange === true
+      ? encoderInputWasRgb
+        ? 1 // the codec-default studio swing the encoder actually applied to RGB input
+        : 2
+      : colorSpace.fullRange === false
+        ? 1
+        : undefined;
   if (
     primaries === undefined &&
     transferCharacteristics === undefined &&
@@ -330,6 +351,10 @@ function configForMuxIntent(
  * Build the {@link TrackInfo} the `Muxer.addTrack` needs from the {@link VideoDecoderConfig} the video
  * encoder published (codec string + `description` + coded dims) plus the target framerate (which fixes
  * the mux timescale, mux.ts `videoTimescale`).
+ *
+ * `encoderInputWasRgb` is the observed pixel format of the frames this encode actually consumed, not a
+ * guess from the request: it decides whether a published full-range claim is substantiated (see
+ * {@link videoColorFromDecoderConfig}).
  */
 export function videoTrackInfoFromDecoderConfig(
   config: VideoDecoderConfig,
@@ -337,8 +362,12 @@ export function videoTrackInfoFromDecoderConfig(
   durationSec?: number,
   rotation?: number,
   colorIntent?: VideoColorMuxIntent,
+  encoderInputWasRgb = false,
 ): TrackInfo {
-  const color = colorForMuxIntent(videoColorFromDecoderConfig(config), colorIntent);
+  const color = colorForMuxIntent(
+    videoColorFromDecoderConfig(config, encoderInputWasRgb),
+    colorIntent,
+  );
   const muxConfig = configForMuxIntent(config, colorIntent, color);
   return {
     id: 0, // overwritten by the muxer's own id allocation; addTrack returns the real id

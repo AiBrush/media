@@ -564,6 +564,9 @@ export class MediaEngineImpl implements MediaEngine {
 
   convert(input: MediaInput, opts: ConvertOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
+      // Lazy: the key table is dead weight in the eager kernel, and every convert immediately loads far
+      // heavier operation modules anyway. It still runs before a single input byte is read.
+      (await import('./convert-options-shape.ts')).assertConvertOptionsShape(opts);
       if (opts.faststart === 'reserve' || opts.maximumPacketCount !== undefined) {
         const { validateReservedFaststart } = await import('./reserved-faststart.ts');
         validateReservedFaststart('convert', opts.to, opts);

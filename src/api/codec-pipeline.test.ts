@@ -2716,38 +2716,33 @@ describe('buildVideoEncoderConfig', () => {
 });
 
 describe('webkitVideoTranscodeDeclineReason', () => {
-  const src = { width: 1920, height: 1080, fps: 30 };
-
-  it('declines the WebKit sub-modes that the browser harness proves unstable for this package', () => {
-    expect(webkitVideoTranscodeDeclineReason({ fps: 15 }, src)).toContain('fps downsample');
-    expect(webkitVideoTranscodeDeclineReason({ fps: 1 }, src)).toContain('fps downsample');
-    expect(webkitVideoTranscodeDeclineReason({ rotate: 90 }, src)).toContain('rotate 90');
-    expect(webkitVideoTranscodeDeclineReason({ rotate: 180 }, src)).toContain('rotate 180');
-    expect(webkitVideoTranscodeDeclineReason({ colorspace: { to: 'bt2020' } }, src)).toContain(
-      'colorspace',
-    );
-    expect(webkitVideoTranscodeDeclineReason({ tonemap: { to: 'sdr' } }, src)).toContain('tonemap');
-    expect(webkitVideoTranscodeDeclineReason({ alpha: 'keep' }, src)).toContain('alpha-preserving');
+  // Only sub-modes whose behaviour is still unverified are declined. `colorspace`, `rotate:90|180` and
+  // fps downsample were declined on a claim that measurement disproved: they completed all along, and
+  // their output is correct now that an RGB-sourced encode is muxed with the codec-default colour range.
+  it('declines only the sub-modes that remain unverified on WebKit', () => {
+    expect(webkitVideoTranscodeDeclineReason({ alpha: 'keep' })).toContain('alpha-preserving');
+    expect(webkitVideoTranscodeDeclineReason({ tonemap: { to: 'sdr' } })).toContain('tonemap');
   });
 
-  it('keeps WebKit sub-modes runnable when focused evidence shows they pass', () => {
-    expect(webkitVideoTranscodeDeclineReason({ fps: 30 }, src)).toBeUndefined();
-    expect(webkitVideoTranscodeDeclineReason({ fps: 60 }, src)).toBeUndefined();
-    expect(webkitVideoTranscodeDeclineReason({ rotate: 270 }, src)).toBeUndefined();
-    expect(webkitVideoTranscodeDeclineReason({ width: 1280, height: 720 }, src)).toBeUndefined();
+  it('no longer declines the transforms the colour-range fix made correct', () => {
+    for (const target of [
+      { fps: 15 },
+      { fps: 1 },
+      { rotate: 90 as const },
+      { rotate: 180 as const },
+      { colorspace: { to: 'bt2020' } },
+      { colorspace: { to: 'bt709' } },
+    ]) {
+      expect(webkitVideoTranscodeDeclineReason(target), JSON.stringify(target)).toBeUndefined();
+    }
   });
 
-  it('does not guess a WebKit fps downsample decline without a finite source fps', () => {
-    expect(
-      webkitVideoTranscodeDeclineReason({ fps: 15 }, { width: 1920, height: 1080 }),
-    ).toBeUndefined();
-    expect(
-      webkitVideoTranscodeDeclineReason(
-        { fps: 15 },
-        { width: 1920, height: 1080, fps: Number.NaN },
-      ),
-    ).toBeUndefined();
-    expect(webkitVideoTranscodeDeclineReason({}, src)).toBeUndefined();
+  it('leaves every unfiltered target runnable', () => {
+    expect(webkitVideoTranscodeDeclineReason({ fps: 30 })).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ fps: 60 })).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ rotate: 270 })).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({ width: 1280, height: 720 })).toBeUndefined();
+    expect(webkitVideoTranscodeDeclineReason({})).toBeUndefined();
   });
 });
 

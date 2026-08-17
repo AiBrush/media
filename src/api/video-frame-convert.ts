@@ -1,5 +1,6 @@
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { eotf, oetf } from '../filters/gpu-uniforms.ts';
+import { copyFrameToRgba, normalizePackedRgba, packedRgbFormat } from '../util/frame-rgba.ts';
 import type { VideoColorMuxIntent } from './mux-trackinfo.ts';
 
 type VideoCanvas = OffscreenCanvas | HTMLCanvasElement;
@@ -35,18 +36,6 @@ function resizeCanvas(canvas: VideoCanvas, width: number, height: number): Video
   canvas.width = width;
   canvas.height = height;
   return canvas;
-}
-
-/** Presentation-raster fallback for runtimes that cannot copy a planar frame directly to packed RGBA. */
-export function rgbaPixelsViaCanvas(
-  frame: VideoFrame,
-  width: number,
-  height: number,
-): Uint8ClampedArray {
-  const canvas = createVideoCanvas(width, height);
-  const context = canvas2d(canvas);
-  context.drawImage(frame as unknown as CanvasImageSource, 0, 0, width, height);
-  return context.getImageData(0, 0, width, height).data.slice();
 }
 
 export function canvasBackedVideoFrameStream(): TransformStream<VideoFrame, VideoFrame> {
@@ -383,7 +372,6 @@ function limitedI420ColorSpace(kind: VideoColorMuxIntent['kind']): VideoColorSpa
       }) as unknown as VideoColorSpaceInit;
 }
 
-type PackedRgbFormat = 'RGBA' | 'RGBX' | 'BGRA' | 'BGRX';
 type PackedRgbTransfer = 'bt709' | 'srgb' | 'unknown';
 
 interface PackedRgbaRead {
@@ -391,29 +379,10 @@ interface PackedRgbaRead {
   readonly transfer: PackedRgbTransfer;
 }
 
-function packedRgbFormat(format: VideoPixelFormat | null): PackedRgbFormat | undefined {
-  return format === 'RGBA' || format === 'RGBX' || format === 'BGRA' || format === 'BGRX'
-    ? format
-    : undefined;
-}
-
 function packedTransfer(transfer: string | null): PackedRgbTransfer {
   if (transfer === 'bt709' || transfer === 'smpte170m') return 'bt709';
   if (transfer === 'iec61966-2-1') return 'srgb';
   return 'unknown';
-}
-
-function normalizePackedRgba(data: Uint8Array, format: PackedRgbFormat): void {
-  const swapRedBlue = format === 'BGRA' || format === 'BGRX';
-  const opaque = format === 'RGBX' || format === 'BGRX';
-  for (let offset = 0; offset < data.byteLength; offset += 4) {
-    if (swapRedBlue) {
-      const red = data[offset] as number;
-      data[offset] = data[offset + 2] as number;
-      data[offset + 2] = red;
-    }
-    if (opaque) data[offset + 3] = 0xff;
-  }
 }
 
 /** Re-encode sRGB nonlinear samples with the BT.709/BT.2020 SDR transfer, preserving alpha. */
@@ -463,7 +432,7 @@ async function packedRgbaFromFrame(
   // Canvas/WebGPU frames can expose a null native format. Their only portable RGB copy target is sRGB;
   // WebGPU BT.2020 output deliberately carries target-coded numeric values in that canvas, while the
   // Canvas2D tone-map output genuinely uses sRGB and is transfer-converted below.
-  await frame.copyTo(data, { format: 'RGBA', colorSpace: 'srgb', rect, layout });
+  await copyFrameToRgba(frame, data, { colorSpace: 'srgb', rect });
   return { data, transfer: 'srgb' };
 }
 

@@ -265,23 +265,30 @@ describe('canDeferFullFrameScale — native-surface resize boundary', () => {
   const source = { displayWidth: 1920, displayHeight: 1080 };
 
   it('defers full-source/full-destination resize for fill and equal-aspect fit modes', () => {
-    for (const fit of [undefined, 'contain', 'cover'] as const) {
-      expect(
-        canDeferFullFrameScale(
-          source,
-          planDraw(
-            {
-              mediaType: 'video',
-              type: 'resize',
-              width: 320,
-              height: 180,
-              ...(fit === undefined ? {} : { fit }),
-            },
-            source.displayWidth,
-            source.displayHeight,
+    for (const target of [
+      [320, 180],
+      [1920, 1080],
+      [3840, 2160],
+    ] as const) {
+      for (const fit of [undefined, 'contain', 'cover'] as const) {
+        expect(
+          canDeferFullFrameScale(
+            source,
+            planDraw(
+              {
+                mediaType: 'video',
+                type: 'resize',
+                width: target[0],
+                height: target[1],
+                ...(fit === undefined ? {} : { fit }),
+              },
+              source.displayWidth,
+              source.displayHeight,
+            ),
           ),
-        ),
-      ).toBe(true);
+          `${target[0]}x${target[1]} ${String(fit)}`,
+        ).toBe(true);
+      }
     }
   });
 
@@ -1292,5 +1299,61 @@ describe('packColorUniforms — std140 layout', () => {
     expect(buf[13]).toBe(1); // srgb encode
     expect(buf[14]).toBe(0); // no tonemap
     expect(buf[15]).toBe(0);
+  });
+});
+
+describe('WebGPU device acquisition failure — the ranked Canvas2D rung still renders', () => {
+  // A granted `navigator.gpu` is not a granted adapter. Headless Chromium, a GPU-blocklisted profile,
+  // and a software-rendering container all expose WebGPU and hand back `null` from requestAdapter().
+  // The transform must still run on the next ranked substrate instead of becoming unavailable.
+  const RESIZE: FilterSpec = { mediaType: 'video', type: 'resize', width: 320, height: 240 };
+
+  /** Load a pristine module instance: the "no adapter" verdict is realm state, not per-call state. */
+  async function loadWithoutAdapter(): Promise<typeof import('./gpu-video.ts')> {
+    vi.stubGlobal('navigator', {
+      userAgent: 'Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36',
+      gpu: {
+        requestAdapter: (): Promise<null> => Promise.resolve(null),
+        getPreferredCanvasFormat: (): string => 'bgra8unorm',
+      },
+    });
+    vi.stubGlobal('OffscreenCanvas', class StubOffscreenCanvas {});
+    vi.stubGlobal('VideoFrame', class StubVideoFrame {});
+    vi.resetModules();
+    return await import('./gpu-video.ts');
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it('starts the filter on Canvas2D and stops offering WebGPU once no adapter is granted', async () => {
+    const mod = await loadWithoutAdapter();
+    expect(mod.webgpuVideoFilterDriver.supports(RESIZE)).toBe(true);
+
+    const stream = mod.webgpuVideoFilterDriver.createFilter(RESIZE);
+    const writer = stream.writable.getWriter();
+    // `close()` settles the transformer's `start()`: a failed acquisition would reject here.
+    await writer.close();
+    expect((await stream.readable.getReader().read()).done).toBe(true);
+
+    // The realm has now demonstrated it cannot grant an adapter, so the route stops being offered.
+    expect(mod.webgpuVideoFilterDriver.supports(RESIZE)).toBe(false);
+  });
+
+  it('still surfaces the typed capability error for a spec Canvas2D cannot render', async () => {
+    const mod = await loadWithoutAdapter();
+    const stream = mod.webgpuVideoFilterDriver.createFilter({
+      mediaType: 'video',
+      type: 'colorspace',
+      to: 'bt2020',
+    });
+    // `vi.resetModules()` gives the reloaded graph its own error classes, so assert on the typed
+    // identity the public contract exposes rather than on cross-registry class identity.
+    await expect(stream.writable.getWriter().close()).rejects.toMatchObject({
+      name: 'CapabilityError',
+      message: 'no WebGPU adapter could be acquired',
+    });
   });
 });

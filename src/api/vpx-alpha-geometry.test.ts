@@ -243,12 +243,9 @@ describe('vpxAlphaFrameForEncode', () => {
       )) as unknown as GeometryVideoFrame;
 
       expect(frame.cloneCalls).toBe(0);
+      // One coded-space read, and no `allocationSize({ format: 'RGBA' })` probe: that query answers with
+      // the frame's NATIVE size on runtimes that cannot convert, so the tight layout is authoritative.
       expect(frame.copyOptions).toEqual([
-        {
-          format: 'RGBA',
-          rect: { x: 0, y: 0, width: 4, height: 4 },
-          layout: [{ offset: 0, stride: 16 }],
-        },
         {
           format: 'RGBA',
           rect: { x: 0, y: 0, width: 4, height: 4 },

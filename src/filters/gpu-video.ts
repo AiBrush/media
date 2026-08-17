@@ -103,8 +103,19 @@ function canvas2dCanColor(f: ColorVideoSpec): boolean {
 
 // ============ capability detection (cheap, honest; no heavy work) ============
 
+/**
+ * Set once `requestAdapter()` in this realm has answered `null`. Exposing `navigator.gpu` is not a
+ * promise that an adapter can be granted: a headless or GPU-blocklisted Chromium, a software-rendering
+ * container, and a power-restricted device all expose the API and grant nothing. That is a stable
+ * property of the realm, not a transient resource failure, so remembering it keeps `supports()` honest
+ * for every later route instead of re-paying a doomed acquisition. Device-creation failures are NOT
+ * recorded here (ADR: a transient failure must never poison a route permanently).
+ */
+let webgpuAdapterUnavailable = false;
+
 /** WebGPU is usable here when a `navigator.gpu` exists alongside `OffscreenCanvas` and `VideoFrame`. */
 function webgpuAvailable(): boolean {
+  if (webgpuAdapterUnavailable) return false;
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   if (/\bFirefox\//.test(ua)) return false;
   return (
@@ -179,13 +190,23 @@ export function planDraw(spec: GeometricVideoSpec, srcW: number, srcH: number): 
  * Whether a blit is a pure full-frame scale that can stay on the source's native pixel surface.
  *
  * A cloned `VideoFrame` with the requested display dimensions is the standard WebCodecs representation
- * of this operation. The downstream encoder scales that visible picture to its configured dimensions,
- * avoiding an otherwise redundant YUV→RGBA canvas conversion. Legacy SD YUV matrices must first pass
- * through the browser's colour-managed renderer: preserving their native planes across a cross-codec
- * scale is not display-equivalent in Chromium. A fill that changes aspect ratio must also materialize:
- * changing only `displayWidth`/`displayHeight` describes non-square display pixels, while the encoder
- * target requires a real non-uniform raster scale. Crops, letterboxes and placed/padded draws need real
- * pixels outside or inside the source rect and therefore retain the rendered path too.
+ * of this operation: the downstream encoder scales that visible picture to its configured dimensions,
+ * avoiding an otherwise redundant YUV→RGBA canvas conversion.
+ *
+ * The filter an encoder applies to a display-scaled frame is unspecified, and it is not uniformly good:
+ * on a 3:1 reduction WebKit's loses roughly a third of the picture's gradient energy (SSIM 0.907 against
+ * a source-decoded reference, versus 0.962 for the rendered path), while Chromium's is faithful. No
+ * canvas-side probe distinguishes them — both rasterize the *same* display-scaled frame correctly, so
+ * only the encoder's internal scaler differs. Rendering every reduction here instead was measured across
+ * the browser matrix and rejected: it recovers one H.264 reduction cell on WebKit but costs ~6× the wall
+ * time there and *lowers* measured quality on the WebM reduction routes, whose colour path reacts badly
+ * to the extra display-RGB round trip. Closing that gap needs the colour interaction understood first.
+ *
+ * Legacy SD YUV matrices must also pass through the browser's colour-managed renderer: preserving their
+ * native planes across a cross-codec scale is not display-equivalent in Chromium. A fill that changes
+ * aspect ratio must materialize too: changing only `displayWidth`/`displayHeight` describes non-square
+ * display pixels, while the encoder target requires a real non-uniform raster scale. Crops, letterboxes
+ * and placed/padded draws need real pixels outside or inside the source rect and keep the rendered path.
  */
 export function canDeferFullFrameScale(
   source: Pick<VideoFrame, 'displayWidth' | 'displayHeight'> & {
@@ -369,7 +390,15 @@ class Canvas2DRenderer implements Renderer {
     // line was the ~12x gap vs engines that draw the very same `VideoFrame` with `drawImage` but leave
     // quality at the browser default (mediabunny's `drawWithFit` never sets it → `'low'`; it still passes
     // the SSIM oracle at ~1.0000). `'medium'` keeps an anti-aliased (mipmapped/area) downscale on the fast
-    // GPU path — no visible-quality or SSIM regression — while removing the main-thread resampler stall.
+    // GPU path while removing the main-thread resampler stall.
+    //
+    // Measured caveat, not yet actionable: Chromium 149 ignores this hint entirely for a
+    // `drawImage(VideoFrame)` reduction (low/medium/high produce byte-identical pixels, 607 ms vs 623 ms
+    // end-to-end), while WebKit 26 does distinguish them — its mipmapped `'medium'` reduction is faithful
+    // only at power-of-two ratios and loses 18% of the gradient energy at 3:1 (26.7 against 32.7 at
+    // `'high'`). Raising it to `'high'` was run across the matrix and did NOT pay: no scenario improved
+    // and `performance/convert-longtasks` measured worse (SSIM 0.8866 → 0.8696), so the WebKit softness
+    // is being dominated by another stage. Re-evaluate together with that stage, not on its own.
     ctx.imageSmoothingQuality = 'medium';
     if (recipe.kind === 'blit') {
       const { src, dst } = recipe.blit;
@@ -650,6 +679,7 @@ class WebGPURenderer implements Renderer {
     }
     const adapter = await gpuApi.requestAdapter();
     if (adapter === null) {
+      webgpuAdapterUnavailable = true;
       throw new CapabilityError('no WebGPU adapter could be acquired', {
         op: { kind: 'route', id: 'filter' },
         tried: ['webgpu'],
@@ -1020,14 +1050,32 @@ export const webgpuVideoFilterDriver: FilterDriver = {
     if (f.type === 'rotate' && f.degrees === 180) {
       return createI420Rotate180Stream(f, o);
     }
-    return createFilterStream(
-      f,
-      /* v8 ignore next -- browser-only renderer construction. */
-      (signal) => WebGPURenderer.create(signal),
-      o,
-    );
+    return createFilterStream(f, (signal) => webgpuOrCanvasRenderer(f, signal), o);
   },
 };
+
+/**
+ * Acquire the WebGPU renderer, or render this same spec on Canvas2D when the device cannot be obtained.
+ *
+ * `supports()` can only answer from cheap surface checks, and a granted `navigator.gpu` is not a granted
+ * adapter or device. Failing the whole transform there would make every geometric/colour operation
+ * unavailable on a real, common configuration (headless or blocklisted GPU) even though the ranked
+ * Canvas2D rung renders it correctly. Cancellation still propagates, and a spec Canvas2D cannot render
+ * still surfaces the typed capability error rather than a silently different result.
+ */
+async function webgpuOrCanvasRenderer(
+  spec: VideoFilterSpec,
+  signal: AbortSignal | undefined,
+): Promise<Renderer> {
+  /* v8 ignore start -- browser-only renderer construction; validated in the Playwright harness. */
+  try {
+    return await WebGPURenderer.create(signal);
+  } catch (error) {
+    if (signal?.aborted === true || !(canvas2dAvailable() && canvas2dHandles(spec))) throw error;
+    return new Canvas2DRenderer();
+  }
+  /* v8 ignore stop */
+}
 
 /**
  * The Canvas2D fallback video filter driver (`substrate:'canvas2d'`, ranked after WebGPU). Geometric ops

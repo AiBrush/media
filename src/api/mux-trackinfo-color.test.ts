@@ -408,3 +408,68 @@ describe('encoder colour metadata -> mux TrackInfo -> MP4 colr', () => {
     expect('color' in unknown).toBe(false);
   });
 });
+
+describe('encoder full-range claim over RGB input — the codec default wins', () => {
+  const config = (fullRange: boolean | null): VideoDecoderConfig => ({
+    codec: 'avc1.64001F',
+    codedWidth: 856,
+    codedHeight: 480,
+    description: AVCC,
+    colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange },
+  });
+
+  // A packed-RGB encoder input means the ENCODER performed RGB->YUV, and every codec here defaults that
+  // conversion to studio swing. A runtime that publishes `fullRange: true` for it is contradicting the
+  // samples it emitted, and with no in-band VUI the authored `colr` is the only signal a decoder gets.
+  it('authors limited range for a full-range claim over RGB input', () => {
+    expect(
+      videoTrackInfoFromDecoderConfig(config(true), 30, 1, undefined, undefined, true).color?.range,
+    ).toBe(1);
+  });
+
+  it('keeps the full-range claim when the encoder consumed planar frames', () => {
+    expect(
+      videoTrackInfoFromDecoderConfig(config(true), 30, 1, undefined, undefined, false).color
+        ?.range,
+    ).toBe(2);
+    expect(videoTrackInfoFromDecoderConfig(config(true), 30, 1).color?.range).toBe(2);
+  });
+
+  it('never promotes a limited or absent declaration, whatever the input format was', () => {
+    for (const rgb of [false, true]) {
+      expect(
+        videoTrackInfoFromDecoderConfig(config(false), 30, 1, undefined, undefined, rgb).color
+          ?.range,
+        `limited/${rgb}`,
+      ).toBe(1);
+      expect(
+        videoTrackInfoFromDecoderConfig(config(null), 30, 1, undefined, undefined, rgb).color
+          ?.range,
+        `absent/${rgb}`,
+      ).toBeUndefined();
+    }
+  });
+
+  it('leaves every other colour field exactly as the encoder published it', () => {
+    const withRgb = videoTrackInfoFromDecoderConfig(
+      config(true),
+      30,
+      1,
+      undefined,
+      undefined,
+      true,
+    );
+    const withPlanar = videoTrackInfoFromDecoderConfig(
+      config(true),
+      30,
+      1,
+      undefined,
+      undefined,
+      false,
+    );
+    expect({ ...withRgb.color, range: undefined }).toEqual({
+      ...withPlanar.color,
+      range: undefined,
+    });
+  });
+});

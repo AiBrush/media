@@ -18,6 +18,7 @@ import type {
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
 import { raceAbort } from '../sources/abort.ts';
 import type { Source } from '../sources/source.ts';
+import { packedRgbFormat } from '../util/frame-rgba.ts';
 import type { SourceGeometry } from './codec-pipeline.ts';
 import {
   type RuntimeVideoFallbackKind,
@@ -620,6 +621,18 @@ export async function encodeVideoStream(
       ),
     );
   }
+  // Observe what the encoder is actually handed. A packed-RGB frame means the encoder owns the RGB→YUV
+  // conversion, which fixes the colour range it produced regardless of what it later claims — see
+  // `mux-trackinfo.ts` `videoColorFromDecoderConfig`. Observation, never inference from the request.
+  let encoderInputWasRgb = false;
+  encodeInput = encodeInput.pipeThrough(
+    new TransformStream<VideoFrame, VideoFrame>({
+      transform(frame, controller): void {
+        encoderInputWasRgb = packedRgbFormat(frame.format) !== undefined;
+        controller.enqueue(frame);
+      },
+    }),
+  );
   const chunks =
     target.alpha === 'keep'
       ? encodeVideoFramesWithAlpha(encodeInput, {
@@ -642,6 +655,7 @@ export async function encodeVideoStream(
         sourceTrack?.durationSec,
         outputVideoRotation(target, sourceTrack?.rotation),
         colorIntent,
+        encoderInputWasRgb,
       );
     },
     signal,

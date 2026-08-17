@@ -27,6 +27,7 @@ import {
 } from '../contracts/errors.ts';
 import { raceAbort, throwIfSourceAborted } from '../sources/abort.ts';
 import type { Source } from '../sources/source.ts';
+import { copyFrameToRgba } from '../util/frame-rgba.ts';
 import type { VideoColorMuxIntent } from './mux-trackinfo.ts';
 import type { CallOptions, VideoTarget } from './types.ts';
 import {
@@ -425,11 +426,9 @@ export async function copyDisplayedRgbaForQuality(
     return { data: await materialize(frame, width, height), width, height };
   }
   const data = new Uint8Array(width * height * 4);
-  await frame.copyTo(data, {
-    format: 'RGBA',
+  await copyFrameToRgba(frame, data, {
     colorSpace: 'srgb',
     rect: { x: visible.x, y: visible.y, width, height },
-    layout: [{ offset: 0, stride: width * 4 }],
   });
   return { data, width, height };
 }

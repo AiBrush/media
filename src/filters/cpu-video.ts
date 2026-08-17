@@ -13,7 +13,8 @@
  *   rungs and above the WASM tail. It is **pure TS**, not WASM: the byte-for-byte colour/geometry math is
  *   plain TypeScript, so it ships zero binary and is Node-validated.
  *
- * **Colour boundary (ADR-038):** `copyTo({ format:'RGBA', colorSpace:'srgb' })` yields normalized sRGB
+ * **Colour boundary (ADR-038):** the packed-RGBA read ({@link ../util/frame-rgba.ts}, which resolves the
+ * runtime's real conversion capability) yields normalized sRGB
  * pixels. That is a sound input for conversion from sRGB to any requested output gamut, but it has already
  * discarded the source's native PQ/HLG representation. Applying a source-aware HDR transfer afterwards
  * would double-convert those display-space samples, so this driver deliberately declines `tonemap` until a
@@ -40,6 +41,7 @@ import {
   type StageOptions,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { RGBA_BYTES_PER_PIXEL, readFrameRgba } from '../util/frame-rgba.ts';
 import {
   type Affine,
   type Blit,
@@ -81,26 +83,7 @@ export interface RgbaImage {
 }
 
 /** Bytes per RGBA pixel. */
-const RGBA = 4;
-
-/**
- * Return the exact destination size for a tightly packed RGBA `VideoFrame.copyTo` layout.
- *
- * `allocationSize({ format: 'RGBA' })` is not usable for every valid decoded frame in Chromium: an
- * HDR frame can expose a null source format even though `copyTo` can perform the requested conversion.
- * Supplying the layout ourselves makes the destination size deterministic and avoids that optional
- * source-format query.
- */
-export function rgbaCopyBufferSize(width: number, height: number): number {
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
-    throw new InputError(`RGBA copy dimensions must be positive integers (${width}×${height})`);
-  }
-  const size = width * height * RGBA;
-  if (!Number.isSafeInteger(size)) {
-    throw new InputError(`RGBA copy buffer size is not safely representable (${width}×${height})`);
-  }
-  return size;
-}
+const RGBA = RGBA_BYTES_PER_PIXEL;
 
 /** Allocate a transparent-black RGBA image of the given dimensions. */
 function blankRgba(dims: Dims): RgbaImage {
@@ -451,19 +434,14 @@ function domColorSpace(init: RgbVideoColorSpaceInit): VideoColorSpaceInit {
   return init as VideoColorSpaceInit;
 }
 
-/** Read a frame's pixels into a tightly-packed RGBA {@link RgbaImage} (async — `copyTo` returns a Promise). */
+/** Read a frame's pixels into a tightly-packed RGBA {@link RgbaImage} (async — the read is a copy). */
 async function frameToRgba(frame: VideoFrame): Promise<RgbaImage> {
   const width = frame.displayWidth;
   const height = frame.displayHeight;
-  const layout: PlaneLayout[] = [{ offset: 0, stride: width * RGBA }];
-  const data = new Uint8ClampedArray(rgbaCopyBufferSize(width, height));
-  await frame.copyTo(data, {
-    format: 'RGBA',
+  return readFrameRgba(frame, {
     colorSpace: 'srgb',
     rect: { x: 0, y: 0, width, height },
-    layout,
   });
-  return { data, width, height };
 }
 
 /** Build an RGBA output `VideoFrame` from a buffer, carrying timing (duration conditional) + colour space. */

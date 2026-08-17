@@ -151,34 +151,30 @@ export function audioTrackAfterLeadingSampleTrim(
 }
 
 /**
- * Runtime evidence from the parent WebKit harness shows this package's WebCodecs path cannot complete
- * a few filtered H.264/VPx transcode sub-modes even though `isConfigSupported` accepts their encoder
- * configs. Return a typed-decline reason for those WebKit-only gaps; callers on Chromium/Firefox should
- * not use this classifier.
+ * Typed decline for filtered H.264/VPx transcode sub-modes on WebKit.
+ *
+ * **Most of what this used to decline was never a capability gap.** Those sub-modes completed on WebKit
+ * all along; what failed was the colour range they were muxed with. WebKit's decoder tags frames
+ * `fullRange: true`, and on a filtered path Canvas2D yields full-swing display RGB which the encoder
+ * converts to YUV with the codec-default STUDIO swing — yet it still publishes `fullRange: true`. With no
+ * SPS VUI in those outputs (parsed: `vui: false`), the `colr` authored from that claim was the only signal
+ * a decoder had, so studio samples passed through unexpanded: decoded luma [18.2, 245.8] for a source
+ * spanning [3, 255], gradient energy 8.35/9.70 = 0.861 against 219/255 = 0.859 for exactly that
+ * compression. `mux-trackinfo.ts` now authors the codec default for an RGB-sourced encode, and the same
+ * conversions measure SSIM 0.9927 (flip) and 0.9926 (colorspace) with luma restored to [2.8, 255] — so
+ * `colorspace`, `rotate:90|180` and fps downsample are no longer declined here.
+ *
+ * What remains is genuinely unverified rather than merely suspected: the alpha path has its own frame
+ * layout question, and `tonemap` is already declined honestly upstream by the filter driver ("no filter
+ * driver for video tonemap"), which is the accurate source of truth for it. Neither is kept on the
+ * strength of the disproven claim above. Callers on Chromium/Firefox should not use this classifier.
  */
-export function webkitVideoTranscodeDeclineReason(
-  target: VideoTarget,
-  src: SourceGeometry,
-): string | undefined {
+export function webkitVideoTranscodeDeclineReason(target: VideoTarget): string | undefined {
   if (target.alpha === 'keep') {
     return 'WebKit aibrush-media declines alpha-preserving video transcode: WebCodecs frame layout is unstable for the alpha path';
   }
-  if (target.colorspace !== undefined) {
-    return 'WebKit aibrush-media declines colorspace video transcode: WebCodecs frame layout is unstable for the colorspace path';
-  }
   if (target.tonemap !== undefined) {
     return 'WebKit aibrush-media declines tonemap video transcode: WebCodecs frame layout is unstable for the tonemap path';
-  }
-  if (target.rotate === 90 || target.rotate === 180) {
-    return `WebKit aibrush-media declines rotate ${target.rotate} video transcode: VideoEncoder rejects this filtered frame path`;
-  }
-  if (
-    target.fps !== undefined &&
-    src.fps !== undefined &&
-    Number.isFinite(src.fps) &&
-    target.fps < src.fps
-  ) {
-    return `WebKit aibrush-media declines fps downsample ${src.fps}->${target.fps}: VideoEncoder rejects this retimed frame path`;
   }
   return undefined;
 }
@@ -306,7 +302,7 @@ export async function buildVideoEncoderConfigForRuntime(
 ): Promise<VideoEncoderConfig> {
   const runtime = await import('./runtime-detect.ts');
   const decline = runtime.isWebKitRuntime()
-    ? webkitVideoTranscodeDeclineReason(target, src)
+    ? webkitVideoTranscodeDeclineReason(target)
     : runtime.isFirefoxRuntime()
       ? firefoxVideoTranscodeDeclineReason(target, sourceCodecString, src)
       : undefined;
