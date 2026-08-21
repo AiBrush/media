@@ -176,7 +176,7 @@ describe('uniformsForRecipe — dispatch', () => {
 });
 
 describe('packUniforms — std140 byte layout', () => {
-  it('packs 12 floats (6 × vec2) into a 48-byte own ArrayBuffer in declared order', () => {
+  it('packs 12 floats (6 × vec2) + the srcPremul vec4 into a 64-byte own ArrayBuffer in declared order', () => {
     const u = uniformsForBlit(
       resizeBlit(200, 100, {
         mediaType: 'video',
@@ -188,7 +188,7 @@ describe('packUniforms — std140 byte layout', () => {
       200,
       100,
     );
-    const packed = packUniforms(u);
+    const packed = packUniforms(u, 1);
     expect(packed.byteLength).toBe(UNIFORM_BYTES);
     expect(packed.buffer.byteLength).toBe(UNIFORM_BYTES);
     // GPU uniforms are f32, so compare against the f32-rounded source values (Math.fround), exactly.
@@ -207,8 +207,18 @@ describe('packUniforms — std140 byte layout', () => {
         u.rot0[1],
         u.rot1[0],
         u.rot1[1],
+        1,
+        0,
+        0,
+        0,
       ].map(f32),
     );
+  });
+
+  it('packs srcPremul = 0 for straight-alpha devices (the shader then applies the canvas premultiply)', () => {
+    const u = uniformsForOriented(rotateGeometry(8, 8, 180));
+    const packed = packUniforms(u, 0);
+    expect(packed[12]).toBe(0);
   });
 
   it('UNIFORM_BYTES is a multiple of 16 (valid uniform-buffer binding size)', () => {
@@ -217,8 +227,8 @@ describe('packUniforms — std140 byte layout', () => {
 
   it('produces an independent buffer each call (no shared mutable state)', () => {
     const u = uniformsForOriented(rotateGeometry(8, 8, 180));
-    const a = packUniforms(u);
-    const b = packUniforms(u);
+    const a = packUniforms(u, 0);
+    const b = packUniforms(u, 0);
     expect(a).not.toBe(b);
     expect(a.buffer).not.toBe(b.buffer);
     expect(Array.from(a)).toEqual(Array.from(b));
@@ -277,9 +287,9 @@ describe('colorspace gamut matrices — complete supported pair coverage', () =>
 });
 
 describe('packColorUniforms — BT.709/BT.2020 GPU matrix layout', () => {
-  it('packs a 709 -> 2020 color plan column-major with no-tonemap params', () => {
+  it('packs a 709 -> 2020 color plan column-major with no-tonemap params and the alpha flag', () => {
     const plan: ColorPlan = planColorspace({ primaries: 'bt709', transfer: 'bt709' }, 'bt2020');
-    const buf = packColorUniforms(plan);
+    const buf = packColorUniforms(plan, 1);
     expect(buf.byteLength).toBe(COLOR_UNIFORM_BYTES);
     expect(buf.buffer.byteLength).toBe(COLOR_UNIFORM_BYTES);
 
@@ -300,5 +310,6 @@ describe('packColorUniforms — BT.709/BT.2020 GPU matrix layout', () => {
       0,
     ]);
     expect(Array.from(buf.slice(12, 16))).toEqual([2, 2, 0, 0]);
+    expect(Array.from(buf.slice(16, 20))).toEqual([1, 0, 0, 0]);
   });
 });

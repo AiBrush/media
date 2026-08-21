@@ -51,6 +51,7 @@ import {
   blitScales,
   canDeferFullFrameScale,
   canvas2dVideoFilterDriver,
+  classifyExternalTextureAlphaSample,
   mapVideoColorSpace,
   packResampleUniforms,
   planColor,
@@ -68,15 +69,63 @@ describe('WebGPU premultiplied canvas boundary', () => {
     expect(premultiplyWebGpuCanvasRgba([0.25, 0.5, 0.75, 1])).toEqual([0.25, 0.5, 0.75, 1]);
   });
 
-  it('pins the premultiplied canvas mode and both fragment shaders to the same conversion', () => {
+  it('pins the premultiplied canvas mode and both fragment shaders to the probed conversion', () => {
     expect(WEBGPU_CANVAS_ALPHA_MODE).toBe('premultiplied');
+    // Both canvas-facing pipelines share the premultiply helper; each consults the probed convention.
     for (const source of [WEBGPU_GEOMETRY_SHADER_SOURCE, WEBGPU_COLOR_SHADER_SOURCE]) {
       expect(source).toContain('return vec4<f32>(c.rgb * c.a, c.a);');
-      expect(source).toContain('return premultiply_for_canvas(');
+      expect(source).toContain('premultiply_for_canvas(');
     }
-    expect(WEBGPU_GEOMETRY_SHADER_SOURCE).toContain('return premultiply_for_canvas(c);');
+    expect(WEBGPU_GEOMETRY_SHADER_SOURCE).toContain('canvas_alpha(c, u.srcPremul.x)');
     expect(WEBGPU_COLOR_SHADER_SOURCE).toContain(
       'return premultiply_for_canvas(vec4<f32>(outRgb, c.a));',
+    );
+  });
+});
+
+describe('external-texture alpha-convention probe (pure decision)', () => {
+  const straight: readonly [number, number, number] = [200 / 255, 160 / 255, 80 / 255];
+  const premultiplied: readonly [number, number, number] = [
+    (200 * 128) / 65025,
+    (160 * 128) / 65025,
+    (80 * 128) / 65025,
+  ];
+
+  it('classifies a straight-alpha readback as straight', () => {
+    expect(classifyExternalTextureAlphaSample(straight, straight, premultiplied)).toBe('straight');
+  });
+
+  it('classifies a premultiplied readback as premultiplied', () => {
+    expect(classifyExternalTextureAlphaSample(premultiplied, straight, premultiplied)).toBe(
+      'premultiplied',
+    );
+  });
+
+  it('is exact at the boundary and robust to f32 sampling dust', () => {
+    // A sample equidistant from both conventions resolves to 'straight' (the <= tie-break), and tiny
+    // noise around either convention must not flip the answer.
+    expect(classifyExternalTextureAlphaSample(straight, straight, premultiplied)).toBe('straight');
+    const dust = 1 / 255;
+    expect(
+      classifyExternalTextureAlphaSample(
+        [premultiplied[0] + dust, premultiplied[1], premultiplied[2]],
+        straight,
+        premultiplied,
+      ),
+    ).toBe('premultiplied');
+  });
+
+  it('wires the probed flag through every canvas-facing shader write', () => {
+    // The geometry quad and the resample vertical pass forward sampled premultiplied RGB untouched;
+    // the colour pipeline un-premultiplies before its transfer math. Each must consult srcPremul.
+    expect(WEBGPU_GEOMETRY_SHADER_SOURCE).toContain('canvas_alpha(c, u.srcPremul.x)');
+    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain(
+      'canvas_alpha(clamp(acc / wsum, vec4<f32>(0.0), vec4<f32>(1.0)), r.srcPremul.x)',
+    );
+    expect(WEBGPU_COLOR_SHADER_SOURCE).toContain('u.alpha.x > 0.5');
+    // The shared helper must skip the multiply under the probed convention.
+    expect(WEBGPU_GEOMETRY_SHADER_SOURCE).toContain(
+      'select(premultiply_for_canvas(c), c, srcPremul > 0.5)',
     );
   });
 });
@@ -111,10 +160,10 @@ describe('band-limited resample — GPU-side contract', () => {
     ).toBe(false);
   });
 
-  it('packs the per-axis uniforms on their own 32-byte ArrayBuffer (writeBuffer-safe)', () => {
-    const buf = packResampleUniforms(0, 1920, 640, 1920, 0);
+  it('packs the per-axis uniforms + alpha flag on their own 48-byte ArrayBuffer (writeBuffer-safe)', () => {
+    const buf = packResampleUniforms(0, 1920, 640, 1920, 0, 1);
     expect(buf.byteLength).toBe(RESAMPLE_UNIFORM_BYTES);
-    expect(buf.byteLength).toBe(32);
+    expect(buf.byteLength).toBe(48);
     const f = new Float32Array(buf);
     expect(f[0]).toBe(0); // srcStart
     expect(f[1]).toBe(1920); // srcSpan
@@ -124,6 +173,7 @@ describe('band-limited resample — GPU-side contract', () => {
     expect(f[5]).toBe(1920); // srcLen
     expect(f[6]).toBe(640); // dstLen
     expect(f[7]).toBe(0); // otherStart
+    expect(f[8]).toBe(1); // srcPremul (probed external-texture convention)
   });
 
   it('does not widen the kernel for magnification or 1:1', () => {
@@ -131,14 +181,14 @@ describe('band-limited resample — GPU-side contract', () => {
       [640, 1280],
       [640, 640],
     ] as const) {
-      const f = new Float32Array(packResampleUniforms(0, span, dst, span, 0));
+      const f = new Float32Array(packResampleUniforms(0, span, dst, span, 0, 0));
       expect(f[3]).toBe(1); // filterScale pinned
       expect(f[4]).toBe(1); // tent radius, not the Catmull-Rom 2
     }
   });
 
   it('carries the source sub-rect through, so crop-and-scale stays one pass', () => {
-    const f = new Float32Array(packResampleUniforms(420, 1080, 100, 1920, 55));
+    const f = new Float32Array(packResampleUniforms(420, 1080, 100, 1920, 55, 0));
     expect(f[0]).toBe(420);
     expect(f[1]).toBe(1080);
     expect(f[7]).toBe(55);
@@ -159,9 +209,10 @@ describe('band-limited resample — GPU-side contract', () => {
     }
   });
 
-  it('keeps the horizontal pass unpremultiplied and premultiplies only at the canvas boundary', () => {
+  it('keeps the horizontal pass unpremultiplied and defers the canvas write to the probed convention', () => {
     expect(WEBGPU_RESAMPLE_H_SHADER_SOURCE).not.toContain('premultiply_for_canvas');
-    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain('return premultiply_for_canvas(');
+    expect(WEBGPU_RESAMPLE_H_SHADER_SOURCE).not.toContain('canvas_alpha');
+    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain('canvas_alpha(');
   });
 
   it('samples the external texture in the first pass and loads texels exactly in the second', () => {
@@ -1349,17 +1400,17 @@ describe('packColorUniforms — std140 layout', () => {
     encode: 'bt709',
   };
 
-  it('produces a 64-byte buffer on its own ArrayBuffer (WebGPU writeBuffer-safe)', () => {
-    const buf = packColorUniforms(plan);
+  it('produces an 80-byte buffer on its own ArrayBuffer (WebGPU writeBuffer-safe)', () => {
+    const buf = packColorUniforms(plan, 0);
     expect(buf.byteLength).toBe(COLOR_UNIFORM_BYTES);
-    expect(buf.byteLength).toBe(64);
-    expect(buf.buffer.byteLength).toBe(64);
+    expect(buf.byteLength).toBe(80);
+    expect(buf.buffer.byteLength).toBe(80);
     expect(buf.byteOffset).toBe(0);
   });
 
   it('lays out the gamut matrix column-major with a 0 w-lane per column', () => {
     const m = plan.gamut;
-    const buf = packColorUniforms(plan);
+    const buf = packColorUniforms(plan, 0);
     // Stored as f32, so compare the f32-rounded source values exactly (per the build's f32-pack convention).
     const f = (i: number): number => Math.fround(m[i] ?? Number.NaN);
     // column 0 = (m0, m3, m6), column 1 = (m1, m4, m7), column 2 = (m2, m5, m8).
@@ -1377,21 +1428,25 @@ describe('packColorUniforms — std140 layout', () => {
     expect(buf[11]).toBe(0);
   });
 
-  it('packs the params vec4 as (decodeTag, encodeTag, tonemapTag, peak)', () => {
-    const buf = packColorUniforms(plan);
+  it('packs the params vec4 as (decodeTag, encodeTag, tonemapTag, peak) and the alpha flag after it', () => {
+    const buf = packColorUniforms(plan, 1);
     expect(buf[12]).toBe(3); // pq
     expect(buf[13]).toBe(2); // bt709
     expect(buf[14]).toBe(1); // reinhard
     expect(buf[15]).toBe(100); // peak
+    expect(Array.from(buf.slice(16, 20))).toEqual([1, 0, 0, 0]); // (srcPremul, pad)
   });
 
   it('encodes a no-tonemap plan with tag 0 and peak 0', () => {
-    const buf = packColorUniforms({
-      decode: 'bt709',
-      gamut: gamutMatrix('bt709', 'bt709'),
-      tonemap: null,
-      encode: 'srgb',
-    });
+    const buf = packColorUniforms(
+      {
+        decode: 'bt709',
+        gamut: gamutMatrix('bt709', 'bt709'),
+        tonemap: null,
+        encode: 'srgb',
+      },
+      0,
+    );
     expect(buf[12]).toBe(2); // bt709 decode
     expect(buf[13]).toBe(1); // srgb encode
     expect(buf[14]).toBe(0); // no tonemap

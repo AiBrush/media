@@ -52,6 +52,7 @@ import {
   type ColorPlan,
   type SourceColor,
   UNIFORM_BYTES,
+  type UniformValues,
   isDisplayColorSpace,
   packColorUniforms,
   packUniforms,
@@ -543,10 +544,41 @@ export function premultiplyWebGpuCanvasRgba(
 /** The canvas alpha representation both WebGPU fragment pipelines write. */
 export const WEBGPU_CANVAS_ALPHA_MODE = 'premultiplied' as const;
 
+/**
+ * How a device's `texture_external` sampling reports alpha-bearing frames — probed at renderer
+ * creation, never assumed. `'premultiplied'` means sampled RGB already carries the alpha factor
+ * (measured Chromium behaviour for `VideoFrame`s with transparency); `'straight'` means the canvas
+ * premultiply must still be applied shader-side.
+ */
+export type ExternalTextureAlphaConvention = 'straight' | 'premultiplied';
+
+/**
+ * Classify one probed sample against the two possible conventions, by squared distance to the
+ * expected straight vs premultiplied RGB (normalized units). Pure; Node-tested so the probe's
+ * decision is pinned without a GPU.
+ */
+export function classifyExternalTextureAlphaSample(
+  sampled: readonly [number, number, number],
+  straight: readonly [number, number, number],
+  premultiplied: readonly [number, number, number],
+): ExternalTextureAlphaConvention {
+  const d2 = (a: readonly [number, number, number]): number =>
+    (a[0] - sampled[0]) ** 2 + (a[1] - sampled[1]) ** 2 + (a[2] - sampled[2]) ** 2;
+  return d2(straight) <= d2(premultiplied) ? 'straight' : 'premultiplied';
+}
+
 /** Shared WGSL mirror of {@link premultiplyWebGpuCanvasRgba}. */
 const PREMULTIPLY_CANVAS_WGSL = /* wgsl */ `
 fn premultiply_for_canvas(c : vec4<f32>) -> vec4<f32> {
   return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+// Map a sampled external-texture texel to the canvas' premultiplied representation. When the probed
+// device convention says sampling already returned premultiplied RGB (Chromium does for alpha-bearing
+// frames), the value is forwarded untouched — multiplying again would darken every semi-transparent
+// pixel by a second factor of alpha.
+fn canvas_alpha(c : vec4<f32>, srcPremul : f32) -> vec4<f32> {
+  return select(premultiply_for_canvas(c), c, srcPremul > 0.5);
 }
 `;
 
@@ -569,6 +601,10 @@ struct Uniforms {
   // 2x2 orientation (rows rot0,rot1) applied around the (0.5,0.5) UV centre — rotate/flip.
   rot0 : vec2<f32>,
   rot1 : vec2<f32>,
+  // Probed external-texture alpha convention: x > 0.5 means sampling already returns premultiplied
+  // RGB (measured Chromium behaviour for alpha-bearing frames), so the canvas-facing premultiply
+  // must be skipped or semi-transparent pixels would darken twice.
+  srcPremul : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var samp : sampler;
@@ -601,7 +637,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
     u.rot0.y * centred.x + u.rot1.y * centred.y) + vec2<f32>(0.5, 0.5);
   let srcUv = oriented * u.uvScale + u.uvOffset;
   let c = textureSampleBaseClampToEdge(tex, samp, srcUv);
-  return premultiply_for_canvas(c);
+  return canvas_alpha(c, u.srcPremul.x);
 }
 `;
 
@@ -634,6 +670,8 @@ struct Resample {
   dstLen : f32,
   // Sub-rect origin along the axis NOT being filtered (rows for the horizontal pass).
   otherStart : f32,
+  // Probed external-texture alpha convention (see the geometry shader's Uniforms.srcPremul).
+  srcPremul : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> r : Resample;
 
@@ -740,12 +778,12 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
     s = s + 1.0;
   }
   if (wsum == 0.0) { return vec4<f32>(0.0); }
-  return premultiply_for_canvas(clamp(acc / wsum, vec4<f32>(0.0), vec4<f32>(1.0)));
+  return canvas_alpha(clamp(acc / wsum, vec4<f32>(0.0), vec4<f32>(1.0)), r.srcPremul.x);
 }
 `;
 
-/** Bytes for the {@link WEBGPU_RESAMPLE_H_SHADER_SOURCE} `Resample` block: 8 × f32, padded to 16. */
-export const RESAMPLE_UNIFORM_BYTES = 32;
+/** Bytes for the {@link WEBGPU_RESAMPLE_H_SHADER_SOURCE} `Resample` block: 8 × f32 + one vec4, padded. */
+export const RESAMPLE_UNIFORM_BYTES = 48;
 
 /**
  * Intermediate format for the horizontal pass. Float storage keeps the Catmull-Rom's negative-lobe
@@ -761,7 +799,8 @@ export function blitScales(blit: Blit): boolean {
 /**
  * Pack the per-axis resample uniforms. `srcStart`/`srcSpan` select the source sub-rect along the filtered
  * axis, `dstLen` is the destination extent, `otherStart` the sub-rect origin along the untouched axis.
- * Mirrors {@link ./resample.ts}'s `planResampleAxis` exactly.
+ * Mirrors {@link ./resample.ts}'s `planResampleAxis` exactly. `srcPremul` carries the probed
+ * external-texture alpha convention consumed by the vertical pass's canvas write.
  */
 export function packResampleUniforms(
   srcStart: number,
@@ -769,6 +808,7 @@ export function packResampleUniforms(
   dstLen: number,
   srcLen: number,
   otherStart: number,
+  srcPremul: number,
 ): ArrayBuffer {
   const buffer = new ArrayBuffer(RESAMPLE_UNIFORM_BYTES);
   const f = new Float32Array(buffer);
@@ -783,6 +823,7 @@ export function packResampleUniforms(
   f[5] = srcLen;
   f[6] = dstLen;
   f[7] = otherStart;
+  f[8] = srcPremul;
   return buffer;
 }
 
@@ -802,6 +843,10 @@ export const WEBGPU_COLOR_SHADER_SOURCE = /* wgsl */ `
 struct ColorUniforms {
   gamut : mat3x3<f32>,
   params : vec4<f32>,   // (decodeTag, encodeTag, tonemapTag, peak)
+  // Probed external-texture alpha convention (see the geometry shader's Uniforms.srcPremul). When
+  // sampling returns premultiplied RGB, the transfer math below needs straight-alpha coordinates,
+  // so the sampled RGB is divided back out by alpha before the EOTF.
+  alpha : vec4<f32>,    // (srcPremul, 0, 0, 0)
 };
 @group(0) @binding(0) var<uniform> u : ColorUniforms;
 @group(0) @binding(1) var samp : sampler;
@@ -904,13 +949,178 @@ fn tonemap3(tag : f32, peak : f32, v : vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let c = textureSampleBaseClampToEdge(tex, samp, in.uv);
-  var lin = eotf3(u.params.x, c.rgb);          // decode to linear light
+  let straight = select(c.rgb, c.rgb / max(c.a, 1.0 / 255.0), u.alpha.x > 0.5);
+  var lin = eotf3(u.params.x, straight);        // decode to linear light
   lin = u.gamut * lin;                          // gamut convert (linear RGB)
   lin = tonemap3(u.params.z, u.params.w, lin);  // HDR -> SDR (no-op when tag 0)
   let outRgb = oetf3(u.params.y, clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)));
   return premultiply_for_canvas(vec4<f32>(outRgb, c.a));
 }
 `;
+
+/**
+ * The identity draw the probe renders: full-frame 1:1, no orientation. Kept next to the probe so the
+ * uniform contract it must satisfy stays obvious.
+ */
+const UNIFORM_IDENTITY: UniformValues = {
+  posScale: [1, 1],
+  posOffset: [0, 0],
+  uvScale: [1, 1],
+  uvOffset: [0, 0],
+  rot0: [1, 0],
+  rot1: [0, 1],
+};
+
+// ---- external-texture alpha-convention probe ----
+
+/** Side length of the tiny render the alpha-convention probe draws (one uniform texel colour). */
+const ALPHA_PROBE_SIZE = 4;
+/** Probe pixel: distinct channels so a channel swap can never masquerade as either convention. */
+const ALPHA_PROBE_RGBA: readonly [number, number, number, number] = [200, 160, 80, 128];
+
+/**
+ * Per-device cache of the probed {@link ExternalTextureAlphaConvention}. A device's sampling behaviour
+ * is stable for its lifetime, so one probe per device answers for every later filter instance.
+ */
+const alphaConventionCache = new WeakMap<GPUDevice, ExternalTextureAlphaConvention>();
+
+/**
+ * Determine — by drawing once through the real geometry pipeline — whether this device's
+ * `texture_external` sampling returns straight-alpha or premultiplied RGB for an alpha-bearing
+ * `VideoFrame`.
+ *
+ * Why a probe rather than an assumption: Chromium composites alpha-bearing frames into its imported
+ * texture **premultiplied**, so a shader that premultiplies again darkens every semi-transparent pixel
+ * by a second factor of alpha (measured: a VP9-alpha pad transcode lost ~1/3 of its luma and failed its
+ * SSIM gate at 0.79). Opaque frames are identical under both conventions, so only transparent content
+ * depends on this — and no standard text pins it. The probe renders a known straight-alpha RGBA frame
+ * with the canvas-facing premultiply disabled (`srcPremul = 0`) into a copyable texture and classifies
+ * the readback against both expected values ({@link classifyExternalTextureAlphaSample}).
+ *
+ * Throws (`CapabilityError`) when the readback cannot be classified — the caller falls back to the
+ * Canvas2D substrate rather than guess and emit wrong pixels.
+ */
+/* v8 ignore start -- browser-only GPU probe; validated in the browser harness. */
+async function probeExternalTextureAlphaConvention(
+  device: GPUDevice,
+  sampler: GPUSampler,
+): Promise<ExternalTextureAlphaConvention> {
+  const cached = alphaConventionCache.get(device);
+  if (cached !== undefined) return cached;
+
+  const module = device.createShaderModule({ code: WEBGPU_GEOMETRY_SHADER_SOURCE });
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-strip' },
+  });
+  const uniformBuffer = device.createBuffer({
+    size: UNIFORM_BYTES,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const texture = device.createTexture({
+    size: { width: ALPHA_PROBE_SIZE, height: ALPHA_PROBE_SIZE },
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+  // bytesPerRow must be a multiple of 256 for `copyTextureToBuffer`.
+  const readBuffer = device.createBuffer({
+    size: 256 * ALPHA_PROBE_SIZE,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  const pixels = new Uint8Array(ALPHA_PROBE_SIZE * ALPHA_PROBE_SIZE * 4);
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = ALPHA_PROBE_RGBA[0];
+    pixels[i + 1] = ALPHA_PROBE_RGBA[1];
+    pixels[i + 2] = ALPHA_PROBE_RGBA[2];
+    pixels[i + 3] = ALPHA_PROBE_RGBA[3];
+  }
+  const frame = new VideoFrame(pixels, {
+    format: 'RGBA',
+    codedWidth: ALPHA_PROBE_SIZE,
+    codedHeight: ALPHA_PROBE_SIZE,
+    timestamp: 0,
+    layout: [{ offset: 0, stride: ALPHA_PROBE_SIZE * 4 }],
+  });
+
+  try {
+    // Identity geometry, canvas-premultiply DISABLED: the readback then reports exactly what the
+    // sampler returned, which is the fact under test.
+    device.queue.writeBuffer(uniformBuffer, 0, packUniforms(UNIFORM_IDENTITY, 0));
+    const external = device.importExternalTexture({ source: frame, colorSpace: 'srgb' });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: texture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: external },
+        ],
+      }),
+    );
+    pass.draw(4);
+    pass.end();
+    encoder.copyTextureToBuffer(
+      { texture },
+      { buffer: readBuffer, bytesPerRow: 256, rowsPerImage: ALPHA_PROBE_SIZE },
+      { width: ALPHA_PROBE_SIZE, height: ALPHA_PROBE_SIZE },
+    );
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const row = new Uint8Array(readBuffer.getMappedRange());
+    const sampled: readonly [number, number, number] = [
+      (row[0] ?? 0) / 255,
+      (row[1] ?? 0) / 255,
+      (row[2] ?? 0) / 255,
+    ];
+    readBuffer.unmap();
+    const straight: readonly [number, number, number] = [
+      ALPHA_PROBE_RGBA[0] / 255,
+      ALPHA_PROBE_RGBA[1] / 255,
+      ALPHA_PROBE_RGBA[2] / 255,
+    ];
+    const premultiplied: readonly [number, number, number] = [
+      (ALPHA_PROBE_RGBA[0] * ALPHA_PROBE_RGBA[3]) / 65025,
+      (ALPHA_PROBE_RGBA[1] * ALPHA_PROBE_RGBA[3]) / 65025,
+      (ALPHA_PROBE_RGBA[2] * ALPHA_PROBE_RGBA[3]) / 65025,
+    ];
+    const convention = classifyExternalTextureAlphaSample(sampled, straight, premultiplied);
+    alphaConventionCache.set(device, convention);
+    return convention;
+  } catch (error) {
+    throw new CapabilityError(
+      'the WebGPU external-texture alpha convention could not be probed',
+      {
+        op: { kind: 'route', id: 'filter' },
+        tried: ['webgpu'],
+        suggestion: 'use the canvas2d filter driver',
+      },
+      { cause: error },
+    );
+  } finally {
+    frame.close();
+    texture.destroy();
+    uniformBuffer.destroy();
+    readBuffer.destroy();
+  }
+}
+/* v8 ignore stop */
 
 /** GPU device + pipeline bundle created once per filter instance. The colour pipeline is built lazily. */
 interface GpuContext {
@@ -944,10 +1154,13 @@ class WebGPURenderer implements Renderer {
   private nextCanvas = 0;
   private readonly colorManagedGeometry = new Canvas2DRenderer();
   private readonly format: GPUTextureFormat;
+  /** Probed external-texture alpha convention: 1 when sampling returns premultiplied RGB. */
+  private readonly srcPremul: number;
 
-  private constructor(gpu: GpuContext, format: GPUTextureFormat) {
+  private constructor(gpu: GpuContext, format: GPUTextureFormat, srcPremul: number) {
     this.gpu = gpu;
     this.format = format;
+    this.srcPremul = srcPremul;
   }
 
   /** Acquire an adapter+device and build the pipeline. Throws `CapabilityError` if no adapter is granted. */
@@ -972,6 +1185,11 @@ class WebGPURenderer implements Renderer {
     if (signal?.aborted === true) throw new MediaError('aborted', 'filter cancelled during setup');
     const device = await adapter.requestDevice();
     const format = gpuApi.getPreferredCanvasFormat();
+    const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    // Probe how this device reports alpha through `texture_external` BEFORE building the pipelines the
+    // shaders share, so every later draw packs uniforms that match the measured convention. A probe
+    // failure declines the substrate (typed capability miss) rather than guessing.
+    const convention = await probeExternalTextureAlphaConvention(device, sampler);
     const module = device.createShaderModule({ code: WEBGPU_GEOMETRY_SHADER_SOURCE });
     const pipeline = device.createRenderPipeline({
       layout: 'auto',
@@ -979,7 +1197,6 @@ class WebGPURenderer implements Renderer {
       fragment: { module, entryPoint: 'fs', targets: [{ format }] },
       primitive: { topology: 'triangle-strip' },
     });
-    const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     const uniformBuffer = device.createBuffer({
       size: UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -987,6 +1204,7 @@ class WebGPURenderer implements Renderer {
     return new WebGPURenderer(
       { device, pipeline, sampler, uniformBuffer, color: null, resample: null },
       format,
+      convention === 'premultiplied' ? 1 : 0,
     );
   }
 
@@ -1054,12 +1272,19 @@ class WebGPURenderer implements Renderer {
     gpu.device.queue.writeBuffer(
       bundle.uniformH,
       0,
-      packResampleUniforms(src.x, src.width, midW, source.displayWidth, src.y),
+      packResampleUniforms(src.x, src.width, midW, source.displayWidth, src.y, this.srcPremul),
     );
     gpu.device.queue.writeBuffer(
       bundle.uniformV,
       0,
-      packResampleUniforms(0, src.height, Math.max(1, Math.round(dst.height)), midH, 0),
+      packResampleUniforms(
+        0,
+        src.height,
+        Math.max(1, Math.round(dst.height)),
+        midH,
+        0,
+        this.srcPremul,
+      ),
     );
 
     const external = gpu.device.importExternalTexture({ source, colorSpace: 'srgb' });
@@ -1185,8 +1410,11 @@ class WebGPURenderer implements Renderer {
       uniformBuffer,
       0,
       recipe.kind === 'color'
-        ? packColorUniforms(recipe.plan)
-        : packUniforms(uniformsForRecipe(recipe, source.displayWidth, source.displayHeight)),
+        ? packColorUniforms(recipe.plan, this.srcPremul)
+        : packUniforms(
+            uniformsForRecipe(recipe, source.displayWidth, source.displayHeight),
+            this.srcPremul,
+          ),
     );
 
     // Pin the representation assumed by `planColor`: WebGPU otherwise defaults this field to sRGB, but

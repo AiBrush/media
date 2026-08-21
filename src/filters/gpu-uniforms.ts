@@ -11,8 +11,11 @@ import { InputError } from '../contracts/errors.ts';
 import type { Blit, OrientedDraw } from './geometry.ts';
 import type { DrawRecipe } from './gpu-video.ts';
 
-/** Byte size of the WGSL `Uniforms` block: 6 × vec2<f32>, tightly packed (16-byte aligned overall). */
-export const UNIFORM_BYTES = 48;
+/**
+ * Byte size of the WGSL `Uniforms` block: 6 × vec2<f32> plus one vec4 carrying the sampled-alpha
+ * convention flag (`srcPremul`, see {@link packUniforms}), 16-byte aligned overall.
+ */
+export const UNIFORM_BYTES = 64;
 
 /**
  * The shader uniforms, all normalized to [0,1] (or ±1 for orientation):
@@ -78,8 +81,16 @@ export function uniformsForRecipe(recipe: DrawRecipe, srcW: number, srcH: number
   throw new InputError('colour recipe has no geometric uniforms');
 }
 
-/** Pack {@link UniformValues} into the {@link UNIFORM_BYTES} std140 layout, on its own `ArrayBuffer`. */
-export function packUniforms(v: UniformValues): Float32Array<ArrayBuffer> {
+/**
+ * Pack {@link UniformValues} into the {@link UNIFORM_BYTES} std140 layout, on its own `ArrayBuffer`.
+ *
+ * `srcPremul` carries the runtime-probed external-texture alpha convention (1 = the device's
+ * `texture_external` sampling already returns premultiplied RGB, 0 = straight alpha), so the fragment
+ * stage knows whether the canvas-facing premultiply must be applied or skipped. See the probe in
+ * {@link ./gpu-video.ts} — Chromium returns premultiplied samples for alpha-bearing frames, which a
+ * blind second multiply would darken twice.
+ */
+export function packUniforms(v: UniformValues, srcPremul: number): Float32Array<ArrayBuffer> {
   const out = new Float32Array(new ArrayBuffer(UNIFORM_BYTES));
   out.set([
     v.posScale[0],
@@ -94,6 +105,10 @@ export function packUniforms(v: UniformValues): Float32Array<ArrayBuffer> {
     v.rot0[1],
     v.rot1[0],
     v.rot1[1],
+    srcPremul,
+    0,
+    0,
+    0,
   ]);
   return out;
 }
@@ -475,8 +490,8 @@ export function planTonemap(source: SourceColor): ColorPlan {
 
 // ---- color uniform packing (the second pipeline's std140 buffer) ----
 
-/** Byte size of the color shader's `ColorUniforms`: a `mat3x3` (3×vec4) + one `vec4` of scalar params. */
-export const COLOR_UNIFORM_BYTES = 64;
+/** Byte size of the color shader's `ColorUniforms`: a `mat3x3` (3×vec4) + two `vec4` scalar params. */
+export const COLOR_UNIFORM_BYTES = 80;
 
 /** Numeric tags the color shader switches on for the transfer curves (kept in sync with the WGSL). */
 const TRANSFER_TAG: Readonly<Record<TransferId, number>> = {
@@ -495,10 +510,12 @@ function tonemapTag(t: Tonemap | null): number {
 
 /**
  * Pack a {@link ColorPlan} into the color shader's std140 buffer: the 3×3 gamut matrix as three `vec4`
- * columns (WGSL `mat3x3` column-major, w-lane padding 0) followed by a `vec4(decodeTag, encodeTag,
- * tonemapTag, peak)`. Owns its `ArrayBuffer` so WebGPU `writeBuffer` accepts it.
+ * columns (WGSL `mat3x3` column-major, w-lane padding 0), a `vec4(decodeTag, encodeTag, tonemapTag,
+ * peak)`, and a `vec4(srcPremul, 0, 0, 0)` carrying the probed external-texture alpha convention (the
+ * shader un-premultiplies before its transfer math when samples arrive premultiplied). Owns its
+ * `ArrayBuffer` so WebGPU `writeBuffer` accepts it.
  */
-export function packColorUniforms(plan: ColorPlan): Float32Array<ArrayBuffer> {
+export function packColorUniforms(plan: ColorPlan, srcPremul: number): Float32Array<ArrayBuffer> {
   const out = new Float32Array(new ArrayBuffer(COLOR_UNIFORM_BYTES));
   const [m0, m1, m2, m3, m4, m5, m6, m7, m8] = plan.gamut;
   // WGSL `mat3x3` is column-major; each column occupies a 4-float (vec4) slot with a 0 w-lane.
@@ -513,6 +530,7 @@ export function packColorUniforms(plan: ColorPlan): Float32Array<ArrayBuffer> {
     ],
     12,
   );
+  out.set([srcPremul, 0, 0, 0], 16);
   return out;
 }
 
