@@ -281,7 +281,7 @@ describe('Vorbis authoring - vendored libvorbisenc core, Ogg mux, ffmpeg oracle'
     expect(snrDb(pcm.interleaved, decoded, pcm.channels), 'tonal SNR').toBeGreaterThan(
       SNR_FLOOR_DB,
     );
-  }, 30_000);
+  });
 
   it('encodes five real WAV fixtures through an independent decoder oracle', async () => {
     if (!externalDecoder()) return;
@@ -308,5 +308,5 @@ describe('Vorbis authoring - vendored libvorbisenc core, Ogg mux, ffmpeg oracle'
     const pcm = await wavPcm('sfx-pcm-s16.wav');
     const ogg = await encodeToOggVorbis(core, pcm, 96_000);
     expect(ogg.byteLength).toBeLessThan(pcm.frames * pcm.channels * 2);
-  }, 30_000);
+  });
 });

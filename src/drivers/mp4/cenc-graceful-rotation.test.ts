@@ -283,5 +283,5 @@ describeBento4('CENC fragmented senc mutation — real Bento4-authored MP4', () 
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 });

@@ -68,6 +68,31 @@ describe('outputGaplessForAudioEncoder — destination-owned audio timing', () =
     ).toBeUndefined();
   });
 
+  it('turns the MP3 encoder lead-in and whole-frame capacity into a trimmable window', () => {
+    // 240 000 program samples at 48 kHz cost LAME 210 whole MPEG-1 frames (241 920 samples) once its
+    // 1105-sample lead-in is in front of them; the balance is the terminal padding a muxer must trim.
+    expect(
+      outputGaplessForAudioEncoder(
+        { codec: 'mp3', sampleRate: 48_000, numberOfChannels: 2 },
+        {
+          sampleRate: 48_000,
+          submittedSamples: 240_000,
+          codedSamples: 241_920,
+          leadingSamples: 1_105,
+        },
+      ),
+    ).toEqual({ leadingSamples: 1_105, trailingSamples: 815, totalSamples: 240_000 });
+  });
+
+  it('declines an MP3 encode that proved no lead-in rather than muxing it untrimmed', () => {
+    expect(
+      outputGaplessForAudioEncoder(
+        { codec: 'mp3', sampleRate: 48_000, numberOfChannels: 2 },
+        { sampleRate: 48_000, submittedSamples: 240_000, codedSamples: 241_920 },
+      ),
+    ).toBeUndefined();
+  });
+
   it('combines Opus pre-skip with coded capacity to derive exact terminal padding', () => {
     expect(
       outputGaplessForAudioEncoder(

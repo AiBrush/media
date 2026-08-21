@@ -10,8 +10,8 @@
  * substrate (here libopus-in-wasm) can change without touching its container/filter neighbours.
  *
  * **Self-hosted wasm, lazy, miss-only (BUILD §7, ADR-004):** the libopus core is vendored *into this
- * directory* and loaded through `new URL('./opus_wasm_bg.wasm', import.meta.url)` — same-origin, no CDN,
- * no COOP/COEP — and only when a coder is actually built. `supports()` answers honestly: if the vendored
+ * directory* — inlined into the JS chunk by `libopus-wasm`, so it is same-origin by construction, with no
+ * CDN, no COOP/COEP and no sibling `.wasm` to co-vendor — and loaded only when a coder is actually built. `supports()` answers honestly: if the vendored
  * core is absent (not yet built — see `BUILD.md`) it returns `false`, so the router falls through to a
  * typed {@link CapabilityError} instead of pretending Opus works. The pure framing/format math lives in
  * {@link import('./opus.ts')} and is validated in Node; the lossy CELT/SILK decode is the wasm core's.
@@ -38,7 +38,6 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
 import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   FrameAccumulator,
@@ -117,8 +116,8 @@ export function decodedSamplesAtRate(packet: Uint8Array, outRate: number): numbe
 
 /**
  * The vendored glue module `wasm-pack build --target web` emits (see `BUILD.md`). Its `default` export is
- * an init function that fetches the sibling `*_bg.wasm` (we pass the `import.meta.url`-resolved URL so the
- * bundler emits it same-origin), and it exposes the {@link OpusWasmCore} factory. Typed structurally so
+ * an init function — a no-op here, since the vendored core carries its own bytes — and it exposes the
+ * {@link OpusWasmCore} factory. Typed structurally so
  * the driver compiles before the artifact exists (its shape is declared in `opus-core.d.ts`); the
  * dynamic specifier is a string literal so bundlers code-split it into its own lazy chunk.
  */
@@ -138,27 +137,27 @@ async function hasOpusCoreGlue(): Promise<boolean> {
 /**
  * Load the vendored libopus-in-wasm core, lazily and at most once. Resolves to the {@link OpusWasmCore},
  * or `null` if the artifact is not vendored yet (the import throws) — that `null` is what makes the
- * driver *honest* about wasm absence rather than fabricating support. The wasm bytes are addressed via
- * `new URL('./opus_wasm_bg.wasm', import.meta.url)` so they ship same-origin alongside this chunk.
+ * driver *honest* about wasm absence rather than fabricating support. This is a **self-contained** tail:
+ * `libopus-wasm` inlines its wasm into the JS chunk, so there is no sibling `.wasm` asset to address. It
+ * previously computed `new URL('./opus_wasm_bg.wasm', import.meta.url)` and handed it to an init that
+ * ignores it (see BUILD.md) — a dangling reference to a file this repo has never vendored, which made the
+ * loader look like it fetched an asset that does not exist. `assetBaseUrl` is accepted for call-site
+ * symmetry with the tails that really do fetch one.
  */
 export async function loadOpusCore(
   runtime?: WasmRuntimeProfile,
   assetBaseUrl?: string,
 ): Promise<OpusWasmCore | null> {
   const profile = runtime ?? resolveWasmRuntimeProfile();
-  const moduleUrl = resolveWasmAssetUrl(
-    './opus_wasm_bg.wasm',
-    new URL('./opus_wasm_bg.wasm', import.meta.url),
-    assetBaseUrl,
-  );
-  const key = `${profile.kind}|${moduleUrl.href}`;
+  void assetBaseUrl;
+  const key = profile.kind;
   let corePromise = corePromises.get(key);
   if (corePromise === undefined) {
     corePromise = (async (): Promise<OpusWasmCore | null> => {
       try {
         // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
         const mod = await import('./opus-core.js');
-        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        await mod.default();
         return mod.createOpusCore();
       } catch {
         // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.

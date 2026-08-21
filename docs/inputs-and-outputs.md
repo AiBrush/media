@@ -145,6 +145,36 @@ Operations buffer into a `Blob` by default. Set `sink` to select another destina
 | `toElement(element, options)` | `undefined` | Attaches output by Blob URL, MSE, or streaming mode |
 | `toStreamTarget(destination, options)` | `undefined` | Writes incrementally to a writable stream or callback |
 
+### Choosing a sink before the operation runs
+
+The right sink depends on the route the engine selects, not just on the request: the same
+`remux(source, { to: 'mp4' })` is an append-only, bounded-memory byte stream for one source and a
+whole-payload rewrite for another. `planRemuxOutput()` declares that contract before any byte is
+produced. It routes the source container and returns immediately; it never encodes, muxes, or writes.
+
+```ts
+import { planRemuxOutput, remux, toBlob, toStreamTarget } from '@aibrush/media';
+
+const plan = await planRemuxOutput(source, { to: 'mp4' });
+// plan.writeOrder            → 'append-only' | 'positioned'
+// plan.requiresSeek          → the sink must accept writes at an earlier offset
+// plan.requiresReservation   → a byte region is reserved up front and patched at the end
+// plan.requiresFinalization  → the bytes are a complete program only after the last chunk
+// plan.boundedRetentionAvailable → peak memory can stay bounded with a streaming sink
+// plan.acceptedSinkKinds     → sink kinds this route accepts
+
+const sink =
+  plan.boundedRetentionAvailable && !plan.requiresSeek
+    ? toStreamTarget(async (chunk) => { await uploadPart(chunk); })
+    : toBlob();
+await remux(source, { to: 'mp4', sink });
+```
+
+The declaration is conservative: where a route may decline at runtime and continue into another, it
+reports the strictest requirement any reachable route imposes, so a sink chosen from it stays valid.
+An illegal request — a reserved fast-start with a whole-output sink, a `maximumPacketCount` without a
+reservation — is rejected here rather than after the operation has run.
+
 ### Readable output
 
 ```ts

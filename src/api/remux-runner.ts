@@ -12,13 +12,48 @@ import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
 import { type MediaInput, type Source, from as normalizeInput } from '../sources/source.ts';
 import { containerHasChunkMuxer } from './codec-routing.ts';
+import {
+  WEBM_STREAMING_MIN_SOURCE_BYTES,
+  planRemuxOutput,
+  requiresStreamingWebmRemux,
+  resolveRemuxOutputRoute,
+  usesStreamCopyRemux,
+} from './remux-output-plan.ts';
+import type { RemuxOutputPlan, RemuxOutputRouteFacts } from './remux-output-plan.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, RemuxOptions } from './types.ts';
 
-// The prepared MP4→WebM-family writer deliberately snapshots at most 64 MiB. Route every larger
-// source directly to the incremental packet-info writer instead of leaving 64 MiB–1 GiB on the
-// generic EncodedChunk + buffered-muxer path, where source, mux state, and output coexist.
-const WEBM_STREAMING_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
+// The output-sink declaration and the routing it describes share one decision table (§5.1). Re-export
+// it here so `remux`'s callers reach the contract through the module that implements the operation.
+export {
+  WEBM_STREAMING_MIN_SOURCE_BYTES,
+  planRemuxOutput,
+  requiresStreamingWebmRemux,
+  resolveRemuxOutputRoute,
+  usesStreamCopyRemux,
+};
+export type {
+  RemuxOutputPlan,
+  RemuxOutputRetention,
+  RemuxOutputRoute,
+  RemuxOutputRouteFacts,
+  RemuxOutputWriteOrder,
+} from './remux-output-plan.ts';
+
+/** Container-driver facts the output declaration reads, projected from a routed driver. */
+export function remuxOutputRouteFacts(
+  container: ContainerDriver,
+  source: Pick<Source, 'size'>,
+): RemuxOutputRouteFacts {
+  return {
+    formats: container.formats,
+    hasStreamCopy: container.streamCopy !== undefined,
+    ...(container.streamCopyTargets === undefined
+      ? {}
+      : { streamCopyTargets: container.streamCopyTargets }),
+    ...(source.size === undefined ? {} : { sourceSizeBytes: source.size }),
+  };
+}
 
 const CONTAINER_MIME: Readonly<Record<string, string>> = {
   mp4: 'video/mp4',
@@ -51,6 +86,27 @@ export interface RemuxRunnerContext {
   ) => Promise<ContainerDriver>;
   readonly muxer: (target: string, pinDriver?: string) => Promise<ContainerDriver>;
   readonly stage: (signal: AbortSignal, options: CallOptions) => StageOptions;
+}
+
+/**
+ * Declare {@link runRemux}'s output-sink contract without producing a byte (REQUIREMENTS §5.1).
+ *
+ * Planning enforces the same request-shape contract execution does — an illegal reserved-faststart
+ * tuple or a raw live `MediaStream` is rejected here rather than after the operation has run (§5.6) —
+ * then routes the source container and projects the driver facts through the shared decision table.
+ */
+export async function planRemuxOutputForInput(
+  context: Pick<RemuxRunnerContext, 'resolveHls' | 'container'>,
+  input: MediaInput,
+  opts: RemuxOptions,
+  options: CallOptions,
+  signal: AbortSignal,
+): Promise<RemuxOutputPlan> {
+  validateReservedFaststart('remux', opts.to, opts);
+  const source = await context.resolveHls(input, normalizeByteInput(input, 'remux'), signal);
+  const container = await context.container(source, 'demux', signal, options.strategy?.pinDriver);
+  throwIfAborted(signal);
+  return planRemuxOutput(remuxOutputRouteFacts(container, source), opts);
 }
 
 /** Execute a lossless remux after the eager engine has established its cancellation domain. */
@@ -229,11 +285,11 @@ export async function runRemux(
     source = replay;
   }
 
+  // One decision table serves both the declaration and the execution: the stream-copy predicate
+  // `planRemuxOutput` reported before any byte was produced is the predicate branched on here.
   if (
-    !wantsTrackSelection &&
-    container.streamCopy !== undefined &&
-    !requiresStreamingWebmRemux(source, opts) &&
-    (container.formats.includes(opts.to) || container.streamCopyTargets?.includes(opts.to) === true)
+    usesStreamCopyRemux(remuxOutputRouteFacts(container, source), opts) &&
+    container.streamCopy !== undefined
   ) {
     const stream = await container.streamCopy(source, {
       ...context.stage(signal, remuxCallOptions),
@@ -252,23 +308,6 @@ export async function runRemux(
   return finish(stream);
 }
 
-/**
- * Large and explicitly fragmented WebM-family outputs belong to the packet-info streaming writer.
- * Keep this check ahead of a source driver's generic `streamCopy`: the WebM driver's legacy copy
- * implementation materializes the complete source before serializing, which defeats a stream sink and
- * can exhaust a browser process on otherwise ordinary large files.
- */
-export function requiresStreamingWebmRemux(
-  source: Pick<Source, 'size'>,
-  opts: RemuxOptions,
-): boolean {
-  return (
-    (opts.to === 'webm' || opts.to === 'mkv') &&
-    (opts.fragmented === true ||
-      (source.size !== undefined && source.size > WEBM_STREAMING_MIN_SOURCE_BYTES))
-  );
-}
-
 async function remuxViaSeam(
   context: RemuxRunnerContext,
   container: ContainerDriver,
@@ -283,11 +322,7 @@ async function remuxViaSeam(
       tried: [container.id, opts.to],
     });
   }
-  if (
-    (opts.to === 'webm' || opts.to === 'mkv') &&
-    (opts.fragmented === true ||
-      (source.size !== undefined && source.size > WEBM_STREAMING_MIN_SOURCE_BYTES))
-  ) {
+  if (requiresStreamingWebmRemux(source, opts)) {
     const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
     return remuxViaStreamingWebm(container, source, opts, context.stage(signal, options));
   }

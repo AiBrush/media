@@ -42,12 +42,17 @@ import {
 } from './gpu-uniforms.ts';
 import {
   GpuVideoFilterModule,
+  RESAMPLE_UNIFORM_BYTES,
   WEBGPU_CANVAS_ALPHA_MODE,
   WEBGPU_COLOR_SHADER_SOURCE,
   WEBGPU_GEOMETRY_SHADER_SOURCE,
+  WEBGPU_RESAMPLE_H_SHADER_SOURCE,
+  WEBGPU_RESAMPLE_V_SHADER_SOURCE,
+  blitScales,
   canDeferFullFrameScale,
   canvas2dVideoFilterDriver,
   mapVideoColorSpace,
+  packResampleUniforms,
   planColor,
   planDraw,
   premultiplyWebGpuCanvasRgba,
@@ -73,6 +78,98 @@ describe('WebGPU premultiplied canvas boundary', () => {
     expect(WEBGPU_COLOR_SHADER_SOURCE).toContain(
       'return premultiply_for_canvas(vec4<f32>(outRgb, c.a));',
     );
+  });
+});
+
+describe('band-limited resample — GPU-side contract', () => {
+  it('routes only density-changing blits to the two-pass resampler', () => {
+    const scaling = resizeBlit(1920, 1080, {
+      mediaType: 'video',
+      type: 'resize',
+      width: 640,
+      height: 360,
+    });
+    expect(blitScales(scaling)).toBe(true);
+    // A crop moves texels but does not change their density — the cheap one-pass quad still applies.
+    expect(
+      blitScales(
+        cropBlit(1920, 1080, {
+          mediaType: 'video',
+          type: 'crop',
+          x: 0,
+          y: 0,
+          width: 100,
+          height: 100,
+        }),
+      ),
+    ).toBe(false);
+    // A 1:1 'resize' is likewise a copy.
+    expect(
+      blitScales(
+        resizeBlit(640, 360, { mediaType: 'video', type: 'resize', width: 640, height: 360 }),
+      ),
+    ).toBe(false);
+  });
+
+  it('packs the per-axis uniforms on their own 32-byte ArrayBuffer (writeBuffer-safe)', () => {
+    const buf = packResampleUniforms(0, 1920, 640, 1920, 0);
+    expect(buf.byteLength).toBe(RESAMPLE_UNIFORM_BYTES);
+    expect(buf.byteLength).toBe(32);
+    const f = new Float32Array(buf);
+    expect(f[0]).toBe(0); // srcStart
+    expect(f[1]).toBe(1920); // srcSpan
+    expect(f[2]).toBe(3); // scale
+    expect(f[3]).toBe(3); // filterScale — widened by the reduction
+    expect(f[4]).toBe(6); // support = 2 * filterScale
+    expect(f[5]).toBe(1920); // srcLen
+    expect(f[6]).toBe(640); // dstLen
+    expect(f[7]).toBe(0); // otherStart
+  });
+
+  it('does not widen the kernel for magnification or 1:1', () => {
+    for (const [span, dst] of [
+      [640, 1280],
+      [640, 640],
+    ] as const) {
+      const f = new Float32Array(packResampleUniforms(0, span, dst, span, 0));
+      expect(f[3]).toBe(1); // filterScale pinned
+      expect(f[4]).toBe(1); // tent radius, not the Catmull-Rom 2
+    }
+  });
+
+  it('carries the source sub-rect through, so crop-and-scale stays one pass', () => {
+    const f = new Float32Array(packResampleUniforms(420, 1080, 100, 1920, 55));
+    expect(f[0]).toBe(420);
+    expect(f[1]).toBe(1080);
+    expect(f[7]).toBe(55);
+    expect(f[5]).toBe(1920); // clamp bound stays the full texture extent
+  });
+
+  it('pins the WGSL kernel to the same Catmull-Rom the CPU driver uses', () => {
+    // Both shaders must carry the identical polynomial; a divergence here silently desynchronizes the
+    // substrates, which no Node test of the TS side alone would catch.
+    for (const source of [WEBGPU_RESAMPLE_H_SHADER_SOURCE, WEBGPU_RESAMPLE_V_SHADER_SOURCE]) {
+      expect(source).toContain('return 1.5 * x3 - 2.5 * x2 + 1.0;');
+      expect(source).toContain('return -0.5 * x3 + 2.5 * x2 - 4.0 * x + 2.0;');
+      // …and must select the tent when the axis is not reducing, matching planResampleAxis().
+      expect(source).toContain('if (r.scale > 1.0) { return catrom(t); }');
+      expect(source).toContain('return select(0.0, 1.0 - x, x < 1.0);');
+      expect(source).toContain('@vertex');
+      expect(source).toContain('@fragment');
+    }
+  });
+
+  it('keeps the horizontal pass unpremultiplied and premultiplies only at the canvas boundary', () => {
+    expect(WEBGPU_RESAMPLE_H_SHADER_SOURCE).not.toContain('premultiply_for_canvas');
+    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain('return premultiply_for_canvas(');
+  });
+
+  it('samples the external texture in the first pass and loads texels exactly in the second', () => {
+    expect(WEBGPU_RESAMPLE_H_SHADER_SOURCE).toContain('texture_external');
+    expect(WEBGPU_RESAMPLE_H_SHADER_SOURCE).toContain('textureSampleBaseClampToEdge');
+    // The vertical pass must not re-filter its input: textureLoad reads the intermediate texel exactly.
+    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain('textureLoad');
+    expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).not.toContain('textureSampleBaseClampToEdge');
   });
 });
 

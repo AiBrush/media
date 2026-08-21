@@ -135,7 +135,7 @@ describe('MP3 output / Mp3Muxer — the engine produces a valid, decodable .mp3 
     expect(reparsed.gapless, 'decoded window and raw LAME tuple round-trip').toEqual(
       sourceInfo.gapless,
     );
-  }, 30_000);
+  });
 
   it('authors ≥2 real MP3 sources to a valid .mp3 (re-parses + ffmpeg-decodes)', async () => {
     const ffmpeg = hasFfmpeg();
@@ -179,7 +179,7 @@ describe('MP3 output / Mp3Muxer — the engine produces a valid, decodable .mp3 
       expect(b.byteLength, `frame ${i} size`).toBe(a.byteLength);
       expect(Buffer.from(b).equals(Buffer.from(a)), `frame ${i} bytes identical`).toBe(true);
     }
-  }, 30_000);
+  });
 
   it('the MP3-in-MP4 elementary stream (2x2-green.mp4) authors to a decodable .mp3 (remux:mp3-in-mp4)', async () => {
     const ffmpeg = hasFfmpeg();

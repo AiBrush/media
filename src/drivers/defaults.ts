@@ -125,6 +125,7 @@ export const DEFAULT_LAZY_CONTAINER_SPECS: readonly LazyContainerSpec[] = [
     load: () => import('./mp3/mp3-driver.ts').then((module) => module.Mp3Driver),
     probe: true,
     packetInfo: true,
+    gaplessSeam: true,
     muxKind: 'mp3',
     validateTrack: validateMp3MuxTrack,
   },
@@ -418,6 +419,16 @@ function lazyCodecDrivers(): readonly CodecDriver[] {
         import('../codecs/wasm-vorbis-enc/wasm-vorbis-enc-driver.ts').then(
           (m) => m.WasmVorbisEncoderDriver,
         ),
+    }),
+    lazyCodec({
+      id: 'wasm-mp3-enc',
+      tier: 'wasm',
+      matches: (q) =>
+        q.mediaType === 'audio' &&
+        q.direction === 'encode' &&
+        (codec(q).startsWith('mp3') || codec(q) === 'mp4a.6b' || codec(q) === 'mp4a.69'),
+      load: () =>
+        import('../codecs/wasm-mp3-enc/wasm-mp3-enc-driver.ts').then((m) => m.WasmMp3EncoderDriver),
     }),
     lazyCodec({
       id: 'wasm-vorbis',

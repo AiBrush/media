@@ -94,7 +94,7 @@ function withFirstChunkOffset(movie: Movie, offset: number): Movie {
     ...track,
     samples: {
       ...track.samples,
-      chunkOffsets: [offset, ...track.samples.chunkOffsets.slice(1)],
+      chunkOffsets: Float64Array.from([offset, ...track.samples.chunkOffsets.slice(1)]),
     },
   };
   return { ...movie, tracks };
@@ -110,8 +110,12 @@ function withUnmappedFirstTrack(movie: Movie): Movie {
     ...track,
     samples: {
       ...track.samples,
-      chunkOffsets: [],
-      sampleToChunk: [],
+      chunkOffsets: new Float64Array(0),
+      sampleToChunk: {
+        firstChunk: new Uint32Array(0),
+        samplesPerChunk: new Uint32Array(0),
+        descIndex: new Uint32Array(0),
+      },
     },
   };
   return { ...movie, tracks };

@@ -13,6 +13,7 @@ import type {
   PcmDynamics,
   Progress,
   TrackInfo,
+  TrimAlignment,
 } from '../contracts/driver.ts';
 import type { Output, Sink } from '../sinks/sink.ts';
 
@@ -64,6 +65,8 @@ export type {
   Progress,
   /** A demuxed track descriptor — the element type of {@link Demuxed.tracks}. */
   TrackInfo,
+  /** The window a trim actually authored, and any adjustment the format forced (REQUIREMENTS §5.7). */
+  TrimAlignment,
   /** Exact ordered Matroska `AttachedFile` payloads carried as container side data. */
   MatroskaAttachmentsSideData,
   /** Marker linking an attached-picture/attachment projection to its exact Matroska side-data item. */
@@ -268,6 +271,12 @@ export interface TrimOptions {
   mode?: 'keyframe' | 'accurate';
   /** Preserve/author fragmented MP4 (CMAF-style init segment plus media fragments) output. */
   fragmented?: boolean;
+  /**
+   * Receives the window the output actually presents, on the source's sample timeline (REQUIREMENTS
+   * §5.7). Routes that can express the request exactly still report, with zero adjustments; routes
+   * bound by whole-access-unit containers report the rounding they could not avoid.
+   */
+  onAlignment?: (alignment: TrimAlignment) => void;
   sink?: Sink;
 }
 

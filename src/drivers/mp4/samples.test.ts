@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ParsedTrack, SampleTable } from './parse.ts';
+import { type ParsedTrack, type SampleTable, type SampleTableInit, sampleTableFrom } from './parse.ts';
 import {
   buildSampleData,
   buildSamples,
@@ -8,19 +8,11 @@ import {
 } from './samples.ts';
 
 function track(
-  partial: Partial<SampleTable>,
+  partial: SampleTableInit,
   timescale = 1000,
   edit: ParsedTrack['edit'] = undefined,
 ): ParsedTrack {
-  const samples: SampleTable = {
-    timeToSample: partial.timeToSample ?? [],
-    compositionOffsets: partial.compositionOffsets ?? [],
-    sampleSizes: partial.sampleSizes ?? [],
-    sampleToChunk: partial.sampleToChunk ?? [],
-    chunkOffsets: partial.chunkOffsets ?? [],
-    syncSamples: partial.syncSamples ?? [],
-    sampleDependencies: partial.sampleDependencies ?? [],
-  };
+  const samples: SampleTable = sampleTableFrom(partial);
   const parsed: ParsedTrack = {
     id: 1,
     mediaType: 'video',

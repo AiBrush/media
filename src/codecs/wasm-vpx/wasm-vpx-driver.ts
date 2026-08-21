@@ -12,8 +12,8 @@
  * change without touching its container/filter neighbours.
  *
  * **Self-hosted wasm, lazy, miss-only (BUILD §7, ADR-004):** the libvpx core is vendored *into this
- * directory* and loaded through `new URL('./vpx.wasm', import.meta.url)` — same-origin, no CDN, no
- * COOP/COEP — and only when a decoder is actually built. `supports()` answers honestly: if the vendored
+ * directory* — the ogv modules embed their own wasm bytes, so it is same-origin by construction, with no
+ * CDN, no COOP/COEP and no sibling `.wasm` to co-vendor — and loaded only when a decoder is actually built. `supports()` answers honestly: if the vendored
  * core is absent (not yet built — see `BUILD.md`) it returns `false`, so the router falls through to a
  * typed {@link CapabilityError} instead of pretending VP9 works. The pure framing/format math lives in
  * {@link import('./vpx.ts')} and is validated in Node; the lossy transform/loop-filter decode is the core's.
@@ -44,7 +44,6 @@ import type {
 } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../../contracts/errors.ts';
-import { resolveWasmAssetUrl, wasmInitForProfile } from '../../kernel/wasm-loader-runtime.ts';
 import { resolveWasmRuntimeProfile } from '../../kernel/wasm-runtime.ts';
 import {
   type VpxCodec,
@@ -101,28 +100,27 @@ async function hasVpxCoreGlue(): Promise<boolean> {
 /**
  * Load the vendored libvpx-in-wasm core, lazily and at most once. Resolves to the {@link VpxWasmCore}, or
  * `null` if the artifact is not vendored yet (the import throws) — that `null` is what makes the driver
- * *honest* about wasm absence rather than fabricating support. The wasm bytes are addressed via
- * `new URL('./vpx.wasm', import.meta.url)` so they ship same-origin alongside this chunk; the specifier is
- * a string literal so bundlers code-split it into its own lazy chunk (loaded only on a real VPX miss).
+ * *honest* about wasm absence rather than fabricating support. This is a **self-contained** tail: the ogv
+ * modules embed their own wasm bytes and `vpx-core.js` instantiates them directly, so there is no sibling
+ * `.wasm` asset to address. It previously computed `new URL('./vpx.wasm', import.meta.url)` and handed it
+ * to an init that ignores it — a dangling reference to a file this repo has never vendored, which made the
+ * loader look like it fetched an asset that does not exist. `assetBaseUrl` is accepted for call-site
+ * symmetry with the tails that really do fetch one.
  */
 export async function loadVpxCore(
   runtime?: WasmRuntimeProfile,
   assetBaseUrl?: string,
 ): Promise<VpxWasmCore | null> {
   const profile = runtime ?? resolveWasmRuntimeProfile();
-  const moduleUrl = resolveWasmAssetUrl(
-    './vpx.wasm',
-    new URL('./vpx.wasm', import.meta.url),
-    assetBaseUrl,
-  );
-  const key = `${profile.kind}|${moduleUrl.href}`;
+  void assetBaseUrl;
+  const key = profile.kind;
   let corePromise = corePromises.get(key);
   if (corePromise === undefined) {
     corePromise = (async (): Promise<VpxWasmCore | null> => {
       try {
         // String-literal specifier → its own code-split chunk; absent until `BUILD.md` is run.
         const mod = await import('./vpx-core.js');
-        await mod.default(wasmInitForProfile(moduleUrl, profile));
+        await mod.default();
         return mod.createVpxCore();
       } catch {
         // Not vendored (or failed to instantiate): report absence; the router yields a CapabilityError.

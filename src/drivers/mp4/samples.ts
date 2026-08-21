@@ -6,7 +6,7 @@
  * Pure TS — validated against the real corpus without a browser.
  */
 
-import type { CompositionOffset, ParsedTrack, TimeToSample } from './parse.ts';
+import type { CompositionOffsetTable, ParsedTrack, SampleToChunkTable, TimeToSampleTable } from './parse.ts';
 
 /** A sample in container-native ticks (exact). */
 export interface SampleData {
@@ -63,33 +63,58 @@ interface RunCursor {
   value: number;
 }
 
-function nextTimeDelta(entries: readonly TimeToSample[], cursor: RunCursor): number {
+function nextRunValue(
+  counts: Uint32Array,
+  values: Uint32Array | Int32Array,
+  cursor: RunCursor,
+): number {
   while (cursor.remaining <= 0) {
-    const entry = entries[cursor.index];
-    if (entry === undefined) return cursor.value;
+    if (cursor.index >= counts.length) return cursor.value;
+    const count = counts[cursor.index] ?? 0;
+    const value = values[cursor.index] ?? 0;
     cursor.index++;
-    if (entry.count <= 0) continue;
-    cursor.remaining = entry.count;
-    cursor.value = entry.delta;
+    if (count <= 0) continue;
+    cursor.remaining = count;
+    cursor.value = value;
   }
   cursor.remaining--;
   return cursor.value;
 }
 
-function nextCompositionOffset(entries: readonly CompositionOffset[], cursor: RunCursor): number {
-  while (cursor.remaining <= 0) {
-    const entry = entries[cursor.index];
-    if (entry === undefined) return cursor.value;
+function nextTimeDelta(entries: TimeToSampleTable, cursor: RunCursor): number {
+  return nextRunValue(entries.counts, entries.deltas, cursor);
+}
+
+function nextCompositionOffset(entries: CompositionOffsetTable, cursor: RunCursor): number {
+  return nextRunValue(entries.counts, entries.offsets, cursor);
+}
+
+/** A monotonic `stsc` walk position: the next unread entry plus the run currently in force. */
+export interface SampleToChunkCursor {
+  index: number;
+  value: number;
+}
+
+/**
+ * The `stsc` samples-per-chunk in force for a 1-based chunk number, advancing a monotonic cursor.
+ * Every sample-table walk shares this so the run-length semantics exist once.
+ */
+export function samplesPerChunkFor(
+  table: SampleToChunkTable,
+  chunkNumber: number,
+  cursor: SampleToChunkCursor,
+): number {
+  while (
+    cursor.index < table.firstChunk.length &&
+    (table.firstChunk[cursor.index] ?? 0) <= chunkNumber
+  ) {
+    cursor.value = table.samplesPerChunk[cursor.index] ?? 0;
     cursor.index++;
-    if (entry.count <= 0) continue;
-    cursor.remaining = entry.count;
-    cursor.value = entry.offset;
   }
-  cursor.remaining--;
   return cursor.value;
 }
 
-function isAscending(values: readonly number[]): boolean {
+function isAscending(values: Uint32Array): boolean {
   let previous = Number.NEGATIVE_INFINITY;
   for (const value of values) {
     if (value < previous) return false;
@@ -106,8 +131,7 @@ export function walkSampleRanges(track: ParsedTrack, visitor: SampleRangeVisitor
   const table = track.samples;
   const sizes = table.sampleSizes;
   const count = sizes.length;
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor = { index: 0, value: 0 };
   let sampleIndex = 0;
   for (
     let chunkIndex = 0;
@@ -116,13 +140,7 @@ export function walkSampleRanges(track: ParsedTrack, visitor: SampleRangeVisitor
   ) {
     const chunkOffset = table.chunkOffsets[chunkIndex];
     if (chunkOffset === undefined) break;
-    const chunkNumber = chunkIndex + 1;
-    while (true) {
-      const entry = table.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(table.sampleToChunk, chunkIndex + 1, stscCursor);
     let offset = chunkOffset;
     for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < count; inChunk++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -149,8 +167,7 @@ export function walkSampleClassificationRanges(
   const allSync = syncSamples.length === 0;
   const sortedSync = allSync || isAscending(syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   for (
@@ -160,13 +177,7 @@ export function walkSampleClassificationRanges(
   ) {
     const chunkOffset = table.chunkOffsets[chunkIndex];
     if (chunkOffset === undefined) break;
-    const chunkNumber = chunkIndex + 1;
-    while (true) {
-      const entry = table.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(table.sampleToChunk, chunkIndex + 1, stscCursor);
     let offset = chunkOffset;
     for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < count; inChunk++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -191,7 +202,7 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
   const st = track.samples;
   const sizes = st.sampleSizes;
   const count = sizes.length;
-  const hasCtts = st.compositionOffsets.length > 0;
+  const hasCtts = st.compositionOffsets.counts.length > 0;
   const allSync = st.syncSamples.length === 0;
   const sortedSync = allSync || isAscending(st.syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(st.syncSamples);
@@ -199,21 +210,14 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
   const out = new Array<SampleData>(count);
   const deltaCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   let dts = 0;
   for (let c = 0; c < st.chunkOffsets.length && sampleIndex < count; c++) {
     const chunkOffset = st.chunkOffsets[c];
     if (chunkOffset === undefined) break;
-    const chunkNumber = c + 1;
-    while (true) {
-      const entry = st.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(st.sampleToChunk, c + 1, stscCursor);
     let offset = chunkOffset;
     for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -250,7 +254,7 @@ export function buildSamples(track: ParsedTrack): Sample[] {
   const count = sizes.length;
   const ts = track.timescale;
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
-  const hasCtts = st.compositionOffsets.length > 0;
+  const hasCtts = st.compositionOffsets.counts.length > 0;
   const allSync = st.syncSamples.length === 0;
   const sortedSync = allSync || isAscending(st.syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(st.syncSamples);
@@ -258,21 +262,14 @@ export function buildSamples(track: ParsedTrack): Sample[] {
   const out = new Array<Sample>(count);
   const deltaCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   let dts = 0;
   for (let c = 0; c < st.chunkOffsets.length && sampleIndex < count; c++) {
     const chunkOffset = st.chunkOffsets[c];
     if (chunkOffset === undefined) break;
-    const chunkNumber = c + 1;
-    while (true) {
-      const entry = st.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(st.sampleToChunk, c + 1, stscCursor);
     let offset = chunkOffset;
     for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -307,28 +304,21 @@ export function walkSamples(track: ParsedTrack, visitor: SampleVisitor): void {
   const st = track.samples;
   const sizes = st.sampleSizes;
   const count = sizes.length;
-  const hasCtts = st.compositionOffsets.length > 0;
+  const hasCtts = st.compositionOffsets.counts.length > 0;
   const allSync = st.syncSamples.length === 0;
   const sortedSync = allSync || isAscending(st.syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(st.syncSamples);
 
   const deltaCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: RunCursor = { index: 0, remaining: 0, value: 0 };
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   let dts = 0;
   for (let c = 0; c < st.chunkOffsets.length && sampleIndex < count; c++) {
     const chunkOffset = st.chunkOffsets[c];
     if (chunkOffset === undefined) break;
-    const chunkNumber = c + 1;
-    while (true) {
-      const entry = st.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(st.sampleToChunk, c + 1, stscCursor);
     let offset = chunkOffset;
     for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
       const size = sizes[sampleIndex] ?? 0;

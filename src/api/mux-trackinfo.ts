@@ -398,17 +398,21 @@ export function audioTrackInfoFromDecoderConfig(
 }
 
 /**
- * Build destination gapless facts from an AAC or Opus encoder's own drained timing. Source
+ * Build destination gapless facts from an AAC, Opus or MP3 encoder's own drained timing. Source
  * delay/padding was already consumed while decoding and is never valid for a new elementary stream
  * (even when both codecs use the same sample rate). Opus still publishes pre-skip in
- * OpusHead/CodecDelay; this tuple adds the exact terminal padding/program window.
+ * OpusHead/CodecDelay; this tuple adds the exact terminal padding/program window. MP3 signals nothing
+ * in-band at all — its priming and terminal padding exist only here and in whatever the container
+ * authors from this tuple (an MP4 `elst`, a raw `.mp3`'s Xing/LAME tag).
  */
 export function outputGaplessForAudioEncoder(
   config: AudioDecoderConfig,
   timing: AudioEncoderOutputTiming | undefined,
 ): TrackInfo['gapless'] | undefined {
   const codec = audioCodecToken(config.codec);
-  if ((codec !== 'aac' && codec !== 'opus') || timing === undefined) return undefined;
+  if ((codec !== 'aac' && codec !== 'opus' && codec !== 'mp3') || timing === undefined) {
+    return undefined;
+  }
   const { sampleRate, submittedSamples, codedSamples, leadingSamples } = timing;
   if (
     sampleRate !== config.sampleRate ||

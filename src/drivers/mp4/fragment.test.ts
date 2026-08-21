@@ -284,7 +284,7 @@ describe('fragmentMp4 — init segment structure', () => {
     expect(movie.tracks[0]?.width).toBe(64);
     expect(movie.tracks[0]?.height).toBe(48);
     // Fragmented ⇒ the moov sample tables are empty (no samples buffered in the init segment).
-    expect(movie.tracks[0]?.samples.sampleSizes).toEqual([]);
+    expect(movie.tracks[0]?.samples.sampleSizes).toHaveLength(0);
 
     // mvex/trex are present (one trex per track).
     const moovBox = top.find((b) => b.type === 'moov');
@@ -673,7 +673,7 @@ describe('fragmentMp4 — real corpus MP4 → CMAF → re-parse (sample-faithful
       expect(initMovie.tracks.length).toBe(movie.tracks.length);
       initMovie.tracks.forEach((it, i) => {
         expect(it.codec).toBe(movie.tracks[i]?.codec);
-        expect(it.samples.sampleSizes).toEqual([]); // fragmented ⇒ no samples in the init moov
+        expect(it.samples.sampleSizes).toHaveLength(0); // fragmented ⇒ no samples in the init moov
       });
 
       // (b) Sample-faithful: every track's fragmented samples reconstruct the source table exactly —

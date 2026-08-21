@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import type { ByteSource } from '../../contracts/driver.ts';
+import type { ByteSource, TrimAlignment } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture, loadGoldenMetadata } from '../../test-support/corpus.ts';
 import { Mp3Driver } from '../mp3/mp3-driver.ts';
 import {
   AdtsDriver,
+  AdtsModule,
   adtsAacPcmDecodePlan,
   adtsAacPcmRuntimePolicy,
   adtsPacketInfoFromBytes,
@@ -334,6 +335,92 @@ describe('probe ADTS — real corpus', () => {
     );
     expect(out).toEqual(expected);
     expect(enumerateAdtsFrames(out)).toHaveLength(selected.length);
+  });
+
+  /**
+   * ISO/IEC 13818-7 gives the ADTS header a frame length and a raw-data-block count and nothing else —
+   * no encoder delay, pre-skip, or end padding, and no edit list. A raw AAC elementary stream can
+   * therefore only begin and end on a whole access unit, and REQUIREMENTS §5.7 obliges the engine to
+   * report that rounding rather than let a caller assume the cut was sample-exact.
+   */
+  it('streamCopy trim reports the whole-access-unit rounding it could not avoid', async () => {
+    if (AdtsDriver.streamCopy === undefined) throw new Error('expected ADTS streamCopy');
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    const { sampleRate } = parseAdts(bytes);
+    const startSec = 0.04;
+    const endSec = 0.16;
+    const seen: TrimAlignment[] = [];
+    await collectBytes(
+      await AdtsDriver.streamCopy(fromBytes(bytes, { mime: 'audio/aac' }), {
+        trim: { startSec, endSec },
+        onTrimAlignment: (alignment) => seen.push(alignment),
+      }),
+    );
+    expect(seen).toHaveLength(1);
+    const alignment = seen[0] as TrimAlignment;
+    const selected = frames.filter(
+      (frame) =>
+        frame.ptsUs + frame.durationUs > Math.round(startSec * 1_000_000) &&
+        frame.ptsUs < Math.round(endSec * 1_000_000),
+    );
+    const first = selected[0] as (typeof selected)[number];
+    const last = selected[selected.length - 1] as (typeof selected)[number];
+    expect(alignment).toEqual({
+      sampleRate,
+      requestedStartSampleFrame: Math.round(startSec * sampleRate),
+      requestedEndSampleFrame: Math.round(endSec * sampleRate),
+      authoredStartSampleFrame: Math.round((first.ptsUs * sampleRate) / 1_000_000),
+      authoredEndSampleFrame: Math.round(((last.ptsUs + last.durationUs) * sampleRate) / 1_000_000),
+      startAdjustmentSampleFrames: expect.any(Number) as number,
+      endAdjustmentSampleFrames: expect.any(Number) as number,
+      reason: expect.stringContaining('whole access units') as string,
+    });
+    // The report is the real rounding, not a placeholder: both edges moved to an access-unit boundary.
+    expect(alignment.startAdjustmentSampleFrames).toBeLessThanOrEqual(0);
+    expect(alignment.endAdjustmentSampleFrames).toBeGreaterThanOrEqual(0);
+    expect(Math.abs(alignment.startAdjustmentSampleFrames)).toBeLessThan(first.samples);
+    expect(alignment.endAdjustmentSampleFrames).toBeLessThan(last.samples);
+  });
+
+  it('streamCopy trim reports a zero adjustment when the cut already lands on access units', async () => {
+    if (AdtsDriver.streamCopy === undefined) throw new Error('expected ADTS streamCopy');
+    const bytes = await loadFixture('sfx.adts');
+    const frames = enumerateAdtsFrames(bytes);
+    const { sampleRate } = parseAdts(bytes);
+    const aligned = frames[4] as (typeof frames)[number];
+    const seen: TrimAlignment[] = [];
+    await collectBytes(
+      await AdtsDriver.streamCopy(fromBytes(bytes, { mime: 'audio/aac' }), {
+        trim: {
+          startSec: aligned.ptsUs / 1_000_000,
+          endSec: (aligned.ptsUs + aligned.durationUs * 6) / 1_000_000,
+        },
+        onTrimAlignment: (alignment) => seen.push(alignment),
+      }),
+    );
+    const alignment = seen[0] as TrimAlignment;
+    expect(alignment.startAdjustmentSampleFrames).toBe(0);
+    expect(alignment.endAdjustmentSampleFrames).toBe(0);
+    expect(alignment.reason).toBeUndefined();
+    expect(alignment.authoredEndSampleFrame - alignment.authoredStartSampleFrame).toBe(
+      6 * aligned.samples,
+    );
+    expect(sampleRate).toBeGreaterThan(0);
+  });
+
+  it('the public trim() surfaces the ADTS alignment report', async () => {
+    const bytes = await loadFixture('sfx.adts');
+    const seen: TrimAlignment[] = [];
+    await createMedia()
+      .use(AdtsModule)
+      .trim(fromBytes(bytes, { mime: 'audio/aac' }), {
+        start: 0.04,
+        end: 0.16,
+        onAlignment: (alignment) => seen.push(alignment),
+      });
+    expect(seen).toHaveLength(1);
+    expect((seen[0] as TrimAlignment).reason).toContain('whole access units');
   });
 
   it('streamCopy trim keeps invalid ranges typed before emitting bytes', async () => {

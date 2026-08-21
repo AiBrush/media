@@ -55,12 +55,58 @@ import {
   assertH264TwoPassPictureEvidenceCapacity,
 } from './video-two-pass.ts';
 
-const MAXIMUM_CANDIDATE_PASSES = 3;
+/** Scheduled fixed-QP candidate passes attempted before the native rate controller is consulted. */
+export const MAXIMUM_CANDIDATE_PASSES = 3;
 const MAXIMUM_NATIVE_RATE_PASSES = 3;
 /** Bound a malfunctioning native controller request independently of the exact audited output cap. */
 const MAXIMUM_NATIVE_RATE_REQUEST_MULTIPLIER = 4;
 const MICROS_PER_SECOND = 1_000_000;
 const BITS_PER_BYTE = 8;
+
+/**
+ * Smallest relative move a recalibrated controller request may make.
+ *
+ * A candidate that overshoots the byte ceiling by a fraction of a percent yields a byte-ratio correction
+ * of ~0.9999, which rounds back to a request the encoder answers with the *same* payload — the search then
+ * burns its remaining passes reproducing one infeasible candidate. Measured on a 480p ABR rung: three
+ * consecutive native passes each returned 2,373,685 bytes against a 2,373,583-byte ceiling. Requiring a
+ * real step guarantees every pass probes a new operating point.
+ */
+const MINIMUM_NATIVE_RATE_STEP = 0.01;
+
+/** Ceiling on the one-step secant correction applied to the quantizer allocator's byte target. */
+const MAXIMUM_ALLOCATOR_TARGET_CORRECTION = 1.5;
+
+/**
+ * Correct the next quantizer-allocation target for the allocator's measured modelling error.
+ *
+ * A per-picture integer-QP schedule reaches only an approximation of its byte target, and when it lands
+ * *under* the hard ceiling the binding constraint is quality, not bytes — so the unused headroom is pure
+ * loss. Aiming the next pass at `ceiling × (requested / achieved)` makes the achieved payload land on the
+ * ceiling instead of below it. Measured on a 480p ABR rung: a pass that requested 2,373,583 bytes achieved
+ * 2,256,210 (95.1%) at SSIM 0.9498 against a 0.95 floor, with the remaining 4.9% of the budget unspent.
+ *
+ * A candidate that already exceeded the ceiling needs no boost — it returns 1 so the next pass simply aims
+ * at the ceiling and lets the allocator step down.
+ */
+export function allocatorTargetCorrection(
+  requestedBytes: number,
+  achievedBytes: number,
+  maximumBytes: number,
+): number {
+  if (
+    !Number.isFinite(requestedBytes) ||
+    !Number.isFinite(achievedBytes) ||
+    requestedBytes <= 0 ||
+    achievedBytes <= 0 ||
+    achievedBytes > maximumBytes
+  ) {
+    return 1;
+  }
+  const correction = requestedBytes / achievedBytes;
+  if (!(correction > 1)) return 1;
+  return Math.min(correction, MAXIMUM_ALLOCATOR_TARGET_CORRECTION);
+}
 
 export function nextNativeRateRequest(
   currentRequest: number,
@@ -70,7 +116,13 @@ export function nextNativeRateRequest(
   minimumQualityMean: number,
 ): number {
   const rateScale = maximumBytes / actualBytes;
-  if (actualBytes > maximumBytes || qualityMean === undefined) {
+  if (actualBytes > maximumBytes) {
+    // Step down by the measured byte ratio, but never by an amount the encoder cannot resolve.
+    const corrected = Math.round(currentRequest * rateScale);
+    const decisive = Math.floor(currentRequest * (1 - MINIMUM_NATIVE_RATE_STEP));
+    return Math.max(1, Math.min(corrected, decisive));
+  }
+  if (qualityMean === undefined) {
     return Math.round(currentRequest * rateScale);
   }
   // Near one, `1 - SSIM` is a useful bounded distortion proxy. If the candidate uses the byte budget
@@ -820,7 +872,10 @@ export async function analyzeH264QualityConstrained(
     // original quality-recovery behavior without inventing a hidden proximity threshold.
     const nextTargetBytes = feasible
       ? averageBitrateByteBudget(request.bitrate, auditedDurationUs)
-      : candidateMaximumBytes;
+      : Math.round(
+          candidateMaximumBytes *
+            allocatorTargetCorrection(plan.targetBytes, auditedPayloadBytes, candidateMaximumBytes),
+        );
     if (nextTargetBytes === 0) break;
     const next = plan.recalibrate(recalibrationSamples, nextTargetBytes);
     if (sameSchedule(plan, next)) break;

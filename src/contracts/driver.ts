@@ -438,9 +438,38 @@ export interface Muxer {
 }
 
 /** Options for a driver-native stream-copy (remux / keyframe-trim), ADR-021. */
+/**
+ * Sample-exact accounting for the window a trim actually authored (REQUIREMENTS §5.7: "The engine MUST
+ * expose any unavoidable alignment adjustment"). Coordinates are source presentation sample frames on the
+ * source's own gapless timeline, so `authored − requested` at each edge is the whole adjustment: both
+ * zero means the output presents exactly the requested interval.
+ *
+ * A compressed format that can signal delay/padding (MP4 edit lists, Ogg Opus pre-skip/granule, MP3
+ * Xing/LAME) reports zeroes. A format with no discard signalling — raw ADTS AAC carries only whole
+ * access units — reports the rounding it could not avoid, with `reason` naming the constraint.
+ */
+export interface TrimAlignment {
+  readonly sampleRate: number;
+  readonly requestedStartSampleFrame: number;
+  readonly requestedEndSampleFrame: number;
+  readonly authoredStartSampleFrame: number;
+  readonly authoredEndSampleFrame: number;
+  /** `authored − requested`; negative means earlier than requested, positive later. */
+  readonly startAdjustmentSampleFrames: number;
+  readonly endAdjustmentSampleFrames: number;
+  /** The format constraint that forced a non-zero adjustment; omitted when the trim is exact. */
+  readonly reason?: string;
+}
+
 export interface StreamCopyOptions extends StageOptions {
   /** Keyframe-aligned time-range copy (trim), in seconds. Omit for a full remux. */
   trim?: { startSec: number; endSec: number };
+  /**
+   * Called once with the window the copy actually authored when `trim` is given. Drivers that can express
+   * the requested interval exactly still report it (with zero adjustments) so callers never have to infer
+   * exactness from silence.
+   */
+  onTrimAlignment?: (alignment: TrimAlignment) => void;
   /**
    * Permit a same-container full-range trim to return the exact source bytes. Callers use this only
    * when their operation contract is semantic identity; ordinary remux callers retain the driver's

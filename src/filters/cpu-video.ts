@@ -65,6 +65,7 @@ import {
   planColorspace,
   planTonemap,
 } from './gpu-uniforms.ts';
+import { planResampleAxis, resampleRgbaRegion } from './resample.ts';
 import {
   type RgbVideoColorSpaceInit,
   mapVideoColorSpace,
@@ -223,62 +224,53 @@ function exactBlitToRgba(blit: Blit, src: RgbaImage): RgbaImage {
   return out;
 }
 
-/** Bilinear-sample the source at fractional `(sx, sy)`, clamping to the source edges (matches GPU linear). */
-function sampleBilinear(
-  view: DataView,
-  src: RgbaImage,
-  sx: number,
-  sy: number,
-): [number, number, number, number] {
-  const clampX = (v: number): number => (v < 0 ? 0 : v > src.width - 1 ? src.width - 1 : v);
-  const clampY = (v: number): number => (v < 0 ? 0 : v > src.height - 1 ? src.height - 1 : v);
-  const fx = clampX(sx);
-  const fy = clampY(sy);
-  const x0 = Math.floor(fx);
-  const y0 = Math.floor(fy);
-  const x1 = clampX(x0 + 1);
-  const y1 = clampY(y0 + 1);
-  const tx = fx - x0;
-  const ty = fy - y0;
-  const p00 = getPixel(view, src.width, x0, y0);
-  const p10 = getPixel(view, src.width, x1, y0);
-  const p01 = getPixel(view, src.width, x0, y1);
-  const p11 = getPixel(view, src.width, x1, y1);
-  const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
-  // Bilinear per channel: interpolate the top and bottom edges in x, then between them in y. Unrolled (a
-  // computed channel index would widen to `| undefined` under noUncheckedIndexedAccess).
-  const bilerp = (i: 0 | 1 | 2 | 3): number =>
-    Math.round(lerp(lerp(p00[i], p10[i], tx), lerp(p01[i], p11[i], tx), ty));
-  return [bilerp(0), bilerp(1), bilerp(2), bilerp(3)];
-}
-
 /**
- * Resize {@link Blit} (source rect scaled into the destination rect): bilinear-resample the source sub-rect
- * into the `dst` rect of a `blit.dims` output. Pixels outside `dst` (the `contain` letterbox) stay
- * transparent black. A fractional destination edge contributes its geometric coverage to the adjacent
- * pixel, matching the antialiased Canvas2D/WebGPU substrates instead of using a fractional typed-array
- * index.
+ * Resize {@link Blit} (source rect scaled into the destination rect): band-limited resample of the source
+ * sub-rect into the `dst` rect of a `blit.dims` output, via the shared {@link ./resample.ts} kernel — a
+ * Catmull-Rom whose support widens with the reduction factor, so a >2:1 downscale integrates its whole
+ * source footprint instead of point-sampling 2 of every N texels. Pixels outside `dst` (the `contain`
+ * letterbox) stay transparent black. A fractional destination edge contributes its geometric coverage to
+ * the adjacent pixel, matching the antialiased Canvas2D/WebGPU substrates instead of using a fractional
+ * typed-array index.
  */
 function resizeBlitToRgba(blit: Blit, src: RgbaImage): RgbaImage {
   const out = blankRgba(blit.dims);
-  const view = viewOf(src);
-  const sxScale = blit.src.width / blit.dst.width;
-  const syScale = blit.src.height / blit.dst.height;
   const startX = Math.max(0, Math.floor(blit.dst.x));
   const startY = Math.max(0, Math.floor(blit.dst.y));
   const endX = Math.min(out.width, Math.ceil(blit.dst.x + blit.dst.width));
   const endY = Math.min(out.height, Math.ceil(blit.dst.y + blit.dst.height));
+  if (endX <= startX || endY <= startY) return out;
+
+  // Plan over the FULL destination rect (so the sample grid does not shift when the rect is clipped by the
+  // output bounds), then read back only the covered window.
+  const axisX = planResampleAxis(src.width, Math.round(blit.dst.width), blit.src.x, blit.src.width);
+  const axisY = planResampleAxis(
+    src.height,
+    Math.round(blit.dst.height),
+    blit.src.y,
+    blit.src.height,
+  );
+  const resampled = resampleRgbaRegion(src, axisX, axisY);
+
   const coverage = (pixel: number, start: number, end: number): number =>
     Math.max(0, Math.min(pixel + 1, end) - Math.max(pixel, start));
   for (let oy = startY; oy < endY; oy++) {
-    // Sample at destination-pixel centres mapped back into the source rect.
-    const sy = blit.src.y + (oy + 0.5 - blit.dst.y) * syScale - 0.5;
+    const ry = Math.min(resampled.height - 1, Math.max(0, Math.round(oy - blit.dst.y)));
     const coverageY = coverage(oy, blit.dst.y, blit.dst.y + blit.dst.height);
     for (let ox = startX; ox < endX; ox++) {
-      const sx = blit.src.x + (ox + 0.5 - blit.dst.x) * sxScale - 0.5;
-      const [r, g, b, a] = sampleBilinear(view, src, sx, sy);
+      const rx = Math.min(resampled.width - 1, Math.max(0, Math.round(ox - blit.dst.x)));
+      const o = (ry * resampled.width + rx) * RGBA;
       const alphaCoverage = coverageY * coverage(ox, blit.dst.x, blit.dst.x + blit.dst.width);
-      setPixel(out, ox, oy, r, g, b, Math.round(a * alphaCoverage));
+      // Uint8ClampedArray rounds and clamps on store, which is exactly what the kernel's negative lobes need.
+      setPixel(
+        out,
+        ox,
+        oy,
+        resampled.data[o] ?? 0,
+        resampled.data[o + 1] ?? 0,
+        resampled.data[o + 2] ?? 0,
+        (resampled.data[o + 3] ?? 0) * alphaCoverage,
+      );
     }
   }
   return out;

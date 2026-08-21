@@ -481,6 +481,54 @@ describe('Mp3Driver — demux seam + muxer', () => {
     expect(parseMp3(out).durationSec).toBeCloseTo((2 * 1152) / 44100, 5);
   });
 
+  it('signals a destination encode window set after the fact through the Xing/LAME tag', async () => {
+    // A newly encoded MP3 only knows its priming/padding once the encoder drains, which is long after
+    // `addTrack`; `setTrackGapless` is that seam. Three MPEG-1 frames hold 3456 samples, of which 1105
+    // are the encoder's lead-in and 2000 are program, leaving 351 samples of terminal padding.
+    const frame = (): Uint8Array => Uint8Array.from(pad(header(), frameLen()));
+    const muxer = Mp3Driver.createMuxer();
+    const id = muxer.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+    for (let i = 0; i < 3; i++) {
+      muxer.addChunkStruct(id, {
+        timestampUs: i * 26_122,
+        durationUs: 26_122,
+        key: true,
+        data: frame(),
+      });
+    }
+    muxer.setTrackGapless(id, { leadingSamples: 1105, trailingSamples: 351, totalSamples: 2000 });
+    await muxer.finalize();
+
+    const out = await collectBytes(muxer.output);
+    const info = parseMp3(out);
+    // The tag's own fields are the encoder-domain pair (LAME's 576 delay, 880 padding); reading them
+    // back through the shipped parser restores the decoder-domain window byte-for-byte.
+    expect(info.gapless).toEqual({
+      basis: 'mp3-xing-lame',
+      leadingSamples: 1105,
+      trailingSamples: 351,
+      totalSamples: 2000,
+      mp3Lame: { encoderDelaySamples: 576, encoderPaddingSamples: 880 },
+    });
+    expect(info.durationSec).toBeCloseTo(2000 / 44100, 9);
+    expect(enumerateMp3Packets(out)).toHaveLength(3);
+  });
+
+  it('refuses gapless timing for a track the MP3 muxer does not have', async () => {
+    const muxer = Mp3Driver.createMuxer();
+    const id = muxer.addTrack({ id: 0, mediaType: 'audio', codec: 'mp3' });
+    expect(() => muxer.setTrackGapless(id + 1, { totalSamples: 1 })).toThrowError(/unknown track/);
+    muxer.addChunkStruct(id, {
+      timestampUs: 0,
+      durationUs: 26_122,
+      key: true,
+      data: Uint8Array.from(pad(header(), frameLen())),
+    });
+    await muxer.finalize();
+    await collectBytes(muxer.output);
+    expect(() => muxer.setTrackGapless(id, { totalSamples: 1 })).toThrowError(/already finalized/);
+  });
+
   it('muxes MPEG-1 mono and MPEG-2 stereo frames with the right Xing side-info layout', async () => {
     const cases = [
       {

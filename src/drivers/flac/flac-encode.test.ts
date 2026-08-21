@@ -230,7 +230,7 @@ describe('FLAC authoring — LPC/Rice compression, bit-exact, independently veri
         ]);
       }
     }
-  }, 30_000);
+  });
 
   it('compresses predictable content strictly below verbatim, and never expands any source', async () => {
     // Strict `<`: real-audio FLAC fixtures + predictable WAV content MUST shrink (FIXED+Rice pays).
@@ -262,7 +262,7 @@ describe('FLAC authoring — LPC/Rice compression, bit-exact, independently veri
         verbatim.byteLength,
       );
     }
-  }, 30_000);
+  });
 
   it('authors native FLAC from real WAV PCM and round-trips sample-exactly', async () => {
     for (const id of WAV_SOURCES) {
@@ -280,7 +280,7 @@ describe('FLAC authoring — LPC/Rice compression, bit-exact, independently veri
         ]);
       }
     }
-  }, 30_000);
+  });
 
   it('an INDEPENDENT decoder (flac/ffmpeg CLI) decodes our FLAC bit-exactly back to the source PCM', async () => {
     const tool = externalDecoder();
@@ -301,7 +301,7 @@ describe('FLAC authoring — LPC/Rice compression, bit-exact, independently veri
         id,
       );
     }
-  }, 30_000);
+  });
 
   it('rejects non-finite samples and bad geometry with typed InputErrors (never malformed output)', async () => {
     const { pcm } = await wavFixtureAsPcm('sfx-pcm-s16.wav');

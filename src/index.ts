@@ -19,6 +19,7 @@ export {
   mux,
   packetInfo,
   packetInfoBatches,
+  planRemuxOutput,
   preload,
   probe,
   remux,
@@ -34,6 +35,15 @@ export type {
   PacketInfoCallOptions,
 } from './api/packet-info-runner.ts';
 export type { MediaJob, MediaJobInput, MediaJobOperation, MediaJobOutput } from './api/job.ts';
+// The pre-execution output-sink declaration (REQUIREMENTS §5.1). Types only: the decision table itself
+// loads with the remux runner, so the eager kernel carries no extra bytes for it.
+export type {
+  RemuxOutputPlan,
+  RemuxOutputRetention,
+  RemuxOutputRoute,
+  RemuxOutputRouteFacts,
+  RemuxOutputWriteOrder,
+} from './api/remux-output-plan.ts';
 
 // Public option/result types
 export type * from './api/types.ts';

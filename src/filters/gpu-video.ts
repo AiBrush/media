@@ -40,6 +40,7 @@ import {
   type Blit,
   type Dims,
   type OrientedDraw,
+  type Rect,
   cropBlit,
   flipGeometry,
   padBlit,
@@ -402,12 +403,22 @@ class Canvas2DRenderer implements Renderer {
     ctx.imageSmoothingQuality = 'medium';
     if (recipe.kind === 'blit') {
       const { src, dst } = recipe.blit;
+      // Band-limit reductions before the final draw. A single `drawImage` reduction reads a fixed two-texel
+      // footprint (Chromium's is bit-exactly a 1-tap bilinear at any quality hint), so >2:1 point-samples
+      // 2 of every N texels and aliases. Canvas2D cannot express the shared Catmull-Rom kernel the WebGPU
+      // and CPU substrates use, but it can express the one reduction a bilinear tap performs *exactly* —
+      // a 2:1 halving, where the tap lands dead centre between two texels and so IS the 2×2 box. Chaining
+      // those per axis down to within 2:1 is a true box mip-chain: band-limited on both axes independently
+      // (which matters — a non-uniform resize such as 1080×1920→1280×720 reduces only one axis), after
+      // which the final `drawImage` is a ≤2:1 step where a bilinear tap is already correct. The residual
+      // difference from the other substrates is the box chain's slightly softer passband, not aliasing.
+      const reduced = this.bandLimitForReduction(source, src, dst);
       ctx.drawImage(
-        source,
-        src.x,
-        src.y,
-        src.width,
-        src.height,
+        reduced.image,
+        reduced.src.x,
+        reduced.src.y,
+        reduced.src.width,
+        reduced.src.height,
         dst.x,
         dst.y,
         dst.width,
@@ -425,8 +436,92 @@ class Canvas2DRenderer implements Renderer {
     return new VideoFrame(canvas, framedInit(source));
   }
 
+  /**
+   * Halve `src` (per axis, independently) until each axis is within 2:1 of its destination extent, so the
+   * caller's final `drawImage` only ever performs a reduction a bilinear tap can represent. Returns the
+   * image to draw from and the source rect within it. A no-op (returning the frame itself) when neither
+   * axis reduces by more than 2:1, which is every magnification, crop and ≤2:1 downscale.
+   */
+  private bandLimitForReduction(
+    source: VideoFrame,
+    src: Rect,
+    dst: Rect,
+  ): { image: CanvasImageSource; src: Rect } {
+    let width = src.width;
+    let height = src.height;
+    let steps = 0;
+    while (width >= dst.width * 2 || height >= dst.height * 2) {
+      width = width >= dst.width * 2 ? Math.max(dst.width, Math.floor(width / 2)) : width;
+      height = height >= dst.height * 2 ? Math.max(dst.height, Math.floor(height / 2)) : height;
+      steps++;
+    }
+    if (steps === 0) return { image: source, src };
+
+    const scratch = this.acquireScratch({ width: Math.round(width), height: Math.round(height) });
+    // Redo the chain, drawing each step: the loop above only computed the final extents, and every
+    // intermediate must actually be rendered for the box cascade to band-limit.
+    let curW = src.width;
+    let curH = src.height;
+    let from: CanvasImageSource = source;
+    let fromRect: Rect = src;
+    for (let i = 0; i < steps; i++) {
+      const nextW = curW >= dst.width * 2 ? Math.max(dst.width, Math.floor(curW / 2)) : curW;
+      const nextH = curH >= dst.height * 2 ? Math.max(dst.height, Math.floor(curH / 2)) : curH;
+      const target =
+        i === steps - 1
+          ? scratch
+          : this.acquireScratch({ width: Math.round(nextW), height: Math.round(nextH) }, 1);
+      target.ctx.setTransform(1, 0, 0, 1, 0, 0);
+      target.ctx.clearRect(0, 0, target.canvas.width, target.canvas.height);
+      target.ctx.imageSmoothingEnabled = true;
+      target.ctx.imageSmoothingQuality = 'medium';
+      target.ctx.drawImage(
+        from,
+        fromRect.x,
+        fromRect.y,
+        fromRect.width,
+        fromRect.height,
+        0,
+        0,
+        Math.round(nextW),
+        Math.round(nextH),
+      );
+      from = target.canvas;
+      fromRect = { x: 0, y: 0, width: Math.round(nextW), height: Math.round(nextH) };
+      curW = nextW;
+      curH = nextH;
+    }
+    return { image: from, src: fromRect };
+  }
+
+  /**
+   * Scratch canvases for the halving cascade, kept in their own two-slot ring (`slot` 0 is the cascade's
+   * final target, 1 its ping-pong partner) so they never contend with the output ring.
+   */
+  private readonly scratch: (Pooled2DCanvas | undefined)[] = [];
+
+  private acquireScratch(dims: Dims, slot = 0): Pooled2DCanvas {
+    const existing = this.scratch[slot];
+    if (
+      existing !== undefined &&
+      existing.canvas.width === dims.width &&
+      existing.canvas.height === dims.height
+    ) {
+      return existing;
+    }
+    const canvas = new OffscreenCanvas(dims.width, dims.height);
+    const ctx = canvas.getContext('2d', { alpha: true });
+    if (ctx === null) {
+      throw new MediaError('encode-error', 'OffscreenCanvas 2D context unavailable');
+    }
+    const made: Pooled2DCanvas = { canvas, ctx };
+    this.scratch[slot] = made;
+    return made;
+  }
+
   dispose(): void {
     this.pool.length = 0;
+    this.scratch.length = 0;
     this.next = 0;
   }
 }
@@ -509,6 +604,187 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   return premultiply_for_canvas(c);
 }
 `;
+
+/**
+ * Shared WGSL for the two **band-limited resample** passes. `resize` is the one geometric op that changes
+ * the sampling density, and a single `textureSampleBaseClampToEdge` reads a fixed two-texel footprint no
+ * matter how far the image shrinks — so above 2:1 it point-samples 2 of every N source texels and folds the
+ * whole alias band back into the output. These passes instead evaluate the shared Catmull-Rom of
+ * {@link ./resample.ts} with its **support widened by the reduction factor**, so every destination pixel
+ * integrates the entire source footprint it covers. The kernel and the tap geometry are computed from the
+ * same formulas the CPU driver uses, so the two substrates agree pixel-for-pixel up to float precision.
+ *
+ * The filter is applied **separably** — horizontal into an `rgba16float` intermediate, then vertical into
+ * the output canvas — which costs `tapsX + tapsY` texture reads per pixel instead of `tapsX * tapsY`. That
+ * is what keeps a 10:1 reduction (≈43 taps per axis) affordable; the naive 2-D form would need ~1850.
+ */
+const RESAMPLE_KERNEL_WGSL = /* wgsl */ `
+struct Resample {
+  // Sub-rect origin and extent along the axis being filtered, in source pixels.
+  srcStart : f32,
+  srcSpan : f32,
+  // srcSpan / dstLen. >1 reduces (support widens); <=1 magnifies (support stays at the kernel radius).
+  scale : f32,
+  filterScale : f32,
+  // Kernel support half-width in source pixels: 2 * filterScale.
+  support : f32,
+  // Clamp bound: the source texture's extent along the filtered axis.
+  srcLen : f32,
+  // Destination extent along the filtered axis.
+  dstLen : f32,
+  // Sub-rect origin along the axis NOT being filtered (rows for the horizontal pass).
+  otherStart : f32,
+};
+@group(0) @binding(0) var<uniform> r : Resample;
+
+// Catmull-Rom (Keys, B=0 C=1/2) — identical to catmullRom() in resample.ts.
+fn catrom(t : f32) -> f32 {
+  let x = abs(t);
+  if (x >= 2.0) { return 0.0; }
+  let x2 = x * x;
+  let x3 = x2 * x;
+  if (x < 1.0) { return 1.5 * x3 - 2.5 * x2 + 1.0; }
+  return -0.5 * x3 + 2.5 * x2 - 4.0 * x + 2.0;
+}
+
+// Kernel selection mirrors planResampleAxis(): the widened Catmull-Rom only when this axis actually
+// reduces, otherwise the tent — the same bilinear reconstruction the single-tap path applied.
+fn weight_at(t : f32) -> f32 {
+  if (r.scale > 1.0) { return catrom(t); }
+  let x = abs(t);
+  return select(0.0, 1.0 - x, x < 1.0);
+}
+
+struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) i : u32) -> VSOut {
+  var q = array<vec2<f32>, 4>(
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0));
+  let ndc = vec2<f32>(2.0 * q[i].x - 1.0, 1.0 - 2.0 * q[i].y);
+  var o : VSOut;
+  o.pos = vec4<f32>(ndc, 0.0, 1.0);
+  o.uv = q[i];
+  return o;
+}
+`;
+
+/**
+ * Horizontal pass: sample the imported external texture, filter along x, write the unpremultiplied result
+ * into the `rgba16float` intermediate. Float storage keeps the kernel's negative-lobe overshoot and avoids
+ * quantising between the two passes.
+ */
+export const WEBGPU_RESAMPLE_H_SHADER_SOURCE = /* wgsl */ `
+${RESAMPLE_KERNEL_WGSL}
+@group(0) @binding(1) var samp : sampler;
+@group(0) @binding(2) var tex : texture_external;
+
+@fragment
+fn fs(in : VSOut) -> @location(0) vec4<f32> {
+  let dims = vec2<f32>(textureDimensions(tex));
+  // Destination column index (pass output is dstLen wide), then the source centre it maps back to.
+  let d = floor(in.uv.x * r.dstLen);
+  let centre = r.srcStart + (d + 0.5) * r.scale;
+  let first = ceil(centre - r.support - 0.5);
+  let last = floor(centre + r.support - 0.5);
+  // Row is untouched by this pass: read the source row straight through.
+  let row = r.otherStart + floor(in.uv.y * dims.y) + 0.5;
+
+  var acc = vec4<f32>(0.0);
+  var wsum = 0.0;
+  var s = first;
+  loop {
+    if (s > last) { break; }
+    let w = weight_at((s + 0.5 - centre) / r.filterScale);
+    if (w != 0.0) {
+      let sx = clamp(s, 0.0, r.srcLen - 1.0) + 0.5;
+      acc = acc + w * textureSampleBaseClampToEdge(tex, samp, vec2<f32>(sx / dims.x, row / dims.y));
+      wsum = wsum + w;
+    }
+    s = s + 1.0;
+  }
+  if (wsum == 0.0) { return vec4<f32>(0.0); }
+  return acc / wsum;
+}
+`;
+
+/**
+ * Vertical pass: filter the intermediate along y and write the premultiplied result to the output canvas.
+ * `textureLoad` reads intermediate texels exactly (no sampler, no filtering of its own).
+ */
+export const WEBGPU_RESAMPLE_V_SHADER_SOURCE = /* wgsl */ `
+${RESAMPLE_KERNEL_WGSL}
+${PREMULTIPLY_CANVAS_WGSL}
+@group(0) @binding(1) var tex : texture_2d<f32>;
+
+@fragment
+fn fs(in : VSOut) -> @location(0) vec4<f32> {
+  let dims = vec2<i32>(textureDimensions(tex));
+  let d = floor(in.uv.y * r.dstLen);
+  let centre = r.srcStart + (d + 0.5) * r.scale;
+  let first = ceil(centre - r.support - 0.5);
+  let last = floor(centre + r.support - 0.5);
+  let col = i32(floor(in.uv.x * f32(dims.x)));
+
+  var acc = vec4<f32>(0.0);
+  var wsum = 0.0;
+  var s = first;
+  loop {
+    if (s > last) { break; }
+    let w = weight_at((s + 0.5 - centre) / r.filterScale);
+    if (w != 0.0) {
+      let sy = clamp(i32(s), 0, dims.y - 1);
+      acc = acc + w * textureLoad(tex, vec2<i32>(col, sy), 0);
+      wsum = wsum + w;
+    }
+    s = s + 1.0;
+  }
+  if (wsum == 0.0) { return vec4<f32>(0.0); }
+  return premultiply_for_canvas(clamp(acc / wsum, vec4<f32>(0.0), vec4<f32>(1.0)));
+}
+`;
+
+/** Bytes for the {@link WEBGPU_RESAMPLE_H_SHADER_SOURCE} `Resample` block: 8 × f32, padded to 16. */
+export const RESAMPLE_UNIFORM_BYTES = 32;
+
+/**
+ * Intermediate format for the horizontal pass. Float storage keeps the Catmull-Rom's negative-lobe
+ * overshoot (which an 8-bit target would clip, biasing edges) and avoids quantising between the passes.
+ */
+const RESAMPLE_INTERMEDIATE_FORMAT: GPUTextureFormat = 'rgba16float';
+
+/** Whether a {@link Blit} changes the sampling density, i.e. needs resampling rather than a 1:1 copy. */
+export function blitScales(blit: Blit): boolean {
+  return blit.src.width !== blit.dst.width || blit.src.height !== blit.dst.height;
+}
+
+/**
+ * Pack the per-axis resample uniforms. `srcStart`/`srcSpan` select the source sub-rect along the filtered
+ * axis, `dstLen` is the destination extent, `otherStart` the sub-rect origin along the untouched axis.
+ * Mirrors {@link ./resample.ts}'s `planResampleAxis` exactly.
+ */
+export function packResampleUniforms(
+  srcStart: number,
+  srcSpan: number,
+  dstLen: number,
+  srcLen: number,
+  otherStart: number,
+): ArrayBuffer {
+  const buffer = new ArrayBuffer(RESAMPLE_UNIFORM_BYTES);
+  const f = new Float32Array(buffer);
+  const scale = srcSpan / dstLen;
+  const reducing = scale > 1;
+  const filterScale = reducing ? scale : 1;
+  f[0] = srcStart;
+  f[1] = srcSpan;
+  f[2] = scale;
+  f[3] = filterScale;
+  f[4] = (reducing ? 2 : 1) * filterScale; // kernel radius × filterScale
+  f[5] = srcLen;
+  f[6] = dstLen;
+  f[7] = otherStart;
+  return buffer;
+}
 
 /**
  * WGSL for the **colour** pipeline (ADR-032): a full-frame quad that samples the external texture and
@@ -644,6 +920,13 @@ interface GpuContext {
   uniformBuffer: GPUBuffer;
   /** The colour pipeline + its uniform buffer, created on the first colour frame (null until then). */
   color: { pipeline: GPURenderPipeline; uniformBuffer: GPUBuffer } | null;
+  /** The two band-limited resample pipelines + their uniform buffers, built on the first scaling blit. */
+  resample: {
+    horizontal: GPURenderPipeline;
+    vertical: GPURenderPipeline;
+    uniformH: GPUBuffer;
+    uniformV: GPUBuffer;
+  } | null;
 }
 
 /** A pooled WebGPU output canvas with its configured context (configured once, reused per frame). */
@@ -701,7 +984,140 @@ class WebGPURenderer implements Renderer {
       size: UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    return new WebGPURenderer({ device, pipeline, sampler, uniformBuffer, color: null }, format);
+    return new WebGPURenderer(
+      { device, pipeline, sampler, uniformBuffer, color: null, resample: null },
+      format,
+    );
+  }
+
+  /**
+   * Lazily build (once) the horizontal+vertical resample pipelines and their uniform buffers. The
+   * horizontal pass targets an `rgba16float` intermediate (float storage preserves the kernel's
+   * negative-lobe overshoot between passes); the vertical pass targets the canvas format.
+   */
+  private resampleBundle(gpu: GpuContext): NonNullable<GpuContext['resample']> {
+    if (gpu.resample !== null) return gpu.resample;
+    const build = (code: string, format: GPUTextureFormat): GPURenderPipeline => {
+      const module = gpu.device.createShaderModule({ code });
+      return gpu.device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs' },
+        fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-strip' },
+      });
+    };
+    const uniform = (): GPUBuffer =>
+      gpu.device.createBuffer({
+        size: RESAMPLE_UNIFORM_BYTES,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    gpu.resample = {
+      horizontal: build(WEBGPU_RESAMPLE_H_SHADER_SOURCE, RESAMPLE_INTERMEDIATE_FORMAT),
+      vertical: build(WEBGPU_RESAMPLE_V_SHADER_SOURCE, this.format),
+      uniformH: uniform(),
+      uniformV: uniform(),
+    };
+    return gpu.resample;
+  }
+
+  /** Reusable horizontal-pass target, reallocated only when the required extent changes. */
+  private intermediate: { texture: GPUTexture; width: number; height: number } | undefined;
+
+  private acquireIntermediate(device: GPUDevice, width: number, height: number): GPUTexture {
+    const existing = this.intermediate;
+    if (existing !== undefined && existing.width === width && existing.height === height) {
+      return existing.texture;
+    }
+    existing?.texture.destroy();
+    const texture = device.createTexture({
+      size: { width, height },
+      format: RESAMPLE_INTERMEDIATE_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.intermediate = { texture, width, height };
+    return texture;
+  }
+
+  /**
+   * Two-pass separable band-limited resample of a scaling {@link Blit}: horizontal into the intermediate,
+   * vertical into the output canvas. The output is cleared first, so a `contain` letterbox (a `dst` rect
+   * smaller than `dims`) keeps its transparent bars — the vertical pass covers only the `dst` rect.
+   */
+  private renderResampledBlit(gpu: GpuContext, source: VideoFrame, blit: Blit): VideoFrame {
+    const { src, dst, dims } = blit;
+    const bundle = this.resampleBundle(gpu);
+    const { canvas, context } = this.acquireCanvas(gpu.device, dims);
+    const midW = Math.max(1, Math.round(dst.width));
+    const midH = Math.max(1, Math.round(src.height));
+    const intermediate = this.acquireIntermediate(gpu.device, midW, midH);
+
+    gpu.device.queue.writeBuffer(
+      bundle.uniformH,
+      0,
+      packResampleUniforms(src.x, src.width, midW, source.displayWidth, src.y),
+    );
+    gpu.device.queue.writeBuffer(
+      bundle.uniformV,
+      0,
+      packResampleUniforms(0, src.height, Math.max(1, Math.round(dst.height)), midH, 0),
+    );
+
+    const external = gpu.device.importExternalTexture({ source, colorSpace: 'srgb' });
+    const encoder = gpu.device.createCommandEncoder();
+
+    const passH = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: intermediate.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    });
+    passH.setPipeline(bundle.horizontal);
+    passH.setBindGroup(
+      0,
+      gpu.device.createBindGroup({
+        layout: bundle.horizontal.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: bundle.uniformH } },
+          { binding: 1, resource: gpu.sampler },
+          { binding: 2, resource: external },
+        ],
+      }),
+    );
+    passH.draw(4);
+    passH.end();
+
+    const passV = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: context.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    });
+    passV.setPipeline(bundle.vertical);
+    passV.setBindGroup(
+      0,
+      gpu.device.createBindGroup({
+        layout: bundle.vertical.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: bundle.uniformV } },
+          { binding: 1, resource: intermediate.createView() },
+        ],
+      }),
+    );
+    // Scissor the draw to the destination rect so a `contain` letterbox keeps the cleared bars.
+    passV.setViewport(dst.x, dst.y, dst.width, dst.height, 0, 1);
+    passV.draw(4);
+    passV.end();
+
+    gpu.device.queue.submit([encoder.finish()]);
+    return new VideoFrame(canvas, framedInit(source));
   }
 
   /** Lazily build (once) the second colour pipeline + its uniform buffer; reused for every colour frame. */
@@ -750,6 +1166,12 @@ class WebGPURenderer implements Renderer {
     if (gpu === undefined) throw new MediaError('encode-error', 'WebGPU renderer already disposed');
     if (recipe.kind !== 'color' && webgpuGeometryNeedsCanvasColorManagement(source.colorSpace)) {
       return this.colorManagedGeometry.render(source, recipe);
+    }
+    // A blit that actually changes the sampling density goes through the band-limited two-pass resampler;
+    // a single bilinear tap would point-sample the footprint and alias above 2:1. Crop/1:1 blits keep the
+    // cheaper one-pass quad — there is no density change to filter.
+    if (recipe.kind === 'blit' && blitScales(recipe.blit)) {
+      return this.renderResampledBlit(gpu, source, recipe.blit);
     }
     const dims = recipeDims(recipe);
     const { canvas, context } = this.acquireCanvas(gpu.device, dims);
@@ -800,6 +1222,10 @@ class WebGPURenderer implements Renderer {
     if (this.gpu !== undefined) {
       this.gpu.uniformBuffer.destroy();
       this.gpu.color?.uniformBuffer.destroy();
+      this.gpu.resample?.uniformH.destroy();
+      this.gpu.resample?.uniformV.destroy();
+      this.intermediate?.texture.destroy();
+      this.intermediate = undefined;
       this.gpu.device.destroy(); // invalidates every pooled canvas context configured on this device
       this.gpu = undefined;
     }

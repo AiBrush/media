@@ -4,7 +4,7 @@
  * transforms** — colorspace/tonemap math and the routed geometry — exhaustively, with the key oracle being **parity
  * with the GPU math**: the CPU colour apply must equal an independent recomputation from the *same* pure
  * primitives the GPU shader mirrors (`eotf`/`oetf`/`applyMat3`/tonemap from gpu-uniforms.ts), plus a few
- * hand-computed ground truths. We also cover geometry (crop exact, flip/rotate lossless, resize bilinear),
+ * hand-computed ground truths. We also cover geometry (crop exact, flip/rotate lossless, band-limited resize),
  * the spec→plan dispatch, the `VideoColorSpace` mapping, and the driver's Node-observable contract.
  */
 
@@ -365,7 +365,7 @@ describe('geometryToRgba — rotate (lossless, dim swap)', () => {
   });
 });
 
-describe('geometryToRgba — resize (bilinear)', () => {
+describe('geometryToRgba — resize (band-limited)', () => {
   it('upscaling a 1×1 fills the whole output with that colour', () => {
     const recipe = planCpuGeometry(
       { mediaType: 'video', type: 'resize', width: 4, height: 4 },
@@ -380,8 +380,8 @@ describe('geometryToRgba — resize (bilinear)', () => {
     }
   });
 
-  it('downscaling a 2×2 to 1×1 averages toward the source pixels (bilinear, in-gamut)', () => {
-    // 2×2: [0, 100; 200, 255] grey. A 1×1 resize samples near the centre → an interior value.
+  it('downscaling a 2×2 to 1×1 averages the source pixels (2:1 box, in-gamut)', () => {
+    // 2×2: [0, 100; 200, 255] grey. At exactly 2:1 the kernel spans the whole source → their mean.
     const src = img(
       2,
       2,

@@ -14,7 +14,8 @@ import { CapabilityError } from '../contracts/errors.ts';
 import WebcodecsVideoModule, {
   ACCELERATION_PROBE_ORDER,
   type EnqueueSink,
-  PendingOutputBackpressure,
+  ENCODER_QUEUE_HIGH_WATER_MARK,
+  drainBelowHighWater,
   type SupportProbe,
   VIDEO_CODEC_PREFIXES,
   type WarmDecoderFactory,
@@ -377,59 +378,92 @@ describe('queueIsBackpressured — decode/encode queue threshold', () => {
   });
 });
 
-describe('PendingOutputBackpressure — bounded encoder output accounting', () => {
-  it('waits at the exact bound and wakes when one output completes', async () => {
-    const gate = new PendingOutputBackpressure(2);
-    gate.submitted();
-    gate.submitted();
+describe('drainBelowHighWater — native WebCodecs queue pacing', () => {
+  class FakeCodecQueue extends EventTarget {
+    queueSize = 0;
+
+    drainTo(queueSize: number): void {
+      this.queueSize = queueSize;
+      this.dispatchEvent(new Event('dequeue'));
+    }
+  }
+
+  it('returns immediately while the native queue is below the bound', async () => {
+    const coder = new FakeCodecQueue();
+    coder.queueSize = ENCODER_QUEUE_HIGH_WATER_MARK - 1;
+    await expect(
+      drainBelowHighWater(coder, () => coder.queueSize, undefined, ENCODER_QUEUE_HIGH_WATER_MARK),
+    ).resolves.toBeUndefined();
+  });
+
+  it('waits at the bound and resumes on the dequeue that drops below it', async () => {
+    const coder = new FakeCodecQueue();
+    coder.queueSize = ENCODER_QUEUE_HIGH_WATER_MARK;
     let released = false;
-    const waiting = gate.waitForRoom(undefined).then(() => {
+    const waiting = drainBelowHighWater(
+      coder,
+      () => coder.queueSize,
+      undefined,
+      ENCODER_QUEUE_HIGH_WATER_MARK,
+    ).then(() => {
       released = true;
     });
     await Promise.resolve();
     expect(released).toBe(false);
-    expect(gate.pending).toBe(2);
 
-    gate.completed();
+    // A dequeue that leaves the queue at the bound must not release the writer.
+    coder.drainTo(ENCODER_QUEUE_HIGH_WATER_MARK);
+    await Promise.resolve();
+    expect(released).toBe(false);
+
+    coder.drainTo(ENCODER_QUEUE_HIGH_WATER_MARK - 1);
     await waiting;
     expect(released).toBe(true);
-    expect(gate.pending).toBe(1);
   });
 
-  it('accounts for synchronous encode failure without underflowing', async () => {
-    const gate = new PendingOutputBackpressure(1);
-    gate.submitted();
-    gate.completed();
-    gate.completed();
-    expect(gate.pending).toBe(0);
-    await expect(gate.waitForRoom(undefined)).resolves.toBeUndefined();
+  it('never gates on emitted output, so an encoder that buffers a deep GOP still runs', async () => {
+    // Every measured browser encoder holds tens of frames before its first chunk. The queue gate must
+    // depend only on frames the encoder has not yet consumed, so submission keeps flowing regardless.
+    const coder = new FakeCodecQueue();
+    let submitted = 0;
+    const emitted = 0;
+    for (let i = 0; i < 64; i++) {
+      await drainBelowHighWater(
+        coder,
+        () => coder.queueSize,
+        undefined,
+        ENCODER_QUEUE_HIGH_WATER_MARK,
+      );
+      coder.queueSize = Math.min(ENCODER_QUEUE_HIGH_WATER_MARK - 1, coder.queueSize + 1);
+      submitted++;
+      queueMicrotask(() => coder.drainTo(Math.max(0, coder.queueSize - 1)));
+    }
+    expect(submitted).toBe(64);
+    expect(emitted).toBe(0);
   });
 
-  it('rejects a blocked writer on abort and removes its waiter', async () => {
-    const gate = new PendingOutputBackpressure(1);
+  it('rejects a blocked writer on abort', async () => {
+    const coder = new FakeCodecQueue();
+    coder.queueSize = ENCODER_QUEUE_HIGH_WATER_MARK;
     const abort = new AbortController();
-    gate.submitted();
-    const waiting = gate.waitForRoom(abort.signal);
+    const waiting = drainBelowHighWater(
+      coder,
+      () => coder.queueSize,
+      abort.signal,
+      ENCODER_QUEUE_HIGH_WATER_MARK,
+    );
     abort.abort();
     await expect(waiting).rejects.toMatchObject({ code: 'aborted' });
-    gate.completed();
-    await expect(gate.waitForRoom(undefined)).resolves.toBeUndefined();
   });
 
-  it('propagates a terminal encoder error to current and future submissions', async () => {
-    const gate = new PendingOutputBackpressure(1);
-    const error = new Error('native encoder failed');
-    gate.submitted();
-    const waiting = gate.waitForRoom(undefined);
-    gate.fail(error);
-    await expect(waiting).rejects.toBe(error);
-    expect(() => gate.submitted()).toThrow(error);
-    await expect(gate.waitForRoom(undefined)).rejects.toBe(error);
-  });
-
-  it('rejects a non-positive bound', () => {
-    expect(() => new PendingOutputBackpressure(0)).toThrow(RangeError);
-    expect(() => new PendingOutputBackpressure(-1)).toThrow(RangeError);
+  it('bounds retained uncompressed pictures to the documented four-frame footprint', () => {
+    expect(ENCODER_QUEUE_HIGH_WATER_MARK).toBe(4);
+    expect(
+      queueIsBackpressured(ENCODER_QUEUE_HIGH_WATER_MARK - 1, ENCODER_QUEUE_HIGH_WATER_MARK),
+    ).toBe(false);
+    expect(queueIsBackpressured(ENCODER_QUEUE_HIGH_WATER_MARK, ENCODER_QUEUE_HIGH_WATER_MARK)).toBe(
+      true,
+    );
   });
 });
 

@@ -51,7 +51,7 @@ interface Mp3FrameRun {
 interface Mp3MuxTrack {
   readonly id: number;
   readonly chunks: ChunkStruct[];
-  readonly gapless: TrackInfo['gapless'];
+  gapless: TrackInfo['gapless'];
   frameCount: number;
   audioBytes: number;
   firstHeader: Mp3FrameHeader | undefined;
@@ -105,6 +105,21 @@ export class Mp3Muxer implements Muxer {
       firstHeader: undefined,
     };
     return id;
+  }
+
+  /**
+   * Attach the destination gapless window after the fact. A newly encoded MP3 only knows its own
+   * priming and terminal padding once the encoder has drained, which is after `addTrack` has already
+   * run; nothing is serialized until {@link finalize}, so the Xing/LAME tag this frame count feeds is
+   * still unwritten and simply picks the timing up.
+   */
+  setTrackGapless(trackId: number, gapless: NonNullable<TrackInfo['gapless']>): void {
+    this.#assertOpen();
+    const track = this.#track;
+    if (track === undefined || track.id !== trackId) {
+      throw new MediaError('mux-error', `set gapless timing on unknown track ${trackId}`);
+    }
+    track.gapless = { ...gapless };
   }
 
   /**
@@ -168,7 +183,9 @@ export class Mp3Muxer implements Muxer {
   }
 }
 
-export function muxPreparedMp3PacketTrack(input: PreparedMp3PacketMuxInput): Uint8Array {
+export function muxPreparedMp3PacketTrack(
+  input: PreparedMp3PacketMuxInput,
+): Uint8Array<ArrayBuffer> {
   const { track: info } = input;
   if (info.mediaType !== 'audio' || info.codec !== 'mp3') {
     throw new CapabilityError(

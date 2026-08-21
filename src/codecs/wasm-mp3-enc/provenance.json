@@ -1,0 +1,34 @@
+{
+  "note": "Provenance for the vendored prebuilt LAME MP3-encoder WASM core. Self-hosted (committed and served same-origin via new URL('./mp3_enc_wasm_bg.wasm', import.meta.url), NOT a runtime CDN dependency); scripts/vendor-wasm.ts co-vendors the *_wasm_bg.wasm + *-core.js pair into dist/. The npm wrapper package is MIT; the compiled encoder is LAME 3.100, LGPL-2.0-or-later. The vendored artifact is the unmodified upstream .wasm byte-for-byte; the loader glue (mp3-enc-core.js) is this repo's own MIT code. Re-vendor + sha256-refresh steps are in BUILD.md.",
+  "package": "wasm-media-encoders",
+  "version": "0.7.0",
+  "url": "https://registry.npmjs.org/wasm-media-encoders/-/wasm-media-encoders-0.7.0.tgz",
+  "tarballSha256": "1ffcadae8dd439253148dfc5e73dd1a0be89b61ba342886707d8b39123f26adc",
+  "licenses": {
+    "wrapper": "MIT",
+    "lame": "LGPL-2.0-or-later"
+  },
+  "upstream": "https://github.com/arseneyr/wasm-media-encoders",
+  "encoder": {
+    "project": "LAME",
+    "version": "3.100",
+    "home": "https://lame.sourceforge.io/",
+    "source": "https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz",
+    "sourceSha256": "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
+    "licenseText": "LICENSE.lame",
+    "licenseTextSha256": "bfe4a52dc4645385f356a8e83cc54216a293e3b6f1cb4f79f5fc0277abf937fd"
+  },
+  "artifacts": [
+    {
+      "file": "mp3_enc_wasm_bg.wasm",
+      "from": "package/wasm/mp3.wasm",
+      "bytes": 132999,
+      "sha256": "85e81719250b9a667b1258143f689dda70e3e57a7e7c29ab0b4cef65c8f6eb9a"
+    },
+    {
+      "file": "LICENSE.wasm-media-encoders",
+      "from": "package/LICENSE",
+      "sha256": "7f766c19bc26ca14d9dad1bf102211f12b0a5c139f66e1132a9867fcfa04bdf0"
+    }
+  ]
+}

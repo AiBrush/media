@@ -420,7 +420,7 @@ describe('Opus authoring — vendored libopus core, Ogg-mux, ffmpeg-decodable (A
       const snr = snrDb(pcm.interleaved, decoded, ch);
       expect(snr, `${ch}ch 48kHz tonal SNR`).toBeGreaterThan(SNR_FLOOR_DB);
     }
-  }, 30_000);
+  });
 
   it('encodes every Opus input rate {8,12,16,24,48} kHz; ffmpeg decodes valid Opus of the right length', async () => {
     const tool = externalDecoder();
@@ -441,7 +441,7 @@ describe('Opus authoring — vendored libopus core, Ogg-mux, ffmpeg-decodable (A
         frameSamplesAtRate(rate, 20) + 1,
       );
     }
-  }, 30_000);
+  });
 
   it('encodes real 48 kHz audio fixtures; ffmpeg decodes ≈ source (≥3 real files)', async () => {
     const tool = externalDecoder();
@@ -456,7 +456,7 @@ describe('Opus authoring — vendored libopus core, Ogg-mux, ffmpeg-decodable (A
       const snr = snrDb(pcm.interleaved, decoded, pcm.channels);
       expect(snr, `${id} SNR`).toBeGreaterThan(SNR_FLOOR_DB);
     }
-  }, 30_000);
+  });
 
   it('produces genuinely compressed Opus (smaller than the source PCM)', async () => {
     const core = await loadCore();
@@ -464,7 +464,7 @@ describe('Opus authoring — vendored libopus core, Ogg-mux, ffmpeg-decodable (A
     const ogg = await encodeToOggOpus(core, pcm, 96_000);
     const sourceBytes = pcm.frames * pcm.channels * 2; // s16
     expect(ogg.byteLength).toBeLessThan(sourceBytes);
-  }, 30_000);
+  });
 });
 
 describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.10, ADR-088)', () => {
@@ -504,7 +504,7 @@ describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.1
     const reference = ffmpegDecodeFile('sfx-opus.ogg', channels, sampleRate);
     const snr = snrSigned(reference, ours, channels);
     expect(snr, 'our Opus decode vs ffmpeg').toBeGreaterThan(60);
-  }, 30_000);
+  });
 
   it('decodes real stereo Opus-in-WebM (bear-opus.webm) ≈ ffmpeg (both are libopus)', async () => {
     const tool = externalDecoder();
@@ -544,7 +544,7 @@ describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.1
     expect(snrSigned(reference, ours, channels), 'our WebM-Opus decode vs ffmpeg').toBeGreaterThan(
       40,
     );
-  }, 30_000);
+  });
 
   it('round-trips: our encode → our decode reproduces the source (≥ the lossy floor)', async () => {
     const core = await loadCore();
@@ -582,5 +582,5 @@ describe('Opus DECODE — vendored libopus core vs the ffmpeg reference (§3.C.1
       snrSigned(pcm.interleaved, decoded, pcm.channels),
       'encode→decode round-trip SNR',
     ).toBeGreaterThan(SNR_FLOOR_DB);
-  }, 30_000);
+  });
 });

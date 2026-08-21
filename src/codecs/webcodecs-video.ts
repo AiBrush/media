@@ -149,90 +149,6 @@ export function queueIsBackpressured(queueSize: number, highWaterMark: number): 
   return queueSize >= highWaterMark;
 }
 
-interface PendingOutputWaiter {
-  resolve(): void;
-  reject(error: Error): void;
-  cleanup(): void;
-}
-
-/**
- * Bounds submitted encoder frames by completed outputs instead of `VideoEncoder.encodeQueueSize`.
- *
- * Chromium's native `dequeue` signal can lag the actual encoder output callback enough to serialize an
- * otherwise healthy pipeline. Output completion is the resource boundary that matters here: until an
- * encoded chunk arrives, the encoder may still retain the submitted frame. This tracker therefore keeps
- * that exact population bounded without allowing the native control queue to grow without limit.
- *
- * The class is WebCodecs-independent so its wakeup, abort, and terminal-error behavior is unit-tested in
- * Node. Call {@link submitted} immediately before `encode()`, and {@link completed} once from the output
- * callback (or if `encode()` throws synchronously).
- */
-export class PendingOutputBackpressure {
-  readonly highWaterMark: number;
-  #pending = 0;
-  #terminalError: Error | undefined;
-  readonly #waiters = new Set<PendingOutputWaiter>();
-
-  constructor(highWaterMark: number) {
-    if (!(highWaterMark > 0)) {
-      throw new RangeError(`highWaterMark must be positive, got ${highWaterMark}`);
-    }
-    this.highWaterMark = highWaterMark;
-  }
-
-  get pending(): number {
-    return this.#pending;
-  }
-
-  submitted(): void {
-    if (this.#terminalError) throw this.#terminalError;
-    this.#pending++;
-  }
-
-  completed(): void {
-    if (this.#pending > 0) this.#pending--;
-    if (!queueIsBackpressured(this.#pending, this.highWaterMark)) {
-      for (const waiter of this.#waiters) waiter.resolve();
-      this.#waiters.clear();
-    }
-  }
-
-  waitForRoom(signal: AbortSignal | undefined): Promise<void> {
-    if (this.#terminalError) return Promise.reject(this.#terminalError);
-    if (signal?.aborted) {
-      return Promise.reject(new MediaError('aborted', 'operation aborted'));
-    }
-    if (!queueIsBackpressured(this.#pending, this.highWaterMark)) return Promise.resolve();
-
-    return new Promise<void>((resolve, reject) => {
-      const onAbort = (): void => {
-        this.#waiters.delete(waiter);
-        waiter.reject(new MediaError('aborted', 'operation aborted'));
-      };
-      const cleanup = (): void => signal?.removeEventListener('abort', onAbort);
-      const waiter: PendingOutputWaiter = {
-        resolve: () => {
-          cleanup();
-          resolve();
-        },
-        reject: (error) => {
-          cleanup();
-          reject(error);
-        },
-        cleanup,
-      };
-      this.#waiters.add(waiter);
-      signal?.addEventListener('abort', onAbort, { once: true });
-    });
-  }
-
-  fail(error: Error): void {
-    if (this.#terminalError === undefined) this.#terminalError = error;
-    for (const waiter of this.#waiters) waiter.reject(this.#terminalError);
-    this.#waiters.clear();
-  }
-}
-
 /**
  * `Transformer` plus the standard `cancel(reason)` hook (fired when the readable is cancelled — e.g. a
  * consumer `reader.cancel()`). The bundled `lib.dom` `Transformer` predates `cancel`, so we add it with a
@@ -830,7 +746,20 @@ function readDecoderAlpha(o: StageOptions | undefined): AlphaOption | undefined 
 // ── environment guards ───────────────────────────────────────────────────────────────────────────
 
 const HIGH_WATER_MARK = 16 as const; // pending decoder requests tolerated before awaiting `dequeue`
-const ENCODER_OUTPUT_HIGH_WATER_MARK = 10 as const;
+/**
+ * Raw frames handed to `VideoEncoder.encode()` but not yet taken off its control queue — the only
+ * uncompressed pictures our submission causes the encoder to retain, and therefore the population the
+ * memory budget's "four decoded frame footprints" clause bounds.
+ *
+ * It deliberately does NOT bound *emitted* chunks. Every measured browser encoder buffers a deep
+ * reorder/lookahead window before its first output (Chromium 41, Firefox 29–37, WebKit 33 frames at
+ * 1080p), so gating submission on completed outputs throttles the pipeline to the encoder's *latency*
+ * instead of its throughput: at a cap of 10 pending outputs Firefox admitted 12 frames in 20 s (0.6 fps)
+ * against 243 fps with this queue gate, and Chromium/WebKit lost 8–10% for nothing. End-to-end wall time
+ * is flat from a cap of 2 up to 16 on all three engines — the encoder, not the gate, is the limiter — so
+ * the smallest cap that costs no throughput is the right one.
+ */
+export const ENCODER_QUEUE_HIGH_WATER_MARK = 4 as const;
 
 function hasVideoDecoder(): boolean {
   return typeof VideoDecoder !== 'undefined';
@@ -987,9 +916,15 @@ function describeError(e: unknown): string {
 
 /* v8 ignore start -- the live coder paths require WebCodecs; validated under browser-mode (Phase 1) */
 
+/** The `dequeue`-event surface both WebCodecs video coders expose; a bare `EventTarget` satisfies it. */
+export interface VideoCodecQueue {
+  addEventListener(type: 'dequeue', listener: () => void): void;
+  removeEventListener(type: 'dequeue', listener: () => void): void;
+}
+
 /** Resolve on the next `dequeue` (queue drained) or reject on abort; cleans up its listeners either way. */
 function awaitDequeueOrAbort(
-  coder: VideoDecoder | VideoEncoder,
+  coder: VideoCodecQueue,
   signal: AbortSignal | undefined,
 ): Promise<void> {
   if (signal?.aborted) return Promise.reject(new MediaError('aborted', 'operation aborted'));
@@ -1011,14 +946,18 @@ function awaitDequeueOrAbort(
   });
 }
 
-/** Await until the coder's pending-work queue falls below the high-water mark (or abort). */
-async function drainBelowHighWater(
-  coder: VideoDecoder | VideoEncoder,
+/**
+ * Await until the coder's pending-work queue falls below the high-water mark (or abort). `sizeOf` reads
+ * the native queue depth — `decodeQueueSize`/`encodeQueueSize` — so the loop stays independent of which
+ * coder it drives and remains drivable by a plain `EventTarget` in Node.
+ */
+export async function drainBelowHighWater(
+  coder: VideoCodecQueue,
+  sizeOf: () => number,
   signal: AbortSignal | undefined,
+  highWaterMark: number = HIGH_WATER_MARK,
 ): Promise<void> {
-  const sizeOf = (): number =>
-    coder instanceof VideoDecoder ? coder.decodeQueueSize : coder.encodeQueueSize;
-  while (queueIsBackpressured(sizeOf(), HIGH_WATER_MARK)) {
+  while (queueIsBackpressured(sizeOf(), highWaterMark)) {
     await awaitDequeueOrAbort(coder, signal);
   }
 }
@@ -1326,7 +1265,8 @@ function createVideoDecoder(
           needsKeyChunk = false;
         }
         await waitForOutputRoom();
-        await drainBelowHighWater(decoder, signal);
+        const pending = decoder;
+        await drainBelowHighWater(pending, () => pending.decodeQueueSize, signal);
         if (closed) throw streamClosedError();
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         decoder.decode(chunk);
@@ -1420,7 +1360,6 @@ function createVideoEncoder(
   let submittedEncodeCount = 0;
   let lastSubmittedTimestamp: number | undefined;
   const rateControlWarmupTimestampsPending = new Set<number>();
-  const outputBackpressure = new PendingOutputBackpressure(ENCODER_OUTPUT_HIGH_WATER_MARK);
   let alignmentCanvas: OffscreenCanvas | undefined;
   const platform = typeof navigator === 'undefined' ? undefined : navigator.platform;
   const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(config, platform);
@@ -1431,13 +1370,46 @@ function createVideoEncoder(
   // — it drops the chunk instead. Prevents the "enqueue into a closed readable" throw when the muxer
   // closes/cancels early (mux error, early-stop trim, abort) while the encoder is still draining.
   let closed = false;
+  // Resolves when the stream is disposed, so a submitter parked on the encoder's `dequeue` event wakes up
+  // even though a disposed encoder will never fire one again.
+  let releaseDisposal: (() => void) | undefined;
+  const disposed = new Promise<void>((resolve) => {
+    releaseDisposal = resolve;
+  });
 
   const dispose = (error = new MediaError('aborted', 'video encoder stream closed')): void => {
+    void error;
     closed = true;
-    outputBackpressure.fail(error);
     if (encoder && encoder.state !== 'closed') encoder.close(); // stop WebCodecs emitting
     alignmentCanvas = undefined;
     rateControlWarmupTimestampsPending.clear();
+    releaseDisposal?.();
+  };
+
+  /**
+   * Wait until the encoder's control queue has room. `encodeQueueSize` is the WebCodecs-defined measure of
+   * frames we have handed over that the encoder has not consumed yet — exactly the uncompressed pictures
+   * our submission keeps alive. Chunks already emitted are bounded separately by the readable's own
+   * high-water mark, which the `TransformStream` propagates back to this writable side.
+   */
+  const awaitEncoderQueueRoom = async (): Promise<void> => {
+    const pending = encoder;
+    if (!pending) return;
+    while (
+      !closed &&
+      queueIsBackpressured(pending.encodeQueueSize, ENCODER_QUEUE_HIGH_WATER_MARK)
+    ) {
+      await Promise.race([
+        drainBelowHighWater(
+          pending,
+          () => pending.encodeQueueSize,
+          signal,
+          ENCODER_QUEUE_HIGH_WATER_MARK,
+        ),
+        disposed,
+      ]);
+    }
+    if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
   };
 
   const submitEncode = (
@@ -1445,13 +1417,11 @@ function createVideoEncoder(
     options: VideoEncoderEncodeOptionsWithCodecQuantizer,
   ): void => {
     if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
-    outputBackpressure.submitted();
     try {
       encoder.encode(frame, options);
       submittedEncodeCount++;
       lastSubmittedTimestamp = frame.timestamp;
     } catch (error) {
-      outputBackpressure.completed();
       throw new MediaError(
         'encode-error',
         `${config.codec} ${config.width}x${config.height} encoder rejected submitted frame ${submittedEncodeCount + 1} at ${frame.timestamp}us: ${describeError(error)}`,
@@ -1473,7 +1443,6 @@ function createVideoEncoder(
       );
       encoder = new VideoEncoder({
         output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata): void => {
-          outputBackpressure.completed();
           // The encoder emits the decoder config (codec string + `description`) with (typically) the
           // first chunk; hand it to the muxer out-of-band, since the chunk stream is bytes-only.
           const decoderConfig = metadata?.decoderConfig;
@@ -1536,7 +1505,7 @@ function createVideoEncoder(
       try {
         if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
         if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
-        await outputBackpressure.waitForRoom(signal);
+        await awaitEncoderQueueRoom();
         if (alignHorizontalPhase) {
           if (frame.displayWidth !== config.width || frame.displayHeight !== config.height) {
             throw new MediaError(
@@ -1590,7 +1559,7 @@ function createVideoEncoder(
           for (let index = 0; index < timestamps.length; index++) {
             if (signal?.aborted) throw new MediaError('aborted', 'operation aborted');
             if (!encoder) throw new MediaError('encode-error', 'encoder not configured');
-            await outputBackpressure.waitForRoom(signal);
+            await awaitEncoderQueueRoom();
             const timestamp = timestamps[index];
             if (timestamp === undefined)
               throw new MediaError('encode-error', 'invalid warmup timeline');
@@ -1643,6 +1612,7 @@ function createVideoEncoder(
       if (encoder && encoder.state !== 'closed') encoder.close();
       alignmentCanvas = undefined;
       rateControlWarmupTimestampsPending.clear();
+      releaseDisposal?.(); // the encoder will never fire `dequeue` again; free any parked submitter
     },
     // The muxer closed/cancelled the readable while the encoder may still be draining: mark closed and
     // dispose the encoder so it stops emitting — no late enqueue. (Chunks are byte buffers; nothing leaks.)

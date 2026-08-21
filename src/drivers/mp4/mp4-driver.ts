@@ -64,13 +64,16 @@ import {
   parseMovie,
   parseMovieMetadata,
   parseMoviePacketInfo,
+  timeToSampleMediaTicks,
 } from './parse.ts';
 import { Reader } from './reader.ts';
 import {
   type Sample,
   type SampleData,
+  type SampleToChunkCursor,
   buildSampleData,
   buildSamples,
+  samplesPerChunkFor,
   walkSampleRanges,
 } from './samples.ts';
 import {
@@ -1343,10 +1346,10 @@ function hasEmptyInitializationSampleTable(track: ParsedTrack): boolean {
   const table = track.samples;
   return (
     track.moovSampleCount === 0 &&
-    table.timeToSample.length === 0 &&
-    table.compositionOffsets.length === 0 &&
+    table.timeToSample.counts.length === 0 &&
+    table.compositionOffsets.counts.length === 0 &&
     table.sampleSizes.length === 0 &&
-    table.sampleToChunk.length === 0 &&
+    table.sampleToChunk.firstChunk.length === 0 &&
     table.chunkOffsets.length === 0 &&
     table.syncSamples.length === 0
   );
@@ -2251,39 +2254,39 @@ function otherTrackHasSamples(
   return track.samples !== undefined;
 }
 
+function nextPacketRunValue(
+  counts: Uint32Array,
+  values: Uint32Array | Int32Array,
+  cursor: SampleTableRunCursor,
+): number {
+  while (cursor.remaining <= 0) {
+    if (cursor.index >= counts.length) return cursor.value;
+    const count = counts[cursor.index] ?? 0;
+    const value = values[cursor.index] ?? 0;
+    cursor.index++;
+    if (count <= 0) continue;
+    cursor.remaining = count;
+    cursor.value = value;
+  }
+  cursor.remaining--;
+  return cursor.value;
+}
+
 function nextPacketTimeDelta(
   entries: ParsedTrack['samples']['timeToSample'],
   cursor: SampleTableRunCursor,
 ): number {
-  while (cursor.remaining <= 0) {
-    const entry = entries[cursor.index];
-    if (entry === undefined) return cursor.value;
-    cursor.index++;
-    if (entry.count <= 0) continue;
-    cursor.remaining = entry.count;
-    cursor.value = entry.delta;
-  }
-  cursor.remaining--;
-  return cursor.value;
+  return nextPacketRunValue(entries.counts, entries.deltas, cursor);
 }
 
 function nextPacketCompositionOffset(
   entries: ParsedTrack['samples']['compositionOffsets'],
   cursor: SampleTableRunCursor,
 ): number {
-  while (cursor.remaining <= 0) {
-    const entry = entries[cursor.index];
-    if (entry === undefined) return cursor.value;
-    cursor.index++;
-    if (entry.count <= 0) continue;
-    cursor.remaining = entry.count;
-    cursor.value = entry.offset;
-  }
-  cursor.remaining--;
-  return cursor.value;
+  return nextPacketRunValue(entries.counts, entries.offsets, cursor);
 }
 
-function sampleNumbersAreAscending(values: readonly number[]): boolean {
+function sampleNumbersAreAscending(values: Uint32Array): boolean {
   let previous = Number.NEGATIVE_INFINITY;
   for (const value of values) {
     if (value < previous) return false;
@@ -2309,7 +2312,7 @@ function appendTrackPacketMetadata(
   const count = sizes.length;
   const timescale = track.timescale;
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
-  const hasCtts = compositionOffsets.length > 0;
+  const hasCtts = compositionOffsets.counts.length > 0;
   const allSync = syncSamples.length === 0;
   const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
@@ -2321,21 +2324,14 @@ function appendTrackPacketMetadata(
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
 
   let writeIndex = packetIndex;
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor: SampleToChunkCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   let dtsTicks = 0;
   for (let c = 0; c < chunkOffsets.length && sampleIndex < count; c++) {
     const chunkOffset = chunkOffsets[c];
     if (chunkOffset === undefined) break;
-    const chunkNumber = c + 1;
-    while (true) {
-      const entry = sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(sampleToChunk, c + 1, stscCursor);
     let offset = chunkOffset;
     for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -2393,7 +2389,7 @@ function progressiveTrackPacketStats(track: ParsedTrack): PacketMetadataStats | 
   if (sizes.length === 0 || track.timescale <= 0) return undefined;
   const deltaCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
-  const hasCtts = track.samples.compositionOffsets.length > 0;
+  const hasCtts = track.samples.compositionOffsets.counts.length > 0;
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
   let dtsTicks = 0;
   let packetCount = 0;
@@ -2510,7 +2506,7 @@ function appendTrackPacketInfoBySampleOrder(
   const syncSamples = st.syncSamples;
   const timescale = track.timescale;
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
-  const hasCtts = compositionOffsets.length > 0;
+  const hasCtts = compositionOffsets.counts.length > 0;
   const allSync = syncSamples.length === 0;
   const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
@@ -2570,7 +2566,7 @@ function appendTrackPacketInfoMetadata(
   const count = sizes.length;
   const timescale = track.timescale;
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
-  const hasCtts = compositionOffsets.length > 0;
+  const hasCtts = compositionOffsets.counts.length > 0;
   const allSync = syncSamples.length === 0;
   const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
@@ -2582,21 +2578,14 @@ function appendTrackPacketInfoMetadata(
   const cttsCursor: SampleTableRunCursor = { index: 0, remaining: 0, value: 0 };
 
   let writeIndex = packetIndex;
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor: SampleToChunkCursor = { index: 0, value: 0 };
   let syncIndex = 0;
   let sampleIndex = 0;
   let dtsTicks = 0;
   for (let c = 0; c < chunkOffsets.length && sampleIndex < count; c++) {
     const chunkOffset = chunkOffsets[c];
     if (chunkOffset === undefined) break;
-    const chunkNumber = c + 1;
-    while (true) {
-      const entry = sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(sampleToChunk, c + 1, stscCursor);
     let offset = chunkOffset;
     for (let s = 0; s < samplesPerChunk && sampleIndex < count; s++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -2730,7 +2719,7 @@ function* progressiveTrackPacketInfoRows(
   const timeToSample = st.timeToSample;
   const compositionOffsets = st.compositionOffsets;
   const syncSamples = st.syncSamples;
-  const hasCtts = compositionOffsets.length > 0;
+  const hasCtts = compositionOffsets.counts.length > 0;
   const allSync = syncSamples.length === 0;
   const sortedSync = allSync || sampleNumbersAreAscending(syncSamples);
   const syncSet = allSync || sortedSync ? undefined : new Set(syncSamples);
@@ -2748,7 +2737,7 @@ function* progressiveTrackPacketInfoRows(
     return allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber;
   };
 
-  if (st.chunkOffsets.length === 0 && st.sampleToChunk.length === 0) {
+  if (st.chunkOffsets.length === 0 && st.sampleToChunk.firstChunk.length === 0) {
     for (let sampleIndex = 0; sampleIndex < sizes.length; sampleIndex++) {
       const size = sizes[sampleIndex] ?? 0;
       const durationTicks = nextPacketTimeDelta(timeToSample, deltaCursor);
@@ -2775,8 +2764,7 @@ function* progressiveTrackPacketInfoRows(
     return;
   }
 
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor: SampleToChunkCursor = { index: 0, value: 0 };
   let sampleIndex = 0;
   for (
     let chunkIndex = 0;
@@ -2785,13 +2773,7 @@ function* progressiveTrackPacketInfoRows(
   ) {
     const chunkOffset = st.chunkOffsets[chunkIndex];
     if (chunkOffset === undefined) break;
-    const chunkNumber = chunkIndex + 1;
-    while (true) {
-      const entry = st.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(st.sampleToChunk, chunkIndex + 1, stscCursor);
     let offset = chunkOffset;
     for (let inChunk = 0; inChunk < samplesPerChunk && sampleIndex < sizes.length; inChunk++) {
       const size = sizes[sampleIndex] ?? 0;
@@ -3046,7 +3028,7 @@ export function mp4PacketInfoMetadata(
   let packetIndex = 0;
   const appendTrack = (track: PacketTimelineTrack, trackIndex: number): void => {
     packetIndex =
-      track.samples.chunkOffsets.length === 0 && track.samples.sampleToChunk.length === 0
+      track.samples.chunkOffsets.length === 0 && track.samples.sampleToChunk.firstChunk.length === 0
         ? appendTrackPacketInfoBySampleOrder(packets, packetIndex, track, trackIndex)
         : appendTrackPacketInfoMetadata(
             packets,
@@ -3610,7 +3592,7 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
   const scale = sampleRate / track.timescale;
   const durationTicks =
     (track.moovMediaTicks ??
-      track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0)) +
+      timeToSampleMediaTicks(track.samples.timeToSample)) +
     (track.fragmentMediaTicks ?? 0);
   const codedSamples =
     durationTicks > 0

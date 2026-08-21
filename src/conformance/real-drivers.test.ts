@@ -3,7 +3,7 @@
  *
  * The harness.test.ts file proves the conformance suite *runs* against the no-op reference driver and can
  * *fail* (anti-cheat). THIS file proves the suite runs against **every first-party driver that ships** —
- * the 11 real `ContainerDriver`s, the 8 real `CodecDriver`s, and the 4 real `FilterDriver`s — so they are
+ * the 11 real `ContainerDriver`s, the 11 real `CodecDriver`s, and the 4 real `FilterDriver`s — so they are
  * all held to identical seam/lifecycle/error behavior (the whole point of a conformance harness).
  *
  * **Node vs browser facets.** This suite runs under Node (vitest's environment), where WebCodecs
@@ -18,9 +18,10 @@
  */
 
 import { describe, expect, it } from 'vitest';
-// Codec drivers (8 real).
+// Codec drivers (11 real).
 import { WasmAacDriver } from '../codecs/wasm-aac/wasm-aac-driver.ts';
 import { WasmAv1Driver } from '../codecs/wasm-av1/wasm-av1-driver.ts';
+import { WasmMp3EncoderDriver } from '../codecs/wasm-mp3-enc/wasm-mp3-enc-driver.ts';
 import { WasmMp3Driver } from '../codecs/wasm-mp3/wasm-mp3-driver.ts';
 import { WasmOpusDriver } from '../codecs/wasm-opus/wasm-opus-driver.ts';
 import { WasmVorbisEncoderDriver } from '../codecs/wasm-vorbis-enc/wasm-vorbis-enc-driver.ts';
@@ -196,6 +197,7 @@ const REAL_CODECS: readonly CodecDriver[] = [
   FlacCodecDriver, // tier:'native', pure-TS FLAC encode (supports() honest-false in Node: needs AudioData)
   WasmAacDriver,
   WasmMp3Driver,
+  WasmMp3EncoderDriver,
   WasmVorbisEncoderDriver,
   WasmVorbisDriver,
   WasmOpusDriver,
@@ -219,6 +221,7 @@ describe('real codec drivers — every one passes the Node-checkable conformance
       'flac-encode',
       'wasm-aac',
       'wasm-mp3',
+      'wasm-mp3-enc',
       'wasm-vorbis-enc',
       'wasm-vorbis',
       'wasm-opus',

@@ -60,9 +60,9 @@ describe('parseMovie — format variants', () => {
     expect(v?.durationSec).toBe(2);
     expect(v?.fps).toBe(1); // 2 samples / 2 s
     expect(v?.trakIndex).toBe(0); // file-order position, for ffprobe-faithful track listings
-    expect(v?.samples.chunkOffsets).toEqual([1000]); // co64
-    expect(v?.samples.compositionOffsets).toHaveLength(1);
-    expect(v?.samples.sampleSizes).toEqual([5, 7]);
+    expect([...(v?.samples.chunkOffsets ?? [])]).toEqual([1000]); // co64
+    expect(v?.samples.compositionOffsets.counts).toHaveLength(1);
+    expect([...(v?.samples.sampleSizes ?? [])]).toEqual([5, 7]);
   });
 
   it('parses the audio track (mp4a fallback without esds, constant stsz, stco)', () => {
@@ -71,8 +71,8 @@ describe('parseMovie — format variants', () => {
     expect(a?.sampleRate).toBe(48000);
     expect(a?.channels).toBe(2);
     expect(a?.trakIndex).toBe(1);
-    expect(a?.samples.sampleSizes).toEqual([100]); // constant-size stsz expanded
-    expect(a?.samples.chunkOffsets).toEqual([2000]); // stco
+    expect([...(a?.samples.sampleSizes ?? [])]).toEqual([100]); // constant-size stsz expanded
+    expect([...(a?.samples.chunkOffsets ?? [])]).toEqual([2000]); // stco
     expect(a?.rotation).toBeUndefined();
   });
 });
@@ -84,16 +84,16 @@ describe('parseMovieMetadata — metadata-only sample tables', () => {
 
     const video = movie.tracks.find((t) => t.mediaType === 'video');
     expect(video?.fps).toBe(1);
-    expect(video?.samples.timeToSample).toEqual([]);
+    expect(video?.samples.timeToSample.counts).toHaveLength(0);
     expect(video?.moovMediaTicks).toBe(600);
-    expect(video?.samples.sampleSizes).toEqual([]);
-    expect(video?.samples.sampleToChunk).toEqual([]);
-    expect(video?.samples.chunkOffsets).toEqual([]);
+    expect(video?.samples.sampleSizes).toHaveLength(0);
+    expect(video?.samples.sampleToChunk.firstChunk).toHaveLength(0);
+    expect(video?.samples.chunkOffsets).toHaveLength(0);
 
     const audio = movie.tracks.find((t) => t.mediaType === 'audio');
-    expect(audio?.samples.timeToSample).toEqual([]);
+    expect(audio?.samples.timeToSample.counts).toHaveLength(0);
     expect(audio?.moovMediaTicks).toBe(48_000);
-    expect(audio?.samples.sampleSizes).toEqual([]);
+    expect(audio?.samples.sampleSizes).toHaveLength(0);
   });
 
   it('falls back to stts sample counts when metadata has no stsz box', () => {
@@ -102,9 +102,9 @@ describe('parseMovieMetadata — metadata-only sample tables', () => {
 
     const video = movie.tracks.find((t) => t.mediaType === 'video');
     expect(video?.fps).toBe(1);
-    expect(video?.samples.timeToSample).toEqual([]);
+    expect(video?.samples.timeToSample.counts).toHaveLength(0);
     expect(video?.moovMediaTicks).toBe(600);
-    expect(video?.samples.sampleSizes).toEqual([]);
+    expect(video?.samples.sampleSizes).toHaveLength(0);
   });
 });
 
@@ -524,11 +524,8 @@ describe('parseMovie — version-0 ctts negative composition offsets (real .mov 
     if (!v) return;
 
     // The negative offset survives as a small signed value (the whole point — 4294967256 would be a bug).
-    expect(v.samples.compositionOffsets).toEqual([
-      { count: 1, offset: 0 },
-      { count: 1, offset: 40 },
-      { count: 1, offset: -40 },
-    ]);
+    expect([...v.samples.compositionOffsets.counts]).toEqual([1, 1, 1]);
+    expect([...v.samples.compositionOffsets.offsets]).toEqual([0, 40, -40]);
 
     // End to end (mdhd timescale 600): dts 0/400/800 ticks, ctts 0/+40/−40 → PTS 0/440/760 ticks. The
     // third sample's PTS lands at 1_266_667 µs; the pre-fix unsigned read would have made it ~7.16e12 µs.

@@ -668,11 +668,13 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     const movie = await readMovie(ra(await collect(muxer.output)));
     const audio = movie.tracks.find((track) => track.mediaType === 'audio');
     expect(audio?.durationSec).toBeCloseTo((1024 + 44673) / 44_100, 12);
+    // Audio-only output runs the movie clock at the audio rate, so the edit declares the program as an
+    // exact sample count rather than the nearest millisecond (44 673 frames, not a 1013 ms rounding).
     expect(audio?.edit).toEqual({
       mediaTimeTicks: 1024,
-      durationSec: 1.013,
-      durationMovieTicks: 1_013,
-      movieTimescale: 1_000,
+      durationSec: 44_673 / 44_100,
+      durationMovieTicks: 44_673,
+      movieTimescale: 44_100,
     });
     const durations = audio ? buildSampleData(audio).map((s) => s.durationTicks) : [];
     expect(durations).toHaveLength(45);
@@ -711,9 +713,9 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     const audio = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
     expect(audio?.edit).toEqual({
       mediaTimeTicks: 0,
-      durationSec: 0.042,
-      durationMovieTicks: 42,
-      movieTimescale: 1_000,
+      durationSec: 2_000 / 48_000,
+      durationMovieTicks: 2_000,
+      movieTimescale: 48_000,
     });
     expect(audio ? buildSampleData(audio).map((sample) => sample.durationTicks) : []).toEqual([
       1024, 1024,
@@ -755,8 +757,8 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(audio?.edit).toEqual({
       mediaTimeTicks: 2_112,
       durationSec: 4,
-      durationMovieTicks: 4_000,
-      movieTimescale: 1_000,
+      durationMovieTicks: 192_000,
+      movieTimescale: 48_000,
     });
     expect(audio ? buildSampleData(audio) : []).toHaveLength(190);
 
@@ -773,6 +775,92 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(view.getUint32(sbgpType + 12)).toBe(1); // entry_count
     expect(view.getUint32(sbgpType + 16)).toBe(190); // every retained AAC AU
     expect(view.getUint32(sbgpType + 20)).toBe(1); // group_description_index
+  });
+
+  it('applies drained destination MP3 timing without inventing an AAC roll group', async () => {
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp3',
+      config: { codec: 'mp3', sampleRate: 48_000, numberOfChannels: 2 },
+    });
+    // 240,000 submitted frames cost LAME 210 whole MPEG-1 frames once its 1,105-frame lead-in sits in
+    // front of them, leaving 815 frames of terminal padding — a window `elst` alone has to express,
+    // because MP3 carries no in-band delay signalling at all.
+    for (let i = 0; i < 210; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 1152 * 1_000_000) / 48_000),
+        durationUs: Math.round((1152 * 1_000_000) / 48_000),
+        key: true,
+        data: new Uint8Array([0xff, 0xfb, i & 0xff, 0x00]),
+      });
+    }
+    muxer.setTrackGapless(aud, {
+      leadingSamples: 1_105,
+      trailingSamples: 815,
+      totalSamples: 240_000,
+    });
+    await muxer.finalize();
+
+    const bytes = await collect(muxer.output);
+    const audio = (await readMovie(ra(bytes))).tracks[0];
+    expect(audio?.edit).toEqual({
+      mediaTimeTicks: 1_105,
+      durationSec: 5,
+      durationMovieTicks: 240_000,
+      movieTimescale: 48_000,
+    });
+    // Every coded frame survives; only the media timeline stops at priming + program, so the last
+    // frame's declared duration is the remainder rather than a whole 1,152 samples.
+    const samples = audio ? buildSampleData(audio) : [];
+    expect(samples).toHaveLength(210);
+    expect(samples.reduce((total, sample) => total + sample.durationTicks, 0)).toBe(
+      1_105 + 240_000,
+    );
+    // `roll` is an AAC-LC pre-roll contract; an MP3 track must not acquire one from the same seam.
+    expect(findFourccOffset(bytes, 'sgpd')).toBe(-1);
+    expect(findFourccOffset(bytes, 'sbgp')).toBe(-1);
+  });
+
+  it('declares a gapless window exactly at a rate no millisecond clock can express', async () => {
+    // `elst segment_duration` lives in the MOVIE timescale. On the legacy 1 kHz clock this program —
+    // 12,288 frames at 11.025 kHz, i.e. 1114.557… ms — rounded to 1115 ms, and a reader converting
+    // that back read 12,293 frames: five more than exist. Running an audio-only movie at the audio
+    // rate makes movie ticks and media ticks the same number, so the declaration is exact.
+    const muxer = new Mp4Muxer();
+    const aud = muxer.addTrack({
+      id: 1,
+      mediaType: 'audio',
+      codec: 'mp3',
+      config: { codec: 'mp3', sampleRate: 11_025, numberOfChannels: 1 },
+    });
+    for (let i = 0; i < 24; i++) {
+      muxer.addChunkStruct(aud, {
+        timestampUs: Math.round((i * 576 * 1_000_000) / 11_025),
+        durationUs: Math.round((576 * 1_000_000) / 11_025),
+        key: true,
+        data: new Uint8Array([0xff, 0xe3, i & 0xff, 0x00]),
+      });
+    }
+    muxer.setTrackGapless(aud, {
+      leadingSamples: 1_105,
+      trailingSamples: 431,
+      totalSamples: 12_288,
+    });
+    await muxer.finalize();
+
+    const audio = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
+    // Exact in media ticks: the edit starts on the first program sample and the media timeline ends
+    // on the last one, so a reader working in the audio clock recovers 12,288 frames with no error.
+    expect(audio?.edit?.mediaTimeTicks).toBe(1_105);
+    const samples = audio ? buildSampleData(audio) : [];
+    expect(samples.reduce((total, sample) => total + sample.durationTicks, 0)).toBe(1_105 + 12_288);
+    // …and now exact in movie ticks too, because the movie clock IS the audio clock.
+    expect(audio?.edit?.movieTimescale).toBe(11_025);
+    expect(audio?.edit?.durationMovieTicks).toBe(12_288);
+    // The round trip a reader performs — declared seconds back to sample frames — is now lossless.
+    expect(Math.round((audio?.edit?.durationSec ?? 0) * 11_025)).toBe(12_288);
   });
 
   it('honors an explicitly proven zero leading delay instead of inferring priming from padding', async () => {
@@ -801,7 +889,7 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
 
     const audio = (await readMovie(ra(await collect(muxer.output)))).tracks[0];
     expect(audio?.edit?.mediaTimeTicks).toBe(0);
-    expect(audio?.edit?.durationMovieTicks).toBe(259);
+    expect(audio?.edit?.durationMovieTicks).toBe(12_432); // the exact program, on the 48 kHz movie clock
   });
 
   it('muxes synthesized raw-box codec records when AV1/VP9/Opus descriptions are absent', async () => {
@@ -981,7 +1069,7 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(samples.map((s) => s.durationTicks)).toEqual([dt, dt, dt, dt]);
     // No reorder ⇒ ctts is omitted ⇒ every cttsTicks reads back as 0.
     expect(samples.map((s) => s.cttsTicks)).toEqual([0, 0, 0, 0]);
-    expect(track?.samples.compositionOffsets).toEqual([]);
+    expect(track?.samples.compositionOffsets.counts).toHaveLength(0);
   });
 
   it('maps Matroska H.273 colour facts into an MP4 colr box without guessing missing fields', async () => {
@@ -1067,7 +1155,7 @@ describe('Mp4Muxer — reference-reimport round-trip on synthesized packets', ()
     expect(samples.map((s) => s.keyframe)).toEqual([true, false, false, false]);
     // PTS = DTS + ctts reconstructs the original presentation order.
     expect(samples.map((s) => s.dtsTicks + s.cttsTicks)).toEqual([0, 3 * f, 1 * f, 2 * f]);
-    expect(track?.samples.compositionOffsets.length).toBeGreaterThan(0); // ctts box written
+    expect(track?.samples.compositionOffsets.counts.length).toBeGreaterThan(0); // ctts box written
   });
 
   it('multitrack video + audio: both re-parse with the right codecs, geometry, and samples', async () => {

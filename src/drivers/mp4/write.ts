@@ -294,6 +294,123 @@ function trackMovieDurationTicks(track: MuxTrackLayoutInput, movieTimescale: num
   );
 }
 
+// ============ the movie clock ============
+
+/** Every version-0 `mvhd`/`tkhd`/`mdhd`/`elst` duration is an unsigned 32-bit field. */
+const MAX_DURATION_TICKS = 0xffffffff;
+
+/**
+ * The 1 kHz movie clock every writer used before an exact audio clock was available: it can only state
+ * whole milliseconds, but it carries ~49 days of u32 range. Retained as the documented fallback.
+ */
+const DEFAULT_MOVIE_TIMESCALE = 1000;
+
+/** The `elst` movie-tick fields for one track — the exact values {@link editList} will write. */
+function editMovieTicks(
+  track: MuxTrackLayoutInput,
+  movieTimescale: number,
+): { segmentDuration: number; leadingEmptyDuration: number } | undefined {
+  const edit = track.edit;
+  if (edit === undefined) return undefined;
+  // An edit carried over from a source movie is only reusable verbatim while we keep that movie clock.
+  const preservesSourceMovieClock = edit.movieTimescale === movieTimescale;
+  return {
+    segmentDuration:
+      preservesSourceMovieClock && edit.durationMovieTicks !== undefined
+        ? edit.durationMovieTicks
+        : Math.round((edit.durationTicks * movieTimescale) / track.timescale),
+    leadingEmptyDuration:
+      preservesSourceMovieClock && edit.leadingEmptyDurationMovieTicks !== undefined
+        ? edit.leadingEmptyDurationMovieTicks
+        : Math.round(((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale),
+  };
+}
+
+/**
+ * The audio clock shared by every track, when the movie carries audio only.
+ *
+ * `mvhd`/`tkhd`/`elst` durations are defined in the **movie** timescale, so a 1 kHz clock cannot state
+ * a program whose length is not a whole number of milliseconds: at 48 kHz the declared duration can
+ * miss the real one by up to 24 sample frames (22 at 44.1 kHz, 6 at 11.025 kHz), and a gapless edit
+ * inherits exactly that error. Taking the audio rate as the movie clock makes movie ticks and media
+ * ticks the same number, so the declaration is exact for every program length.
+ *
+ * Only a single shared audio rate qualifies. With two audio rates one of them must still be rescaled,
+ * and with video present the video clock has its own exactness requirement (and its own range), so
+ * neither case can be improved by this rule and both keep {@link DEFAULT_MOVIE_TIMESCALE}.
+ */
+function sharedAudioTimescale(tracks: readonly MuxTrackLayoutInput[]): number | undefined {
+  const timescale = tracks[0]?.timescale;
+  if (timescale === undefined || !Number.isInteger(timescale) || timescale <= 0) return undefined;
+  for (const track of tracks) {
+    if (track.mediaType !== 'audio' || track.timescale !== timescale) return undefined;
+  }
+  return timescale;
+}
+
+/**
+ * Whether every u32 duration this movie clock would produce still fits its field.
+ *
+ * A finer clock trades range for exactness, and a duration that does not fit must never be written
+ * truncated — so a movie that would overflow keeps the coarse clock instead. Note the exact clock costs
+ * *no* real range for an ordinary track: it equals the track clock, so the movie duration is the media
+ * duration, and `mdhd` — which no movie-clock choice can coarsen — already binds at the same value
+ * (~24.9 h at 48 kHz). The two diverge only where the movie timeline runs longer than the media, i.e.
+ * behind a leading empty edit; that is the case this guard exists for. Both bounds are enforced
+ * unconditionally by {@link durationU32} when the boxes are written.
+ */
+function movieClockFits(tracks: readonly MuxTrackLayoutInput[], movieTimescale: number): boolean {
+  for (const track of tracks) {
+    if (trackMovieDurationTicks(track, movieTimescale) > MAX_DURATION_TICKS) return false;
+    const edit = editMovieTicks(track, movieTimescale);
+    if (edit === undefined) continue;
+    if (edit.segmentDuration > MAX_DURATION_TICKS) return false;
+    if (edit.leadingEmptyDuration > MAX_DURATION_TICKS) return false;
+  }
+  return true;
+}
+
+/**
+ * The movie timescale to author with. An explicitly requested clock is always honoured verbatim — a
+ * remux that preserves a source movie's edits depends on keeping that movie's own clock. Otherwise an
+ * audio-only movie adopts its audio rate (exact, see {@link sharedAudioTimescale}) when the whole movie
+ * fits that clock, and everything else keeps {@link DEFAULT_MOVIE_TIMESCALE}.
+ */
+export function resolveMovieTimescale(
+  tracks: readonly MuxTrackLayoutInput[],
+  requested: number | undefined,
+): number {
+  if (requested !== undefined) return requested;
+  const audioTimescale = sharedAudioTimescale(tracks);
+  return audioTimescale !== undefined && movieClockFits(tracks, audioTimescale)
+    ? audioTimescale
+    : DEFAULT_MOVIE_TIMESCALE;
+}
+
+/**
+ * A duration destined for a u32 box field. ISO-BMFF version-0 headers cannot express more, and a
+ * wrapped duration is a silently corrupt timeline, so this is a typed mux failure rather than a cast.
+ *
+ * **Do not "restore" the 1 kHz movie clock here believing it buys range — it never did.** The obvious
+ * reading of {@link sharedAudioTimescale} is that it trades reach for exactness, because `mvhd` at
+ * 48 kHz tops out near 24.9 h against a millisecond clock's ~49 days. That reading is wrong: `mdhd`
+ * carries the same duration in the **track** clock, which no movie-clock choice can coarsen, so it
+ * already bound at that identical 24.9 h. The millisecond clock's apparent headroom was never
+ * reachable — and past the bound this function's field used to be written silently wrapped. Adopting
+ * the audio clock therefore costs nothing and this guard turns the wrap into a refusal, which is the
+ * §8.4 contract ("no size or offset path may truncate"). `write.test.ts` pins both halves: the exact
+ * clock and a pinned `movieTimescale: 1000` fail at precisely the same input.
+ */
+function durationU32(value: number, box: string): number[] {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_DURATION_TICKS) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 ${box} duration ${value} exceeds the version-0 32-bit field; use a coarser timescale`,
+    );
+  }
+  return u32(value);
+}
+
 /** Build an `esds` box wrapping an AudioSpecificConfig (the reverse of `parseEsds`). */
 function esdsBox(asc: Uint8Array): number[] {
   const dsi = cat([0x05, asc.byteLength], [...asc]);
@@ -542,15 +659,16 @@ function sampleTable(track: MuxTrackLayoutInput, chunkTable: TrackChunkTable): n
 function editList(track: MuxTrackLayoutInput, movieTimescale: number): number[] {
   const edit = track.edit;
   if (edit === undefined) return [];
-  const preservesSourceMovieClock = edit.movieTimescale === movieTimescale;
-  const segmentDuration =
-    preservesSourceMovieClock && edit.durationMovieTicks !== undefined
-      ? edit.durationMovieTicks
-      : Math.round((edit.durationTicks * movieTimescale) / track.timescale);
-  const leadingEmptyDuration =
-    preservesSourceMovieClock && edit.leadingEmptyDurationMovieTicks !== undefined
-      ? edit.leadingEmptyDurationMovieTicks
-      : Math.round(((edit.leadingEmptyDurationTicks ?? 0) * movieTimescale) / track.timescale);
+  const ticks = editMovieTicks(track, movieTimescale);
+  if (ticks === undefined) return [];
+  const { segmentDuration, leadingEmptyDuration } = ticks;
+  // NOT DEAD CODE, but unreachable-by-construction through `writeMp4`: `trackMovieDurationTicks`
+  // returns `segmentDuration + leadingEmptyDuration` on the same branch condition `editMovieTicks`
+  // uses, a leading empty edit is never negative, and `moov` writes `mvhd` before any `trak` — so an
+  // overflow here always trips {@link durationU32} on the movie header first. It is kept as defence
+  // in depth for a future caller that authors an `elst` without going through `moov`, and because the
+  // negative arm is reachable from malformed input. `write.test.ts` pins that ordering deliberately
+  // rather than pretending the two bounds can be provoked apart; do not delete this as unused.
   if (segmentDuration < 0 || segmentDuration > 0xffffffff) {
     throw new MediaError(
       'mux-error',
@@ -595,7 +713,7 @@ function trak(
       zeros(8),
       u32(trackId),
       zeros(4),
-      u32(movieDur),
+      durationU32(movieDur, 'tkhd'),
       zeros(8),
       u16(0),
       u16(0),
@@ -609,7 +727,7 @@ function trak(
     'mdhd',
     0,
     0,
-    cat(zeros(8), u32(track.timescale), u32(durTicks), u16(0x55c4), u16(0)),
+    cat(zeros(8), u32(track.timescale), durationU32(durTicks, 'mdhd'), u16(0x55c4), u16(0)),
   );
   const hdlr = full(
     'hdlr',
@@ -642,7 +760,7 @@ function moov(
     cat(
       zeros(8),
       u32(movieTimescale),
-      u32(movieDur),
+      durationU32(movieDur, 'mvhd'),
       u32(0x00010000),
       u16(0x0100),
       zeros(10), // rate + volume + reserved
@@ -1027,7 +1145,7 @@ function mp4LayoutParts(
   tracks: readonly MuxTrackLayoutInput[],
   opts: WriteOptions = {},
 ): Mp4LayoutParts {
-  const movieTimescale = opts.movieTimescale ?? 1000;
+  const movieTimescale = resolveMovieTimescale(tracks, opts.movieTimescale);
   const faststart = opts.faststart ?? true;
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
 
@@ -1113,7 +1231,7 @@ export function planReservedMp4ByteStreamLayout(
     }
   }
 
-  const movieTimescale = opts.movieTimescale ?? 1000;
+  const movieTimescale = resolveMovieTimescale(tracks, opts.movieTimescale);
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
   const { layouts: trackChunks, totalPayloadBytes: mdatPayloadLen } = trackChunkLayouts(tracks);
   const moovBytes = moov(tracks, movieTimescale, zeroChunkTables(trackChunks));
@@ -1218,7 +1336,7 @@ export function writeSparseMp4(
     chunkTables.push({ chunks, chunkOffsets: offsets });
   }
 
-  const movieTimescale = opts.movieTimescale ?? 1000;
+  const movieTimescale = resolveMovieTimescale(tracks, opts.movieTimescale);
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
   const moovBytes = moov(tracks, movieTimescale, chunkTables);
   const mdatStart = BigInt(ftyp.length + moovBytes.length);

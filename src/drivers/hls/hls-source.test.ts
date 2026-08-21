@@ -288,7 +288,7 @@ describe('resolveHlsSource — honest typed errors', () => {
       );
       expect(out).toEqual(clear);
     }
-  }, 10_000);
+  });
 
   it('honors an already-aborted signal', async () => {
     await expect(

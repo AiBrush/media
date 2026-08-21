@@ -131,6 +131,7 @@ export async function runTrim(
         ...context.stage(signal, options),
         trim: { startSec: opts.start, endSec: opts.end },
         identitySourceIfFullRange: true,
+        ...(opts.onAlignment === undefined ? {} : { onTrimAlignment: opts.onAlignment }),
         ...fragmented,
         ...streamCopySinkMode(opts.sink),
       });
@@ -164,6 +165,12 @@ export async function runTrim(
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
     }
     return materializeOutput(opts.sink ?? toBlob(), source.stream(), mimeOptions(signal, target));
+  }
+  // MP3 signals delay/padding, so both trim modes author the exact decoded window rather than rounding
+  // to a frame: the emitted frames are verbatim source frames and Xing/LAME discards the lead-in.
+  if (target === 'mp3' && container.id === 'mp3') {
+    const stream = await trimMp3ExactCopy(source, opts, signal);
+    return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
   }
   if (opts.mode === 'accurate') {
     if (target === 'adts' || target === 'aac') {
@@ -293,6 +300,36 @@ async function tryAccurateAdtsPrefixCopy(
     container: target,
     trim: { startSec: opts.start, endSec: opts.end },
     ...streamCopySinkMode(opts.sink),
+  });
+}
+
+/**
+ * Author the exact decoded window of an MP3 → MP3 trim. MP3 is one of the formats REQUIREMENTS §5.7 calls
+ * out as able to signal delay/padding, so neither trim mode has to round to a frame: the driver copies
+ * verbatim source frames plus a synthesized bit-reservoir carrier, and the Xing/LAME encoder-delay and
+ * encoder-padding fields discard the lead-in and the tail.
+ */
+async function trimMp3ExactCopy(
+  source: Source,
+  opts: TrimOptions,
+  signal: AbortSignal,
+): Promise<ReadableStream<Uint8Array>> {
+  const [{ mp3TrimAlignment, trimMp3Exact }, { readAllSource }] = await Promise.all([
+    import('../drivers/mp3/mp3-exact-trim.ts'),
+    import('./source-io.ts'),
+  ]);
+  const bytes = await readAllSource(source, signal);
+  const result = trimMp3Exact(bytes, { startSec: opts.start, endSec: opts.end });
+  opts.onAlignment?.(mp3TrimAlignment(result));
+  return bytesToTrimStream(result.bytes);
+}
+
+function bytesToTrimStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(bytes);
+      controller.close();
+    },
   });
 }
 

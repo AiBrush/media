@@ -205,13 +205,40 @@ describe('materialize — Blob/File part construction', () => {
     vi.restoreAllMocks();
   });
 
-  it('passes independent reusable-source chunks directly to the Blob constructor without joining', async () => {
-    const calls: { parts: BlobPart[]; options: BlobPropertyBag | undefined }[] = [];
-    class RecordingBlob {
-      constructor(parts: BlobPart[] = [], options?: BlobPropertyBag) {
-        calls.push({ parts: [...parts], options });
-      }
+  /**
+   * A `Blob` stand-in that records the parts it was handed and can flatten a nested part list back to
+   * bytes — so a test can assert the produced byte sequence without depending on how many segments the
+   * materializer spilled it into.
+   */
+  class RecordingBlob {
+    static readonly calls: { parts: BlobPart[]; options: BlobPropertyBag | undefined }[] = [];
+    readonly parts: BlobPart[];
+    constructor(parts: BlobPart[] = [], options?: BlobPropertyBag) {
+      this.parts = [...parts];
+      RecordingBlob.calls.push({ parts: this.parts, options });
     }
+  }
+
+  function flatten(parts: readonly BlobPart[]): number[] {
+    const bytes: number[] = [];
+    for (const part of parts) {
+      if (part instanceof RecordingBlob) bytes.push(...flatten(part.parts));
+      else bytes.push(...(part as Uint8Array));
+    }
+    return bytes;
+  }
+
+  function ownedHeapParts(parts: readonly BlobPart[]): Uint8Array[] {
+    const owned: Uint8Array[] = [];
+    for (const part of parts) {
+      if (part instanceof RecordingBlob) owned.push(...ownedHeapParts(part.parts));
+      else owned.push(part as Uint8Array);
+    }
+    return owned;
+  }
+
+  it('copies reusable-source chunks and preserves the exact produced byte sequence', async () => {
+    RecordingBlob.calls.length = 0;
     vi.stubGlobal('Blob', RecordingBlob);
 
     const out = await materialize(toBlob(), reusedChunkStream([1, 2], [3], [4, 5, 6]), {
@@ -219,22 +246,63 @@ describe('materialize — Blob/File part construction', () => {
     });
 
     expect(out).toBeInstanceOf(RecordingBlob);
-    expect(calls).toHaveLength(1);
-    const parts = calls[0]?.parts;
-    expect(parts?.every((part) => part instanceof Uint8Array)).toBe(true);
-    expect(parts?.map((part) => [...(part as Uint8Array)])).toEqual([[1, 2], [3], [4, 5, 6]]);
-    expect(parts?.map((part) => (part as Uint8Array).byteLength)).toEqual([2, 1, 3]);
-    expect(new Set(parts?.map((part) => (part as Uint8Array).buffer)).size).toBe(3);
-    expect(calls[0]?.options).toEqual({ type: 'video/mp4' });
+    const published = RecordingBlob.calls.at(-1);
+    // A producer that recycles ONE backing store must still yield the exact emitted sequence, which is
+    // only possible if every delivered chunk was copied before backpressure was released.
+    expect(flatten(published?.parts ?? [])).toEqual([1, 2, 3, 4, 5, 6]);
+    const owned = ownedHeapParts(published?.parts ?? []);
+    expect(owned.map((part) => part.byteLength)).toEqual([2, 1, 3]);
+    expect(new Set(owned.map((part) => part.buffer)).size).toBe(3);
+    // No total-sized join: nothing handed over is a single buffer holding the whole output.
+    expect(owned.some((part) => part.byteLength === 6)).toBe(false);
+    expect(published?.options).toEqual({ type: 'video/mp4' });
   });
 
-  it('passes every emitted part and metadata directly to the File constructor without joining', async () => {
+  it('spills to user-agent blob storage so heap retention stays flat in the output size', async () => {
+    RecordingBlob.calls.length = 0;
+    vi.stubGlobal('Blob', RecordingBlob);
+
+    // Twenty-four 1 MiB chunks: with an 8 MiB spill segment the materializer must hand the user agent
+    // three intermediate segments and hold at most one segment's worth of bytes on the heap at a time.
+    const chunkBytes = 1024 * 1024;
+    const chunks = Array.from({ length: 24 }, (_unused, index) => {
+      const chunk = new Uint8Array(chunkBytes);
+      chunk.fill(index & 0xff);
+      return chunk;
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const out = await materialize(toBlob(), stream, {});
+    expect(out).toBeInstanceOf(RecordingBlob);
+    const published = RecordingBlob.calls.at(-1);
+    const segments = (published?.parts ?? []).filter((part) => part instanceof RecordingBlob);
+    expect(segments.length).toBe(3);
+    for (const segment of segments) {
+      const bytes = ownedHeapParts((segment as RecordingBlob).parts).reduce(
+        (total, part) => total + part.byteLength,
+        0,
+      );
+      expect(bytes).toBeLessThanOrEqual(8 * 1024 * 1024);
+    }
+    // Every byte still reaches the output exactly once, in order.
+    const flat = ownedHeapParts(published?.parts ?? []);
+    expect(flat.reduce((total, part) => total + part.byteLength, 0)).toBe(24 * chunkBytes);
+    expect(flat.map((part) => part[0])).toEqual(chunks.map((_unused, index) => index & 0xff));
+  });
+
+  it('passes the spilled parts and metadata to the File constructor without joining', async () => {
+    RecordingBlob.calls.length = 0;
     const calls: { parts: BlobPart[]; name: string; options: FilePropertyBag | undefined }[] = [];
     class RecordingFile {
       constructor(parts: BlobPart[], name: string, options?: FilePropertyBag) {
         calls.push({ parts: [...parts], name, options });
       }
     }
+    vi.stubGlobal('Blob', RecordingBlob);
     vi.stubGlobal('File', RecordingFile);
 
     const out = await materialize(toFile('clip.mp4'), bytesStream([9, 8], [7], [6, 5, 4]), {
@@ -243,12 +311,8 @@ describe('materialize — Blob/File part construction', () => {
 
     expect(out).toBeInstanceOf(RecordingFile);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.parts.map((part) => [...(part as Uint8Array)])).toEqual([
-      [9, 8],
-      [7],
-      [6, 5, 4],
-    ]);
-    expect(calls[0]?.parts.map((part) => (part as Uint8Array).byteLength)).toEqual([2, 1, 3]);
+    expect(flatten(calls[0]?.parts ?? [])).toEqual([9, 8, 7, 6, 5, 4]);
+    expect(ownedHeapParts(calls[0]?.parts ?? []).map((part) => part.byteLength)).toEqual([2, 1, 3]);
     expect(calls[0]?.name).toBe('clip.mp4');
     expect(calls[0]?.options).toEqual({ type: 'video/mp4' });
   });

@@ -172,5 +172,5 @@ describe('ADTS output / AdtsMuxer — the engine produces a valid, decodable .ad
     m.addChunkStruct(id, { timestampUs: 0, durationUs: 0, key: true, data: au });
     await m.finalize();
     await expect(m.finalize()).rejects.toThrowError(MediaError);
-  }, 30_000);
+  });
 });

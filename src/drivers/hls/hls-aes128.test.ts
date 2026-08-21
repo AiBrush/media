@@ -533,7 +533,9 @@ describe('resolveHlsSource — the fair-harness hls_aes128 shape (ADR-183)', () 
     expect(info.container).toBe('ts');
     expect(info.tracks.some((t) => t.type === 'video')).toBe(true);
     expect(info.tracks.some((t) => t.type === 'audio')).toBe(true);
-  }, 30_000); // real 4.5 MB AES-128 decrypt + full probe — generous under v8-coverage instrumentation
+    // Real 4.5 MB AES-128 decrypt + full probe; slow under v8-coverage instrumentation, so it leans on
+    // the global testTimeout in vitest.config.ts rather than carrying its own smaller deadline.
+  });
 });
 
 describe('isHlsPlaylist — structural #EXTM3U detection (RFC 8216 §4.3.1.1)', () => {

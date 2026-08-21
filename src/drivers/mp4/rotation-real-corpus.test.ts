@@ -278,7 +278,7 @@ describe('MP4/MOV real rotation corpus vs ffmpeg/ffprobe', () => {
         ).toBe(true);
         if (row.vfr === true) {
           expect(
-            new Set(sourceVideo.samples.timeToSample.map((run) => run.delta)).size,
+            new Set(sourceVideo.samples.timeToSample.deltas).size,
           ).toBeGreaterThan(1);
         }
 

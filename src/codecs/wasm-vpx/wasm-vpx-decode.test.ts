@@ -147,5 +147,5 @@ describe('VP8/VP9 decode — vendored ogv.js libvpx cores vs the ffmpeg referenc
     } finally {
       decoder.free();
     }
-  }, 30_000);
+  });
 });

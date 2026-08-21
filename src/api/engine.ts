@@ -96,6 +96,7 @@ import type { PacketInfoBatchCallOptions, PacketInfoCallOptions } from './packet
 // (narrower) deps at its call site, so only this one type is referenced here.
 import type { PcmConvertDeps } from './pcm-convert-plan.ts';
 import type { ProbeRunnerContext } from './probe-runner.ts';
+import type { RemuxOutputPlan } from './remux-output-plan.ts';
 import type { RemuxRunnerContext } from './remux-runner.ts';
 import {
   HINTED_HEAD_BYTES,
@@ -158,6 +159,23 @@ export interface MediaEngine {
     o?: CallOptions,
   ): Cancellable<readonly Output[]>;
   remux(input: MediaInput, opts: RemuxOptions, o?: CallOptions): Cancellable<Output>;
+  /**
+   * Declare the output-sink contract {@link remux} would honour for this request *before* it runs
+   * (REQUIREMENTS §5.1): whether the selected container route needs seeking, an up-front reservation,
+   * or a finalizing write, whether it is fragmented, which sink kinds it accepts, and whether peak
+   * output retention can stay bounded by active media state rather than by output size.
+   *
+   * It routes the source container (one sniffing read, cancellable) and produces no media bytes, so a
+   * caller can size or choose its destination — an upload body, a `FileSystemWritableFileStream`, an
+   * OPFS file — without speculatively executing the operation. Where a route may decline at runtime
+   * and continue into another, the declaration reports the strictest requirement any reachable route
+   * imposes; it never under-declares.
+   */
+  planRemuxOutput(
+    input: MediaInput,
+    opts: RemuxOptions,
+    o?: CallOptions,
+  ): Cancellable<RemuxOutputPlan>;
   trim(input: MediaInput, opts: TrimOptions, o?: CallOptions): Cancellable<Output>;
   decode(input: MediaInput, o?: DecodeOptions): MediaStreams;
   encode(frames: MediaStreams, opts: EncodeOptions, o?: CallOptions): Cancellable<Output>;
@@ -701,6 +719,17 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       const { runRemux } = await import('./remux-runner.ts');
       return runRemux(this.#operationRunnerContext(), input, opts, o, signal);
+    });
+  }
+
+  planRemuxOutput(
+    input: MediaInput,
+    opts: RemuxOptions,
+    o: CallOptions = {},
+  ): Cancellable<RemuxOutputPlan> {
+    return this.#withCancel(o, async (signal) => {
+      const { planRemuxOutputForInput } = await import('./remux-runner.ts');
+      return planRemuxOutputForInput(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
@@ -1558,13 +1587,16 @@ export class MediaEngineImpl implements MediaEngine {
     if (
       outputTrackId !== undefined &&
       muxer.setTrackGapless !== undefined &&
-      (outputCodec === 'aac' || outputCodec === 'opus')
+      (outputCodec === 'aac' || outputCodec === 'opus' || outputCodec === 'mp3')
     ) {
       const gapless = outputGaplessForAudioEncoder(publishedConfig, encoderTiming);
       if (gapless === undefined) {
-        if (outputCodec === 'aac') {
+        // AAC and MP3 are lapped transforms with no in-band delay signalling: without the encoder's
+        // own timing there is nothing to author, and the muxed program would silently run long by the
+        // encoder's priming. Opus still carries its pre-skip in OpusHead, so it degrades honestly.
+        if (outputCodec === 'aac' || outputCodec === 'mp3') {
           throw new CapabilityError(
-            `sample-accurate AAC MP4 muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
+            `sample-accurate ${outputCodec.toUpperCase()} muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
             {
               op: {
                 kind: 'route',
@@ -1573,7 +1605,7 @@ export class MediaEngineImpl implements MediaEngine {
               },
               tried: [codec.id],
               suggestion:
-                'use a runtime with a proven AAC encoder-delay fact or an encoder that publishes one',
+                'use a runtime with a proven encoder-delay fact or an encoder that publishes one',
             },
           );
         }

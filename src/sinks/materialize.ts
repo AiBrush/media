@@ -20,11 +20,11 @@ export async function materialize(
       // Lazy: hand the stream back untouched (the caller drives it).
       return stream;
     case 'blob': {
-      const parts = await collectOwnedParts(stream, opts);
+      const parts = await collectSpilledParts(stream, opts);
       return new Blob(parts, type ? { type } : {});
     }
     case 'file': {
-      const parts = await collectOwnedParts(stream, opts);
+      const parts = await collectSpilledParts(stream, opts);
       return new File(parts, sink.name, type ? { type } : {});
     }
     case 'opfs':
@@ -55,32 +55,61 @@ export async function materialize(
 }
 
 /**
- * Retain independently owned stream chunks for Blob/File construction without first joining them into
- * one total-sized `Uint8Array`. A producer may recycle or mutate a chunk's backing store after the write
- * completes, so every delivered part is copied before backpressure is released.
+ * Bytes of freshly delivered output held on the JavaScript heap before they are spilled into a `Blob`
+ * segment. Blob storage is owned by the user agent — it lives outside the JS heap and large blobs page to
+ * disk — so spilling keeps heap retention flat in the output size instead of proportional to it. The
+ * segment size trades that residency against segment count: 8 MiB keeps a multi-gigabyte output to a few
+ * hundred segments while retaining well under any documented operation budget.
  */
-async function collectOwnedParts(
+const BLOB_SPILL_SEGMENT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Collect a produced stream into `Blob`/`File` parts without ever holding the whole output on the JS heap.
+ *
+ * A producer may recycle or mutate a chunk's backing store once the write resolves, so every delivered
+ * chunk is copied before backpressure is released. Those copies are then handed to the user agent in
+ * {@link BLOB_SPILL_SEGMENT_BYTES} segments; the returned parts are blobs plus at most one trailing
+ * segment's worth of bytes, and `new Blob(parts)` concatenates blob parts by reference rather than
+ * copying them again.
+ */
+async function collectSpilledParts(
   readable: ReadableStream<Uint8Array>,
   opts: ExecuteOptions,
-): Promise<Uint8Array<ArrayBuffer>[]> {
-  const parts: Uint8Array<ArrayBuffer>[] = [];
+): Promise<BlobPart[]> {
+  const parts: BlobPart[] = [];
+  let pending: Uint8Array<ArrayBuffer>[] = [];
+  let pendingBytes = 0;
   let total = 0;
+  const spill = (): void => {
+    if (pendingBytes === 0) return;
+    parts.push(new Blob(pending));
+    pending = [];
+    pendingBytes = 0;
+  };
   await runToSink(
     readable,
     new WritableStream<Uint8Array>({
       write(chunk): void {
         const part = new Uint8Array(chunk.byteLength);
         part.set(chunk);
-        parts.push(part);
+        pending.push(part);
+        pendingBytes += part.byteLength;
         total += part.byteLength;
+        if (pendingBytes >= BLOB_SPILL_SEGMENT_BYTES) spill();
         opts.onProgress?.({ done: total, stage: 'collect' });
+      },
+      close(): void {
+        spill();
       },
       abort(): void {
         parts.length = 0;
+        pending = [];
+        pendingBytes = 0;
       },
     }),
     opts,
   );
+  spill(); // idempotent: covers a drain that resolves without invoking the sink's `close`
   return parts;
 }
 

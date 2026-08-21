@@ -497,10 +497,14 @@ describe('trim — compressed audio packet-copy path', () => {
       const mp3 = await outputBytes(
         await media().trim(await fixtureSource('sound_5.mp3'), { start: 1, end: 3 }),
       );
-      // Packet-copy trimming selects complete MPEG frames. The real 22.05 kHz corpus fixture selects
-      // 77 × 576-sample frames; the output intentionally has no source Xing/LAME tuple after the
-      // window changes, so this is the exact coded duration rather than a loose two-second check.
-      expect(parseMp3(mp3, mp3.byteLength).durationSec).toBeCloseTo((77 * 576) / 22_050, 12);
+      // MP3 signals delay/padding, so the trim authors the requested window to the sample rather than
+      // rounding out to whole MPEG frames (REQUIREMENTS §5.7): the copied frames still start on a frame
+      // boundary, and a rewritten Xing/LAME tuple discards the lead-in and the tail.
+      const trimmedMp3 = parseMp3(mp3, mp3.byteLength);
+      expect(trimmedMp3.durationSec).toBeCloseTo(2, 12);
+      expect(trimmedMp3.gapless?.basis).toBe('mp3-xing-lame');
+      expect(trimmedMp3.gapless?.mp3Lame?.encoderDelaySamples).toBeGreaterThan(0);
+      expect(Math.round(trimmedMp3.durationSec * trimmedMp3.sampleRate)).toBe(2 * 22_050);
 
       const adts = await outputBytes(
         await media().trim(await fixtureSource('sfx.adts'), { start: 0.04, end: 0.16 }),

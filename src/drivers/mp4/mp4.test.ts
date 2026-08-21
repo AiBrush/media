@@ -12,6 +12,7 @@ import {
   readMovie,
   readMovieMetadata,
 } from './mp4-driver.ts';
+import { timeToSampleMediaTicks } from './parse.ts';
 import { buildSamples } from './samples.ts';
 import { type MuxTrackInput, writeMp4 } from './write.ts';
 
@@ -487,19 +488,14 @@ describe('probe (golden-metadata invariants) across the real MP4 corpus', () => 
 
     for (const track of metadata.tracks) {
       expect(track.samples.sampleSizes).toHaveLength(0);
-      expect(track.samples.sampleToChunk).toHaveLength(0);
+      expect(track.samples.sampleToChunk.firstChunk).toHaveLength(0);
       expect(track.samples.chunkOffsets).toHaveLength(0);
 
       const fullTrack = full.tracks.find((candidate) => candidate.id === track.id);
       expect(fullTrack).toBeDefined();
       if (!fullTrack) continue;
-      expect(track.samples.timeToSample).toHaveLength(0);
-      expect(track.moovMediaTicks).toBe(
-        fullTrack.samples.timeToSample.reduce(
-          (total, entry) => total + entry.count * entry.delta,
-          0,
-        ),
-      );
+      expect(track.samples.timeToSample.counts).toHaveLength(0);
+      expect(track.moovMediaTicks).toBe(timeToSampleMediaTicks(fullTrack.samples.timeToSample));
       expect({
         id: track.id,
         mediaType: track.mediaType,
@@ -1769,7 +1765,7 @@ describe('demux sample tables (golden-packets invariants)', () => {
     const movie = await readMovie(makeRA(bytes));
     const video = movie.tracks.find((t) => t.mediaType === 'video');
     expect(video).toBeDefined();
-    if (video && video.samples.compositionOffsets.length > 0) {
+    if (video && video.samples.compositionOffsets.counts.length > 0) {
       const samples = buildSamples(video);
       expect(samples.some((s) => s.ptsUs !== s.dtsUs)).toBe(true);
     }

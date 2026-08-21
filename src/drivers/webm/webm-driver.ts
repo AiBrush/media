@@ -2,7 +2,9 @@
  * The WebM/MKV (EBML/Matroska) container driver — hand-written TS on top of {@link ebml}. Probe walks
  * EBML header → DocType, then Segment → Info (TimecodeScale, Duration) and Tracks (TrackEntry: type,
  * CodecID, geometry, declared AlphaMode, audio params). Metadata lives at the segment start (before
- * clusters), so a head read suffices (docs/architecture/09).
+ * clusters), so a head read suffices. When the head declares neither Duration nor DefaultDuration, the
+ * missing timeline is recovered from the *other* end of the file — Cues, else a bounded tail window —
+ * so probing a two-hour capture stays O(index) rather than O(file).
  */
 
 import { probeJpeg } from '../../codecs/image/probe.ts';
@@ -103,7 +105,14 @@ const ID = {
   Attachments: 0x1941a469,
   Chapters: 0x1043a770,
   Tags: 0x1254c367,
+  Seek: 0x4dbb,
+  SeekID: 0x53ab,
+  SeekPosition: 0x53ac,
   Cues: 0x1c53bb6b,
+  CuePoint: 0xbb,
+  CueTime: 0xb3,
+  CueTrackPositions: 0xb7,
+  CueClusterPosition: 0xf1,
   AttachedFile: 0x61a7,
   FileName: 0x466e,
   FileMimeType: 0x4660,
@@ -145,6 +154,31 @@ const WEBM_UNKNOWN_REMOTE_METADATA_PREFIX_BYTES = [
   1024 * 1024,
   4 * 1024 * 1024,
 ] as const;
+/**
+ * The terminal window a metadata probe reads from the end of a long WebM when the head prefix cannot
+ * prove duration or video cadence. A streamable WebM ends with its final Clusters and (usually) the
+ * Cues index, so this window holds a 2 h file's complete Cues (~150 KB) plus a dozen 1080p Clusters —
+ * everything the terminal facts need. Below this size the file itself is no larger than the window, so
+ * probe keeps reading it whole: one exact read is both cheaper and stricter than two bounded ones.
+ */
+export const WEBM_METADATA_TAIL_BYTES = 4 * 1024 * 1024;
+/**
+ * First rung of the tail ladder. One ordinary Cluster of 1080p video is well under this, so an
+ * unindexed file usually answers here and only long-GOP/high-bitrate writers pay the full window.
+ */
+const WEBM_METADATA_TAIL_PROBE_BYTES = 256 * 1024;
+/**
+ * Cues is a bounded index element, not payload: a 2 h one-cue-per-second index is ~150 KB. Cap the
+ * declared element so a hostile (or simply absurd) Cues size can never be materialized during probe.
+ */
+export const WEBM_METADATA_CUES_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * When Cues proves the final Cluster starts before the ordinary tail window (very large Clusters), the
+ * scan re-anchors on that position. Cap that one read so the terminal scan stays O(index), not O(file).
+ */
+const WEBM_METADATA_TERMINAL_MAX_BYTES = 16 * 1024 * 1024;
+/** Bound the CPU of the no-Cues anchor search over an adversarial tail window. */
+const WEBM_METADATA_TERMINAL_ANCHOR_MAX_CANDIDATES = 64;
 /** Ordinary EBML bootstrap read; late declarations are discovered by the bounded Segment walk. */
 const WEBM_PACKET_INFO_PREFIX_BYTES = 256 * 1024;
 /** A valid but unusually padded EBML Header may exceed the ordinary prefix; keep that retry bounded. */
@@ -558,22 +592,36 @@ function recordBlockTime(acc: Map<number, BlockTiming>, trackNumber: number, tim
   prev.count += 1;
 }
 
-/** Accumulate every (Simple)Block's presentation time into `acc`, keyed by its TrackNumber. */
+/** Whether a (Simple)Block's TrackNumber vint and int16 relative timecode are both present. */
+function blockTimeReadable(dv: DataView, el: EbmlElement): boolean {
+  const tn = readVint(dv, el.dataStart, false);
+  return tn !== undefined && el.dataStart + tn.length + 2 <= el.dataEnd;
+}
+
+/**
+ * Accumulate every (Simple)Block's presentation time into `acc`, keyed by its TrackNumber.
+ * `boundedWindow` is for a window whose final block is cut by the window edge: a block whose *header*
+ * the cut reaches has no readable relative timecode and would otherwise fold in as its cluster's start
+ * time. A block whose payload alone is cut still carries an exact time, so it is kept.
+ */
 function collectClusterBlockTimes(
   dv: DataView,
   cluster: EbmlElement,
   acc: Map<number, BlockTiming>,
+  boundedWindow = false,
 ): void {
   let timecode = 0;
   for (const c of elements(dv, cluster.dataStart, cluster.dataEnd)) {
     if (c.id === ID.Timecode) {
       timecode = readUint(dv, c);
     } else if (c.id === ID.SimpleBlock || c.id === ID.Block) {
+      if (boundedWindow && !blockTimeReadable(dv, c)) continue;
       const tn = blockTrackNumber(dv, c);
       if (tn !== undefined) recordBlockTime(acc, tn, timecode + blockRelTimecode(dv, c));
     } else if (c.id === ID.BlockGroup) {
       const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
       if (block) {
+        if (boundedWindow && !blockTimeReadable(dv, block)) continue;
         const tn = blockTrackNumber(dv, block);
         if (tn !== undefined) recordBlockTime(acc, tn, timecode + blockRelTimecode(dv, block));
       }
@@ -981,6 +1029,18 @@ function fpsFromBlockTiming(timing: BlockTiming, timecodeScale: number): number 
   return snapFpsToCadence((timing.count - 1) / spanSec);
 }
 
+/**
+ * Terminal timeline facts recovered by a bounded Cues/tail scan when the head prefix cannot prove
+ * them. They are exactly the two products a whole-file Cluster walk contributes, so injecting them
+ * makes the bounded parse take the same code path (and arithmetic) as the whole-file parse.
+ */
+interface WebmTerminalTimeline {
+  /** Greatest observed `cluster Timecode + last block relative timecode`, in TimecodeScale ticks. */
+  readonly lastEndTicks: number;
+  /** Per-TrackNumber whole-file block timing, for the DefaultDuration-less fps fallback. */
+  readonly blockTimes: ReadonlyMap<number, BlockTiming>;
+}
+
 /** Parse WebM/MKV metadata from (enough of) the file head. Pure. */
 interface ParseWebmOptions {
   readonly scanClusters?: boolean;
@@ -988,6 +1048,8 @@ interface ParseWebmOptions {
   readonly scanFirstKeyframes?: boolean;
   /** Whole-container size, used only as a conservative VP9 bitrate upper bound during prefix probe. */
   readonly sourceSizeBytes?: number;
+  /** Timeline facts a bounded terminal scan proved about Clusters outside `bytes`. */
+  readonly terminalTimeline?: WebmTerminalTimeline;
 }
 
 interface EbmlHeaderFacts {
@@ -1137,9 +1199,14 @@ export function parseWebm(bytes: Uint8Array, options: ParseWebmOptions = {}): We
 
   let timecodeScale = 1_000_000;
   let duration = 0;
-  let lastEndTicks = 0; // max (clusterTimecode + blockRel), used when Duration is absent (streamed)
+  // max (clusterTimecode + blockRel), used when Duration is absent (streamed); seeded by a bounded
+  // terminal scan when the caller proved the tail without holding the whole file.
+  let lastEndTicks = options.terminalTimeline?.lastEndTicks ?? 0;
   const tracks: WebmTrack[] = [];
   const blockTimes = new Map<number, BlockTiming>(); // TrackNumber → block-timing, for fps fallback
+  for (const [trackNumber, timing] of options.terminalTimeline?.blockTimes ?? []) {
+    blockTimes.set(trackNumber, { ...timing });
+  }
   const firstKeyframes = new Map<number, Uint8Array>();
   let keyframeTrackNumbers: readonly number[] = [];
   for (const el of segmentElements(dv, segment, false)) {
@@ -3343,15 +3410,10 @@ function metadataReadiness(bytes: Uint8Array, info: WebmInfo): MetadataReadiness
     // partial stream list; grow the range until the finite Attachments element is wholly available.
     if (child.id === ID.Attachments && !child.complete) return 'incomplete';
   }
-  // With scanClusters:false, absent duration/fps means the container declarations cannot answer the
-  // public timeline. No larger bounded prefix can prove terminal cadence for VFR or a missing Duration;
-  // a complete Cluster scan is required, so known-size callers can skip intermediate ladder windows.
-  if (
-    info.durationSec <= 0 ||
-    info.tracks.some((track) => track.mediaType === 'video' && track.fps === undefined)
-  ) {
-    return 'needs-terminal-scan';
-  }
+  // An unqualified VP9/AV1 track is answerable by a larger prefix (the first key access unit), so it is
+  // ordinary incompleteness and must be settled *before* the terminal verdict below — otherwise a
+  // MediaRecorder-style stream (no Duration, no DefaultDuration, no CodecPrivate) leaves the ladder at
+  // its first rung and can never qualify its codec from the head.
   for (const track of info.tracks) {
     if (
       track.mediaType === 'video' &&
@@ -3361,9 +3423,674 @@ function metadataReadiness(bytes: Uint8Array, info: WebmInfo): MetadataReadiness
       return 'incomplete';
     }
   }
+  // With scanClusters:false, absent duration/fps means the container declarations cannot answer the
+  // public timeline. No larger bounded *prefix* can prove terminal cadence for VFR or a missing
+  // Duration; the answer lives at the end of the file (Cues / the final Clusters).
+  if (
+    info.durationSec <= 0 ||
+    info.tracks.some((track) => track.mediaType === 'video' && track.fps === undefined)
+  ) {
+    return 'needs-terminal-scan';
+  }
   if (!segmentHasDeclaredDuration(dv, segment)) return 'incomplete';
   if (!videoTracksHaveDefaultDuration(dv, segment)) return 'incomplete';
   return 'complete';
+}
+
+// ── bounded terminal metadata scan ────────────────────────────────────────────────────────────────
+// Duration (when Segment>Info>Duration is absent) and video cadence (when TrackEntry>DefaultDuration
+// is absent) are terminal facts, not whole-file facts: the last Cluster's timecode answers the first
+// and a bounded number of blocks answers the second. This section reads them with O(index) I/O —
+// SeekHead→Cues when the writer indexed the file, else a bounded tail window — and hands them to
+// {@link parseWebm} as a {@link WebmTerminalTimeline} so the *same* arithmetic produces the result.
+
+/** The Segment payload span in file coordinates (a bounded prefix DataView clamps the declared end). */
+interface SegmentSpan {
+  readonly dataStart: number;
+  readonly dataEnd: number;
+}
+
+/** One Cluster-walk sample: the two products a Cluster contributes to {@link parseWebm}. */
+interface ClusterTimelineSample {
+  lastEndTicks: number;
+  readonly blockTimes: Map<number, BlockTiming>;
+  clusters: number;
+  /** Greatest Cluster Timestamp in the sample, which the terminal chain must not go back behind. */
+  lastTimecode: number;
+}
+
+function emptyTimelineSample(): ClusterTimelineSample {
+  return { lastEndTicks: 0, blockTimes: new Map(), clusters: 0, lastTimecode: -1 };
+}
+
+/**
+ * The Segment's span in *file* coordinates. {@link findSegment} reports the end clamped to the prefix
+ * window, which is exactly the value a terminal scan must not use.
+ */
+function segmentSpan(dv: DataView, sourceSize: number): SegmentSpan | undefined {
+  let position = 0;
+  for (const el of elements(dv, 0, dv.byteLength)) {
+    if (el.id === ID.Segment) {
+      // The Segment id is a 4-byte vint, so its size vint starts at a known offset. An unknown-sized
+      // (live-written) Segment, or one whose declaration outruns the file, ends at EOF.
+      const size = readVint(dv, position + 4, false);
+      const declaredEnd =
+        size === undefined || size.value < 0 ? sourceSize : el.dataStart + size.value;
+      return { dataStart: el.dataStart, dataEnd: Math.min(declaredEnd, sourceSize) };
+    }
+    position = el.dataEnd;
+  }
+  return undefined;
+}
+
+/** Segment>Info>TimecodeScale, or the Matroska default when the head does not override it. */
+function segmentTimecodeScale(dv: DataView, span: SegmentSpan): number {
+  const info = findChild(dv, span.dataStart, Math.min(span.dataEnd, dv.byteLength), ID.Info);
+  if (info === undefined) return 1_000_000;
+  const scale = findChild(dv, info.dataStart, info.dataEnd, ID.TimecodeScale);
+  return scale === undefined ? 1_000_000 : readUint(dv, scale);
+}
+
+/** Declared TrackNumbers — a Cluster whose blocks name an undeclared track is not a real Cluster. */
+function declaredTrackNumbers(info: WebmInfo): Set<number> {
+  const numbers = new Set<number>();
+  for (const track of info.tracks) {
+    if (track.trackNumber !== undefined) numbers.add(track.trackNumber);
+  }
+  return numbers;
+}
+
+/**
+ * Fold one SeekHead's entries into `targets`: target element id → absolute file offset (SeekPosition is
+ * Segment-relative). Matroska writers commonly place a stub SeekHead at the head that points at a second
+ * SeekHead next to the trailing Cues, so the caller follows one level of indirection.
+ */
+function collectSeekEntries(
+  dv: DataView,
+  seekHead: EbmlElement,
+  span: SegmentSpan,
+  targets: Map<number, number>,
+): void {
+  for (const seek of elements(dv, seekHead.dataStart, seekHead.dataEnd)) {
+    if (seek.id !== ID.Seek || !seek.complete) continue;
+    const idEl = findChild(dv, seek.dataStart, seek.dataEnd, ID.SeekID);
+    const positionEl = findChild(dv, seek.dataStart, seek.dataEnd, ID.SeekPosition);
+    if (idEl === undefined || positionEl === undefined) continue;
+    if (!idEl.complete || !positionEl.complete) continue;
+    const target = readUint(dv, idEl); // SeekID carries the element id with its vint marker
+    const position = span.dataStart + readUint(dv, positionEl);
+    if (Number.isSafeInteger(position) && !targets.has(target)) targets.set(target, position);
+  }
+}
+
+/** Fold every complete SeekHead declared inside the head prefix. */
+function collectPrefixSeekEntries(
+  dv: DataView,
+  span: SegmentSpan,
+  targets: Map<number, number>,
+): void {
+  for (const el of elements(dv, span.dataStart, Math.min(span.dataEnd, dv.byteLength))) {
+    if (el.id === ID.SeekHead && el.complete) collectSeekEntries(dv, el, span, targets);
+  }
+}
+
+/**
+ * The file position of a Segment-level element of `id` declared inside the head prefix, including one
+ * whose payload the prefix truncates (its header is what a terminal read needs).
+ */
+function prefixSegmentChildPosition(
+  dv: DataView,
+  span: SegmentSpan,
+  id: number,
+): number | undefined {
+  // `elements` advances to each element's data end, which is the next element's header position.
+  let position = span.dataStart;
+  for (const el of elements(dv, span.dataStart, Math.min(span.dataEnd, dv.byteLength))) {
+    if (el.id === id) return position;
+    position = el.dataEnd;
+  }
+  return undefined;
+}
+
+/**
+ * Parse a Cues element that already sits wholly inside a buffer read at file offset `base`, so the
+ * common layouts (Cues in the head prefix, or Cues inside the tail window) cost no extra range read.
+ */
+function cuesFromBuffer(
+  bytes: Uint8Array,
+  base: number,
+  position: number,
+  span: SegmentSpan,
+): number[] | undefined {
+  const at = position - base;
+  if (at < 0 || at >= bytes.byteLength) return undefined;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (const el of elements(dv, at, bytes.byteLength)) {
+    return el.id === ID.Cues && el.complete ? cueClusterPositions(dv, el, span) : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Read one complete declared element at `position`. Refuses an element that is unknown-sized, escapes
+ * EOF, exceeds `maxBytes`, or does not carry `expectedId` — the four ways a bogus SeekHead offset or a
+ * truncated index shows up. Costs exactly one range read: the window *is* the cap, so a legal element
+ * is wholly inside it (and an illegal one is refused rather than chased with a second request).
+ */
+async function readElementAt(
+  src: FiniteRangeByteSource,
+  position: number,
+  expectedId: number,
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+): Promise<{ readonly bytes: Uint8Array; readonly element: EbmlElement } | undefined> {
+  if (!Number.isSafeInteger(position) || position < 0 || position >= src.size) return undefined;
+  const probeEnd = Math.min(position + maxBytes, src.size);
+  const probe = await src.range(position, probeEnd);
+  assertNotAborted(signal);
+  const probeDv = new DataView(probe.buffer, probe.byteOffset, probe.byteLength);
+  const id = readVint(probeDv, 0, true);
+  const size = id === undefined ? undefined : readVint(probeDv, id.length, false);
+  if (id === undefined || id.value !== expectedId || size === undefined || size.value < 0) {
+    src.releaseRange?.(probe);
+    return undefined;
+  }
+  const headerLength = id.length + size.length;
+  const declaredEnd = position + headerLength + size.value;
+  const element: EbmlElement = {
+    id: id.value,
+    dataStart: headerLength,
+    dataEnd: headerLength + size.value,
+    complete: true,
+    unknownSize: false,
+  };
+  if (declaredEnd > src.size || element.dataEnd > probe.byteLength) {
+    src.releaseRange?.(probe);
+    return undefined;
+  }
+  return { bytes: probe, element };
+}
+
+/** Absolute Cluster positions declared by a Cues index, ascending and inside the Segment. */
+function cueClusterPositions(dv: DataView, cues: EbmlElement, span: SegmentSpan): number[] {
+  const positions: number[] = [];
+  for (const point of elements(dv, cues.dataStart, cues.dataEnd)) {
+    if (point.id !== ID.CuePoint || !point.complete) continue;
+    for (const child of elements(dv, point.dataStart, point.dataEnd)) {
+      if (child.id !== ID.CueTrackPositions || !child.complete) continue;
+      const position = findChild(dv, child.dataStart, child.dataEnd, ID.CueClusterPosition);
+      if (position === undefined || !position.complete) continue;
+      const absolute = span.dataStart + readUint(dv, position);
+      if (absolute >= span.dataStart && absolute < span.dataEnd) positions.push(absolute);
+    }
+  }
+  positions.sort((a, b) => a - b);
+  // One CuePoint carries a CueTrackPositions per indexed track, all naming the same Cluster.
+  return positions.filter((position, index) => index === 0 || position !== positions[index - 1]);
+}
+
+/**
+ * Validate one Cluster and return its Timecode. A Cluster with no Timecode, with no block, or with a
+ * block naming an undeclared track is not a Cluster — it is a byte pattern inside payload that the
+ * anchor search happened to land on, and accepting it would fabricate a timeline.
+ */
+function terminalClusterTimecode(
+  dv: DataView,
+  cluster: EbmlElement,
+  trackNumbers: ReadonlySet<number>,
+): number | undefined {
+  let timecode: number | undefined;
+  let blocks = 0;
+  for (const c of elements(dv, cluster.dataStart, cluster.dataEnd)) {
+    if (c.id === ID.Timecode) {
+      timecode = readUint(dv, c);
+    } else if (c.id === ID.SimpleBlock || c.id === ID.Block) {
+      const trackNumber = blockTrackNumber(dv, c);
+      if (trackNumber === undefined || !trackNumbers.has(trackNumber)) return undefined;
+      blocks += 1;
+    } else if (c.id === ID.BlockGroup) {
+      const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
+      if (block === undefined) continue;
+      const trackNumber = blockTrackNumber(dv, block);
+      if (trackNumber === undefined || !trackNumbers.has(trackNumber)) return undefined;
+      blocks += 1;
+    }
+  }
+  return timecode !== undefined && blocks > 0 ? timecode : undefined;
+}
+
+/**
+ * The outcome of one anchored walk. `'not-a-chain'` only rejects the anchor — another candidate may
+ * still describe the tail. `'unusable'` rejects the *file*: it means the terminal region contradicts
+ * what a bounded scan can conclude (Clusters whose timestamps go backwards, so the greatest one may
+ * live in a Cluster no window covers; or Attachments, whose streams the head parse cannot see).
+ */
+type TerminalWalk = ClusterTimelineSample | 'not-a-chain' | 'unusable';
+
+/**
+ * Walk Segment-level elements from a candidate Cluster anchor to the terminal boundary, folding every
+ * Cluster into `sample`. The region must tile exactly — every element header valid, every id legal at
+ * Segment level, the last element ending precisely on `end` — which is what turns a *guessed* anchor
+ * into a proven one.
+ */
+function walkTerminalClusters(
+  dv: DataView,
+  from: number,
+  end: number,
+  trackNumbers: ReadonlySet<number>,
+  earliestTimecode: number,
+): TerminalWalk {
+  const sample = emptyTimelineSample();
+  let offset = from;
+  let previousTimecode = earliestTimecode;
+  while (offset < end) {
+    const id = readVint(dv, offset, true);
+    // Void/CRC-32 are legal filler between Segment-level elements; a writer's reserved padding must
+    // not make the chain unreadable.
+    const known =
+      id !== undefined &&
+      (SEGMENT_LEVEL_IDS.has(id.value) || id.value === ID.Void || id.value === ID.CRC32);
+    if (id === undefined || !known) return 'not-a-chain';
+    if (id.value === ID.Attachments) return 'unusable';
+    const size = readVint(dv, offset + id.length, false);
+    if (size === undefined) return 'not-a-chain';
+    const dataStart = offset + id.length + size.length;
+    if (dataStart > end) return 'not-a-chain';
+    let dataEnd: number;
+    if (size.value < 0) {
+      if (id.value !== ID.Cluster) return 'not-a-chain';
+      dataEnd = unknownClusterEnd(dv, dataStart, end);
+    } else {
+      dataEnd = dataStart + size.value;
+      // A trailing index/tag element cut by the end of the file (a truncated download, an interrupted
+      // writer) carries no timeline: the Cluster chain in front of it is still proved and complete.
+      if (dataEnd > end) return id.value === ID.Cluster ? 'not-a-chain' : sample;
+    }
+    if (id.value === ID.Cluster) {
+      const cluster: EbmlElement = {
+        id: id.value,
+        dataStart,
+        dataEnd,
+        complete: size.value >= 0,
+        unknownSize: size.value < 0,
+      };
+      const timecode = terminalClusterTimecode(dv, cluster, trackNumbers);
+      if (timecode === undefined) return 'not-a-chain';
+      if (timecode < previousTimecode) return 'unusable';
+      previousTimecode = timecode;
+      sample.lastTimecode = Math.max(sample.lastTimecode, timecode);
+      sample.lastEndTicks = Math.max(sample.lastEndTicks, clusterEnd(dv, cluster));
+      collectClusterBlockTimes(dv, cluster, sample.blockTimes);
+      sample.clusters += 1;
+    }
+    offset = dataEnd;
+  }
+  // The walk starts on a Cluster, so a chain that tiles exactly has folded in at least one.
+  return offset === end ? sample : 'not-a-chain';
+}
+
+/**
+ * Whether `at` could open a Cluster: the id, a well-formed size, and a Timestamp among its first
+ * children (Matroska requires one, and permits only CRC-32/Void ahead of it). Payload bytes that
+ * happen to spell the Cluster id almost never continue like this, so this is what keeps the anchor
+ * search — and the walk it feeds — from spending its budget on decoys.
+ */
+function plausibleClusterAt(dv: DataView, at: number, end: number): boolean {
+  // The caller has already matched the Cluster id at `at`; what is in question is what follows it.
+  for (const cluster of elements(dv, at, end)) {
+    let leading = 0;
+    for (const child of elements(dv, cluster.dataStart, cluster.dataEnd)) {
+      if (child.id === ID.Timecode) return child.dataEnd - child.dataStart <= 8;
+      leading += 1;
+      if (leading > 2 || (child.id !== ID.CRC32 && child.id !== ID.Void)) return false;
+    }
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Candidate Cluster starts inside a window, earliest first. EBML has no back-pointers and a window read
+ * from the tail lands mid-element, so without Cues the only way in is to look for a Cluster opening and
+ * let {@link walkTerminalClusters} prove or reject each candidate. Earliest-first maximizes the number
+ * of sampled blocks; the count is capped so an adversarial window cannot buy unbounded validation work.
+ */
+function terminalClusterAnchors(dv: DataView, from: number, end: number): number[] {
+  const anchors: number[] = [];
+  for (let at = from; at + 4 <= end; at++) {
+    if (dv.getUint32(at, false) !== ID.Cluster || !plausibleClusterAt(dv, at, end)) continue;
+    anchors.push(at);
+    if (anchors.length >= WEBM_METADATA_TERMINAL_ANCHOR_MAX_CANDIDATES) break;
+  }
+  return anchors;
+}
+
+/**
+ * The first candidate anchor whose Cluster chain the walk proves. A single `'unusable'` verdict ends
+ * the search: a later anchor could only "succeed" by looking at less of the same contradiction.
+ */
+function walkFromAnchors(
+  dv: DataView,
+  anchors: readonly number[],
+  end: number,
+  trackNumbers: ReadonlySet<number>,
+  earliestTimecode: number,
+): TerminalWalk {
+  for (const anchor of anchors) {
+    const walk = walkTerminalClusters(dv, anchor, end, trackNumbers, earliestTimecode);
+    if (walk !== 'not-a-chain') return walk;
+  }
+  return 'not-a-chain';
+}
+
+/** Fold the head prefix's Clusters into a timeline sample (the first block times live here). */
+function scanPrefixClusters(
+  prefix: Uint8Array,
+  span: SegmentSpan,
+  sample: ClusterTimelineSample,
+): void {
+  const dv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+  const segment: EbmlElement = {
+    id: ID.Segment,
+    dataStart: span.dataStart,
+    dataEnd: Math.min(span.dataEnd, prefix.byteLength),
+    complete: span.dataEnd <= prefix.byteLength,
+    unknownSize: false,
+  };
+  // Non-strict and already parsed: {@link parseWebm} walked these same bytes with the same iterator
+  // before the caller asked for a terminal scan, so this walk cannot fail where that one did not.
+  for (const el of segmentElements(dv, segment, false)) {
+    if (el.id !== ID.Cluster) continue;
+    const timecode = findChild(dv, el.dataStart, el.dataEnd, ID.Timecode);
+    if (timecode !== undefined) {
+      sample.lastTimecode = Math.max(sample.lastTimecode, readUint(dv, timecode));
+    }
+    sample.lastEndTicks = Math.max(sample.lastEndTicks, clusterEnd(dv, el));
+    collectClusterBlockTimes(dv, el, sample.blockTimes, true);
+    sample.clusters += 1;
+  }
+}
+
+/** Head and tail cadence must agree this closely before a whole-file block count is predicted. */
+const TERMINAL_CADENCE_REL_TOLERANCE = 0.02;
+/**
+ * How close to an integer cadence a predicted estimate must land to be trusted when the block spacing
+ * is not exactly uniform. A predicted count can be a few blocks off over a two-hour span; at this
+ * margin (a quarter of {@link FPS_SNAP_REL_TOLERANCE}) that error cannot move the snapped answer.
+ */
+const TERMINAL_CADENCE_SNAP_MARGIN = 0.005;
+
+/**
+ * Predict a track's whole-file {@link BlockTiming} from bounded head and tail samples.
+ *
+ * The whole-file fps fallback is `(count − 1) / span`, so a bounded scan must reproduce `count`. It can,
+ * for a constant-cadence track: the tail sample gives the block interval, the head sample gives the
+ * first block time, and the interval tiles the global span. Two acceptance gates keep that from becoming
+ * a guess — an exactly uniform tick interval that divides the span (the prediction is then arithmetically
+ * exact), or a cadence that quantizes to an integer frame rate with margin to spare (a few miscounted
+ * blocks cannot change the reported value). Anything else — genuine VFR, disagreeing head/tail cadence —
+ * returns `undefined` so the caller falls back to the whole-file read instead of reporting a near miss.
+ */
+function predictBlockTiming(
+  head: BlockTiming | undefined,
+  tail: BlockTiming | undefined,
+  timecodeScale: number,
+): BlockTiming | undefined {
+  if (head === undefined || tail === undefined || tail.count < 2) return undefined;
+  const first = Math.min(head.first, tail.first);
+  const last = Math.max(head.last, tail.last);
+  const span = last - first;
+  const tailSpan = tail.last - tail.first;
+  if (span <= 0 || tailSpan <= 0) return undefined;
+  const tailIntervals = tail.count - 1;
+  const interval = tailSpan / tailIntervals;
+  const headIntervals = head.count - 1;
+  const headSpan = head.last - head.first;
+  if (headIntervals > 0 && headSpan > 0) {
+    const headInterval = headSpan / headIntervals;
+    if (Math.abs(headInterval - interval) > interval * TERMINAL_CADENCE_REL_TOLERANCE) {
+      return undefined;
+    }
+  }
+  const intervals = Math.round(span / interval);
+  if (intervals < 1) return undefined;
+  const timing: BlockTiming = { first, last, count: intervals + 1 };
+  const uniform =
+    tailSpan % tailIntervals === 0 &&
+    span % interval === 0 &&
+    (headIntervals <= 0 ||
+      (headSpan % headIntervals === 0 && headSpan / headIntervals === interval));
+  if (uniform) return timing;
+  const raw = fpsFromBlockTiming(timing, timecodeScale);
+  if (raw === undefined) return undefined;
+  const nearest = Math.round(raw);
+  return nearest >= 1 && Math.abs(raw - nearest) <= nearest * TERMINAL_CADENCE_SNAP_MARGIN
+    ? timing
+    : undefined;
+}
+
+/** What the Segment's index declarations say about a file the head prefix does not cover. */
+interface TerminalIndexPlan {
+  /** Absolute position of the Cues element, when one is declared. */
+  readonly cues?: number;
+  /** An Attachments element outside the prefix carries streams a bounded parse would silently drop. */
+  readonly attachmentsOutsidePrefix: boolean;
+}
+
+/**
+ * Locate the Cues index without reading a byte of payload: it is either declared inside the head prefix
+ * or named by a SeekHead entry (following at most one SeekHead→SeekHead hop, which is how mkvmerge
+ * points at its trailing index). Returns positions only — the bytes are read by the caller, if at all.
+ */
+async function planTerminalIndex(
+  src: FiniteRangeByteSource,
+  prefix: Uint8Array,
+  span: SegmentSpan,
+  signal: AbortSignal | undefined,
+): Promise<TerminalIndexPlan> {
+  const prefixDv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+  const targets = new Map<number, number>();
+  collectPrefixSeekEntries(prefixDv, span, targets);
+  const nested = targets.get(ID.SeekHead);
+  if (nested !== undefined && nested >= prefix.byteLength) {
+    const read = await readElementAt(
+      src,
+      nested,
+      ID.SeekHead,
+      WEBM_METADATA_CUES_MAX_BYTES,
+      signal,
+    );
+    if (read !== undefined) {
+      const dv = new DataView(read.bytes.buffer, read.bytes.byteOffset, read.bytes.byteLength);
+      collectSeekEntries(dv, read.element, span, targets);
+      src.releaseRange?.(read.bytes); // only offsets escape this buffer
+    }
+  }
+  const attachments =
+    prefixSegmentChildPosition(prefixDv, span, ID.Attachments) ?? targets.get(ID.Attachments);
+  const cues = prefixSegmentChildPosition(prefixDv, span, ID.Cues) ?? targets.get(ID.Cues);
+  return {
+    ...(cues !== undefined ? { cues } : {}),
+    attachmentsOutsidePrefix: attachments !== undefined && attachments >= prefix.byteLength,
+  };
+}
+
+/**
+ * The Cues-proved start of the terminal read: the final indexed Cluster, widened to the one before it
+ * only when both together are still smaller than the first tail rung (short Clusters give a thin
+ * cadence sample). `undefined` when Cues is absent or names nothing this side of a bounded read.
+ */
+function terminalWindowStart(
+  positions: readonly number[] | undefined,
+  span: SegmentSpan,
+): number | undefined {
+  const last = positions?.at(-1);
+  if (last === undefined) return undefined;
+  if (span.dataEnd - last > WEBM_METADATA_TERMINAL_MAX_BYTES) return undefined;
+  const penultimate = positions?.at(-2);
+  return penultimate !== undefined && span.dataEnd - penultimate <= WEBM_METADATA_TAIL_PROBE_BYTES
+    ? penultimate
+    : last;
+}
+
+/** Read the Cues index, preferring the head prefix already in hand over a fresh bounded range read. */
+async function readCueClusterPositions(
+  src: FiniteRangeByteSource,
+  position: number,
+  prefix: Uint8Array,
+  span: SegmentSpan,
+  signal: AbortSignal | undefined,
+): Promise<number[] | undefined> {
+  const local = cuesFromBuffer(prefix, 0, position, span);
+  if (local !== undefined) return local;
+  const read = await readElementAt(src, position, ID.Cues, WEBM_METADATA_CUES_MAX_BYTES, signal);
+  if (read === undefined) return undefined;
+  const dv = new DataView(read.bytes.buffer, read.bytes.byteOffset, read.bytes.byteLength);
+  const positions = cueClusterPositions(dv, read.element, span);
+  src.releaseRange?.(read.bytes); // only offsets escape this buffer
+  return positions;
+}
+
+/**
+ * Recover the terminal timeline with bounded I/O, or `undefined` when it cannot be *proved* bounded.
+ *
+ * Strategy, in preference order: a Cues-declared final Cluster position (exact, no guessing) → a
+ * bounded tail window whose Cluster chain is proved by tiling exactly onto the Segment end → give up.
+ * Giving up is the caller's cue to fall back to the whole-file read, which is the only honest answer
+ * when neither an index nor a valid terminal chain exists.
+ */
+async function readTerminalTimeline(
+  src: FiniteRangeByteSource,
+  prefix: Uint8Array,
+  info: WebmInfo,
+  signal: AbortSignal | undefined,
+): Promise<WebmTerminalTimeline | undefined> {
+  const size = src.size;
+  const prefixDv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+  const span = segmentSpan(prefixDv, size);
+  if (span === undefined || span.dataEnd <= span.dataStart) return undefined;
+  const plan = await planTerminalIndex(src, prefix, span, signal);
+  // Attachments become public streams; a bounded parse that never sees them would report fewer tracks.
+  if (plan.attachmentsOutsidePrefix) return undefined;
+
+  const cuePositions =
+    plan.cues === undefined
+      ? undefined
+      : await readCueClusterPositions(src, plan.cues, prefix, span, signal);
+  // Cues names the final Clusters outright, so the window shrinks to exactly them. Without an index
+  // the window is a search area, and it starts small: one ordinary Cluster answers most files, and
+  // only a writer with very large Clusters pays for the full tail.
+  const indexed = terminalWindowStart(cuePositions, span);
+  const windows = [
+    ...(indexed !== undefined ? [indexed] : []),
+    ...[WEBM_METADATA_TAIL_PROBE_BYTES, WEBM_METADATA_TAIL_BYTES].map((bytes) =>
+      Math.max(span.dataStart, span.dataEnd - bytes),
+    ),
+  ];
+  const trackNumbers = declaredTrackNumbers(info);
+  const head = emptyTimelineSample();
+  scanPrefixClusters(prefix, span, head);
+  const timecodeScale = segmentTimecodeScale(prefixDv, span);
+  let previousStart = span.dataEnd;
+  for (const windowStart of windows) {
+    if (windowStart >= previousStart) continue; // an earlier rung already covered this span
+    previousStart = windowStart;
+    const window = await src.range(windowStart, span.dataEnd);
+    assertNotAborted(signal);
+    if (window.byteLength !== span.dataEnd - windowStart) return undefined;
+    const windowDv = new DataView(window.buffer, window.byteOffset, window.byteLength);
+    const end = window.byteLength;
+    const indexedAnchors = (cuePositions ?? [])
+      .filter((position) => position >= windowStart)
+      .map((position) => position - windowStart);
+    // Trust the index first, but never *only* the index: Cues that points into payload is exactly the
+    // case the unindexed anchor search already handles, over a window that is already in hand.
+    // A terminal Cluster that starts before the head sample's latest Timestamp would make the greatest
+    // timecode live somewhere this scan never looked, so a chain that goes backwards is refused. The
+    // seed only applies to a window disjoint from the prefix — an overlapping window revisits Clusters
+    // the head already folded in, where an earlier Timestamp is expected rather than suspicious.
+    const earliestTimecode = windowStart >= prefix.byteLength ? head.lastTimecode : -1;
+    const fromIndex = walkFromAnchors(
+      windowDv,
+      indexedAnchors,
+      end,
+      trackNumbers,
+      earliestTimecode,
+    );
+    const tail =
+      fromIndex !== 'not-a-chain'
+        ? fromIndex
+        : walkFromAnchors(
+            windowDv,
+            terminalClusterAnchors(windowDv, 0, end),
+            end,
+            trackNumbers,
+            earliestTimecode,
+          );
+    src.releaseRange?.(window); // the sample retains timecodes and counts, never Cluster bytes
+    if (tail === 'unusable') return undefined;
+    if (tail === 'not-a-chain') continue;
+    const timeline = terminalTimelineFrom(head, tail, info, timecodeScale);
+    // A proved chain that is too thin to date the cadence is not a failure yet: the next rung is a
+    // wider window over the same tail, and only an exhausted ladder falls back to the whole file.
+    if (timeline !== undefined) return timeline;
+  }
+  return undefined;
+}
+
+/**
+ * Assemble the whole-file timeline from the head and terminal samples, or `undefined` when a video
+ * track's cadence cannot be reproduced exactly.
+ */
+function terminalTimelineFrom(
+  head: ClusterTimelineSample,
+  tail: ClusterTimelineSample,
+  info: WebmInfo,
+  timecodeScale: number,
+): WebmTerminalTimeline | undefined {
+  const blockTimes = new Map<number, BlockTiming>();
+  for (const track of info.tracks) {
+    if (track.mediaType !== 'video' || track.fps !== undefined) continue;
+    if (track.trackNumber === undefined) return undefined;
+    const timing = predictBlockTiming(
+      head.blockTimes.get(track.trackNumber),
+      tail.blockTimes.get(track.trackNumber),
+      timecodeScale,
+    );
+    if (timing === undefined) return undefined;
+    blockTimes.set(track.trackNumber, timing);
+  }
+  // Cluster timecodes are monotonic in every writer this engine targets (and the terminal walk rejects
+  // a chain that is not), so the greatest end lives in the head sample or the final Clusters. A file
+  // that hides its greatest timecode in an unscanned middle Cluster is the residual gap here.
+  return { lastEndTicks: Math.max(head.lastEndTicks, tail.lastEndTicks), blockTimes };
+}
+
+/**
+ * The bounded answer to `needs-terminal-scan`, or `undefined` when the file must be read whole. The
+ * result is produced by re-parsing the *same* head prefix with the terminal facts injected, so every
+ * field except duration/fps comes from the exact bytes the ladder already validated.
+ */
+async function boundedTerminalInfo(
+  src: FiniteRangeByteSource,
+  prefix: Uint8Array,
+  prefixInfo: WebmInfo,
+  signal: AbortSignal | undefined,
+): Promise<WebmInfo | undefined> {
+  // Below the tail window the whole file is the cheaper read *and* the exact one; keep it.
+  if (src.size <= WEBM_METADATA_TAIL_BYTES) return undefined;
+  const timeline = await readTerminalTimeline(src, prefix, prefixInfo, signal);
+  if (timeline === undefined) return undefined;
+  const info = parseWebm(prefix, {
+    scanClusters: false,
+    sourceSizeBytes: src.size,
+    terminalTimeline: timeline,
+  });
+  if (info.durationSec <= 0) return undefined;
+  if (info.tracks.some((track) => track.mediaType === 'video' && track.fps === undefined)) {
+    return undefined;
+  }
+  return info;
 }
 
 async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<WebmInfo> {
@@ -3411,6 +4138,12 @@ async function readMetadataInfo(src: ByteSource, signal?: AbortSignal): Promise<
       src.size !== undefined &&
       bytes.byteLength < src.size
     ) {
+      // Duration and cadence live at the *end* of the file, so read the end — not the file. This is
+      // O(index): a Cues-anchored or tail-window Cluster chain, never the body (docs/architecture/09).
+      const bounded = await boundedTerminalInfo(src as FiniteRangeByteSource, bytes, info, signal);
+      if (bounded !== undefined) return bounded;
+      // Last resort: no index, no provable terminal Cluster chain. Reporting a guessed timeline would
+      // be worse than reading the file, so this path stays — it must simply stay rare.
       const completeBytes = await range.call(src, 0, src.size);
       assertNotAborted(signal);
       if (completeBytes.byteLength < src.size) {

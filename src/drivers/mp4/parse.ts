@@ -26,34 +26,45 @@ import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 export type { ColrInfo } from './codec-strings.ts';
 
-export interface TimeToSample {
-  count: number;
-  delta: number;
+/**
+ * Run-length `stts` as parallel columns: entry `i` declares `counts[i]` consecutive samples of
+ * `deltas[i]` ticks. Columns instead of `{count, delta}[]` because a variable-frame-rate or
+ * per-sample-`ctts` track has one entry per sample: 216,000 entries (a 2 h 30 fps movie) cost
+ * ~1.7 MB as two `Uint32Array`s versus ~12 MB as boxed objects plus their pointer array.
+ */
+export interface TimeToSampleTable {
+  readonly counts: Uint32Array;
+  readonly deltas: Uint32Array;
 }
-export interface CompositionOffset {
-  count: number;
-  offset: number;
+/** Run-length `ctts`; offsets are signed for both box versions (see {@link parseCtts}). */
+export interface CompositionOffsetTable {
+  readonly counts: Uint32Array;
+  readonly offsets: Int32Array;
 }
-export interface SampleToChunk {
-  firstChunk: number;
-  samplesPerChunk: number;
-  descIndex: number;
+/** Run-length `stsc` as parallel columns; entry `i` starts at 1-based chunk `firstChunk[i]`. */
+export interface SampleToChunkTable {
+  readonly firstChunk: Uint32Array;
+  readonly samplesPerChunk: Uint32Array;
+  readonly descIndex: Uint32Array;
 }
 
-/** ISO-BMFF `sdtp.sample_depends_on`: 0 unknown, 1 dependent, 2 independent, 3 reserved. */
-export type SampleDependency = 0 | 1 | 2 | 3;
-
+/**
+ * The per-track sample tables in their container-native form. Every column is a typed array so a
+ * long movie costs its exact byte size instead of a boxed JS value plus object header per entry;
+ * consumers read them by index exactly as they read an array (docs/architecture/09 demux).
+ */
 export interface SampleTable {
-  timeToSample: TimeToSample[];
-  compositionOffsets: CompositionOffset[];
+  timeToSample: TimeToSampleTable;
+  compositionOffsets: CompositionOffsetTable;
   /** Per-sample sizes (length === sampleCount). */
-  sampleSizes: number[];
-  sampleToChunk: SampleToChunk[];
-  chunkOffsets: number[];
+  sampleSizes: Uint32Array;
+  sampleToChunk: SampleToChunkTable;
+  /** Chunk byte offsets; `Float64Array` because `co64` offsets exceed 32 bits (exact to 2^53). */
+  chunkOffsets: Float64Array;
   /** 1-based sample numbers that are sync (keyframes); empty means "every sample is sync". */
-  syncSamples: number[];
-  /** Per-sample `sdtp.sample_depends_on` values; missing/short entries mean unknown. */
-  sampleDependencies: SampleDependency[];
+  syncSamples: Uint32Array;
+  /** Per-sample `sdtp.sample_depends_on` (0 unknown, 1 dependent, 2 independent, 3 reserved). */
+  sampleDependencies: Uint8Array;
 }
 
 /** The raw codec-configuration box (`avcC`/`esds`) preserved verbatim for lossless stream-copy. */
@@ -566,9 +577,7 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
     }
     // fps is frames over the *content* span (Σ sample durations), not the presentation end, so a
     // start offset in `durationSec` doesn't deflate it — this equals ffprobe's avg_frame_rate.
-    const moovMediaTicks =
-      track.moovMediaTicks ??
-      track.samples.timeToSample.reduce((total, entry) => total + entry.count * entry.delta, 0);
+    const moovMediaTicks = track.moovMediaTicks ?? timeToSampleMediaTicks(track.samples.timeToSample);
     const mediaSec =
       Math.max(declaredMediaDurationTicks, moovMediaTicks + frag.mediaTicks) / track.timescale;
     const sampleCount =
@@ -578,6 +587,13 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
   }
   movie.durationSec = movieDurationSec;
   return movie;
+}
+
+/** Σ (count × delta) over a run-length `stts` — the track's media span in its own ticks. */
+export function timeToSampleMediaTicks(table: TimeToSampleTable): number {
+  let total = 0;
+  for (let i = 0; i < table.counts.length; i++) total += (table.counts[i] ?? 0) * (table.deltas[i] ?? 0);
+  return total;
 }
 
 /** Run a lenient sub-parse: malformed boxes in a non-media trak yield undefined, never a throw. */
@@ -1435,16 +1451,67 @@ function readSenc(r: Reader, stbl: BoxHeader, enc: Omit<TrackProtection, 'senc'>
   return { ...enc, senc: r.bytesAt(senc.payloadStart, senc.end).slice() };
 }
 
-function emptySampleTable(): SampleTable {
-  return {
-    timeToSample: [],
-    compositionOffsets: [],
-    sampleSizes: [],
-    sampleToChunk: [],
-    chunkOffsets: [],
-    syncSamples: [],
-    sampleDependencies: [],
+/** Plain run/scalar values for {@link sampleTableFrom} — the shape a caller can write by hand. */
+export interface SampleTableInit {
+  readonly timeToSample?: readonly { readonly count: number; readonly delta: number }[];
+  readonly compositionOffsets?: readonly { readonly count: number; readonly offset: number }[];
+  readonly sampleSizes?: ArrayLike<number>;
+  readonly sampleToChunk?: readonly {
+    readonly firstChunk: number;
+    readonly samplesPerChunk: number;
+    readonly descIndex: number;
+  }[];
+  readonly chunkOffsets?: ArrayLike<number>;
+  readonly syncSamples?: ArrayLike<number>;
+  readonly sampleDependencies?: ArrayLike<number>;
+}
+
+/**
+ * The canonical {@link SampleTable} constructor: it packs plain run/scalar values into the typed
+ * columns the parsed representation owns. Box parsing fills its columns directly from the reader
+ * (no intermediate objects); this exists for callers that hold decoded values already.
+ */
+export function sampleTableFrom(init: SampleTableInit = {}): SampleTable {
+  const runs = init.timeToSample ?? [];
+  const offsets = init.compositionOffsets ?? [];
+  const chunks = init.sampleToChunk ?? [];
+  const table: SampleTable = {
+    timeToSample: { counts: new Uint32Array(runs.length), deltas: new Uint32Array(runs.length) },
+    compositionOffsets: {
+      counts: new Uint32Array(offsets.length),
+      offsets: new Int32Array(offsets.length),
+    },
+    sampleSizes: Uint32Array.from(init.sampleSizes ?? []),
+    sampleToChunk: {
+      firstChunk: new Uint32Array(chunks.length),
+      samplesPerChunk: new Uint32Array(chunks.length),
+      descIndex: new Uint32Array(chunks.length),
+    },
+    chunkOffsets: Float64Array.from(init.chunkOffsets ?? []),
+    syncSamples: Uint32Array.from(init.syncSamples ?? []),
+    sampleDependencies: Uint8Array.from(init.sampleDependencies ?? []),
   };
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i] as { count: number; delta: number };
+    table.timeToSample.counts[i] = run.count;
+    table.timeToSample.deltas[i] = run.delta;
+  }
+  for (let i = 0; i < offsets.length; i++) {
+    const run = offsets[i] as { count: number; offset: number };
+    table.compositionOffsets.counts[i] = run.count;
+    table.compositionOffsets.offsets[i] = run.offset;
+  }
+  for (let i = 0; i < chunks.length; i++) {
+    const entry = chunks[i] as { firstChunk: number; samplesPerChunk: number; descIndex: number };
+    table.sampleToChunk.firstChunk[i] = entry.firstChunk;
+    table.sampleToChunk.samplesPerChunk[i] = entry.samplesPerChunk;
+    table.sampleToChunk.descIndex[i] = entry.descIndex;
+  }
+  return table;
+}
+
+function emptySampleTable(): SampleTable {
+  return sampleTableFrom();
 }
 
 interface ParsedSampleTable {
@@ -1471,8 +1538,12 @@ function parsePacketInfoSampleTable(r: Reader, stbl: BoxHeader): ParsedSampleTab
     timeToSample: parseStts(r, child(r, stbl, 'stts')),
     compositionOffsets: parseCtts(r, child(r, stbl, 'ctts')),
     sampleSizes: parseStsz(r, child(r, stbl, 'stsz')),
-    sampleToChunk: [],
-    chunkOffsets: [],
+    sampleToChunk: {
+      firstChunk: new Uint32Array(0),
+      samplesPerChunk: new Uint32Array(0),
+      descIndex: new Uint32Array(0),
+    },
+    chunkOffsets: new Float64Array(0),
     syncSamples: parseStss(r, child(r, stbl, 'stss')),
     sampleDependencies: parseSdtp(r, child(r, stbl, 'sdtp')),
   };
@@ -1493,14 +1564,35 @@ function parseStszSampleCount(r: Reader, box: BoxHeader | undefined): number | u
   return r.u32();
 }
 
-function parseStts(r: Reader, box: BoxHeader | undefined): TimeToSample[] {
-  if (!box) return [];
+/**
+ * The declared entry count of a table box, validated against the bytes the box actually carries.
+ * A truncated table is the same `demux-error` the sequential reader would raise on the overrun, but
+ * it is raised *before* the exact-size typed columns are allocated, so a box declaring 2^32−1 entries
+ * can never reserve gigabytes on the strength of a 4-byte field alone.
+ */
+function tableEntryCount(r: Reader, box: BoxHeader, bytesPerEntry: number): number {
+  const n = r.u32();
+  if (n > Math.floor(Math.min(r.remaining, box.end - r.pos) / bytesPerEntry)) {
+    throw new MediaError(
+      'demux-error',
+      `truncated MP4 box: ${n} table entries need ${n * bytesPerEntry} bytes, ${r.remaining} available`,
+    );
+  }
+  return n;
+}
+
+function parseStts(r: Reader, box: BoxHeader | undefined): TimeToSampleTable {
+  if (!box) return { counts: new Uint32Array(0), deltas: new Uint32Array(0) };
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
-  const n = r.u32();
-  const out: TimeToSample[] = [];
-  for (let i = 0; i < n; i++) out.push({ count: r.u32(), delta: r.u32() });
-  return out;
+  const n = tableEntryCount(r, box, 8);
+  const counts = new Uint32Array(n);
+  const deltas = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    counts[i] = r.u32();
+    deltas[i] = r.u32();
+  }
+  return { counts, deltas };
 }
 
 function parseSttsSummary(
@@ -1522,12 +1614,13 @@ function parseSttsSummary(
   return { sampleCount, mediaTicks };
 }
 
-function parseCtts(r: Reader, box: BoxHeader | undefined): CompositionOffset[] {
-  if (!box) return [];
+function parseCtts(r: Reader, box: BoxHeader | undefined): CompositionOffsetTable {
+  if (!box) return { counts: new Uint32Array(0), offsets: new Int32Array(0) };
   r.seek(box.payloadStart);
   readFullBoxHeader(r); // version/flags — offsets are read signed for BOTH versions (see below)
-  const n = r.u32();
-  const out: CompositionOffset[] = [];
+  const n = tableEntryCount(r, box, 8);
+  const counts = new Uint32Array(n);
+  const offsets = new Int32Array(n);
   // Read composition offsets as signed int32 regardless of the `ctts` version. Version 1 defines them
   // signed; version 0 defines them unsigned, but real-world muxers (ffmpeg's mov muxer, QuickTime) write
   // genuinely-negative composition offsets into a *version-0* `ctts` as two's-complement, and every real
@@ -1536,68 +1629,94 @@ function parseCtts(r: Reader, box: BoxHeader | undefined): CompositionOffset[] {
   // reading is lossless for real positive offsets and corrects the negative ones. Real .mov B-frame
   // reorder regression: a version-0 `ctts` carrying −40 ticks was read as 4294967256, exploding the PTS
   // (0.0667 s → 7.16e6 s) and breaking decode/seek frame selection (ADR-185 addendum).
-  for (let i = 0; i < n; i++) out.push({ count: r.u32(), offset: r.i32() });
-  return out;
+  for (let i = 0; i < n; i++) {
+    counts[i] = r.u32();
+    offsets[i] = r.i32();
+  }
+  return { counts, offsets };
 }
 
-function parseStsz(r: Reader, box: BoxHeader | undefined): number[] {
-  if (!box) return [];
+/**
+ * A constant-size `stsz` carries no per-sample bytes, so its `sample_count` cannot be validated
+ * against the box payload the way every other table is. Reject an implausible declaration instead of
+ * reserving its typed column: 2^24 samples is 6.4 days of 30 fps video or ~4 days of 48 kHz AAC
+ * frames — beyond any real asset — while the declared 2^32−1 would otherwise reserve 16 GB.
+ */
+const MAX_DECLARED_SAMPLE_COUNT = 1 << 24;
+
+function parseStsz(r: Reader, box: BoxHeader | undefined): Uint32Array {
+  if (!box) return new Uint32Array(0);
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
   const sampleSize = r.u32();
-  const count = r.u32();
-  if (sampleSize !== 0) return new Array<number>(count).fill(sampleSize);
-  const out: number[] = [];
-  for (let i = 0; i < count; i++) out.push(r.u32());
+  if (sampleSize !== 0) {
+    const count = r.u32();
+    if (count > MAX_DECLARED_SAMPLE_COUNT) {
+      throw new MediaError(
+        'demux-error',
+        `MP4 stsz declares an implausible sample_count ${count} for a constant sample size`,
+      );
+    }
+    return new Uint32Array(count).fill(sampleSize);
+  }
+  const count = tableEntryCount(r, box, 4);
+  const out = new Uint32Array(count);
+  for (let i = 0; i < count; i++) out[i] = r.u32();
   return out;
 }
 
-function parseStsc(r: Reader, box: BoxHeader | undefined): SampleToChunk[] {
-  if (!box) return [];
+function parseStsc(r: Reader, box: BoxHeader | undefined): SampleToChunkTable {
+  if (!box) {
+    return {
+      firstChunk: new Uint32Array(0),
+      samplesPerChunk: new Uint32Array(0),
+      descIndex: new Uint32Array(0),
+    };
+  }
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
-  const n = r.u32();
-  const out: SampleToChunk[] = [];
+  const n = tableEntryCount(r, box, 12);
+  const firstChunk = new Uint32Array(n);
+  const samplesPerChunk = new Uint32Array(n);
+  const descIndex = new Uint32Array(n);
   for (let i = 0; i < n; i++) {
-    out.push({
-      firstChunk: r.u32(),
-      samplesPerChunk: r.u32(),
-      descIndex: r.u32(),
-    });
+    firstChunk[i] = r.u32();
+    samplesPerChunk[i] = r.u32();
+    descIndex[i] = r.u32();
   }
-  return out;
+  return { firstChunk, samplesPerChunk, descIndex };
 }
 
 function parseChunkOffsets(
   r: Reader,
   stco: BoxHeader | undefined,
   co64: BoxHeader | undefined,
-): number[] {
+): Float64Array {
   const box = stco ?? co64;
-  if (!box) return [];
+  if (!box) return new Float64Array(0);
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
-  const n = r.u32();
-  const out: number[] = [];
-  for (let i = 0; i < n; i++) out.push(co64 ? r.u64() : r.u32());
+  const n = tableEntryCount(r, box, co64 ? 8 : 4);
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) out[i] = co64 ? r.u64() : r.u32();
   return out;
 }
 
-function parseStss(r: Reader, box: BoxHeader | undefined): number[] {
-  if (!box) return [];
+function parseStss(r: Reader, box: BoxHeader | undefined): Uint32Array {
+  if (!box) return new Uint32Array(0);
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
-  const n = r.u32();
-  const out: number[] = [];
-  for (let i = 0; i < n; i++) out.push(r.u32());
+  const n = tableEntryCount(r, box, 4);
+  const out = new Uint32Array(n);
+  for (let i = 0; i < n; i++) out[i] = r.u32();
   return out;
 }
 
-function parseSdtp(r: Reader, box: BoxHeader | undefined): SampleDependency[] {
-  if (!box) return [];
+function parseSdtp(r: Reader, box: BoxHeader | undefined): Uint8Array {
+  if (!box) return new Uint8Array(0);
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
-  const out: SampleDependency[] = [];
-  while (r.pos < box.end) out.push(((r.u8() >> 4) & 3) as SampleDependency);
+  const out = new Uint8Array(Math.max(0, Math.min(box.end, r.length) - r.pos));
+  for (let i = 0; i < out.length; i++) out[i] = (r.u8() >> 4) & 3;
   return out;
 }

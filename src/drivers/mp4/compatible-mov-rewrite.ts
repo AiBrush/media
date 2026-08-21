@@ -1,6 +1,7 @@
 import type { ByteSource, StreamCopyOptions } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
 import type { Movie, ParsedTrack } from './parse.ts';
+import { type SampleToChunkCursor, samplesPerChunkFor } from './samples.ts';
 
 interface RandomAccessView {
   readonly size?: number | undefined;
@@ -123,8 +124,7 @@ function validateTrackRanges(track: ParsedTrack, sourceSize: number): void {
   const table = track.samples;
   const sizes = table.sampleSizes;
   let sampleIndex = 0;
-  let stscIndex = 0;
-  let samplesPerChunk = 0;
+  const stscCursor: SampleToChunkCursor = { index: 0, value: 0 };
 
   for (
     let chunkIndex = 0;
@@ -133,13 +133,7 @@ function validateTrackRanges(track: ParsedTrack, sourceSize: number): void {
   ) {
     const chunkOffset = table.chunkOffsets[chunkIndex];
     if (chunkOffset === undefined) break;
-    const chunkNumber = chunkIndex + 1;
-    for (;;) {
-      const entry = table.sampleToChunk[stscIndex];
-      if (entry === undefined || entry.firstChunk > chunkNumber) break;
-      samplesPerChunk = entry.samplesPerChunk;
-      stscIndex++;
-    }
+    const samplesPerChunk = samplesPerChunkFor(table.sampleToChunk, chunkIndex + 1, stscCursor);
     let offset = chunkOffset;
     for (
       let sampleInChunk = 0;

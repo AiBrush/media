@@ -38,6 +38,7 @@ behind bare functions; the next bare call creates a new instance.
 | `transcode` | Alias of `convert` | `Cancellable<Output>` |
 | `h264AbrLadder` | `(input, rungs, callOptions?)` | `Cancellable<readonly Output[]>` |
 | `remux` | `(input, remuxOptions, callOptions?)` | `Cancellable<Output>` |
+| `planRemuxOutput` | `(input, remuxOptions, callOptions?)` | `Cancellable<RemuxOutputPlan>` |
 | `trim` | `(input, trimOptions, callOptions?)` | `Cancellable<Output>` |
 | `decode` | `(input, decodeOptions?)` | `MediaStreams` |
 | `seek` | `(input, timeUs, callOptions?)` | `Cancellable<VideoFrame>` |
@@ -134,6 +135,7 @@ interface TrimOptions {
   end: number;
   mode?: 'keyframe' | 'accurate';
   fragmented?: boolean;
+  onAlignment?: (alignment: TrimAlignment) => void;
   sink?: Sink;
 }
 
@@ -158,6 +160,26 @@ interface DecryptOptions {
   sink?: Sink;
 }
 ```
+
+`TrimOptions.onAlignment` reports the window the output actually presents, in source sample frames:
+
+```ts
+interface TrimAlignment {
+  sampleRate: number;
+  requestedStartSampleFrame: number;
+  requestedEndSampleFrame: number;
+  authoredStartSampleFrame: number;
+  authoredEndSampleFrame: number;
+  startAdjustmentSampleFrames: number; // authored − requested
+  endAdjustmentSampleFrames: number;
+  reason?: string; // present only when an adjustment was unavoidable
+}
+```
+
+Formats that can signal delay/padding report zero adjustments: an MP3 → MP3 copy trim is sample-exact
+because it rewrites the Xing/LAME encoder-delay and encoder-padding fields around verbatim source frames.
+A raw ADTS AAC stream carries whole access units and no discard metadata, so its copy trim rounds to an
+access-unit boundary and reports the difference with a `reason`.
 
 `DecodeOptions` extends `CallOptions` with `trackSelect?: readonly string[]`.
 

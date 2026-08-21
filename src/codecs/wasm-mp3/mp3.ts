@@ -190,6 +190,55 @@ export function parseMp3FrameHeader(bytes: Uint8Array, offset = 0): Mp3FrameHead
   };
 }
 
+/**
+ * Bytes of Layer III side information a frame carries between its header (plus optional CRC) and its
+ * main-data slot — ISO/IEC 11172-3 §2.4.1.7 / 13818-3: MPEG-1 stereo 32, mono 17; MPEG-2/2.5 stereo 17,
+ * mono 9. The first field of that block is `main_data_begin`, the bit-reservoir back-pointer.
+ */
+export function layer3SideInfoBytes(version: MpegVersion, channels: number): number {
+  const mono = channels === 1;
+  return version === 'mpeg1' ? (mono ? 17 : 32) : mono ? 9 : 17;
+}
+
+/**
+ * The bit-reservoir back-pointer of the Layer III frame starting at `offset`: how many bytes BEFORE this
+ * frame's own main-data slot its main data begins (ISO/IEC 11172-3 §2.4.2.7). 9 bits on MPEG-1, 8 bits on
+ * MPEG-2/2.5, and always the first field of the side-information block. Returns `undefined` when the frame
+ * is truncated before that field.
+ */
+export function layer3MainDataBegin(
+  bytes: Uint8Array,
+  offset: number,
+  header: Mp3FrameHeader,
+): number | undefined {
+  const at = offset + 4 + (header.crcAbsent ? 0 : 2);
+  const b0 = bytes[at];
+  if (b0 === undefined) return undefined;
+  if (header.version !== 'mpeg1') return b0;
+  const b1 = bytes[at + 1];
+  return b1 === undefined ? undefined : ((b0 << 1) | (b1 >> 7)) & 0x1ff;
+}
+
+/**
+ * The un-padded Layer III frame size in bytes for a header bitrate index (1–14), or `undefined` when the
+ * index names the `free`/invalid entry. Lets a writer pick the smallest legal frame that can hold a
+ * required payload without re-deriving the version's bitrate table.
+ */
+export function layer3FrameSizeForBitrateIndex(
+  version: MpegVersion,
+  sampleRate: number,
+  index: number,
+): number | undefined {
+  const bitrateKbps = bitrateTable(version, 3)[index];
+  if (bitrateKbps === undefined || bitrateKbps === 0) return undefined;
+  return frameSizeBytes(version, 3, bitrateKbps * 1000, sampleRate, false);
+}
+
+/** Every Layer III bitrate index (1–14) that names a real bitrate, smallest frame first. */
+export const LAYER_III_BITRATE_INDEXES: readonly number[] = Object.freeze([
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+]);
+
 function versionFromBits(bits: number): MpegVersion {
   switch (bits) {
     case 0:

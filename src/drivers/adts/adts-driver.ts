@@ -29,6 +29,7 @@ import {
   type StageOptions,
   type StreamCopyOptions,
   type TrackInfo,
+  type TrimAlignment,
 } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import type { PcmAudio } from '../../dsp/index.ts';
@@ -447,15 +448,56 @@ function adtsFramesDurationSec(frames: readonly AdtsPacket[]): number {
   return last === undefined ? 0 : (last.ptsUs + last.durationUs) / 1_000_000;
 }
 
+/**
+ * The window an ADTS copy trim really authored. ISO/IEC 13818-7 gives the ADTS header a frame length and a
+ * raw-data-block count and nothing else: there is no encoder-delay, pre-skip, or end-padding field, and no
+ * edit list, so an elementary AAC stream can only begin and end on a whole access unit. A cut inside one
+ * is therefore reported here (REQUIREMENTS §5.7) rather than silently rounded.
+ */
+function adtsTrimAlignment(
+  selected: readonly AdtsPacket[],
+  sampleRate: number,
+  trim: NonNullable<StreamCopyOptions['trim']>,
+): TrimAlignment {
+  const first = selected[0] as AdtsPacket;
+  const last = selected[selected.length - 1] as AdtsPacket;
+  const toFrames = (seconds: number): number => Math.round(seconds * sampleRate);
+  const requestedStart = Math.max(0, toFrames(trim.startSec));
+  const requestedEnd = Math.max(requestedStart, toFrames(trim.endSec));
+  const authoredStart = Math.round((first.ptsUs * sampleRate) / 1_000_000);
+  const authoredEnd = Math.round(((last.ptsUs + last.durationUs) * sampleRate) / 1_000_000);
+  const exact = authoredStart === requestedStart && authoredEnd === requestedEnd;
+  return {
+    sampleRate,
+    requestedStartSampleFrame: requestedStart,
+    requestedEndSampleFrame: requestedEnd,
+    authoredStartSampleFrame: authoredStart,
+    authoredEndSampleFrame: authoredEnd,
+    startAdjustmentSampleFrames: authoredStart - requestedStart,
+    endAdjustmentSampleFrames: authoredEnd - requestedEnd,
+    ...(exact
+      ? {}
+      : {
+          reason:
+            'raw ADTS AAC carries whole access units only and has no encoder-delay/end-padding field, ' +
+            'so a cut inside an access unit cannot be signalled',
+        }),
+  };
+}
+
 function writeAdtsPacketCopy(
   bytes: Uint8Array,
   trim: StreamCopyOptions['trim'] | undefined,
+  onTrimAlignment?: (alignment: TrimAlignment) => void,
 ): Uint8Array {
   const frames = enumerateAdtsFrames(bytes);
   assertAdtsTrimRange(trim, adtsFramesDurationSec(frames));
   const selected = selectAdtsFrames(frames, trim);
   if (selected.length === 0) {
     throw new InputError('ADTS trim selected no audio frames');
+  }
+  if (trim !== undefined && onTrimAlignment !== undefined) {
+    onTrimAlignment(adtsTrimAlignment(selected, readLayout(bytes).info.sampleRate, trim));
   }
   let total = 0;
   for (const frame of selected) total += frame.size;
@@ -855,7 +897,7 @@ export const AdtsDriver = {
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     assertAdtsStreamCopyTarget(o?.container);
     throwIfAborted(o?.signal);
-    const out = writeAdtsPacketCopy(await readAll(src), o?.trim);
+    const out = writeAdtsPacketCopy(await readAll(src), o?.trim, o?.onTrimAlignment);
     throwIfAborted(o?.signal);
     return new ReadableStream<Uint8Array>({
       start(c): void {

@@ -27,6 +27,8 @@ import {
 } from './video-quality-constraint.ts';
 import {
   type H264QualityOutputRoute,
+  MAXIMUM_CANDIDATE_PASSES,
+  allocatorTargetCorrection,
   analyzeH264QualityConstrained,
   copyDisplayedRgbaForQuality,
   nextNativeRateRequest,
@@ -380,6 +382,73 @@ describe('native H.264 request calibration', () => {
     expect(nextNativeRateRequest(1_000_000, 100, 100, 0.9, 0.95)).toBe(2_000_000);
     expect(nextNativeRateRequest(1_000_000, 80, 100, 0.96, 0.95)).toBe(1_250_000);
     expect(nextNativeRateRequest(1, 1, 1, 0.99, 1)).toBeGreaterThan(1);
+  });
+
+  it('always moves off a request whose overshoot is only a rounding step', () => {
+    // Measured stall: 2,373,685 bytes against a 2,373,583-byte ceiling. The byte ratio alone (0.99996)
+    // returns essentially the same request, and the encoder answers it with the same payload forever.
+    const request = 1_820_000;
+    const next = nextNativeRateRequest(request, 2_373_685, 2_373_583, undefined, 0.95);
+    expect(next).toBeLessThan(request);
+    expect(next).toBeLessThanOrEqual(Math.floor(request * 0.99));
+    expect(next).toBeGreaterThan(0);
+  });
+
+  it('strictly decreases on every overshoot, from a single byte over to a 4x blowout', () => {
+    const ceiling = 1_000_000;
+    for (const over of [1, 100, 10_000, 500_000, 3_000_000]) {
+      let current = 1_820_000;
+      for (let pass = 0; pass < 32; pass++) {
+        const next = nextNativeRateRequest(current, ceiling + over, ceiling, undefined, 0.95);
+        expect(next).toBeLessThan(current);
+        expect(Number.isSafeInteger(next)).toBe(true);
+        current = next;
+        if (current <= 1) break;
+      }
+    }
+  });
+
+  it('never returns a non-positive or non-integer request', () => {
+    for (const [current, actual, cap] of [
+      [1, 2, 1],
+      [2, 1_000_000, 1],
+      [7, 8, 7],
+    ] as const) {
+      const next = nextNativeRateRequest(current, actual, cap, undefined, 0.95);
+      expect(Number.isSafeInteger(next)).toBe(true);
+      expect(next).toBeGreaterThanOrEqual(1);
+    }
+  });
+});
+
+describe('allocatorTargetCorrection — spend the byte budget the QP schedule left unused', () => {
+  it('aims the next pass so the achieved payload lands on the ceiling', () => {
+    // Measured 480p ABR rung: requested 2,373,583, achieved 2,256,210 (95.1%) at SSIM 0.9498/0.95.
+    const correction = allocatorTargetCorrection(2_373_583, 2_256_210, 2_373_583);
+    expect(correction).toBeGreaterThan(1);
+    expect(2_256_210 * correction).toBeCloseTo(2_373_583, 0);
+  });
+
+  it('leaves an over-ceiling candidate to aim at the ceiling itself', () => {
+    expect(allocatorTargetCorrection(1_000, 1_200, 1_000)).toBe(1);
+    expect(allocatorTargetCorrection(1_200, 1_000, 1_000)).toBe(1.2);
+  });
+
+  it('never boosts below one and is bounded above', () => {
+    expect(allocatorTargetCorrection(500, 1_000, 2_000)).toBe(1);
+    expect(allocatorTargetCorrection(10_000, 100, 1_000)).toBe(1.5);
+  });
+
+  it('degrades to a no-op on degenerate evidence', () => {
+    for (const [requested, achieved, cap] of [
+      [0, 100, 1_000],
+      [100, 0, 1_000],
+      [Number.NaN, 100, 1_000],
+      [100, Number.POSITIVE_INFINITY, 1_000],
+      [-5, 100, 1_000],
+    ] as const) {
+      expect(allocatorTargetCorrection(requested, achieved, cap)).toBe(1);
+    }
   });
 });
 
@@ -985,20 +1054,31 @@ describe('replay-backed H.264 quality candidate runner', () => {
       runtime.context,
     );
 
-    expect(candidate.attempts).toHaveLength(4);
     expect(candidate.qualityMean).toBeGreaterThanOrEqual(request.quality.minimumMean);
     expect(candidate.averageBitrate).toBeLessThanOrEqual(request.maxAverageBitrate);
-    expect(runtime.state.candidateQuantizers[3]).toEqual([28, 28, 28, 28]);
-    expect(runtime.state.candidateBitrates.slice(0, 2)).toEqual([undefined, undefined]);
-    expect(runtime.state.candidateBitrates[2]).toBe(request.maxAverageBitrate);
-    expect(runtime.state.candidateBitrates[3]).toBe(request.maxAverageBitrate * 4);
-    expect(runtime.state.candidateRateControlWarmupFrames).toEqual([undefined, undefined, 3, 3]);
+    // The scheduled-QP passes come first (no `bitrate` on the encoder config) and exhaust their budget
+    // before the native rate controller is asked for anything; the winning native pass carries the
+    // rate-control warm-up frames.
+    const nativeIndex = runtime.state.candidateBitrates.findIndex((rate) => rate !== undefined);
+    expect(nativeIndex).toBe(MAXIMUM_CANDIDATE_PASSES);
+    expect(
+      runtime.state.candidateBitrates.slice(0, nativeIndex).every((r) => r === undefined),
+    ).toBe(true);
+    expect(runtime.state.candidateBitrates[nativeIndex]).toBe(request.maxAverageBitrate);
+    expect(runtime.state.candidateQuantizers[nativeIndex]).toEqual([28, 28, 28, 28]);
+    expect(runtime.state.candidateRateControlWarmupFrames[nativeIndex]).toBe(3);
+    expect(
+      runtime.state.candidateRateControlWarmupFrames
+        .slice(0, nativeIndex)
+        .every((f) => f === undefined),
+    ).toBe(true);
   });
 
   it('rejects an over-cap native candidate and corrects its controller request downward', async () => {
     const runtime = fakeRuntime(undefined, {
-      candidateByteLengthFactors: [1, 1, 2, 1],
-      candidateQualityQuantizers: [51, 51, 0, 0],
+      // The scheduled-QP passes run first, so the over-cap candidate is placed on the FIRST native pass.
+      candidateByteLengthFactors: [1, 1, 1, 2, 1],
+      candidateQualityQuantizers: [51, 51, 51, 0, 0],
     });
     const videoTarget = target(0.99);
     const request = assertH264QualityConstraintPreflight(videoTarget, runtime.source);
@@ -1016,12 +1096,17 @@ describe('replay-backed H.264 quality candidate runner', () => {
       runtime.context,
     );
 
-    expect(candidate.attempts).toHaveLength(4);
-    expect(candidate.attempts[2]?.averageBitrate).toBeGreaterThan(request.maxAverageBitrate);
-    expect(candidate.attempts[2]?.qualityMean).toBeUndefined();
+    const nativeIndex = runtime.state.candidateBitrates.findIndex((rate) => rate !== undefined);
+    expect(nativeIndex).toBeGreaterThanOrEqual(0);
+    expect(candidate.attempts[nativeIndex]?.averageBitrate).toBeGreaterThan(
+      request.maxAverageBitrate,
+    );
+    expect(candidate.attempts[nativeIndex]?.qualityMean).toBeUndefined();
     expect(candidate.qualityMean).toBeGreaterThanOrEqual(request.quality.minimumMean);
-    expect(runtime.state.candidateBitrates[2]).toBe(request.maxAverageBitrate);
-    expect(runtime.state.candidateBitrates[3]).toBeLessThan(request.maxAverageBitrate);
+    expect(runtime.state.candidateBitrates[nativeIndex]).toBe(request.maxAverageBitrate);
+    // The over-cap response must move the controller request by a resolvable amount, not a rounding step.
+    const corrected = runtime.state.candidateBitrates[nativeIndex + 1] as number;
+    expect(corrected).toBeLessThanOrEqual(request.maxAverageBitrate * (1 - 0.01));
   });
 
   it('retains no over-spool native bytes before a later bounded candidate succeeds', async () => {

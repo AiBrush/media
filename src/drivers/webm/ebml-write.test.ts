@@ -187,10 +187,11 @@ function gaplessFromMp4Track(track: ParsedTrack): TrackInfo['gapless'] | undefin
     return undefined;
   }
   const scale = track.sampleRate / track.timescale;
-  const codedSamples = track.samples.timeToSample.reduce(
-    (total, entry) => total + Math.round(entry.count * entry.delta * scale),
-    0,
-  );
+  const runs = track.samples.timeToSample;
+  let codedSamples = 0;
+  for (let i = 0; i < runs.counts.length; i++) {
+    codedSamples += Math.round((runs.counts[i] ?? 0) * (runs.deltas[i] ?? 0) * scale);
+  }
   const leadingSamples = Math.max(0, Math.round(track.edit.mediaTimeTicks * scale));
   const totalSamples = Math.max(0, Math.round(track.edit.durationSec * track.sampleRate));
   const trailingSamples = Math.max(0, codedSamples - leadingSamples - totalSamples);

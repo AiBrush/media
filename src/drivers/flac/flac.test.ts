@@ -677,7 +677,7 @@ describe('media.trim — native FLAC sample-accurate lossless cut', () => {
       );
       expectDecodedSlice(source, decodeFlac(out), startSec, endSec, id);
     }
-  }, 30_000);
+  });
 });
 
 describe('media.trim — native FLAC keyframe packet-copy', () => {
@@ -849,7 +849,10 @@ describe('FLAC packet seam — native frame enumeration for Ogg remux', () => {
         expectBytesEqual(frame.data, decodedFrame.data, `${entry.id}: decoded frame ${i}`);
       }
     }
-  }, 30_000);
+    // The heaviest test in the file: every FLAC fixture walked twice (fast enumeration + full decode)
+    // and compared byte-for-byte. 9.7 s alone, 31.5 s under contention — so it keeps a deadline above
+    // the file default rather than being the one that trips first when the machine is busy.
+  }, 120_000);
 });
 
 describe('FlacDriver.decodePcm — pure-TS decode to WAV (ADR-024)', () => {
@@ -1283,5 +1286,5 @@ describe('media.encode — native FLAC output via pure-TS FLAC encoder + muxer',
     } finally {
       restore();
     }
-  }, 30_000);
+  });
 });

@@ -41,11 +41,11 @@ const HEAVY_LAZY_GUARDS: readonly HeavyLazyGuard[] = [
   },
   {
     label: 'WASM codec driver',
-    pattern: /^wasm-(?:aac|av1|mp3|opus|vorbis|vorbis-enc|vpx)-driver-[A-Z0-9]+\.js$/,
+    pattern: /^wasm-(?:aac|av1|mp3|mp3-enc|opus|vorbis|vorbis-enc|vpx)-driver-[A-Z0-9]+\.js$/,
   },
   {
     label: 'WASM/codec core',
-    pattern: /^(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core(?:-[A-Z0-9]+)?\.js$/,
+    pattern: /^(?:aac|dav1d|mp3|mp3-enc|opus|vorbis|vorbis-enc|vpx)-core(?:-[A-Z0-9]+)?\.js$/,
   },
   {
     label: 'lazy FLAC implementation',
@@ -283,7 +283,8 @@ const REQUIRED_DEFAULT_PROBE_LAZY_IMPORTS: readonly LazyImportRequirement[] = [
     label: 'WASM fallback driver',
     pattern: /^wasm-(?:aac|av1|mp3|opus|vorbis|vpx)-driver-[A-Z0-9]+\.js$/,
   },
-  { label: 'WASM encoder driver', pattern: /^wasm-vorbis-enc-driver-[A-Z0-9]+\.js$/ },
+  { label: 'WASM Vorbis encoder driver', pattern: /^wasm-vorbis-enc-driver-[A-Z0-9]+\.js$/ },
+  { label: 'WASM MP3 encoder driver', pattern: /^wasm-mp3-enc-driver-[A-Z0-9]+\.js$/ },
 ];
 
 interface FileReport {
@@ -754,7 +755,18 @@ function assertWasmPackaging(
       `emitted WASM asset ${wasmFile} is not referenced by a same-origin import.meta.url URL`,
     );
   }
+  // …and the converse, which nothing else covers. The check above catches an ORPHAN asset (vendored but
+  // unreferenced); this catches a DANGLING reference (a driver asking for a core that was never emitted).
+  // That asymmetry is the one that reaches users: `vendor-wasm` discovers cores by filename suffix and
+  // never reads the driver, so renaming a core, or adding a tail whose `.wasm` is not co-vendored, leaves
+  // every build/lint/test gate green and fails only in a browser — as `WebAssembly.compile: HTTP status
+  // code is not ok` on the 404, or, behind a dev server with an SPA fallback, as the more obscure
+  // "Incorrect response MIME type" when the 404 is answered with index.html.
   for (const ref of urlRefs) {
+    assert(
+      emittedWasm.has(ref.asset),
+      `dist/${ref.file} loads './${ref.asset}' via import.meta.url but no such asset was emitted (run \`bun run vendor-wasm\`, or fix the name in the driver)`,
+    );
     assert(
       !eagerKernel.has(ref.file),
       `eager kernel contains a WASM URL reference (${ref.file} -> ${ref.asset})`,
@@ -803,9 +815,15 @@ assert(graph.files.includes('core.js'), 'dist/core.js is missing');
 assert(graph.files.includes('core.d.ts'), 'dist/core.d.ts is missing');
 
 const defaultDriverChunk = findDefaultDriverChunk(graph);
+// Whole-CHUNK closure: every chunk `dist/index.js` statically imports, counted as a whole file. A real
+// consumer re-bundles and dead-code-eliminates at declaration granularity, so this is deliberately the
+// **ceiling**, several KiB above what `verify:package`'s namespace-import seed measures — and it is that
+// seed, not this number, that gates REQUIREMENTS §8.3. Both are reported so the gap is never mistaken for
+// a regression again; this one's job is to keep the shipped chunk graph honest (no heavy lazy leaks, no
+// eager WASM), which it does at a granularity a consumer bundler would hide.
 const eagerKernel = closure(graph, 'index.js');
 const eagerTotal = closureReport(
-  'Eager kernel closure (statically reachable from the default entry):',
+  'Eager kernel closure (whole chunks statically reachable from the default entry; no consumer DCE — the ceiling, not the §8.3 gate):',
   eagerKernel,
   KERNEL_BUDGET,
 );

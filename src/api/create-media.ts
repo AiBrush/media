@@ -48,6 +48,8 @@ export const h264AbrLadder: MediaEngine['h264AbrLadder'] = bare('h264AbrLadder')
 /** `transcode` is an exported alias of `convert` (ADR-012). */
 export const transcode = convert;
 export const remux: MediaEngine['remux'] = bare('remux');
+/** Declare a remux's output-sink contract (seek/reservation/finalization, retention) before it runs. */
+export const planRemuxOutput: MediaEngine['planRemuxOutput'] = bare('planRemuxOutput');
 export const trim: MediaEngine['trim'] = bare('trim');
 export const demux: MediaEngine['demux'] = bare('demux');
 /** Materialize all packet-info rows. Prefer {@link packetInfoBatches} for very large files. */

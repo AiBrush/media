@@ -106,7 +106,7 @@ describe('FLAC encode — verbatim pure-TS authoring with STREAMINFO MD5 oracle'
       const roundTrip = decodeFlac(encoded);
       expect(hex(roundTrip.md5), entry.id).toBe(hex(source.md5));
     }
-  }, 30_000);
+  });
 
   it('encodes existing real WAV PCM fixtures as native FLAC and decodes sample-exactly', async () => {
     const ids = ['sfx-pcm-u8.wav', 'sfx-pcm-s16.wav', 'sfx-pcm-s24.wav'] as const;

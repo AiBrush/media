@@ -271,7 +271,7 @@ describe('hybrid fragmented MP4 — real FFmpeg corpus', () => {
     const movie = await readMovie(randomAccess(file));
     const track = movie.tracks[0];
     expect(movie.hasFragments).toBe(true);
-    expect(track?.samples.sampleSizes).toEqual([]);
+    expect(track?.samples.sampleSizes).toHaveLength(0);
     expect(track?.codec).toBe('mp4a.40.5');
     expect(track?.fragmentSampleCount).toBe(aac.frames.length);
     expect(track?.fragmentMediaTicks).toBe(aac.frames.length * samplesPerAccessUnit);

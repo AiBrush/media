@@ -1,9 +1,19 @@
 #!/usr/bin/env bun
 /**
  * Verify the package as a clean consumer sees it: pack the current workspace, install that tarball into a
- * fresh app, typecheck public export-map imports, run a package-name import, and measure a tree-shaken
- * probe-only browser bundle. This is intentionally downstream of `bun run build && bun run vendor-wasm`:
- * the packed artifact must contain the same `dist/` a publisher would ship.
+ * fresh app, typecheck public export-map imports, run a package-name import, and measure real consumer
+ * browser bundles. This is intentionally downstream of `bun run build && bun run vendor-wasm`: the packed
+ * artifact must contain the same `dist/` a publisher would ship.
+ *
+ * **Three eager numbers, one gate.** REQUIREMENTS §8.3 budgets the *"default-import eager static
+ * JavaScript closure"*, *"measured from a clean consumer build"* — so the gate is a namespace-import app
+ * (`import * as media`), which no bundler can tree-shake. Two other figures are reported beside it and are
+ * *expected* to differ by several KiB: a `import { probe }` app (the floor, since a single named import
+ * lets the consumer shake everything else) and the whole-chunk static closure of the shipped
+ * `dist/index.js` that `scripts/check-budgets.ts` gates on (the ceiling, since it sums whole chunk files
+ * with no consumer DCE). Reporting all three together is deliberate: measuring the floor and calling it
+ * the budget understates what a consumer pays, and the two tools disagreeing by ~5 KiB has already been
+ * mistaken once for a regression.
  */
 
 import { access, mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -19,6 +29,13 @@ const TSC = join(ROOT, 'node_modules/typescript/bin/tsc');
 const EAGER_KERNEL_BUDGET = 50 * 1024;
 const TYPICAL_APP_BUDGET = 250 * 1024;
 const MIN_BUDGET_MARGIN = 512;
+/**
+ * Headroom below which the eager gate is reported as at-risk. The gate itself only fails *above* the
+ * budget, which gives no warning until a release is already blocked — and the closure is currently within
+ * a fraction of a KiB, so a single modest public export crosses it. One KiB is roughly the cost of one new
+ * eagerly-reachable export plus what it drags in, so this fires while there is still time to choose.
+ */
+const MIN_EAGER_BUDGET_MARGIN = 1024;
 const KEEP_TEMP = process.argv.includes('--keep-temp');
 const REPORT_PATH = optionValue('--report');
 const INSTALL_SPEC = optionValue('--install-spec') ?? optionValue('--package');
@@ -47,6 +64,28 @@ interface SizedFileReport {
   readonly size: number;
 }
 
+/**
+ * The three eager-closure figures, reported side by side so the difference between them is never
+ * re-litigated from memory. They measure genuinely different subjects and are expected to differ:
+ *
+ *  - `namespaceEager` — **the §8.3 gate.** A clean consumer build of `import * as media from
+ *    '@aibrush/media'`, i.e. the "default-import eager static JavaScript closure" the requirement names,
+ *    measured by the method it specifies.
+ *  - `probeOnlyEager` — the informational **floor**: an app importing the single name `probe`, so the
+ *    consumer bundler shakes out every other export. Always ≤ the gate.
+ *  - `shippedChunkClosure` — what `scripts/check-budgets.ts` reports: the whole-chunk static closure of
+ *    the shipped `dist/index.js`, summed at **file** granularity with **no consumer DCE**. Always ≥ the
+ *    gate, because a chunk is counted whole even where a consumer keeps only part of it.
+ */
+interface EagerClosureReport {
+  readonly subject: 'namespace-import' | 'probe-only' | 'shipped-chunk-closure';
+  readonly method: string;
+  readonly rawBytes: number;
+  readonly gzipBytes: number;
+  readonly brotliBytes: number;
+  readonly files: readonly SizedFileReport[];
+}
+
 interface BundleReport {
   readonly entryFile: string;
   readonly eagerBudgetBytes: number;
@@ -54,6 +93,10 @@ interface BundleReport {
   readonly eagerGzipBytes: number;
   readonly eagerBrotliBytes: number;
   readonly eagerMarginBytes: number;
+  /** The gated closure, the floor, and the un-shaken shipped closure (see {@link EagerClosureReport}). */
+  readonly eagerClosures: readonly EagerClosureReport[];
+  readonly probeOnlyEagerJsBytes: number;
+  readonly shippedChunkClosureBytes: number;
   readonly eagerWorkerJsBytes: 0;
   readonly eagerWasmBytes: 0;
   readonly eagerCodecDataBytes: 0;
@@ -529,11 +572,13 @@ async function writeConsumerSources(
 ): Promise<{
   readonly probeEntry: string;
   readonly remuxEntry: string;
+  readonly namespaceEntry: string;
   readonly typecheckConfig: string;
   readonly runtimeProbe: string;
 }> {
   const probeEntry = join(appDir, 'probe-only.ts');
   const remuxEntry = join(appDir, 'remux-only.ts');
+  const namespaceEntry = join(appDir, 'namespace-entry.ts');
   const typeProbe = join(appDir, 'types-probe.ts');
   const typecheckConfig = join(appDir, 'tsconfig.json');
   const runtimeProbe = join(appDir, 'runtime-probe.mjs');
@@ -565,6 +610,28 @@ async function writeConsumerSources(
       '  const result = await output.arrayBuffer();',
       '  if (result.byteLength === 0) throw new Error("default MP4 remux returned an empty Blob");',
       '  return result.byteLength;',
+      '}',
+      '',
+    ].join('\n'),
+  );
+
+  // The §8.3 subject: the **default-import** eager static closure. `probe-only.ts` above imports one
+  // name, so a consumer bundler dead-code-eliminates the rest of the entry and measures a *floor*, not
+  // the closure the requirement names. This seed imports the namespace and reads it through
+  // `Object.keys`, which no bundler can shake — it cannot prove any export unused — so what survives is
+  // exactly "what a consumer pays for `import … from '@aibrush/media'`", measured on §8.3's own method
+  // (a clean consumer build). Keep both: the floor is useful, but the gate belongs on this one.
+  await writeFile(
+    namespaceEntry,
+    [
+      "import * as media from '@aibrush/media';",
+      '',
+      'export function run(): number {',
+      '  const names = Object.keys(media);',
+      '  if (names.length === 0) {',
+      '    throw new Error("@aibrush/media namespace import exposed no exports");',
+      '  }',
+      '  return names.length;',
       '}',
       '',
     ].join('\n'),
@@ -670,7 +737,7 @@ async function writeConsumerSources(
     )}\n`,
   );
 
-  return { probeEntry, remuxEntry, typecheckConfig, runtimeProbe };
+  return { probeEntry, remuxEntry, namespaceEntry, typecheckConfig, runtimeProbe };
 }
 
 function runTypecheck(typecheckConfig: string, appDir: string): void {
@@ -923,13 +990,53 @@ function routeReport(
   };
 }
 
+/**
+ * The whole-chunk static closure of the **shipped** `dist/index.js` — the figure
+ * `scripts/check-budgets.ts` gates on, recomputed here from the installed package so all three eager
+ * numbers come from one run and one tree. No consumer bundler is involved, so nothing is shaken: a chunk
+ * that `index.js` imports is counted whole even when a consumer would keep only part of it.
+ */
+async function measureShippedChunkClosure(installedDir: string): Promise<EagerClosureReport> {
+  const distDir = join(installedDir, 'dist');
+  const files = (await collectFiles(distDir)).filter((file) => file.endsWith('.js'));
+  const jsText = new Map<string, string>();
+  const jsSizes = new Map<string, number>();
+  for (const file of files) {
+    const path = join(distDir, file);
+    jsText.set(file, await Bun.file(path).text());
+    jsSizes.set(file, (await stat(path)).size);
+  }
+  assertCondition(jsText.has('index.js'), 'bundle', 'installed dist/index.js is missing');
+  const closure = staticClosure('index.js', jsText, jsSizes);
+  let raw = 0;
+  let gzip = 0;
+  let brotli = 0;
+  for (const [file, size] of closure) {
+    const bytes = new TextEncoder().encode(jsText.get(file) ?? '');
+    raw += size;
+    gzip += gzipSync(bytes).byteLength;
+    brotli += brotliCompressSync(bytes).byteLength;
+  }
+  return {
+    subject: 'shipped-chunk-closure',
+    method: 'whole-chunk static closure of the shipped dist/index.js; no consumer bundler, no DCE',
+    rawBytes: raw,
+    gzipBytes: gzip,
+    brotliBytes: brotli,
+    files: fileDetails(closure),
+  };
+}
+
 async function measureConsumerBundles(
   probeEntry: string,
   remuxEntry: string,
+  namespaceEntry: string,
   outRoot: string,
+  installedDir: string,
 ): Promise<BundleReport> {
   const probeGraph = await buildConsumerBundle(probeEntry, join(outRoot, 'probe'));
   const remuxGraph = await buildConsumerBundle(remuxEntry, join(outRoot, 'remux'));
+  const namespaceGraph = await buildConsumerBundle(namespaceEntry, join(outRoot, 'namespace'));
 
   const probeSeeds = [
     probeGraph.entryFile,
@@ -971,7 +1078,7 @@ async function measureConsumerBundles(
     'finite faststart MP4 probe route',
     typicalMp4ProbeFiles,
     probeGraph,
-    /\/dist\/(?:defaults|drivers\/mp4|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|materialize|mux-packet-streams|mux-runner|preload|remux-runner|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
+    /\/dist\/(?:defaults|drivers\/mp4|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|mp3-enc|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|materialize|mux-packet-streams|mux-runner|preload|remux-runner|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
   );
 
   const remuxSeeds = [
@@ -999,7 +1106,7 @@ async function measureConsumerBundles(
     'default Blob MP4 remux route',
     typicalMp4RemuxFiles,
     remuxGraph,
-    /\/dist\/(?:defaults|drivers\/(?:webm|wav|mp3|ogg|adts|aiff|caf|mpegts|avi|flac)|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|mux-packet-streams|mux-runner|preload|probe-runner|remux-metadata|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
+    /\/dist\/(?:defaults|drivers\/(?:webm|wav|mp3|ogg|adts|aiff|caf|mpegts|avi|flac)|(?:flac|wav)-lazy-driver|webcodecs-(?:audio|video)|wasm-[^/]+|(?:aac|dav1d|mp3|mp3-enc|opus|vorbis|vorbis-enc|vpx)-core|gpu-video|cpu-video|audio-dsp|image-driver|(?:audio-stream-plan|codec-pipeline|decrypt-runner|element-materialize|job-runner|live-convert|live-media|mux-packet-streams|mux-runner|preload|probe-runner|remux-metadata|stream-target-materialize|trim-runner|video-frame-convert|video-stream-plan|worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*))[^/]*\.js$/,
   );
 
   const typicalMp4Probe = routeReport(
@@ -1031,29 +1138,101 @@ async function measureConsumerBundles(
     'probe-only eager closure contains worker JavaScript',
     eagerWorkerFiles,
   );
-  const eagerJsBytes = [...eagerClosure.values()].reduce((sum, size) => sum + size, 0);
+  const probeOnlyEagerJsBytes = [...eagerClosure.values()].reduce((sum, size) => sum + size, 0);
   const emittedJsBytes = [...probeGraph.jsSizes.values()].reduce((sum, size) => sum + size, 0);
-  const eagerJsFiles = fileDetails(eagerClosure);
   const emittedJsFileDetails = fileDetails(probeGraph.jsSizes);
+
+  // The gated subject: what a consumer pays for `import … from '@aibrush/media'` (REQUIREMENTS §8.3,
+  // "Default-import eager static JavaScript closure ≤ 50 KiB", "measured from a clean consumer build").
+  const namespaceClosure = staticClosure(
+    namespaceGraph.entryFile,
+    namespaceGraph.jsText,
+    namespaceGraph.jsSizes,
+  );
+  const namespaceCompressed = compressedRouteSizes(namespaceClosure, namespaceGraph);
+  const eagerJsBytes = [...namespaceClosure.values()].reduce((sum, size) => sum + size, 0);
+  const eagerJsFiles = fileDetails(namespaceClosure);
+  const namespaceWorkerFiles = [...namespaceClosure.keys()].filter((file) =>
+    /(?:^|\/)worker(?!-mode(?:-[A-Z0-9]+)?\.js$)[^/]*\.js$/.test(file),
+  );
+  assertCondition(
+    namespaceWorkerFiles.length === 0,
+    'bundle',
+    'default-import eager closure contains worker JavaScript',
+    namespaceWorkerFiles,
+  );
+  // A single-name import can never pull more than the whole namespace; if it does, one of the two
+  // measurements is wrong and neither number can be trusted.
+  assertCondition(
+    probeOnlyEagerJsBytes <= eagerJsBytes,
+    'bundle',
+    `probe-only floor ${fmt(probeOnlyEagerJsBytes)} exceeds the default-import closure ${fmt(
+      eagerJsBytes,
+    )}; the two eager measurements disagree`,
+    { probeOnlyEagerJsBytes, eagerJsBytes },
+  );
+
+  const shippedClosure = await measureShippedChunkClosure(installedDir);
+  const eagerClosures: readonly EagerClosureReport[] = [
+    {
+      subject: 'namespace-import',
+      method: "clean consumer build of `import * as media from '@aibrush/media'` (the §8.3 gate)",
+      rawBytes: eagerJsBytes,
+      gzipBytes: namespaceCompressed.gzip,
+      brotliBytes: namespaceCompressed.brotli,
+      files: eagerJsFiles,
+    },
+    {
+      subject: 'probe-only',
+      method: 'clean consumer build of `import { probe }` — informational floor, not the gate',
+      rawBytes: probeOnlyEagerJsBytes,
+      gzipBytes: eagerCompressed.gzip,
+      brotliBytes: eagerCompressed.brotli,
+      files: fileDetails(eagerClosure),
+    },
+    shippedClosure,
+  ];
+
   assertCondition(
     eagerJsBytes <= EAGER_KERNEL_BUDGET,
     'bundle',
-    `probe-only eager JS closure ${fmt(eagerJsBytes)} exceeds ${fmt(EAGER_KERNEL_BUDGET)}`,
+    `default-import eager JS closure ${fmt(eagerJsBytes)} exceeds ${fmt(
+      EAGER_KERNEL_BUDGET,
+    )} (REQUIREMENTS §8.3). This is a real budget breach, not a measurement artifact: raising the budget requires architecture review and benchmark evidence, not a new number.`,
     eagerJsFiles,
   );
+  const eagerMargin = EAGER_KERNEL_BUDGET - eagerJsBytes;
+  if (eagerMargin < MIN_EAGER_BUDGET_MARGIN) {
+    // Loud on purpose: passing at 99 % of budget looks identical to passing comfortably in a CI log, and
+    // the person who breaches it will be whoever adds the next export — not whoever spent the headroom.
+    console.warn(
+      `verify-package-install: !! default-import eager closure has only ${fmt(
+        eagerMargin,
+      )} headroom (${fmt(eagerJsBytes)} of ${fmt(
+        EAGER_KERNEL_BUDGET,
+      )}, ${((eagerJsBytes / EAGER_KERNEL_BUDGET) * 100).toFixed(2)}% used; recommended headroom ${fmt(
+        MIN_EAGER_BUDGET_MARGIN,
+      )}). The next eagerly-reachable public export is likely to breach REQUIREMENTS §8.3 — reclaim space before adding one.`,
+    );
+  }
 
   return {
     entryFile: probeGraph.entryFile,
     eagerBudgetBytes: EAGER_KERNEL_BUDGET,
     eagerJsBytes,
-    eagerGzipBytes: eagerCompressed.gzip,
-    eagerBrotliBytes: eagerCompressed.brotli,
+    eagerGzipBytes: namespaceCompressed.gzip,
+    eagerBrotliBytes: namespaceCompressed.brotli,
     eagerMarginBytes: EAGER_KERNEL_BUDGET - eagerJsBytes,
+    eagerClosures,
+    probeOnlyEagerJsBytes,
+    shippedChunkClosureBytes: shippedClosure.rawBytes,
     eagerWorkerJsBytes: 0,
     eagerWasmBytes: 0,
     eagerCodecDataBytes: 0,
     emittedJsBytes,
-    lazyJsBytes: emittedJsBytes - eagerJsBytes,
+    // `emittedJsBytes` is the probe app's whole output, so the lazy remainder is measured against the
+    // probe app's own eager closure — mixing in the namespace figure would subtract across two bundles.
+    lazyJsBytes: emittedJsBytes - probeOnlyEagerJsBytes,
     eagerJsFiles,
     emittedJsFiles: probeGraph.jsFiles,
     emittedJsFileDetails,
@@ -1158,7 +1337,13 @@ async function main(): Promise<void> {
     const sources = await writeConsumerSources(appDir, pkg.concreteDriverSubpath);
     runTypecheck(sources.typecheckConfig, appDir);
     runRuntimeImport(sources.runtimeProbe, appDir);
-    const bundle = await measureConsumerBundles(sources.probeEntry, sources.remuxEntry, bundleDir);
+    const bundle = await measureConsumerBundles(
+      sources.probeEntry,
+      sources.remuxEntry,
+      sources.namespaceEntry,
+      bundleDir,
+      installedDir,
+    );
 
     const report: VerificationReport = {
       packageName: pkg.name,
@@ -1205,13 +1390,26 @@ async function main(): Promise<void> {
     console.info('verify-package-install: clean npm install + public runtime import passed');
     console.info('verify-package-install: export map and declarations passed TypeScript');
     console.info(
-      `verify-package-install: probe-only eager JS ${fmt(bundle.eagerJsBytes)} / ${fmt(
+      `verify-package-install: default-import eager JS ${fmt(bundle.eagerJsBytes)} / ${fmt(
         bundle.eagerBudgetBytes,
       )} (margin ${fmt(bundle.eagerMarginBytes)}); gzip ${fmt(
         bundle.eagerGzipBytes,
-      )}; Brotli ${fmt(bundle.eagerBrotliBytes)}; emitted JS ${fmt(
+      )}; Brotli ${fmt(bundle.eagerBrotliBytes)}; eager worker/WASM/codec data 0/0/0 bytes`,
+    );
+    // All three eager figures together, so the ~5 KiB they differ by is never mistaken for a regression
+    // again. They measure different subjects; only the first is the §8.3 gate.
+    console.info('verify-package-install: eager closure by subject (only the first is gated):');
+    for (const closure of bundle.eagerClosures) {
+      console.info(
+        `  ${fmt(closure.rawBytes).padStart(10)}  ${closure.subject.padEnd(21)} gzip ${fmt(
+          closure.gzipBytes,
+        )}; ${closure.method}`,
+      );
+    }
+    console.info(
+      `verify-package-install: probe-only app emitted JS ${fmt(
         bundle.emittedJsBytes,
-      )} including lazy ${fmt(bundle.lazyJsBytes)}; eager worker/WASM/codec data 0/0/0 bytes`,
+      )} including lazy ${fmt(bundle.lazyJsBytes)}`,
     );
     for (const route of [bundle.typicalMp4Probe, bundle.typicalMp4Remux]) {
       console.info(

@@ -9,7 +9,7 @@ import {
   planLazySampleDataFragmentRuns,
   readMovie,
 } from './mp4-driver.ts';
-import type { Movie, ParsedTrack } from './parse.ts';
+import { type Movie, type ParsedTrack, sampleTableFrom } from './parse.ts';
 import { type SampleData, buildSampleData, buildSamples } from './samples.ts';
 import { type MuxTrackInput, writeMp4 } from './write.ts';
 
@@ -77,9 +77,8 @@ function syntheticAudioMovie(sampleSizes: number[], chunkOffsets: number[]): Mov
     config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
     sampleRate: 48_000,
     channels: 2,
-    samples: {
+    samples: sampleTableFrom({
       timeToSample: [{ count: sampleSizes.length, delta: 1 }],
-      compositionOffsets: [],
       sampleSizes,
       sampleToChunk: chunkOffsets.map((_, i) => ({
         firstChunk: i + 1,
@@ -87,9 +86,7 @@ function syntheticAudioMovie(sampleSizes: number[], chunkOffsets: number[]): Mov
         descIndex: 1,
       })),
       chunkOffsets,
-      syncSamples: [],
-      sampleDependencies: [],
-    },
+    }),
   };
   return { brand: 'isom', timescale: 1_000, durationSec: track.durationSec, tracks: [track] };
 }
@@ -106,7 +103,7 @@ function syntheticBFrameMovie(): Movie {
     config: { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 },
     width: 16,
     height: 16,
-    samples: {
+    samples: sampleTableFrom({
       timeToSample: [{ count: 3, delta: 1_000 }],
       compositionOffsets: [
         { count: 1, offset: 2_000 },
@@ -116,8 +113,7 @@ function syntheticBFrameMovie(): Movie {
       sampleToChunk: [{ firstChunk: 1, samplesPerChunk: 3, descIndex: 1 }],
       chunkOffsets: [100],
       syncSamples: [1],
-      sampleDependencies: [],
-    },
+    }),
   };
   return { brand: 'isom', timescale: 1_000, durationSec: 3, tracks: [track] };
 }
@@ -740,7 +736,6 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
 
   it.each([
     ['fractional offset', 1.5, 1],
-    ['fractional size', 1, 1.5],
     ['unsafe offset', Number.MAX_SAFE_INTEGER + 1, 0],
     ['overflowing end', Number.MAX_SAFE_INTEGER, 1],
     ['non-finite offset', Number.POSITIVE_INFINITY, 0],
@@ -748,6 +743,13 @@ describe('MP4 muxer — reference-reimport round-trip on the real corpus', () =>
     expect(() => mp4PacketMetadata(syntheticAudioMovie([size], [offset]))).toThrow(
       /outside the source/,
     );
+  });
+
+  it('cannot represent a fractional sample size at all: the size column is integral', () => {
+    // Sizes live in a `Uint32Array`, so a fractional/NaN size is unrepresentable rather than
+    // rejected downstream — the range validator only has to police offsets and bounds.
+    const table = sampleTableFrom({ sampleSizes: [1.5, Number.NaN] });
+    expect([...table.sampleSizes]).toEqual([1, 0]);
   });
 
   it('packet metadata keeps a zero-size sample at the known source boundary', () => {

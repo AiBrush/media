@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MediaError } from '../../contracts/errors.ts';
 import { readMovie } from './mp4-driver.ts';
 import { buildSampleData } from './samples.ts';
 import { type MuxTrackInput, writeMp4, writeSparseMp4 } from './write.ts';
@@ -77,8 +78,8 @@ describe('writeMp4 — encode path (synthesizes avcC/esds from description)', ()
     const v = movie.tracks.find((t) => t.mediaType === 'video');
     const a = movie.tracks.find((t) => t.mediaType === 'audio');
     expect(v?.codec).toBe('avc1.42C01E');
-    expect(v?.samples.compositionOffsets.length).toBeGreaterThan(0); // ctts written
-    expect(v?.samples.syncSamples).toEqual([1]); // stss written (sample 2 is not a keyframe)
+    expect(v?.samples.compositionOffsets.counts.length).toBeGreaterThan(0); // ctts written
+    expect([...(v?.samples.syncSamples ?? [])]).toEqual([1]); // stss written (sample 2 is not a keyframe)
     expect(a?.codec).toBe('mp4a.40.2');
     expect(a?.sampleRate).toBe(48000);
     expect(a?.channels).toBe(2);
@@ -317,22 +318,153 @@ describe('writeMp4 — encode path (synthesizes avcC/esds from description)', ()
     expect(() => writeMp4([{ ...video, encryption }])).toThrow(message);
   });
 
-  it.each([
-    {
-      label: 'segment duration',
-      track: { ...video, edit: { durationTicks: 0x1_0000_0000, mediaTimeTicks: 0 } },
-      message: /segment_duration/,
+  /**
+   * The version-0 `elst` `segment_duration` bound and the movie-header duration bound are NOT
+   * independent, so they cannot be provoked separately. `trackMovieDurationTicks` branches on exactly
+   * the condition `editMovieTicks` branches on and returns `segmentDuration + leadingEmptyDuration`,
+   * and a leading empty edit is never negative — so `segmentDuration > 0xffffffff` implies
+   * `movieDuration > 0xffffffff`. `moov` writes `mvhd` before any `trak`, so the movie-header guard
+   * always fires first and the `segment_duration` branch is unreachable for well-formed input. These
+   * two tests assert that ordering deliberately rather than pretending the guards are separable.
+   */
+  it('reports the movie-header bound first when an edit overflows both version-0 fields', () => {
+    // 0x1_0000_0000 media ticks at 600 Hz is 7,158,278,827 movie ticks at 1 kHz — over u32 by ~2.9e9,
+    // and the `elst` segment would be the same 7,158,278,827.
+    expect(() =>
+      writeMp4([{ ...video, edit: { durationTicks: 0x1_0000_0000, mediaTimeTicks: 0 } }]),
+    ).toThrow(/mvhd duration/);
+  });
+
+  it('writes an edit landing exactly on the u32 maximum, and refuses one tick beyond', async () => {
+    // A guard that rejected the legal maximum would be as wrong as one that wrapped, so pin both
+    // sides with an edit list actually present. At the audio clock the edit's movie ticks ARE its
+    // media ticks, so `segment_duration` is exactly 0xffffffff here.
+    const atLimit: MuxTrackInput = {
+      mediaType: 'audio',
+      sampleEntryType: 'mp4a',
+      timescale: 48_000,
+      description: new Uint8Array([0x11, 0x90]),
+      sampleRate: 48_000,
+      channels: 2,
+      mediaDurationTicks: 0xffff_ffff,
+      edit: { mediaTimeTicks: 0, durationTicks: 0xffff_ffff },
+      samples: [{ data: new Uint8Array([1]), durationTicks: 1, cttsTicks: 0, keyframe: true }],
+    };
+    const movie = await readMovie(ra(writeMp4([atLimit])));
+    expect(movie.timescale).toBe(48_000);
+    expect(movie.tracks[0]?.edit?.durationMovieTicks).toBe(0xffff_ffff);
+
+    expect(() =>
+      writeMp4([
+        {
+          ...atLimit,
+          mediaDurationTicks: 0x1_0000_0000,
+          edit: { mediaTimeTicks: 0, durationTicks: 0x1_0000_0000 },
+        },
+      ]),
+    ).toThrow(/duration 4294967296 exceeds the version-0 32-bit field/);
+  });
+
+  it('rejects a version-0 edit list media_time overflow on its own', () => {
+    // `media_time` is an i32 in the MEDIA clock, bounded by nothing else here: a 300-tick edit keeps
+    // every duration field tiny, so this guard is genuinely reachable in isolation.
+    expect(() =>
+      writeMp4([{ ...video, edit: { durationTicks: 300, mediaTimeTicks: 0x8000_0000 } }]),
+    ).toThrow(/media_time/);
+  });
+});
+
+describe('the movie clock', () => {
+  /** One audio track whose whole duration is a single long sample — lets a u32 boundary be reached. */
+  function longAudio(timescale: number, durationTicks: number): MuxTrackInput {
+    return {
+      mediaType: 'audio',
+      sampleEntryType: 'mp4a',
+      timescale,
+      description: new Uint8Array([0x11, 0x90]),
+      sampleRate: timescale,
+      channels: 2,
+      samples: [{ data: new Uint8Array([1]), durationTicks, cttsTicks: 0, keyframe: true }],
+    };
+  }
+
+  it('runs an audio-only movie at the audio rate so declared durations are exact', async () => {
+    // 44 101 frames at 44.1 kHz is 1000.0226… ms: no millisecond clock can state it, and the legacy
+    // 1 kHz movie clock declared 1000 ms, i.e. 44 100 frames — one frame short of the media.
+    const bytes = writeMp4([longAudio(44_100, 44_101)]);
+    const movie = await readMovie(ra(bytes));
+    expect(movie.timescale).toBe(44_100);
+    expect(movie.durationSec).toBe(44_101 / 44_100);
+    expect(Math.round(movie.durationSec * 44_100)).toBe(44_101);
+  });
+
+  it('keeps the millisecond clock when a movie is not audio-only or mixes audio rates', async () => {
+    // Video present: the video clock has its own exactness requirement, so the rule does not apply.
+    expect((await readMovie(ra(writeMp4([video, audio])))).timescale).toBe(1_000);
+    // Two audio rates: whichever is adopted, the other is still rescaled — no clock is exact for both.
+    const mixed = writeMp4([longAudio(48_000, 48_000), longAudio(44_100, 44_100)]);
+    expect((await readMovie(ra(mixed))).timescale).toBe(1_000);
+  });
+
+  it('honors an explicitly pinned movie timescale over the audio rate', async () => {
+    // A remux that preserves a source movie's edits depends on keeping that movie's own clock.
+    const bytes = writeMp4([longAudio(48_000, 48_000)], { movieTimescale: 600 });
+    expect((await readMovie(ra(bytes))).timescale).toBe(600);
+  });
+
+  // 0xffffffff ticks is ~24.9 h at 48 kHz, ~27.1 h at 44.1 kHz and ~149 h at 8 kHz. At the limit the
+  // exact clock is kept; one tick past it, NO movie clock can help — `mdhd` is in the track clock —
+  // so the write is a typed failure and never a wrapped duration (REQUIREMENTS §8.4).
+  it.each([{ rate: 48_000 }, { rate: 44_100 }, { rate: 8_000 }])(
+    'holds the exact clock at the u32 duration limit and refuses to truncate past it ($rate Hz)',
+    async ({ rate }) => {
+      const atLimit = await readMovie(ra(writeMp4([longAudio(rate, 0xffff_ffff)])));
+      expect(atLimit.timescale).toBe(rate);
+      expect(atLimit.durationSec).toBe(0xffff_ffff / rate);
+
+      let thrown: unknown;
+      try {
+        writeMp4([longAudio(rate, 0x1_0000_0000)]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(MediaError);
+      expect((thrown as MediaError).message).toMatch(/mdhd duration 4294967296 exceeds/);
     },
-    {
-      label: 'media time',
-      track: { ...video, edit: { durationTicks: 300, mediaTimeTicks: 0x8000_0000 } },
-      message: /media_time/,
-    },
-  ] satisfies ReadonlyArray<{
-    readonly label: string;
-    readonly track: MuxTrackInput;
-    readonly message: RegExp;
-  }>)('rejects version-0 edit list overflow for $label', ({ track, message }) => {
-    expect(() => writeMp4([track])).toThrow(message);
+  );
+
+  it('falls back to the millisecond clock one tick past the limit rather than truncating', async () => {
+    // The audio clock only loses range where the movie timeline is LONGER than the media — here a
+    // leading empty edit delays a 1 s track far enough that 48 kHz movie ticks overflow u32 while
+    // millisecond ticks still fit. The coarse clock is chosen; nothing is written wrapped.
+    const track: MuxTrackInput = {
+      ...longAudio(48_000, 48_000),
+      edit: { mediaTimeTicks: 0, durationTicks: 48_000, leadingEmptyDurationTicks: 0xffff_ffff },
+    };
+    const movie = await readMovie(ra(writeMp4([track])));
+    expect(movie.timescale).toBe(1_000);
+    expect(movie.tracks[0]?.edit?.durationMovieTicks).toBe(1_000);
+    // One tick less on the empty edit still fits the audio clock, so exactness is kept.
+    const exact = await readMovie(
+      ra(
+        writeMp4([
+          {
+            ...track,
+            edit: { ...track.edit, leadingEmptyDurationTicks: 0xffff_ffff - 48_000 },
+          } as MuxTrackInput,
+        ]),
+      ),
+    );
+    expect(exact.timescale).toBe(48_000);
+  });
+
+  it('does not lose usable range by adopting the audio clock', () => {
+    // The exact clock equals the track clock, so the movie duration IS the media duration and `mdhd`
+    // binds at the same value. The legacy 1 kHz movie clock never bought reach: pinning it explicitly
+    // fails at exactly the same input, which is why this change costs no headroom.
+    expect(() => writeMp4([longAudio(48_000, 0x1_0000_0000)])).toThrow(/mdhd duration/);
+    expect(() => writeMp4([longAudio(48_000, 0x1_0000_0000)], { movieTimescale: 1_000 })).toThrow(
+      /mdhd duration/,
+    );
   });
 });
