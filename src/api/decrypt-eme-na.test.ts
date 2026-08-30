@@ -121,3 +121,84 @@ describe('media.decrypt — unsupported encrypted-media schemes are typed misses
     });
   }
 });
+
+describe('media.decrypt — strict key/IV/mode validation before crypto (REQUIREMENTS §5.8)', () => {
+  it.each(['cenc', 'cens', 'cbcs'] as const)(
+    "scheme '%s' rejects short 8-byte key before I/O",
+    async (scheme) => {
+      const err = await createMedia()
+        .decrypt(explodingSource, {
+          scheme,
+          keys: { '00112233445566778899aabbccddeeff': '00112233' } as any,
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(MediaError);
+      expect((err as MediaError).message).toMatch(/16 bytes/);
+    },
+  );
+
+  it.each(['cenc', 'cens', 'cbcs'] as const)(
+    "scheme '%s' rejects malformed KID before I/O",
+    async (scheme) => {
+      const err = await createMedia()
+        .decrypt(explodingSource, {
+          scheme,
+          keys: { short: '00112233445566778899aabbccddeeff' } as any,
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(MediaError);
+      expect((err as MediaError).message).toMatch(/KID/);
+    },
+  );
+
+  it('hls-aes128 rejects short IV before I/O', async () => {
+    const err = await createMedia()
+      .decrypt(explodingSource, {
+        scheme: 'hls-aes128',
+        keys: { key: '00112233445566778899aabbccddeeff', iv: '00112233' } as any,
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).message).toMatch(/16 bytes/);
+  });
+
+  it('rejects non-hex key before I/O', async () => {
+    const err = await createMedia()
+      .decrypt(explodingSource, {
+        scheme: 'cenc',
+        keys: { '00112233445566778899aabbccddeeff': 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' } as any,
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(MediaError);
+    expect((err as MediaError).message).toMatch(/valid hex/);
+  });
+
+  it('randomized malformed keys are always rejected (20×)', async () => {
+    for (let i = 0; i < 20; i++) {
+      const badLen = 1 + Math.floor(Math.random() * 15);
+      const badHex = '00'.repeat(badLen);
+      const err = await createMedia()
+        .decrypt(explodingSource, {
+          scheme: 'cenc',
+          keys: { '00112233445566778899aabbccddeeff': badHex } as any,
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(MediaError);
+    }
+  });
+});

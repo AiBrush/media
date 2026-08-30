@@ -56,10 +56,15 @@ function tableBox(
 }
 
 const AVC_C = box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
-const VISUAL_ENTRY = box(
-  'avc1',
-  [...zeros(6), ...be16(1), ...zeros(16), ...be16(1920), ...be16(1080), ...zeros(50), ...AVC_C],
-);
+const VISUAL_ENTRY = box('avc1', [
+  ...zeros(6),
+  ...be16(1),
+  ...zeros(16),
+  ...be16(1920),
+  ...be16(1080),
+  ...zeros(50),
+  ...AVC_C,
+]);
 
 interface LongMovieOptions {
   readonly sampleCount: number;
@@ -88,25 +93,28 @@ function longMovie(options: LongMovieOptions): { file: Uint8Array; moovPayload: 
   const mediaTicks = samples * delta;
 
   const stsd = full('stsd', 0, [...be32(1), ...VISUAL_ENTRY]);
-  const stbl = options.omitTables === true ? join([stsd]) : join([
-    stsd,
-    tableBox('stts', 8, 1, (view, offset) => {
-      view.setUint32(offset, samples);
-      view.setUint32(offset + 4, delta);
-    }),
-    tableBox('stsz', 4, samples, (view, offset) => view.setUint32(offset, sampleBytes), [0]),
-    tableBox('stsc', 12, 1, (view, offset) => {
-      view.setUint32(offset, 1);
-      view.setUint32(offset + 4, perChunk);
-      view.setUint32(offset + 8, 1);
-    }),
-    tableBox('stco', 4, chunks, (view, offset, index) =>
-      view.setUint32(offset, 4096 + index * sampleBytes * perChunk),
-    ),
-    tableBox('stss', 4, Math.ceil(samples / 60), (view, offset, index) =>
-      view.setUint32(offset, 1 + index * 60),
-    ),
-  ]);
+  const stbl =
+    options.omitTables === true
+      ? join([stsd])
+      : join([
+          stsd,
+          tableBox('stts', 8, 1, (view, offset) => {
+            view.setUint32(offset, samples);
+            view.setUint32(offset + 4, delta);
+          }),
+          tableBox('stsz', 4, samples, (view, offset) => view.setUint32(offset, sampleBytes), [0]),
+          tableBox('stsc', 12, 1, (view, offset) => {
+            view.setUint32(offset, 1);
+            view.setUint32(offset + 4, perChunk);
+            view.setUint32(offset + 8, 1);
+          }),
+          tableBox('stco', 4, chunks, (view, offset, index) =>
+            view.setUint32(offset, 4096 + index * sampleBytes * perChunk),
+          ),
+          tableBox('stss', 4, Math.ceil(samples / 60), (view, offset, index) =>
+            view.setUint32(offset, 1 + index * 60),
+          ),
+        ]);
   const trak = join([
     [...be32(0), ...str('trak')], // patched below
     full('tkhd', 0, [
@@ -154,7 +162,10 @@ function longMovie(options: LongMovieOptions): { file: Uint8Array; moovPayload: 
   ]);
   const moov = join([[...be32(8 + moovPayload.byteLength), ...str('moov')], moovPayload]);
   const ftyp = join([box('ftyp', [...str('isom'), ...be32(512), ...str('isom'), ...str('mp42')])]);
-  const mdat = join([[...be32(mdatBytes), ...str('mdat')], new Uint8Array(Math.max(0, mdatBytes - 8))]);
+  const mdat = join([
+    [...be32(mdatBytes), ...str('mdat')],
+    new Uint8Array(Math.max(0, mdatBytes - 8)),
+  ]);
   return { file: join([ftyp, moov, mdat]), moovPayload };
 }
 

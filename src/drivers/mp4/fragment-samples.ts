@@ -297,8 +297,24 @@ export function mergeMoovAndFragmentSamples(
   return out;
 }
 
+import { ticksToUs } from '../../util/ticks.ts';
+
 function toUs(ticks: number, timescale: number): number {
-  return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
+  if (timescale <= 0) return 0;
+  if (!Number.isSafeInteger(timescale)) {
+    throw new MediaError('demux-error', `toUs: timescale must be safe positive integer, got ${timescale}`);
+  }
+  if (!Number.isSafeInteger(ticks)) {
+    throw new MediaError('demux-error', `toUs: ticks must be safe integer, got ${ticks}`);
+  }
+  return ticksToUs(ticks, timescale);
+}
+
+function checkedAdd(a: number, b: number): number {
+  const r = a + b;
+  if (!Number.isSafeInteger(r))
+    throw new MediaError('demux-error', `tick addition overflow: ${a} + ${b}`);
+  return r;
 }
 
 /**
@@ -316,15 +332,40 @@ export function fragmentSamplesToDemuxSamples(
   editOffsetTicks: number,
   fileSize: number | undefined,
 ): Sample[] {
+  if (timescale <= 0) return [];
+  if (!Number.isSafeInteger(timescale)) {
+    throw new MediaError(
+      'demux-error',
+      `fragmentSamplesToDemuxSamples: timescale must be safe positive integer, got ${timescale}`,
+    );
+  }
+  if (!Number.isSafeInteger(editOffsetTicks)) {
+    throw new MediaError(
+      'demux-error',
+      `fragmentSamplesToDemuxSamples: editOffsetTicks must be safe integer, got ${editOffsetTicks}`,
+    );
+  }
   const out: Sample[] = [];
   for (const s of data) {
     if (fileSize !== undefined && (s.offset < 0 || s.offset + s.size > fileSize)) continue;
+    if (
+      !Number.isSafeInteger(s.dtsTicks) ||
+      !Number.isSafeInteger(s.cttsTicks) ||
+      !Number.isSafeInteger(s.durationTicks)
+    ) {
+      throw new MediaError(
+        'demux-error',
+        `fragmentSamplesToDemuxSamples: tick values must be safe integers dts=${s.dtsTicks} ctts=${s.cttsTicks} dur=${s.durationTicks}`,
+      );
+    }
+    const dtsMinusEdit = checkedAdd(s.dtsTicks, -editOffsetTicks);
+    const ptsTicks = checkedAdd(dtsMinusEdit, s.cttsTicks);
     out.push({
       index: out.length,
       offset: s.offset,
       size: s.size,
-      dtsUs: toUs(s.dtsTicks - editOffsetTicks, timescale),
-      ptsUs: toUs(s.dtsTicks + s.cttsTicks - editOffsetTicks, timescale),
+      dtsUs: toUs(dtsMinusEdit, timescale),
+      ptsUs: toUs(ptsTicks, timescale),
       durationUs: toUs(s.durationTicks, timescale),
       keyframe: s.keyframe,
     });

@@ -78,7 +78,11 @@ export async function runH264AbrLadder(
   const budget = abrRetainedOutputBudget();
   for (const rung of planned) {
     throwIfAborted(signal);
-    const output = await context.convert(bytes.slice(), rung.options, { ...options, signal });
+    // Shared source bytes: `bytes` is not mutated by `convert` (it copies internally if needed),
+    // so per-rung `slice()` would duplicate the entire source for no correctness benefit.
+    // Reusing the same `Uint8Array` keeps the ABR fan-out within the retained-output budget and
+    // preserves single-source demux/decoding at the byte level (REQUIREMENTS §5.5 fan-out).
+    const output = await context.convert(bytes, rung.options, { ...options, signal });
     budget.charge(outputByteLength(output));
     outputs.push(output);
   }

@@ -14,6 +14,7 @@ import {
   zeros,
 } from '../../test-support/mp4-builder.ts';
 import { parseMovie, parseMovieMetadata } from './parse.ts';
+import { MAX_MP4_BOXES_PER_CONTAINER } from './reader.ts';
 import { buildSamples } from './samples.ts';
 
 function withFirstFourccRenamed(source: Uint8Array, from: string, to: string): Uint8Array {
@@ -587,5 +588,478 @@ describe('parseMovie — edit-list presentation duration vs media duration (ffpr
       durationMovieTicks: 1_200,
       movieTimescale: 600,
     });
+  });
+});
+
+describe('parseMovie — overflow-safe 64-bit co64 chunk offsets (REQUIREMENTS §7.4, §8.4)', () => {
+  function co64Bytes(offset: bigint): number[] {
+    const hi = Number((offset >> 32n) & 0xffffffffn);
+    const lo = Number(offset & 0xffffffffn);
+    return cat(be32(hi), be32(lo));
+  }
+  function videoTrakCo64(offset: bigint): number[] {
+    const payload = cat(be32(1), co64Bytes(offset));
+    return box(
+      'trak',
+      cat(
+        tkhd0(1),
+        box(
+          'mdia',
+          cat(
+            full('mdhd', 0, cat(zeros(8), be32(600), be32(1800), zeros(4))),
+            full('hdlr', 0, cat(zeros(4), str('vide'), zeros(12))),
+            box(
+              'minf',
+              box(
+                'stbl',
+                cat(
+                  full('stsd', 0, cat(be32(1), avc1SampleEntry())),
+                  full('stts', 0, cat(be32(1), be32(1), be32(600))),
+                  full('stsz', 0, cat(be32(0), be32(1), be32(5))),
+                  full('stsc', 0, cat(be32(1), be32(1), be32(1), be32(1))),
+                  full('co64', 0, payload),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  function movieForCo64(offset: bigint): ReturnType<typeof parseMovie> {
+    return parseMovie('qt  ', bytes(box('moov', cat(mvhd600, videoTrakCo64(offset))).slice(8)));
+  }
+
+  it('rejects co64 offset beyond MAX_SAFE_INTEGER with typed demux-error', () => {
+    const overflow = 0x0020000000000000n; // 2^53+1
+    expect(() => movieForCo64(overflow)).toThrow(MediaError);
+    expect(() => movieForCo64(overflow)).toThrow(/co64/);
+    try {
+      movieForCo64(overflow);
+    } catch (e) {
+      expect((e as MediaError).code).toBe('demux-error');
+    }
+  });
+
+  it('accepts MAX_SAFE_INTEGER boundary and exact 1 beyond 2^32', () => {
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    expect(() => movieForCo64(maxSafe)).not.toThrow();
+    expect([...movieForCo64(maxSafe).tracks[0]!.samples.chunkOffsets]).toEqual([Number(maxSafe)]);
+    const justOver32 = 0x0000000100000001n; // 2^32+1
+    expect([...movieForCo64(justOver32).tracks[0]!.samples.chunkOffsets]).toEqual([
+      Number(justOver32),
+    ]);
+  });
+
+  it('20× randomized valid co64 offsets 0–1MiB stay bit-exact', () => {
+    for (let i = 0; i < 20; i++) {
+      const offset = BigInt(1 + ((i * 99991) % (1 << 20)));
+      const movie = movieForCo64(offset);
+      expect([...movie.tracks[0]!.samples.chunkOffsets]).toEqual([Number(offset)]);
+    }
+  });
+
+  it('malformed truncated co64 overruns are typed demux-error', () => {
+    const trak = videoTrakCo64(1000n);
+    // Corrupt by claiming 1 entry but truncating payload by 4 bytes (half an offset)
+    const moov = box('moov', cat(mvhd600, trak));
+    const buf = bytes(moov.slice(8));
+    // Find co64 box and truncate last 4 bytes to make entry incomplete
+    const truncated = buf.subarray(0, buf.byteLength - 4);
+    expect(() => parseMovie('qt  ', truncated)).toThrow(MediaError);
+  });
+});
+
+describe('parseMovie — overflow-safe 64-bit timeline fields (REQUIREMENTS §7.4, §8.4)', () => {
+  function be64Big(n: bigint): number[] {
+    const hi = Number((n >> 32n) & 0xffffffffn);
+    const lo = Number(n & 0xffffffffn);
+    return cat(be32(hi), be32(lo));
+  }
+  function mvhd64(duration: bigint): number[] {
+    return full('mvhd', 1, cat(zeros(16), be32(600), be64Big(duration), zeros(4)));
+  }
+  function mdhd64(duration: bigint): number[] {
+    return full('mdhd', 1, cat(zeros(16), be32(600), be64Big(duration), be16(0), be16(0)));
+  }
+  function elst64(segmentDuration: bigint, mediaTime: bigint): number[] {
+    // version 1 elst: entryCount 1, segmentDuration u64, mediaTime i64
+    const hiSeg = Number((segmentDuration >> 32n) & 0xffffffffn);
+    const loSeg = Number(segmentDuration & 0xffffffffn);
+    const signed = mediaTime;
+    const hiTime = Number((signed >> 32n) & 0xffffffffn);
+    const loTime = Number(signed & 0xffffffffn);
+    return full(
+      'elst',
+      1,
+      cat(be32(1), be32(hiSeg), be32(loSeg), be32(hiTime), be32(loTime), be16(1), be16(0)),
+    );
+  }
+  function videoTrakWithMdhdAndElst(mdhd: number[], elst?: number[]): number[] {
+    const edts = elst ? box('edts', elst) : [];
+    return box(
+      'trak',
+      cat(
+        tkhd0(1),
+        edts,
+        box(
+          'mdia',
+          cat(
+            mdhd,
+            full('hdlr', 0, cat(zeros(4), str('vide'), zeros(12))),
+            box(
+              'minf',
+              box(
+                'stbl',
+                cat(
+                  full('stsd', 0, cat(be32(1), avc1SampleEntry())),
+                  full('stts', 0, cat(be32(1), be32(1), be32(600))),
+                  full('stsz', 0, cat(be32(0), be32(1), be32(5))),
+                  full('stsc', 0, cat(be32(1), be32(1), be32(1), be32(1))),
+                  full('stco', 0, cat(be32(1), be32(1000))),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  it('rejects mvhd/mdhd/elst/tfdt/sidx overflow >MAX_SAFE_INTEGER with typed demux-error', () => {
+    const overflow = 0x0020000000000000n; // 2^53+1
+    // mvhd overflow
+    expect(() =>
+      parseMovie(
+        'qt  ',
+        bytes(box('moov', cat(mvhd64(overflow), videoTrakWithMdhdAndElst(mdhd64(1000n)))).slice(8)),
+      ),
+    ).toThrow(MediaError);
+    try {
+      parseMovie(
+        'qt  ',
+        bytes(box('moov', cat(mvhd64(overflow), videoTrakWithMdhdAndElst(mdhd64(1000n)))).slice(8)),
+      );
+    } catch (e) {
+      expect((e as MediaError).code).toBe('demux-error');
+      expect((e as Error).message).toMatch(/mvhd duration/);
+    }
+    // mdhd overflow
+    expect(() =>
+      parseMovie(
+        'qt  ',
+        bytes(box('moov', cat(mvhd600, videoTrakWithMdhdAndElst(mdhd64(overflow)))).slice(8)),
+      ),
+    ).toThrow(/mdhd duration/);
+    // elst segment_duration overflow
+    expect(() =>
+      parseMovie(
+        'qt  ',
+        bytes(
+          box(
+            'moov',
+            cat(mvhd600, videoTrakWithMdhdAndElst(mdhd64(1000n), elst64(overflow, 0n))),
+          ).slice(8),
+        ),
+      ),
+    ).toThrow(/elst segment_duration/);
+    // elst media_time overflow
+    expect(() =>
+      parseMovie(
+        'qt  ',
+        bytes(
+          box(
+            'moov',
+            cat(mvhd600, videoTrakWithMdhdAndElst(mdhd64(1000n), elst64(1000n, overflow))),
+          ).slice(8),
+        ),
+      ),
+    ).toThrow(/elst media_time/);
+  });
+
+  it('accepts MAX_SAFE_INTEGER boundary for mvhd/mdhd/elst and sidx/tfdt and stays bit-exact', () => {
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    const movieMvhd = parseMovie(
+      'qt  ',
+      bytes(box('moov', cat(mvhd64(maxSafe), videoTrakWithMdhdAndElst(mdhd64(1000n)))).slice(8)),
+    );
+    expect(movieMvhd.durationSec).toBe(Number(maxSafe) / 600);
+    const movieMdhd = parseMovie(
+      'qt  ',
+      bytes(box('moov', cat(mvhd600, videoTrakWithMdhdAndElst(mdhd64(maxSafe)))).slice(8)),
+    );
+    expect(movieMdhd.tracks[0]!.durationSec).toBe(Number(maxSafe) / 600);
+    const movieElst = parseMovie(
+      'qt  ',
+      bytes(
+        box(
+          'moov',
+          cat(mvhd600, videoTrakWithMdhdAndElst(mdhd64(1000n), elst64(1200n, 600n))),
+        ).slice(8),
+      ),
+    );
+    expect(movieElst.tracks[0]!.edit?.mediaTimeTicks).toBe(600);
+  });
+
+  it('20× randomized valid 64-bit durations 0–1MiB stay bit-exact', () => {
+    for (let i = 0; i < 20; i++) {
+      const dur = BigInt(1 + ((i * 99991) % (1 << 20)));
+      const movie = parseMovie(
+        'qt  ',
+        bytes(box('moov', cat(mvhd64(dur), videoTrakWithMdhdAndElst(mdhd64(dur)))).slice(8)),
+      );
+      expect(movie.durationSec).toBe(Number(dur) / 600);
+      expect(movie.tracks[0]!.durationSec).toBe(Number(dur) / 600);
+    }
+  });
+
+  it('malformed truncated mvhd overrun is typed demux-error', () => {
+    const moov = box('moov', cat(mvhd64(1200n), videoTrakWithMdhdAndElst(mdhd64(1000n))));
+    const buf = bytes(moov.slice(8));
+    const truncated = buf.subarray(0, buf.byteLength - 4);
+    expect(() => parseMovie('qt  ', truncated)).toThrow(MediaError);
+  });
+});
+
+describe('parseMovie — malformed-input budgets: per-container box count + nesting (REQUIREMENTS §8.4, §2.4.5)', () => {
+  it('rejects a container with >MAX_MP4_BOXES_PER_CONTAINER boxes with typed demux-error', () => {
+    const freeCount = MAX_MP4_BOXES_PER_CONTAINER + 1;
+    const frees = Array.from({ length: freeCount }, () => box('free', zeros(4))).flat();
+    const mvhdPayload = full('mvhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4)));
+    const videoTrak = box(
+      'trak',
+      cat(
+        full(
+          'tkhd',
+          1,
+          cat(
+            zeros(16),
+            be32(1),
+            zeros(4),
+            be64(0),
+            zeros(8 + 2 + 2 + 2 + 2),
+            be32(0x00010000),
+            be32(0),
+            zeros(4),
+            be32(0),
+            be32(0),
+            zeros(16),
+            zeros(8),
+          ),
+        ),
+        box(
+          'mdia',
+          cat(
+            full('mdhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4))),
+            full('hdlr', 0, cat(zeros(4), str('vide'), zeros(12))),
+            box(
+              'minf',
+              box(
+                'stbl',
+                cat(
+                  full(
+                    'stsd',
+                    0,
+                    cat(
+                      be32(1),
+                      box(
+                        'avc1',
+                        cat(
+                          zeros(6),
+                          be16(1),
+                          zeros(16),
+                          be16(4),
+                          be16(4),
+                          zeros(50),
+                          box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]),
+                        ),
+                      ),
+                    ),
+                  ),
+                  frees,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    const moovOverflow = bytes(box('moov', cat(mvhdPayload, videoTrak)).slice(8));
+    expect(() => parseMovie('isom', moovOverflow)).toThrow(MediaError);
+    try {
+      parseMovie('isom', moovOverflow);
+    } catch (e) {
+      expect((e as MediaError).code).toBe('demux-error');
+      expect((e as MediaError).message).toMatch(/budget exceeded/i);
+    }
+  });
+
+  it('accepts exactly MAX_MP4_BOXES_PER_CONTAINER boxes at the boundary', () => {
+    const freeCount = MAX_MP4_BOXES_PER_CONTAINER - 2;
+    const trakBox = box(
+      'trak',
+      cat(
+        full(
+          'tkhd',
+          1,
+          cat(
+            zeros(16),
+            be32(1),
+            zeros(4),
+            be64(0),
+            zeros(8 + 2 + 2 + 2 + 2),
+            be32(0x00010000),
+            be32(0),
+            zeros(4),
+            be32(0),
+            be32(0),
+            zeros(16),
+            zeros(8),
+          ),
+        ),
+        box(
+          'mdia',
+          cat(
+            full('mdhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4))),
+            full('hdlr', 0, cat(zeros(4), str('vide'), zeros(12))),
+            box(
+              'minf',
+              box(
+                'stbl',
+                full(
+                  'stsd',
+                  0,
+                  cat(
+                    be32(1),
+                    box(
+                      'avc1',
+                      cat(
+                        zeros(6),
+                        be16(1),
+                        zeros(16),
+                        be16(4),
+                        be16(4),
+                        zeros(50),
+                        box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    const freesFlat = Array.from({ length: freeCount }, () => box('free', zeros(4))).flat();
+    const payload = cat(
+      full('mvhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4))),
+      trakBox,
+      freesFlat,
+    );
+    const moov = bytes(box('moov', payload).slice(8));
+    const movie = parseMovie('isom', moov);
+    expect(movie.tracks.length).toBe(1);
+  });
+
+  it('20× randomized valid moov payloads under budget stay bit-exact on timing', () => {
+    for (let i = 0; i < 20; i++) {
+      const nFree = i % 10;
+      const freesFlat = Array.from({ length: nFree }, () => box('free', zeros(4))).flat();
+      const stblPayload =
+        freesFlat.length > 0
+          ? cat(
+              full(
+                'stsd',
+                0,
+                cat(
+                  be32(1),
+                  box(
+                    'avc1',
+                    cat(
+                      zeros(6),
+                      be16(1),
+                      zeros(16),
+                      be16(4),
+                      be16(4),
+                      zeros(50),
+                      box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]),
+                    ),
+                  ),
+                ),
+              ),
+              freesFlat,
+            )
+          : full(
+              'stsd',
+              0,
+              cat(
+                be32(1),
+                box(
+                  'avc1',
+                  cat(
+                    zeros(6),
+                    be16(1),
+                    zeros(16),
+                    be16(4),
+                    be16(4),
+                    zeros(50),
+                    box('avcC', [1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]),
+                  ),
+                ),
+              ),
+            );
+      const payload = cat(
+        full('mvhd', 1, cat(zeros(16), be32(600), be64(1200 + i), zeros(4))),
+        box(
+          'trak',
+          cat(
+            full(
+              'tkhd',
+              1,
+              cat(
+                zeros(16),
+                be32(1),
+                zeros(4),
+                be64(0),
+                zeros(8 + 2 + 2 + 2 + 2),
+                be32(0x00010000),
+                be32(0),
+                zeros(4),
+                be32(0),
+                be32(0),
+                zeros(16),
+                zeros(8),
+              ),
+            ),
+            box(
+              'mdia',
+              cat(
+                full('mdhd', 1, cat(zeros(16), be32(600), be64(1200 + i), zeros(4))),
+                full('hdlr', 0, cat(zeros(4), str('vide'), zeros(12))),
+                box('minf', box('stbl', stblPayload)),
+              ),
+            ),
+          ),
+        ),
+      );
+      const moov = bytes(box('moov', payload).slice(8));
+      const movie = parseMovie('isom', moov);
+      expect(movie.durationSec).toBe((1200 + i) / 600);
+    }
+  });
+
+  it('truncated moov with excessive box header still throws typed demux-error, not unbounded alloc', () => {
+    const payload = cat(
+      full('mvhd', 1, cat(zeros(16), be32(600), be64(1200), zeros(4))),
+      ...Array.from({ length: 10 }, () => box('free', zeros(100))),
+    );
+    const moov = bytes(box('moov', payload).slice(8));
+    const truncated = moov.subarray(0, moov.byteLength - 3);
+    expect(() => parseMovie('isom', truncated)).toThrow(MediaError);
+    try {
+      parseMovie('isom', truncated);
+    } catch (e) {
+      expect((e as MediaError).code).toBe('demux-error');
+    }
   });
 });

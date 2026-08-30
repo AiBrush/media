@@ -8,8 +8,9 @@ import {
 } from '../../contracts/errors.ts';
 
 const TS_PACKET_SIZE = 188;
-const TS_CLOCK_HZ = 90_000;
+export const TS_CLOCK_HZ = 90_000;
 const MICROSECONDS_PER_SECOND = 1_000_000;
+export const MAX_TS_MUX_ACCESS_UNITS_PER_TRACK = 100_000;
 const PAT_PID = 0x0000;
 const PMT_PID = 0x0100;
 const FIRST_ES_PID = 0x0101;
@@ -185,6 +186,12 @@ export class MpegTsMuxer implements Muxer {
     }
     if (chunk.data.byteLength === 0) {
       throw new MediaError('mux-error', 'Cannot mux an empty MPEG-TS access unit.', { trackId });
+    }
+    if (track.chunks.length + 1 > MAX_TS_MUX_ACCESS_UNITS_PER_TRACK) {
+      throw new MediaError(
+        'mux-error',
+        `MPEG-TS track ${track.pid} has >${MAX_TS_MUX_ACCESS_UNITS_PER_TRACK} access units (budget exceeded)`,
+      );
     }
     track.chunks.push(storedChunk(chunk, true));
   }
@@ -945,7 +952,20 @@ function validateDuration(value: number, name: string): void {
 }
 
 function usToTsTicks(timestampUs: number): number {
-  return Math.round((timestampUs * TS_CLOCK_HZ) / MICROSECONDS_PER_SECOND);
+  // Exact half-away bigint (REQUIREMENTS §7.4) — avoids float drift at 90 kHz / 1e6 and near 2^33 wrap.
+  const us = BigInt(Math.round(timestampUs));
+  const neg = us < 0n;
+  const abs = neg ? -us : us;
+  const ticksAbs =
+    (abs * BigInt(TS_CLOCK_HZ) + BigInt(MICROSECONDS_PER_SECOND / 2)) /
+    BigInt(MICROSECONDS_PER_SECOND);
+  const ticks = neg ? -ticksAbs : ticksAbs;
+  if (ticks > BigInt(Number.MAX_SAFE_INTEGER) || ticks < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new MediaError('mux-error', 'MPEG-TS timestamp exceeds safe integer range.', {
+      timestampUs,
+    });
+  }
+  return Number(ticks);
 }
 
 function normalizeTimestamp33(ticks: number): number {

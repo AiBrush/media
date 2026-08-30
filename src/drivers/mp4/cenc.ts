@@ -1056,7 +1056,16 @@ function buildFlatSamples(bytes: Uint8Array, stbl: BoxHeader): SampleLoc[] {
     const rc = new Reader(bytes, co64.payloadStart);
     readFullBoxHeader(rc);
     const n = rc.u32();
-    for (let i = 0; i < n; i++) chunkOffsets.push(rc.u64());
+    for (let i = 0; i < n; i++) {
+      const big = rc.u64BigInt();
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new MediaError(
+          'demux-error',
+          `truncated MP4 box: co64 chunk offset ${big} at entry ${i} exceeds safe integer range`,
+        );
+      }
+      chunkOffsets.push(Number(big));
+    }
   }
 
   const rs = new Reader(bytes, stsc.payloadStart);
@@ -1500,6 +1509,12 @@ export async function decryptCencFile(
       throw new InputError(`no key provided for KID ${id}`, { kid: id });
     }
     const raw = hexToBytes(hex);
+    if (raw.byteLength !== 16) {
+      throw new InputError(
+        `key for KID ${id} must be 16 bytes (32 hex chars) for ${opts.scheme}, got ${raw.byteLength}`,
+        { kid: id, scheme: opts.scheme },
+      );
+    }
     const prepared =
       opts.scheme === CBCS_SCHEME
         ? prepareAesCbcKey(raw, 'no-padding-decrypt')

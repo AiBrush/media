@@ -76,9 +76,30 @@ export class Reader {
   }
   /** 64-bit unsigned as a JS number (safe up to 2^53; MP4 durations/offsets fit in practice). */
   u64(): number {
-    const hi = this.u32();
-    const lo = this.u32();
-    return hi * 2 ** 32 + lo;
+    this.#need(8);
+    const big = this.#view.getBigUint64(this.pos);
+    if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: 64-bit value ${big} exceeds safe integer range`,
+      );
+    }
+    this.pos += 8;
+    return Number(big);
+  }
+  /** 64-bit unsigned as bigint (exact, for largesize/co64 beyond 2^53). */
+  u64BigInt(): bigint {
+    this.#need(8);
+    const v = this.#view.getBigUint64(this.pos);
+    this.pos += 8;
+    return v;
+  }
+  /** 64-bit signed as bigint (exact, for elst media_time v1). */
+  i64BigInt(): bigint {
+    this.#need(8);
+    const v = this.#view.getBigInt64(this.pos);
+    this.pos += 8;
+    return v;
   }
   /** 16.16 fixed-point. */
   fixed16(): number {
@@ -142,7 +163,14 @@ export function readBoxHeader(r: Reader): BoxHeader {
   const type = r.fourcc();
   let headerSize = 8;
   if (size === 1) {
-    size = r.u64();
+    const big = r.u64BigInt();
+    if (big < 16n || big > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: 64-bit largesize ${big} for '${type}' at ${start} is out of safe range`,
+      );
+    }
+    size = Number(big);
     headerSize = 16;
   } else if (size === 0) {
     size = r.length - start;
@@ -150,9 +178,20 @@ export function readBoxHeader(r: Reader): BoxHeader {
   return { type, size, headerSize, start, payloadStart: start + headerSize, end: start + size };
 }
 
+/** Budgets for malformed-input protection (REQUIREMENTS §8.4, §2.4.5): bounded per-container allocation/time. */
+export const MAX_MP4_BOXES_PER_CONTAINER = 2048;
+export const MAX_MP4_NESTING_DEPTH = 32;
+
 /** Iterate the boxes between the cursor and `end`, stopping on a malformed box. */
 export function* boxes(r: Reader, end: number = r.length): Generator<BoxHeader> {
+  let count = 0;
   while (r.pos + 8 <= end) {
+    if (++count > MAX_MP4_BOXES_PER_CONTAINER) {
+      throw new MediaError(
+        'demux-error',
+        `truncated MP4 box: container has >${MAX_MP4_BOXES_PER_CONTAINER} boxes (budget exceeded) at ${r.pos}`,
+      );
+    }
     const h = readBoxHeader(r);
     if (h.size < h.headerSize || h.end > end || h.end <= h.start) return;
     yield h;

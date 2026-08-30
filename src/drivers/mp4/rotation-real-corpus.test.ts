@@ -277,9 +277,7 @@ describe('MP4/MOV real rotation corpus vs ffmpeg/ffprobe', () => {
             : sourceVideo.codec.startsWith('hvc') || sourceVideo.codec.startsWith('hev'),
         ).toBe(true);
         if (row.vfr === true) {
-          expect(
-            new Set(sourceVideo.samples.timeToSample.deltas).size,
-          ).toBeGreaterThan(1);
+          expect(new Set(sourceVideo.samples.timeToSample.deltas).size).toBeGreaterThan(1);
         }
 
         const sourceTracks = await muxTracksFromMovie(randomAccess(source), sourceMovie);

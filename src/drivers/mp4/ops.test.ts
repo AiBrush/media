@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { createMedia } from '../../api/create-media.ts';
-import type { ByteSource, StreamCopyOptions } from '../../contracts/driver.ts';
+import type { StreamCopyOptions } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { toStreamTarget } from '../../sinks/stream-target.ts';
 import { fromBytes } from '../../sources/source.ts';
 import { fixtureSource, loadFixture } from '../../test-support/corpus.ts';
-import { materializeCompatibleMovToMp4Bytes } from './compatible-mov-rewrite.ts';
+import { streamCompatibleMovToMp4 } from './compatible-mov-rewrite.ts';
 import { Mp4Module, muxTracksFromMovie, readMovie } from './mp4-driver.ts';
 import type { Movie } from './parse.ts';
 import { buildSampleData } from './samples.ts';
@@ -64,14 +64,15 @@ function writeU32At(bytes: Uint8Array, offset: number, value: number): void {
   bytes[offset + 3] = value & 0xff;
 }
 
-function kindedSource(kind: string): ByteSource {
-  return {
-    kind,
-    stream: () =>
-      new ReadableStream<Uint8Array>({
-        start: (controller) => controller.close(),
-      }),
-  } as ByteSource & { readonly kind: string };
+function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 async function quickTimeBrandedCompatibleMov(fixture: string): Promise<Uint8Array> {
@@ -205,21 +206,16 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     const opts: StreamCopyOptions = { container: 'mp4', buffered: true };
 
     await expect(
-      materializeCompatibleMovToMp4Bytes(
-        kindedSource('bytes'),
-        { read: ra(input).read },
-        movie,
-        opts,
-      ),
+      streamCompatibleMovToMp4({ read: ra(input).read }, movie, opts),
     ).resolves.toBeUndefined();
     await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(input), movie, {
+      streamCompatibleMovToMp4(ra(input), movie, {
         ...opts,
         container: 'mov',
       }),
     ).resolves.toBeUndefined();
     await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(input), movie, {
+      streamCompatibleMovToMp4(ra(input), movie, {
         ...opts,
         trim: { startSec: 0, endSec: 1 },
       }),
@@ -227,35 +223,27 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
 
     const wrongFirstBox = input.slice();
     writeFourcc(wrongFirstBox, 4, 'free');
-    await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(wrongFirstBox), movie, opts),
-    ).resolves.toBeUndefined();
+    await expect(streamCompatibleMovToMp4(ra(wrongFirstBox), movie, opts)).resolves.toBeUndefined();
 
     const wrongSecondBox = input.slice();
     writeFourcc(wrongSecondBox, u32(wrongSecondBox, 0) + 4, 'free');
     await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(wrongSecondBox), movie, opts),
+      streamCompatibleMovToMp4(ra(wrongSecondBox), movie, opts),
     ).resolves.toBeUndefined();
 
     const tinyFtyp = input.slice();
     writeU32At(tinyFtyp, 0, 16);
-    await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(tinyFtyp), movie, opts),
-    ).resolves.toBeUndefined();
+    await expect(streamCompatibleMovToMp4(ra(tinyFtyp), movie, opts)).resolves.toBeUndefined();
 
     const invalidTopBox = new Uint8Array(16);
     writeU32At(invalidTopBox, 0, 4);
     writeFourcc(invalidTopBox, 4, 'ftyp');
-    await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(invalidTopBox), movie, opts),
-    ).resolves.toBeUndefined();
+    await expect(streamCompatibleMovToMp4(ra(invalidTopBox), movie, opts)).resolves.toBeUndefined();
 
     const zeroSizeFtyp = new Uint8Array(24);
     writeU32At(zeroSizeFtyp, 0, 0);
     writeFourcc(zeroSizeFtyp, 4, 'ftyp');
-    await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(zeroSizeFtyp), movie, opts),
-    ).resolves.toBeUndefined();
+    await expect(streamCompatibleMovToMp4(ra(zeroSizeFtyp), movie, opts)).resolves.toBeUndefined();
 
     const largeSizeFtyp = new Uint8Array(32);
     writeU32At(largeSizeFtyp, 0, 1);
@@ -263,55 +251,105 @@ describe('media.remux (mp4 → mp4 stream-copy)', () => {
     writeU32At(largeSizeFtyp, 8, 0);
     writeU32At(largeSizeFtyp, 12, 24);
     writeFourcc(largeSizeFtyp, 24, 'free');
-    await expect(
-      materializeCompatibleMovToMp4Bytes(kindedSource('bytes'), ra(largeSizeFtyp), movie, opts),
-    ).resolves.toBeUndefined();
+    await expect(streamCompatibleMovToMp4(ra(largeSizeFtyp), movie, opts)).resolves.toBeUndefined();
 
     await expect(
-      materializeCompatibleMovToMp4Bytes(
-        kindedSource('bytes'),
-        ra(input),
-        withFirstChunkOffset(movie, input.byteLength + 1),
-        opts,
-      ),
+      streamCompatibleMovToMp4(ra(input), withFirstChunkOffset(movie, input.byteLength + 1), opts),
     ).rejects.toBeInstanceOf(MediaError);
 
     await expect(
-      materializeCompatibleMovToMp4Bytes(
-        kindedSource('bytes'),
-        ra(input),
-        withUnmappedFirstTrack(movie),
-        opts,
-      ),
+      streamCompatibleMovToMp4(ra(input), withUnmappedFirstTrack(movie), opts),
     ).rejects.toBeInstanceOf(MediaError);
 
+    // A source shorter than its declared size fails track-range validation and is declined with the
+    // typed demux error (the streamed rewrite never materializes the whole file, so there is no
+    // full-read to come up short).
     await expect(
-      materializeCompatibleMovToMp4Bytes(
-        kindedSource('bytes'),
+      streamCompatibleMovToMp4(
         {
-          size: input.byteLength,
-          read: (offset, length) =>
-            Promise.resolve(
-              input.subarray(
-                offset,
-                offset + (offset === 0 && length === input.byteLength ? length - 1 : length),
-              ),
-            ),
+          size: input.byteLength - 1,
+          read: (offset, length) => Promise.resolve(input.subarray(offset, offset + length)),
         },
         movie,
         opts,
       ),
     ).rejects.toBeInstanceOf(MediaError);
 
-    const urlBytes = input.slice();
-    const urlOut = await materializeCompatibleMovToMp4Bytes(
-      kindedSource('url'),
-      ra(urlBytes),
-      movie,
-      opts,
-    );
-    expect(urlOut?.buffer).toBe(urlBytes.buffer);
-    expect(fourccAt(urlBytes, 8)).toBe('isom');
+    // The streamed rewrite must leave the caller's source bytes untouched and produce the patched
+    // container through bounded windows (never a whole-file materialization).
+    const sourceBytes = input.slice();
+    const streamed = await streamCompatibleMovToMp4(ra(sourceBytes), movie, opts);
+    expect(streamed).toBeDefined();
+    const chunks: Uint8Array[] = [];
+    const reader = streamed!.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const out = concatBytes(chunks);
+    expect(fourccAt(sourceBytes, 8)).toBe('qt  '); // source not mutated
+    expect(fourccAt(out, 8)).toBe('isom');
+    expect(fourccAt(out, 16)).toBe('mp42');
+    expect(out.byteLength).toBe(sourceBytes.byteLength);
+    const ftypSize = u32(sourceBytes, 0);
+    expect(out.subarray(ftypSize)).toEqual(sourceBytes.subarray(ftypSize));
+  });
+
+  it('MOV→MP4 rewrite survives chunked short reads (bounded windows, randomized small chunks)', async () => {
+    const input = await quickTimeBrandedCompatibleMov('movie_5.mp4');
+    const movie = await readMovie(ra(input));
+    const opts: StreamCopyOptions = { container: 'mp4', buffered: true };
+
+    // Transport that always returns at most 512 bytes even when asked for 8 MiB — the bug was
+    // `cursor += length` (requested) instead of `chunk.byteLength` (actual), which dropped bytes.
+    // A deterministic worst case is 1 byte per read, but 512 bytes keeps the test fast while still
+    // forcing ~100+ pulls for a 50 KiB fixture.
+    const chunked = (bytes: Uint8Array, max = 512) => ({
+      size: bytes.byteLength,
+      read: (offset: number, length: number) => {
+        const capped = Math.min(length, max, bytes.byteLength - offset);
+        // Simulate a non-cooperative range server that fulfills with at most `max` bytes.
+        return Promise.resolve(bytes.subarray(offset, offset + capped));
+      },
+    });
+    const viaChunked = await streamCompatibleMovToMp4(chunked(input), movie, opts);
+    expect(viaChunked).toBeDefined();
+    const chunks: Uint8Array[] = [];
+    for await (const c of viaChunked as ReadableStream<Uint8Array>) chunks.push(c);
+    const out = concatBytes(chunks);
+    expect(fourccAt(input, 8)).toBe('qt  ');
+    expect(fourccAt(out, 8)).toBe('isom');
+    expect(out.byteLength).toBe(input.byteLength);
+    const ftypSize = u32(input, 0);
+    expect(out.subarray(ftypSize)).toEqual(input.subarray(ftypSize));
+
+    // Randomized variant: 30 runs with max 1–1024 bytes, 1 byte would imply ~50k pulls so cap runs.
+    for (let run = 0; run < 30; run++) {
+      const maxBytes = 1 + Math.floor(Math.random() * 1024);
+      const ra2 = {
+        size: input.byteLength,
+        read: (off: number, len: number) =>
+          Promise.resolve(input.subarray(off, off + Math.min(len, maxBytes))),
+      };
+      const stream = await streamCompatibleMovToMp4(ra2, movie, opts);
+      if (stream === undefined) throw new Error('expected chunked MOV→MP4 to remain eligible');
+      const bufs: Uint8Array[] = [];
+      for await (const b of stream) bufs.push(b);
+      const got = concatBytes(bufs);
+      expect(got.byteLength).toBe(input.byteLength);
+      expect(got.subarray(ftypSize)).toEqual(input.subarray(ftypSize));
+    }
+
+    // Byte-exact against the non-chunked oracle — ftyp patch is the only difference.
+    const expected = await (async () => {
+      const s = await streamCompatibleMovToMp4(ra(input), movie, opts);
+      if (!s) throw new Error('oracle stream missing');
+      const bs: Uint8Array[] = [];
+      for await (const b of s) bs.push(b);
+      return concatBytes(bs);
+    })();
+    expect(out).toEqual(expected);
   });
 
   it('rejects a cross-container remux with a typed CapabilityError', async () => {

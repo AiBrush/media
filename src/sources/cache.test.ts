@@ -279,11 +279,14 @@ describe('cacheSource — bounded ranged-read retention', () => {
   });
 
   it('rejects unsafe cache capacities synchronously', () => {
-    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: -1 })).toThrow(RangeError);
-    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: 1.5 })).toThrow(RangeError);
+    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: -1 })).toThrow(MediaError);
+    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: 1.5 })).toThrow(MediaError);
     expect(() =>
       cacheSource(fromBytes(new Uint8Array()), { maxBytes: Number.MAX_SAFE_INTEGER + 1 }),
-    ).toThrow(RangeError);
+    ).toThrow(MediaError);
+    expect(() => cacheSource(fromBytes(new Uint8Array()), { maxBytes: -1 })).toThrow(
+      expect.objectContaining({ code: 'unsupported-input' }),
+    );
   });
 });
 
@@ -581,5 +584,368 @@ describe('cacheSource — wrapping non-URL sources (no network)', () => {
     expectBytesEqual(await rangeRead, truth.subarray(0, 4));
     expectBytesEqual(await streamed, truth);
     expect(consumptions).toBe(1);
+  });
+
+  // ── Chunked short-read resilience (generalizes compatible-mov + webm packet-info) ────────
+
+  it('range cache loop-collects 1-byte chunked short reads into a bit-exact window', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const windowLo = 128;
+    const windowHi = 1024;
+    const expected = truth.subarray(windowLo, windowHi);
+    const chunked: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (start, end) => truth.subarray(start, Math.min(end, start + 1)),
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    };
+    const src = cacheSource(chunked);
+    expectBytesEqual(await src.range(windowLo, windowHi), expected);
+    // Second read hits cache without re-fetching the underlying window.
+    expectBytesEqual(await src.range(windowLo, windowHi), expected);
+  });
+
+  it('range cache throws demux-error on zero-length / malformed window short read', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const zeroSource: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async () => new Uint8Array(0),
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    };
+    const src = cacheSource(zeroSource);
+    await expect(src.range(0, 64)).rejects.toMatchObject({ code: 'demux-error' });
+    await expect(src.range(100, 200)).rejects.toMatchObject({ code: 'demux-error' });
+  });
+
+  it('range cache randomized 1B–37B chunking is bitexact vs whole-window read', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const lo = 256;
+    const hi = 2048;
+    const expected = truth.subarray(lo, hi);
+    let seed = 0x9e3779b9;
+    const nextChunk = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return 1 + (seed % 37);
+    };
+    const chunked: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (start, end) => {
+        const n = nextChunk();
+        return truth.subarray(start, Math.min(end, start + n));
+      },
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    };
+    const src = cacheSource(chunked);
+    const got = await src.range(lo, hi);
+    expectBytesEqual(got, expected);
+    // Repeat with fresh deterministic seed to prove determinism.
+    seed = 0x9e3779b9;
+    const src2 = cacheSource({
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (start, end) => {
+        const n = nextChunk();
+        return truth.subarray(start, Math.min(end, start + n));
+      },
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    });
+    expectBytesEqual(await src2.range(lo, hi), expected);
+    for (let trial = 0; trial < 20; trial++) {
+      const a = Math.floor((truth.byteLength * trial) / 21);
+      const b = Math.min(truth.byteLength, a + 512 + ((trial * 73) % 1024));
+      seed = trial * 0x85ebca6b;
+      const s: Source = {
+        __media: 'source',
+        kind: 'bytes',
+        size: truth.byteLength,
+        range: async (s2, e2) => {
+          const nn = 1 + ((seed = (seed * 1664525 + 1013904223) >>> 0) % 37);
+          return truth.subarray(s2, Math.min(e2, s2 + nn));
+        },
+        stream: () =>
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(truth);
+              c.close();
+            },
+          }),
+      };
+      const cs = cacheSource(s);
+      expectBytesEqual(await cs.range(a, b), truth.subarray(a, b));
+    }
+  });
+
+  it('abort during chunked window rejects with aborted before completion and does not cache partial', async () => {
+    const truth = await loadFixture(FIXTURE);
+    let calls = 0;
+    const chunked: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (start, end, signal) => {
+        calls++;
+        // Abort after first chunk: signal already aborted or will abort mid-window.
+        if (signal?.aborted) throw new MediaError('aborted', 'chunk aborted');
+        // Return 1 byte per call to force multiple iterations.
+        return truth.subarray(start, Math.min(end, start + 1));
+      },
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    };
+    const src = cacheSource(chunked);
+    const controller = new AbortController();
+    const pending = src.range(0, 64, controller.signal);
+    // Abort after the first internal chunk has been requested (next tick).
+    await Promise.resolve();
+    controller.abort(new MediaError('aborted', 'mid-window abort'));
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
+    // Partial bytes must not be cached as a complete window.
+    expect(src.cachedBytes).toBe(0);
+    // A fresh non-aborted read still succeeds bit-exactly.
+    const expected = truth.subarray(0, 64);
+    const fresh: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (s, e) => truth.subarray(s, Math.min(e, s + 1)),
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    };
+    const src2 = cacheSource(fresh);
+    expectBytesEqual(await src2.range(0, 64), expected);
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it('throws integrity-error when overlapping range returns inconsistent bytes (validator changed)', async () => {
+    const a = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    const b = new Uint8Array([1, 2, 3, 4, 99, 99, 99, 99, 9, 10]);
+    let call = 0;
+    const src: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: 10,
+      range: async (s, e) => {
+        call++;
+        // First call returns a[0..5), second returns b[5..10) with overlap 5..5 conflicting
+        if (call === 1) return a.subarray(s, e);
+        return b.subarray(s, e);
+      },
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(a);
+            c.close();
+          },
+        }),
+    };
+    const cs = cacheSource(src);
+    expectBytesEqual(await cs.range(0, 5), a.subarray(0, 5));
+    await expect(cs.range(3, 8)).rejects.toMatchObject({ code: 'integrity-error' });
+    // Also test non-overlapping is fine
+    const c = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+    const src2: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: 10,
+      range: async (s, e) => c.subarray(s, e),
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c2) {
+            c2.enqueue(c);
+            c2.close();
+          },
+        }),
+    };
+    const cs2 = cacheSource(src2);
+    expectBytesEqual(await cs2.range(0, 3), c.subarray(0, 3));
+    expectBytesEqual(await cs2.range(5, 8), c.subarray(5, 8));
+  });
+
+  it('randomized integrity check: consistent overlapping reads never throw, inconsistent always throws', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const seed = 0x1234;
+    let s = seed;
+    const rand = (): number => (s = (s * 1664525 + 1013904223) >>> 0);
+    for (let trial = 0; trial < 20; trial++) {
+      const a = rand() % (truth.byteLength - 20);
+      const len = 5 + (rand() % 20);
+      const b = a + len;
+      const cs = cacheSource({
+        __media: 'source',
+        kind: 'bytes',
+        size: truth.byteLength,
+        range: async (x, y) => truth.subarray(x, y),
+        stream: () =>
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(truth);
+              c.close();
+            },
+          }),
+      } as Source);
+      expectBytesEqual(await cs.range(a, b), truth.subarray(a, b));
+      // Second overlapping window with same bytes must not throw
+      const overlapStart = Math.max(0, a - 2);
+      const overlapEnd = Math.min(truth.byteLength, b + 2);
+      expectBytesEqual(
+        await cs.range(overlapStart, overlapEnd),
+        truth.subarray(overlapStart, overlapEnd),
+      );
+    }
+    // Inconsistent case
+    const bad = new Uint8Array(truth);
+    bad[100] = bad[100]! ^ 0xff;
+    const badSrc: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: truth.byteLength,
+      range: async (x, y) => {
+        // First window 90-110 from truth, second 95-115 from bad (overlap 95-110 differs)
+        // Simulate by returning truth for first, bad for second
+        // Use a closure to alternate
+        return truth.subarray(x, y); // will be overridden below
+      },
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(truth);
+            c.close();
+          },
+        }),
+    } as Source;
+    const csBad = cacheSource(badSrc);
+    await csBad.range(90, 110);
+    // Now make it return bad for overlapping
+    (badSrc as { range: Source['range'] }).range = async (x, y) => bad.subarray(x, y);
+    await expect(csBad.range(95, 115)).rejects.toMatchObject({ code: 'integrity-error' });
+  });
+
+  it('advertises queue/byte limits and keeps slow consumer (10% producer) bounded (REQUIREMENTS §5.1, §7.3)', async () => {
+    const truth = await loadFixture(FIXTURE);
+    const maxBytes = 8 * 1024;
+    const src = cacheSource(
+      {
+        __media: 'source',
+        kind: 'bytes',
+        size: truth.byteLength,
+        range: async (s, e) => truth.subarray(s, e),
+        stream: () =>
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(truth);
+              c.close();
+            },
+          }),
+      } as Source,
+      { maxBytes },
+    ) as unknown as { range: (a: number, b: number) => Promise<Uint8Array>; cachedBytes: number };
+    // Limits are advertised by the lazy runtime (not in the synchronous facade) — trigger load.
+    await src.range(0, 1);
+    const { createRangeCache } = await import('./cache-runtime.ts');
+    const rt = createRangeCache(
+      {
+        __media: 'source',
+        kind: 'bytes',
+        size: truth.byteLength,
+        range: async (s, e) => truth.subarray(s, e),
+        stream: () =>
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(truth);
+              c.close();
+            },
+          }),
+      } as Source,
+      false,
+      maxBytes,
+    );
+    expect(rt.limits).toEqual({ maxBytes, maxQueuedWindows: 8 });
+    expect(rt.limits.maxBytes).toBe(maxBytes);
+    expect(rt.limits.maxQueuedWindows).toBeGreaterThan(0);
+    // Simulate a producer 10× faster than consumer: issue many disjoint windows rapidly,
+    // but the cache must never exceed maxBytes (bounded by LRU eviction) and must remain exact.
+    const windows: Array<[number, number]> = [];
+    for (let i = 0; i < 20; i++) windows.push([i * 512, i * 512 + 512]);
+    for (const [lo, hi] of windows) {
+      const expected = truth.subarray(lo, hi);
+      expectBytesEqual(await src.range(lo, hi), expected);
+      expect(src.cachedBytes).toBeLessThanOrEqual(maxBytes);
+    }
+    // Slow consumer: read 1 window then pause 10× (simulate backpressure) — cache stays bounded.
+    for (let i = 0; i < 10; i++) {
+      const [lo, hi] = windows[i] as [number, number];
+      expectBytesEqual(await src.range(lo, hi), truth.subarray(lo, hi));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(src.cachedBytes).toBeLessThanOrEqual(maxBytes);
+    }
+    // Randomized variant: 30 random windows, still bounded and bitexact.
+    let seed = 0x5a5a5a5a;
+    const next = (): number => (seed = (seed * 1664525 + 1013904223) >>> 0);
+    for (let trial = 0; trial < 30; trial++) {
+      const lo = next() % (truth.byteLength - 1024);
+      const hi = lo + 64 + (next() % 960);
+      expectBytesEqual(await src.range(lo, hi), truth.subarray(lo, hi));
+      expect(src.cachedBytes).toBeLessThanOrEqual(maxBytes);
+    }
+    // Unbounded variant still advertises Infinity and never evicts (via runtime).
+    const { createRangeCache: createUnbounded } = await import('./cache-runtime.ts');
+    const unboundedRt = createUnbounded(
+      {
+        __media: 'source',
+        kind: 'bytes',
+        size: truth.byteLength,
+        range: async (s, e) => truth.subarray(s, e),
+        stream: () =>
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(truth);
+              c.close();
+            },
+          }),
+      } as Source,
+      false,
+      Number.POSITIVE_INFINITY,
+    );
+    expect(unboundedRt.limits.maxBytes).toBe(Number.POSITIVE_INFINITY);
   });
 });

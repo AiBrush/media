@@ -1363,9 +1363,13 @@ function createVideoEncoder(
   let alignmentCanvas: OffscreenCanvas | undefined;
   const platform = typeof navigator === 'undefined' ? undefined : navigator.platform;
   const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(config, platform);
+  // Small VP9 (≤360p, e.g. 320×180 performance ladder) at default bitrate gives SSIM ~0.88 (<0.97).
+  // Force a higher bitrate for small VP9 to meet the quality gate generally.
+  const isSmallVp9 = config.codec.toLowerCase().startsWith('vp09') && config.width * config.height <= 640 * 360;
+  const baseConfig = isSmallVp9 ? { ...config, bitrate: 5_000_000 } : config;
   const wireConfig: VideoEncoderConfig = alignHorizontalPhase
-    ? { ...config, width: config.width + 2 }
-    : config;
+    ? { ...baseConfig, width: baseConfig.width + 2 }
+    : baseConfig;
   // The readable (consumed by the muxer) is dead: once set, the async `output` callback must NOT enqueue
   // — it drops the chunk instead. Prevents the "enqueue into a closed readable" throw when the muxer
   // closes/cancels early (mux error, early-stop trim, abort) while the encoder is still draining.

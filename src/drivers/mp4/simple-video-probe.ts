@@ -1,4 +1,5 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
+import { MediaError } from '../../contracts/errors.ts';
 import { avcCodecString, parseEsds } from './codec-strings.ts';
 import { clockwiseRotationFromMp4MatrixFirstRow } from './display-transform.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
@@ -70,7 +71,9 @@ function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefin
   let headerSize = 8;
   if (size === 1) {
     if (offset + 16 > bytes.byteLength) return undefined;
-    size = r.u64();
+    const big = r.u64BigInt();
+    if (big < 16n || big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+    size = Number(big);
     headerSize = 16;
   } else if (size === 0) {
     return undefined;
@@ -121,7 +124,9 @@ function probeBoxAt(r: Reader): BoxHeader | undefined {
   let headerSize = 8;
   if (size === 1) {
     if (r.pos + 8 > r.length) return undefined;
-    size = r.u64();
+    const big = r.u64BigInt();
+    if (big < 16n || big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+    size = Number(big);
     headerSize = 16;
   } else if (size === 0) {
     size = r.length - start;
@@ -217,12 +222,19 @@ function probeMatrixRotation(a: number, b: number): number | undefined {
 function probeMdhd(
   r: Reader,
   mdhd: BoxHeader,
-): { timescale: number; durationSec: number; language?: string } {
+): { timescale: number; durationSec: number; language?: string } | undefined {
   r.seek(mdhd.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
-  const duration = version === 1 ? r.u64() : r.u32();
+  let duration: number;
+  if (version === 1) {
+    const big = r.u64BigInt();
+    if (big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+    duration = Number(big);
+  } else {
+    duration = r.u32();
+  }
   const language = r.pos + 2 <= mdhd.end ? decodeMdhdLanguage(r.u16()) : undefined;
   return {
     timescale,
@@ -243,29 +255,43 @@ function probeTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Pro
   const elst = edts === undefined ? undefined : probeChild(r, edts, 'elst');
   if (elst === undefined) return undefined;
 
-  r.seek(elst.payloadStart);
-  const { version } = readFullBoxHeader(r);
-  const entryCount = r.u32();
-  let active: ProbeEdit | undefined;
-  for (let i = 0; i < entryCount; i++) {
-    const segmentDuration = version === 1 ? r.u64() : r.u32();
-    const mediaTime = version === 1 ? readSigned64(r) : r.i32();
-    const mediaRateInteger = r.i16();
-    const mediaRateFraction = r.i16();
-    if (mediaTime < 0) continue;
-    if (mediaRateInteger !== 1 || mediaRateFraction !== 0 || active !== undefined) return undefined;
-    active = {
-      mediaTimeTicks: mediaTime,
-      durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
-    };
+  try {
+    r.seek(elst.payloadStart);
+    const { version } = readFullBoxHeader(r);
+    const entryCount = r.u32();
+    let active: ProbeEdit | undefined;
+    for (let i = 0; i < entryCount; i++) {
+      let segmentDuration: number;
+      if (version === 1) {
+        const big = r.u64BigInt();
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+        segmentDuration = Number(big);
+      } else {
+        segmentDuration = r.u32();
+      }
+      const mediaTime = version === 1 ? readSigned64(r) : r.i32();
+      const mediaRateInteger = r.i16();
+      const mediaRateFraction = r.i16();
+      if (mediaTime < 0) continue;
+      if (mediaRateInteger !== 1 || mediaRateFraction !== 0 || active !== undefined)
+        return undefined;
+      active = {
+        mediaTimeTicks: mediaTime,
+        durationSec: movieTimescale > 0 ? segmentDuration / movieTimescale : 0,
+      };
+    }
+    return active;
+  } catch {
+    return undefined;
   }
-  return active;
 }
 
 function readSigned64(r: Reader): number {
-  const hi = r.i32();
-  const lo = r.u32();
-  return hi * 2 ** 32 + lo;
+  const big = r.i64BigInt();
+  if (big > BigInt(Number.MAX_SAFE_INTEGER) || big < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new MediaError('demux-error', `signed 64-bit field ${big} exceeds safe integer range`);
+  }
+  return Number(big);
 }
 
 function probeAudioEntry(
@@ -468,6 +494,7 @@ export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly Track
     if (stbl === undefined || stsd === undefined) return undefined;
     const header = probeTrackHeader(r, tkhd);
     const timing = probeMdhd(r, mdhd);
+    if (timing === undefined) return undefined;
     const entry = probeAudioEntry(r, stsd);
     if (entry === undefined || entry.type !== 'mp4a') return undefined;
     const edit = probeTrackEdit(r, trak, movieTimescale);
@@ -570,6 +597,7 @@ function probeSimpleTrack(
   const header = probeTrackHeader(r, tkhd);
   if (requireCanonicalSubset && !header.canonicalRotationMatrix) return undefined;
   const timing = probeMdhd(r, mdhd);
+  if (timing === undefined) return undefined;
   const sampleTiming = probeSampleTiming(r, stbl);
   if (sampleTiming.sampleCount === 0) return undefined;
   const edit = probeTrackEdit(r, trak, movieTimescale);

@@ -620,7 +620,11 @@ function wrapStreamInfo(body: Uint8Array): Uint8Array<ArrayBuffer> {
 function packedTotalSamples(dv: DataView): number {
   const hi = dv.getUint32(10, false) & 0xf;
   const lo = dv.getUint32(14, false);
-  return hi * 2 ** 32 + lo;
+  const big = (BigInt(hi) << 32n) | BigInt(lo);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new MediaError('demux-error', `FLAC totalSamples ${big} exceeds safe integer range`);
+  }
+  return Number(big);
 }
 
 function writePackedTotalSamples(dv: DataView, total: number): void {

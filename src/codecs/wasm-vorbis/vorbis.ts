@@ -146,7 +146,14 @@ export function readOggPackets(bytes: Uint8Array): OggPacket[] {
     }
     const granuleLo = view.getUint32(offset + 6, true);
     const granuleHi = view.getUint32(offset + 10, true);
-    const granulePosition = granuleHi * 2 ** 32 + granuleLo;
+    const granuleBig = (BigInt(granuleHi) << 32n) | BigInt(granuleLo);
+    if (granuleBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new MediaError(
+        'demux-error',
+        `vorbis: Ogg granule ${granuleBig} exceeds safe integer range at byte ${offset}`,
+      );
+    }
+    const granulePosition = Number(granuleBig);
     const segCount = bytes[offset + 26] ?? 0;
     const lacingStart = offset + 27;
     const dataStart = lacingStart + segCount;

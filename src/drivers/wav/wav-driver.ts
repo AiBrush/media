@@ -330,7 +330,14 @@ async function sequentialWavDecode(
       throw new InputError('not a RIFF/WAVE file');
     }
     let format: WavFormat | undefined;
+    let chunks = 0;
     for (;;) {
+      if (++chunks > 2048) {
+        throw new MediaError(
+          'demux-error',
+          `WAV file has >2048 chunks (budget exceeded) at ${cursor.position}`,
+        );
+      }
       const header = await cursor.read(8);
       if (header.byteLength === 0) {
         if (format === undefined) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');

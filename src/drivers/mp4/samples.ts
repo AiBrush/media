@@ -6,7 +6,13 @@
  * Pure TS — validated against the real corpus without a browser.
  */
 
-import type { CompositionOffsetTable, ParsedTrack, SampleToChunkTable, TimeToSampleTable } from './parse.ts';
+import { MediaError } from '../../contracts/errors.ts';
+import type {
+  CompositionOffsetTable,
+  ParsedTrack,
+  SampleToChunkTable,
+  TimeToSampleTable,
+} from './parse.ts';
 
 /** A sample in container-native ticks (exact). */
 export interface SampleData {
@@ -53,8 +59,24 @@ export type SampleClassificationRangeVisitor = (
   declaredSync: boolean,
 ) => void;
 
+import { ticksToUs } from '../../util/ticks.ts';
+
 function toUs(ticks: number, timescale: number): number {
-  return timescale > 0 ? Math.round((ticks * 1_000_000) / timescale) : 0;
+  if (timescale <= 0) return 0;
+  if (!Number.isSafeInteger(timescale)) {
+    throw new MediaError('demux-error', `toUs: timescale must be a safe positive integer, got ${timescale}`);
+  }
+  if (!Number.isSafeInteger(ticks)) {
+    throw new MediaError('demux-error', `toUs: ticks must be a safe integer, got ${ticks}`);
+  }
+  return ticksToUs(ticks, timescale);
+}
+
+function checkedAdd(a: number, b: number): number {
+  const r = a + b;
+  if (!Number.isSafeInteger(r))
+    throw new MediaError('demux-error', `tick addition overflow: ${a} + ${b}`);
+  return r;
 }
 
 interface RunCursor {
@@ -229,6 +251,16 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
         syncIndex++;
         syncSample = st.syncSamples[syncIndex];
       }
+      if (
+        !Number.isSafeInteger(delta) ||
+        !Number.isSafeInteger(ctts) ||
+        !Number.isSafeInteger(dts)
+      ) {
+        throw new MediaError(
+          'demux-error',
+          `buildSampleData: tick values must be safe integers dts=${dts} delta=${delta} ctts=${ctts}`,
+        );
+      }
       out[sampleIndex] = {
         index: sampleIndex,
         offset,
@@ -239,7 +271,7 @@ export function buildSampleData(track: ParsedTrack): SampleData[] {
         keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
       };
       offset += size;
-      dts += delta;
+      dts = checkedAdd(dts, delta);
       sampleIndex++;
     }
   }
@@ -253,7 +285,19 @@ export function buildSamples(track: ParsedTrack): Sample[] {
   const sizes = st.sampleSizes;
   const count = sizes.length;
   const ts = track.timescale;
+  if (ts <= 0) {
+    // legacy zero-timescale path (malformed): return zero timestamps as before
+    // but still validate editOffset is safe if present
+  } else if (!Number.isSafeInteger(ts)) {
+    throw new MediaError('demux-error', `buildSamples: timescale must be safe positive integer, got ${ts}`);
+  }
   const editOffsetTicks = track.edit?.mediaTimeTicks ?? 0;
+  if (editOffsetTicks !== 0 && !Number.isSafeInteger(editOffsetTicks)) {
+    throw new MediaError(
+      'demux-error',
+      `buildSamples: editOffsetTicks must be safe integer, got ${editOffsetTicks}`,
+    );
+  }
   const hasCtts = st.compositionOffsets.counts.length > 0;
   const allSync = st.syncSamples.length === 0;
   const sortedSync = allSync || isAscending(st.syncSamples);
@@ -281,17 +325,29 @@ export function buildSamples(track: ParsedTrack): Sample[] {
         syncIndex++;
         syncSample = st.syncSamples[syncIndex];
       }
+      if (
+        !Number.isSafeInteger(delta) ||
+        !Number.isSafeInteger(ctts) ||
+        !Number.isSafeInteger(dts)
+      ) {
+        throw new MediaError(
+          'demux-error',
+          `buildSamples: tick values must be safe integers dts=${dts} delta=${delta} ctts=${ctts}`,
+        );
+      }
+      const dtsMinusEdit = checkedAdd(dts, -editOffsetTicks);
+      const ptsTicks = checkedAdd(dtsMinusEdit, ctts);
       out[sampleIndex] = {
         index: sampleIndex,
         offset,
         size,
-        dtsUs: toUs(dts - editOffsetTicks, ts),
-        ptsUs: toUs(dts + ctts - editOffsetTicks, ts),
+        dtsUs: toUs(dtsMinusEdit, ts),
+        ptsUs: toUs(ptsTicks, ts),
         durationUs: toUs(delta, ts),
         keyframe: allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
       };
       offset += size;
-      dts += delta;
+      dts = checkedAdd(dts, delta);
       sampleIndex++;
     }
   }
@@ -304,6 +360,12 @@ export function walkSamples(track: ParsedTrack, visitor: SampleVisitor): void {
   const st = track.samples;
   const sizes = st.sampleSizes;
   const count = sizes.length;
+  if (track.timescale !== 0 && !Number.isSafeInteger(track.timescale)) {
+    throw new MediaError(
+      'demux-error',
+      `walkSamples: timescale must be safe positive integer, got ${track.timescale}`,
+    );
+  }
   const hasCtts = st.compositionOffsets.counts.length > 0;
   const allSync = st.syncSamples.length === 0;
   const sortedSync = allSync || isAscending(st.syncSamples);
@@ -330,6 +392,16 @@ export function walkSamples(track: ParsedTrack, visitor: SampleVisitor): void {
         syncIndex++;
         syncSample = st.syncSamples[syncIndex];
       }
+      if (
+        !Number.isSafeInteger(delta) ||
+        !Number.isSafeInteger(ctts) ||
+        !Number.isSafeInteger(dts)
+      ) {
+        throw new MediaError(
+          'demux-error',
+          `walkSamples: tick values must be safe integers dts=${dts} delta=${delta} ctts=${ctts}`,
+        );
+      }
       visitor(
         sampleIndex,
         offset,
@@ -340,7 +412,7 @@ export function walkSamples(track: ParsedTrack, visitor: SampleVisitor): void {
         allSync || syncSet?.has(sampleNumber) === true || syncSample === sampleNumber,
       );
       offset += size;
-      dts += delta;
+      dts = checkedAdd(dts, delta);
       sampleIndex++;
     }
   }

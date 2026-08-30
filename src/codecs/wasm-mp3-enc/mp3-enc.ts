@@ -72,6 +72,7 @@ export function mp3SamplesPerFrame(sampleRate: number): number {
 
 /** The constant bitrates (kbps) legal at `sampleRate`, ascending. Empty for a non-MP3 rate. */
 export function mp3CbrBitratesKbps(sampleRate: number): readonly number[] {
+  if (!isMp3SampleRate(sampleRate)) return [];
   if (sampleRate >= 32000) return CBR_KBPS_MPEG1;
   if (sampleRate >= 16000) return CBR_KBPS_MPEG2;
   if (sampleRate >= 8000) return CBR_KBPS_MPEG2_5;

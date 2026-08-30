@@ -37,6 +37,7 @@ export const WAV_PROBE_HEAD_BYTES = 128;
 const WAV_REMOTE_PROBE_HEAD_BYTES = 16 * 1024;
 const WAV_PROBE_MAX_SPARSE_WINDOWS = 8;
 export const WAV_DEMUX_HEAD_BYTES = 65536;
+export const MAX_WAV_CHUNKS_PER_FILE = 2048;
 const OPERATION_ABORTED = 'operation aborted';
 
 export function ascii(bytes: Uint8Array, offset: number, length: number): string {
@@ -76,7 +77,14 @@ export function parseWavHeader(bytes: Uint8Array, totalSize?: number): ParsedWav
   let dataSize = 0;
   let dataFound = false;
   let pos = 12;
+  let chunks = 0;
   while (pos + 8 <= bytes.byteLength) {
+    if (++chunks > MAX_WAV_CHUNKS_PER_FILE) {
+      throw new MediaError(
+        'demux-error',
+        `WAV file has >${MAX_WAV_CHUNKS_PER_FILE} chunks (budget exceeded) at ${pos}`,
+      );
+    }
     const id = ascii(bytes, pos, 4);
     const size = dv.getUint32(pos + 4, true);
     const body = pos + 8;
@@ -152,7 +160,13 @@ async function readSparseWavProbeHeader(
   let dataFound = false;
   let pos = 12;
   let chunks = 0;
-  while (pos + 8 <= size && chunks < 8192) {
+  while (pos + 8 <= size) {
+    if (++chunks > MAX_WAV_CHUNKS_PER_FILE) {
+      throw new MediaError(
+        'demux-error',
+        `WAV file has >${MAX_WAV_CHUNKS_PER_FILE} chunks (budget exceeded) at ${pos}`,
+      );
+    }
     const header = await readAt(pos, 8);
     if (header === undefined) return undefined;
     if (header.byteLength < 8) break;
@@ -178,7 +192,6 @@ async function readSparseWavProbeHeader(
       break;
     }
     pos = body + chunkSize + (chunkSize & 1);
-    chunks++;
   }
   if (format === undefined) throw new MediaError('demux-error', 'WAVE file has no fmt chunk');
   return parsedWavHeader(format, dataOffset, dataBytes, dataFound);

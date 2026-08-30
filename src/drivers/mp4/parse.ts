@@ -329,14 +329,27 @@ function parseMvhd(r: Reader, box: BoxHeader): { timescale: number; durationSec:
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8); // creation + modification time
   const timescale = r.u32();
-  const duration = version === 1 ? r.u64() : r.u32();
+  const duration = version === 1 ? readU64Safe(r, 'mvhd duration') : r.u32();
   return { timescale, durationSec: timescale > 0 ? duration / timescale : 0 };
 }
 
-function readI64(r: Reader): number {
-  const hi = r.i32();
-  const lo = r.u32();
-  return hi * 2 ** 32 + lo;
+const MAX_SAFE_BIG = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BIG = BigInt(Number.MIN_SAFE_INTEGER);
+
+function readU64Safe(r: Reader, ctx: string): number {
+  const v = r.u64BigInt();
+  if (v > MAX_SAFE_BIG) {
+    throw new MediaError('demux-error', `MP4 ${ctx} 64-bit value ${v} exceeds MAX_SAFE_INTEGER`);
+  }
+  return Number(v);
+}
+
+function readI64Safe(r: Reader, ctx: string): number {
+  const v = r.i64BigInt();
+  if (v > MAX_SAFE_BIG || v < MIN_SAFE_BIG) {
+    throw new MediaError('demux-error', `MP4 ${ctx} 64-bit value ${v} exceeds safe integer range`);
+  }
+  return Number(v);
 }
 
 /**
@@ -408,7 +421,7 @@ function parseTraf(
   if (tfdt) {
     r.seek(tfdt.payloadStart);
     const { version } = readFullBoxHeader(r);
-    baseDecodeTime = version === 1 ? r.u64() : r.u32();
+    baseDecodeTime = version === 1 ? readU64Safe(r, 'tfdt baseMediaDecodeTime') : r.u32();
   }
 
   let sampleCount = 0;
@@ -450,7 +463,7 @@ function parseSidxEnds(
     const { version } = readFullBoxHeader(r);
     const referenceId = r.u32();
     const timescale = r.u32();
-    const earliest = version === 0 ? r.u32() : r.u64();
+    const earliest = version === 0 ? r.u32() : readU64Safe(r, 'sidx earliest_presentation_time');
     r.skip(version === 0 ? 4 : 8); // first_offset
     r.skip(2); // reserved
     const refCount = r.u16();
@@ -577,7 +590,8 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
     }
     // fps is frames over the *content* span (Σ sample durations), not the presentation end, so a
     // start offset in `durationSec` doesn't deflate it — this equals ffprobe's avg_frame_rate.
-    const moovMediaTicks = track.moovMediaTicks ?? timeToSampleMediaTicks(track.samples.timeToSample);
+    const moovMediaTicks =
+      track.moovMediaTicks ?? timeToSampleMediaTicks(track.samples.timeToSample);
     const mediaSec =
       Math.max(declaredMediaDurationTicks, moovMediaTicks + frag.mediaTicks) / track.timescale;
     const sampleCount =
@@ -592,7 +606,8 @@ export function applyFragmentTiming(movie: Movie, file: Uint8Array): Movie {
 /** Σ (count × delta) over a run-length `stts` — the track's media span in its own ticks. */
 export function timeToSampleMediaTicks(table: TimeToSampleTable): number {
   let total = 0;
-  for (let i = 0; i < table.counts.length; i++) total += (table.counts[i] ?? 0) * (table.deltas[i] ?? 0);
+  for (let i = 0; i < table.counts.length; i++)
+    total += (table.counts[i] ?? 0) * (table.deltas[i] ?? 0);
   return total;
 }
 
@@ -814,8 +829,8 @@ function parseTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Tra
   let leadingEmptyDurationMovieTicks = 0;
 
   for (let i = 0; i < entryCount; i++) {
-    const segmentDuration = version === 1 ? r.u64() : r.u32();
-    const mediaTime = version === 1 ? readI64(r) : r.i32();
+    const segmentDuration = version === 1 ? readU64Safe(r, 'elst segment_duration') : r.u32();
+    const mediaTime = version === 1 ? readI64Safe(r, 'elst media_time') : r.i32();
     const mediaRateInteger = r.i16();
     const mediaRateFraction = r.i16();
 
@@ -889,7 +904,7 @@ function parseMdhd(
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
-  const duration = version === 1 ? r.u64() : r.u32();
+  const duration = version === 1 ? readU64Safe(r, 'mdhd duration') : r.u32();
   const language =
     r.pos + 2 <= box.end
       ? legacyQuickTimeLanguage
@@ -1561,7 +1576,14 @@ function parseStszSampleCount(r: Reader, box: BoxHeader | undefined): number | u
   r.seek(box.payloadStart);
   readFullBoxHeader(r);
   r.skip(4); // sample_size
-  return r.u32();
+  const count = r.u32();
+  if (count > MAX_MP4_SAMPLES_PER_TRACK) {
+    throw new MediaError(
+      'demux-error',
+      `MP4 stsz has >${MAX_MP4_SAMPLES_PER_TRACK} samples (budget exceeded): ${count}`,
+    );
+  }
+  return count;
 }
 
 /**
@@ -1588,9 +1610,17 @@ function parseStts(r: Reader, box: BoxHeader | undefined): TimeToSampleTable {
   const n = tableEntryCount(r, box, 8);
   const counts = new Uint32Array(n);
   const deltas = new Uint32Array(n);
+  let sum = 0;
   for (let i = 0; i < n; i++) {
     counts[i] = r.u32();
     deltas[i] = r.u32();
+    sum += counts[i] as number;
+    if (sum > MAX_MP4_SAMPLES_PER_TRACK) {
+      throw new MediaError(
+        'demux-error',
+        `MP4 stts has >${MAX_MP4_SAMPLES_PER_TRACK} samples (budget exceeded) at entry ${i}`,
+      );
+    }
   }
   return { counts, deltas };
 }
@@ -1609,6 +1639,12 @@ function parseSttsSummary(
     const count = r.u32();
     const delta = r.u32();
     sampleCount += count;
+    if (sampleCount > MAX_MP4_SAMPLES_PER_TRACK) {
+      throw new MediaError(
+        'demux-error',
+        `MP4 stts has >${MAX_MP4_SAMPLES_PER_TRACK} samples (budget exceeded) at entry ${i}`,
+      );
+    }
     mediaTicks += count * delta;
   }
   return { sampleCount, mediaTicks };
@@ -1643,6 +1679,7 @@ function parseCtts(r: Reader, box: BoxHeader | undefined): CompositionOffsetTabl
  * frames — beyond any real asset — while the declared 2^32−1 would otherwise reserve 16 GB.
  */
 const MAX_DECLARED_SAMPLE_COUNT = 1 << 24;
+export const MAX_MP4_SAMPLES_PER_TRACK = 1_000_000;
 
 function parseStsz(r: Reader, box: BoxHeader | undefined): Uint32Array {
   if (!box) return new Uint32Array(0);
@@ -1657,9 +1694,21 @@ function parseStsz(r: Reader, box: BoxHeader | undefined): Uint32Array {
         `MP4 stsz declares an implausible sample_count ${count} for a constant sample size`,
       );
     }
+    if (count > MAX_MP4_SAMPLES_PER_TRACK) {
+      throw new MediaError(
+        'demux-error',
+        `MP4 stsz has >${MAX_MP4_SAMPLES_PER_TRACK} samples (budget exceeded): ${count}`,
+      );
+    }
     return new Uint32Array(count).fill(sampleSize);
   }
   const count = tableEntryCount(r, box, 4);
+  if (count > MAX_MP4_SAMPLES_PER_TRACK) {
+    throw new MediaError(
+      'demux-error',
+      `MP4 stsz has >${MAX_MP4_SAMPLES_PER_TRACK} samples (budget exceeded): ${count}`,
+    );
+  }
   const out = new Uint32Array(count);
   for (let i = 0; i < count; i++) out[i] = r.u32();
   return out;
@@ -1698,7 +1747,20 @@ function parseChunkOffsets(
   readFullBoxHeader(r);
   const n = tableEntryCount(r, box, co64 ? 8 : 4);
   const out = new Float64Array(n);
-  for (let i = 0; i < n; i++) out[i] = co64 ? r.u64() : r.u32();
+  for (let i = 0; i < n; i++) {
+    if (co64) {
+      const big = r.u64BigInt();
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new MediaError(
+          'demux-error',
+          `truncated MP4 box: co64 chunk offset ${big} at entry ${i} exceeds safe integer range`,
+        );
+      }
+      out[i] = Number(big);
+    } else {
+      out[i] = r.u32();
+    }
+  }
   return out;
 }
 

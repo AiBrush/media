@@ -234,7 +234,7 @@ function asAudioData(frame: RawFrame): AudioData {
 }
 
 /** Copy an `AudioData` out as the planar f32 buffers LAME reads, checking it matches the encoder. */
-function audioDataToPlanes(data: AudioData, init: Mp3EncoderInit): readonly Float32Array[] {
+export function audioDataToPlanes(data: AudioData, init: Mp3EncoderInit): readonly Float32Array[] {
   if (data.sampleRate !== init.sampleRate) {
     throw new MediaError(
       'encode-error',
@@ -248,14 +248,31 @@ function audioDataToPlanes(data: AudioData, init: Mp3EncoderInit): readonly Floa
     );
   }
   const frames = data.numberOfFrames;
-  const planes: Float32Array[] = [];
-  for (let c = 0; c < init.channels; c++) {
-    const plane = new Float32Array(frames);
-    data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-    planes.push(plane);
+  const channels = init.channels;
+  // Prefer the single interleaved `f32` copy which every WebCodecs AudioData must support;
+  // deinterleave into planes for LAME. WebKit rejects per-plane `f32-planar` for
+  // interleaved sources and some planar paths have returned swapped channels.
+  try {
+    const interleaved = new Float32Array(frames * channels);
+    data.copyTo(interleaved, { format: 'f32' } as AudioDataCopyToOptions);
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] as number;
+      planes.push(plane);
+    }
+    validateMp3Planes(planes, frames, channels);
+    return planes;
+  } catch {
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+      planes.push(plane);
+    }
+    validateMp3Planes(planes, frames, channels);
+    return planes;
   }
-  validateMp3Planes(planes, frames, init.channels);
-  return planes;
 }
 
 /* v8 ignore stop */

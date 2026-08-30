@@ -247,16 +247,26 @@ function chunkBytes(chunk: EncodedAudioChunk): Uint8Array {
 }
 
 /** Read an `AudioData`'s channels as interleaved f32 (the wasm encoder's input layout). */
-function audioDataToInterleaved(data: AudioData): Float32Array {
+export function audioDataToInterleaved(data: AudioData): Float32Array {
   const channels = data.numberOfChannels;
   const frames = data.numberOfFrames;
-  const planes: Float32Array[] = [];
-  for (let c = 0; c < channels; c++) {
-    const plane = new Float32Array(frames);
-    data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-    planes.push(plane);
+  // Prefer the single `f32` interleaved copy which every WebCodecs AudioData must support.
+  // WebKit rejects per-plane `f32-planar` for interleaved sources and has historically
+  // returned swapped channels via the planar path; interleaved keeps the two engines
+  // bit-exact without fixture branching.
+  try {
+    const interleaved = new Float32Array(frames * channels);
+    data.copyTo(interleaved, { format: 'f32' } as AudioDataCopyToOptions);
+    return interleaved;
+  } catch {
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+      planes.push(plane);
+    }
+    return interleaveF32(planes, frames);
   }
-  return interleaveF32(planes, frames);
 }
 
 /**

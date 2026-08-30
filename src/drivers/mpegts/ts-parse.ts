@@ -23,6 +23,8 @@ export type { PacketSize } from './ts-framing.ts';
 
 // `VideoDecoderConfig`/`AudioDecoderConfig` are the global WebCodecs DOM types (as in `contracts/driver.ts`).
 
+export const MAX_TS_PACKETS_PER_FILE = 100_000;
+export const MAX_TS_ACCESS_UNITS_PER_TRACK = 100_000;
 const SYNC_BYTE = 0x47;
 /** The TS clock is 90 kHz; PTS/DTS are 33-bit values on it. */
 export const TS_CLOCK_HZ = 90_000;
@@ -723,6 +725,7 @@ export function parseTs(
   let sawScrambled = false;
   let sawSync = false;
   let observedDiscontinuity = false;
+  let packetCount = 0;
 
   const flush = (pid: number): void => {
     const builder = builders.get(pid);
@@ -740,6 +743,12 @@ export function parseTs(
         deframers.set(pid, deframer);
       }
       deframer.push(split.payload, split.pts);
+      if (deframer.units.length > MAX_TS_ACCESS_UNITS_PER_TRACK) {
+        throw new MediaError(
+          'demux-error',
+          `MPEG-TS track ${pid} has >${MAX_TS_ACCESS_UNITS_PER_TRACK} access units (budget exceeded)`,
+        );
+      }
       return;
     }
     if (split.pts === undefined) return; // no PTS → cannot place on the timeline; drop
@@ -747,6 +756,12 @@ export function parseTs(
     // with the PES's own PTS/DTS (a separate DTS keeps B-frame decode order intact).
     const h264Scan = stream.codec === 'h264' ? scanH264Pes(split.payload) : undefined;
     const list = unitsByPid.get(pid) ?? [];
+    if (list.length + 1 > MAX_TS_ACCESS_UNITS_PER_TRACK) {
+      throw new MediaError(
+        'demux-error',
+        `MPEG-TS track ${pid} has >${MAX_TS_ACCESS_UNITS_PER_TRACK} access units (budget exceeded)`,
+      );
+    }
     list.push({
       data: split.payload,
       ptsUs: ticksToUs(split.pts),
@@ -771,6 +786,12 @@ export function parseTs(
       continue;
     }
     sawSync = true;
+    if (++packetCount > MAX_TS_PACKETS_PER_FILE) {
+      throw new MediaError(
+        'demux-error',
+        `MPEG-TS file has >${MAX_TS_PACKETS_PER_FILE} packets (budget exceeded) at ${syncAt}`,
+      );
+    }
     const packet = parsePacket(bytes, syncAt);
     off += packetSize; // next packet start (prefix + 188 + any parity)
     if (!packet) continue;
@@ -829,7 +850,16 @@ export function parseTs(
   for (const stream of streamsByPid.values()) {
     if (stream.codec !== 'h264') continue;
     const pesUnits = unitsByPid.get(stream.pid);
-    if (pesUnits !== undefined) unitsByPid.set(stream.pid, deframeH264PesUnits(pesUnits));
+    if (pesUnits !== undefined) {
+      const deframed = deframeH264PesUnits(pesUnits);
+      if (deframed.length > MAX_TS_ACCESS_UNITS_PER_TRACK) {
+        throw new MediaError(
+          'demux-error',
+          `MPEG-TS track ${stream.pid} has >${MAX_TS_ACCESS_UNITS_PER_TRACK} access units (budget exceeded)`,
+        );
+      }
+      unitsByPid.set(stream.pid, deframed);
+    }
   }
 
   if (!sawSync) {

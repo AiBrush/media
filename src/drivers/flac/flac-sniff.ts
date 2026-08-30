@@ -61,7 +61,14 @@ export function parseFlacStreamInfo(bytes: Uint8Array): FlacStreamInfo {
   const sampleRate = hi >>> 12;
   const channels = ((hi >>> 9) & 0x7) + 1;
   const bitsPerSample = ((hi >>> 4) & 0x1f) + 1;
-  const totalSamples = (hi & 0xf) * 2 ** 32 + lo;
+  const totalSamplesBig = (BigInt(hi & 0xf) << 32n) | BigInt(lo);
+  if (totalSamplesBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new MediaError(
+      'demux-error',
+      `FLAC totalSamples ${totalSamplesBig} exceeds safe integer range`,
+    );
+  }
+  const totalSamples = Number(totalSamplesBig);
   if (sampleRate === 0) {
     throw new MediaError('demux-error', 'FLAC: STREAMINFO has zero sample rate');
   }
@@ -150,6 +157,9 @@ export function flacMetadataLayout(bytes: Uint8Array): FlacMetadataLayout {
   return { start, audioStart: at, streamInfoBody, info };
 }
 
+/** Malformed-input guard: per-stream FLAC frame budget (REQUIREMENTS §8.4). */
+export const MAX_FLAC_FRAMES_PER_STREAM = 100_000;
+
 export function fastFlacFrames(bytes: Uint8Array, layout: FlacMetadataLayout): FastFlacFrameSpan[] {
   const frames: FastFlacFrameSpan[] = [];
   let offset = layout.audioStart;
@@ -175,6 +185,12 @@ export function fastFlacFrames(bytes: Uint8Array, layout: FlacMetadataLayout): F
       ptsUs: Math.round((produced / layout.info.sampleRate) * 1_000_000),
       durationUs: Math.round((samples / layout.info.sampleRate) * 1_000_000),
     });
+    if (frames.length > MAX_FLAC_FRAMES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `FLAC stream has >${MAX_FLAC_FRAMES_PER_STREAM} frames (budget exceeded) at ${offset}`,
+      );
+    }
     produced += samples;
     offset = end;
     header = next;
@@ -239,6 +255,12 @@ export function flacPacketInfoTable(bytes: Uint8Array): PacketInfoTable {
       durationUs: Math.round((samples / layout.info.sampleRate) * 1_000_000),
       keyframe: true,
     });
+    if (packets.length > MAX_FLAC_FRAMES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `FLAC stream has >${MAX_FLAC_FRAMES_PER_STREAM} frames (budget exceeded) at ${offset}`,
+      );
+    }
     produced += samples;
     offset = end;
     header = next;

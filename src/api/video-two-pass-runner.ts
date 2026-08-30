@@ -53,6 +53,7 @@ export interface RoutedVideoEncoder {
   readonly codec: CodecDriver;
   readonly config: VideoEncoderConfig;
   readonly usedAlternateConfig: boolean;
+  readonly warning?: import('./types.ts').LogEvent;
 }
 
 /**
@@ -93,8 +94,8 @@ export async function routeVideoEncoderWithImplicitH264Fallback(
     }
     const inheritedH264Profile =
       target.codec === undefined &&
-      /^(?:avc1|avc3)\.(?:4d|64)/i.test(sourceCodecString ?? '') &&
-      /^(?:avc1|avc3)\.(?:4d|64)/i.test(config.codec);
+      /^(?:avc1|avc3)\.(?:4d|64|6e)/i.test(sourceCodecString ?? '') &&
+      /^(?:avc1|avc3)\.(?:4d|64|6e)/i.test(config.codec);
     if (!inheritedH264Profile) throw terminalError;
     const profileBase = alternateConfig ?? config;
     const fallbackConfig: VideoEncoderConfig = {
@@ -105,10 +106,12 @@ export async function routeVideoEncoderWithImplicitH264Fallback(
         profileBase.framerate,
       ),
     };
+    const { h264ProfileFallbackWarning } = await import('./rate-control-warnings.ts');
     return {
       codec: await routeCodec(encodeQueryFor(fallbackConfig), options),
       config: fallbackConfig,
       usedAlternateConfig: alternateConfig !== undefined,
+      warning: h264ProfileFallbackWarning(config.codec, fallbackConfig.codec, sourceCodecString),
     };
   }
 }

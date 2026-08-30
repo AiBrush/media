@@ -87,7 +87,11 @@ export function selectDecodeTrackInfo<T extends Pick<TrackInfo, 'mediaType'>>(
   selectors: readonly string[] | undefined,
 ): T | undefined {
   if (!hasTrackSelection(selectors)) {
-    return tracks.find((track) => track.mediaType === mediaType);
+    const candidates = tracks.filter((track) => track.mediaType === mediaType);
+    const preferred = candidates.find(
+      (track) => (track as unknown as TrackInfo).defaultDisposition === true,
+    );
+    return preferred ?? candidates[0];
   }
   const selected = selectTrackInfos(tracks, selectors).filter(
     (track) => track.mediaType === mediaType,

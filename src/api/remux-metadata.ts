@@ -345,8 +345,9 @@ function readU64(bytes: Uint8Array, offset: number): number | undefined {
   const high = readU32(bytes, offset);
   const low = readU32(bytes, offset + 4);
   if (high === undefined || low === undefined) return undefined;
-  const value = high * 2 ** 32 + low;
-  return Number.isSafeInteger(value) ? value : undefined;
+  const big = (BigInt(high) << 32n) | BigInt(low);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  return Number(big);
 }
 
 function fourcc(bytes: Uint8Array, offset: number): string {

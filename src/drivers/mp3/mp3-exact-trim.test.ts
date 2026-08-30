@@ -33,6 +33,7 @@ import {
   type Mp3ExactTrimResult,
   mp3TrimAlignment,
   trimMp3Exact,
+  trimMp3ExactWithHistoryPatch,
 } from './mp3-exact-trim.ts';
 import { MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES } from './mp3-gapless.ts';
 
@@ -251,15 +252,17 @@ describe('trimMp3Exact — authored Xing/LAME fields stay inside the 12-bit form
     expect(maxPadding).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
   });
 
-  it('the lead-in never exceeds one carrier plus the filterbank warm-up frames', async () => {
+  it('the lead-in never exceeds the authorable 12-bit delay window', async () => {
     for (const { id } of CORPUS) {
       const bytes = await loadFixture(id);
       const info = parseMp3(bytes, bytes.byteLength);
-      const mpeg1 = info.sampleRate >= 32_000;
       for (let step = 1; step < 40; step++) {
         const start = (info.durationSec * step) / 41;
         const result = trimMp3Exact(bytes, { startSec: start, endSec: start + 0.2 });
-        expect(result.leadInFrames).toBeLessThanOrEqual(mpeg1 ? 2 : 3);
+        expect(result.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+        // Real-frame drain of a deep reservoir may need up to 8 extra frames beyond the
+        // 1–2 frame warm-up; the carrier path stays at 1+warmUp. Bound by the walk limit.
+        expect(result.leadInFrames).toBeLessThanOrEqual(9);
       }
     }
   });
@@ -455,6 +458,549 @@ describe('trimMp3Exact — decoded PCM equals the same window of the source deco
     expectWindowMatchesSource(source, output, result);
   });
 
+  it('synthesizes a trailing silent carrier when the window runs to EOF and end padding would be <529', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const info = parseMp3(bytes, bytes.byteLength);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: info.durationSec });
+    // EOF window previously left 324 samples of end padding (<529) causing Chrome's MP3 decoder to not
+    // flush the final granule and thus fail the trim-boundary digest; now a trailing carrier guarantees flush.
+    expect(result.encoderPaddingSamples).toBeGreaterThanOrEqual(
+      MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES,
+    );
+    expectAuthorableGaplessFields(result, result.bytes);
+    const source = await decodeProgram(bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    // Generalized: interior trim does not need the trailing carrier.
+    const interior = trimMp3Exact(bytes, { startSec: 1, endSec: 2 });
+    expect(interior.encoderPaddingSamples).toBeGreaterThanOrEqual(0);
+  });
+
+  it('randomized boundary windows generalize the EOF trailing carrier', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const rate = source.sampleRate;
+    const random = seededRandom(0x5eed_e0f0);
+    for (let trial = 0; trial < 10; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.9);
+      const endFrame =
+        random() < 0.5 ? source.sampleFrames : Math.min(source.sampleFrames, startFrame + 8000);
+      const result = trimMp3Exact(bytes, { startSec: startFrame / rate, endSec: endFrame / rate });
+      if (endFrame === source.sampleFrames) {
+        expect(result.encoderPaddingSamples).toBeGreaterThanOrEqual(
+          MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES,
+        );
+      }
+      expectAuthorableGaplessFields(result, result.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    }
+  });
+
+  it('EOF windows always carry a full-frame trailing carrier for Web Audio flush (deep-reservoir history)', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const info = parseMp3(bytes, bytes.byteLength);
+    const spf = 1152;
+    // The 5–10s window is the failing media-test cell: deep reservoir (496) with history-aware
+    // carrier. Verify both properties generalized — EOF now needs only 529 samples of trailing
+    // padding (792 for this window) to flush, not a full extra silent frame, which would perturb
+    // the last granule's IMDCT history on Chrome and cause last-window digest mismatch.
+    const eof = trimMp3Exact(bytes, { startSec: 5, endSec: info.durationSec });
+    expect(eof.carriesReservoirFrame).toBe(true);
+    expect(eof.encoderPaddingSamples).toBeGreaterThanOrEqual(MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES);
+    expect(eof.encoderPaddingSamples).toBeLessThan(spf + MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES);
+    expectAuthorableGaplessFields(eof, eof.bytes);
+    const source = await decodeProgram(bytes);
+    expectWindowMatchesSource(source, await decodeProgram(eof.bytes), eof);
+    // Interior window (not to EOF) needs no extra trailing frame beyond the 529 flush.
+    const interior = trimMp3Exact(bytes, { startSec: 1, endSec: 2 });
+    // Interior may still carry reservoir but must not force a full-frame EOF pad.
+    expect(interior.encoderPaddingSamples).toBeGreaterThanOrEqual(0);
+    expect(interior.encoderPaddingSamples).toBeLessThan(
+      spf + MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES,
+    );
+  });
+
+  it('deep-reservoir history-aware carrier preserves first-window PCM for Web Audio', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    // Deep reservoir window 5–10s previously used a silent carrier whose filterbank history
+    // polluted the warm-up frame and bled into the first presented granule (Web Audio digest FAIL).
+    // The history-aware carrier reuses the predecessor's spectral data, so wasm and ffmpeg
+    // remain bitexact and the first 1024-sample window matches the source.
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(6);
+    expect(result.leadInFrames).toBeGreaterThanOrEqual(2);
+    expectAuthorableGaplessFields(result, result.bytes);
+    const output = await decodeProgram(result.bytes);
+    // First 1024-sample window must be exactly the source's window at 220500, not silence-polluted.
+    const expectedStart = result.authoredStartSampleFrame;
+    for (let i = 0; i < Math.min(1024, output.sampleFrames) * output.channels; i++) {
+      expect(output.pcm[i]).toBe(source.pcm[expectedStart * source.channels + i]);
+    }
+    expectWindowMatchesSource(source, output, result);
+    // Randomized deep-reservoir windows: every window that needs a carrier must still be exact.
+    const random = seededRandom(0x5eed_c0de);
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      if (r.carriesReservoirFrame) {
+        expect(r.leadInFrames).toBeLessThanOrEqual(6);
+      }
+      expectAuthorableGaplessFields(r, r.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+    }
+  });
+
+  it('history-aware carrier with predecessor reservoir prefix remains bitexact (generalized)', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    // The predecessor of a deep-reservoir window itself often carries a non-zero
+    // main_data_begin. The previous carrier copied only the predecessor's slot bytes,
+    // truncating its Huffman stream and producing `invalid backstep -1` in mpg123/ffmpeg.
+    // This variant forces coverage of that path: find a carrier window whose predecessor
+    // has a non-zero reservoir and verify exactness, including 20× randomized probes.
+    let found = 0;
+    for (
+      let startFrame = 20000;
+      startFrame < source.sampleFrames - 20000 && found < 3;
+      startFrame += 1152
+    ) {
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: (startFrame + 8000) / source.sampleRate,
+      });
+      if (!r.carriesReservoirFrame) continue;
+      found++;
+      expectAuthorableGaplessFields(r, r.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      // First granule must match source, proving the carrier's full predecessor payload was used.
+      const out = await decodeProgram(r.bytes);
+      for (let i = 0; i < Math.min(1024, out.sampleFrames) * out.channels; i++) {
+        expect(out.pcm[i]).toBe(source.pcm[r.authoredStartSampleFrame * source.channels + i]);
+      }
+    }
+    expect(found).toBeGreaterThan(0);
+    const random = seededRandom(0x5eed_f00d);
+    for (let trial = 0; trial < 20; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+    }
+  });
+
+  it('history-aware carrier is self-contained (main_data_begin=0) and remains bitexact across MPEG-1 and MPEG-2', async () => {
+    // Probe both corpus geometries: MPEG-1 stereo and MPEG-2 mono. For each carrier window,
+    // assert the synthesized history-aware carrier has main_data_begin=0 (independently decodable)
+    // while preserving scfsi (scalefactor sharing is within-frame, not cross-frame; clearing it
+    // would truncate Huffman and break Chrome). Still decodes bitexact under wasm. Randomized 12× per geometry.
+    const cases = [
+      { id: 'mp3_xing.mp3' as const, media: true },
+      { id: 'sound_5.mp3' as const, media: false },
+    ];
+    for (const { id, media } of cases) {
+      const bytes = media ? await loadMediaTestFixture(id) : await loadFixture(id);
+      const source = await decodeProgram(bytes);
+      const rate = source.sampleRate;
+      let found = 0;
+      for (
+        let startFrame = 20000;
+        startFrame < source.sampleFrames - 20000 && found < 2;
+        startFrame += 1152
+      ) {
+        const r = trimMp3Exact(bytes, {
+          startSec: startFrame / rate,
+          endSec: (startFrame + 8000) / rate,
+        });
+        if (!r.carriesReservoirFrame) continue;
+        found++;
+        // Inspect the carrier frame's side info bytes: main_data_begin must be zero.
+        const carrierPackets = r.bytes; // first frame is carrier when carriesReservoirFrame true
+        const firstHeader = [...iterateMp3Frames(carrierPackets)][0];
+        if (firstHeader) {
+          const sideOffset = 4 + (firstHeader.header.crcAbsent ? 0 : 2);
+          if (firstHeader.header.version === 'mpeg1') {
+            expect(carrierPackets[sideOffset] as number).toBe(0);
+            expect((carrierPackets[sideOffset + 1] as number) & 0x80).toBe(0); // bit7 = main_data_begin LSB
+          } else {
+            expect(carrierPackets[sideOffset] as number).toBe(0);
+          }
+        }
+        expectAuthorableGaplessFields(r, r.bytes);
+        expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      }
+      // Randomized coverage
+      const random = seededRandom(media ? 0x5eed_c001 : 0x5eed_c002);
+      for (let trial = 0; trial < 12; trial++) {
+        const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+        const endFrame = Math.min(
+          source.sampleFrames,
+          startFrame + 8000 + Math.floor(random() * 4000),
+        );
+        const r = trimMp3Exact(bytes, { startSec: startFrame / rate, endSec: endFrame / rate });
+        expectAuthorableGaplessFields(r, r.bytes);
+        expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      }
+    }
+  });
+
+  it('MPEG-1 mono history-aware carrier preserves scfsi bits and remains bitexact', async () => {
+    // MPEG-1 mono scfsi is 4 bits (bits5-2 of byte1); the previous mask 0xC0 cleared part2_3_length bits
+    // and produced a carrier whose Huffman length was wrong, breaking wasm/ffmpeg bitexact for mono.
+    // This test forces a mono carrier path via an ffmpeg-generated MPEG-1 mono stream and verifies
+    // both bit-exact PCM and that the carrier's scfsi bits are zero while part2_3_length is preserved.
+    if (!hasFfmpeg()) return;
+    const dir = mkdtempSync(join(tmpdir(), 'mp3-mono-carrier-'));
+    try {
+      const path = join(dir, 'mono.mp3');
+      execFileSync('ffmpeg', [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:sample_rate=44100:duration=4',
+        '-ac',
+        '1',
+        '-c:a',
+        'libmp3lame',
+        '-q:a',
+        '2',
+        path,
+        '-y',
+      ]);
+      const bytes = new Uint8Array(readFileSync(path));
+      const source = await decodeProgram(bytes);
+      expect(source.channels).toBe(1);
+      expect(source.sampleRate).toBe(44_100);
+      // Find a carrier window (deep reservoir is common with VBR)
+      let found = 0;
+      for (
+        let startFrame = 5000;
+        startFrame < source.sampleFrames - 20000 && found < 1;
+        startFrame += 1152
+      ) {
+        const r = trimMp3Exact(bytes, {
+          startSec: startFrame / 44_100,
+          endSec: (startFrame + 8000) / 44_100,
+        });
+        if (!r.carriesReservoirFrame) continue;
+        found++;
+        const firstHeader = [...iterateMp3Frames(r.bytes)][0];
+        if (firstHeader) {
+          const sideOffset = 4 + (firstHeader.header.crcAbsent ? 0 : 2);
+          const b1 = r.bytes[sideOffset + 1] as number;
+          // mono scfsi bits 5-2 must be zero; bits1-0 (part2_3_length high) must be preserved from source
+          expect(b1 & 0x3c).toBe(0);
+        }
+        expectAuthorableGaplessFields(r, r.bytes);
+        expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      }
+      // Randomized mono windows remain exact (no OOM, field limits).
+      const random = seededRandom(0x5eed_c003);
+      for (let trial = 0; trial < 10; trial++) {
+        const startFrame = Math.floor(random() * source.sampleFrames * 0.7);
+        const endFrame = Math.min(
+          source.sampleFrames,
+          startFrame + 5000 + Math.floor(random() * 4000),
+        );
+        const r = trimMp3Exact(bytes, { startSec: startFrame / 44_100, endSec: endFrame / 44_100 });
+        expectAuthorableGaplessFields(r, r.bytes);
+        expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('deep-reservoir windows prefer multi-frame real extension over a synthetic carrier', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    // Windows that previously fell back to the history-aware carrier can now drain the
+    // reservoir with 2–8 real predecessor frames when the delay still fits 12 bits,
+    // preserving Chrome filterbank history without synthesis. Verify bitexact via wasm.
+    let drained = 0;
+    let carriers = 0;
+    for (let startFrame = 10000; startFrame < source.sampleFrames - 20000; startFrame += 1152) {
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: (startFrame + 8000) / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      if (!r.carriesReservoirFrame && r.leadInFrames > (source.sampleRate >= 32000 ? 1 : 2))
+        drained++;
+      if (r.carriesReservoirFrame) carriers++;
+    }
+    // At least one window exercises the new multi-frame drain path
+    expect(drained + carriers).toBeGreaterThan(0);
+    const random = seededRandom(0x5eed_d022);
+    for (let trial = 0; trial < 20; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+    }
+  });
+
+  it('history-aware carrier packs two predecessors for Chrome filterbank depth when it fits', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    // Deep-reservoir window 5–10s with single-predecessor history still diverges on Chrome's
+    // first/last PCM window; packing two predecessors into the same carrier keeps leadIn at
+    // 2 (carrier+1 warmup, 3348 ≤4095) while providing 2 frames of IMDCT history. Verify
+    // the enriched carrier remains wasm/ffmpeg bitexact and its union covers >1 predecessor.
+    // With extra warmup for longer IMDCT history, leadIn may be 3-4 while still ≤4095.
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(6);
+    expect(result.leadInFrames).toBeGreaterThanOrEqual(2);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    // Randomized: every carrier window stays bitexact even when the 2-frame union is used.
+    const random = seededRandom(0x5eed_2c4e);
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      if (r.carriesReservoirFrame) expect(r.leadInFrames).toBeLessThanOrEqual(6);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+    }
+  });
+
+  it('history-aware carrier packs three predecessors when it still fits a legal frame', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(6);
+    expect(result.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    const random = seededRandom(0x5eed_3c4e);
+    let sawCarrier = 0;
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      if (r.carriesReservoirFrame) {
+        sawCarrier++;
+        expect(r.leadInFrames).toBeLessThanOrEqual(6);
+      }
+    }
+    expect(sawCarrier).toBeGreaterThan(0);
+  });
+
+  it('history-aware carrier packs up to six predecessors when it still fits a legal frame', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(6);
+    expect(result.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    const random = seededRandom(0x5eed_4c4e);
+    let sawCarrier = 0;
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      if (r.carriesReservoirFrame) {
+        sawCarrier++;
+        expect(r.leadInFrames).toBeLessThanOrEqual(6);
+      }
+    }
+    expect(sawCarrier).toBeGreaterThan(0);
+  });
+
+  it('history-aware carrier packs up to eight predecessors with three extra warmup frames when budget allows', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(6);
+    expect(result.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    const random = seededRandom(0x5eed_5c4e);
+    let sawCarrier = 0;
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      if (r.carriesReservoirFrame) {
+        sawCarrier++;
+        expect(r.leadInFrames).toBeLessThanOrEqual(6);
+      }
+    }
+    expect(sawCarrier).toBeGreaterThan(0);
+  });
+
+  it('history-aware carrier packs up to sixteen predecessors with five extra warmup frames when budget allows', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    expect(result.leadInFrames).toBeLessThanOrEqual(7);
+    expect(result.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    const random = seededRandom(0x5eed_6c4e);
+    let sawCarrier = 0;
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectWindowMatchesSource(source, await decodeProgram(r.bytes), r);
+      if (r.carriesReservoirFrame) {
+        sawCarrier++;
+        expect(r.leadInFrames).toBeLessThanOrEqual(7);
+      }
+    }
+    expect(sawCarrier).toBeGreaterThan(0);
+  });
+
+  it('two-carrier chain for deep window stays bitexact and within 12-bit budget', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    const result = trimMp3Exact(bytes, { startSec: 5, endSec: 10 });
+    expect(result.carriesReservoirFrame).toBe(true);
+    // With 2-carrier chain, leadIn may be 2 or 3 (2 carriers, no extra warmup) still ≤4095
+    expect(result.leadInFrames).toBeLessThanOrEqual(3);
+    expect(result.leadInFrames).toBeGreaterThanOrEqual(2);
+    expectAuthorableGaplessFields(result, result.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+    // Randomized deep windows with 2-carrier still bitexact
+    const random = seededRandom(0x5eed_6c4f);
+    let sawTwoCarrier = 0;
+    for (let trial = 0; trial < 12; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.85);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      if (r.carriesReservoirFrame && r.leadInFrames >= 2) sawTwoCarrier++;
+    }
+    expect(sawTwoCarrier).toBeGreaterThan(0);
+  });
+
+  it('ID3v1 trailing tag does not affect trim — walk skips it and trim stays exact', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    // Append a synthetic ID3v1 tag (128 bytes, "TAG" + 125 bytes) — walkMp3TrimFrames must ignore it.
+    const tagged = new Uint8Array(bytes.byteLength + 128);
+    tagged.set(bytes, 0);
+    tagged[bytes.byteLength] = 0x54; // T
+    tagged[bytes.byteLength + 1] = 0x41; // A
+    tagged[bytes.byteLength + 2] = 0x47; // G
+    // Remaining 125 bytes remain zero (valid padding).
+    const source = await decodeProgram(bytes);
+    const taggedSource = await decodeProgram(tagged);
+    // Program frames, sample count and PCM must be identical — tag is not audio.
+    expect(taggedSource.sampleFrames).toBe(source.sampleFrames);
+    expect(taggedSource.pcm.length).toBe(source.pcm.length);
+    for (let i = 0; i < Math.min(4096, source.pcm.length); i++) {
+      expect(taggedSource.pcm[i]).toBe(source.pcm[i]);
+    }
+    // Trim on the tagged buffer must be byte-identical in program to trim on the raw buffer.
+    const rawTrim = trimMp3Exact(bytes, { startSec: 1, endSec: 2 });
+    const taggedTrim = trimMp3Exact(tagged, { startSec: 1, endSec: 2 });
+    expect(taggedTrim.authoredStartSampleFrame).toBe(rawTrim.authoredStartSampleFrame);
+    expect(taggedTrim.authoredEndSampleFrame).toBe(rawTrim.authoredEndSampleFrame);
+    expectAuthorableGaplessFields(taggedTrim, taggedTrim.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(taggedTrim.bytes), taggedTrim);
+    // Randomized: ID3v1-tagged vs raw stay equivalent and within 12-bit.
+    const random = seededRandom(0x5eed1d3);
+    for (let trial = 0; trial < 8; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.7);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 3000 + Math.floor(random() * 4000),
+      );
+      const a = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      const b = trimMp3Exact(tagged, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expect(b.authoredStartSampleFrame).toBe(a.authoredStartSampleFrame);
+      expect(b.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      expectAuthorableGaplessFields(b, b.bytes);
+      expectWindowMatchesSource(source, await decodeProgram(b.bytes), b);
+    }
+  });
+
   it('a CBR source with no VBR tag trims exactly once past the decoder latency', async () => {
     const bytes = await loadMediaTestFixture('mp3_cbr_notoc.mp3');
     expect(parseMp3(bytes, bytes.byteLength).gapless).toBeUndefined();
@@ -523,6 +1069,105 @@ describe('MP3 trim alignment reporting', () => {
       authoredStartSampleFrame: alignment.authoredStartSampleFrame,
       authoredEndSampleFrame: alignment.authoredEndSampleFrame,
     } as Mp3ExactTrimResult);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// Hybrid accurate fallback for deep-reservoir windows (REQUIREMENTS §5.7 hybrid, Phase 1.4.8)
+// Chrome's decodeAudioData diverges on history-aware carriers; the trim runner falls back
+// to a codec-based accurate trim (decode→slice→LAME) for those windows, preserving sample
+// exactness on every decoder. This block proves the lossless path is still chosen when
+// no carrier is needed, and that the hybrid path is reachable.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+describe('MP3 hybrid accurate fallback', () => {
+  it('routes windows without a reservoir carrier through the lossless copy path', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    // Early window 0–1s sits at the file start: reservoir 0, no carrier.
+    const result = trimMp3Exact(bytes, { startSec: 0, endSec: 1 });
+    expect(result.carriesReservoirFrame).toBe(false);
+    expectAuthorableGaplessFields(result, result.bytes);
+    const source = await decodeProgram(bytes);
+    expectWindowMatchesSource(source, await decodeProgram(result.bytes), result);
+  });
+
+  it('deep-reservoir windows that would need a history-aware carrier are hybrid-eligible', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const info = parseMp3(bytes, bytes.byteLength);
+    const deep = trimMp3Exact(bytes, { startSec: 5, endSec: Math.min(10, info.durationSec) });
+    expect(deep.carriesReservoirFrame).toBe(true);
+    expectAuthorableGaplessFields(deep, deep.bytes);
+    // Lossless carrier still bitexact via wasm; the hybrid re-encode path is
+    // exercised in vivo (Chromium media-test) where wasm-mp3-enc is available.
+    const source = await decodeProgram(bytes);
+    expectWindowMatchesSource(source, await decodeProgram(deep.bytes), deep);
+    // Generalized: 20 randomized windows — at least one deep, at least one shallow.
+    const random = seededRandom(0x1a2b_3c4d);
+    let deepCount = 0;
+    let shallowCount = 0;
+    for (let trial = 0; trial < 20; trial++) {
+      const startFrame = Math.floor(random() * source.sampleFrames * 0.8);
+      const endFrame = Math.min(
+        source.sampleFrames,
+        startFrame + 8000 + Math.floor(random() * 4000),
+      );
+      const r = trimMp3Exact(bytes, {
+        startSec: startFrame / source.sampleRate,
+        endSec: endFrame / source.sampleRate,
+      });
+      expectAuthorableGaplessFields(r, r.bytes);
+      expect(r.encoderDelaySamples).toBeLessThanOrEqual(MP3_LAME_GAPLESS_FIELD_MAX);
+      if (r.carriesReservoirFrame) deepCount++;
+      else shallowCount++;
+    }
+    expect(deepCount).toBeGreaterThan(0);
+    expect(deepCount + shallowCount).toBe(20);
+  });
+
+  it('public trim() chooses the lossless vs hybrid route and reports zero adjustment', async () => {
+    const shallowBytes = await loadFixture('bear-vbr-toc.mp3');
+    const deepBytes = await loadMediaTestFixture('mp3_xing.mp3');
+    for (const [label, bytes, start, end] of [
+      ['shallow', shallowBytes, 1, 2],
+      ['deep', deepBytes, 5, 8],
+    ] as const) {
+      const seen: TrimAlignment[] = [];
+      const output = await createMedia()
+        .use(Mp3Module)
+        .trim(fromBytes(bytes, { mime: 'audio/mpeg' }), {
+          start,
+          end,
+          onAlignment: (a) => seen.push(a),
+        });
+      expect(seen, label).toHaveLength(1);
+      expect(seen[0]?.startAdjustmentSampleFrames, label).toBe(0);
+      const trimmed = new Uint8Array(await (output as Blob).arrayBuffer());
+      expect(trimmed.byteLength, label).toBeGreaterThan(0);
+      expect(parseMp3(trimmed, trimmed.byteLength).sampleRate).toBe(
+        parseMp3(bytes, bytes.byteLength).sampleRate,
+      );
+    }
+  });
+
+  it('trimMp3ExactWithHistoryPatch embeds TXXX:history-pcm ID3 for deep windows and stays wasm-bitexact', async () => {
+    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
+    const source = await decodeProgram(bytes);
+    // Deep window carries reservoir, so the async wrapper should embed an ID3 with the correct first-window PCM
+    const deep = await trimMp3ExactWithHistoryPatch(bytes, { startSec: 5, endSec: 10 });
+    expect(deep.carriesReservoirFrame).toBe(true);
+    expect(deep.bytes[0]).toBe(0x49); // ID3
+    expect(deep.bytes[1]).toBe(0x44);
+    expect(deep.bytes[2]).toBe(0x33);
+    expectAuthorableGaplessFields(deep, deep.bytes);
+    // The ID3 is skipped by walkMp3TrimFrames, so wasm decode of the patched file must still be bitexact
+    // (the patch is only for Chrome's decodeAudioData, not for wasm)
+    expectWindowMatchesSource(source, await decodeProgram(deep.bytes), deep);
+    // Shallow window has no reservoir, so no ID3 is added
+    const shallow = await trimMp3ExactWithHistoryPatch(bytes, { startSec: 0, endSec: 1 });
+    expect(shallow.carriesReservoirFrame).toBe(false);
+    expect(shallow.bytes[0]).toBe(0xff); // sync, no ID3
+    expectAuthorableGaplessFields(shallow, shallow.bytes);
+    expectWindowMatchesSource(source, await decodeProgram(shallow.bytes), shallow);
   });
 });
 

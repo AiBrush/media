@@ -133,10 +133,19 @@ interface Chunk {
   size: number;
 }
 
+export const MAX_AIFF_CHUNKS_PER_FILE = 2048;
+
 /** Walk the `FORM` body, returning each chunk's id/offset/size (big-endian, even-padded like RIFF). */
 function* chunks(bytes: Uint8Array, dv: DataView): Generator<Chunk> {
   let pos = 12; // FORM(4) + size(4) + formType(4)
+  let count = 0;
   while (pos + 8 <= bytes.byteLength) {
+    if (++count > MAX_AIFF_CHUNKS_PER_FILE) {
+      throw new MediaError(
+        'demux-error',
+        `AIFF file has >${MAX_AIFF_CHUNKS_PER_FILE} chunks (budget exceeded) at ${pos}`,
+      );
+    }
     const id = ascii(bytes, pos, 4);
     const size = dv.getUint32(pos + 4);
     const body = pos + 8;

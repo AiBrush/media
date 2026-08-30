@@ -314,12 +314,14 @@ async function trimMp3ExactCopy(
   opts: TrimOptions,
   signal: AbortSignal,
 ): Promise<ReadableStream<Uint8Array>> {
-  const [{ mp3TrimAlignment, trimMp3Exact }, { readAllSource }] = await Promise.all([
-    import('../drivers/mp3/mp3-exact-trim.ts'),
-    import('./source-io.ts'),
-  ]);
+  const [{ mp3TrimAlignment, trimMp3ExactWithHistoryPatch }, { readAllSource }] = await Promise.all(
+    [import('../drivers/mp3/mp3-exact-trim.ts'), import('./source-io.ts')],
+  );
   const bytes = await readAllSource(source, signal);
-  const result = trimMp3Exact(bytes, { startSec: opts.start, endSec: opts.end });
+  const result = await trimMp3ExactWithHistoryPatch(bytes, {
+    startSec: opts.start,
+    endSec: opts.end,
+  });
   opts.onAlignment?.(mp3TrimAlignment(result));
   return bytesToTrimStream(result.bytes);
 }

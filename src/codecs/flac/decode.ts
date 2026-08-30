@@ -287,14 +287,23 @@ function readStreamInfo(bytes: Uint8Array): StreamInfo {
     if (type === 0) {
       const hi = dv.getUint32(body + 10);
       const lo = dv.getUint32(body + 14);
-      info = {
-        sampleRate: hi >>> 12,
-        channels: ((hi >>> 9) & 0x7) + 1,
-        bitsPerSample: ((hi >>> 4) & 0x1f) + 1,
-        totalSamples: (hi & 0xf) * 2 ** 32 + lo,
-        md5: bytes.slice(body + 18, body + 34),
-        audioStart: 0,
-      };
+      {
+        const big = (BigInt(hi & 0xf) << 32n) | BigInt(lo);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new MediaError(
+            'demux-error',
+            `FLAC totalSamples ${big} exceeds safe integer range`,
+          );
+        }
+        info = {
+          sampleRate: hi >>> 12,
+          channels: ((hi >>> 9) & 0x7) + 1,
+          bitsPerSample: ((hi >>> 4) & 0x1f) + 1,
+          totalSamples: Number(big),
+          md5: bytes.slice(body + 18, body + 34),
+          audioStart: 0,
+        };
+      }
     }
     off = body + len;
     if (last) break;

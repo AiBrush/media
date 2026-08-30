@@ -36,6 +36,7 @@ import { h273Matrix, h273Primaries, h273Transfer } from '../mp4/codec-strings.ts
 import { type ChunkStruct, WebmMuxer } from './ebml-write.ts';
 import {
   type EbmlElement,
+  MAX_EBML_ELEMENTS_PER_CONTAINER,
   elements,
   findChild,
   readAscii,
@@ -1379,6 +1380,7 @@ function* segmentElements(
   }
 
   let offset = segment.dataStart;
+  let yielded = 0;
   while (offset < segment.dataEnd) {
     const id = readVint(dv, offset, true);
     if (id === undefined) {
@@ -1415,6 +1417,12 @@ function* segmentElements(
         );
       }
       const dataEnd = unknownClusterEnd(dv, dataStart, segment.dataEnd);
+      if (++yielded > MAX_EBML_ELEMENTS_PER_CONTAINER) {
+        throw new MediaError(
+          'demux-error',
+          `WebM Segment has >${MAX_EBML_ELEMENTS_PER_CONTAINER} elements (budget exceeded) at ${offset}`,
+        );
+      }
       yield {
         id: id.value,
         dataStart,
@@ -1429,6 +1437,12 @@ function* segmentElements(
     const dataEnd = dataStart + size.value;
     if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > segment.dataEnd) {
       if (!strict && Number.isSafeInteger(dataEnd) && dataEnd >= dataStart) {
+        if (++yielded > MAX_EBML_ELEMENTS_PER_CONTAINER) {
+          throw new MediaError(
+            'demux-error',
+            `WebM Segment has >${MAX_EBML_ELEMENTS_PER_CONTAINER} elements (budget exceeded) at ${offset}`,
+          );
+        }
         yield {
           id: id.value,
           dataStart,
@@ -1441,6 +1455,12 @@ function* segmentElements(
       throw new MediaError(
         'demux-error',
         `EBML element 0x${id.value.toString(16)} escapes the WebM Segment`,
+      );
+    }
+    if (++yielded > MAX_EBML_ELEMENTS_PER_CONTAINER) {
+      throw new MediaError(
+        'demux-error',
+        `WebM Segment has >${MAX_EBML_ELEMENTS_PER_CONTAINER} elements (budget exceeded) at ${offset}`,
       );
     }
     yield {

@@ -30,6 +30,9 @@ const ID3V1_TAG_BYTES = 128;
  * (7 bytes) or a tag magic + ID3v2 size header (10 bytes) split across the boundary is never lost.
  */
 const SCAN_WAIT_TAIL_BYTES = ID3V2_HEADER_BYTES - 1;
+/** Malformed-input guard: per-stream ADTS frame budget (REQUIREMENTS §8.4). */
+export const MAX_ADTS_FRAMES_PER_STREAM = 100_000;
+
 /** Default probe window: bounded memory, few range round-trips even on hour-long streams. */
 const DEFAULT_PROBE_WINDOW_BYTES = 4 * 1024 * 1024;
 const MIN_PROBE_WINDOW_BYTES = 32;
@@ -393,6 +396,12 @@ export class AdtsFrameWalker {
     });
     this.#runSamples += samples;
     this.#frames++;
+    if (this.#frames > MAX_ADTS_FRAMES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `ADTS stream has >${MAX_ADTS_FRAMES_PER_STREAM} frames (budget exceeded)`,
+      );
+    }
     this.#lockedOnce = true;
     this.#confirmPending = false;
   }

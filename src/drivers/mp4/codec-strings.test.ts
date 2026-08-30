@@ -35,6 +35,28 @@ describe('hevcCodecString (RFC 6381, independent)', () => {
     const hvcC = Uint8Array.from([0x01, 0x62, 0x00, 0, 0, 0x01, 0x40, 0x00, 0x80, 0, 0, 0, 0x78]);
     expect(hevcCodecString('hev1', hvcC)).toBe('hev1.A2.80000000.H120.40.00.80');
   });
+
+  it('rejects truncated hvcC with typed demux-error and accepts exact 13-byte boundary', () => {
+    for (const bytes of [new Uint8Array([0x01]), new Uint8Array(12)]) {
+      try {
+        hevcCodecString('hvc1', bytes);
+        expect.unreachable('should throw');
+      } catch (e) {
+        expect((e as { code?: string }).code).toBe('demux-error');
+        expect(String((e as Error).message)).toMatch(/truncated/);
+      }
+    }
+    expect(hevcCodecString('hvc1', new Uint8Array(13).fill(0x01))).toBeDefined();
+    // 20× randomized valid hvcC (13-23 bytes) still produce a codec string without throwing
+    for (let i = 0; i < 20; i++) {
+      const len = 13 + Math.floor(Math.random() * 10);
+      const bytes = new Uint8Array(len);
+      bytes[0] = 0x01;
+      bytes[1] = 0x01;
+      for (let j = 2; j < len; j++) bytes[j] = Math.floor(Math.random() * 256);
+      expect(hevcCodecString('hvc1', bytes)).toMatch(/^hvc1\./);
+    }
+  });
 });
 
 describe('av1CodecString (AV1-ISOBMFF, independent)', () => {
@@ -55,6 +77,27 @@ describe('av1CodecString (AV1-ISOBMFF, independent)', () => {
   it('encodes high_bitdepth on a non-profile-2 stream as 10-bit', () => {
     // profile 0 + high_bitdepth (b2=0x40) → 10-bit (the twelve_bit flag only applies to profile 2).
     expect(av1CodecString(Uint8Array.from([0x81, 0x08, 0x40, 0x00]))).toBe('av01.0.08M.10');
+  });
+
+  it('rejects truncated av1C with typed demux-error and accepts exact 4-byte boundary', () => {
+    for (const bytes of [new Uint8Array([0x81]), new Uint8Array(3)]) {
+      try {
+        av1CodecString(bytes);
+        expect.unreachable('should throw');
+      } catch (e) {
+        expect((e as { code?: string }).code).toBe('demux-error');
+        expect(String((e as Error).message)).toMatch(/truncated/);
+      }
+    }
+    expect(av1CodecString(new Uint8Array([0x81, 0x08, 0x0c, 0x00]))).toBe('av01.0.08M.08');
+    for (let i = 0; i < 20; i++) {
+      const bytes = new Uint8Array(4);
+      bytes[0] = 0x81;
+      bytes[1] = Math.floor(Math.random() * 256);
+      bytes[2] = Math.floor(Math.random() * 256);
+      bytes[3] = 0x00;
+      expect(av1CodecString(bytes)).toMatch(/^av01\./);
+    }
   });
 });
 

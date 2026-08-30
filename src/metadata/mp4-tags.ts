@@ -94,7 +94,9 @@ function readU64(bytes: Uint8Array, offset: number): number | undefined {
   const hi = readU32(bytes, offset);
   const lo = readU32(bytes, offset + 4);
   if (hi === undefined || lo === undefined) return undefined;
-  return hi * 2 ** 32 + lo;
+  const big = (BigInt(hi) << 32n) | BigInt(lo);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  return Number(big);
 }
 
 function writeU64(bytes: Uint8Array, offset: number, value: number): void {

@@ -102,4 +102,65 @@ describe('writeMp4 — large-output assembly (Uint8Array, not number[])', () => 
     expect(out[out.length - 1]).toBe(7);
     expect(out[out.length - n]).toBe(7);
   });
+
+  it('reserve: bounded gap, positional patch, and overflow preflight before first write', () => {
+    const track = videoTrack([new Uint8Array([1]), new Uint8Array([2, 3])]);
+    // Bounded: reservation must be at least moov+8 and at most estimate, and linear in packet ceiling.
+    const small = planReservedMp4ByteStreamLayout([track], 2);
+    const large = planReservedMp4ByteStreamLayout([track], 200);
+    expect(large.reservationBytes).toBeGreaterThan(small.reservationBytes);
+    expect(small.reservationBytes).toBeGreaterThanOrEqual(small.moovPatch.byteLength);
+    // Positional: ftyp → reservation → mdat strictly contiguous
+    expect(small.reservationPosition).toBe(small.ftyp.byteLength);
+    expect(small.mdatPosition).toBe(small.reservationPosition + small.reservationBytes);
+    expect(small.totalLen).toBe(
+      small.ftyp.byteLength +
+        small.reservationBytes +
+        small.mdatHeader.byteLength +
+        small.mdatPayloadLen,
+    );
+    // Overflow preflight: estimate > 0xffffffff throws typed mux-error before any allocation
+    const hugeMax = Math.ceil((0xffffffff - 1024) / 64) + 1;
+    expect(() => planReservedMp4ByteStreamLayout([track], hugeMax)).toThrow(
+      /exceeds the 32-bit box limit/,
+    );
+    expect(() => planReservedMp4ByteStreamLayout([], 8)).toThrow(/zero tracks/);
+    expect(() => planReservedMp4ByteStreamLayout([track], 0)).toThrow(/positive integer/);
+    expect(() => planReservedMp4ByteStreamLayout([track], 1.5)).toThrow(/positive integer/);
+  });
+
+  it('reserve: malformed and boundary inputs fail deterministically', () => {
+    const track = videoTrack([new Uint8Array([9])]);
+    expect(() => planReservedMp4ByteStreamLayout([track], Number.NaN)).toThrow(/positive integer/);
+    expect(() => planReservedMp4ByteStreamLayout([track], Number.POSITIVE_INFINITY)).toThrow(
+      /positive integer/,
+    );
+    // Number.MAX_SAFE_INTEGER as packet ceiling must overflow the 32-bit estimate check, not silently wrap
+    expect(() => planReservedMp4ByteStreamLayout([track], Number.MAX_SAFE_INTEGER)).toThrow(
+      /exceeds the 32-bit box limit/,
+    );
+  });
+
+  it('reserve: 20× randomized ceilings are bounded and positional', () => {
+    for (let i = 0; i < 20; i++) {
+      const packets = 1 + Math.floor(Math.random() * 500);
+      const trackCount = 1 + Math.floor(Math.random() * 3);
+      const tracks = Array.from({ length: trackCount }, () => videoTrack([new Uint8Array([7])]));
+      const layout = planReservedMp4ByteStreamLayout(tracks, packets);
+      const estimate = 1024 + trackCount * (4 * 1024 + packets * 64);
+      // reservation is max(estimate, moov+8) and never exceeds u32
+      expect(layout.reservationBytes).toBeGreaterThanOrEqual(estimate);
+      expect(layout.reservationBytes).toBeLessThanOrEqual(0xffffffff);
+      expect(layout.mdatPosition).toBe(layout.reservationPosition + layout.reservationBytes);
+      expect(layout.moovPatch.byteLength).toBe(layout.reservationBytes);
+      // free box after moov must be valid (size >=8)
+      const moovSize = new DataView(
+        layout.moovPatch.buffer,
+        layout.moovPatch.byteOffset,
+        layout.moovPatch.byteLength,
+      ).getUint32(0);
+      expect(moovSize).toBeGreaterThan(8);
+      expect(moovSize + 8).toBeLessThanOrEqual(layout.reservationBytes);
+    }
+  });
 });

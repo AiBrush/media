@@ -51,7 +51,14 @@ function readGranule(dv: DataView, offset: number): number {
   const lo = dv.getUint32(offset, true);
   const hi = dv.getUint32(offset + 4, true);
   if (lo === 0xffffffff && hi === 0xffffffff) return -1;
-  return hi * 2 ** 32 + lo;
+  const big = (BigInt(hi) << 32n) | BigInt(lo);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new MediaError(
+      'demux-error',
+      `Ogg granule ${big} at ${offset} exceeds safe integer range`,
+    );
+  }
+  return Number(big);
 }
 
 function granuleBytes(value: number): number[] {

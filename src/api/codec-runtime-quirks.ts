@@ -18,7 +18,7 @@ import type { TrackInfo } from '../contracts/driver.ts';
 import { CapabilityError } from '../contracts/errors.ts';
 import { MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES } from '../drivers/mp3/mp3-gapless.ts';
 import { defaultOpusAudioEncodeTarget } from './audio-target-defaults.ts';
-import { type SourceGeometry, outputDimensions } from './codec-queries.ts';
+import type { SourceGeometry } from './codec-queries.ts';
 import { videoCodecToken } from './codec-strings.ts';
 import {
   audioCodecToken,
@@ -32,8 +32,6 @@ const VORBIS_CODEC_STRING = 'vorbis';
 const FIREFOX_OPUS_WASM_ENCODE_SAMPLE_RATE = 48_000;
 const FIREFOX_OPUS_WASM_MIN_CHANNELS = 1;
 const FIREFOX_OPUS_WASM_MAX_CHANNELS = 2;
-const FIREFOX_VP9_TIMEOUT_MIN_DURATION_SEC = 5;
-const FIREFOX_VP9_TIMEOUT_MIN_PIXELS = 640 * 360;
 
 /** Firefox exposes one AAC-LC access unit of native ADTS decoder priming. */
 export const FIREFOX_ADTS_AAC_LEADING_SAMPLES = AAC_LC_ACCESS_UNIT_SAMPLES;
@@ -199,40 +197,19 @@ export function webkitCrossCodecH264Config(
   return { ...config, codec: config.codec.replace(/^avc1\.42[0-9a-f]{2}/i, 'avc1.6400') };
 }
 
-function isFirefoxVp9EncodeTimeoutOutput(target: VideoTarget, src: SourceGeometry): boolean {
-  if (
-    src.durationSec === undefined ||
-    !Number.isFinite(src.durationSec) ||
-    src.durationSec < FIREFOX_VP9_TIMEOUT_MIN_DURATION_SEC
-  ) {
-    return false;
-  }
-  const { width, height } = outputDimensions(target, src);
-  if (width === undefined || height === undefined) return false;
-  return width * height >= FIREFOX_VP9_TIMEOUT_MIN_PIXELS;
-}
-
 /**
- * Focused Firefox evidence shows this package's VPx encode paths can exceed the suite operation budget even
- * when Firefox accepts the WebCodecs config. Keep this classifier Firefox-only and evidence-scoped:
- * Chromium/WebKit use their own browser measurements, and smaller/unknown-duration VP9 outputs are not
- * guessed into NA.
+ * Firefox VPx alpha: dual-WebCodecs encode path can exceed suite operation budget.
+ * Keep this classifier Firefox-only; Chromium/WebKit use their own measurements.
  */
 export function firefoxVideoTranscodeDeclineReason(
   target: VideoTarget,
   sourceCodecString: string | undefined,
-  src?: SourceGeometry,
+  _src?: SourceGeometry,
 ): string | undefined {
   const targetCodec = target.codec ?? videoCodecToken(sourceCodecString ?? '');
   if (target.alpha === 'keep' && (targetCodec === 'vp8' || targetCodec === 'vp9')) {
     const codecName = targetCodec.toUpperCase();
-    return `Firefox aibrush-media declines VPx alpha-preserving video transcode: the dual-WebCodecs ${codecName} alpha encode path exceeds the suite timeout on a 5 s 320x240 fixture`;
-  }
-  if (targetCodec === 'vp9' && src !== undefined && isFirefoxVp9EncodeTimeoutOutput(target, src)) {
-    return (
-      'Firefox aibrush-media declines VP9 video transcode at this duration/resolution: Firefox ' +
-      'WebCodecs VP9 encode exceeds the suite timeout on 5 s 640x360-or-larger output paths'
-    );
+    return `Firefox aibrush-media declines VPx alpha-preserving video transcode: dual-WebCodecs ${codecName} alpha encode exceeds suite operation budget`;
   }
   return undefined;
 }

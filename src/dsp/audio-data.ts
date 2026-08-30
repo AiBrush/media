@@ -20,15 +20,41 @@ export function audioDataToPcm(data: AudioData): PcmAudio {
   const channels = data.numberOfChannels;
   const frames = data.numberOfFrames;
   const sampleRate = data.sampleRate;
-  const planar: Float64Array[] = [];
-  for (let c = 0; c < channels; c++) {
-    const plane = new Float32Array(frames);
-    if (frames > 0) data.copyTo(plane, { planeIndex: c, format: F32_PLANAR });
-    const ch = new Float64Array(frames);
-    for (let i = 0; i < frames; i++) ch[i] = plane[i] as number;
-    planar.push(ch);
+  if (frames === 0) {
+    return {
+      sampleRate,
+      channels,
+      frames,
+      planar: Array.from({ length: channels }, () => new Float64Array(0)),
+    };
   }
-  return { sampleRate, channels, frames, planar };
+  // WebKit's AudioData rejects per-plane `f32-planar` copies for some source formats (it reports
+  // the native interleaved layout instead). The single `f32` copy is required to be supported for
+  // every AudioData regardless of its internal format (WebCodecs), so use it and deinterleave.
+  // This keeps Chromium and WebKit on the same codepath and avoids channel-swap bugs from
+  // assuming planar copy always succeeds.
+  try {
+    const interleaved = new Float32Array(frames * channels);
+    data.copyTo(interleaved, { format: 'f32' } as AudioDataCopyToOptions);
+    const planar: Float64Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const ch = new Float64Array(frames);
+      for (let i = 0; i < frames; i++) ch[i] = interleaved[i * channels + c] as number;
+      planar.push(ch);
+    }
+    return { sampleRate, channels, frames, planar };
+  } catch {
+    // Fallback for very old implementations that only support planar copies.
+    const planar: Float64Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      data.copyTo(plane, { planeIndex: c, format: F32_PLANAR });
+      const ch = new Float64Array(frames);
+      for (let i = 0; i < frames; i++) ch[i] = plane[i] as number;
+      planar.push(ch);
+    }
+    return { sampleRate, channels, frames, planar };
+  }
 }
 
 /**

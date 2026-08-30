@@ -1231,32 +1231,50 @@ export function planReservedMp4ByteStreamLayout(
     }
   }
 
+  // Overflow-safe estimate: compute with bigint to avoid intermediate Number overflow
+  // before the 32-bit box limit check (REQUIREMENTS §7.4, §8.4).
+  const estimateBig =
+    1024n +
+    BigInt(tracks.length) *
+      (BigInt(RESERVE_TRACK_OVERHEAD_BYTES) +
+        BigInt(maximumPacketCount) * BigInt(RESERVE_PACKET_TABLE_BYTES));
+  if (estimateBig > 0xffffffffn) {
+    throw new MediaError(
+      'mux-error',
+      `MP4 faststart reserve estimate ${estimateBig} exceeds the 32-bit box limit`,
+    );
+  }
+  void Number(estimateBig);
+
   const movieTimescale = resolveMovieTimescale(tracks, opts.movieTimescale);
   const ftyp = ftypBox(opts.brand ?? 'mp4', tracks);
   const { layouts: trackChunks, totalPayloadBytes: mdatPayloadLen } = trackChunkLayouts(tracks);
   const moovBytes = moov(tracks, movieTimescale, zeroChunkTables(trackChunks));
-  const estimate =
-    1024 +
-    tracks.length *
-      (RESERVE_TRACK_OVERHEAD_BYTES + maximumPacketCount * RESERVE_PACKET_TABLE_BYTES);
-  if (!Number.isSafeInteger(estimate) || estimate > 0xffffffff) {
-    throw new MediaError(
-      'mux-error',
-      `MP4 faststart reserve estimate ${estimate} exceeds the 32-bit box limit`,
-    );
-  }
   // Always leave at least one legal 8-byte `free` box. Besides making under-fill explicit, this avoids
   // an invalid 1..7-byte tail when actual moov length happens to sit just below the estimate.
-  const reservationBytes = Math.max(estimate, moovBytes.length + 8);
-  if (reservationBytes > 0xffffffff) {
+  const reservationBig =
+    estimateBig > BigInt(moovBytes.length + 8) ? estimateBig : BigInt(moovBytes.length + 8);
+  if (reservationBig > 0xffffffffn) {
     throw new MediaError(
       'mux-error',
-      `MP4 faststart reserve ${reservationBytes} exceeds the 32-bit box limit`,
+      `MP4 faststart reserve ${reservationBig} exceeds the 32-bit box limit`,
     );
   }
+  const reservationBytes = Number(reservationBig);
   const reservationPosition = ftyp.length;
   const mdatPosition = reservationPosition + reservationBytes;
   patchGeneratedMoovChunkOffsets(moovBytes, chunkTablesFor(trackChunks, mdatPosition));
+
+  const mdatHeader = Uint8Array.from(cat(u32(8 + mdatPayloadLen), fourcc('mdat')));
+  const totalLenBig =
+    BigInt(ftyp.length) + reservationBig + BigInt(mdatHeader.byteLength) + BigInt(mdatPayloadLen);
+  if (totalLenBig > BigInt(MAX_SINGLE_BUFFER)) {
+    throw new MediaError(
+      'mux-error',
+      `output is ${totalLenBig} bytes, over the ${MAX_SINGLE_BUFFER}-byte single-buffer limit; use a stream target`,
+    );
+  }
+  const totalLen = Number(totalLenBig);
 
   const moovPatch = new Uint8Array(reservationBytes);
   moovPatch.set(moovBytes);
@@ -1264,10 +1282,6 @@ export function planReservedMp4ByteStreamLayout(
   const freeOffset = moovBytes.length;
   moovPatch.set(u32(freeBytes), freeOffset);
   moovPatch.set(fourcc('free'), freeOffset + 4);
-
-  const mdatHeader = Uint8Array.from(cat(u32(8 + mdatPayloadLen), fourcc('mdat')));
-  const totalLen = ftyp.length + reservationBytes + mdatHeader.byteLength + mdatPayloadLen;
-  assertSingleBufferSize(totalLen);
   return {
     ftyp: Uint8Array.from(ftyp),
     moovPatch,

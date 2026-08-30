@@ -21,6 +21,7 @@
  * unaffected unless you ask to cache it.
  */
 
+import { MediaError } from '../contracts/errors.ts';
 import { raceAbort, throwIfSourceAborted } from './abort.ts';
 import type { RangeCacheRuntime, StartedCacheRead } from './cache-runtime.ts';
 import { type Source, type SourceKind, fromURL, isSource } from './source.ts';
@@ -232,7 +233,7 @@ class DeferredRangeCache implements CachingSource {
 function normalizeMaxBytes(maxBytes: number | undefined): number {
   if (maxBytes === undefined) return Number.POSITIVE_INFINITY;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
-    throw new RangeError('cache maxBytes must be a non-negative safe integer');
+    throw new MediaError('unsupported-input', 'cache maxBytes must be a non-negative safe integer');
   }
   return maxBytes;
 }

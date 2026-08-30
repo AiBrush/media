@@ -120,11 +120,14 @@ export function resizeBlit(srcW: number, srcH: number, spec: ResizeSpec): Blit {
   }
 
   // cover: scale to cover the box; crop the centered overflow from the *source* so the output is full.
+  // Use round for centering so an odd 1px remainder is split without bias (floor would put the extra
+  // pixel always on the trailing side, breaking odd-size symmetry and causing a 0.5px shift on the
+  // resampler's sub-rect).
   const scale = Math.max(width / srcW, height / srcH);
   const cropW = Math.min(srcW, Math.max(1, Math.round(width / scale)));
   const cropH = Math.min(srcH, Math.max(1, Math.round(height / scale)));
-  const sx = Math.floor((srcW - cropW) / 2);
-  const sy = Math.floor((srcH - cropH) / 2);
+  const sx = Math.round((srcW - cropW) / 2);
+  const sy = Math.round((srcH - cropH) / 2);
   return {
     dims,
     src: { x: sx, y: sy, width: cropW, height: cropH },

@@ -333,6 +333,9 @@ export function firstFrameOffset(bytes: Uint8Array): number {
   throw new InputError('mp3: no MPEG-audio frame found');
 }
 
+/** Maximum MP3 frames per stream before rejecting as malformed (REQUIREMENTS §8.4). */
+export const MAX_MP3_FRAMES_PER_STREAM = 100_000;
+
 /**
  * Walk every MP3 frame in a raw stream (after any ID3v2 tag), yielding each frame's header + a zero-copy
  * view of its bytes. Stops at an ID3v1 trailer or end of buffer; a sync loss mid-stream ends iteration
@@ -343,7 +346,14 @@ export function* iterateMp3Frames(
 ): Generator<{ header: Mp3FrameHeader; data: Uint8Array }, void, unknown> {
   const end = hasId3v1(bytes) ? bytes.length - 128 : bytes.length;
   let pos = firstFrameOffset(bytes);
+  let frames = 0;
   while (pos + 4 <= end) {
+    if (++frames > MAX_MP3_FRAMES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `MP3 stream has >${MAX_MP3_FRAMES_PER_STREAM} frames (budget exceeded) at ${pos}`,
+      );
+    }
     let header: Mp3FrameHeader;
     try {
       header = parseMp3FrameHeader(bytes, pos);

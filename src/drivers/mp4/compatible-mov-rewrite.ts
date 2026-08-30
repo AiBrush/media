@@ -1,4 +1,4 @@
-import type { ByteSource, StreamCopyOptions } from '../../contracts/driver.ts';
+import type { StreamCopyOptions } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
 import type { Movie, ParsedTrack } from './parse.ts';
 import { type SampleToChunkCursor, samplesPerChunkFor } from './samples.ts';
@@ -47,7 +47,34 @@ async function readTopLevelBox(
   offset: number,
 ): Promise<TopLevelBox | undefined> {
   if (offset < 0 || offset + 8 > ra.size) return undefined;
-  const header = await ra.read(offset, Math.min(16, ra.size - offset));
+  // Loop-collect the box header so a chunked range transport (≤1 B per read)
+  // cannot truncate it: collect up to 16 bytes, then interpret.
+  let header: Uint8Array | undefined;
+  {
+    const need = Math.min(16, ra.size - offset);
+    const chunks: Uint8Array[] = [];
+    let collected = 0;
+    let at = offset;
+    let remaining = need;
+    while (remaining > 0) {
+      const chunk = await ra.read(at, remaining);
+      if (chunk.byteLength === 0) break;
+      chunks.push(chunk);
+      at += chunk.byteLength;
+      collected += chunk.byteLength;
+      remaining -= chunk.byteLength;
+      // Header size is unknown until we have 8 bytes; stop early if we cannot get 8.
+      if (collected >= 8) {
+        const probe =
+          chunks.length === 1 ? (chunks[0] as Uint8Array) : concatChunks(chunks, collected);
+        const probeSize = u32(probe, 0);
+        const probeNeed = probeSize === 1 ? 16 : 8;
+        if (collected >= probeNeed || collected >= need) break;
+      }
+    }
+    if (collected < 8) return undefined;
+    header = chunks.length === 1 ? (chunks[0] as Uint8Array) : concatChunks(chunks, collected);
+  }
   if (header.byteLength < 8) return undefined;
   let size = u32(header, 0);
   const type = fourcc(header, 4);
@@ -69,11 +96,6 @@ function isSized(ra: RandomAccessView): ra is SizedRandomAccessView {
   return ra.size !== undefined;
 }
 
-function canReuseFullRead(src: ByteSource): boolean {
-  const kind = (src as ByteSource & { readonly kind?: string }).kind;
-  return kind === 'url' || kind === 'element' || kind === 'blob' || kind === 'opfs';
-}
-
 function writeFourcc(bytes: Uint8Array, offset: number, value: string): void {
   for (let i = 0; i < value.length; i++) bytes[offset + i] = value.charCodeAt(i);
 }
@@ -83,6 +105,16 @@ function writeU32(bytes: Uint8Array, offset: number, value: number): void {
   bytes[offset + 1] = (value >>> 16) & 0xff;
   bytes[offset + 2] = (value >>> 8) & 0xff;
   bytes[offset + 3] = value & 0xff;
+}
+
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 function isCompatibleTrack(track: ParsedTrack): boolean {
@@ -154,12 +186,26 @@ function validateTrackRanges(track: ParsedTrack, sourceSize: number): void {
   );
 }
 
-export async function materializeCompatibleMovToMp4Bytes(
-  src: ByteSource,
+/**
+ * Bytes per verbatim source window in the streamed compatible-brand rewrite. The operation patches
+ * exactly twelve bytes inside `ftyp`; everything after that box is byte-identical source payload, so it
+ * streams through in bounded windows and peak memory stays flat in the file size instead of holding two
+ * whole-file copies on the heap (REQUIREMENTS §7.3).
+ */
+const COMPATIBLE_REWRITE_WINDOW_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Stream a QuickTime-branded (`qt  `) MOV as an MP4-compatible container by rewriting **only** the
+ * `ftyp` payload — major brand `isom`, minor version `0x200`, first compatible brand `mp42` — and
+ * forwarding every remaining source byte verbatim in bounded windows. Returns `undefined` when the
+ * source shape is not the exact safe shortcut (wrong brands/box order, trim/streaming requests,
+ * incompatible tracks); the caller then falls through to the general re-layout path.
+ */
+export async function streamCompatibleMovToMp4(
   ra: RandomAccessView,
   movie: Movie,
   o: StreamCopyOptions | undefined,
-): Promise<Uint8Array | undefined> {
+): Promise<ReadableStream<Uint8Array> | undefined> {
   if (!shouldRewrite(movie, o) || !isSized(ra)) return undefined;
 
   const ftyp = await readTopLevelBox(ra, 0);
@@ -171,16 +217,57 @@ export async function materializeCompatibleMovToMp4Bytes(
 
   for (const track of movie.tracks) validateTrackRanges(track, ra.size);
 
-  const full = await ra.read(0, ra.size);
-  if (full.byteLength !== ra.size) {
-    throw new MediaError(
-      'demux-error',
-      `MP4 compatible MOV full-source read was short: got ${full.byteLength} of ${ra.size} bytes`,
-    );
+  // Copy before patching: for in-memory sources `ra.read` returns a view over the caller's bytes, and
+  // this operation must never mutate its input. Loop until `ftyp.size` bytes are collected so a
+  // short transport read (chunked range response) does not truncate the header.
+  let ftypBytes: Uint8Array | undefined;
+  {
+    const chunks: Uint8Array[] = [];
+    let remaining = ftyp.size;
+    let offset = 0;
+    while (remaining > 0) {
+      const chunk = await ra.read(offset, remaining);
+      if (chunk.byteLength === 0) break;
+      chunks.push(chunk);
+      offset += chunk.byteLength;
+      remaining -= chunk.byteLength;
+    }
+    if (remaining !== 0) {
+      throw new MediaError(
+        'demux-error',
+        `MP4 compatible MOV ftyp read was short: got ${ftyp.size - remaining} of ${ftyp.size} bytes`,
+      );
+    }
+    const collected =
+      chunks.length === 1 ? (chunks[0] as Uint8Array) : concatChunks(chunks, ftyp.size);
+    ftypBytes = collected.slice();
   }
-  const out = canReuseFullRead(src) ? full : full.slice();
-  writeFourcc(out, ftyp.payloadStart, 'isom');
-  writeU32(out, ftyp.payloadStart + 4, 0x200);
-  writeFourcc(out, ftyp.payloadStart + 8, 'mp42');
-  return out;
+  writeFourcc(ftypBytes, ftyp.headerSize, 'isom');
+  writeU32(ftypBytes, ftyp.headerSize + 4, 0x200);
+  writeFourcc(ftypBytes, ftyp.headerSize + 8, 'mp42');
+
+  const total = ra.size;
+  let cursor = ftyp.end;
+  let emittedHeader = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller): Promise<void> {
+      if (!emittedHeader) {
+        emittedHeader = true;
+        controller.enqueue(ftypBytes as Uint8Array);
+        return;
+      }
+      if (cursor >= total) {
+        controller.close();
+        return;
+      }
+      const length = Math.min(COMPATIBLE_REWRITE_WINDOW_BYTES, total - cursor);
+      const chunk = await ra.read(cursor, length);
+      if (chunk.byteLength === 0) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+      cursor += chunk.byteLength;
+    },
+  });
 }

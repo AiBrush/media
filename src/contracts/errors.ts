@@ -19,6 +19,8 @@ export type MediaErrorCode =
   | 'demux-error'
   | 'mux-error'
   | 'constraint-unsatisfied' // a valid request whose declared output constraints cannot all be met
+  | 'resource-exhaustion' // bounded-memory/byte budget exceeded (REQUIREMENTS §8.4)
+  | 'integrity-error' // range validator (ETag/Last-Modified) changed mid-assembly (REQUIREMENTS §5.1)
   | 'aborted' // signal aborted
   | 'driver-incompatible'; // apiVersion mismatch at registration
 

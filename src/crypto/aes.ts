@@ -27,6 +27,17 @@ export function hexToBytes(hex: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+/** Validate a hex-decoded AES-128 key is exactly 16 bytes (typed InputError on mismatch). */
+export function assertAes128HexKey(hex: string, label = 'AES-128 key'): Uint8Array<ArrayBuffer> {
+  const bytes = hexToBytes(hex);
+  if (bytes.byteLength !== AES_BLOCK) {
+    throw new InputError(
+      `${label} must be ${AES_BLOCK} bytes (${AES_BLOCK * 2} hex chars), got ${bytes.byteLength}`,
+    );
+  }
+  return bytes;
+}
+
 /** The AES block size in bytes (128-bit). */
 export const AES_BLOCK = 16;
 
@@ -70,13 +81,23 @@ function webCryptoView(data: Uint8Array): Uint8Array<ArrayBuffer> {
     : data.slice();
 }
 
+function assertAes128Key(key: Uint8Array): void {
+  if (key.byteLength !== AES_BLOCK) {
+    throw new InputError(`AES-128 key must be ${AES_BLOCK} bytes, got ${key.byteLength}`);
+  }
+}
+
 /** Import one non-extractable AES-CTR key for reuse across an operation's independent samples. */
 export async function prepareAesCtrKey(key: Uint8Array<ArrayBuffer>): Promise<PreparedAesKey> {
+  assertAes128Key(key);
   const s = subtle();
+  const copy = ownedCopy(key);
+  const cryptoKey = await s.importKey('raw', copy, 'AES-CTR', false, ['encrypt']);
+  copy.fill(0);
   return {
     algorithm: 'AES-CTR',
     subtle: s,
-    key: await s.importKey('raw', ownedCopy(key), 'AES-CTR', false, ['encrypt']),
+    key: cryptoKey,
   };
 }
 
@@ -93,6 +114,12 @@ export async function aesCtrWithPreparedKey(
 ): Promise<Uint8Array<ArrayBuffer>> {
   if (prepared.algorithm !== 'AES-CTR') {
     throw new InputError('prepared AES key is not an AES-CTR key');
+  }
+  if (counter.byteLength !== AES_BLOCK) {
+    throw new InputError(`AES-CTR counter must be ${AES_BLOCK} bytes, got ${counter.byteLength}`);
+  }
+  if (counterBits !== 64 && counterBits !== 128) {
+    throw new InputError(`AES-CTR counterBits must be 64 or 128, got ${counterBits}`);
   }
   const result = await prepared.subtle.encrypt(
     { name: 'AES-CTR', counter: webCryptoView(counter), length: counterBits },
@@ -129,7 +156,10 @@ async function importCbcKey(
   key: Uint8Array<ArrayBuffer>,
   usage: 'encrypt' | 'decrypt',
 ): Promise<CryptoKey> {
-  return s.importKey('raw', ownedCopy(key), 'AES-CBC', false, [usage]);
+  const copy = ownedCopy(key);
+  const cryptoKey = await s.importKey('raw', copy, 'AES-CBC', false, [usage]);
+  copy.fill(0);
+  return cryptoKey;
 }
 
 /**
@@ -141,12 +171,16 @@ export async function prepareAesCbcKey(
   key: Uint8Array<ArrayBuffer>,
   usage: 'encrypt' | 'no-padding-decrypt',
 ): Promise<PreparedAesKey> {
+  assertAes128Key(key);
   const s = subtle();
   const usages: KeyUsage[] = usage === 'encrypt' ? ['encrypt'] : ['encrypt', 'decrypt'];
+  const copy = ownedCopy(key);
+  const cryptoKey = await s.importKey('raw', copy, 'AES-CBC', false, usages);
+  copy.fill(0);
   return {
     algorithm: 'AES-CBC',
     subtle: s,
-    key: await s.importKey('raw', ownedCopy(key), 'AES-CBC', false, usages),
+    key: cryptoKey,
   };
 }
 

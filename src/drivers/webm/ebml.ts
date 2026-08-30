@@ -1,3 +1,5 @@
+import { MediaError } from '../../contracts/errors.ts';
+
 /**
  * Minimal EBML reader for WebM/MKV (ISO/Matroska). EBML elements are `ID(vint) · size(vint) · data`;
  * a vint's first byte's leading-zero count gives its length, and the leading 1 is a marker. The ID
@@ -43,10 +45,13 @@ export function readVint(
   return { value, length };
 }
 
+export const MAX_EBML_ELEMENTS_PER_CONTAINER = 100_000;
+
 /** Iterate the child elements within `[start, end)`. An unknown-size element runs to `end`. */
 export function* elements(dv: DataView, start: number, end: number): Generator<EbmlElement> {
   let at = start;
   const limit = Math.min(end, dv.byteLength);
+  let count = 0;
   while (at < limit) {
     const id = readVint(dv, at, true);
     if (!id) return;
@@ -56,6 +61,12 @@ export function* elements(dv: DataView, start: number, end: number): Generator<E
     const declaredDataEnd = size.value < 0 ? limit : dataStart + size.value;
     const dataEnd = Math.min(declaredDataEnd, limit);
     if (dataEnd < dataStart) return;
+    if (++count > MAX_EBML_ELEMENTS_PER_CONTAINER) {
+      throw new MediaError(
+        'demux-error',
+        `WebM file has >${MAX_EBML_ELEMENTS_PER_CONTAINER} EBML elements (budget exceeded) at ${at} within [${start},${end})`,
+      );
+    }
     yield {
       id: id.value,
       dataStart,

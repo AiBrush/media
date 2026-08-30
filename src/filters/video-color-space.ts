@@ -13,6 +13,8 @@ import { parseColorSpace } from './gpu-uniforms.ts';
 export interface VideoColorSpaceLike {
   readonly primaries: string | null;
   readonly transfer: string | null;
+  readonly matrix?: string | null;
+  readonly fullRange?: boolean | null;
 }
 
 /** The default source colour interpretation when a frame carries no metadata: BT.709 SDR. */
@@ -55,6 +57,27 @@ function mapPrimaries(primaries: string | null): ColorSpaceId {
 export function mapVideoColorSpace(cs: VideoColorSpaceLike | null | undefined): SourceColor {
   if (cs === null || cs === undefined) return DEFAULT_SOURCE_COLOR;
   return { primaries: mapPrimaries(cs.primaries), transfer: mapTransfer(cs.transfer) };
+}
+
+/**
+ * Whether a source frame's colour space is limited-range (needs YUV range expansion).
+ * `fullRange === false` is limited; `true` or absent is full-range for the `rgb` path.
+ * Pure helper for the CPU/GPU range-correctness tests.
+ */
+export function isLimitedRange(cs: VideoColorSpaceLike | null | undefined): boolean {
+  if (cs === null || cs === undefined) return false;
+  return cs.fullRange === false;
+}
+
+/**
+ * Expand a single 8-bit limited-range sample (16..235) to full-range (0..255).
+ * Clamps outside the narrow range to the edge, half-up rounding. Pure, no VideoFrame.
+ */
+export function limitedToFullRange8(v: number): number {
+  if (!Number.isFinite(v) || !Number.isSafeInteger(v)) return 0;
+  if (v <= 16) return 0;
+  if (v >= 235) return 255;
+  return Math.round(((v - 16) * 255) / 219);
 }
 
 /** DOM/lib token for an output RGB frame's primaries. */

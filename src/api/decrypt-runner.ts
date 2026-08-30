@@ -1,5 +1,5 @@
 import type { ContainerDriver, ContainerQuery, StageOptions } from '../contracts/driver.ts';
-import { CapabilityError } from '../contracts/errors.ts';
+import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
@@ -46,11 +46,22 @@ export async function runDecrypt(
   signal: AbortSignal,
 ): Promise<Output> {
   assertSupportedDecryptScheme(opts.scheme);
+  // Live MediaStream sources require finite container bytes; decline before
+  // input validation so a live source always yields a typed CapabilityError
+  // (REQUIREMENTS §5.9) rather than an InputError about key shape.
+  const liveSource = normalizeInput(input);
+  if (isLiveMediaSource(liveSource)) {
+    throw new CapabilityError(
+      `decrypt requires finite encoded/container bytes and is unavailable for a raw live MediaStream`,
+      { op: { kind: 'route', id: 'decrypt' }, tried: ['media-stream/raw-frames'] },
+    );
+  }
   // Empty keys mean a live EME/license exchange, which is deliberately outside this byte-transform API.
-  // Reject before normalization/routing so a one-shot source is untouched.
+  // Reject before routing so a one-shot source is untouched.
   if (Object.keys(opts.keys).length === 0) {
     throw new CapabilityError('keys', { op: { kind: 'route', id: 'decrypt' }, tried: [] });
   }
+  validateDecryptKeys(opts.scheme, opts.keys);
   const source = normalizeByteInput(input, 'decrypt');
   const container = await context.container(source, 'demux', signal, options.strategy?.pinDriver);
   if (container.decrypt === undefined) {
@@ -81,6 +92,30 @@ function assertSupportedDecryptScheme(scheme: unknown): asserts scheme is Decryp
       return;
   }
   throw new CapabilityError('bad decrypt', { op: { kind: 'route', id: 'decrypt' }, tried: [] });
+}
+
+function validateDecryptKeys(scheme: DecryptOptions['scheme'], keys: Record<string, string>): void {
+  const hexRe = /^[0-9a-fA-F]+$/;
+  const isCenc = scheme === 'cenc' || scheme === 'cens' || scheme === 'cbcs';
+  for (const [kid, hex] of Object.entries(keys)) {
+    if (typeof hex !== 'string' || hex.length === 0 || !hexRe.test(hex) || hex.length % 2 !== 0) {
+      throw new InputError(`decrypt ${scheme}: key for '${kid}' is not valid hex`);
+    }
+    const bytes = hex.length / 2;
+    if (bytes !== 16) {
+      throw new InputError(
+        `decrypt ${scheme}: key for '${kid}' must be 16 bytes (32 hex chars), got ${bytes}`,
+      );
+    }
+    if (isCenc) {
+      // Unencrypted-noop case uses KID 'default' as placeholder (not a real 16-byte hex KID).
+      // Allow that verbatim so an unprotected file can return untouched instead of throwing.
+      if (kid === 'default') continue;
+      if (typeof kid !== 'string' || kid.length !== 32 || !hexRe.test(kid)) {
+        throw new InputError(`decrypt ${scheme}: KID '${kid}' must be 16 bytes (32 hex chars)`);
+      }
+    }
+  }
 }
 
 function normalizeByteInput(input: MediaInput, op: string): Source {

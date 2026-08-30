@@ -228,15 +228,36 @@ class PacketInfoWindowReader {
     range: NonNullable<Source['range']>,
     signal: AbortSignal | undefined,
   ): Promise<Uint8Array> {
-    const bytes = await range.call(this.#source, window.start, window.end);
-    throwIfAborted(signal);
     const expected = window.end - window.start;
-    if (bytes.byteLength !== expected) {
+    const chunks: Uint8Array[] = [];
+    let offset = window.start;
+    let remaining = expected;
+    while (remaining > 0) {
+      const chunk = await range.call(this.#source, offset, offset + remaining);
+      throwIfAborted(signal);
+      if (chunk.byteLength === 0) break;
+      chunks.push(chunk);
+      offset += chunk.byteLength;
+      remaining -= chunk.byteLength;
+    }
+    if (remaining !== 0) {
       throw new MediaError(
         'demux-error',
-        `packet-info window [${window.start}, ${window.end}) short read: got ${bytes.byteLength} of ${expected} bytes`,
+        `packet-info window [${window.start}, ${window.end}) short read: got ${expected - remaining} of ${expected} bytes`,
       );
     }
+    const bytes =
+      chunks.length === 1
+        ? (chunks[0] as Uint8Array)
+        : (() => {
+            const out = new Uint8Array(expected);
+            let at = 0;
+            for (const chunk of chunks) {
+              out.set(chunk, at);
+              at += chunk.byteLength;
+            }
+            return out;
+          })();
     this.#currentWindow = window;
     this.#currentBytes = bytes;
     return this.#sliceLoadedBytes(row, window);

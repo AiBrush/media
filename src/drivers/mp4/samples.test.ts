@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { type ParsedTrack, type SampleTable, type SampleTableInit, sampleTableFrom } from './parse.ts';
+import {
+  type ParsedTrack,
+  type SampleTable,
+  type SampleTableInit,
+  sampleTableFrom,
+} from './parse.ts';
 import {
   buildSampleData,
   buildSamples,

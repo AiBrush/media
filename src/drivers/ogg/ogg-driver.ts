@@ -60,7 +60,11 @@ function readGranule(dv: DataView, at: number): number {
   const lo = dv.getUint32(at, true);
   const hi = dv.getUint32(at + 4, true);
   if (lo === 0xffffffff && hi === 0xffffffff) return -1;
-  return hi * 2 ** 32 + lo;
+  const big = (BigInt(hi) << 32n) | BigInt(lo);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new MediaError('demux-error', `Ogg granule ${big} at ${at} exceeds safe integer range`);
+  }
+  return Number(big);
 }
 
 /** Parse the Ogg page header at `at` ('OggS' …), or undefined if it isn't a valid page. */
@@ -149,15 +153,25 @@ function identifyStream(dv: DataView, page: PageHeader): OggStream | undefined {
   return undefined;
 }
 
+/** Budgets for malformed-input protection (REQUIREMENTS §8.4, §2.4.5): bounded per-stream allocation/time. */
+export const MAX_OGG_PAGES_PER_STREAM = 100_000;
+
 /** Scan a buffer for pages of `serial`, returning the largest valid granule (total samples). */
 function maxGranule(dv: DataView, serial: number): number {
   let best = 0;
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength) {
     const page = parsePage(dv, at);
     if (!page) {
       at++;
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     if (page.serial === serial && page.granule > best) best = page.granule;
     at = page.pageEnd > at ? page.pageEnd : at + 1;
@@ -169,11 +183,18 @@ function maxGranule(dv: DataView, serial: number): number {
 function eosGranule(dv: DataView, serial: number): number | undefined {
   let terminal: number | undefined;
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength) {
     const page = parsePage(dv, at);
     if (!page) {
       at++;
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     if (page.serial === serial && (page.headerType & 0x04) !== 0 && page.granule >= 0) {
       terminal = page.granule;
@@ -224,6 +245,7 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
   let pendingSpans: OggPacketSpan[] = [];
   let pendingSize = 0;
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength) {
     const header = asciiAt(dv, at, 4);
     if (header !== 'OggS' || dv.getUint8(at + 4) !== 0) {
@@ -243,6 +265,12 @@ function delacePackets(dv: DataView, serial: number): RawPacket[] {
     if (pageSerial !== serial) {
       at = pageEnd > at ? pageEnd : at + 1; // different logical stream: skip its whole body
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     // De-lace this page's segment table. A run of segments forms one packet that ends on the first <255.
     // A run carried in from the previous page (HT_CONTINUED) resumes from `pendingSpans`.
@@ -424,11 +452,18 @@ function headerPacketCount(codec: string, dv: DataView, raw: readonly RawPacket[
 /** The first recognized logical stream in an Ogg buffer, or `undefined` when none is complete. */
 function firstRecognizedStream(dv: DataView): OggStream | undefined {
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength) {
     const page = parsePage(dv, at);
     if (!page) {
       at++;
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     if (page.headerType & 0x02) {
       const stream = identifyStream(dv, page);
@@ -635,11 +670,18 @@ function oggPacketLocation(packet: RawPacket): Pick<OggPacket, 'offset' | 'spans
 /** Read the Opus `pre_skip` (16-bit LE at OpusHead+10) from the BOS page of `serial`; 0 if absent. */
 function readOpusPreSkip(dv: DataView, serial: number): number {
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength) {
     const page = parsePage(dv, at);
     if (!page) {
       at++;
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     if (
       page.serial === serial &&
@@ -736,11 +778,18 @@ export function parseOgg(head: Uint8Array, tail?: Uint8Array): OggInfo {
   const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
   let stream: OggStream | undefined;
   let at = 0;
+  let pages = 0;
   while (at + 27 <= dv.byteLength && !stream) {
     const page = parsePage(dv, at);
     if (!page) {
       at++;
       continue;
+    }
+    if (++pages > MAX_OGG_PAGES_PER_STREAM) {
+      throw new MediaError(
+        'demux-error',
+        `Ogg stream has >${MAX_OGG_PAGES_PER_STREAM} pages (budget exceeded) at ${at}`,
+      );
     }
     if (page.headerType & 0x02) stream = identifyStream(dv, page); // BOS page
     at = page.pageEnd > at ? page.pageEnd : at + 1;

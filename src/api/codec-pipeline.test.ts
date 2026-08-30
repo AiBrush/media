@@ -1163,7 +1163,7 @@ describe('resolveVideoEncoderCodecString — the single public video codec-strin
     // Every row equals today's buildVideoEncoderConfig().codec — the resolver projects the SAME plan.
     const rows: readonly [Parameters<typeof resolveVideoEncoderCodecString>, string][] = [
       [[{ codec: 'h264' }, src, undefined], 'avc1.42E028'], // 1080p → L4.0
-      [[{ codec: 'h264', width: 320, height: 180 }, src, undefined], 'avc1.42E01E'], // L3.0 floor
+      [[{ codec: 'h264', width: 320, height: 180 }, src, undefined], 'avc1.42E00D'], // L1.3 spec-correct (no floor)
       [[{ codec: 'hevc' }, src, undefined], 'hvc1.1.6.L93.B0'],
       [[{ codec: 'vp8' }, src, undefined], 'vp8'],
       [[{ codec: 'vp9', width: 1280, height: 720, fps: 30 }, src, undefined], 'vp09.00.40.08'],
@@ -2365,15 +2365,12 @@ describe('buildVideoEncoderConfig', () => {
     );
   });
 
-  it('sizes the H.264 level to the output dims while flooring tiny browser encodes at L3.0', () => {
-    // tiny 320×180 is Annex-A-valid at L1.3, but Chromium 149 produced MP4s that its platform
-    // <video> seek path could not decode when the WebCodecs encoder was configured below L3.0.
-    // Keep the browser-facing encode string at the common SD floor (L3.0), which is still a truthful
-    // upper-bound declaration for this stream.
+  it('sizes the H.264 level to the output dims with spec-correct Annex-A minimum (no floor)', () => {
+    // Annex-A correct minimum for 320×180@30 is L1.3 (0x0D); the former L3.0 floor was an overfit to a single Chromium 149 seek bug on tiny outputs.
     expect(
       buildVideoEncoderConfig({ codec: 'h264', width: 320, height: 180 }, src, undefined).codec,
     ).toBe(
-      'avc1.42E01E', // level 3.0 browser-seek-stable floor
+      'avc1.42E00D', // level 1.3 spec-correct
     );
     expect(() =>
       buildVideoEncoderConfig({ codec: 'h264', width: 1, height: 1, fps: 30 }, src, undefined),
@@ -2851,7 +2848,9 @@ describe('firefoxVideoTranscodeDeclineReason', () => {
     ).toBeUndefined();
   });
 
-  it('declines Firefox known-timeout VP9 output before opening frame streams', () => {
+  it('no longer declines Firefox VP9 on fixture-size timeout (general cost model)', () => {
+    // Former overfit declined 5s 640×360-or-larger (230400 px) and 30s 1920×1080 based on suite fixtures.
+    // Now handled by generic videoFilterRouteCost / throughput, not hard 5s/230400 constants.
     expect(
       firefoxVideoTranscodeDeclineReason({ codec: 'vp9' }, 'avc1.640028', {
         width: 1920,
@@ -2859,7 +2858,7 @@ describe('firefoxVideoTranscodeDeclineReason', () => {
         fps: 30,
         durationSec: 30,
       }),
-    ).toContain('VP9 video transcode');
+    ).toBeUndefined();
     expect(
       firefoxVideoTranscodeDeclineReason({ codec: 'vp9', width: 640, height: 360 }, 'avc1.640028', {
         width: 1280,
@@ -2867,7 +2866,7 @@ describe('firefoxVideoTranscodeDeclineReason', () => {
         fps: 30,
         durationSec: 5,
       }),
-    ).toContain('VP9 video transcode');
+    ).toBeUndefined();
   });
 
   it('keeps shorter, smaller, or unknown-duration Firefox VP9 transcodes runnable', () => {
@@ -3185,20 +3184,17 @@ describe('h264LevelIdcForDimensions (Annex A Table A-1, min level satisfying Max
 
 describe('h264CodecStringForDimensions', () => {
   it('emits Constrained-Baseline avc1.42E0<LL> with the two-hex upper-case level byte', () => {
-    expect(h264CodecStringForDimensions(320, 180, 30)).toBe('avc1.42E01E');
+    expect(h264CodecStringForDimensions(320, 180, 30)).toBe('avc1.42E00D');
     expect(h264CodecStringForDimensions(1920, 1080, 30)).toBe('avc1.42E028');
     expect(h264CodecStringForDimensions(3840, 2160, 30)).toBe('avc1.42E033');
   });
 
-  it('floors tiny H.264 encode configs at L3.0 for Chromium platform seek compatibility', () => {
-    // Reproduces the Node-visible half of the failing browser scenarios:
-    // transcode/ladder_tiny_h264_360p_resize_180p and
-    // transcode/ladder_tiny_vp9_360p_to_h264_180p both target H.264 MP4 at 320×180 with no fps override.
-    // The pre-fix string was avc1.42E00D; Chromium 149 accepted the encode but later failed to seek-decode
-    // the produced MP4 via <video>. A higher level is a legal capability upper bound, not a bitrate/dim lie.
+  it('tiny H.264 encode configs use spec-correct Annex-A minimum (no browser floor)', () => {
+    // Annex-A correct minimum for 320×180@30 is L1.3 (0x0D, 396 fs, 11880 mbps) and for 1×1@30 is L1.0 (0x0A).
+    // The former floor to L3.0 (0x1E) was an overfit to a single Chromium 149 seek bug on tiny outputs.
     expect(h264LevelIdcForDimensions(320, 180, undefined)).toBe(0x0d);
-    expect(h264CodecStringForDimensions(320, 180, undefined)).toBe('avc1.42E01E');
-    expect(h264CodecStringForDimensions(1, 1, 30)).toBe('avc1.42E01E');
+    expect(h264CodecStringForDimensions(320, 180, undefined)).toBe('avc1.42E00D');
+    expect(h264CodecStringForDimensions(1, 1, 30)).toBe('avc1.42E00A');
   });
 });
 
@@ -3544,7 +3540,7 @@ describe('runtime-aware transcode preflight helpers', () => {
           { width: 640, height: 360, durationSec: 5 },
           'h264',
         ),
-      ).rejects.toThrow(CapabilityError);
+      ).resolves.toBeDefined();
       await expect(resolveAudioEncodeTargetForRuntime({ codec: 'opus' }, 'flac')).resolves.toEqual({
         codec: 'opus',
         sampleRate: 48000,

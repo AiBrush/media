@@ -120,6 +120,8 @@ const MOVIE_PARSE_HANDOFF_TTL_MS = 250;
 const PROGRESSIVE_SINGLE_READ_MAX_BYTES = 64 * 1024 * 1024;
 const PROGRESSIVE_SINGLE_READ_MAX_GAP_BYTES = 1024 * 1024;
 const SMALL_URL_TRIM_RANDOM_ACCESS_MAX_BYTES = 8 * 1024 * 1024;
+const WHOLE_FILE_PROBE_BUDGET_BYTES = 64 * 1024 * 1024;
+const WHOLE_FILE_REMUX_BUDGET_BYTES = 128 * 1024 * 1024;
 const TRIM_END_RANGE_SLACK_SEC = 1;
 const TRIM_DECODE_VALIDATION_CACHE_TTL_MS = 60_000;
 const TRIM_DECODE_VALIDATION_CACHE_MAX_ENTRIES = 128;
@@ -646,7 +648,11 @@ function topBoxHeader(bytes: Uint8Array, offset: number): TopBoxHeader | undefin
   let headerSize = 8;
   if (size === 1) {
     if (offset + 16 > bytes.byteLength) return undefined;
-    size = r.u64();
+    try {
+      size = r.u64();
+    } catch {
+      return undefined;
+    }
     headerSize = 16;
   } else if (size === 0) {
     return undefined;
@@ -1429,6 +1435,8 @@ export async function readMovie(ra: RandomAccess): Promise<Movie> {
         movie.hasFragments === true ||
         movie.tracks.some((t) => t.samples.sampleSizes.length === 0)
       ) {
+        const sparse = await readSparseFragmentTimingBoxes(ra, undefined, undefined);
+        if (sparse !== undefined) return applyFragmentTiming(movie, sparse);
         return applyFragmentTiming(movie, await readWholeFile(ra, limit));
       }
       return movie;
@@ -1514,9 +1522,12 @@ export async function readMoviePacketInfo(ra: RandomAccess): Promise<Movie> {
     }
     if (type === 'moov') {
       const movie = parseMoviePacketInfo(brand, (await ra.read(offset, size)).subarray(headerSize));
-      return movie.hasFragments === true
-        ? applyFragmentTiming(movie, await readWholeFile(ra, limit))
-        : movie;
+      if (movie.hasFragments === true) {
+        const sparse = await readSparseFragmentTimingBoxes(ra, undefined, undefined);
+        if (sparse !== undefined) return applyFragmentTiming(movie, sparse);
+        return applyFragmentTiming(movie, await readWholeFile(ra, limit));
+      }
+      return movie;
     }
     offset += size;
   }
@@ -1524,10 +1535,24 @@ export async function readMoviePacketInfo(ra: RandomAccess): Promise<Movie> {
 }
 
 /** The full source bytes (fragments can follow `moov`); the size is known once we have reached `moov`. */
-async function readWholeFile(ra: RandomAccess, limit: number): Promise<Uint8Array> {
+async function readWholeFile(
+  ra: RandomAccess,
+  limit: number,
+  budgetBytes: number = WHOLE_FILE_PROBE_BUDGET_BYTES,
+): Promise<Uint8Array> {
   const size = ra.size ?? limit;
   if (!Number.isFinite(size))
     throw new MediaError('demux-error', 'fragmented MP4 needs a known size');
+  if (size > budgetBytes) {
+    // 1.1.8/1.1.9: a RandomAccess that already holds the whole file in memory (bytes/file sources) may
+    // return a zero-copy view without allocating, so even a large in-memory source stays bounded.
+    const retained = coveredByteView(ra.cachedWhole?.(), 0, size);
+    if (retained !== undefined) return retained;
+    throw new MediaError(
+      'resource-exhaustion',
+      `full-file read of ${size} bytes exceeds ${budgetBytes} byte budget (fragmented MP4 for 10 GiB must be range-backed with sparse fragment parsing)`,
+    );
+  }
   const retained = coveredByteView(ra.cachedWhole?.(), 0, size);
   if (retained !== undefined) return retained;
   return ra.read(0, size);
@@ -1783,7 +1808,9 @@ async function readMovieAndMediaDataRanges(
     movie.hasFragments === true ||
     movie.tracks.some((track) => track.samples.sampleSizes.length === 0)
   ) {
-    movie = applyFragmentTiming(movie, await readWholeFile(ra, sourceSize));
+    const sparse = await readSparseFragmentTimingBoxes(ra, undefined, undefined);
+    if (sparse !== undefined) movie = applyFragmentTiming(movie, sparse);
+    else movie = applyFragmentTiming(movie, await readWholeFile(ra, sourceSize));
   }
   return { movie, mediaDataRanges: ranges };
 }
@@ -2056,7 +2083,11 @@ async function buildFragmentSampleDataMap(
   ra: RandomAccess,
 ): Promise<Map<number, SampleData[]> | undefined> {
   if (!movieIsFragmented(movie)) return undefined;
-  const file = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+  const file = await readWholeFile(
+    ra,
+    ra.size ?? Number.MAX_SAFE_INTEGER,
+    WHOLE_FILE_REMUX_BUDGET_BYTES,
+  );
   const fragmentsByTrack = parseFragmentSamples(file);
   const out = new Map<number, SampleData[]>();
   for (const track of movie.tracks) {
@@ -3591,8 +3622,7 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
   const sampleRate = track.sampleRate;
   const scale = sampleRate / track.timescale;
   const durationTicks =
-    (track.moovMediaTicks ??
-      timeToSampleMediaTicks(track.samples.timeToSample)) +
+    (track.moovMediaTicks ?? timeToSampleMediaTicks(track.samples.timeToSample)) +
     (track.fragmentMediaTicks ?? 0);
   const codedSamples =
     durationTicks > 0
@@ -3944,7 +3974,11 @@ async function buildFragmentSampleMap(
   ra: RandomAccess,
 ): Promise<Map<number, Sample[]> | undefined> {
   if (!movieIsFragmented(movie)) return undefined;
-  const file = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+  const file = await readWholeFile(
+    ra,
+    ra.size ?? Number.MAX_SAFE_INTEGER,
+    WHOLE_FILE_REMUX_BUDGET_BYTES,
+  );
   const byTrack = parseFragmentSamples(file);
   const out = new Map<number, Sample[]>();
   for (const track of movie.tracks) {
@@ -5342,6 +5376,19 @@ export const Mp4Driver: ContainerDriver = {
         : {}),
     });
     const movie = await readMovie(ra);
+    if (
+      (movie.otherTracks?.length ?? 0) > 0 &&
+      (o?.container === undefined ||
+        o.container === 'mp4' ||
+        o.container === 'mov' ||
+        o.container === 'qt') &&
+      movie.otherTracks!.some((track) => (track.sampleCount ?? 0) > 0)
+    ) {
+      throw new CapabilityError(
+        `mp4 remux cannot preserve generic data/other track '${movie.otherTracks!.find((t) => (t.sampleCount ?? 0) > 0)?.handler ?? ''}' in ISO BMFF output`,
+        { op: { kind: 'route', id: 'mp4-other-track' }, tried: ['mp4'] },
+      );
+    }
     if (o?.faststart === 'reserve') {
       if (o.streaming !== true) {
         throw new CapabilityError(
@@ -5380,9 +5427,9 @@ export const Mp4Driver: ContainerDriver = {
           ? null
           : trimDecodeValidationCacheBase(src, ra);
     if (shouldLoadCompatibleMovToMp4Rewrite(movie, o)) {
-      const { materializeCompatibleMovToMp4Bytes } = await import('./compatible-mov-rewrite.ts');
-      const compatibleBrandRewrite = await materializeCompatibleMovToMp4Bytes(src, ra, movie, o);
-      if (compatibleBrandRewrite !== undefined) return oneShot(compatibleBrandRewrite);
+      const { streamCompatibleMovToMp4 } = await import('./compatible-mov-rewrite.ts');
+      const compatibleBrandStream = await streamCompatibleMovToMp4(ra, movie, o);
+      if (compatibleBrandStream !== undefined) return compatibleBrandStream;
     }
     if (o?.fragmented === true && trim === undefined) {
       return fragmentedSourceStream(ra, movie, o, await buildFragmentSampleDataMap(movie, ra));
@@ -5438,7 +5485,9 @@ export const Mp4Driver: ContainerDriver = {
     // input (a re-mux would only be decode-equal, and needlessly copies every sample + rewrites `moov`).
     // The CENC module load, sample materialization, and re-mux below are all skipped when unprotected.
     if (!movie.tracks.some((t) => t.encryption !== undefined)) {
-      return oneShot(await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
+      return oneShot(
+        await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
+      );
     }
     const cenc = await loadCencModule();
     // Fragmented/CMAF protected files carry sample-encryption metadata in `moof`/`traf`, not the (empty)
@@ -5449,7 +5498,11 @@ export const Mp4Driver: ContainerDriver = {
     if (
       movie.tracks.some((t) => t.encryption !== undefined && t.samples.sampleSizes.length === 0)
     ) {
-      const fileBytes = await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER);
+      const fileBytes = await readWholeFile(
+        ra,
+        ra.size ?? Number.MAX_SAFE_INTEGER,
+        WHOLE_FILE_REMUX_BUDGET_BYTES,
+      );
       const decrypted = await cenc.decryptCencFile(fileBytes, {
         scheme: o.scheme,
         keys: o.keys,

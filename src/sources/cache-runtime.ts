@@ -5,6 +5,7 @@
  * whole-object machinery below loads only when a caller actually asks the wrapper to cache a range.
  */
 
+import { MediaError } from '../contracts/errors.ts';
 import { raceAbort, throwIfSourceAborted } from './abort.ts';
 import type { ByteRange, CachingSource } from './cache.ts';
 import { drainStream } from './read-all.ts';
@@ -29,6 +30,8 @@ export interface RangeCacheRuntime extends CachingSource {
     signal: AbortSignal,
     started: StartedCacheRead,
   ): Promise<Uint8Array>;
+  /** Advertised queue/byte limits for backpressure (REQUIREMENTS §7.3). */
+  readonly limits: { readonly maxBytes: number; readonly maxQueuedWindows: number };
 }
 
 export function createRangeCache(
@@ -83,6 +86,10 @@ class RangeCache implements RangeCacheRuntime {
     if (src.size !== undefined) this.size = src.size;
     if (src.mimeHint !== undefined) this.mimeHint = src.mimeHint;
     if (src.filename !== undefined) this.filename = src.filename;
+  }
+
+  get limits(): { readonly maxBytes: number; readonly maxQueuedWindows: number } {
+    return { maxBytes: this.#maxBytes, maxQueuedWindows: 8 };
   }
 
   get cachedBytes(): number {
@@ -195,7 +202,7 @@ class RangeCache implements RangeCacheRuntime {
     if (started?.kind === 'full-range') return started.load;
     if (started?.kind === 'full-stream') return drainStream(started.stream, signal);
     if (this.#src.range && this.size !== undefined) {
-      return this.#src.range(0, this.size, signal);
+      return this.#readExactWindow(0, this.size, signal);
     }
     return drainStream(this.#src.stream(), signal);
   }
@@ -207,15 +214,125 @@ class RangeCache implements RangeCacheRuntime {
     signal?: AbortSignal,
     preloaded?: Promise<Uint8Array>,
   ): Promise<Uint8Array> {
-    if (preloaded !== undefined) return raceAbort(preloaded, signal);
+    if (preloaded !== undefined) {
+      return raceAbort(this.#readExactWindow(lo, hi, signal, preloaded), signal);
+    }
     const key = `${lo}:${hi}`;
-    const range = this.#src.range as NonNullable<Source['range']>;
-    if (signal !== undefined) return raceAbort(range.call(this.#src, lo, hi, signal), signal);
+    if (signal !== undefined) {
+      return raceAbort(this.#readExactWindow(lo, hi, signal), signal);
+    }
     const existing = this.#inflight.get(key);
     if (existing) return existing;
-    const load = range.call(this.#src, lo, hi).finally(() => this.#inflight.delete(key));
+    const load = this.#readExactWindow(lo, hi, undefined).finally(() => this.#inflight.delete(key));
     this.#inflight.set(key, load);
     return load;
+  }
+
+  async #readExactWindow(
+    lo: number,
+    hi: number,
+    signal?: AbortSignal,
+    preloaded?: Promise<Uint8Array>,
+  ): Promise<Uint8Array> {
+    const range = this.#src.range as NonNullable<Source['range']>;
+    const expected = hi - lo;
+    // Preloaded covers the first chunk when the facade already started this exact window.
+    if (preloaded !== undefined) {
+      const first = await preloaded;
+      throwIfSourceAborted(signal);
+      if (first.byteLength === expected) return first;
+      if (first.byteLength === 0 || first.byteLength > expected) {
+        throw new MediaError(
+          'demux-error',
+          `range cache window [${lo}, ${hi}) short read: got ${first.byteLength} of ${expected} bytes`,
+        );
+      }
+      const chunks: Uint8Array[] = [first];
+      let offset = lo + first.byteLength;
+      let remaining = expected - first.byteLength;
+      while (remaining > 0) {
+        const chunk = await range.call(this.#src, offset, offset + remaining, signal);
+        throwIfSourceAborted(signal);
+        if (chunk.byteLength === 0) break;
+        chunks.push(chunk);
+        offset += chunk.byteLength;
+        remaining -= chunk.byteLength;
+      }
+      if (remaining !== 0) {
+        // If size is known, a short read is a transport error; if unknown, it signals EOF.
+        if (this.size !== undefined) {
+          throw new MediaError(
+            'demux-error',
+            `range cache window [${lo}, ${hi}) short read: got ${expected - remaining} of ${expected} bytes`,
+          );
+        }
+        const collected = expected - remaining;
+        if (collected === 0) {
+          throw new MediaError(
+            'demux-error',
+            `range cache window [${lo}, ${hi}) short read: got 0 of ${expected} bytes`,
+          );
+        }
+        this.size = lo + collected;
+        const out = new Uint8Array(collected);
+        let at = 0;
+        for (const c of chunks) {
+          out.set(c, at);
+          at += c.byteLength;
+        }
+        return out;
+      }
+      if (chunks.length === 1) return chunks[0] as Uint8Array;
+      const out = new Uint8Array(expected);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.byteLength;
+      }
+      return out;
+    }
+    const chunks: Uint8Array[] = [];
+    let offset = lo;
+    let remaining = expected;
+    while (remaining > 0) {
+      const chunk = await range.call(this.#src, offset, offset + remaining, signal);
+      throwIfSourceAborted(signal);
+      if (chunk.byteLength === 0) break;
+      chunks.push(chunk);
+      offset += chunk.byteLength;
+      remaining -= chunk.byteLength;
+    }
+    if (remaining !== 0) {
+      if (this.size !== undefined) {
+        throw new MediaError(
+          'demux-error',
+          `range cache window [${lo}, ${hi}) short read: got ${expected - remaining} of ${expected} bytes`,
+        );
+      }
+      const collected = expected - remaining;
+      if (collected === 0) {
+        throw new MediaError(
+          'demux-error',
+          `range cache window [${lo}, ${hi}) short read: got 0 of ${expected} bytes`,
+        );
+      }
+      this.size = lo + collected;
+      const out = new Uint8Array(collected);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.byteLength;
+      }
+      return out;
+    }
+    if (chunks.length === 1) return chunks[0] as Uint8Array;
+    const out = new Uint8Array(expected);
+    let at = 0;
+    for (const c of chunks) {
+      out.set(c, at);
+      at += c.byteLength;
+    }
+    return out;
   }
 
   /** Return `[lo, hi)` from a single covering cached interval, or `undefined` if not fully covered. */
@@ -247,6 +364,26 @@ class RangeCache implements RangeCacheRuntime {
    */
   #insert(start: number, end: number, bytes: Uint8Array): void {
     if (end <= start || this.#maxBytes === 0 || bytes.byteLength > this.#maxBytes) return;
+    // Integrity check: overlapping ranges must be byte-identical, otherwise the range
+    // server returned inconsistent data (validator changed) and we must not silently
+    // assemble a corrupt file (REQUIREMENTS §5.1).
+    for (const interval of this.#intervals) {
+      const overlapStart = Math.max(start, interval.start);
+      const overlapEnd = Math.min(end, interval.end);
+      if (overlapStart < overlapEnd) {
+        const aOffset = overlapStart - start;
+        const bOffset = overlapStart - interval.start;
+        const len = overlapEnd - overlapStart;
+        for (let i = 0; i < len; i++) {
+          if (bytes[aOffset + i] !== interval.bytes[bOffset + i]) {
+            throw new MediaError(
+              'integrity-error',
+              `range cache integrity error: overlapping bytes differ at ${overlapStart + i}`,
+            );
+          }
+        }
+      }
+    }
     const incoming: Interval = {
       start,
       end,

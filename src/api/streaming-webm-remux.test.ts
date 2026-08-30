@@ -874,6 +874,7 @@ describe('remuxViaStreamingWebm', () => {
 
   it('surfaces packet-info range short reads and still closes the demuxer once', async () => {
     const restore = installChunkConstructors();
+    let calls = 0;
     const rangedSource: Source = {
       __media: 'source',
       kind: 'bytes',
@@ -881,7 +882,10 @@ describe('remuxViaStreamingWebm', () => {
       stream(): ReadableStream<Uint8Array> {
         throw new Error('packet-info short-read path must not stream the full source');
       },
-      range: vi.fn(async () => Uint8Array.from([1, 2])),
+      range: vi.fn(async () => {
+        calls++;
+        return calls === 1 ? Uint8Array.from([1, 2]) : new Uint8Array(0);
+      }),
     };
     const track: TrackInfo = {
       id: 11,
@@ -1098,6 +1102,213 @@ describe('remuxViaStreamingWebm', () => {
       expect(reader.cancel).toHaveBeenCalledWith(packetError);
       expect(reader.releaseLock).toHaveBeenCalledTimes(1);
       expect(demuxer.close).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('tolerates short range reads via 1-byte chunking and still remuxes packet-info windows', async () => {
+    const restore = installChunkConstructors();
+    const mediaBytes = Uint8Array.from([10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    const chunkSize = 1;
+    const rangedSource: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: mediaBytes.byteLength,
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('chunked packet-info remux must not stream the full source');
+      },
+      range: vi.fn(async (start: number, end: number): Promise<Uint8Array> => {
+        const remaining = end - start;
+        const take = Math.min(chunkSize, remaining, mediaBytes.byteLength - start);
+        return mediaBytes.subarray(start, start + take);
+      }),
+    };
+    const track: TrackInfo = {
+      id: 25,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      durationSec: 0.099,
+      config: { codec: 'vp09.00.10.08', codedWidth: 2, codedHeight: 2 },
+    };
+    const table: PacketInfoTable = {
+      tracks: [track],
+      packets: [
+        {
+          trackIndex: 0,
+          offset: 0,
+          size: 3,
+          ptsUs: 0,
+          dtsUs: 0,
+          durationUs: 33_000,
+          keyframe: true,
+        },
+        {
+          trackIndex: 0,
+          offset: 3,
+          size: 4,
+          ptsUs: 33_000,
+          dtsUs: 33_000,
+          durationUs: 33_000,
+          keyframe: false,
+        },
+        {
+          trackIndex: 0,
+          offset: 7,
+          size: 4,
+          ptsUs: 66_000,
+          dtsUs: 66_000,
+          durationUs: 33_000,
+          keyframe: true,
+        },
+      ],
+    };
+    const container = containerWithPacketInfo(table);
+    try {
+      const stream = await remuxViaStreamingWebm(container, rangedSource, { to: 'mkv' }, {});
+      const bytes = await collect(stream);
+      expect(parseWebm(bytes).tracks[0]?.codec).toBe('vp9');
+      // Window covering 0..11 must have been assembled from 11 one-byte range calls
+      expect(rangedSource.range).toHaveBeenCalled();
+      const calls = (rangedSource.range as ReturnType<typeof vi.fn>).mock.calls as Array<
+        [number, number]
+      >;
+      const totalFetched = calls.reduce((sum, [s, e]) => sum + (e - s), 0);
+      expect(totalFetched).toBeGreaterThanOrEqual(mediaBytes.byteLength);
+      expect(container.packetInfo).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('fails deterministically on zero-length range reads and malformed windows under randomized chunking', async () => {
+    const restore = installChunkConstructors();
+    const malformedTrack: TrackInfo = {
+      id: 26,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      config: { codec: 'vp09.00.10.08', codedWidth: 2, codedHeight: 2 },
+    };
+    // Zero-length read then truncated: range returns 0 bytes immediately
+    const zeroSource: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: 4,
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('zero-read path must not stream');
+      },
+      range: vi.fn(async () => new Uint8Array(0)),
+    };
+    const table: PacketInfoTable = {
+      tracks: [malformedTrack],
+      packets: [
+        {
+          trackIndex: 0,
+          offset: 0,
+          size: 4,
+          ptsUs: 0,
+          dtsUs: 0,
+          durationUs: 33_000,
+          keyframe: true,
+        },
+      ],
+    };
+    const demuxer: PacketInfoDemuxer = {
+      tracks: [malformedTrack],
+      packetInfoTable: () => table.packets,
+      packets: vi.fn(() => {
+        throw new Error('must not open packets');
+      }),
+      close: vi.fn(async () => undefined),
+    };
+    try {
+      const stream = await remuxViaStreamingWebm(
+        containerWith(demuxer),
+        zeroSource,
+        { to: 'mkv' },
+        {},
+      );
+      await expect(collect(stream)).rejects.toThrow('short read');
+    } finally {
+      restore();
+    }
+  });
+
+  it('produces bitexact output under randomized 1B–1KiB chunking vs whole-window read', async () => {
+    const restore = installChunkConstructors();
+    const mediaBytes = Uint8Array.from({ length: 256 }, (_, i) => i & 0xff);
+    const wholeSource: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: mediaBytes.byteLength,
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('no stream');
+      },
+      range: vi.fn(async (s: number, e: number) => mediaBytes.subarray(s, e)),
+    };
+    const track: TrackInfo = {
+      id: 27,
+      mediaType: 'video',
+      codec: 'vp09.00.10.08',
+      config: { codec: 'vp09.00.10.08', codedWidth: 4, codedHeight: 4 },
+    };
+    const table: PacketInfoTable = {
+      tracks: [track],
+      packets: [
+        {
+          trackIndex: 0,
+          offset: 10,
+          size: 20,
+          ptsUs: 0,
+          dtsUs: 0,
+          durationUs: 33_000,
+          keyframe: true,
+        },
+        {
+          trackIndex: 0,
+          offset: 40,
+          size: 30,
+          ptsUs: 33_000,
+          dtsUs: 33_000,
+          durationUs: 33_000,
+          keyframe: false,
+        },
+      ],
+    };
+    const jitterSource: Source = {
+      __media: 'source',
+      kind: 'bytes',
+      size: mediaBytes.byteLength,
+      stream(): ReadableStream<Uint8Array> {
+        throw new Error('no stream');
+      },
+      range: vi.fn(async (s: number, e: number) => {
+        // deterministic jitter: return at most 37 bytes per call to simulate 1B–1KiB chunking
+        const take = Math.min(37, e - s);
+        return mediaBytes.subarray(s, s + take);
+      }),
+    };
+    try {
+      const [wholeBytes, jitterBytes] = await Promise.all([
+        collect(
+          await remuxViaStreamingWebm(
+            containerWithPacketInfo(table),
+            wholeSource,
+            { to: 'mkv' },
+            {},
+          ),
+        ),
+        collect(
+          await remuxViaStreamingWebm(
+            containerWithPacketInfo(table),
+            jitterSource,
+            { to: 'mkv' },
+            {},
+          ),
+        ),
+      ]);
+      expect(jitterBytes.byteLength).toBe(wholeBytes.byteLength);
+      expect(Buffer.from(jitterBytes).equals(Buffer.from(wholeBytes))).toBe(true);
     } finally {
       restore();
     }

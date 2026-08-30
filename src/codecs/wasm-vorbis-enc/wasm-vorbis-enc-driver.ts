@@ -124,7 +124,7 @@ function asAudioData(frame: RawFrame): AudioData {
   );
 }
 
-function audioDataToInterleaved(data: AudioData, init: VorbisEncoderInit): Float32Array {
+export function audioDataToInterleaved(data: AudioData, init: VorbisEncoderInit): Float32Array {
   if (data.sampleRate !== init.sampleRate) {
     throw new MediaError(
       'encode-error',
@@ -138,13 +138,25 @@ function audioDataToInterleaved(data: AudioData, init: VorbisEncoderInit): Float
     );
   }
   const frames = data.numberOfFrames;
-  const planes: Float32Array[] = [];
-  for (let c = 0; c < init.channels; c++) {
-    const plane = new Float32Array(frames);
-    data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-    planes.push(plane);
+  const channels = init.channels;
+  // Use the single `f32` interleaved copy which every WebCodecs AudioData must support
+  // regardless of its internal storage format. WebKit rejects per-plane `f32-planar`
+  // copies for interleaved sources, and some WebKit planar sources have been observed
+  // to return channel-swapped planes via the planar path; the interleaved path keeps
+  // Chromium and WebKit bit-exact without fixture-specific branching.
+  try {
+    const interleaved = new Float32Array(frames * channels);
+    data.copyTo(interleaved, { format: 'f32' } as AudioDataCopyToOptions);
+    return interleaved;
+  } catch {
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+      planes.push(plane);
+    }
+    return interleaveF32(planes, frames);
   }
-  return interleaveF32(planes, frames);
 }
 
 function publishConfig(

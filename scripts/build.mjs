@@ -206,4 +206,31 @@ await emitDeclarations();
 await rewriteDeclarationSpecifiers();
 await writeDeclarationEntries();
 
+// Co-vendor WASM tails so a single `bun run build` emits a complete dist/ including same-origin
+// `*_wasm_bg.wasm` assets. esbuild does not copy `new URL('./...wasm', import.meta.url)` assets, so
+// without this the check-budget WASM assertion would fail and browsers would 404 on codec miss paths.
+// This mirrors `scripts/vendor-wasm.ts` discover+copy but runs inline to close the esbuild gap (todo 0.6).
+await (async function vendorWasmIntoDist() {
+  const { readdir: readdirFs } = await import('node:fs/promises');
+  const { join: joinPath } = await import('node:path');
+  const codecsDir = join(ROOT, 'src/codecs');
+  const entries = await readdirFs(codecsDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('wasm-')) continue;
+    const dir = joinPath(codecsDir, entry.name);
+    const files = await readdirFs(dir).catch(() => []);
+    const wasmName = files.find((f) => f.endsWith('_wasm_bg.wasm'));
+    const glueName = files.find((f) => f.endsWith('-core.js'));
+    // Self-contained tails have glue+carrier but NO external wasm; any tail with an external
+    // `*_wasm_bg.wasm` must be co-vendored regardless of whether it also ships a helper carrier
+    // (wasm-av1 has dav1d-wasm.js alongside dav1d_wasm_bg.wasm). Only skip when wasm is absent.
+    if (wasmName && glueName) {
+      const wasmBytes = await readFile(joinPath(dir, wasmName));
+      const glueBytes = await readFile(joinPath(dir, glueName));
+      await writeFile(joinPath(DIST, wasmName), wasmBytes);
+      await writeFile(joinPath(DIST, glueName), glueBytes);
+    }
+  }
+})();
+
 console.log('Built ESM bundles with esbuild and declarations with TypeScript 7.');

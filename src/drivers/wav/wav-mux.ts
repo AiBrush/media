@@ -1,6 +1,7 @@
 import type { MuxOptions, Muxer, Packet, TrackInfo } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
 import { bytesPerSample, decodePcm } from '../../dsp/pcm.ts';
+import { zeroCopySubarray } from '../../util/zero-copy.ts';
 import {
   type WavMuxTrackConfig,
   assertAudioMuxOptions,
@@ -102,7 +103,11 @@ export class WavMuxer implements Muxer {
     if (frameBytes <= 0 || chunk.data.byteLength % frameBytes !== 0) {
       throw new MediaError('mux-error', 'WAV mux packet does not contain whole PCM sample frames');
     }
-    track.chunks.push(chunk.data.slice());
+    // Zero-copy: keep a view sharing the source ArrayBuffer when the chunk is already a
+    // Uint8Array view (the common path from `copyChunkBytes` and `writePcm`). This avoids an
+    // extra `slice()` copy per packet and keeps the WAV mux within the bounded-memory budget
+    // (REQUIREMENTS §8.4) for long, many-packet trims.
+    track.chunks.push(zeroCopySubarray(chunk.data, 0, chunk.data.byteLength));
     track.audioBytes += chunk.data.byteLength;
   }
 

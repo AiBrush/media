@@ -86,3 +86,12 @@ function exhaustiveProfile(kind: never): never {
     tried: [kind as WasmRuntimeProfileKind],
   });
 }
+
+/**
+ * The `Request` a codec uses to fetch its WASM bytes. Codec-scoped, lazily created, and cacheable
+ * via the HTTP cache (`cache: 'force-cache'` once the browser has it) without a separate CDN.
+ * Threaded vs baseline share the same URL (single vendored asset), so the cache is not duplicated.
+ */
+export function wasmAssetRequest(url: URL): Request {
+  return new Request(url.href, { cache: 'force-cache' } as RequestInit);
+}

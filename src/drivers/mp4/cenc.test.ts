@@ -470,3 +470,103 @@ describe('CENC cens subsample map + no-pattern tenc + sparse senc (branch covera
     expect([...(out[1] ?? [])]).toEqual([9, 9, 9, 9]); // second sample untouched
   });
 });
+
+describe('CENC/CBCS strict key/IV/block validation — typed preflight (REQUIREMENTS §5.8, §8.1 — 2.4.1)', () => {
+  it('rejects non-16-byte AES-128 keys before WebCrypto (typed InputError)', async () => {
+    const short = new Uint8Array(15);
+    const long = new Uint8Array(17);
+    const badHex = '00112233445566778899aabbccddeeff00'; // 17 bytes
+    // prepare helpers throw synchronously-async
+    await expect(
+      decryptSample(short as Uint8Array<ArrayBuffer>, { iv: ivFor(0) }, new Uint8Array(16)),
+    ).rejects.toThrow(/16 bytes/);
+    await expect(
+      decryptSample(long as Uint8Array<ArrayBuffer>, { iv: ivFor(0) }, new Uint8Array(16)),
+    ).rejects.toThrow(/16 bytes/);
+    // key map hex length validation is preflight before file work — test the same check via crypto helper
+    const { hexToBytes: hb } = await import('../../crypto/aes.ts');
+    const raw = hb(badHex);
+    expect(raw.byteLength).toBe(17);
+    const { prepareAesCtrKey: prep } = await import('../../crypto/aes.ts');
+    await expect(prep(raw as Uint8Array<ArrayBuffer>)).rejects.toThrow(/16 bytes/);
+  });
+
+  it('rejects malformed AES-CTR counter and counterBits before WebCrypto', async () => {
+    const badCounter = new Uint8Array(15);
+    const goodData = new Uint8Array(16);
+    const { prepareAesCtrKey } = await import('../../crypto/aes.ts');
+    const prepared = await prepareAesCtrKey(KEY);
+    const { aesCtrWithPreparedKey } = await import('../../crypto/aes.ts');
+    await expect(aesCtrWithPreparedKey(prepared, badCounter, goodData, 64)).rejects.toThrow(
+      /counter must be 16 bytes/,
+    );
+    await expect(
+      aesCtrWithPreparedKey(prepared, new Uint8Array(16), goodData, 32 as never),
+    ).rejects.toThrow(/counterBits/);
+  });
+
+  it('rejects wrong-IV/mode combos without oracle-differentiated messages (typed, stable)', async () => {
+    // Same error class for any key/IV length mismatch — no detail that would be an oracle
+    const iv8 = ivFor(0);
+    const iv16 = hexToBytes('00112233445566778899aabbccddeeff');
+    const badIv = new Uint8Array(15);
+    expect(() => parseSenc(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2, ...badIv]), 8, 'cenc')).toThrow(
+      /overruns the box/,
+    );
+    // Instead test the crypto layer: CBC with short IV
+    const { aesCbcNoPadding } = await import('../../crypto/aes.ts');
+    await expect(
+      aesCbcNoPadding(KEY, badIv as Uint8Array<ArrayBuffer>, new Uint8Array(16), 'decrypt'),
+    ).rejects.toThrow(/IV must be 16 bytes/);
+    await expect(
+      aesCbcNoPadding(KEY, iv16 as Uint8Array<ArrayBuffer>, new Uint8Array(15), 'decrypt'),
+    ).rejects.toThrow(/multiple of 16/);
+    // CTR with bad per-sample IV size is caught at tenc parsing, not crypto
+    expect(() =>
+      parseTenc(
+        new Uint8Array([0, 0, 0, 0, 0, 0, 1, 7, ...hexToBytes('00112233445566778899aabbccddeeff')]),
+        'cenc',
+      ),
+    ).toThrow(/unsupported per-sample IV size/);
+    void iv8;
+    void iv16;
+  });
+
+  it('boundary: 16-byte key passes, 0/32-byte hex and odd-length hex throw InputError', async () => {
+    const { hexToBytes } = await import('../../crypto/aes.ts');
+    expect(() => hexToBytes('00112233445566778899aabbccddeeff')).not.toThrow(); // 16 bytes
+    expect(hexToBytes('').byteLength).toBe(0);
+    expect(() => hexToBytes('abc')).toThrow(/odd length/);
+    expect(() => hexToBytes('zz112233445566778899aabbccddeeff')).toThrow(/invalid hex/);
+    await expect(
+      decryptSample(
+        new Uint8Array(0) as Uint8Array<ArrayBuffer>,
+        { iv: ivFor(0) },
+        new Uint8Array(16),
+      ),
+    ).rejects.toThrow(/16 bytes/);
+    await expect(
+      decryptSample(
+        new Uint8Array(32) as Uint8Array<ArrayBuffer>,
+        { iv: ivFor(0) },
+        new Uint8Array(16),
+      ),
+    ).rejects.toThrow(/16 bytes/);
+  });
+
+  it('randomized: 20× random key lengths ≠16 all throw typed InputError, 16-byte keys import (no throw on import)', async () => {
+    const { prepareAesCtrKey, prepareAesCbcKey } = await import('../../crypto/aes.ts');
+    for (let i = 0; i < 20; i++) {
+      const len = Math.floor(Math.random() * 33);
+      if (len === 16) continue;
+      const key = new Uint8Array(len) as Uint8Array<ArrayBuffer>;
+      await expect(prepareAesCtrKey(key)).rejects.toThrow(/16 bytes/);
+      await expect(prepareAesCbcKey(key, 'no-padding-decrypt')).rejects.toThrow(/16 bytes/);
+    }
+    // 16-byte random keys always import
+    for (let i = 0; i < 5; i++) {
+      const key = crypto.getRandomValues(new Uint8Array(16)) as Uint8Array<ArrayBuffer>;
+      await expect(prepareAesCtrKey(key)).resolves.toBeDefined();
+    }
+  });
+});

@@ -225,15 +225,6 @@ const H264_DEFAULT_FPS = 30;
 const H264_TOP_LEVEL_IDC = 0x3e;
 
 /**
- * Browser-interoperability floor for H.264 *encode* codec strings. Ultra-low legal levels (L1.0–L1.3)
- * are enough for tiny 320×180/1×1 streams on paper, but Chromium 149 accepted such WebCodecs encodes
- * and then failed to seek-decode the resulting MP4 through `<video>`. L3.0 is the common SD floor used
- * by browser-oriented encoders; it is still a truthful upper-bound for smaller streams and avoids the
- * low-level platform seek failure without inflating larger outputs.
- */
-const H264_BROWSER_PLAYBACK_MIN_LEVEL_IDC = 0x1e;
-
-/**
  * The MINIMUM H.264 `level_idc` byte that can encode `width`×`height` at `fps` — the smallest Annex-A
  * level whose MaxFS covers the frame's macroblock count AND whose MaxMBPS covers macroblocks/second
  * (fps defaults to {@link H264_DEFAULT_FPS} when unknown). Falls back to the top level (6.2) for an
@@ -256,12 +247,9 @@ export function h264LevelIdcForDimensions(
   return H264_TOP_LEVEL_IDC; // over-spec resolution; the encoder probe makes the final call
 }
 
-/** The browser-facing encode level byte: the Annex-A minimum floored at L3.0 (two-hex, upper-case). */
+/** The Annex-A minimum level byte as two-hex, upper-case (spec-correct, no browser floor). */
 function h264EncodeLevelHex(width: number, height: number, fps: number | undefined): string {
-  const idc = Math.max(
-    H264_BROWSER_PLAYBACK_MIN_LEVEL_IDC,
-    h264LevelIdcForDimensions(width, height, fps),
-  );
+  const idc = h264LevelIdcForDimensions(width, height, fps);
   return idc.toString(16).toUpperCase().padStart(2, '0');
 }
 
@@ -296,7 +284,9 @@ function h264CodecStringForSourceProfile(
   const profile = /^(?:avc1|avc3)\.([0-9a-f]{2})/i
     .exec(sourceCodecString ?? '')?.[1]
     ?.toUpperCase();
-  const profileAndCompatibility = profile === '64' ? '6400' : profile === '4D' ? '4D00' : '42E0';
+  // High10 (0x6E) down-converted to 8-bit preserves High tools (CABAC, 8×8) → High, not Baseline.
+  const profileAndCompatibility =
+    profile === '64' || profile === '6E' ? '6400' : profile === '4D' ? '4D00' : '42E0';
   return `avc1.${profileAndCompatibility}${h264EncodeLevelHex(width, height, fps)}`;
 }
 

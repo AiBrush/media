@@ -185,13 +185,28 @@ function asAudioData(frame: RawFrame): AudioData {
 function audioDataToPlanarF32(data: AudioData): Float32Array[] {
   const channels = data.numberOfChannels;
   const frames = data.numberOfFrames;
-  const planes: Float32Array[] = [];
-  for (let c = 0; c < channels; c++) {
-    const plane = new Float32Array(frames);
-    if (frames > 0) data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-    planes.push(plane);
+  if (frames === 0) return Array.from({ length: channels }, () => new Float32Array(0));
+  // Prefer the single interleaved `f32` copy which every WebCodecs AudioData must support;
+  // WebKit rejects per-plane `f32-planar` for interleaved sources.
+  try {
+    const interleaved = new Float32Array(frames * channels);
+    data.copyTo(interleaved, { format: 'f32' } as AudioDataCopyToOptions);
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      for (let i = 0; i < frames; i++) plane[i] = interleaved[i * channels + c] as number;
+      planes.push(plane);
+    }
+    return planes;
+  } catch {
+    const planes: Float32Array[] = [];
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames);
+      data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+      planes.push(plane);
+    }
+    return planes;
   }
-  return planes;
 }
 
 /** Microseconds for a sample offset at a sample rate (WebCodecs timestamps are µs). */

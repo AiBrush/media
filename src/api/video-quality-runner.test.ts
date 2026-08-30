@@ -802,7 +802,7 @@ describe('replay-backed H.264 quality candidate runner', () => {
     expect(candidate.qualityMean).toBeGreaterThanOrEqual(0.98);
     expect(candidate.averageBitrate).toBeLessThanOrEqual(300_000);
     expect(candidate.chunks).toHaveLength(FRAME_COUNT);
-    expect(candidate.track.config).toMatchObject({ codec: 'avc1.42E01E' });
+    expect(candidate.track.config).toMatchObject({ codec: 'avc1.42E00A' });
     expect(runtime.state).toMatchObject({
       demuxOpened: 7,
       demuxClosed: 7,

@@ -77,4 +77,59 @@ describe('box headers', () => {
       flags: 5,
     });
   });
+
+  it('rejects 64-bit largesize beyond safe integer and below header size', () => {
+    const tooSmall = new Uint8Array([0, 0, 0, 1, ...ascii('mdat'), 0, 0, 0, 0, 0, 0, 0, 8]);
+    expect(() => readBoxHeader(new Reader(tooSmall))).toThrow(/largesize/);
+    const overflow = new Uint8Array([0, 0, 0, 1, ...ascii('mdat'), 0x00, 0x20, 0, 0, 0, 0, 0, 0]);
+    // 0x0020000000000000 = 2^53+1 > MAX_SAFE_INTEGER
+    expect(() => readBoxHeader(new Reader(overflow))).toThrow(/largesize/);
+    const maxSafe = new Uint8Array([
+      0,
+      0,
+      0,
+      1,
+      ...ascii('mdat'),
+      0,
+      0,
+      0x1f,
+      0xff,
+      0xff,
+      0xff,
+      0xff,
+      0xff,
+    ]);
+    // 0x001FFFFFFFFFFFFF = MAX_SAFE_INTEGER (9007199254740991) — must not throw at header parse level
+    expect(() => readBoxHeader(new Reader(maxSafe))).not.toThrow();
+  });
+
+  it('parses u64BigInt exactly beyond 32-bit and randomized largesize stays within safe range', () => {
+    const r = new Reader(new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02]));
+    expect(r.u64BigInt()).toBe(0x0000000100000002n);
+    // 20× randomized valid largesize headers [16, 1MiB] all parse and round-trip
+    for (let i = 0; i < 20; i++) {
+      const size = 16 + ((i * 1234567) % (1 << 20));
+      const bytes = new Uint8Array([
+        0,
+        0,
+        0,
+        1,
+        ...ascii('free'),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        (size >>> 8) & 0xff,
+        size & 0xff,
+      ]);
+      // patch big-endian correctly for sizes < 64k in this loop
+      const view = new DataView(bytes.buffer);
+      view.setBigUint64(8, BigInt(size));
+      const h = readBoxHeader(new Reader(bytes));
+      expect(h.size).toBe(size);
+      expect(h.headerSize).toBe(16);
+    }
+  });
 });

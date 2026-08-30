@@ -6,6 +6,7 @@
  * PCM sound-description fourccs → engine PCM tokens (ADR-185, docs/notes/qtff-mov-parsing.md).
  */
 
+import { MediaError } from '../../contracts/errors.ts';
 import { Reader, readFullBoxHeader } from './reader.ts';
 
 function hex2(n: number): string {
@@ -33,6 +34,9 @@ function reverseBits32(x: number): number {
  * level-idc, then the general_constraint_indicator bytes as hex with trailing zero bytes omitted.
  */
 export function hevcCodecString(prefix: string, hvcC: Uint8Array): string {
+  if (hvcC.byteLength < 13) {
+    throw new MediaError('demux-error', `hvcC is truncated: ${hvcC.byteLength} bytes, need 13`);
+  }
   const dv = new DataView(hvcC.buffer, hvcC.byteOffset, hvcC.byteLength);
   const b1 = dv.getUint8(1);
   const profileSpace = (b1 >> 6) & 0x3;
@@ -50,6 +54,9 @@ export function hevcCodecString(prefix: string, hvcC: Uint8Array): string {
 
 /** `av01.P.LLT.DD` from an AV1CodecConfigurationRecord (`av1C`), per the AV1-ISOBMFF binding. */
 export function av1CodecString(av1C: Uint8Array): string {
+  if (av1C.byteLength < 4) {
+    throw new MediaError('demux-error', `av1C is truncated: ${av1C.byteLength} bytes, need 4`);
+  }
   const dv = new DataView(av1C.buffer, av1C.byteOffset, av1C.byteLength);
   const b1 = dv.getUint8(1);
   const b2 = dv.getUint8(2);
