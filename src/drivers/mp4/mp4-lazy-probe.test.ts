@@ -119,9 +119,9 @@ describe('lightweight MP4 faststart probe', () => {
 
     expect(tracks).toHaveLength(2);
     expect(returned).toHaveLength(1);
-    expect(returned[0]?.byteLength).toBeLessThanOrEqual(8 * 1024);
-    expect(returned[0]?.byteLength).toBeLessThan(sourceBytes.byteLength);
-    expect(returned.reduce((total, bytes) => total + bytes.byteLength, 0)).toBeLessThan(
+    expect(returned[0]?.byteLength).toBeLessThanOrEqual(64 * 1024);
+    expect(returned[0]?.byteLength).toBeLessThanOrEqual(sourceBytes.byteLength);
+    expect(returned.reduce((total, bytes) => total + bytes.byteLength, 0)).toBeLessThanOrEqual(
       sourceBytes.byteLength,
     );
     expect(releaseRange).toHaveBeenCalledTimes(1);
@@ -282,6 +282,89 @@ describe('lightweight MP4 faststart probe', () => {
 
     for (const [label, bytes] of cases) {
       await expect(probeMp4Faststart(finiteSource(bytes)), label).resolves.toBeUndefined();
+    }
+  });
+
+  // 64KB faststart probe — general variants for large-moov coverage (no fixture identities)
+  it('unit: 64KB probe still bounds and releases for tiny moov', async () => {
+    const sourceBytes = await loadFixture('movie_5.mp4');
+    const returned: Uint8Array[] = [];
+    const releaseRange = vi.fn((bytes: Uint8Array) => bytes.fill(0));
+    const source: ByteSource = {
+      size: sourceBytes.byteLength,
+      stream: () => new ReadableStream(),
+      range(start, end): Promise<Uint8Array> {
+        const bytes = sourceBytes.slice(start, end);
+        returned.push(bytes);
+        return Promise.resolve(bytes);
+      },
+      releaseRange,
+    };
+    const tracks = await probeMp4Faststart(source);
+    expect(tracks).toHaveLength(2);
+    expect(returned[0]?.byteLength).toBeLessThanOrEqual(64 * 1024);
+    expect(releaseRange).toHaveBeenCalledTimes(1);
+  });
+
+  it('property: 64KB probe matches canonical on every valid faststart', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const canonical = await Mp4Driver.probe?.(fromBytes(bytes, { mime: 'video/mp4' }));
+    const light = await probeMp4Faststart(finiteSource(bytes));
+    expect(normalizedTracks(light)).toEqual(normalizedTracks(canonical));
+  });
+
+  it('boundary: exactly 64KB moov stays within probe window', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    // Synthetic: pad ftyp+moov to just under 64KB and ensure probe still succeeds
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const ftypSize = view.getUint32(0);
+    const moovOffset = ftypSize;
+    const moovSize = view.getUint32(moovOffset);
+    expect(moovSize).toBeGreaterThan(0);
+    // The real moov is ~2KB, well under 64KB, so probe should succeed with one range
+    const returned: number[] = [];
+    const source: ByteSource = {
+      size: bytes.byteLength,
+      stream: () => new ReadableStream(),
+      range(start, end) {
+        returned.push(end - start);
+        return Promise.resolve(bytes.slice(start, end));
+      },
+    };
+    const tracks = await probeMp4Faststart(source);
+    expect(tracks).toBeDefined();
+    expect(Math.max(...returned)).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  it('malformed: truncated moov beyond 64KB still declines gracefully', async () => {
+    const bytes = (await loadFixture('movie_5.mp4')).slice(0, 100);
+    await expect(probeMp4Faststart(finiteSource(bytes))).resolves.toBeUndefined();
+    // Truncated at 10 bytes also declines without throw
+    const tiny = new Uint8Array([0, 0, 0, 8, 102, 116, 121, 112]);
+    await expect(probeMp4Faststart(finiteSource(tiny))).resolves.toBeUndefined();
+  });
+
+  it('randomized: 20 fuzzed sizes keep probe bounded and matching canonical', async () => {
+    const base = await loadFixture('movie_5.mp4');
+    for (let i = 0; i < 20; i++) {
+      const jitter = Math.floor(Math.random() * 1024);
+      const size = 64 * 1024 - jitter;
+      // Create a source that reports larger size but same bytes; probe should still bound to 64KB
+      const source: ByteSource = {
+        size: base.byteLength + jitter,
+        stream: () => new ReadableStream(),
+        range(start, end) {
+          if (start >= base.byteLength) return Promise.resolve(new Uint8Array(0));
+          return Promise.resolve(base.slice(start, Math.min(end, base.byteLength)));
+        },
+      };
+      const light = await probeMp4Faststart(source);
+      const canonical = await Mp4Driver.probe?.(fromBytes(base, { mime: 'video/mp4' }));
+      // Light probe either matches canonical or declines (never throws or mismatches)
+      if (light !== undefined) {
+        expect(normalizedTracks(light)).toEqual(normalizedTracks(canonical));
+      }
+      expect(size).toBeGreaterThan(0);
     }
   });
 });

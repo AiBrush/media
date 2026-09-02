@@ -5,7 +5,7 @@ import type { ByteSource, StageOptions, TrackInfo } from '../../contracts/driver
 import { raceAbort, sourceAbortError } from '../../sources/abort.ts';
 import { readSimpleVideoFaststartProbe } from './simple-video-probe.ts';
 
-const FASTSTART_PROBE_INITIAL_BYTES = 8 * 1024;
+const FASTSTART_PROBE_INITIAL_BYTES = 64 * 1024;
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw sourceAbortError(signal);

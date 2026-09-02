@@ -1393,6 +1393,10 @@ function gaplessLayoutFor(t: TrackState, samples: readonly MuxSampleInput[]): Ga
   ) {
     return { samples: [...samples] };
   }
+  // AAC and MP3-in-MP4 both author the `mp4a` sample entry (mux.ts maps mp3/mp4a.6b/mp4a.40.34 to
+  // 'mp4a'), so this gate covers every codec whose presentation trimming is expressed through `elst`.
+  // Entries that carry decoder-side trimming themselves (Opus `dOps` pre-skip, FLAC `dfLa`) must NOT
+  // be elst-trimmed on top, or the program duration drifts from the source (webm→mp4 copy rows).
 
   const rawDurationTicks = samples.reduce((total, sample) => total + sample.durationTicks, 0);
   const leadingSamples =

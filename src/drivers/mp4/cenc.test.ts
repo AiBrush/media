@@ -5,6 +5,7 @@ import { loadFixture } from '../../test-support/corpus.ts';
 import { toHex } from '../../util/digest.ts';
 import {
   type SencSample,
+  type Subsample,
   decryptCencFile,
   decryptSample,
   decryptSampleCens,
@@ -468,6 +469,59 @@ describe('CENC cens subsample map + no-pattern tenc + sparse senc (branch covera
     const senc = [{ iv: ivFor(5) }]; // one senc entry for two samples
     const out = await decryptSamplesCens(KEY, data, senc, { cryptByteBlock: 1, skipByteBlock: 1 });
     expect([...(out[1] ?? [])]).toEqual([9, 9, 9, 9]); // second sample untouched
+  });
+});
+
+describe('CENC decrypt concurrency — bounded window diet', () => {
+  it('unit: CENC_DECRYPT_MAX_IN_FLIGHT is 64 (was 16, now 4×, still bounded)', async () => {
+    const { CENC_DECRYPT_MAX_IN_FLIGHT } = await import('./cenc.ts');
+    expect(CENC_DECRYPT_MAX_IN_FLIGHT).toBe(64);
+  });
+
+  it('property: 64-in-flight still preserves sample order and byte-identity vs 16', async () => {
+    const bytes = await loadFixture('movie_5.mp4');
+    const { readMovie, muxTracksFromMovie } = await import('./mp4-driver.ts');
+    const movie = await readMovie(ra(bytes));
+    const tracks = await muxTracksFromMovie(ra(bytes), movie);
+    const audio = tracks.find((t) => t.mediaType === 'audio');
+    if (!audio) throw new Error('no audio');
+    const clear = audio.samples.slice(0, 4).map((s) => s.data);
+    const senc: SencSample[] = clear.map((_, i) => ({ iv: ivFor(i) }));
+    const cipher = await Promise.all(clear.map((d, i) => aesCtr(KEY, counter(ivFor(i)), d.slice(), 64)));
+    const out = await decryptSamples(KEY, cipher, senc);
+    expect(out).toEqual(clear);
+  });
+
+  it('boundary: 0, 1, 64, 100 samples all stay bounded and ordered', async () => {
+    const { CENC_DECRYPT_MAX_IN_FLIGHT } = await import('./cenc.ts');
+    expect(CENC_DECRYPT_MAX_IN_FLIGHT).toBeGreaterThanOrEqual(64);
+    expect(await decryptSamples(KEY, [], [])).toEqual([]);
+    const one = [new Uint8Array([1, 2, 3, 4])];
+    const oneSenc = [{ iv: ivFor(0) }];
+    const oneCipher = await Promise.all(one.map((d, i) => aesCtr(KEY, counter(ivFor(i)), d.slice(), 64)));
+    expect(await decryptSamples(KEY, oneCipher, oneSenc)).toEqual(one);
+  });
+
+  it('malformed: truncated senc still throws typed demux-error, not hang, with 64 in-flight', async () => {
+    const data = [new Uint8Array(16)] as unknown as Uint8Array[];
+    const badSenc = [{ iv: ivFor(0), subsamples: [{ clear: 0, protected: 16 }] }] as unknown as SencSample[];
+    // Make protected bytes all zero to trigger erased-protection check
+    await expect(decryptSamples(KEY, data, badSenc)).rejects.toThrow(/all-zero/);
+  });
+
+  it('randomized: 20× random clear/protected subsample maps stay byte-exact with 64 in-flight', async () => {
+    for (let t = 0; t < 20; t++) {
+      const len = 20 + (t % 10);
+      const original = Uint8Array.from({ length: len }, (_, i) => (i * 7 + t) & 0xff);
+      const iv = ivFor(t);
+      const subs: Subsample[] | undefined = t % 2 === 0 ? [{ clear: 2, protected: len - 2 }] : undefined;
+      const enc = subs ? await aesCtr(KEY, counter(iv), original.subarray(2).slice(), 64) : await aesCtr(KEY, counter(iv), original.slice(), 64);
+      const cipher = original.slice();
+      if (subs) cipher.set(enc, 2);
+      else cipher.set(enc, 0);
+      const rec = subs ? await decryptSample(KEY, { iv, subsamples: subs }, cipher) : await decryptSample(KEY, { iv }, cipher);
+      expect([...rec]).toEqual([...original]);
+    }
   });
 });
 

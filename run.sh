@@ -5,7 +5,7 @@
 # - Picks highest-impact P0→P1 from todo.md (correctness > coverage > robustness > memory > speed > size)
 # - Implements smallest clean fix, adds property/boundary/fuzz tests, runs gates
 # - Uses todo.md as single source of truth — updates it each cycle, never creates history docs
-# Usage: ./run.sh  |  bash run.sh --model opencode/muse-spark-1.2-contributor-free
+# Usage: ./run.sh  |  bash run.sh --model opencode/muse-spark-1.2-contributor-free, opencode-go/qwen3.8-flash
 
 set -euo pipefail
 

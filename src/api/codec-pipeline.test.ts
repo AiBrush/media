@@ -294,6 +294,87 @@ describe('mergeVpxAlphaLuma', () => {
       'VPx alpha luma has 1 bytes for 8 RGBA bytes',
     );
   });
+
+  it('unit: aligned Uint32 fast path matches portable byte loop', () => {
+    const colorAligned = Uint8ClampedArray.from([
+      1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,
+    ]);
+    const alpha = Uint8Array.from([10, 20, 30, 40]);
+    const backing = new ArrayBuffer(32);
+    const unalignedColor = new Uint8ClampedArray(backing, 1, 16);
+    unalignedColor.set(colorAligned);
+    const unalignedAlpha = Uint8Array.from([10, 20, 30, 40]);
+    mergeVpxAlphaLuma(colorAligned, alpha);
+    mergeVpxAlphaLuma(unalignedColor, unalignedAlpha);
+    expect([...colorAligned]).toEqual([...unalignedColor]);
+    expect([...colorAligned]).toEqual([1, 2, 3, 10, 4, 5, 6, 20, 7, 8, 9, 30, 10, 11, 12, 40]);
+  });
+
+  it('property: randomized RGB preserved and alpha channel set exactly', () => {
+    let seed = 0x1234_5678;
+    const next = (): number => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return (seed >>> 24) & 0xff;
+    };
+    for (let trial = 0; trial < 20; trial++) {
+      const pixels = 16 + (next() % 64);
+      const color = Uint8ClampedArray.from({ length: pixels * 4 }, next);
+      const alpha = Uint8Array.from({ length: pixels }, next);
+      const expectedAlpha = alpha.slice();
+      const expectedRgb = color.slice();
+      for (let i = 0; i < pixels; i++) expectedRgb[i * 4 + 3] = expectedAlpha[i] as number;
+      mergeVpxAlphaLuma(color, alpha);
+      for (let i = 0; i < pixels; i++) {
+        expect(color[i * 4]).toBe(expectedRgb[i * 4]);
+        expect(color[i * 4 + 1]).toBe(expectedRgb[i * 4 + 1]);
+        expect(color[i * 4 + 2]).toBe(expectedRgb[i * 4 + 2]);
+        expect(color[i * 4 + 3]).toBe(expectedAlpha[i]);
+      }
+    }
+  });
+
+  it('boundary: handles 0, 1, and large pixel counts', () => {
+    const empty = new Uint8ClampedArray(0);
+    mergeVpxAlphaLuma(empty, new Uint8Array(0));
+    expect(empty.length).toBe(0);
+    const one = Uint8ClampedArray.from([9, 9, 9, 255]);
+    mergeVpxAlphaLuma(one, Uint8Array.from([7]));
+    expect([...one]).toEqual([9, 9, 9, 7]);
+    const largePixels = 1024;
+    const largeColor = new Uint8ClampedArray(largePixels * 4).fill(128);
+    const largeAlpha = new Uint8Array(largePixels).fill(64);
+    mergeVpxAlphaLuma(largeColor, largeAlpha);
+    for (let i = 0; i < largePixels; i++) expect(largeColor[i * 4 + 3]).toBe(64);
+  });
+
+  it('malformed: rejects non-multiple-of-4 color length and short alpha', () => {
+    expect(() => mergeVpxAlphaLuma(new Uint8ClampedArray(3), new Uint8Array(1))).toThrow(
+      'VPx alpha luma has 1 bytes for 3 RGBA bytes',
+    );
+    expect(() => mergeVpxAlphaLuma(new Uint8ClampedArray(4), new Uint8Array(0))).toThrow(
+      'VPx alpha luma has 0 bytes for 4 RGBA bytes',
+    );
+    expect(() => mergeVpxAlphaLuma(new Uint8ClampedArray(8), new Uint8Array(1))).toThrow(
+      'VPx alpha luma has 1 bytes for 8 RGBA bytes',
+    );
+  });
+
+  it('randomized: 20 fuzzed merges are byte-exact vs reference loop', () => {
+    let state = 0x9e37_79b9;
+    const rnd = (): number => {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      return state & 0xff;
+    };
+    for (let t = 0; t < 20; t++) {
+      const pixels = 1 + (rnd() % 128);
+      const color = Uint8ClampedArray.from({ length: pixels * 4 }, rnd);
+      const alpha = Uint8Array.from({ length: pixels }, rnd);
+      const ref = color.slice();
+      for (let i = 0; i < pixels; i++) ref[i * 4 + 3] = alpha[i] as number;
+      mergeVpxAlphaLuma(color, alpha);
+      expect([...color]).toEqual([...ref]);
+    }
+  });
 });
 
 describe('vpxAlphaI420FromPackedRgba', () => {

@@ -75,6 +75,8 @@ export function videoColorMuxIntent(target: VideoTarget): VideoColorMuxIntent | 
  * plain object, so the whole chain is Node-validated; the GPU substrate that runs it is browser-only.
  * Empty array ⇒ no filters (the decode→encode is direct).
  */
+const EMPTY_FILTER_SPECS: readonly FilterSpec[] = Object.freeze([]);
+
 export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): FilterSpec[] {
   assertCompatibleVideoColorTransforms(target);
   const specs: FilterSpec[] = [];
@@ -164,7 +166,7 @@ export function videoFilterSpecs(target: VideoTarget, src: SourceGeometry): Filt
     }
     specs.push({ mediaType: 'video', type: 'tonemap', to: 'sdr' });
   }
-  return specs;
+  return specs.length === 0 ? (EMPTY_FILTER_SPECS as FilterSpec[]) : specs;
 }
 
 /**

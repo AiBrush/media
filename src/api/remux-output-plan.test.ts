@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { CapabilityError, InputError } from '../contracts/errors.ts';
 import { Mp4Module } from '../drivers/mp4/mp4-driver.ts';
 import { WebmModule } from '../drivers/webm/webm-driver.ts';
+import { STREAMED_WHOLE_PROGRAM_MAX_BYTES } from '../internal/buffer-policy.ts';
 import type { Sink } from '../sinks/sink.ts';
 import { toBlob, toFile, toOPFS, toStream } from '../sinks/sink.ts';
 import { toStreamTarget } from '../sinks/stream-target.ts';
@@ -24,6 +25,7 @@ import {
   type RemuxOutputRouteFacts,
   WEBM_STREAMING_MIN_SOURCE_BYTES,
   planRemuxOutput,
+  publishesWholeProgramBlob,
   resolveRemuxOutputRoute,
   usesStreamCopyRemux,
 } from './remux-output-plan.ts';
@@ -206,10 +208,42 @@ describe('remux output plan — declared retention', () => {
   it('reports bounded retention for a copy route drained through a streaming sink', () => {
     for (const sink of streamingSinks) {
       expect(plan({ to: 'mp4', sink }).retention, sink.kind).toBe('bounded');
-      expect(plan({ to: 'mkv', sink }, { sourceSizeBytes: 2 * GIB }).retention, sink.kind).toBe(
+      expect(plan({ to: 'mp4', sink }, { sourceSizeBytes: 2 * GIB }).retention, sink.kind).toBe(
         'bounded',
       );
+      // Large WebM-family output keeps a bounded drain only where the caller can write incrementally.
+      expect(
+        plan({ to: 'mkv', sink }, { sourceSizeBytes: 128 * MIB }).retention,
+        sink.kind,
+      ).toBe('bounded');
     }
+  });
+
+  it('declares whole-output retention for a bare stream sink it will spool as a Blob', () => {
+    // Same facts, position-aware streaming sinks keep their bounded declaration …
+    for (const sink of [toStreamTarget(() => {}), toOPFS('out.mkv')]) {
+      expect(
+        plan({ to: 'mkv', sink }, { sourceSizeBytes: 2 * GIB }).retention,
+        sink.kind,
+      ).toBe('bounded');
+    }
+    // … while a plain `toStream()` consumer of an over-ceiling Matroska program receives a
+    // materialized Blob, and the declaration says so.
+    expect(plan({ to: 'mkv', sink: toStream() }, { sourceSizeBytes: 2 * GIB }).retention).toBe(
+      'whole-output',
+    );
+    expect(plan({ to: 'webm', sink: toStream() }, { sourceSizeBytes: 2 * GIB }).retention).toBe(
+      'whole-output',
+    );
+    // Exactly at the ceiling is still the lazy stream.
+    expect(
+      plan({ to: 'mkv', sink: toStream() }, { sourceSizeBytes: STREAMED_WHOLE_PROGRAM_MAX_BYTES })
+        .retention,
+    ).toBe('bounded');
+    // A bounded answer is still advertised as reachable, because another sink can take it.
+    expect(
+      plan({ to: 'mkv', sink: toStream() }, { sourceSizeBytes: 2 * GIB }).boundedRetentionAvailable,
+    ).toBe(true);
   });
 
   it('reports whole-output retention when the caller asked for a whole-output sink', () => {
@@ -388,6 +422,89 @@ describe('remux output plan — resolveRemuxOutputRoute agrees with the plan it 
           resolveRemuxOutputRoute(routeFacts, { to }),
         );
       }
+    }
+  });
+});
+
+// ── Whole-program Blob publication policy ──────────────────────────────────────────────────────
+
+describe('publishesWholeProgramBlob', () => {
+  const over = { size: STREAMED_WHOLE_PROGRAM_MAX_BYTES + 1 };
+  const at = { size: STREAMED_WHOLE_PROGRAM_MAX_BYTES };
+
+  it('unit: a bare stream sink over the ceiling spools the containers without a fragmented form', () => {
+    expect(publishesWholeProgramBlob(over, { to: 'mkv', sink: toStream() })).toBe(true);
+    expect(publishesWholeProgramBlob(over, { to: 'webm', sink: toStream() })).toBe(true);
+    // ISO targets keep the lazy stream: the copy upgrades to the fragmented layout instead.
+    expect(publishesWholeProgramBlob(over, { to: 'mp4', sink: toStream() })).toBe(false);
+    expect(publishesWholeProgramBlob(over, { to: 'ts', sink: toStream() })).toBe(false);
+    // Sinks that prove incremental writing always keep the lazy stream.
+    expect(publishesWholeProgramBlob(over, { to: 'mkv', sink: toStreamTarget(() => {}) })).toBe(false);
+    expect(publishesWholeProgramBlob(over, { to: 'mkv', sink: toOPFS('out.mkv') })).toBe(false);
+    // Whole-output sinks never change shape.
+    expect(publishesWholeProgramBlob(over, { to: 'mkv', sink: toBlob() })).toBe(false);
+    expect(publishesWholeProgramBlob(over, { to: 'mkv' })).toBe(false);
+  });
+
+  it('boundary: exactly the ceiling stays a lazy stream, ceiling + 1 spools', () => {
+    expect(publishesWholeProgramBlob(at, { to: 'mkv', sink: toStream() })).toBe(false);
+    expect(
+      publishesWholeProgramBlob({ size: STREAMED_WHOLE_PROGRAM_MAX_BYTES + 1 }, { to: 'mkv', sink: toStream() }),
+    ).toBe(true);
+  });
+
+  it('malformed: an unknown size never triggers the spool (no conservative guess)', () => {
+    expect(publishesWholeProgramBlob({}, { to: 'mkv', sink: toStream() })).toBe(false);
+    expect(publishesWholeProgramBlob({ size: undefined }, { to: 'webm', sink: toStream() })).toBe(false);
+    expect(publishesWholeProgramBlob({ size: Number.NaN }, { to: 'mkv', sink: toStream() })).toBe(false);
+  });
+
+  it('property: the plan’s retention declaration follows the publication predicate exactly', () => {
+    for (const size of [undefined, 1, at.size, over.size, 8 * GIB]) {
+      for (const to of ['mp4', 'mov', 'webm', 'mkv', 'ts'] as const) {
+        for (const sink of [
+          undefined,
+          toStream(),
+          toStreamTarget(() => {}),
+          toOPFS('o'),
+          toBlob(),
+        ] as const) {
+          const source = size === undefined ? {} : { size };
+          const spools = publishesWholeProgramBlob(source, { to, ...(sink ? { sink } : {}) });
+          const declared = planRemuxOutput(
+            facts(size === undefined ? {} : { sourceSizeBytes: size }),
+            { to, ...(sink ? { sink } : {}) } as RemuxOptions,
+          );
+          // A declared whole-output answer for a streaming sink can only be the spool (or tags).
+          if (spools && sink?.kind === 'stream') {
+            expect(declared.retention, `${to}/${String(size)}/${sink?.kind ?? 'default'}`).toBe(
+              'whole-output',
+            );
+          }
+        }
+      }
+    }
+  });
+
+  it('randomized: the decision is exactly sink=stream ∧ webm-family ∧ size above ceiling', () => {
+    let seed = 0x2f6e2b1;
+    const rand = () => {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      return (seed >>> 0) / 0x100000000;
+    };
+    const sinks = [toStream(), toStreamTarget(() => {}), toOPFS('o'), toBlob(), undefined];
+    const containers = ['mp4', 'mov', 'webm', 'mkv', 'ts', 'ogg'];
+    for (let i = 0; i < 300; i++) {
+      const sink = sinks[Math.floor(rand() * sinks.length)] as Sink | undefined;
+      const to = containers[Math.floor(rand() * containers.length)] as Container;
+      const size = Math.floor(rand() * 3 * GIB);
+      const expected =
+        sink?.kind === 'stream' &&
+        (to === 'webm' || to === 'mkv') &&
+        size > STREAMED_WHOLE_PROGRAM_MAX_BYTES;
+      expect(publishesWholeProgramBlob({ size }, { to, ...(sink ? { sink } : {}) })).toBe(expected);
     }
   });
 });

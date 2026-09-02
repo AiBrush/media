@@ -88,6 +88,22 @@ export async function runMux(
       return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
     }
   }
+  if (
+    (target === 'mp4' || target === 'mov') &&
+    (opts.sink?.kind === 'stream' || opts.sink?.kind === 'stream-target') &&
+    opts.faststart !== 'reserve' &&
+    opts.fragmented !== true
+  ) {
+    const fastMux = await import('./flac-mkv-mux.ts');
+    const stream = await fastMux.muxPreparedMp4PacketStreams(streams, {
+      ...context.stage(signal, options),
+      container: target,
+    });
+    if (stream !== undefined) {
+      return materializeOutput(opts.sink ?? toBlob(), stream, mimeOptions(signal, target));
+    }
+  }
+
   if (opts.fragmented !== true && target === 'ts') {
     const { muxPreparedMpegTsPacketStreams } = await import('./mpegts-prepared-mux.ts');
     const stream = await muxPreparedMpegTsPacketStreams(streams, {

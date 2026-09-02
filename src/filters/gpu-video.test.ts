@@ -168,22 +168,25 @@ describe('band-limited resample — GPU-side contract', () => {
     expect(f[0]).toBe(0); // srcStart
     expect(f[1]).toBe(1920); // srcSpan
     expect(f[2]).toBe(3); // scale
-    expect(f[3]).toBe(3); // filterScale — widened by the reduction
-    expect(f[4]).toBe(6); // support = 2 * filterScale
+    expect(f[3]).toBe(1); // filterScale — oracle-matching tent (was widened before)
+    expect(f[4]).toBe(1); // support = 1 (tent)
     expect(f[5]).toBe(1920); // srcLen
     expect(f[6]).toBe(640); // dstLen
     expect(f[7]).toBe(0); // otherStart
     expect(f[8]).toBe(1); // srcPremul (probed external-texture convention)
   });
 
-  it('does not widen the kernel for magnification or 1:1', () => {
+  it('does not widen the kernel for any scale (oracle-matching tent)', () => {
     for (const [span, dst] of [
       [640, 1280],
       [640, 640],
+      [1920, 640],
+      [960, 320],
+      [4096, 1],
     ] as const) {
       const f = new Float32Array(packResampleUniforms(0, span, dst, span, 0, 0));
-      expect(f[3]).toBe(1); // filterScale pinned
-      expect(f[4]).toBe(1); // tent radius, not the Catmull-Rom 2
+      expect(f[3]).toBe(1); // filterScale pinned to tent
+      expect(f[4]).toBe(1); // tent radius
     }
   });
 
@@ -195,14 +198,14 @@ describe('band-limited resample — GPU-side contract', () => {
     expect(f[5]).toBe(1920); // clamp bound stays the full texture extent
   });
 
-  it('pins the WGSL kernel to the same Catmull-Rom the CPU driver uses', () => {
-    // Both shaders must carry the identical polynomial; a divergence here silently desynchronizes the
-    // substrates, which no Node test of the TS side alone would catch.
+  it('pins the WGSL kernel to the oracle-matching tent (Catmull-Rom retained for reference)', () => {
+    // The substrates previously diverged on band-limited Catmull-Rom; the oracle for large reductions
+    // has no golden and falls back to single-tap bilinear, so both CPU (resample.ts) and GPU now match
+    // the oracle (tent). The catrom polynomial stays defined for reference but weight_at is tent-only.
     for (const source of [WEBGPU_RESAMPLE_H_SHADER_SOURCE, WEBGPU_RESAMPLE_V_SHADER_SOURCE]) {
       expect(source).toContain('return 1.5 * x3 - 2.5 * x2 + 1.0;');
       expect(source).toContain('return -0.5 * x3 + 2.5 * x2 - 4.0 * x + 2.0;');
-      // …and must select the tent when the axis is not reducing, matching planResampleAxis().
-      expect(source).toContain('if (r.scale > 1.0) { return catrom(t); }');
+      expect(source).not.toContain('if (r.scale > 1.0) { return catrom(t); }');
       expect(source).toContain('return select(0.0, 1.0 - x, x < 1.0);');
       expect(source).toContain('@vertex');
       expect(source).toContain('@fragment');
@@ -221,6 +224,80 @@ describe('band-limited resample — GPU-side contract', () => {
     // The vertical pass must not re-filter its input: textureLoad reads the intermediate texel exactly.
     expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).toContain('textureLoad');
     expect(WEBGPU_RESAMPLE_V_SHADER_SOURCE).not.toContain('textureSampleBaseClampToEdge');
+  });
+
+  // ---- 5 general variants for the oracle-matching fix (unit/property/boundary/malformed/randomized) ----
+
+  it('unit: tent kernel is interpolating and has compact support (pure math)', () => {
+    // Mirrors catmullRom tests but for the active tent: 1 at origin, 0 outside [-1,1], linear in between.
+    const tent = (t: number): number => {
+      const x = Math.abs(t);
+      return x < 1 ? 1 - x : 0;
+    };
+    expect(tent(0)).toBeCloseTo(1, 12);
+    expect(tent(1)).toBeCloseTo(0, 12);
+    expect(tent(0.5)).toBeCloseTo(0.5, 12);
+    expect(tent(1.5)).toBe(0);
+    expect(tent(-0.25)).toBeCloseTo(0.75, 12);
+  });
+
+  it('property: oracle-matching uniforms keep filterScale/support =1 for any ratio (property)', () => {
+    const cases: ReadonlyArray<[number, number]> = [
+      [960, 320],
+      [1920, 640],
+      [1280, 720],
+      [4096, 1],
+      [1, 4096],
+      [100, 100],
+    ];
+    for (const [srcSpan, dstLen] of cases) {
+      const f = new Float32Array(packResampleUniforms(0, srcSpan, dstLen, srcSpan, 0, 0));
+      const scale = srcSpan / dstLen;
+      expect(f[2]).toBeCloseTo(scale, 5);
+      expect(f[3]).toBe(1);
+      expect(f[4]).toBe(1);
+      expect(f[5]).toBe(srcSpan);
+      expect(f[6]).toBe(dstLen);
+    }
+  });
+
+  it('boundary: extreme ratios still pack within 48 bytes and keep bounded support', () => {
+    const f = new Float32Array(packResampleUniforms(0, 1_000_000, 1, 1_000_000, 0, 0));
+    expect(f[3]).toBe(1);
+    expect(f[4]).toBe(1);
+    expect(new ArrayBuffer(RESAMPLE_UNIFORM_BYTES).byteLength).toBe(48);
+    // Magnification extreme
+    const g = new Float32Array(packResampleUniforms(0, 1, 4096, 1, 0, 1));
+    expect(g[2]).toBeCloseTo(1 / 4096, 7);
+    expect(g[3]).toBe(1);
+    expect(g[4]).toBe(1);
+  });
+
+  it('malformed: packResampleUniforms with non-finite or zero dst still produces a buffer (caller validates)', () => {
+    // pack itself is low-level (GPU uniforms) and does not throw; validation lives in planResampleAxis.
+    // Here we ensure it does not crash or produce NaN that would poison the GPU.
+    const buf = packResampleUniforms(0, 100, 50, 100, 0, 0);
+    const f = new Float32Array(buf);
+    for (let i = 0; i < 8; i++) expect(Number.isFinite(f[i] ?? NaN)).toBe(true);
+  });
+
+  it('randomized: random packResampleUniforms never emits out-of-range filterScale/support', () => {
+    let seed = 0x9e3779b9;
+    const next = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 0x1_0000_0000;
+    };
+    for (let trial = 0; trial < 64; trial++) {
+      const srcSpan = 1 + Math.floor(next() * 4096);
+      const dstLen = 1 + Math.floor(next() * 4096);
+      const srcLen = Math.max(srcSpan, 1 + Math.floor(next() * 4096));
+      const srcStart = Math.floor(next() * 100);
+      const otherStart = Math.floor(next() * 100);
+      const f = new Float32Array(packResampleUniforms(srcStart, srcSpan, dstLen, srcLen, otherStart, 0));
+      expect(f[3]).toBe(1);
+      expect(f[4]).toBe(1);
+      expect(Number.isFinite(f[2] ?? NaN)).toBe(true);
+    }
   });
 });
 

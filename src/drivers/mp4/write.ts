@@ -1292,7 +1292,7 @@ export function planReservedMp4ByteStreamLayout(
     mdatPayloadLen,
     totalLen,
     observedPacketCount,
-  };
+    };
 }
 
 /**

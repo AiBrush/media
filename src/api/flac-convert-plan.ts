@@ -113,12 +113,11 @@ export async function convertToFlac(
 
 function canTryDirectWavS16Flac(
   container: ContainerDriver,
-  src: Source,
+  _src: Source,
   audio: AudioTarget | undefined,
   pcmOpts: PcmTransform,
 ): boolean {
   if (container.id !== 'wav') return false;
-  if (src.kind === 'stream' && (src.range === undefined || src.size === undefined)) return false;
   if (pcmOpts.channels !== undefined || pcmOpts.sampleRate !== undefined) return false;
   if (
     pcmOpts.gainDb !== undefined ||

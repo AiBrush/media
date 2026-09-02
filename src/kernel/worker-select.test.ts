@@ -22,21 +22,15 @@ function select(
 }
 
 describe('selectWorkerMode', () => {
-  it('defaults to INLINE when worker is unset (offload is opt-in), even if Worker exists', () => {
-    expect(select(undefined, true)).toBe('inline');
+  it('defaults to OFFLOAD when worker is unset and Worker exists (heavy win)', () => {
+    expect(select(undefined, true)).toBe('offload');
   });
 
-  it('matches its own JSDoc: the doc states the opt-in reality, never "unset defaults to offload"', () => {
-    // Punch-list 2 (doc/code drift): the leading JSDoc once claimed `true`/`{pool}`/unset "default to
-    // offload" while the body returns 'inline' for unset. Pin BOTH sides: the behavior…
-    expect(selectWorkerMode(undefined, true)).toBe('inline');
+  it('matches its own JSDoc: unset now defaults to offload when Worker exists', () => {
+    expect(selectWorkerMode(undefined, true)).toBe('offload');
     expect(selectWorkerMode(true, true)).toBe('offload');
-    // …and the prose. The doc must describe offload as opt-in and must not claim an unset default
-    // offloads (the exact drift this guards against).
     const source = readFileSync(new URL('./worker-mode.ts', import.meta.url), 'utf8');
-    expect(source).toMatch(/opt-in/i);
-    expect(source).not.toMatch(/unset\s+default(?:s)?\s+to\s+offload/i);
-    expect(source).not.toMatch(/`\{pool\}`\/unset default to offload/);
+    expect(source).toMatch(/Heavy convert\/trim offload is now the default/i);
   });
 
   it('offloads when worker:true and Worker exists', () => {

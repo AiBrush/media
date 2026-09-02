@@ -10,8 +10,6 @@ import {
 import type { MuxTrackInput } from './write.ts';
 import { type ContainerBrand, planMp4ByteStreamLayout, writeMp4 } from './write.ts';
 
-const STREAM_PAYLOAD_CHUNK_TARGET_BYTES = 256 * 1024;
-
 interface PayloadCursor {
   trackIndex: number;
   sampleIndex: number;
@@ -129,6 +127,8 @@ export function mp4PacketMuxTracks(inputs: readonly Mp4PacketTrackInput[]): MuxT
     return toMuxTrack(state, leadingEmptyUs);
   });
 }
+
+const STREAM_PAYLOAD_CHUNK_TARGET_BYTES = 256 * 1024;
 
 function nextPayloadChunk(
   tracks: readonly MuxTrackInput[],

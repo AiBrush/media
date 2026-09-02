@@ -194,6 +194,18 @@ export function mergeVpxAlphaLuma(color: Uint8ClampedArray, alpha: Uint8Array): 
       `VPx alpha luma has ${alpha.byteLength} bytes for ${color.byteLength} RGBA bytes`,
     );
   }
+  if (
+    HOST_IS_LITTLE_ENDIAN &&
+    color.byteOffset % Uint32Array.BYTES_PER_ELEMENT === 0 &&
+    color.byteLength % Uint32Array.BYTES_PER_ELEMENT === 0
+  ) {
+    const color32 = new Uint32Array(color.buffer, color.byteOffset, pixelCount);
+    for (let pixel = 0; pixel < pixelCount; pixel++) {
+      const word = color32[pixel] as number;
+      color32[pixel] = (word & 0x00ff_ffff) | ((alpha[pixel] as number) << 24);
+    }
+    return;
+  }
   for (let pixel = 0; pixel < pixelCount; pixel++) {
     color[pixel * RGBA_BYTES_PER_PIXEL + 3] = alpha[pixel] as number;
   }

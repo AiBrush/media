@@ -22,6 +22,7 @@
  * would not.
  */
 
+import { STREAMED_WHOLE_PROGRAM_MAX_BYTES } from '../internal/buffer-policy.ts';
 import type { Sink } from '../sinks/sink.ts';
 import type { Container, RemuxOptions } from './types.ts';
 
@@ -144,6 +145,27 @@ export function requiresStreamingWebmRemux(
   );
 }
 
+/**
+ * True when the remux hands the finished program to the caller as a materialized `Blob` instead of
+ * a pulled `ReadableStream`: a bare `toStream()` consumer of a whole program above
+ * {@link STREAMED_WHOLE_PROGRAM_MAX_BYTES} must retain every byte anyway, and the WebM/Matroska
+ * family has no fragmented ISO BMFF form that keeps such a program incrementally consumable past
+ * that ceiling. Sinks that prove incremental writing (`toStreamTarget()`, OPFS) and containers that
+ * can switch to the fragmented layout are untouched; the spill materializer keeps the JS-heap
+ * retention flat in output size regardless.
+ */
+export function publishesWholeProgramBlob(
+  source: { readonly size?: number | undefined },
+  opts: Pick<RemuxOptions, 'to' | 'sink'>,
+): boolean {
+  return (
+    opts.sink?.kind === 'stream' &&
+    (opts.to === 'webm' || opts.to === 'mkv') &&
+    source.size !== undefined &&
+    source.size > STREAMED_WHOLE_PROGRAM_MAX_BYTES
+  );
+}
+
 function wantsTrackSelection(opts: RemuxOptions): boolean {
   return opts.trackSelect !== undefined && opts.trackSelect.length > 0;
 }
@@ -210,6 +232,9 @@ export function planRemuxOutput(facts: RemuxOutputRouteFacts, opts: RemuxOptions
   const boundedRetentionAvailable =
     opts.tags === undefined && (route === 'stream-copy' || route === 'streaming-webm');
   const sinkKind = opts.sink?.kind ?? 'blob';
+  // The whole-program Blob publication retains every byte before the caller sees the last one, so
+  // the declaration must say so even though a stream sink was supplied.
+  const wholeProgramBlob = publishesWholeProgramBlob({ size: facts.sourceSizeBytes }, opts);
   return Object.freeze({
     schema: 'aibrush-media/remux-output-plan@1',
     container: opts.to,
@@ -222,7 +247,9 @@ export function planRemuxOutput(facts: RemuxOutputRouteFacts, opts: RemuxOptions
     requiresFinalization: !fragmented,
     fragmented,
     retention:
-      boundedRetentionAvailable && STREAMING_SINK_KINDS.has(sinkKind) ? 'bounded' : 'whole-output',
+      boundedRetentionAvailable && STREAMING_SINK_KINDS.has(sinkKind) && !wholeProgramBlob
+        ? 'bounded'
+        : 'whole-output',
     boundedRetentionAvailable,
     acceptedSinkKinds: reserved ? POSITIONED_SINK_KINDS : EVERY_SINK_KIND,
   });

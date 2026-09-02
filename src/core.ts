@@ -39,6 +39,10 @@ export {
 export { closeFrame, closeFrames, type Closable, isClosable } from './kernel/frames.ts';
 export { collect, composeChain, type ExecuteOptions, runToSink } from './kernel/executor.ts';
 export {
+  collectPresentationOrdered,
+  type PresentationPipeline,
+} from './kernel/presentation-order.ts';
+export {
   DEFAULT_CREDIT,
   InlineBridge,
   type RunStreamOptions,
@@ -137,6 +141,13 @@ export {
   muxPreparedSparseMp4PacketTrack,
 } from './api/mp4-prepared-mux.ts';
 export { muxPreparedMpegTsPacketTracks } from './api/mpegts-prepared-mux.ts';
+/**
+ * Byte-for-byte compatible QuickTime→MP4 rewrap (brand patch, or moov relocation with an exact
+ * stco/co64 shift) for buffered consumers. Declines (`undefined`) on any shape the audit cannot
+ * prove safe, so callers fall through to the general stream-copy. Sample bytes are never decoded
+ * or rewritten; peak memory stays bounded to one output buffer plus the input view.
+ */
+export { rewrapCompatibleMovToMp4FromBytes } from './drivers/mp4/compatible-mov-rewrite.ts';
 export type {
   Mp4PacketInfoFromUrlOptions,
   Mp4TrimFromUrlOptions,

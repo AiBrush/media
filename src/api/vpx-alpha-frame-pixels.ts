@@ -28,14 +28,20 @@ export async function decodedVpxAlphaLuma(
     throw new MediaError('decode-error', 'decoded VPx alpha frame has no valid luma plane');
   }
 
-  const alpha = new Uint8Array(width * height);
+  const pixelCount = width * height;
+  if (!Number.isSafeInteger(pixelCount) || pixelCount < 0) {
+    throw new MediaError('decode-error', `VPx alpha frame has invalid dimensions ${width}x${height}`);
+  }
+  if (luma.offset + luma.stride * (height - 1) + width > storage.byteLength) {
+    throw new MediaError('decode-error', 'decoded VPx alpha luma plane is truncated');
+  }
+  if (luma.stride === width) {
+    return storage.slice(luma.offset, luma.offset + pixelCount);
+  }
+  const alpha = new Uint8Array(pixelCount);
   for (let row = 0; row < height; row++) {
     const start = luma.offset + row * luma.stride;
-    const end = start + width;
-    if (end > storage.byteLength) {
-      throw new MediaError('decode-error', 'decoded VPx alpha luma plane is truncated');
-    }
-    alpha.set(storage.subarray(start, end), row * width);
+    alpha.set(storage.subarray(start, start + width), row * width);
   }
   return alpha;
 }

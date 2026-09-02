@@ -328,7 +328,7 @@ function asArrayBufferBytes(data: Uint8Array): Uint8Array<ArrayBuffer> {
 }
 
 /** Maximum independent sample transforms submitted to WebCrypto at once (ADR-201). */
-export const CENC_DECRYPT_MAX_IN_FLIGHT = 16;
+export const CENC_DECRYPT_MAX_IN_FLIGHT = 64;
 
 /**
  * Run address-independent sample work through a bounded window. On failure, stop admitting new work,
@@ -375,16 +375,32 @@ async function forEachSampleBounded<T>(
  * 23001-7 the metadata no longer describes decryptable content, so it is rejected with a typed error (the
  * graceful-failure contract). One linear pass; real ciphertext never accumulates a 16-byte zero run.
  */
-function assertNotErasedProtection(protectedBytes: Uint8Array): void {
-  let zeroRun = 0;
-  for (const byte of protectedBytes) {
-    zeroRun = byte === 0 ? zeroRun + 1 : 0;
-    if (zeroRun >= AES_BLOCK) {
+export function assertNotErasedProtection(protectedBytes: Uint8Array): void {
+  const len = protectedBytes.byteLength;
+  if (len < AES_BLOCK) return;
+  // Fast native scan: jump between zero bytes via indexOf (C++), then verify 16-byte window.
+  // Random ciphertext has ~1/256 zeros, so this skips ~256× bytes per JS iteration vs per-byte loop.
+  let pos = 0;
+  while (pos <= len - AES_BLOCK) {
+    const idx = protectedBytes.indexOf(0, pos);
+    if (idx === -1 || idx > len - AES_BLOCK) return;
+    let allZero = true;
+    for (let i = 0; i < AES_BLOCK; i++) {
+      if (protectedBytes[idx + i] !== 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) {
       throw new MediaError(
         'demux-error',
         `CENC protected data contains a ${AES_BLOCK}-byte all-zero run — erased/tampered ciphertext, not decryptable content`,
       );
     }
+    // Skip the current zero run to avoid re-checking overlapping windows.
+    let next = idx + 1;
+    while (next < len && protectedBytes[next] === 0) next++;
+    pos = next;
   }
 }
 

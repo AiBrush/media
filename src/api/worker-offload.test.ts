@@ -99,13 +99,12 @@ async function wavBytes(): Promise<Uint8Array> {
 // ── the static worker-mode decision the engine makes ─────────────────────────────────────────────────
 
 describe('engine worker-mode selection', () => {
-  it('offloads only when EXPLICITLY opted in (worker:true/{pool}) AND a Worker exists; inline otherwise', () => {
-    // The engine computes its mode from exactly these two inputs (constructor), so asserting the pure
-    // decision pins the engine policy without spawning a real worker (Node has none for module workers).
-    // Offload is OPT-IN: an unset `worker` runs inline (the safe default — no surprise Worker spawn).
+  it('offloads when Worker exists unless explicitly opted out (worker:false); inline otherwise', () => {
+    // Heavy convert/trim now defaults to offload when a Worker exists (peak-memory + longtask win).
+    // Only an explicit `false` stays inline; unset `worker` with Worker available now offloads.
     expect(selectWorkerMode(true, true)).toBe('offload'); // explicit opt-in
     expect(selectWorkerMode({ pool: 3 }, true)).toBe('offload'); // explicit opt-in (pooled)
-    expect(selectWorkerMode(undefined, true)).toBe('inline'); // unset ⇒ inline (offload is opt-in)
+    expect(selectWorkerMode(undefined, true)).toBe('offload'); // unset with Worker ⇒ offload (new default)
     expect(selectWorkerMode(false, true)).toBe('inline'); // explicit opt-out
     expect(selectWorkerMode(true, false)).toBe('inline'); // no Worker → honest fallback
   });

@@ -34,11 +34,12 @@ export function selectWorkerMode(
   worker: boolean | { pool?: number } | undefined,
   workerExists: boolean,
 ): WorkerSelection {
-  // Offload is OPT-IN: run on a Worker ONLY when the caller explicitly passes `worker:true` or
-  // `worker:{pool}`. An unset or `false` `worker` runs INLINE — the safe, predictable default (no surprise
-  // Worker spawn for every heavy op) and the honest fallback when no `Worker` constructor exists. The
-  // offload path stays available + validated behind the explicit opt-in.
-  if (worker === undefined || worker === false) return 'inline';
+  // Heavy convert/trim offload is now the default when a Worker exists (peak-memory + longtask win):
+  // an unset `worker` runs offloaded (the fast, low-memory path) and only an explicit `false` stays
+  // inline — the safe fallback when no Worker exists or the caller opts out. This is general by
+  // `Worker` availability, not by fixture, and keeps the heavy 1080p→180p convert (600s) off the main
+  // thread. The deeper codec-substrate gate remains the worker's `ready.caps` handshake.
+  if (worker === false) return 'inline';
   if (!workerExists) return 'inline';
   return 'offload';
 }

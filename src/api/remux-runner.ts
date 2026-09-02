@@ -15,6 +15,7 @@ import { containerHasChunkMuxer } from './codec-routing.ts';
 import {
   WEBM_STREAMING_MIN_SOURCE_BYTES,
   planRemuxOutput,
+  publishesWholeProgramBlob,
   requiresStreamingWebmRemux,
   resolveRemuxOutputRoute,
   usesStreamCopyRemux,
@@ -28,6 +29,7 @@ import type { CallOptions, RemuxOptions } from './types.ts';
 export {
   WEBM_STREAMING_MIN_SOURCE_BYTES,
   planRemuxOutput,
+  publishesWholeProgramBlob,
   requiresStreamingWebmRemux,
   resolveRemuxOutputRoute,
   usesStreamCopyRemux,
@@ -141,7 +143,15 @@ export async function runRemux(
               ...(progress?.metadata === undefined ? {} : { onProgress: progress.metadata }),
             }),
           );
-    return materializeOutput(opts.sink ?? toBlob(), outputStream, mimeOptions(signal, opts.to));
+    // Whole programs above the single-buffer ceiling that cannot switch to a fragmented layout are
+    // spooled through the `toBlob()` materializer (UA-owned, disk-paged parts) rather than handed to
+    // the caller as a lazy stream they must fully retain. The declaration in `planRemuxOutput` reads
+    // the same predicate, so the sink contract never drifts from the delivered publication.
+    return materializeOutput(
+      publishesWholeProgramBlob(source, opts) ? toBlob() : (opts.sink ?? toBlob()),
+      outputStream,
+      mimeOptions(signal, opts.to),
+    );
   };
 
   let source = await context.resolveHls(input, normalizeByteInput(input, 'remux'), signal);

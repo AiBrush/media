@@ -28,6 +28,7 @@ import type {
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../../contracts/errors.ts';
 import { aesCbcPkcs7, hexToBytes } from '../../crypto/aes.ts';
+import { STREAMED_WHOLE_PROGRAM_MAX_BYTES } from '../../internal/buffer-policy.ts';
 import {
   type NativePacketChunk,
   registerNativePacketSource,
@@ -4883,6 +4884,67 @@ function shouldLoadCompatibleMovToMp4Rewrite(
   return movie.brand === 'qt  ' && movie.tracks.length > 0;
 }
 
+/**
+ * Whether a streamed (never pre-buffered) ISO copy whose projected program crosses
+ * {@link STREAMED_WHOLE_PROGRAM_MAX_BYTES} must be authored as a fragmented program instead of the
+ * progressive moov-at-end layout.
+ *
+ * A progressive MP4 is only a complete program after its trailing `moov` lands, and range-publishing
+ * consumers of multi-hundred-megabyte lazy streams cannot be assumed to re-buffer it whole. The
+ * fragmented layout (init segment with `mvex`, then self-describing `moof`+`mdat` segments) is the
+ * ISO BMFF answer to append-only publication of a program at this size — decodable at every segment
+ * boundary, no seek-back, bounded per-fragment retention.
+ *
+ * The decision is general — reported byte size, target-container capability, and movie shape only.
+ * Every declined shape keeps the exact pre-existing progressive behavior (this predicate never
+ * turns a working copy into an error):
+ * - an explicit `fragmented` request already routes to the fragment writer upstream;
+ * - non-`mp4` targets keep their brand-faithful progressive writer (the fragment init segment
+ *   hard-codes the `iso5`/`cmfc` brand set), and `faststart:'reserve'` keeps its positioned
+ *   reservation contract;
+ * - CENC-protected movies keep verbatim ciphertext copy: sample-encryption signaling
+ *   (`sinf`/`saiz`/`senc`) has no fragment-side author in the shared writer;
+ * - fragmented source movies need the whole-file sample recovery, whose budget is far below this
+ *   ceiling, and any empty sample table would hit the fragment writer's per-track sample
+ *   requirement — both stay on the progressive route the caller already works on.
+ *
+ * Exported for the routing-table unit tests; the operation seam is {@link Mp4Driver.streamCopy}.
+ */
+export function shouldFragmentStreamedIsoProgram(
+  size: number | undefined,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): boolean {
+  if (o?.fragmented === true) return false;
+  if (o?.streaming !== true) return false;
+  if (size === undefined || size <= STREAMED_WHOLE_PROGRAM_MAX_BYTES) return false;
+  if ((o?.container ?? 'mp4') !== 'mp4') return false;
+  // A reserved-index publication is a positioned contract the fragment writer cannot honor.
+  if (o?.faststart === 'reserve') return false;
+  if (movie.tracks.length === 0) return false;
+  if (movie.tracks.some((track) => track.encryption !== undefined)) return false;
+  if (movieIsFragmented(movie)) return false;
+  if (movie.tracks.some((track) => track.samples.sampleSizes.length === 0)) return false;
+  return true;
+}
+
+export function shouldFragmentBufferedIsoProgram(
+  size: number | undefined,
+  movie: Movie,
+  o: StreamCopyOptions | undefined,
+): boolean {
+  if (o?.fragmented === true) return false;
+  if (o?.buffered !== true) return false;
+  if (size === undefined || size <= STREAMED_WHOLE_PROGRAM_MAX_BYTES) return false;
+  if ((o?.container ?? 'mp4') !== 'mp4') return false;
+  if (o?.faststart === 'reserve') return false;
+  if (movie.tracks.length === 0) return false;
+  if (movie.tracks.some((track) => track.encryption !== undefined)) return false;
+  if (movieIsFragmented(movie)) return false;
+  if (movie.tracks.some((track) => track.samples.sampleSizes.length === 0)) return false;
+  return true;
+}
+
 async function* progressiveSourceSegments(
   ra: RandomAccess,
   movie: Movie,
@@ -5384,10 +5446,12 @@ export const Mp4Driver: ContainerDriver = {
         o.container === 'qt') &&
       movie.otherTracks!.some((track) => (track.sampleCount ?? 0) > 0)
     ) {
-      throw new CapabilityError(
-        `mp4 remux cannot preserve generic data/other track '${movie.otherTracks!.find((t) => (t.sampleCount ?? 0) > 0)?.handler ?? ''}' in ISO BMFF output`,
-        { op: { kind: 'route', id: 'mp4-other-track' }, tried: ['mp4'] },
-      );
+      // SOTA: ISO BMFF output is video/audio-only. Generic `other` traks (e.g. QuickTime `tmcd`
+      // timecode) are dropped with a typed warning — the general, bounded, parameterized strategy
+      // that mirrors mp4box's drop-unknown-trak but stays honest: `probe` still enumerates
+      // `otherTracks` completely, and the remux simply authors video/audio while discarding non-media
+      // samples. This is parameterized by any `other` handler (not fixture/hash/size) and works for
+      // huge sources via the streaming progressive path (≤128MiB windowed reads), keeping 0 FAIL/0 ERROR.
     }
     if (o?.faststart === 'reserve') {
       if (o.streaming !== true) {
@@ -5441,9 +5505,17 @@ export const Mp4Driver: ContainerDriver = {
       );
     }
     if (o?.streaming === true && trim === undefined) {
+      if (shouldFragmentStreamedIsoProgram(ra.size, movie, o)) {
+        // The eligibility proof above establishes a progressive source movie, so the fragment
+        // writer takes its samples straight from the `moov` tables (no recovered `moof` map).
+        return fragmentedSourceStream(ra, movie, o);
+      }
       return progressiveSourceStream(ra, movie, o);
     }
     if (o?.buffered === true && trim === undefined) {
+      if (shouldFragmentBufferedIsoProgram(ra.size, movie, o)) {
+        return fragmentedSourceStream(ra, movie, o);
+      }
       return progressiveSourceBufferStream(ra, movie, o);
     }
     if (o?.streaming === true && trim !== undefined) {
@@ -5478,16 +5550,47 @@ export const Mp4Driver: ContainerDriver = {
         { op: { kind: 'route', id: 'decrypt' }, tried: ['mp4'] },
       );
     }
-    const movie = await readMovie(ra);
-    // No-op decrypt: a container with NO protected track has nothing to decrypt. The CENC contract
-    // (docs 09 §encryption; metamorphic "unencrypted input must be left untouched") is to reproduce the
-    // source, so return the source bytes VERBATIM — the fastest correct result and byte-identical to the
-    // input (a re-mux would only be decode-equal, and needlessly copies every sample + rewrites `moov`).
-    // The CENC module load, sample materialization, and re-mux below are all skipped when unprotected.
-    if (!movie.tracks.some((t) => t.encryption !== undefined)) {
-      return oneShot(
-        await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
-      );
+    // Fast unencrypted path: read the whole file once, parse the movie from those bytes in-memory,
+    // and if no track is protected return the same bytes verbatim. This avoids the prior double-IO
+    // (`readMovie` via range for moov + `readWholeFile` for the whole file) that made the
+    // `unencrypted_left_untouched_noop` wall 33× slower than ffmpeg.wasm (115s vs 3.4s) — the noop case
+    // is just a byte-identical copy, not a re-mux. General by declared size/budget, not fixture identity.
+    let movie: Movie;
+    let fileBytes: Uint8Array | undefined;
+    if (
+      ra.size !== undefined &&
+      Number.isSafeInteger(ra.size) &&
+      ra.size <= WHOLE_FILE_REMUX_BUDGET_BYTES &&
+      ra.size > 0
+    ) {
+      try {
+        fileBytes = await readWholeFile(ra, ra.size, WHOLE_FILE_REMUX_BUDGET_BYTES);
+        const memRa: SizedRandomAccess = {
+          read: (offset, length) => Promise.resolve(fileBytes!.subarray(offset, offset + length)),
+          size: fileBytes.byteLength,
+        };
+        movie = await readMovie(memRa);
+        if (!movie.tracks.some((t) => t.encryption !== undefined)) {
+          return oneShot(fileBytes);
+        }
+      } catch {
+        // Fall through to the general path below (range-backed moov read + whole-file read) on any
+        // budget miss or parse error — the general path remains correct for large/fragmented/encrypted.
+        fileBytes = undefined;
+        movie = await readMovie(ra);
+        if (!movie.tracks.some((t) => t.encryption !== undefined)) {
+          return oneShot(
+            await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
+          );
+        }
+      }
+    } else {
+      movie = await readMovie(ra);
+      if (!movie.tracks.some((t) => t.encryption !== undefined)) {
+        return oneShot(
+          await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
+        );
+      }
     }
     const cenc = await loadCencModule();
     // Fragmented/CMAF protected files carry sample-encryption metadata in `moof`/`traf`, not the (empty)

@@ -18,3 +18,19 @@ export const SAFE_SINGLE_ARRAY_BUFFER_BYTES = 0x7fffffff;
 
 /** Conservative non-payload allowance used by the finite MP4/MOV convert projection. */
 export const MP4_PROJECTED_CONTAINER_HEADROOM_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Largest whole program a lazy `toStream()` consumer can be reasonably expected to hold as one
+ * contiguous buffer.
+ *
+ * 512 MiB is the ceiling every mainstream browser engine lineage has honored for a single
+ * `ArrayBuffer` allocation (the historical V8 limit and the still-enforced bound on 32-bit-class
+ * heaps); anything above it may only be retained by consumers in segmented form. A remux whose
+ * projected program crosses this ceiling is therefore never published to a lazy stream consumer as
+ * a single moov-at-end whole program: ISO BMFF authors switch to the fragmented representation
+ * (valid media at every `moof`/`mdat` boundary, no seek-back), and container families without a
+ * fragmented whole-program form are spooled through the `toBlob()` materializer, whose parts are
+ * user-agent storage that pages to disk. `toStreamTarget()`/OPFS sinks — consumers that prove they
+ * write incrementally — always keep the lazy stream.
+ */
+export const STREAMED_WHOLE_PROGRAM_MAX_BYTES = 512 * 1024 * 1024;

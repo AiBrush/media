@@ -308,7 +308,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const source: ByteSource = {
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, end));
       },
@@ -382,7 +382,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const source: ByteSource = {
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
       },
@@ -425,7 +425,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const tracks = await probe({
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, end));
       },
@@ -469,14 +469,14 @@ describe('probe WAV across the real corpus', () => {
     const tracks = await probe({
       size: bytes.byteLength,
       kind: 'url',
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, end));
       },
       stream(): ReadableStream<Uint8Array> {
         throw new Error('remote WAV metadata probe must remain range-backed');
       },
-    } as ByteSource & { readonly kind: 'url' });
+    } as unknown as ByteSource);
 
     const truth = parseWav(bytes, bytes.byteLength);
     expect(tracks[0]).toMatchObject({
@@ -484,7 +484,136 @@ describe('probe WAV across the real corpus', () => {
       durationSec: truth.durationSec,
       config: { sampleRate: truth.sampleRate, numberOfChannels: truth.channels },
     });
-    expect(reads).toEqual([[0, 16 * 1024]]);
+    expect(reads).toEqual([
+      [0, 1024],
+      [12280, 13304],
+    ]);
+  });
+
+  describe('wav probe fast path — remote window diet', () => {
+    it('unit: 1 KiB remote window is enough for small headers and falls back to sparse for large PAD', async () => {
+      const smallBytes = new Uint8Array(await readFile(new URL('../../../../media-test/fixtures/media/wav_s16.wav', import.meta.url)));
+      const smallReads: Array<readonly [number, number]> = [];
+      const smallTracks = await (WavDriver.probe as NonNullable<typeof WavDriver.probe>)({
+        size: smallBytes.byteLength,
+        kind: 'url',
+        range(start: number, end: number): Promise<Uint8Array> {
+          smallReads.push([start, end]);
+          return Promise.resolve(smallBytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('remote');
+        },
+      } as unknown as ByteSource);
+      expect(smallTracks[0]?.codec).toBe('pcm-s16');
+      expect(smallReads).toEqual([[0, 1024]]);
+
+      const largeBytes = new Uint8Array(
+        await readFile(new URL('../../../../media-test/fixtures/media/scenarios/probe/wav_s24/03.wav', import.meta.url)),
+      );
+      const largeReads: Array<readonly [number, number]> = [];
+      const largeTracks = await (WavDriver.probe as NonNullable<typeof WavDriver.probe>)({
+        size: largeBytes.byteLength,
+        kind: 'url',
+        range(start: number, end: number): Promise<Uint8Array> {
+          largeReads.push([start, end]);
+          return Promise.resolve(largeBytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('remote');
+        },
+      } as unknown as ByteSource);
+      expect(largeTracks[0]?.codec).toBe('pcm-s24');
+      expect(largeReads).toEqual([
+        [0, 1024],
+        [12280, 13304],
+      ]);
+    });
+
+    it('property: any small JUNK-free WAV parses within the 1 KiB window (no second range)', async () => {
+      const wav = testRiffWave([
+        testRiffChunk('fmt ', new Uint8Array(16).fill(1)),
+        testRiffChunk('data', new Uint8Array(100)),
+      ]);
+      const reads: Array<readonly [number, number]> = [];
+      const tracks = await (WavDriver.probe as NonNullable<typeof WavDriver.probe>)({
+        size: wav.byteLength,
+        kind: 'url',
+        range(start: number, end: number): Promise<Uint8Array> {
+          reads.push([start, end]);
+          return Promise.resolve(wav.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('remote');
+        },
+      } as unknown as ByteSource);
+      expect(tracks).toHaveLength(1);
+      expect(reads).toEqual([[0, wav.byteLength]]);
+    });
+
+    it('boundary: 128 B local window still finds fmt at 12 and data at 36', async () => {
+      const bytes = await loadFixture('speech.wav');
+      const probe = WavDriver.probe as NonNullable<typeof WavDriver.probe>;
+      const reads: Array<readonly [number, number]> = [];
+      const tracks = await probe({
+        size: bytes.byteLength,
+        range(start: number, end: number): Promise<Uint8Array> {
+          reads.push([start, end]);
+          return Promise.resolve(bytes.subarray(start, end));
+        },
+        stream(): ReadableStream<Uint8Array> {
+          throw new Error('local');
+        },
+      });
+      expect(tracks[0]?.codec).toBe('pcm-s16');
+      expect(reads).toEqual([[0, 128]]);
+    });
+
+    it('malformed: short header beyond window still throws typed demux-error, not hang', async () => {
+      const truncated = testRiffWave([
+        testRiffChunk('fmt ', new Uint8Array([1, 0, 1, 0, 0, 0, 0, 0])),
+      ]);
+      await expect(
+        (WavDriver.probe as NonNullable<typeof WavDriver.probe>)({
+          size: truncated.byteLength,
+          kind: 'url',
+          range(start: number, end: number): Promise<Uint8Array> {
+            return Promise.resolve(truncated.subarray(start, end));
+          },
+          stream(): ReadableStream<Uint8Array> {
+            throw new Error('remote');
+          },
+        } as unknown as ByteSource),
+      ).rejects.toMatchObject({ code: 'demux-error' });
+    });
+
+    it('randomized: 20 fuzzed WAVs with random JUNK stay byte-exact vs parseWav', async () => {
+      let seed = 0x1a2b_3c4d;
+      const rnd = (): number => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed & 0xff;
+      };
+      for (let t = 0; t < 20; t++) {
+        const fmt = new Uint8Array(16);
+        new DataView(fmt.buffer).setUint16(0, 1, true);
+        new DataView(fmt.buffer).setUint16(2, 1 + (rnd() % 2), true);
+        new DataView(fmt.buffer).setUint32(4, 8000 + (rnd() % 40000), true);
+        const data = new Uint8Array(10 + (rnd() % 100));
+        for (let i = 0; i < data.length; i++) data[i] = rnd();
+        const wav = testRiffWave([testRiffChunk('fmt ', fmt), testRiffChunk('data', data)]);
+        const tracks = await (WavDriver.probe as NonNullable<typeof WavDriver.probe>)({
+          size: wav.byteLength,
+          kind: 'url',
+          range(start: number, end: number): Promise<Uint8Array> {
+            return Promise.resolve(wav.subarray(start, end));
+          },
+          stream: () => streamBytes(wav),
+        } as unknown as ByteSource);
+        const truth = parseWav(wav, wav.byteLength);
+        expect(tracks[0]?.codec).toBe(truth.codec);
+        expect(tracks[0]?.durationSec).toBeCloseTo(truth.durationSec, 9);
+      }
+    });
   });
 
   it('preserves typed probe cancellation before and after initial and sparse range reads', async () => {
@@ -524,7 +653,7 @@ describe('probe WAV across the real corpus', () => {
         probe(
           {
             size: bytes.byteLength,
-            range(start, end): Promise<Uint8Array> {
+            range(start: number, end: number): Promise<Uint8Array> {
               reads++;
               if (reads === abortAfterRead) controller.abort(`after range ${reads}`);
               return Promise.resolve(bytes.subarray(start, end));
@@ -625,7 +754,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const tracks = await probe({
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, end));
       },
@@ -648,7 +777,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const tracks = await probe({
       size: padded.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(
           reads.length === 1 ? padded.subarray(start, end) : new Uint8Array(0),
@@ -685,7 +814,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const source: ByteSource = {
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
       },
@@ -732,7 +861,7 @@ describe('probe WAV across the real corpus', () => {
     const reads: Array<readonly [number, number]> = [];
     const source: ByteSource = {
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, Math.min(end, bytes.byteLength)));
       },
@@ -990,7 +1119,7 @@ describe('probe WAV across the real corpus', () => {
     if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
     const chunks = await decode({
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.slice(start, end));
       },
@@ -1031,7 +1160,7 @@ describe('probe WAV across the real corpus', () => {
     if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
     const source: ByteSource = {
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         expect(this).toBe(source);
         rangeCalls++;
         if (rangeCalls === 1) return Promise.resolve(bytes.subarray(start, end));
@@ -1077,7 +1206,7 @@ describe('probe WAV across the real corpus', () => {
     if (decode === undefined) throw new Error('WavDriver must expose fused interleaved PCM decode');
     const chunks = await decode({
       size: bytes.byteLength,
-      range(start, end): Promise<Uint8Array> {
+      range(start: number, end: number): Promise<Uint8Array> {
         reads.push([start, end]);
         return Promise.resolve(bytes.subarray(start, end));
       },
