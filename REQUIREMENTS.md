@@ -3,9 +3,9 @@
 | Field | Baseline |
 | --- | --- |
 | Status | Living requirements for the current codebase and future releases |
-| Date | 2026-08-09 |
+| Date | 2026-09-05 |
 | Package | Pre-1.0 (`0.0.0` at the baseline date) |
-| Benchmark | Chromium 150 result cache generated 2026-08-08; content hash `1493b70bbbbd107ff008d738f562115d5f399eb9f9792869c17bf53b677322aa` |
+| Benchmark | Chromium 152 result cache generated 2026-09-04; content hash `d5777801d0152df050827481317d6a758d4609f54ebdd302977aaee93eca1112` |
 
 The baseline source in the development workspace is `../media-test/results/cache-chromium-1788562444700.json`.
 
@@ -89,55 +89,59 @@ This architecture is the foundation, not proof that the SOTA requirements have b
 
 ### 4.2 Latest available correctness/coverage evidence
 
-The referenced cache stores 591 Chromium result records for each versioned engine comparison, except for one extra web-demuxer record. Its raw status totals are:
+The referenced cache stores 592 Chromium 152 result records for each of the six versioned engines
+(3,552 entries, none excluded as incompatible). Its raw status totals are:
 
 | Engine | PASS | FAIL | ERROR | NA_ENGINE | Other NA | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| AiBrush (development) | **497** | 11 | 12 | 61 | 10 | 591 |
-| MediaBunny 1.48.0 | 433 | 5 | 20 | 121 | 12 | 591 |
-| ffmpeg.wasm 0.12.15 | 407 | 9 | 4 | 169 | 2 | 591 |
-| Remotion 4.0.479 | 219 | 1 | 1 | 369 | 1 | 591 |
-| web-demuxer 4.0.0 | 151 | 0 | 0 | 440 | 1 | 592* |
-| MP4Box 2.3.0 | 89 | 0 | 0 | 502 | 0 | 591 |
+| AiBrush (development) | **575** | 7 | 7 | 2 | 1 | 592 |
+| MediaBunny 1.48.0 | 432 | 6 | 7 | 138 | 9 | 592 |
+| ffmpeg.wasm 0.12.15 | 374 | 19 | 9 | 189 | 1 | 592 |
+| Remotion 4.0.479 | 205 | 0 | 1 | 386 | 0 | 592 |
+| web-demuxer 4.0.0 | 147 | 0 | 0 | 445 | 0 | 592 |
+| MP4Box 2.3.0 | 84 | 0 | 0 | 508 | 0 | 592 |
 
-\*The export declares 3,624 stored records, excludes 72 incompatible records, and exposes 3,552 entries. Of the exposed entries, 268 are marked invalidated, primarily because required execution-manifest evidence is missing. It also contains five unversioned alias records and one extra web-demuxer record. Canonical release comparisons MUST therefore use the execution manifest rather than assume every cached record is comparable.
+Of the 3,552 entries, 221 are marked invalidated (AiBrush 9, ffmpeg.wasm 82, MediaBunny 64, Remotion 57,
+web-demuxer 5, MP4Box 4), primarily because required execution-manifest evidence is missing. Canonical
+release comparisons MUST therefore use the execution manifest rather than assume every cached record is
+comparable.
 
-AiBrush currently has the highest absolute PASS count in this run. This is coverage evidence, not a weighted SOTA score. `NA_ENGINE`, `NA_ASSET`, and `NA_BROWSER` have different meanings; no unsupported or unevaluated result may be treated as a pass.
+AiBrush has the highest absolute PASS count in this run, up from 497 in the 2026-08-08 baseline. This is
+coverage evidence, not a weighted SOTA score. `NA_ENGINE`, `NA_ASSET`, and `NA_BROWSER` have different
+meanings; no unsupported or unevaluated result may be treated as a pass.
 
 Current AiBrush results by family:
 
 | Family | PASS / total | Main unresolved state |
 | --- | ---: | --- |
-| Audio DSP | 34 / 36 | 5.1 mixing and presentation timing |
-| Decode/seek | 44 / 46 | rotation and asset coverage |
-| Demux | 45 / 49 | large-input memory protocol failures |
-| Encryption | 18 / 23 | authenticated/HLS negative cases and assets |
-| Metadata | 24 / 25 | remaining unsupported metadata path |
-| Mux | 46 / 53 | Matroska timing, fast-start reservation, 64-bit offsets |
-| Performance | 31 / 33 | massive packet iteration and unavailable exhaustive size evidence |
-| Probe | 50 / 60 | large authenticated range transport and format gaps |
-| Remux | 48 / 49 | massive-input path |
-| Robustness | 55 / 63 | malformed-input and capability gaps |
-| Streaming output | 19 / 27 | finite WebM/TS streaming and sink behavior |
-| Transcode | 45 / 84 | transforms, codecs, alpha, multitrack, and advanced rate control |
-| Trim | 38 / 43 | exact compressed-audio/open-GOP and huge-copy behavior |
+| Audio DSP | 36 / 36 | — |
+| Decode/seek | 45 / 46 | `decode_rotated_display_matrix` SSIM/PSNR verdict |
+| Demux | 48 / 49 | `mislabeled_h264` golden metadata/packets |
+| Encryption | 24 / 24 | — |
+| Metadata | 25 / 25 | — |
+| Mux | 53 / 53 | — |
+| Performance | 28 / 33 | large/huge/massive size-ladder rows errored with "engine not initialized" (all five invalidated) |
+| Probe | 59 / 60 | `h264_1080p_30s` golden metadata |
+| Remux | 48 / 49 | finite remux output above 1 GiB (`massive_h264_1080p_2h_mp4_to_mkv`) |
+| Robustness | 63 / 63 | — |
+| Streaming output | 27 / 27 | — |
+| Transcode | 78 / 84 | AAC/MP3/FLAC audio-output property invariants, HDR10 tone-map timeout, 10-bit HEVC encoder unavailable in this browser, one oracle error |
+| Trim | 41 / 43 | ADTS AAC copy trim presentation timing, one oracle error |
 
 ### 4.3 Known gap register
 
 | Priority | Area | Current evidence | Required outcome |
 | --- | --- | --- | --- |
-| P0 | Large and remote inputs | Large/huge/massive probe, demux, remux, and trim paths report range-transport or memory-protocol errors. | Range-backed, resumable, bounded-memory operation independent of total file size. |
-| P0 | Transform correctness | Crop, flip, padding, rotation, 10-to-8-bit conversion, and a 4K resize path fail or error. | A fused, color-correct CPU/GPU transform graph that passes odd-size, alpha, HDR/bit-depth, and 4K/8K cases. |
-| P0 | Timeline accuracy | AAC/Opus gapless timing, priming, open-GOP trim, VFR/B-frame composition, and exact MP3/AAC trim remain incomplete. | One rational, overflow-safe timeline model used by every container and codec. |
-| P0 | Container scalability | Fast-start reservation, sparse `co64`, full Matroska timeline, WebM streaming, and TS small-write cases are incomplete. | Correct seekable and append-only writers with 64-bit-safe offsets and bounded buffering. |
-| P1 | Audio output routes | Browser fallback lacks AAC and MP3 encoders; Ogg Opus and some Vorbis/FLAC conversion paths are incomplete. | Lazy, focused codec routes with deterministic timestamps and gapless metadata. |
-| P1 | Video output routes | HEVC 10-bit, two-pass rate control, VP8/VP9 alpha, and some H.264 conversions are unavailable or incorrect. | Quality-normalized encode routes with declared licensing and runtime capability behavior. |
-| P1 | Track and image workflows | Multitrack video selection and image/still-image representation are incomplete. | Explicit track selection and coherent image/video conversion semantics. |
-| P1 | Encryption and robustness | Some wrong-IV/mode HLS cases, round-trip properties, and fan-out behavior are incomplete. | Strict validation, stable error taxonomy, and property/fuzz coverage. |
+| P0 | Large and remote inputs | The large/huge/massive performance size-ladder rows error before the engine initializes, and finite remux output above 1 GiB is declared unsupported. | Range-backed, resumable, bounded-memory operation independent of total file size, including >1 GiB finite outputs. |
+| P0 | Timeline accuracy | AAC→MP3, WAV→MP3, and WAV→FLAC outputs fail their presentation-count/property invariants; ADTS AAC packet-copy trim cannot author an exact presentation window. | One rational, overflow-safe timeline model used by every container and codec, with encoder delay/padding written and honored. |
+| P1 | Transform correctness | Rotation display-matrix decode fails the SSIM/PSNR verdict; HDR10→SDR tone mapping exceeds the 120 s functional timeout. | A fused, color-correct CPU/GPU transform graph with one rotation authority and bounded tone-map cost. |
+| P1 | Mislabeled and malformed inputs | `demux/mislabeled_h264` misses its golden metadata/packets although in-memory hint correction now routes by magic. | Definite-magic routing for every source kind with golden-equivalent output. |
+| P1 | Video output routes | 10-bit HEVC encoding is unavailable in the tested browser. | Declared capability preflight with a documented software/route fallback or an explicit unsupported result. |
+| P2 | Evidence hygiene | Nine AiBrush records are invalidated for missing execution-manifest evidence; two rows carry oracle errors rather than engine verdicts. | Every required record carries manifest evidence and an engine-attributable verdict. |
 
 The final clean installed-consumer verifier reports the default-import eager static JavaScript closure at **44,638 B (43.59 KiB) raw, 18,005 B gzip, and 15,972 B Brotli**. Its concrete typed fast-start MP4 `Blob` probe route is **94,059 B (91.85 KiB) raw, 37,603 B gzip, and 33,478 B Brotli**; its ordinary default-`Blob` MP4 remux route is **231,436 B (226.01 KiB) raw, 83,182 B gzip, and 73,056 B Brotli**. The verifier prunes each consumer bundle to the measured first-operation closure and successfully executes that route; both route reports contain zero worker, WebAssembly, codec-data, or other non-JavaScript assets. These measurements satisfy the normative 50 KiB eager and 250 KiB typical-route ceilings without changing either limit.
 
-The current result cache does not contain complete comparable numeric speed, memory, or bundle measurements. Its bundle-size measurement is unavailable because exhaustive JS, worker, codec-core, and WebAssembly evidence was not joined. Its invalidated records also prevent this cache alone from certifying a release. Therefore this baseline cannot establish that AiBrush is currently the fastest or smallest engine.
+The current result cache still does not contain complete comparable numeric speed, memory, or bundle measurements: only AiBrush carries benchmark samples on most performance rows, competitors' mux and several transcode rows record no bench at all, and per-repetition memory sampling inflates cell durations (see the 2026-09-01 review). Its invalidated records also prevent this cache alone from certifying a release. Therefore this baseline cannot establish that AiBrush is currently the fastest or smallest engine; the cell-by-cell comparisons recorded in `REVIEW-2026-09-01.md` are the current speed evidence.
 
 ## 5. Functional requirements
 
