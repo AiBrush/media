@@ -26,7 +26,7 @@ import {
   type OffloadRuntime,
   ensureOffloadPool,
 } from './worker-offload-runtime.ts';
-import type { WorkerSpawn } from './worker-spawn.ts';
+import { type WorkerSpawn, spawnWorkerAt } from './worker-spawn.ts';
 
 export {
   type DomWorkerLike,
@@ -62,6 +62,8 @@ export {
 /** Injectable wiring for {@link tryOffload} — production passes nothing (real spawn, default runtime). */
 export interface OffloadWiring {
   readonly spawn?: WorkerSpawn;
+  /** An explicit worker script URL (`createMedia({ worker: { url } })`) when no `spawn` is injected. */
+  readonly workerUrl?: string | URL;
   readonly runtime?: OffloadRuntime;
 }
 
@@ -82,7 +84,9 @@ export async function tryOffload<T extends WithOptionalSink>(
   opts: OffloadStreamOptions = {},
   wiring: OffloadWiring = {},
 ): Promise<ReadableStream<Uint8Array> | undefined> {
-  const pool = await ensureOffloadPool(cache, poolSize, wiring.spawn, wiring.runtime);
+  const spawn =
+    wiring.spawn ?? (wiring.workerUrl !== undefined ? spawnWorkerAt(wiring.workerUrl) : undefined);
+  const pool = await ensureOffloadPool(cache, poolSize, spawn, wiring.runtime);
   if (pool === null) return undefined;
   if (!capsSatisfy(pool.caps, offloadCapsNeed(publicOpts))) return undefined;
   return offloadHeavyOp(pool, src, kind, publicOpts, opts);

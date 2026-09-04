@@ -208,7 +208,7 @@ async function readFirst<T>(stream: ReadableStream<T> | undefined): Promise<T | 
 const BYTES = new Uint8Array([0x66, 0x74, 0x79, 0x70, 1, 2, 3, 4]);
 
 describe('routed acceleration verdict (R-S01.2 / ADR-203)', () => {
-  it('configures the decoder prefer-hardware from the verdict with exactly 1 probe per exact config', async () => {
+  it('leaves a hardware-capable verdict to the browser with exactly 1 probe per exact config', async () => {
     const frames: CountingFrame[] = [];
     const codec = fakeCodec('accel-codec', {
       codec: 'fake-accel',
@@ -224,10 +224,11 @@ describe('routed acceleration verdict (R-S01.2 / ADR-203)', () => {
     (first as unknown as CountingFrame).close();
     expect(codec.supports).toHaveBeenCalledTimes(1);
     expect(codec.decoderConfigs).toHaveLength(1);
-    expect(codec.decoderConfigs[0]).toMatchObject({
-      codec: 'fake-accel',
-      hardwareAcceleration: 'prefer-hardware',
-    });
+    // A hardware-capable verdict is not pinned onto the decoder: forcing `prefer-hardware` costs a
+    // ~2.5 ms session per decoder on small pictures, and the browser still picks hardware for
+    // sustained decodes under its own default.
+    expect(codec.decoderConfigs[0]).toMatchObject({ codec: 'fake-accel' });
+    expect(codec.decoderConfigs[0]).not.toHaveProperty('hardwareAcceleration');
 
     // Same exact config again on the same engine: the cached CodecRoute serves the verdict — still
     // exactly ONE probe in total, and the decoder still gets the exact accepted rung.
@@ -235,7 +236,7 @@ describe('routed acceleration verdict (R-S01.2 / ADR-203)', () => {
     (second as unknown as CountingFrame).close();
     expect(codec.supports).toHaveBeenCalledTimes(1);
     expect(codec.decoderConfigs).toHaveLength(2);
-    expect(codec.decoderConfigs[1]).toMatchObject({ hardwareAcceleration: 'prefer-hardware' });
+    expect(codec.decoderConfigs[1]).not.toHaveProperty('hardwareAcceleration');
 
     // Frame-lifetime audit: every decoded frame was closed exactly once (by its owning consumer).
     expect(frames).toHaveLength(2);
@@ -269,11 +270,16 @@ describe('routed acceleration verdict (R-S01.2 / ADR-203)', () => {
     const config = { codec: 'vp8', codedWidth: 16, codedHeight: 16 } as const;
     const routed = decoderConfigWithRoutedAcceleration(config, {
       supported: true,
-      hardwareAccelerated: true,
+      hardwareAccelerated: false,
     });
     expect(routed).not.toBe(config);
-    expect(routed).toMatchObject({ codec: 'vp8', hardwareAcceleration: 'prefer-hardware' });
+    expect(routed).toMatchObject({ codec: 'vp8', hardwareAcceleration: 'prefer-software' });
     expect('hardwareAcceleration' in config).toBe(false);
+    // A hardware-capable verdict and a verdict without an acceleration fact both pass the routed
+    // config through untouched (same object, cache keys stay byte-stable).
+    expect(
+      decoderConfigWithRoutedAcceleration(config, { supported: true, hardwareAccelerated: true }),
+    ).toBe(config);
     expect(decoderConfigWithRoutedAcceleration(config, { supported: true })).toBe(config);
   });
 });
@@ -339,7 +345,6 @@ describe('warm decoder pool is capability-driven (R-S05.2)', () => {
     // The borrowed decoder was configured with the exact accepted acceleration rung — no re-probe.
     expect(poolState.borrowConfigs[borrowsBefore]).toMatchObject({
       codec: 'fake-pool',
-      hardwareAcceleration: 'prefer-hardware',
     });
     expect(codec.supports).toHaveBeenCalledTimes(1);
 

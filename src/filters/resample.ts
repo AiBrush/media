@@ -113,6 +113,10 @@ export interface ResampleTap {
 export interface ResampleAxisPlan {
   /** Tap list per destination pixel, in destination order. */
   readonly weights: readonly (readonly ResampleTap[])[];
+  /** The same taps flattened for the hot loops: destination `d` owns `[tapOffsets[d], tapOffsets[d + 1])`. */
+  readonly tapOffsets: Int32Array;
+  readonly tapIndices: Int32Array;
+  readonly tapWeights: Float32Array;
   /** `srcSpan / dstLen` — >1 reduces (the widened Catmull-Rom engages), ≤1 magnifies (tent). */
   readonly scale: number;
   /** Kernel support half-width in source pixels: `2 * scale` when reducing, `1` otherwise. */
@@ -186,7 +190,30 @@ export function planResampleAxis(
     weights.push(normalized);
     maxTaps = Math.max(maxTaps, normalized.length);
   }
-  return { weights, scale, support, maxTaps };
+  return { weights, ...flattenTaps(weights), scale, support, maxTaps };
+}
+
+function flattenTaps(weights: readonly (readonly ResampleTap[])[]): {
+  tapOffsets: Int32Array;
+  tapIndices: Int32Array;
+  tapWeights: Float32Array;
+} {
+  let total = 0;
+  for (const taps of weights) total += taps.length;
+  const tapOffsets = new Int32Array(weights.length + 1);
+  const tapIndices = new Int32Array(total);
+  const tapWeights = new Float32Array(total);
+  let at = 0;
+  for (let d = 0; d < weights.length; d++) {
+    tapOffsets[d] = at;
+    for (const tap of weights[d] as readonly ResampleTap[]) {
+      tapIndices[at] = tap.index;
+      tapWeights[at] = tap.weight;
+      at++;
+    }
+  }
+  tapOffsets[weights.length] = at;
+  return { tapOffsets, tapIndices, tapWeights };
 }
 
 /**
@@ -205,26 +232,33 @@ export function resampleRgbaRegion(
 ): { data: Float32Array; width: number; height: number } {
   const dstW = axisX.weights.length;
   const dstH = axisY.weights.length;
+  const srcW = src.width;
+  const srcH = src.height;
+  const data = src.data;
+  const xOffsets = axisX.tapOffsets;
+  const xIndices = axisX.tapIndices;
+  const xWeights = axisX.tapWeights;
 
-  // Horizontal: src.width × src.height → dstW × src.height.
-  const horizontal = new Float32Array(dstW * src.height * 4);
-  for (let x = 0; x < dstW; x++) {
-    const taps = axisX.weights[x] ?? [];
-    for (let y = 0; y < src.height; y++) {
-      const rowBase = y * src.width;
+  // Horizontal pass, row-major so the source row and the destination row both stay in cache.
+  const horizontal = new Float32Array(dstW * srcH * 4);
+  for (let y = 0; y < srcH; y++) {
+    const rowBase = y * srcW * 4;
+    const outBase = y * dstW * 4;
+    for (let x = 0; x < dstW; x++) {
       let r = 0;
       let g = 0;
       let b = 0;
       let a = 0;
-      for (const tap of taps) {
-        const o = (rowBase + tap.index) * 4;
-        const w = tap.weight;
-        r += (src.data[o] ?? 0) * w;
-        g += (src.data[o + 1] ?? 0) * w;
-        b += (src.data[o + 2] ?? 0) * w;
-        a += (src.data[o + 3] ?? 0) * w;
+      const end = xOffsets[x + 1] as number;
+      for (let t = xOffsets[x] as number; t < end; t++) {
+        const o = rowBase + (xIndices[t] as number) * 4;
+        const w = xWeights[t] as number;
+        r += (data[o] as number) * w;
+        g += (data[o + 1] as number) * w;
+        b += (data[o + 2] as number) * w;
+        a += (data[o + 3] as number) * w;
       }
-      const q = (y * dstW + x) * 4;
+      const q = outBase + x * 4;
       horizontal[q] = r;
       horizontal[q + 1] = g;
       horizontal[q + 2] = b;
@@ -232,28 +266,22 @@ export function resampleRgbaRegion(
     }
   }
 
-  // Vertical: dstW × src.height → dstW × dstH.
+  // Vertical pass: each destination row accumulates whole intermediate rows one tap at a time, so the
+  // inner loop is a contiguous multiply-add over `dstW * 4` floats.
+  const yOffsets = axisY.tapOffsets;
+  const yIndices = axisY.tapIndices;
+  const yWeights = axisY.tapWeights;
+  const rowLen = dstW * 4;
   const out = new Float32Array(dstW * dstH * 4);
   for (let y = 0; y < dstH; y++) {
-    const taps = axisY.weights[y] ?? [];
-    for (let x = 0; x < dstW; x++) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let a = 0;
-      for (const tap of taps) {
-        const o = (tap.index * dstW + x) * 4;
-        const w = tap.weight;
-        r += (horizontal[o] ?? 0) * w;
-        g += (horizontal[o + 1] ?? 0) * w;
-        b += (horizontal[o + 2] ?? 0) * w;
-        a += (horizontal[o + 3] ?? 0) * w;
+    const outBase = y * rowLen;
+    const end = yOffsets[y + 1] as number;
+    for (let t = yOffsets[y] as number; t < end; t++) {
+      const inBase = (yIndices[t] as number) * rowLen;
+      const w = yWeights[t] as number;
+      for (let i = 0; i < rowLen; i++) {
+        out[outBase + i] = (out[outBase + i] as number) + (horizontal[inBase + i] as number) * w;
       }
-      const q = (y * dstW + x) * 4;
-      out[q] = r;
-      out[q + 1] = g;
-      out[q + 2] = b;
-      out[q + 3] = a;
     }
   }
   return { data: out, width: dstW, height: dstH };

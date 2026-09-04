@@ -103,6 +103,7 @@ export {
   assertVideoEncoderOutputBitDepth,
   audioTrackInfoFromDecoderConfig,
   canCopyAudioTrackToContainer,
+  canCopyVideoTrackToContainer,
   outputGaplessForAudioEncoder,
   videoTrackInfoFromDecoderConfig,
 } from './mux-trackinfo.ts';

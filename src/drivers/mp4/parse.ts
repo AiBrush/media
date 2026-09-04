@@ -21,7 +21,7 @@ import {
   type Mp4DisplayTransform,
   clockwiseRotationFromMp4Matrix,
 } from './display-transform.ts';
-import { decodeMdhdLanguage, decodeQuickTimeMdhdLanguage } from './mdhd-language.ts';
+import { decodeQuickTimeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 export type { ColrInfo } from './codec-strings.ts';
@@ -302,7 +302,7 @@ function parseMovieInternal(brand: string, moov: Uint8Array, mode: ParseMode): M
   let needsFragmentTiming = false;
   let trakIndex = 0;
   for (const trak of children(r, root, 'trak')) {
-    const parsed = parseTrak(r, trak, movie.timescale, mode, trakIndex, brand === 'qt  ');
+    const parsed = parseTrak(r, trak, movie.timescale, mode, trakIndex);
     trakIndex++;
     if (parsed.kind === 'other') {
       otherTracks.push(parsed.track);
@@ -652,7 +652,6 @@ function parseOtherTrak(
   movieTimescale: number,
   mode: ParseMode,
   trakIndex: number,
-  legacyQuickTimeLanguage: boolean,
 ): OtherTrack {
   const trackHeader = attempt(() => {
     const tkhd = child(r, trak, 'tkhd');
@@ -661,7 +660,7 @@ function parseOtherTrak(
   const timing = attempt(() => {
     const mdia = child(r, trak, 'mdia');
     const mdhd = mdia ? child(r, mdia, 'mdhd') : undefined;
-    return mdhd ? parseMdhd(r, mdhd, legacyQuickTimeLanguage) : undefined;
+    return mdhd ? parseMdhd(r, mdhd) : undefined;
   });
   const stbl = attempt(() => {
     const mdia = child(r, trak, 'mdia');
@@ -714,7 +713,6 @@ function parseTrak(
   movieTimescale: number,
   mode: ParseMode,
   trakIndex: number,
-  legacyQuickTimeLanguage: boolean,
 ): ParsedTrakResult {
   // The handler decides the path: `vide`/`soun` keep the strict decode-grade parse below; any other
   // (or unreadable) handler surfaces as a lenient OtherTrack — a declared trak is NEVER dropped.
@@ -731,7 +729,6 @@ function parseTrak(
         movieTimescale,
         mode,
         trakIndex,
-        legacyQuickTimeLanguage,
       ),
     };
   }
@@ -746,7 +743,7 @@ function parseTrak(
     durationSec,
     durationTicks: mediaDurationTicks,
     language,
-  } = parseMdhd(r, mdhd, legacyQuickTimeLanguage);
+  } = parseMdhd(r, mdhd);
 
   const minf = child(r, mdia, 'minf') ?? fail('mdia has no minf');
   const stbl = child(r, minf, 'stbl') ?? fail('minf has no stbl');
@@ -898,19 +895,15 @@ function parseTkhd(
 function parseMdhd(
   r: Reader,
   box: BoxHeader,
-  legacyQuickTimeLanguage = false,
 ): { timescale: number; durationSec: number; durationTicks: number; language?: string } {
   r.seek(box.payloadStart);
   const { version } = readFullBoxHeader(r);
   r.skip(version === 1 ? 16 : 8);
   const timescale = r.u32();
   const duration = version === 1 ? readU64Safe(r, 'mdhd duration') : r.u32();
-  const language =
-    r.pos + 2 <= box.end
-      ? legacyQuickTimeLanguage
-        ? decodeQuickTimeMdhdLanguage(r.u16())
-        : decodeMdhdLanguage(r.u16())
-      : undefined;
+  // ISO 639-2 packed code, or a legacy Macintosh language id (< 0x400) — read the way ffprobe does,
+  // regardless of brand: QuickTime-era tooling writes id 0 (`eng`) into `isom` movies too.
+  const language = r.pos + 2 <= box.end ? decodeQuickTimeMdhdLanguage(r.u16()) : undefined;
   return {
     timescale,
     durationSec: timescale > 0 ? duration / timescale : 0,

@@ -13,7 +13,7 @@ If you are integrating the package for the first time, read these pages in order
 4. [Runtime and capabilities](runtime-and-capabilities.md)
 5. [Errors and resource ownership](errors-and-lifecycle.md)
 
-Use the [API reference](api-reference.md) when you already know the operation you need.
+Use the [API reference](api-reference.md) when you already know the operation you need. The planned simplification of this surface is described in [Simple API design](simple-api-design.md).
 
 ## By task
 
@@ -39,6 +39,7 @@ Use the [API reference](api-reference.md) when you already know the operation yo
 | `@aibrush/media/image` | Direct image inspection and browser image decoding |
 | `@aibrush/media/wav` | Small synchronous WAV header and PCM utilities |
 | `@aibrush/media/mp4-packet-info` | Focused MP4/MOV packet metadata inspection |
+| `@aibrush/media/hls` | HLS manifest parsing and key/segment resolution |
 | `@aibrush/media/core` | Driver contracts and advanced embedding APIs |
 | `@aibrush/media/drivers/*` | Explicit first-party driver modules |
 

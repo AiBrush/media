@@ -15,6 +15,7 @@ import { CapabilityError } from '../contracts/errors.ts';
 import type { MaterializeOptions, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
 import { type MediaInput, type Source, from as normalizeInput } from '../sources/source.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import type {
   CallOptions,
   ConvertOptions,
@@ -25,6 +26,9 @@ import type {
   Output,
   RemuxOptions,
 } from './types.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadMaterializeModule = memoizeAsync(() => import('../sinks/materialize.ts'));
 
 export const MICROS_PER_SECOND = 1_000_000;
 
@@ -44,7 +48,7 @@ export async function materializeOutput(
   opts: MaterializeOptions,
 ): Promise<Output> {
   if (sink.kind === 'stream') return stream;
-  const { materialize } = await import('../sinks/materialize.ts');
+  const { materialize } = await loadMaterializeModule();
   return materialize(sink, stream, opts);
 }
 
@@ -199,6 +203,9 @@ function toInfoTrack(t: TrackInfo): MediaInfoTrack {
   };
   if (t.durationSec !== undefined) base.durationSec = t.durationSec;
   if (t.language !== undefined) base.language = t.language;
+  if (t.defaultDisposition !== undefined) base.defaultDisposition = t.defaultDisposition;
+  if (t.encrypted === true) base.encrypted = true;
+  if (t.encryptionScheme !== undefined) base.encryptionScheme = t.encryptionScheme;
   if (t.fps !== undefined) base.fps = t.fps;
   if (t.rotation !== undefined) base.rotation = t.rotation;
   const config = t.config;

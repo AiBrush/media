@@ -28,6 +28,7 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import { packetStatsFromRows } from '../../internal/packet-stats.ts';
 import { matchesOgg } from '../audio-container-sniff.ts';
 import { type ChunkStruct, OggMuxer, trackStateFrom, writeOgg } from './ogg-write.ts';
+import { validateOggMuxTrack } from '../audio-container-mux-validation.ts';
 
 function asciiAt(dv: DataView, offset: number, length: number): string {
   if (offset + length > dv.byteLength) return '';
@@ -1572,6 +1573,7 @@ export const OggDriver: ContainerDriver = {
       close: () => Promise.resolve(),
     };
   },
+  validateMuxTrack: validateOggMuxTrack,
   createMuxer(o?: MuxOptions): Muxer {
     // The EncodedChunk-seam adapter over the Ogg page writer ({@link OggMuxer}); the packet→page lacing
     // + granule timing is pure + Node-validated, only the per-chunk `copyTo` is browser-only (ogg-write.ts).

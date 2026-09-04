@@ -46,6 +46,8 @@ describe('parseMovie — format variants', () => {
         codec: 'tx3g',
         timescale: 1000,
         durationSec: 1,
+        // mdhd language id 0 is the Macintosh code for English, read as ffprobe does for any brand.
+        language: 'eng',
         sampleCount: 0,
         trakIndex: 2,
       },
@@ -375,11 +377,13 @@ describe('parseMovie — non-media traks are never dropped, however malformed', 
     expect(movieWith([videoTrakWith([], 0, false)]).tracks[0]?.defaultDisposition).toBe(false);
   });
 
-  it('interprets legacy Macintosh mdhd language codes only for a QuickTime major brand', () => {
+  it('interprets legacy Macintosh mdhd language codes regardless of major brand (the ffprobe rule)', () => {
+    // A packed value below 0x400 cannot be an ISO 639-2 triple (each letter is ≥ 1), so it is a
+    // Macintosh language id whatever the brand: QuickTime-era tooling writes id 0 into `isom` too.
     const payload = bytes(box('moov', cat(mvhd600, videoTrakWith([], 0))).slice(8));
 
     expect(parseMovie('qt  ', payload).tracks[0]?.language).toBe('eng');
-    expect(parseMovie('isom', payload).tracks[0]?.language).toBeUndefined();
+    expect(parseMovie('isom', payload).tracks[0]?.language).toBe('eng');
   });
 
   it('decodes mdhd language for both AV and non-media tracks, retaining explicit undetermined', () => {

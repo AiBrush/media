@@ -6,6 +6,12 @@ import { raceAbort, sourceAbortError } from '../../sources/abort.ts';
 import { readSimpleVideoFaststartProbe } from './simple-video-probe.ts';
 
 const FASTSTART_PROBE_INITIAL_BYTES = 64 * 1024;
+/**
+ * A Blob range is a real copy out of blob storage, so a metadata-only probe uses the same bounded layout
+ * window as the driver's probe path: a small faststart file must not be materialized wholesale to read
+ * its `moov`. In-memory bytes and remote sources keep the wider first window.
+ */
+const BLOB_FASTSTART_PROBE_INITIAL_BYTES = 16 * 1024;
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw sourceAbortError(signal);
@@ -91,7 +97,9 @@ export async function probeMp4Faststart(
     };
     const simple = await readSimpleVideoFaststartProbe(
       randomAccess,
-      FASTSTART_PROBE_INITIAL_BYTES,
+      (src as ByteSource & { readonly kind?: string }).kind === 'blob'
+        ? BLOB_FASTSTART_PROBE_INITIAL_BYTES
+        : FASTSTART_PROBE_INITIAL_BYTES,
       true,
     );
     const simpleTracks =

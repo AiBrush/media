@@ -10,6 +10,7 @@
  */
 
 import { InputError } from '../contracts/errors.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import { raceAbort, throwIfSourceAborted } from './abort.ts';
 import { parseContentLength, parseContentRangeTotal } from './http-range.ts';
 import {
@@ -19,6 +20,11 @@ import {
   isLiveMediaSource,
   mediaStreamOf,
 } from './live-source.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadOpfsModule = memoizeAsync(() => import('./opfs.ts'));
+const loadStreamInputModule = memoizeAsync(() => import('./stream-input.ts'));
+const loadUrlSizeModule = memoizeAsync(() => import('./url-size.ts'));
 
 /**
  * Internal identity hook used for short-lived cross-operation source caches. Not exported from the
@@ -74,6 +80,12 @@ export interface Source {
   stream(): ReadableStream<Uint8Array>;
   /** Total byte length when known ahead of time (absent/`undefined` ⇒ unknown until probed). */
   readonly size?: number;
+  /**
+   * In-memory sources only: the first `n` bytes as a view, with no read accounting. The router uses it
+   * to let a file's own magic correct a wrong MIME/extension label without touching the read budget.
+   * @internal
+   */
+  readonly peekHead?: (n: number) => Uint8Array;
   /**
    * Random access for header-only reads; half-open `[start, end)`, negative `start` clamped to 0.
    *
@@ -161,6 +173,7 @@ export function fromBytes(bytes: ArrayBuffer | ArrayBufferView, opts?: { mime?: 
     __media: 'source',
     kind: 'bytes',
     size: u8.byteLength,
+    peekHead: (n: number) => u8.subarray(0, Math.min(n, u8.byteLength)),
     ...(opts?.mime !== undefined ? { mimeHint: opts.mime } : {}),
     stream: () =>
       new ReadableStream<Uint8Array>({
@@ -283,14 +296,14 @@ export async function peekSourceHead(
     throwIfSourceAborted(signal);
     return head;
   }
-  const { peekUnseekableSourceHead } = await import('./stream-input.ts');
+  const { peekUnseekableSourceHead } = await loadStreamInputModule();
   return peekUnseekableSourceHead(src, bounded, signal);
 }
 
 /** Cancel a normalized one-shot source if it currently owns a routing reader. */
 export async function cancelSource(src: Source, reason?: unknown): Promise<void> {
   if (!(SOURCE_STREAM_STATE in src)) return;
-  const { cancelOneShotSource } = await import('./stream-input.ts');
+  const { cancelOneShotSource } = await loadStreamInputModule();
   await cancelOneShotSource(src, reason);
 }
 
@@ -387,7 +400,7 @@ export function fromElement(el: HTMLMediaElement, opts: FromElementOptions = {})
 
 /** Read a file from the Origin Private File System by path. */
 export async function fromOPFS(path: string): Promise<Source> {
-  const { fromOPFSImpl } = await import('./opfs.ts');
+  const { fromOPFSImpl } = await loadOpfsModule();
   return fromOPFSImpl(path);
 }
 
@@ -578,7 +591,7 @@ export async function probeUrlSize(
   url: string | URL,
   signal?: AbortSignal,
 ): Promise<number | undefined> {
-  const { probeUrlSizeImpl } = await import('./url-size.ts');
+  const { probeUrlSizeImpl } = await loadUrlSizeModule();
   return probeUrlSizeImpl(url, signal);
 }
 

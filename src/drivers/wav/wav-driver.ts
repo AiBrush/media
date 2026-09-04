@@ -45,6 +45,8 @@ import {
   readWavHead,
   wavTrackInfo,
 } from './wav-probe.ts';
+import { wavMuxTrackConfig } from '../audio-container-mux-validation.ts';
+import type { TrackInfo } from '../../contracts/driver.ts';
 
 export { wavPacketInfoFromBytes, wavPacketInfoFromUrl } from './wav-packet-info.ts';
 export type { WavPacketInfoFromUrlOptions } from './wav-packet-info.ts';
@@ -730,6 +732,9 @@ export const WavDriver: ContainerDriver = {
       }
     }
     throw new MediaError('demux-error', 'WAV PCM source has no readable byte path');
+  },
+  validateMuxTrack(track: TrackInfo, index: number): void {
+    wavMuxTrackConfig(track, index);
   },
   createMuxer(o?: MuxOptions): Muxer {
     return new WavMuxer(o);

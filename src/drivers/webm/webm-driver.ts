@@ -75,6 +75,7 @@ const ID = {
   CodecID: 0x86,
   TrackNumber: 0xd7,
   Language: 0x22b59c,
+  FlagDefault: 0x88,
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
@@ -258,8 +259,10 @@ function mapCodec(codecId: string, bitDepth?: number): string {
 export interface WebmTrack {
   mediaType: MediaType;
   codec: string;
-  /** Explicit Matroska `Language` value (ISO-639-2); the implicit spec default is not invented. */
+  /** Matroska `Language` (ISO-639-2). The element's spec default `eng` applies when it is absent. */
   language?: string;
+  /** Matroska `FlagDefault` (spec default 1 when absent): the track a player should select by default. */
+  defaultDisposition?: boolean;
   /** Declared stream that is enumerable but not decodable (for example a JSON attachment). */
   nonMedia?: true;
   /** Matroska TrackNumber — the value carried by each (Simple)Block, used to attribute block timing. */
@@ -367,6 +370,7 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
   let codecId = '';
   let trackNumber: number | undefined;
   let language: string | undefined;
+  let defaultDisposition = true;
   let width: number | undefined;
   let height: number | undefined;
   let alphaModeDeclarations = 0;
@@ -390,7 +394,8 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
       // TrackInfo's public language vocabulary is ISO-639-2/T. LanguageIETF is deliberately not
       // projected here because an arbitrary BCP-47 tag cannot be losslessly represented by that seam.
       if (/^[a-z]{3}$/.test(declared)) language = declared;
-    } else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
+    } else if (c.id === ID.FlagDefault) defaultDisposition = readUint(dv, c) !== 0;
+    else if (c.id === ID.CodecPrivate) codecPrivate = readBytes(bytes, c);
     else if (c.id === ID.DefaultDuration) defaultDuration = readUint(dv, c);
     else if (c.id === ID.CodecDelay) codecDelayNs = readUint(dv, c);
     else if (c.id === ID.SeekPreRoll) seekPreRollNs = readUint(dv, c);
@@ -458,7 +463,9 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, te: EbmlElement): Webm
     mediaType,
     codec,
     ...(trackNumber !== undefined ? { trackNumber } : {}),
-    ...(language !== undefined ? { language } : {}),
+    // Matroska defines `Language` with the default value `eng`; ffprobe reports the same.
+    language: language ?? 'eng',
+    defaultDisposition,
     ...(codecDelayNs > 0 ? { codecDelayNs } : {}),
     ...(seekPreRollNs > 0 ? { seekPreRollNs } : {}),
     ...(reorderDepth !== undefined ? { reorderDepth } : {}),
@@ -910,74 +917,99 @@ function collectFrames(
           preserveSubTick: false,
         });
   };
+  for (const el of completeSegmentElements(dv, segment)) {
+    if (el.id !== ID.Cluster) continue;
+    lastEndTicks = Math.max(
+      lastEndTicks,
+      collectClusterFrames(bytes, dv, el, timecodeScale, codecDelayForBlock, byTrack, blockTimes),
+    );
+  }
+  return { byTrackNumber: byTrack, blockTimes, lastEndTicks };
+}
+
+/**
+ * De-lace one Cluster's blocks into per-track frames (decode order). Shared by the whole-file demux
+ * and the Cues-driven seek window, so both produce byte-identical frames for the same Cluster.
+ * Returns the greatest block time seen, in timecode ticks.
+ */
+function collectClusterFrames(
+  bytes: Uint8Array,
+  dv: DataView,
+  cluster: EbmlElement,
+  timecodeScale: number,
+  codecDelayForBlock: (block: EbmlElement) => {
+    readonly nanoseconds: number;
+    readonly preserveSubTick: boolean;
+  },
+  byTrack: Map<number, WebmFrame[]>,
+  blockTimes: Map<number, BlockTiming>,
+): number {
+  let lastEndTicks = 0;
   const push = (parsed: { trackNumber: number; frames: WebmFrame[] } | undefined): void => {
     if (!parsed) return;
     const list = byTrack.get(parsed.trackNumber) ?? [];
     for (const f of parsed.frames) list.push(f);
     byTrack.set(parsed.trackNumber, list);
   };
-  for (const el of completeSegmentElements(dv, segment)) {
-    if (el.id !== ID.Cluster) continue;
-    let clusterTimecode = 0;
-    for (const c of elements(dv, el.dataStart, el.dataEnd)) {
-      if (c.id === ID.Timecode) {
-        clusterTimecode = readUint(dv, c);
-      } else if (c.id === ID.SimpleBlock) {
-        const trackNumber = blockTrackNumber(dv, c);
+  let clusterTimecode = 0;
+  for (const c of elements(dv, cluster.dataStart, cluster.dataEnd)) {
+    if (c.id === ID.Timecode) {
+      clusterTimecode = readUint(dv, c);
+    } else if (c.id === ID.SimpleBlock) {
+      const trackNumber = blockTrackNumber(dv, c);
+      if (trackNumber !== undefined) {
+        const blockTime = clusterTimecode + blockRelTimecode(dv, c);
+        recordBlockTime(blockTimes, trackNumber, blockTime);
+        lastEndTicks = Math.max(lastEndTicks, blockTime);
+      }
+      const delay = codecDelayForBlock(c);
+      push(
+        blockFrames(
+          bytes,
+          dv,
+          c,
+          clusterTimecode,
+          timecodeScale,
+          delay.nanoseconds,
+          delay.preserveSubTick,
+          undefined,
+          undefined,
+          undefined,
+        ),
+      );
+    } else if (c.id === ID.BlockGroup) {
+      const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
+      if (block) {
+        const trackNumber = blockTrackNumber(dv, block);
         if (trackNumber !== undefined) {
-          const blockTime = clusterTimecode + blockRelTimecode(dv, c);
+          const blockTime = clusterTimecode + blockRelTimecode(dv, block);
           recordBlockTime(blockTimes, trackNumber, blockTime);
           lastEndTicks = Math.max(lastEndTicks, blockTime);
         }
-        const delay = codecDelayForBlock(c);
+        // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
+        const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
+        const discardPadding = findChild(dv, c.dataStart, c.dataEnd, ID.DiscardPadding);
+        const blockDuration = findChild(dv, c.dataStart, c.dataEnd, ID.BlockDuration);
+        const delay = codecDelayForBlock(block);
         push(
           blockFrames(
             bytes,
             dv,
-            c,
+            block,
             clusterTimecode,
             timecodeScale,
             delay.nanoseconds,
             delay.preserveSubTick,
-            undefined,
-            undefined,
-            undefined,
+            isKeyframe,
+            readMainBlockAdditional(bytes, dv, c.dataStart, c.dataEnd),
+            discardPadding === undefined ? undefined : readInt(dv, discardPadding),
+            blockDuration === undefined ? undefined : readUint(dv, blockDuration),
           ),
         );
-      } else if (c.id === ID.BlockGroup) {
-        const block = findChild(dv, c.dataStart, c.dataEnd, ID.Block);
-        if (block) {
-          const trackNumber = blockTrackNumber(dv, block);
-          if (trackNumber !== undefined) {
-            const blockTime = clusterTimecode + blockRelTimecode(dv, block);
-            recordBlockTime(blockTimes, trackNumber, blockTime);
-            lastEndTicks = Math.max(lastEndTicks, blockTime);
-          }
-          // A Block is a keyframe iff its BlockGroup has no ReferenceBlock (it references no other frame).
-          const isKeyframe = findChild(dv, c.dataStart, c.dataEnd, ID.ReferenceBlock) === undefined;
-          const discardPadding = findChild(dv, c.dataStart, c.dataEnd, ID.DiscardPadding);
-          const blockDuration = findChild(dv, c.dataStart, c.dataEnd, ID.BlockDuration);
-          const delay = codecDelayForBlock(block);
-          push(
-            blockFrames(
-              bytes,
-              dv,
-              block,
-              clusterTimecode,
-              timecodeScale,
-              delay.nanoseconds,
-              delay.preserveSubTick,
-              isKeyframe,
-              readMainBlockAdditional(bytes, dv, c.dataStart, c.dataEnd),
-              discardPadding === undefined ? undefined : readInt(dv, discardPadding),
-              blockDuration === undefined ? undefined : readUint(dv, blockDuration),
-            ),
-          );
-        }
       }
     }
   }
-  return { byTrackNumber: byTrack, blockTimes, lastEndTicks };
+  return lastEndTicks;
 }
 
 function readMainBlockAdditional(
@@ -3243,6 +3275,9 @@ function toTrackInfo(
     codec: track.codec,
     ...(durationSec !== undefined ? { durationSec } : {}),
     ...(track.language !== undefined ? { language: track.language } : {}),
+    ...(track.defaultDisposition !== undefined
+      ? { defaultDisposition: track.defaultDisposition }
+      : {}),
     ...(track.fps !== undefined ? { fps: track.fps } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     ...(track.alpha === true || observedAlpha === true ? { alpha: true } : {}),
@@ -4619,6 +4654,232 @@ function packetStream(
   /* v8 ignore stop */
 }
 
+// ============ Cues-driven random access (seek) ============
+
+const CUE_TRACK_ID = 0xf7;
+/** A Cluster larger than this is not read as one window; the seek then declines to the demux path. */
+const WEBM_SEEK_CLUSTER_MAX_BYTES = 64 * 1024 * 1024;
+
+interface WebmCuePoint {
+  readonly timeTicks: number;
+  readonly clusterPosition: number;
+  readonly trackNumber: number | undefined;
+}
+
+export interface WebmSeekFrames {
+  readonly info: WebmInfo;
+  readonly track: WebmTrack;
+  /** Frames of the requested track, one array per Cluster, in file order from the chosen cue. */
+  readonly clusters: AsyncIterable<readonly WebmFrame[]>;
+  /** Absolute file position of the first Cluster read. */
+  readonly startPosition: number;
+}
+
+function cuePointsFromCues(dv: DataView, cues: EbmlElement, span: SegmentSpan): WebmCuePoint[] {
+  const points: WebmCuePoint[] = [];
+  for (const point of elements(dv, cues.dataStart, cues.dataEnd)) {
+    if (point.id !== ID.CuePoint || !point.complete) continue;
+    const time = findChild(dv, point.dataStart, point.dataEnd, ID.CueTime);
+    if (time === undefined || !time.complete) continue;
+    const timeTicks = readUint(dv, time);
+    for (const child of elements(dv, point.dataStart, point.dataEnd)) {
+      if (child.id !== ID.CueTrackPositions || !child.complete) continue;
+      const position = findChild(dv, child.dataStart, child.dataEnd, ID.CueClusterPosition);
+      if (position === undefined || !position.complete) continue;
+      const trackElement = findChild(dv, child.dataStart, child.dataEnd, CUE_TRACK_ID);
+      const clusterPosition = span.dataStart + readUint(dv, position);
+      if (clusterPosition < span.dataStart || clusterPosition >= span.dataEnd) continue;
+      points.push({
+        timeTicks,
+        clusterPosition,
+        trackNumber: trackElement === undefined ? undefined : readUint(dv, trackElement),
+      });
+    }
+  }
+  return points;
+}
+
+async function readCuePoints(
+  src: FiniteRangeByteSource,
+  position: number,
+  prefix: Uint8Array,
+  span: SegmentSpan,
+  signal: AbortSignal | undefined,
+): Promise<WebmCuePoint[] | undefined> {
+  if (position >= 0 && position < prefix.byteLength) {
+    const dv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+    for (const el of elements(dv, position, prefix.byteLength)) {
+      if (el.id === ID.Cues && el.complete) return cuePointsFromCues(dv, el, span);
+      break;
+    }
+  }
+  const read = await readElementAt(src, position, ID.Cues, WEBM_METADATA_CUES_MAX_BYTES, signal);
+  if (read === undefined) return undefined;
+  const dv = new DataView(read.bytes.buffer, read.bytes.byteOffset, read.bytes.byteLength);
+  const points = cuePointsFromCues(dv, read.element, span);
+  src.releaseRange?.(read.bytes); // only offsets escape this buffer
+  return points;
+}
+
+/**
+ * Open a Cues-driven frame window for one track: bounded metadata, the Cues index, then Clusters read
+ * one at a time from the last cue point at or before `timeUs`. Pure range reads — a 2 h remote file
+ * costs the head prefix, the index and the Clusters actually decoded, never a whole-file download.
+ * `undefined` when the source or file cannot support it (no random access, no Cues, unknown-size
+ * Clusters); the caller then keeps the whole-file demux path.
+ */
+export async function webmSeekFrames(
+  src: ByteSource,
+  trackId: number,
+  timeUs: number,
+  signal?: AbortSignal,
+): Promise<WebmSeekFrames | undefined> {
+  if (
+    src.range === undefined ||
+    src.size === undefined ||
+    !Number.isSafeInteger(src.size) ||
+    src.size <= 0 ||
+    !Number.isFinite(timeUs) ||
+    timeUs < 0
+  ) {
+    return undefined;
+  }
+  const ranged = src as FiniteRangeByteSource;
+  const info = await readMetadataInfo(src, signal);
+  assertNotAborted(signal);
+  const track = info.tracks[trackId];
+  if (track === undefined || track.trackNumber === undefined) return undefined;
+  const trackNumber = track.trackNumber;
+
+  const prefixEnd = Math.min(ranged.size, WEBM_METADATA_PREFIX_BYTES[1] ?? 64 * 1024);
+  const prefix = await readPacketInfoRange(ranged, 0, prefixEnd, signal);
+  let points: WebmCuePoint[] | undefined;
+  let span: SegmentSpan | undefined;
+  let timecodeScale = 1_000_000;
+  try {
+    const prefixDv = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+    span = segmentSpan(prefixDv, ranged.size);
+    if (span === undefined || span.dataEnd <= span.dataStart) return undefined;
+    timecodeScale = segmentTimecodeScale(prefixDv, span);
+    const plan = await planTerminalIndex(ranged, prefix, span, signal);
+    if (plan.cues === undefined) return undefined;
+    points = await readCuePoints(ranged, plan.cues, prefix, span, signal);
+  } finally {
+    ranged.releaseRange?.(prefix);
+  }
+  assertNotAborted(signal);
+  if (points === undefined || span === undefined) return undefined;
+  const candidates = points.filter(
+    (point) => point.trackNumber === undefined || point.trackNumber === trackNumber,
+  );
+  if (candidates.length === 0) return undefined;
+  const targetTicks = Math.floor((timeUs * 1000) / timecodeScale);
+  let start: WebmCuePoint | undefined;
+  let earliest: WebmCuePoint | undefined;
+  for (const point of candidates) {
+    if (earliest === undefined || point.timeTicks < earliest.timeTicks) earliest = point;
+    if (
+      point.timeTicks <= targetTicks &&
+      (start === undefined || point.timeTicks > start.timeTicks)
+    ) {
+      start = point;
+    }
+  }
+  const origin = (start ?? earliest) as WebmCuePoint;
+  const segment = span;
+  const delays = codecDelayMap(info);
+
+  const reader = new WebmPacketInfoRangeReader(ranged, signal);
+  // Validate the first Cluster before handing out a stream so an unsupported layout declines cleanly.
+  let first: WebmElementRange;
+  try {
+    first = await readWebmElementRange(reader, origin.clusterPosition, segment.dataEnd, false);
+  } catch {
+    reader.close();
+    return undefined;
+  }
+  if (first.id !== ID.Cluster || first.unknownSize) {
+    reader.close();
+    return undefined;
+  }
+
+  const clusters = (async function* (): AsyncGenerator<readonly WebmFrame[]> {
+    let cursor = origin.clusterPosition;
+    try {
+      while (cursor < segment.dataEnd) {
+        assertNotAborted(signal);
+        const element = await readWebmElementRange(reader, cursor, segment.dataEnd, false);
+        if (element.id !== ID.Cluster) {
+          if (element.unknownSize) return;
+          cursor = element.dataEnd;
+          continue;
+        }
+        if (element.unknownSize) return;
+        if (element.dataEnd - cursor > WEBM_SEEK_CLUSTER_MAX_BYTES) {
+          throw new MediaError(
+            'demux-error',
+            `WebM Cluster at ${cursor} exceeds the ${WEBM_SEEK_CLUSTER_MAX_BYTES}-byte seek window`,
+          );
+        }
+        const bytes = await readPacketInfoRange(ranged, cursor, element.dataEnd, signal);
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const cluster: EbmlElement = {
+          id: ID.Cluster,
+          dataStart: element.dataStart - cursor,
+          dataEnd: element.dataEnd - cursor,
+          complete: true,
+          unknownSize: false,
+        };
+        const byTrack = new Map<number, WebmFrame[]>();
+        collectClusterFrames(
+          bytes,
+          dv,
+          cluster,
+          timecodeScale,
+          (block) => {
+            const number = blockTrackNumber(dv, block);
+            return number === undefined
+              ? { nanoseconds: 0, preserveSubTick: false }
+              : (delays.get(number) ?? { nanoseconds: 0, preserveSubTick: false });
+          },
+          byTrack,
+          new Map(),
+        );
+        const frames = byTrack.get(trackNumber);
+        if (frames !== undefined && frames.length > 0) yield frames;
+        cursor = element.dataEnd;
+      }
+    } finally {
+      reader.close();
+    }
+  })();
+
+  return { info, track, clusters, startPosition: origin.clusterPosition };
+}
+
+/** One Packet for one de-laced frame, with the same sync/alpha semantics as {@link packetStream}. */
+function framePacket(frame: WebmFrame, track: WebmTrack): Packet {
+  const isVideo = track.mediaType === 'video';
+  const keyframe = track.codec === 'opus' || track.codec === 'vorbis' || frame.keyframe;
+  const init = {
+    type: (keyframe ? 'key' : 'delta') as EncodedVideoChunkType,
+    timestamp: frame.timestampUs,
+    data: frame.data,
+  };
+  const chunk = isVideo ? new EncodedVideoChunk(init) : new EncodedAudioChunk(init);
+  const alpha =
+    isVideo && frame.alpha !== undefined
+      ? new EncodedVideoChunk({ ...init, data: frame.alpha })
+      : undefined;
+  return {
+    chunk,
+    data: frame.data,
+    sizeBytes: frame.data.byteLength,
+    ...(!isVideo ? { dtsUs: frame.timestampUs } : {}),
+    ...(alpha !== undefined ? { alpha } : {}),
+  };
+}
+
 export const WebmDriver: ContainerDriver = {
   id: 'webm',
   apiVersion: DRIVER_API_VERSION,
@@ -4666,6 +4927,48 @@ export const WebmDriver: ContainerDriver = {
       },
       close: () => Promise.resolve(),
     };
+  },
+  async seekPackets(
+    src: ByteSource,
+    trackId: number,
+    timeUs: number,
+    o?: StageOptions,
+  ): Promise<ReadableStream<Packet> | undefined> {
+    const signal = o?.signal;
+    const seek = await webmSeekFrames(src, trackId, timeUs, signal);
+    if (seek === undefined) return undefined;
+    if (typeof EncodedVideoChunk === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
+      throw new CapabilityError(
+        'WebM packet demux requires WebCodecs EncodedVideoChunk/EncodedAudioChunk (browser/worker only)',
+        { op: { kind: 'route', id: 'seek' }, tried: [] },
+      );
+    }
+    /* v8 ignore start -- requires WebCodecs Encoded*Chunk; validated under browser-mode (codec phase) */
+    const iterator = seek.clusters[Symbol.asyncIterator]();
+    let pending: readonly WebmFrame[] = [];
+    let index = 0;
+    return new ReadableStream<Packet>(
+      {
+        async pull(controller): Promise<void> {
+          while (index >= pending.length) {
+            const next = await iterator.next();
+            if (next.done === true) {
+              controller.close();
+              return;
+            }
+            pending = next.value;
+            index = 0;
+          }
+          const frame = pending[index++] as WebmFrame;
+          controller.enqueue(framePacket(frame, seek.track));
+        },
+        async cancel(): Promise<void> {
+          await iterator.return?.();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    /* v8 ignore stop */
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     return streamCopyWebm(src, o);

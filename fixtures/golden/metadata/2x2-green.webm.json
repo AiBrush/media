@@ -9,6 +9,7 @@
       "codec": "vp8",
       "durationSec": 0.096,
       "language": "und",
+      "defaultDisposition": false,
       "fps": 25,
       "width": 2,
       "height": 2
@@ -19,6 +20,7 @@
       "codec": "opus",
       "durationSec": 0.096,
       "language": "und",
+      "defaultDisposition": false,
       "sampleRate": 48000,
       "channels": 1
     }

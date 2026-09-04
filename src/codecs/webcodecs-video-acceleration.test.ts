@@ -382,6 +382,20 @@ describe('WebCodecs decoder startup — configuration is proven before packet su
       await expect(
         WebcodecsVideoDriver.supports({ mediaType: 'video', direction: 'decode', config }),
       ).resolves.toMatchObject({ supported: true, hardwareAccelerated: true });
+      // The capability verdict does not pin later decoders. A decoder that was explicitly asked for
+      // hardware remembers that rung; the next decoder for the same config recalls it, and when the
+      // session turns out stale it falls back through the empty-flush barrier before any decode().
+      const pinned = WebcodecsVideoDriver.createDecoder({
+        ...config,
+        hardwareAcceleration: 'prefer-hardware',
+      });
+      const pinnedWriter = pinned.writable.getWriter();
+      await pinnedWriter.write(new TestEncodedVideoChunk() as unknown as EncodedVideoChunk);
+      await pinnedWriter.close();
+      await expect(pinned.readable.getReader().read()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
       hardwareSupported = false;
 
       const stream = WebcodecsVideoDriver.createDecoder(config);
@@ -395,8 +409,12 @@ describe('WebCodecs decoder startup — configuration is proven before packet su
       });
 
       expect(probeCalls).toBe(2);
-      expect(configureAccelerations).toEqual(['prefer-hardware', 'no-preference']);
-      expect(decodedAccelerations).toEqual(['no-preference']);
+      expect(configureAccelerations).toEqual([
+        'prefer-hardware',
+        'prefer-hardware',
+        'no-preference',
+      ]);
+      expect(decodedAccelerations).toEqual(['prefer-hardware', 'no-preference']);
     } finally {
       restoreGlobalProperty('EncodedVideoChunk', priorChunk);
       restoreGlobalProperty('VideoDecoder', priorDecoder);

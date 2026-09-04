@@ -9,6 +9,7 @@
       "codec": "avc1.64000B",
       "durationSec": 1,
       "language": "und",
+      "defaultDisposition": true,
       "fps": 10,
       "rotation": 0,
       "width": 320,

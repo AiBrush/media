@@ -52,13 +52,13 @@ describe('convert target preflight — route projection', () => {
     expect(dependencies.probeCodec).not.toHaveBeenCalled();
   });
 
-  it('projects an ordinary container and both explicit codecs into route probes', async () => {
+  it('projects an ordinary container and a transforming video target plus the audio codec into route probes', async () => {
     const dependencies = context();
     dependencies.muxer.mockResolvedValue({} as ContainerDriver);
     dependencies.probeCodec.mockResolvedValue(undefined);
     await preflightConvert(dependencies, {
       to: 'mp4',
-      video: { codec: 'h264' },
+      video: { codec: 'h264', width: 640 },
       audio: { codec: 'aac' },
     });
     expect(dependencies.muxer).toHaveBeenCalledWith('mp4');
@@ -67,6 +67,15 @@ describe('convert target preflight — route projection', () => {
       { mediaType: 'video', direction: 'encode' },
       { mediaType: 'audio', direction: 'encode' },
     ]);
+  });
+
+  it('defers the encoder probe for a codec-only video target (the runner may copy the source packets)', async () => {
+    const dependencies = context();
+    dependencies.muxer.mockResolvedValue({} as ContainerDriver);
+    dependencies.probeCodec.mockResolvedValue(undefined);
+    await preflightConvert(dependencies, { to: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } });
+    expect(dependencies.probeCodec).toHaveBeenCalledTimes(1);
+    expect(dependencies.probeCodec.mock.calls[0]?.[0]).toMatchObject({ mediaType: 'audio', direction: 'encode' });
   });
 
   it('does not manufacture routes for omitted output and disabled tracks', async () => {

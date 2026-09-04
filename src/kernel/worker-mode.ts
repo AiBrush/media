@@ -31,7 +31,7 @@ export function workerOffloadAvailable(): boolean {
  * spawned worker's `ready.caps` handshake, applied by the engine after this static decision.
  */
 export function selectWorkerMode(
-  worker: boolean | { pool?: number } | undefined,
+  worker: boolean | { pool?: number; url?: string | URL } | undefined,
   workerExists: boolean,
 ): WorkerSelection {
   // Heavy convert/trim offload is now the default when a Worker exists (peak-memory + longtask win):
@@ -50,7 +50,7 @@ export function selectWorkerMode(
  * worker-less pool); `true`/`false`/unset/`{}` default to a single worker (no fan-out — one job streams
  * on one worker; the pipeline is already streamed, doc 06 §4). Pure + total.
  */
-export function resolvePoolSize(worker: boolean | { pool?: number } | undefined): number {
+export function resolvePoolSize(worker: boolean | { pool?: number; url?: string | URL } | undefined): number {
   if (typeof worker === 'object' && worker.pool !== undefined) {
     return Math.max(1, Math.floor(worker.pool));
   }

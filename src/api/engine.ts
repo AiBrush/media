@@ -12,14 +12,8 @@
  */
 
 import type { ImageOps } from '../codecs/image/index.ts';
-import type { AudioEncoderStageOptions } from '../codecs/webcodecs-audio.ts';
+import type { WarmVideoDecoderPool } from '../codecs/webcodecs-video.ts';
 import type {
-  VideoDecoderStageOptions,
-  VideoEncoderStageOptions,
-  WarmVideoDecoderPool,
-} from '../codecs/webcodecs-video.ts';
-import type {
-  AudioEncoderOutputTiming,
   CodecDriver,
   CodecQuery,
   ContainerDriver,
@@ -46,7 +40,7 @@ import { normalizeWasmAssetBaseUrl, resolveWasmRuntimeProfile } from '../kernel/
 // Only the tiny, DEPENDENCY-FREE worker-mode selectors are statically imported here, from the dedicated
 // `worker-mode.ts` (NOT `worker-bridge.ts`) so the eager kernel never pulls the heavy worker pump/pool or
 // the offload protocol into its closure (doc 08 §7 budget). The actual worker spawn + ensure-pool + offload
-// runner + payload assembly ALL live behind a lazy `import('../kernel/worker-host.ts')` ({@link tryOffload},
+// runner + payload assembly ALL live behind a lazy `loadWorkerHostModule()` ({@link tryOffload},
 // ADR-019); `OffloadPoolCache` is consumed here only as an erased `import type` (the engine holds the cache
 // by reference, worker-host owns the spawn LOGIC).
 import type { OffloadPoolCache } from '../kernel/worker-host.ts';
@@ -70,7 +64,7 @@ import {
 } from '../sources/source.ts';
 import type { ProbeContainerResultCache } from './blob-probe-handoff.ts';
 import { createMediaChain } from './chain.ts';
-import { decoderConfigWithRoutedAcceleration } from './codec-route.ts';
+import { FIRST_PARTY_CONTAINER_ID_SET } from '../drivers/container-ids.ts';
 import { containerHasChunkMuxer, isPcmContainer } from './codec-routing.ts';
 import { mimeOpts } from './container-mime.ts';
 import type { DecryptRunnerContext } from './decrypt-runner.ts';
@@ -78,8 +72,6 @@ import { bridgeSignal, closeIfClosable, deferredStream, memoizeAsync } from './f
 import type { MediaJob } from './job.ts';
 import type { MuxRunnerContext } from './mux-runner.ts';
 import {
-  audioGeometryOf,
-  forceSoftware,
   isFlacAuthorCodec,
   isPcmCodec,
   isPinnedDriverMiss,
@@ -110,6 +102,7 @@ import {
   sourceMayHaveBlobProbeHandoff,
   throwIfAborted,
 } from './source-io.ts';
+import type { TranscodeStreamDeps } from './engine-transcode-streams.ts';
 import type { TrimRunnerContext } from './trim-runner.ts';
 import type {
   AudioTarget,
@@ -131,11 +124,51 @@ import type {
   PacketStreams,
   PreloadSpec,
   RemuxOptions,
+  SeekOptions,
   TrimOptions,
   VideoTarget,
 } from './types.ts';
 import type { H264TwoPassRunnerContext } from './video-two-pass-runner.ts';
 import type { H264TwoPassPlan } from './video-two-pass.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadAbrLadderRunnerModule = memoizeAsync(() => import('./abr-ladder-runner.ts'));
+const loadCodecConvertRunnerModule = memoizeAsync(() => import('./codec-convert-runner.ts'));
+const loadCodecPipelineModule = memoizeAsync(() => import('./codec-pipeline.ts'));
+const loadConvertOptionsShapeModule = memoizeAsync(() => import('./convert-options-shape.ts'));
+const loadConvertPreflightModule = memoizeAsync(() => import('./convert-preflight.ts'));
+const loadDecodeRunnerModule = memoizeAsync(() => import('./decode-runner.ts'));
+const loadDecryptRunnerModule = memoizeAsync(() => import('./decrypt-runner.ts'));
+const loadDefaultCodecRegistrationModule = memoizeAsync(
+  () => import('../drivers/default-codec-registration.ts'),
+);
+const loadDefaultContainerRegistrationModule = memoizeAsync(
+  () => import('../drivers/default-container-registration.ts'),
+);
+const loadDefaultsModule = memoizeAsync(() => import('../drivers/defaults.ts'));
+const loadEncodeRunnerModule = memoizeAsync(() => import('./encode-runner.ts'));
+const loadFlacConvertPlanModule = memoizeAsync(() => import('./flac-convert-plan.ts'));
+const loadHlsSourceModule = memoizeAsync(() => import('../drivers/hls/hls-source.ts'));
+const loadJobRunnerModule = memoizeAsync(() => import('./job-runner.ts'));
+const loadLiveConvertModule = memoizeAsync(() => import('./live-convert.ts'));
+const loadLiveMediaModule = memoizeAsync(() => import('../sources/live-media.ts'));
+const loadMediaFilterRunnerModule = memoizeAsync(() => import('./media-filter-runner.ts'));
+const loadMuxRunnerModule = memoizeAsync(() => import('./mux-runner.ts'));
+const loadPacketInfoRunnerModule = memoizeAsync(() => import('./packet-info-runner.ts'));
+const loadPcmConvertPlanModule = memoizeAsync(() => import('./pcm-convert-plan.ts'));
+const loadPreloadModule = memoizeAsync(() => import('./preload.ts'));
+const loadProbeRunnerModule = memoizeAsync(() => import('./probe-runner.ts'));
+const loadRemuxRunnerModule = memoizeAsync(() => import('./remux-runner.ts'));
+const loadReservedFaststartModule = memoizeAsync(() => import('./reserved-faststart.ts'));
+const loadSeekRunnerModule = memoizeAsync(() => import('./seek-runner.ts'));
+const loadTrimRunnerModule = memoizeAsync(() => import('./trim-runner.ts'));
+const loadTranscodeStreamsModule = memoizeAsync(() => import('./engine-transcode-streams.ts'));
+const loadVideoQualityConstraintModule = memoizeAsync(
+  () => import('./video-quality-constraint.ts'),
+);
+const loadVideoTwoPassRunnerModule = memoizeAsync(() => import('./video-two-pass-runner.ts'));
+const loadWebcodecsVideoModule = memoizeAsync(() => import('../codecs/webcodecs-video.ts'));
+const loadWorkerHostModule = memoizeAsync(() => import('../kernel/worker-host.ts'));
 
 /** The developer-facing engine surface (ADR-009). */
 export interface MediaEngine {
@@ -180,8 +213,12 @@ export interface MediaEngine {
   decode(input: MediaInput, o?: DecodeOptions): MediaStreams;
   encode(frames: MediaStreams, opts: EncodeOptions, o?: CallOptions): Cancellable<Output>;
   mux(streams: PacketStreams, opts: MuxSpec, o?: CallOptions): Cancellable<Output>;
-  /** Decode and return the single frame at/just-after `timeUs` (frame-accurate seek, doc 09). */
-  seek(input: MediaInput, timeUs: number, o?: CallOptions): Cancellable<VideoFrame>;
+  /**
+   * Decode and return one frame for `timeUs`: the first frame at/after it by default, the nearest
+   * frame, or the GOP's random-access frame (`SeekOptions.mode`). Containers with an index seek
+   * through bounded ranges; others decode from the whole-file demux (doc 09).
+   */
+  seek(input: MediaInput, timeUs: number, o?: SeekOptions): Cancellable<VideoFrame>;
   decrypt(input: MediaInput, opts: DecryptOptions, o?: CallOptions): Cancellable<Output>;
   /** Execute one fully validated declarative job through the canonical flat operations (ADR-010). */
   run(job: MediaJob, o?: CallOptions): Cancellable<Blob>;
@@ -220,7 +257,7 @@ export interface MediaEngine {
 
 type CodecPipelineModule = typeof import('./codec-pipeline.ts');
 function loadCodecPipeline(): Promise<CodecPipelineModule> {
-  return import('./codec-pipeline.ts');
+  return loadCodecPipelineModule();
 }
 
 /** Shared one-shot loader for the probe range-cache chunk (no bare mutable module state, R-S05.11). */
@@ -416,7 +453,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   run(job: MediaJob, o: CallOptions = {}): Cancellable<Blob> {
     return this.#withCancel(o, async (signal) => {
-      const { runMediaJob } = await import('./job-runner.ts');
+      const { runMediaJob } = await loadJobRunnerModule();
       return runMediaJob(this, job, { ...o, signal });
     });
   }
@@ -428,11 +465,11 @@ export class MediaEngineImpl implements MediaEngine {
         const normalized = normalizeInput(input);
         if (isLiveMediaSource(normalized)) {
           throwIfAborted(signal);
-          const { probeLiveMediaStream } = await import('../sources/live-media.ts');
+          const { probeLiveMediaStream } = await loadLiveMediaModule();
           throwIfAborted(signal);
           return probeLiveMediaStream(normalized);
         }
-        const { runProbe } = await import('./probe-runner.ts');
+        const { runProbe } = await loadProbeRunnerModule();
         return runProbe(this.#probeRunnerContext(), input, normalized, o, signal);
       })
     );
@@ -447,7 +484,7 @@ export class MediaEngineImpl implements MediaEngine {
       this.#probeContainerResultCache?.hit(input, o, container) ??
       this.#withCancel(o, async (signal) => {
         const normalized = normalizeByteInput(input, 'probeContainer');
-        const { runProbeContainer } = await import('./probe-runner.ts');
+        const { runProbeContainer } = await loadProbeRunnerModule();
         return runProbeContainer(
           this.#probeRunnerContext(),
           input,
@@ -500,7 +537,7 @@ export class MediaEngineImpl implements MediaEngine {
     operation: 'runPacketInfo' | 'runPacketInfoBatches',
   ): Cancellable<PacketInfoTable | PacketInfoBatchStream> {
     return this.#withCancel(o, async (signal) => {
-      const runners = await import('./packet-info-runner.ts');
+      const runners = await loadPacketInfoRunnerModule();
       const run = runners[operation] as (
         context: Parameters<typeof runners.runPacketInfo>[0],
         source: MediaInput,
@@ -536,7 +573,7 @@ export class MediaEngineImpl implements MediaEngine {
   ): Cancellable<Output | Uint8Array> {
     this.#assertNotDisposed();
     const run = async (signal?: AbortSignal): Promise<Output | Uint8Array> => {
-      const { pcm } = await import('./pcm-convert-plan.ts');
+      const { pcm } = await loadPcmConvertPlanModule();
       return pcm(
         this.#authoringDeps(o),
         (container, direction) =>
@@ -572,7 +609,7 @@ export class MediaEngineImpl implements MediaEngine {
   }): Cancellable<Uint8Array> {
     this.#assertNotDisposed();
     const run = async (): Promise<Uint8Array> => {
-      const { wavPcmPacketCopy } = await import('./pcm-convert-plan.ts');
+      const { wavPcmPacketCopy } = await loadPcmConvertPlanModule();
       return wavPcmPacketCopy(input);
     };
     const p = run() as Cancellable<Uint8Array>;
@@ -584,14 +621,14 @@ export class MediaEngineImpl implements MediaEngine {
     return this.#withCancel(o, async (signal) => {
       // Lazy: the key table is dead weight in the eager kernel, and every convert immediately loads far
       // heavier operation modules anyway. It still runs before a single input byte is read.
-      (await import('./convert-options-shape.ts')).assertConvertOptionsShape(opts);
+      (await loadConvertOptionsShapeModule()).assertConvertOptionsShape(opts);
       if (opts.faststart === 'reserve' || opts.maximumPacketCount !== undefined) {
-        const { validateReservedFaststart } = await import('./reserved-faststart.ts');
+        const { validateReservedFaststart } = await loadReservedFaststartModule();
         validateReservedFaststart('convert', opts.to, opts);
       }
       const normalized = normalizeInput(input);
       if (isLiveMediaSource(normalized)) {
-        const live = await import('./live-convert.ts');
+        const live = await loadLiveConvertModule();
         return live.convertLiveMediaStream(
           normalized,
           opts,
@@ -642,7 +679,7 @@ export class MediaEngineImpl implements MediaEngine {
         finiteVideoTarget?.quality !== undefined ||
         finiteVideoTarget?.maxAverageBitrate !== undefined
       ) {
-        (await import('./video-quality-constraint.ts')).assertH264QualityConstraintPreflight(
+        (await loadVideoQualityConstraintModule()).assertH264QualityConstraintPreflight(
           finiteVideoTarget,
           normalized,
         );
@@ -658,7 +695,7 @@ export class MediaEngineImpl implements MediaEngine {
         // The FLAC-authoring ROUTINE lives in a lazily-imported chunk (`flac-convert-plan.ts`), reached only
         // for an eligible `to:'flac'` convert, so the eager kernel never carries it (doc 08 §7). The thin
         // gate above stays inline-eager so a non-FLAC convert never loads the chunk.
-        const { convertToFlac } = await import('./flac-convert-plan.ts');
+        const { convertToFlac } = await loadFlacConvertPlanModule();
         const flac = await convertToFlac(this.#authoringDeps(o), src, opts, audio, signal, o);
         if (flac !== undefined) return flac;
       }
@@ -673,7 +710,7 @@ export class MediaEngineImpl implements MediaEngine {
         audio !== false &&
         isPcmCodec(audio?.codec)
       ) {
-        const { convertPcmNative } = await import('./pcm-convert-plan.ts');
+        const { convertPcmNative } = await loadPcmConvertPlanModule();
         const pcm = await convertPcmNative(
           this.#authoringDeps(o),
           src,
@@ -698,7 +735,7 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions = {},
   ): Cancellable<readonly Output[]> {
     return this.#withCancel(o, async (signal) => {
-      const { runH264AbrLadder } = await import('./abr-ladder-runner.ts');
+      const { runH264AbrLadder } = await loadAbrLadderRunnerModule();
       return runH264AbrLadder(
         {
           workerMode: this.#workerMode,
@@ -717,7 +754,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   remux(input: MediaInput, opts: RemuxOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const { runRemux } = await import('./remux-runner.ts');
+      const { runRemux } = await loadRemuxRunnerModule();
       return runRemux(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
@@ -728,14 +765,14 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions = {},
   ): Cancellable<RemuxOutputPlan> {
     return this.#withCancel(o, async (signal) => {
-      const { planRemuxOutputForInput } = await import('./remux-runner.ts');
+      const { planRemuxOutputForInput } = await loadRemuxRunnerModule();
       return planRemuxOutputForInput(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
   trim(input: MediaInput, opts: TrimOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const { runTrim } = await import('./trim-runner.ts');
+      const { runTrim } = await loadTrimRunnerModule();
       return runTrim(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
@@ -746,7 +783,7 @@ export class MediaEngineImpl implements MediaEngine {
     const ctrl = new AbortController();
     bridgeSignal(o.signal, ctrl);
     const runner = memoizeAsync(async () => {
-      const { createDecodeRunner } = await import('./decode-runner.ts');
+      const { createDecodeRunner } = await loadDecodeRunnerModule();
       return createDecodeRunner(
         {
           cacheSource: (source) => cacheProbeRanges(source, this.#sourcePrefixHandoff, 'consume'),
@@ -773,7 +810,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   encode(frames: MediaStreams, opts: EncodeOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const { runEncode } = await import('./encode-runner.ts');
+      const { runEncode } = await loadEncodeRunnerModule();
       return runEncode(
         {
           muxer: this.#routeMuxer.bind(this),
@@ -788,9 +825,9 @@ export class MediaEngineImpl implements MediaEngine {
     });
   }
 
-  seek(input: MediaInput, timeUs: number, o: CallOptions = {}): Cancellable<VideoFrame> {
+  seek(input: MediaInput, timeUs: number, o: SeekOptions = {}): Cancellable<VideoFrame> {
     return this.#withCancel(o, async (signal) => {
-      const { runSeek } = await import('./seek-runner.ts');
+      const { runSeek } = await loadSeekRunnerModule();
       return runSeek(
         {
           routeContainer: (source, activeSignal, pinDriver) =>
@@ -809,21 +846,21 @@ export class MediaEngineImpl implements MediaEngine {
 
   mux(streams: PacketStreams, opts: MuxSpec, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const { runMux } = await import('./mux-runner.ts');
+      const { runMux } = await loadMuxRunnerModule();
       return runMux(this.#operationRunnerContext(), streams, opts, o, signal);
     });
   }
 
   decrypt(input: MediaInput, opts: DecryptOptions, o: CallOptions = {}): Cancellable<Output> {
     return this.#withCancel(o, async (signal) => {
-      const { runDecrypt } = await import('./decrypt-runner.ts');
+      const { runDecrypt } = await loadDecryptRunnerModule();
       return runDecrypt(this.#operationRunnerContext(), input, opts, o, signal);
     });
   }
 
   async preload(...specs: PreloadSpec[]): Promise<void> {
     this.#assertNotDisposed();
-    const { runPreload } = await import('./preload.ts');
+    const { runPreload } = await loadPreloadModule();
     await runPreload(
       {
         tasks: this.#preloadTasks,
@@ -834,7 +871,7 @@ export class MediaEngineImpl implements MediaEngine {
         ensureDefaultDrivers: () => this.#ensureDefaultDrivers(),
         warmOperationChunks: async (op) => {
           if (op === 'probe') {
-            await Promise.all([loadProbeRangeCache(), import('./probe-runner.ts')]);
+            await Promise.all([loadProbeRangeCache(), loadProbeRunnerModule()]);
           }
         },
         pickContainer: async (q) => {
@@ -859,7 +896,7 @@ export class MediaEngineImpl implements MediaEngine {
 
   canConvert(opts: ConvertOptions): Promise<boolean> {
     this.#assertNotDisposed();
-    return import('./convert-preflight.ts').then(({ canConvert }) =>
+    return loadConvertPreflightModule().then(({ canConvert }) =>
       canConvert(
         {
           muxer: (target) => this.#routeMuxer(target),
@@ -898,9 +935,7 @@ export class MediaEngineImpl implements MediaEngine {
       // driver. Ambiguous/unsupported queries and failed pinned retries retain the complete established
       // defaults fallback. An explicitly `use()`d matching driver never reaches either path.
       if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
-      const { pickContainerWithDefaultFallback } = await import(
-        '../drivers/default-container-registration.ts'
-      );
+      const { pickContainerWithDefaultFallback } = await loadDefaultContainerRegistrationModule();
       return pickContainerWithDefaultFallback(
         this.#registry,
         this.#router,
@@ -926,7 +961,7 @@ export class MediaEngineImpl implements MediaEngine {
     // non-HLS container (mp4/wav/flac/…) costs nothing. The content sniff + stitch live behind the
     // dynamic import, keeping the whole HLS path out of the eager kernel.
     if (!sourceMayBeHlsManifest(src)) return src;
-    const hls = await import('../drivers/hls/hls-source.ts');
+    const hls = await loadHlsSourceModule();
     return hls.resolveHlsInputIfManifest(input, src, signal);
   }
 
@@ -940,7 +975,7 @@ export class MediaEngineImpl implements MediaEngine {
       const ext = extensionOf(src.filename);
       if (src.mimeHint !== undefined || ext !== undefined) {
         try {
-          return await this.#pickContainer(
+          const hinted = await this.#pickContainer(
             {
               direction,
               ...(src.mimeHint !== undefined ? { mime: src.mimeHint } : {}),
@@ -948,6 +983,15 @@ export class MediaEngineImpl implements MediaEngine {
             },
             pinDriver,
           );
+          // Definite magic beats a wrong label (a TS or EBML payload named `.mp4`): sniff the head of an
+          // in-memory source, where the look costs no I/O. A head that no driver claims (an `mdat`-first
+          // movie) leaves the hinted route in charge; blob/remote sources keep the hint-first contract
+          // their bounded-read accounting is built on.
+          if (pinDriver === undefined && direction === 'demux' && src.peekHead !== undefined) {
+            const sniffed = await this.#sniffContainer(src.peekHead(routeHeadBytes(src)), hinted);
+            if (sniffed !== undefined) return sniffed;
+          }
+          return hinted;
         } catch (error) {
           if (!(error instanceof CapabilityError)) throw error;
           // A pin miss is final for this route. Do not consume a one-shot source merely to repeat the same
@@ -967,6 +1011,29 @@ export class MediaEngineImpl implements MediaEngine {
       );
     } catch (error) {
       await cancelSource(src, error);
+      throw error;
+    }
+  }
+
+  /**
+   * The container whose magic claims `head` when the hinted driver's own sniff rejects those bytes;
+   * `undefined` keeps the hinted route (it accepts the head, or no driver claims it).
+   */
+  async #sniffContainer(
+    head: Uint8Array,
+    hinted: ContainerDriver,
+  ): Promise<ContainerDriver | undefined> {
+    // Only first-party ↔ first-party corrections: an injected driver may legitimately match by MIME
+    // alone, and an ID3v2 prefix names no container (MP3 and ADTS both wear it).
+    if (!FIRST_PARTY_CONTAINER_ID_SET.has(hinted.id) || startsWithId3(head)) return undefined;
+    if (hinted.supports({ direction: 'demux', head })) return undefined;
+    try {
+      const sniffed = await this.#pickContainer({ direction: 'demux', head });
+      return sniffed.id === hinted.id || !FIRST_PARTY_CONTAINER_ID_SET.has(sniffed.id)
+        ? undefined
+        : sniffed;
+    } catch (error) {
+      if (error instanceof CapabilityError) return undefined;
       throw error;
     }
   }
@@ -1000,7 +1067,7 @@ export class MediaEngineImpl implements MediaEngine {
     const pending =
       this.#defaultDriversPromise ??
       (async (): Promise<void> => {
-        const { registerDefaultDrivers } = await import('../drivers/defaults.ts');
+        const { registerDefaultDrivers } = await loadDefaultsModule();
         this.#invalidateProbeResults();
         registerDefaultDrivers(this.#registry);
         this.#router.clearCache();
@@ -1037,7 +1104,10 @@ export class MediaEngineImpl implements MediaEngine {
     /* v8 ignore start -- offload mode needs a real `Worker` (browser); in Node `#workerMode` is 'inline', so
        this lazy import + spawn is never reached. The ensure-pool/offload LOGIC in `worker-host` is unit-tested
        via `createWorkerPool`/`offloadHeavyOp` with an injected transport; browser-harness validated end to end. */
-    const { tryOffload } = await import('../kernel/worker-host.ts');
+    const { tryOffload } = await loadWorkerHostModule();
+    const worker = this.#opts.worker;
+    const workerWiring =
+      typeof worker === 'object' && worker.url !== undefined ? { workerUrl: worker.url } : {};
     return tryOffload(this.#poolCache, resolvePoolSize(this.#opts.worker), src, kind, publicOpts, {
       signal,
       determinism: this.#determinism(o),
@@ -1045,7 +1115,7 @@ export class MediaEngineImpl implements MediaEngine {
       wasmRuntime: this.#wasmRuntime,
       ...(this.#wasmAssetBaseUrl !== undefined ? { wasmAssetBaseUrl: this.#wasmAssetBaseUrl } : {}),
       ...(o.onProgress ? { onProgress: o.onProgress } : {}),
-    });
+    }, workerWiring);
     /* v8 ignore stop */
   }
 
@@ -1067,9 +1137,7 @@ export class MediaEngineImpl implements MediaEngine {
       return await this.#router.probeCodec(q, opts);
     } catch (e) {
       if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
-      const { registerDefaultCodecForQuery } = await import(
-        '../drivers/default-codec-registration.ts'
-      );
+      const { registerDefaultCodecForQuery } = await loadDefaultCodecRegistrationModule();
       if (await registerDefaultCodecForQuery(this.#registry, q, opts)) {
         this.#router.clearCache();
         try {
@@ -1096,7 +1164,7 @@ export class MediaEngineImpl implements MediaEngine {
   /* v8 ignore start -- requires a real VideoDecoder (browser); the pool logic is Node-tested directly. */
   async #ensureVideoDecoderPool(): Promise<WarmVideoDecoderPool> {
     if (this.#videoDecoderPool === undefined) {
-      const { createWarmVideoDecoderPool } = await import('../codecs/webcodecs-video.ts');
+      const { createWarmVideoDecoderPool } = await loadWebcodecsVideoModule();
       this.#videoDecoderPool ??= createWarmVideoDecoderPool();
     }
     return this.#videoDecoderPool;
@@ -1129,56 +1197,63 @@ export class MediaEngineImpl implements MediaEngine {
     return ops?.sniff(head) === undefined ? undefined : ops;
   }
 
+  #transcodeDeps(): TranscodeStreamDeps {
+    return {
+      stageOptions: this.#stageOptions.bind(this),
+      probeCodec: this.#probeCodec.bind(this),
+      routeCodec: this.#routeCodec.bind(this),
+      applyVideoFilters: this.#applyVideoFilters.bind(this),
+    };
+  }
+
+  /** Transcode-only stream stages live in a lazy chunk (`engine-transcode-streams.ts`). */
   async #decodeAudioTrackPackets(
     demuxer: Demuxer,
     track: TrackInfo,
     stage: StageOptions,
     o: CallOptions,
     sourceContainerId?: string,
-  ): Promise<{
-    readonly frames: ReadableStream<AudioData>;
-    readonly leadingSamplesRemoved: number;
-  }> {
-    const {
-      audioDecodeLeadingSamplesForRuntime,
-      audioDecodeNativeGaplessSuppressionForRuntime,
-      audioTrackAfterNativeGaplessSuppression,
-      decodeQueryFor,
-      decodedAudioStreamWithGapless,
-      unwrapPackets,
-    } = await loadCodecPipeline();
-    const decodeQuery = await decodeQueryFor(track);
-    const route = await this.#probeCodec(decodeQuery, o);
-    const codec = route.driver;
-    const config = decoderConfigWithRoutedAcceleration(decodeQuery.config, route.support);
-    const decoded = unwrapPackets(demuxer.packets(track.id)).pipeThrough(
-      codec.createDecoder(config, stage),
-    ) as ReadableStream<AudioData>;
-    const nativeGaplessSuppression = await audioDecodeNativeGaplessSuppressionForRuntime(
-      sourceContainerId,
-      track,
-      codec.id,
-    );
-    const presentedTrack = audioTrackAfterNativeGaplessSuppression(track, nativeGaplessSuppression);
-    const presented = await decodedAudioStreamWithGapless(decoded, presentedTrack, {
-      packets: demuxer.packets(track.id),
-      createDecoder: () => codec.createDecoder(config, stage),
-      signal: stage.signal,
-    });
-    const leadingSamples = await audioDecodeLeadingSamplesForRuntime(
-      sourceContainerId,
-      track.codec,
-      codec.id,
-    );
-    if (leadingSamples === 0) return { frames: presented, leadingSamplesRemoved: 0 };
-    const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import(
-      './trim-streams.ts'
-    );
-    return {
-      frames: trimAudioGaplessFrameStream(presented, { leadingSamples }, restampAudioDataRange),
-      leadingSamplesRemoved: leadingSamples,
-    };
+  ): Promise<{ readonly frames: ReadableStream<AudioData>; readonly leadingSamplesRemoved: number }> {
+    const m = await loadTranscodeStreamsModule();
+    return m.decodeAudioTrackPackets(this.#transcodeDeps(), demuxer, track, stage, o, sourceContainerId);
   }
+
+  async #transcodeVpxAlphaGeometryPacketStream(
+    packets: ReadableStream<Packet>,
+    target: VideoTarget,
+    sourceTrack: TrackInfo,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const m = await loadTranscodeStreamsModule();
+    return m.transcodeVpxAlphaGeometryPacketStream(this.#transcodeDeps(), packets, target, sourceTrack, muxer, signal, o);
+  }
+
+  async #transcodeVpxAlphaPacketStream(
+    packets: ReadableStream<Packet>,
+    target: VideoTarget,
+    sourceTrack: TrackInfo,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const m = await loadTranscodeStreamsModule();
+    return m.transcodeVpxAlphaPacketStream(this.#transcodeDeps(), packets, target, sourceTrack, muxer, signal, o);
+  }
+
+  async #encodeAudioStream(
+    frames: ReadableStream<AudioData>,
+    target: AudioTarget,
+    sourceTrack: TrackInfo | undefined,
+    muxer: Muxer,
+    signal: AbortSignal,
+    o: CallOptions,
+  ): Promise<void> {
+    const m = await loadTranscodeStreamsModule();
+    return m.encodeAudioStream(this.#transcodeDeps(), frames, target, sourceTrack, muxer, signal, o);
+  }
+
 
   /** Bind only engine-private routing/codec seams; complete remux/trim orchestration stays lazy. */
   #operationRunnerContext(): DecryptRunnerContext &
@@ -1234,7 +1309,7 @@ export class MediaEngineImpl implements MediaEngine {
     o: CallOptions,
     input: MediaInput,
   ): Promise<Output> {
-    const { runCodecConvert } = await import('./codec-convert-runner.ts');
+    const { runCodecConvert } = await loadCodecConvertRunnerModule();
     return runCodecConvert(src, opts, signal, o, input, {
       routeContainer: this.#routeContainer.bind(this),
       stageOptions: this.#stageOptions.bind(this),
@@ -1267,92 +1342,6 @@ export class MediaEngineImpl implements MediaEngine {
     };
   }
 
-  /** Resize VPx colour and alpha planes independently, avoiding an intermediate merged RGBA frame. */
-  async #transcodeVpxAlphaGeometryPacketStream(
-    packets: ReadableStream<Packet>,
-    target: VideoTarget,
-    sourceTrack: TrackInfo,
-    muxer: Muxer,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<void> {
-    const {
-      buildVideoEncoderConfig,
-      decodeQueryFor,
-      decodeVpxAlphaPacketStreams,
-      drainEncoderToMuxer,
-      encodeVpxAlphaFrameStreams,
-      encodeQueryFor,
-      prepareVpxAlphaFramesForEncode,
-      requireEncoderConfig,
-      videoTrackInfoFromDecoderConfig,
-    } = await loadCodecPipeline();
-    const decodeQuery = await decodeQueryFor(sourceTrack);
-    const decodeRoute = await this.#probeCodec(decodeQuery, o);
-    const decodeCodec = decodeRoute.driver;
-    const decodeConfig = decoderConfigWithRoutedAcceleration(
-      decodeQuery.config,
-      decodeRoute.support,
-    );
-    const encodeConfig = buildVideoEncoderConfig(
-      target,
-      sourceGeometryOf(sourceTrack),
-      sourceTrack.codec,
-    );
-    const encoderConfig: VideoEncoderConfig = {
-      ...encodeConfig,
-      alpha: 'discard',
-    };
-    const decodeStage: VideoDecoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      alpha: 'discard',
-    };
-    const planes = decodeVpxAlphaPacketStreams(packets, () =>
-      decodeCodec.createDecoder(decodeConfig, decodeStage),
-    );
-    const colorFrames = await this.#applyVideoFilters(planes.color, target, sourceTrack, signal, o);
-    const filteredAlphaFrames = await this.#applyVideoFilters(
-      planes.alpha,
-      target,
-      sourceTrack,
-      signal,
-      o,
-    );
-    const alphaFrames = prepareVpxAlphaFramesForEncode(filteredAlphaFrames);
-    /* v8 ignore start -- requires live WebCodecs decode/filter/encode; browser-harness validated. */
-    let decoderConfig: VideoDecoderConfig | undefined;
-    const colorStage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      onDecoderConfig: (config) => {
-        decoderConfig = config;
-      },
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-    };
-    const alphaStage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-    };
-    const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
-    const chunks = encodeVpxAlphaFrameStreams(colorFrames, alphaFrames, {
-      encodeConfig: encoderConfig,
-      createEncoder: (config, stageOptions) => encodeCodec.createEncoder(config, stageOptions),
-      colorStage,
-      alphaStage,
-    });
-    await drainEncoderToMuxer(
-      chunks,
-      muxer,
-      () =>
-        videoTrackInfoFromDecoderConfig(
-          requireEncoderConfig(decoderConfig, 'video'),
-          target.fps,
-          sourceTrack.durationSec,
-          sourceTrack.rotation,
-        ),
-      signal,
-    );
-    /* v8 ignore stop */
-  }
 
   /**
    * Compose the video transform chain for a decoded stream. Geometry/colour ops are router-resolved
@@ -1369,7 +1358,7 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<VideoFrame>> {
-    const { applyVideoFrameFilters } = await import('./media-filter-runner.ts');
+    const { applyVideoFrameFilters } = await loadMediaFilterRunnerModule();
     return applyVideoFrameFilters(frames, target, track, signal, o, {
       routeFilter: this.#routeFilter.bind(this),
       stageOptions: this.#stageOptions.bind(this),
@@ -1393,7 +1382,7 @@ export class MediaEngineImpl implements MediaEngine {
     signal: AbortSignal,
     o: CallOptions,
   ): Promise<ReadableStream<AudioData>> {
-    const { applyAudioFrameFilters } = await import('./media-filter-runner.ts');
+    const { applyAudioFrameFilters } = await loadMediaFilterRunnerModule();
     return applyAudioFrameFilters(frames, target, track, signal, o, {
       routeFilter: this.#routeFilter.bind(this),
       stageOptions: this.#stageOptions.bind(this),
@@ -1401,90 +1390,6 @@ export class MediaEngineImpl implements MediaEngine {
   }
   /* v8 ignore stop */
 
-  /** Transcode an unfiltered VPx-alpha packet stream without merging/splitting RGBA frames. */
-  async #transcodeVpxAlphaPacketStream(
-    packets: ReadableStream<Packet>,
-    target: VideoTarget,
-    sourceTrack: TrackInfo,
-    muxer: Muxer,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<void> {
-    const {
-      buildVideoEncoderConfig,
-      canCopyVpxAlphaSideData,
-      decodeQueryFor,
-      drainEncoderToMuxer,
-      encodeQueryFor,
-      requireEncoderConfig,
-      transcodeVpxAlphaPackets,
-      videoTrackInfoFromDecoderConfig,
-    } = await loadCodecPipeline();
-    const decodeQuery = await decodeQueryFor(sourceTrack);
-    // Packet-plane VPx alpha decodes colour and alpha elementary streams independently. Route the exact
-    // `alpha:'discard'` config those decoders receive; probing implicit `keep` here made a discard-capable
-    // browser miss before construction (and a coarse Router cache made the result operation-order dependent).
-    const decodeConfig: VideoDecoderConfig & { readonly alpha: AlphaOption } = {
-      ...(decodeQuery.config as VideoDecoderConfig),
-      alpha: 'discard',
-    };
-    const decodeRoute = await this.#probeCodec({ ...decodeQuery, config: decodeConfig }, o);
-    const decodeCodec = decodeRoute.driver;
-    const routedDecodeConfig = decoderConfigWithRoutedAcceleration(
-      decodeConfig,
-      decodeRoute.support,
-    );
-    const encodeConfig = buildVideoEncoderConfig(
-      target,
-      sourceGeometryOf(sourceTrack),
-      sourceTrack.codec,
-    );
-    const encoderConfig: VideoEncoderConfig = {
-      ...encodeConfig,
-      alpha: 'discard',
-    };
-    const encodeCodec = await this.#routeCodec(encodeQueryFor(encoderConfig), o);
-    /* v8 ignore start -- requires live WebCodecs decoders/encoders; browser-harness validated. */
-    let decoderConfig: VideoDecoderConfig | undefined;
-    const colorStage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      onDecoderConfig: (c) => {
-        decoderConfig = c;
-      },
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-    };
-    const alphaStage: VideoEncoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      ...(target.crf !== undefined ? { quantizer: target.crf } : {}),
-    };
-    const decodeStage: VideoDecoderStageOptions = {
-      ...this.#stageOptions(signal, o),
-      alpha: 'discard',
-    };
-    const chunks = transcodeVpxAlphaPackets(packets, {
-      decodeConfig: routedDecodeConfig,
-      encodeConfig: encoderConfig,
-      createDecoder: (c, stageOptions) => decodeCodec.createDecoder(c, stageOptions),
-      createEncoder: (c, stageOptions) => encodeCodec.createEncoder(c, stageOptions),
-      decodeStage,
-      colorStage,
-      alphaStage,
-      copyAlpha: canCopyVpxAlphaSideData(target, decodeConfig.codec, encoderConfig.codec),
-    });
-    await drainEncoderToMuxer(
-      chunks,
-      muxer,
-      () =>
-        videoTrackInfoFromDecoderConfig(
-          requireEncoderConfig(decoderConfig, 'video'),
-          target.fps,
-          sourceTrack.durationSec,
-          sourceTrack.rotation,
-        ),
-      signal,
-    );
-    /* v8 ignore stop */
-  }
 
   /** Encode one video stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
   async #encodeVideoStream(
@@ -1498,7 +1403,7 @@ export class MediaEngineImpl implements MediaEngine {
     twoPassPlan?: H264TwoPassPlan,
     capabilityFallbackTarget?: VideoTarget,
   ): Promise<void> {
-    const { encodeVideoStream } = await import('./video-two-pass-runner.ts');
+    const { encodeVideoStream } = await loadVideoTwoPassRunnerModule();
     await encodeVideoStream(
       frames,
       target,
@@ -1513,108 +1418,6 @@ export class MediaEngineImpl implements MediaEngine {
     );
   }
 
-  /** Encode one audio stream and drain its chunks into the muxer (with the encoder→muxer config bridge). */
-  async #encodeAudioStream(
-    frames: ReadableStream<AudioData>,
-    target: AudioTarget,
-    sourceTrack: TrackInfo | undefined,
-    muxer: Muxer,
-    signal: AbortSignal,
-    o: CallOptions,
-  ): Promise<void> {
-    const {
-      audioEncodeSoftwareDriverForRuntime,
-      audioCodecToken,
-      audioTrackInfoFromDecoderConfig,
-      buildAudioEncoderConfig,
-      drainEncoderToMuxer,
-      encodeQueryFor,
-      outputGaplessForAudioEncoder,
-      requireEncoderConfig,
-    } = await loadCodecPipeline();
-    const config = buildAudioEncoderConfig(
-      target,
-      audioGeometryOf(sourceTrack),
-      sourceTrack?.codec,
-    );
-    const softwareDriver = await audioEncodeSoftwareDriverForRuntime(config);
-    let encodeOptions = o;
-    if (softwareDriver !== undefined) {
-      const softwareOptions = forceSoftware(o);
-      encodeOptions =
-        o.strategy?.pinDriver === undefined
-          ? {
-              ...softwareOptions,
-              strategy: { ...softwareOptions.strategy, pinDriver: softwareDriver },
-            }
-          : softwareOptions;
-    }
-    const codec = await this.#routeCodec(encodeQueryFor(config), encodeOptions);
-    // Past here is the live WebCodecs path — unreachable in Node (the route above throws first).
-    /* v8 ignore start -- requires a real AudioEncoder; validated in the browser harness (BUILD §6.1). */
-    let decoderConfig: AudioDecoderConfig | undefined;
-    let encoderTiming: AudioEncoderOutputTiming | undefined;
-    const stage: AudioEncoderStageOptions = {
-      ...this.#stageOptions(signal, encodeOptions),
-      onConfig: (c) => {
-        decoderConfig = c;
-      },
-      onTiming: (timing) => {
-        encoderTiming = timing;
-      },
-    };
-    const chunks = frames.pipeThrough(codec.createEncoder(config, stage));
-    let outputTrackId: number | undefined;
-    await drainEncoderToMuxer(
-      chunks,
-      {
-        addTrack: (info) => {
-          const id = muxer.addTrack(info);
-          outputTrackId = id;
-          return id;
-        },
-        write: (trackId, packet) => muxer.write(trackId, packet),
-      },
-      () =>
-        audioTrackInfoFromDecoderConfig(
-          requireEncoderConfig(decoderConfig, 'audio'),
-          sourceTrack?.durationSec,
-        ),
-      signal,
-    );
-    const publishedConfig = requireEncoderConfig(decoderConfig, 'audio') as AudioDecoderConfig;
-    const outputCodec = audioCodecToken(publishedConfig.codec);
-    if (
-      outputTrackId !== undefined &&
-      muxer.setTrackGapless !== undefined &&
-      (outputCodec === 'aac' || outputCodec === 'opus' || outputCodec === 'mp3')
-    ) {
-      const gapless = outputGaplessForAudioEncoder(publishedConfig, encoderTiming);
-      if (gapless === undefined) {
-        // AAC and MP3 are lapped transforms with no in-band delay signalling: without the encoder's
-        // own timing there is nothing to author, and the muxed program would silently run long by the
-        // encoder's priming. Opus still carries its pre-skip in OpusHead, so it degrades honestly.
-        if (outputCodec === 'aac' || outputCodec === 'mp3') {
-          throw new CapabilityError(
-            `sample-accurate ${outputCodec.toUpperCase()} muxing requires destination encoder-delay timing that ${codec.id} did not prove on this runtime`,
-            {
-              op: {
-                kind: 'route',
-                id: 'mux',
-                facts: { mediaType: 'audio', codec: publishedConfig.codec },
-              },
-              tried: [codec.id],
-              suggestion:
-                'use a runtime with a proven encoder-delay fact or an encoder that publishes one',
-            },
-          );
-        }
-      } else {
-        muxer.setTrackGapless(outputTrackId, gapless);
-      }
-    }
-    /* v8 ignore stop */
-  }
 
   #withCancel<T>(o: CallOptions, exec: (signal: AbortSignal) => Promise<T>): Cancellable<T> {
     this.#assertNotDisposed();
@@ -1659,9 +1462,7 @@ export class MediaEngineImpl implements MediaEngine {
   async #ensurePinRegistered(o: CallOptions): Promise<void> {
     const pin = o.strategy?.pinDriver;
     if (pin === undefined || this.#hasDriverId(pin)) return;
-    const { registerDefaultNativeCodecPin } = await import(
-      '../drivers/default-codec-registration.ts'
-    );
+    const { registerDefaultNativeCodecPin } = await loadDefaultCodecRegistrationModule();
     if (await registerDefaultNativeCodecPin(this.#registry, pin)) {
       this.#router.clearCache();
       return;
@@ -1691,3 +1492,7 @@ export class MediaEngineImpl implements MediaEngine {
 // two lines are deleted and engine.ts exports exactly MediaEngine + MediaEngineImpl.
 export { deferredStream } from './frame-streams.ts';
 export { assertTrimRange } from './trim-range.ts';
+
+function startsWithId3(head: Uint8Array): boolean {
+  return head.byteLength >= 3 && head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33;
+}

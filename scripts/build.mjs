@@ -109,7 +109,8 @@ async function bundleJavaScript() {
   // packet metadata. It reuses the canonical implementation and only duplicates the reachable code.
   await build({
     absWorkingDir: ROOT,
-    entryPoints: { 'mp4-packet-info': 'src/mp4-packet-info.ts' },
+    // `hls` is the same idea for manifest resolution: parse + key/segment fetch without `/core`.
+    entryPoints: { 'mp4-packet-info': 'src/mp4-packet-info.ts', hls: 'src/hls.ts' },
     outdir: DIST,
     bundle: true,
     format: 'esm',

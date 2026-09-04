@@ -57,6 +57,7 @@ import {
   parseFlacStreamInfo,
   readSeekableFlacStreamInfo,
 } from './flac-sniff.ts';
+import { validateFlacMuxTrack } from './flac-match.ts';
 
 export type FlacInfo = FlacStreamInfo;
 
@@ -786,6 +787,7 @@ export const FlacDriver: ContainerDriver = {
       },
     });
   },
+  validateMuxTrack: validateFlacMuxTrack,
   createMuxer(o?: MuxOptions): Muxer {
     if (o?.fragmented === true) {
       throw new CapabilityError('FLAC has no fragmented/segmented mux form', {

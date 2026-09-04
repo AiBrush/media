@@ -24,6 +24,7 @@ import { CapabilityError, InputError, MediaError } from '../../contracts/errors.
 import { matchesMp3 } from '../audio-container-sniff.ts';
 import { mp3PresentationGaplessFromLame } from './mp3-gapless.ts';
 import { Mp3Muxer, muxPreparedMp3PacketTrack } from './mp3-mux.ts';
+import { validateMp3MuxTrack } from '../audio-container-mux-validation.ts';
 export { muxPreparedMp3PacketTrack };
 export type { PreparedMp3Packet, PreparedMp3PacketMuxInput } from './mp3-mux.ts';
 
@@ -469,6 +470,7 @@ export const Mp3Driver = {
       close: () => Promise.resolve(),
     };
   },
+  validateMuxTrack: validateMp3MuxTrack,
   createMuxer(o?: MuxOptions): Mp3Muxer {
     // MP3 is an elementary stream of self-describing frames — concatenate the track's MPEG Layer III
     // frames into a `.mp3` (no fragmented form; the encoder/remux path feeds the frames). See {@link Mp3Muxer}.

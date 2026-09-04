@@ -318,6 +318,8 @@ export function normalizeVideoDecoderConfig(
  * when the hardware probe actually succeeds).
  */
 export const ACCELERATION_PROBE_ORDER = ['prefer-hardware', 'no-preference'] as const;
+/** The live decoder's own order: the browser's choice first, then the software-permitting fallback. */
+export const LIVE_DECODER_PROBE_ORDER = ['no-preference', 'prefer-software'] as const;
 
 /** Exact acceleration probes for a routing mode; deterministic selection never probes a hardware hint. */
 export function videoAccelerationProbeOrder(
@@ -383,10 +385,11 @@ export async function resolveVideoDecoderAcceleration(
   probe: VideoDecoderAccelerationProbe,
   shouldContinue: () => boolean = () => true,
   cancellation?: Promise<never>,
+  order: readonly HardwareAcceleration[] = ACCELERATION_PROBE_ORDER,
 ): Promise<HardwareAcceleration | undefined> {
   const immediate = immediateVideoDecoderAcceleration(determinism, cached);
   if (immediate !== undefined) return immediate;
-  for (const requested of ACCELERATION_PROBE_ORDER) {
+  for (const requested of order) {
     if (!shouldContinue()) return undefined;
     try {
       const pending = probe(requested);
@@ -845,17 +848,10 @@ async function supportsDecode(
         result.supported &&
         (determinism !== 'force-software' || acceptedAcceleration === 'prefer-software');
       probes.push({ supported, acceleration: acceptedAcceleration });
-      if (supported) {
-        if (determinism !== 'force-software') {
-          rememberVideoDecoderAcceleration(
-            videoDecoderAccelerationCache,
-            videoConfig,
-            undefined,
-            acceptedAcceleration,
-          );
-        }
-        break; // first win short-circuits (hardware preferred)
-      }
+      // The capability verdict is not seeded into the live-decoder cache: that cache holds only the
+      // rung a real decoder configured (browser's choice first, LIVE_DECODER_PROBE_ORDER). Seeding
+      // `prefer-hardware` here pinned every subsequent decoder to a ~2.5 ms hardware session.
+      if (supported) break; // first win short-circuits (hardware preferred)
     } catch (e) {
       lastReason = describeError(e); // isConfigSupported rejects only on a malformed config
     }
@@ -1196,12 +1192,18 @@ function createVideoDecoder(
     }
   };
   const probeAndConfigure = async (): Promise<void> => {
+    // The live decoder asks the browser for its own choice first. Probing hardware first and pinning
+    // `prefer-hardware` cost ~2.5 ms of decoder-session setup on tiny pictures and short clips (one
+    // H.264 frame: 3.15 ms → 0.5 ms measured in Chromium 2026-09-03), while `no-preference` still lets
+    // the browser pick hardware for large sustained decodes. Capability evidence (`supports()`) keeps
+    // the hardware-first order so `hardwareAccelerated` stays an honest fact.
     const acceleration = await resolveVideoDecoderAcceleration(
       o?.determinism,
       undefined,
       (requested) => probeVideoDecoderAcceleration(config, alpha, requested),
       () => !closed && signal?.aborted !== true,
       startupCancellation,
+      LIVE_DECODER_PROBE_ORDER,
     );
     if (closed || signal?.aborted) throw streamClosedError();
     if (acceleration === undefined) throw unsupportedExactConfig();
@@ -1245,7 +1247,10 @@ function createVideoDecoder(
           return Promise.reject(error);
         }
         const cached = recallVideoDecoderAcceleration(videoDecoderAccelerationCache, config, alpha);
-        const immediate = immediateVideoDecoderAcceleration(o?.determinism, cached);
+        const immediate = immediateVideoDecoderAcceleration(
+          o?.determinism,
+          config.hardwareAcceleration ?? cached,
+        );
         try {
           const pending =
             immediate === undefined ? probeAndConfigure() : configureAccepted(immediate);
@@ -1365,7 +1370,8 @@ function createVideoEncoder(
   const alignHorizontalPhase = needsAppleH264HorizontalPhaseCompensation(config, platform);
   // Small VP9 (≤360p, e.g. 320×180 performance ladder) at default bitrate gives SSIM ~0.88 (<0.97).
   // Force a higher bitrate for small VP9 to meet the quality gate generally.
-  const isSmallVp9 = config.codec.toLowerCase().startsWith('vp09') && config.width * config.height <= 640 * 360;
+  const isSmallVp9 =
+    config.codec.toLowerCase().startsWith('vp09') && config.width * config.height <= 640 * 360;
   const baseConfig = isSmallVp9 ? { ...config, bitrate: 5_000_000 } : config;
   const wireConfig: VideoEncoderConfig = alignHorizontalPhase
     ? { ...baseConfig, width: baseConfig.width + 2 }

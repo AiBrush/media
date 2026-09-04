@@ -442,6 +442,39 @@ export function outputGaplessForAudioEncoder(
  * codec-private box or Matroska CodecPrivate. The public caller separately proves that no audio option
  * was requested and that the track is unencrypted.
  */
+/**
+ * Same destination contract for video: the container must be able to carry the coded family verbatim and
+ * the track must carry the WebCodecs config the muxer authors its sample entry / CodecPrivate from. The
+ * caller separately proves the request asks for nothing but the same codec family.
+ */
+export function canCopyVideoTrackToContainer(
+  container: string,
+  track: Pick<TrackInfo, 'mediaType' | 'codec' | 'config' | 'encrypted'>,
+): boolean {
+  if (track.mediaType !== 'video' || track.config === undefined || track.encrypted === true) {
+    return false;
+  }
+  const codec = track.codec.toLowerCase();
+  const h264 = codec.startsWith('avc1') || codec.startsWith('avc3') || codec === 'h264';
+  const hevc = codec.startsWith('hev1') || codec.startsWith('hvc1') || codec === 'hevc';
+  const av1 = codec.startsWith('av01') || codec === 'av1';
+  const vp9 = codec.startsWith('vp09') || codec === 'vp9';
+  const vp8 = codec === 'vp8' || codec.startsWith('vp8.');
+  switch (container) {
+    case 'mp4':
+    case 'mov':
+      return h264 || hevc || av1 || vp9;
+    case 'webm':
+      return vp8 || vp9 || av1;
+    case 'mkv':
+      return h264 || hevc || vp8 || vp9 || av1;
+    case 'ts':
+      return h264;
+    default:
+      return false;
+  }
+}
+
 export function canCopyAudioTrackToContainer(
   container: string,
   track: Pick<TrackInfo, 'mediaType' | 'codec' | 'config' | 'encrypted'>,

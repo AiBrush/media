@@ -50,11 +50,13 @@ const distBuilt =
   existsSync(fileURLToPath(new URL('../dist/core.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/image.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/mp4-packet-info.js', import.meta.url))) &&
+  existsSync(fileURLToPath(new URL('../dist/hls.js', import.meta.url))) &&
   existsSync(fileURLToPath(new URL('../dist/wav.js', import.meta.url)));
 const suite = distBuilt ? describe : describe.skip;
 const packageSubpath = (subpath: string): string => `@aibrush/media/${subpath}`;
 type ImageEntry = typeof import('./image.ts');
 type Mp4PacketInfoEntry = typeof import('./mp4-packet-info.ts');
+type HlsEntry = typeof import('./hls.ts');
 type WavEntry = typeof import('./wav.ts');
 type CoreEntryWithWavPcmToAiff = typeof core & {
   readonly wavPcmToAiffFromBytes?: unknown;
@@ -70,6 +72,17 @@ suite('dist smoke (built package via exports map)', () => {
     await expect(packetInfo.mp4PacketInfoFromBytes(Uint8Array.of(0))).rejects.toBeInstanceOf(
       packetInfo.MediaError,
     );
+  });
+
+  it('hls subpath exposes manifest parsing and resolution without the engine surface', async () => {
+    const hls = (await import(packageSubpath('hls'))) as HlsEntry;
+    expect(typeof hls.parseM3u8).toBe('function');
+    expect(typeof hls.resolveHlsSource).toBe('function');
+    expect(typeof hls.hlsPlaylistHasEncryptedSegments).toBe('function');
+    expect(typeof hls.MediaError).toBe('function');
+    expect('createMedia' in hls).toBe(false);
+    const playlist = hls.parseM3u8('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n', 'https://x/');
+    expect(playlist.type).toBe('media');
   });
 
   it('wav subpath re-authors a valid empty PCM WAV without loading the engine surface', async () => {

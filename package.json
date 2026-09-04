@@ -44,6 +44,10 @@
       "types": "./dist/mp4-packet-info.d.ts",
       "import": "./dist/mp4-packet-info.js"
     },
+    "./hls": {
+      "types": "./dist/hls.d.ts",
+      "import": "./dist/hls.js"
+    },
     "./image": {
       "types": "./dist/image.d.ts",
       "import": "./dist/image.js"

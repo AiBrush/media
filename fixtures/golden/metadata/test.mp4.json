@@ -9,6 +9,7 @@
       "codec": "mp4a.40.2",
       "durationSec": 6.03718820861678,
       "language": "eng",
+      "defaultDisposition": true,
       "sampleRate": 44100,
       "channels": 2
     },
@@ -18,6 +19,7 @@
       "codec": "avc1.4D400D",
       "durationSec": 6.0424,
       "language": "eng",
+      "defaultDisposition": true,
       "fps": 30.120481927710845,
       "rotation": 0,
       "width": 320,

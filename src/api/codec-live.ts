@@ -21,6 +21,7 @@ import type {
 } from '../contracts/driver.ts';
 import { InputError, MediaError } from '../contracts/errors.ts';
 import { closeFrame } from '../kernel/frames.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import type { GaplessNativeSuppressionProbe } from './gapless-native-suppression.ts';
 import {
   AlphaPairingBuffer,
@@ -30,7 +31,8 @@ import {
   splitFrameForVpxAlpha,
   unwrapPackets,
 } from './vpx-alpha.ts';
-
+const loadGaplessSuppression = memoizeAsync(() => import('./gapless-native-suppression.ts'));
+const loadTrimStreams = memoizeAsync(() => import('./trim-streams.ts'));
 // ============ stream-factory option shapes ============
 
 export interface VpxAlphaEncodeOptions {
@@ -42,7 +44,6 @@ export interface VpxAlphaEncodeOptions {
   readonly colorStage?: StageOptions;
   readonly alphaStage?: StageOptions;
 }
-
 export interface VpxAlphaPacketTranscodeOptions {
   readonly decodeConfig: DecoderConfig;
   readonly encodeConfig: VideoEncoderConfig;
@@ -70,7 +71,6 @@ export interface VpxAlphaFrameTranscodeOptions {
   readonly colorStage?: StageOptions;
   readonly alphaStage?: StageOptions;
 }
-
 // ============ seek: drop-until-target predicate ============
 
 /**
@@ -101,7 +101,7 @@ export async function decodedAudioStreamWithGapless(
     config !== undefined &&
     'sampleRate' in config
   ) {
-    const { nativeSuppressedGaplessSamples } = await import('./gapless-native-suppression.ts');
+    const { nativeSuppressedGaplessSamples } = await loadGaplessSuppression();
     const nativeSuppressed = await nativeSuppressedGaplessSamples(
       suppressionProbe,
       leadingSamples,
@@ -112,7 +112,7 @@ export async function decodedAudioStreamWithGapless(
       gapless = { ...gapless, leadingSamples: Math.max(0, leadingSamples - nativeSuppressed) };
     }
   }
-  const { restampAudioDataRange, trimAudioGaplessFrameStream } = await import('./trim-streams.ts');
+  const { restampAudioDataRange, trimAudioGaplessFrameStream } = await loadTrimStreams();
   return trimAudioGaplessFrameStream(frames, gapless, restampAudioDataRange);
 }
 

@@ -2,8 +2,12 @@
 
 import type { DriverModule, Registry } from '../../contracts/driver.ts';
 import { DRIVER_API_VERSION } from '../../contracts/driver.ts';
+import { memoizeAsync } from '../../util/memoize-async.ts';
 import { type LazyContainerSpec, lazyContainer } from '../lazy-container.ts';
 import { matchesMp4 } from './mp4-sniff.ts';
+
+// One import per module, not per probe: a cached dynamic import still costs ~10 µs in Chromium.
+const loadLazyProbe = memoizeAsync(() => import('./mp4-lazy-probe.ts'));
 
 export const MP4_LAZY_CONTAINER_SPEC: LazyContainerSpec = {
   id: 'mp4',
@@ -12,7 +16,7 @@ export const MP4_LAZY_CONTAINER_SPEC: LazyContainerSpec = {
   load: () => import('./mp4-driver.ts').then((module) => module.Mp4Driver),
   probe: true,
   probeImpl: (src, options) =>
-    import('./mp4-lazy-probe.ts').then((module) => module.probeMp4Faststart(src, options)),
+    loadLazyProbe().then((module) => module.probeMp4Faststart(src, options)),
   packetInfo: true,
   packetInfoBatches: true,
   auditMuxedTrack: true,

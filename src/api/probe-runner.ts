@@ -8,6 +8,7 @@ import type { ImageOps } from '../codecs/image/index.ts';
 import type { ContainerDriver, StageOptions } from '../contracts/driver.ts';
 import { MediaError } from '../contracts/errors.ts';
 import { type MediaInput, type Source, cancelSource } from '../sources/source.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import type { ProbeContainerResultCache } from './blob-probe-handoff.ts';
 import { toMediaInfo } from './op-support.ts';
 import {
@@ -18,6 +19,9 @@ import {
   throwIfAborted,
 } from './source-io.ts';
 import type { CallOptions, Container, MediaInfo } from './types.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadProbeModule = memoizeAsync(() => import('../codecs/image/probe.ts'));
 
 export interface ProbeRunnerContext {
   readonly cacheOwner: object;
@@ -62,7 +66,7 @@ async function probeImageInfo(
   const ops = await context.imageOps(source, signal);
   if (ops === undefined) return undefined;
   const bytes = await readAllSource(source, signal);
-  const { imageInfoToMediaMetadata } = await import('../codecs/image/probe.ts');
+  const { imageInfoToMediaMetadata } = await loadProbeModule();
   return imageInfoToMediaMetadata(await ops.probe(bytes), source.size);
 }
 
@@ -81,16 +85,18 @@ export async function runProbe(
   let operationResultCache: ProbeContainerResultCache | undefined;
   let info: MediaInfo;
   try {
-    if (
-      resolved.range !== undefined &&
-      (resolved.kind !== 'bytes' || resolved.mimeHint !== undefined)
-    ) {
+    // In-memory bytes answer every range as a subarray: caching copies of those reads or recording a
+    // prefix for a later demux handoff would only add allocations to the hottest probe path.
+    const inMemory = resolved.kind === 'bytes';
+    if (resolved.range !== undefined) {
       probeRangeCache = await context.loadRangeCache();
-      source = probeRangeCache.cacheRepeatedProbeRangesFor(context.cacheOwner, resolved);
+      if (!inMemory) {
+        source = probeRangeCache.cacheRepeatedProbeRangesFor(context.cacheOwner, resolved);
+      }
     }
     if (sourceMayHaveBlobProbeHandoff(resolved)) {
       [source, operationResultCache] = await context.blobProbe(source);
-    } else {
+    } else if (!inMemory) {
       source = cacheProbeRanges(source, context.sourcePrefixHandoff, 'store');
     }
 

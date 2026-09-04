@@ -2,9 +2,17 @@ import type { ContainerDriver, MuxOptions, StageOptions } from '../contracts/dri
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import { containerHasChunkMuxer } from './codec-routing.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
-import type { CallOptions, MuxSpec, PacketStreams } from './types.ts';
+import type { CallOptions, MuxSpec, PacketStream, PacketStreams } from './types.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadCodecPipelineModule = memoizeAsync(() => import('./codec-pipeline.ts'));
+const loadFlacMkvMuxModule = memoizeAsync(() => import('./flac-mkv-mux.ts'));
+const loadMpegtsPreparedMuxModule = memoizeAsync(() => import('./mpegts-prepared-mux.ts'));
+const loadMuxPacketStreamsModule = memoizeAsync(() => import('./mux-packet-streams.ts'));
+const loadNativePacketMuxModule = memoizeAsync(() => import('./native-packet-mux.ts'));
 
 const CONTAINER_MIME: Readonly<Record<string, string>> = {
   mp4: 'video/mp4',
@@ -48,6 +56,14 @@ export async function runMux(
       tried: [target],
     });
   }
+  // Reject an illegal codec→container pair before any muxer chunk loads or a packet is read: the
+  // eager driver proxy carries the container's track rule when it has one (REQUIREMENTS §5.5).
+  const validateMuxTrack = (await context.muxer(target, options.strategy?.pinDriver)).validateMuxTrack;
+  if (validateMuxTrack !== undefined) {
+    [streams.video, streams.audio, ...(streams.tracks ?? [])]
+      .filter((stream): stream is PacketStream => stream !== undefined)
+      .forEach((stream, index) => validateMuxTrack(stream.track, index));
+  }
   if (
     opts.faststart !== 'reserve' &&
     opts.fragmented !== true &&
@@ -59,7 +75,7 @@ export async function runMux(
       (target === 'mp4' || target === 'mov') &&
       (opts.sink === undefined || opts.sink.kind === 'blob')
     ) {
-      const { muxNativeFirstPartyPacketStreams } = await import('./native-packet-mux.ts');
+      const { muxNativeFirstPartyPacketStreams } = await loadNativePacketMuxModule();
       const native = await muxNativeFirstPartyPacketStreams(streams, {
         container: target,
         ...(opts.faststart !== undefined ? { faststart: opts.faststart } : {}),
@@ -69,7 +85,7 @@ export async function runMux(
         return materializeOutput(opts.sink ?? toBlob(), native, mimeOptions(signal, target));
       }
     }
-    const fastMux = await import('./flac-mkv-mux.ts');
+    const fastMux = await loadFlacMkvMuxModule();
     const muxPrepared =
       target === 'mp4' || target === 'mov'
         ? fastMux.muxPreparedMp4PacketStreams
@@ -94,7 +110,7 @@ export async function runMux(
     opts.faststart !== 'reserve' &&
     opts.fragmented !== true
   ) {
-    const fastMux = await import('./flac-mkv-mux.ts');
+    const fastMux = await loadFlacMkvMuxModule();
     const stream = await fastMux.muxPreparedMp4PacketStreams(streams, {
       ...context.stage(signal, options),
       container: target,
@@ -105,7 +121,7 @@ export async function runMux(
   }
 
   if (opts.fragmented !== true && target === 'ts') {
-    const { muxPreparedMpegTsPacketStreams } = await import('./mpegts-prepared-mux.ts');
+    const { muxPreparedMpegTsPacketStreams } = await loadMpegtsPreparedMuxModule();
     const stream = await muxPreparedMpegTsPacketStreams(streams, {
       ...context.stage(signal, options),
       container: target,
@@ -115,7 +131,7 @@ export async function runMux(
     }
   }
 
-  const { muxPacketStreams, readablePacketStreams } = await import('./mux-packet-streams.ts');
+  const { muxPacketStreams, readablePacketStreams } = await loadMuxPacketStreamsModule();
   let inputs: ReturnType<typeof muxPacketStreams>;
   try {
     inputs = muxPacketStreams(streams);
@@ -130,7 +146,7 @@ export async function runMux(
     const muxer = (await context.muxer(target, options.strategy?.pinDriver)).createMuxer(
       muxOptions(opts),
     );
-    const { createDrainTaskGroup, drainEncoderToMuxer } = await import('./codec-pipeline.ts');
+    const { createDrainTaskGroup, drainEncoderToMuxer } = await loadCodecPipelineModule();
     const group = createDrainTaskGroup(signal);
     const tasks = inputs.map((input) =>
       drainEncoderToMuxer(input.packets, muxer, input.track, group.signal),

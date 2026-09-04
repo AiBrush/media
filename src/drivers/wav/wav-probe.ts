@@ -34,7 +34,7 @@ export interface ParsedWavHeader {
 }
 
 export const WAV_PROBE_HEAD_BYTES = 128;
-const WAV_REMOTE_PROBE_HEAD_BYTES = 16 * 1024;
+const WAV_REMOTE_PROBE_HEAD_BYTES = 1024;
 const WAV_PROBE_MAX_SPARSE_WINDOWS = 8;
 export const WAV_DEMUX_HEAD_BYTES = 65536;
 export const MAX_WAV_CHUNKS_PER_FILE = 2048;

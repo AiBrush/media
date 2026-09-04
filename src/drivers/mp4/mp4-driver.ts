@@ -263,10 +263,12 @@ function metadataProbePrefetchBytes(src: ByteSource): number {
   const kind = sourceKind(src);
   // One 128 KiB HTTP window is the latency/overfetch crossover for remote metadata: it captures the
   // common medium faststart `moov` in one request, while keeping tail-moov overfetch strictly bounded.
-  // Local byte/blob sources retain the smaller window because their range reads have no round-trip.
-  return kind === 'url' || kind === 'element'
-    ? REMOTE_FASTSTART_METADATA_PREFETCH_BYTES
-    : FASTSTART_METADATA_PREFETCH_BYTES;
+  // In-memory bytes keep the 32 KiB window because a subarray costs nothing. A Blob range is a real
+  // copy out of blob storage, so it uses the same bounded layout window as the metadata-only probe:
+  // a small faststart file must not be materialized wholesale just to read its `moov`.
+  if (kind === 'url' || kind === 'element') return REMOTE_FASTSTART_METADATA_PREFETCH_BYTES;
+  if (kind === 'blob') return VIDEO_METADATA_LAYOUT_WINDOW_BYTES;
+  return FASTSTART_METADATA_PREFETCH_BYTES;
 }
 
 function shouldEagerReadRandomAccess(
@@ -3523,7 +3525,9 @@ function toTrackInfo(t: ParsedTrack): TrackInfo {
     ...(t.language !== undefined ? { language: t.language } : {}),
     ...(t.fps !== undefined ? { fps: t.fps } : {}),
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
-    ...(t.encryption !== undefined ? { encrypted: true } : {}),
+    ...(t.encryption !== undefined
+      ? { encrypted: true, encryptionScheme: t.encryption.schemeType }
+      : {}),
     ...(color !== undefined ? { color } : {}),
     ...(gapless !== undefined ? { gapless } : {}),
     config: t.config,
@@ -5580,7 +5584,11 @@ export const Mp4Driver: ContainerDriver = {
         movie = await readMovie(ra);
         if (!movie.tracks.some((t) => t.encryption !== undefined)) {
           return oneShot(
-            await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
+            await readWholeFile(
+              ra,
+              ra.size ?? Number.MAX_SAFE_INTEGER,
+              WHOLE_FILE_REMUX_BUDGET_BYTES,
+            ),
           );
         }
       }
@@ -5588,7 +5596,11 @@ export const Mp4Driver: ContainerDriver = {
       movie = await readMovie(ra);
       if (!movie.tracks.some((t) => t.encryption !== undefined)) {
         return oneShot(
-          await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER, WHOLE_FILE_REMUX_BUDGET_BYTES),
+          await readWholeFile(
+            ra,
+            ra.size ?? Number.MAX_SAFE_INTEGER,
+            WHOLE_FILE_REMUX_BUDGET_BYTES,
+          ),
         );
       }
     }

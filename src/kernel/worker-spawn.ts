@@ -19,6 +19,11 @@ import type {
 /** A spawned dedicated worker as the bridge needs it (a duplex message port that can also terminate). */
 export interface SpawnedWorker extends MessageLike<WorkerMessage, HostMessage> {
   terminate(): void;
+  /**
+   * Subscribe to the worker's own failure signal (a DOM `error`/`messageerror` event: the module script
+   * did not load, or threw while booting). Returns the unsubscribe. Optional so test fakes stay small.
+   */
+  onFailure?(listener: () => void): () => void;
 }
 
 /** How {@link ensureWorkerBridge} obtains a worker — a real `Worker` in production, a fake in Node tests. */
@@ -103,14 +108,19 @@ function awaitReady(
       finish(ev.data.caps);
     };
     const timer = setTimeout(() => finish(undefined), timeoutMs);
+    let stopFailure: (() => void) | undefined;
     const finish = (caps: WorkerMediaCaps | undefined): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       worker.removeEventListener('message', onMessage);
+      stopFailure?.();
       resolve(caps);
     };
     worker.addEventListener('message', onMessage);
+    // A worker whose script fails to load (a re-bundled asset path, a CSP block) never answers; its
+    // `error` event is the immediate verdict — do not wait out the whole handshake budget for it.
+    stopFailure = worker.onFailure?.(() => finish(undefined));
   });
 }
 
@@ -118,8 +128,8 @@ function awaitReady(
  * stand-in in Node tests — the adapter's listener bookkeeping is Node-proven, not browser-only). */
 export interface DomWorkerLike {
   postMessage(message: unknown, transfer?: Transferable[]): void;
-  addEventListener(type: 'message', listener: (ev: Event) => void): void;
-  removeEventListener(type: 'message', listener: (ev: Event) => void): void;
+  addEventListener(type: 'message' | 'error' | 'messageerror', listener: (ev: Event) => void): void;
+  removeEventListener(type: 'message' | 'error' | 'messageerror', listener: (ev: Event) => void): void;
   terminate(): void;
 }
 
@@ -151,6 +161,15 @@ export function adaptWorker(worker: DomWorkerLike): SpawnedWorker {
       worker.removeEventListener(type, wrapper);
     },
     terminate: () => worker.terminate(),
+    onFailure: (listener) => {
+      const onError = (): void => listener();
+      worker.addEventListener('error', onError);
+      worker.addEventListener('messageerror', onError);
+      return () => {
+        worker.removeEventListener('error', onError);
+        worker.removeEventListener('messageerror', onError);
+      };
+    },
   };
 }
 
@@ -178,5 +197,13 @@ function defaultSpawn(): SpawnedWorker | undefined {
   const url = workerMainUrl();
   if (url === undefined) return undefined;
   return adaptWorker(new Worker(url, { type: 'module' }));
+}
+
+/** A spawn bound to an explicit worker script URL (`createMedia({ worker: { url } })`). */
+export function spawnWorkerAt(url: string | URL): WorkerSpawn {
+  return () => {
+    if (typeof Worker !== 'function') return undefined;
+    return adaptWorker(new Worker(url, { type: 'module' }));
+  };
 }
 /* v8 ignore stop */

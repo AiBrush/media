@@ -9,6 +9,7 @@
       "codec": "avc1.64002A",
       "durationSec": 6.283,
       "language": "und",
+      "defaultDisposition": true,
       "fps": 60.00318319274232,
       "rotation": 0,
       "width": 1920,
@@ -20,6 +21,7 @@
       "codec": "mp4a.40.2",
       "durationSec": 6.271,
       "language": "und",
+      "defaultDisposition": true,
       "sampleRate": 48000,
       "channels": 2
     }

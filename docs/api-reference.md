@@ -19,7 +19,7 @@ behind bare functions; the next bare call creates a new instance.
 | --- | --- | --- |
 | `determinism` | `'auto' | 'force-software'` | Selects automatic routing or a proved software route |
 | `enableThreads` | `boolean` | Enables threaded WASM only when isolation and `SharedArrayBuffer` are available |
-| `worker` | `boolean | { pool?: number }` | Opts heavy pipelines into worker execution |
+| `worker` | `boolean | { pool?: number; url?: string | URL }` | Worker offload for heavy pipelines; `url` names the worker script when a bundler renames `dist/worker.js` (a failed spawn falls back to inline at once) |
 | `assetBaseUrl` | `string` | Same-origin base directory for selected WASM assets |
 | `onLog` | `(event: LogEvent) => void` | Receives diagnostic events |
 
@@ -326,6 +326,12 @@ rewrites. It does not initialize the media engine.
 
 Focused `mp4PacketInfoFromBytes` and `mp4PacketInfoFromUrl` functions plus typed media errors. Use it in
 startup-sensitive code that only needs MP4/MOV packet metadata.
+
+### `@aibrush/media/hls`
+
+The HLS manifest surface on its own: `parseM3u8`, `resolveHlsSource`, `resolveHlsSourceFromSource`,
+`resolveHlsProbeSource`, `hlsPlaylistHasEncryptedSegments`, `isHlsPlaylist`, plus typed media errors. Use
+it where a player or harness resolves playlists and keys without the rest of the engine.
 
 ### `@aibrush/media/core`
 

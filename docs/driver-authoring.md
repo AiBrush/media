@@ -56,6 +56,21 @@ Container drivers also declare `formats`, synchronously answer `supports(query)`
 and provide `createMuxer()`. Focused drivers can add efficient `probe`, packet metadata, stream-copy,
 PCM, or decrypt capabilities.
 
+A container with a random-access index can implement
+`seekPackets(src, trackId, timeUs): Promise<ReadableStream<Packet> | undefined>`: the packets of one
+track starting at the index's last random-access point at or before `timeUs`, read through bounded
+ranges. The engine's seek tries it before `demux()`, so a seek into a large remote file costs the head
+prefix, the index, and the clusters actually decoded instead of a whole-file download. Return
+`undefined` whenever the source or layout cannot honour that contract (no random access, no index,
+unknown-size clusters); the engine then falls back to `demux()` unchanged. The stream may start earlier
+than the target; the engine still applies its own keyframe logic.
+
+`validateMuxTrack(track, trackIndex)` is the container's synchronous track rule (codec family, track
+count, PCM shape) — the same check the muxer applies in `addTrack`. Lazy specs expose it eagerly through
+`validateTrack`, so `mux()` rejects an illegal codec→container request with a typed `CapabilityError`
+before any muxer chunk loads or a packet is read. Real drivers that carry a track rule should expose the
+same function, because a query-selective registration may hand the router the loaded module directly.
+
 A demuxer can implement `packetStats(trackId): PacketMetadataStats | undefined` so conversion planning
 can measure coded bitrate and presentation span without calling the legacy row-materializing
 `packetTable()`. The result must be computed with constant-sized auxiliary state: publish packet count,

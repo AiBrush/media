@@ -1486,7 +1486,7 @@ describe('mux — caller packet streams (public packet seam)', () => {
     ).rejects.toBeInstanceOf(CapabilityError);
   });
 
-  it('preflights known tracks and cancels a locked sibling when one target pairing is illegal', async () => {
+  it('preflights known tracks and leaves every caller stream untouched when one target pairing is illegal', async () => {
     let validPulls = 0;
     let validCancels = 0;
     let invalidPulls = 0;
@@ -1542,10 +1542,12 @@ describe('mux — caller packet streams (public packet seam)', () => {
         { container: 'ogg' },
       ),
     ).rejects.toBeInstanceOf(CapabilityError);
-    expect(validPulls).toBe(1);
-    expect(validCancels).toBe(1);
+    // The container's track rule runs before any stream is read or locked (reject before work): the
+    // caller keeps both streams exactly as it passed them.
+    expect(validPulls).toBe(0);
+    expect(validCancels).toBe(0);
     expect(invalidPulls).toBe(0);
-    expect(invalidCancels).toBe(1);
+    expect(invalidCancels).toBe(0);
   });
 
   // Multi-source / multi-track assembly (PacketStreams.tracks): tracks demuxed from DIFFERENT sources, or

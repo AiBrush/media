@@ -26,6 +26,7 @@ import type { Sink } from '../sinks/sink.ts';
 import { toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions } from '../sinks/sink.ts';
 import type { MediaInput, Source } from '../sources/source.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import {
   assertBufferedMp4ConvertProjection,
   isBuiltInBufferedMp4MuxDriverId,
@@ -36,6 +37,7 @@ import {
   audioTrackAfterLeadingSampleTrim,
   buildVideoEncoderConfigForRuntime,
   canCopyAudioTrackToContainer,
+  canCopyVideoTrackToContainer,
   canUseVpxAlphaGeometryPacketTranscode,
   canUseVpxAlphaPacketTranscode,
   decodeQueryFor,
@@ -46,10 +48,23 @@ import {
   sourceVideoBitrateFromPacketStats,
   unwrapPackets,
 } from './codec-pipeline.ts';
+import { videoCodecToken } from './codec-strings.ts';
 import { chooseOutputContainer, containerHasChunkMuxer } from './codec-routing.ts';
 import type { AudioTarget, CallOptions, ConvertOptions, Output, VideoTarget } from './types.ts';
 import type { H264TwoPassRunnerContext } from './video-two-pass-runner.ts';
 import type { H264TwoPassPlan } from './video-two-pass.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadAudioDataModule = memoizeAsync(() => import('../dsp/audio-data.ts'));
+const loadConvertStreamCopyModule = memoizeAsync(() => import('./convert-stream-copy.ts'));
+const loadReplayableVideoDecoderModule = memoizeAsync(
+  () => import('./replayable-video-decoder.ts'),
+);
+const loadVideoQualityConstraintModule = memoizeAsync(
+  () => import('./video-quality-constraint.ts'),
+);
+const loadVideoQualityRunnerModule = memoizeAsync(() => import('./video-quality-runner.ts'));
+const loadVideoTwoPassRunnerModule = memoizeAsync(() => import('./video-two-pass-runner.ts'));
 
 export interface CodecConvertRunnerContext {
   readonly routeContainer: (
@@ -154,7 +169,7 @@ export async function runCodecConvert(
   const qualityRequest =
     opts.video === false
       ? undefined
-      : (await import('./video-quality-constraint.ts')).assertH264QualityConstraintPreflight(
+      : (await loadVideoQualityConstraintModule()).assertH264QualityConstraintPreflight(
           opts.video ?? {},
           src,
         );
@@ -166,7 +181,7 @@ export async function runCodecConvert(
   );
   const target = chooseOutputContainer(opts.to, container.formats[0]);
 
-  const copied = await (await import('./convert-stream-copy.ts')).tryConvertStreamCopy(
+  const copied = await (await loadConvertStreamCopyModule()).tryConvertStreamCopy(
     container,
     target,
     src,
@@ -220,6 +235,13 @@ export async function runCodecConvert(
       audioTrack !== undefined &&
       opts.audio === undefined &&
       canCopyAudioTrackToContainer(target, audioTrack);
+    // Same rule for video: no target, or a codec-only target naming the source's own family, with a
+    // container that carries that family verbatim — copy the coded packets instead of re-encoding.
+    const copyVideoPackets =
+      selectedVideoTrack !== undefined &&
+      !usesQualityCandidate &&
+      isPassthroughVideoTarget(opts.video, selectedVideoTrack) &&
+      canCopyVideoTrackToContainer(target, selectedVideoTrack);
     const packetStatsCache = new Map<number, PacketMetadataStats | undefined>();
     const packetStatsFor = (trackId: number): PacketMetadataStats | undefined => {
       if (packetStatsCache.has(trackId)) return packetStatsCache.get(trackId);
@@ -231,7 +253,7 @@ export async function runCodecConvert(
     let videoTrack: TrackInfo | undefined;
     let videoTarget: VideoTarget | undefined;
     let videoEncoderConfig: VideoEncoderConfig | undefined;
-    if (selectedVideoTrack !== undefined && !usesQualityCandidate) {
+    if (selectedVideoTrack !== undefined && !usesQualityCandidate && !copyVideoPackets) {
       const measuredBitrate =
         selectedVideoTrack.bitrate ??
         sourceVideoBitrateFromPacketStats(packetStatsFor(selectedVideoTrack.id));
@@ -266,7 +288,10 @@ export async function runCodecConvert(
       const plannedVideoBitrate =
         selectedVideoTrack === undefined
           ? undefined
-          : (videoEncoderConfig?.bitrate ??
+          : copyVideoPackets
+            ? (selectedVideoTrack.bitrate ??
+              sourceVideoBitrateFromPacketStats(packetStatsFor(selectedVideoTrack.id)))
+            : (videoEncoderConfig?.bitrate ??
             (opts.video === false
               ? undefined
               : (opts.video?.maxAverageBitrate ?? opts.video?.bitrate)));
@@ -294,7 +319,7 @@ export async function runCodecConvert(
     // the buffer-all projection has accepted the resolved source duration and actual planned rate.
     const twoPassPlan =
       opts.video !== false && opts.video?.twoPass === true
-        ? await (await import('./video-two-pass-runner.ts')).analyzeH264TwoPass(
+        ? await (await loadVideoTwoPassRunnerModule()).analyzeH264TwoPass(
             src,
             container,
             opts.video,
@@ -307,7 +332,7 @@ export async function runCodecConvert(
     const qualityCandidate =
       !usesQualityCandidate || qualityVideoTarget === undefined
         ? undefined
-        : await (await import('./video-quality-runner.ts')).analyzeH264QualityConstrained(
+        : await (await loadVideoQualityRunnerModule()).analyzeH264QualityConstrained(
             src,
             container,
             qualityVideoTarget,
@@ -328,7 +353,11 @@ export async function runCodecConvert(
     const openStreams: ReadableStream<unknown>[] = [];
 
     if (selectedVideoTrack !== undefined) {
-      if (qualityCandidate !== undefined) {
+      if (copyVideoPackets) {
+        const packets = demuxer.packets(selectedVideoTrack.id);
+        openStreams.push(packets);
+        tasks.push(drainEncoderToMuxer(packets, muxer, selectedVideoTrack, signal));
+      } else if (qualityCandidate !== undefined) {
         const chunks = streamOf(qualityCandidate.chunks);
         openStreams.push(chunks);
         tasks.push(drainEncoderToMuxer(chunks, muxer, qualityCandidate.track, signal));
@@ -383,9 +412,7 @@ export async function runCodecConvert(
           const config = decodeQuery.config;
           const decodeStage = context.stageOptions(signal, callOptions);
           const runtimeFallback =
-            plannedVideoTrack.alpha === true
-              ? undefined
-              : await import('./replayable-video-decoder.ts');
+            plannedVideoTrack.alpha === true ? undefined : await loadReplayableVideoDecoderModule();
           const fallbackKind = runtimeFallback?.planRuntimeVideoFallback(
             videoCodec.id,
             config.codec,
@@ -482,7 +509,7 @@ export async function runCodecConvert(
           container.decodePcmInterleavedStream !== undefined
         ) {
           const chunks = await container.decodePcmInterleavedStream(src, stage);
-          decoded = (await import('../dsp/audio-data.ts')).interleavedPcmChunksToAudioDataStream(
+          decoded = (await loadAudioDataModule()).interleavedPcmChunksToAudioDataStream(
             chunks,
             stage,
             audioTrack.codec,
@@ -492,7 +519,7 @@ export async function runCodecConvert(
           container.decodePcmAudioStream !== undefined
         ) {
           const chunks = await container.decodePcmAudioStream(src, stage);
-          decoded = (await import('../dsp/audio-data.ts')).pcmAudioChunksToAudioDataStream(
+          decoded = (await loadAudioDataModule()).pcmAudioChunksToAudioDataStream(
             chunks,
             stage,
             audioTrack.codec,
@@ -502,7 +529,7 @@ export async function runCodecConvert(
           container.decodePcmAudio !== undefined &&
           (context.isRawPcmTrack(audioTrack) || audioTrack.codec === 'flac')
         ) {
-          decoded = (await import('../dsp/audio-data.ts')).pcmAudioToAudioDataStream(
+          decoded = (await loadAudioDataModule()).pcmAudioToAudioDataStream(
             await container.decodePcmAudio(src, stage),
             stage,
             audioTrack.codec,
@@ -606,4 +633,26 @@ async function allOrCancelStreams(
     await Promise.all(streams.map((stream) => cancelStream(stream)));
     throw error;
   }
+}
+
+/** The keys of a `VideoTarget` that ask for anything beyond the coded family. */
+const VIDEO_TRANSFORM_KEYS = [
+  'width', 'height', 'fit', 'fps', 'bitrate', 'maxAverageBitrate', 'quality', 'bitrateMode', 'crf',
+  'twoPass', 'bitDepth', 'alpha', 'rotate', 'flip', 'crop', 'pad', 'colorspace', 'tonemap',
+] as const;
+
+/**
+ * True when the request asks for nothing the source video does not already satisfy: no video target at
+ * all, or a target whose only key is the source's own codec family.
+ */
+export function isPassthroughVideoTarget(
+  target: VideoTarget | false | undefined,
+  track: Pick<TrackInfo, 'codec'>,
+): boolean {
+  if (target === false) return false;
+  if (target === undefined) return true;
+  if (VIDEO_TRANSFORM_KEYS.some((key) => target[key] !== undefined)) return false;
+  if (target.codec === undefined) return true;
+  const family = videoCodecToken(track.codec);
+  return family !== undefined && videoCodecToken(target.codec) === family;
 }

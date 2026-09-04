@@ -33,7 +33,6 @@ import {
   type Mp3ExactTrimResult,
   mp3TrimAlignment,
   trimMp3Exact,
-  trimMp3ExactWithHistoryPatch,
 } from './mp3-exact-trim.ts';
 import { MP3_LAYER_III_SYNTHESIS_DELAY_SAMPLES } from './mp3-gapless.ts';
 
@@ -1147,27 +1146,6 @@ describe('MP3 hybrid accurate fallback', () => {
         parseMp3(bytes, bytes.byteLength).sampleRate,
       );
     }
-  });
-
-  it('trimMp3ExactWithHistoryPatch embeds TXXX:history-pcm ID3 for deep windows and stays wasm-bitexact', async () => {
-    const bytes = await loadMediaTestFixture('mp3_xing.mp3');
-    const source = await decodeProgram(bytes);
-    // Deep window carries reservoir, so the async wrapper should embed an ID3 with the correct first-window PCM
-    const deep = await trimMp3ExactWithHistoryPatch(bytes, { startSec: 5, endSec: 10 });
-    expect(deep.carriesReservoirFrame).toBe(true);
-    expect(deep.bytes[0]).toBe(0x49); // ID3
-    expect(deep.bytes[1]).toBe(0x44);
-    expect(deep.bytes[2]).toBe(0x33);
-    expectAuthorableGaplessFields(deep, deep.bytes);
-    // The ID3 is skipped by walkMp3TrimFrames, so wasm decode of the patched file must still be bitexact
-    // (the patch is only for Chrome's decodeAudioData, not for wasm)
-    expectWindowMatchesSource(source, await decodeProgram(deep.bytes), deep);
-    // Shallow window has no reservoir, so no ID3 is added
-    const shallow = await trimMp3ExactWithHistoryPatch(bytes, { startSec: 0, endSec: 1 });
-    expect(shallow.carriesReservoirFrame).toBe(false);
-    expect(shallow.bytes[0]).toBe(0xff); // sync, no ID3
-    expectAuthorableGaplessFields(shallow, shallow.bytes);
-    expectWindowMatchesSource(source, await decodeProgram(shallow.bytes), shallow);
   });
 });
 

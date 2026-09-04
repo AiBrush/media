@@ -7,7 +7,7 @@
 | Package | Pre-1.0 (`0.0.0` at the baseline date) |
 | Benchmark | Chromium 150 result cache generated 2026-08-08; content hash `1493b70bbbbd107ff008d738f562115d5f399eb9f9792869c17bf53b677322aa` |
 
-The baseline source in the development workspace is `../media-test/results/cache-chromium-1786228958094.json`. It used media-test suite `0.1.0`, corpus checksum `bc915fedcf0a74842700b60a0f663778e6e2aac135889ca011881c369ac36d4e`, and Chromium `150.0.0.0` on an Apple M4 GPU environment.
+The baseline source in the development workspace is `../media-test/results/cache-chromium-1788562444700.json`.
 
 This document is the authoritative product and engineering specification for `@aibrush/media`. It defines what “the best media engine in the browser” means, records the current evidence, and establishes the work and release gates required to make that claim honestly.
 
@@ -395,6 +395,15 @@ The benchmark system MUST provide:
 - raw result artifacts sufficient for a third party to recompute the score.
 
 At least 20% of release correctness scenarios SHOULD be held out from routine implementation runs. A change that improves named fixtures but regresses generated or held-out variants MUST be rejected.
+
+Additional integrity rules, learned from the 2026-09-01 review:
+
+- Produced output MUST NOT carry data intended for the evaluator. Metadata, tags, or side channels that embed expected samples, pixels, hashes, or decoder state so an oracle can substitute them are prohibited, and any oracle that reads such data is invalid.
+- A correct algorithm MUST NOT be downgraded to match an approximate reference. When a reference is found to be less accurate than the implementation, the reference is the defect and MUST be re-baked with an independent tool.
+- Caches MUST be owned by the engine instance and MUST NOT survive `dispose()`. Module-level caches keyed by URL, size, or content hash are prohibited. Range fetches MUST use the platform default cache mode and MUST revalidate.
+- The autonomous implementation loop MUST NOT modify `media-test`. Benchmark, oracle, fixture, and adapter changes are made by a human in a separate change with their own review.
+- The `media-test` adapter for this engine MUST import only the public root entry, MUST NOT branch on harness context, MUST NOT post-process or repair library output, and SHOULD stay under 1,500 lines. Every adapter workaround is a library gap and MUST be recorded as such.
+- A backlog item MAY be marked done only with a measured `--no-reuse` run of at least 30 iterations attached; estimates are not evidence.
 
 ## 11. Validation and evidence
 

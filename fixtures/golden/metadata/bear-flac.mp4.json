@@ -9,6 +9,7 @@
       "codec": "fLaC",
       "durationSec": 2.7399546485260773,
       "language": "und",
+      "defaultDisposition": true,
       "sampleRate": 44100,
       "channels": 2
     }

@@ -24,8 +24,11 @@ console.info({
 });
 ```
 
-Each track reports its id, type, codec, duration when known, and media-specific geometry. Video tracks
+A wrong MIME type or extension on an in-memory input is corrected by the file's own magic bytes (an
+MPEG-TS payload named `.mp4` probes as `ts`). Each track reports its id, type, codec, duration when known, and media-specific geometry. Video tracks
 may report width, height, rotation, and frame rate; audio tracks may report sample rate and channel count.
+When the container carries a default-selection flag (`tkhd` Track_enabled, Matroska `FlagDefault`) the
+track also reports `defaultDisposition`; `language` is the container's declared ISO-639-2 code.
 
 ### `packetInfo` and `packetInfoBatches`
 
@@ -126,6 +129,12 @@ const output = await convert(file, {
 ```
 
 Set `video: false` or `audio: false` to omit that media type. `transcode` is an alias of `convert`.
+
+A request that asks for nothing beyond the source's own codec family copies the coded packets instead
+of re-encoding: no video target, or a target whose only key is a `codec` matching the source
+(`{ video: { codec: 'h264' } }` on an H.264 source), when the destination container carries that family.
+Audio follows the same rule when no audio target is given. Any transform key (size, fps, bitrate, crf,
+crop, rotate, colour, alpha, ...) selects an encoder.
 
 ### Video transforms
 
@@ -278,6 +287,16 @@ try {
 } finally {
   frame.close();
 }
+```
+
+`mode` picks a different landing rule: `'nearest'` returns the frame whose presentation time is closest
+to the target (the earlier one on a tie), and `'keyframe'` returns the last random-access frame at or
+before the target (or the first one after it), decoded alone — the fastest thumbnail a container can
+give. Containers with a random-access index (WebM/Matroska Cues, MP4 sample tables) seek through
+bounded ranges, so a seek into a large remote file does not download the whole file.
+
+```ts
+const thumbnail = await seek(url, 90_000_000, { mode: 'keyframe' });
 ```
 
 ### `encode` and `mux`

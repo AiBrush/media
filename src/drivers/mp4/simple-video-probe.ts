@@ -1,13 +1,20 @@
 import type { TrackInfo } from '../../contracts/driver.ts';
 import { MediaError } from '../../contracts/errors.ts';
-import { avcCodecString, parseEsds } from './codec-strings.ts';
+import {
+  type ColrInfo,
+  avcCodecString,
+  parseEsds,
+  videoColorSpaceFromColr,
+} from './codec-strings.ts';
 import { clockwiseRotationFromMp4MatrixFirstRow } from './display-transform.ts';
 import { gaplessFromMp4Edit } from './gapless.ts';
-import { decodeMdhdLanguage } from './mdhd-language.ts';
+import { decodeQuickTimeMdhdLanguage } from './mdhd-language.ts';
 import { type BoxHeader, Reader, boxes, readFullBoxHeader } from './reader.ts';
 
 const SIMPLE_VIDEO_FASTSTART_PROBE_PREFETCH_BYTES = 8 * 1024;
 const SIMPLE_VIDEO_FASTSTART_PROBE_MAX_PREFETCH_BYTES = 128 * 1024;
+/** Largest `moov` the compact probe re-reads whole; beyond it the complete driver's bounded parse wins. */
+const SIMPLE_VIDEO_FASTSTART_PROBE_MAX_MOOV_BYTES = 16 * 1024 * 1024;
 const TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES = 16 * 1024;
 
 interface SimpleRandomAccess {
@@ -38,6 +45,7 @@ interface ProbeVideoEntry {
   readonly codec: string;
   readonly width: number;
   readonly height: number;
+  readonly color?: TrackInfo['color'];
   readonly config: VideoDecoderConfig;
 }
 
@@ -102,9 +110,19 @@ export async function readSimpleVideoFaststartProbe(
       brand = new Reader(head.subarray(offset + 8, offset + 12)).fourcc();
     }
     if (header.type === 'moov') {
-      if (offset + header.size > head.byteLength) return undefined;
+      let moovBytes = head;
+      if (offset + header.size > head.byteLength) {
+        // The movie box outruns the prefetch window (long or many-sample movies). One exact bounded
+        // read keeps the compact probe on its path instead of declining to the complete driver.
+        if (header.size > SIMPLE_VIDEO_FASTSTART_PROBE_MAX_MOOV_BYTES || offset + header.size > ra.size) {
+          return undefined;
+        }
+        moovBytes = await ra.read(offset, header.size);
+        if (moovBytes.byteLength < header.size) return undefined;
+        offset = 0;
+      }
       try {
-        const moov = head.subarray(offset + header.headerSize, offset + header.size);
+        const moov = moovBytes.subarray(offset + header.headerSize, offset + header.size);
         const tracks = parseSimpleVideoFaststartProbeTracks(moov, requireEveryTrack);
         return tracks === undefined ? undefined : { tracks, brand, moov };
       } catch {
@@ -235,7 +253,9 @@ function probeMdhd(
   } else {
     duration = r.u32();
   }
-  const language = r.pos + 2 <= mdhd.end ? decodeMdhdLanguage(r.u16()) : undefined;
+  // ISO 639-2 packed code, or a legacy Macintosh language id (< 0x400) as ffprobe reads it regardless
+  // of brand: MP4 files exported by QuickTime-era tooling carry id 0 (`eng`) in an `isom` movie.
+  const language = r.pos + 2 <= mdhd.end ? decodeQuickTimeMdhdLanguage(r.u16()) : undefined;
   return {
     timescale,
     durationSec: timescale > 0 ? duration / timescale : 0,
@@ -284,6 +304,28 @@ function probeTrackEdit(r: Reader, trak: BoxHeader, movieTimescale: number): Pro
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The public track duration the canonical parser publishes: a fully-contained single-rate edit on a
+ * non-AAC track is a presentation trim and its segment duration is the span; AAC keeps its media
+ * duration because its edit is the separate gapless priming/padding contract. Mirrors
+ * `presentationDurationSec` in `mp4-driver.ts` so the compact probe stays a canonical subset.
+ */
+function presentationDurationSec(
+  edit: ProbeEdit | undefined,
+  mediaDurationSec: number,
+  timescale: number,
+  isAac: boolean,
+): number {
+  if (edit === undefined || edit.durationSec <= 0 || isAac || timescale <= 0) {
+    return mediaDurationSec;
+  }
+  const editEndSec = edit.mediaTimeTicks / timescale + edit.durationSec;
+  const containedToleranceSec = 1 / timescale;
+  const isContainedPresentationTrim =
+    edit.durationSec < mediaDurationSec && editEndSec <= mediaDurationSec + containedToleranceSec;
+  return isContainedPresentationTrim ? edit.durationSec : mediaDurationSec;
 }
 
 function readSigned64(r: Reader): number {
@@ -349,24 +391,101 @@ function probeVideoEntry(
   const height = r.u16();
   r.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
   const childStart = r.pos;
-  if (
-    requireCanonicalSubset &&
-    ['colr', 'pasp', 'clap'].some(
-      (type) => probeBoxFrom(r, childStart, entry.end, type) !== undefined,
-    )
-  ) {
+  // A clean aperture crops the displayed picture; only the canonical parser publishes that geometry.
+  if (requireCanonicalSubset && probeBoxFrom(r, childStart, entry.end, 'clap') !== undefined) {
     return undefined;
   }
+  // `colr` and `pasp` are the two display atoms every ffmpeg-written file carries. They map onto the
+  // same public facts the canonical parser publishes (`color`, `config.colorSpace`, the container
+  // display aspect), so the compact probe reproduces them instead of declining the whole file.
+  const colr = probeColr(r, childStart, entry.end);
+  if (colr === null) return undefined;
+  const pasp = probePasp(r, childStart, entry.end);
   const avcC = probeBoxFrom(r, childStart, entry.end, 'avcC');
   if (avcC === undefined) return undefined;
   const description = r.bytesAt(avcC.payloadStart, avcC.end).slice();
   const codec = avcCodecString(description);
+  const colorSpace = colr === undefined ? undefined : videoColorSpaceFromColr(colr);
+  const color: TrackInfo['color'] | undefined =
+    colr === undefined
+      ? undefined
+      : {
+          matrixCoefficients: colr.matrix,
+          transferCharacteristics: colr.transfer,
+          primaries: colr.primaries,
+          ...(colr.fullRange !== undefined ? { range: colr.fullRange ? 2 : 1 } : {}),
+        };
   return {
     codec,
     width,
     height,
-    config: { codec, codedWidth: width, codedHeight: height, description },
+    ...(color !== undefined ? { color } : {}),
+    config: {
+      codec,
+      codedWidth: width,
+      codedHeight: height,
+      description,
+      ...(colorSpace !== undefined ? { colorSpace } : {}),
+      ...containerDisplayAspect(width, height, pasp),
+    },
   };
+}
+
+/** `colr` (nclc/nclx) of a visual sample entry; `null` marks a colour type the compact probe cannot map. */
+function probeColr(r: Reader, childStart: number, end: number): ColrInfo | undefined | null {
+  const colr = probeBoxFrom(r, childStart, end, 'colr');
+  if (colr === undefined) return undefined;
+  r.seek(colr.payloadStart);
+  const colourType = r.fourcc();
+  if (colourType !== 'nclc' && colourType !== 'nclx') return null;
+  const primaries = r.u16();
+  const transfer = r.u16();
+  const matrix = r.u16();
+  if (colourType === 'nclx') {
+    return { colourType, primaries, transfer, matrix, fullRange: (r.u8() & 0x80) !== 0 };
+  }
+  return { colourType, primaries, transfer, matrix };
+}
+
+/** `pasp` pixel aspect ratio of a visual sample entry (hSpacing:vSpacing). */
+function probePasp(
+  r: Reader,
+  childStart: number,
+  end: number,
+): { readonly hSpacing: number; readonly vSpacing: number } | undefined {
+  const pasp = probeBoxFrom(r, childStart, end, 'pasp');
+  if (pasp === undefined) return undefined;
+  r.seek(pasp.payloadStart);
+  return { hSpacing: r.u32(), vSpacing: r.u32() };
+}
+
+/**
+ * The container display aspect the canonical parser puts on the decoder config: a `pasp` is
+ * authoritative, including the square-pixel case, and is reduced against the coded geometry.
+ */
+function containerDisplayAspect(
+  width: number,
+  height: number,
+  pasp: { readonly hSpacing: number; readonly vSpacing: number } | undefined,
+): Pick<VideoDecoderConfig, 'displayAspectWidth' | 'displayAspectHeight'> {
+  if (pasp === undefined || pasp.hSpacing === 0 || pasp.vSpacing === 0) return {};
+  const horizontal = width * pasp.hSpacing;
+  const vertical = height * pasp.vSpacing;
+  let a = horizontal;
+  let b = vertical;
+  while (b !== 0) [a, b] = [b, a % b];
+  const divisor = a || 1;
+  const displayAspectWidth = horizontal / divisor;
+  const displayAspectHeight = vertical / divisor;
+  if (
+    displayAspectWidth <= 0 ||
+    displayAspectHeight <= 0 ||
+    displayAspectWidth > 0xffff_ffff ||
+    displayAspectHeight > 0xffff_ffff
+  ) {
+    return {};
+  }
+  return { displayAspectWidth, displayAspectHeight };
 }
 
 function probeAudioGeometry(
@@ -559,10 +678,9 @@ function parseSimpleVideoFaststartProbeTracks(
   const tracks: TrackInfo[] = [];
   let sawVideo = false;
   for (const trak of probeChildren(r, root, 'trak')) {
-    // The compact fast path intentionally does not publish every edit-derived TrackInfo fact. In
-    // strict mode, decline using the parsed box hierarchy (including extended-size headers) rather
-    // than accepting a result that can differ from the canonical metadata parser.
-    if (requireEveryTrack && probeChild(r, trak, 'edts') !== undefined) return undefined;
+    // Edit lists are handled inside `probeSimpleTrack`: the single-rate shapes the canonical parser
+    // publishes (AAC priming, contained presentation trims, the plain zero-offset list every ffmpeg
+    // file carries) are reproduced exactly; anything else declines in strict mode.
     const parsed = probeSimpleTrack(r, trak, movieTimescale, requireEveryTrack);
     if (parsed === undefined) return undefined;
     if (parsed.kind === 'skip') {
@@ -572,7 +690,9 @@ function parseSimpleVideoFaststartProbeTracks(
     sawVideo ||= parsed.track.mediaType === 'video';
     tracks.push(parsed.track);
   }
-  return sawVideo && tracks.length > 0 ? tracks : undefined;
+  // The strict lazy route may also answer audio-only movies: every track went through the same
+  // canonical-subset checks, so the result equals the full parser's just as it does with video.
+  return tracks.length > 0 && (sawVideo || requireEveryTrack) ? tracks : undefined;
 }
 
 function probeSimpleTrack(
@@ -601,6 +721,11 @@ function probeSimpleTrack(
   const sampleTiming = probeSampleTiming(r, stbl);
   if (sampleTiming.sampleCount === 0) return undefined;
   const edit = probeTrackEdit(r, trak, movieTimescale);
+  // An edit list the compact reader cannot express as one single-rate mapping (multiple active
+  // entries, a non-unit rate) carries facts only the canonical parser publishes: decline strictly.
+  if (requireCanonicalSubset && edit === undefined && probeChild(r, trak, 'edts') !== undefined) {
+    return undefined;
+  }
   if (handler === 'vide') {
     const entry = probeVideoEntry(r, stsd, requireCanonicalSubset);
     if (entry === undefined) return undefined;
@@ -615,10 +740,11 @@ function probeSimpleTrack(
         mediaType: 'video',
         codec: entry.codec,
         defaultDisposition: header.defaultDisposition,
-        durationSec: timing.durationSec,
+        durationSec: presentationDurationSec(edit, timing.durationSec, timing.timescale, false),
         ...(timing.language !== undefined ? { language: timing.language } : {}),
         ...(fps !== undefined ? { fps } : {}),
         ...(header.rotation !== undefined ? { rotation: header.rotation } : {}),
+        ...(entry.color !== undefined ? { color: entry.color } : {}),
         config: entry.config,
       },
     };
@@ -639,7 +765,12 @@ function probeSimpleTrack(
       mediaType: 'audio',
       codec: entry.codec,
       defaultDisposition: header.defaultDisposition,
-      durationSec: timing.durationSec,
+      durationSec: presentationDurationSec(
+        edit,
+        timing.durationSec,
+        timing.timescale,
+        entry.codec.startsWith('mp4a'),
+      ),
       ...(timing.language !== undefined ? { language: timing.language } : {}),
       ...(gapless !== undefined ? { gapless } : {}),
       config: entry.config,

@@ -146,13 +146,22 @@ describe('transform property — split-vs-whole equivalence (4K)', () => {
     const whole2 = reduce(src, dw, dh);
     expect(whole.width).toBe(whole2.width);
     expect(whole.height).toBe(whole2.height);
-    for (let i = 0; i < whole.data.length; i++)
-      expect(whole.data[i]).toBeCloseTo(whole2.data[i] as number, 5);
-    // Also verify that resampling 4K→1080p does not OOM and stays in range
+    // One assertion per property over the 8.3M samples: per-sample `expect` calls made this test take
+    // over a minute for a ~100 ms resample.
+    let maxDelta = 0;
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
     for (let i = 0; i < whole.data.length; i++) {
-      expect(whole.data[i] as number).toBeGreaterThan(-64);
-      expect(whole.data[i] as number).toBeLessThan(320);
+      const v = whole.data[i] as number;
+      const delta = Math.abs(v - (whole2.data[i] as number));
+      if (delta > maxDelta) maxDelta = delta;
+      if (v < min) min = v;
+      if (v > max) max = v;
     }
+    expect(maxDelta).toBeLessThan(1e-5);
+    // Also verify that resampling 4K→1080p does not OOM and stays in range
+    expect(min).toBeGreaterThan(-64);
+    expect(max).toBeLessThan(320);
   });
 
   it('4K odd-size split (3840×2160 → 1280×720) via axis sub-rect equals direct', () => {

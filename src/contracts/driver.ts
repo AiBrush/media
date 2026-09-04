@@ -295,6 +295,8 @@ export interface TrackInfo {
   rotation?: number;
   /** True when encoded samples are protected and must be decrypted before generic decode/seek. */
   encrypted?: boolean;
+  /** The container's declared protection scheme for those samples (ISO BMFF `schm`: `cenc`, `cbcs`, ...). */
+  encryptionScheme?: string;
   /** True when a container declaration or complete demux proves a separate coded alpha side channel. */
   alpha?: boolean;
   /** Exact non-packet container metadata that follows this descriptor through track selection/muxing. */
@@ -581,6 +583,26 @@ export interface ContainerDriver extends DriverBase {
    */
   packetInfoBatches?(src: ByteSource, o?: PacketInfoBatchOptions): Promise<PacketInfoBatchStream>;
   demux(src: ByteSource, o?: StageOptions): Promise<Demuxer>;
+  /**
+   * Optional index-driven random access for seek: the packets of one track (by `probe()` track id)
+   * starting at the container index's last random-access point at or before `timeUs`, read through
+   * bounded ranges instead of a whole-file demux. `undefined` means the source or index cannot support
+   * it (no index, unknown-size clusters, one-shot source); the caller then falls back to `demux()`.
+   * The stream may begin earlier than the requested point; callers still apply their keyframe logic.
+   */
+  seekPackets?(
+    src: ByteSource,
+    trackId: number,
+    timeUs: number,
+    o?: StageOptions,
+  ): Promise<ReadableStream<Packet> | undefined>;
+  /**
+   * Optional synchronous legality check for one track this container would receive from
+   * {@link createMuxer}: codec family, track count, PCM shape. Lazy drivers expose it eagerly so an
+   * illegal codec→container request is rejected (typed `CapabilityError`) before any muxer chunk
+   * loads. `trackIndex` counts tracks already accepted for the same output.
+   */
+  validateMuxTrack?(track: TrackInfo, trackIndex: number): void;
   createMuxer(o?: MuxOptions): Muxer;
   /**
    * Optional exact pre-publication accounting for one encoded track. The iterable is single-use and may

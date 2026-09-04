@@ -47,6 +47,7 @@ import {
   walkAdtsBuffer,
 } from './adts-frames.ts';
 import { AdtsMuxer } from './adts-mux.ts';
+import { adtsMuxTrackConfig } from '../audio-container-mux-validation.ts';
 
 const NATIVE_AAC_TRIED = ['webcodecs-audio'] as const;
 const WASM_AAC_TRIED = ['wasm-aac'] as const;
@@ -921,6 +922,9 @@ export const AdtsDriver = {
         assertDecryptedAdtsSegment(clear);
       },
     });
+  },
+  validateMuxTrack(track: TrackInfo, index: number): void {
+    adtsMuxTrackConfig(track, index);
   },
   createMuxer(o?: MuxOptions): AdtsMuxer {
     // ADTS is an elementary stream: wrap each raw AAC access unit in a 7-byte ADTS header (no re-encode;

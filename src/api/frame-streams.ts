@@ -10,13 +10,7 @@ import { MediaError } from '../contracts/errors.ts';
 import type { MediaStreams } from './types.ts';
 
 /** Memoize an async loader so concurrent callers share exactly one in-flight promise. */
-export function memoizeAsync<T>(load: () => Promise<T>): () => Promise<T> {
-  let promise: Promise<T> | undefined;
-  return () => {
-    promise ??= load();
-    return promise;
-  };
-}
+export { memoizeAsync } from '../util/memoize-async.ts';
 
 /** Mirror an external `AbortSignal` onto an internal controller (pre-aborted or future abort). */
 export function bridgeSignal(caller: AbortSignal | undefined, ctrl: AbortController): void {

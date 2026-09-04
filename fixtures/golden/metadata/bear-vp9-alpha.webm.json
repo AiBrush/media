@@ -8,10 +8,11 @@
       "type": "video",
       "codec": "vp9",
       "durationSec": 2.733,
+      "language": "eng",
+      "defaultDisposition": true,
       "fps": 30.000000300000004,
       "width": 320,
-      "height": 240,
-      "language": "eng"
+      "height": 240
     }
   ]
 }

@@ -11,6 +11,7 @@ import { materialize, toBlob } from '../sinks/sink.ts';
 import type { MaterializeOptions, Output, Sink } from '../sinks/sink.ts';
 import { isLiveMediaSource } from '../sources/live-source.ts';
 import { type MediaInput, type Source, from as normalizeInput } from '../sources/source.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import { containerHasChunkMuxer } from './codec-routing.ts';
 import {
   WEBM_STREAMING_MIN_SOURCE_BYTES,
@@ -23,6 +24,14 @@ import {
 import type { RemuxOutputPlan, RemuxOutputRouteFacts } from './remux-output-plan.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { CallOptions, RemuxOptions } from './types.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadCodecPipelineModule = memoizeAsync(() => import('./codec-pipeline.ts'));
+const loadMpegtsPacketInfoRemuxModule = memoizeAsync(() => import('./mpegts-packet-info-remux.ts'));
+const loadRemuxMetadataModule = memoizeAsync(() => import('./remux-metadata.ts'));
+const loadStreamingWebmRemuxModule = memoizeAsync(() => import('./streaming-webm-remux.ts'));
+const loadTrackSelectModule = memoizeAsync(() => import('./track-select.ts'));
+const loadWebmPacketInfoRemuxModule = memoizeAsync(() => import('./webm-packet-info-remux.ts'));
 
 // The output-sink declaration and the routing it describes share one decision table (§5.1). Re-export
 // it here so `remux`'s callers reach the contract through the module that implements the operation.
@@ -126,7 +135,7 @@ export async function runRemux(
   const metadata =
     tags === undefined
       ? undefined
-      : await import('./remux-metadata.ts').then((module) => ({
+      : await loadRemuxMetadataModule().then((module) => ({
           module,
           plan: module.planRemuxMetadata(opts.to, tags),
         }));
@@ -271,7 +280,7 @@ export async function runRemux(
         await demuxer.close();
       }
     }
-    const { selectTrackInfos } = await import('./track-select.ts');
+    const { selectTrackInfos } = await loadTrackSelectModule();
     const selected = selectTrackInfos(tracks, opts.trackSelect);
     const keepsCompleteOrder =
       selected.length === tracks.length &&
@@ -333,11 +342,11 @@ async function remuxViaSeam(
     });
   }
   if (requiresStreamingWebmRemux(source, opts)) {
-    const { remuxViaStreamingWebm } = await import('./streaming-webm-remux.ts');
+    const { remuxViaStreamingWebm } = await loadStreamingWebmRemuxModule();
     return remuxViaStreamingWebm(container, source, opts, context.stage(signal, options));
   }
   if (opts.to === 'ts') {
-    const { tryRemuxPacketInfoToMpegTs } = await import('./mpegts-packet-info-remux.ts');
+    const { tryRemuxPacketInfoToMpegTs } = await loadMpegtsPacketInfoRemuxModule();
     const stream = await tryRemuxPacketInfoToMpegTs(
       container,
       source,
@@ -347,7 +356,7 @@ async function remuxViaSeam(
     if (stream !== undefined) return stream;
   }
   if (opts.to === 'webm' || opts.to === 'mkv') {
-    const { tryRemuxPacketInfoToBufferedWebm } = await import('./webm-packet-info-remux.ts');
+    const { tryRemuxPacketInfoToBufferedWebm } = await loadWebmPacketInfoRemuxModule();
     const stream = await tryRemuxPacketInfoToBufferedWebm(
       container,
       source,
@@ -367,7 +376,7 @@ async function remuxViaSeam(
   const muxer = (await context.muxer(opts.to, options.strategy?.pinDriver)).createMuxer(
     remuxMuxOptions(opts),
   );
-  const { selectTrackInfos } = await import('./track-select.ts');
+  const { selectTrackInfos } = await loadTrackSelectModule();
   const tracks = selectTrackInfos(
     demuxer.tracks.filter(
       (track) => track.config !== undefined && track.containerProjection === undefined,
@@ -385,7 +394,7 @@ async function remuxViaSeam(
   /* v8 ignore start -- the verbatim packet copy requires browser EncodedChunk constructors; routing,
      fan-out, cancellation, and finalization are covered with real/fake browser seams. */
   try {
-    const { createDrainTaskGroup, drainEncoderToMuxer } = await import('./codec-pipeline.ts');
+    const { createDrainTaskGroup, drainEncoderToMuxer } = await loadCodecPipelineModule();
     const group = createDrainTaskGroup(signal);
     const tasks = tracks.map((track) => {
       const packets = demuxer.packets(track.id);

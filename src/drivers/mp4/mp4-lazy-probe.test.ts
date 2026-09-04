@@ -142,6 +142,18 @@ describe('lightweight MP4 faststart probe', () => {
     expect(normalizedTracks(light)).toEqual(normalizedTracks(canonical));
   });
 
+  it('matches canonical on the plain edit list, colr and pasp atoms every ffmpeg file carries', async () => {
+    // A single zero-offset elst plus nclx colr / square pasp is the default ffmpeg layout. Declining
+    // it loaded the full driver for almost every real MP4 probe; the compact reader now reproduces
+    // the canonical public facts (presentation duration, `color`, `config.colorSpace`, display aspect).
+    const bytes = await loadFixture('h264.mp4');
+    const canonical = await Mp4Driver.probe?.(fromBytes(bytes, { mime: 'video/mp4' }));
+    const light = await probeMp4Faststart(finiteSource(bytes));
+
+    expect(light).toBeDefined();
+    expect(normalizedTracks(light)).toEqual(normalizedTracks(canonical));
+  });
+
   it('declines a scaled near-identity tkhd matrix that canonical omits from public rotation', async () => {
     const bytes = (await loadFixture('movie_5.mp4')).slice();
     const typeOffset = firstFourccOffset(bytes, 'tkhd');
@@ -267,7 +279,6 @@ describe('lightweight MP4 faststart probe', () => {
     const cases: Array<readonly [string, Uint8Array]> = [
       ['container colour', new Uint8Array(await readFile(`${DERIVED_DIR}mp4-nclx-fullrange.mp4`))],
       ['pixel aspect', await loadFixture('bear-non-square-pixel.mp4')],
-      ['edit list', await loadFixture('h264.mp4')],
       [
         'encrypted sample entries',
         new Uint8Array(
@@ -366,5 +377,53 @@ describe('lightweight MP4 faststart probe', () => {
       }
       expect(size).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('probeMp4Faststart — movie box larger than the prefetch window', () => {
+  it('re-reads the exact moov once instead of declining to the complete driver', async () => {
+    const original = await loadFixture('bear-1280x720.mp4');
+    // Inject a 100 KiB `free` child at the front of `moov` so the box outruns the 64 KiB window.
+    const dv = new DataView(original.buffer, original.byteOffset, original.byteLength);
+    let offset = 0;
+    let moovStart = -1;
+    while (offset + 8 <= original.byteLength) {
+      const size = dv.getUint32(offset);
+      const type = String.fromCharCode(...original.subarray(offset + 4, offset + 8));
+      if (type === 'moov') {
+        moovStart = offset;
+        break;
+      }
+      offset += size;
+    }
+    expect(moovStart).toBeGreaterThanOrEqual(0);
+    const moovSize = dv.getUint32(moovStart);
+    const padding = 100 * 1024;
+    const grown = new Uint8Array(original.byteLength + padding);
+    grown.set(original.subarray(0, moovStart + 8), 0);
+    new DataView(grown.buffer).setUint32(moovStart, moovSize + padding);
+    new DataView(grown.buffer).setUint32(moovStart + 8, padding);
+    grown.set(new TextEncoder().encode('free'), moovStart + 12);
+    grown.set(original.subarray(moovStart + 8), moovStart + 8 + padding);
+    // `stco` offsets now point `padding` bytes early; the probe never touches sample data, so the
+    // track facts stay identical to the unmodified file's.
+    const reads: number[] = [];
+    const base = fromBytes(grown, { mime: 'video/mp4' });
+    const source: ByteSource = {
+      ...base,
+      range: async (start: number, end: number, signal?: AbortSignal) => {
+        reads.push(end - start);
+        return base.range!(start, end, signal);
+      },
+    };
+    const tracks = await probeMp4Faststart(source, {});
+    expect(tracks).toBeDefined();
+    expect(tracks!.map((track) => track.mediaType).sort()).toEqual(['audio', 'video']);
+    expect(reads.length).toBeLessThanOrEqual(2);
+    expect(Math.max(...reads)).toBeGreaterThanOrEqual(moovSize + padding);
+    const reference = await probeMp4Faststart(fromBytes(original, { mime: 'video/mp4' }), {});
+    expect(tracks!.map((t) => [t.codec, t.durationSec, t.fps])).toEqual(
+      reference!.map((t) => [t.codec, t.durationSec, t.fps]),
+    );
   });
 });

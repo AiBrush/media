@@ -6,7 +6,7 @@ import type { CodecQuery, ContainerDriver } from '../contracts/driver.ts';
 import { CapabilityError, MediaError } from '../contracts/errors.ts';
 import { isPcmContainer } from './codec-routing.ts';
 import { isFlacAuthorCodec, isPcmCodec } from './op-support.ts';
-import type { ConvertOptions } from './types.ts';
+import type { ConvertOptions, VideoTarget } from './types.ts';
 
 export interface ConvertPreflightContext {
   muxer(target: string): Promise<ContainerDriver>;
@@ -41,7 +41,9 @@ export async function preflightConvert(
   if (opts.to !== undefined) {
     await context.muxer(opts.to);
   }
-  if (wantsVideo && video.codec !== undefined) {
+  // A codec-only video target may be satisfied by copying the source's own packets (the runner decides
+  // once it has demuxed), so an encoder is probed here only when the request also transforms video.
+  if (wantsVideo && video.codec !== undefined && videoTargetTransforms(video)) {
     const { preflightVideoEncodeQuery } = await import('./preload.ts');
     await context.probeCodec(preflightVideoEncodeQuery(video.codec));
   }
@@ -62,4 +64,13 @@ export async function canConvert(
     if (error instanceof MediaError) return false;
     throw error;
   }
+}
+
+const VIDEO_TRANSFORM_KEYS = [
+  'width', 'height', 'fit', 'fps', 'bitrate', 'maxAverageBitrate', 'quality', 'bitrateMode', 'crf',
+  'twoPass', 'bitDepth', 'alpha', 'rotate', 'flip', 'crop', 'pad', 'colorspace', 'tonemap',
+] as const;
+
+function videoTargetTransforms(target: VideoTarget): boolean {
+  return VIDEO_TRANSFORM_KEYS.some((key) => target[key] !== undefined);
 }

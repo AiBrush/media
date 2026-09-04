@@ -144,6 +144,7 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
       const loaded = await load();
       return loaded.demux(src, o);
     },
+    ...(spec.validateTrack !== undefined ? { validateMuxTrack: spec.validateTrack } : {}),
     createMuxer(o?: MuxOptions): Muxer {
       if (spec.rejectChunkMux !== undefined) return rejectRawPcmChunkMux(spec.rejectChunkMux);
       if (spec.muxKind !== undefined) assertAudioMuxOptions(spec.muxKind, o);

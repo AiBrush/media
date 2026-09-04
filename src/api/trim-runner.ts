@@ -20,9 +20,16 @@ import {
   type Source,
   from as normalizeInput,
 } from '../sources/source.ts';
+import { memoizeAsync } from '../util/memoize-async.ts';
 import { containerHasChunkMuxer, isPcmContainer } from './codec-routing.ts';
 import { assertTrimRange } from './trim-range.ts';
 import type { AudioTarget, CallOptions, Container, TrimOptions, VideoTarget } from './types.ts';
+
+/** Memoized lazy chunks: one dynamic import per module, not per call. */
+const loadCodecPipelineModule = memoizeAsync(() => import('./codec-pipeline.ts'));
+const loadMp3ExactTrimModule = memoizeAsync(() => import('../drivers/mp3/mp3-exact-trim.ts'));
+const loadSourceIoModule = memoizeAsync(() => import('./source-io.ts'));
+const loadTrimStreamsModule = memoizeAsync(() => import('./trim-streams.ts'));
 
 const AUDIO_PACKET_TRIM_CONTAINERS = new Set<Container>(['mp3', 'adts', 'ogg']);
 const TRIM_IDENTITY_START_EPSILON_SEC = 1e-9;
@@ -314,14 +321,12 @@ async function trimMp3ExactCopy(
   opts: TrimOptions,
   signal: AbortSignal,
 ): Promise<ReadableStream<Uint8Array>> {
-  const [{ mp3TrimAlignment, trimMp3ExactWithHistoryPatch }, { readAllSource }] = await Promise.all(
-    [import('../drivers/mp3/mp3-exact-trim.ts'), import('./source-io.ts')],
-  );
+  const [{ mp3TrimAlignment, trimMp3Exact }, { readAllSource }] = await Promise.all([
+    loadMp3ExactTrimModule(),
+    loadSourceIoModule(),
+  ]);
   const bytes = await readAllSource(source, signal);
-  const result = await trimMp3ExactWithHistoryPatch(bytes, {
-    startSec: opts.start,
-    endSec: opts.end,
-  });
+  const result = trimMp3Exact(bytes, { startSec: opts.start, endSec: opts.end });
   opts.onAlignment?.(mp3TrimAlignment(result));
   return bytesToTrimStream(result.bytes);
 }
@@ -350,9 +355,8 @@ async function trimAudioPacketsViaSeam(
       tried: [container.id, target],
     });
   }
-  const { trimAudioPacketStream, trimBoundsUs, trimPacketCopyTrack } = await import(
-    './trim-streams.ts'
-  );
+  const { trimAudioPacketStream, trimBoundsUs, trimPacketCopyTrack } =
+    await loadTrimStreamsModule();
   const bounds = trimBoundsUs(opts.start, opts.end);
   const demuxer = await container.demux(source, context.stage(signal, options));
   const muxer = (await context.muxer(target, options.strategy?.pinDriver)).createMuxer({
@@ -382,7 +386,7 @@ async function trimAudioPacketsViaSeam(
       });
     }
     const packets = trimAudioPacketStream(demuxer.packets(track.id), bounds);
-    const { drainEncoderToMuxer } = await import('./codec-pipeline.ts');
+    const { drainEncoderToMuxer } = await loadCodecPipelineModule();
     await drainEncoderToMuxer(packets, muxer, trimPacketCopyTrack(track, bounds), signal);
     await muxer.finalize();
     return muxer.output;
@@ -426,7 +430,7 @@ async function trimViaCodec(
     trimVideoEncodeFallbackTarget,
     trimVideoEncodeTarget,
     trimVideoPacketInfoChunkStream,
-  } = await import('./trim-streams.ts');
+  } = await loadTrimStreamsModule();
   const endSec = durationSec > 0 ? Math.min(opts.end, durationSec) : opts.end;
   const bounds = trimBoundsUs(opts.start, endSec);
   const demuxer = await container.demux(source, context.stage(signal, options));
@@ -434,7 +438,7 @@ async function trimViaCodec(
     container: target,
     ...(opts.fragmented === true ? { fragmented: true } : {}),
   });
-  const { createDrainTaskGroup, drainEncoderToMuxer } = await import('./codec-pipeline.ts');
+  const { createDrainTaskGroup, drainEncoderToMuxer } = await loadCodecPipelineModule();
   const group = createDrainTaskGroup(signal);
   const taskSignal = group.signal;
   const tasks: Promise<void>[] = [];
@@ -451,9 +455,8 @@ async function trimViaCodec(
 
     if (videoTrack !== undefined) {
       assertTrimTrackDecodable(videoTrack);
-      const { decodeQueryFor, startAtSeekKeyframe, unwrapPackets } = await import(
-        './codec-pipeline.ts'
-      );
+      const { decodeQueryFor, startAtSeekKeyframe, unwrapPackets } =
+        await loadCodecPipelineModule();
       const decodeQuery = await decodeQueryFor(videoTrack);
       const codec = await context.codec(decodeQuery, options);
       const videoTrackIndex = demuxer.tracks.findIndex((track) => track.id === videoTrack.id);

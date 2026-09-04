@@ -8,6 +8,8 @@
       "type": "video",
       "codec": "vp8",
       "durationSec": 10,
+      "language": "eng",
+      "defaultDisposition": true,
       "fps": 30,
       "width": 320,
       "height": 240

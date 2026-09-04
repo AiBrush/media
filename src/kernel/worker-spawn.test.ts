@@ -235,3 +235,16 @@ describe('ensureWorkerBridge over adaptWorker — per-op caps handshake', () => 
     expect(fake.messageListenerCount).toBe(0);
   });
 });
+
+describe('ensureWorkerBridge — a worker that fails to boot', () => {
+  it('resolves inline immediately on the worker error event instead of waiting out the handshake', async () => {
+    const dom = new FakeDomWorker(() => {});
+    const spawned = adaptWorker(dom);
+    const started = performance.now();
+    const pending = ensureWorkerBridge(() => spawned, 5_000);
+    queueMicrotask(() => dom.dispatchEvent(new Event('error')));
+    await expect(pending).resolves.toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(dom.terminated).toBe(true);
+  });
+});

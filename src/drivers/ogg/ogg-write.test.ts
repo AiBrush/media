@@ -294,6 +294,54 @@ describe('buildPages — lacing (pure)', () => {
     expect(pages.map((page) => page.granule)).toEqual([0, 3_072]);
     expect(pages.every((page) => (page.headerType & HT_CONTINUED) === 0)).toBe(true);
   });
+
+  it('randomized: HT_CONTINUED is set exactly when the previous page ended mid-packet', () => {
+    // Property: a page carries the continuation bit iff the previous page's last lacing value was 255
+    // (a packet still open). Edge sizes cover 255-multiples (trailing 0 lacing), empty packets, tiny
+    // packets that fill the 255-entry segment table, and packets wider than one page (65 025 B+).
+    let seed = 0x5eed;
+    const random = (): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const edge = [0, 1, 254, 255, 256, 510, 511, 765, 8191, 8192, 8193, 65025, 65026, 70000];
+    for (let round = 0; round < 25; round++) {
+      const count = 1 + Math.floor(random() * 300);
+      const packets = Array.from({ length: count }, (_, i) => {
+        const size =
+          random() < 0.3
+            ? (edge[Math.floor(random() * edge.length)] as number)
+            : Math.floor(random() * 3_000);
+        return { data: new Uint8Array(size).fill(i & 0xff), granule: (i + 1) * 960 };
+      });
+      const options =
+        random() < 0.5
+          ? {
+              maxGranuleSpan: 960 * (1 + Math.floor(random() * 50)),
+              flushAfterFirstPacket: random() < 0.5,
+            }
+          : {};
+      const pages = buildPages(packets, HT_BOS, HT_EOS, options);
+      let open = false;
+      for (const page of pages) {
+        expect((page.headerType & HT_CONTINUED) !== 0).toBe(open);
+        expect(page.lacing.length).toBeLessThanOrEqual(255);
+        expect(page.lacing.length).toBeGreaterThan(0);
+        open = page.lacing[page.lacing.length - 1] === 255;
+      }
+      expect(open).toBe(false);
+      const delaced = delacePackets(
+        pages.map((page, seq) => ({ ...page, serial: 1, seq, storedCrc: 0, computedCrc: 0 })),
+      );
+      expect(delaced.length).toBe(packets.length);
+      for (let i = 0; i < packets.length; i++) {
+        const want = packets[i]?.data as Uint8Array;
+        const got = delaced[i] as Uint8Array;
+        expect(got.byteLength).toBe(want.byteLength);
+        expect(Buffer.compare(got, want)).toBe(0);
+      }
+    }
+  });
 });
 
 describe('OggMuxer — Opus round-trip (parseOgg + independent page/CRC scan)', () => {

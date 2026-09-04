@@ -86,8 +86,14 @@ export interface LogEvent {
 export interface CreateMediaOptions {
   determinism?: Determinism; // default 'auto'                 (ADR-007)
   enableThreads?: boolean; // default = crossOriginIsolated    (ADR-006)
-  /** Opt into worker offload; omitted/false runs inline, true uses one worker, and a pool enables fanout. */
-  worker?: boolean | { pool?: number };
+  /**
+   * Worker offload: `false` runs inline; omitted/`true` offloads heavy operations to the package's own
+   * module Worker when one can be spawned; `pool` enables fanout. `url` names the worker script for
+   * bundled applications whose build renames `dist/worker.js` (a Vite/Rollup asset URL, or the file
+   * copied next to the app's chunks); without it the engine resolves `./worker.js` beside its own
+   * chunk and, when that does not load, falls back to inline work at once.
+   */
+  worker?: boolean | { pool?: number; url?: string | URL };
   /** Optional same-origin asset directory; normalized once, default keeps literal import.meta URLs. */
   assetBaseUrl?: string; // default = import.meta.url-resolved  (ADR-005/237)
   onLog?: (e: LogEvent) => void;
@@ -105,6 +111,20 @@ export interface CallOptions {
   signal?: AbortSignal;
   onProgress?: (p: Progress) => void;
   strategy?: StrategyOverride;
+}
+
+/**
+ * Which frame {@link MediaEngine.seek} lands on for a target time:
+ * - `'exact'` (default): the first frame presented at or after the target;
+ * - `'nearest'`: the frame whose presentation time is closest to the target (earlier wins a tie);
+ * - `'keyframe'`: the last random-access frame at or before the target, or the first one after it
+ *   when none precedes the target — decoded without any following frames.
+ */
+export type SeekMode = 'exact' | 'nearest' | 'keyframe';
+
+/** Per-call options for {@link MediaEngine.seek}. */
+export interface SeekOptions extends CallOptions {
+  mode?: SeekMode;
 }
 
 /** Per-call options for {@link MediaEngine.decode}. */
@@ -349,6 +369,14 @@ export interface MediaInfoTrack {
   channels?: number;
   /** ISO-639-2/T language declared by the container, including the explicit `und` code. */
   language?: string;
+  /**
+   * Whether the container marks the track as selected by default (ISO BMFF `tkhd` Track_enabled,
+   * Matroska `FlagDefault`). Absent when the container carries no such flag.
+   */
+  defaultDisposition?: boolean;
+  /** True when the samples are protected; `encryptionScheme` names the container's scheme (`cenc`, `cbcs`, ...). */
+  encrypted?: boolean;
+  encryptionScheme?: string;
 }
 
 export interface MediaInfo {
