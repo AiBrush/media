@@ -5,12 +5,16 @@
  */
 
 import type { ImageOps } from '../codecs/image/index.ts';
-import type { ContainerDriver, StageOptions } from '../contracts/driver.ts';
+import type { ContainerDriver, ContainerQuery, StageOptions } from '../contracts/driver.ts';
+import {
+  matchesIsoBmffMagic,
+  matchesMatroskaMagic,
+} from '../drivers/container-magic-registration.ts';
 import { MediaError } from '../contracts/errors.ts';
 import { type MediaInput, type Source, cancelSource } from '../sources/source.ts';
 import { memoizeAsync } from '../util/memoize-async.ts';
 import type { ProbeContainerResultCache } from './blob-probe-handoff.ts';
-import { toMediaInfo } from './op-support.ts';
+import { toMediaInfo } from './probe-media-info.ts';
 import {
   type SourcePrefixHandoff,
   cacheProbeRanges,
@@ -70,6 +74,35 @@ async function probeImageInfo(
   return imageInfoToMediaMetadata(await ops.probe(bytes), source.size);
 }
 
+/**
+ * Whether the source's leading bytes carry a first-party container's magic. Only definite signatures
+ * count, and none of them can also be an image signature, so a `true` here means the image route
+ * cannot be the answer and the container route is worth trying first.
+ */
+async function headIsDefiniteContainerMagic(source: Source): Promise<boolean> {
+  // Only an in-memory source can answer this for free. Issuing a read here would add a range request
+  // to every unlabeled remote probe, which is the opposite of the point.
+  const head = source.peekHead?.(CONTAINER_MAGIC_HEAD_BYTES);
+  if (head === undefined || head.byteLength < 4) return false;
+  const query: ContainerQuery = { direction: 'demux', head };
+  if (matchesIsoBmffMagic(query) || matchesMatroskaMagic(query)) return true;
+  const { matchesAdts, matchesAiff, matchesCaf, matchesMp3, matchesOgg, matchesWav } =
+    await loadAudioContainerSniffModule();
+  return (
+    matchesWav(query) ||
+    matchesOgg(query) ||
+    matchesAiff(query) ||
+    matchesCaf(query) ||
+    matchesMp3(query) ||
+    matchesAdts(query)
+  );
+}
+
+const CONTAINER_MAGIC_HEAD_BYTES = 16;
+const loadAudioContainerSniffModule = memoizeAsync(
+  () => import('../drivers/audio-container-sniff.ts'),
+);
+
 /** Run the generic byte/image probe after the eager layer has normalized and classified its input. */
 export async function runProbe(
   context: ProbeRunnerContext,
@@ -100,15 +133,26 @@ export async function runProbe(
       source = cacheProbeRanges(source, context.sourcePrefixHandoff, 'store');
     }
 
-    // A concrete seekable audio/video MIME gets the cheap container route first. MIME remains only a
-    // hint: a typed container rejection still falls back to image magic, while one-shot sources stay
-    // image-first because a rejected container probe may consume their bytes irreversibly.
-    if (source.range !== undefined && probeRangeCache?.hasConcreteAudioVideoMime(source.mimeHint)) {
+    // A concrete seekable audio/video MIME, or a head whose magic is a definite non-image container,
+    // gets the cheap container route first. MIME remains only a hint: a typed container rejection
+    // still falls back to image magic, while one-shot sources stay image-first because a rejected
+    // container probe may consume their bytes irreversibly. The magic test is what keeps unlabeled
+    // media bytes — the common `probe(bytes)` case — from loading the image orchestration first,
+    // without letting a MIME-only driver claim bytes whose magic says they are an image.
+    const definiteContainerMagic = await headIsDefiniteContainerMagic(source);
+    if (
+      source.range !== undefined &&
+      (probeRangeCache?.hasConcreteAudioVideoMime(source.mimeHint) === true ||
+        definiteContainerMagic)
+    ) {
       try {
         info = await probeContainerInfo(context, source, signal, options);
       } catch (error) {
         throwIfAborted(signal);
         if (!(error instanceof MediaError) || error.code === 'aborted') throw error;
+        // The same magic that put the container route first also rules the image route out, so a
+        // rejection here is the answer — loading the image orchestration could only repeat it.
+        if (definiteContainerMagic) throw error;
         const imageInfo = await probeImageInfo(context, source, signal);
         if (imageInfo !== undefined) info = imageInfo;
         else throw error;

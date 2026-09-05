@@ -132,6 +132,12 @@ export interface PacketInfoMetadata {
 
 /** Tracks plus a lightweight packet table, without constructing payload streams. */
 export interface PacketInfoTable {
+  /**
+   * The canonical container token the engine routed to. Drivers omit it; the engine stamps the
+   * selected driver's first {@link ContainerDriver.formats} entry before returning the table, so a
+   * caller reads the resolved format instead of re-deriving it from a name or MIME hint.
+   */
+  readonly container?: string;
   readonly tracks: readonly TrackInfo[];
   readonly packets: readonly PacketInfoMetadata[];
 }
@@ -155,6 +161,8 @@ export interface PacketInfoBatchOptions extends StageOptions {
  * breaking iteration or calling {@link cancel} releases in-flight driver work.
  */
 export interface PacketInfoBatchStream extends AsyncIterable<readonly PacketInfoMetadata[]> {
+  /** The canonical container token the engine routed to; see {@link PacketInfoTable.container}. */
+  readonly container?: string;
   readonly tracks: readonly TrackInfo[];
   cancel(reason?: unknown): Promise<void>;
 }
@@ -389,6 +397,11 @@ export interface VideoColorMetadata {
 
 /** A live demux session: per-track lazy packet streams ({@link Packet} carries PTS + optional DTS). */
 export interface Demuxer {
+  /**
+   * The concrete container flavor this demux actually parsed, for a driver that serves several
+   * (`mov` vs `mp4`, `mkv` vs `webm`). Omitted ⇒ the engine reports the driver's primary format.
+   */
+  readonly container?: string;
   readonly tracks: readonly TrackInfo[];
   /** Optional packet-table fast path: no encoded payload bytes are read or materialized. */
   packetTable?(): readonly PacketMetadata[];
@@ -560,6 +573,16 @@ export interface DecryptParams extends StageOptions {
   keys: Record<string, string>;
 }
 
+/**
+ * The track facts a metadata-only probe returns, optionally carrying the file-level container metadata
+ * the same parse already observed — the ISO-BMFF `ftyp` major brand, Matroska `Tags`, ID3 frames, and
+ * Vorbis comments all sit in the window a probe must read anyway, so reporting them costs no extra read.
+ * A driver with nothing to report returns a plain array; `tags` surfaces as {@link MediaInfo.tags}.
+ */
+export type ProbeTracks = readonly TrackInfo[] & {
+  readonly tags?: Readonly<Record<string, string>>;
+};
+
 /** Demux/mux one container family (e.g. ['mp4','mov']). `supports()` is synchronous (magic/mime). */
 export interface ContainerDriver extends DriverBase {
   readonly kind: 'container';
@@ -568,9 +591,10 @@ export interface ContainerDriver extends DriverBase {
   /**
    * Optional metadata-only probe: return track facts without constructing a live demux session or packet
    * streams. Drivers that omit it keep the v1 fallback: `MediaEngine.probe()` calls `demux()` and maps
-   * `demuxer.tracks`.
+   * `demuxer.tracks`. Return the bare track array when the container carries no file-level metadata, or
+   * {@link ProbeTracks} carrying `tags` to also report the file metadata the same parse observed.
    */
-  probe?(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]>;
+  probe?(src: ByteSource, o?: StageOptions): Promise<ProbeTracks>;
   /**
    * Optional packet-info probe: return track facts plus timeline packet rows without constructing live
    * payload streams. Drivers that omit it keep the normal `demux()` path.

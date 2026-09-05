@@ -472,8 +472,8 @@ describe('simple MP4 faststart probes', () => {
   it('uses nested ASC over stale version-2 geometry and converts version-1 edit timing', async () => {
     const tracks = await readTinyAudioFaststartProbe(ra(tinyAudioMovieWithV2WaveEsds()));
 
-    expect(tracks).toHaveLength(1);
-    expect(tracks?.[0]).toMatchObject({
+    expect(tracks?.tracks).toHaveLength(1);
+    expect(tracks?.tracks[0]).toMatchObject({
       id: 5,
       mediaType: 'audio',
       codec: 'mp4a.40.2',
@@ -486,7 +486,7 @@ describe('simple MP4 faststart probes', () => {
         totalSamples: 2822,
       },
     });
-    expect(tracks?.[0]?.config).toMatchObject({
+    expect(tracks?.tracks[0]?.config).toMatchObject({
       codec: 'mp4a.40.2',
       sampleRate: 44100,
       numberOfChannels: 2,
@@ -518,7 +518,7 @@ describe('simple MP4 faststart probes', () => {
         ),
       ),
     );
-    expect(tinyAudio?.[0]?.language).toBe('eng');
+    expect(tinyAudio?.tracks[0]?.language).toBe('eng');
   });
 
   it('projects the tkhd enabled flag as the default disposition in both bounded probe paths', async () => {
@@ -541,7 +541,7 @@ describe('simple MP4 faststart probes', () => {
     const tinyAudio = await readTinyAudioFaststartProbe(
       ra(simpleMovie(simpleAudioTrack(audioTable, mdhdV0(44100, 2048), tkhdV0(2, false)))),
     );
-    expect(tinyAudio?.[0]?.defaultDisposition).toBe(false);
+    expect(tinyAudio?.tracks[0]?.defaultDisposition).toBe(false);
   });
 
   it('covers direct version-0 AAC, HE-AAC SBR, zero timing, and absent timing tables', async () => {
@@ -557,20 +557,20 @@ describe('simple MP4 faststart probes', () => {
         ),
       ),
     );
-    expect(heAac?.[0]).toMatchObject({ codec: 'mp4a.40.2', config: { sampleRate: 48000 } });
+    expect(heAac?.tracks[0]).toMatchObject({ codec: 'mp4a.40.2', config: { sampleRate: 48000 } });
 
     const direct = await readTinyAudioFaststartProbe(ra(simpleMovie(validSimpleAudioTrack())));
-    expect(direct?.[0]).toMatchObject({ codec: 'mp4a.40.2', durationSec: 2048 / 44100 });
+    expect(direct?.tracks[0]).toMatchObject({ codec: 'mp4a.40.2', durationSec: 2048 / 44100 });
 
     const zeroTiming = await readTinyAudioFaststartProbe(
       ra(simpleMovie(simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(0, 0)))),
     );
-    expect(zeroTiming?.[0]?.durationSec).toBe(0);
+    expect(zeroTiming?.tracks[0]?.durationSec).toBe(0);
 
     const noTiming = await readTinyAudioFaststartProbe(
       ra(simpleMovie(simpleAudioTrack(stsd(box('mp4a', mp4aV0Payload())), mdhdV0(44100, 0)))),
     );
-    expect(noTiming?.[0]?.durationSec).toBe(0);
+    expect(noTiming?.tracks[0]?.durationSec).toBe(0);
 
     const noSamples = await readTinyAudioFaststartProbe(
       ra(
@@ -582,7 +582,7 @@ describe('simple MP4 faststart probes', () => {
         ),
       ),
     );
-    expect(noSamples).toHaveLength(1);
+    expect(noSamples?.tracks).toHaveLength(1);
 
     const simpleNoSamples = await readSimpleVideoFaststartProbe(
       ra(

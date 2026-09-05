@@ -122,7 +122,7 @@ describe('packet-info runner branch lifecycle', () => {
         { strategy: { pinDriver: 'packet-info-runner-test' } },
         signal,
       ),
-    ).resolves.toEqual({ tracks: [], packets: [ROW] });
+    ).resolves.toEqual({ container: 'mp4', tracks: [], packets: [ROW] });
     await expect(
       runPacketInfo(
         context,
@@ -130,7 +130,7 @@ describe('packet-info runner branch lifecycle', () => {
         { container: 'mp4', strategy: { pinDriver: 'packet-info-runner-test' } },
         signal,
       ),
-    ).resolves.toEqual({ tracks: [], packets: [ROW] });
+    ).resolves.toEqual({ container: 'mp4', tracks: [], packets: [ROW] });
 
     expect(routes).toEqual(['source:packet-info-runner-test', 'token:mp4:packet-info-runner-test']);
     expect(stageSignals).toEqual([signal, signal]);

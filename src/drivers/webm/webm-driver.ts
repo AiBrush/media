@@ -2897,6 +2897,7 @@ async function webmPacketInfoFromWholeSource(
     // before an owned whole-range response can be detached or recycled by `releaseRange`.
     const detachedInfo = { ...info, tracks: info.tracks.map(copyWebmTrack) };
     return {
+      container: detachedInfo.container,
       tracks: toTrackInfos(detachedInfo, framesByIndex),
       packets: packetPayloadRows(bytes, info.tracks, framesByIndex, sourceDurationUs).map(
         ({ data: _data, alpha: _alpha, ...row }) => row,
@@ -3113,6 +3114,7 @@ async function webmPacketInfoFromSource(
   const sourceDurationUs =
     info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
   return {
+    container: info.container,
     tracks: toTrackInfos(info, framesByIndex),
     packets: scannedPacketRows(info.tracks, framesByIndex, sourceDurationUs),
   };
@@ -4908,6 +4910,7 @@ export const WebmDriver: ContainerDriver = {
     const sourceDurationUs =
       info.durationSec > 0 ? Math.round(info.durationSec * MICROS_PER_SECOND) : undefined;
     return {
+      container: info.container,
       tracks,
       packetStats(trackId: number): PacketMetadataStats | undefined {
         const frames = framesByIndex[trackId];

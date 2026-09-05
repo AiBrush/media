@@ -16,6 +16,7 @@
  * stitched bytes are a valid single TS; fMP4 needs its `EXT-X-MAP` init segment once, up front.
  */
 
+import { isHlsPlaylist } from '../../api/source-io.ts';
 import { InputError, MediaError } from '../../contracts/errors.ts';
 import { AES_BLOCK } from '../../crypto/aes.ts';
 import { decryptHlsAes128, decryptHlsSampleAesTs } from '../../crypto/hls-aes.ts';
@@ -66,39 +67,6 @@ const AAC_ADTS_MIME = 'audio/aac';
 const TS_SYNC_BYTE = 0x47;
 const AES128_KEY_LEN = 16;
 type HlsAes128KeyCache = Map<string, Promise<Uint8Array<ArrayBuffer>>>;
-
-/** `#EXTM3U` — the Basic Tag RFC 8216 §4.3.1.1 mandates as the very first line of EVERY playlist. */
-const EXTM3U_TAG = Uint8Array.of(0x23, 0x45, 0x58, 0x54, 0x4d, 0x33, 0x55);
-/** A leading UTF-8 byte-order mark, tolerated before the `#EXTM3U` tag. */
-const UTF8_BOM = Uint8Array.of(0xef, 0xbb, 0xbf);
-
-/**
- * Detect an HLS playlist **structurally** from its leading bytes: RFC 8216 §4.3.1.1 requires the first
- * line of every Media/Master Playlist to be exactly the `#EXTM3U` tag, so a manifest is identified by
- * that signature — never by a `.m3u8` extension or a MIME guess alone (a `video/mp2t`-tagged manifest,
- * as the fair harness feeds, would otherwise be mis-routed straight into the MPEG-TS driver, which then
- * finds no `0x47` sync run in the undecrypted manifest/segment bytes — ADR-183). A leading UTF-8 BOM is
- * tolerated; the tag MUST be followed by a line terminator, ASCII whitespace, or end-of-head, so a longer
- * token such as `#EXTM3UX` is rejected. `head` is any prefix of the resource — a dozen bytes suffice, so
- * the engine can pass the same magic-sniff head it routes containers with.
- */
-export function isHlsPlaylist(head: Uint8Array): boolean {
-  const off =
-    head.length >= UTF8_BOM.length &&
-    head[0] === UTF8_BOM[0] &&
-    head[1] === UTF8_BOM[1] &&
-    head[2] === UTF8_BOM[2]
-      ? UTF8_BOM.length
-      : 0;
-  for (let i = 0; i < EXTM3U_TAG.length; i++) {
-    if (head[off + i] !== EXTM3U_TAG[i]) return false;
-  }
-  const after = head[off + EXTM3U_TAG.length];
-  // End-of-head, or a boundary byte (LF / CR / space / tab) — never a longer identifier like `#EXTM3Ualbum`.
-  return (
-    after === undefined || after === 0x0a || after === 0x0d || after === 0x20 || after === 0x09
-  );
-}
 
 /**
  * Resolve an HLS playlist into a single demuxable {@link Source}: parse → (pick variant) → fetch + decrypt +
@@ -531,3 +499,6 @@ async function defaultFetchResource(uri: string): Promise<Uint8Array> {
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new MediaError('aborted', 'operation cancelled');
 }
+
+/** Re-exported from the eager source layer, where the gate needs the same signature check. */
+export { isHlsPlaylist };

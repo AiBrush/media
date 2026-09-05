@@ -6,7 +6,9 @@ import { memoizeAsync } from '../../util/memoize-async.ts';
 import { type LazyContainerSpec, lazyContainer } from '../lazy-container.ts';
 import { matchesMp4 } from './mp4-sniff.ts';
 
-// One import per module, not per probe: a cached dynamic import still costs ~10 µs in Chromium.
+// One import per module, not per probe: a cached dynamic import still costs ~10 µs in Chromium. The
+// registration closure must keep this lazy (checked by the package budgets), so callers that care
+// about the first probe's latency warm it through `preload({ op: 'probe' })`.
 const loadLazyProbe = memoizeAsync(() => import('./mp4-lazy-probe.ts'));
 
 export const MP4_LAZY_CONTAINER_SPEC: LazyContainerSpec = {
@@ -17,8 +19,10 @@ export const MP4_LAZY_CONTAINER_SPEC: LazyContainerSpec = {
   probe: true,
   probeImpl: (src, options) =>
     loadLazyProbe().then((module) => module.probeMp4Faststart(src, options)),
+  warmProbeImpl: loadLazyProbe,
   packetInfo: true,
   packetInfoBatches: true,
+  seekPackets: true,
   auditMuxedTrack: true,
   streamCopy: true,
   decrypt: true,

@@ -33,6 +33,7 @@ import type {
   WasmRuntimeProfile,
 } from '../contracts/driver.ts';
 import { CapabilityError, InputError, MediaError } from '../contracts/errors.ts';
+import { registerContainerForMagicHead } from '../drivers/container-magic-registration.ts';
 import { Registry, isApiVersionSupported } from '../kernel/registry.ts';
 import { type CodecRoute, Router, type StageSelectOptions } from '../kernel/router.ts';
 import type { RouteCost } from '../kernel/tier-thresholds.ts';
@@ -80,6 +81,7 @@ import {
   muxOptionsFrom,
   normalizeByteInput,
   sourceGeometryOf,
+  stampContainerToken,
 } from './op-support.ts';
 import type { PacketInfoBatchCallOptions, PacketInfoCallOptions } from './packet-info-runner.ts';
 // Type-only: erased at build time, so this is NOT a static import edge — the FLAC + raw-PCM authoring
@@ -469,6 +471,12 @@ export class MediaEngineImpl implements MediaEngine {
           throwIfAborted(signal);
           return probeLiveMediaStream(normalized);
         }
+        // An empty byte source cannot carry any container or image: reject it here, exactly as
+        // `demux()` does, rather than loading the probe runner, its range cache, and the image
+        // orchestration only for every route to decline on zero bytes.
+        if (normalized.size === 0) {
+          throw new InputError('cannot probe an empty input');
+        }
         const { runProbe } = await loadProbeRunnerModule();
         return runProbe(this.#probeRunnerContext(), input, normalized, o, signal);
       })
@@ -505,10 +513,21 @@ export class MediaEngineImpl implements MediaEngine {
         throw new InputError('cannot demux an empty input');
       }
       let src = await this.#resolveHlsInput(input, normalized, signal);
+      // A resolved manifest is an HLS presentation, not the container of the segments it stitched:
+      // report what the caller asked to demux rather than the transport its segments happen to use.
+      const resolvedFromHls = src !== normalized;
       try {
         src = await this.#cacheFiniteBlobRanges(src);
         const container = await this.#routeContainer(src, 'demux', signal, o.strategy?.pinDriver);
-        return await container.demux(src, this.#stageOptions(signal, o));
+        const demuxer = await container.demux(src, this.#stageOptions(signal, o));
+        return resolvedFromHls
+          ? (Object.defineProperty(demuxer, 'container', {
+              value: 'hls',
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            }) as Demuxed)
+          : stampContainerToken(demuxer, container);
       } catch (error) {
         await cancelSource(src, error);
         throw error;
@@ -874,9 +893,16 @@ export class MediaEngineImpl implements MediaEngine {
             await Promise.all([loadProbeRangeCache(), loadProbeRunnerModule()]);
           }
         },
-        pickContainer: async (q) => {
-          const driver = this.#router.pickContainer(q);
-          await (driver as ContainerDriver & LazyChunkDriver).ensureLoaded?.();
+        pickContainer: async (q, op) => {
+          const driver = this.#router.pickContainer(q) as ContainerDriver &
+            LazyChunkDriver & { ensureProbeLoaded?: () => Promise<void> };
+          // A probe never touches the complete demux/mux driver: warm the chunk its metadata-only
+          // path actually imports, so the first probe pays no module fetch inside its own timing.
+          if (op === 'probe' && driver.ensureProbeLoaded !== undefined) {
+            await driver.ensureProbeLoaded();
+            return;
+          }
+          await driver.ensureLoaded?.();
         },
         pickCodec: async (q) => {
           // Warm through the verdict-carrying route (ADR-203): the cached CodecRoute the first real
@@ -935,6 +961,17 @@ export class MediaEngineImpl implements MediaEngine {
       // driver. Ambiguous/unsupported queries and failed pinned retries retain the complete established
       // defaults fallback. An explicitly `use()`d matching driver never reaches either path.
       if (!(e instanceof CapabilityError) || this.#defaultsLoaded) throw e;
+      // A definite magic head names its driver without consulting the selective-registration module, so
+      // the first operation on an unlabeled source loads that one driver instead of paying a second
+      // serialized chunk round trip to learn the same thing. Anything else keeps the complete fallback.
+      if (await registerContainerForMagicHead(this.#registry, q, pinDriver, () => this.#invalidateProbeResults())) {
+        this.#router.clearCache();
+        try {
+          return this.#router.pickContainer(q, select);
+        } catch (retry) {
+          if (!(retry instanceof CapabilityError)) throw retry;
+        }
+      }
       const { pickContainerWithDefaultFallback } = await loadDefaultContainerRegistrationModule();
       return pickContainerWithDefaultFallback(
         this.#registry,

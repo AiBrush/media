@@ -132,6 +132,34 @@ export function extensionOf(filename: string | undefined): string | undefined {
  * harness labels them — mislabeled as an MPEG-TS stream (`video/mp2t`). Every definite non-HLS
  * container (mp4/wav/flac/webm/…) returns `false` so the HLS path costs it no extra head read.
  */
+/**
+ * Detect an HLS playlist **structurally** from its leading bytes: RFC 8216 §4.3.1.1 requires the first
+ * line of every Media/Master Playlist to be exactly the `#EXTM3U` tag, so a manifest is identified by
+ * that signature — never by a `.m3u8` extension or a MIME guess alone (a `video/mp2t`-tagged manifest,
+ * as the fair harness feeds, would otherwise be mis-routed straight into the MPEG-TS driver, which then
+ * finds no `0x47` sync run in the undecrypted manifest/segment bytes — ADR-183). A leading UTF-8 BOM is
+ * tolerated; the tag MUST be followed by a line terminator, ASCII whitespace, or end-of-head, so a longer
+ * token such as `#EXTM3UX` is rejected. `head` is any prefix of the resource — a dozen bytes suffice, so
+ * the engine can pass the same magic-sniff head it routes containers with.
+ */
+export function isHlsPlaylist(head: Uint8Array): boolean {
+  const off = head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf ? 3 : 0;
+  if (
+    head[off] !== 0x23 ||
+    head[off + 1] !== 0x45 ||
+    head[off + 2] !== 0x58 ||
+    head[off + 3] !== 0x54 ||
+    head[off + 4] !== 0x4d ||
+    head[off + 5] !== 0x33 ||
+    head[off + 6] !== 0x55
+  ) {
+    return false;
+  }
+  const after = head[off + 7];
+  // End-of-head, or a boundary byte (LF / CR / space / tab) — never a longer identifier like `#EXTM3Ualbum`.
+  return after === undefined || after === 0x0a || after === 0x0d || after === 0x20 || after === 0x09;
+}
+
 export function sourceMayBeHlsManifest(src: Source): boolean {
   const ext = extensionOf(src.filename);
   if (ext === 'm3u8' || ext === 'm3u') return true;
@@ -146,7 +174,11 @@ export function sourceMayBeHlsManifest(src: Source): boolean {
   ) {
     return false;
   }
-  return true;
+  // An in-memory source answers the question exactly from its own bytes at no I/O cost. Unlabeled bytes
+  // carry no extension or MIME to gate on, so without this every such probe/demux would load the HLS
+  // module just to read the same seven bytes.
+  const peek = src.peekHead;
+  return peek === undefined || isHlsPlaylist(peek(16));
 }
 
 /** Cheap eager gate before loading the finite blob-URL handoff implementation. */

@@ -8,6 +8,7 @@
 import type {
   ByteSource,
   ContainerDriver,
+  ProbeTracks,
   ContainerQuery,
   DecryptParams,
   Demuxer,
@@ -53,9 +54,16 @@ export interface LazyContainerSpec {
   readonly probeImpl?: (
     src: ByteSource,
     o?: StageOptions,
-  ) => Promise<readonly TrackInfo[] | undefined>;
+  ) => Promise<ProbeTracks | undefined>;
+  /**
+   * Warm exactly the chunk {@link probeImpl} imports. `preload({ op: 'probe' })` uses it so the first
+   * probe pays no module fetch, without dragging in the complete driver it never touches.
+   */
+  readonly warmProbeImpl?: () => Promise<unknown>;
   readonly packetInfo?: true;
   readonly packetInfoBatches?: true;
+  /** Index-driven random access for seek; the proxy forwards it to the loaded driver. */
+  readonly seekPackets?: true;
   readonly auditMuxedTrack?: true;
   readonly streamCopy?: true;
   readonly decrypt?: true;
@@ -100,9 +108,16 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
     formats: spec.formats,
     ...(spec.streamCopyTargets === undefined ? {} : { streamCopyTargets: spec.streamCopyTargets }),
     supports: spec.supports,
+    ...(spec.warmProbeImpl !== undefined
+      ? {
+          ensureProbeLoaded: async (): Promise<void> => {
+            await spec.warmProbeImpl?.();
+          },
+        }
+      : {}),
     ...(spec.probe === true
       ? {
-          async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+          async probe(src: ByteSource, o?: StageOptions): Promise<ProbeTracks> {
             if (spec.probeImpl !== undefined) {
               const tracks = await spec.probeImpl(src, o);
               if (tracks !== undefined) return tracks;
@@ -157,6 +172,21 @@ export function lazyContainer(spec: LazyContainerSpec): ContainerDriver {
         gaplessSeam: spec.gaplessSeam === true,
       });
     },
+    ...(spec.seekPackets === true
+      ? {
+          async seekPackets(
+            src: ByteSource,
+            trackId: number,
+            timeUs: number,
+            o?: StageOptions,
+          ): Promise<ReadableStream<Packet> | undefined> {
+            const loaded = await load();
+            const seekPackets = loaded.seekPackets;
+            if (seekPackets === undefined) throw missingLazyMethod(spec.id, 'seekPackets');
+            return seekPackets.call(loaded, src, trackId, timeUs, o);
+          },
+        }
+      : {}),
     ...(spec.auditMuxedTrack === true
       ? {
           async auditMuxedTrack(

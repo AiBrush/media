@@ -1,7 +1,8 @@
 /** Lightweight finite-range MP4 faststart probe used by the default lazy container proxy. */
 
 import { h264AvcCSampleAspectRatios } from '../../codecs/h264-avcc-crop.ts';
-import type { ByteSource, StageOptions, TrackInfo } from '../../contracts/driver.ts';
+import type { ByteSource, ProbeTracks, StageOptions, TrackInfo } from '../../contracts/driver.ts';
+import { MediaError } from '../../contracts/errors.ts';
 import { raceAbort, sourceAbortError } from '../../sources/abort.ts';
 import { readSimpleVideoFaststartProbe } from './simple-video-probe.ts';
 
@@ -55,13 +56,49 @@ function simpleResultIsCanonicalSubset(brand: string, tracks: readonly TrackInfo
 }
 
 /**
+ * True when walking the top-level boxes present in `head` proves no `moov` can ever be read: a box
+ * declares an end beyond the finite source size, so the extent after it does not exist. Every other
+ * shape — a box that runs past the *window* rather than the file, a `size: 0` box that legally extends
+ * to EOF, a `moov` reached first, a header we cannot read yet — returns false and keeps the normal path.
+ */
+function isUnreachableIsoBmffLayout(head: Uint8Array, size: number): boolean {
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  let offset = 0;
+  while (offset + 8 <= head.byteLength) {
+    let boxSize = view.getUint32(offset);
+    let headerSize = 8;
+    if (boxSize === 1) {
+      if (offset + 16 > head.byteLength) return false;
+      const high = view.getUint32(offset + 8);
+      const low = view.getUint32(offset + 12);
+      boxSize = high * 0x1_0000_0000 + low;
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      return false;
+    }
+    if (boxSize < headerSize) return false;
+    const type = String.fromCharCode(
+      head[offset + 4] ?? 0,
+      head[offset + 5] ?? 0,
+      head[offset + 6] ?? 0,
+      head[offset + 7] ?? 0,
+    );
+    if (type === 'moov') return false;
+    const end = offset + boxSize;
+    if (end > size) return true;
+    offset = end;
+  }
+  return false;
+}
+
+/**
  * Probe the common finite faststart MP4 shape without loading the full demux/mux driver. `undefined`
  * is a deliberate decline: the lazy proxy then loads and calls the canonical complete driver once.
  */
 export async function probeMp4Faststart(
   src: ByteSource,
   options?: StageOptions,
-): Promise<readonly TrackInfo[] | undefined> {
+): Promise<ProbeTracks | undefined> {
   const range = src.range;
   const size = src.size;
   if (range === undefined || size === undefined || !Number.isSafeInteger(size) || size <= 0) {
@@ -71,10 +108,16 @@ export async function probeMp4Faststart(
   const retained = new Set<Uint8Array>();
   try {
     throwIfAborted(signal);
+    // The head is read once and reused: the layout pre-check and the compact parser both start at
+    // offset 0, and a second underlying range request there would be pure waste.
+    let firstHead: Uint8Array | undefined;
     const randomAccess = {
       size,
       async read(offset: number, length: number): Promise<Uint8Array> {
         throwIfAborted(signal);
+        if (offset === 0 && firstHead !== undefined && length <= firstHead.byteLength) {
+          return length === firstHead.byteLength ? firstHead : firstHead.subarray(0, length);
+        }
         const requested = range.call(src, offset, offset + length, signal);
         let bytes: Uint8Array;
         try {
@@ -92,14 +135,25 @@ export async function probeMp4Faststart(
         }
         retained.add(bytes);
         throwIfAborted(signal);
-        return bytes.byteLength <= length ? bytes : bytes.subarray(0, length);
+        const view = bytes.byteLength <= length ? bytes : bytes.subarray(0, length);
+        if (firstHead === undefined && offset === 0) firstHead = view;
+        return view;
       },
     };
-    const simple = await readSimpleVideoFaststartProbe(
-      randomAccess,
+    // A top-level box that declares an extent past a known finite EOF makes every later box —
+    // including the `moov`, if the file has one — unreachable, so the file cannot be a movie. Reaching
+    // that conclusion from the head the compact parser is about to read anyway keeps a malformed input
+    // from walking (and materializing) the boxes it declares, and from loading the complete driver.
+    const initialBytes =
       (src as ByteSource & { readonly kind?: string }).kind === 'blob'
         ? BLOB_FASTSTART_PROBE_INITIAL_BYTES
-        : FASTSTART_PROBE_INITIAL_BYTES,
+        : FASTSTART_PROBE_INITIAL_BYTES;
+    if (isUnreachableIsoBmffLayout(await randomAccess.read(0, Math.min(size, initialBytes)), size)) {
+      throw new MediaError('demux-error', 'no moov box found (not a valid MP4/MOV)');
+    }
+    const simple = await readSimpleVideoFaststartProbe(
+      randomAccess,
+      initialBytes,
       true,
     );
     const simpleTracks =
@@ -107,7 +161,14 @@ export async function probeMp4Faststart(
         ? simple.tracks
         : undefined;
     throwIfAborted(signal);
-    return simpleTracks?.map(detachTrack);
+    if (simpleTracks === undefined || simple === undefined) return undefined;
+    // The `ftyp` brand came out of the same head window this probe already read, so reporting it as a
+    // container tag costs nothing. Non-enumerable: the result still behaves as the plain track array.
+    return Object.defineProperty(simpleTracks.map(detachTrack), 'tags', {
+      value: Object.freeze({ major_brand: simple.brand }),
+      enumerable: false,
+      configurable: true,
+    }) as ProbeTracks;
   } finally {
     for (const bytes of retained) src.releaseRange?.(bytes);
   }

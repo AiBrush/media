@@ -20,8 +20,6 @@ import type {
   CallOptions,
   ConvertOptions,
   EncodeOptions,
-  MediaInfo,
-  MediaInfoTrack,
   MuxSpec,
   Output,
   RemuxOptions,
@@ -180,42 +178,28 @@ export function isFlacAuthorCodec(codec: string | undefined): boolean {
   return codec === undefined || codec === 'flac' || codec === 'pcm' || codec.startsWith('pcm-');
 }
 
-export function toMediaInfo(
+/**
+ * Stamp the routed container token onto a driver result. The engine owns routing, so it is the only
+ * layer that knows which container a name-free or mislabeled source actually resolved to; drivers
+ * therefore never populate the field themselves. The token is added as an own enumerable property on
+ * the driver's own result object, keeping every optional driver member (packet tables, packet stats)
+ * reachable by the caller.
+ */
+export function stampContainerToken<T extends object>(
+  result: T,
   container: ContainerDriver,
-  tracks: readonly TrackInfo[],
-  src: Source,
-): MediaInfo {
-  const infoTracks = tracks.map(toInfoTrack);
-  const durationSec = infoTracks.reduce((max, t) => Math.max(max, t.durationSec ?? 0), 0);
-  return {
-    container: container.formats[0] ?? 'unknown',
-    durationSec,
-    ...(src.size !== undefined ? { sizeBytes: src.size } : {}),
-    tracks: infoTracks,
-  };
+): T & { readonly container: string } {
+  // A multi-format driver (mp4/mov, webm/mkv) knows which flavor it actually parsed and reports it on
+  // its own result; only a driver that stays silent falls back to its primary format.
+  const reported = (result as { container?: unknown }).container;
+  return Object.defineProperty(result, 'container', {
+    value:
+      typeof reported === 'string' && reported.length > 0
+        ? reported
+        : container.formats[0] ?? 'unknown',
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  }) as T & { readonly container: string };
 }
 
-function toInfoTrack(t: TrackInfo): MediaInfoTrack {
-  const base: MediaInfoTrack = {
-    id: t.id,
-    type: t.nonMedia ? 'other' : t.mediaType,
-    codec: t.codec,
-  };
-  if (t.durationSec !== undefined) base.durationSec = t.durationSec;
-  if (t.language !== undefined) base.language = t.language;
-  if (t.defaultDisposition !== undefined) base.defaultDisposition = t.defaultDisposition;
-  if (t.encrypted === true) base.encrypted = true;
-  if (t.encryptionScheme !== undefined) base.encryptionScheme = t.encryptionScheme;
-  if (t.fps !== undefined) base.fps = t.fps;
-  if (t.rotation !== undefined) base.rotation = t.rotation;
-  const config = t.config;
-  if (config && 'codedWidth' in config) {
-    if (config.codedWidth !== undefined) base.width = config.codedWidth;
-    if (config.codedHeight !== undefined) base.height = config.codedHeight;
-  }
-  if (config && 'sampleRate' in config) {
-    base.sampleRate = config.sampleRate;
-    base.channels = config.numberOfChannels;
-  }
-  return base;
-}

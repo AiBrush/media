@@ -18,6 +18,7 @@ import type {
   PacketInfoBatchOptions,
   PacketInfoBatchStream,
   PacketInfoTable,
+  ProbeTracks,
   PacketMetadata,
   PacketMetadataStats,
   Registry,
@@ -862,7 +863,7 @@ async function applyFragmentTimingForProbe(
   return applyFragmentTiming(movie, await readWholeFile(ra, ra.size ?? Number.MAX_SAFE_INTEGER));
 }
 
-type SmallFaststartMetadataProbeTracks = readonly TrackInfo[] | false | undefined;
+type SmallFaststartMetadataProbeTracks = ProbeTracks | false | undefined;
 
 function isBoundedVideoMetadataTrack(track: ParsedTrack, fragmentTimingPending = false): boolean {
   if (track.mediaType === 'video') {
@@ -945,7 +946,10 @@ async function readBoundedVideoMetadataProbeTracks(
           return false;
         }
         if (movie.needsFragmentTiming && !authoritativeFragmentedAudio) {
-          return toProbeTracks(await applyFragmentTimingForProbe(movie, ra, signal, initialPrefix));
+          return withMajorBrandTag(
+            toProbeTracks(await applyFragmentTimingForProbe(movie, ra, signal, initialPrefix)),
+            brand,
+          );
         }
         // A `video/mp4` MIME or `.mp4` suffix identifies the container, not the track set. If the
         // canonical metadata parser proves the complete moov is AAC-only, its result is just as final
@@ -956,7 +960,7 @@ async function readBoundedVideoMetadataProbeTracks(
         if (key !== undefined && canHandoffFullMovie(src, ra)) {
           storeFaststartMoovParseHandoff(key, brand, moov.slice());
         }
-        return toProbeTracks(movie);
+        return withMajorBrandTag(toProbeTracks(movie), brand);
       } catch (error) {
         throwIfAborted(signal);
         if (error instanceof MediaError && error.code === 'aborted') throw error;
@@ -971,7 +975,7 @@ async function readBoundedVideoMetadataProbeTracks(
 async function readSimpleVideoFaststartProbeTracks(
   src: ByteSource,
   ra: RandomAccess,
-): Promise<readonly TrackInfo[] | undefined> {
+): Promise<ProbeTracks | undefined> {
   const { readSimpleVideoFaststartProbe } = await loadFaststartProbeModule();
   const result = await readSimpleVideoFaststartProbe(ra);
   if (result === undefined) return undefined;
@@ -979,14 +983,15 @@ async function readSimpleVideoFaststartProbeTracks(
   if (key !== undefined && canHandoffFullMovie(src, ra)) {
     storeFaststartMoovParseHandoff(key, result.brand, result.moov.slice());
   }
-  return result.tracks;
+  return withMajorBrandTag(result.tracks, result.brand);
 }
 
 async function readTinyAudioFaststartProbeTracks(
   ra: RandomAccess,
-): Promise<readonly TrackInfo[] | undefined> {
+): Promise<ProbeTracks | undefined> {
   const { readTinyAudioFaststartProbe } = await loadFaststartProbeModule();
-  return readTinyAudioFaststartProbe(ra);
+  const result = await readTinyAudioFaststartProbe(ra);
+  return result === undefined ? undefined : withMajorBrandTag(result.tracks, result.brand);
 }
 
 interface DeclaredProbeBox extends TopBoxHeader {
@@ -1244,7 +1249,7 @@ function joinProbeBoxes(parts: readonly Uint8Array[]): Uint8Array {
 async function readSparseFaststartProbeTracks(
   ra: SizedRandomAccess,
   signal: AbortSignal | undefined,
-): Promise<readonly TrackInfo[] | undefined> {
+): Promise<ProbeTracks | undefined> {
   const prefetchBytes = Math.min(
     ra.size,
     ra.metadataPrefetchBytes ?? FASTSTART_METADATA_PREFETCH_BYTES,
@@ -1344,7 +1349,7 @@ async function readSparseFaststartProbeTracks(
     ) {
       return undefined;
     }
-    return toProbeTracks(movie);
+    return withMajorBrandTag(toProbeTracks(movie), brand);
   } catch {
     return undefined;
   }
@@ -2993,6 +2998,7 @@ function createMp4PacketInfoBatchStream(
   if (externalSignal?.aborted === true) onAbort();
   else externalSignal?.addEventListener('abort', onAbort, { once: true });
   return {
+    container: movieContainerToken(movie),
     tracks: packetInfoTracks(movie),
     cancel: close,
     [Symbol.asyncIterator](): AsyncIterator<readonly Mp4PacketInfoMetadata[]> {
@@ -3599,6 +3605,20 @@ function toOtherProbeTrackInfo(track: OtherTrack): TrackInfo {
  * presentation trim (whose edit-list duration is the public span); AAC gapless edits stay separate.
  * Non-media traks are enumerated honestly instead of dropped.
  */
+/**
+ * Attach the file-level container metadata a probe already observed. The property is non-enumerable so
+ * the result still compares and serializes as the plain track array every consumer expects, while
+ * `MediaEngine.probe()` can report `MediaInfo.tags`. ISO-BMFF's only file-level fact reachable from the
+ * metadata window every probe path reads is the `ftyp` major brand.
+ */
+function withMajorBrandTag(tracks: readonly TrackInfo[], brand: string): ProbeTracks {
+  return Object.defineProperty(tracks.slice(), 'tags', {
+    value: Object.freeze({ major_brand: brand }),
+    enumerable: false,
+    configurable: true,
+  }) as ProbeTracks;
+}
+
 function toProbeTracks(movie: Movie): readonly TrackInfo[] {
   const others = movie.otherTracks ?? [];
   if (others.length === 0) return movie.tracks.map(toProbeTrackInfo);
@@ -3651,6 +3671,23 @@ function audioGaplessInfo(track: ParsedTrack): TrackInfo['gapless'] | undefined 
  * timestamp from the `stts` table, so a B-frame/open-GOP track enumerates and remuxes in decode order
  * losslessly (ADR-045). For a non-reordered track `dtsUs === ptsUs`, which is the documented no-op.
  */
+/**
+ * The ordinal of the last sync sample presented at or before `timeUs`, or 0 when the target precedes
+ * the first one. `undefined` means the track declares no sync sample at all (every frame a keyframe is
+ * expressed as `keyframe: true` on each sample, so an empty result is a real decline, not a default).
+ */
+function seekStartOrdinal(samples: readonly Sample[], timeUs: number): number | undefined {
+  let found: number | undefined;
+  for (let index = 0; index < samples.length; index++) {
+    const sample = samples[index];
+    if (sample === undefined || !sample.keyframe) continue;
+    if (sample.ptsUs > timeUs) break;
+    found = index;
+  }
+  if (found !== undefined) return found;
+  return samples.some((sample) => sample.keyframe) ? 0 : undefined;
+}
+
 function packetStream(
   ra: RandomAccess,
   track: ParsedTrack,
@@ -3913,6 +3950,11 @@ function packetReadableStream(
  * synchronous boundary receives RandomAccess only through the revocable cell, so clearing the cell severs
  * the sole source lease while independently retained methods and completed packet streams remain usable.
  */
+/** QuickTime files declare the `qt  ` brand; everything else in this family is reported as `mp4`. */
+function movieContainerToken(movie: Movie): 'mp4' | 'mov' {
+  return movie.brand === 'qt  ' ? 'mov' : 'mp4';
+}
+
 function createMp4Demuxer(
   movie: Movie,
   sourceSize: number | undefined,
@@ -3925,6 +3967,7 @@ function createMp4Demuxer(
   const publicTracks = movie.tracks.map(toTrackInfo);
   const publicById = new Map(publicTracks.map((track) => [track.id, track] as const));
   return {
+    container: movieContainerToken(movie),
     tracks: publicTracks,
     packetStats(trackId: number): PacketMetadataStats | undefined {
       const track = byId.get(trackId);
@@ -5347,7 +5390,11 @@ async function collectPacketInfoBatches(stream: PacketInfoBatchStream): Promise<
   const packets: import('../../contracts/driver.ts').PacketInfoMetadata[] = [];
   try {
     for await (const batch of stream) packets.push(...batch);
-    return { tracks: stream.tracks, packets };
+    return {
+      ...(stream.container === undefined ? {} : { container: stream.container }),
+      tracks: stream.tracks,
+      packets,
+    };
   } finally {
     await stream.cancel();
   }
@@ -5360,7 +5407,7 @@ export const Mp4Driver: ContainerDriver = {
   formats: ['mp4', 'mov'],
   validatesStreamCopyTrim: true,
   supports: matchesMp4,
-  async probe(src: ByteSource, o?: StageOptions): Promise<readonly TrackInfo[]> {
+  async probe(src: ByteSource, o?: StageOptions): Promise<ProbeTracks> {
     const signal = o?.signal;
     const ra = await randomAccess(src, {
       releaseRangesOnDispose: true,
@@ -5397,7 +5444,7 @@ export const Mp4Driver: ContainerDriver = {
       }
       const movie = await readMovieForProbe(src, ra);
       throwIfAborted(signal);
-      return toProbeTracks(movie);
+      return withMajorBrandTag(toProbeTracks(movie), movie.brand);
     } finally {
       ra.dispose?.();
     }
@@ -5434,6 +5481,55 @@ export const Mp4Driver: ContainerDriver = {
       mediaDataRanges ?? (await readMediaDataRanges(ra)),
     );
     return createMp4Demuxer(movie, sourceSize, sourceCell, byId, fragmentSamples, signal);
+  },
+  /**
+   * Index-driven random access (ADR-020 seek): start a track's packet stream at the last sync sample
+   * at or before `timeUs`, read through the same planned windows `packets()` uses, so a seek near the
+   * end of a movie costs its trailing GOP instead of a whole-file demux. `undefined` declines the
+   * shapes whose timeline is not in the `moov` sample tables (fragmented movies, no sync table, no
+   * range access); the caller then keeps the established whole-file path.
+   */
+  async seekPackets(
+    src: ByteSource,
+    trackId: number,
+    timeUs: number,
+    o?: StageOptions,
+  ): Promise<ReadableStream<Packet> | undefined> {
+    if (src.range === undefined || !Number.isFinite(timeUs)) return undefined;
+    const signal = o?.signal;
+    const ra = await randomAccess(src, { ...(signal === undefined ? {} : { signal }) });
+    let opened = false;
+    try {
+      throwIfAborted(signal);
+      const movie = await readMovie(ra);
+      throwIfAborted(signal);
+      if (movieIsFragmented(movie)) return undefined;
+      const track = movie.tracks.find((candidate) => candidate.id === trackId);
+      if (track === undefined || track.samples.sampleSizes.length === 0) return undefined;
+      const samples = samplesWithinActiveEdit(track, buildSamples(track));
+      const start = seekStartOrdinal(samples, timeUs);
+      if (start === undefined) return undefined;
+      const fromKeyframe = start === 0 ? samples : samples.slice(start);
+      opened = true;
+      return packetReadableStream(
+        {
+          source: ra,
+          samples: fromKeyframe,
+          readPlan: planPacketReadWindows(fromKeyframe),
+          ordinal: 0,
+          plannedWindowIndex: 0,
+          cancelled: false,
+          currentWindow: undefined,
+          currentBytes: undefined,
+        },
+        track.mediaType === 'video',
+        toTrackInfo(track),
+        ra.inMemory !== true,
+        signal,
+      );
+    } finally {
+      if (!opened) ra.dispose?.();
+    }
   },
   async streamCopy(src: ByteSource, o?: StreamCopyOptions): Promise<ReadableStream<Uint8Array>> {
     const ra = await randomAccess(src, {

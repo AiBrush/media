@@ -452,7 +452,7 @@ describe('probe FLAC — real corpus + STREAMINFO parsing', () => {
     };
 
     const table = await media.packetInfo(src, { container: 'flac' });
-    expect(table).toEqual(flacPacketInfoTable(bytes));
+    expect(table).toEqual({ container: 'flac', ...flacPacketInfoTable(bytes) });
     expect(readable?.locked).toBe(false);
   });
 

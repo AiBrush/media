@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { ByteSource, PacketInfoTable } from '../../contracts/driver.ts';
 import { loadFixture } from '../../test-support/corpus.ts';
-import { WebmDriver, webmPacketPayloadInfoFromBytes } from './webm-driver.ts';
+import { WebmDriver, demuxWebm, webmPacketPayloadInfoFromBytes } from './webm-driver.ts';
 
 const MEDIA_TEST = new URL('../../../../media-test/fixtures/media/', import.meta.url).pathname;
 
@@ -64,9 +64,15 @@ function expectExactReleaseOfEveryResponse(owned: OwnedRangeSource): void {
 function expectedPacketInfo(bytes: Uint8Array): PacketInfoTable {
   const payload = webmPacketPayloadInfoFromBytes(bytes);
   return {
+    container: webmContainerToken(bytes),
     tracks: payload.tracks,
     packets: payload.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
   };
+}
+
+/** The DocType the same fixture declares, which packet-info now reports alongside its rows. */
+function webmContainerToken(bytes: Uint8Array): string {
+  return demuxWebm(bytes).info.container;
 }
 
 async function packetInfo(source: ByteSource, signal?: AbortSignal): Promise<PacketInfoTable> {

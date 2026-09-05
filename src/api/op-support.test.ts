@@ -12,8 +12,8 @@ import {
   muxOptionsFrom,
   sourceGeometryOf,
   stageStrategy,
-  toMediaInfo,
 } from './op-support.ts';
+import { toMediaInfo } from './probe-media-info.ts';
 import { validateReservedFaststart } from './reserved-faststart.ts';
 import type { MuxSpec, RemuxOptions } from './types.ts';
 

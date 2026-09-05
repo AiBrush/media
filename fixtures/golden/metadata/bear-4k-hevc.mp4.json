@@ -25,5 +25,8 @@
       "sampleRate": 44100,
       "channels": 2
     }
-  ]
+  ],
+  "tags": {
+    "major_brand": "isom"
+  }
 }

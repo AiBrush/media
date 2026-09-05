@@ -32,7 +32,7 @@ export interface PreloadHost {
   readonly wasmAssetBaseUrl?: string;
   ensureDefaultDrivers(): Promise<void>;
   warmOperationChunks(op: string): Promise<void>;
-  pickContainer(q: ContainerQuery): void | Promise<void>;
+  pickContainer(q: ContainerQuery, op: string): void | Promise<void>;
   pickCodec(q: CodecQuery): Promise<void>;
   pickFilter(spec: FilterSpec): void;
   onLog?: (event: LogEvent) => void;
@@ -90,7 +90,9 @@ async function runPreloadTask(host: PreloadHost, spec: NormalizedPreloadSpec): P
 
 async function warmContainerPreload(host: PreloadHost, spec: NormalizedPreloadSpec): Promise<void> {
   await Promise.allSettled(
-    preloadContainerQueries(spec).map((q) => Promise.resolve().then(() => host.pickContainer(q))),
+    preloadContainerQueries(spec).map((q) =>
+      Promise.resolve().then(() => host.pickContainer(q, spec.op)),
+    ),
   );
 }
 

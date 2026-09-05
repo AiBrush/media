@@ -639,21 +639,34 @@ export function parseAudioFaststartProbeTracks(moov: Uint8Array): readonly Track
 
 export async function readTinyAudioFaststartProbe(
   ra: SimpleRandomAccess,
-): Promise<readonly TrackInfo[] | undefined> {
+): Promise<TinyAudioFaststartProbe | undefined> {
   const head = await ra.read(0, Math.min(ra.size ?? 0, TINY_AUDIO_FASTSTART_PROBE_MAX_BYTES));
   let offset = 0;
+  let brand = 'mp42';
   for (;;) {
     const header = topBoxHeader(head, offset);
     if (header === undefined) return undefined;
+    if (header.type === 'ftyp' && offset + header.headerSize + 4 <= head.byteLength) {
+      brand = new Reader(
+        head.subarray(offset + header.headerSize, offset + header.headerSize + 4),
+      ).fourcc();
+    }
     if (header.type === 'moov') {
       if (offset + header.size > head.byteLength) return undefined;
-      return parseAudioFaststartProbeTracks(
+      const tracks = parseAudioFaststartProbeTracks(
         head.subarray(offset + header.headerSize, offset + header.size),
       );
+      return tracks === undefined ? undefined : { tracks, brand };
     }
     offset += header.size;
     if (offset + 8 > head.byteLength) return undefined;
   }
+}
+
+/** The tiny-audio faststart probe result: its track facts plus the `ftyp` brand read from the same head. */
+export interface TinyAudioFaststartProbe {
+  readonly tracks: readonly TrackInfo[];
+  readonly brand: string;
 }
 
 function parseSimpleVideoFaststartProbeTracks(

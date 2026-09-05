@@ -356,7 +356,11 @@ export async function mp4PacketInfoFromBytes(
     const packets = [];
     try {
       for await (const batch of stream) packets.push(...batch);
-      return { tracks: stream.tracks, packets };
+      return {
+        ...(stream.container === undefined ? {} : { container: stream.container }),
+        tracks: stream.tracks,
+        packets,
+      };
     } finally {
       await stream.cancel();
     }

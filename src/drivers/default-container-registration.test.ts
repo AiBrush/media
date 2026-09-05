@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createMedia } from '../api/create-media.ts';
-import { toMediaInfo } from '../api/op-support.ts';
+import { toMediaInfo } from '../api/probe-media-info.ts';
 import { Registry } from '../kernel/registry.ts';
 import { Router } from '../kernel/router.ts';
 import { fromBytes } from '../sources/source.ts';

@@ -13,7 +13,7 @@ import type {
 import { CapabilityError } from '../contracts/errors.ts';
 import { cancelSource } from '../sources/source.ts';
 import type { MediaInput, Source } from '../sources/source.ts';
-import { normalizeByteInput } from './op-support.ts';
+import { normalizeByteInput, stampContainerToken } from './op-support.ts';
 import type { CallOptions, Container } from './types.ts';
 
 export type PacketInfoCallOptions = CallOptions & { readonly container?: Container };
@@ -53,7 +53,10 @@ export async function runPacketInfo(
         tried: [container.id],
       });
     }
-    return await container.packetInfo(source, context.stage(signal, options));
+    return stampContainerToken(
+      await container.packetInfo(source, context.stage(signal, options)),
+      container,
+    );
   } finally {
     await cancelSource(source, signal.reason);
   }
@@ -98,7 +101,7 @@ export async function runPacketInfoBatches(
         : {}),
     };
     const inner = await container.packetInfoBatches(source, stage);
-    return ownPacketInfoBatchSource(inner, source, lifecycleSignal);
+    return stampContainerToken(ownPacketInfoBatchSource(inner, source, lifecycleSignal), container);
   } catch (error) {
     await cancelSource(source, error);
     throw error;

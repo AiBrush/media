@@ -753,6 +753,7 @@ describe('createMedia', () => {
   it('demux routes to a registered container driver and exposes packet streams', async () => {
     const media = createMedia().use(NoopDriverModule);
     const demuxed = await media.demux(NOOP_BYTES);
+    expect(demuxed.container).toBe('noop');
     expect(demuxed.tracks).toEqual([]);
     const reader = demuxed.packets(0).getReader();
     expect((await reader.read()).done).toBe(true);
@@ -763,7 +764,7 @@ describe('createMedia', () => {
     const withPacketInfo = createMedia().use(packetInfoModule());
     await expect(
       withPacketInfo.packetInfo(fromBytes(new Uint8Array([1]), { mime: 'video/x-packet-info' })),
-    ).resolves.toEqual({ tracks: [], packets: [] });
+    ).resolves.toEqual({ container: 'mp4', tracks: [], packets: [] });
 
     const withoutPacketInfo = createMedia().use(NoopDriverModule);
     await expect(withoutPacketInfo.packetInfo(NOOP_BYTES)).rejects.toBeInstanceOf(CapabilityError);

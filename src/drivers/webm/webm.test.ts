@@ -890,6 +890,7 @@ describe('probe WebM across the real corpus', () => {
     });
 
     expect(actual).toEqual({
+      container: 'webm',
       tracks: expected.tracks,
       packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
     });
@@ -996,6 +997,7 @@ describe('probe WebM across the real corpus', () => {
     });
 
     expect(actual).toEqual({
+      container: 'webm',
       tracks: expected.tracks,
       packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
     });
@@ -1050,6 +1052,7 @@ describe('probe WebM across the real corpus', () => {
     });
 
     expect(actual).toEqual({
+      container: 'webm',
       tracks: expected.tracks,
       packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
     });
@@ -1097,6 +1100,7 @@ describe('probe WebM across the real corpus', () => {
       },
     });
     expect(actual).toEqual({
+      container: 'webm',
       tracks: expected.tracks,
       packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
     });
@@ -1189,6 +1193,7 @@ describe('probe WebM across the real corpus', () => {
       },
     });
     expect(actual).toEqual({
+      container: 'webm',
       tracks: expected.tracks,
       packets: expected.packets.map(({ data: _data, alpha: _alpha, ...packet }) => packet),
     });

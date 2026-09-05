@@ -389,6 +389,13 @@ export interface MediaInfo {
 
 /** A live demux result (public-facing); {@link Packet} carries each chunk's PTS plus optional side data. */
 export interface Demuxed {
+  /**
+   * The canonical container token the engine actually routed to (the selected driver's first
+   * {@link ContainerDriver.formats} entry), so a caller demuxing an unlabeled or mislabeled blob
+   * reads the resolved format from the result instead of re-deriving it from a name or MIME hint.
+   * Matches {@link MediaInfo.container} for the same input.
+   */
+  readonly container: string;
   readonly tracks: readonly TrackInfo[];
   packetTable?(): readonly PacketMetadata[];
   packets(trackId: number): ReadableStream<Packet>;
